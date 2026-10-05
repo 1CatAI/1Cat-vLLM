@@ -7,13 +7,15 @@ import torch
 
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.models.qwen4_exp.nvidia.sm70_ngram_input import prepare_ngram_input
+from vllm.v1.worker.gpu.buffer_utils import UvaBuffer
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
 @pytest.mark.parametrize("requests,padded", [(0, 4), (1, 1), (1, 4), (4, 4)])
 @pytest.mark.parametrize("length", [2, 7])
-def test_official_state_and_rollback_graph(requests, padded, length):
+@pytest.mark.parametrize("uva", [False, True])
+def test_official_state_and_rollback_graph(requests, padded, length, uva):
     device = "cuda"
     eos = 248046
     expected_context = torch.empty((padded, length), dtype=torch.int32, device=device)
@@ -23,6 +25,10 @@ def test_official_state_and_rollback_graph(requests, padded, length):
     mapping = torch.tensor([3, 1, 2, 0], dtype=torch.int32, device=device)
     computed = torch.tensor([31, 0, 2, 23], dtype=torch.int32, device=device)
     tokens = torch.arange(4 * 64, dtype=torch.int32, device=device).reshape(4, 64)
+    if uva:
+        backing = UvaBuffer((4, 64), torch.int32)
+        backing.cpu.copy_(torch.arange(4 * 64, dtype=torch.int32).reshape(4, 64))
+        tokens = backing.uva
     batch = SimpleNamespace(
         num_reqs=requests, num_reqs_after_padding=padded, idx_mapping=mapping
     )

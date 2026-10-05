@@ -15,6 +15,7 @@ import torch
 import vllm
 from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
 from vllm.models.qwen4_exp.nvidia.sm70_ngram_input import prepare_ngram_input
+from vllm.v1.worker.gpu.buffer_utils import UvaBuffer
 
 
 def main():
@@ -22,7 +23,11 @@ def main():
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
     assert "site-packages" in vllm.__file__
-    report = {"version": vllm.__version__, "cases": []}
+    report = {
+        "version": vllm.__version__,
+        "token_storage": "pinned UVA as in RequestState",
+        "cases": [],
+    }
     from vllm import _C
 
     report["core_sha256"] = hashlib.sha256(Path(_C.__file__).read_bytes()).hexdigest()
@@ -33,8 +38,11 @@ def main():
         destination = torch.empty_like(query)
         mapping = torch.arange(requests, dtype=torch.int32, device="cuda")
         computed = torch.arange(requests, dtype=torch.int32, device="cuda") + 8192
-        tokens = torch.arange(requests * 9216, dtype=torch.int32, device="cuda")
-        tokens = tokens.reshape(requests, 9216)
+        backing = UvaBuffer((requests, 9216), torch.int32)
+        backing.cpu.copy_(
+            torch.arange(requests * 9216, dtype=torch.int32).reshape(requests, 9216)
+        )
+        tokens = backing.uva
         batch = SimpleNamespace(
             num_reqs=requests, num_reqs_after_padding=requests, idx_mapping=mapping
         )
