@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.build_sm70_mtp_draft_vocab import mix_target_counts, rank_vocab
+from benchmarks.build_sm70_mtp_draft_vocab import (
+    cjk_vocab_ids,
+    mix_target_counts,
+    rank_vocab,
+)
 
 
 def test_heldout_counts_do_not_change_training_ranking():
@@ -38,3 +43,21 @@ def test_quality_outputs_cannot_be_used_as_training():
             {("en", "train"): Counter({0: 1})},
             [{"id": "gsm8k/gsm8k_588", "language": "en", "token_ids": [0]}],
         )
+
+
+def test_cjk_extension_uses_decoded_original_ids_without_evaluation():
+    decoded = {
+        "bytes1": "漢字",
+        "bytes2": "かな",
+        "bytes3": "한글",
+        "bytes4": "𠀀",
+        "ascii": "hello",
+        "partial": "�",
+    }
+    backend = SimpleNamespace(
+        get_vocab=lambda: {token: token_id for token_id, token in enumerate(decoded)},
+        decoder=SimpleNamespace(decode=lambda tokens: decoded[tokens[0]]),
+    )
+    assert cjk_vocab_ids(SimpleNamespace(backend_tokenizer=backend)) == {0, 1, 2, 3}
+    with pytest.raises(ValueError, match="fast tokenizer"):
+        cjk_vocab_ids(SimpleNamespace())

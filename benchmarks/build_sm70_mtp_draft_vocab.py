@@ -15,6 +15,31 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
+# Include ideographs, kana and Hangul, including compatibility/extension blocks.
+CJK_RANGES = (
+    (0x3000, 0x30FF),
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xAC00, 0xD7A3),
+    (0xF900, 0xFAFF),
+    (0x20000, 0x323AF),
+    (0x1100, 0x11FF),
+    (0x3130, 0x318F),
+)
+
+
+def cjk_vocab_ids(tokenizer):
+    """Extend independently of evaluation text, preserving original global IDs."""
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    if backend is None or backend.decoder is None:
+        raise ValueError("CJK extension requires a fast tokenizer with a decoder")
+    selected = set()
+    for token, token_id in backend.get_vocab().items():
+        decoded = backend.decoder.decode([token])
+        if any(any(lo <= ord(c) <= hi for lo, hi in CJK_RANGES) for c in decoded):
+            selected.add(token_id)
+    return selected
+
 
 def rank_vocab(counts, size, special_ids, language_weights):
     mandatory = set(special_ids)
@@ -68,6 +93,11 @@ def main():
     parser.add_argument("--size", type=int, default=32768)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--target-outputs", type=Path)
+    parser.add_argument(
+        "--include-cjk",
+        action="store_true",
+        help="Union with all CJK tokens; actual size can exceed --size",
+    )
     args = parser.parse_args()
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, local_files_only=True)
     documents = json.loads(args.corpus.read_text())
@@ -107,6 +137,8 @@ def main():
             raise ValueError("Training output contains invalid token IDs")
         ranked = mix_target_counts(counts, training)
     ids = rank_vocab(ranked, args.size, tokenizer.all_special_ids, weights)
+    cjk_ids = cjk_vocab_ids(tokenizer) if args.include_cjk else set()
+    ids = sorted(set(ids) | cjk_ids)
     selected = set(ids)
     statistics = [
         {
@@ -131,6 +163,13 @@ def main():
         "coverage_is_admission_gate": False,
         "model_admission": False,
     }
+    if args.include_cjk:
+        result["cjk_extension"] = {
+            "frequency_subset_size": args.size,
+            "all_cjk_token_count": len(cjk_ids),
+            "unicode_ranges": CJK_RANGES,
+            "evaluation_used": False,
+        }
     if args.target_outputs:
         result["target_outputs_sha256"] = hashlib.sha256(
             args.target_outputs.read_bytes()
