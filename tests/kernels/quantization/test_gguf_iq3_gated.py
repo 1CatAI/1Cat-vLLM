@@ -35,6 +35,12 @@ def test_only_measured_pair_and_m_are_admitted(monkeypatch):
         ((21, 21), 4352, 5120),
     ):
         assert iq3_gated_pair_capability(types, k, n, torch.float16).reason
+    assert (
+        iq3_gated_pair_capability(
+            (21, 21), 5120, 4352, torch.float16, compute_capability=80
+        ).reason
+        == "requires_sm70_device"
+    )
     assert iq3_gated_pair_capability((21, 21), 5120, 4352, torch.bfloat16).reason
     assert iq3_gated_pair_capability((21, 21), 5120, 4352, torch.float16, False).reason
 

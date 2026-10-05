@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.gguf_turbomind import (
     _admitted_bands,
     _prepared_gguf_projection,
 )
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
@@ -74,6 +75,11 @@ direct_register_custom_op(
 
 
 def prepare_iq3_gated_pair(layer, sources, projections, enabled: bool):
+    device_capability = (
+        current_platform.get_device_capability(sources[0][0].device.index)
+        if sources and sources[0][0].device.type == "cuda"
+        else None
+    )
     capability = iq3_gated_pair_capability(
         tuple(t for _, t in sources),
         5120,
@@ -82,6 +88,7 @@ def prepare_iq3_gated_pair(layer, sources, projections, enabled: bool):
         if projections and projections[0].kernel is not None
         else None,
         enabled,
+        compute_capability=device_capability.to_int() if device_capability else 0,
     )
     reason = capability.reason
     if reason is None:

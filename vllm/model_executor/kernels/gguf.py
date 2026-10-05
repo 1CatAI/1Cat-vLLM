@@ -80,10 +80,13 @@ def iq3_gated_pair_capability(
     n: int,
     dtype: torch.dtype,
     enabled: bool = True,
+    compute_capability: int = 70,
 ) -> GGUFOperatorCapability:
     reason = None
     if not enabled:
         reason = "disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "requires_sm70_device"
     elif dtype != torch.float16:
         reason = "requires_fp16_activations"
     elif source_types != (21, 21) or (k, n) != (5120, 4352):
