@@ -482,6 +482,8 @@ def native_linear_capability(
         reason = "requires_sm70_device"
     elif dtype != torch.float16:
         reason = "requires_fp16_activations"
+    elif source_type in (12, 23) and (k, n) == (4352, 5120):
+        reason = "measured_route_not_faster"
     elif source_type not in (10, 17, 18, 21, 22) or (k, n) != (4352, 5120):
         reason = "single_projection_shape_or_source_has_no_calibration"
     elif not hasattr(torch.ops._C, operator):
