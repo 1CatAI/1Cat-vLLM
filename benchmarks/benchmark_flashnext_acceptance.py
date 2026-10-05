@@ -31,6 +31,15 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).hexdigest()
 
 
+def set_input_preparation_phase(worker, early):
+    state = worker.model_runner.model_state
+    declared = type(state).supports_early_input_preparation
+    if early and not declared:
+        raise RuntimeError("Model state has not declared independent inputs")
+    state.supports_early_input_preparation = early
+    return {"rank": worker.rank, "early": early, "declared": declared}
+
+
 def observed_cohort(llm, fixed_ids, params, width=1):
     records = []
     client = llm.llm_engine.engine_core
@@ -77,6 +86,7 @@ def main():
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--node-trace", action="store_true")
     parser.add_argument("--trace-only", action="store_true")
+    parser.add_argument("--input-phase-ab", action="store_true")
     parser.add_argument("--require-installed", action="store_true")
     args = parser.parse_args()
     if args.trace_only:
@@ -219,10 +229,20 @@ def main():
                 temperature=0, top_p=1, top_k=-1, max_tokens=256, ignore_eos=True
             )
             llm.generate({"prompt_token_ids": fixed_ids}, probe_params, use_tqdm=False)
-            for arm in (
-                () if args.trace_only else ("off_before", "cpu_observed", "off_after")
-            ):
-                if arm == "cpu_observed":
+            arms = (
+                ("late_observed", "early_observed", "early_off", "late_off")
+                if args.input_phase_ab
+                else ("off_before", "cpu_observed", "off_after")
+            )
+            for arm in () if args.trace_only else arms:
+                if args.input_phase_ab:
+                    llm.collective_rpc(
+                        set_input_preparation_phase,
+                        args=(arm.startswith("early"),),
+                        timeout=30,
+                    )
+                observing = arm == "cpu_observed" or arm.endswith("_observed")
+                if observing:
                     llm.collective_rpc(
                         "start_graph_parity_observer", args=(False,), timeout=30
                     )
@@ -232,24 +252,40 @@ def main():
                     summary=summarize(steps, 1),
                     output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
                 )
-                if arm == "cpu_observed":
+                if observing:
                     probe["workers"] = llm.collective_rpc(
                         "read_graph_parity_observer", timeout=30
                     )
                 report["probes"].append(probe)
                 save()
                 print(json.dumps(dict(arm=arm, summary=probe["summary"])), flush=True)
+            if args.input_phase_ab:
+                llm.collective_rpc(
+                    set_input_preparation_phase, args=(True,), timeout=30
+                )
             if not args.trace_only:
                 c4_ids = fixed_ids[:128]
                 c4_params = SamplingParams(
                     temperature=0, max_tokens=600, ignore_eos=True
                 )
-                steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
-                report["c4_probe"] = dict(
-                    summary=summarize(steps, 4),
-                    output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
-                )
-                save()
+                c4_phases = (False, True) if args.input_phase_ab else (True,)
+                report["c4_probes"] = []
+                for early in c4_phases:
+                    if args.input_phase_ab:
+                        llm.collective_rpc(
+                            set_input_preparation_phase, args=(early,), timeout=30
+                        )
+                    steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
+                    cohort = dict(
+                        early=early,
+                        summary=summarize(steps, 4),
+                        output_token_ids=[
+                            list(o.outputs[0].token_ids) for o in outputs
+                        ],
+                    )
+                    report["c4_probes"].append(cohort)
+                    report["c4_probe"] = cohort
+                    save()
             if args.node_trace:
                 llm.collective_rpc(
                     "start_graph_parity_observer", args=(True,), timeout=30
