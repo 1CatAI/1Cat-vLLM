@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 #include "src/turbomind/kernels/gemm/lattice_codebooks.h"
+#include "src/turbomind/kernels/gemm/transform.h"
 
 namespace vllm::sm70_gguf {
 struct Q8_1 {
@@ -13,6 +14,19 @@ struct Q8_1 {
   int8_t qs[32];
 };
 static_assert(sizeof(Q8_1) == 36);
+
+__device__ __forceinline__ void quantize_q8_1_warp(Q8_1* out, float value) {
+  const int lane = threadIdx.x % 32;
+  float maximum = fabsf(value), sum = value;
+#pragma unroll
+  for (int offset = 16; offset; offset >>= 1) {
+    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
+    sum += __shfl_xor_sync(0xffffffff, sum, offset);
+  }
+  const float d = maximum / 127.f;
+  out->qs[lane] = maximum == 0.f ? 0 : int8_t(roundf(value / d));
+  if (!lane) out->ds = __floats2half2_rn(d, sum);
+}
 
 __device__ __forceinline__ uint32_t load_u32_2(const uint8_t* p) {
   return uint32_t(*reinterpret_cast<const uint16_t*>(p)) |
@@ -110,4 +124,46 @@ struct LatticeDot {
   }
 };
 using IQ3SDot = LatticeDot<21>;
+
+// Existing N32/K8 storage handles TP boundaries inside Q2_0's source K64
+// blocks without expanded FP16 weights or a second layout. Its scale and
+// centered integer values are exact; IQ4_NL uses the shared TurboMind LUT.
+template <int Type>
+struct CanonicalIntegerDot {
+  static_assert(Type == 20 || Type == 42);
+  __device__ static float dot(const void* weight, const void* stats, int n,
+                              int k, int col, int group, const Q8_1& x) {
+    int sum = 0;
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+#pragma unroll
+    for (int fragment = 0; fragment < 4; ++fragment) {
+      const int64_t packet =
+          (int64_t{col / 32} * (k / 8) + group * 4 + fragment) * 32 + col % 32;
+      uint32_t even, odd;
+      if constexpr (Type == 20) {
+        const uint32_t packed = static_cast<const uint32_t*>(weight)[packet];
+        using Lut = turbomind::gemm::Transform_HMMA_SM70_Lut4<0>;
+        even = Lut::iq_values(packed) ^ 0x80808080U;
+        odd = Lut::iq_values(packed >> 16) ^ 0x80808080U;
+      } else {
+        const uint32_t packed = static_cast<const uint16_t*>(weight)[packet];
+        const auto expand = [](uint32_t p) {
+          return (p & 3) | (((p >> 2) & 3) << 8) | (((p >> 4) & 3) << 16) |
+                 (((p >> 6) & 3) << 24);
+        };
+        even = __vsub4(expand(packed), 0x01010101U);
+        odd = __vsub4(expand(packed >> 8), 0x01010101U);
+      }
+      const int w0 = __byte_perm(even, odd, 0x5140);
+      const int w1 = __byte_perm(even, odd, 0x7362);
+      sum = __dp4a(w0, activation[fragment * 2], sum);
+      sum = __dp4a(w1, activation[fragment * 2 + 1], sum);
+    }
+    const int64_t coefficient = int64_t{group} * n + col;
+    const half scale =
+        Type == 20 ? static_cast<const half*>(stats)[coefficient]
+                   : __low2half(static_cast<const half2*>(stats)[coefficient]);
+    return float(sum) * (__half2float(scale) * __low2float(x.ds));
+  }
+};
 }  // namespace vllm::sm70_gguf

@@ -18,6 +18,7 @@ from safetensors import safe_open
 import vllm
 from vllm import _sm70_ops as sm70
 from vllm.model_executor.layers.quantization.gguf_raw import RawGGUFProjection
+from vllm.model_executor.layers.quantization.gguf_turbomind_moe import GGUFExpertBank
 from vllm.model_executor.layers.quantization.sm70_turbomind import unpack_mxfp4_weight
 from vllm.transformers_utils.gguf_tensor_reader import GGUFReader, dequantize
 
@@ -118,8 +119,19 @@ def main():
     experts, n, stride = banks[0].shape
     k = 2560
     nv = nvfp4_bank(args.nvfp4, args.layer, args.rank) if args.nvfp4 else None
+    canonical = []
+    if source_type == 22 and 20 in args.m:
+        for source in sources:
+            bank = GGUFExpertBank(
+                source_type, experts, torch.device("cuda"), torch.float16
+            )
+            for expert, rows in enumerate(source):
+                bank.add(expert, torch.from_numpy(rows.copy()), 0, 1, axis=0)
+            bank.finalize()
+            canonical.append(bank)
     result = {
         "version": vllm.__version__,
+        "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "core_sha256": hashlib.sha256(Path(core.__file__).read_bytes()).hexdigest(),
         "shape": [experts, n, k],
         "layer": args.layer,
@@ -156,10 +168,31 @@ def main():
             routed=routed,
             banks=banks,
             offsets=offsets,
+            use_canonical=source_type == 22 and m == 20,
         ):
-            torch.ops._C.gguf_lattice_raw_grouped_gate_up_sm70_out(
-                old_gate, old_up, routed, *banks, offsets, sorted_i64, source_type, 10
-            )
+            if use_canonical:
+                for out, bank in zip((old_gate, old_up), canonical):
+                    torch.ops._C.gguf_lattice_grouped_gemm_sm70_out(
+                        out,
+                        routed,
+                        offsets,
+                        bank.weight_ptrs,
+                        bank.stat_ptrs,
+                        source_type,
+                        experts,
+                        bank.group,
+                    )
+            else:
+                torch.ops._C.gguf_lattice_raw_grouped_gate_up_sm70_out(
+                    old_gate,
+                    old_up,
+                    routed,
+                    *banks,
+                    offsets,
+                    sorted_i64,
+                    source_type,
+                    10,
+                )
 
         def dp4a(fused=fused, q8=q8, ids=ids, banks=banks):
             torch.ops._C.gguf_dp4a_gate_up_sm70_out(
@@ -267,6 +300,9 @@ def main():
         unique_bytes = ids.unique().numel() * n * stride * 2
         row = {
             "m": m,
+            "native_control": "canonical_grouped_gemm"
+            if source_type == 22 and m == 20
+            else "original_grouped_vector",
             "routes": m * 10,
             "active_experts": ids.unique().numel(),
             "route_weight_bytes": route_bytes,
@@ -280,7 +316,7 @@ def main():
             "kernel_count": {
                 "dp4a_fused_gate_up": 1,
                 "dp4a_quantize_and_fused": 2,
-                "native_gate_up": 1,
+                "native_gate_up": 2 if source_type == 22 and m == 20 else 1,
                 "nvfp4_plan_and_w13": 2,
             },
             "errors": error_rows,

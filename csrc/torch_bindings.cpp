@@ -213,6 +213,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int group_size) -> ()");
   ops.impl("gguf_small_grouped_vec_sm70_out", torch::kCUDA,
            &gguf_small_grouped_vec_sm70_out);
+  ops.def(
+      "gguf_dp4a_down_unroute_sm70_out(Tensor(a!) out, Tensor input, Tensor "
+      "ids, Tensor route_weights, Tensor weight_ptrs, Tensor stats_ptrs, int "
+      "source_type, int num_experts) -> ()");
+  ops.impl("gguf_dp4a_down_unroute_sm70_out", torch::kCUDA,
+           &gguf_dp4a_down_unroute_sm70_out);
   ops.def("gguf_quantize_q8_1_sm70_out(Tensor(a!) out, Tensor input) -> ()");
   ops.impl("gguf_quantize_q8_1_sm70_out", torch::kCUDA,
            &gguf_quantize_q8_1_sm70_out);
