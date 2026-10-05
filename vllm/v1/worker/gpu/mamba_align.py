@@ -32,9 +32,11 @@ def _copy_mamba_state_block(
     state_inner_sizes_ptr,
     state_conv_widths_ptr,
     state_group_indices_ptr,
+    state_wy_ptr,
     tile_idx,
     COPY_BLOCK_SIZE: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    POSTPROCESS: tl.constexpr,
 ):
     """Copy one SD-layout conv or temporal state using V1 align semantics."""
     state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
@@ -42,6 +44,9 @@ def _copy_mamba_state_block(
     state_elem_size = tl.load(state_elem_sizes_ptr + state_idx).to(tl.int64)
     state_inner_size = tl.load(state_inner_sizes_ptr + state_idx).to(tl.int64)
     conv_width = tl.load(state_conv_widths_ptr + state_idx)
+    published_wy = tl.load(state_wy_ptr + state_idx)
+    if POSTPROCESS and conv_width == 0 and published_wy:
+        return
 
     group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
     group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
@@ -71,7 +76,8 @@ def _copy_mamba_state_block(
         is_left_overlap = (dst_addr < src_addr) & (dst_addr + copy_size > src_addr)
     else:
         # Temporal state chooses the accepted speculative column.
-        src_block_id = tl.load(block_table + src_col + token_bias).to(tl.int64)
+        temporal_bias = tl.where(published_wy, 0, token_bias)
+        src_block_id = tl.load(block_table + src_col + temporal_bias).to(tl.int64)
         src_addr = state_base_addr + src_block_id * state_block_stride
         copy_size = state_inner_size * state_elem_size
         bytes_per_tile = (copy_size + TEMPORAL_TILES - 1) // TEMPORAL_TILES
@@ -152,6 +158,7 @@ def _precopy_mamba_align_kernel(
     state_inner_sizes_ptr,
     state_conv_widths_ptr,
     state_group_indices_ptr,
+    state_wy_ptr,
     idx_mapping_ptr,
     query_start_loc_ptr,
     num_reqs,
@@ -189,9 +196,11 @@ def _precopy_mamba_align_kernel(
         state_inner_sizes_ptr,
         state_conv_widths_ptr,
         state_group_indices_ptr,
+        state_wy_ptr,
         tile_idx,
         COPY_BLOCK_SIZE,
         TEMPORAL_TILES,
+        False,
     )
 
 
@@ -209,6 +218,7 @@ def _postprocess_mamba_align_kernel(
     state_inner_sizes_ptr,
     state_conv_widths_ptr,
     state_group_indices_ptr,
+    state_wy_ptr,
     idx_mapping_ptr,
     num_reqs,
     MAMBA_BLOCK_SIZE: tl.constexpr,
@@ -253,9 +263,11 @@ def _postprocess_mamba_align_kernel(
         state_inner_sizes_ptr,
         state_conv_widths_ptr,
         state_group_indices_ptr,
+        state_wy_ptr,
         tile_idx,
         COPY_BLOCK_SIZE,
         TEMPORAL_TILES,
+        True,
     )
 
 
@@ -283,6 +295,7 @@ def run_mamba_align_precopy(
         ctx.state_inner_sizes,
         ctx.state_conv_widths,
         ctx.state_group_indices,
+        ctx.state_wy,
         idx_mapping,
         query_start_loc,
         num_reqs,
@@ -301,6 +314,13 @@ def run_mamba_align_postprocess(
 ) -> None:
     if num_reqs == 0 or not ctx.is_initialized:
         return
+    if ctx.wy_commit_group is not None:
+        ctx.wy_commit_group.commit_v2(
+            ctx,
+            idx_mapping,
+            num_accepted_tokens,
+            new_num_computed_tokens,
+        )
     # Snapshot the decision array because one program may reset a request's
     # output count while programs copying other state tensors still read it.
     snapshot = ctx.num_accepted_tokens_out
@@ -319,9 +339,17 @@ def run_mamba_align_postprocess(
         ctx.state_inner_sizes,
         ctx.state_conv_widths,
         ctx.state_group_indices,
+        ctx.state_wy,
         idx_mapping,
         num_reqs,
         MAMBA_BLOCK_SIZE=ctx.block_size,
         COPY_BLOCK_SIZE=1024,
         TEMPORAL_TILES=_TEMPORAL_TILES,
     )
+    if ctx.wy_commit_group is not None:
+        ctx.wy_commit_group.finish_v2(
+            ctx,
+            idx_mapping,
+            num_accepted_tokens,
+            new_num_computed_tokens,
+        )

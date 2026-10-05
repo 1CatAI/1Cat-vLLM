@@ -86,6 +86,7 @@ def postprocess_mamba_fused_kernel(
     state_inner_sizes_ptr,  # number of elements in inner dimensions
     state_conv_widths_ptr,  # conv width for conv states (0 for temporal)
     state_group_indices_ptr,  # maps state_idx to group index in block table
+    state_wy_ptr,  # temporal states already published by WY group commit
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
     spec_state_slot_selectors_out_ptr,
@@ -158,6 +159,8 @@ def postprocess_mamba_fused_kernel(
     state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
     state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
     conv_width = tl.load(state_conv_widths_ptr + state_idx)
+    if conv_width == 0 and tl.load(state_wy_ptr + state_idx):
+        return
 
     # Load the group index for this state, then index into the correct
     # group's block table. Each mamba group has independently allocated
@@ -424,6 +427,7 @@ class MambaSpecDecodeGPUContext:
     state_inner_sizes: torch.Tensor  # int64: elements in inner dimensions
     state_conv_widths: torch.Tensor  # int32: conv width (0 for temporal states)
     state_group_indices: torch.Tensor  # int32: maps state_idx to group index
+    state_wy: torch.Tensor  # bool: skip snapshot copies after WY publication
 
     # Configuration
     block_size: int
@@ -453,6 +457,7 @@ class MambaSpecDecodeGPUContext:
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
+    wy_commit_group: Any = None
 
     @classmethod
     def create(
@@ -490,6 +495,7 @@ class MambaSpecDecodeGPUContext:
             state_group_indices=torch.zeros(
                 num_states, dtype=torch.int32, device=device
             ),
+            state_wy=torch.zeros(num_states, dtype=torch.bool, device=device),
             block_size=mamba_spec.block_size,
             num_layers=num_layers,
             num_states=num_states,
@@ -611,6 +617,11 @@ class MambaSpecDecodeGPUContext:
                         # state tensor is as_strided with padded page strides
                         # (state_block_stride would be the page size, too big).
                         self.state_conv_widths[idx] = 0
+                        spec = kv_cache_config.kv_cache_groups[
+                            mamba_group_id
+                        ].kv_cache_spec
+                        assert isinstance(spec, MambaSpec)
+                        self.state_wy[idx] = spec.gdn_wy
                         self.state_inner_sizes[idx] = (
                             state[0].numel() if state.dim() > 1 else 1
                         )
@@ -638,6 +649,21 @@ class MambaSpecDecodeGPUContext:
             self.block_table_ptrs[i] = bt.data_ptr()
 
         self.is_initialized = True
+        if any(
+            isinstance(kv_cache_config.kv_cache_groups[gid].kv_cache_spec, MambaSpec)
+            and getattr(
+                kv_cache_config.kv_cache_groups[gid].kv_cache_spec, "gdn_wy", False
+            )
+            for gid in self.mamba_group_ids
+        ):
+            from vllm.model_executor.layers.mamba.gdn.sm70_wy import WYCommitGroup
+
+            self.wy_commit_group = WYCommitGroup(
+                kv_cache_config,
+                forward_context,
+                self.mamba_group_ids,
+                self.state_base_addrs.device,
+            )
         _debug_mamba_align(
             "postprocess_init",
             num_groups=self.num_groups,
@@ -706,6 +732,7 @@ class MambaSpecDecodeGPUContext:
             self.state_inner_sizes,
             self.state_conv_widths,
             self.state_group_indices,
+            self.state_wy,
             self.num_accepted_tokens_out,
             self.spec_state_slot_selectors_out,
             num_reqs,
@@ -760,6 +787,7 @@ class MambaSpecDecodeGPUContext:
                 self.state_inner_sizes,
                 self.state_conv_widths,
                 self.state_group_indices,
+                self.state_wy,
                 self.num_accepted_tokens_out,
                 self.spec_state_slot_selectors_out,
                 num_reqs,
@@ -851,7 +879,13 @@ def collect_mamba_copy_meta(
             for state, state_copy_func in zip(kv_caches, group_copy_funcs):
                 copy_src_block_idx = src_block_idx
                 copy_num_accepted_tokens = accept_token_bias + 1
-                if state_slot_bias != accept_token_bias:
+                spec = kv_cache_config.kv_cache_groups[mamba_group_id].kv_cache_spec
+                assert isinstance(spec, MambaSpec)
+                if spec.gdn_wy and state_copy_func is get_temporal_copy_spec:
+                    # Accepted SSM state was published during post-sampling.
+                    # Convolution still uses its accepted-history offset.
+                    copy_num_accepted_tokens = 1
+                elif state_slot_bias != accept_token_bias:
                     copy_src_block_idx = src_block_idx + state_slot_bias
                     copy_num_accepted_tokens = 1
                 copy_spec = state_copy_func(
@@ -1187,6 +1221,11 @@ def postprocess_mamba_align_gpu(
         num_states=ctx.num_states,
         block_size=ctx.block_size,
     )
+    if ctx.wy_commit_group is not None:
+        # Save boundary prefixes before generic convolution copies, then publish
+        # accepted running state and clear factors before the scheduler can
+        # reorder, preempt, reuse a prefix, or continue prefill.
+        ctx.wy_commit_group.commit(ctx, num_reqs, num_accepted_tokens_gpu)
     ctx.run_fused_postprocess(
         num_reqs=num_reqs,
         num_accepted_tokens_gpu=num_accepted_tokens_gpu,
@@ -1197,6 +1236,11 @@ def postprocess_mamba_align_gpu(
         num_draft_tokens_gpu=ctx.num_draft_tokens_buf.gpu,
         ddtree_accepted_node_indices=ddtree_accepted_node_indices,
     )
+    if ctx.wy_commit_group is not None:
+        # Normalize the running convolution window after prefix copies finish.
+        # The next recurrent call (including plain decode/prefill) now starts
+        # from slot zero with an accepted-history selector of one.
+        ctx.wy_commit_group.finish(ctx, num_reqs, num_accepted_tokens_gpu)
     if _ddtree_trace_path():
         _write_ddtree_trace_event(
             "mamba_postprocess_gpu",
