@@ -156,15 +156,16 @@ constexpr size_t kSm70Tp4PushAllreduceLegacyBufferBytes =
 // Private packets keep norm collectives separate from ordinary/HC push traffic.
 constexpr int kSm70PushNormRows = 8;
 constexpr int kSm70PushNormParts = 5;
-struct Sm70PushNormMeta {
+struct alignas(8) Sm70PushNormMeta {
   uint32_t generation[kSm70PushNormRows];
-  uint32_t ready[kSm70PushNormRows][kSm70PushNormParts];
-  uint32_t normalized[kSm70PushNormRows];
-  float partial[kSm70PushNormRows][kSm70PushNormParts];
-  float inverse[kSm70PushNormRows];
+  // Sum-of-squares partials double as readiness payloads. -1 is empty.
+  float partial[kSm70Tp4PushAllreduceEpochs][kSm70PushNormRows]
+               [kSm70PushNormParts];
+  uint64_t inverse_packet[kSm70PushNormRows];
 };
 constexpr size_t kSm70PushNormMetaBytes =
     ((sizeof(Sm70PushNormMeta) + 127) / 128) * 128;
+static_assert(kSm70PushNormMetaBytes == 512);
 constexpr size_t kSm70PushNormOffset =
     ((kSm70Tp4PushAllreduceLegacyBufferBytes + 127) / 128) * 128;
 constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
@@ -1794,28 +1795,46 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
   __shared__ float inverse;
   variance = Reduce(storage).Reduce(variance, CubAddOp{}, Threads);
   __syncthreads();
-  if (tid == 0) {
-    meta->partial[row][part] = variance;
-    __threadfence();
-    meta->ready[row][part] = generation;
-    if (part == 0) {
-#pragma unroll
-      for (int p = 0; p < Parts; ++p)
-        while (meta->ready[row][p] != generation) {
-        }
-      float total = 0;
-#pragma unroll
-      for (int p = 0; p < Parts; ++p) total += meta->partial[row][p];
-      meta->inverse[row] = rsqrtf(total / Width + epsilon);
-      __threadfence();
-      meta->normalized[row] = generation;
-      // Every part has read generation before publishing its partial.
-      meta->generation[row] = generation;
-    } else {
-      while (meta->normalized[row] != generation) {
+  // A nonnegative sum of squares is its own readiness payload. There is
+  // no separate flag that needs a fence after storing the value.
+  const int phase = generation & 1;
+  if (tid == 0) meta->partial[phase][row][part] = variance;
+  __syncwarp();
+  if (part == 0 && tid < 32) {
+    float own_partial = 0;
+    if (tid < Parts) {
+      while (true) {
+        own_partial = meta->partial[phase][row][tid];
+        if (__float_as_uint(own_partial) != __float_as_uint(-1.0f)) break;
       }
     }
-    inverse = meta->inverse[row];
+    __syncwarp();
+    float total = 0;
+#pragma unroll
+    for (int p = 0; p < Parts; ++p)
+      total += __shfl_sync(0xffffffff, own_partial, p);
+    if (tid < Parts) meta->partial[phase][row][tid] = -1.0f;
+    if (tid == 0) {
+      inverse = rsqrtf(total / Width + epsilon);
+      const uint64_t packet =
+          (uint64_t(generation) << 32) | __float_as_uint(inverse);
+      // The generation and inverse are one naturally aligned 64-bit store.
+      // Partial resets are only reused after the complete kernel finishes.
+      asm volatile(
+          "st.volatile.global.u64 [%0], %1;" ::"l"(&meta->inverse_packet[row]),
+          "l"(packet)
+          : "memory");
+      meta->generation[row] = generation;
+    }
+  } else if (part != 0 && tid == 0) {
+    uint64_t packet;
+    do {
+      asm volatile("ld.volatile.global.u64 %0, [%1];"
+                   : "=l"(packet)
+                   : "l"(&meta->inverse_packet[row])
+                   : "memory");
+    } while (uint32_t(packet >> 32) != generation);
+    inverse = __uint_as_float(uint32_t(packet));
   }
   __syncthreads();
   if (tid < PacksPerPart) {
@@ -2002,7 +2021,13 @@ class CustomAllreduce {
         hc_up, 0,
         kSm70Tp4PushAllreduceBufferBytes - kSm70Qwen38HcUpFusedEpochOffset));
     auto* norm_meta = static_cast<char*>(ptrs[rank_]) + kSm70PushNormOffset;
-    CUDACHECK(cudaMemset(norm_meta, 0, kSm70PushNormMetaBytes));
+    Sm70PushNormMeta initial_norm{};
+    for (int epoch = 0; epoch < kSm70Tp4PushAllreduceEpochs; ++epoch)
+      for (int row = 0; row < kSm70PushNormRows; ++row)
+        for (int part = 0; part < kSm70PushNormParts; ++part)
+          initial_norm.partial[epoch][row][part] = -1.0f;
+    CUDACHECK(cudaMemcpy(norm_meta, &initial_norm, sizeof(initial_norm),
+                         cudaMemcpyHostToDevice));
     CUDACHECK(cudaMemset(norm_meta + kSm70PushNormMetaBytes,
                          kSm70Tp4PushAllreduceSentinelByte,
                          kSm70Tp4PushAllreduceBufferBytes -
