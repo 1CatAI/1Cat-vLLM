@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // QKVZ and floating B/A share a launch, with independent operand readers.
 #include <climits>
+#include <array>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/Exceptions.h>
@@ -48,13 +49,14 @@ struct QkvzSources {
   QkvzSource items[5];
 };
 
+template <int SourceCount, int OutputWidth>
 __global__ __launch_bounds__(512, 2) void qkvz_shared_a_kernel(
     half* output, const half* input, QkvzSources sources, float* partials,
     int* counters) {
   __shared__ alignas(16) uint8_t shared[33793];
-  int source = 4;
+  int source = SourceCount - 1;
 #pragma unroll
-  for (int i = 0; i < 4; ++i)
+  for (int i = 0; i < SourceCount - 1; ++i)
     if (blockIdx.x >= sources.items[i].first_tile &&
         blockIdx.x < sources.items[i + 1].first_tile)
       source = i;
@@ -63,7 +65,7 @@ __global__ __launch_bounds__(512, 2) void qkvz_shared_a_kernel(
 #define RUN_READER(Reader, Canonical)                                         \
   native_linear_n64_body<Reader, Canonical>(                                  \
       output, input, descriptor.weight, descriptor.stats, partials, counters, \
-      descriptor.columns, 5120, tile, blockIdx.x, 4120,                       \
+      descriptor.columns, 5120, tile, blockIdx.x, OutputWidth,                \
       descriptor.output_offset, descriptor.stats_stride, shared)
   switch (descriptor.type) {
     case 10:
@@ -111,13 +113,17 @@ __global__ __launch_bounds__(512, 2) void qkvz_shared_a_kernel(
 }
 }  // namespace vllm::sm70_gguf
 
-void gguf_qkvz_sm70_out(torch::Tensor output, torch::Tensor input,
-                        const std::vector<torch::Tensor>& weights,
-                        const std::vector<torch::Tensor>& stats,
-                        const std::vector<int64_t>& types,
-                        torch::Tensor partials, torch::Tensor counters) {
-  TORCH_CHECK(weights.size() == 5 && stats.size() == 5 && types.size() == 5,
-              "GGUF QKVZ requires four quantized sources and packed FP16 B/A");
+namespace {
+template <int SourceCount, int OutputWidth>
+void gguf_joint_input_out(torch::Tensor output, torch::Tensor input,
+                          const std::vector<torch::Tensor>& weights,
+                          const std::vector<torch::Tensor>& stats,
+                          const std::vector<int64_t>& types,
+                          torch::Tensor partials, torch::Tensor counters) {
+  constexpr int Tiles = (OutputWidth + 63) / 64;
+  TORCH_CHECK(weights.size() == SourceCount && stats.size() == SourceCount &&
+                  types.size() == SourceCount,
+              "GGUF joint input source count mismatch");
   const auto device = input.device();
   auto check = [&](const torch::Tensor& tensor, at::ScalarType dtype,
                    bool contiguous = true) {
@@ -131,14 +137,19 @@ void gguf_qkvz_sm70_out(torch::Tensor output, torch::Tensor input,
   check(partials, torch::kFloat32);
   check(counters, torch::kInt32);
   TORCH_CHECK(input.sizes() == c10::IntArrayRef({8, 5120}) &&
-                  output.sizes() == c10::IntArrayRef({8, 4120}) &&
-                  partials.sizes() == c10::IntArrayRef({65, 2, 512}) &&
-                  counters.sizes() == c10::IntArrayRef({65}),
-              "GGUF QKVZ requires M8/K5120/N4120 and matching workspace");
-  constexpr int widths[5] = {512, 512, 1536, 1536, 24};
+                  output.sizes() == c10::IntArrayRef({8, OutputWidth}) &&
+                  partials.sizes() == c10::IntArrayRef({Tiles, 2, 512}) &&
+                  counters.sizes() == c10::IntArrayRef({Tiles}),
+              "GGUF joint input requires M8/K5120 and matching workspace");
+  constexpr auto widths = [] {
+    if constexpr (SourceCount == 5)
+      return std::array<int, 5>{512, 512, 1536, 1536, 24};
+    else
+      return std::array<int, 3>{3072, 256, 256};
+  }();
   vllm::sm70_gguf::QkvzSources descriptors{};
   int first_tile = 0, offset = 0;
-  for (int i = 0; i < 5; ++i) {
+  for (int i = 0; i < SourceCount; ++i) {
     const int type = types[i], n = widths[i];
     if (i == 4) {
       TORCH_CHECK(type == 1, "GGUF QKVZ requires FP16 B/A");
@@ -211,11 +222,31 @@ void gguf_qkvz_sm70_out(torch::Tensor output, torch::Tensor input,
               "GGUF QKVZ requires SM70");
   const auto stream = at::cuda::getCurrentCUDAStream();
   C10_CUDA_CHECK(cudaFuncSetAttribute(
-      vllm::sm70_gguf::qkvz_shared_a_kernel,
+      vllm::sm70_gguf::qkvz_shared_a_kernel<SourceCount, OutputWidth>,
       cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-  vllm::sm70_gguf::qkvz_shared_a_kernel<<<dim3(65, 2), 512, 0, stream>>>(
-      reinterpret_cast<half*>(output.data_ptr<at::Half>()),
-      reinterpret_cast<const half*>(input.data_ptr<at::Half>()), descriptors,
-      partials.data_ptr<float>(), counters.data_ptr<int>());
+  vllm::sm70_gguf::qkvz_shared_a_kernel<SourceCount, OutputWidth>
+      <<<dim3(Tiles, 2), 512, 0, stream>>>(
+          reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+          reinterpret_cast<const half*>(input.data_ptr<at::Half>()),
+          descriptors, partials.data_ptr<float>(), counters.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+}  // namespace
+
+void gguf_qkvz_sm70_out(torch::Tensor output, torch::Tensor input,
+                        const std::vector<torch::Tensor>& weights,
+                        const std::vector<torch::Tensor>& stats,
+                        const std::vector<int64_t>& types,
+                        torch::Tensor partials, torch::Tensor counters) {
+  gguf_joint_input_out<5, 4120>(output, input, weights, stats, types, partials,
+                                counters);
+}
+
+void gguf_qkv_sm70_out(torch::Tensor output, torch::Tensor input,
+                       const std::vector<torch::Tensor>& weights,
+                       const std::vector<torch::Tensor>& stats,
+                       const std::vector<int64_t>& types,
+                       torch::Tensor partials, torch::Tensor counters) {
+  gguf_joint_input_out<3, 3584>(output, input, weights, stats, types, partials,
+                                counters);
 }

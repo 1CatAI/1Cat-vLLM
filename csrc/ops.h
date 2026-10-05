@@ -1026,6 +1026,11 @@ void gguf_qkvz_sm70_out(torch::Tensor output, torch::Tensor input,
                         const std::vector<torch::Tensor>& stats,
                         const std::vector<int64_t>& types,
                         torch::Tensor partials, torch::Tensor counters);
+void gguf_qkv_sm70_out(torch::Tensor output, torch::Tensor input,
+                       const std::vector<torch::Tensor>& weights,
+                       const std::vector<torch::Tensor>& stats,
+                       const std::vector<int64_t>& types,
+                       torch::Tensor partials, torch::Tensor counters);
 
 void gguf_small_output_sm70_out(torch::Tensor output, torch::Tensor input,
                                 torch::Tensor weight, torch::Tensor partials,

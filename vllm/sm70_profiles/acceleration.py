@@ -146,6 +146,12 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "qkvz_projection": getattr(method, "native_admission", {}).get(
                 "qkvz_projection"
             ),
+            "qkv_projection": getattr(method, "native_admission", {}).get(
+                "qkv_projection"
+            ),
+            "small_output_projection": getattr(method, "native_admission", {}).get(
+                "small_output_projection"
+            ),
             "single_projection": getattr(method, "native_admission", {}).get(
                 "single_projection"
             ),
