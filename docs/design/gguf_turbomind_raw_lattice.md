@@ -1489,3 +1489,24 @@ Flash dense gate (108.183 versus 89.500 µs) and regress the 27B down projection
 (487.469 versus 378.309 µs). This candidate is removed. A general M32/N128
 candidate is evaluated next to reduce per-CTA resource demand; performance
 eligibility is unchanged until it passes matched measurements.
+
+The M32/N128 repertoire with exact integer IQ3_S factor formation passes
+129 checks. Dense M512 descriptors remain slower and are excluded from plane
+capability admission. Single-expert eight-bank prototype measurements do not
+exceed twice L2; they are retained as cached controls, not cold-bank evidence.
+Corrected captures use 72 IQ3_S banks (12,672,000 bytes) and 96 IQ2_S banks
+(12,595,200 bytes), both above twice the 6,291,456-byte V100 L2. They measure
+35.325/36.733 µs versus 68.631/64.234 µs canonical at N160/K2560/M512, with
+relative L2 0.0002063/0.0002076. Activations remain FP16 and accumulation FP32.
+
+NCU after explicit eviction reads 2,824,864/2,783,008 bytes for IQ3_S/IQ2_S,
+versus 2,797,440/2,752,640 bytes of activation plus original weight payload.
+Other reads are included; these totals are not attributed solely to weights.
+The selected kernels use 141/120 registers, 16,400/14,368 dynamic shared bytes,
+and 11.39/22.67% active warps. Profiler node times are not model step times.
+
+Paired Nsight Systems full-graph node traces also retain the remaining dense
+workspace gap: profiled means are 16.569 µs DQ, 91.450 µs FP32-output GEMM and
+4.207 µs final cast, versus 108.704 µs canonical fused GEMM. Profiling changes
+these absolute times; matched unprofiled comparisons remain about 92.3 versus
+90.0 µs. Model defaults and end-to-end savings remain pending.
