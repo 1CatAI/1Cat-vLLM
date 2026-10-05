@@ -289,6 +289,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_dp4a_gate_up_sm70_out", torch::kCUDA,
            &gguf_dp4a_gate_up_sm70_out);
   ops.def(
+      "gguf_dp4a_lut4_gate_up_sm70_out(Tensor(a!) out, Tensor activation, "
+      "Tensor ids, Tensor gate, Tensor gate_stats, Tensor up, Tensor up_stats, "
+      "int num_experts, int lanes_per_row=16) -> ()");
+  ops.impl("gguf_dp4a_lut4_gate_up_sm70_out", torch::kCUDA,
+           &gguf_dp4a_lut4_gate_up_sm70_out);
+  ops.def(
       "gguf_lattice_raw_dequantize_sm70_out(Tensor(a!) out, Tensor weight, int "
       "source_type) -> ()");
   ops.impl("gguf_lattice_raw_dequantize_sm70_out", torch::kCUDA,

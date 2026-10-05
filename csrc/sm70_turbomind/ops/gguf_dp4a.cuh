@@ -131,6 +131,7 @@ using IQ3SDot = LatticeDot<21>;
 template <int Type>
 struct CanonicalIntegerDot {
   static_assert(Type == 20 || Type == 42);
+  static constexpr int kBookWords = 1;
   __device__ static float dot(const void* weight, const void* stats, int n,
                               int k, int col, int group, const Q8_1& x) {
     int sum = 0;

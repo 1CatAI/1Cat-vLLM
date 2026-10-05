@@ -4,10 +4,12 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <type_traits>
 #include "gguf_dp4a.cuh"
 #include "src/turbomind/kernels/gemm/matrix_ptr.h"
 
 namespace {
+using turbomind::gemm::StridedPtr;
 using vllm::sm70_gguf::LatticeDot;
 using vllm::sm70_gguf::Q8_1;
 
@@ -20,11 +22,15 @@ __global__ void quantize_q8(Q8_1* out, const half* input, int k) {
 }
 
 template <int Type, bool Activated, class Index, int Lanes = 16,
-          bool Quantized = false>
+          bool Quantized = false, bool Canonical = false>
 __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
                         const uint8_t* gate, const uint8_t* up, int n, int k,
-                        int stride, int top_k) {
-  using Dot = LatticeDot<Type>;
+                        int stride, int top_k,
+                        const StridedPtr* gate_stats = nullptr,
+                        const StridedPtr* up_stats = nullptr) {
+  using Dot =
+      std::conditional_t<Canonical, vllm::sm70_gguf::CanonicalIntegerDot<Type>,
+                         LatticeDot<Type>>;
   __shared__ uint32_t book[Dot::kBookWords];
   __shared__ uint32_t masks[16];
   __shared__ half intermediate[32];
@@ -34,7 +40,10 @@ __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
   for (int i = threadIdx.x; i < groups * 9; i += blockDim.x)
     reinterpret_cast<uint32_t*>(shared_x)[i] =
         reinterpret_cast<const uint32_t*>(x)[i];
-  Dot::initialize(book, masks);
+  if constexpr (Canonical)
+    __syncthreads();
+  else
+    Dot::initialize(book, masks);
   const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   constexpr int Rows = Quantized ? 32 : 8;
   const int local_row = warp * (32 / Lanes) + lane / Lanes;
@@ -45,8 +54,18 @@ __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
   const uint8_t* u = up + expert_row * stride;
   float gs = 0.f, us = 0.f;
   for (int group = lane % Lanes; group < groups; group += Lanes) {
-    gs += Dot::dot(g, group, shared_x[group], book, masks);
-    us += Dot::dot(u, group, shared_x[group], book, masks);
+    if constexpr (Canonical) {
+      const int expert = ids[route];
+      const auto* gate_ptrs = reinterpret_cast<const StridedPtr*>(gate);
+      const auto* up_ptrs = reinterpret_cast<const StridedPtr*>(up);
+      gs += Dot::dot(gate_ptrs[expert].ptr, gate_stats[expert].ptr, n, k, row,
+                     group, shared_x[group]);
+      us += Dot::dot(up_ptrs[expert].ptr, up_stats[expert].ptr, n, k, row,
+                     group, shared_x[group]);
+    } else {
+      gs += Dot::dot(g, group, shared_x[group], book, masks);
+      us += Dot::dot(u, group, shared_x[group], book, masks);
+    }
   }
 #pragma unroll
   for (int offset = Lanes / 2; offset; offset >>= 1) {
@@ -78,6 +97,42 @@ __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
           static_cast<Q8_1*>(output) + int64_t{route} * (n / 32) + blockIdx.x,
           __half2float(intermediate[threadIdx.x]));
   }
+}
+
+template <class Index, int Lanes, bool Quantized>
+void launch_lut4_gate_up(torch::Tensor out, torch::Tensor activation,
+                         torch::Tensor ids, torch::Tensor gate,
+                         torch::Tensor gate_stats, torch::Tensor up,
+                         torch::Tensor up_stats, int n) {
+  constexpr int Rows = Quantized ? 32 : 8;
+  gate_up<20, true, Index, Lanes, Quantized, true>
+      <<<dim3(n / Rows, activation.size(0) * ids.size(1)),
+         Quantized ? 32 * Lanes : 128, activation.size(1) * sizeof(Q8_1),
+         at::cuda::getCurrentCUDAStream()>>>(
+          out.data_ptr(), reinterpret_cast<const Q8_1*>(activation.data_ptr()),
+          ids.data_ptr<Index>(), gate.data_ptr<uint8_t>(),
+          up.data_ptr<uint8_t>(), n, activation.size(1) * 32, 0, ids.size(1),
+          reinterpret_cast<const StridedPtr*>(gate_stats.data_ptr()),
+          reinterpret_cast<const StridedPtr*>(up_stats.data_ptr()));
+}
+
+template <class Index>
+void dispatch_lut4_gate_up(torch::Tensor out, torch::Tensor activation,
+                           torch::Tensor ids, torch::Tensor gate,
+                           torch::Tensor gate_stats, torch::Tensor up,
+                           torch::Tensor up_stats, int n, int lanes) {
+  if (out.scalar_type() == torch::kFloat16)
+    launch_lut4_gate_up<Index, 16, false>(out, activation, ids, gate,
+                                          gate_stats, up, up_stats, n);
+  else if (lanes == 4)
+    launch_lut4_gate_up<Index, 4, true>(out, activation, ids, gate, gate_stats,
+                                        up, up_stats, n);
+  else if (lanes == 8)
+    launch_lut4_gate_up<Index, 8, true>(out, activation, ids, gate, gate_stats,
+                                        up, up_stats, n);
+  else
+    launch_lut4_gate_up<Index, 16, true>(out, activation, ids, gate, gate_stats,
+                                         up, up_stats, n);
 }
 
 template <int Type, class Index, int Lanes>
@@ -304,6 +359,51 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
   else
     dispatch_gate_up<22>(out, activation, ids, gate, up, activated,
                          lanes_per_row);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gguf_dp4a_lut4_gate_up_sm70_out(
+    torch::Tensor out, torch::Tensor activation, torch::Tensor ids,
+    torch::Tensor gate, torch::Tensor gate_stats, torch::Tensor up,
+    torch::Tensor up_stats, int64_t num_experts, int64_t lanes_per_row) {
+  TORCH_CHECK(activation.is_cuda() && activation.is_contiguous() &&
+                  activation.scalar_type() == torch::kUInt8 &&
+                  activation.dim() == 3 && activation.size(0) > 0 &&
+                  activation.size(0) <= 20 && activation.size(1) > 0 &&
+                  activation.size(2) == sizeof(Q8_1),
+              "Expected small Q8_1 activation blocks");
+  const bool quantized = out.scalar_type() == torch::kUInt8;
+  TORCH_CHECK(
+      (quantized ? out.dim() == 4 && out.size(3) == sizeof(Q8_1)
+                 : out.scalar_type() == torch::kFloat16 && out.dim() == 3) &&
+          out.size(0) == activation.size(0) && out.size(2) > 0 &&
+          ids.dim() == 2 && ids.size(0) == activation.size(0) &&
+          ids.size(1) > 0 && ids.size(1) <= 16 &&
+          (ids.scalar_type() == torch::kInt32 ||
+           ids.scalar_type() == torch::kInt64) &&
+          out.size(1) == ids.size(1),
+      "Invalid canonical IQ4 gate/up output or routes");
+  const int n = out.size(2) * (quantized ? 32 : 1);
+  TORCH_CHECK(n <= 256 && n % 32 == 0 && num_experts > 0 &&
+                  num_experts <= 65535 &&
+                  (lanes_per_row == 16 ||
+                   (quantized && (lanes_per_row == 4 || lanes_per_row == 8))),
+              "Unsupported canonical IQ4 gate/up row partition");
+  for (const auto& t : {out, ids, gate, gate_stats, up, up_stats})
+    TORCH_CHECK(t.device() == activation.device() && t.is_contiguous(),
+                "Canonical IQ4 descriptors must share the activation device");
+  for (const auto& t : {gate, gate_stats, up, up_stats})
+    TORCH_CHECK(t.scalar_type() == torch::kUInt8 &&
+                    t.numel() == num_experts * sizeof(StridedPtr),
+                "Invalid canonical IQ4 expert descriptor");
+  const c10::cuda::CUDAGuard guard(activation.device());
+  require_sm70();
+  if (ids.scalar_type() == torch::kInt32)
+    dispatch_lut4_gate_up<int32_t>(out, activation, ids, gate, gate_stats, up,
+                                   up_stats, n, lanes_per_row);
+  else
+    dispatch_lut4_gate_up<int64_t>(out, activation, ids, gate, gate_stats, up,
+                                   up_stats, n, lanes_per_row);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
