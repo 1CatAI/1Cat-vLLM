@@ -78,6 +78,7 @@ def main():
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--node-trace", action="store_true")
     parser.add_argument("--trace-only", action="store_true")
+    parser.add_argument("--round-events", action="store_true")
     input_ab = parser.add_mutually_exclusive_group()
     input_ab.add_argument("--input-phase-ab", action="store_true")
     input_ab.add_argument("--ple-input-ab", action="store_true")
@@ -287,6 +288,10 @@ def main():
                 if args.input_phase_ab
                 else ("off_before", "cpu_observed", "off_after")
             )
+            if args.round_events:
+                if args.input_phase_ab or args.ple_input_ab:
+                    raise ValueError("Round events require the fixed input policy")
+                arms = ("off_before", "gpu_observed", "off_after")
             for arm in () if args.trace_only else arms:
                 if args.input_phase_ab:
                     llm.collective_rpc(
@@ -300,10 +305,14 @@ def main():
                         args=(arm.startswith("fused"),),
                         timeout=30,
                     )
-                observing = arm == "cpu_observed" or arm.endswith("_observed")
+                observing = arm in ("cpu_observed", "gpu_observed") or arm.endswith(
+                    "_observed"
+                )
                 if observing:
                     llm.collective_rpc(
-                        "start_graph_parity_observer", args=(False,), timeout=30
+                        "start_graph_parity_observer",
+                        args=(False, True) if args.round_events else (False,),
+                        timeout=30,
                     )
                 steps, outputs = observed_cohort(llm, fixed_ids, probe_params)
                 probe = dict(

@@ -20,6 +20,9 @@ class CPUStageRecorder:
         self.step = 0
         self.dropped = 0
         self._target = threading.local()
+        self.gpu_timing = False
+        self.gpu_anchor = None
+        self.gpu_events = []
 
     @contextmanager
     def stage(self, label, metadata=None):
@@ -33,6 +36,21 @@ class CPUStageRecorder:
             "start_ns": time.perf_counter_ns(),
             **(metadata or {}),
         }
+        gpu_pair = None
+        if self.gpu_timing and label in (
+            "worker.execute",
+            "worker.sample",
+            "target.replay",
+            "draft.propose",
+            "runner.sample",
+        ):
+            import torch
+
+            gpu_pair = (
+                torch.Event(device="cuda", enable_timing=True),
+                torch.Event(device="cuda", enable_timing=True),
+            )
+            gpu_pair[0].record()
         if self.nvtx:
             import torch
 
@@ -40,6 +58,10 @@ class CPUStageRecorder:
         try:
             yield
         finally:
+            if gpu_pair is not None:
+                gpu_pair[1].record()
+                if len(self.gpu_events) < self.limit:
+                    self.gpu_events.append((event, gpu_pair))
             if self.nvtx:
                 torch.cuda.nvtx.range_pop()
             event["end_ns"] = time.perf_counter_ns()
@@ -101,12 +123,30 @@ class CPUStageRecorder:
     def read(self, stop=True):
         if stop:
             self.enabled = False
+        gpu_records = []
+        if self.gpu_events:
+            import torch
+
+            torch.accelerator.synchronize()
+            assert self.gpu_anchor is not None
+            for event, (begin, end) in self.gpu_events:
+                gpu_records.append(
+                    {
+                        "label": event["label"],
+                        "step": event["step"],
+                        "start_ms": self.gpu_anchor.elapsed_time(begin),
+                        "end_ms": self.gpu_anchor.elapsed_time(end),
+                        "elapsed_ms": begin.elapsed_time(end),
+                    }
+                )
         return {
             "rank": self.rank,
             "pid": os.getpid(),
             "clock": "perf_counter_ns",
             "events": list(self.events),
             "dropped": self.dropped,
+            "gpu_events": gpu_records,
+            "gpu_event_scope": "current-stream envelopes; nested spans overlap",
         }
 
 
@@ -131,7 +171,7 @@ class GraphParityWorkerExtension:
         state._ple_kernel_config.ple_input_prepare = bool(fused)
         return {"rank": self.rank, "ple_input_prepare": bool(fused)}
 
-    def start_graph_parity_observer(self, nvtx=False):
+    def start_graph_parity_observer(self, nvtx=False, gpu_timing=False):
         if not hasattr(self, "_graph_parity_recorder"):
             from vllm.v1.executor.multiproc_executor import WorkerProc
             from vllm.v1.worker.gpu.async_utils import AsyncOutput
@@ -165,9 +205,22 @@ class GraphParityWorkerExtension:
         rec = self._graph_parity_recorder
         rec.events.clear()
         rec.step = rec.dropped = 0
+        rec.gpu_events.clear()
+        rec.gpu_timing = gpu_timing
+        rec.gpu_anchor = None
+        if gpu_timing:
+            import torch
+
+            rec.gpu_anchor = torch.Event(device="cuda", enable_timing=True)
+            rec.gpu_anchor.record()
         rec.nvtx = nvtx
         rec.enabled = True
-        return {"rank": self.rank, "clock": "perf_counter_ns", "nvtx": nvtx}
+        return {
+            "rank": self.rank,
+            "clock": "perf_counter_ns",
+            "nvtx": nvtx,
+            "gpu_timing": gpu_timing,
+        }
 
     def read_graph_parity_observer(self, stop=True):
         return self._graph_parity_recorder.read(stop)

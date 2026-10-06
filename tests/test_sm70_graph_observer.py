@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import msgspec
 import pytest
+import torch
 
 from vllm.sm70_graph_observer import CPUStageRecorder, GraphParityWorkerExtension
 from vllm.v1.serial_utils import MsgpackEncoder
@@ -54,6 +55,41 @@ def test_bounded_observer_reports_dropped_events():
     with rec.stage("second"):
         pass
     assert rec.read()["dropped"] == 1
+
+
+def test_gpu_timing_is_explicit_and_keeps_nested_spans(monkeypatch):
+    tick = 0
+
+    class Event:
+        def __init__(self, **kwargs):
+            self.time = None
+
+        def record(self):
+            nonlocal tick
+            self.time = tick
+            tick += 1
+
+        def elapsed_time(self, other):
+            return float(other.time - self.time)
+
+    monkeypatch.setattr(torch, "Event", Event)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    rec = CPUStageRecorder(0)
+    rec.enabled = True
+    with rec.stage("target.replay"):
+        pass
+    assert not rec.gpu_events
+    rec.gpu_timing = True
+    rec.gpu_anchor = Event()
+    rec.gpu_anchor.record()
+    with rec.stage("worker.sample"), rec.stage("draft.propose"):
+        pass
+    row = rec.read()
+    spans = {s["label"]: s for s in row["gpu_events"]}
+    assert spans["worker.sample"]["elapsed_ms"] == 3
+    assert spans["draft.propose"]["elapsed_ms"] == 1
+    assert spans["worker.sample"]["start_ms"] < spans["draft.propose"]["start_ms"]
+    assert msgspec.msgpack.encode(row)
 
 
 def test_target_replay_marks_actual_graph_and_excludes_draft():
