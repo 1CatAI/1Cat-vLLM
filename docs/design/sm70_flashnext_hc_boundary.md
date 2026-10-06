@@ -99,3 +99,52 @@ Next decisions are driven by local load/MMA/partial-reduction counters. For
 the restored-rounding candidate, separate per-stream partials are unnecessary:
 norm factors have already been applied before down MMA. A compact FP32 partial
 layout can reduce traffic without moving the FP16 rounding boundary.
+
+## Load prologue and compact-partial screen
+
+The same hardware/runtime and eight-pair working set produce these matched
+four-rank CUDA Graph results. These rows still use research-only diagnostic
+DSOs; packaged operator qualification remains required before promotion.
+
+| Two-projection chain | M=5, µs | M=20, µs |
+| --- | ---: | ---: |
+| Matched diagnostic control | 22.650 | 32.045 |
+| Up shared-memory row padding | 20.903 | 31.444 |
+| Down weight prologue plus up padding | 19.701 | 31.235 |
+
+Both candidate arms match the packaged control's output and injection bitwise
+for all eight real HC pairs, both batches and every rank. The prologue retains
+MMA operands/order, ordered FP32 reductions and FP16 activation boundaries.
+Its M=5 chain saving estimates 0.283ms across 96 pairs; that is not a measured
+model-round improvement. Standalone up timing changes much less than chain
+timing, so do not sum isolated projection deltas to replace the paired result.
+
+The normal operator adds `optimized_loads` to both native calls, with the
+original branch available in the same wheel. `KernelConfig.hc_ll_optimized_loads`
+defaults on and records the selected policy or rejection reason alongside the
+existing TP4/SM70/topology admission. Only the measured 20-split, eight-warp
+down and five-warp up schedules use optimized loads; other research schedules
+retain their prior implementation. No new environment variable is added.
+
+The complete restored-rounding fusion screen gives:
+
+| Complete M=5 boundary | µs |
+| --- | ---: |
+| Packaged reduction + combine/norm + HC | 31.764 |
+| Restored-rounding HCX | 27.345 |
+| Compact FP32 partials | 25.798 |
+| Compact partials with transposed split dimension | 26.408 |
+| Compact partials reading existing canonical shards | 25.825 |
+
+Transposing the partials regresses relative to the compact layout and is
+rejected. Direct canonical reads match the supplied HCX MMA fragment bits
+for all eight real pairs/four ranks and avoid a second weight allocation.
+Block/injection relative L2 remain 6.53e-5/3.88e-5 against the complete control.
+The 0.570ms saving estimated for 96 boundaries leaves approximately 2.48ms
+of HC, so the 1ms goal is not achieved.
+
+Corrected graph-tail phase samples show approximately 6µs from lora publication
+to up readiness. A subsequent research candidate assigns reception/forwarding
+to one CTA per row, publishes local decoded data with GPU release/acquire
+flags and eliminates the repeated full-buffer poll plus 80-CTA receive barrier.
+This candidate is not selected until its numerical and replay tests pass.

@@ -1014,12 +1014,14 @@ void gguf_dense_restore_canonical_sm70_out(
 
 void sm70_hc_ll_down_out(torch::Tensor x, torch::Tensor wd, torch::Tensor part,
                          torch::Tensor cnt, std::vector<int64_t> ll,
-                         torch::Tensor seq, int64_t rank, int64_t variant);
+                         torch::Tensor seq, int64_t rank, int64_t variant,
+                         bool optimized_loads);
 void sm70_hc_ll_up_out(int64_t ll_lora, torch::Tensor wu, torch::Tensor x,
                        torch::Tensor cnt, std::vector<int64_t> ll,
                        torch::Tensor seq, torch::Tensor down_seq, int64_t rank,
                        torch::Tensor out, torch::Tensor lora_out,
-                       torch::Tensor inj_out, int64_t warps);
+                       torch::Tensor inj_out, int64_t warps,
+                       bool optimized_loads);
 void gguf_canonical_linear_n64_sm70_out(
     torch::Tensor output, torch::Tensor input, torch::Tensor weight,
     torch::Tensor stats, torch::Tensor partials, torch::Tensor counters,

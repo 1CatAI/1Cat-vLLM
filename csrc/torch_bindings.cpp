@@ -276,12 +276,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "sm70_hc_ll_down_out(Tensor x, Tensor wd, Tensor(a!) part, Tensor(b!) "
       "cnt, "
-      "int[] ll, Tensor(c!) seq, int rank, int variant) -> ()");
+      "int[] ll, Tensor(c!) seq, int rank, int variant, bool "
+      "optimized_loads=True) -> ()");
   ops.impl("sm70_hc_ll_down_out", torch::kCUDA, &sm70_hc_ll_down_out);
   ops.def(
       "sm70_hc_ll_up_out(int ll_lora, Tensor wu, Tensor x, Tensor(a!) cnt, "
       "int[] ll, Tensor(b!) seq, Tensor down_seq, int rank, Tensor(c!) out, "
-      "Tensor(d!) lora_out, Tensor(e!) inj_out, int warps) -> ()");
+      "Tensor(d!) lora_out, Tensor(e!) inj_out, int warps, bool "
+      "optimized_loads=True) -> ()");
   ops.impl("sm70_hc_ll_up_out", torch::kCUDA, &sm70_hc_ll_up_out);
 
   ops.def("gguf_quantize_q8_1_sm70_out(Tensor(a!) out, Tensor input) -> ()");
