@@ -121,6 +121,8 @@ def test_bundled_storage_and_invalid_views():
         pytest.skip("requires SM70")
     import vllm._C  # noqa: F401
 
+    import vllm._sm70_ops  # noqa: F401
+
     torch.manual_seed(79)
     n, k = 64, 128
     codes = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda")
@@ -132,6 +134,11 @@ def test_bundled_storage_and_invalid_views():
     assert c.untyped_storage().nbytes() == codes.numel() + scales.numel()
     assert torch.equal(c.contiguous().view_as(codes), codes)
     assert torch.equal(s.contiguous().view_as(scales), scales)
+    torch.library.opcheck(
+        torch.ops._C.nvfp4_qpn2_bundle_sm70.default,
+        (codes, scales),
+        test_utils=("test_schema", "test_faketensor"),
+    )
 
     x = torch.zeros(8, k, dtype=torch.float16, device="cuda")
     out = torch.empty(8, n, dtype=x.dtype, device=x.device)
