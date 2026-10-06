@@ -136,6 +136,10 @@ __global__ void __launch_bounds__(32 * WARPS)
   if (dbg && threadIdx.x == 0) {
     dbg[diagnostic_cta * 4] = started;
     dbg[diagnostic_cta * 4 + 1] = clock64();
+    // The last split can change on each replay. Do not retain a previous
+    // generation's reduction/exchange timestamps on a non-last CTA.
+    dbg[diagnostic_cta * 4 + 2] = 0;
+    dbg[diagnostic_cta * 4 + 3] = 0;
   }
   __shared__ float red[WARPS][8][32];
   __shared__ bool last;
