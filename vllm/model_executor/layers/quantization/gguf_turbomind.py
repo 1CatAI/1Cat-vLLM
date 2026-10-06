@@ -79,6 +79,24 @@ def _prepared_gguf_projection(
     # Keep M-dependent policy behind an opaque op: vLLM's range compilation
     # drops Dynamo guards and would otherwise freeze the prefill branch.
     rows = x.reshape(-1, x.shape[-1]).contiguous()
+    if family == 4:
+        from .gguf_dmv import restore
+
+        output = rows.new_empty((rows.shape[0], output_size))
+        restore(
+            rows,
+            codes,
+            stats,
+            cache,
+            decoder,
+            output_size,
+            k_ld,
+            q_ld,
+            output,
+            cache_bands,
+            blas_bands,
+        )
+        return output.reshape(*x.shape[:-1], logical_size)
     if family == 3:
         from .gguf_dense_hmma import apply_segments, restore_and_apply
 
@@ -191,7 +209,7 @@ def _prepared_gguf_mixed_projection(
     # Retain the calibrated per-projection policy outside measured target
     # verification sizes. This decision must use actual M inside the op.
     direct = (
-        not any(spec[0] == 3 for spec in specs)
+        not any(spec[0] in (3, 4) for spec in specs)
         and rows.shape[0] in (5, 20)
         and all(
             not _supports_band(rows.shape[0], cb)
@@ -330,10 +348,19 @@ def prepared_projection_arguments(projections):
         )
         codes.append(projection.codes)
         stats.append(projection.stats)
+        if hasattr(projection, "dmv_format"):
+            family, decoder = 4, projection.dmv_format
+            cb = []
         if hasattr(projection, "segment_format"):
             family, decoder = 3, projection.segment_format
             cb = bb = []
-        caches.append(projection.segment_high if family == 3 else projection.fp16_cache)
+        caches.append(
+            projection.dmv_high
+            if family == 4
+            else projection.segment_high
+            if family == 3
+            else projection.fp16_cache
+        )
         descriptors.extend(
             (
                 family,
@@ -362,7 +389,7 @@ def _admitted_bands(capabilities):
 
 
 def prepare_gguf_projections(
-    sources, act_dtype, enabled, prefill_min_m, input_layout=None
+    sources, act_dtype, enabled, prefill_min_m, input_layout=None, dmv_enabled=False
 ):
     """Coalesce adjacent compatible shards without changing projection order."""
     groups: list[tuple[list[torch.Tensor], int]] = []
@@ -387,6 +414,7 @@ def prepare_gguf_projections(
             enabled,
             prefill_min_m,
             input_layout=input_layout,
+            dmv_enabled=dmv_enabled,
         )
         projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
         projections.append(projection)
@@ -408,7 +436,14 @@ class GGUFPreparedProjection(Module):
     """One mixed projection; canonical preparation never changes its row order."""
 
     def __init__(
-        self, weight, source_type, act_dtype, enabled, prefill_min_m, input_layout=None
+        self,
+        weight,
+        source_type,
+        act_dtype,
+        enabled,
+        prefill_min_m,
+        input_layout=None,
+        dmv_enabled=False,
     ):
         super().__init__()
         self.source_type = int(source_type)
@@ -416,6 +451,7 @@ class GGUFPreparedProjection(Module):
         self.prefill_min_m = prefill_min_m
         self.kernel = None
         self.input_layout = input_layout
+        self.dmv_enabled = dmv_enabled
         self.input_layout_restored = False
         self.input_layout_rejection_reasons = []
         self.logical_output_size = weight.shape[0]
@@ -475,25 +511,43 @@ class GGUFPreparedProjection(Module):
         if self.input_layout is not None:
             if not isinstance(self.input_layout, GGUFHeadTilingLayout):
                 return "input_layout_codec_unavailable"
-            if not isinstance(canonical, AffineGGUFProjection):
-                return "input_layout_requires_affine_groups"
-            head_span, remainder = divmod(
-                self.input_layout.head_dim, canonical.group_size
-            )
-            if remainder:
-                return "input_layout_cuts_canonical_group"
-            canonical = replace(
-                canonical,
-                codes=self.input_layout.weight_to_vllm(
-                    torch.from_numpy(canonical.codes), dim=1
-                ).numpy(),
-                scales=self.input_layout.weight_to_vllm(
-                    torch.from_numpy(canonical.scales), dim=1, head_dim=head_span
-                ).numpy(),
-                mins=self.input_layout.weight_to_vllm(
-                    torch.from_numpy(canonical.mins), dim=1, head_dim=head_span
-                ).numpy(),
-            )
+            if self.dmv_enabled and isinstance(canonical, LatticeGGUFProjection):
+                canonical = replace(
+                    canonical,
+                    **{
+                        name: self.input_layout.weight_to_vllm(
+                            torch.from_numpy(getattr(canonical, name)),
+                            dim=1,
+                            head_dim=self.input_layout.head_dim // stride,
+                        ).numpy()
+                        for name, stride in (
+                            ("indices", canonical.grid_width),
+                            ("signs", 8),
+                            ("deltas", 8),
+                            ("scales", canonical.group_size),
+                        )
+                    },
+                )
+            else:
+                if not isinstance(canonical, AffineGGUFProjection):
+                    return "input_layout_requires_affine_groups"
+                head_span, remainder = divmod(
+                    self.input_layout.head_dim, canonical.group_size
+                )
+                if remainder:
+                    return "input_layout_cuts_canonical_group"
+                canonical = replace(
+                    canonical,
+                    codes=self.input_layout.weight_to_vllm(
+                        torch.from_numpy(canonical.codes), dim=1
+                    ).numpy(),
+                    scales=self.input_layout.weight_to_vllm(
+                        torch.from_numpy(canonical.scales), dim=1, head_dim=head_span
+                    ).numpy(),
+                    mins=self.input_layout.weight_to_vllm(
+                        torch.from_numpy(canonical.mins), dim=1, head_dim=head_span
+                    ).numpy(),
+                )
         padding = -n % 32
         if padding:
             canonical = replace(
@@ -546,6 +600,11 @@ class GGUFPreparedProjection(Module):
         self.output_padding = padding
         from .gguf_dense_hmma import prepare_segment_bank, remember_descriptor
 
+        if self.dmv_enabled:
+            from .gguf_dmv import prepare_bank
+
+            if prepare_bank(self, weight):
+                return None
         if prepare_segment_bank(self, canonical, weight.device):
             remember_descriptor(
                 k,
@@ -592,6 +651,7 @@ class GGUFPreparedProjection(Module):
                         (self.kernel.capability,),
                     ),
                     *self.cache_capabilities,
+                    *([self.dmv_capability] if hasattr(self, "dmv_capability") else []),
                     *(
                         [self.segment_capability, self.segment_m20_capability]
                         if hasattr(self, "segment_capability")
@@ -615,6 +675,8 @@ class GGUFPreparedProjection(Module):
                 family, decoder = 1, kernel.lut_id
             else:
                 family, decoder = 2, kernel.source_type
+            if hasattr(self, "dmv_format"):
+                family, decoder = 4, self.dmv_format
             if hasattr(self, "segment_format"):
                 family, decoder = 3, self.segment_format
             capabilities = getattr(kernel, "operator_capabilities", ())
@@ -623,7 +685,11 @@ class GGUFPreparedProjection(Module):
                 x,
                 self.codes,
                 self.stats,
-                self.segment_high if family == 3 else self.fp16_cache,
+                self.dmv_high
+                if family == 4
+                else self.segment_high
+                if family == 3
+                else self.fp16_cache,
                 family,
                 decoder,
                 config.group_size,

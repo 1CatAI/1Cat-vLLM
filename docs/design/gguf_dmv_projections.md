@@ -14,3 +14,22 @@ layer and must remain stable across graph replay.
 The implementation derives from the dmv11 projection and pack/pack3 layout.
 Measured operator results, memory accounting and model-level results will be
 recorded here before admission.
+
+IQ3_XXS retains the original FP16 block coefficient. Multiplying it by 0.25
+before packing introduces a second rounding for subnormal coefficients; the
+reader applies that factor in FP32 together with the local scale and rounds
+only the expanded group coefficient. Canonical restoration retains every
+index and sign and reconstructs the same group coefficient.
+
+Initial operator checks used real TP4 27B rank-0 shards on V100-SXM2-32GB
+at 1290 MHz, CUDA 12.8 and Torch 2.10.0. With M8, graph replay and rotating
+more than 48 MB of weight planes, down projections measured 20.3–22.3 µs
+and GDN output projections 10.6–11.1 µs. Relative L2 error against official
+GGUF dequantization was 3.4e-4–7.5e-4 across 24 role/type cases. These are
+operator measurements, not model-level latency results.
+
+All 16 ordered format combinations passed fused gate/up checks against the
+official reference and 50 unchanged-input graph replays. Mixed IQ3_S/IQ3_XXS
+GDN inputs with a/b passed 20 changed-input split-K graph checks; counters
+returned to zero after every replay. IQ3_S, IQ3_XXS and compact IQ4_XS planes
+restored their canonical packed codes and coefficient metadata bitwise.

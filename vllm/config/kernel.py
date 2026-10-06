@@ -364,6 +364,9 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    projection_planes: bool = True
+    """Use measured M8 shared-activation projection planes with canonical fallback."""
+
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
 

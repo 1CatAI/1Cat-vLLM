@@ -700,13 +700,39 @@ class GGUFLinearMethod(LinearMethodBase):
                 ]
             else:
                 sources = [(qweight, layer.qweight_type.weight_type)]
+            from vllm.model_executor.layers.quantization.gguf_dmv import (
+                eligible_sources,
+                prepare_layer,
+            )
+
+            dmv_enabled = eligible_sources(sources)
             projections = prepare_gguf_projections(
                 sources,
                 self.params_dtype,
                 self.native_enabled,
                 self.prefill_min_m,
                 input_layout=self.layout,
+                dmv_enabled=dmv_enabled,
             )
+            if dmv_enabled:
+                admission = prepare_layer(layer, projections)
+                self.native_admission["projection_planes"] = admission
+                if admission["reason"] is None:
+                    layer.gguf_tm_projections = torch.nn.ModuleList(projections)
+                    self.canonical_projections = layer.gguf_tm_projections
+                    self.native_admission["canonical_projections"] = [
+                        p.admission() for p in projections
+                    ]
+                    if all(p.input_layout_restored for p in projections):
+                        self.layout = None
+                    qweight.data_container.clear()
+                    empty = Parameter(
+                        torch.empty(0, dtype=self.params_dtype, device=qweight.device),
+                        False,
+                    )
+                    set_weight_attrs(empty, vars(qweight))
+                    layer.register_parameter("qweight", empty)
+                    return
             from vllm.model_executor.layers.quantization.gguf_iq3_gated import (
                 prepare_iq3_gated_pair,
             )
@@ -835,6 +861,10 @@ class GGUFLinearMethod(LinearMethodBase):
         self._create_padded_weight_param(layer)
 
     def apply_fused_silu_and_mul(self, layer, x):
+        if hasattr(layer, "gguf_dmv_operands"):
+            from vllm.model_executor.layers.quantization.gguf_dmv import apply_layer
+
+            return apply_layer(layer, x, fused=True)
         if hasattr(layer, "gguf_native_gated_records"):
             from vllm.model_executor.layers.quantization.gguf_native_pair import (
                 apply_native_gated_pair,
@@ -909,7 +939,11 @@ class GGUFLinearMethod(LinearMethodBase):
                 apply_prepared_gguf_projections,
             )
 
-            if hasattr(layer, "gguf_qkvz_weights"):
+            if hasattr(layer, "gguf_dmv_operands"):
+                from vllm.model_executor.layers.quantization.gguf_dmv import apply_layer
+
+                out = apply_layer(layer, x)
+            elif hasattr(layer, "gguf_qkvz_weights"):
                 from vllm.model_executor.layers.quantization.gguf_qkvz import (
                     apply_native_qkvz,
                 )

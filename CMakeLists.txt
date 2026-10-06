@@ -430,6 +430,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_shared_expert_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_iq3_signed_pair_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_linear_sm70.cu"
+      "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_dmv_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_qkvz_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_small_output_sm70.cu"
       "${VLLM_SM70_TURBOMIND_ROOT}/ops/gguf_native_pair_sm70.cu")

@@ -1040,3 +1040,21 @@ void gguf_small_output_sm70_out(torch::Tensor output, torch::Tensor input,
                                 torch::Tensor weight, torch::Tensor partials,
                                 torch::Tensor counters, int64_t type,
                                 int64_t splits, bool gdn_head_tiling);
+
+void gguf_dmv_sm70_out(torch::Tensor input, std::vector<torch::Tensor> codes,
+                       std::vector<torch::Tensor> high,
+                       std::vector<torch::Tensor> scale,
+                       std::vector<torch::Tensor> outputs,
+                       std::vector<int64_t> formats,
+                       std::vector<int64_t> widths, int64_t k, int64_t split,
+                       int64_t kw, torch::Tensor workspace,
+                       torch::Tensor counters, int64_t tn,
+                       std::optional<torch::Tensor> sigmoid_gate,
+                       std::optional<torch::Tensor> table,
+                       std::optional<torch::Tensor> floating_weight,
+                       std::optional<torch::Tensor> floating_output,
+                       std::optional<torch::Tensor> pair_output);
+
+void gguf_dmv_restore_sm70_out(torch::Tensor weight, torch::Tensor stats,
+                               torch::Tensor codes, torch::Tensor scale,
+                               int64_t fmt, int64_t k, int64_t n);
