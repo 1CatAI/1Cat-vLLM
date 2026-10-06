@@ -560,6 +560,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "nvfp4_qpn2_prepare_sm70(Tensor weight_packed, Tensor weight_scale) -> "
       "Tensor[]");
   ops.impl("nvfp4_qpn2_prepare_sm70", torch::kCUDA, &nvfp4_qpn2_prepare_sm70);
+  ops.def("nvfp4_qpn2_bundle_sm70(Tensor codes, Tensor scales) -> Tensor[]");
+  ops.impl("nvfp4_qpn2_bundle_sm70", torch::kCUDA, &nvfp4_qpn2_bundle_sm70);
 
   ops.def("nvfp4_qpn2_prepare_scales_sm70(Tensor weight_scale) -> Tensor");
   ops.def(
