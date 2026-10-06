@@ -516,6 +516,55 @@ approximately 0.063-ms metadata-prefetch estimate, it is deferred rather than
 used to justify another model load. All three screens are private-DSO research
 measurements; none changes packaged model dispatch or qualifies endpoint gain.
 
+### Repaired model critical-path trace
+
+The same repaired wheel records 983 target nodes/rank, down from the earlier
+1263. In 37 aligned TP windows, profiled median window/target envelope is
+18.5346/14.0354 ms. GPU target-entry skew has median/p90 0.0193/0.0287 ms.
+One retained window has 25.1406 ms of rank-2 entry skew and a 46.9751-ms total;
+this outlier is not the typical launch-skew budget.
+
+For composition, excluding that single window using median window + 1 ms
+leaves 36 windows. The exclusive rank-0 ledger closes as follows. The older
+trace is a different source build and profiler run, so this is an ordering and
+composition comparison, not the matched endpoint speed claim.
+
+| Exclusive recorded activity, ms/window | Earlier control trace | Repaired HCX trace |
+| --- | ---: | ---: |
+| Target | 13.5660 | 12.8711 |
+| Draft | 3.8439 | 3.0851 |
+| Outside graphs | 0.9436 | 0.6534 |
+| Copies | 0.1875 | 0.1320 |
+| No recorded activity | 2.3530 | 1.7857 |
+| Common TP window | 20.8939 | 18.5273 |
+
+The repaired graph has approximately 1.23 ms of overlapping kernel service
+per rank. Kernel service is not additive wall time. In the stable composition,
+HC is 2.9623 ms, expert gate/up plus down/unroute approximately 2.75 ms,
+dense projections 2.3117 ms, QSA approximately 1.63 ms and router approximately
+1.10 ms. Shared gate/up service is 0.7963 ms and largely overlaps routed work.
+The four surviving all-reduce calls have a large all-window mean inflated by
+the recorded entry outlier; it is not a new steady 0.54-ms collective budget.
+
+The largest idle edges are HC to shared gate/up (approximately 0.176 ms/round)
+and expert down to two-plane concatenation (approximately 0.139 ms/round).
+They cannot redeem the remaining 5.4-ms endpoint gap alone. The HC stage
+screen identifies approximately 6.1 us per boundary in LoRA arrival, weight
+prefetch and the second grid barrier. A research-only partition-ready up
+screen consumes each warp's 64-column LoRA block as it arrives, replacing
+that whole-CTA barrier. It recomputes the identical FP16-normalized gate-mix
+input from the residual published before the first barrier, preserving the
+existing arithmetic and removing a dependency on later xn writes. Numerical
+and same-machine four-rank graph ABBA checks precede any model integration.
+
+Direct per-warp LL polling passes byte-exact outputs and changed-input graph
+checks, but regresses maximum-rank median from 29.252 to 55.204 us. It is
+rejected. It repeats tagged polling across 80 consumers instead of polling
+each record once and bulk-reading ready data. The next isolated screen
+publishes readiness per 64-column tile with one producer, then lets up warps
+bulk-read that tile. It remains research-only pending the same numerical
+and latency checks.
+
 ## Community designs and applicability
 
 [SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)
