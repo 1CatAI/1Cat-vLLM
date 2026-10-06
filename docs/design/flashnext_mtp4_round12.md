@@ -273,6 +273,33 @@ of the HC boundary through kernel configuration. Compiled Q6 fusion uses
 180 registers/thread versus 92 without a producer projection; neither
 variant spills. This is a screening observation, not a performance claim.
 
+### Owned-payload control and next decoder screen
+
+The owned-payload wheel's switch-off control completes all checks. Its
+unobserved C1 cohorts are 19.188 and 18.275 ms/round (mean 18.731), both
+emitting 4.886 tokens/round with identical C1 output sequences. The first
+cohort's median is 18.310 ms; its slower tail is retained in the mean and
+has not been attributed. The low-overhead observed cohort measures
+18.305 ms, with target/draft/preparation envelopes 14.386/3.316/0.097 ms.
+C4 measures 43.211 ms/round and eight-prompt mean acceptance is 47.812%.
+Both short natural completions terminate at EOS.
+
+On 64 aligned teacher positions against the prior integrated control,
+mean KL is 0.000686, maximum KL 0.009153, and top-1 agreement is 63/64.
+Maximum absolute logit error is 1.0645 and relative L2 error is 0.1271.
+This records fresh-process numerical variation even without selecting HCX;
+it does not establish its cause. The native HC boundary with a separate
+output projection requires its own matched model gate.
+
+The next expert-reader screen retains the original compressed bytes, base
+scales and integer-dot arithmetic. It separates IQ2_S's two codebook words
+into shared-memory planes and generates four-byte sign masks in registers
+using PRMT. No format expansion or new precision reduction is introduced.
+The existing native operator exposes an optional switch, disabled by default,
+for same-wheel comparisons. Thirty-six changed-input/route graph and canary
+cases, then real-shard cold-cache ABBA at M=1/5/20, are required before model
+dispatch changes. Compilation alone is not speed or correctness evidence.
+
 ## Community designs and applicability
 
 [SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)
