@@ -101,6 +101,7 @@ def main():
     parser.add_argument("--probe", action="store_true")
     parser.add_argument("--node-trace", action="store_true")
     parser.add_argument("--trace-only", action="store_true")
+    parser.add_argument("--trace-width", type=int, choices=(1, 4), default=1)
     parser.add_argument("--round-events", action="store_true")
     input_ab = parser.add_mutually_exclusive_group()
     input_ab.add_argument("--input-phase-ab", action="store_true")
@@ -476,12 +477,20 @@ def main():
                 )
                 llm.collective_rpc("start_graph_parity_capture", timeout=30)
                 try:
+                    trace_ids = fixed_ids if args.trace_width == 1 else fixed_ids[:128]
+                    trace_tokens = 256 if args.trace_width == 1 else 600
                     steps, outputs = observed_cohort(
                         llm,
-                        fixed_ids,
-                        SamplingParams(temperature=0, max_tokens=256, ignore_eos=True),
+                        trace_ids,
+                        SamplingParams(
+                            temperature=0, max_tokens=trace_tokens, ignore_eos=True
+                        ),
+                        width=args.trace_width,
                     )
                     report["node_trace"] = dict(
+                        concurrency=args.trace_width,
+                        input_tokens=len(trace_ids),
+                        max_tokens=trace_tokens,
                         output_token_ids=[
                             list(o.outputs[0].token_ids) for o in outputs
                         ],
@@ -493,7 +502,7 @@ def main():
                     # Preserve completed generation and CPU records before
                     # profiler shutdown or optional interval statistics.
                     save()
-                    report["node_trace"]["summary"] = summarize(steps, 1)
+                    report["node_trace"]["summary"] = summarize(steps, args.trace_width)
                     save()
                 finally:
                     llm.collective_rpc("stop_graph_parity_capture", timeout=30)

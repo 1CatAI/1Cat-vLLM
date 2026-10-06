@@ -9,7 +9,7 @@ import sqlite3
 import statistics
 from pathlib import Path
 
-from benchmarks.analyze_flashnext_graph_nodes import family
+from benchmarks.analyze_flashnext_graph_nodes import family, select_target_ranges
 
 
 def union_ns(intervals):
@@ -101,7 +101,7 @@ def classify(name):
     return family(name)
 
 
-def analyze(sqlite_path, benchmark_path, trim=8):
+def analyze(sqlite_path, benchmark_path, trim=8, tokens=None, requests=1):
     report = json.loads(benchmark_path.read_text())
     workers = report["node_trace"]["workers"]
     ranks = {w["pid"]: w["rank"] for w in workers}
@@ -118,6 +118,28 @@ def analyze(sqlite_path, benchmark_path, trim=8):
         ):
             if (tid >> 24) & 0xFFFFFF in ranks:
                 ranges[tid].append((start, end, label))
+        target_ranges = select_target_ranges(
+            workers,
+            {
+                tid: [
+                    (a, b) for a, b, label in spans if label.endswith("target.replay")
+                ]
+                for tid, spans in ranges.items()
+                if any(label.endswith("target.replay") for _, _, label in spans)
+            },
+            tokens,
+            requests,
+        )
+        if tokens is not None:
+            ranges = {
+                tid: [
+                    (a, b, label)
+                    for a, b, label in spans
+                    if not label.endswith("target.replay")
+                    or (a, b) in target_ranges.get(tid, ())
+                ]
+                for tid, spans in ranges.items()
+            }
         scope = {}
         target_ids = collections.defaultdict(list)
         for start, end, tid, cid in db.execute(
@@ -275,8 +297,12 @@ def main():
     parser.add_argument("sqlite", type=Path)
     parser.add_argument("benchmark", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--tokens", type=int)
+    parser.add_argument("--requests", type=int, default=1)
     args = parser.parse_args()
-    result = analyze(args.sqlite, args.benchmark)
+    result = analyze(
+        args.sqlite, args.benchmark, tokens=args.tokens, requests=args.requests
+    )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(
         json.dumps(

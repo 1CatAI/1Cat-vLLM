@@ -3,6 +3,7 @@
 
 import pytest
 
+from benchmarks.analyze_flashnext_graph_nodes import select_target_ranges
 from benchmarks.analyze_flashnext_round_ledger import (
     classify,
     clipped,
@@ -65,6 +66,34 @@ def test_idle_edge_uses_last_finishing_event_across_streams():
 
 def test_idle_window_without_activity_is_explicit():
     assert idle_edges([], 10, 25) == [(15, None, None)]
+
+
+def test_shape_selection_uses_worker_ordinal_not_clock_proximity():
+    workers = [
+        {
+            "pid": 7,
+            "events": [
+                {"label": "target.replay", "start_ns": 90, "tokens": 4, "requests": 4},
+                {
+                    "label": "target.replay",
+                    "start_ns": 110,
+                    "tokens": 20,
+                    "requests": 4,
+                },
+                {
+                    "label": "target.replay",
+                    "start_ns": 1000,
+                    "tokens": 15,
+                    "requests": 3,
+                },
+            ],
+        }
+    ]
+    tid = (7 << 24) | 3
+    ranges = {tid: [(2000, 2010), (2020, 2030), (2040, 2050)]}
+    assert select_target_ranges(workers, ranges, 20, 4) == {tid: [(2020, 2030)]}
+    with pytest.raises(AssertionError):
+        select_target_ranges(workers, {tid: ranges[tid][:2]}, 20, 4)
 
 
 @pytest.mark.parametrize(
