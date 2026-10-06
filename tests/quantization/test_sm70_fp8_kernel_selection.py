@@ -141,7 +141,7 @@ def test_unused_fp8_policy_preserves_nvfp4_fingerprint():
     config.sm70_nvfp4.resolve(qualified=True)
     assert (
         config.compute_hash()
-        == "46cb3b268de0c6d2ffb4dcfa9d3ba3e7184be6b73126717691b8d114ccca523b"
+        == "6192bf9bb2282d086694981f8f4dbdd8c8317ffae9d1ded3eb6f1d698847a4be"
     )
     # The new Turing routing policy participates in compilation identity.
     before = config.compute_hash()

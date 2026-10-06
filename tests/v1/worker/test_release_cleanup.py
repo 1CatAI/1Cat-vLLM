@@ -74,8 +74,8 @@ def test_worker_shutdown_flushes_route_summary_once(monkeypatch):
 
 
 def test_sm70_workspace_cleanup_releases_all_tensor_owners():
+    from vllm.model_executor.kernels.linear.scaled_mm import sm70_fp8
     from vllm.model_executor.layers.quantization import (
-        fp8,
         nvfp4_sm70_moe,
         sm70_turbomind,
     )
@@ -102,8 +102,8 @@ def test_sm70_workspace_cleanup_releases_all_tensor_owners():
         tensor,
         tensor,
     )
-    fp8._sm70_fp8_prefill_dense_workspaces[(0, tensor.dtype)] = tensor
-    fp8._sm70_fp8_qpn8_pp2_tp4_workspaces[(0, tensor.dtype)] = tensor
+    sm70_fp8._sm70_fp8_prefill_dense_workspaces[(0, tensor.dtype)] = tensor
+    sm70_fp8._sm70_fp8_qpn8_pp2_tp4_workspaces[(0, tensor.dtype)] = tensor
     sm70_turbomind._nvfp4_qpn4_dense_workspaces[(0, tensor.dtype)] = tensor
     nvfp4_sm70_moe._qwen38_raw_scale_workspaces[0] = tensor
 
@@ -114,8 +114,8 @@ def test_sm70_workspace_cleanup_releases_all_tensor_owners():
     assert not flash_attn_v100._fp8_prefill_bridge_tail_workspaces
     assert not flash_attn_v100._prefill_gather_dense_workspaces
     assert not flash_attn_v100._prefill_dense_splitkv3_workspaces
-    assert not fp8._sm70_fp8_prefill_dense_workspaces
-    assert not fp8._sm70_fp8_qpn8_pp2_tp4_workspaces
+    assert not sm70_fp8._sm70_fp8_prefill_dense_workspaces
+    assert not sm70_fp8._sm70_fp8_qpn8_pp2_tp4_workspaces
     assert not sm70_turbomind._nvfp4_qpn4_dense_workspaces
     assert not nvfp4_sm70_moe._qwen38_raw_scale_workspaces
 
