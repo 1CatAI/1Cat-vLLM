@@ -159,3 +159,57 @@ def test_gdn_heads_are_loaded_in_original_gguf_order(kind):
     tiled = x.reshape(8, 4, 3, 128).transpose(1, 2).reshape(8, 1536)
     reference = tiled.float() @ weight.T
     assert (out.float() - reference).norm() / reference.norm() < 0.003
+
+
+@pytest.mark.parametrize("kind", [18, 21])
+def test_large_scale_retains_canonical(kind):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization.gguf_dmv import prepare_bank
+
+    projection = SimpleNamespace(
+        source_type=kind,
+        output_padding=0,
+        kernel=SimpleNamespace(
+            config=SimpleNamespace(partition_weight_shape=(5120, 4352))
+        ),
+    )
+    canonical = SimpleNamespace(scales=np.array([[64.0]], dtype=np.float16))
+    raw = torch.empty((4352, 2200), dtype=torch.uint8, device="meta")
+    assert not prepare_bank(projection, raw, canonical)
+    assert (
+        projection.dmv_rejection_reason == "iq3_scale_exceeds_decode_cancellation_range"
+    )
+
+
+def test_rejected_shard_rolls_back_every_plane(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization import gguf_turbomind as tm
+
+    calls = []
+
+    def fake(
+        weight, kind, dtype, enabled, threshold, input_layout=None, dmv_enabled=False
+    ):
+        calls.append(dmv_enabled)
+        result = SimpleNamespace(
+            source_type=kind, kernel=object(), input_layout_restored=False
+        )
+        if dmv_enabled and kind == 21:
+            result.dmv_format = 5
+        elif dmv_enabled:
+            result.dmv_rejection_reason = "rejected_test_scale"
+        return result
+
+    monkeypatch.setattr(tm, "GGUFPreparedProjection", fake)
+    sources = [
+        (torch.empty((32, size), dtype=torch.uint8, device="meta"), kind)
+        for kind, size in ((21, 110), (18, 98))
+    ]
+    projections = tm.prepare_gguf_projections(
+        sources, torch.float16, True, 8, dmv_enabled=True
+    )
+    assert calls == [True, True, False, False]
+    assert all(not hasattr(p, "dmv_format") for p in projections)
+    assert all(p.dmv_rejection_reasons == ["rejected_test_scale"] for p in projections)

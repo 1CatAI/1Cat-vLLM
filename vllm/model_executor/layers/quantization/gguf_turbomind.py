@@ -424,7 +424,8 @@ def prepare_gguf_projections(
         projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
         projections.append(projection)
     if dmv_enabled and any(
-        p.kernel is not None and not hasattr(p, "dmv_format") for p in projections
+        p.source_type in (12, 18, 21, 23) and not hasattr(p, "dmv_format")
+        for p in projections
     ):
         reasons = [
             getattr(p, "dmv_rejection_reason", "plane_preparation_not_qualified")
