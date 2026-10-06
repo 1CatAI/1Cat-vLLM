@@ -2,6 +2,26 @@
 
 Date: 2026-05-30
 
+## QPN2 serving admission and activation reuse, 2026-10-07
+
+Bundled-scale production PR #1008 is merged (`deca1e0da775`). Matched TP4
+256K/C4 same-service C1 moves 14.82269→14.38960 ms at 1K and
+15.25806→14.84206 ms at 8K with 1290 MHz/300 W; warmed C4 supports parity.
+At the separately validated highest supported 1530 MHz clock, the bundled
+route measures 13.62042/14.01472 ms, with matching acceptance intervals within
+each layout comparison and natural EOS. Clocks are restored to 1290 MHz.
+Do not present that hardware result as the default software-only baseline.
+
+Further cold real-weight activation screens reject finer N16 geometry, full
+80 KiB CTA input caching, chunked 16 KiB input caching and FP8 warp-coalesced
+loads. NVFP4 N32 warp-coalescing saves only 0.090 ms in the optimistic layer
+extrapolation and is not promoted. NCU confirms reduced L1 requests but
+unchanged L2/DRAM reads, and two resident CTAs with 0.85 capacity waves.
+Do not repeat the unqualified 1.7-wave diagnosis or promote a candidate from
+reduced traffic alone. Detailed positive/negative evidence is retained in
+[the bundled-layout screen](sm70_qpn2_bundle_screen.md). Production graph
+kernel counts are unchanged by the accepted layout change.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:
