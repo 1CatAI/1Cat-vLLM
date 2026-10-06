@@ -287,6 +287,9 @@ void fp8_gemm_sm70_prescaled_m1_out(torch::Tensor out, torch::Tensor _in_feats,
 std::vector<torch::Tensor> nvfp4_qpn2_prepare_sm70(torch::Tensor weight_packed,
                                                    torch::Tensor weight_scale);
 
+std::vector<torch::Tensor> nvfp4_qpn2_bundle_sm70(torch::Tensor codes,
+                                                  torch::Tensor scales);
+
 torch::Tensor nvfp4_qpn2_prepare_scales_sm70(torch::Tensor weight_scale);
 void nvfp4_qpn2_restore_tm_scales_sm70_out(torch::Tensor out,
                                            torch::Tensor scales,

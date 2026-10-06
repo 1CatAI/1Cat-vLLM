@@ -515,7 +515,9 @@ def pad_qpn2_output_rows(
     return padded_weight, padded_scales, physical_n
 
 
-def prepare_nvfp4_qpn2_dense_linear(layer: torch.nn.Module) -> None:
+def prepare_nvfp4_qpn2_dense_linear(
+    layer: torch.nn.Module, *, bundle_scales: bool = False
+) -> None:
     """Prepare the QPN2 prepack as the only resident layout of an NVFP4 linear.
 
     Decode (M <= ``QPN2_DISPATCH_MAX_ROWS``) runs the QPN2 kernels on it;
@@ -539,6 +541,8 @@ def prepare_nvfp4_qpn2_dense_linear(layer: torch.nn.Module) -> None:
         layer.weight.data, layer.weight_scale.data
     )
     codes, qpn2_scales = sm70_ops.nvfp4_qpn2_prepare_sm70(weight, scales)
+    if bundle_scales and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70"):
+        codes, qpn2_scales = sm70_ops.nvfp4_qpn2_bundle_sm70(codes, qpn2_scales)
     output_size = int(layer.weight.shape[0])
     input_size = int(layer.weight.shape[1]) * 2
     split_k, accumulator_chains = qpn2_launch_config(input_size, padded_output_size)

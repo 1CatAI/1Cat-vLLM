@@ -1422,6 +1422,24 @@ if hasattr(torch.ops._C, "nvfp4_qpn2_prepare_sm70"):
         return [codes, scales]
 
 
+def nvfp4_qpn2_bundle_sm70(
+    codes: torch.Tensor, scales: torch.Tensor
+) -> list[torch.Tensor]:
+    """Return code/scale views sharing one interleaved native allocation."""
+    return _op("nvfp4_qpn2_bundle_sm70")(codes, scales)
+
+
+if hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70"):
+
+    @register_fake("_C::nvfp4_qpn2_bundle_sm70")
+    def _nvfp4_qpn2_bundle_sm70_fake(
+        codes: torch.Tensor, scales: torch.Tensor
+    ) -> list[torch.Tensor]:
+        n, packed_k = codes.shape
+        packed = codes.new_empty((n // 32, packed_k // 8, 288))
+        return [packed[..., :256], packed[..., 256:]]
+
+
 def nvfp4_qpn2_prepare_scales_sm70(weight_scale: torch.Tensor) -> torch.Tensor:
     """Pack E4M3 scales, padding N to 32, without allocating weight codes."""
     return _op("nvfp4_qpn2_prepare_scales_sm70")(weight_scale)
