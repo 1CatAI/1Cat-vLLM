@@ -9,7 +9,7 @@ import torch
 import torch.multiprocessing as mp
 
 
-def _worker(rank, port, results):
+def _worker_run(rank, port, results):
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import (
         init_distributed_environment,
@@ -95,6 +95,19 @@ def _worker(rank, port, results):
         results.put((rank, report))
 
 
+def _worker(rank, port, results):
+    import traceback
+
+    try:
+        _worker_run(rank, port, results)
+    except BaseException:
+        results.put((rank, {"error": traceback.format_exc()}))
+        raise
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_hcx_owned_payload_compilation_and_graph_replay():
     if torch.cuda.device_count() != 4 or torch.cuda.get_device_capability() != (7, 0):
@@ -114,6 +127,7 @@ def test_hcx_owned_payload_compilation_and_graph_replay():
             if worker.is_alive():
                 worker.terminate()
                 worker.join()
+    assert all(isinstance(report, list) for _, report in reports), reports
     assert all(worker.exitcode == 0 for worker in workers)
     assert sorted(rank for rank, _ in reports) == list(range(4))
     print(sorted(reports))

@@ -305,7 +305,9 @@ def _hcx_combine_and_mix(
         hidden_states, reduced, injection
     )
     assert inj is not None
-    return hidden, block, inj
+    # Match the fake's contiguous outputs. The original large-M injection
+    # is a view of the padded 336-column projection, with row stride 336.
+    return hidden.contiguous(), block.contiguous(), inj.contiguous()
 
 
 def _hcx_combine_and_mix_fake(hidden_states, block_output, injection, name):

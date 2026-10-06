@@ -249,3 +249,17 @@ def test_compiled_moe_payload_keeps_both_dependencies_live():
         torch.testing.assert_close(block, x * 3.5, rtol=0, atol=0)
         torch.testing.assert_close(scratch, x * 100, rtol=0, atol=0)
     del library
+
+
+def test_large_m_injection_matches_contiguous_fake_contract():
+    hidden, block = torch.ones(20, 16), torch.ones(20, 4)
+    padded_injection = torch.ones(20, 336)
+    injection = padded_injection[:, :4]
+    assert injection.stride(0) == 336
+    hc._PARTIAL_MODULES["consumer"] = SimpleNamespace(
+        _partial_pair=lambda x: (x, None),
+        _combine_and_mix_reduced=lambda h, b, i: (h, b, i),
+    )
+    outputs = hc._hcx_combine_and_mix(hidden, block, injection, "consumer")
+    assert all(t.is_contiguous() for t in outputs)
+    torch.testing.assert_close(outputs[2], injection, rtol=0, atol=0)
