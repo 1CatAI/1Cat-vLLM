@@ -216,9 +216,14 @@ def prepare_layer(layer, projections):
     layer.gguf_dmv_operands = (codes, high, scales, fmts, ns, kw, tn, split, pair)
     floating = [p.weight for p in projections if p.kernel is None]
     if floating:
-        layer.register_parameter(
-            "gguf_dmv_floating", Parameter(torch.cat(floating, dim=0), False)
-        )
+        combined = floating[0] if len(floating) == 1 else torch.cat(floating, dim=0)
+        layer.register_parameter("gguf_dmv_floating", Parameter(combined, False))
+        offset = 0
+        for projection in projections:
+            if projection.kernel is None:
+                n = projection.weight.shape[0]
+                projection.weight = Parameter(combined.narrow(0, offset, n), False)
+                offset += n
     return {
         "reason": None,
         "operator": "gguf_dmv_sm70_out",
@@ -249,6 +254,7 @@ def _project(
     partials: torch.Tensor,
     counters: torch.Tensor,
     floating: torch.Tensor | None,
+    fallback_floating: list[torch.Tensor],
     fallback_codes: list[torch.Tensor],
     fallback_stats: list[torch.Tensor],
     fallback_caches: list[torch.Tensor | None],
@@ -274,11 +280,12 @@ def _project(
             cache_bands,
             blas_bands,
         )
-        if floating is not None:
-            values = torch.ops.vllm.prepared_gguf_fp16_projection(
-                rows, floating, 30, True
-            )
-            result = torch.cat((result, values), dim=1)
+        if fallback_floating:
+            values = [
+                torch.ops.vllm.prepared_gguf_fp16_projection(rows, w, 30, True)
+                for w in fallback_floating
+            ]
+            result = torch.cat((result, *values), dim=1)
         if pair:
             out = rows.new_empty((rows.shape[0], width))
             torch.ops._C.silu_and_mul(out, result)
@@ -333,6 +340,7 @@ def _project_fake(
     partials,
     counters,
     floating,
+    fallback_floating,
     fallback_codes,
     fallback_stats,
     fallback_caches,
@@ -375,6 +383,7 @@ def apply_layer(layer, x, fused=False):
         layer.gguf_dmv_partials,
         layer.gguf_dmv_counters,
         getattr(layer, "gguf_dmv_floating", None),
+        [p.weight for p in layer.gguf_tm_projections if p.kernel is None],
         *prepared_projection_arguments(
             [p for p in layer.gguf_tm_projections if p.kernel is not None]
         ),

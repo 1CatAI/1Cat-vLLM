@@ -1058,3 +1058,9 @@ void gguf_dmv_sm70_out(torch::Tensor input, std::vector<torch::Tensor> codes,
 void gguf_dmv_restore_sm70_out(torch::Tensor weight, torch::Tensor stats,
                                torch::Tensor codes, torch::Tensor scale,
                                int64_t fmt, int64_t k, int64_t n);
+
+void gguf_dmvq_sm70_out(torch::Tensor output, torch::Tensor input,
+                        torch::Tensor weight, torch::Tensor workspace,
+                        torch::Tensor counters, torch::Tensor table,
+                        int64_t type, int64_t kw, int64_t split);
+void gguf_dmvq_book_sm70_out(torch::Tensor table, int64_t type);

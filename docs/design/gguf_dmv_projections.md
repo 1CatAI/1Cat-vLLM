@@ -33,3 +33,11 @@ official reference and 50 unchanged-input graph replays. Mixed IQ3_S/IQ3_XXS
 GDN inputs with a/b passed 20 changed-input split-K graph checks; counters
 returned to zero after every replay. IQ3_S, IQ3_XXS and compact IQ4_XS planes
 restored their canonical packed codes and coefficient metadata bitwise.
+
+The temporary original-record DMVQ reader is admitted only for TP4 IQ2_XS
+and IQ2_S down matrices (N5120,K4352,M8,KW8,split1). Same-process cold-L2
+ABBA measured 23.81 versus 32.32 µs for IQ2_XS and 25.12 versus 33.91 µs
+for IQ2_S against canonical GEMM. Relative L2 errors were 2.9e-4.
+Q2_K down (33.70 versus 28.68 µs) and IQ1_M gate (43.46 versus 32.72 µs)
+retain their prior routes. IQ2_XXS gate measured 23.76 versus 31.40 µs as a
+single matrix, but that result does not qualify an entire fused gate/up pair.

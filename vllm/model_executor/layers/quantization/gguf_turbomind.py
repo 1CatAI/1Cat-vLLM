@@ -528,6 +528,19 @@ class GGUFPreparedProjection(Module):
                         )
                     },
                 )
+            elif self.dmv_enabled and isinstance(canonical, Lut4GGUFProjection):
+                canonical = replace(
+                    canonical,
+                    codes=self.input_layout.weight_to_vllm(
+                        torch.from_numpy(canonical.codes),
+                        dim=1,
+                    ).numpy(),
+                    scales=self.input_layout.weight_to_vllm(
+                        torch.from_numpy(canonical.scales),
+                        dim=1,
+                        head_dim=self.input_layout.head_dim // canonical.group_size,
+                    ).numpy(),
+                )
             else:
                 if not isinstance(canonical, AffineGGUFProjection):
                     return "input_layout_requires_affine_groups"

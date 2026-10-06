@@ -52,6 +52,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "weight, "
       "int source_type) -> ()");
   ops.def(
+      "gguf_dmvq_sm70_out(Tensor(a!) output, Tensor input, Tensor weight, "
+      "Tensor(b!) workspace, Tensor(c!) counters, Tensor table, int type, "
+      "int kw, int split) -> ()");
+  ops.impl("gguf_dmvq_sm70_out", torch::kCUDA, &gguf_dmvq_sm70_out);
+  ops.def("gguf_dmvq_book_sm70_out(Tensor(a!) table, int type) -> ()");
+  ops.impl("gguf_dmvq_book_sm70_out", torch::kCUDA, &gguf_dmvq_book_sm70_out);
+  ops.def(
       "gguf_dmv_sm70_out(Tensor input, Tensor[] codes, Tensor[] high, "
       "Tensor[] scale, Tensor(a!)[] outputs, int[] formats, int[] widths, "
       "int k, int split, int kw, Tensor(b!) workspace, Tensor(c!) counters, "
