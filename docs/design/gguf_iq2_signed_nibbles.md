@@ -57,8 +57,17 @@ and activation rounding. Its same-wheel model comparison saved 0.148ms/round
 at 1K and 0.167ms at 8K, while emitted-token latency worsened
 5.373→5.597ms and 5.651→5.734ms because tokens per round declined.
 That version is not promoted. The arithmetic-compatible revision above
-is undergoing a new same-wheel model comparison; it has no qualified
-model-speed claim yet. Both versions' measurements remain in the data file.
+passes a new same-wheel sixteen-prompt comparison. Full rounds improve
+16.157→16.097ms at 1K and 16.944→16.875ms at 8K. Emitted-token latency
+improves 5.459→5.422ms and 5.773→5.745ms. All sixteen prompt pairs have
+shorter mean rounds. Paired prompt bootstrap 95% intervals for round saving
+are 0.042–0.078ms and 0.061–0.079ms; tokens-per-round intervals include zero.
+Mean KL is 6.86e-6, maximum 1.19e-4, with 99.2% top-1 agreement on all 128
+matched rows. Both natural prompts end normally; C4 produces reasonable
+text at its fixed length limit. All four ranks record 1290/877MHz during
+all thirty-two measured generation windows. Measured allocated memory rises
+7.15MiB per rank, distinct from the canonical-only storage estimate below.
+Both revisions' measurements remain in the data file.
 
 The complete thirty-tensor IQ2 inventory would add46.797MiB/card relative
 to canonical storage alone. This phase admits twenty-three gate/up/down
@@ -68,7 +77,7 @@ canonical alone; record measured resident memory when integrating.
 
 ## Current complete-round ledger
 
-The qualified unprofiled reference is16.176ms at1K and16.958ms at8K on four
+The latest qualified unprofiled result is16.097ms at1K and16.875ms at8K on four
 V100-SXM2-32GB cards with full NVLink,1290/877MHz, CUDA12.8 and Torch2.10.0+cu128.
 Projection planes, collective/norm fusion and page832 draft split attention
 are active. The following single diagnostic trace predates the draft split
@@ -121,3 +130,11 @@ The model trace still takes20.34us. The difference cannot be claimed as an
 end-to-end opportunity until its execution context is reproduced. Controls
 changing shared-memory/cache preferences and touching large page ranges do
 not reproduce that full difference.
+
+A real packed-GDN predecessor control uses TP4 Q/K=4, V=12, D=128, eight
+verify rows, FP32 state snapshots and the existing one-pass gated RMSNorm.
+The incremental projection cost is 10.70us alone and 11.53us after GDN and
+norm. This does not reproduce the model trace's 20.34us service. Additional
+split-K and KW6 configurations are slower in that same context and excluded.
+A large artificial instruction footprint can reproduce a slowdown, but the
+actual GDN control does not establish that mechanism as the model root cause.
