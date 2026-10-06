@@ -64,7 +64,9 @@ def main():
             actual = owner.apply(x, *w)
             torch.cuda.synchronize()
             for a, b in zip(actual, reference):
-                torch.testing.assert_close(a, b, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    a.view(torch.int16), b.view(torch.int16), rtol=0, atol=0
+                )
         if m not in (5, 20):
             continue
         graphs = {}
@@ -93,7 +95,9 @@ def main():
             expected = owner.apply(x, *packed[-1])
             torch.cuda.synchronize()
             for a, b in zip(graphs[arm][1], expected):
-                torch.testing.assert_close(a, b, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    a.view(torch.int16), b.view(torch.int16), rtol=0, atol=0
+                )
         samples = {arm: [] for arm in graphs}
         for arm in ("A", "B", "B", "A"):
             g = graphs[arm][0]
