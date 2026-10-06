@@ -220,7 +220,17 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
             k = layer.input_size_per_partition
             n = (layer.weight.shape[0] + 31) // 32 * 32
             if workspace is not None and workspace.numel() >= k * n:
-                sm70_tm.prepare_nvfp4_qpn2_dense_linear(layer)
+                bundle_scales = (
+                    (k, n) in {(5120, 8704), (4352, 5120)}
+                    and hasattr(torch.ops._C, "nvfp4_qpn2_bundle_sm70")
+                    and sm70_nvfp4_native._get_bundled_prefill_code_workspace(
+                        layer.weight, workspace
+                    )
+                    is not None
+                )
+                sm70_tm.prepare_nvfp4_qpn2_dense_linear(
+                    layer, bundle_scales=bundle_scales
+                )
                 layer.sm70_nvfp4_qpn2_native = True
                 layer.sm70_nvfp4_qpn2_output_size = n
                 layer.sm70_nvfp4_qpn2_gated_silu = self.config.gated_silu
