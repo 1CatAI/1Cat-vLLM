@@ -406,7 +406,7 @@ class Sm70RingConfig:
     enabled: bool = True
     """Admit the ring operator when topology and peer atomics are supported."""
 
-    max_bytes: int = Field(default=25600, gt=0, le=25600)
+    max_bytes: int = Field(default=25600, gt=0, le=102400)
     """Largest calibrated input payload; larger messages retain NCCL."""
 
 

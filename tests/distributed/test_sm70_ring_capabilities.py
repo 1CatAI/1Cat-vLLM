@@ -56,7 +56,24 @@ def test_runtime_capability_guards(bytes_, dtype, contiguous, reason):
 def test_policy_cannot_admit_uncalibrated_payload():
     assert Sm70RingConfig().enabled
     with pytest.raises(ValueError):
-        Sm70RingConfig(max_bytes=25602)
+        Sm70RingConfig(max_bytes=102402)
+
+
+def test_large_payload_policy_preserves_explicit_small_ceiling():
+    comm = Sm70RingCommunicator.__new__(Sm70RingCommunicator)
+    comm.device = torch.device("cuda:0")
+    comm.status = {"enabled": True}
+    tensor = SimpleNamespace(
+        dtype=torch.float16,
+        device=comm.device,
+        is_contiguous=lambda: True,
+        numel=lambda: 20 * 2560,
+        element_size=lambda: 2,
+    )
+    comm.policy = Sm70RingConfig(max_bytes=102400)
+    assert comm.rejection_reason(tensor) is None
+    comm.policy = Sm70RingConfig(max_bytes=25600)
+    assert comm.rejection_reason(tensor) == "payload_outside_calibrated_byte_range"
 
 
 @pytest.mark.parametrize("admitted", [True, False])

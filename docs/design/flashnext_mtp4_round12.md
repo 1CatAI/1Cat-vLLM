@@ -604,6 +604,32 @@ saved before the profiler-stop RPC exceeded its original 30-second timeout;
 the report was exported successfully. C4 profiler flushing now allows 120
 seconds without changing model execution.
 
+The frozen historical runtime also records 1754 target nodes/rank with the
+same kernel families and counts (apart from additional unused template
+parameters in symbol names). Its profiled window/target envelope medians
+are 50.7989/37.1971 ms, versus 50.5335/37.0428 in the current control. This
+does not reproduce a new compute-path regression. It does not replace the
+earlier unprofiled C4 result or prove that its drift is resolved.
+
+Cold-cache installed-operator tests reject the smaller expert row partitions:
+M5 IQ3_XXS is 40.960/43.008/54.272 us for 16/8/4 lanes; IQ3_S is
+45.056/49.152/66.560 us; IQ2_S is 40.960/44.032/66.560 us. The largest
+decoded-Q8 relative L2 difference is 5.42e-5. Dense warp/split tests likewise
+find no M5 improvement. M20 output projections improve with four rather than
+eight warps: GDN 25.600 to 16.384 us and attention 21.504 to 14.336 us.
+Their official-dequant error is unchanged to three significant figures.
+This C4-only opportunity is not used to claim progress toward the C1 goal.
+
+The ring's 25,600-byte admission ceiling covers M5 at hidden2560 but rejects
+M20's 102,400 bytes. Rank-0 idle edges entering NCCL account for approximately
+4.53 ms in the current C4 trace. This is a ceiling, not a speed prediction.
+An installed-operator calibration at 102,400 bytes passes mixed-width,
+changed-input and FP64/subnormal checks. Maximum-rank median NCCL/ring service
+is 19.8031/16.1757 us at M20 and 16.6997/5.0369 us at M5, using 98-call
+graphs. The larger message allowance is opt-in pending endpoint validation;
+the existing default ceiling remains 25,600 bytes. The calibration uses the
+normal packaged operator, with no private DSO or topology override.
+
 ## Community designs and applicability
 
 [SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)
