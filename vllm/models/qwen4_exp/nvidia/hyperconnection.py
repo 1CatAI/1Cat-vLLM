@@ -189,8 +189,17 @@ class GatedResidual(nn.Module):
                 self._hcx_up = pack_up(up.data, runtime.logical_rank)
 
     def _reduce_partial(self, block_output: torch.Tensor) -> torch.Tensor:
-        if not getattr(self, "_partial_inputs", False):
+        if not getattr(self, "_partial_inputs", False) or block_output.shape[0] > 8:
             return block_output
+        moe_name = getattr(self, "_hcx_moe_name", None)
+        if moe_name is not None:
+            from vllm.distributed import tensor_model_parallel_all_reduce_sum2
+
+            from .sm70_hcx import moe_inputs
+
+            first, second = moe_inputs(moe_name, block_output.shape[0])
+            if second is not None:
+                return tensor_model_parallel_all_reduce_sum2(first, second)
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         return tensor_model_parallel_all_reduce(block_output)
@@ -261,7 +270,13 @@ def _hcx_combine_and_mix(
     module = _PARTIAL_MODULES[name]
     runtime = getattr(module, "_hcx", None)
     oproj = getattr(module, "_hcx_oproj", None)
-    if runtime is not None and block_output.shape[0] <= 8:
+    secondary = None
+    moe_name = getattr(module, "_hcx_moe_name", None)
+    if moe_name is not None and 0 < block_output.shape[0] <= 8:
+        from .sm70_hcx import moe_inputs
+
+        block_output, secondary = moe_inputs(moe_name, block_output.shape[0])
+    if runtime is not None and 0 < block_output.shape[0] <= 8:
         return runtime.run(
             block_output,
             hidden_states,
@@ -271,14 +286,22 @@ def _hcx_combine_and_mix(
             module._hcx_down,
             module._hcx_up,
             None if oproj is None else oproj[1:],
+            secondary=secondary,
         )
     from vllm.distributed import tensor_model_parallel_all_reduce
 
-    if oproj is not None:
+    if oproj is not None and block_output.shape[0] <= 8:
         # Deferred projection: the block output carries the o-proj input.
         layer, k = oproj[0], oproj[1]
         block_output, _ = layer(block_output[:, :k].contiguous())
-    reduced = tensor_model_parallel_all_reduce(block_output)
+    reduced = block_output
+    if block_output.shape[0] <= 8:
+        if secondary is not None:
+            from vllm.distributed import tensor_model_parallel_all_reduce_sum2
+
+            reduced = tensor_model_parallel_all_reduce_sum2(block_output, secondary)
+        else:
+            reduced = tensor_model_parallel_all_reduce(block_output)
     hidden, block, inj = module._combine_and_mix_reduced(
         hidden_states, reduced, injection
     )

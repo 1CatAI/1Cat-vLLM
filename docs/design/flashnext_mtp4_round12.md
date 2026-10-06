@@ -138,3 +138,47 @@ ablation is selected from the observed critical path; single-graph drafting
 and greedy verification are separate hypotheses, not presumed gains. HCX
 promotion also requires resolving redundant HC weight packs and verifying its
 FP16 normalization boundary against the agreed numerical gate.
+
+### Matched integrated control and HCX ablation
+
+With the same integrated extension and switches fixed before worker startup,
+HCX alone gives the following completed endpoint measurements:
+
+| Route | C1 ms/round | C1 tokens/round | C4 ms/round | Eight-prompt mean acceptance |
+| --- | ---: | ---: | ---: | ---: |
+| Integrated control | 18.298 | 4.886 | 43.264 | 44.755% |
+| HCX only | 18.004 | 4.886 | 46.588 | 47.528% |
+
+C1 averages the unobserved cohorts before and after GPU-event recording.
+HCX saves 0.294 ms, while C4 regresses by 7.7%; this configuration is not
+eligible for promotion. The control's long natural outputs also differ from
+the frozen-main baseline. Its prompt-mean acceptance difference is -2.876
+percentage points, paired bootstrap 95% CI [-5.788, -0.077]. C1 probe output
+is identical, but that alone does not qualify long-output acceptance.
+
+HCX versus the same-wheel control on 64 aligned teacher-forcing positions
+has mean KL 0.000698, maximum KL 0.006981, 63/64 matching top-1 predictions,
+maximum absolute logit error 0.7344 and maximum relative L2 error 0.07993.
+The earlier control-versus-reference comparison has mean KL 0.000671 and
+63/64 matching top-1 predictions. These are measured errors, not a claim of
+bit equality. The staged draft M1/M5 MoE kernels pass four changed-input,
+changed-route and graph-canary tests against their retained references.
+
+Current-stream events give a lower-overhead round ledger: target replay is
+14.375–14.381 ms across ranks, draft proposal is 3.314–3.330 ms, sampling
+outside draft is 0.511–0.527 ms, and preparation not hidden behind prior GPU
+work is approximately 0.095–0.099 ms. The observed round is 18.316 ms versus
+18.298 ms without observers. HCX lowers target replay by approximately
+0.27 ms and leaves the other envelopes essentially unchanged. CPU metadata
+service and CPU graph-submission skew are not equivalent to an unhidden GPU
+bubble; host preparation alone cannot recover the missing 6.3 ms.
+
+The HCX integration now dispatches on actual M inside opaque operators:
+M>8 retains the original projection and reduction chain rather than moving
+it to the next HC boundary. Shared and routed expert outputs remain separate
+through the small-M consumer and are summed by HCX in FP32. HC following an
+already-reduced dense FFN retains its original path. Preparation admits all
+required dense FP16 HC weights before changing any producers, and records
+capability and fallback reasons. Twelve CPU dispatch, compilation and
+precision tests pass. Model speed, C4 and acceptance of this repair remain
+to be measured; it stays opt-in.

@@ -11,16 +11,22 @@ chain.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.distributed as dist
 
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
 HD, KD, LORA, INJ = 2560, 10240, 320, 4
 HCX_MAX_M = 8
+_OUTPUT_PROJECTIONS: dict[str, tuple] = {}
+_MOE_RUNNERS: dict[str, Any] = {}
+_MOE_INPUTS: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor | None]] = {}
 AR_BYTES = 4 * 80 * 256 * 8
 LORA_BYTES = 8 * 336 * 8
 HB_BYTES = 8 * HD * 4
@@ -28,6 +34,73 @@ TOP1_ROWS = 32
 TOP1_BYTES = 2 * 2 * TOP1_ROWS * 16
 _LANE_R = [(L & 3) + (4 if L & 16 else 0) for L in range(32)]
 _LANE_Q = [(L >> 2) & 3 for L in range(32)]
+
+
+def register_output_projection(name, layer, defer):
+    _OUTPUT_PROJECTIONS[name] = (layer, defer)
+
+
+def register_moe_runner(name, runner):
+    _MOE_RUNNERS[name] = runner
+
+
+def moe_inputs(name, rows):
+    # The producer updates these references immediately before its HC consumer
+    # during eager execution/capture. Graph replay uses the recorded native
+    # tensor addresses, with no Python lookup or per-replay allocation.
+    return _MOE_INPUTS[name, rows]
+
+
+def _output_projection(x: torch.Tensor, name: str) -> torch.Tensor:
+    # Resolve actual M inside the opaque op, rather than freezing a decode
+    # choice while compiling a range that also includes C4 and prefill.
+    layer, defer = _OUTPUT_PROJECTIONS[name]
+    if 0 < x.shape[0] <= HCX_MAX_M and defer:
+        return torch.nn.functional.pad(x, (0, layer.output_size - x.shape[1]))
+    projected, _ = layer(x)
+    if x.shape[0] > HCX_MAX_M:
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        projected = tensor_model_parallel_all_reduce(projected)
+    return projected
+
+
+def _output_projection_fake(x: torch.Tensor, name: str) -> torch.Tensor:
+    layer, _ = _OUTPUT_PROJECTIONS[name]
+    return x.new_empty((x.shape[0], layer.output_size))
+
+
+def _moe_output(
+    shared: torch.Tensor | None, fused: torch.Tensor, name: str, trunc_size: int
+) -> torch.Tensor:
+    if 0 < fused.shape[0] <= HCX_MAX_M:
+        _MOE_INPUTS[name, fused.shape[0]] = (fused, shared)
+        partial = fused.clone() if shared is None else shared + fused
+        return partial[..., :trunc_size].contiguous()
+    # Keep the original sum2/all-reduce precision and launch chain outside
+    # the HCX range; the following HC consumes an already-reduced output.
+    runner = _MOE_RUNNERS[name]
+    reduced = runner._maybe_sm70_moe_sum2_allreduce(shared, fused, trunc_size)
+    if reduced is not None:
+        return reduced
+    summed = fused if shared is None else shared + fused
+    return runner._maybe_reduce_final_output(summed, trunc_size)
+
+
+def _moe_output_fake(shared, fused, name, trunc_size):
+    return fused.new_empty((fused.shape[0], trunc_size))
+
+
+direct_register_custom_op(
+    "qwen38_sm70_hcx_output_projection",
+    _output_projection,
+    fake_impl=_output_projection_fake,
+)
+direct_register_custom_op(
+    "qwen38_sm70_hcx_moe_output",
+    _moe_output,
+    fake_impl=_moe_output_fake,
+)
 
 
 def pack_down(w: torch.Tensor, rank: int) -> torch.Tensor:
@@ -246,6 +319,7 @@ class Sm70HcxRuntime:
         packed_down,
         packed_up,
         oproj=None,
+        secondary=None,
     ):
         m = partial.shape[0]
         ox = ocodes = ohigh = oscale = None
@@ -259,7 +333,7 @@ class Sm70HcxRuntime:
         injection_out = partial.new_empty((m, INJ))
         torch.ops._C.sm70_hcx_out(
             partial if ox is not None else partial.contiguous(),
-            None,
+            secondary,
             hidden.contiguous(),
             injection.contiguous(),
             norm_weight,

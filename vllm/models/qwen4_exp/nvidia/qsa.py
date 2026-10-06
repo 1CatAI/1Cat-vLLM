@@ -985,11 +985,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 encoded_layer_name,
             )
         flat_output = attn_output.view(num_tokens, -1)
-        deferred = getattr(self, "sm70_defer_o_proj", 0)
-        if deferred and deferred == flat_output.shape[1]:
-            # The SM70 HCX consumer applies o_proj; keep the hidden-width layout.
-            projected_output = torch.nn.functional.pad(
-                flat_output, (0, self.o_proj.output_size - deferred)
+        hcx_projection = getattr(self, "sm70_hcx_projection_name", None)
+        if hcx_projection is not None:
+            projected_output = torch.ops.vllm.qwen38_sm70_hcx_output_projection(
+                flat_output, hcx_projection
             )
             if output is not None:
                 output.copy_(projected_output)

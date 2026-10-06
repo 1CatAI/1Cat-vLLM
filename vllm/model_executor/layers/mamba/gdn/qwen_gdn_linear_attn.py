@@ -4047,11 +4047,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = _sm70_gdn_prefill_profile_start()
-        deferred = getattr(self, "sm70_defer_out_proj", 0)
-        if deferred and deferred == core_attn_out.shape[-1] and output is None:
-            # The SM70 HCX consumer applies out_proj; keep the hidden width.
-            proj_out = torch.nn.functional.pad(
-                core_attn_out, (0, self.out_proj.output_size - deferred)
+        hcx_projection = getattr(self, "sm70_hcx_projection_name", None)
+        if hcx_projection is not None and output is None:
+            proj_out = torch.ops.vllm.qwen38_sm70_hcx_output_projection(
+                core_attn_out, hcx_projection
             )
         elif output is None:
             proj_out, _ = self.out_proj(core_attn_out)
