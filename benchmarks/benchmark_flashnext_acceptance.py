@@ -117,7 +117,14 @@ def main():
     parser.add_argument("--teacher-forcing", action="store_true")
     parser.add_argument("--teacher-reference", type=Path)
     parser.add_argument("--teacher-positions", type=int, default=8)
+    parser.add_argument("--hcx-diagnose", action="store_true")
     args = parser.parse_args()
+    if args.hcx_diagnose and (
+        not args.kernel_config.get("sm70_hcx")
+        or not args.kernel_config.get("sm70_hcx_diagnostics")
+        or args.kernel_config.get("sm70_hcx_output_projection", True)
+    ):
+        raise ValueError("HCX diagnosis requires snapshots and separate projections")
     if args.execution_ab and (
         not args.probe
         or args.trace_only
@@ -160,7 +167,7 @@ def main():
         compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
         worker_extension_cls=(
             "vllm.sm70_gguf_quality.GGUFTeacherWorkerExtension"
-            if args.teacher_forcing
+            if args.teacher_forcing or args.hcx_diagnose
             else "vllm.sm70_graph_observer.GraphParityWorkerExtension"
         ),
         kernel_config=args.kernel_config,
@@ -237,6 +244,23 @@ def main():
             ids = tokenizer.encode(rendered, add_special_tokens=False)
             tokenized.append(list(ids))
         report["prompt_tokens_sha256"] = digest(tokenized)
+        if args.hcx_diagnose:
+            reference = tokenized[1]
+            fixed_ids = (reference * (8192 // len(reference) + 1))[:8192]
+            llm.generate(
+                {"prompt_token_ids": fixed_ids},
+                SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
+                use_tqdm=False,
+            )
+            report["hcx_diagnosis"] = llm.collective_rpc(
+                "inspect_hcx_snapshots",
+                args=(str(args.output.parent / "hcx-snapshots"),),
+                timeout=300,
+            )
+            report["measurement_scope"] = "numerical diagnosis; no speed measurements"
+            report["complete"] = True
+            save()
+            return
         params = SamplingParams(
             temperature=0,
             top_p=1,

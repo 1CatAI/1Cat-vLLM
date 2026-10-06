@@ -494,7 +494,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
 
 def enable_sm70_hcx(
-    model: nn.Module, device: torch.device, *, fuse_output_projection: bool = True
+    model: nn.Module,
+    device: torch.device,
+    *,
+    fuse_output_projection: bool = True,
+    diagnostic: bool = False,
 ) -> bool:
     """Leave supported small-M outputs partial; retain larger-batch reductions."""
     from .sm70_hcx import (
@@ -505,6 +509,7 @@ def enable_sm70_hcx(
     )
 
     runtime = get_hcx_runtime(device)
+    runtime.diagnostic = diagnostic
     status: dict[str, Any] = dict(
         enabled=False,
         reason=runtime.reason,
@@ -638,6 +643,7 @@ def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) -> 
             model,
             device,
             fuse_output_projection=kernel_config.sm70_hcx_output_projection,
+            diagnostic=kernel_config.sm70_hcx_diagnostics,
         )
         kernel_config.collective_kernel_selections["hcx:target"] = model.sm70_hcx_status
 

@@ -202,6 +202,8 @@ class Sm70HcxRuntime:
 
         self.reason: str | None = None
         self.top1_enabled = False
+        self.diagnostic = False
+        self.snapshots: dict[str, dict[str, torch.Tensor]] = {}
         self.group = group
         self.rank = dist.get_rank(group)
         if dist.get_world_size(group) != 4:
@@ -318,6 +320,7 @@ class Sm70HcxRuntime:
         packed_up,
         oproj=None,
         secondary=None,
+        snapshot_name=None,
     ):
         m = partial.shape[0]
         ox = ocodes = ohigh = oscale = None
@@ -329,6 +332,21 @@ class Sm70HcxRuntime:
         hidden_out = torch.empty_like(hidden)
         block = partial.new_empty((m, HD))
         injection_out = partial.new_empty((m, INJ))
+        snapshot = None
+        if self.diagnostic and m == 5 and snapshot_name is not None:
+            if oproj is not None:
+                raise RuntimeError("HCX diagnosis requires separate output projections")
+            inputs = {"partial": partial, "hidden": hidden, "injection": injection}
+            if secondary is not None:
+                inputs["secondary"] = secondary
+            snapshot = self.snapshots.setdefault(snapshot_name, {})
+            for key, value in inputs.items():
+                if key not in snapshot:
+                    snapshot[key] = torch.empty_like(value)
+                snapshot[key].copy_(value)
+            if "epoch" not in snapshot:
+                snapshot["epoch"] = torch.empty_like(self.seq)
+            snapshot["epoch"].copy_(self.seq)
         torch.ops._C.sm70_hcx_out(
             partial if ox is not None else partial.contiguous(),
             secondary,
@@ -362,6 +380,15 @@ class Sm70HcxRuntime:
             1e-6,
             None,
         )
+        if snapshot is not None:
+            for key, value in (
+                ("hidden_out", hidden_out),
+                ("block_out", block),
+                ("injection_out", injection_out),
+            ):
+                if key not in snapshot:
+                    snapshot[key] = torch.empty_like(value)
+                snapshot[key].copy_(value)
         return hidden_out, block, injection_out
 
 

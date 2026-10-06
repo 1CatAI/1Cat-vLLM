@@ -10,6 +10,116 @@ from vllm.sm70_graph_observer import GraphParityWorkerExtension
 
 
 class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
+    @torch.inference_mode()
+    def inspect_hcx_snapshots(self, directory: str):
+        """Compare graph-recorded real HC inputs with isolated dense arithmetic.
+
+        This RPC runs between completed requests. Diagnostic copies are in the
+        captured target graph, so these runs are not latency measurements.
+        """
+        import torch.distributed as dist
+        import torch.nn.functional as F
+
+        from vllm.distributed import (
+            get_tp_group,
+            tensor_model_parallel_all_reduce,
+            tensor_model_parallel_all_reduce_sum2,
+        )
+        from vllm.models.qwen4_exp.nvidia.hyperconnection import _PARTIAL_MODULES
+        from vllm.models.qwen4_exp.nvidia.ops.hc import (
+            hc_combine_norm,
+            hc_gate_mix,
+            hc_silu,
+        )
+        from vllm.models.qwen4_exp.nvidia.sm70_hcx import current_hcx_runtime
+
+        runtime = current_hcx_runtime()
+        if runtime is None or not runtime.diagnostic or not runtime.snapshots:
+            raise RuntimeError("HCX M5 snapshots were not recorded")
+        torch.accelerator.synchronize()
+        keys = sorted(runtime.snapshots)
+        epochs = {key: int(runtime.snapshots[key]["epoch"].item()) for key in keys}
+        keys.sort(key=epochs.__getitem__)
+        frames = [None] * 4
+        dist.all_gather_object(frames, epochs, group=get_tp_group().cpu_group)
+        if any(frame != epochs for frame in frames):
+            raise RuntimeError(f"HCX snapshot frames differ across TP ranks: {frames}")
+        report = []
+        failed = []
+        root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
+        for key in keys:
+            snapshot = runtime.snapshots[key]
+            module = _PARTIAL_MODULES[key]
+            first, second = snapshot["partial"], snapshot.get("secondary")
+            reduced = (
+                tensor_model_parallel_all_reduce(first)
+                if second is None
+                else tensor_model_parallel_all_reduce_sum2(first, second)
+            )
+            hidden, xn = hc_combine_norm(
+                snapshot["hidden"],
+                reduced,
+                snapshot["injection"],
+                module.hc_norm.weight,
+                module.config.rms_norm_eps,
+                module.hc_count,
+            )
+            down_weight = module.input_mix_weight_down_block_inject.weight
+            up_weight = module.input_mix_weight_up.weight
+            down = F.linear(xn.float(), down_weight.float()).half()
+            gate = F.linear(hc_silu(down[:, :320], 4).float(), up_weight.float()).half()
+            expected = {
+                "hidden_out": hidden,
+                "block_out": hc_gate_mix(xn, gate, 4),
+                "injection_out": down[:, 320:324],
+            }
+            errors = {}
+            for name, reference in expected.items():
+                actual = snapshot[name].float()
+                difference = actual - reference.float()
+                errors[name] = {
+                    "max_abs": float(difference.abs().max().item()),
+                    "relative_l2": float(
+                        (difference.norm() / (reference.float().norm() + 1e-9)).item()
+                    ),
+                    "finite": bool(torch.isfinite(actual).all().item()),
+                }
+            row = dict(name=key, epoch=epochs[key], errors=errors)
+            report.append(row)
+            if max(error["relative_l2"] for error in errors.values()) > 0.005:
+                failed.append((key, expected, errors))
+        # Write after all coupled collectives; save first and worst boundaries.
+        worst = sorted(
+            failed,
+            key=lambda item: max(error["relative_l2"] for error in item[2].values()),
+            reverse=True,
+        )[:3]
+        selected = {
+            key: (expected, errors) for key, expected, errors in failed[:3] + worst
+        }
+        for key, (expected, errors) in selected.items():
+            module = _PARTIAL_MODULES[key]
+            torch.save(
+                dict(
+                    inputs={
+                        name: value.cpu()
+                        for name, value in runtime.snapshots[key].items()
+                    },
+                    norm=module.hc_norm.weight.cpu(),
+                    down=module.input_mix_weight_down_block_inject.weight.cpu(),
+                    up=module.input_mix_weight_up.weight.cpu(),
+                    reference={name: value.cpu() for name, value in expected.items()},
+                    errors=errors,
+                ),
+                root / f"rank{self.rank}-{key}.pt",
+            )
+        return {
+            "rank": self.rank,
+            "rows": report,
+            "scope": "HCX actual M5 graph inputs",
+        }
+
     def start_teacher_capture(self, directory: str, key: str):
         if hasattr(self, "_teacher_original_execute"):
             raise RuntimeError("Teacher capture is already active")

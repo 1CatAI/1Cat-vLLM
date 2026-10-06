@@ -44,6 +44,7 @@ def _worker_run(rank, port, results):
                 parameter.copy_(torch.randn_like(parameter) * 0.02)
         runtime = get_hcx_runtime(torch.device("cuda", rank))
         assert runtime.enabled, runtime.reason
+        runtime.diagnostic = True
         module.enable_partial_inputs("payload", runtime)
         module._hcx_moe_payload = True
         register_moe_runner(
@@ -91,6 +92,14 @@ def _worker_run(rank, port, results):
                     assert error < 0.002, (rank, rows, error)
                     errors.append(error)
                 torch.testing.assert_close(scratch, x * 17, rtol=0, atol=0)
+                if rows == 5:
+                    snapshot = runtime.snapshots["payload"]
+                    torch.testing.assert_close(snapshot["partial"], x * 3)
+                    torch.testing.assert_close(snapshot["secondary"], x * 4)
+                    for key, value in zip(
+                        ("hidden_out", "block_out", "injection_out"), outputs
+                    ):
+                        torch.testing.assert_close(snapshot[key], value, rtol=0, atol=0)
                 report.append((rows, errors))
         results.put((rank, report))
 

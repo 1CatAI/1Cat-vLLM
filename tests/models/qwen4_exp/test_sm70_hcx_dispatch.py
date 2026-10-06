@@ -263,3 +263,35 @@ def test_large_m_injection_matches_contiguous_fake_contract():
     outputs = hc._hcx_combine_and_mix(hidden, block, injection, "consumer")
     assert all(t.is_contiguous() for t in outputs)
     torch.testing.assert_close(outputs[2], injection, rtol=0, atol=0)
+
+
+def test_diagnostic_snapshots_own_storage_and_reuse_addresses(monkeypatch):
+    runtime = hcx.Sm70HcxRuntime.__new__(hcx.Sm70HcxRuntime)
+    runtime.diagnostic, runtime.snapshots = True, {}
+    runtime.xn = runtime.sq = runtime.dpart = runtime.bar = None
+    runtime.seq = torch.zeros(1, dtype=torch.int32)
+    runtime.ar = runtime.lora = runtime.hb = []
+    runtime.logical_rank, runtime.full = 0, False
+
+    def native(*args):
+        args[8].copy_(args[2])
+        args[9].copy_(args[0] + args[1])
+        args[10].copy_(args[3])
+        args[15].add_(1)
+
+    monkeypatch.setattr(torch.ops._C, "sm70_hcx_out", native, raising=False)
+    partial, secondary = torch.ones(5, 2560), torch.full((5, 2560), 2.0)
+    hidden, injection = torch.ones(5, 10240), torch.ones(5, 4)
+    arguments = (partial, hidden, injection, torch.ones(2560), 1e-6, None, None)
+    runtime.run(*arguments, secondary=secondary, snapshot_name="layer0.mlp")
+    snapshot = runtime.snapshots["layer0.mlp"]
+    pointers = {name: value.data_ptr() for name, value in snapshot.items()}
+    assert snapshot["partial"].data_ptr() != partial.data_ptr()
+    assert snapshot["epoch"].item() == 0
+    partial.add_(5)
+    secondary.add_(7)
+    runtime.run(*arguments, secondary=secondary, snapshot_name="layer0.mlp")
+    assert pointers == {name: value.data_ptr() for name, value in snapshot.items()}
+    torch.testing.assert_close(snapshot["partial"], partial)
+    torch.testing.assert_close(snapshot["block_out"], partial + secondary)
+    assert snapshot["epoch"].item() == 1

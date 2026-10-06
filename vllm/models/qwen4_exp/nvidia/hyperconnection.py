@@ -276,6 +276,9 @@ def _hcx_combine_and_mix(
     oproj = getattr(module, "_hcx_oproj", None)
     block_output, secondary = module._partial_pair(block_output)
     if runtime is not None and 0 < block_output.shape[0] <= 8:
+        diagnostic = (
+            {"snapshot_name": name} if getattr(runtime, "diagnostic", False) else {}
+        )
         return runtime.run(
             block_output,
             hidden_states,
@@ -286,6 +289,7 @@ def _hcx_combine_and_mix(
             module._hcx_up,
             None if oproj is None else oproj[1:],
             secondary=secondary,
+            **diagnostic,
         )
     from vllm.distributed import tensor_model_parallel_all_reduce
 

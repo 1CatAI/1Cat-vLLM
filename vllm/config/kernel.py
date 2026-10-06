@@ -586,6 +586,10 @@ class KernelConfig:
     """Fuse eligible output projections into HCX when HCX is enabled. Disable
     to compare the separate projection and HC boundary with identical weights."""
 
+    sm70_hcx_diagnostics: bool = False
+    """Record M5 HCX inputs and outputs in owned graph buffers for numerical
+    diagnosis. Requires separate output projections; timings are diagnostic."""
+
     qsa_dense_short_context: bool = False
     """Attend densely, without index selection, in context-bucketed decode graphs
     whose bucket does not exceed the indexer budget (where QSA selects every
