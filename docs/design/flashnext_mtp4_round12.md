@@ -590,6 +590,12 @@ IQ3_S 46.080 to 56.320 us; M20 also regresses. Larger shared tables and their
 initialization do not redeem the lookup cost in this implementation. These
 are research-only private-DSO measurements, not packaged endpoint results.
 
+Preparing the presigned book once per device and using read-only global
+lookups also passes all six byte-exact checks. M5 IQ3_XXS regresses from
+45.056 to 70.656 us and IQ3_S from 46.592 to 71.680 us. Moving divergent
+lookups out of shared memory is rejected; removing table initialization alone
+does not produce a faster decoder.
+
 ### C4 shape-selected control trace
 
 The current switch-off control captures the actual C4 shape (20 verification
