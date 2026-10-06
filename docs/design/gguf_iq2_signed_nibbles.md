@@ -25,27 +25,40 @@ on and contributes to the graph hash for an independent control arm.
 
 ## Measurements
 
-The initial research control uses real rank0 blocks, M8, cold rotating weight
-banks, graph replay and balanced ABBA readings at1290MHz SM/877MHz memory.
-These measurements are not model savings. The ordinary `_C` wheel from source `9e899927b4` passes120 GPU/codec
-checks, including bitwise canonical storage and output restoration outside
-M8. All twelve real mixed pairs and seven down tensors win in matched
-ABBA graph replay: their weighted sum drops0.841→0.602ms. This is0.239ms
-of isolated operator saving; no model saving is claimed yet.
+Real rank0 blocks are measured at M8 with cold rotating weight banks,
+graph replay and balanced ABBA readings at 1290MHz SM/877MHz memory.
+These measurements are distinct from model savings. The ordinary wheel
+from source `cfd4f5db47` passes 129 GPU/codec checks. All twelve real mixed
+pairs and seven down projections match the existing native output bits
+at three activation amplitudes. Their weighted sum drops 0.8403→0.7257ms,
+which is 0.1146ms of isolated operator saving.
 
 | Projection | Types | Existing us | Nibble us | Nibble weight MB | Weight GB/s |
 | --- | --- | ---: | ---: | ---: | ---: |
-| gate/up | IQ2_XS / IQ2_XXS | 50.169 | 36.027 | 25.068 | 695.8 |
-| gate/up | IQ2_S / IQ3_S | 53.368 | 38.564 | 22.282 | 577.8 |
-| down | IQ2_XS | 28.086 | 20.941 | 12.534 | 598.5 |
-| down | IQ2_S | 29.647 | 21.768 | 12.534 | 575.8 |
+| gate/up | IQ2_XS / IQ2_XXS | 50.287 | 41.620 | 25.068 | 602.3 |
+| gate/up | IQ2_S / IQ3_S | 52.969 | 50.556 | 22.282 | 440.7 |
+| down | IQ2_XS | 29.052 | 23.727 | 12.534 | 528.2 |
+| down | IQ2_S | 29.755 | 23.712 | 12.534 | 528.6 |
+
+The model route uses KW8/TN2/split1. Pairs preserve the existing eight
+contiguous K reductions and FP16 SiLU activation boundary; down preserves
+eight interleaved K reductions. Mixed IQ3 operands retain the original
+scale and final FP16 reconstruction. Dot products accumulate in FP32.
+IQ2 mixed with IQ4_XS remains excluded until its original scale precision
+is preserved. The nineteen measured projections contain no such pair.
 
 Official dequantization to FP16 matches every expanded IQ2 weight exactly.
-Three activation amplitudes give output relative L2 below4.9e-5 in these
-four controls. Eighteen CPU codec cases pass, including negative `d` and
-FP16 subnormals. GPU tests also cover canonical packet restoration, changed
-input graph replay, mixed type pairs, and bitwise fallback output at
-M1/2/4/16/32/512. All120 checks pass in the source-complete wheel.
+CPU codec checks cover negative `d` and FP16 subnormals. GPU checks cover
+canonical packet restoration, changed-input graph replay, mixed-type pairs,
+bitwise native M8 output, and bitwise fallback output at M1/2/4/16/32/512.
+
+The first version saved 0.239ms in isolated operators but changed reduction
+and activation rounding. Its same-wheel model comparison saved 0.148ms/round
+at 1K and 0.167ms at 8K, while emitted-token latency worsened
+5.373→5.597ms and 5.651→5.734ms because tokens per round declined.
+That version is not promoted. The arithmetic-compatible revision above
+is undergoing a new same-wheel model comparison; it has no qualified
+model-speed claim yet. Both versions' measurements remain in the data file.
 
 The complete thirty-tensor IQ2 inventory would add46.797MiB/card relative
 to canonical storage alone. This phase admits twenty-three gate/up/down
