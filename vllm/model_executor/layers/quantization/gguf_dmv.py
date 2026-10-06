@@ -24,10 +24,15 @@ def table(device):
     return _tables[device]
 
 
-def eligible_sources(sources):
+def eligible_sources(sources, prefix):
     """Restrict storage replacement to complete, measured TP4 projection shapes."""
     cfg = get_current_vllm_config_or_none()
     if cfg is None or not cfg.kernel_config.sm70_gguf.projection_planes:
+        return False
+    scope = cfg.kernel_config.sm70_gguf.projection_plane_scope
+    if scope == "gated_pair" and not prefix.endswith(".gate_up_proj"):
+        return False
+    if scope == "iq3_xxs" and not any(t == 18 for _, t in sources):
         return False
     quantized = [(w, t) for w, t in sources if t not in (1, 30)]
     if not quantized or len({t for _, t in quantized}) > 2:

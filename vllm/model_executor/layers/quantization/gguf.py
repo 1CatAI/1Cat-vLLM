@@ -705,7 +705,7 @@ class GGUFLinearMethod(LinearMethodBase):
                 prepare_layer,
             )
 
-            dmv_enabled = eligible_sources(sources)
+            dmv_enabled = eligible_sources(sources, layer.prefix)
             config = get_current_vllm_config_or_none()
             plane_policy = (
                 config.kernel_config.sm70_gguf.projection_planes if config else False

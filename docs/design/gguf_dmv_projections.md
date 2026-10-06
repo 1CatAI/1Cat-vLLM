@@ -47,3 +47,9 @@ activations in that order inside the shared-activation kernel; other M uses
 the existing input transpose and canonical arithmetic. This avoids changing
 prefill accumulation order while removing the M8 activation-copy launch.
 Affine GDN projections keep the existing restored-weight layout.
+
+`projection_plane_scope` selects `all`, `gated_pair`, or `iq3_xxs` for
+same-wheel numerical comparisons. The latter selects whole projections that
+contain IQ3_XXS, including their fused companion shards; it does not isolate
+an individual reader inside a fused launch. Only `all` admits temporary IQ2
+down readers. The default production scope is `all`.
