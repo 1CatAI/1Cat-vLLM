@@ -56,6 +56,7 @@ struct Segs {
   int pair;    // segs 0/1 = gate/up of equal n; TN must be 2
   half* hout;  // [M, hld] silu(gate) * up
   int hld;
+  bool gdn_heads;
   const half* sgate;  // optional: out = fp16(fp16(acc) * sigmoid(sgate[token]))
 };
 
@@ -322,12 +323,10 @@ __device__ __constant__ int8_t kIQ4[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 template <int FMT, int KW, int TN>
-__device__ __forceinline__ void body6(const Seg& sg, int t, bool on, int kslot,
-                                      int pid, int g0, int g1, int S, int G,
-                                      const half* __restrict__ x, int ldx,
-                                      int M, uint4* xs, half2* lut,
-                                      float (&acc)[8],
-                                      const uint4* __restrict__ tab) {
+__device__ __forceinline__ void body6(
+    const Seg& sg, int t, bool on, int kslot, int pid, int g0, int g1, int S,
+    int G, const half* __restrict__ x, int ldx, int M, uint4* xs, half2* lut,
+    float (&acc)[8], const uint4* __restrict__ tab, bool gdn_heads) {
   constexpr int NT = 32 * KW * TN, PARTS = 4 / TN;
   const int lane = threadIdx.x % 32;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
@@ -341,8 +340,9 @@ __device__ __forceinline__ void body6(const Seg& sg, int t, bool on, int kslot,
       const int idx = lane + 32 * (pid + TN * jj), c = idx >> 3, row = idx & 7;
       X[jj] = make_uint4(0, 0, 0, 0);
       if (row < M)
-        X[jj] = __ldg(
-            reinterpret_cast<const uint4*>(x + row * ldx + gg * 128 + c * 8));
+        X[jj] = __ldg(reinterpret_cast<const uint4*>(
+            x + row * ldx + (gdn_heads ? (gg % 4) * 3 + gg / 4 : gg) * 128 +
+            c * 8));
     }
   };
   auto xstore = [&](int b) {
@@ -490,10 +490,10 @@ __global__ void __launch_bounds__(32 * KW * TN)
   float acc[8] = {};
   if (FA == FB || sg.fmt == FA)
     body6<FA, KW, TN>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut,
-                      acc, segs.tab);
+                      acc, segs.tab, segs.gdn_heads);
   else
     body6<FB, KW, TN>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut,
-                      acc, segs.tab);
+                      acc, segs.tab, segs.gdn_heads);
   __syncthreads();
   float* red = reinterpret_cast<float*>(smem);
 #pragma unroll
@@ -621,7 +621,8 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
                        std::optional<torch::Tensor> tab = std::nullopt,
                        std::optional<torch::Tensor> ab_w = std::nullopt,
                        std::optional<torch::Tensor> ab_out = std::nullopt,
-                       std::optional<torch::Tensor> pair_out = std::nullopt) {
+                       std::optional<torch::Tensor> pair_out = std::nullopt,
+                       bool gdn_heads = false) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
                   x.stride(1) == 1 && x.size(0) == 8 && x.size(1) == K,
               "DMV requires eight FP16 rows with contiguous K");
@@ -700,7 +701,9 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
                     ab_out->stride(1) == 1,
                 "invalid DMV floating operands");
   }
+  TORCH_CHECK(!gdn_heads || K == 1536, "GDN head tiling requires K1536");
   Segs segs{};
+  segs.gdn_heads = gdn_heads;
   if (pair_out && pair_out->numel()) {
     segs.pair = 1;
     segs.hout = reinterpret_cast<half*>(pair_out->data_ptr());

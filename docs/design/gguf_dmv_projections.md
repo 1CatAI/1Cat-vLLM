@@ -41,3 +41,9 @@ for IQ2_S against canonical GEMM. Relative L2 errors were 2.9e-4.
 Q2_K down (33.70 versus 28.68 µs) and IQ1_M gate (43.46 versus 32.72 µs)
 retain their prior routes. IQ2_XXS gate measured 23.76 versus 31.40 µs as a
 single matrix, but that result does not qualify an entire fused gate/up pair.
+
+GDN lattice and LUT4 planes retain their original GGUF head order. M8 loads
+activations in that order inside the shared-activation kernel; other M uses
+the existing input transpose and canonical arithmetic. This avoids changing
+prefill accumulation order while removing the M8 activation-copy launch.
+Affine GDN projections keep the existing restored-weight layout.

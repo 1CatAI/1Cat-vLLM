@@ -735,7 +735,10 @@ class GGUFLinearMethod(LinearMethodBase):
                     self.native_admission["canonical_projections"] = [
                         p.admission() for p in projections
                     ]
-                    if all(p.input_layout_restored for p in projections):
+                    if all(
+                        p.input_layout_restored or getattr(p, "dmv_gdn_heads", False)
+                        for p in projections
+                    ):
                         self.layout = None
                     qweight.data_container.clear()
                     empty = Parameter(

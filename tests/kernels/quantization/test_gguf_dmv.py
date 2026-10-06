@@ -17,12 +17,12 @@ from vllm.model_executor.layers.quantization.gguf_lut_transcode import transcode
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-def planes(kind):
+def planes(kind, k=512):
     if torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 required")
     import vllm._C  # noqa: F401
 
-    n, k = 64, 512
+    n = 64
     size = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(kind)][1]
     raw = np.random.default_rng(kind).integers(
         0, 256, (n, k // 256, size), dtype=np.uint8
@@ -107,6 +107,7 @@ def test_pair_official_and_changed_input_graph(gate, up, split):
             None,
             None,
             out,
+            False,
         )
 
     call()
@@ -124,3 +125,37 @@ def test_pair_official_and_changed_input_graph(gate, up, split):
         reference = g * torch.sigmoid(g) * u
         assert (out.float() - reference).norm() / reference.norm() < 0.003
         assert not counters.any()
+
+
+@pytest.mark.parametrize("kind", [18, 21, 23])
+def test_gdn_heads_are_loaded_in_original_gguf_order(kind):
+    fmt, buffers, weight, _ = planes(kind, k=1536)
+    x = torch.randn(8, 1536, device="cuda", dtype=torch.float16)
+    out = torch.empty(8, 64, device="cuda", dtype=torch.float16)
+    partials = torch.empty(1024, device="cuda", dtype=torch.float32)
+    counters = torch.zeros(1, device="cuda", dtype=torch.int32)
+    table = torch.from_numpy(iq.tables()).cuda()
+    torch.ops._C.gguf_dmv_sm70_out(
+        x,
+        [buffers[0]],
+        [buffers[1]],
+        [buffers[2]],
+        [out],
+        [fmt],
+        [64],
+        1536,
+        1,
+        4,
+        partials,
+        counters,
+        2,
+        None,
+        table,
+        None,
+        None,
+        None,
+        True,
+    )
+    tiled = x.reshape(8, 4, 3, 128).transpose(1, 2).reshape(8, 1536)
+    reference = tiled.float() @ weight.T
+    assert (out.float() - reference).norm() / reference.norm() < 0.003

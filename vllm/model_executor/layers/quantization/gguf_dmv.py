@@ -213,7 +213,19 @@ def prepare_layer(layer, projections):
         torch.zeros(tiles, dtype=torch.int32, device=device),
         persistent=False,
     )
-    layer.gguf_dmv_operands = (codes, high, scales, fmts, ns, kw, tn, split, pair)
+    gdn_heads = any(getattr(p, "dmv_gdn_heads", False) for p in projections)
+    layer.gguf_dmv_operands = (
+        codes,
+        high,
+        scales,
+        fmts,
+        ns,
+        kw,
+        tn,
+        split,
+        pair,
+        gdn_heads,
+    )
     floating = [p.weight for p in projections if p.kernel is None]
     if floating:
         combined = floating[0] if len(floating) == 1 else torch.cat(floating, dim=0)
@@ -251,6 +263,7 @@ def _project(
     tn: int,
     split: int,
     pair: bool,
+    gdn_heads: bool,
     partials: torch.Tensor,
     counters: torch.Tensor,
     floating: torch.Tensor | None,
@@ -271,6 +284,13 @@ def _project(
         else sum(widths) + (floating.shape[0] if floating is not None else 0)
     )
     if rows.shape[0] != 8:
+        if gdn_heads:
+            rows = (
+                rows.reshape(-1, 4, 3, 128)
+                .transpose(1, 2)
+                .reshape(-1, 1536)
+                .contiguous()
+            )
         result = _prepared_gguf_mixed_projection(
             rows,
             fallback_codes,
@@ -322,6 +342,7 @@ def _project(
         floating,
         ab_out,
         out if pair else None,
+        gdn_heads,
     )
     return out.reshape(*x.shape[:-1], width)
 
@@ -337,6 +358,7 @@ def _project_fake(
     tn,
     split,
     pair,
+    gdn_heads,
     partials,
     counters,
     floating,
@@ -367,7 +389,9 @@ direct_register_custom_op(
 def apply_layer(layer, x, fused=False):
     from .gguf_turbomind import prepared_projection_arguments
 
-    codes, high, scales, fmts, ns, kw, tn, split, pair = layer.gguf_dmv_operands
+    codes, high, scales, fmts, ns, kw, tn, split, pair, gdn_heads = (
+        layer.gguf_dmv_operands
+    )
     pair = pair and fused
     return torch.ops.vllm.gguf_dmv_projection(
         x,
@@ -380,6 +404,7 @@ def apply_layer(layer, x, fused=False):
         tn,
         split,
         pair,
+        gdn_heads,
         layer.gguf_dmv_partials,
         layer.gguf_dmv_counters,
         getattr(layer, "gguf_dmv_floating", None),

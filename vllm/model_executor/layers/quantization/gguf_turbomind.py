@@ -407,19 +407,25 @@ def prepare_gguf_projections(
             groups.append(([weight], source_type))
     projections = []
     for weights, source_type in groups:
+        raw_gdn_order = (
+            dmv_enabled and input_layout is not None and source_type in (18, 21, 23)
+        )
         projection = GGUFPreparedProjection(
             weights[0] if len(weights) == 1 else torch.cat(weights, dim=0),
             source_type,
             act_dtype,
             enabled,
             prefill_min_m,
-            input_layout=input_layout,
+            input_layout=None if raw_gdn_order else input_layout,
             dmv_enabled=dmv_enabled,
         )
+        if raw_gdn_order and hasattr(projection, "dmv_format"):
+            projection.dmv_gdn_heads = True
         projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
         projections.append(projection)
     if input_layout is not None and not all(
-        projection.input_layout_restored for projection in projections
+        projection.input_layout_restored or getattr(projection, "dmv_gdn_heads", False)
+        for projection in projections
     ):
         # Keep every shard in the same input order when one cannot be restored.
         reasons = [
@@ -511,56 +517,25 @@ class GGUFPreparedProjection(Module):
         if self.input_layout is not None:
             if not isinstance(self.input_layout, GGUFHeadTilingLayout):
                 return "input_layout_codec_unavailable"
-            if self.dmv_enabled and isinstance(canonical, LatticeGGUFProjection):
-                canonical = replace(
-                    canonical,
-                    **{
-                        name: self.input_layout.weight_to_vllm(
-                            torch.from_numpy(getattr(canonical, name)),
-                            dim=1,
-                            head_dim=self.input_layout.head_dim // stride,
-                        ).numpy()
-                        for name, stride in (
-                            ("indices", canonical.grid_width),
-                            ("signs", 8),
-                            ("deltas", 8),
-                            ("scales", canonical.group_size),
-                        )
-                    },
-                )
-            elif self.dmv_enabled and isinstance(canonical, Lut4GGUFProjection):
-                canonical = replace(
-                    canonical,
-                    codes=self.input_layout.weight_to_vllm(
-                        torch.from_numpy(canonical.codes),
-                        dim=1,
-                    ).numpy(),
-                    scales=self.input_layout.weight_to_vllm(
-                        torch.from_numpy(canonical.scales),
-                        dim=1,
-                        head_dim=self.input_layout.head_dim // canonical.group_size,
-                    ).numpy(),
-                )
-            else:
-                if not isinstance(canonical, AffineGGUFProjection):
-                    return "input_layout_requires_affine_groups"
-                head_span, remainder = divmod(
-                    self.input_layout.head_dim, canonical.group_size
-                )
-                if remainder:
-                    return "input_layout_cuts_canonical_group"
-                canonical = replace(
-                    canonical,
-                    codes=self.input_layout.weight_to_vllm(
-                        torch.from_numpy(canonical.codes), dim=1
-                    ).numpy(),
-                    scales=self.input_layout.weight_to_vllm(
-                        torch.from_numpy(canonical.scales), dim=1, head_dim=head_span
-                    ).numpy(),
-                    mins=self.input_layout.weight_to_vllm(
-                        torch.from_numpy(canonical.mins), dim=1, head_dim=head_span
-                    ).numpy(),
-                )
+            if not isinstance(canonical, AffineGGUFProjection):
+                return "input_layout_requires_affine_groups"
+            head_span, remainder = divmod(
+                self.input_layout.head_dim, canonical.group_size
+            )
+            if remainder:
+                return "input_layout_cuts_canonical_group"
+            canonical = replace(
+                canonical,
+                codes=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.codes), dim=1
+                ).numpy(),
+                scales=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.scales), dim=1, head_dim=head_span
+                ).numpy(),
+                mins=self.input_layout.weight_to_vllm(
+                    torch.from_numpy(canonical.mins), dim=1, head_dim=head_span
+                ).numpy(),
+            )
         padding = -n % 32
         if padding:
             canonical = replace(
