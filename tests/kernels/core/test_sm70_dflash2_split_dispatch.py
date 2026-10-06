@@ -36,20 +36,23 @@ class Descriptor:
 
 
 @pytest.mark.parametrize(
-    "page,batch,split_available,contiguous,expected",
+    "page,batch,split_available,contiguous,native_available,expected",
     [
-        (832, 1, True, True, "split"),
-        (832, 1, False, True, "fallback"),
-        (832, 1, True, False, "fallback"),
-        (832, 4, True, True, "fallback"),
-        (1024, 1, True, True, "split"),
-        (2048, 1, False, True, "native"),
-        (1024, 4, True, True, "native"),
-        (1648, 1, True, True, "fallback"),
+        (832, 1, True, True, True, "split"),
+        (832, 1, True, True, False, "split"),
+        (832, 1, False, True, False, "fallback"),
+        (1024, 4, True, True, False, "fallback"),
+        (832, 1, False, True, True, "fallback"),
+        (832, 1, True, False, True, "fallback"),
+        (832, 4, True, True, True, "fallback"),
+        (1024, 1, True, True, True, "split"),
+        (2048, 1, False, True, True, "native"),
+        (1024, 4, True, True, True, "native"),
+        (1648, 1, True, True, True, "fallback"),
     ],
 )
 def test_page_abi_dispatch(
-    monkeypatch, page, batch, split_available, contiguous, expected
+    monkeypatch, page, batch, split_available, contiguous, native_available, expected
 ):
     source = (
         Path(__file__).parents[3]
@@ -75,6 +78,8 @@ def test_page_abi_dispatch(
         dflash2_paged_bmhd_fwd=route("native"),
         prefill_paged_fwd=route("fallback"),
     )
+    if not native_available:
+        del extension.dflash2_paged_bmhd_fwd
     module = ModuleType("flash_attn_v100.sm70_dflash2_split")
     module.__dict__["forward"] = route("split")
     monkeypatch.setitem(sys.modules, module.__name__, module)

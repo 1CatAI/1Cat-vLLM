@@ -1600,7 +1600,6 @@ def flash_attn_prefill_paged(
         and k_cache.shape[2:] == v_cache.shape[2:] == (2, 128)
         and k_cache.stride(-1) == v_cache.stride(-1) == 1
         and torch.cuda.get_device_capability(q.device) == (7, 0)
-        and hasattr(flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd")
         and (out is None or out.is_contiguous())
     ):
         # Single-request query blocks benefit from splitting the live window.
@@ -1641,7 +1640,9 @@ def flash_attn_prefill_paged(
         # The split kernel uses the live page size and strides. The native
         # concurrent kernel has a narrower page ABI: never send page832 to it,
         # including when the optional split implementation cannot be imported.
-        if k_cache.shape[1] in (1024, 2048):
+        if k_cache.shape[1] in (1024, 2048) and hasattr(
+            flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd"
+        ):
             return flash_attn_v100_cuda.dflash2_paged_bmhd_fwd(
                 q.contiguous(),
                 k_cache,
