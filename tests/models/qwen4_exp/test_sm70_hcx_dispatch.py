@@ -130,6 +130,43 @@ def test_ple_diagnostic_gate_uses_module_flag(monkeypatch):
     assert calls == [(cuda_input, "enabled")]
 
 
+@pytest.mark.parametrize("rows", [5, 20])
+def test_materialization_reduces_small_payloads_at_runtime(rows, monkeypatch):
+    from vllm import distributed
+
+    calls = []
+
+    def sum2(first, second):
+        calls.append("reduce")
+        return (first.float() + second.float()).mul(4).half()
+
+    monkeypatch.setattr(distributed, "tensor_model_parallel_all_reduce_sum2", sum2)
+    monkeypatch.setattr(hc, "hc_combine", lambda h, b, i, count: b.clone())
+    module = SimpleNamespace(
+        _partial_inputs=True,
+        _hcx_moe_payload=True,
+        hc_count=4,
+        _partial_pair=lambda payload: (payload[:rows], payload[rows:]),
+        _combine_and_mix_reduced=lambda h, b, i: (b.clone(), b.clone(), None),
+    )
+    module._reduce_partial = lambda payload: hc.GatedResidual._reduce_partial(
+        module, payload
+    )
+    hc._PARTIAL_MODULES["materialize"] = module
+    first = torch.ones(rows, 4, dtype=torch.float16)
+    # The second plane is unused for an already-reduced large batch.
+    second = torch.full_like(first, 2 if rows == 5 else float("nan"))
+    payload = torch.cat((first, second))
+    expected = first * (12 if rows == 5 else 1)
+    hidden, injection = torch.ones_like(first), torch.ones_like(first)
+    actual = hc._hcx_combine(hidden, payload, injection, "materialize")
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    final = hc._hcx_final_mix(hidden, payload, injection, "materialize")
+    for output in final:
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert calls == (["reduce", "reduce"] if rows == 5 else [])
+
+
 def test_large_m_hc_does_not_reduce_or_recompute_projection():
     calls = []
 

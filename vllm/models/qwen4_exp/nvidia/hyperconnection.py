@@ -220,7 +220,12 @@ class GatedResidual(nn.Module):
         block's mix. Its combine with ``block_output`` is fused with this
         module's input RMSNorm.
         """
-        if getattr(self, "_partial_inputs", False) and self.use_combine:
+        if getattr(self, "_partial_inputs", False):
+            if not self.use_combine:
+                hidden, block = torch.ops.vllm.qwen38_sm70_hcx_final_mix(
+                    hidden_states, prev_block_output, prev_injection, self._hcx_name
+                )
+                return hidden, block, None
             return torch.ops.vllm.qwen38_sm70_hcx_combine_and_mix(
                 hidden_states, prev_block_output, prev_injection, self._hcx_name
             )
@@ -254,6 +259,10 @@ class GatedResidual(nn.Module):
         block_output: torch.Tensor,
         injection: torch.Tensor,
     ) -> torch.Tensor:
+        if getattr(self, "_partial_inputs", False):
+            return torch.ops.vllm.qwen38_sm70_hcx_combine(
+                hidden_states, block_output, injection, self._hcx_name
+            )
         block_output = self._reduce_partial(block_output)
         return hc_combine(hidden_states, block_output, injection, self.hc_count)
 
@@ -321,6 +330,53 @@ def _hcx_combine_and_mix_fake(hidden_states, block_output, injection, name):
         block_output.new_empty((m, block_output.shape[1])),
         injection.new_empty((m, injection.shape[1])),
     )
+
+
+def _hcx_combine(
+    hidden_states: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    # Keep the M-dependent TP reduction opaque to range compilation. The
+    # prefill trace can contain already-reduced payloads, whereas the same
+    # compiled range executes un-reduced small verification batches.
+    module = _PARTIAL_MODULES[name]
+    reduced = module._reduce_partial(block_output)
+    return hc_combine(hidden_states, reduced, injection, module.hc_count)
+
+
+def _hcx_final_mix(
+    hidden_states: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    module = _PARTIAL_MODULES[name]
+    reduced = module._reduce_partial(block_output)
+    hidden, block, _ = module._combine_and_mix_reduced(
+        hidden_states, reduced, injection
+    )
+    return hidden.contiguous(), block.contiguous()
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_hcx_final_mix",
+    op_func=_hcx_final_mix,
+    fake_impl=lambda hidden_states, block_output, injection, name: (
+        torch.empty_like(hidden_states),
+        block_output.new_empty((hidden_states.shape[0], block_output.shape[1])),
+    ),
+)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_hcx_combine",
+    op_func=_hcx_combine,
+    fake_impl=lambda hidden_states, block_output, injection, name: torch.empty_like(
+        hidden_states
+    ),
+)
 
 
 direct_register_custom_op(

@@ -47,6 +47,14 @@ def _worker_run(rank, port, results):
         runtime.diagnostic = True
         module.enable_partial_inputs("payload", runtime)
         module._hcx_moe_payload = True
+        final_module = (
+            GatedResidual(config, use_combine=False, prefix="final").cuda().half()
+        )
+        with torch.no_grad():
+            for parameter in final_module.parameters():
+                parameter.copy_(torch.randn_like(parameter) * 0.02)
+        final_module.enable_partial_inputs("final")
+        final_module._hcx_moe_payload = True
         register_moe_runner(
             "payload",
             SimpleNamespace(
@@ -64,6 +72,17 @@ def _worker_run(rank, port, results):
             scratch = x * 17
             outputs = module.combine_and_mix(hidden, payload, injection)
             return outputs, scratch
+
+        @torch.compile(backend="inductor", dynamic=True, fullgraph=True)
+        def materialize(x, hidden, injection):
+            payload = torch.ops.vllm.qwen38_sm70_hcx_moe_output(
+                x * 4, x * 3, "payload", 2560
+            )
+            return (
+                module.combine(hidden, payload, injection),
+                final_module.combine_and_mix(hidden, payload, injection),
+                x * 17,
+            )
 
         report = []
         from vllm.models.qwen4_exp.nvidia import ple_layer
@@ -90,22 +109,32 @@ def _worker_run(rank, port, results):
                 ple_layer._PLE_DIAGNOSTIC_BUFFERS["after"], ple_result
             )
             torch.testing.assert_close(ple_scratch, ple_input * 17)
-        for rows in (5, 20):
+        for rows in (20, 5):
             torch.manual_seed(1)
             hidden = (torch.randn(rows, 10240, device="cuda") * 0.5).half()
             injection = torch.randn(rows, 4, device="cuda").half()
             torch.manual_seed(100 + rank)
             x = (torch.randn(rows, 2560, device="cuda") * 0.02).half()
             compiled(x, hidden, injection)
+            materialize(x, hidden, injection)
             torch.accelerator.synchronize()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 outputs, scratch = compiled(x, hidden, injection)
+                combined, final_outputs, final_scratch = materialize(
+                    x, hidden, injection
+                )
             for _ in range(2):
                 x.copy_(torch.randn_like(x) * 0.02)
                 graph.replay()
                 reduced = tensor_model_parallel_all_reduce_sum2(x * 4, x * 3)
                 reference = module._combine_and_mix_reduced(hidden, reduced, injection)
+                from vllm.models.qwen4_exp.nvidia.ops.hc import hc_combine
+
+                combined_reference = hc_combine(hidden, reduced, injection, 4)
+                final_reference = final_module._combine_and_mix_reduced(
+                    hidden, reduced, injection
+                )
                 torch.accelerator.synchronize()
                 errors = []
                 for actual, expected in zip(outputs, reference):
@@ -116,6 +145,11 @@ def _worker_run(rank, port, results):
                     assert error < 0.002, (rank, rows, error)
                     errors.append(error)
                 torch.testing.assert_close(scratch, x * 17, rtol=0, atol=0)
+                torch.testing.assert_close(combined, combined_reference, rtol=0, atol=0)
+                assert final_outputs[2] is None
+                for actual, expected in zip(final_outputs[:2], final_reference[:2]):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(final_scratch, x * 17, rtol=0, atol=0)
                 if rows == 5:
                     snapshot = runtime.snapshots["payload"]
                     torch.testing.assert_close(snapshot["partial"], x * 3)

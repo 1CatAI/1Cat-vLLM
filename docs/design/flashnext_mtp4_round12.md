@@ -366,8 +366,10 @@ the model's native outputs byte for byte. In a diagnostic isolation only,
 replacing the residual input with the same rank-0 residual on all four ranks
 reduces block errors to 2.17e-4–2.96e-4 and injection errors to
 6.46e-5–2.21e-4. This is not a production broadcast fix or a speed result.
-The next diagnostic records PLE stages and weight fingerprints to locate
-the first rank divergence. Compiler payload ownership is not established
+The first PLE stage attempt did not activate its helper because the forward
+configuration context did not retain the diagnostic flag. The flag is now
+fixed on the module, and reports save each completed step independently.
+This failed attempt is not stage-localization evidence. Compiler payload ownership is not established
 as the cause of this actual-input failure.
 
 The actual control decode graph selects FP32 `all_reduce_sum2`. A hypothesis
@@ -385,6 +387,35 @@ justify examining instruction readiness and register-limited residency;
 they do not establish a pure HBM or codebook-bank bottleneck. Profiling does
 not fix clocks (reported SM frequency 1.17 GHz), so its 48.22-us duration is
 not substituted for unprofiled ABBA or complete-round latency.
+
+### Range-compiled partial materialization
+
+Inspection of the retained HCX backbone graph shows the first MoE payload
+being sliced to its first plane and passed directly to PLE's HC combine,
+without `all_reduce_sum2`. The Python M branch was specialized while tracing
+an already-reduced large batch. Small verification calls use local two-plane
+payloads, so reusing that graph violates the replicated-residual contract.
+The final HC mixer has the same Python M branch.
+
+Move PLE combine and final-mixer materialization into opaque operations that
+select the TP reduction at actual runtime M. Large batches consume only the
+already-reduced first plane; small batches sum both planes across TP before
+combining. Numerical stage capture and full-model qualification remain
+required; this source diagnosis does not establish endpoint improvement.
+
+### Further IQ scheduling screens
+
+A forced three-CTA register schedule spills registers and regresses IQ3_S M5
+from 45.568 to 73.728 us in same-process graph ABBA. It is rejected.
+A two-row-per-lane schedule gives no IQ3_S M5 improvement (49.152 us for both
+arms). Both screens encounter two one-LSB Q8 output differences at M20,
+so neither is described as byte-exact or admitted to model dispatch.
+
+An additional installed-kernel NCU sample reports long-scoreboard stalls
+42.73%, MIO throttle 15.84%, short-scoreboard stalls 5.66%, and math-pipe
+throttle 3.82%. Shared-load bank-conflict count is 742,063. These metrics
+support testing weight prefetch and shared-codebook scheduling; they do not
+justify replacing endpoint measurements with a throughput estimate.
 
 ## Community designs and applicability
 
