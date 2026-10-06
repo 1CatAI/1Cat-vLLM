@@ -109,6 +109,27 @@ def test_ple_diagnostic_snapshot_owns_both_outputs(monkeypatch):
     torch.testing.assert_close(saved, source)
 
 
+def test_ple_diagnostic_gate_uses_module_flag(monkeypatch):
+    from vllm.models.qwen4_exp.nvidia import ple_layer
+
+    calls = []
+    captured = object()
+
+    def snapshot(tensor, label):
+        calls.append((tensor, label))
+        return captured
+
+    monkeypatch.setattr(torch.ops.vllm, "qwen4_exp_ple_diagnostic_snapshot", snapshot)
+    cuda_input = SimpleNamespace(is_cuda=True)
+    cpu_input = SimpleNamespace(is_cuda=False)
+    assert ple_layer.snapshot_ple_diagnostic(cuda_input, "enabled", True) is captured
+    assert (
+        ple_layer.snapshot_ple_diagnostic(cuda_input, "disabled", False) is cuda_input
+    )
+    assert ple_layer.snapshot_ple_diagnostic(cpu_input, "cpu", True) is cpu_input
+    assert calls == [(cuda_input, "enabled")]
+
+
 def test_large_m_hc_does_not_reduce_or_recompute_projection():
     calls = []
 

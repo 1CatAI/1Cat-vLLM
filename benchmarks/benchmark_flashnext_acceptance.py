@@ -252,19 +252,21 @@ def main():
                 SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
                 use_tqdm=False,
             )
+            report["diagnostic_output_token_ids"] = [
+                list(output.outputs[0].token_ids) for output in diagnostic_outputs
+            ]
+            save()
             report["hcx_diagnosis"] = llm.collective_rpc(
                 "inspect_hcx_snapshots",
                 args=(str(args.output.parent / "hcx-snapshots"),),
                 timeout=300,
             )
+            save()
             report["ple_diagnosis"] = llm.collective_rpc(
                 "inspect_ple_snapshots",
                 args=(str(args.output.parent / "ple-snapshots"),),
                 timeout=300,
             )
-            report["diagnostic_output_token_ids"] = [
-                list(output.outputs[0].token_ids) for output in diagnostic_outputs
-            ]
             report["measurement_scope"] = "numerical diagnosis; no speed measurements"
             report["diagnostic_sampling"] = {
                 "temperature": 0,

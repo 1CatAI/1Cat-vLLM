@@ -70,10 +70,8 @@ def _worker_run(rank, port, results):
 
         @torch.compile(backend="inductor", dynamic=True, fullgraph=True)
         def ple_snapshots(x):
-            first = torch.ops.vllm.qwen4_exp_ple_diagnostic_snapshot(x * 3, "before")
-            second = torch.ops.vllm.qwen4_exp_ple_diagnostic_snapshot(
-                first * 2, "after"
-            )
+            first = ple_layer.snapshot_ple_diagnostic(x * 3, "before", True)
+            second = ple_layer.snapshot_ple_diagnostic(first * 2, "after", True)
             return second, x * 17
 
         ple_input = torch.randn(5, 16, device="cuda").half()

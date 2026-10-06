@@ -138,13 +138,10 @@ direct_register_custom_op(
 )
 
 
-def snapshot_ple_diagnostic(tensor: torch.Tensor, label: str) -> torch.Tensor:
-    config = get_current_vllm_config_or_none()
-    if (
-        config is not None
-        and config.kernel_config.sm70_hcx_diagnostics
-        and tensor.is_cuda
-    ):
+def snapshot_ple_diagnostic(
+    tensor: torch.Tensor, label: str, enabled: bool
+) -> torch.Tensor:
+    if enabled and tensor.is_cuda:
         return torch.ops.vllm.qwen4_exp_ple_diagnostic_snapshot(tensor, label)
     return tensor
 
@@ -1807,7 +1804,9 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 self.layer_name,
             )
         ngram_ids = snapshot_ple_diagnostic(
-            ngram_ids, self.layer_name + ":02_ngram_ids"
+            ngram_ids,
+            self.layer_name + ":02_ngram_ids",
+            getattr(self, "_sm70_hcx_diagnostics", False),
         )
         if output_buffer is not None:
             output = output_buffer[:num_tokens, : self.embedding_dim]
@@ -2083,6 +2082,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # workers, so preserve the model-dtype scale contract explicitly for
         # its checkpoint-only load path.
         self.ple_embedding._offload_model_dtype = model_config.dtype
+        self._sm70_hcx_diagnostics = vllm_config.kernel_config.sm70_hcx_diagnostics
+        self.ple_embedding._sm70_hcx_diagnostics = self._sm70_hcx_diagnostics
         self.key_proj = ReplicatedLinear(
             int(config.ple_embed_dim),
             self.hc_hidden_size,
@@ -2800,8 +2801,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        diagnostic = self._sm70_hcx_diagnostics
         input_ids = input_ids.reshape(-1)
-        input_ids = snapshot_ple_diagnostic(input_ids, self.prefix + ":02_input_ids")
+        input_ids = snapshot_ple_diagnostic(
+            input_ids, self.prefix + ":02_input_ids", diagnostic
+        )
         if input_ids.shape[0] != hidden_states.shape[0]:
             raise ValueError(
                 "PLE expects input_ids and hidden_states to have the same "
@@ -2814,24 +2818,30 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             query_start_loc,
             ngram_context,
         )
-        embeddings = snapshot_ple_diagnostic(embeddings, self.prefix + ":02_embeddings")
+        embeddings = snapshot_ple_diagnostic(
+            embeddings, self.prefix + ":02_embeddings", diagnostic
+        )
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
-        key = snapshot_ple_diagnostic(key, self.prefix + ":03_key")
-        value = snapshot_ple_diagnostic(value, self.prefix + ":04_value")
+        key = snapshot_ple_diagnostic(key, self.prefix + ":03_key", diagnostic)
+        value = snapshot_ple_diagnostic(value, self.prefix + ":04_value", diagnostic)
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
         key = self._apply_norm(self.norm_key, key)
         query = self._apply_norm(self.norm_query, query)
-        key = snapshot_ple_diagnostic(key, self.prefix + ":05_key_norm")
-        query = snapshot_ple_diagnostic(query, self.prefix + ":06_query_norm")
+        key = snapshot_ple_diagnostic(key, self.prefix + ":05_key_norm", diagnostic)
+        query = snapshot_ple_diagnostic(
+            query, self.prefix + ":06_query_norm", diagnostic
+        )
         gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
         gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
         gated_value = gate * value.unsqueeze(-2)
         normalized = self._apply_norm(self.norm_conv, gated_value).flatten(-2)
-        normalized = snapshot_ple_diagnostic(normalized, self.prefix + ":07_conv_input")
+        normalized = snapshot_ple_diagnostic(
+            normalized, self.prefix + ":07_conv_input", diagnostic
+        )
         conv_output = torch.zeros_like(normalized)
         torch.ops.vllm.qwen4_exp_ple_short_conv(
             normalized,
@@ -2839,7 +2849,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             self.prefix,
         )
         conv_output = snapshot_ple_diagnostic(
-            conv_output, self.prefix + ":08_conv_output"
+            conv_output, self.prefix + ":08_conv_output", diagnostic
         )
         return gated_value.flatten(-2) + conv_output
 

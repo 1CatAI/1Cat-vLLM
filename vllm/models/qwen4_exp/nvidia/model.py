@@ -432,8 +432,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if self.ple is not None:
             from .ple_layer import snapshot_ple_diagnostic
 
+            diagnostic = self.ple._sm70_hcx_diagnostics
             hidden_states = snapshot_ple_diagnostic(
-                hidden_states, self.ple.prefix + ":00_before_combine"
+                hidden_states, self.ple.prefix + ":00_before_combine", diagnostic
             )
             # PLE adds directly to the multi-stream state, so pending HC state
             # must be materialized before the addition.
@@ -444,7 +445,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prev_block_output = prev_injection = None
 
             hidden_states = snapshot_ple_diagnostic(
-                hidden_states, self.ple.prefix + ":01_after_combine"
+                hidden_states, self.ple.prefix + ":01_after_combine", diagnostic
             )
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
@@ -456,7 +457,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 ngram_context,
             )
             hidden_states = snapshot_ple_diagnostic(
-                hidden_states, self.ple.prefix + ":09_after_add"
+                hidden_states, self.ple.prefix + ":09_after_add", diagnostic
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
