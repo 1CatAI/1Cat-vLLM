@@ -125,6 +125,62 @@ struct LatticeDot {
 };
 using IQ3SDot = LatticeDot<21>;
 
+// Lossless scalar LUT expansion avoids the correlated codebook in shared
+// memory. Records preserve the source base and integer subscales, so dot
+// arithmetic and the final FP16 boundary remain the same as LatticeDot.
+template <int Type>
+struct SignedLutDot {
+  static_assert(Type == 18 || Type == 21 || Type == 22);
+  static constexpr int kBookWords = 1;
+  __device__ static void initialize(uint32_t*, uint32_t*) { __syncthreads(); }
+  __host__ __device__ static constexpr int value(int i) {
+    if constexpr (Type == 21) return 2 * i - 15;
+    if constexpr (Type == 18) {
+      const int levels[16] = {-62, -52, -44, -36, -28, -20, -12, -4,
+                              4,   12,  20,  28,  36,  44,  52,  62};
+      return levels[i];
+    }
+    const int levels[16] = {-43, -25, -8, 8, 25, 43};
+    return levels[i];
+  }
+  __host__ __device__ static constexpr uint32_t table(int start) {
+    uint32_t word = 0;
+    for (int i = 0; i < 4; ++i)
+      word |= uint32_t(value(start + i) + 128) << (8 * i);
+    return word;
+  }
+  __device__ static uint32_t decode(uint32_t nibbles) {
+    const uint32_t selector = nibbles & 0x7777U;
+    const uint32_t low = __byte_perm(table(0), table(4), selector);
+    const uint32_t high = __byte_perm(table(8), table(12), selector);
+    return __byte_perm(low, high, ((nibbles & 0x8888U) >> 1) | 0x3210U) ^
+           0x80808080U;
+  }
+  __device__ static float dot(const uint8_t* row, int group, const Q8_1& x,
+                              const uint32_t*, const uint32_t*) {
+    const uint8_t* b = row + group * 20;
+    const auto* activation = reinterpret_cast<const int*>(x.qs);
+    int sum0 = 0, sum1 = 0;
+#pragma unroll
+    for (int fragment = 0; fragment < 4; ++fragment) {
+      const uint32_t packed = reinterpret_cast<const uint32_t*>(b)[fragment];
+      int& sum = Type == 22 && fragment >= 2 ? sum1 : sum0;
+      const int low = static_cast<int>(decode(packed));
+      const int high = static_cast<int>(decode(packed >> 16));
+      sum = __dp4a(low, activation[2 * fragment], sum);
+      sum = __dp4a(high, activation[2 * fragment + 1], sum);
+    }
+    const float d = __half2float(*reinterpret_cast<const half*>(b + 16)) *
+                    __low2float(x.ds);
+    if constexpr (Type == 18)
+      return d * (float(sum0) * float(b[18]) * .25f);
+    else if constexpr (Type == 21)
+      return d * float(sum0 * b[18]);
+    else
+      return d * float(sum0 * b[18] + sum1 * b[19]) * .125f;
+  }
+};
+
 // Existing N32/K8 storage handles TP boundaries inside Q2_0's source K64
 // blocks without expanded FP16 weights or a second layout. Its scale and
 // centered integer values are exact; IQ4_NL uses the shared TurboMind LUT.

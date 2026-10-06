@@ -358,6 +358,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_quantize_q8_1_sm70_out", torch::kCUDA,
            &gguf_quantize_q8_1_sm70_out);
   ops.def(
+      "gguf_dp4a_scalar_lut_gate_up_sm70_out(Tensor(a!) out, Tensor "
+      "activation, "
+      "Tensor ids, Tensor gate, Tensor up, int source_type, bool activated) -> "
+      "()");
+  ops.impl("gguf_dp4a_scalar_lut_gate_up_sm70_out", torch::kCUDA,
+           &gguf_dp4a_scalar_lut_gate_up_sm70_out);
+  ops.def(
       "gguf_dp4a_gate_up_sm70_out(Tensor(a!) out, Tensor activation, Tensor "
       "ids, Tensor gate, Tensor up, int source_type, bool activated, "
       "int lanes_per_row=16) -> ()");

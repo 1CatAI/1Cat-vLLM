@@ -182,3 +182,46 @@ required dense FP16 HC weights before changing any producers, and records
 capability and fallback reasons. Twelve CPU dispatch, compilation and
 precision tests pass. Model speed, C4 and acceptance of this repair remain
 to be measured; it stays opt-in.
+
+### Same-engine execution-policy ablation
+
+A source-complete wheel captures both draft policies before requests. Five
+arms run in one loaded engine, followed by a repeat switch-off control. Every
+arm produces exactly the same eight natural output sequences and acceptance
+counters; prompt-mean acceptance is 47.306%. The C1 probe also emits the same
+4.886 tokens per round in every arm.
+
+| Execution policy | C1 ms/round | C4 ms/round |
+| --- | ---: | ---: |
+| Control | 18.273 | 43.277 |
+| Single-graph draft | 18.600 | 43.467 |
+| Local argmax verification | 18.092 | 43.497 |
+| Both | 19.543 | 43.225 |
+| Repeat control | 18.283 | 44.344 |
+
+Single-graph drafting is rejected for this workload. Local argmax verification
+saves about 0.18 ms in C1; its C4 delta requires an unprofiled confirmation,
+since the repeat C4 control itself drifts upward by 1.067 ms. The Nsight
+library is attached throughout but collection is disabled during these
+cohorts. Neither the approximately 0.6-ms difference from a separate
+startup cohort with both switches enabled nor microbenchmarks is substituted
+for the measured ablation. The acceptance variation between fresh engines
+remains unresolved; within-engine bit equality does not explain it.
+
+### Signed-nibble lattice experiment
+
+The largest remaining expert gate/up service component is approximately
+1.79 ms per target replay. A candidate decoder expands correlated IQ indices
+and signs to signed scalar nibble codes at load time. IQ3_S needs 16 odd
+integer levels, IQ3_XXS needs 16 signed levels and IQ2_S needs six. Each
+32-weight record stores 16 code bytes, the original FP16 base scale and one
+or two integer odd subscales. The dot keeps the existing integer scaling and
+FP32 accumulation order, rather than expanding and rounding coefficients.
+
+All three codecs reproduce official GGUF dequantization element by element.
+The CUDA experiment reuses the existing activation encoding, gate/up,
+SiLU/multiply and Q8 intermediate skeleton, replacing only the decoder.
+It removes shared-memory correlated-codebook lookup, but reads more weight
+bytes: 160 versus 98, 110 or 82 bytes per source 256-weight block. Its speed
+is unqualified until a same-card real-shard M=5/M=20 comparison passes the
+retained integer-dot and graph-canary checks. No model dispatch changes yet.

@@ -985,6 +985,11 @@ void gguf_dp4a_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor stats_ptrs,
                                      int64_t source_type, int64_t num_experts);
 void gguf_quantize_q8_1_sm70_out(torch::Tensor out, torch::Tensor input);
+void gguf_dp4a_scalar_lut_gate_up_sm70_out(torch::Tensor out,
+                                           torch::Tensor activation,
+                                           torch::Tensor ids,
+                                           torch::Tensor gate, torch::Tensor up,
+                                           int64_t source_type, bool activated);
 void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor ids, torch::Tensor gate,
                                 torch::Tensor up, int64_t source_type,
