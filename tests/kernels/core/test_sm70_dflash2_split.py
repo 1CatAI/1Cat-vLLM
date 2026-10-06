@@ -94,3 +94,60 @@ def test_live_window_graph(page, scale, through_api):
         graph.replay()
         truth = _dense(q, k, v, table, length, scale)
         torch.testing.assert_close(output.double(), truth, atol=0.001, rtol=0.002)
+
+
+def test_page832_split_route_without_native_symbol(monkeypatch):
+    from flash_attn_v100 import flash_attn_interface as interface
+    from flash_attn_v100 import sm70_dflash2_split as split
+
+    calls = []
+    original = split.forward
+
+    def record(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(split, "forward", record)
+    monkeypatch.delattr(
+        interface.flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd", raising=False
+    )
+    query = torch.randn(1, 8, 8, 128, dtype=torch.float16, device="cuda")
+    kv = torch.randn(2, 2, 832, 2, 128, dtype=torch.float16, device="cuda")
+    table = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([1032], dtype=torch.int32, device="cuda")
+    output = torch.empty_like(query)
+    arguments = dict(out=output, causal=False, window_size=(2047, 2047))
+    interface.flash_attn_prefill_paged(
+        query,
+        kv[:, 0],
+        kv[:, 1],
+        table,
+        lengths,
+        dflash2_window_split=False,
+        **arguments,
+    )
+    baseline = output.clone()
+    assert calls == []
+    graph = torch.cuda.CUDAGraph()
+    interface.flash_attn_prefill_paged(
+        query,
+        kv[:, 0],
+        kv[:, 1],
+        table,
+        lengths,
+        dflash2_window_split=True,
+        **arguments,
+    )
+    with torch.cuda.graph(graph):
+        interface.flash_attn_prefill_paged(
+            query,
+            kv[:, 0],
+            kv[:, 1],
+            table,
+            lengths,
+            dflash2_window_split=True,
+            **arguments,
+        )
+    graph.replay()
+    torch.testing.assert_close(output, baseline, atol=0.001, rtol=0.002)
+    assert len(calls) == 2
