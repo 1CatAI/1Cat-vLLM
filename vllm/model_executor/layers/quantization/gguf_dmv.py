@@ -46,6 +46,8 @@ def eligible_sources(sources, prefix):
     if not quantized or len({t for _, t in quantized}) > 2:
         return False
     if any(t in iq.IQ2_FORMATS for _, t in quantized):
+        if not cfg.kernel_config.sm70_gguf.iq2_signed_nibbles:
+            return False
         # Only the measured gate/up and down shapes admit the new decoder.
         if not prefix.endswith((".gate_up_proj", ".down_proj")):
             return False

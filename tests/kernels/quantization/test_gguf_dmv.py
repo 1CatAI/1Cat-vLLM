@@ -224,3 +224,11 @@ def test_rejected_shard_rolls_back_every_plane(monkeypatch):
     assert calls == [True, True, False, False]
     assert all(not hasattr(p, "dmv_format") for p in projections)
     assert all(p.dmv_rejection_reasons == ["rejected_test_scale"] for p in projections)
+
+
+def test_iq2_plane_policy_changes_graph_hash():
+    from vllm.config.kernel import KernelConfig, Sm70GgufConfig
+
+    enabled = KernelConfig(sm70_gguf=Sm70GgufConfig(iq2_signed_nibbles=True))
+    disabled = KernelConfig(sm70_gguf=Sm70GgufConfig(iq2_signed_nibbles=False))
+    assert enabled.compute_hash() != disabled.compute_hash()
