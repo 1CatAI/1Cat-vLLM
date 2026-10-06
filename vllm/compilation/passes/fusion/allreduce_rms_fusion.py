@@ -597,9 +597,12 @@ class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
 
 
 class Sm70Tp4PushGemmaRMSNormPattern(BasePattern):
-    def __init__(self, dtype: torch.dtype, device: str | None) -> None:
+    def __init__(
+        self, dtype: torch.dtype, device: str | None, epsilon: float = 1e-6
+    ) -> None:
         super().__init__(dtype, device)
         self.group_name = get_tp_group().unique_name
+        self.epsilon = epsilon
 
     def get_inputs(self) -> list[torch.Tensor]:
         return [self.empty(8, 5120), self.empty_f32(8, 5120), self.empty(5120)]
@@ -608,12 +611,12 @@ class Sm70Tp4PushGemmaRMSNormPattern(BasePattern):
         def pattern(input, residual, weight):
             reduced = tensor_model_parallel_all_reduce(input)
             return torch.ops.vllm.sm70_dflash2_gemma_fused_add_rms_norm(
-                reduced, residual, weight, 1e-6
+                reduced, residual, weight, self.epsilon
             )
 
         def replacement(input, residual, weight):
             return torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm(
-                input, residual, weight, 1e-6, group_name=self.group_name
+                input, residual, weight, self.epsilon, group_name=self.group_name
             )
 
         pm.register_replacement(
@@ -1065,6 +1068,12 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             )
             return
         self.hidden_dim = config.model_config.get_hidden_size()
+        # GGUF metadata stores epsilon as float32. Preserve the config value:
+        # its Python float differs from the literal 1e-6 used by HF configs,
+        # and a literal mismatch prevents otherwise valid graph fusion.
+        self.sm70_norm_epsilon = getattr(
+            config.model_config.hf_text_config, "rms_norm_eps", 1e-6
+        )
         self.group = get_tp_group().device_group
         rank = get_tensor_model_parallel_rank()
         self.rank = rank
@@ -1211,9 +1220,9 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             # Import registers the norm boundary even when the model is traced later.
             import vllm.model_executor.layers.layernorm  # noqa: F401
 
-            Sm70Tp4PushGemmaRMSNormPattern(self.model_dtype, self.device).register(
-                self.patterns
-            )
+            Sm70Tp4PushGemmaRMSNormPattern(
+                self.model_dtype, self.device, self.sm70_norm_epsilon
+            ).register(self.patterns)
             self.disabled = False
             return
         if self.sm70_tp4_long_mode:

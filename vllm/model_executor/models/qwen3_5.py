@@ -586,7 +586,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             and _is_dflash2_spec_config(vllm_config)
             and vllm_config.parallel_config.tensor_parallel_size == 4
             and model_config.dtype == torch.float16
-            and model_config.quantization == "compressed-tensors"
+            and model_config.quantization in ("compressed-tensors", "gguf")
             and config.hidden_size == 5120
             and config.model_type == "qwen3_5_text"
         )
