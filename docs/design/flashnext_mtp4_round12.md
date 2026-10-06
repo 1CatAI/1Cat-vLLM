@@ -406,8 +406,8 @@ stages are byte-identical across TP, with equal weight fingerprints. All 94
 HC boundaries have maximum relative L2 below 0.000435, replacing the earlier
 approximately 7% errors. The short diagnostic generation matches the control
 prefix for 32 tokens. This cohort includes diagnostic copies and is not a
-speed result. Same-wheel unobserved C1/C4, eight-prompt acceptance and aligned
-64-position teacher-forcing comparisons are running.
+speed result. The same-wheel endpoint and numerical comparisons below exclude diagnostic
+copies.
 
 ### Further IQ scheduling screens
 
@@ -450,7 +450,71 @@ The repaired wheel's new switch-off control records C1 cohorts of 18.317 and
 64/64. Long natural sequences differ. Both configurations resolve to page816
 and use the same prompt tokens. The earlier C4 record is 43.211 ms/round;
 this difference is retained for investigation, not discarded as a favorable
-new denominator. The matched HCX arm is still running.
+new denominator. The completed matched comparison is recorded below.
+
+### Repaired HCX matched endpoint comparison
+
+Both arms use the same source-complete wheel at `75470871a`, core SHA256
+`1fb69a6549693048bf4c704cbef523fee1c72a9b85e2e3ca21ce9fd2327e2f1d`.
+Only HCX is switched; output-projection fusion and diagnostics are off.
+The workload is TP4 V100, CUDA 12.8, Torch 2.10, FP16 activations/KV,
+FP32 SSM, FULL target/draft graphs, MTP4 and page816. C1 uses 8192 input and
+256 output tokens; C4 uses 128 input and 600 output tokens per request.
+
+| Measurement | Control | HCX |
+| --- | ---: | ---: |
+| C1 unobserved mean, ms/round | 18.3192 | 17.3988 |
+| C1 emitted tokens/round | 4.8857 | 4.8857 |
+| C4, ms/round | 45.8460 | 45.6969 |
+| Eight-prompt mean acceptance | 45.8638% | 47.3311% |
+
+All six C1 256-token output sequences are identical across cohorts and arms.
+HCX saves 0.9204 ms/round (5.02%). The paired acceptance difference is
++1.4673 percentage points, with bootstrap 95% CI [-0.3854, +3.3670] points
+(100,000 resamples, seed 20261007). This interval does not prove zero loss;
+no decrease is observed. Natural outputs remain coherent, and the short
+arithmetic and blue-sky completions terminate normally. Natural sequences
+are not byte-identical. On 64 identically conditioned teacher positions,
+mean/max KL is 0.0004822/0.0057093 and top-1 agreement is 63/64. Maximum
+absolute logit difference is 0.7588; maximum logit relative L2 is 0.05972.
+
+Low-overhead rank-0 median GPU envelopes locate the endpoint saving:
+
+| Envelope, ms | Control | HCX |
+| --- | ---: | ---: |
+| Target replay | 14.3949 | 13.4769 |
+| Four draft steps | 3.3147 | 3.3178 |
+| Sampling outside draft | 0.5371 | 0.5274 |
+| Execute before target | 0.1030 | 0.0952 |
+| Target to next target | 18.3716 | 17.4336 |
+
+These are medians of nested envelopes, not an additive closed ledger.
+CPU target-entry skew increases to median 1.5371 ms while GPU before-target
+work remains about 0.10 ms: the CPU timestamps alone do not establish a
+redeemable GPU stall. A new graph-node trace will locate actual TP entry and
+dependency waits. The 12-ms objective remains unmet by 5.4 ms. The historical
+43.211-ms C4 result remains a separate unresolved control drift; the new
+same-wheel comparison alone does not establish no regression against it.
+
+### Additional precise screens rejected or deferred
+
+The row-ready HC variant preserves every checked output byte, including two
+changed-input graph checks, but increases the four-rank maximum median from
+27.208 to 28.396 us. It is rejected. Publishing separate row readiness does
+not redeem the synchronization budget in this topology.
+
+A coalesced N32/K8 scalar-code layout increases expert storage to 20 bytes per
+32 weights. IQ3_S M5 regresses from 45.056 to 52.224 us, despite higher logical
+bandwidth; IQ3_XXS and IQ2_S also regress. Some Q8 packet scale-sum bytes differ
+with identical decoded values, and the worst tested output relative L2 is
+0.000273. This layout is rejected for latency.
+
+Carry-free packed-byte sign restoration is exact on 45,056 exhaustive
+codebook/sign combinations and all nine real-shard GPU points. Its M5 weighted
+service estimate saves only approximately 0.067 ms/round. Together with the
+approximately 0.063-ms metadata-prefetch estimate, it is deferred rather than
+used to justify another model load. All three screens are private-DSO research
+measurements; none changes packaged model dispatch or qualifies endpoint gain.
 
 ## Community designs and applicability
 
