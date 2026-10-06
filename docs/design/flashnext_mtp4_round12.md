@@ -260,9 +260,40 @@ graph memory planning. HCX now receives an owned two-plane Tensor payload;
 views of its two contiguous planes reach the native consumer. Large batches
 retain the original reduction, copy the result into the first plane, and
 ignore the uninitialized second plane. Hidden Tensor registries are removed.
-Thirteen CPU tests, including Inductor temporary reuse and mixed-M dispatch,
-pass. A four-rank compiled graph replay comparison is the next gate before
-another model run. Output-projection fusion can be screened independently
+Fourteen CPU tests, including Inductor temporary reuse and mixed-M dispatch,
+pass. Four-rank compiled graph replay passes at M=5 and M=20 with changed
+inputs and live scratch allocations. At M=20 all three outputs match exactly;
+the maximum M=5 block/injection relative L2 errors are 3.43e-4/7.74e-4.
+The compiled test first exposed the original large-M injection view's
+336-column row stride, which disagreed with the opaque operator's contiguous
+fake output. The fallback now materializes contiguous outputs. This fixes a
+compiler contract; the added C4 copy cost still needs an endpoint comparison.
+Output-projection fusion can be screened independently
 of the HC boundary through kernel configuration. Compiled Q6 fusion uses
 180 registers/thread versus 92 without a producer projection; neither
 variant spills. This is a screening observation, not a performance claim.
+
+## Community designs and applicability
+
+[SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)
+describes overlapping mixing-coefficient computation with Attention or MoE,
+fusing adjacent output/input combinations and normalization, and having the
+router produce the consumer's layout directly. These are dependency and
+schedule changes, rather than a claim that fewer kernels necessarily shorten
+the critical path. Flash-Next's HC down projection consumes the normalized
+post-combine residual, so it cannot simply be launched alongside the preceding
+block without changing that dependency.
+
+[mKernel](https://arxiv.org/abs/2609.13585) publishes tile readiness to overlap
+communication with computation, partitions compute/communication resources,
+and accounts for pipeline fill/drain and synchronization. Its reported H200
+multi-node results are not V100 latency estimates. Here the small-M critical
+path and two-hop TP4 topology require measuring those fixed costs before
+reserving SMs for communication or introducing a persistent kernel.
+
+[DeepSeek TileKernels](https://github.com/deepseek-ai/TileKernels) includes mHC
+kernels and an Ascend backend. Its documented NVIDIA requirements are
+SM90/SM100 and CUDA 13.1; it is an algorithm reference for this SM70 workload,
+not an installable V100 fast path. Flash-Next's gated HC also differs from
+DeepSeek's Sinkhorn-normalized mHC, so a Sinkhorn-specific improvement does
+not explain this model's measured HC cost.
