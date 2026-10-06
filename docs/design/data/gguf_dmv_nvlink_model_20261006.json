@@ -615,5 +615,682 @@
       }
     ]
   },
-  "trace": "pending one new same-host post-batch capture"
+  "trace": {
+    "contract": {
+      "input": 1024,
+      "output": 64,
+      "max_model_len": 32768,
+      "tp": 4,
+      "sm_clock_mhz": 1290,
+      "memory_clock_mhz": 877,
+      "sampling": {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 20,
+        "seed": 123
+      },
+      "nsys": "2024.6.2",
+      "boundary": "first target GPU node to next target GPU node; drop first and final transition",
+      "interpretation": "Service sums are non-additive; profiled intervals do not replace unprofiled model latency. Weight footprints are not measured DRAM traffic."
+    },
+    "clock_samples": [
+      {
+        "rank": 0,
+        "sm": "1290 MHz",
+        "memory": "877 MHz",
+        "count": 1
+      },
+      {
+        "rank": 1,
+        "sm": "1290 MHz",
+        "memory": "877 MHz",
+        "count": 1
+      },
+      {
+        "rank": 2,
+        "sm": "1290 MHz",
+        "memory": "877 MHz",
+        "count": 1
+      },
+      {
+        "rank": 3,
+        "sm": "1290 MHz",
+        "memory": "877 MHz",
+        "count": 1
+      }
+    ],
+    "ranks": [
+      {
+        "rank": 0,
+        "rounds": 13,
+        "projection_service_ms": 8.51211376923077,
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 34.07795993589744,
+            "service_ms_per_round": 1.635742076923077,
+            "weight_stream_bytes_per_call": 9924266.666666666,
+            "effective_weight_gbps": 291.2224407016961
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 20.25391185897436,
+            "service_ms_per_round": 0.9721877692307693,
+            "weight_stream_bytes_per_call": 3932160.0,
+            "effective_weight_gbps": 194.14323649570383
+          },
+          "gate_up.native": {
+            "calls_per_round": 14.0,
+            "us_per_call": 62.63500549450549,
+            "service_ms_per_round": 0.8768900769230769,
+            "weight_stream_bytes_per_call": 14771931.42857143,
+            "effective_weight_gbps": 235.8414645603769
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 28.793234375,
+            "service_ms_per_round": 1.842767,
+            "weight_stream_bytes_per_call": 10681440.0,
+            "effective_weight_gbps": 370.9704808041385
+          },
+          "gate_up.planes": {
+            "calls_per_round": 50.0,
+            "us_per_call": 46.03506461538462,
+            "service_ms_per_round": 2.301753230769231,
+            "weight_stream_bytes_per_call": 20833894.4,
+            "effective_weight_gbps": 452.5657685953904
+          },
+          "attention.q+k+v": {
+            "calls_per_round": 16.0,
+            "us_per_call": 36.05434134615385,
+            "service_ms_per_round": 0.5768694615384615,
+            "weight_stream_bytes_per_call": 8780800.0,
+            "effective_weight_gbps": 243.54348664135856
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 19.119009615384616,
+            "service_ms_per_round": 0.3059041538461539,
+            "weight_stream_bytes_per_call": 3824640.0,
+            "effective_weight_gbps": 200.0438347456242
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 11.501345562130178,
+            "service_ms_per_round": 1.4951749230769233
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 6.011525939177102,
+            "service_ms_per_round": 0.7754868461538461
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.463080128205128,
+            "service_ms_per_round": 1.2186835384615387
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.8038978365384617,
+            "service_ms_per_round": 0.48689892307692306
+          },
+          "layout_or_copy": {
+            "calls_per_round": 37.0,
+            "us_per_call": 3.306060291060291,
+            "service_ms_per_round": 0.12232423076923077
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.18285096153846,
+            "service_ms_per_round": 1.029851230769231
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.781599889319314,
+            "service_ms_per_round": 0.8036423846153847
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.4217525083612,
+            "service_ms_per_round": 0.9987003076923077
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 12.881,
+            "service_ms_per_round": 0.231858
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 270.1082307692308,
+            "service_ms_per_round": 0.2701082307692308
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.404983277591973,
+            "service_ms_per_round": 0.1703146153846154
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 103.82418461538461,
+            "service_ms_per_round": 0.519120923076923
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 273.09430769230767,
+            "service_ms_per_round": 0.27309430769230775
+          }
+        },
+        "means": {
+          "round_ms": 18.805984384615385,
+          "target_graph_ms": 14.929987615384615,
+          "target_kernel_union_ms": 13.624705692307693,
+          "target_inter_kernel_gap_ms": 1.305281923076923,
+          "after_target_ms": 3.875996769230769,
+          "after_target_kernel_union_ms": 3.266504,
+          "after_target_inter_kernel_gap_ms": 0.6094927692307692,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 10.107153846153846,
+          "graph_boundary_idle_us": 353.8066153846154,
+          "draft_graph_end_to_next_target_us": 214.1376923076923,
+          "last_tail_graph_to_next_target_us": 214.1376923076923
+        },
+        "previous_output_batch": {
+          "projection_service_ms": 10.541797846153846,
+          "means": {
+            "round_ms": 21.043222692307694,
+            "target_graph_ms": 17.128622,
+            "target_kernel_union_ms": 15.766467153846154,
+            "target_inter_kernel_gap_ms": 1.3621548461538462,
+            "after_target_ms": 3.914600692307692,
+            "after_target_kernel_union_ms": 3.2977805384615384,
+            "after_target_inter_kernel_gap_ms": 0.6168201538461539,
+            "tail_kernel_count": 210,
+            "tail_last_kernel_to_next_target_us": 10.569846153846154,
+            "graph_boundary_idle_us": 357.80315384615386,
+            "draft_graph_end_to_next_target_us": 216.07807692307694,
+            "last_tail_graph_to_next_target_us": 216.07807692307694
+          }
+        }
+      },
+      {
+        "rank": 1,
+        "rounds": 13,
+        "projection_service_ms": 8.630130538461538,
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 34.2138766025641,
+            "service_ms_per_round": 1.6422660769230768,
+            "weight_stream_bytes_per_call": 9924266.666666666,
+            "effective_weight_gbps": 290.0655421760336
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 20.44430128205128,
+            "service_ms_per_round": 0.9813264615384616,
+            "weight_stream_bytes_per_call": 3932160.0,
+            "effective_weight_gbps": 192.33525987274365
+          },
+          "gate_up.native": {
+            "calls_per_round": 14.0,
+            "us_per_call": 62.7789010989011,
+            "service_ms_per_round": 0.8789046153846155,
+            "weight_stream_bytes_per_call": 14771931.42857143,
+            "effective_weight_gbps": 235.3008920194368
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 29.14625721153846,
+            "service_ms_per_round": 1.8653604615384616,
+            "weight_stream_bytes_per_call": 10681440.0,
+            "effective_weight_gbps": 366.4772434579153
+          },
+          "gate_up.planes": {
+            "calls_per_round": 50.0,
+            "us_per_call": 47.47655384615384,
+            "service_ms_per_round": 2.3738276923076924,
+            "weight_stream_bytes_per_call": 20833894.4,
+            "effective_weight_gbps": 438.8249085540523
+          },
+          "attention.q+k+v": {
+            "calls_per_round": 16.0,
+            "us_per_call": 36.05008173076923,
+            "service_ms_per_round": 0.5768013076923076,
+            "weight_stream_bytes_per_call": 8780800.0,
+            "effective_weight_gbps": 243.57226331904454
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 19.477745192307694,
+            "service_ms_per_round": 0.3116439230769231,
+            "weight_stream_bytes_per_call": 3824640.0,
+            "effective_weight_gbps": 196.35948423385565
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 10.727166863905325,
+            "service_ms_per_round": 1.3945316923076922
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 6.013612403100775,
+            "service_ms_per_round": 0.775756
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.466296474358975,
+            "service_ms_per_round": 1.2191466923076923
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.8615078125,
+            "service_ms_per_round": 0.494273
+          },
+          "layout_or_copy": {
+            "calls_per_round": 37.0,
+            "us_per_call": 3.297802494802495,
+            "service_ms_per_round": 0.1220186923076923
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.267459134615386,
+            "service_ms_per_round": 1.0325586923076924
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.833294410625346,
+            "service_ms_per_round": 0.8108279230769232
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.77227090301003,
+            "service_ms_per_round": 1.0067622307692308
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 11.355649572649572,
+            "service_ms_per_round": 0.2044016923076923
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 274.03646153846154,
+            "service_ms_per_round": 0.27403646153846156
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.44638127090301,
+            "service_ms_per_round": 0.17126676923076922
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 104.51021538461538,
+            "service_ms_per_round": 0.5225510769230769
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 278.2579230769231,
+            "service_ms_per_round": 0.2782579230769231
+          }
+        },
+        "means": {
+          "round_ms": 18.826123384615386,
+          "target_graph_ms": 14.952870384615384,
+          "target_kernel_union_ms": 13.652215923076923,
+          "target_inter_kernel_gap_ms": 1.3006544615384616,
+          "after_target_ms": 3.873253,
+          "after_target_kernel_union_ms": 3.2678702307692307,
+          "after_target_inter_kernel_gap_ms": 0.6053827692307693,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.020307692307693,
+          "graph_boundary_idle_us": 347.27715384615385,
+          "draft_graph_end_to_next_target_us": 211.4123076923077,
+          "last_tail_graph_to_next_target_us": 211.4123076923077
+        },
+        "previous_output_batch": {
+          "projection_service_ms": 10.548743769230768,
+          "means": {
+            "round_ms": 21.090526384615384,
+            "target_graph_ms": 17.175171307692306,
+            "target_kernel_union_ms": 15.720770230769231,
+            "target_inter_kernel_gap_ms": 1.4544010769230769,
+            "after_target_ms": 3.9153550769230767,
+            "after_target_kernel_union_ms": 3.290934076923077,
+            "after_target_inter_kernel_gap_ms": 0.624421,
+            "tail_kernel_count": 210,
+            "tail_last_kernel_to_next_target_us": 11.367384615384616,
+            "graph_boundary_idle_us": 364.3433076923077,
+            "draft_graph_end_to_next_target_us": 216.597,
+            "last_tail_graph_to_next_target_us": 216.597
+          }
+        }
+      },
+      {
+        "rank": 2,
+        "rounds": 13,
+        "projection_service_ms": 8.604730230769231,
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 34.045003205128204,
+            "service_ms_per_round": 1.6341601538461537,
+            "weight_stream_bytes_per_call": 9924266.666666666,
+            "effective_weight_gbps": 291.5043540125669
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 20.463020833333335,
+            "service_ms_per_round": 0.9822250000000001,
+            "weight_stream_bytes_per_call": 3932160.0,
+            "effective_weight_gbps": 192.15931176665222
+          },
+          "gate_up.native": {
+            "calls_per_round": 14.0,
+            "us_per_call": 62.85009340659341,
+            "service_ms_per_round": 0.8799013076923077,
+            "weight_stream_bytes_per_call": 14771931.42857143,
+            "effective_weight_gbps": 235.0343591855625
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 29.09953245192308,
+            "service_ms_per_round": 1.862370076923077,
+            "weight_stream_bytes_per_call": 10681440.0,
+            "effective_weight_gbps": 367.0656914384239
+          },
+          "gate_up.planes": {
+            "calls_per_round": 50.0,
+            "us_per_call": 47.169546153846156,
+            "service_ms_per_round": 2.358477307692308,
+            "weight_stream_bytes_per_call": 20833894.4,
+            "effective_weight_gbps": 441.68104420697773
+          },
+          "attention.q+k+v": {
+            "calls_per_round": 16.0,
+            "us_per_call": 36.0082548076923,
+            "service_ms_per_round": 0.5761320769230769,
+            "weight_stream_bytes_per_call": 8780800.0,
+            "effective_weight_gbps": 243.8551950627774
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 19.46651923076923,
+            "service_ms_per_round": 0.31146430769230765,
+            "weight_stream_bytes_per_call": 3824640.0,
+            "effective_weight_gbps": 196.47272091431145
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 11.121586982248521,
+            "service_ms_per_round": 1.4458063076923076
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 5.986113297555158,
+            "service_ms_per_round": 0.7722086153846153
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.463426282051282,
+            "service_ms_per_round": 1.2187333846153847
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.397537860576923,
+            "service_ms_per_round": 0.43488484615384615
+          },
+          "layout_or_copy": {
+            "calls_per_round": 37.0,
+            "us_per_call": 3.3084511434511437,
+            "service_ms_per_round": 0.1224126923076923
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.287471153846155,
+            "service_ms_per_round": 1.033199076923077
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.847888765910349,
+            "service_ms_per_round": 0.8128565384615384
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 43.752575250836124,
+            "service_ms_per_round": 1.0063092307692307
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 11.116602564102564,
+            "service_ms_per_round": 0.20009884615384615
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 275.71015384615384,
+            "service_ms_per_round": 0.2757101538461538
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.457531772575251,
+            "service_ms_per_round": 0.1715232307692308
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 104.91946153846153,
+            "service_ms_per_round": 0.5245973076923077
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 277.9896153846154,
+            "service_ms_per_round": 0.27798961538461536
+          }
+        },
+        "means": {
+          "round_ms": 18.826081923076924,
+          "target_graph_ms": 14.947994384615384,
+          "target_kernel_union_ms": 13.616474846153846,
+          "target_inter_kernel_gap_ms": 1.3315195384615384,
+          "after_target_ms": 3.8780875384615383,
+          "after_target_kernel_union_ms": 3.268929846153846,
+          "after_target_inter_kernel_gap_ms": 0.6091576923076923,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.773538461538461,
+          "graph_boundary_idle_us": 348.6576153846154,
+          "draft_graph_end_to_next_target_us": 215.79876923076924,
+          "last_tail_graph_to_next_target_us": 215.79876923076924
+        },
+        "previous_output_batch": {
+          "projection_service_ms": 10.565824538461538,
+          "means": {
+            "round_ms": 21.082971846153846,
+            "target_graph_ms": 17.165003923076924,
+            "target_kernel_union_ms": 15.696188846153845,
+            "target_inter_kernel_gap_ms": 1.468815076923077,
+            "after_target_ms": 3.917967923076923,
+            "after_target_kernel_union_ms": 3.2784144615384614,
+            "after_target_inter_kernel_gap_ms": 0.6395534615384615,
+            "tail_kernel_count": 210,
+            "tail_last_kernel_to_next_target_us": 11.596230769230768,
+            "graph_boundary_idle_us": 373.73853846153844,
+            "draft_graph_end_to_next_target_us": 219.19876923076924,
+            "last_tail_graph_to_next_target_us": 219.19876923076924
+          }
+        }
+      },
+      {
+        "rank": 3,
+        "rounds": 13,
+        "projection_service_ms": 8.593690461538461,
+        "projection_roles": {
+          "qkvz+a_b": {
+            "calls_per_round": 48.0,
+            "us_per_call": 34.06272275641025,
+            "service_ms_per_round": 1.6350106923076924,
+            "weight_stream_bytes_per_call": 9924266.666666666,
+            "effective_weight_gbps": 291.3527123958117
+          },
+          "gdn_out": {
+            "calls_per_round": 48.0,
+            "us_per_call": 20.469971153846156,
+            "service_ms_per_round": 0.9825586153846154,
+            "weight_stream_bytes_per_call": 3932160.0,
+            "effective_weight_gbps": 192.0940664960916
+          },
+          "gate_up.native": {
+            "calls_per_round": 14.0,
+            "us_per_call": 62.681412087912086,
+            "service_ms_per_round": 0.8775397692307693,
+            "weight_stream_bytes_per_call": 14771931.42857143,
+            "effective_weight_gbps": 235.66685778957026
+          },
+          "down": {
+            "calls_per_round": 64.0,
+            "us_per_call": 29.025498798076924,
+            "service_ms_per_round": 1.8576319230769232,
+            "weight_stream_bytes_per_call": 10681440.0,
+            "effective_weight_gbps": 368.00194457666635
+          },
+          "gate_up.planes": {
+            "calls_per_round": 50.0,
+            "us_per_call": 47.055275384615385,
+            "service_ms_per_round": 2.3527637692307692,
+            "weight_stream_bytes_per_call": 20833894.4,
+            "effective_weight_gbps": 442.7536387729142
+          },
+          "attention.q+k+v": {
+            "calls_per_round": 16.0,
+            "us_per_call": 36.00343269230769,
+            "service_ms_per_round": 0.5760549230769231,
+            "weight_stream_bytes_per_call": 8780800.0,
+            "effective_weight_gbps": 243.88785577870914
+          },
+          "attention.o": {
+            "calls_per_round": 16.0,
+            "us_per_call": 19.508173076923075,
+            "service_ms_per_round": 0.3121307692307692,
+            "weight_stream_bytes_per_call": 3824640.0,
+            "effective_weight_gbps": 196.05321241097175
+          }
+        },
+        "target_aux_categories": {
+          "communication_or_reduction": {
+            "calls_per_round": 130.0,
+            "us_per_call": 10.925832544378698,
+            "service_ms_per_round": 1.4203582307692306
+          },
+          "rms_norm": {
+            "calls_per_round": 129.0,
+            "us_per_call": 5.987897435897436,
+            "service_ms_per_round": 0.7724387692307693
+          },
+          "GDN_state_or_gating": {
+            "calls_per_round": 144.0,
+            "us_per_call": 8.457738247863247,
+            "service_ms_per_round": 1.2179143076923078
+          },
+          "other_target": {
+            "calls_per_round": 128.0,
+            "us_per_call": 3.726155048076923,
+            "service_ms_per_round": 0.47694784615384617
+          },
+          "layout_or_copy": {
+            "calls_per_round": 37.0,
+            "us_per_call": 3.3306632016632016,
+            "service_ms_per_round": 0.12323453846153846
+          },
+          "attention": {
+            "calls_per_round": 32.0,
+            "us_per_call": 32.153509615384614,
+            "service_ms_per_round": 1.0289123076923077
+          }
+        },
+        "tail_categories": {
+          "other_tail": {
+            "calls_per_round": 139.0,
+            "us_per_call": 5.839433868289984,
+            "service_ms_per_round": 0.8116813076923076
+          },
+          "draft_GEMM": {
+            "calls_per_round": 23.0,
+            "us_per_call": 44.06875250836121,
+            "service_ms_per_round": 1.0135813076923077
+          },
+          "communication_or_reduction": {
+            "calls_per_round": 18.0,
+            "us_per_call": 10.665576923076923,
+            "service_ms_per_round": 0.19198038461538458
+          },
+          "target_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 275.5154615384615,
+            "service_ms_per_round": 0.2755154615384615
+          },
+          "sampling_and_sorting": {
+            "calls_per_round": 23.0,
+            "us_per_call": 7.416939799331104,
+            "service_ms_per_round": 0.17058961538461537
+          },
+          "draft_attention": {
+            "calls_per_round": 5.0,
+            "us_per_call": 104.31423076923078,
+            "service_ms_per_round": 0.5215711538461538
+          },
+          "draft_shared_head": {
+            "calls_per_round": 1.0,
+            "us_per_call": 278.12953846153846,
+            "service_ms_per_round": 0.2781295384615385
+          }
+        },
+        "means": {
+          "round_ms": 18.84253453846154,
+          "target_graph_ms": 14.963159769230769,
+          "target_kernel_union_ms": 13.617535846153846,
+          "target_inter_kernel_gap_ms": 1.3456239230769231,
+          "after_target_ms": 3.879374769230769,
+          "after_target_kernel_union_ms": 3.262782923076923,
+          "after_target_inter_kernel_gap_ms": 0.6165918461538461,
+          "tail_kernel_count": 210,
+          "tail_last_kernel_to_next_target_us": 11.143384615384615,
+          "graph_boundary_idle_us": 360.00053846153844,
+          "draft_graph_end_to_next_target_us": 217.49692307692308,
+          "last_tail_graph_to_next_target_us": 217.49692307692308
+        },
+        "previous_output_batch": {
+          "projection_service_ms": 10.522513923076923,
+          "means": {
+            "round_ms": 21.10212523076923,
+            "target_graph_ms": 17.184784076923076,
+            "target_kernel_union_ms": 15.726993076923076,
+            "target_inter_kernel_gap_ms": 1.457791,
+            "after_target_ms": 3.917341153846154,
+            "after_target_kernel_union_ms": 3.2890576153846154,
+            "after_target_inter_kernel_gap_ms": 0.6282835384615384,
+            "tail_kernel_count": 210,
+            "tail_last_kernel_to_next_target_us": 12.24853846153846,
+            "graph_boundary_idle_us": 362.88953846153845,
+            "draft_graph_end_to_next_target_us": 219.24276923076923,
+            "last_tail_graph_to_next_target_us": 219.24276923076923
+          }
+        }
+      }
+    ],
+    "raw_sha256": {
+      "trace-dmv.nsys-rep": "b8f1391106b3db4bb27044e4ad9527156cd9643de128ecadd522a22eacf67318",
+      "trace-dmv.sqlite": "b4393c1dc6e612b6b11637b003499aefce7ef0a87da165a258ec3c3f01b65653",
+      "trace-dmv.json": "85b690373e400c3da280fe57ba9202cae538b460ec7e7ea811423fa7c0d1336b",
+      "trace-projections.json": "cad1315f919f52caf6fbd09d0ca2a1f89526accb7140182a3887ea9dc96bab93",
+      "trace-clocks.csv": "6646686785aa0db98018ec6102e6451714dd344e32d379b8ef165b80982b5e73"
+    }
+  }
 }

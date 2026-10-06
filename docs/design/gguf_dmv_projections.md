@@ -115,6 +115,66 @@ repeating either model run. Model and clock evidence hashes, contract and
 per-prompt results are in
 [the matched NVLink data](data/gguf_dmv_nvlink_model_20261006.json).
 
+### One post-batch trace on the NVLink machine
+
+The single new capture uses the established diagnostic contract: 1K input,
+64 output, maximum length 32768, TP4, seven draft tokens, FP16 KV,
+temperature 0.7/top-p 0.95/top-k 20/seed 123 and first-target-GPU-node round
+boundaries. Sixteen M8 verifier replays per rank yield thirteen interior
+round intervals. The four clock samples within this short request all show
+1290/877 MHz. Nsight Systems 2024.6.2 graph-node tracing adds overhead;
+its 18.806 ms rank-0 interval is not the unprofiled 17.237 ms model result.
+
+| Rank | Traced round ms | Target graph ms | Target gaps ms | After target ms | Projection service ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 18.806 | 14.930 | 1.305 | 3.876 | 8.512 |
+| 1 | 18.826 | 14.953 | 1.301 | 3.873 | 8.630 |
+| 2 | 18.826 | 14.948 | 1.332 | 3.878 | 8.605 |
+| 3 | 18.843 | 14.963 | 1.346 | 3.879 | 8.594 |
+
+Rank-0 projection service decreases from the previous same-machine output
+batch's 10.542 to 8.512 ms, or 2.030 ms. The full traced round decreases
+from 21.043 to 18.806 ms and the target graph from 17.129 to 14.930 ms.
+The after-target envelope remains approximately 3.88 ms with 210 kernels;
+no draft-side optimization is claimed. The 6 ms projection-service goal
+remains unmet despite reaching the approximately 18 ms model-round goal.
+
+| Projection | Calls/round | us/call | Bytes/card/call | Effective GB/s | Service ms/round |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| qkvz with a/b | 48 | 34.078 | 9924267 | 291.2 | 1.636 |
+| GDN out | 48 | 20.254 | 3932160 | 194.1 | 0.972 |
+| gate/up existing reader | 14 | 62.635 | 14771931 | 235.8 | 0.877 |
+| down | 64 | 28.793 | 10681440 | 371.0 | 1.843 |
+| gate/up projection planes | 50 | 46.035 | 20833894 | 452.6 | 2.302 |
+| attention q/k/v | 16 | 36.054 | 8780800 | 243.5 | 0.577 |
+| attention o | 16 | 19.119 | 3824640 | 200.0 | 0.306 |
+
+Bytes are loaded operand footprints including fused floating rows; they
+exclude activation/workspace/codebook traffic. Effective bandwidth is not
+an NCU DRAM measurement. Per-role means include mixed types and fallbacks.
+
+Target communication/reduction is 130 calls at 11.501 us, or 1.495 ms;
+RMSNorm is 129 calls at 6.012 us, or 0.775 ms. Target inter-kernel gaps
+total 1.305 ms. Neither a fused communication epilogue nor a new small
+kernel fusion is added here.
+
+| After-target category | Calls/round | us/call | Service ms/round |
+| --- | ---: | ---: | ---: |
+| draft GEMM | 23 | 43.422 | 0.999 |
+| draft attention | 5 | 103.824 | 0.519 |
+| target head | 1 | 270.108 | 0.270 |
+| draft shared head | 1 | 273.094 | 0.273 |
+| sampling/sorting | 23 | 7.405 | 0.170 |
+| communication/reduction | 18 | 12.881 | 0.232 |
+| other tail | 139 | 5.782 | 0.804 |
+
+The two vocabulary heads remain distinct target and draft calls. Tail gaps
+total 0.609 ms; gaps between graph envelopes total 353.807 us, while draft
+graph end to the next target is 214.138 us. These gap definitions overlap
+and must not be summed with kernel service as independent wall time.
+Raw profile and SQLite evidence were retained once; GPU processes exited
+and all six agreed lock files were confirmed released.
+
 ## Earlier installed-wheel comparison with cross-NUMA links
 
 The ordinary SM70 wheel passed 41 GPU operator tests. The installed native
