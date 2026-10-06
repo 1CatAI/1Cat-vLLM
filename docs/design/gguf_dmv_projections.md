@@ -63,7 +63,59 @@ even if the actual weight remained finite; these layers retain canonical
 storage. Replacement is atomic across a fused projection, so a rejected shard
 never leaves a mixture of plane and canonical buffers for a legacy reader.
 
-## Installed-wheel model comparison
+## Matched model result on fully connected NVLink
+
+A same-wheel off/on comparison on four fully connected V100-SXM2-32GB
+cards measures **17.237 ms at 1K** and **18.345 ms at 8K** per complete
+speculative round. Controls measure 19.507/20.569 ms, reproducing the later
+19.512/20.557 ms historical baseline on this topology. The measured savings
+are 2.271 and 2.224 ms; these are end-to-end output timestamp intervals,
+not a sum of projection kernel measurements.
+
+All GPU pairs use NV2 links and share NUMA node 0. SM clocks are 1290 MHz,
+memory clocks 877 MHz and power limits 300 W. All 688 per-card clock samples
+within the sixteen-prompt timing windows match those values. Both arms use
+the ordinary `1.5.2.dev1003+gd6268878bb` wheel, with packaged native
+library hashes verified. No private kernel library or runtime override is
+used. The only changed policy is `sm70_gguf.projection_planes`.
+
+Use the same sixteen prompts, 600 timing tokens per prompt, temperature
+0.7/top-p 0.9/top-k 20/seed 123, thinking disabled, TP4 target and draft,
+seven probabilistic draft tokens, FP16 KV, FP32 SSM, Flash-V100 and CUDA
+graphs. Maximum length is 262144, batched-token budget 1024, maximum
+sequences four and prefix caching disabled. Omit the first twenty output
+rounds per prompt. Round means weight prompts equally; output-token latency
+pools retained intervals and emitted tokens.
+
+| Input | Off round ms | On round ms | Saving ms | Off tokens/round | On tokens/round | Off ms/output token | On ms/output token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1K | 19.507 | 17.237 | 2.271 | 2.921 | 2.852 | 6.707 | 6.065 |
+| 8K | 20.569 | 18.345 | 2.224 | 2.894 | 2.990 | 7.177 | 6.166 |
+
+Output-token rates improve from 149.11 to 164.88 tokens/s at 1K and from
+139.33 to 162.19 tokens/s at 8K. Draft acceptance fractions are
+27.333%/26.494% off/on at 1K and 26.606%/28.026% at 8K; acceptance
+lengths are reported separately instead of assuming identical outputs.
+Mean TTFT increases from 346.08 to 371.18 ms and from 2693.33 to
+2841.85 ms. Prefill/restoration cost therefore remains a limitation of the
+M8 storage route even though steady decode improves.
+
+Every rank admits 215 plane projections and seven temporary IQ2 down
+readers. Fourteen existing native gate/up readers remain as fallback.
+The control retains all sixty previously admitted native gate/up pairs.
+Both natural EOS checks stop normally, including the arithmetic answer
+`391`. C4 completes four requests; its 7.746 s cold smoke includes
+first-use compilation and is not a concurrency throughput benchmark.
+No new KL claim is made from this timing run; the unchanged wheel's
+distribution checks are recorded in the earlier comparison below.
+
+The remote controller completed both arms while new SSH connections were
+temporarily unavailable. The results were recovered without restarting or
+repeating either model run. Model and clock evidence hashes, contract and
+per-prompt results are in
+[the matched NVLink data](data/gguf_dmv_nvlink_model_20261006.json).
+
+## Earlier installed-wheel comparison with cross-NUMA links
 
 The ordinary SM70 wheel passed 41 GPU operator tests. The installed native
 libraries matched the packaged libraries by SHA-256; no private extension
