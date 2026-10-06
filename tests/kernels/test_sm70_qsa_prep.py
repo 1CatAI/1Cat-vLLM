@@ -56,5 +56,7 @@ def test_prep_matches_reference(tokens):
     torch.testing.assert_close(query.float(), q_ref.float(), atol=4e-3, rtol=4e-3)
     for t in range(1, tokens):
         b, o = divmod(int(slot[t]), BS)
-        torch.testing.assert_close(kc[b, o].float(), k_ref[t].float(), atol=4e-3, rtol=4e-3)
+        torch.testing.assert_close(
+            kc[b, o].float(), k_ref[t].float(), atol=4e-3, rtol=4e-3
+        )
         assert torch.equal(vc[b, o], v[t])

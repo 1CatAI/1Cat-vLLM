@@ -9,6 +9,7 @@ Per lane and K128 group (four 32-weight steps):
 Weight = fp16(d * (1 + 2 * nibble) / 8) * grid_value, sign applied as an exact bit
 flip. Grid table: 1024 entries x 8 bytes (two uint32 words per index).
 """
+
 import gguf.quants as Q
 import numpy as np
 
@@ -28,11 +29,15 @@ def pack_iq2s(raw):
     N = raw.shape[0]
     b = raw.reshape(N, -1, 82)
     nb = b.shape[1]
-    S, G, T = nb * 8, nb * 2, N // 32
+    G, T = nb * 2, N // 32
     assert N % 32 == 0
-    d = b[..., 0:2].copy().view(np.uint16)[..., 0].astype(np.uint32)  # (N, nb) fp16 bits
-    lo = b[..., 2:34].reshape(N, nb, 8, 4)        # 8 steps x 4 index bytes
-    sg = b[..., 34:66].reshape(N, nb, 8, 4)       # 8 steps x 4 sign bytes (one per 8 weights)
+    d = (
+        b[..., 0:2].copy().view(np.uint16)[..., 0].astype(np.uint32)
+    )  # (N, nb) fp16 bits
+    lo = b[..., 2:34].reshape(N, nb, 8, 4)  # 8 steps x 4 index bytes
+    sg = b[..., 34:66].reshape(
+        N, nb, 8, 4
+    )  # 8 steps x 4 sign bytes (one per 8 weights)
     qh = b[..., 66:74].reshape(N, nb, 8).astype(np.uint32)
     sc = b[..., 74:82].reshape(N, nb, 8).astype(np.uint32)
     lo_w = np.ascontiguousarray(lo).view(np.uint32).reshape(N, G, 4)  # word per step

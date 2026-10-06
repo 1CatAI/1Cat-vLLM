@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// QSA short-context decode attention for SM70 (contexts within the indexer budget, where QSA selects
-// every visible token). Dense causal paged attention over [0, pos] per query token, split-K
-// flash-decoding: grid (split, kv head, request); a CTA stacks the request's tokens x GROUP query
-// heads as up to 32 mma rows (wmma 16x16x16 fp16 -> fp32). Same arithmetic contract as
-// _qsa_sparse_paged_gqa_splitk_kernel: scores * d^-0.5 * log2(e), exp2 online softmax, fp16 P.V with
-// fp32 accumulation, fp16 output, then output * sigmoid(gate) in fp32.
+// QSA short-context decode attention for SM70 (contexts within the indexer
+// budget, where QSA selects every visible token). Dense causal paged attention
+// over [0, pos] per query token, split-K flash-decoding: grid (split, kv head,
+// request); a CTA stacks the request's tokens x GROUP query heads as up to 32
+// mma rows (wmma 16x16x16 fp16 -> fp32). Same arithmetic contract as
+// _qsa_sparse_paged_gqa_splitk_kernel: scores * d^-0.5 * log2(e), exp2 online
+// softmax, fp16 P.V with fp32 accumulation, fp16 output, then output *
+// sigmoid(gate) in fp32.
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
@@ -27,14 +29,16 @@ struct Args {
   const int* pos;
   half* out;
   const half* gate;
-  float* ws_o;  // [nreq][S][RT][D]
-  float* ws_ml; // [nreq][S][RT][2]
-  long long sq_row, sq_head, sk_block, sk_tok, sk_head, sv_block, sv_tok, sv_head, so_row, so_head, sg_row, sg_head;
+  float* ws_o;   // [nreq][S][RT][D]
+  float* ws_ml;  // [nreq][S][RT][2]
+  long long sq_row, sq_head, sk_block, sk_tok, sk_head, sv_block, sv_tok,
+      sv_head, so_row, so_head, sg_row, sg_head;
   int stab, T, G, HQ, BS, S;
   float scale_log2;
 };
 
-__device__ __forceinline__ void request_rows(const Args& a, int req, int& t0, int& nt) {
+__device__ __forceinline__ void request_rows(const Args& a, int req, int& t0,
+                                             int& nt) {
   t0 = -1;
   nt = 0;
   for (int t = 0; t < a.T; ++t)
@@ -47,15 +51,16 @@ __device__ __forceinline__ void request_rows(const Args& a, int req, int& t0, in
 template <int NW>
 __global__ void __launch_bounds__(32 * NW) partial(Args a) {
   extern __shared__ __align__(16) unsigned char smem[];
-  half* qs = reinterpret_cast<half*>(smem);       // [RT][QLD]
-  half* ks = qs + RT * QLD;                        // [KT][QLD]
-  half* vs = ks + KT * QLD;                        // [KT][QLD]
-  half* ps = vs + KT * QLD;                        // [RT][PLD]
+  half* qs = reinterpret_cast<half*>(smem);             // [RT][QLD]
+  half* ks = qs + RT * QLD;                             // [KT][QLD]
+  half* vs = ks + KT * QLD;                             // [KT][QLD]
+  half* ps = vs + KT * QLD;                             // [RT][PLD]
   float* ss = reinterpret_cast<float*>(ps + RT * PLD);  // [RT][SLD]
-  float* os = ss + RT * SLD;                       // [RT][OLD]
+  float* os = ss + RT * SLD;                            // [RT][OLD]
   __shared__ float m_r[RT], l_r[RT], al_r[RT];
   __shared__ int lim_r[RT];
-  const int split = blockIdx.x, kvh = blockIdx.y, req = blockIdx.z, tid = threadIdx.x, warp = tid / 32;
+  const int split = blockIdx.x, kvh = blockIdx.y, req = blockIdx.z,
+            tid = threadIdx.x, warp = tid / 32;
   int t0, nt;
   request_rows(a, req, t0, nt);
   const int rows = nt * a.G;
@@ -65,7 +70,8 @@ __global__ void __launch_bounds__(32 * NW) partial(Args a) {
     uint4 v = make_uint4(0, 0, 0, 0);
     if (r < rows) {
       const int t = t0 + r / a.G, h = kvh * a.G + r % a.G;
-      v = *reinterpret_cast<const uint4*>(a.q + t * a.sq_row + h * a.sq_head + c);
+      v = *reinterpret_cast<const uint4*>(a.q + t * a.sq_row + h * a.sq_head +
+                                          c);
     }
     *reinterpret_cast<uint4*>(qs + r * QLD + c) = v;
   }
@@ -90,8 +96,10 @@ __global__ void __launch_bounds__(32 * NW) partial(Args a) {
       uint4 kv = make_uint4(0, 0, 0, 0), vv = make_uint4(0, 0, 0, 0);
       if (key < k1) {
         const long long page = bt[key / a.BS], off = key % a.BS;
-        kv = *reinterpret_cast<const uint4*>(a.kc + page * a.sk_block + off * a.sk_tok + kvh * a.sk_head + c);
-        vv = *reinterpret_cast<const uint4*>(a.vc + page * a.sv_block + off * a.sv_tok + kvh * a.sv_head + c);
+        kv = *reinterpret_cast<const uint4*>(
+            a.kc + page * a.sk_block + off * a.sk_tok + kvh * a.sk_head + c);
+        vv = *reinterpret_cast<const uint4*>(
+            a.vc + page * a.sv_block + off * a.sv_tok + kvh * a.sv_head + c);
       }
       *reinterpret_cast<uint4*>(ks + j * QLD + c) = kv;
       *reinterpret_cast<uint4*>(vs + j * QLD + c) = vv;
@@ -109,7 +117,8 @@ __global__ void __launch_bounds__(32 * NW) partial(Args a) {
         wmma::load_matrix_sync(fb, ks + tc * 16 * QLD + k, QLD);
         wmma::mma_sync(acc, fa, fb, acc);
       }
-      wmma::store_matrix_sync(ss + tr * 16 * SLD + tc * 16, acc, SLD, wmma::mem_row_major);
+      wmma::store_matrix_sync(ss + tr * 16 * SLD + tc * 16, acc, SLD,
+                              wmma::mem_row_major);
     }
     __syncthreads();
     if (tid < RT) {  // online softmax for row tid over this tile
@@ -136,13 +145,15 @@ __global__ void __launch_bounds__(32 * NW) partial(Args a) {
       al_r[r] = alpha;
     }
     __syncthreads();
-    for (int i = tid; i < RT * D; i += blockDim.x) os[(i / D) * OLD + i % D] *= al_r[i / D];
+    for (int i = tid; i < RT * D; i += blockDim.x)
+      os[(i / D) * OLD + i % D] *= al_r[i / D];
     __syncthreads();
     // O += P V: 2 row tiles x 16 dim tiles, 8 per warp
     for (int tt = warp; tt < 2 * (D / 16); tt += NW) {
       const int tr = tt / (D / 16), tc = tt % (D / 16);
       wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-      wmma::load_matrix_sync(acc, os + tr * 16 * OLD + tc * 16, OLD, wmma::mem_row_major);
+      wmma::load_matrix_sync(acc, os + tr * 16 * OLD + tc * 16, OLD,
+                             wmma::mem_row_major);
 #pragma unroll
       for (int k = 0; k < KT; k += 16) {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> fa;
@@ -151,14 +162,20 @@ __global__ void __launch_bounds__(32 * NW) partial(Args a) {
         wmma::load_matrix_sync(fb, vs + k * QLD + tc * 16, QLD);
         wmma::mma_sync(acc, fa, fb, acc);
       }
-      wmma::store_matrix_sync(os + tr * 16 * OLD + tc * 16, acc, OLD, wmma::mem_row_major);
+      wmma::store_matrix_sync(os + tr * 16 * OLD + tc * 16, acc, OLD,
+                              wmma::mem_row_major);
     }
     __syncthreads();
   }
   // partials
-  float* wo = a.ws_o + ((static_cast<long long>(req) * gridDim.y + kvh) * a.S + split) * RT * D;
-  float* wml = a.ws_ml + ((static_cast<long long>(req) * gridDim.y + kvh) * a.S + split) * RT * 2;
-  for (int i = tid; i < RT * D; i += blockDim.x) wo[i] = os[(i / D) * OLD + i % D];
+  float* wo =
+      a.ws_o +
+      ((static_cast<long long>(req) * gridDim.y + kvh) * a.S + split) * RT * D;
+  float* wml =
+      a.ws_ml +
+      ((static_cast<long long>(req) * gridDim.y + kvh) * a.S + split) * RT * 2;
+  for (int i = tid; i < RT * D; i += blockDim.x)
+    wo[i] = os[(i / D) * OLD + i % D];
   if (tid < RT) {
     wml[tid * 2] = m_r[tid];
     wml[tid * 2 + 1] = l_r[tid];
@@ -180,11 +197,13 @@ __global__ void __launch_bounds__(D) merge(Args a) {
       if (l > 0.f) M = fmaxf(M, a.ws_ml[(base + s) * RT * 2 + r * 2]);
     }
 #pragma unroll
-    for (int o = 16; o; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+    for (int o = 16; o; o >>= 1)
+      M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
     float den = 0.f;
     for (int s = d; s < a.S; s += 32) {
       const float l = a.ws_ml[(base + s) * RT * 2 + r * 2 + 1];
-      const float w = l > 0.f ? exp2f(a.ws_ml[(base + s) * RT * 2 + r * 2] - M) : 0.f;
+      const float w =
+          l > 0.f ? exp2f(a.ws_ml[(base + s) * RT * 2 + r * 2] - M) : 0.f;
       w_s[s] = w;
       den += w * l;
     }
@@ -196,7 +215,8 @@ __global__ void __launch_bounds__(D) merge(Args a) {
   float num = 0.f;
   const float* op = a.ws_o + base * RT * D + r * D + d;
 #pragma unroll 8
-  for (int s = 0; s < a.S; ++s) num += w_s[s] * op[static_cast<long long>(s) * RT * D];
+  for (int s = 0; s < a.S; ++s)
+    num += w_s[s] * op[static_cast<long long>(s) * RT * D];
   const float den = s_den;
   const int t = t0 + r / a.G, h = kvh * a.G + r % a.G;
   float o = den > 0.f ? num / fmaxf(den, 1.0e-20f) : 0.f;
@@ -209,18 +229,25 @@ __global__ void __launch_bounds__(D) merge(Args a) {
 }
 }  // namespace qd
 
-void qsa_dense_decode_sm70_out(torch::Tensor out, torch::Tensor q, torch::Tensor kc, torch::Tensor vc,
-                              torch::Tensor block_table, torch::Tensor token_to_req, torch::Tensor pos,
-                              std::optional<torch::Tensor> gate, torch::Tensor ws_o, torch::Tensor ws_ml, int64_t nreq,
-                              int64_t splits, int64_t nw) {
+void qsa_dense_decode_sm70_out(torch::Tensor out, torch::Tensor q,
+                               torch::Tensor kc, torch::Tensor vc,
+                               torch::Tensor block_table,
+                               torch::Tensor token_to_req, torch::Tensor pos,
+                               std::optional<torch::Tensor> gate,
+                               torch::Tensor ws_o, torch::Tensor ws_ml,
+                               int64_t nreq, int64_t splits, int64_t nw) {
   qd::Args a{};
-  TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kFloat16 && kc.scalar_type() == torch::kFloat16 &&
-                  vc.scalar_type() == torch::kFloat16 && out.scalar_type() == torch::kFloat16,
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == torch::kFloat16 &&
+                  kc.scalar_type() == torch::kFloat16 &&
+                  vc.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16,
               "qsa dense decode requires FP16 tensors");
-  TORCH_CHECK(block_table.scalar_type() == torch::kInt32 && token_to_req.scalar_type() == torch::kInt32 &&
+  TORCH_CHECK(block_table.scalar_type() == torch::kInt32 &&
+                  token_to_req.scalar_type() == torch::kInt32 &&
                   pos.scalar_type() == torch::kInt32,
               "qsa dense decode requires int32 metadata");
-  TORCH_CHECK(kc.size(3) == qd::D && vc.size(3) == qd::D && q.size(2) == qd::D, "head size must be 256");
+  TORCH_CHECK(kc.size(3) == qd::D && vc.size(3) == qd::D && q.size(2) == qd::D,
+              "head size must be 256");
   const c10::cuda::CUDAGuard guard(q.device());
   TORCH_CHECK(q.size(2) == qd::D && kc.size(3) == qd::D);
   a.q = reinterpret_cast<const half*>(q.data_ptr());
@@ -254,12 +281,16 @@ void qsa_dense_decode_sm70_out(torch::Tensor out, torch::Tensor q, torch::Tensor
   a.G = a.HQ / HK;
   a.BS = kc.size(1);
   a.S = splits;
-  a.scale_log2 = (1.0f / sqrtf(static_cast<float>(qd::D))) * 1.4426950408889634f;
-  TORCH_CHECK(a.G * 5 <= qd::RT || a.T <= qd::RT / a.G, "rows per request must fit in 32");
+  a.scale_log2 =
+      (1.0f / sqrtf(static_cast<float>(qd::D))) * 1.4426950408889634f;
+  TORCH_CHECK(a.G * 5 <= qd::RT || a.T <= qd::RT / a.G,
+              "rows per request must fit in 32");
   TORCH_CHECK(splits <= 128, "splits");
-  TORCH_CHECK(ws_o.numel() >= nreq * HK * splits * qd::RT * qd::D && ws_ml.numel() >= nreq * HK * splits * qd::RT * 2);
-  const size_t sm = (qd::RT * qd::QLD + 2 * qd::KT * qd::QLD + qd::RT * qd::PLD) * 2 +
-                    (qd::RT * qd::SLD + qd::RT * qd::OLD) * 4;
+  TORCH_CHECK(ws_o.numel() >= nreq * HK * splits * qd::RT * qd::D &&
+              ws_ml.numel() >= nreq * HK * splits * qd::RT * 2);
+  const size_t sm =
+      (qd::RT * qd::QLD + 2 * qd::KT * qd::QLD + qd::RT * qd::PLD) * 2 +
+      (qd::RT * qd::SLD + qd::RT * qd::OLD) * 4;
   auto st = at::cuda::getCurrentCUDAStream();
   auto go = [&](auto w) {
     constexpr int NWV = decltype(w)::value;
@@ -267,15 +298,19 @@ void qsa_dense_decode_sm70_out(torch::Tensor out, torch::Tensor q, torch::Tensor
     int dev = 0;
     cudaGetDevice(&dev);
     if (!init[dev & 15]) {
-      C10_CUDA_CHECK(cudaFuncSetAttribute(qd::partial<NWV>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sm)));
+      C10_CUDA_CHECK(cudaFuncSetAttribute(
+          qd::partial<NWV>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(sm)));
       init[dev & 15] = true;
     }
     qd::partial<NWV><<<dim3(splits, HK, nreq), 32 * NWV, sm, st>>>(a);
   };
-  if (nw == 16) go(std::integral_constant<int, 16>{});
-  else if (nw == 8) go(std::integral_constant<int, 8>{});
-  else go(std::integral_constant<int, 4>{});
+  if (nw == 16)
+    go(std::integral_constant<int, 16>{});
+  else if (nw == 8)
+    go(std::integral_constant<int, 8>{});
+  else
+    go(std::integral_constant<int, 4>{});
   qd::merge<<<dim3(qd::RT, HK, nreq), qd::D, 0, st>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-

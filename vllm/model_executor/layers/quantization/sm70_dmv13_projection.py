@@ -50,7 +50,7 @@ def _fp16_weight(layer) -> torch.Tensor | None:
     return None
 
 
-_PROJECTIONS: dict[str, "Dmv13Projection"] = {}
+_PROJECTIONS: dict[str, Dmv13Projection] = {}
 
 
 class Dmv13Projection:
@@ -69,7 +69,11 @@ class Dmv13Projection:
         for raw, qtype in shards:
             device = raw.device if raw.is_cuda else device
             fmt, q, s, m, gs = dense.decode(raw.detach().cpu().numpy(), qtype)
-            if q.shape[0] % 32 or q.shape[1] % 128 or (k is not None and k != q.shape[1]):
+            if (
+                q.shape[0] % 32
+                or q.shape[1] % 128
+                or (k is not None and k != q.shape[1])
+            ):
                 return
             k = q.shape[1]
             codes, high, scale = dense.pack(fmt, q, s, m, gs)
@@ -84,7 +88,9 @@ class Dmv13Projection:
             self.scale.append(torch.from_numpy(np.ascontiguousarray(scale)))
             self.formats.append(int(fmt))
             self.widths.append(int(q.shape[0]))
-        device = device or torch.device("cuda", torch.cuda.current_device())
+        device = device or torch.device(
+            "cuda", torch.accelerator.current_device_index()
+        )
         for name in ("codes", "high", "scale"):
             setattr(self, name, [t.to(device) for t in getattr(self, name)])
         self.k = k
@@ -110,7 +116,9 @@ class Dmv13Projection:
         for width in self.widths:
             views.append(out[:, start : start + width])
             start += width
-        extra_out = x.new_empty((m, self.extra.shape[0] if self.extra is not None else 0))
+        extra_out = x.new_empty(
+            (m, self.extra.shape[0] if self.extra is not None else 0)
+        )
         torch.ops._C.sm70_dmv13_out(
             x.contiguous(),
             self.codes,

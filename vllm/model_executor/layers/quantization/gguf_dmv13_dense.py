@@ -6,13 +6,16 @@
 Codes stay exact integers. Per-group coefficients are rounded to FP16 the same
 way as the canonical TurboMind path (scale*code+min evaluated in FP16).
 """
+
 import numpy as np
 
 Q4K, Q5K, Q6K, LUT4, Q8 = 0, 1, 2, 3, 4
 # GGUF type ids
 T_Q8_0, T_Q4_K, T_Q5_K, T_Q6_K, T_IQ4_NL, T_IQ4_XS = 8, 12, 13, 14, 20, 23
-KV = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
-              dtype=np.float32)
+KV = np.array(
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
+    dtype=np.float32,
+)
 
 
 def _f16(b):
@@ -33,7 +36,7 @@ def _k_scales(sc12):
 
 
 def decode(raw, gtype):
-    """raw: (N, row_bytes) uint8 -> (fmt, q (N,K) uint8, s (N,K/gs) f32, m or None, gs)."""
+    """Decode raw rows to format, integer codes, scales, minima and group size."""
     N = raw.shape[0]
     if gtype in (T_Q4_K, T_Q5_K):
         B = 144 if gtype == T_Q4_K else 176
@@ -50,18 +53,23 @@ def decode(raw, gtype):
             qs = b[..., 48:176]
         q = np.empty((N, nb, 256), np.uint8)
         for i in range(4):
-            c = qs[..., 32 * i:32 * i + 32]
+            c = qs[..., 32 * i : 32 * i + 32]
             lo = c & 0xF
             hi = c >> 4
             if qh is not None:
                 lo = lo | (((qh >> (2 * i)) & 1) << 4)
                 hi = hi | (((qh >> (2 * i + 1)) & 1) << 4)
-            q[..., 64 * i:64 * i + 32] = lo
-            q[..., 64 * i + 32:64 * i + 64] = hi
+            q[..., 64 * i : 64 * i + 32] = lo
+            q[..., 64 * i + 32 : 64 * i + 64] = hi
         s = d[..., None] * sc
         m = -dmin[..., None] * mn
-        return (Q4K if gtype == T_Q4_K else Q5K, q.reshape(N, -1), s.reshape(N, -1),
-                m.reshape(N, -1), 32)
+        return (
+            Q4K if gtype == T_Q4_K else Q5K,
+            q.reshape(N, -1),
+            s.reshape(N, -1),
+            m.reshape(N, -1),
+            32,
+        )
     if gtype == T_Q6_K:
         b = raw.reshape(N, -1, 210)
         nb = b.shape[1]
@@ -70,13 +78,13 @@ def decode(raw, gtype):
         d = _f16(b[..., 208:210])[..., 0]
         q = np.empty((N, nb, 256), np.uint8)
         for n in range(2):
-            l = ql[..., 64 * n:64 * n + 64]
-            h = qh[..., 32 * n:32 * n + 32]
+            low = ql[..., 64 * n : 64 * n + 64]
+            h = qh[..., 32 * n : 32 * n + 32]
             o = 128 * n
-            q[..., o:o + 32] = (l[..., :32] & 0xF) | (((h >> 0) & 3) << 4)
-            q[..., o + 32:o + 64] = (l[..., 32:] & 0xF) | (((h >> 2) & 3) << 4)
-            q[..., o + 64:o + 96] = (l[..., :32] >> 4) | (((h >> 4) & 3) << 4)
-            q[..., o + 96:o + 128] = (l[..., 32:] >> 4) | (((h >> 6) & 3) << 4)
+            q[..., o : o + 32] = (low[..., :32] & 0xF) | (((h >> 0) & 3) << 4)
+            q[..., o + 32 : o + 64] = (low[..., 32:] & 0xF) | (((h >> 2) & 3) << 4)
+            q[..., o + 64 : o + 96] = (low[..., :32] >> 4) | (((h >> 4) & 3) << 4)
+            q[..., o + 96 : o + 128] = (low[..., 32:] >> 4) | (((h >> 6) & 3) << 4)
         s = d[..., None] * sc
         return Q6K, q.reshape(N, -1), s.reshape(N, -1), None, 16
     if gtype == T_IQ4_XS:
@@ -89,11 +97,13 @@ def decode(raw, gtype):
         q = np.empty((N, nb, 256), np.uint8)
         s = np.empty((N, nb, 8), np.float32)
         for ib in range(8):
-            ls = ((sl[..., ib // 2] >> (4 * (ib % 2))) & 0xF) | (((sh >> (2 * ib)) & 3) << 4)
+            ls = ((sl[..., ib // 2] >> (4 * (ib % 2))) & 0xF) | (
+                ((sh >> (2 * ib)) & 3) << 4
+            )
             s[..., ib] = d * (ls - 32)
-            c = qs[..., 16 * ib:16 * ib + 16]
-            q[..., 32 * ib:32 * ib + 16] = c & 0xF
-            q[..., 32 * ib + 16:32 * ib + 32] = c >> 4
+            c = qs[..., 16 * ib : 16 * ib + 16]
+            q[..., 32 * ib : 32 * ib + 16] = c & 0xF
+            q[..., 32 * ib + 16 : 32 * ib + 32] = c >> 4
         return LUT4, q.reshape(N, -1), s.reshape(N, -1), None, 32
     if gtype == T_IQ4_NL:
         b = raw.reshape(N, -1, 18)
@@ -114,22 +124,36 @@ def reconstruct(fmt, q, s, m, gs):
     s16 = s.astype(np.float16)
     if fmt in (Q4K, Q5K):
         qf = q.astype(np.float16)
-        w = qf.reshape(q.shape[0], -1, gs) * s16[..., None] + m.astype(np.float16)[..., None]
+        w = (
+            qf.reshape(q.shape[0], -1, gs) * s16[..., None]
+            + m.astype(np.float16)[..., None]
+        )
         # fp16 fma: compute in fp32 then round once
-        w = (q.astype(np.float32).reshape(q.shape[0], -1, gs) * s16.astype(np.float32)[..., None]
-             + m.astype(np.float16).astype(np.float32)[..., None]).astype(np.float16)
+        w = (
+            q.astype(np.float32).reshape(q.shape[0], -1, gs)
+            * s16.astype(np.float32)[..., None]
+            + m.astype(np.float16).astype(np.float32)[..., None]
+        ).astype(np.float16)
     elif fmt == Q6K:
-        w = ((q.astype(np.float32) - 32).reshape(q.shape[0], -1, gs)
-             * s16.astype(np.float32)[..., None]).astype(np.float16)
+        w = (
+            (q.astype(np.float32) - 32).reshape(q.shape[0], -1, gs)
+            * s16.astype(np.float32)[..., None]
+        ).astype(np.float16)
     elif fmt == LUT4:
-        w = (KV[q].reshape(q.shape[0], -1, gs) * s16.astype(np.float32)[..., None]).astype(np.float16)
+        w = (
+            KV[q].reshape(q.shape[0], -1, gs) * s16.astype(np.float32)[..., None]
+        ).astype(np.float16)
     else:
-        w = (q.view(np.int8).astype(np.float32).reshape(q.shape[0], -1, gs)
-             * s16.astype(np.float32)[..., None]).astype(np.float16)
+        w = (
+            q.view(np.int8).astype(np.float32).reshape(q.shape[0], -1, gs)
+            * s16.astype(np.float32)[..., None]
+        ).astype(np.float16)
     return w.reshape(q.shape[0], -1)
 
 
-ROWMAP = np.array([((L >> 2) & 3) * 8 + (L & 3) + (4 if L & 16 else 0) for L in range(32)])
+ROWMAP = np.array(
+    [((L >> 2) & 3) * 8 + (L & 3) + (4 if L & 16 else 0) for L in range(32)]
+)
 
 
 def pack(fmt, q, s, m, gs):
@@ -145,12 +169,12 @@ def pack(fmt, q, s, m, gs):
     Q = qp.reshape(T, 32, Sp, 32)[:, ROWMAP].astype(np.uint32)
     lo = Q & 0xF
     sp = np.zeros((T * 32, Sp * 32 // gs), np.float32)
-    sp[:N, :K // gs] = s
+    sp[:N, : K // gs] = s
     S16 = sp.astype(np.float16).view(np.uint16).astype(np.uint32)
     S16 = S16.reshape(T, 32, Sp, 32 // gs)[:, ROWMAP]
     if m is not None:
         mp = np.zeros_like(sp)
-        mp[:N, :K // gs] = m
+        mp[:N, : K // gs] = m
         M16 = mp.astype(np.float16).view(np.uint16).astype(np.uint32)
         M16 = M16.reshape(T, 32, Sp, 1)[:, ROWMAP]
     high = np.zeros(0, np.uint8)

@@ -117,7 +117,9 @@ class MTPQPN8Head(nn.Module):
                 False,
             )
             pairs = logits.new_empty((rows, 2), dtype=torch.float32)
-            partial = logits.new_empty((rows, (hot + 511) // 512, 2), dtype=torch.float32)
+            partial = logits.new_empty(
+                (rows, (hot + 511) // 512, 2), dtype=torch.float32
+            )
             torch.ops._C.qwen38_mtp_local_top1_sm70_out(pairs, partial, logits, hot, 0)
             local = pairs[:, 1].long()
             pairs[:, 1] = self.hot_ids[local].float()

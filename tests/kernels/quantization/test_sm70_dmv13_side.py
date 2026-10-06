@@ -44,8 +44,8 @@ class _Extra:
 @pytest.mark.parametrize("tokens", [1, 5, 8])
 def test_side_projection_matches_dequant(qtype, tokens):
     from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
-        Dmv13Projection,
         _PROJECTIONS,
+        Dmv13Projection,
     )
 
     rng = np.random.default_rng(qtype + tokens)

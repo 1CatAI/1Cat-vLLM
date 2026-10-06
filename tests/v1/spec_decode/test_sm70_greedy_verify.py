@@ -32,7 +32,17 @@ def test_greedy_verify_matches_rejection_sample(num_reqs, match_rate):
     temperature = torch.zeros(num_reqs, device=dev)
     seeds = torch.zeros(num_reqs, device=dev, dtype=torch.int64)
     ref, ref_n = rejection_sample(
-        logits, None, draft, cu, pos, idx, expanded, local_pos, temperature, seeds, steps
+        logits,
+        None,
+        draft,
+        cu,
+        pos,
+        idx,
+        expanded,
+        local_pos,
+        temperature,
+        seeds,
+        steps,
     )
     out, out_n = greedy_verify(target, draft, cu, steps)
     assert torch.equal(ref_n, out_n)

@@ -554,7 +554,9 @@ def _maybe_fuse_sm70_side_projections(model: nn.Module) -> None:
                 fused += 1
         else:
             attn = layer.self_attn
-            if attach(attn.qkv_proj, attn.indexer.index_qk_proj, "sm70_side_projection"):
+            if attach(
+                attn.qkv_proj, attn.indexer.index_qk_proj, "sm70_side_projection"
+            ):
                 attn.sm70_side_projection = attn.qkv_proj.sm70_side_projection
                 fused += 1
     logger.info_once("SM70 fused side projections attached to %d layers.", fused)

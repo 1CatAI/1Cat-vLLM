@@ -668,10 +668,11 @@ class EagleSpeculator:
         finally:
             self._mtp_decode_end()
 
-        if getattr(self, "multistep_cudagraph_manager", None) is not None:
+        multistep = getattr(self, "multistep_cudagraph_manager", None)
+        if multistep is not None:
             self._mtp_decode_begin()
             try:
-                self.multistep_cudagraph_manager.capture(
+                multistep.capture(
                     self._generate_all_draft_steps,
                     self.model_state,
                     self.input_buffers,
@@ -682,7 +683,7 @@ class EagleSpeculator:
                 )
                 logger.info(
                     "Captured %d single-graph MTP draft decode shapes.",
-                    len(self.multistep_cudagraph_manager.graphs),
+                    len(multistep.graphs),
                 )
             finally:
                 self._mtp_decode_end()

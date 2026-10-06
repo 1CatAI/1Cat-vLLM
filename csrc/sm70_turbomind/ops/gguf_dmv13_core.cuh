@@ -13,23 +13,35 @@
 #include <cstdint>
 #include <vector>
 #ifndef DMV_IQ4_PRMT
-#define DMV_IQ4_PRMT 1
+  #define DMV_IQ4_PRMT 1
 #endif
 #ifndef DMV_FULLK
-#define DMV_FULLK 1
+  #define DMV_FULLK 1
 #endif
 #ifndef DMV_PROBE
-#define DMV_PROBE 0
+  #define DMV_PROBE 0
 #endif
 
 namespace {
 
-enum Fmt { Q4K = 0, Q5K = 1, Q6K = 2, LUT4 = 3, Q8 = 4, IQ3S = 5, IQ3X = 6, IQ2S = 7 };
+enum Fmt {
+  Q4K = 0,
+  Q5K = 1,
+  Q6K = 2,
+  LUT4 = 3,
+  Q8 = 4,
+  IQ3S = 5,
+  IQ3X = 6,
+  IQ2S = 7
+};
 constexpr bool is_iq3(int f) { return f == IQ3S || f == IQ3X; }
-constexpr int TAB_VECS = 192;  // IQ3_S grid (512 words) then IQ3_XXS grid (256 words)
+constexpr int TAB_VECS =
+    192;  // IQ3_S grid (512 words) then IQ3_XXS grid (256 words)
 constexpr int TAB_VECS_IQ2S = 512;  // IQ2_S grid: 1024 entries x 2 words
 template <int F>
-constexpr int tab_vecs() { return F == IQ2S ? TAB_VECS_IQ2S : TAB_VECS; }
+constexpr int tab_vecs() {
+  return F == IQ2S ? TAB_VECS_IQ2S : TAB_VECS;
+}
 constexpr int MAXSEG = 4;
 
 struct Seg {
@@ -53,12 +65,13 @@ struct Segs {
   int ab_n;
   int ab_ld;
   int main_tiles;
-  int pair;      // segs 0/1 = gate/up of equal n; TN must be 2
-  half* hout;    // [M, hld] silu(gate) * up
+  int pair;    // segs 0/1 = gate/up of equal n; TN must be 2
+  half* hout;  // [M, hld] silu(gate) * up
   int hld;
   const half* sgate;  // optional: out = fp16(fp16(acc) * sigmoid(sgate[token]))
-  // Optional fused argmax over the (FP16-rounded) outputs of segment 0, per token:
-  // key = order(fp16) << 32 | (~row); max key = largest logit, lowest row on ties.
+  // Optional fused argmax over the (FP16-rounded) outputs of segment 0, per
+  // token: key = order(fp16) << 32 | (~row); max key = largest logit, lowest
+  // row on ties.
   unsigned long long* amax_ws;   // [main_tiles][8]
   unsigned long long* amax_out;  // [8]
   int* amax_cnt;
@@ -67,7 +80,8 @@ struct Segs {
 __device__ __forceinline__ unsigned long long amax_key(float val, int row) {
   const unsigned short b = __half_as_ushort(__float2half_rn(val));
   const unsigned u = (b & 0x8000u) ? (~b & 0xFFFFu) : (b | 0x8000u);
-  return (static_cast<unsigned long long>(u) << 32) | (0xFFFFFFFFu - static_cast<unsigned>(row));
+  return (static_cast<unsigned long long>(u) << 32) |
+         (0xFFFFFFFFu - static_cast<unsigned>(row));
 }
 
 __device__ __forceinline__ void mma(float (&d)[8], uint32_t a0, uint32_t a1,
@@ -102,8 +116,10 @@ __device__ __forceinline__ half2 hi2(uint32_t v) {
 }
 template <int S>
 __device__ __forceinline__ uint32_t shf(uint32_t x) {
-  if constexpr (S >= 0) return x >> S;
-  else return x << (-S);
+  if constexpr (S >= 0)
+    return x >> S;
+  else
+    return x << (-S);
 }
 
 template <int FMT>
@@ -130,18 +146,22 @@ __device__ __forceinline__ void load(Ld<FMT>& L, const Seg& s, int t, int g,
   }
   if constexpr (is_iq3(FMT)) {
 #pragma unroll
-    for (int j = 0; j < 3; ++j) L.c[j][0] = __ldcs(s.codes + (tg * 3 + j) * 32 + lane);
+    for (int j = 0; j < 3; ++j)
+      L.c[j][0] = __ldcs(s.codes + (tg * 3 + j) * 32 + lane);
     if constexpr (FMT == IQ3S) {
-      const uint2 m = __ldcs(reinterpret_cast<const uint2*>(s.scale) + tg * 32 + lane);
+      const uint2 m =
+          __ldcs(reinterpret_cast<const uint2*>(s.scale) + tg * 32 + lane);
       L.sc.x = m.x;
       L.sc.y = m.y;
     } else {
-      L.sc.y = __ldcs(reinterpret_cast<const unsigned int*>(s.scale) + tg * 32 + lane);
+      L.sc.y = __ldcs(reinterpret_cast<const unsigned int*>(s.scale) + tg * 32 +
+                      lane);
     }
     return;
   }
   if constexpr (FMT == LUT4) {
-    const uint2 m = __ldcs(reinterpret_cast<const uint2*>(s.scale) + tg * 32 + lane);
+    const uint2 m =
+        __ldcs(reinterpret_cast<const uint2*>(s.scale) + tg * 32 + lane);
     L.sc.x = m.x;
     L.sc.y = m.y;
   } else {
@@ -160,7 +180,8 @@ __device__ __forceinline__ void load(Ld<FMT>& L, const Seg& s, int t, int g,
 #pragma unroll
       for (int j = 0; j < CW<FMT>::v; ++j)
         L.c[st][j] = __ldcs(
-            s.codes + ((static_cast<size_t>(t) * Sp + sidx) * CW<FMT>::v + j) * 32 +
+            s.codes +
+            ((static_cast<size_t>(t) * Sp + sidx) * CW<FMT>::v + j) * 32 +
             lane);
     }
   }
@@ -172,34 +193,44 @@ __device__ __forceinline__ uint32_t word(const uint4& v, int i) {
 
 // Decode one 32-weight step into 16 half2 in k order.
 template <int FMT>
-__device__ __forceinline__ void decode(const Ld<FMT>& L, int st, uint32_t (&hw)[16],
-                                       const half2* lut) {
+__device__ __forceinline__ void decode(const Ld<FMT>& L, int st,
+                                       uint32_t (&hw)[16], const half2* lut) {
   const uint32_t MAGIC = 0x64006400u;
   if constexpr (FMT == IQ2S) {
     const uint32_t* grid = reinterpret_cast<const uint32_t*>(lut);
     const uint32_t lo = word(L.c[0][0], st), sg = word(L.c[1][0], st);
     const uint32_t hb = (L.sc.x >> (8 * st)) & 255u;
-    const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(L.sc.y & 0xffffu)));
+    const float d = __half2float(
+        __ushort_as_half(static_cast<unsigned short>(L.sc.y & 0xffffu)));
     const uint32_t nb = (L.sc.z >> (8 * st)) & 255u;
 #pragma unroll
     for (int half16 = 0; half16 < 2; ++half16) {
-      const float sf = d * static_cast<float>(1 + 2 * ((nb >> (4 * half16)) & 15u)) * 0.125f;
+      const float sf =
+          d * static_cast<float>(1 + 2 * ((nb >> (4 * half16)) & 15u)) * 0.125f;
       const half2 s2 = __float2half2_rn(sf);
-      const half2 nb2 = __float2half2_rn(-1024.0f * __half2float(__low2half(s2)));
+      const half2 nb2 =
+          __float2half2_rn(-1024.0f * __half2float(__low2half(s2)));
 #pragma unroll
       for (int qq = 0; qq < 2; ++qq) {
         const int q = half16 * 2 + qq;  // index q covers weights 8q .. 8q+7
-        const uint32_t idx = ((lo >> (8 * q)) & 255u) | (((hb >> (2 * q)) & 3u) << 8);
+        const uint32_t idx =
+            ((lo >> (8 * q)) & 255u) | (((hb >> (2 * q)) & 3u) << 8);
         const uint32_t g0 = grid[2 * idx], g1 = grid[2 * idx + 1];
 #pragma unroll
         for (int w = 0; w < 2; ++w) {
           const uint32_t gw = w ? g1 : g0;
           uint32_t a, b;
-          asm("prmt.b32 %0, %1, %2, 0x4140;" : "=r"(a) : "r"(gw), "r"(0x64646464u));
-          asm("prmt.b32 %0, %1, %2, 0x4342;" : "=r"(b) : "r"(gw), "r"(0x64646464u));
+          asm("prmt.b32 %0, %1, %2, 0x4140;"
+              : "=r"(a)
+              : "r"(gw), "r"(0x64646464u));
+          asm("prmt.b32 %0, %1, %2, 0x4342;"
+              : "=r"(b)
+              : "r"(gw), "r"(0x64646464u));
           const int k = 8 * q + 4 * w;  // weights k .. k+3
-          const uint32_t ma = (((sg >> k) & 1u) << 15) | (((sg >> (k + 1)) & 1u) << 31);
-          const uint32_t mb = (((sg >> (k + 2)) & 1u) << 15) | (((sg >> (k + 3)) & 1u) << 31);
+          const uint32_t ma =
+              (((sg >> k) & 1u) << 15) | (((sg >> (k + 1)) & 1u) << 31);
+          const uint32_t mb =
+              (((sg >> (k + 2)) & 1u) << 15) | (((sg >> (k + 3)) & 1u) << 31);
           hw[k / 2] = u32(__hfma2(h2(a), s2, nb2)) ^ ma;
           hw[k / 2 + 1] = u32(__hfma2(h2(b), s2, nb2)) ^ mb;
         }
@@ -208,7 +239,8 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st, uint32_t (&hw)[
     return;
   }
   if constexpr (is_iq3(FMT)) {
-    const uint32_t* grid = reinterpret_cast<const uint32_t*>(lut) + (FMT == IQ3X ? 512 : 0);
+    const uint32_t* grid =
+        reinterpret_cast<const uint32_t*>(lut) + (FMT == IQ3X ? 512 : 0);
     const uint4& I = L.c[st >> 1][0];
     const uint32_t w0 = (st & 1) ? I.z : I.x, w1 = (st & 1) ? I.w : I.y;
     // Sign word: bit p = weight 2p, bit 16+p = weight 2p+1 of this step.
@@ -216,14 +248,18 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st, uint32_t (&hw)[
     const uint32_t dsw = L.sc.y;
     const uint32_t hs = FMT == IQ3S ? ((L.sc.x >> (8 * st)) & 255u) << 8 : 0u;
     const uint32_t nib = (dsw >> (16 + 4 * st)) & 15u;
-    const float sf = __half2float(__ushort_as_half(static_cast<unsigned short>(dsw & 0xffffu))) *
-                     static_cast<float>(1 + 2 * nib) * (FMT == IQ3X ? 0.25f : 1.0f);
+    const float sf =
+        __half2float(
+            __ushort_as_half(static_cast<unsigned short>(dsw & 0xffffu))) *
+        static_cast<float>(1 + 2 * nib) * (FMT == IQ3X ? 0.25f : 1.0f);
     const half2 s2 = __float2half2_rn(sf);
     const half2 nb2 = __float2half2_rn(-1024.0f * __half2float(__low2half(s2)));
 #pragma unroll
     for (int q = 0; q < 8; ++q) {
       uint32_t idx;
-      asm("prmt.b32 %0, %1, 0, %2;" : "=r"(idx) : "r"(q < 4 ? w0 : w1), "r"(0x4440u | (q & 3)));
+      asm("prmt.b32 %0, %1, 0, %2;"
+          : "=r"(idx)
+          : "r"(q < 4 ? w0 : w1), "r"(0x4440u | (q & 3)));
       if constexpr (FMT == IQ3S) idx = lop_or(hs >> q, 0x100u, idx);
 #if DMV_PROBE == 2
       const uint32_t gw = idx * 0x01010101u;
@@ -236,8 +272,12 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st, uint32_t (&hw)[
       const uint32_t va = u32(__hfma2(h2(a), s2, nb2));
       const uint32_t vb = u32(__hfma2(h2(b), s2, nb2));
       uint32_t ra, rb;  // r = v ^ ((sg << (15 - p)) & 0x80008000)
-      asm("lop3.b32 %0, %1, %2, %3, 0x78;" : "=r"(ra) : "r"(va), "r"(sg << (15 - 2 * q)), "r"(0x80008000u));
-      asm("lop3.b32 %0, %1, %2, %3, 0x78;" : "=r"(rb) : "r"(vb), "r"(sg << (14 - 2 * q)), "r"(0x80008000u));
+      asm("lop3.b32 %0, %1, %2, %3, 0x78;"
+          : "=r"(ra)
+          : "r"(va), "r"(sg << (15 - 2 * q)), "r"(0x80008000u));
+      asm("lop3.b32 %0, %1, %2, %3, 0x78;"
+          : "=r"(rb)
+          : "r"(vb), "r"(sg << (14 - 2 * q)), "r"(0x80008000u));
       hw[2 * q] = ra;
       hw[2 * q + 1] = rb;
     }
@@ -248,7 +288,8 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st, uint32_t (&hw)[
     const half2 s2 = lo2(sc), m2 = hi2(sc);
     uint32_t hb = 0;
     if constexpr (FMT == Q5K) hb = word(L.hi[0], st);
-    const uint32_t cr[4] = {L.c[st][0].x, L.c[st][0].y, L.c[st][0].z, L.c[st][0].w};
+    const uint32_t cr[4] = {L.c[st][0].x, L.c[st][0].y, L.c[st][0].z,
+                            L.c[st][0].w};
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
 #pragma unroll
@@ -269,7 +310,8 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st, uint32_t (&hw)[
     const uint4& hv = L.hi[st >> 1];
     const uint32_t hx = (st & 1) ? hv.z : hv.x;
     const uint32_t hy = (st & 1) ? hv.w : hv.y;
-    const uint32_t cr[4] = {L.c[st][0].x, L.c[st][0].y, L.c[st][0].z, L.c[st][0].w};
+    const uint32_t cr[4] = {L.c[st][0].x, L.c[st][0].y, L.c[st][0].z,
+                            L.c[st][0].w};
     const half2 bias = h2(0x64206420u);  // 1056 = 1024 + 32
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
@@ -277,7 +319,8 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st, uint32_t (&hw)[
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const int s = 2 * (4 * (c & 1) + j) - 4;
-        const uint32_t sh = s >= 0 ? (hb >> (s >= 0 ? s : 0)) : (hb << (s < 0 ? -s : 0));
+        const uint32_t sh =
+            s >= 0 ? (hb >> (s >= 0 ? s : 0)) : (hb << (s < 0 ? -s : 0));
         const uint32_t extra = lop_or(sh, 0x00300030u, MAGIC);
         const uint32_t h = lop_or(cr[c] >> (4 * j), 0x000f000fu, extra);
         hw[4 * c + j] = u32(__hmul2(__hsub2(h2(h), bias), c < 2 ? s0 : s1));
@@ -287,32 +330,48 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st, uint32_t (&hw)[
     // compact plane: word0 = s0 | s1 << 16, word1 = s2 | s3 << 16
     const uint32_t sw = (st & 2) ? L.sc.y : L.sc.x;
     uint32_t s2u;
-    asm("prmt.b32 %0, %1, 0, %2;" : "=r"(s2u) : "r"(sw), "r"((st & 1) ? 0x3232u : 0x1010u));
+    asm("prmt.b32 %0, %1, 0, %2;"
+        : "=r"(s2u)
+        : "r"(sw), "r"((st & 1) ? 0x3232u : 0x1010u));
     const half2 s2 = h2(s2u);
-    const uint32_t cr[4] = {L.c[st][0].x, L.c[st][0].y, L.c[st][0].z, L.c[st][0].w};
+    const uint32_t cr[4] = {L.c[st][0].x, L.c[st][0].y, L.c[st][0].z,
+                            L.c[st][0].w};
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
 #if DMV_IQ4_PRMT
       // kIQ4 + 128 as bytes; nibble bit 3 picks the upper table half.
-      const uint32_t T0 = 0x3F2D1801u, T1 = 0x766A5D4Fu, T2 = 0xA6998D81u, T3 = 0xF1D9C5B5u;
+      const uint32_t T0 = 0x3F2D1801u, T1 = 0x766A5D4Fu, T2 = 0xA6998D81u,
+                     T3 = 0xF1D9C5B5u;
       const half2 b1152 = h2(0x64806480u);
       const uint32_t q = cr[c];
       const uint32_t qm = q & 0x77777777u;
       uint32_t sel;
-      asm("lop3.b32 %0, %1, %2, %3, 0xEA;" : "=r"(sel) : "r"(q >> 1), "r"(0x44444444u), "r"(0x32103210u));
-#pragma unroll
+      asm("lop3.b32 %0, %1, %2, %3, 0xEA;"
+          : "=r"(sel)
+          : "r"(q >> 1), "r"(0x44444444u), "r"(0x32103210u));
+  #pragma unroll
       for (int i = 0; i < 2; ++i) {
         uint32_t lo, hi, v, a, b;
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(lo) : "r"(T0), "r"(T1), "r"(qm >> (16 * i)));
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(hi) : "r"(T2), "r"(T3), "r"(qm >> (16 * i)));
-        asm("prmt.b32 %0, %1, %2, %3;" : "=r"(v) : "r"(lo), "r"(hi), "r"(sel >> (16 * i)));
-        asm("prmt.b32 %0, %1, %2, 0x4140;" : "=r"(a) : "r"(v), "r"(0x64646464u));
-        asm("prmt.b32 %0, %1, %2, 0x4342;" : "=r"(b) : "r"(v), "r"(0x64646464u));
+        asm("prmt.b32 %0, %1, %2, %3;"
+            : "=r"(lo)
+            : "r"(T0), "r"(T1), "r"(qm >> (16 * i)));
+        asm("prmt.b32 %0, %1, %2, %3;"
+            : "=r"(hi)
+            : "r"(T2), "r"(T3), "r"(qm >> (16 * i)));
+        asm("prmt.b32 %0, %1, %2, %3;"
+            : "=r"(v)
+            : "r"(lo), "r"(hi), "r"(sel >> (16 * i)));
+        asm("prmt.b32 %0, %1, %2, 0x4140;"
+            : "=r"(a)
+            : "r"(v), "r"(0x64646464u));
+        asm("prmt.b32 %0, %1, %2, 0x4342;"
+            : "=r"(b)
+            : "r"(v), "r"(0x64646464u));
         hw[4 * c + 2 * i] = u32(__hmul2(__hsub2(h2(a), b1152), s2));
         hw[4 * c + 2 * i + 1] = u32(__hmul2(__hsub2(h2(b), b1152), s2));
       }
 #else
-#pragma unroll
+  #pragma unroll
       for (int b = 0; b < 4; ++b)
         hw[4 * c + b] = u32(__hmul2(lut[(cr[c] >> (8 * b)) & 0xff], s2));
 #endif
@@ -332,14 +391,14 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st, uint32_t (&hw)[
   }
 }
 
-__device__ __constant__ int8_t kIQ4[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
-                                           1,    13,   25,  38,  53,  69,  89,  113};
+__device__ __constant__ int8_t kIQ4[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 template <int FMT, int KW, int TN>
-__device__ __forceinline__ void body6(const Seg& sg, int t, bool on, int kslot, int pid, int g0,
-                                      int g1, int S, int G, const half* __restrict__ x, int ldx,
-                                      int M, uint4* xs, half2* lut, float (&acc)[8],
-                                      const uint4* __restrict__ tab, const int* rmap = nullptr) {
+__device__ __forceinline__ void body6(
+    const Seg& sg, int t, bool on, int kslot, int pid, int g0, int g1, int S,
+    int G, const half* __restrict__ x, int ldx, int M, uint4* xs, half2* lut,
+    float (&acc)[8], const uint4* __restrict__ tab, const int* rmap = nullptr) {
   constexpr int NT = 32 * KW * TN, PARTS = 4 / TN;
   const int lane = threadIdx.x % 32;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
@@ -353,16 +412,19 @@ __device__ __forceinline__ void body6(const Seg& sg, int t, bool on, int kslot, 
       const int idx = lane + 32 * (pid + TN * jj), c = idx >> 3, row = idx & 7;
       X[jj] = make_uint4(0, 0, 0, 0);
       if (row < M)
-        X[jj] = __ldg(reinterpret_cast<const uint4*>(x + (rmap ? rmap[row] : row) * ldx + gg * 128 + c * 8));
+        X[jj] = __ldg(reinterpret_cast<const uint4*>(
+            x + (rmap ? rmap[row] : row) * ldx + gg * 128 + c * 8));
     }
   };
   auto xstore = [&](int b) {
 #pragma unroll
-    for (int jj = 0; jj < PARTS; ++jj) slot[b * 128 + lane + 32 * (pid + TN * jj)] = X[jj];
+    for (int jj = 0; jj < PARTS; ++jj)
+      slot[b * 128 + lane + 32 * (pid + TN * jj)] = X[jj];
   };
   auto xsync = [&]() {
     if constexpr (TN > 1)
-      asm volatile("bar.sync %0, %1;" ::"r"(kslot + 1), "r"(TN * 32) : "memory");
+      asm volatile("bar.sync %0, %1;" ::"r"(kslot + 1), "r"(TN * 32)
+                   : "memory");
     else
       __syncwarp();
   };
@@ -370,10 +432,12 @@ __device__ __forceinline__ void body6(const Seg& sg, int t, bool on, int kslot, 
     if (on) load<FMT>(A, sg, t, g, S, G, lane);
     xload(g);
   }
-  static_assert(DMV_IQ4_PRMT, "pair mode needs the shared-memory-free IQ4 decode");
+  static_assert(DMV_IQ4_PRMT,
+                "pair mode needs the shared-memory-free IQ4 decode");
   if (tab != nullptr) {
     uint4* t4 = reinterpret_cast<uint4*>(lut);
-    for (int i = threadIdx.x; i < tab_vecs<FMT>(); i += NT) t4[i] = __ldg(tab + i);
+    for (int i = threadIdx.x; i < tab_vecs<FMT>(); i += NT)
+      t4[i] = __ldg(tab + i);
   }
   __syncthreads();
   if (g >= g1) return;
@@ -413,15 +477,17 @@ __device__ __forceinline__ void body6(const Seg& sg, int t, bool on, int kslot, 
   }
 }
 
-__device__ __forceinline__ void write_out(const Seg& sg, int t, int v, float val,
-                                          int M, const half* sgate = nullptr) {
+__device__ __forceinline__ void write_out(const Seg& sg, int t, int v,
+                                          float val, int M,
+                                          const half* sgate = nullptr) {
   const int lv = v >> 3, i = v & 7;
   const int token = (i & 2) | ((lv & 16) ? 4 : 0) | (lv & 1);
   const int col = (i & 1) | (((lv >> 1) & 1) << 1) | ((i >> 2) << 2);
   const int row = t * 32 + ((lv >> 2) & 3) * 8 + col;
   if (token < M && row < sg.n) {
     if (sgate != nullptr) {
-      const float gate = 1.0f / (1.0f + __expf(-__half2float(__ldcg(sgate + token))));
+      const float gate =
+          1.0f / (1.0f + __expf(-__half2float(__ldcg(sgate + token))));
       val = __half2float(__float2half_rn(val)) * gate;
     }
     sg.out[token * sg.out_ld + row] = __float2half_rn(val);
@@ -429,12 +495,14 @@ __device__ __forceinline__ void write_out(const Seg& sg, int t, int v, float val
 }
 
 // Extra CTAs: one warp per row, out[m, r] = sum_k x[m, k] * w[r, k] in FP32.
-__device__ __forceinline__ void ab_row(const Segs& segs, const half* __restrict__ x, int ldx,
+__device__ __forceinline__ void ab_row(const Segs& segs,
+                                       const half* __restrict__ x, int ldx,
                                        int M, int K, int row) {
   const int lane = threadIdx.x % 32;
   float acc[8] = {};
   for (int k = lane * 8; k < K; k += 256) {
-    const uint4 wv = __ldcs(reinterpret_cast<const uint4*>(segs.ab_w + (size_t)row * K + k));
+    const uint4 wv =
+        __ldcs(reinterpret_cast<const uint4*>(segs.ab_w + (size_t)row * K + k));
     const half2* wh = reinterpret_cast<const half2*>(&wv);
     float2 wf[4];
 #pragma unroll
@@ -458,14 +526,15 @@ __device__ __forceinline__ void ab_row(const Segs& segs, const half* __restrict_
     float v = acc[m];
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    if (lane == 0 && m < M) segs.ab_out[(size_t)m * segs.ab_ld + row] = __float2half_rn(v);
+    if (lane == 0 && m < M)
+      segs.ab_out[(size_t)m * segs.ab_ld + row] = __float2half_rn(v);
   }
 }
 
 template <int KW, int TN, int FA, int FB>
-__global__ void __launch_bounds__(32 * KW * TN) dense_mv(Segs segs, const half* __restrict__ x,
-                                                         int ldx, int M, int K, int S, int G,
-                                                         int split, float* ws, int* cnt) {
+__global__ void __launch_bounds__(32 * KW * TN)
+    dense_mv(Segs segs, const half* __restrict__ x, int ldx, int M, int K,
+             int S, int G, int split, float* ws, int* cnt) {
   constexpr int W = KW * TN;
   extern __shared__ uint4 smem[];
   __shared__ int last;
@@ -492,9 +561,11 @@ __global__ void __launch_bounds__(32 * KW * TN) dense_mv(Segs segs, const half* 
   half2* lut = reinterpret_cast<half2*>(smem + KW * 256);
   float acc[8] = {};
   if (FA == FB || sg.fmt == FA)
-    body6<FA, KW, TN>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut, acc, segs.tab);
+    body6<FA, KW, TN>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut,
+                      acc, segs.tab);
   else
-    body6<FB, KW, TN>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut, acc, segs.tab);
+    body6<FB, KW, TN>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut,
+                      acc, segs.tab);
   __syncthreads();
   float* red = reinterpret_cast<float*>(smem);
 #pragma unroll
@@ -510,7 +581,8 @@ __global__ void __launch_bounds__(32 * KW * TN) dense_mv(Segs segs, const half* 
       if (token < M && row < segs.s[0].n) {
         const float gf = __half2float(__float2half_rn(g));
         const float uf = __half2float(__float2half_rn(u));
-        segs.hout[(size_t)token * segs.hld + row] = __float2half_rn(gf / (1.0f + __expf(-gf)) * uf);
+        segs.hout[(size_t)token * segs.hld + row] =
+            __float2half_rn(gf / (1.0f + __expf(-gf)) * uf);
       }
     };
     for (int v = threadIdx.x; v < PP * 256; v += 32 * W) {
@@ -521,10 +593,13 @@ __global__ void __launch_bounds__(32 * KW * TN) dense_mv(Segs segs, const half* 
         g += red[(k * TN + pt) * 256 + e];
         u += red[(k * TN + PP + pt) * 256 + e];
       }
-      if (split == 1) write_h(v, g, u);
+      if (split == 1)
+        write_h(v, g, u);
       else {
         __stcg(ws + (static_cast<size_t>(tg) * split + sp) * PP * 512 + v, g);
-        __stcg(ws + (static_cast<size_t>(tg) * split + sp) * PP * 512 + PP * 256 + v, u);
+        __stcg(ws + (static_cast<size_t>(tg) * split + sp) * PP * 512 +
+                   PP * 256 + v,
+               u);
       }
     }
     if (split == 1) return;
@@ -540,7 +615,8 @@ __global__ void __launch_bounds__(32 * KW * TN) dense_mv(Segs segs, const half* 
       float g = 0.f, u = 0.f;
       for (int p = 0; p < split; ++p) {
         g += __ldcg(ws + (static_cast<size_t>(tg) * split + p) * PP * 512 + v);
-        u += __ldcg(ws + (static_cast<size_t>(tg) * split + p) * PP * 512 + PP * 256 + v);
+        u += __ldcg(ws + (static_cast<size_t>(tg) * split + p) * PP * 512 +
+                    PP * 256 + v);
       }
       write_h(v, g, u);
     }
@@ -576,10 +652,13 @@ __global__ void __launch_bounds__(32 * KW * TN) dense_mv(Segs segs, const half* 
   }
   if (am) {
     __syncthreads();
-    if (threadIdx.x < M) segs.amax_ws[static_cast<size_t>(tg) * 8 + threadIdx.x] = tmax[threadIdx.x];
+    if (threadIdx.x < M)
+      segs.amax_ws[static_cast<size_t>(tg) * 8 + threadIdx.x] =
+          tmax[threadIdx.x];
     __threadfence();
     __syncthreads();
-    if (threadIdx.x == 0) alast = atomicAdd(segs.amax_cnt, 1) == segs.main_tiles - 1;
+    if (threadIdx.x == 0)
+      alast = atomicAdd(segs.amax_cnt, 1) == segs.main_tiles - 1;
     __syncthreads();
     if (!alast) return;
     __threadfence();
@@ -587,7 +666,8 @@ __global__ void __launch_bounds__(32 * KW * TN) dense_mv(Segs segs, const half* 
     for (int tok = threadIdx.x / 32; tok < M; tok += W) {
       unsigned long long best = 0ull;
       for (int t2 = lane; t2 < segs.main_tiles; t2 += 32) {
-        const unsigned long long k2 = __ldcg(segs.amax_ws + static_cast<size_t>(t2) * 8 + tok);
+        const unsigned long long k2 =
+            __ldcg(segs.amax_ws + static_cast<size_t>(t2) * 8 + tok);
         best = k2 > best ? k2 : best;
       }
 #pragma unroll
@@ -613,7 +693,10 @@ __global__ void __launch_bounds__(32 * KW * TN) dense_mv(Segs segs, const half* 
     float pv[8];
 #pragma unroll
     for (int p = 0; p < 8; ++p)
-      pv[p] = p < split ? __ldcg(ws + (static_cast<size_t>(tg) * split + p) * TN * 256 + v) : 0.f;
+      pv[p] = p < split
+                  ? __ldcg(ws +
+                           (static_cast<size_t>(tg) * split + p) * TN * 256 + v)
+                  : 0.f;
     float s = 0.f;
 #pragma unroll
     for (int p = 0; p < 8; ++p) s += pv[p];
@@ -623,18 +706,21 @@ __global__ void __launch_bounds__(32 * KW * TN) dense_mv(Segs segs, const half* 
 }
 
 template <int KW, int TN, int FA, int FB>
-void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S, int G,
-            int split, float* ws, int* cnt, int tiles, cudaStream_t st) {
+void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
+            int G, int split, float* ws, int* cnt, int tiles, cudaStream_t st) {
   constexpr int W = KW * TN;
   const size_t xs_bytes = static_cast<size_t>(KW) * 256 * 16 + TAB_VECS * 16;
   const size_t red_bytes = static_cast<size_t>(W) * 256 * 4;
   const size_t smem = xs_bytes > red_bytes ? xs_bytes : red_bytes;
   static bool init = false;
   if (!init) {
-    cudaFuncSetAttribute(dense_mv<KW, TN, FA, FB>, cudaFuncAttributeMaxDynamicSharedMemorySize, 90 * 1024);
+    cudaFuncSetAttribute(dense_mv<KW, TN, FA, FB>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         90 * 1024);
     init = true;
   }
-  dense_mv<KW, TN, FA, FB><<<dim3(tiles, split), 32 * W, smem, st>>>(segs, x, ldx, M, K, S, G, split, ws, cnt);
+  dense_mv<KW, TN, FA, FB><<<dim3(tiles, split), 32 * W, smem, st>>>(
+      segs, x, ldx, M, K, S, G, split, ws, cnt);
   const cudaError_t e = cudaGetLastError();
   TORCH_CHECK(e == cudaSuccess, "dense_mv launch: ", cudaGetErrorString(e));
 }
@@ -642,22 +728,26 @@ void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S, int G
 }  // namespace
 
 // codes/high/scale: per segment planes; out: per segment [M, n] views.
-inline void run(torch::Tensor x, std::vector<torch::Tensor> codes, std::vector<torch::Tensor> high,
-         std::vector<torch::Tensor> scale, std::vector<torch::Tensor> out,
-         std::vector<int64_t> fmt, std::vector<int64_t> n, int64_t K, int64_t split,
-         int64_t warps, torch::Tensor ws, torch::Tensor cnt, int64_t tp,
-         std::optional<torch::Tensor> sgate = std::nullopt,
-         std::optional<torch::Tensor> tab = std::nullopt,
-         std::optional<torch::Tensor> ab_w = std::nullopt,
-         std::optional<torch::Tensor> ab_out = std::nullopt,
-         std::optional<torch::Tensor> pair_out = std::nullopt,
-         std::optional<torch::Tensor> amax_ws = std::nullopt,
-         std::optional<torch::Tensor> amax_out = std::nullopt,
-         std::optional<torch::Tensor> amax_cnt = std::nullopt) {
+inline void run(torch::Tensor x, std::vector<torch::Tensor> codes,
+                std::vector<torch::Tensor> high,
+                std::vector<torch::Tensor> scale,
+                std::vector<torch::Tensor> out, std::vector<int64_t> fmt,
+                std::vector<int64_t> n, int64_t K, int64_t split, int64_t warps,
+                torch::Tensor ws, torch::Tensor cnt, int64_t tp,
+                std::optional<torch::Tensor> sgate = std::nullopt,
+                std::optional<torch::Tensor> tab = std::nullopt,
+                std::optional<torch::Tensor> ab_w = std::nullopt,
+                std::optional<torch::Tensor> ab_out = std::nullopt,
+                std::optional<torch::Tensor> pair_out = std::nullopt,
+                std::optional<torch::Tensor> amax_ws = std::nullopt,
+                std::optional<torch::Tensor> amax_out = std::nullopt,
+                std::optional<torch::Tensor> amax_cnt = std::nullopt) {
   Segs segs{};
   if (amax_out && amax_out->numel()) {
-    segs.amax_ws = reinterpret_cast<unsigned long long*>(amax_ws->data_ptr<int64_t>());
-    segs.amax_out = reinterpret_cast<unsigned long long*>(amax_out->data_ptr<int64_t>());
+    segs.amax_ws =
+        reinterpret_cast<unsigned long long*>(amax_ws->data_ptr<int64_t>());
+    segs.amax_out =
+        reinterpret_cast<unsigned long long*>(amax_out->data_ptr<int64_t>());
     segs.amax_cnt = amax_cnt->data_ptr<int>();
   }
   if (pair_out && pair_out->numel()) {
@@ -671,15 +761,21 @@ inline void run(torch::Tensor x, std::vector<torch::Tensor> codes, std::vector<t
     segs.ab_n = static_cast<int>(ab_w->size(0));
     segs.ab_ld = static_cast<int>(ab_out->stride(0));
   }
-  segs.tab = tab && tab->numel() ? reinterpret_cast<const uint4*>(tab->data_ptr()) : nullptr;
-  segs.sgate = sgate && sgate->numel() ? reinterpret_cast<const half*>(sgate->data_ptr()) : nullptr;
+  segs.tab = tab && tab->numel()
+                 ? reinterpret_cast<const uint4*>(tab->data_ptr())
+                 : nullptr;
+  segs.sgate = sgate && sgate->numel()
+                   ? reinterpret_cast<const half*>(sgate->data_ptr())
+                   : nullptr;
   segs.nseg = static_cast<int>(codes.size());
   TORCH_CHECK(segs.nseg <= MAXSEG);
   int tiles = 0;
   for (int i = 0; i < segs.nseg; ++i) {
     Seg& s = segs.s[i];
     s.codes = reinterpret_cast<const uint4*>(codes[i].data_ptr());
-    s.high = high[i].numel() ? reinterpret_cast<const uint4*>(high[i].data_ptr()) : nullptr;
+    s.high = high[i].numel()
+                 ? reinterpret_cast<const uint4*>(high[i].data_ptr())
+                 : nullptr;
     s.scale = reinterpret_cast<const uint4*>(scale[i].data_ptr());
     s.out = reinterpret_cast<half*>(out[i].data_ptr());
     s.out_ld = out[i].stride(0);
@@ -700,8 +796,10 @@ inline void run(torch::Tensor x, std::vector<torch::Tensor> codes, std::vector<t
   int* cp = cnt.data_ptr<int>();
   TORCH_CHECK(split <= 8);
   if (segs.pair) {
-    TORCH_CHECK(segs.nseg == 2 && n[0] == n[1] && tp % 2 == 0, "pair mode: gate/up of equal n, even tp");
-    TORCH_CHECK((n[0] / 32) % (tp / 2) == 0, "pair mode: tiles must divide by tp/2");
+    TORCH_CHECK(segs.nseg == 2 && n[0] == n[1] && tp % 2 == 0,
+                "pair mode: gate/up of equal n, even tp");
+    TORCH_CHECK((n[0] / 32) % (tp / 2) == 0,
+                "pair mode: tiles must divide by tp/2");
     tiles = static_cast<int>(n[0]) / 32 / (tp / 2);
   }
   segs.main_tiles = tiles;
@@ -710,20 +808,40 @@ inline void run(torch::Tensor x, std::vector<torch::Tensor> codes, std::vector<t
   for (int i = 1; i < segs.nseg; ++i)
     if (segs.s[i].fmt != fa) fb = segs.s[i].fmt;
   for (int i = 0; i < segs.nseg; ++i)
-    TORCH_CHECK(segs.s[i].fmt == fa || segs.s[i].fmt == fb, "at most two formats per launch");
-#define CFG(A, B, X, Y)                                                        \
-  if (warps == A && tp == B && fa == X && fb == Y)                             \
-    return launch<A, B, X, Y>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
-#define FMTS(A, B)                                                             \
-  CFG(A, B, Q6K, Q6K) CFG(A, B, Q6K, Q4K) CFG(A, B, Q4K, Q6K)                  \
-  CFG(A, B, Q6K, LUT4) CFG(A, B, LUT4, Q6K) CFG(A, B, Q4K, Q4K)                \
-  CFG(A, B, Q5K, Q5K) CFG(A, B, LUT4, LUT4) CFG(A, B, Q8, Q8)                  \
-  CFG(A, B, Q4K, LUT4) CFG(A, B, LUT4, Q4K) CFG(A, B, Q5K, LUT4)               \
-  CFG(A, B, LUT4, Q5K) CFG(A, B, Q5K, Q6K) CFG(A, B, Q6K, Q5K)                 \
-  CFG(A, B, Q4K, Q5K) CFG(A, B, Q5K, Q4K) CFG(A, B, LUT4, Q8) CFG(A, B, Q8, LUT4)
-  FMTS(4, 1) FMTS(2, 2) FMTS(4, 2) FMTS(8, 2) FMTS(4, 4) FMTS(2, 4) FMTS(8, 1)
+    TORCH_CHECK(segs.s[i].fmt == fa || segs.s[i].fmt == fb,
+                "at most two formats per launch");
+#define CFG(A, B, X, Y)                                                  \
+  if (warps == A && tp == B && fa == X && fb == Y)                       \
+    return launch<A, B, X, Y>(segs, xp, ldx, M, K, S, G, split, wsp, cp, \
+                              tiles, st);
+#define FMTS(A, B)       \
+  CFG(A, B, Q6K, Q6K);   \
+  CFG(A, B, Q6K, Q4K);   \
+  CFG(A, B, Q4K, Q6K);   \
+  CFG(A, B, Q6K, LUT4);  \
+  CFG(A, B, LUT4, Q6K);  \
+  CFG(A, B, Q4K, Q4K);   \
+  CFG(A, B, Q5K, Q5K);   \
+  CFG(A, B, LUT4, LUT4); \
+  CFG(A, B, Q8, Q8);     \
+  CFG(A, B, Q4K, LUT4);  \
+  CFG(A, B, LUT4, Q4K);  \
+  CFG(A, B, Q5K, LUT4);  \
+  CFG(A, B, LUT4, Q5K);  \
+  CFG(A, B, Q5K, Q6K);   \
+  CFG(A, B, Q6K, Q5K);   \
+  CFG(A, B, Q4K, Q5K);   \
+  CFG(A, B, Q5K, Q4K);   \
+  CFG(A, B, LUT4, Q8);   \
+  CFG(A, B, Q8, LUT4);
+  FMTS(4, 1);
+  FMTS(2, 2);
+  FMTS(4, 2);
+  FMTS(8, 2);
+  FMTS(4, 4);
+  FMTS(2, 4);
+  FMTS(8, 1);
 #undef FMTS
 #undef CFG
   TORCH_CHECK(false, "unsupported warps/tp");
 }
-

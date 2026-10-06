@@ -36,7 +36,11 @@ def _q8_reference(hidden):
     maximum = v.abs().amax(-1, keepdim=True)
     d = maximum / 127.0
     safe = torch.where(maximum == 0, torch.ones_like(d), d)
-    q = torch.where(maximum == 0, torch.zeros_like(v), torch.sign(v) * torch.floor(v.abs() / safe + 0.5))
+    q = torch.where(
+        maximum == 0,
+        torch.zeros_like(v),
+        torch.sign(v) * torch.floor(v.abs() / safe + 0.5),
+    )
     ds = torch.cat([d, v.sum(-1, keepdim=True)], -1).half().contiguous()
     out = torch.empty(m, top_k, n // 32, 36, dtype=torch.uint8, device=hidden.device)
     out[..., :4] = ds.view(torch.uint8).reshape(m, top_k, n // 32, 4)
@@ -51,7 +55,9 @@ def _q8_decode(blocks):
 
 
 @pytest.mark.parametrize("kind", [18, 21, 22])
-@pytest.mark.parametrize("tokens,distinct", [(1, 10), (5, 31), (8, 50), (20, 12), (20, 60)])
+@pytest.mark.parametrize(
+    "tokens,distinct", [(1, 10), (5, 31), (8, 50), (20, 12), (20, 60)]
+)
 def test_grouped_gate_up_matches_dequantized_reference(kind, tokens, distinct):
     rng = np.random.default_rng(kind * 100 + tokens)
     experts, n, k, top_k = 64, 64, 2560, 10

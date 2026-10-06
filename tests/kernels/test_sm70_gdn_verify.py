@@ -54,9 +54,26 @@ def test_cuda_verify_matches_triton(tokens, accepted):
     out = torch.empty(tokens, HV, K, device=dev, dtype=torch.half)
     new_state = state.clone()
     torch.ops._C.sm70_gdn_verify_out(
-        qkv, a, b, A_log, dt_bias, new_state, out, cu, idx, nacc, H, HV, K**-0.5,
-        1, None, None, None, tokens,
+        qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        new_state,
+        out,
+        cu,
+        idx,
+        nacc,
+        H,
+        HV,
+        K**-0.5,
+        1,
+        None,
+        None,
+        None,
+        tokens,
     )
-    torch.testing.assert_close(out.float(), ref.reshape(tokens, HV, K).float(),
-                               atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(
+        out.float(), ref.reshape(tokens, HV, K).float(), atol=2e-3, rtol=2e-3
+    )
     torch.testing.assert_close(new_state, ref_state, atol=1e-5, rtol=1e-4)

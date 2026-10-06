@@ -605,6 +605,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         if (
             short is not None
             and short in self.graphs
+            and short.attention_context_bucket is not None
             and cpu_upper_bounds.device.type == "cpu"
             and cpu_upper_bounds.ndim == 1
             and desc.num_reqs is not None

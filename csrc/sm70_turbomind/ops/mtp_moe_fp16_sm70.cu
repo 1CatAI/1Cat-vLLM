@@ -58,16 +58,18 @@ __global__ void mtp_moe_fp16_tile_kernel(const half* x, const half* w,
   }
 }
 
-// M1 W13: one CTA per (route, ROWS-row block) streams double-buffered coalesced tiles into shared
-// memory; the first ROWS threads keep the original sequential FP32 FMA order per output row, so
-// the result is bit-identical to the one-thread-per-row kernel it replaces.
+// M1 W13: one CTA per (route, ROWS-row block) streams double-buffered coalesced
+// tiles into shared memory; the first ROWS threads keep the original sequential
+// FP32 FMA order per output row, so the result is bit-identical to the
+// one-thread-per-row kernel it replaces.
 template <int ROWS, int BK, int NT>
-__global__ __launch_bounds__(NT, 1) void mtp_moe_fp16_m1_w13_staged_kernel(const half* __restrict__ x, const half* __restrict__ w,
-                                                const int32_t* __restrict__ ids,
-                                                const int32_t* __restrict__ padded, half* __restrict__ y) {
+__global__ __launch_bounds__(NT, 1) void mtp_moe_fp16_m1_w13_staged_kernel(
+    const half* __restrict__ x, const half* __restrict__ w,
+    const int32_t* __restrict__ ids, const int32_t* __restrict__ padded,
+    half* __restrict__ y) {
   constexpr int kN = 320, kK = 2560, PAD = BK + 8;
-  constexpr int VEC = ROWS * BK / 8;               // uint4 per stage
-  constexpr int PER = (VEC + NT - 1) / NT;          // uint4 per thread per stage
+  constexpr int VEC = ROWS * BK / 8;        // uint4 per stage
+  constexpr int PER = (VEC + NT - 1) / NT;  // uint4 per thread per stage
   constexpr int STAGES = kK / BK;
   __shared__ float input[kK];
   __shared__ __align__(16) half tile[2][ROWS][PAD];
@@ -76,7 +78,8 @@ __global__ __launch_bounds__(NT, 1) void mtp_moe_fp16_m1_w13_staged_kernel(const
   const int expert = ids[route];
   const bool ok = expert >= 0 && expert < 512;
   if (!ok) {
-    for (int r = t; r < ROWS; r += NT) y[route * kN + row0 + r] = __float2half_rn(0.0f);
+    for (int r = t; r < ROWS; r += NT)
+      y[route * kN + row0 + r] = __float2half_rn(0.0f);
     return;
   }
   const half* base = w + (int64_t(expert) * kN + row0) * kK;
@@ -87,7 +90,8 @@ __global__ __launch_bounds__(NT, 1) void mtp_moe_fp16_m1_w13_staged_kernel(const
       const int v = t + i * NT;
       if (VEC % NT == 0 || v < VEC) {
         const int r = v / (BK / 8), c = v % (BK / 8) * 8;
-        reg[i] = __ldg(reinterpret_cast<const uint4*>(base + int64_t(r) * kK + s * BK + c));
+        reg[i] = __ldg(reinterpret_cast<const uint4*>(base + int64_t(r) * kK +
+                                                      s * BK + c));
       }
     }
   };
@@ -113,10 +117,14 @@ __global__ __launch_bounds__(NT, 1) void mtp_moe_fp16_m1_w13_staged_kernel(const
       const float* in = input + s * BK;
 #pragma unroll 4
       for (int k = 0; k < BK; k += 8) {
-        union { uint4 v; half h[8]; } d;
+        union {
+          uint4 v;
+          half h[8];
+        } d;
         d.v = *reinterpret_cast<const uint4*>(tr + k);
 #pragma unroll
-        for (int j = 0; j < 8; ++j) acc = __fmaf_rn(in[k + j], __half2float(d.h[j]), acc);
+        for (int j = 0; j < 8; ++j)
+          acc = __fmaf_rn(in[k + j], __half2float(d.h[j]), acc);
       }
     }
     if (s + 1 < STAGES) sstore((s + 1) & 1);

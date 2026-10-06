@@ -95,9 +95,12 @@ def pack_output_projection(layer) -> tuple | None:
     if layout is not None:
         # The GEMV consumes input_to_gguf(x); fold that reorder into the columns
         # so the fused kernel can read the vLLM-ordered activation directly.
-        order = layout.input_to_gguf(
-            torch.arange(q.shape[1], dtype=torch.float32)[None]
-        )[0].round().long().numpy()
+        order = (
+            layout.input_to_gguf(torch.arange(q.shape[1], dtype=torch.float32)[None])[0]
+            .round()
+            .long()
+            .numpy()
+        )
         cols = np.argsort(order)
         if (cols.reshape(-1, gs) % gs != np.arange(gs)).any():
             return None
@@ -127,6 +130,7 @@ class Sm70HcxRuntime:
         from vllm.distributed.device_communicators.sm70_ring import find_peer_order
 
         self.reason: str | None = None
+        self.top1_enabled = False
         self.group = group
         self.rank = dist.get_rank(group)
         if dist.get_world_size(group) != 4:
@@ -201,7 +205,9 @@ class Sm70HcxRuntime:
             self.top1_seq = torch.zeros(1, device=device, dtype=torch.int32)
             self.xn = torch.zeros(HCX_MAX_M, KD, device=device, dtype=torch.float16)
             self.sq = torch.zeros(80 * 8 * 4, device=device, dtype=torch.float32)
-            self.dpart = torch.zeros(80 * 8 * 96 * 4, device=device, dtype=torch.float32)
+            self.dpart = torch.zeros(
+                80 * 8 * 96 * 4, device=device, dtype=torch.float32
+            )
             self.bar = torch.zeros(2, device=device, dtype=torch.int32)
             self.seq = torch.zeros(1, device=device, dtype=torch.int32)
             torch.accelerator.synchronize()

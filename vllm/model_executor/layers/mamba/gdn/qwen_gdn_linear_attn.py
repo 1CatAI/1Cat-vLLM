@@ -6154,31 +6154,31 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     core_attn_out_spec, last_recurrent_state = verify_out, ssm_state
                 else:
                     core_attn_out_spec, last_recurrent_state = (
-                    fused_sigmoid_gating_delta_rule_update_mixed_qkv(
-                        A_log=self.A_log,
-                        a=a_spec,
-                        b=b_spec,
-                        dt_bias=self.dt_bias,
-                        mixed_qkv=mixed_qkv_spec,
-                        num_q_heads=self.num_k_heads // self.tp_size,
-                        num_v_heads=self.num_v_heads // self.tp_size,
-                        head_k_dim=self.head_k_dim,
-                        head_v_dim=self.head_v_dim,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=spec_query_start_loc[
-                            : attn_metadata.num_spec_decodes + 1
-                        ],
-                        ssm_state_indices=spec_state_indices_tensor,
-                        num_accepted_tokens=spec_state_slot_selectors,
-                        use_qk_l2norm_in_kernel=True,
-                        out=(
-                            core_attn_out[:num_actual_tokens].unsqueeze(0)
-                            if direct_verify_out
-                            else None
-                        ),
+                        fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+                            A_log=self.A_log,
+                            a=a_spec,
+                            b=b_spec,
+                            dt_bias=self.dt_bias,
+                            mixed_qkv=mixed_qkv_spec,
+                            num_q_heads=self.num_k_heads // self.tp_size,
+                            num_v_heads=self.num_v_heads // self.tp_size,
+                            head_k_dim=self.head_k_dim,
+                            head_v_dim=self.head_v_dim,
+                            initial_state=ssm_state,
+                            inplace_final_state=True,
+                            cu_seqlens=spec_query_start_loc[
+                                : attn_metadata.num_spec_decodes + 1
+                            ],
+                            ssm_state_indices=spec_state_indices_tensor,
+                            num_accepted_tokens=spec_state_slot_selectors,
+                            use_qk_l2norm_in_kernel=True,
+                            out=(
+                                core_attn_out[:num_actual_tokens].unsqueeze(0)
+                                if direct_verify_out
+                                else None
+                            ),
+                        )
                     )
-                )
                 _log_runtime_route_once(
                     "SM70 mixed-QKV fused GDN target-verification route hit."
                 )
