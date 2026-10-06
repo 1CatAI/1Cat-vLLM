@@ -189,6 +189,79 @@ Target communication/reduction service is 4.681 ms and RMSNorm service is
 
 ## Model-context gap and rejected changes
 
+### Reproduction and complete weighted operator audit
+
+The original dmv11 source and packing scripts were reproduced separately from
+the ordinary installed wheel. Original-source research extensions are used
+only for this operator comparison; model results above use the ordinary
+wheel. The audit covers 70 role/type classes representing all 256 target
+projection calls at M8, including unchanged fallback combinations. It uses
+real rank-0 TP4 fixtures, cold resident-weight rotation, graph replay and
+four balanced ABBA measurements. Production shape configurations are used
+for the complete weighted totals, rather than selecting the minimum of a
+configuration sweep. SM clocks are recorded but not locked; active samples
+range from 1290 to 1530 MHz, with paired comparisons within each process.
+
+| Role | Calls | Existing main operator ms | Candidate operator ms | Saving ms |
+| --- | ---: | ---: | ---: | ---: |
+| gate/up with SiLU | 64 | 2.982 | 2.361 | 0.621 |
+| down | 64 | 1.859 | 1.294 | 0.565 |
+| qkvz with a/b | 48 | 1.512 | 1.159 | 0.352 |
+| GDN out | 48 | 0.674 | 0.473 | 0.201 |
+| attention q/k/v | 16 | 0.475 | 0.408 | 0.067 |
+| attention o | 16 | 0.221 | 0.156 | 0.065 |
+| Total | 256 | 7.724 | 5.852 | 1.872 |
+
+These are sums of isolated operator measurements weighted by layer count,
+not measured model rounds. The control preserves existing main's native
+pairs, native down, joint qkvz/qkv and small-output routes. Comparing only
+against canonical GEMM would overstate the incremental benefit. Unchanged
+fallback rows share the same measured latency in both arms; they do not
+claim a new speedup. Fourteen gate/up layers and nine qkvz layers retain
+their existing readers. The temporary IQ2 reader covers seven down layers.
+
+The 193 calls covered by the four plane formats total 4.137 ms with the
+original source and 4.143 ms with the ordinary wheel. The difference is
+0.006 ms, or 0.14%; the port does not explain a multi-millisecond loss.
+Original best-of-five runs reproduce roughly 31–35 us fused gate/up and
+22–24 us qkvz with a/b. Corrected IQ3_XXS coefficient handling in the wheel
+also reduces its numerical error; precision is not reduced.
+
+A graph-context control interleaves the same compiled Torch strided-read
+kernel over either reused addresses or a 10 GiB range. Nsight attributes
+only projection kernel service, excluding the preceding read kernel:
+
+| Reader | Isolated us | Reused-address interleaving us | Wide-address interleaving us |
+| --- | ---: | ---: | ---: |
+| Original dmv11 | 11.118 | 11.379 | 19.094 |
+| Ordinary wheel | 11.416 | 11.723 | 19.367 |
+
+Both readers reproduce the context cost. This establishes a limitation of
+substituting isolated measurements for model-graph service; it does not
+identify the hardware mechanism. Prototype fixtures use contiguous first
+quarters of GGUF tensors. Actual GDN head-selected shards and layout are
+validated separately by the loader-equivalent tests above; the prototype
+fixtures alone are not a model-level correctness check.
+
+The historical baseline also needs the matching source revision. The
+projection batch at `49ac1c58ff` measured 20.639/21.734 ms for 1K/8K,
+with 11.372 ms of projection trace service. The later output batch at
+`6d11576ee9` measured **19.512/20.557 ms**, with **10.542 ms** of
+projection trace service. Its 1290 MHz fully connected NVLink machine
+differs from the current same-wheel comparison's topology and clocks.
+Neither historical record supports treating 12.8 ms as current main's
+projection baseline or subtracting 7.3 ms from a later model result.
+
+The complete isolated audit's 1.872 ms increment is consistent with the
+already measured 1K full-round improvement of 1.668 ms. The 8K improvement
+is 1.018 ms; isolated sums do not explain that cohort's smaller benefit.
+The measured model projection service remains 7.76–7.86 ms, above the
+6 ms goal. No 7.3 ms model speedup or 13.34 ms model round is claimed.
+
+Per-class measurements, operand footprints, clock histograms and evidence
+hashes are in
+[the audit data](data/gguf_dmv_operator_audit_20261006.json).
+
 A new ordinary-wheel cold-rotation ABBA uses the actual loader-equivalent
 TP4 shards, including `GGUFHeadTilingLayout.shard_weight` for GDN output.
 All eight down/GDN-output type cases pass official-dequantization checks.
