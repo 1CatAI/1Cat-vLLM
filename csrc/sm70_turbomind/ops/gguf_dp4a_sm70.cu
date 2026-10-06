@@ -23,7 +23,7 @@ __global__ void quantize_q8(Q8_1* out, const half* input, int k) {
 
 template <int Type, bool Activated, class Index, int Lanes = 16,
           bool Quantized = false, bool Canonical = false,
-          bool ScalarLut = false>
+          bool ScalarLut = false, bool BankAware = false>
 __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
                         const uint8_t* gate, const uint8_t* up, int n, int k,
                         int stride, int top_k,
@@ -32,7 +32,7 @@ __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
   using Dot = std::conditional_t<
       Canonical, vllm::sm70_gguf::CanonicalIntegerDot<Type>,
       std::conditional_t<ScalarLut, vllm::sm70_gguf::SignedLutDot<Type>,
-                         LatticeDot<Type>>>;
+                         LatticeDot<Type, BankAware>>>;
   __shared__ uint32_t book[Dot::kBookWords];
   __shared__ uint32_t masks[16];
   __shared__ half intermediate[32];
@@ -137,12 +137,12 @@ void dispatch_lut4_gate_up(torch::Tensor out, torch::Tensor activation,
                                          up, up_stats, n);
 }
 
-template <int Type, class Index, int Lanes>
+template <int Type, class Index, int Lanes, bool BankAware = false>
 void launch_quantized_gate_up(torch::Tensor out, torch::Tensor activation,
                               torch::Tensor ids, torch::Tensor gate,
                               torch::Tensor up) {
   const int n = gate.size(1), top_k = ids.size(1);
-  gate_up<Type, true, Index, Lanes, true>
+  gate_up<Type, true, Index, Lanes, true, false, false, BankAware>
       <<<dim3(n / 32, activation.size(0) * top_k), 32 * Lanes,
          activation.size(1) * sizeof(Q8_1), at::cuda::getCurrentCUDAStream()>>>(
           out.data_ptr(), reinterpret_cast<const Q8_1*>(activation.data_ptr()),
@@ -151,17 +151,20 @@ void launch_quantized_gate_up(torch::Tensor out, torch::Tensor activation,
           top_k);
 }
 
-template <int Type, class Index>
+template <int Type, class Index, bool BankAware = false>
 void launch_gate_up(torch::Tensor out, torch::Tensor activation,
                     torch::Tensor ids, torch::Tensor gate, torch::Tensor up,
                     bool activated, int lanes) {
   if (out.scalar_type() == torch::kUInt8) {
     if (lanes == 4)
-      launch_quantized_gate_up<Type, Index, 4>(out, activation, ids, gate, up);
+      launch_quantized_gate_up<Type, Index, 4, BankAware>(out, activation, ids,
+                                                          gate, up);
     else if (lanes == 8)
-      launch_quantized_gate_up<Type, Index, 8>(out, activation, ids, gate, up);
+      launch_quantized_gate_up<Type, Index, 8, BankAware>(out, activation, ids,
+                                                          gate, up);
     else
-      launch_quantized_gate_up<Type, Index, 16>(out, activation, ids, gate, up);
+      launch_quantized_gate_up<Type, Index, 16, BankAware>(out, activation, ids,
+                                                           gate, up);
     return;
   }
   const int n = gate.size(1), top_k = ids.size(1);
@@ -171,27 +174,29 @@ void launch_gate_up(torch::Tensor out, torch::Tensor activation,
   const auto output = reinterpret_cast<half*>(out.data_ptr());
   const auto x = reinterpret_cast<const Q8_1*>(activation.data_ptr());
   if (activated)
-    gate_up<Type, true, Index><<<grid, 128, shared, stream>>>(
-        output, x, ids.data_ptr<Index>(), gate.data_ptr<uint8_t>(),
-        up.data_ptr<uint8_t>(), n, activation.size(1) * 32, gate.size(2),
-        top_k);
+    gate_up<Type, true, Index, 16, false, false, false, BankAware>
+        <<<grid, 128, shared, stream>>>(
+            output, x, ids.data_ptr<Index>(), gate.data_ptr<uint8_t>(),
+            up.data_ptr<uint8_t>(), n, activation.size(1) * 32, gate.size(2),
+            top_k);
   else
-    gate_up<Type, false, Index><<<grid, 128, shared, stream>>>(
-        output, x, ids.data_ptr<Index>(), gate.data_ptr<uint8_t>(),
-        up.data_ptr<uint8_t>(), n, activation.size(1) * 32, gate.size(2),
-        top_k);
+    gate_up<Type, false, Index, 16, false, false, false, BankAware>
+        <<<grid, 128, shared, stream>>>(
+            output, x, ids.data_ptr<Index>(), gate.data_ptr<uint8_t>(),
+            up.data_ptr<uint8_t>(), n, activation.size(1) * 32, gate.size(2),
+            top_k);
 }
 
-template <int Type>
+template <int Type, bool BankAware = false>
 void dispatch_gate_up(torch::Tensor out, torch::Tensor activation,
                       torch::Tensor ids, torch::Tensor gate, torch::Tensor up,
                       bool activated, int lanes) {
   if (ids.scalar_type() == torch::kInt32)
-    launch_gate_up<Type, int32_t>(out, activation, ids, gate, up, activated,
-                                  lanes);
+    launch_gate_up<Type, int32_t, BankAware>(out, activation, ids, gate, up,
+                                             activated, lanes);
   else
-    launch_gate_up<Type, int64_t>(out, activation, ids, gate, up, activated,
-                                  lanes);
+    launch_gate_up<Type, int64_t, BankAware>(out, activation, ids, gate, up,
+                                             activated, lanes);
 }
 
 template <int Type, class Index>
@@ -351,7 +356,8 @@ void gguf_quantize_q8_1_sm70_out(torch::Tensor out, torch::Tensor input) {
 void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor ids, torch::Tensor gate,
                                 torch::Tensor up, int64_t source_type,
-                                bool activated, int64_t lanes_per_row) {
+                                bool activated, int64_t lanes_per_row,
+                                bool bank_aware) {
   TORCH_CHECK(source_type == 18 || source_type == 21 || source_type == 22,
               "Unsupported GGUF lattice dp4a reader");
   const int block_bytes = source_type == 18 ? 98 : source_type == 21 ? 110 : 82;
@@ -393,15 +399,21 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
       "Invalid fused gate/up output");
   const c10::cuda::CUDAGuard guard(activation.device());
   require_sm70();
-  if (source_type == 18)
-    dispatch_gate_up<18>(out, activation, ids, gate, up, activated,
-                         lanes_per_row);
-  else if (source_type == 21)
-    dispatch_gate_up<21>(out, activation, ids, gate, up, activated,
-                         lanes_per_row);
-  else
-    dispatch_gate_up<22>(out, activation, ids, gate, up, activated,
-                         lanes_per_row);
+#define DISPATCH_LATTICE(TYPE)                                               \
+  if (bank_aware)                                                            \
+    dispatch_gate_up<TYPE, true>(out, activation, ids, gate, up, activated,  \
+                                 lanes_per_row);                             \
+  else                                                                       \
+    dispatch_gate_up<TYPE, false>(out, activation, ids, gate, up, activated, \
+                                  lanes_per_row)
+  if (source_type == 18) {
+    DISPATCH_LATTICE(18);
+  } else if (source_type == 21) {
+    DISPATCH_LATTICE(21);
+  } else {
+    DISPATCH_LATTICE(22);
+  }
+#undef DISPATCH_LATTICE
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

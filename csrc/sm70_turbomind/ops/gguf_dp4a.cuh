@@ -35,7 +35,7 @@ __device__ __forceinline__ uint32_t load_u32_2(const uint8_t* p) {
 
 // Shared by dense and routed kernels. Only integer codebook values reach
 // dp4a; original weight and activation scales are applied after the dot.
-template <int Type>
+template <int Type, bool BankAware = false>
 struct LatticeDot {
   static_assert(Type == 18 || Type == 21 || Type == 22);
   using Book = turbomind::gemm::LatticeCodebook<Type>;
@@ -43,14 +43,34 @@ struct LatticeDot {
   static constexpr int kBlockBytes = Type == 18 ? 98 : Type == 21 ? 110 : 82;
 
   __device__ static void initialize(uint32_t* book, uint32_t* masks) {
-    for (int i = threadIdx.x; i < kBookWords; i += blockDim.x)
-      book[i] = Book::word(i) ^ 0x80808080U;
-    if (threadIdx.x < 16) {
+    for (int i = threadIdx.x; i < kBookWords; i += blockDim.x) {
+      // IQ2 entries have two words. Separate their planes so each lookup
+      // can address all 32 banks, rather than only even or odd banks.
+      const int slot =
+          BankAware && Type == 22 ? (i / 2 + (i % 2) * (kBookWords / 2)) : i;
+      book[slot] = Book::word(i) ^ 0x80808080U;
+    }
+    if (!BankAware && threadIdx.x < 16) {
       const int s = threadIdx.x;
       masks[s] = ((s & 1) ? 0x000000ffU : 0) | ((s & 2) ? 0x0000ff00U : 0) |
                  ((s & 4) ? 0x00ff0000U : 0) | ((s & 8) ? 0xff000000U : 0);
     }
     __syncthreads();
+  }
+
+  __device__ static uint32_t sign_mask(int nibble) {
+    // Spread the four bits into byte sign positions, then sign-extend each
+    // byte with PRMT. __byte_perm clears selector sign bits; use PTX here.
+    const uint32_t bits = uint32_t(nibble) * 0x10204080U;
+    uint32_t mask;
+    asm("prmt.b32 %0, %1, 0, 0xba98;" : "=r"(mask) : "r"(bits));
+    return mask;
+  }
+
+  __device__ static uint32_t word(const uint32_t* book, int index) {
+    if constexpr (BankAware && Type == 22)
+      return book[index / 2 + (index % 2) * (kBookWords / 2)];
+    return book[index];
   }
 
   __device__ static float dot(const uint8_t* row, int group, const Q8_1& x,
@@ -91,9 +111,10 @@ struct LatticeDot {
       } else {
         sign = (signs >> (8 * octet)) & 255;
       }
-      const uint32_t s0 = masks[sign & 15], s1 = masks[sign >> 4];
-      const int w0 = __vsub4(book[first] ^ s0, s0);
-      const int w1 = __vsub4(book[second] ^ s1, s1);
+      const uint32_t s0 = BankAware ? sign_mask(sign & 15) : masks[sign & 15];
+      const uint32_t s1 = BankAware ? sign_mask(sign >> 4) : masks[sign >> 4];
+      const int w0 = __vsub4(word(book, first) ^ s0, s0);
+      const int w1 = __vsub4(word(book, second) ^ s1, s1);
       if constexpr (Type == 22) {
         if (octet < 2) {
           sum0 = __dp4a(w0, activation[2 * octet], sum0);

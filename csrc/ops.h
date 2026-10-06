@@ -993,7 +993,8 @@ void gguf_dp4a_scalar_lut_gate_up_sm70_out(torch::Tensor out,
 void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor ids, torch::Tensor gate,
                                 torch::Tensor up, int64_t source_type,
-                                bool activated, int64_t lanes_per_row);
+                                bool activated, int64_t lanes_per_row,
+                                bool bank_aware);
 void gguf_dp4a_lut4_gate_up_sm70_out(
     torch::Tensor out, torch::Tensor activation, torch::Tensor ids,
     torch::Tensor gate, torch::Tensor gate_stats, torch::Tensor up,

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cold-cache ABBA of retained and signed-nibble IQ expert gate/up.
+"""Cold-cache ABBA of retained and candidate IQ expert gate/up decoders.
 
 Run under the GPU ownership locks, with an installed source-complete wheel.
 CUDA events are graph nodes surrounding one gate/up launch. A 64-MiB cache
@@ -24,10 +24,14 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_tensor_reader import GGUFReader, quant_size
 
 
-def run(which, output, activation, ids, weights, kind):
+def run(which, output, activation, ids, weights, kind, decoder):
     if which == 0:
         torch.ops._C.gguf_dp4a_gate_up_sm70_out(
             output, activation, ids, *weights, kind, True
+        )
+    elif decoder == "bank-aware":
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            output, activation, ids, *weights, kind, True, 16, True
         )
     else:
         torch.ops._C.gguf_dp4a_scalar_lut_gate_up_sm70_out(
@@ -38,6 +42,9 @@ def run(which, output, activation, ids, weights, kind):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("models", type=Path, nargs="+")
+    parser.add_argument(
+        "--decoder", choices=["scalar-lut", "bank-aware"], default="scalar-lut"
+    )
     parser.add_argument("--rank", type=int, default=0, choices=range(4))
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--cycles", type=int, default=40)
@@ -72,6 +79,7 @@ def main():
         torch=torch.__version__,
         cuda=torch.version.cuda,
         rank=args.rank,
+        candidate_decoder=args.decoder,
         graph_kernel_count=1,
         cache_scrub_bytes=64 * 1024 * 1024,
         bandwidth_scope=(
@@ -95,9 +103,17 @@ def main():
             ).reshape(e * n, -1)
             shas.append(hashlib.sha256(rows.tobytes()).hexdigest())
             raw = RawGGUFProjection.from_rows(rows, kind)
-            packed = pack_lattice_lut(rows, kind)
+            packed = (
+                pack_lattice_lut(rows, kind)
+                if args.decoder == "scalar-lut"
+                else raw.data
+            )
             original.append(torch.from_numpy(raw.data.reshape(e, n, -1)).cuda())
-            normalized.append(torch.from_numpy(packed.reshape(e, n, -1)).cuda())
+            normalized.append(
+                torch.from_numpy(packed.reshape(e, n, -1)).cuda()
+                if args.decoder == "scalar-lut"
+                else original[-1]
+            )
             del rows, raw, packed
         for m in (1, 5, 20):
             top_k = 10
@@ -121,6 +137,7 @@ def main():
                     ids,
                     original if which == 0 else normalized,
                     kind,
+                    args.decoder,
                 )
             torch.accelerator.synchronize()
             torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
@@ -138,6 +155,7 @@ def main():
                         ids,
                         original if which == 0 else normalized,
                         kind,
+                        args.decoder,
                     )
                     end.record()
                 graphs.append(graph)
@@ -162,7 +180,9 @@ def main():
             unique = len(np.unique(routes))
             bytes_per_expert = [
                 2 * n * (k // 256) * block_bytes,
-                2 * n * (k // 32) * 20,
+                2 * n * (k // 32) * 20
+                if args.decoder == "scalar-lut"
+                else 2 * n * (k // 256) * block_bytes,
             ]
             medians = [float(np.median(t)) for t in timings]
             row = dict(
@@ -177,7 +197,7 @@ def main():
                 output_bytes_equal=True,
                 clocks_mhz=sorted(set(clocks)),
                 retained_us=medians[0],
-                scalar_lut_us=medians[1],
+                candidate_us=medians[1],
                 saving_us=medians[0] - medians[1],
                 unique_payload_GBs=[
                     unique * b / t / 1000 for b, t in zip(bytes_per_expert, medians)
