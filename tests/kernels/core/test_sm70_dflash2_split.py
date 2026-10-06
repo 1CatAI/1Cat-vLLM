@@ -31,7 +31,7 @@ def _dense(q, k, v, table, length, scale):
 
 
 @pytest.mark.parametrize("through_api", [False, True])
-@pytest.mark.parametrize("page", [1024, 2048])
+@pytest.mark.parametrize("page", [832, 1024, 2048])
 @pytest.mark.parametrize("scale", [1 / math.sqrt(128), 0.1])
 def test_live_window_graph(page, scale, through_api):
     from flash_attn_v100.sm70_dflash2_split import forward
@@ -55,11 +55,13 @@ def test_live_window_graph(page, scale, through_api):
         call = forward
 
     torch.manual_seed(123)
-    capacity = 10240
-    pages = capacity // page
+    pages = math.ceil(10240 / page)
+    capacity = pages * page
     q = torch.zeros(1, 8, 8, 128, device="cuda", dtype=torch.float16)
-    k = torch.zeros(pages, page, 2, 128, device="cuda", dtype=torch.float16)
-    v = torch.empty_like(k)
+    # Match the model's interleaved K/V allocation, including noncontiguous
+    # page strides, instead of testing only independent contiguous caches.
+    kv = torch.zeros(pages, 2, page, 2, 128, device="cuda", dtype=torch.float16)
+    k, v = kv[:, 0], kv[:, 1]
     table = torch.randperm(pages, device="cuda").int()[None]
     lengths = torch.zeros(1, device="cuda", dtype=torch.int32)
     output = torch.empty_like(q)

@@ -11,7 +11,7 @@ import torch
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("kv_dtype", ["auto", "fp8_e4m3"])
-@pytest.mark.parametrize("block", [16, 1648])
+@pytest.mark.parametrize("block", [16, 832, 1648])
 @pytest.mark.parametrize(
     "batch,q_len,context",
     [(1, 8, 2048), (4, 8, 2048), (8, 8, 32768), (4, 4, 4096), (8, 1, 262144)],
@@ -82,7 +82,8 @@ def test_dflash_batch_matches_serial_with_live_graph_metadata(
     with torch.cuda.graph(graph):
         run()
     route = "prefill_prefix_dflash_noncausal_batch"
-    assert (route in routes) == (batch > 1)
+    split = batch == 1 and q_len == 8 and block == 832 and kv_dtype == "auto"
+    assert (route in routes) == (batch > 1 or split)
     for step in range(3):
         storage.normal_()
         table.random_(0, 64)
