@@ -54,8 +54,20 @@ logits retain all 128 probe rows: mean KL 6.803e-6, max KL 1.159e-4 and
 top-1 agreement 100%. Natural answers are identical and terminate normally.
 Four concurrent requests pass text-health checks; no C4 speed claim follows.
 
-There is no measured round saving. Keep integration pending while a single
-post-batch node trace records the actual C1 query layout and dispatch. A
+The comparison above did not select the split path. A single post-batch
+trace records B1/Q8/H8/KV2/D128, contiguous FP16 query/output, interleaved
+FP16 KV pages of size832, `auto` KV dtype, and window `(2047,2047)`.
+All input guards pass, but the general paged kernel remains selected five
+times per round (105.000us/call). The wheel does not export
+`dflash2_paged_bmhd_fwd`; the public guard incorrectly required this unrelated
+native symbol before trying the independent packaged Triton split path.
+
+The correction admits the split path independently. Only the native
+1024/2048 concurrent branch requires the native BMHD symbol. Eleven CPU
+dispatch checks and thirty-four installed-wheel policy/GPU checks pass,
+including a live page832 graph with the native symbol explicitly absent.
+The corrected model comparison is running; the earlier numbers are retained
+as an admission failure, not as a split-kernel performance result. A
 compile-only recorder in the on-arm benchmark harness reads unmatched
 collective boundaries; it does not mutate graphs or run during timing.
 Raw counts, acceptance and artifact hashes are in
