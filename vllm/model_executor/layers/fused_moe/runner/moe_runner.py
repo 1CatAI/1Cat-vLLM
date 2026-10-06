@@ -946,6 +946,13 @@ class MoERunner(MoERunnerInterface):
             self.layer_name,
         )
 
+        if getattr(self, "sm70_partial_output", False):
+            # The consumer (SM70 HCX) all-reduces the shared + routed partial.
+            partial = (
+                fused_output if shared_output is None else shared_output + fused_output
+            )
+            return self._maybe_add_zero_expert_output(partial[..., :og_hidden_dim])
+
         result = self._maybe_sm70_moe_sum2_allreduce(
             shared_output, fused_output, og_hidden_dim
         )

@@ -52,6 +52,74 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "weight, "
       "int source_type) -> ()");
   ops.def(
+      "gguf_dmvq_sm70_out(Tensor(a!) output, Tensor input, Tensor weight, "
+      "Tensor(b!) workspace, Tensor(c!) counters, Tensor table, int type, "
+      "int kw, int split) -> ()");
+  ops.impl("gguf_dmvq_sm70_out", torch::kCUDA, &gguf_dmvq_sm70_out);
+  ops.def("gguf_dmvq_book_sm70_out(Tensor(a!) table, int type) -> ()");
+  ops.impl("gguf_dmvq_book_sm70_out", torch::kCUDA, &gguf_dmvq_book_sm70_out);
+  ops.def(
+      "gguf_dmv_sm70_out(Tensor input, Tensor[] codes, Tensor[] high, "
+      "Tensor[] scale, Tensor(a!)[] outputs, int[] formats, int[] widths, "
+      "int k, int split, int kw, Tensor(b!) workspace, Tensor(c!) counters, "
+      "int tn, Tensor? sigmoid_gate, Tensor? table, Tensor? floating_weight, "
+      "Tensor(d!)? floating_output, Tensor(e!)? pair_output, bool gdn_heads) "
+      "-> ()");
+  ops.impl("gguf_dmv_sm70_out", torch::kCUDA, &gguf_dmv_sm70_out);
+  ops.def(
+      "sm70_hcx_out(Tensor p0, Tensor? p1, Tensor res, Tensor inj, Tensor nw,"
+      " float eps, Tensor wd, Tensor wu, Tensor(a!) res_out, Tensor(b!) blk_o"
+      "ut, Tensor(c!) inj_out, Tensor(d!) xn, Tensor(e!) sq, Tensor(f!) dpart"
+      ", Tensor(g!) bar, Tensor(h!) seq, int[] ar, int[] lora, int[] hb, int "
+      "rank, Tensor? dbg, int full, Tensor? ox, Tensor? ocodes, Tensor? ohigh"
+      ", Tensor? oscale, int ofmt, Tensor? gz, Tensor? gw, float geps, Tensor"
+      "(i!)? gscr) -> ()");
+  ops.impl("sm70_hcx_out", torch::kCUDA, &sm70_hcx_out);
+  ops.def(
+      "sm70_dmv13_out(Tensor x, Tensor[] codes, Tensor[] high, Tensor[] scale, "
+      "Tensor(a!)[] out, int[] fmt, int[] n, int K, int split, int warps, "
+      "Tensor(b!) ws, Tensor(c!) cnt, int tp, Tensor? extra_weight, "
+      "Tensor(d!)? extra_out) -> ()");
+  ops.impl("sm70_dmv13_out", torch::kCUDA, &sm70_dmv13_out);
+  ops.def(
+      "qsa_prep_sm70_out(Tensor qkv, Tensor positions, Tensor cos_sin, "
+      "Tensor q_norm_weight, Tensor k_norm_weight, float eps, Tensor(a!) "
+      "query, "
+      "Tensor(b!) key_cache, Tensor(c!) value_cache, Tensor slot_mapping) -> "
+      "()");
+  ops.impl("qsa_prep_sm70_out", torch::kCUDA, &qsa_prep_sm70_out);
+  ops.def(
+      "sm70_top1x_out(Tensor(a!) out, Tensor pairs, int[] buffers, "
+      "Tensor(b!) seq, int rank) -> ()");
+  ops.impl("sm70_top1x_out", torch::kCUDA, &sm70_top1x_out);
+  ops.def(
+      "sm70_gdn_verify_out(Tensor qkv, Tensor a, Tensor b, Tensor A_log, "
+      "Tensor dt_bias, Tensor(a!) state, Tensor(b!) o, Tensor cu, Tensor idx, "
+      "Tensor? nacc, int H, int HV, float scale, int cfg, Tensor? rbuf, "
+      "Tensor? rn, Tensor? ctr, int tmax) -> ()");
+  ops.impl("sm70_gdn_verify_out", torch::kCUDA, &sm70_gdn_verify_out);
+  ops.def(
+      "qsa_dense_decode_sm70_out(Tensor(a!) out, Tensor query, Tensor "
+      "key_cache, "
+      "Tensor value_cache, Tensor block_table, Tensor token_to_req, Tensor "
+      "positions, "
+      "Tensor? gate, Tensor(b!) ws_o, Tensor(c!) ws_ml, int num_requests, int "
+      "splits, "
+      "int warps) -> ()");
+  ops.impl("qsa_dense_decode_sm70_out", torch::kCUDA,
+           &qsa_dense_decode_sm70_out);
+  ops.def(
+      "gguf_moe_gate_up_sm70_out(Tensor(a!) hidden, Tensor input, Tensor ids, "
+      "Tensor gate_codes, Tensor gate_scale, Tensor up_codes, Tensor up_scale, "
+      "int format, Tensor table, int kw) -> ()");
+  ops.impl("gguf_moe_gate_up_sm70_out", torch::kCUDA,
+           &gguf_moe_gate_up_sm70_out);
+  ops.def(
+      "gguf_dmv_restore_sm70_out(Tensor(a!) weight, Tensor(b!) stats, "
+      "Tensor codes, Tensor scale, int format, int k, int n) -> ()");
+  ops.impl("gguf_dmv_restore_sm70_out", torch::kCUDA,
+           &gguf_dmv_restore_sm70_out);
+  ops.def(
       "gguf_qkvz_sm70_out(Tensor(a!) output, Tensor input, "
       "Tensor[] weights, Tensor[] stats, int[] types, "
       "Tensor(b!) partials, Tensor(c!) counters) -> ()");

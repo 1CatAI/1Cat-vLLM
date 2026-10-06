@@ -176,6 +176,18 @@ def _maybe_sync_top1_all_gather(
         torch.cuda.current_stream(local_pair.device).synchronize()
 
 
+def _maybe_sm70_top1x(local_pair: torch.Tensor) -> torch.Tensor | None:
+    from vllm.models.qwen4_exp.nvidia.sm70_hcx import current_hcx_runtime
+
+    runtime = current_hcx_runtime()
+    if runtime is None or not getattr(runtime, "top1_enabled", False):
+        return None
+    tokens = runtime.top1(local_pair)
+    if tokens is not None:
+        logger.info_once("SM70 two-hop top1 exchange enabled.")
+    return tokens
+
+
 # --8<-- [start:logits_processor]
 @PluggableLayer.register("logits_processor")
 class LogitsProcessor(PluggableLayer):
@@ -369,6 +381,9 @@ class LogitsProcessor(PluggableLayer):
                 [local_max_vals.float(), global_indices.float()], dim=-1
             )
         _maybe_sync_top1_all_gather(self, local_pair)
+        top1x_tokens = _maybe_sm70_top1x(local_pair)
+        if top1x_tokens is not None:
+            return top1x_tokens
         custom_top_tokens = self._maybe_custom_top1_argmax(local_pair)
         if custom_top_tokens is not None:
             self._maybe_dump_top_token_margin(

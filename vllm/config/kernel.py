@@ -364,6 +364,12 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    projection_planes: bool = True
+    """Use measured M8 shared-activation projection planes with canonical fallback."""
+
+    projection_plane_scope: Literal["all", "gated_pair", "iq3_xxs"] = "all"
+    """Select all planes, gated pairs, or XXS-containing layers for comparisons."""
+
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
 
@@ -375,6 +381,12 @@ class Sm70GgufConfig:
 
     q8_expert_intermediate: bool = True
     """Encode routed intermediates once in qualified integer expert gate/up."""
+
+    grouped_mma_gate_up: bool = False
+    """Run routed IQ3 gate/up at M1..8 as expert-grouped FP16 MMA on repacked planes."""
+
+    grouped_mma_release_raw: bool = True
+    """Free the original-block IQ3 gate/up banks once the MMA planes replace them."""
 
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
@@ -536,6 +548,44 @@ class KernelConfig:
         default_factory=dict, init=False, repr=False
     )
     """Observed selector decisions for loaded local layouts; diagnostic only."""
+
+    sm70_fused_side_projections: bool = False
+    """Compute the GDN a/b and QSA indexer q/k FP16 projections inside the
+    small-M GGUF input projection launch (packed dense_mv planes)."""
+
+    sm70_qsa_prep: bool = False
+    """Fuse QSA q/k GemmaRMSNorm, partial NeoX RoPE and the FP16 K/V cache
+    write into one SM70 launch for decode batches."""
+
+    sm70_draft_hot_vocab: int = 0
+    """Greedy MTP drafts choose among this many lowest token ids (BPE merge
+    order) spread evenly across TP ranks; 0 keeps the full vocabulary. Only
+    the draft proposal changes; verification still uses the full head."""
+
+    sm70_draft_single_graph: bool = False
+    """Capture all MTP draft decode steps, including their slot mappings and
+    attention metadata, as one CUDA graph instead of one replay per step."""
+
+    sm70_top1x: bool = False
+    """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
+    instead of an all-gather."""
+
+    sm70_greedy_verify: bool = False
+    """Verify greedy MTP drafts from TP-local target argmax pairs instead of
+    gathering full-vocabulary logits for the rejection sampler."""
+
+    sm70_gdn_verify: bool = False
+    """Run single-request MTP GDN verification with the SM70 sequential CUDA
+    recurrence instead of the Triton fused kernel."""
+
+    sm70_hcx: bool = False
+    """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
+    HC down and HC up as one SM70 kernel for verification batches up to 8."""
+
+    qsa_dense_short_context: bool = False
+    """Attend densely, without index selection, in context-bucketed decode graphs
+    whose bucket does not exceed the indexer budget (where QSA selects every
+    visible token)."""
 
     qsa_auto_e4m3: bool = True
     """Default eligible calibrated QSA caches to E4M3 without speculation."""
