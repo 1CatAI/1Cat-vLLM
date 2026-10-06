@@ -55,10 +55,11 @@ canonical alone; record measured resident memory when integrating.
 
 ## Current complete-round ledger
 
-The qualified unprofiled reference is16.623ms at1K and17.720ms at8K on four
+The qualified unprofiled reference is16.176ms at1K and16.958ms at8K on four
 V100-SXM2-32GB cards with full NVLink,1290/877MHz, CUDA12.8 and Torch2.10.0+cu128.
-Both projection planes and collective/norm fusion are active. The source
-for the following single diagnostic trace includes those integration fixes.
+Projection planes, collective/norm fusion and page832 draft split attention
+are active. The following single diagnostic trace predates the draft split
+dispatch correction and includes projection and collective/norm integration.
 Trace envelopes are separate from unprofiled complete-round latency.
 
 Rank0 target-start to next target-start is18.142ms under node tracing:
@@ -84,7 +85,11 @@ predictions for an unprofiled speedup. The goal of12ms has not been reached.
 The draft attention dispatch issue is independent: actual page832 inputs
 pass the layout guards, but an unrelated missing native BMHD symbol gated
 the packaged Triton split path. Both earlier policy arms used the general
-paged kernel. The corrected route needs its own same-wheel model control.
+paged kernel. The corrected route passes a same-wheel sixteen-prompt model
+control: complete rounds improve16.607→16.176ms at1K and17.700→16.958ms at8K.
+Mean KL is5.84e-6 and top-1 agreement is100% over128 matched logit rows.
+Natural EOS and the four-request health check pass. These are independent
+draft-side savings; they are not attributed to IQ2 expansion.
 
 Retain rejected controls: two copies of the IQ3 shared grid, common mixed
 loops, folded coefficients, shared reduction swizzles and a shorter K loop
@@ -92,5 +97,14 @@ did not improve the full215-projection graph. The shorter loop gives
 5.689→5.742ms with bitwise equal output, and is not admitted. A dynamic
 barrier allocation is not the occupancy limit here: Volta exposes64 block
 barriers per SM, so sixteen allocated barriers allow four blocks while
-register and warp limits are tighter. An equal-byte group-major plane
-experiment tests weight request distribution without changing arithmetic.
+register and warp limits are tighter. Equal-byte group-major planes improve
+the215-projection graph only5.698→5.643ms. A smaller register fragment,
+additional split-K and a specialized pair kernel do not improve the complete
+graph. None of these controls is admitted.
+
+A same-input projection-only graph quantifies instrumentation overhead:
+GDN out averages11.24us without profiling and13.23us with graph-node tracing.
+The model trace still takes20.34us. The difference cannot be claimed as an
+end-to-end opportunity until its execution context is reproduced. Controls
+changing shared-memory/cache preferences and touching large page ranges do
+not reproduce that full difference.
