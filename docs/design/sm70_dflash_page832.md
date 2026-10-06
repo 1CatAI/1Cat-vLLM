@@ -1,74 +1,58 @@
 # DFlash2 split windows on 832-token KV pages
 
-The GGUF hybrid cache uses interleaved `[pages, 2, 832, 2, 128]` FP16
-storage. After splitting K/V, the page stride is 425984 elements. The
-existing split-window implementation accepts this page size and stride,
-but both adapter and backend admission previously required 1024/2048.
-The fallback uses a small paged grid instead of splitting the live window.
+The hybrid GGUF cache uses interleaved `[pages,2,832,2,128]` FP16 storage.
+The draft context query is B1/Q8/H8/KV2/D128 with window `(2047,2047)`.
+The public adapter unnecessarily required the native `dflash2_paged_bmhd_fwd`
+symbol before trying the independent packaged Triton split implementation.
+That symbol is absent from the qualified wheel, so the general paged kernel
+ran five times per round at about105us/call in the diagnostic1K trace.
 
-Admit B1/Q8/H8/KV2/D128, window `(2047, 2047)`, FP16 KV and SM70 to the
-packaged FP32 split path. Keep the native concurrent BMHD page ABI limited
-to 1024/2048. Page832 concurrent requests, unsupported layouts and missing
-split imports retain general paged attention. The per-engine
-`speculative_config.sm70_dflash2.draft_window_split` setting defaults on,
-provides the page832 control arm, and participates in the graph hash.
-There is no new environment variable or kernel implementation.
-
-## Validation
-
-A normal wheel from source `4658e8aeb031ef7b95db0fea9c6b53cb4d79d36c`
-contains latest integration changes and this adapter/backend/configuration
-change. All installed Python and sixteen native hashes match the artifact;
-the wheel SHA256 is `508348421cd6b6c545de72a831bd1a9940c54fa936e4d661066c10d9208914c0`.
-
-Eight dispatch checks, fifteen policy checks and twelve live-graph
-FP64-reference cases pass in the installed wheel. Six focused paged batch
-checks also pass, including concurrent fallback behavior. The GPU tests
-use interleaved K/V strides, changed live lengths, indirection, zero padding
-and window-edge masks.
-
-A preceding research comparison on five separate KV banks at the actual
-832-token page/stride measures 94.403 to 55.785 us/call at 1K, 205.604 to
-60.738 at 8K, and 203.123 to 60.763 at 32K. FP64-relative L2 error is about
-2.0e-4 for the split path. These are isolated graph operator measurements;
-multiplying by five gives estimates of 0.193/0.724 ms per round at 1K/8K.
-They are not end-to-end savings. The matched model comparison below
-does not show those operator savings, so this path is not admitted yet.
+Admit the packaged FP32 split path independently for the qualified input
+layout, dtype and page sizes. Only the native concurrent1024/2048 branch
+requires its BMHD symbol. Missing split imports, unsupported layouts and
+page832 concurrent requests retain general paged attention. The per-engine
+`speculative_config.sm70_dflash2.draft_window_split` setting defaults on and
+participates in the graph hash. There is no new environment variable or
+kernel implementation, and probability/PV arithmetic remains FP32.
 
 ## Same-wheel model comparison
 
-Both arms include projection planes and collective/norm fusion. Only the
-page832 split policy changes. TP4 FP16 KV, FP32 SSM, FULL_AND_PIECEWISE,
-maximum context 262144 and seven probabilistic draft tokens are fixed.
-Sixteen matched prompts generate 600 tokens each, with temperature 0.7,
-top-p 0.9, top-k 20 and seed 123. Exclude the first twenty output rounds.
-Timing ignores EOS; natural-output checks terminate normally.
+The source-complete wheel from `6549744cd41e9e926c26c43b2d833d09cbb51cc8`
+contains the adapter/backend/configuration change and all integration fixes.
+All installed Python and sixteen native hashes match its audit. Only the
+page832 policy changes between arms; projection planes and collective/norm
+fusion are enabled in both. Four V100-SXM2-32GB cards use full NVLink, TP4,
+1290/877MHz, CUDA12.8 and Torch2.10.0+cu128. FP16 KV, FP32 SSM,
+FULL_AND_PIECEWISE, context262144 and seven draft tokens are fixed.
 
-| Input | Off ms/round | On ms/round | Off tokens/round | On tokens/round | Off ms/output token | On ms/output token |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1K | 16.608 | 16.636 | 3.049 | 2.964 | 5.491 | 5.640 |
-| 8K | 17.714 | 17.728 | 2.983 | 2.952 | 5.970 | 6.044 |
+Sixteen matched prompts generate600 tokens each at temperature0.7, top-p0.9,
+top-k20 and seed123. Omit the first twenty output rounds. Timing ignores
+EOS; separate natural-output checks terminate normally. Full-round means
+are weighted equally by prompt; output-token costs pool all observations.
 
-Every timed request records 1290/877 MHz on all four ranks. Common-context
-logits retain all 128 probe rows: mean KL 6.803e-6, max KL 1.159e-4 and
-top-1 agreement 100%. Natural answers are identical and terminate normally.
-Four concurrent requests pass text-health checks; no C4 speed claim follows.
+| Input | Off ms/round | On ms/round | Saving ms | Off tokens/round | On tokens/round | Off ms/output token | On ms/output token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1K | 16.607 | 16.176 | 0.431 | 2.918 | 2.897 | 5.713 | 5.615 |
+| 8K | 17.700 | 16.958 | 0.742 | 2.928 | 3.040 | 6.071 | 5.610 |
 
-The comparison above did not select the split path. A single post-batch
-trace records B1/Q8/H8/KV2/D128, contiguous FP16 query/output, interleaved
-FP16 KV pages of size832, `auto` KV dtype, and window `(2047,2047)`.
-All input guards pass, but the general paged kernel remains selected five
-times per round (105.000us/call). The wheel does not export
-`dflash2_paged_bmhd_fwd`; the public guard incorrectly required this unrelated
-native symbol before trying the independent packaged Triton split path.
+Draft acceptance is27.333→27.033% at1K and27.249→28.670% at8K; report
+those changes separately from round latency. Every timed request records
+1290/877MHz on all four ranks. Mean TTFT is367.618→367.194ms at1K and
+2834.572→2835.586ms at8K. These are unprofiled model measurements.
 
-The correction admits the split path independently. Only the native
-1024/2048 concurrent branch requires the native BMHD symbol. Eleven CPU
-dispatch checks and thirty-four installed-wheel policy/GPU checks pass,
-including a live page832 graph with the native symbol explicitly absent.
-The corrected model comparison is running; the earlier numbers are retained
-as an admission failure, not as a split-kernel performance result. A
-compile-only recorder in the on-arm benchmark harness reads unmatched
-collective boundaries; it does not mutate graphs or run during timing.
-Raw counts, acceptance and artifact hashes are in
+## Correctness and dispatch
+
+Eleven CPU dispatch checks and thirty-four installed-wheel policy/GPU
+checks pass. They include a live page832 graph with the native symbol
+explicitly absent, changed live lengths, interleaved K/V strides, page
+indirection, zero-length queries, window masks and concurrent fallback.
+The on-arm compilation contains split `part`/`merge` kernels while the off
+arm does not. The earlier configuration comparison exercised the fallback
+in both arms and is not evidence of split-kernel performance.
+
+All128 common-context logit rows are retained: mean KL5.836e-6, max
+KL3.996e-5 and top-1 agreement100%. Natural numerical and English prompts
+finish normally with identical outputs. Four concurrent requests pass text
+health checks; no C4 throughput claim follows. Artifact hashes, counts,
+acceptance and the full-round comparison are recorded in
 `data/sm70_dflash_page832_20261007.json`.
