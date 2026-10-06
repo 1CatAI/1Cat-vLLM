@@ -258,6 +258,12 @@ def main():
                 timeout=300,
             )
             report["measurement_scope"] = "numerical diagnosis; no speed measurements"
+            report["diagnostic_sampling"] = {
+                "temperature": 0,
+                "ignore_eos": True,
+                "max_tokens": 32,
+                "input_tokens": len(fixed_ids),
+            }
             report["complete"] = True
             save()
             return
