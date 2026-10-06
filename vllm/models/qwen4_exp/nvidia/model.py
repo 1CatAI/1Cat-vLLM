@@ -492,6 +492,89 @@ class Qwen4ExpDecoderLayer(nn.Module):
         return hidden_states, mlp_out, injection
 
 
+def enable_sm70_hcx(model: nn.Module, device: torch.device) -> bool:
+    """Make every target block output a TP partial consumed by HC modules."""
+    from .sm70_hcx import get_hcx_runtime
+
+    runtime = get_hcx_runtime(device)
+    if not runtime.enabled:
+        logger.info_once("SM70 HCX not admitted: %s.", runtime.reason)
+        return False
+    for layer in model.layers:
+        if not isinstance(layer, Qwen4ExpDecoderLayer):
+            continue
+        attention = (
+            layer.linear_attn.out_proj
+            if layer.layer_type == "linear_attention"
+            else layer.self_attn.o_proj
+        )
+        attention.reduce_results = False
+        from .sm70_hcx import pack_output_projection
+
+        planes = pack_output_projection(attention)
+        width = getattr(attention, "input_size_per_partition", None)
+        if planes is not None and planes[0] != width:
+            logger.info_once(
+                "SM70 HCX o-proj fusion skipped: packed K %d != shard K %s.",
+                planes[0],
+                width,
+            )
+            planes = None
+        if planes is not None:
+            layer.mlp_hyper_connection._hcx_oproj = (attention, *planes)
+            if layer.layer_type == "linear_attention":
+                layer.linear_attn.sm70_defer_out_proj = planes[0]
+            else:
+                layer.self_attn.sm70_defer_o_proj = planes[0]
+        if isinstance(layer.mlp, Qwen4ExpSparseMoeBlock):
+            layer.mlp.experts.runner.sm70_partial_output = True
+        else:
+            layer.mlp.down_proj.reduce_results = False
+        prefix = f"layer{layer.layer_idx}"
+        layer.attn_hyper_connection.enable_partial_inputs(prefix + ".attn", runtime)
+        layer.mlp_hyper_connection.enable_partial_inputs(prefix + ".mlp", runtime)
+    if model.hyper_connection_mixer is not None:
+        model.hyper_connection_mixer.enable_partial_inputs("final")
+    return True
+
+
+def _maybe_fuse_sm70_side_projections(model: nn.Module) -> None:
+    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import attach
+
+    fused = 0
+    for layer in model.layers:
+        if not isinstance(layer, Qwen4ExpDecoderLayer):
+            continue
+        if layer.layer_type == "linear_attention":
+            gdn = layer.linear_attn
+            if gdn.in_proj_ba is not None and attach(
+                gdn.in_proj_qkvz, gdn.in_proj_ba, "sm70_side_projection"
+            ):
+                gdn.sm70_side_projection = gdn.in_proj_qkvz.sm70_side_projection
+                fused += 1
+        else:
+            attn = layer.self_attn
+            if attach(attn.qkv_proj, attn.indexer.index_qk_proj, "sm70_side_projection"):
+                attn.sm70_side_projection = attn.qkv_proj.sm70_side_projection
+                fused += 1
+    logger.info_once("SM70 fused side projections attached to %d layers.", fused)
+
+
+def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) -> None:
+    if vllm_config.kernel_config.sm70_fused_side_projections:
+        _maybe_fuse_sm70_side_projections(model)
+    kernel_config = vllm_config.kernel_config
+    if not (kernel_config.sm70_hcx or kernel_config.sm70_top1x):
+        return
+    device = next(model.parameters()).device
+    from .sm70_hcx import get_hcx_runtime
+
+    runtime = get_hcx_runtime(device)
+    runtime.top1_enabled = bool(kernel_config.sm70_top1x and runtime.enabled)
+    if kernel_config.sm70_hcx:
+        enable_sm70_hcx(model, device)
+
+
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
     """Expose Qwen4Exp routed experts through vLLM's EPLB protocol."""
 
@@ -1160,6 +1243,7 @@ class Qwen4ExpForCausalLM(
                     self.vllm_config.kernel_config.qsa_auto_e4m3_active
                 ),
             )
+        _maybe_enable_sm70_peer_paths(self.vllm_config, self.model)
         return loaded
 
 
@@ -1376,6 +1460,9 @@ class Qwen4ExpForConditionalGeneration(
             require_calibrated_target=(
                 self.language_model.vllm_config.kernel_config.qsa_auto_e4m3_active
             ),
+        )
+        _maybe_enable_sm70_peer_paths(
+            self.language_model.vllm_config, self.language_model.model
         )
         return loaded
 

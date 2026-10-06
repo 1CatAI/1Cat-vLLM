@@ -33,6 +33,7 @@ from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
     maybe_apply_fused_hc,
 )
 from vllm.model_executor.models.utils import maybe_prefix
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
@@ -172,6 +173,28 @@ class GatedResidual(nn.Module):
 
         return hidden_states, block_input, injection
 
+    def enable_partial_inputs(self, name: str, runtime=None) -> None:
+        """Block outputs reaching this module are TP partials from now on."""
+        self._partial_inputs = True
+        self._hcx_name = name
+        _PARTIAL_MODULES[name] = self
+        if runtime is not None and self.use_combine:
+            from .sm70_hcx import pack_down, pack_up
+
+            down = self.input_mix_weight_down_block_inject.weight
+            up = self.input_mix_weight_up.weight
+            if down.dtype == torch.float16 and tuple(down.shape) == (336, 10240):
+                self._hcx = runtime
+                self._hcx_down = pack_down(down.data, runtime.logical_rank)
+                self._hcx_up = pack_up(up.data, runtime.logical_rank)
+
+    def _reduce_partial(self, block_output: torch.Tensor) -> torch.Tensor:
+        if not getattr(self, "_partial_inputs", False):
+            return block_output
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        return tensor_model_parallel_all_reduce(block_output)
+
     def combine_and_mix(
         self,
         hidden_states: torch.Tensor,
@@ -184,6 +207,21 @@ class GatedResidual(nn.Module):
         block's mix. Its combine with ``block_output`` is fused with this
         module's input RMSNorm.
         """
+        if getattr(self, "_partial_inputs", False) and self.use_combine:
+            return torch.ops.vllm.qwen38_sm70_hcx_combine_and_mix(
+                hidden_states, prev_block_output, prev_injection, self._hcx_name
+            )
+        prev_block_output = self._reduce_partial(prev_block_output)
+        return self._combine_and_mix_reduced(
+            hidden_states, prev_block_output, prev_injection
+        )
+
+    def _combine_and_mix_reduced(
+        self,
+        hidden_states: torch.Tensor,
+        prev_block_output: torch.Tensor,
+        prev_injection: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_states, xn = hc_combine_norm(
             hidden_states,
             prev_block_output,
@@ -203,12 +241,65 @@ class GatedResidual(nn.Module):
         block_output: torch.Tensor,
         injection: torch.Tensor,
     ) -> torch.Tensor:
+        block_output = self._reduce_partial(block_output)
         return hc_combine(hidden_states, block_output, injection, self.hc_count)
 
     @property
     def hyper_hidden_size(self) -> int:
         return self.hc_count * self.hidden_size
 
+
+_PARTIAL_MODULES: dict[str, "GatedResidual"] = {}
+
+
+def _hcx_combine_and_mix(
+    hidden_states: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    module = _PARTIAL_MODULES[name]
+    runtime = getattr(module, "_hcx", None)
+    oproj = getattr(module, "_hcx_oproj", None)
+    if runtime is not None and block_output.shape[0] <= 8:
+        return runtime.run(
+            block_output,
+            hidden_states,
+            injection,
+            module.hc_norm.weight,
+            module.config.rms_norm_eps,
+            module._hcx_down,
+            module._hcx_up,
+            None if oproj is None else oproj[1:],
+        )
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
+    if oproj is not None:
+        # Deferred projection: the block output carries the o-proj input.
+        layer, k = oproj[0], oproj[1]
+        block_output, _ = layer(block_output[:, :k].contiguous())
+    reduced = tensor_model_parallel_all_reduce(block_output)
+    hidden, block, inj = module._combine_and_mix_reduced(
+        hidden_states, reduced, injection
+    )
+    assert inj is not None
+    return hidden, block, inj
+
+
+def _hcx_combine_and_mix_fake(hidden_states, block_output, injection, name):
+    m = block_output.shape[0]
+    return (
+        torch.empty_like(hidden_states),
+        block_output.new_empty((m, block_output.shape[1])),
+        injection.new_empty((m, injection.shape[1])),
+    )
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_hcx_combine_and_mix",
+    op_func=_hcx_combine_and_mix,
+    fake_impl=_hcx_combine_and_mix_fake,
+)
 
 __all__ = [
     "GatedResidual",
