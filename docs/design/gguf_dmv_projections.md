@@ -63,7 +63,212 @@ even if the actual weight remained finite; these layers retain canonical
 storage. Replacement is atomic across a fused projection, so a rejected shard
 never leaves a mixture of plane and canonical buffers for a legacy reader.
 
-## Installed-wheel model comparison
+## Matched model result on fully connected NVLink
+
+A same-wheel off/on comparison on four fully connected V100-SXM2-32GB
+cards measures **17.237 ms at 1K** and **18.345 ms at 8K** per complete
+speculative round. Controls measure 19.507/20.569 ms, reproducing the later
+19.512/20.557 ms historical baseline on this topology. The measured savings
+are 2.271 and 2.224 ms; these are end-to-end output timestamp intervals,
+not a sum of projection kernel measurements.
+
+All GPU pairs use NV2 links and share NUMA node 0. SM clocks are 1290 MHz,
+memory clocks 877 MHz and power limits 300 W. All 688 per-card clock samples
+within the sixteen-prompt timing windows match those values. Both arms use
+the ordinary `1.5.2.dev1003+gd6268878bb` wheel, with packaged native
+library hashes verified. No private kernel library or runtime override is
+used. The only changed policy is `sm70_gguf.projection_planes`.
+
+Use the same sixteen prompts, 600 timing tokens per prompt, temperature
+0.7/top-p 0.9/top-k 20/seed 123, thinking disabled, TP4 target and draft,
+seven probabilistic draft tokens, FP16 KV, FP32 SSM, Flash-V100 and CUDA
+graphs. Maximum length is 262144, batched-token budget 1024, maximum
+sequences four and prefix caching disabled. Omit the first twenty output
+rounds per prompt. Round means weight prompts equally; output-token latency
+pools retained intervals and emitted tokens.
+
+| Input | Off round ms | On round ms | Saving ms | Off tokens/round | On tokens/round | Off ms/output token | On ms/output token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1K | 19.507 | 17.237 | 2.271 | 2.921 | 2.852 | 6.707 | 6.065 |
+| 8K | 20.569 | 18.345 | 2.224 | 2.894 | 2.990 | 7.177 | 6.166 |
+
+Output-token rates improve from 149.11 to 164.88 tokens/s at 1K and from
+139.33 to 162.19 tokens/s at 8K. Draft acceptance fractions are
+27.333%/26.494% off/on at 1K and 26.606%/28.026% at 8K; acceptance
+lengths are reported separately instead of assuming identical outputs.
+Mean TTFT increases from 346.08 to 371.18 ms and from 2693.33 to
+2841.85 ms. Prefill/restoration cost therefore remains a limitation of the
+M8 storage route even though steady decode improves.
+
+Every rank admits 215 plane projections and seven temporary IQ2 down
+readers. Fourteen existing native gate/up readers remain as fallback.
+The control retains all sixty previously admitted native gate/up pairs.
+Both natural EOS checks stop normally, including the arithmetic answer
+`391`. C4 completes four requests; its 7.746 s cold smoke includes
+first-use compilation and is not a concurrency throughput benchmark.
+No new KL claim is made from this timing run; the unchanged wheel's
+distribution checks are recorded in the earlier comparison below.
+
+The remote controller completed both arms while new SSH connections were
+temporarily unavailable. The results were recovered without restarting or
+repeating either model run. Model and clock evidence hashes, contract and
+per-prompt results are in
+[the matched NVLink data](data/gguf_dmv_nvlink_model_20261006.json).
+
+### One post-batch trace on the NVLink machine
+
+The single new capture uses the established diagnostic contract: 1K input,
+64 output, maximum length 32768, TP4, seven draft tokens, FP16 KV,
+temperature 0.7/top-p 0.95/top-k 20/seed 123 and first-target-GPU-node round
+boundaries. Sixteen M8 verifier replays per rank yield thirteen interior
+round intervals. The four clock samples within this short request all show
+1290/877 MHz. Nsight Systems 2024.6.2 graph-node tracing adds overhead;
+its 18.806 ms rank-0 interval is not the unprofiled 17.237 ms model result.
+
+| Rank | Traced round ms | Target graph ms | Target gaps ms | After target ms | Projection service ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 18.806 | 14.930 | 1.305 | 3.876 | 8.512 |
+| 1 | 18.826 | 14.953 | 1.301 | 3.873 | 8.630 |
+| 2 | 18.826 | 14.948 | 1.332 | 3.878 | 8.605 |
+| 3 | 18.843 | 14.963 | 1.346 | 3.879 | 8.594 |
+
+Rank-0 projection service decreases from the previous same-machine output
+batch's 10.542 to 8.512 ms, or 2.030 ms. The full traced round decreases
+from 21.043 to 18.806 ms and the target graph from 17.129 to 14.930 ms.
+The after-target envelope remains approximately 3.88 ms with 210 kernels;
+no draft-side optimization is claimed. The 6 ms projection-service goal
+remains unmet despite reaching the approximately 18 ms model-round goal.
+
+| Projection | Calls/round | us/call | Bytes/card/call | Effective GB/s | Service ms/round |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| qkvz with a/b | 48 | 34.078 | 9924267 | 291.2 | 1.636 |
+| GDN out | 48 | 20.254 | 3932160 | 194.1 | 0.972 |
+| gate/up existing reader | 14 | 62.635 | 14771931 | 235.8 | 0.877 |
+| down | 64 | 28.793 | 10681440 | 371.0 | 1.843 |
+| gate/up projection planes | 50 | 46.035 | 20833894 | 452.6 | 2.302 |
+| attention q/k/v | 16 | 36.054 | 8780800 | 243.5 | 0.577 |
+| attention o | 16 | 19.119 | 3824640 | 200.0 | 0.306 |
+
+Bytes are loaded operand footprints including fused floating rows; they
+exclude activation/workspace/codebook traffic. Effective bandwidth is not
+an NCU DRAM measurement. Per-role means include mixed types and fallbacks.
+
+Target communication/reduction is 130 calls at 11.501 us, or 1.495 ms;
+RMSNorm is 129 calls at 6.012 us, or 0.775 ms. Target inter-kernel gaps
+total 1.305 ms. Neither a fused communication epilogue nor a new small
+kernel fusion is added here.
+
+| After-target category | Calls/round | us/call | Service ms/round |
+| --- | ---: | ---: | ---: |
+| draft GEMM | 23 | 43.422 | 0.999 |
+| draft attention | 5 | 103.824 | 0.519 |
+| target head | 1 | 270.108 | 0.270 |
+| draft shared head | 1 | 273.094 | 0.273 |
+| sampling/sorting | 23 | 7.405 | 0.170 |
+| communication/reduction | 18 | 12.881 | 0.232 |
+| other tail | 139 | 5.782 | 0.804 |
+
+The two vocabulary heads remain distinct target and draft calls. Tail gaps
+total 0.609 ms; gaps between graph envelopes total 353.807 us, while draft
+graph end to the next target is 214.138 us. These gap definitions overlap
+and must not be summed with kernel service as independent wall time.
+Raw profile and SQLite evidence were retained once; GPU processes exited
+and all six agreed lock files were confirmed released.
+
+### Operator increments and absolute timing gaps
+
+The isolated audit measures an existing-to-candidate increment of 1.872 ms
+(7.724 to 5.852 ms). The fully connected NVLink trace measures a 2.030 ms
+projection increment (10.542 to 8.512 ms), and matched unprofiled full rounds
+improve by 2.271/2.224 ms. The existing operator improvement is therefore
+visible in the model; 8.512 minus 5.852 is not an additional uncollected
+optimization. Those absolute values differ in clocks, fixtures, graph context,
+and instrumentation. The control also has an absolute audit-to-trace gap of
+2.818 ms. Neither absolute gap can be subtracted from the model round as a
+qualified future saving.
+
+New head-selected rank-0 IQ3_S controls on the NVLink host use 1290/877 MHz,
+M8, KW4/TN2/split1, balanced measurements and the ordinary installed wheel.
+GDN output measures 11.193 us in an isolated cold-weight graph and 19.443 us
+when interleaved with Torch's sparse 10 GiB read; down measures
+22.118/29.502 us. These are graph-node service measurements. All variants
+remain bitwise equal and the original official-dequantization checks have
+relative L2 errors of 3.66e-4 and 3.58e-4.
+
+Weight loads through streaming, global-only or read-only caches do not recover
+the interleaved cost. Function shared-memory carveouts of 32/64/96 KiB and
+uniform device cache preferences also fail. Device-resident descriptors reduce
+registers from 99 to 94 but are slower: GDN output 20.582 versus 19.394 us
+and down 30.735 versus 29.341 us in the sparse graph. External event nodes
+increase complete unprofiled graph envelopes; shifting node service into
+another boundary is not a speedup. None of these variants is admitted.
+
+The sparse-read control has an additional confound: Torch's wide strided
+view cannot use 32-bit indexing and decomposes one operation into eight
+kernels; its reused-address control uses one. A dedicated CUDA read kernel
+keeps the same binary, grid, launch count and logical read count across
+wide/reused addresses. GDN output then measures 13.688/11.440 us and down
+24.307/22.166 us, compared with 19.362/29.446 us following the Torch wide
+operation. Address breadth still has a cost, but the larger Torch result
+cannot be attributed entirely to address/cache pressure. An eight-launch CUDA
+control, with the same small parameter structure and read count in both arms, measures GDN output 19.381/13.102 us and down
+29.206/23.103 us for wide/reused addresses. The cost therefore interacts with
+both address breadth and the preceding launch sequence; it is not established
+as a pure translation, weight-bandwidth, or instruction-issue bottleneck.
+
+A short unprofiled request with the trace's prompt and sampling contract
+measures 16.916 ms over fifteen output intervals. This is diagnostic evidence,
+not a replacement for the sixteen-prompt result: output token IDs differ from
+the profiled request, and the later resident-projection inspection initially
+failed because it mutated an inference tensor outside InferenceMode. The
+retry adds InferenceMode and skips repeated timing requests. Whole-graph NCU
+counters include the sparse predecessor and substantially perturb graph
+latency; they are not used as per-projection bottleneck proof.
+
+### Loaded-model projection graph at the measured clock
+
+A new ordinary-wheel probe uses the actual loaded head-selected TP4 operands,
+including fused floating a/b rows and real segment boundaries. It covers the
+215 admitted DMV projections; the seven temporary IQ2 readers and thirty-four
+other fallbacks are outside this probe. No attention, GDN state, communication,
+head or sampling operations are interleaved. Timing uses unprofiled CUDA-event
+graph envelopes with fixed production configurations and balanced ordering.
+
+| Rank | Calls | Full projection graph ms | Replay output |
+| --- | ---: | ---: | --- |
+| 0 | 215 | 5.691 | Bitwise stable |
+| 1 | 215 | 5.680 | Bitwise stable |
+| 2 | 215 | 5.693 | Bitwise stable |
+| 3 | 215 | 5.690 | Bitwise stable |
+
+All twenty-two per-card samples within each rank's timing window show
+1290/877 MHz. Rank-0 operands occupy 2,364,497,920 bytes. Their snapshot is
+retained outside Git so subsequent operator experiments need not repeat model loading.
+These are isolated projection-graph results, not a new end-to-end speed claim.
+
+| Plane role | Calls | Role-only graph ms |
+| --- | ---: | ---: |
+| gate/up | 50 | 2.049 |
+| down | 56 | 1.264 |
+| qkvz with a/b | 39 | 1.056 |
+| GDN out | 48 | 0.538 |
+| attention q/k/v | 6 | 0.140 |
+| attention o | 16 | 0.176 |
+
+The separately replayed rank-0 role graphs sum to 5.222 ms, versus 5.691 ms
+when interleaved in layer/role order. Dependencies prevent simply grouping
+roles across layers in the model. The corresponding 215 calls in the existing
+rank-0 model trace total 6.564 ms of service. Their 0.872 ms difference from
+the pure graph includes changed surrounding work and instrumentation; it is
+not a qualified recoverable saving. The earlier 2.660 ms absolute comparison
+is superseded as an estimate of missing operator gains.
+
+The harness retry uses InferenceMode and skips repeated timing requests;
+all four ranks complete. No cache, descriptor, event or sparse-read research
+variant is admitted to the production route. The matched sixteen-prompt
+17.237/18.345 ms result remains the end-to-end result.
+
+## Earlier installed-wheel comparison with cross-NUMA links
 
 The ordinary SM70 wheel passed 41 GPU operator tests. The installed native
 libraries matched the packaged libraries by SHA-256; no private extension
