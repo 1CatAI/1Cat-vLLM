@@ -14,7 +14,6 @@ from vllm.models.qwen4_exp.nvidia import sm70_hcx as hcx
 def isolate_registries(monkeypatch):
     monkeypatch.setattr(hcx, "_OUTPUT_PROJECTIONS", {})
     monkeypatch.setattr(hcx, "_MOE_RUNNERS", {})
-    monkeypatch.setattr(hcx, "_MOE_INPUTS", {})
     monkeypatch.setattr(hc, "_PARTIAL_MODULES", {})
 
 
@@ -56,13 +55,13 @@ def test_large_m_moe_keeps_original_fp32_sum2(rows):
 
     def sum2(a, b, trunc):
         calls.append((a, b, trunc))
-        return a.float() + b.float()
+        return (a.float() + b.float() - 80000).half()
 
     hcx.register_moe_runner("p", SimpleNamespace(_maybe_sm70_moe_sum2_allreduce=sum2))
     out = hcx._moe_output(shared, fused, "p", 4)
     assert calls == [(shared, fused, 4)]
-    assert out.dtype == torch.float32 and torch.all(out == 80000)
-    assert not hcx._MOE_INPUTS
+    assert out.shape == (2 * rows, 4)
+    assert torch.all(out[:rows] == 0)
 
 
 def test_small_m_hc_consumes_unrounded_moe_pair():
@@ -79,7 +78,7 @@ def test_small_m_hc_consumes_unrounded_moe_pair():
 
     module = SimpleNamespace(
         _hcx=SimpleNamespace(run=run),
-        _hcx_moe_name="p",
+        _partial_pair=lambda x: (x[:5], x[5:]),
         hc_norm=SimpleNamespace(weight=torch.ones(4)),
         config=SimpleNamespace(rms_norm_eps=1e-6),
         _hcx_down=None,
@@ -87,8 +86,9 @@ def test_small_m_hc_consumes_unrounded_moe_pair():
     )
     hc._PARTIAL_MODULES["consumer"] = module
     hc._hcx_combine_and_mix(torch.ones(5, 16), partial, torch.ones(5, 4), "consumer")
-    assert seen[0][0] is fused and seen[0][1] is shared
-    assert torch.all(partial == 2048)
+    torch.testing.assert_close(seen[0][0], fused, rtol=0, atol=0)
+    torch.testing.assert_close(seen[0][1], shared, rtol=0, atol=0)
+    assert partial.shape == (10, 4)
     assert torch.all(seen[0][0].float() + seen[0][1].float() == 2049)
 
 
@@ -101,6 +101,7 @@ def test_large_m_hc_does_not_reduce_or_recompute_projection():
 
     hc._PARTIAL_MODULES["consumer"] = SimpleNamespace(
         _hcx=SimpleNamespace(run=lambda *a, **k: pytest.fail("small-M HCX")),
+        _partial_pair=lambda x: (x, None),
         _hcx_oproj=(lambda x: pytest.fail("duplicate projection"), 2),
         _combine_and_mix_reduced=original,
     )
@@ -189,7 +190,62 @@ def test_hcx_only_consumes_partial_producers(monkeypatch):
     )
     assert model_module.enable_sm70_hcx(model, torch.device("cpu"))
     assert not model.layers[0].attn_hyper_connection.partial
-    assert model.layers[1].attn_hyper_connection._hcx_moe_name == "layer0"
+    assert model.layers[1].attn_hyper_connection._hcx_moe_payload
     assert not model.layers[2].attn_hyper_connection.partial
-    assert model.hyper_connection_mixer._hcx_moe_name == "layer2"
+    assert model.hyper_connection_mixer._hcx_moe_payload
     assert model.sm70_hcx_status["prepared_modules"] == 4
+
+
+def test_compiled_moe_payload_keeps_both_dependencies_live():
+    names = {
+        "qwen38_sm70_hcx_moe_output": hcx._moe_output,
+        "qwen38_sm70_hcx_combine_and_mix": hc._hcx_combine_and_mix,
+    }
+    library = torch.library.Library("vllm", "IMPL", "CPU")
+    for name, function in names.items():
+        if not torch._C._dispatch_has_kernel_for_dispatch_key("vllm::" + name, "CPU"):
+            library.impl(name, function)
+
+    def native(first, hidden, injection, *args, secondary):
+        block = ((first.float() + secondary.float()) * 0.5).half()
+        return hidden.clone(), block, injection.clone()
+
+    def original(hidden, block, injection):
+        return hidden.clone(), block * 0.5, injection.clone()
+
+    hc._PARTIAL_MODULES["consumer"] = SimpleNamespace(
+        _hcx=SimpleNamespace(run=native),
+        _partial_pair=lambda x: (x[: x.shape[0] // 2], x[x.shape[0] // 2 :]),
+        hc_norm=SimpleNamespace(weight=torch.ones(4)),
+        config=SimpleNamespace(rms_norm_eps=1e-6),
+        _hcx_down=None,
+        _hcx_up=None,
+        _combine_and_mix_reduced=original,
+    )
+    hcx.register_moe_runner(
+        "producer",
+        SimpleNamespace(
+            _maybe_sm70_moe_sum2_allreduce=lambda a, b, n: (
+                a.float() + b.float()
+            ).half(),
+        ),
+    )
+
+    @torch.compile(backend="inductor", dynamic=True, fullgraph=True)
+    def model(x, hidden, injection):
+        # These producer temporaries can be reused after packing. Their values
+        # must survive in the explicit payload, not in hidden Python refs.
+        payload = torch.ops.vllm.qwen38_sm70_hcx_moe_output(x * 4, x * 3, "producer", 4)
+        scratch = x * 100
+        _, block, _ = torch.ops.vllm.qwen38_sm70_hcx_combine_and_mix(
+            hidden, payload, injection, "consumer"
+        )
+        return block, scratch
+
+    for rows in [5, 20, 8, 9, 5]:
+        x = torch.arange(rows * 4).reshape(rows, 4).half() * 0.125
+        hidden, injection = torch.ones(rows, 16).half(), torch.ones(rows, 4).half()
+        block, scratch = model(x, hidden, injection)
+        torch.testing.assert_close(block, x * 3.5, rtol=0, atol=0)
+        torch.testing.assert_close(scratch, x * 100, rtol=0, atol=0)
+    del library

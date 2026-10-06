@@ -582,6 +582,10 @@ class KernelConfig:
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""
 
+    sm70_hcx_output_projection: bool = True
+    """Fuse eligible output projections into HCX when HCX is enabled. Disable
+    to compare the separate projection and HC boundary with identical weights."""
+
     qsa_dense_short_context: bool = False
     """Attend densely, without index selection, in context-bucketed decode graphs
     whose bucket does not exceed the indexer budget (where QSA selects every

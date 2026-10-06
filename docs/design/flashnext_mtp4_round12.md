@@ -225,3 +225,44 @@ It removes shared-memory correlated-codebook lookup, but reads more weight
 bytes: 160 versus 98, 110 or 82 bytes per source 256-weight block. Its speed
 is unqualified until a same-card real-shard M=5/M=20 comparison passes the
 retained integer-dot and graph-canary checks. No model dispatch changes yet.
+
+### Rejected scalar LUT and hidden-reference HCX paths
+
+The signed-nibble experiment passes 36 GPU integer-dot, changed-input,
+changed-route and graph-canary checks, with byte-identical outputs. Real TP4
+expert shards use E=512, N=160, K=2560 and 47 unique experts at M=5. Cold-cache
+ABBA records the following gate/up medians:
+
+| Type | M=5 retained, us | M=5 scalar LUT, us | M=20 retained, us | M=20 scalar LUT, us |
+| --- | ---: | ---: | ---: | ---: |
+| IQ3_XXS | 44.032 | 48.128 | 119.808 | 139.264 |
+| IQ3_S | 46.592 | 46.080 | 122.880 | 134.144 |
+| IQ2_S | 40.960 | 49.152 | 106.496 | 136.192 |
+
+The M=5 clock windows are respectively 1290, 1425 and 1530 MHz; mixed clock
+windows at other points remain in the raw data. These are paired comparisons
+within each point, not cross-type rankings. The approximately 0.5-us IQ3_S
+difference is too small to qualify. The weighted service estimate regresses
+by 0.228 ms across the three expert layer groups, before any model overhead.
+The route is rejected. Numerical and timing data are retained in
+`data/flashnext_iq_scalar_lut_20261007.json`.
+
+The initial HCX large-batch repair using hidden producer Tensor references
+fails the model gate: C1 emits 2.365 versus 4.886 tokens per round and target
+output differs. Eight-prompt acceptance falls to 35.797%; 64 teacher-forcing
+positions have mean KL 0.3635, maximum KL 4.4217, 90.625% matching top-1,
+maximum absolute logit error 13.254 and relative L2 error 1.7374. Its physical
+round latency is not a valid speed result. Short natural EOS checks pass,
+which confirms that those smokes alone cannot qualify this change.
+
+Producer temporaries must have explicit consumer edges for compilation and
+graph memory planning. HCX now receives an owned two-plane Tensor payload;
+views of its two contiguous planes reach the native consumer. Large batches
+retain the original reduction, copy the result into the first plane, and
+ignore the uninitialized second plane. Hidden Tensor registries are removed.
+Thirteen CPU tests, including Inductor temporary reuse and mixed-M dispatch,
+pass. A four-rank compiled graph replay comparison is the next gate before
+another model run. Output-projection fusion can be screened independently
+of the HC boundary through kernel configuration. Compiled Q6 fusion uses
+180 registers/thread versus 92 without a producer projection; neither
+variant spills. This is a screening observation, not a performance claim.

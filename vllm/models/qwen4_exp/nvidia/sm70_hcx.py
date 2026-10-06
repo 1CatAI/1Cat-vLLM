@@ -26,7 +26,6 @@ HD, KD, LORA, INJ = 2560, 10240, 320, 4
 HCX_MAX_M = 8
 _OUTPUT_PROJECTIONS: dict[str, tuple] = {}
 _MOE_RUNNERS: dict[str, Any] = {}
-_MOE_INPUTS: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor | None]] = {}
 AR_BYTES = 4 * 80 * 256 * 8
 LORA_BYTES = 8 * 336 * 8
 HB_BYTES = 8 * HD * 4
@@ -42,13 +41,6 @@ def register_output_projection(name, layer, defer):
 
 def register_moe_runner(name, runner):
     _MOE_RUNNERS[name] = runner
-
-
-def moe_inputs(name, rows):
-    # The producer updates these references immediately before its HC consumer
-    # during eager execution/capture. Graph replay uses the recorded native
-    # tensor addresses, with no Python lookup or per-replay allocation.
-    return _MOE_INPUTS[name, rows]
 
 
 def _output_projection(x: torch.Tensor, name: str) -> torch.Tensor:
@@ -73,22 +65,28 @@ def _output_projection_fake(x: torch.Tensor, name: str) -> torch.Tensor:
 def _moe_output(
     shared: torch.Tensor | None, fused: torch.Tensor, name: str, trunc_size: int
 ) -> torch.Tensor:
-    if 0 < fused.shape[0] <= HCX_MAX_M:
-        _MOE_INPUTS[name, fused.shape[0]] = (fused, shared)
-        partial = fused.clone() if shared is None else shared + fused
-        return partial[..., :trunc_size].contiguous()
-    # Keep the original sum2/all-reduce precision and launch chain outside
-    # the HCX range; the following HC consumes an already-reduced output.
+    rows = fused.shape[0]
+    if 0 < rows <= HCX_MAX_M:
+        # An owned payload makes both contributions explicit to the compiler
+        # and graph allocator. Hidden references to producer temporaries are
+        # unsafe: the memory planner cannot see those additional consumers.
+        first = fused[..., :trunc_size]
+        second = torch.zeros_like(first) if shared is None else shared[..., :trunc_size]
+        return torch.cat((first, second), dim=0)
     runner = _MOE_RUNNERS[name]
     reduced = runner._maybe_sm70_moe_sum2_allreduce(shared, fused, trunc_size)
-    if reduced is not None:
-        return reduced
-    summed = fused if shared is None else shared + fused
-    return runner._maybe_reduce_final_output(summed, trunc_size)
+    if reduced is None:
+        summed = fused if shared is None else shared + fused
+        reduced = runner._maybe_reduce_final_output(summed, trunc_size)
+    # Large batches retain the original reduction. The unused second plane
+    # needs no initialization; the consumer reads only the first plane.
+    payload = fused.new_empty((2 * rows, trunc_size))
+    payload[:rows].copy_(reduced)
+    return payload
 
 
 def _moe_output_fake(shared, fused, name, trunc_size):
-    return fused.new_empty((fused.shape[0], trunc_size))
+    return fused.new_empty((2 * fused.shape[0], trunc_size))
 
 
 direct_register_custom_op(

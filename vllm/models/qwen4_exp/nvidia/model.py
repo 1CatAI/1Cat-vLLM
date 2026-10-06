@@ -493,7 +493,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         return hidden_states, mlp_out, injection
 
 
-def enable_sm70_hcx(model: nn.Module, device: torch.device) -> bool:
+def enable_sm70_hcx(
+    model: nn.Module, device: torch.device, *, fuse_output_projection: bool = True
+) -> bool:
     """Leave supported small-M outputs partial; retain larger-batch reductions."""
     from .sm70_hcx import (
         get_hcx_runtime,
@@ -511,6 +513,7 @@ def enable_sm70_hcx(model: nn.Module, device: torch.device) -> bool:
         max_m=8,
         prepared_modules=0,
         deferred_projections=0,
+        output_projection_policy="fused" if fuse_output_projection else "separate",
         large_m_policy="original_projection_and_reduction",
     )
     model.sm70_hcx_status = status
@@ -545,7 +548,6 @@ def enable_sm70_hcx(model: nn.Module, device: torch.device) -> bool:
             logger.info_once("SM70 HCX not admitted: %s.", status["reason"])
             return False
     previous_moe = False
-    previous_moe_name = None
     for layer in layers:
         attention = (
             layer.linear_attn.out_proj
@@ -553,7 +555,7 @@ def enable_sm70_hcx(model: nn.Module, device: torch.device) -> bool:
             else layer.self_attn.o_proj
         )
         attention.reduce_results = False
-        planes = pack_output_projection(attention)
+        planes = pack_output_projection(attention) if fuse_output_projection else None
         width = getattr(attention, "input_size_per_partition", None)
         if planes is not None and planes[0] != width:
             logger.info_once(
@@ -578,18 +580,18 @@ def enable_sm70_hcx(model: nn.Module, device: torch.device) -> bool:
         if isinstance(layer.mlp, Qwen4ExpSparseMoeBlock):
             runner = layer.mlp.experts.runner
             runner.sm70_partial_output = True
+            layer.mlp.sm70_hcx_packed_outputs = True
             runner.sm70_hcx_name = prefix
             register_moe_runner(prefix, runner)
         if previous_moe:
-            layer.attn_hyper_connection._hcx_moe_name = previous_moe_name
+            layer.attn_hyper_connection._hcx_moe_payload = True
             layer.attn_hyper_connection.enable_partial_inputs(prefix + ".attn", runtime)
             status["prepared_modules"] += 1
         layer.mlp_hyper_connection.enable_partial_inputs(prefix + ".mlp", runtime)
         status["prepared_modules"] += 1
         previous_moe = isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
-        previous_moe_name = prefix if previous_moe else None
     if previous_moe and model.hyper_connection_mixer is not None:
-        model.hyper_connection_mixer._hcx_moe_name = previous_moe_name
+        model.hyper_connection_mixer._hcx_moe_payload = True
         model.hyper_connection_mixer.enable_partial_inputs("final")
     status.update(enabled=True, reason=None)
     logger.info_once("SM70 HCX loaded operator capability: %s.", str(status))
@@ -632,7 +634,11 @@ def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) -> 
     runtime = get_hcx_runtime(device)
     runtime.top1_enabled = bool(kernel_config.sm70_top1x and runtime.enabled)
     if kernel_config.sm70_hcx:
-        enable_sm70_hcx(model, device)
+        enable_sm70_hcx(
+            model,
+            device,
+            fuse_output_projection=kernel_config.sm70_hcx_output_projection,
+        )
         kernel_config.collective_kernel_selections["hcx:target"] = model.sm70_hcx_status
 
 

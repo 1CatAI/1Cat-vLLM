@@ -188,21 +188,25 @@ class GatedResidual(nn.Module):
                 self._hcx_down = pack_down(down.data, runtime.logical_rank)
                 self._hcx_up = pack_up(up.data, runtime.logical_rank)
 
+    def _partial_pair(self, block_output):
+        if getattr(self, "_hcx_moe_payload", False):
+            rows = block_output.shape[0] // 2
+            return block_output[:rows], block_output[rows:]
+        return block_output, None
+
     def _reduce_partial(self, block_output: torch.Tensor) -> torch.Tensor:
-        if not getattr(self, "_partial_inputs", False) or block_output.shape[0] > 8:
+        if not getattr(self, "_partial_inputs", False):
             return block_output
-        moe_name = getattr(self, "_hcx_moe_name", None)
-        if moe_name is not None:
+        first, second = self._partial_pair(block_output)
+        if first.shape[0] > 8:
+            return first
+        if second is not None:
             from vllm.distributed import tensor_model_parallel_all_reduce_sum2
 
-            from .sm70_hcx import moe_inputs
-
-            first, second = moe_inputs(moe_name, block_output.shape[0])
-            if second is not None:
-                return tensor_model_parallel_all_reduce_sum2(first, second)
+            return tensor_model_parallel_all_reduce_sum2(first, second)
         from vllm.distributed import tensor_model_parallel_all_reduce
 
-        return tensor_model_parallel_all_reduce(block_output)
+        return tensor_model_parallel_all_reduce(first)
 
     def combine_and_mix(
         self,
@@ -270,12 +274,7 @@ def _hcx_combine_and_mix(
     module = _PARTIAL_MODULES[name]
     runtime = getattr(module, "_hcx", None)
     oproj = getattr(module, "_hcx_oproj", None)
-    secondary = None
-    moe_name = getattr(module, "_hcx_moe_name", None)
-    if moe_name is not None and 0 < block_output.shape[0] <= 8:
-        from .sm70_hcx import moe_inputs
-
-        block_output, secondary = moe_inputs(moe_name, block_output.shape[0])
+    block_output, secondary = module._partial_pair(block_output)
     if runtime is not None and 0 < block_output.shape[0] <= 8:
         return runtime.run(
             block_output,
@@ -310,7 +309,7 @@ def _hcx_combine_and_mix(
 
 
 def _hcx_combine_and_mix_fake(hidden_states, block_output, injection, name):
-    m = block_output.shape[0]
+    m = hidden_states.shape[0]
     return (
         torch.empty_like(hidden_states),
         block_output.new_empty((m, block_output.shape[1])),
