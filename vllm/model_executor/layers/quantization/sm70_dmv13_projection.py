@@ -21,7 +21,7 @@ logger = init_logger(__name__)
 MAX_M = 8
 MAX_SEGMENTS = 4
 _DENSE_TYPES = {8, 12, 13, 14, 20, 23}
-_F16_TYPES = {1}
+_F16_TYPES = {1, 30}  # F16 and BF16 use the existing FP16 dense contract.
 
 
 def _raw_shards(layer) -> list[tuple[torch.Tensor, int]] | None:
@@ -44,10 +44,29 @@ def _fp16_weight(layer) -> torch.Tensor | None:
     if isinstance(weight, torch.Tensor) and weight.dtype == torch.float16:
         return weight.data if weight.ndim == 2 else None
     shards = _raw_shards(layer)
-    if shards and len(shards) == 1 and shards[0][1] in _F16_TYPES:
-        raw = shards[0][0]
-        return raw.view(torch.float16) if raw.dtype == torch.uint8 else raw
-    return None
+    if not shards or any(kind not in _F16_TYPES for _, kind in shards):
+        return None
+    parts = []
+    for raw, kind in shards:
+        dtype = torch.bfloat16 if kind == 30 else torch.float16
+        if raw.ndim != 2:
+            return None
+        if raw.dtype == torch.uint8:
+            if raw.shape[1] % 2:
+                return None
+            raw = raw.contiguous().view(dtype)
+        elif raw.dtype != dtype:
+            return None
+        if dtype == torch.bfloat16:
+            # Preparation runs during loading. Preserve the existing FP16
+            # weight contract; decline coefficients that cannot be represented.
+            if not bool((raw.float().abs() <= torch.finfo(torch.float16).max).all()):
+                return None
+            raw = raw.to(torch.float16)
+        parts.append(raw)
+    if len({part.shape[1] for part in parts}) != 1:
+        return None
+    return torch.cat(parts) if len(parts) > 1 else parts[0]
 
 
 _PROJECTIONS: dict[str, Dmv13Projection] = {}

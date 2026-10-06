@@ -194,6 +194,24 @@ class GraphParityWorkerExtension:
                 rec.wrap(runner, name, "runner." + name)
             for name in ("prepare_inputs", "prepare_attn", "preprocess_state"):
                 rec.wrap(runner.model_state, name, "model_state." + name)
+            seen_builders = set()
+            for group_id, groups in enumerate(runner.attn_groups):
+                for group in groups:
+                    builder = group.get_metadata_builder(0)
+                    if id(builder) not in seen_builders:
+                        seen_builders.add(id(builder))
+                        rec.wrap(
+                            builder,
+                            "build",
+                            f"metadata.{type(builder).__name__}.{group_id}",
+                        )
+            from vllm.v1.worker.gpu.model_states import mamba_hybrid
+
+            rec.wrap(
+                mamba_hybrid,
+                "prepare_dflash2_gdn_group_metadata",
+                "metadata.gdn_shared",
+            )
             rec.wrap(runner.block_tables, "apply_staged_writes", "block_tables.apply")
             rec.wrap(runner.speculator, "propose", "draft.propose")
             rec.wrap(runner._ple_offload_connector, "prepare_forward", "ple.prepare")

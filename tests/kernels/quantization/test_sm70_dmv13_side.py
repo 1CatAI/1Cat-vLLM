@@ -40,9 +40,20 @@ class _Extra:
         self.weight = weight
 
 
+class _MergedBf16Extra:
+    def __init__(self, weight):
+        pieces = [part.contiguous().view(torch.uint8) for part in weight.chunk(2)]
+        self.qweight = pieces[0]
+        self.qweight.data_container = pieces
+        self.qweight.shard_id = [0, 1]
+        self.qweight.shard_id_map = {0: 0, 1: 1}
+        self.qweight_type = type("T", (), {"shard_weight_type": {0: 30, 1: 30}})()
+
+
 @pytest.mark.parametrize("qtype", [12, 14])
 @pytest.mark.parametrize("tokens", [1, 5, 8])
-def test_side_projection_matches_dequant(qtype, tokens):
+@pytest.mark.parametrize("merged_bf16", [False, True])
+def test_side_projection_matches_dequant(qtype, tokens, merged_bf16):
     from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
         _PROJECTIONS,
         Dmv13Projection,
@@ -52,7 +63,10 @@ def test_side_projection_matches_dequant(qtype, tokens):
     n, k, extra_n = 256, 2560, 24
     raw = _raw(rng, n, k, qtype)
     extra = (torch.randn(extra_n, k, device="cuda") * 0.02).half()
-    proj = Dmv13Projection(_Shard(raw, qtype), _Extra(extra))
+    if merged_bf16:
+        extra = extra.bfloat16()
+    side = _MergedBf16Extra(extra) if merged_bf16 else _Extra(extra)
+    proj = Dmv13Projection(_Shard(raw, qtype), side)
     assert proj.ready
     _PROJECTIONS[proj.name] = proj
     x = (torch.randn(tokens, k, device="cuda") * 0.5).half()
@@ -62,5 +76,5 @@ def test_side_projection_matches_dequant(qtype, tokens):
     err = (out.float().cpu() - ref).norm() / ref.norm()
     assert float(err) < 2e-3
     torch.testing.assert_close(
-        extra_out.float(), (x.float() @ extra.float().T), atol=2e-2, rtol=2e-2
+        extra_out.float(), (x.float() @ extra.half().float().T), atol=2e-2, rtol=2e-2
     )
