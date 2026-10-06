@@ -408,7 +408,7 @@ def _project(
         counters,
         tn,
         None,
-        table(rows.device),
+        table(rows.device) if any(fmt in (5, 6) for fmt in formats) else None,
         floating,
         ab_out,
         out if pair else None,

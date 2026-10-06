@@ -27,8 +27,11 @@ on and contributes to the graph hash for an independent control arm.
 
 The initial research control uses real rank0 blocks, M8, cold rotating weight
 banks, graph replay and balanced ABBA readings at1290MHz SM/877MHz memory.
-These measurements are not model savings. The ordinary `_C` extension has
-been built; its full geometry and canonical fallback checks are running.
+These measurements are not model savings. The ordinary `_C` wheel from source `9e899927b4` passes120 GPU/codec
+checks, including bitwise canonical storage and output restoration outside
+M8. All twelve real mixed pairs and seven down tensors win in matched
+ABBA graph replay: their weighted sum drops0.841→0.602ms. This is0.239ms
+of isolated operator saving; no model saving is claimed yet.
 
 | Projection | Types | Existing us | Nibble us | Nibble weight MB | Weight GB/s |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -42,12 +45,13 @@ Three activation amplitudes give output relative L2 below4.9e-5 in these
 four controls. Eighteen CPU codec cases pass, including negative `d` and
 FP16 subnormals. GPU tests also cover canonical packet restoration, changed
 input graph replay, mixed type pairs, and bitwise fallback output at
-M1/2/4/16/32/512. Their results must qualify admission before integration.
+M1/2/4/16/32/512. All120 checks pass in the source-complete wheel.
 
 The complete thirty-tensor IQ2 inventory would add46.797MiB/card relative
-to canonical storage alone. This phase admits twenty-four gate/up/down
+to canonical storage alone. This phase admits twenty-three gate/up/down
 source tensors; mixed companions and release of old banks also affect the
-actual model budget. Record measured resident memory when integrating.
+actual model budget. The admitted IQ2 tensors add38.516MiB relative to
+canonical alone; record measured resident memory when integrating.
 
 ## Current complete-round ledger
 
