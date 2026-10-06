@@ -423,6 +423,22 @@ def prepare_gguf_projections(
             projection.dmv_gdn_heads = True
         projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
         projections.append(projection)
+    if dmv_enabled and any(
+        p.kernel is not None and not hasattr(p, "dmv_format") for p in projections
+    ):
+        reasons = [
+            getattr(p, "dmv_rejection_reason", "plane_preparation_not_qualified")
+            for p in projections
+            if not hasattr(p, "dmv_format")
+        ]
+        # Storage replacement is atomic across a fused layer. A partially
+        # replaced bank cannot be handed to a legacy canonical/native reader.
+        fallback = prepare_gguf_projections(
+            sources, act_dtype, enabled, prefill_min_m, input_layout=input_layout
+        )
+        for projection in fallback:
+            projection.dmv_rejection_reasons = reasons
+        return fallback
     if input_layout is not None and not all(
         projection.input_layout_restored or getattr(projection, "dmv_gdn_heads", False)
         for projection in projections
@@ -591,7 +607,7 @@ class GGUFPreparedProjection(Module):
         if self.dmv_enabled:
             from .gguf_dmv import prepare_bank
 
-            if prepare_bank(self, weight):
+            if prepare_bank(self, weight, canonical):
                 return None
         if prepare_segment_bank(self, canonical, weight.device):
             remember_descriptor(

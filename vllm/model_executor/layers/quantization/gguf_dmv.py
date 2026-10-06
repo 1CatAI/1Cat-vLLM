@@ -60,10 +60,19 @@ def eligible_sources(sources, prefix):
     )
 
 
-def prepare_bank(projection, raw_weight):
+def prepare_bank(projection, raw_weight, canonical):
     kind = projection.source_type
     k, n = projection.kernel.config.partition_weight_shape
     if kind not in FORMATS or projection.output_padding:
+        return False
+    # The IQ3 byte-to-half trick uses a 1024*scale cancellation term.
+    # Preserve canonical arithmetic for coefficients whose cancellation term
+    # would overflow, even when the reconstructed weight itself is finite.
+    if (
+        kind in (18, 21)
+        and np.max(np.abs(canonical.scales.astype(np.float32))) > 63.96875
+    ):
+        projection.dmv_rejection_reason = "iq3_scale_exceeds_decode_cancellation_range"
         return False
     if not all(
         hasattr(torch.ops._C, op)
@@ -176,7 +185,16 @@ def restore(
 def prepare_layer(layer, projections):
     quantized = [p for p in projections if p.kernel is not None]
     if not quantized or not all(hasattr(p, "dmv_format") for p in quantized):
-        return {"reason": "projection_planes_not_qualified"}
+        return {
+            "reason": next(
+                (
+                    reason
+                    for p in projections
+                    for reason in getattr(p, "dmv_rejection_reasons", ())
+                ),
+                "projection_planes_not_qualified",
+            )
+        }
     # Retain source boundaries even when the canonical loader coalesces them.
     codes, scales, high, fmts, ns = [], [], [], [], []
     for p in quantized:

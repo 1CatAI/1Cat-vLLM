@@ -53,3 +53,9 @@ same-wheel numerical comparisons. The latter selects whole projections that
 contain IQ3_XXS, including their fused companion shards; it does not isolate
 an individual reader inside a fused launch. Only `all` admits temporary IQ2
 down readers. The default production scope is `all`.
+
+IQ3 admission also checks the cancellation term used by the byte-to-half
+conversion. Expanded scales above 63.96875 would overflow `1024 * scale`,
+even if the actual weight remained finite; these layers retain canonical
+storage. Replacement is atomic across a fused projection, so a rejected shard
+never leaves a mixture of plane and canonical buffers for a legacy reader.
