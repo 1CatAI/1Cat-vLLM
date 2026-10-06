@@ -32,5 +32,31 @@ A preceding research comparison on five separate KV banks at the actual
 60.738 at 8K, and 203.123 to 60.763 at 32K. FP64-relative L2 error is about
 2.0e-4 for the split path. These are isolated graph operator measurements;
 multiplying by five gives estimates of 0.193/0.724 ms per round at 1K/8K.
-They are not end-to-end savings. The matched same-wheel sixteen-prompt
-model comparison is still running.
+They are not end-to-end savings. The matched model comparison below
+does not show those operator savings, so this path is not admitted yet.
+
+## Same-wheel model comparison
+
+Both arms include projection planes and collective/norm fusion. Only the
+page832 split policy changes. TP4 FP16 KV, FP32 SSM, FULL_AND_PIECEWISE,
+maximum context 262144 and seven probabilistic draft tokens are fixed.
+Sixteen matched prompts generate 600 tokens each, with temperature 0.7,
+top-p 0.9, top-k 20 and seed 123. Exclude the first twenty output rounds.
+Timing ignores EOS; natural-output checks terminate normally.
+
+| Input | Off ms/round | On ms/round | Off tokens/round | On tokens/round | Off ms/output token | On ms/output token |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1K | 16.608 | 16.636 | 3.049 | 2.964 | 5.491 | 5.640 |
+| 8K | 17.714 | 17.728 | 2.983 | 2.952 | 5.970 | 6.044 |
+
+Every timed request records 1290/877 MHz on all four ranks. Common-context
+logits retain all 128 probe rows: mean KL 6.803e-6, max KL 1.159e-4 and
+top-1 agreement 100%. Natural answers are identical and terminate normally.
+Four concurrent requests pass text-health checks; no C4 speed claim follows.
+
+There is no measured round saving. Keep integration pending while a single
+post-batch node trace records the actual C1 query layout and dispatch. A
+compile-only recorder in the on-arm benchmark harness reads unmatched
+collective boundaries; it does not mutate graphs or run during timing.
+Raw counts, acceptance and artifact hashes are in
+`data/sm70_dflash_page832_20261007.json`.
