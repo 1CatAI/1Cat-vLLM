@@ -175,6 +175,99 @@ and must not be summed with kernel service as independent wall time.
 Raw profile and SQLite evidence were retained once; GPU processes exited
 and all six agreed lock files were confirmed released.
 
+### Operator increments and absolute timing gaps
+
+The isolated audit measures an existing-to-candidate increment of 1.872 ms
+(7.724 to 5.852 ms). The fully connected NVLink trace measures a 2.030 ms
+projection increment (10.542 to 8.512 ms), and matched unprofiled full rounds
+improve by 2.271/2.224 ms. The existing operator improvement is therefore
+visible in the model; 8.512 minus 5.852 is not an additional uncollected
+optimization. Those absolute values differ in clocks, fixtures, graph context,
+and instrumentation. The control also has an absolute audit-to-trace gap of
+2.818 ms. Neither absolute gap can be subtracted from the model round as a
+qualified future saving.
+
+New head-selected rank-0 IQ3_S controls on the NVLink host use 1290/877 MHz,
+M8, KW4/TN2/split1, balanced measurements and the ordinary installed wheel.
+GDN output measures 11.193 us in an isolated cold-weight graph and 19.443 us
+when interleaved with Torch's sparse 10 GiB read; down measures
+22.118/29.502 us. These are graph-node service measurements. All variants
+remain bitwise equal and the original official-dequantization checks have
+relative L2 errors of 3.66e-4 and 3.58e-4.
+
+Weight loads through streaming, global-only or read-only caches do not recover
+the interleaved cost. Function shared-memory carveouts of 32/64/96 KiB and
+uniform device cache preferences also fail. Device-resident descriptors reduce
+registers from 99 to 94 but are slower: GDN output 20.582 versus 19.394 us
+and down 30.735 versus 29.341 us in the sparse graph. External event nodes
+increase complete unprofiled graph envelopes; shifting node service into
+another boundary is not a speedup. None of these variants is admitted.
+
+The sparse-read control has an additional confound: Torch's wide strided
+view cannot use 32-bit indexing and decomposes one operation into eight
+kernels; its reused-address control uses one. A dedicated CUDA read kernel
+keeps the same binary, grid, launch count and logical read count across
+wide/reused addresses. GDN output then measures 13.688/11.440 us and down
+24.307/22.166 us, compared with 19.362/29.446 us following the Torch wide
+operation. Address breadth still has a cost, but the larger Torch result
+cannot be attributed entirely to address/cache pressure. An eight-launch CUDA
+control, with the same small parameter structure and read count in both arms, measures GDN output 19.381/13.102 us and down
+29.206/23.103 us for wide/reused addresses. The cost therefore interacts with
+both address breadth and the preceding launch sequence; it is not established
+as a pure translation, weight-bandwidth, or instruction-issue bottleneck.
+
+A short unprofiled request with the trace's prompt and sampling contract
+measures 16.916 ms over fifteen output intervals. This is diagnostic evidence,
+not a replacement for the sixteen-prompt result: output token IDs differ from
+the profiled request, and the later resident-projection inspection initially
+failed because it mutated an inference tensor outside InferenceMode. The
+retry adds InferenceMode and skips repeated timing requests. Whole-graph NCU
+counters include the sparse predecessor and substantially perturb graph
+latency; they are not used as per-projection bottleneck proof.
+
+### Loaded-model projection graph at the measured clock
+
+A new ordinary-wheel probe uses the actual loaded head-selected TP4 operands,
+including fused floating a/b rows and real segment boundaries. It covers the
+215 admitted DMV projections; the seven temporary IQ2 readers and thirty-four
+other fallbacks are outside this probe. No attention, GDN state, communication,
+head or sampling operations are interleaved. Timing uses unprofiled CUDA-event
+graph envelopes with fixed production configurations and balanced ordering.
+
+| Rank | Calls | Full projection graph ms | Replay output |
+| --- | ---: | ---: | --- |
+| 0 | 215 | 5.691 | Bitwise stable |
+| 1 | 215 | 5.680 | Bitwise stable |
+| 2 | 215 | 5.693 | Bitwise stable |
+| 3 | 215 | 5.690 | Bitwise stable |
+
+All twenty-two per-card samples within each rank's timing window show
+1290/877 MHz. Rank-0 operands occupy 2,364,497,920 bytes. Their snapshot is
+retained outside Git so subsequent operator experiments need not repeat model loading.
+These are isolated projection-graph results, not a new end-to-end speed claim.
+
+| Plane role | Calls | Role-only graph ms |
+| --- | ---: | ---: |
+| gate/up | 50 | 2.049 |
+| down | 56 | 1.264 |
+| qkvz with a/b | 39 | 1.056 |
+| GDN out | 48 | 0.538 |
+| attention q/k/v | 6 | 0.140 |
+| attention o | 16 | 0.176 |
+
+The separately replayed rank-0 role graphs sum to 5.222 ms, versus 5.691 ms
+when interleaved in layer/role order. Dependencies prevent simply grouping
+roles across layers in the model. The corresponding 215 calls in the existing
+rank-0 model trace total 6.564 ms of service. Their 0.872 ms difference from
+the pure graph includes changed surrounding work and instrumentation; it is
+not a qualified recoverable saving. The earlier 2.660 ms absolute comparison
+is superseded as an estimate of missing operator gains.
+
+The harness retry uses InferenceMode and skips repeated timing requests;
+all four ranks complete. No cache, descriptor, event or sparse-read research
+variant is admitted to the production route. The matched sixteen-prompt
+17.237/18.345 ms result remains the end-to-end result.
+
 ## Earlier installed-wheel comparison with cross-NUMA links
 
 The ordinary SM70 wheel passed 41 GPU operator tests. The installed native
