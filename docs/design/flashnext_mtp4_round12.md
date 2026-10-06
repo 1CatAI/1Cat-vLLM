@@ -400,8 +400,14 @@ The final HC mixer has the same Python M branch.
 Move PLE combine and final-mixer materialization into opaque operations that
 select the TP reduction at actual runtime M. Large batches consume only the
 already-reduced first plane; small batches sum both planes across TP before
-combining. Numerical stage capture and full-model qualification remain
-required; this source diagnosis does not establish endpoint improvement.
+combining. The repaired source-complete wheel's four-rank compiled M20-first/M5-second
+materialization tests pass. In the actual model, all twelve recorded PLE
+stages are byte-identical across TP, with equal weight fingerprints. All 94
+HC boundaries have maximum relative L2 below 0.000435, replacing the earlier
+approximately 7% errors. The short diagnostic generation matches the control
+prefix for 32 tokens. This cohort includes diagnostic copies and is not a
+speed result. Same-wheel unobserved C1/C4, eight-prompt acceptance and aligned
+64-position teacher-forcing comparisons are running.
 
 ### Further IQ scheduling screens
 
@@ -409,13 +415,23 @@ A forced three-CTA register schedule spills registers and regresses IQ3_S M5
 from 45.568 to 73.728 us in same-process graph ABBA. It is rejected.
 A two-row-per-lane schedule gives no IQ3_S M5 improvement (49.152 us for both
 arms). Both screens encounter two one-LSB Q8 output differences at M20,
-so neither is described as byte-exact or admitted to model dispatch.
+so neither is described as byte-exact or admitted to model dispatch. Their
+research builds also used fast-math unlike the packaged native build. The
+negative screens do not qualify an equal-arithmetic implementation.
 
 An additional installed-kernel NCU sample reports long-scoreboard stalls
 42.73%, MIO throttle 15.84%, short-scoreboard stalls 5.66%, and math-pipe
 throttle 3.82%. Shared-load bank-conflict count is 742,063. These metrics
 support testing weight prefetch and shared-codebook scheduling; they do not
 justify replacing endpoint measurements with a throughput estimate.
+
+The initial aligned-record screen incorrectly treated the reader's per-row
+alignment bytes as payload and failed before timing. Its conversion now
+uses only payload bytes, then adds two leading alignment bytes per original
+block. The initial row-ready HC screen differs in three FP16 hidden values
+(maximum 0.00024414); its research compiler enabled fast-math while the
+packaged HC build does not. Both next screens use the native math flags.
+Neither is admitted to model dispatch on these failed attempts.
 
 ## Community designs and applicability
 
