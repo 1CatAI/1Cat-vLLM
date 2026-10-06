@@ -83,6 +83,101 @@ def test_restore_canonical_storage_exactly(kind):
 
 
 @pytest.mark.parametrize(
+    "gate,up", [(17, 16), (22, 21), (17, 18), (16, 22), (22, 17), (18, 22), (21, 22)]
+)
+def test_iq2_pair_preserves_native_m8_arithmetic(gate, up):
+    from vllm.model_executor.layers.quantization.gguf_native_pair import _SOURCE_PACKERS
+
+    ga, gb, _, gr = planes(gate, k=5120)
+    ua, ub, _, ur = planes(up, k=5120)
+    raw_gate = torch.from_numpy(_SOURCE_PACKERS[gate](gr)).cuda()
+    raw_up = torch.from_numpy(_SOURCE_PACKERS[up](ur)).cuda()
+    x = torch.randn(8, 5120, device="cuda", dtype=torch.float16)
+    expected = torch.empty(8, 64, device="cuda", dtype=torch.float16)
+    actual = torch.empty_like(expected)
+    workspace = torch.empty(2048, device="cuda", dtype=torch.float32)
+    counters = torch.zeros(2, device="cuda", dtype=torch.int32)
+    table = torch.from_numpy(iq.tables()).cuda()
+
+    def call():
+        torch.ops._C.gguf_dmv_sm70_out(
+            x,
+            [gb[0], ub[0]],
+            [gb[1], ub[1]],
+            [gb[2], ub[2]],
+            [actual, actual],
+            [ga, ua],
+            [64, 64],
+            5120,
+            1,
+            8,
+            workspace,
+            counters,
+            2,
+            None,
+            table,
+            None,
+            None,
+            actual,
+            False,
+        )
+
+    call()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for amplitude in (0.125, 1.0, 4.0):
+        x.normal_().mul_(amplitude)
+        torch.ops._C.gguf_native_pair_sm70_out(expected, x, raw_gate, raw_up, gate, up)
+        call()
+        assert torch.equal(actual, expected)
+        graph.replay()
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("kind", [17, 22])
+def test_iq2_down_preserves_native_m8_arithmetic(kind):
+    from vllm.model_executor.layers.quantization.gguf_native_pair import _SOURCE_PACKERS
+
+    fmt, buffers, _, raw = planes(kind, k=4352)
+    records = torch.from_numpy(_SOURCE_PACKERS[kind](raw)).cuda()
+    book = torch.empty(4096 if kind == 17 else 8192, device="cuda", dtype=torch.uint8)
+    torch.ops._C.gguf_dmvq_book_sm70_out(book, kind)
+    x = torch.randn(8, 4352, device="cuda", dtype=torch.float16)
+    expected = torch.empty(8, 64, device="cuda", dtype=torch.float16)
+    actual = torch.empty_like(expected)
+    workspace = torch.empty(4096, device="cuda", dtype=torch.float32)
+    counters = torch.zeros(2, device="cuda", dtype=torch.int32)
+    for amplitude in (0.125, 1.0, 4.0):
+        x.normal_().mul_(amplitude)
+        torch.ops._C.gguf_dmvq_sm70_out(
+            expected, x, records, workspace, counters, book, kind, 8, 1
+        )
+        torch.ops._C.gguf_dmv_sm70_out(
+            x,
+            [buffers[0]],
+            [buffers[1]],
+            [buffers[2]],
+            [actual],
+            [fmt],
+            [64],
+            4352,
+            1,
+            8,
+            workspace,
+            counters,
+            2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+        )
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
     "gate,up",
     [(a, b) for a in (12, 18, 21, 23) for b in (12, 18, 21, 23)]
     + [(a, b) for a in (16, 17, 22) for b in (16, 17, 18, 21, 22, 23)]

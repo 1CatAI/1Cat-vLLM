@@ -51,7 +51,7 @@ def eligible_sources(sources, prefix):
         # Only the measured gate/up and down shapes admit the new decoder.
         if not prefix.endswith((".gate_up_proj", ".down_proj")):
             return False
-        if any(t == 12 for _, t in quantized):
+        if any(t in (12, 23) for _, t in quantized):
             return False
     for w, t in quantized:
         if t not in FORMATS or w.dtype != torch.uint8 or w.ndim != 2:
@@ -231,6 +231,9 @@ def restore(
 
 def prepare_layer(layer, projections):
     quantized = [p for p in projections if p.kernel is not None]
+    source_types = {p.source_type for p in quantized}
+    if 23 in source_types and source_types.intersection(iq.IQ2_FORMATS):
+        return {"reason": "iq2_mixed_iq4_requires_original_scale_precision"}
     if not quantized or not all(hasattr(p, "dmv_format") for p in quantized):
         return {
             "reason": next(
@@ -263,6 +266,10 @@ def prepare_layer(layer, projections):
         return {"reason": "too_many_projection_segments"}
     pair = layer.prefix.endswith(".gate_up_proj")
     kw, tn, split = (4, 4, 1) if pair else (4, 2, 1)
+    if any(fmt in iq.IQ2_FORMATS.values() for fmt in fmts):
+        # Match the existing eight-part FP32 reduction; pairs also preserve
+        # contiguous K partitions and the FP16 SiLU activation boundary.
+        kw, tn, split = 8, 2, 1
     # Narrow segments share one launch with wider projections; split2 is used
     # only for an independently launched narrow matrix.
     if not pair and sum(ns) <= 1536:

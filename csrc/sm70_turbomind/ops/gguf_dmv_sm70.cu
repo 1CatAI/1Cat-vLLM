@@ -172,7 +172,7 @@ __device__ __forceinline__ uint32_t word(const uint4& v, int i) {
 }
 
 // Decode one 32-weight step into 16 half2 in k order.
-template <int FMT>
+template <int FMT, bool ExactLattice = false>
 __device__ __forceinline__ void decode(const Ld<FMT>& L, int st,
                                        uint32_t (&hw)[16], const half2* lut) {
   const uint32_t MAGIC = 0x64006400u;
@@ -207,8 +207,21 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st,
       uint32_t a, b;
       asm("prmt.b32 %0, %1, %2, 0x4140;" : "=r"(a) : "r"(gw), "r"(0x64646464u));
       asm("prmt.b32 %0, %1, %2, 0x4342;" : "=r"(b) : "r"(gw), "r"(0x64646464u));
-      const uint32_t va = u32(__hfma2(h2(a), s2, nb2));
-      const uint32_t vb = u32(__hfma2(h2(b), s2, nb2));
+      uint32_t va, vb;
+      if constexpr (ExactLattice) {
+        // Preserve the original reader's one final operand rounding. The
+        // integer grid times the local scale is exactly representable in half.
+        const half2 small = __float2half2_rn(static_cast<float>(1 + 2 * nib) *
+                                             (FMT == IQ3X ? 0.25f : 1.0f));
+        const half2 original_d = lo2(dsw);
+        va =
+            u32(__hmul2(__hmul2(__hsub2(h2(a), h2(MAGIC)), small), original_d));
+        vb =
+            u32(__hmul2(__hmul2(__hsub2(h2(b), h2(MAGIC)), small), original_d));
+      } else {
+        va = u32(__hfma2(h2(a), s2, nb2));
+        vb = u32(__hfma2(h2(b), s2, nb2));
+      }
       uint32_t ra, rb;  // r = v ^ ((sg << (15 - p)) & 0x80008000)
       asm("lop3.b32 %0, %1, %2, %3, 0x78;"
           : "=r"(ra)
@@ -348,16 +361,25 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st,
 __device__ __constant__ int8_t kIQ4[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
-template <int FMT, int KW, int TN>
+template <int FMT, int KW, int TN, bool LegacyIq2 = false>
 __device__ __forceinline__ void body6(
     const Seg& sg, int t, bool on, int kslot, int pid, int g0, int g1, int S,
     int G, const half* __restrict__ x, int ldx, int M, uint4* xs, half2* lut,
-    float (&acc)[8], const uint4* __restrict__ tab, bool gdn_heads) {
+    float (&acc)[8], const uint4* __restrict__ tab, bool gdn_heads, bool pair) {
   constexpr int NT = 32 * KW * TN, PARTS = 4 / TN;
   const int lane = threadIdx.x % 32;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
   Ld<FMT> A;
   int g = g0 + kslot;
+  int end = g1, stride = KW;
+  if constexpr (LegacyIq2) {
+    if (pair) {
+      const int part = (g1 - g0) / KW;
+      g = g0 + kslot * part;
+      end = g + part;
+      stride = 1;
+    }
+  }
   uint4* slot = xs + kslot * 256;
   uint4 X[PARTS];
   auto xload = [&](int gg) {
@@ -383,7 +405,7 @@ __device__ __forceinline__ void body6(
     else
       __syncwarp();
   };
-  if (g < g1) {
+  if (g < end) {
     if (on) load<FMT>(A, sg, t, g, S, G, lane);
     xload(g);
   }
@@ -394,14 +416,14 @@ __device__ __forceinline__ void body6(
     for (int i = threadIdx.x; i < TAB_VECS; i += NT) t4[i] = __ldg(tab + i);
   }
   __syncthreads();
-  if (g >= g1) return;
+  if (g >= end) return;
   xstore(0);
   xsync();
   int cur = 0;
   while (true) {
     Ld<FMT> B;
-    const int gn = g + KW;
-    const bool more = gn < g1;
+    const int gn = g + stride;
+    const bool more = gn < end;
     if (more) {
       if (on) load<FMT>(B, sg, t, gn, S, G, lane);
       xload(gn);
@@ -414,7 +436,7 @@ __device__ __forceinline__ void body6(
 #pragma unroll
         for (int j = 0; j < 4; ++j) xa[j] = xp[j * 8];
         uint32_t hw[16];
-        decode<FMT>(A, st, hw, lut);
+        decode<FMT, LegacyIq2>(A, st, hw, lut);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           mma(acc, xa[j].x, xa[j].y, hw[4 * j], hw[4 * j + 1]);
@@ -514,12 +536,15 @@ __global__ void __launch_bounds__(32 * KW * TN)
   uint4* xs = smem;
   half2* lut = reinterpret_cast<half2*>(smem + KW * 256);
   float acc[8] = {};
+  constexpr bool legacy_iq2 = KW == 8 && TN == 2 && (FA == LUT6 || FB == LUT6);
   if (FA == FB || sg.fmt == FA)
-    body6<FA, KW, TN>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut,
-                      acc, segs.tab, segs.gdn_heads);
+    body6<FA, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx,
+                                  M, xs, lut, acc, segs.tab, segs.gdn_heads,
+                                  pair);
   else
-    body6<FB, KW, TN>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut,
-                      acc, segs.tab, segs.gdn_heads);
+    body6<FB, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx,
+                                  M, xs, lut, acc, segs.tab, segs.gdn_heads,
+                                  pair);
   __syncthreads();
   float* red = reinterpret_cast<float*>(smem);
 #pragma unroll
@@ -535,8 +560,14 @@ __global__ void __launch_bounds__(32 * KW * TN)
       if (token < M && row < segs.s[0].n) {
         const float gf = __half2float(__float2half_rn(g));
         const float uf = __half2float(__float2half_rn(u));
-        segs.hout[(size_t)token * segs.hld + row] =
-            __float2half_rn(gf / (1.0f + __expf(-gf)) * uf);
+        if constexpr (legacy_iq2) {
+          const half activated = __float2half_rn(gf / (1.0f + expf(-gf)));
+          segs.hout[(size_t)token * segs.hld + row] =
+              __hmul(activated, __float2half_rn(uf));
+        } else {
+          segs.hout[(size_t)token * segs.hld + row] =
+              __float2half_rn(gf / (1.0f + __expf(-gf)) * uf);
+        }
       }
     };
     for (int v = threadIdx.x; v < PP * 256; v += 32 * W) {
@@ -782,6 +813,9 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
     TORCH_CHECK((n[0] / 32) % (tp / 2) == 0,
                 "pair mode: tiles must divide by tp/2");
     tiles = static_cast<int>(n[0]) / 32 / (tp / 2);
+    if (warps == 8 && (is_iq2(fmt[0]) || is_iq2(fmt[1])))
+      TORCH_CHECK(split == 1 && (K / 128) % warps == 0,
+                  "IQ2 pair requires complete contiguous warp partitions");
   }
   segs.main_tiles = tiles;
   if (segs.ab_n > 0) tiles += (segs.ab_n + warps * tp - 1) / (warps * tp);
@@ -822,6 +856,7 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
   CFG(A, B, LUT4, LUT6);
   IQ2_FMTS(4, 2);
   IQ2_FMTS(4, 4);
+  IQ2_FMTS(8, 2);
 #undef IQ2_FMTS
   FMTS(4, 1);
   FMTS(2, 2);
