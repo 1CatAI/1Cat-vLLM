@@ -300,6 +300,55 @@ for same-wheel comparisons. Thirty-six changed-input/route graph and canary
 cases, then real-shard cold-cache ABBA at M=1/5/20, are required before model
 dispatch changes. Compilation alone is not speed or correctness evidence.
 
+### Rejected owned-payload HC boundary
+
+The matched owned-payload HCX cohort keeps the output projection separate.
+It emits only 2.370 tokens/round instead of 4.886, and its C1 target output
+differs from the control. C4 increases from 43.211 to 45.884 ms/round. Against
+the same-wheel control at 64 aligned teacher positions, mean KL is 0.22484,
+maximum KL is 2.45558, and top-1 agreement is 55/64. Maximum absolute logit
+error is 13.2695 and relative L2 error is 2.0790. None of the eight natural
+output sequences matches. The higher natural acceptance mean, 55.489%, is
+not a correctness pass. This path remains disabled; its shorter physical
+round is not an eligible performance result.
+
+The owned payload and contiguous fallback repair compiler contracts, but
+they do not explain or fix this full-model failure. A diagnostic-only graph
+records actual M=5 inputs and outputs at every HC boundary, with explicit
+owned buffers and TP frame checks. Each boundary is compared against the
+isolated FP32-accumulating dense reference with FP16 intermediate boundaries.
+Diagnostic graph copies are excluded from performance claims.
+
+### Bank-aware decoder result
+
+The original-record bank-aware decoder passes all 36 changed-input, route,
+graph and canary checks with byte-identical outputs. Cold-cache, same-pointer
+ABBA on real TP4 expert shards gives:
+
+| Type | M=5 retained, us | M=5 bank-aware, us | M=20 retained, us | M=20 bank-aware, us |
+| --- | ---: | ---: | ---: | ---: |
+| IQ3_XXS | 45.056 | 43.008 | 119.808 | 112.640 |
+| IQ3_S | 45.056 | 44.032 | 116.736 | 113.664 |
+| IQ2_S | 40.960 | 39.936 | 106.496 | 101.376 |
+
+These are single-kernel service measurements. Across 17 IQ3_XXS, ten IQ3_S
+and twenty IQ2_S layers, the M=5 estimate is only 0.066 ms/round; it cannot
+explain the 6.6-ms endpoint gap. The decoder stays disabled pending a model
+ablation alongside a larger qualified change. Reported bandwidth counts
+logical expert payload, not measured DRAM traffic.
+
+### HC stage budget
+
+A four-rank graph screen uses real checkpoint HC weights and the installed
+native extension. Instrumented and uninstrumented outputs match byte for
+byte. The maximum-rank median is 30.100 us without instrumentation; the
+instrumented cohort is 28.861 us. This difference is not promoted as a gain.
+Per-CTA local-clock stage medians identify 6.144 us in the combined LoRA
+exchange, up-weight prefetch and second grid barrier, versus 3.072 us in the
+first grid barrier. They do not isolate pure communication cost and cannot
+be summed into a critical-path ledger. This budget motivates examining
+readiness and synchronization after the model numerical failure is localized.
+
 ## Community designs and applicability
 
 [SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)
