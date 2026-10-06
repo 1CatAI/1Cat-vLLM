@@ -114,3 +114,74 @@ def compact_lut4_scale(scale):
     out[:, 0] = lo[:, 0] | (lo[:, 1] << 16)
     out[:, 1] = lo[:, 2] | (lo[:, 3] << 16)
     return out.view(np.uint8).reshape(-1)
+
+
+IQ2_FORMATS = {16: 7, 17: 8, 22: 9}
+IQ2_VALUES = np.array([-43, -25, -8, 8, 25, 43], np.int8)
+
+
+def iq2_reverse_table(kind):
+    """Invert the eight-value magnitude grid using a 3^8-entry table.
+
+    This table is only read by canonical restoration, never by the M8 kernel.
+    It keeps the original grid indices and sign masks exactly recoverable.
+    """
+    from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+        lattice_grid,
+    )
+
+    grid = lattice_grid(kind).astype(np.int8)
+    digits = np.searchsorted(np.array([8, 25, 43]), grid).astype(np.int32)
+    keys = (digits * (3 ** np.arange(8, dtype=np.int32))).sum(axis=1)
+    if len(np.unique(keys)) != len(keys):
+        raise ValueError("IQ2 grid contains duplicate magnitude tuples")
+    result = np.full(3**8, 65535, np.uint16)
+    result[keys] = np.arange(len(keys), dtype=np.uint16)
+    return result.view(np.uint8)
+
+
+def pack_iq2(raw, kind):
+    """Lossless signed nibbles with original d16 and eight scale nibbles/K128.
+
+    grid*small is exactly representable in FP16. The M8 decoder multiplies
+    that product by original d and rounds only the final reconstructed weight.
+    """
+    from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import (
+        pack as pack_planes,
+    )
+    from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+        lattice_grid,
+        transcode_lattice,
+    )
+    from vllm.transformers_utils.gguf_tensor_reader import quant_size
+
+    if kind not in IQ2_FORMATS:
+        raise ValueError(kind)
+    canonical = transcode_lattice(raw, kind)
+    n, k = canonical.shape
+    values = lattice_grid(kind)[canonical.indices].reshape(n, k)
+    signs = (canonical.signs[..., None] >> np.arange(8, dtype=np.uint8)) & 1
+    values = (values * (1 - 2 * signs.astype(np.int8)).reshape(n, k)).astype(np.int8)
+    q = np.searchsorted(IQ2_VALUES, values).astype(np.uint8)
+    if not np.array_equal(IQ2_VALUES[q], values):
+        raise ValueError("IQ2 grid does not fit the signed six-value codebook")
+    codes, _, _ = pack_planes(3, q, np.zeros((n, k // 32)), None, 32)
+    _, size = quant_size(kind)
+    blocks = np.ascontiguousarray(raw).reshape(n, -1, size)
+    groups = k // 128
+    ds = np.repeat(blocks[..., :2].copy().view(np.uint16).reshape(n, -1), 2, axis=1)
+    if kind == 16:
+        words = blocks[..., 2:].copy().view(np.uint32).reshape(n, -1, 8, 2)
+        nib = np.repeat(words[..., 1] >> 28, 2, axis=2).reshape(n, groups, 8)
+    else:
+        tail = blocks[..., 66:] if kind == 17 else blocks[..., 74:]
+        nib = (tail[..., None] >> np.array([0, 4], np.uint8)) & 15
+        nib = nib.reshape(n, groups, 8).astype(np.uint32)
+    packed = np.bitwise_or.reduce(nib << (4 * np.arange(8, dtype=np.uint32)), axis=-1)
+    meta = np.stack([ds.astype(np.uint32), packed], axis=-1)
+    meta = meta.reshape(n // 32, 32, groups, 2)[:, ROWMAP].transpose(0, 2, 1, 3)
+    return (
+        IQ2_FORMATS[kind],
+        codes,
+        np.ascontiguousarray(meta).view(np.uint8).reshape(-1),
+    )

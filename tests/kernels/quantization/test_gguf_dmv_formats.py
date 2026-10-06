@@ -80,3 +80,45 @@ def test_compact_lut4_scale_is_lossless():
     duplicated = (half | (half << 16)).view(np.uint8)
     compact = _module.compact_lut4_scale(duplicated)
     np.testing.assert_array_equal(compact.view(np.uint16), half.astype(np.uint16))
+
+
+@pytest.mark.parametrize("kind", [16, 17, 22])
+@pytest.mark.parametrize("d", [0.0, 2**-24, 0.0007, -0.125, 200.0])
+def test_iq2_signed_nibbles_preserve_official_weights_and_indices(kind, d):
+    from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
+        transcode_lattice,
+    )
+
+    n, k = 64, 512
+    size = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(kind)][1]
+    blocks = np.random.default_rng(kind).integers(
+        0, 256, (n, k // 256, size), dtype=np.uint8
+    )
+    blocks[..., :2] = np.array([d], np.float16).view(np.uint8)
+    raw = blocks.reshape(n, -1)
+    fmt, codes, meta = _module.pack_iq2(raw, kind)
+    assert fmt == _module.IQ2_FORMATS[kind]
+    inverse_lane = np.argsort(_module.ROWMAP)
+    words = codes.view(np.uint32).reshape(n // 32, k // 32, 32, 4)
+    q = (words[..., None] >> (4 * np.arange(8, dtype=np.uint32))) & 15
+    q = q[:, :, inverse_lane].transpose(0, 2, 1, 3, 4).reshape(n, k)
+    scales = meta.view(np.uint32).reshape(n // 32, k // 128, 32, 2)
+    scales = scales[:, :, inverse_lane].transpose(0, 2, 1, 3).reshape(n, k // 128, 2)
+    local = (scales[..., 1, None] >> (4 * np.arange(8, dtype=np.uint32))) & 15
+    original_d = scales[..., 0].astype(np.uint16).view(np.float16)
+    factor = (0.5 + local.astype(np.float32)) * 0.25
+    values = _module.IQ2_VALUES[q].reshape(n, k // 128, 8, 16).astype(np.float32)
+    result = (values * factor[..., None] * original_d[..., None, None]).reshape(n, k)
+    official = gguf.quants.dequantize(raw, gguf.GGMLQuantizationType(kind))
+    np.testing.assert_array_equal(
+        result.astype(np.float16).view(np.uint16),
+        official.astype(np.float16).view(np.uint16),
+    )
+    canonical = transcode_lattice(raw, kind)
+    magnitude = np.abs(_module.IQ2_VALUES[q]).reshape(n, k // 8, 8)
+    digits = np.searchsorted(np.array([8, 25, 43]), magnitude)
+    keys = (digits * (3 ** np.arange(8))).sum(axis=-1)
+    recovered = _module.iq2_reverse_table(kind).view(np.uint16)[keys]
+    np.testing.assert_array_equal(recovered, canonical.indices)
+    signs = ((q.reshape(n, k // 8, 8) < 3) << np.arange(8)).sum(axis=-1)
+    np.testing.assert_array_equal(signs, canonical.signs)

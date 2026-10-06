@@ -31,7 +31,10 @@ def planes(kind, k=512):
     if kind == 12:
         raw[..., 2:4] = np.array([0.0003], np.float16).view(np.uint8)
     raw = raw.reshape(n, -1)
-    if kind in (18, 21):
+    if kind in iq.IQ2_FORMATS:
+        fmt, codes, scale = iq.pack_iq2(raw, kind)
+        high = iq.iq2_reverse_table(kind)
+    elif kind in (18, 21):
         fmt, codes, scale = iq.pack(raw, kind)
         high = np.empty(0, np.uint8)
     else:
@@ -45,17 +48,17 @@ def planes(kind, k=512):
     return fmt, buffers, reference, raw
 
 
-@pytest.mark.parametrize("kind", [18, 21, 23])
+@pytest.mark.parametrize("kind", [16, 17, 18, 21, 22, 23])
 def test_restore_canonical_storage_exactly(kind):
     fmt, (codes, high, scale), reference, raw = planes(kind)
-    if kind in (18, 21):
+    if kind in (16, 17, 18, 21, 22):
         converted = transcode_lattice(raw, kind)
         c, s = converted.mma884_storage()
         original = torch.ops._C.gguf_lattice_sm70_prepare(
             torch.from_numpy(c).cuda(),
-            torch.from_numpy(s.view(np.int64)).cuda(),
+            torch.from_numpy(s.view(np.int64 if kind in (18, 21) else np.int32)).cuda(),
             kind,
-            32,
+            converted.group_size,
         )
     else:
         converted = transcode_lut4(raw, kind)
@@ -67,15 +70,23 @@ def test_restore_canonical_storage_exactly(kind):
         )
     weight, stats = original[:2]
     restored_weight, restored_stats = torch.empty_like(weight), torch.empty_like(stats)
-    torch.ops._C.gguf_dmv_restore_sm70_out(
-        restored_weight, restored_stats, codes, scale, fmt, 512, 64
-    )
+    if kind in iq.IQ2_FORMATS:
+        torch.ops._C.gguf_dmv_restore_iq2_sm70_out(
+            restored_weight, restored_stats, codes, scale, high, kind, 512, 64
+        )
+    else:
+        torch.ops._C.gguf_dmv_restore_sm70_out(
+            restored_weight, restored_stats, codes, scale, fmt, 512, 64
+        )
     assert torch.equal(weight, restored_weight)
     assert torch.equal(stats, restored_stats)
 
 
 @pytest.mark.parametrize(
-    "gate,up", [(a, b) for a in (12, 18, 21, 23) for b in (12, 18, 21, 23)]
+    "gate,up",
+    [(a, b) for a in (12, 18, 21, 23) for b in (12, 18, 21, 23)]
+    + [(a, b) for a in (16, 17, 22) for b in (16, 17, 18, 21, 22, 23)]
+    + [(a, b) for a in (18, 21, 23) for b in (16, 17, 22)],
 )
 @pytest.mark.parametrize("split", [1, 2])
 def test_pair_official_and_changed_input_graph(gate, up, split):
