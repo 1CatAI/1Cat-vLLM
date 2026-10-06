@@ -92,6 +92,23 @@ def test_small_m_hc_consumes_unrounded_moe_pair():
     assert torch.all(seen[0][0].float() + seen[0][1].float() == 2049)
 
 
+def test_ple_diagnostic_snapshot_owns_both_outputs(monkeypatch):
+    from vllm.models.qwen4_exp.nvidia import ple_layer
+
+    monkeypatch.setattr(ple_layer, "_PLE_DIAGNOSTIC_BUFFERS", {})
+    source = torch.arange(20).reshape(5, 4)
+    output = ple_layer._ple_diagnostic_snapshot(source, "test")
+    saved = ple_layer._PLE_DIAGNOSTIC_BUFFERS["test"]
+    assert len({source.data_ptr(), output.data_ptr(), saved.data_ptr()}) == 3
+    output.zero_()
+    source.add_(100)
+    torch.testing.assert_close(saved, torch.arange(20).reshape(5, 4))
+    pointer = saved.data_ptr()
+    ple_layer._ple_diagnostic_snapshot(source, "test")
+    assert ple_layer._PLE_DIAGNOSTIC_BUFFERS["test"].data_ptr() == pointer
+    torch.testing.assert_close(saved, source)
+
+
 def test_large_m_hc_does_not_reduce_or_recompute_projection():
     calls = []
 

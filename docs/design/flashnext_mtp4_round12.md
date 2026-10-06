@@ -349,6 +349,43 @@ first grid barrier. They do not isolate pure communication cost and cannot
 be summed into a critical-path ledger. This budget motivates examining
 readiness and synchronization after the model numerical failure is localized.
 
+### Actual HC inputs localize a TP consistency failure
+
+The diagnostic model records 94 M5 boundaries in the same frame on all four
+ranks. Layer 0's MLP HC has block relative L2 error 2.72e-4. At layer 1's MLP
+HC, after the PLE boundary, hidden inputs differ across ranks by up to 0.0858
+while norm/down/up checkpoint weights are byte-identical. Ninety-two later
+boundaries exceed 0.005 relative L2; early block errors are about 0.07–0.08.
+The native sharded down/up design requires replicated HC inputs, which this
+cohort violates. A local dense HC reference naturally differs by rank when
+its input residual differs, whereas sharded HC assembles a common output
+from those inconsistent inputs.
+
+Four-rank eager and graph replay of the three saved real boundaries reproduce
+the model's native outputs byte for byte. In a diagnostic isolation only,
+replacing the residual input with the same rank-0 residual on all four ranks
+reduces block errors to 2.17e-4–2.96e-4 and injection errors to
+6.46e-5–2.21e-4. This is not a production broadcast fix or a speed result.
+The next diagnostic records PLE stages and weight fingerprints to locate
+the first rank divergence. Compiler payload ownership is not established
+as the cause of this actual-input failure.
+
+The actual control decode graph selects FP32 `all_reduce_sum2`. A hypothesis
+based only on the registered environment variable's default FP16 local sum
+is rejected: the selected SM70 profile enables the sum2 route at runtime.
+
+### IQ3_S single-kernel counters
+
+Nsight Compute samples one installed real TP4 IQ3_S gate/up launch at
+M5/N160/K2560, with 47 unique routed experts. It observes 375 GB/s memory
+throughput, 50% theoretical occupancy and 42.73% achieved occupancy.
+There are 56 registers/thread and 512 threads/CTA, limiting residency to two
+CTAs/SM. Schedulers have no eligible warp in 51.8% of cycles. These counters
+justify examining instruction readiness and register-limited residency;
+they do not establish a pure HBM or codebook-bank bottleneck. Profiling does
+not fix clocks (reported SM frequency 1.17 GHz), so its 48.22-us duration is
+not substituted for unprofiled ABBA or complete-round latency.
+
 ## Community designs and applicability
 
 [SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)

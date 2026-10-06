@@ -3,6 +3,7 @@
 """Opt-in full-vocabulary teacher logits from the actual MTP target graph."""
 
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -10,6 +11,66 @@ from vllm.sm70_graph_observer import GraphParityWorkerExtension
 
 
 class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
+    @torch.inference_mode()
+    def inspect_ple_snapshots(self, directory: str):
+        """Locate the first TP divergence at the PLE residual boundary."""
+        import hashlib
+
+        import torch.distributed as dist
+
+        from vllm.distributed import get_tp_group
+        from vllm.models.qwen4_exp.nvidia.ple_layer import _PLE_DIAGNOSTIC_BUFFERS
+
+        torch.accelerator.synchronize()
+        stages = {key: value.cpu() for key, value in _PLE_DIAGNOSTIC_BUFFERS.items()}
+        if not stages:
+            raise RuntimeError("PLE M5 snapshots were not recorded")
+        weights = {
+            name: value.detach().cpu()
+            for name, value in self.model_runner.model.named_parameters()
+            if ".ple." in name and ".ple_embedding." not in name
+        }
+        digests = {
+            key: hashlib.sha256(
+                value.contiguous().reshape(-1).view(torch.uint8).numpy()
+            ).hexdigest()
+            for key, value in weights.items()
+        }
+        gathered: list[Any] = [None] * 4
+        dist.all_gather_object(
+            gathered,
+            {"stages": stages, "weight_hashes": digests},
+            group=get_tp_group().cpu_group,
+        )
+        reference = gathered[0]["stages"]
+        rows = []
+        for key in sorted(reference):
+            value, expected = stages[key].double(), reference[key].double()
+            difference = value - expected
+            rows.append(
+                {
+                    "stage": key,
+                    "max_abs_vs_rank0": float(difference.abs().max()),
+                    "relative_l2_vs_rank0": float(
+                        difference.norm() / (expected.norm() + 1e-9)
+                    ),
+                    "finite": bool(torch.isfinite(value).all()),
+                    "exactly_equal_vs_rank0": torch.equal(stages[key], reference[key]),
+                }
+            )
+        root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"stages": stages, "weights": weights}, root / f"ple-rank{self.rank}.pt"
+        )
+        return {
+            "rank": self.rank,
+            "scope": "diagnostic-only actual M5 PLE stage equality across TP",
+            "rows": rows,
+            "weight_hashes": digests,
+            "weight_hashes_equal_to_rank0": digests == gathered[0]["weight_hashes"],
+        }
+
     @torch.inference_mode()
     def inspect_hcx_snapshots(self, directory: str):
         """Compare graph-recorded real HC inputs with isolated dense arithmetic.
@@ -87,8 +148,7 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
                 }
             row = dict(name=key, epoch=epochs[key], errors=errors)
             report.append(row)
-            if max(error["relative_l2"] for error in errors.values()) > 0.005:
-                failed.append((key, expected, errors))
+            failed.append((key, expected, errors))
         # Write after all coupled collectives; save first and worst boundaries.
         worst = sorted(
             failed,

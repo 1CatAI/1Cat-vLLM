@@ -247,7 +247,7 @@ def main():
         if args.hcx_diagnose:
             reference = tokenized[1]
             fixed_ids = (reference * (8192 // len(reference) + 1))[:8192]
-            llm.generate(
+            diagnostic_outputs = llm.generate(
                 {"prompt_token_ids": fixed_ids},
                 SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
                 use_tqdm=False,
@@ -257,6 +257,14 @@ def main():
                 args=(str(args.output.parent / "hcx-snapshots"),),
                 timeout=300,
             )
+            report["ple_diagnosis"] = llm.collective_rpc(
+                "inspect_ple_snapshots",
+                args=(str(args.output.parent / "ple-snapshots"),),
+                timeout=300,
+            )
+            report["diagnostic_output_token_ids"] = [
+                list(output.outputs[0].token_ids) for output in diagnostic_outputs
+            ]
             report["measurement_scope"] = "numerical diagnosis; no speed measurements"
             report["diagnostic_sampling"] = {
                 "temperature": 0,
@@ -363,6 +371,7 @@ def main():
                 steps, outputs = observed_cohort(llm, fixed_ids, probe_params)
                 probe = dict(
                     arm=arm,
+                    steps=steps,
                     summary=summarize(steps, 1),
                     output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
                 )
@@ -403,6 +412,7 @@ def main():
                         )
                     steps, outputs = observed_cohort(llm, c4_ids, c4_params, width=4)
                     cohort = dict(
+                        steps=steps,
                         input_switch="ple_input_prepare"
                         if args.ple_input_ab
                         else "early",
@@ -441,6 +451,7 @@ def main():
                         ablation["probes"].append(
                             dict(
                                 width=width,
+                                steps=steps,
                                 summary=summarize(steps, width),
                                 acceptance=_spec_decoding_delta(
                                     before, _metric_snapshot(llm)

@@ -66,6 +66,32 @@ def _worker_run(rank, port, results):
             return outputs, scratch
 
         report = []
+        from vllm.models.qwen4_exp.nvidia import ple_layer
+
+        @torch.compile(backend="inductor", dynamic=True, fullgraph=True)
+        def ple_snapshots(x):
+            first = torch.ops.vllm.qwen4_exp_ple_diagnostic_snapshot(x * 3, "before")
+            second = torch.ops.vllm.qwen4_exp_ple_diagnostic_snapshot(
+                first * 2, "after"
+            )
+            return second, x * 17
+
+        ple_input = torch.randn(5, 16, device="cuda").half()
+        ple_snapshots(ple_input)
+        ple_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(ple_graph):
+            ple_result, ple_scratch = ple_snapshots(ple_input)
+        for multiplier in (1, 2):
+            ple_input.mul_(multiplier)
+            ple_graph.replay()
+            torch.accelerator.synchronize()
+            torch.testing.assert_close(
+                ple_layer._PLE_DIAGNOSTIC_BUFFERS["before"], ple_input * 3
+            )
+            torch.testing.assert_close(
+                ple_layer._PLE_DIAGNOSTIC_BUFFERS["after"], ple_result
+            )
+            torch.testing.assert_close(ple_scratch, ple_input * 17)
         for rows in (5, 20):
             torch.manual_seed(1)
             hidden = (torch.randn(rows, 10240, device="cuda") * 0.5).half()

@@ -430,6 +430,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
         if self.ple is not None:
+            from .ple_layer import snapshot_ple_diagnostic
+
+            hidden_states = snapshot_ple_diagnostic(
+                hidden_states, self.ple.prefix + ":00_before_combine"
+            )
             # PLE adds directly to the multi-stream state, so pending HC state
             # must be materialized before the addition.
             if prev_block_output is not None and prev_injection is not None:
@@ -438,6 +443,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 )
                 prev_block_output = prev_injection = None
 
+            hidden_states = snapshot_ple_diagnostic(
+                hidden_states, self.ple.prefix + ":01_after_combine"
+            )
+
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
             hidden_states = hidden_states + self.ple(
@@ -445,6 +454,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 input_ids,
                 query_start_loc,
                 ngram_context,
+            )
+            hidden_states = snapshot_ple_diagnostic(
+                hidden_states, self.ple.prefix + ":09_after_add"
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
