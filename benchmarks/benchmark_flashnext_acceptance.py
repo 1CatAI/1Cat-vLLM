@@ -67,6 +67,29 @@ def observed_cohort(llm, fixed_ids, params, width=1):
     return records, outputs
 
 
+def natural_row(llm, prompt, ids, params):
+    before = _metric_snapshot(llm)
+    started = time.perf_counter()
+    result = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
+    elapsed = time.perf_counter() - started
+    acceptance = _spec_decoding_delta(before, _metric_snapshot(llm))
+    if acceptance is None:
+        raise RuntimeError("No request-level speculative counters")
+    output = result.outputs[0]
+    return dict(
+        id=prompt["id"],
+        prompt=prompt["prompt"],
+        prompt_token_ids=ids,
+        output_token_ids=list(output.token_ids),
+        text=output.text,
+        output_tokens=len(output.token_ids),
+        finish_reason=output.finish_reason,
+        wall_seconds=elapsed,
+        acceptance=acceptance,
+        metrics=_request_metrics_dict(result.metrics, len(output.token_ids)),
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model", type=Path)
@@ -82,6 +105,11 @@ def main():
     input_ab = parser.add_mutually_exclusive_group()
     input_ab.add_argument("--input-phase-ab", action="store_true")
     input_ab.add_argument("--ple-input-ab", action="store_true")
+    input_ab.add_argument(
+        "--execution-ab",
+        action="store_true",
+        help="Ablate captured MTP drafting and greedy verification in one engine",
+    )
     parser.add_argument("--require-installed", action="store_true")
     parser.add_argument("--diagnose-attention-transfers", action="store_true")
     parser.add_argument("--kernel-config", type=json.loads, default={})
@@ -90,6 +118,13 @@ def main():
     parser.add_argument("--teacher-reference", type=Path)
     parser.add_argument("--teacher-positions", type=int, default=8)
     args = parser.parse_args()
+    if args.execution_ab and (
+        not args.probe
+        or args.trace_only
+        or not args.kernel_config.get("sm70_draft_single_graph")
+        or not args.kernel_config.get("sm70_greedy_verify")
+    ):
+        raise ValueError("Execution A/B requires --probe and both execution policies")
     if args.trace_only:
         args.probe = args.node_trace = True
     if args.require_installed and "site-packages" not in vllm.__file__:
@@ -216,26 +251,7 @@ def main():
             use_tqdm=False,
         )
         for prompt, ids in () if args.trace_only else zip(prompts, tokenized):
-            before = _metric_snapshot(llm)
-            started = time.perf_counter()
-            result = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
-            elapsed = time.perf_counter() - started
-            acceptance = _spec_decoding_delta(before, _metric_snapshot(llm))
-            if acceptance is None:
-                raise RuntimeError("No request-level speculative counters")
-            output = result.outputs[0]
-            row = dict(
-                id=prompt["id"],
-                prompt=prompt["prompt"],
-                prompt_token_ids=ids,
-                output_token_ids=list(output.token_ids),
-                text=output.text,
-                output_tokens=len(output.token_ids),
-                finish_reason=output.finish_reason,
-                wall_seconds=elapsed,
-                acceptance=acceptance,
-                metrics=_request_metrics_dict(result.metrics, len(output.token_ids)),
-            )
+            row = natural_row(llm, prompt, ids, params)
             report["rows"].append(row)
             save()
             print(
@@ -369,6 +385,48 @@ def main():
                     report["c4_probes"].append(cohort)
                     report["c4_probe"] = cohort
                     save()
+            if args.execution_ab:
+                report["execution_ablations"] = []
+                for label, draft, greedy in (
+                    ("control", False, False),
+                    ("draft_only", True, False),
+                    ("greedy_only", False, True),
+                    ("both", True, True),
+                    ("control_repeat", False, False),
+                ):
+                    policy = llm.collective_rpc(
+                        "set_mtp_execution_policy", args=(draft, greedy), timeout=30
+                    )
+                    ablation = dict(arm=label, policy=policy, rows=[], probes=[])
+                    report["execution_ablations"].append(ablation)
+                    for prompt, ids in zip(prompts, tokenized):
+                        ablation["rows"].append(natural_row(llm, prompt, ids, params))
+                        save()
+                    for width, ids, sampling in (
+                        (1, fixed_ids, probe_params),
+                        (4, c4_ids, c4_params),
+                    ):
+                        before = _metric_snapshot(llm)
+                        steps, outputs = observed_cohort(llm, ids, sampling, width)
+                        ablation["probes"].append(
+                            dict(
+                                width=width,
+                                summary=summarize(steps, width),
+                                acceptance=_spec_decoding_delta(
+                                    before, _metric_snapshot(llm)
+                                ),
+                                output_token_ids=[
+                                    list(o.outputs[0].token_ids) for o in outputs
+                                ],
+                            )
+                        )
+                        save()
+                    print(json.dumps(ablation["probes"], default=str), flush=True)
+                # Teacher forcing and any subsequent trace use the declared
+                # startup policy, after the final switch-off drift control.
+                llm.collective_rpc(
+                    "set_mtp_execution_policy", args=(True, True), timeout=30
+                )
             if args.node_trace:
                 llm.collective_rpc(
                     "start_graph_parity_observer", args=(True,), timeout=30

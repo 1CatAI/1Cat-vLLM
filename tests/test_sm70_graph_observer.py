@@ -152,3 +152,57 @@ def test_phase_rpc_uses_serializable_named_method_and_declared_capability():
     worker.model_runner.model_state = DependentState()
     with pytest.raises(RuntimeError, match="has not declared"):
         worker.set_graph_input_preparation(True)
+
+
+def _mtp_policy_worker(graphs):
+    worker = GraphParityWorkerExtension()
+    worker.rank = 2
+    config = lambda: SimpleNamespace(
+        kernel_config=SimpleNamespace(
+            sm70_draft_single_graph=True, sm70_greedy_verify=True
+        )
+    )
+    worker.model_runner = SimpleNamespace(
+        model=SimpleNamespace(get_top_tokens=lambda x: x),
+        vllm_config=config(),
+        speculator=SimpleNamespace(
+            method="mtp",
+            vllm_config=config(),
+            multistep_cudagraph_manager=SimpleNamespace(graphs=graphs),
+        ),
+    )
+    return worker
+
+
+def test_mtp_policy_rpc_preserves_captured_graphs_across_ablations():
+    graphs = {"c1": object(), "c4": object()}
+    worker = _mtp_policy_worker(graphs)
+    for draft, greedy in ((False, False), (True, False), (False, True), (True, True)):
+        result = worker.set_mtp_execution_policy(draft, greedy)
+        assert result == {
+            "rank": 2,
+            "draft_single_graph": draft,
+            "greedy_verify": greedy,
+        }
+        for config in (
+            worker.model_runner.vllm_config,
+            worker.model_runner.speculator.vllm_config,
+        ):
+            assert config.kernel_config.sm70_draft_single_graph is draft
+            assert config.kernel_config.sm70_greedy_verify is greedy
+        assert (
+            worker.model_runner.speculator.multistep_cudagraph_manager.graphs is graphs
+        )
+        assert MsgpackEncoder().encode(
+            ("set_mtp_execution_policy", (draft, greedy), {})
+        )
+
+
+def test_mtp_policy_rpc_rejects_missing_capture_before_mutating_policy():
+    worker = _mtp_policy_worker({})
+    worker.set_mtp_execution_policy(False, False)
+    with pytest.raises(RuntimeError, match="not captured"):
+        worker.set_mtp_execution_policy(True, True)
+    assert worker.model_runner.vllm_config.kernel_config.sm70_greedy_verify is False
+    with pytest.raises(TypeError, match="boolean"):
+        worker.set_mtp_execution_policy(1, False)

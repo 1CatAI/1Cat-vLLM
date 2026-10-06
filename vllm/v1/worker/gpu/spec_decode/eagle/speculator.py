@@ -456,6 +456,7 @@ class EagleSpeculator:
         multistep = getattr(self, "multistep_cudagraph_manager", None)
         if (
             multistep is not None
+            and self.vllm_config.kernel_config.sm70_draft_single_graph
             and batch_desc.cg_mode == CUDAGraphMode.FULL
             and batch_desc in multistep.graphs
         ):

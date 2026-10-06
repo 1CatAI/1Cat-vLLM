@@ -156,6 +156,34 @@ class GraphParityWorkerExtension:
     rank: int
     model_runner: Any
 
+    def set_mtp_execution_policy(self, draft_single_graph, greedy_verify):
+        """Benchmark RPC: change host dispatch between completed cohorts.
+
+        Draft graphs must already have been captured during engine startup.
+        Changing this policy neither recaptures graphs nor modifies weights.
+        """
+        if not isinstance(draft_single_graph, bool) or not isinstance(
+            greedy_verify, bool
+        ):
+            raise TypeError("MTP execution policy requires boolean values")
+        runner = self.model_runner
+        speculator = runner.speculator
+        if speculator is None or getattr(speculator, "method", None) != "mtp":
+            raise RuntimeError("Execution policy requires an MTP speculator")
+        manager = getattr(speculator, "multistep_cudagraph_manager", None)
+        if draft_single_graph and (manager is None or not manager.graphs):
+            raise RuntimeError("Single-graph draft shapes were not captured")
+        if greedy_verify and not hasattr(runner.model, "get_top_tokens"):
+            raise RuntimeError("Target model does not expose local argmax")
+        for config in (runner.vllm_config, speculator.vllm_config):
+            config.kernel_config.sm70_draft_single_graph = draft_single_graph
+            config.kernel_config.sm70_greedy_verify = greedy_verify
+        return {
+            "rank": self.rank,
+            "draft_single_graph": draft_single_graph,
+            "greedy_verify": greedy_verify,
+        }
+
     def set_graph_input_preparation(self, early):
         state = self.model_runner.model_state
         declared = type(state).supports_early_input_preparation
