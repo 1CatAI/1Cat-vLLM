@@ -1,0 +1,1395 @@
+{
+  "contract": {
+    "host": "fully connected NVLink V100-SXM2 TP4 host",
+    "sm_mhz": 1290,
+    "memory_mhz": 877,
+    "model": "Qwen3.8-27B GSQ-RCO IQ3_S",
+    "m": 8,
+    "ordinary_runtime": "1.5.2.dev1003+gd6268878bb",
+    "numerical_contract": "FP16 group coefficients; FP32 accumulation; bitwise replay stability"
+  },
+  "existing_increment_ms": {
+    "isolated_audit": 1.8722971282538234,
+    "model_projection_trace": 2.029684,
+    "full_round_1k": 2.27067793305093,
+    "full_round_8k": 2.223976465154209
+  },
+  "ordinary_iq3s_service_us": {
+    "gdn_out": {
+      "isolated": 11.193446428571429,
+      "torch_wide": 19.443198214285715
+    },
+    "down": {
+      "isolated": 22.11787,
+      "torch_wide": 29.501695
+    }
+  },
+  "policy_variants": {
+    "ssm_out/wheel/isolated": {
+      "mean_us": 11.193446428571429,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/wheel/wide": {
+      "mean_us": 19.443198214285715,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p0:c-1/isolated": {
+      "mean_us": 11.1611625,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p0:c-1/wide": {
+      "mean_us": 19.086533928571427,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p0:c0/isolated": {
+      "mean_us": 11.205221428571429,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ssm_out/p0:c0/wide": {
+      "mean_us": 19.101473214285715,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ssm_out/p0:c50/isolated": {
+      "mean_us": 11.224648214285715,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p0:c50/wide": {
+      "mean_us": 19.045669642857142,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p0:c100/isolated": {
+      "mean_us": 11.161905357142857,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ssm_out/p0:c100/wide": {
+      "mean_us": 19.2853125,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ssm_out/p1:c-1/isolated": {
+      "mean_us": 12.252217857142856,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p1:c-1/wide": {
+      "mean_us": 18.977973214285715,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p1:c0/isolated": {
+      "mean_us": 12.206275,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ssm_out/p1:c0/wide": {
+      "mean_us": 18.957774999999998,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ssm_out/p1:c50/isolated": {
+      "mean_us": 12.25040357142857,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p1:c50/wide": {
+      "mean_us": 19.45563392857143,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p1:c100/isolated": {
+      "mean_us": 12.271587499999999,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ssm_out/p1:c100/wide": {
+      "mean_us": 19.317725,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ssm_out/p2:c-1/isolated": {
+      "mean_us": 12.244730357142856,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p2:c-1/wide": {
+      "mean_us": 18.995785714285713,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p2:c0/isolated": {
+      "mean_us": 12.260560714285715,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ssm_out/p2:c0/wide": {
+      "mean_us": 19.232057142857144,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ssm_out/p2:c50/isolated": {
+      "mean_us": 12.277249999999999,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p2:c50/wide": {
+      "mean_us": 19.26439642857143,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ssm_out/p2:c100/isolated": {
+      "mean_us": 12.318558928571429,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ssm_out/p2:c100/wide": {
+      "mean_us": 19.31946607142857,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ffn_down/wheel/isolated": {
+      "mean_us": 22.11787,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/wheel/wide": {
+      "mean_us": 29.501695,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p0:c-1/isolated": {
+      "mean_us": 22.170035000000002,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p0:c-1/wide": {
+      "mean_us": 29.530630000000002,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p0:c0/isolated": {
+      "mean_us": 22.05851,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ffn_down/p0:c0/wide": {
+      "mean_us": 29.403280000000002,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ffn_down/p0:c50/isolated": {
+      "mean_us": 22.227625,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p0:c50/wide": {
+      "mean_us": 29.52169,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p0:c100/isolated": {
+      "mean_us": 22.361535,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ffn_down/p0:c100/wide": {
+      "mean_us": 29.54831,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ffn_down/p1:c-1/isolated": {
+      "mean_us": 24.23591,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p1:c-1/wide": {
+      "mean_us": 29.268895,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p1:c0/isolated": {
+      "mean_us": 24.31638,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ffn_down/p1:c0/wide": {
+      "mean_us": 29.36507,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ffn_down/p1:c50/isolated": {
+      "mean_us": 24.308374999999998,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p1:c50/wide": {
+      "mean_us": 29.661985,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p1:c100/isolated": {
+      "mean_us": 24.32501,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ffn_down/p1:c100/wide": {
+      "mean_us": 29.567115,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ffn_down/p2:c-1/isolated": {
+      "mean_us": 24.26215,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p2:c-1/wide": {
+      "mean_us": 29.587145,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p2:c0/isolated": {
+      "mean_us": 24.304375,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ffn_down/p2:c0/wide": {
+      "mean_us": 29.82424,
+      "registers": 99,
+      "shared_executed": 32768
+    },
+    "ffn_down/p2:c50/isolated": {
+      "mean_us": 24.349655,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p2:c50/wide": {
+      "mean_us": 29.42717,
+      "registers": 99,
+      "shared_executed": 65536
+    },
+    "ffn_down/p2:c100/isolated": {
+      "mean_us": 24.471265,
+      "registers": 99,
+      "shared_executed": 98304
+    },
+    "ffn_down/p2:c100/wide": {
+      "mean_us": 29.829505,
+      "registers": 99,
+      "shared_executed": 98304
+    }
+  },
+  "uniform_cache_variants": [
+    {
+      "cache_mode": 0,
+      "role": "ssm_out",
+      "variant": "wheel",
+      "context": "isolated",
+      "mean_us": 11.208244642857142,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 0,
+      "role": "ssm_out",
+      "variant": "p0:c-1",
+      "context": "isolated",
+      "mean_us": 11.169621428571428,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 0,
+      "role": "ssm_out",
+      "variant": "p0:c0",
+      "context": "isolated",
+      "mean_us": 11.204485714285713,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 0,
+      "role": "ssm_out",
+      "variant": "p0:c100",
+      "context": "isolated",
+      "mean_us": 11.234133928571428,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 0,
+      "role": "ssm_out",
+      "variant": "wheel",
+      "context": "wide",
+      "mean_us": 19.422092857142857,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 0,
+      "role": "ssm_out",
+      "variant": "p0:c-1",
+      "context": "wide",
+      "mean_us": 19.109067857142858,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 0,
+      "role": "ssm_out",
+      "variant": "p0:c0",
+      "context": "wide",
+      "mean_us": 19.07386964285714,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 0,
+      "role": "ssm_out",
+      "variant": "p0:c100",
+      "context": "wide",
+      "mean_us": 19.11613392857143,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 0,
+      "role": "ffn_down",
+      "variant": "wheel",
+      "context": "isolated",
+      "mean_us": 22.09042,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 0,
+      "role": "ffn_down",
+      "variant": "p0:c-1",
+      "context": "isolated",
+      "mean_us": 22.108510000000003,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 0,
+      "role": "ffn_down",
+      "variant": "p0:c0",
+      "context": "isolated",
+      "mean_us": 22.00947,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 0,
+      "role": "ffn_down",
+      "variant": "p0:c100",
+      "context": "isolated",
+      "mean_us": 22.267705,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 0,
+      "role": "ffn_down",
+      "variant": "wheel",
+      "context": "wide",
+      "mean_us": 29.265729999999998,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 0,
+      "role": "ffn_down",
+      "variant": "p0:c-1",
+      "context": "wide",
+      "mean_us": 29.30697,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 0,
+      "role": "ffn_down",
+      "variant": "p0:c0",
+      "context": "wide",
+      "mean_us": 29.28106,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 0,
+      "role": "ffn_down",
+      "variant": "p0:c100",
+      "context": "wide",
+      "mean_us": 29.37339,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 1,
+      "role": "ssm_out",
+      "variant": "wheel",
+      "context": "isolated",
+      "mean_us": 11.200828571428572,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 1,
+      "role": "ssm_out",
+      "variant": "p0:c-1",
+      "context": "isolated",
+      "mean_us": 11.160425,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 1,
+      "role": "ssm_out",
+      "variant": "p0:c0",
+      "context": "isolated",
+      "mean_us": 11.206142857142858,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 1,
+      "role": "ssm_out",
+      "variant": "p0:c100",
+      "context": "isolated",
+      "mean_us": 11.230544642857144,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 1,
+      "role": "ssm_out",
+      "variant": "wheel",
+      "context": "wide",
+      "mean_us": 19.40929107142857,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        98304,
+        2
+      ]
+    },
+    {
+      "cache_mode": 1,
+      "role": "ssm_out",
+      "variant": "p0:c-1",
+      "context": "wide",
+      "mean_us": 19.105817857142856,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        98304,
+        2
+      ]
+    },
+    {
+      "cache_mode": 1,
+      "role": "ssm_out",
+      "variant": "p0:c0",
+      "context": "wide",
+      "mean_us": 19.08079107142857,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        98304,
+        2
+      ]
+    },
+    {
+      "cache_mode": 1,
+      "role": "ssm_out",
+      "variant": "p0:c100",
+      "context": "wide",
+      "mean_us": 19.089642857142856,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        98304,
+        2
+      ]
+    },
+    {
+      "cache_mode": 1,
+      "role": "ffn_down",
+      "variant": "wheel",
+      "context": "isolated",
+      "mean_us": 22.147395,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 1,
+      "role": "ffn_down",
+      "variant": "p0:c-1",
+      "context": "isolated",
+      "mean_us": 22.17781,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 1,
+      "role": "ffn_down",
+      "variant": "p0:c0",
+      "context": "isolated",
+      "mean_us": 22.000845,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 1,
+      "role": "ffn_down",
+      "variant": "p0:c100",
+      "context": "isolated",
+      "mean_us": 22.2346,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 1,
+      "role": "ffn_down",
+      "variant": "wheel",
+      "context": "wide",
+      "mean_us": 29.470025,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        98304,
+        2
+      ]
+    },
+    {
+      "cache_mode": 1,
+      "role": "ffn_down",
+      "variant": "p0:c-1",
+      "context": "wide",
+      "mean_us": 29.35002,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        98304,
+        2
+      ]
+    },
+    {
+      "cache_mode": 1,
+      "role": "ffn_down",
+      "variant": "p0:c0",
+      "context": "wide",
+      "mean_us": 29.31085,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        98304,
+        2
+      ]
+    },
+    {
+      "cache_mode": 1,
+      "role": "ffn_down",
+      "variant": "p0:c100",
+      "context": "wide",
+      "mean_us": 29.30122,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        98304,
+        2
+      ]
+    },
+    {
+      "cache_mode": 2,
+      "role": "ssm_out",
+      "variant": "wheel",
+      "context": "isolated",
+      "mean_us": 11.171685714285715,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 2,
+      "role": "ssm_out",
+      "variant": "p0:c-1",
+      "context": "isolated",
+      "mean_us": 11.1586625,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 2,
+      "role": "ssm_out",
+      "variant": "p0:c0",
+      "context": "isolated",
+      "mean_us": 11.211803571428572,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 2,
+      "role": "ssm_out",
+      "variant": "p0:c100",
+      "context": "isolated",
+      "mean_us": 11.2316375,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 2,
+      "role": "ssm_out",
+      "variant": "wheel",
+      "context": "wide",
+      "mean_us": 19.395539285714285,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 2,
+      "role": "ssm_out",
+      "variant": "p0:c-1",
+      "context": "wide",
+      "mean_us": 19.12999464285714,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 2,
+      "role": "ssm_out",
+      "variant": "p0:c0",
+      "context": "wide",
+      "mean_us": 19.073769642857144,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 2,
+      "role": "ssm_out",
+      "variant": "p0:c100",
+      "context": "wide",
+      "mean_us": 19.104969642857142,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 2,
+      "role": "ffn_down",
+      "variant": "wheel",
+      "context": "isolated",
+      "mean_us": 22.05652,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 2,
+      "role": "ffn_down",
+      "variant": "p0:c-1",
+      "context": "isolated",
+      "mean_us": 22.05861,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 2,
+      "role": "ffn_down",
+      "variant": "p0:c0",
+      "context": "isolated",
+      "mean_us": 21.992055,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 2,
+      "role": "ffn_down",
+      "variant": "p0:c100",
+      "context": "isolated",
+      "mean_us": 22.27893,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 2,
+      "role": "ffn_down",
+      "variant": "wheel",
+      "context": "wide",
+      "mean_us": 29.300595,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 2,
+      "role": "ffn_down",
+      "variant": "p0:c-1",
+      "context": "wide",
+      "mean_us": 29.440445,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 2,
+      "role": "ffn_down",
+      "variant": "p0:c0",
+      "context": "wide",
+      "mean_us": 29.40253,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 2,
+      "role": "ffn_down",
+      "variant": "p0:c100",
+      "context": "wide",
+      "mean_us": 29.370845,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        0,
+        3
+      ]
+    },
+    {
+      "cache_mode": 3,
+      "role": "ssm_out",
+      "variant": "wheel",
+      "context": "isolated",
+      "mean_us": 11.190839285714286,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 3,
+      "role": "ssm_out",
+      "variant": "p0:c-1",
+      "context": "isolated",
+      "mean_us": 11.145869642857143,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 3,
+      "role": "ssm_out",
+      "variant": "p0:c0",
+      "context": "isolated",
+      "mean_us": 11.21964107142857,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 3,
+      "role": "ssm_out",
+      "variant": "p0:c100",
+      "context": "isolated",
+      "mean_us": 11.234046428571428,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 3,
+      "role": "ssm_out",
+      "variant": "wheel",
+      "context": "wide",
+      "mean_us": 19.399226785714287,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": [
+        65536,
+        4
+      ]
+    },
+    {
+      "cache_mode": 3,
+      "role": "ssm_out",
+      "variant": "p0:c-1",
+      "context": "wide",
+      "mean_us": 19.100330357142855,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": [
+        65536,
+        4
+      ]
+    },
+    {
+      "cache_mode": 3,
+      "role": "ssm_out",
+      "variant": "p0:c0",
+      "context": "wide",
+      "mean_us": 19.0649875,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        65536,
+        4
+      ]
+    },
+    {
+      "cache_mode": 3,
+      "role": "ssm_out",
+      "variant": "p0:c100",
+      "context": "wide",
+      "mean_us": 19.08702857142857,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        65536,
+        4
+      ]
+    },
+    {
+      "cache_mode": 3,
+      "role": "ffn_down",
+      "variant": "wheel",
+      "context": "isolated",
+      "mean_us": 22.052705000000003,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 3,
+      "role": "ffn_down",
+      "variant": "p0:c-1",
+      "context": "isolated",
+      "mean_us": 22.124365,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 3,
+      "role": "ffn_down",
+      "variant": "p0:c0",
+      "context": "isolated",
+      "mean_us": 22.008210000000002,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 3,
+      "role": "ffn_down",
+      "variant": "p0:c100",
+      "context": "isolated",
+      "mean_us": 22.270445,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": null
+    },
+    {
+      "cache_mode": 3,
+      "role": "ffn_down",
+      "variant": "wheel",
+      "context": "wide",
+      "mean_us": 29.34914,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": [
+        65536,
+        4
+      ]
+    },
+    {
+      "cache_mode": 3,
+      "role": "ffn_down",
+      "variant": "p0:c-1",
+      "context": "wide",
+      "mean_us": 29.429065,
+      "project_shared_cache": [
+        65536,
+        4
+      ],
+      "pre_shared_cache": [
+        65536,
+        4
+      ]
+    },
+    {
+      "cache_mode": 3,
+      "role": "ffn_down",
+      "variant": "p0:c0",
+      "context": "wide",
+      "mean_us": 29.36124,
+      "project_shared_cache": [
+        32768,
+        1
+      ],
+      "pre_shared_cache": [
+        65536,
+        4
+      ]
+    },
+    {
+      "cache_mode": 3,
+      "role": "ffn_down",
+      "variant": "p0:c100",
+      "context": "wide",
+      "mean_us": 29.39166,
+      "project_shared_cache": [
+        98304,
+        2
+      ],
+      "pre_shared_cache": [
+        65536,
+        4
+      ]
+    }
+  ],
+  "resident_descriptor_variants": {
+    "ssm_out/wheel/isolated": {
+      "mean_us": 11.185958928571429,
+      "registers": 99
+    },
+    "ssm_out/wheel/wide": {
+      "mean_us": 19.393889285714284,
+      "registers": 99
+    },
+    "ssm_out/inline/isolated": {
+      "mean_us": 11.157332142857143,
+      "registers": 99
+    },
+    "ssm_out/inline/wide": {
+      "mean_us": 19.11147857142857,
+      "registers": 99
+    },
+    "ssm_out/resident/isolated": {
+      "mean_us": 12.329266071428572,
+      "registers": 94
+    },
+    "ssm_out/resident/wide": {
+      "mean_us": 20.58215714285714,
+      "registers": 94
+    },
+    "ffn_down/wheel/isolated": {
+      "mean_us": 22.127175,
+      "registers": 99
+    },
+    "ffn_down/wheel/wide": {
+      "mean_us": 29.34055,
+      "registers": 99
+    },
+    "ffn_down/inline/isolated": {
+      "mean_us": 22.118685,
+      "registers": 99
+    },
+    "ffn_down/inline/wide": {
+      "mean_us": 29.381954999999998,
+      "registers": 99
+    },
+    "ffn_down/resident/isolated": {
+      "mean_us": 23.201725,
+      "registers": 94
+    },
+    "ffn_down/resident/wide": {
+      "mean_us": 30.73478,
+      "registers": 94
+    }
+  },
+  "single_kernel_sparse_controls": {
+    "ssm_out/wheel/isolated": 11.178444642857142,
+    "ssm_out/wheel/torch_wide": 19.36208392857143,
+    "ssm_out/wheel/custom_wide": 13.687998214285715,
+    "ssm_out/wheel/custom_reused": 11.439873214285715,
+    "ffn_down/wheel/isolated": 22.048415,
+    "ffn_down/wheel/torch_wide": 29.446044999999998,
+    "ffn_down/wheel/custom_wide": 24.306849999999997,
+    "ffn_down/wheel/custom_reused": 22.166305
+  },
+  "rejected": [
+    "weight cache hints",
+    "shared carveout and device cache preference",
+    "device-resident descriptor",
+    "external event nodes"
+  ],
+  "admitted_production_changes": [],
+  "interpretation": "Existing incremental operator savings are present in end-to-end. Absolute audit/model differences are not an uncollected optimization. Torch sparse control changes kernel count; one-kernel control is required.",
+  "loaded_model_plane_probe": {
+    "contract": "Packaged DMV kernels; actual loaded head-selected TP4 operands; M8; FP16 scales and FP32 accumulation; no interleaved attention/GDN/communication; CUDA event graph envelopes include gaps",
+    "ranks": [
+      {
+        "rank": 0,
+        "bitwise_replay_stable": true,
+        "groups": {
+          "all": {
+            "calls": 215,
+            "graph_ms": 5.691473693847656
+          },
+          "qkvz_ab": {
+            "calls": 39,
+            "graph_ms": 1.055877113342285
+          },
+          "attention_qkv": {
+            "calls": 6,
+            "graph_ms": 0.14040575981140135
+          },
+          "gdn_out": {
+            "calls": 48,
+            "graph_ms": 0.5379839992523193
+          },
+          "attention_o": {
+            "calls": 16,
+            "graph_ms": 0.17556992053985596
+          },
+          "gate_up": {
+            "calls": 50,
+            "graph_ms": 2.04853759765625
+          },
+          "down": {
+            "calls": 56,
+            "graph_ms": 1.2640000152587891
+          }
+        },
+        "operand_bytes": 2364497920
+      },
+      {
+        "rank": 1,
+        "bitwise_replay_stable": true,
+        "groups": {
+          "all": {
+            "calls": 215,
+            "graph_ms": 5.679851684570313
+          },
+          "qkvz_ab": {
+            "calls": 39,
+            "graph_ms": 1.0552371215820313
+          },
+          "attention_qkv": {
+            "calls": 6,
+            "graph_ms": 0.14136319875717163
+          },
+          "gdn_out": {
+            "calls": 48,
+            "graph_ms": 0.5376358318328858
+          },
+          "attention_o": {
+            "calls": 16,
+            "graph_ms": 0.17780735969543457
+          },
+          "gate_up": {
+            "calls": 50,
+            "graph_ms": 2.0400896072387695
+          },
+          "down": {
+            "calls": 56,
+            "graph_ms": 1.2656332969665527
+          }
+        },
+        "operand_bytes": 2364497920
+      },
+      {
+        "rank": 2,
+        "bitwise_replay_stable": true,
+        "groups": {
+          "all": {
+            "calls": 215,
+            "graph_ms": 5.693255615234375
+          },
+          "qkvz_ab": {
+            "calls": 39,
+            "graph_ms": 1.0560153579711913
+          },
+          "attention_qkv": {
+            "calls": 6,
+            "graph_ms": 0.14028287887573243
+          },
+          "gdn_out": {
+            "calls": 48,
+            "graph_ms": 0.5382195091247559
+          },
+          "attention_o": {
+            "calls": 16,
+            "graph_ms": 0.17596928119659425
+          },
+          "gate_up": {
+            "calls": 50,
+            "graph_ms": 2.0455884552001953
+          },
+          "down": {
+            "calls": 56,
+            "graph_ms": 1.2619315147399903
+          }
+        },
+        "operand_bytes": 2364497920
+      },
+      {
+        "rank": 3,
+        "bitwise_replay_stable": true,
+        "groups": {
+          "all": {
+            "calls": 215,
+            "graph_ms": 5.690019683837891
+          },
+          "qkvz_ab": {
+            "calls": 39,
+            "graph_ms": 1.0570444679260254
+          },
+          "attention_qkv": {
+            "calls": 6,
+            "graph_ms": 0.14106112241744995
+          },
+          "gdn_out": {
+            "calls": 48,
+            "graph_ms": 0.5363507175445557
+          },
+          "attention_o": {
+            "calls": 16,
+            "graph_ms": 0.17507327556610108
+          },
+          "gate_up": {
+            "calls": 50,
+            "graph_ms": 2.0575641632080077
+          },
+          "down": {
+            "calls": 56,
+            "graph_ms": 1.2613632011413576
+          }
+        },
+        "operand_bytes": 2364497920
+      }
+    ],
+    "plane_only_trace_ms_rank0": 6.563552846153846,
+    "plane_trace_minus_pure_graph_ms_rank0": 0.8720791523061902,
+    "clock_samples_per_rank": 22,
+    "sm_clock_mhz": 1290,
+    "memory_clock_mhz": 877,
+    "baseline_scope": "215admittedDMVcalls; excludes7IQ2 and34otherfallbacks; puregraph envelopes and traced services are distinct timing views"
+  },
+  "eight_launch_sparse_controls": {
+    "ssm_out/wheel/isolated": 11.187210714285714,
+    "ssm_out/wheel/torch_wide": 19.383751785714285,
+    "ssm_out/wheel/custom_wide": 13.682683928571429,
+    "ssm_out/wheel/custom_reused": 11.4289875,
+    "ssm_out/wheel/chunks_wide": 19.381114285714286,
+    "ssm_out/wheel/chunks_reused": 13.102174999999999,
+    "ffn_down/wheel/isolated": 22.065360000000002,
+    "ffn_down/wheel/torch_wide": 29.361314999999998,
+    "ffn_down/wheel/custom_wide": 24.256415,
+    "ffn_down/wheel/custom_reused": 22.117035,
+    "ffn_down/wheel/chunks_wide": 29.20565,
+    "ffn_down/wheel/chunks_reused": 23.102635
+  },
+  "short_request_reference": {
+    "mean_full_verify_round_ms": 16.915990132838488,
+    "verify_intervals": 15,
+    "same_prompt_as_trace": true,
+    "same_output_ids_as_trace": false,
+    "formal_speed_claim": false
+  }
+}
