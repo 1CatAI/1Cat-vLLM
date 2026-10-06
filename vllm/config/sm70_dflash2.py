@@ -64,6 +64,9 @@ class Sm70DFlash2Config:
     Explicit settings take precedence over legacy aliases during compatibility.
     """
 
+    draft_window_split: bool = True
+    """Use the qualified FP16 single-request split window on 832-token pages."""
+
     fused_gdn_verify: bool | None = None
     """Policy for fused gdn verify; None retains automatic qualification."""
 
@@ -163,7 +166,8 @@ class Sm70DFlash2Config:
 
     def graph_options(self) -> dict[str, bool | None]:
         return {
-            field: getattr(self, field) for field in SM70_DFLASH2_LEGACY_FIELDS.values()
+            field: getattr(self, field)
+            for field in (*SM70_DFLASH2_LEGACY_FIELDS.values(), "draft_window_split")
         }
 
 
