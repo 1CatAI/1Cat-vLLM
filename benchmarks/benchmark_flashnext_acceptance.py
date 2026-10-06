@@ -505,7 +505,9 @@ def main():
                     report["node_trace"]["summary"] = summarize(steps, args.trace_width)
                     save()
                 finally:
-                    llm.collective_rpc("stop_graph_parity_capture", timeout=30)
+                    # Node tracing can take longer to flush a C4 capture than
+                    # generation itself. The completed records are saved above.
+                    llm.collective_rpc("stop_graph_parity_capture", timeout=120)
         if args.teacher_forcing:
             reference = (
                 json.loads(args.teacher_reference.read_text())

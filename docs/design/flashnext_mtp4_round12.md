@@ -491,8 +491,8 @@ Low-overhead rank-0 median GPU envelopes locate the endpoint saving:
 These are medians of nested envelopes, not an additive closed ledger.
 CPU target-entry skew increases to median 1.5371 ms while GPU before-target
 work remains about 0.10 ms: the CPU timestamps alone do not establish a
-redeemable GPU stall. A new graph-node trace will locate actual TP entry and
-dependency waits. The 12-ms objective remains unmet by 5.4 ms. The historical
+redeemable GPU stall. The graph-node ledger below measures actual TP entry
+and dependency waits. The 12-ms objective remains unmet by 5.4 ms. The historical
 43.211-ms C4 result remains a separate unresolved control drift; the new
 same-wheel comparison alone does not establish no regression against it.
 
@@ -562,8 +562,47 @@ checks, but regresses maximum-rank median from 29.252 to 55.204 us. It is
 rejected. It repeats tagged polling across 80 consumers instead of polling
 each record once and bulk-reading ready data. The next isolated screen
 publishes readiness per 64-column tile with one producer, then lets up warps
-bulk-read that tile. It remains research-only pending the same numerical
-and latency checks.
+bulk-read that tile. It also passes byte-exact outputs and two changed-input
+graph checks, but regresses maximum-rank median from 30.364 to 34.996 us.
+Both polling variants are rejected.
+
+### Closed budget and further rejected decoding screens
+
+The 1.7857-ms uncovered GPU budget is an upper bound on eliminating every
+recorded gap, not an estimate of recoverable host time. Even eliminating it
+entirely cannot supply the remaining 5.4-ms unprofiled endpoint reduction.
+The major target compute chains must also shrink. Shared-expert service is
+largely parallel, so its service saving cannot be added directly to the round.
+
+Compact scalar planes retaining original IQ block coefficients match official
+dequantization exactly on 34,560 CPU values. All nine GPU points produce
+byte-identical Q8 packets. IQ3_XXS/S records grow from 98/110 to 136 bytes per
+256 weights, and IQ2_S records grow from 82 to 108. M5 IQ3_XXS regresses from
+43.520 to 49.152 us; IQ3_S is unchanged at 49.152 us; IQ2_S improves from
+43.008 to 40.960 us. The weighted M5 service estimate regresses 0.0548 ms.
+Explicit vector loads also pass all nine checks but regress the weighted M5
+estimate 0.0584 ms. Neither layout is selected; complete expert expansion
+would additionally consume about 2.3 GiB per rank.
+
+A presigned shared-codebook screen keeps original weight records and passes
+six byte-exact output checks. M5 IQ3_XXS regresses 45.056 to 47.104 us and
+IQ3_S 46.080 to 56.320 us; M20 also regresses. Larger shared tables and their
+initialization do not redeem the lookup cost in this implementation. These
+are research-only private-DSO measurements, not packaged endpoint results.
+
+### C4 shape-selected control trace
+
+The current switch-off control captures the actual C4 shape (20 verification
+rows, four requests), rather than extrapolating its M5 graph. It records 1754
+target nodes per rank, including 98 NCCL all-reduces and the larger-batch
+two-kernel HC chain. Across 227 common TP windows the profiled window/target
+envelope medians are 50.5335/37.0428 ms, and GPU entry skew p50/p90 is
+0.3242/0.4618 ms. These perturbed capture timings are not C4 endpoint numbers.
+The historical runtime is being captured with the same configuration to
+localize the previously recorded C4 drift. Generation and CPU records were
+saved before the profiler-stop RPC exceeded its original 30-second timeout;
+the report was exported successfully. C4 profiler flushing now allows 120
+seconds without changing model execution.
 
 ## Community designs and applicability
 
@@ -589,3 +628,13 @@ SM90/SM100 and CUDA 13.1; it is an algorithm reference for this SM70 workload,
 not an installable V100 fast path. Flash-Next's gated HC also differs from
 DeepSeek's Sinkhorn-normalized mHC, so a Sinkhorn-specific improvement does
 not explain this model's measured HC cost.
+
+[SGLang issue #29960](https://github.com/sgl-project/sglang/issues/29960)
+reports exposed submission latency for large speculative verification graphs
+and proposes splitting replay into two ordered graphs. It is a proposal, not
+a measured fix for this workload. Here the measured small GPU entry skew and
+bounded gap budget do not support assigning the entire remaining reduction
+to submission. [TensorRT-LLM's speculative-decoding integration](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.md)
+also discusses capturing dependent draft and target work. The local
+single-graph draft experiment already regresses endpoint latency, so graph
+consolidation is not selected merely because it reduces replay count.
