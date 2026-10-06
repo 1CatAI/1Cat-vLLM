@@ -145,9 +145,19 @@ def main():
                 samples.append(a.elapsed_time(b) * 1000 / 40 / 8 / len(packed))
             timings[name] = samples
             del g
-        down(packed[0], dbg=debug_down)
-        up(packed[0], dbg=debug_up)
+        # Sample the tail of a coupled replay. Separately launching these
+        # probes from Python includes inter-rank CPU launch skew in the
+        # peer-poll timestamps and cannot attribute device exchange cost.
+        dist.barrier()
+        phase_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(phase_graph):
+            for _ in range(64):
+                down(packed[0], dbg=debug_down)
+                up(packed[0], dbg=debug_up)
+        for _ in range(3):
+            phase_graph.replay()
         torch.cuda.synchronize()
+        del phase_graph
         rows.append(
             dict(
                 m=m,
