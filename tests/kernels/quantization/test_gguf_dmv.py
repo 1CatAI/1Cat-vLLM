@@ -232,3 +232,21 @@ def test_iq2_plane_policy_changes_graph_hash():
     enabled = KernelConfig(sm70_gguf=Sm70GgufConfig(iq2_signed_nibbles=True))
     disabled = KernelConfig(sm70_gguf=Sm70GgufConfig(iq2_signed_nibbles=False))
     assert enabled.compute_hash() != disabled.compute_hash()
+
+
+@pytest.mark.parametrize("kind", [16, 17, 22])
+def test_iq2_non_m8_retains_canonical_output_bitwise(kind):
+    from vllm.model_executor.layers.quantization.gguf_turbomind import (
+        GGUFPreparedProjection,
+    )
+
+    _, _, _, raw = planes(kind)
+    weight = torch.from_numpy(raw).cuda()
+    baseline = GGUFPreparedProjection(weight, kind, torch.float16, True, 512)
+    candidate = GGUFPreparedProjection(
+        weight, kind, torch.float16, True, 512, dmv_enabled=True
+    )
+    assert candidate.dmv_format == iq.IQ2_FORMATS[kind]
+    for m in (1, 2, 4, 16, 32, 512):
+        x = torch.randn(m, 512, device="cuda", dtype=torch.float16)
+        assert torch.equal(baseline(x), candidate(x)), (kind, m)
