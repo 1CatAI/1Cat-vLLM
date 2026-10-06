@@ -710,10 +710,21 @@ class GGUFLinearMethod(LinearMethodBase):
             plane_policy = (
                 config.kernel_config.sm70_gguf.projection_planes if config else False
             )
+            scope = (
+                config.kernel_config.sm70_gguf.projection_plane_scope
+                if config
+                else "all"
+            )
+            excluded = (
+                scope == "gated_pair" and not layer.prefix.endswith(".gate_up_proj")
+            ) or (scope == "iq3_xxs" and not any(kind == 18 for _, kind in sources))
             self.native_admission["projection_planes"] = {
-                "reason": "projection_shape_or_formats_not_qualified"
-                if plane_policy
-                else "disabled_by_kernel_config",
+                "scope": scope,
+                "reason": "disabled_by_kernel_config"
+                if not plane_policy
+                else "excluded_by_projection_plane_scope"
+                if excluded
+                else "projection_shape_or_formats_not_qualified",
                 "min_m": 8,
                 "max_m": 8,
                 "fallback": "canonical",
