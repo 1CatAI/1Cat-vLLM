@@ -26,7 +26,16 @@
 
 namespace {
 
-enum Fmt { Q4K = 0, Q5K = 1, Q6K = 2, LUT4 = 3, Q8 = 4, IQ3S = 5, IQ3X = 6, LUT6 = 7 };
+enum Fmt {
+  Q4K = 0,
+  Q5K = 1,
+  Q6K = 2,
+  LUT4 = 3,
+  Q8 = 4,
+  IQ3S = 5,
+  IQ3X = 6,
+  LUT6 = 7
+};
 constexpr bool is_iq3(int f) { return f == IQ3S || f == IQ3X; }
 constexpr bool is_iq2(int f) { return f >= 7 && f <= 9; }
 constexpr int TAB_VECS =
@@ -268,7 +277,8 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st,
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
       const unsigned nibble = (L.sc.y >> (8 * st + (c < 2 ? 0 : 4))) & 15u;
-      const half2 s2 = FMT == LUT6 ? __float2half2_rn((0.5f + nibble) * 0.25f) : s4;
+      const half2 s2 =
+          FMT == LUT6 ? __float2half2_rn((0.5f + nibble) * 0.25f) : s4;
 #if DMV_IQ4_PRMT
       // kIQ4 + 128 as bytes; nibble bit 3 picks the upper table half.
       const uint32_t T0 = FMT == LUT6 ? 0x88786755u : 0x3F2D1801u;
@@ -290,12 +300,12 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st,
         if constexpr (FMT == LUT6) {
           v = lo;
         } else {
-        asm("prmt.b32 %0, %1, %2, %3;"
-            : "=r"(hi)
-            : "r"(T2), "r"(T3), "r"(qm >> (16 * i)));
-        asm("prmt.b32 %0, %1, %2, %3;"
-            : "=r"(v)
-            : "r"(lo), "r"(hi), "r"(sel >> (16 * i)));
+          asm("prmt.b32 %0, %1, %2, %3;"
+              : "=r"(hi)
+              : "r"(T2), "r"(T3), "r"(qm >> (16 * i)));
+          asm("prmt.b32 %0, %1, %2, %3;"
+              : "=r"(v)
+              : "r"(lo), "r"(hi), "r"(sel >> (16 * i)));
         }
         asm("prmt.b32 %0, %1, %2, 0x4140;"
             : "=r"(a)
@@ -663,8 +673,9 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
   bool needs_table = false;
   int64_t main_tiles = 0;
   for (size_t i = 0; i < codes.size(); ++i) {
-    TORCH_CHECK(fmt[i] == Q4K || fmt[i] == LUT4 || is_iq2(fmt[i]) || is_iq3(fmt[i]),
-                "unqualified DMV format");
+    TORCH_CHECK(
+        fmt[i] == Q4K || fmt[i] == LUT4 || is_iq2(fmt[i]) || is_iq3(fmt[i]),
+        "unqualified DMV format");
     TORCH_CHECK(n[i] > 0 && n[i] % 32 == 0, "DMV N must align to 32");
     storage(codes[i], at::kByte);
     storage(scale[i], at::kByte);
@@ -801,7 +812,7 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
   CFG(A, B, IQ3X, Q4K);  \
   CFG(A, B, Q4K, LUT4);  \
   CFG(A, B, LUT4, Q4K);
-#define IQ2_FMTS(A, B) \
+#define IQ2_FMTS(A, B)   \
   CFG(A, B, LUT6, LUT6); \
   CFG(A, B, LUT6, IQ3S); \
   CFG(A, B, IQ3S, LUT6); \
@@ -914,8 +925,8 @@ namespace {
 // Reverse signed nibbles into the original u2 index/sign packets. Only the
 // fallback path reads the magnitude table; M8 needs no shared codebook.
 __global__ void dmv_restore_iq2(const uint4* codes, const uint2* meta,
-                              const uint16_t* reverse, uint16_t* weight,
-                              uint32_t* stats, int kind, int k, int n) {
+                                const uint16_t* reverse, uint16_t* weight,
+                                uint32_t* stats, int kind, int k, int n) {
   const int64_t i = int64_t{blockIdx.x} * blockDim.x + threadIdx.x;
   if (i >= int64_t{k / 32} * n) return;
   const int col = i % n, step = i / n;
@@ -957,9 +968,9 @@ __global__ void dmv_restore_iq2(const uint4* codes, const uint2* meta,
 }  // namespace
 
 void gguf_dmv_restore_iq2_sm70_out(torch::Tensor weight, torch::Tensor stats,
-                                  torch::Tensor codes, torch::Tensor meta,
-                                  torch::Tensor reverse, int64_t kind,
-                                  int64_t k, int64_t n) {
+                                   torch::Tensor codes, torch::Tensor meta,
+                                   torch::Tensor reverse, int64_t kind,
+                                   int64_t k, int64_t n) {
   TORCH_CHECK(kind == 16 || kind == 17 || kind == 22, "invalid IQ2 type");
   TORCH_CHECK(k > 0 && k % 128 == 0 && n > 0 && n % 32 == 0,
               "invalid IQ2 restore geometry");
