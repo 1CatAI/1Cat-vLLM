@@ -14,14 +14,22 @@ from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import deco
 from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
-FORMATS = {12: 0, 23: 3, 21: 5, 18: 6}
+FORMATS = {12: 0, 23: 3, 21: 5, 18: 6, **iq.IQ2_FORMATS}
 _tables = {}
+_reverse_tables = {}
 
 
 def table(device):
     if device not in _tables:
         _tables[device] = torch.from_numpy(iq.tables()).to(device)
     return _tables[device]
+
+
+def reverse_table(kind, device):
+    key = (kind, device)
+    if key not in _reverse_tables:
+        _reverse_tables[key] = torch.from_numpy(iq.iq2_reverse_table(kind)).to(device)
+    return _reverse_tables[key]
 
 
 def eligible_sources(sources, prefix):
@@ -37,6 +45,14 @@ def eligible_sources(sources, prefix):
     quantized = [(w, t) for w, t in sources if t not in (1, 30)]
     if not quantized or len({t for _, t in quantized}) > 2:
         return False
+    if any(t in iq.IQ2_FORMATS for _, t in quantized):
+        if not cfg.kernel_config.sm70_gguf.iq2_signed_nibbles:
+            return False
+        # Only the measured gate/up and down shapes admit the new decoder.
+        if not prefix.endswith((".gate_up_proj", ".down_proj")):
+            return False
+        if any(t in (12, 23) for _, t in quantized):
+            return False
     for w, t in quantized:
         if t not in FORMATS or w.dtype != torch.uint8 or w.ndim != 2:
             return False
@@ -82,8 +98,15 @@ def prepare_bank(projection, raw_weight, canonical):
         )
     ):
         return False
+    if kind in iq.IQ2_FORMATS and not hasattr(
+        torch.ops._C, "gguf_dmv_restore_iq2_sm70_out"
+    ):
+        return False
     raw = raw_weight.detach().cpu().numpy()
-    if kind in (18, 21):
+    if kind in iq.IQ2_FORMATS:
+        fmt, codes, scale = iq.pack_iq2(raw, kind)
+        high = None
+    elif kind in (18, 21):
         fmt, codes, scale = iq.pack(raw, kind)
         high = np.empty(0, dtype=np.uint8)
     else:
@@ -113,7 +136,13 @@ def prepare_bank(projection, raw_weight, canonical):
     projection.codes = Parameter(torch.from_numpy(codes).to(raw_weight.device), False)
     projection.stats = Parameter(torch.from_numpy(scale).to(raw_weight.device), False)
     projection.register_parameter(
-        "dmv_high", Parameter(torch.from_numpy(high).to(raw_weight.device), False)
+        "dmv_high",
+        Parameter(
+            reverse_table(kind, raw_weight.device)
+            if kind in iq.IQ2_FORMATS
+            else torch.from_numpy(high).to(raw_weight.device),
+            False,
+        ),
     )
     projection.dmv_format = fmt
     projection.cache_capabilities = ()
@@ -144,10 +173,18 @@ def restore(
     scratch = workspace(rows.device)
     count = k * n // (8 if fmt in (0, 3) else 16)
     weight = scratch["weight"][: count * 4].view(torch.int32).view(k, -1)
-    dtype = torch.int16 if fmt == 3 else torch.int32 if fmt == 0 else torch.int64
-    size = 2 if fmt == 3 else 4 if fmt == 0 else 8
-    stats = scratch["stats"][: k // 32 * n * size].view(dtype).view(k // 32, n)
-    if fmt == 0:
+    kind = {7: 16, 8: 17, 9: 22}.get(fmt)
+    group = 16 if kind in (17, 22) else 32
+    dtype = (
+        torch.int16 if fmt == 3 else torch.int32 if fmt == 0 or kind else torch.int64
+    )
+    size = 2 if fmt == 3 else 4 if fmt == 0 or kind else 8
+    stats = scratch["stats"][: k // group * n * size].view(dtype).view(k // group, n)
+    if kind is not None:
+        torch.ops._C.gguf_dmv_restore_iq2_sm70_out(
+            weight, stats, codes, scales, high, kind, k, n
+        )
+    elif fmt == 0:
         torch.ops._C.gguf_dense_restore_canonical_sm70_out(
             weight,
             stats,
@@ -163,7 +200,17 @@ def restore(
     from .gguf_turbomind import _prepared_gguf_projection
 
     family = 0 if fmt == 0 else 1 if fmt == 3 else 2
-    decoder = 4 if fmt == 0 else 0 if fmt == 3 else 21 if fmt == 5 else 18
+    decoder = (
+        kind
+        if kind is not None
+        else 4
+        if fmt == 0
+        else 0
+        if fmt == 3
+        else 21
+        if fmt == 5
+        else 18
+    )
     result = _prepared_gguf_projection(
         rows,
         weight,
@@ -171,7 +218,7 @@ def restore(
         None,
         family,
         decoder,
-        32,
+        group,
         k_ld,
         q_ld,
         n,
@@ -184,6 +231,9 @@ def restore(
 
 def prepare_layer(layer, projections):
     quantized = [p for p in projections if p.kernel is not None]
+    source_types = {p.source_type for p in quantized}
+    if 23 in source_types and source_types.intersection(iq.IQ2_FORMATS):
+        return {"reason": "iq2_mixed_iq4_requires_original_scale_precision"}
     if not quantized or not all(hasattr(p, "dmv_format") for p in quantized):
         return {
             "reason": next(
@@ -216,6 +266,10 @@ def prepare_layer(layer, projections):
         return {"reason": "too_many_projection_segments"}
     pair = layer.prefix.endswith(".gate_up_proj")
     kw, tn, split = (4, 4, 1) if pair else (4, 2, 1)
+    if any(fmt in iq.IQ2_FORMATS.values() for fmt in fmts):
+        # Match the existing eight-part FP32 reduction; pairs also preserve
+        # contiguous K partitions and the FP16 SiLU activation boundary.
+        kw, tn, split = 8, 2, 1
     # Narrow segments share one launch with wider projections; split2 is used
     # only for an independently launched narrow matrix.
     if not pair and sum(ns) <= 1536:
@@ -361,7 +415,7 @@ def _project(
         counters,
         tn,
         None,
-        table(rows.device),
+        table(rows.device) if any(fmt in (5, 6) for fmt in formats) else None,
         floating,
         ab_out,
         out if pair else None,
