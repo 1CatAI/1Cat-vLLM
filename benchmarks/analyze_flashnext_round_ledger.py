@@ -24,6 +24,27 @@ def clipped(intervals, start, end):
     return [(max(a, start), min(b, end)) for a, b in intervals if a < end and b > start]
 
 
+def idle_edges(activities, start, end):
+    """Attribute uncovered wall intervals to frontier events, not stream sums.
+
+    Input entries are (start, end, scope, name). An overlapping event that ends
+    earlier must not replace the event that defines the busy frontier.
+    """
+    cursor, previous = start, None
+    gaps = []
+    for a, b, scope, name in sorted(activities):
+        if b <= start or a >= end:
+            continue
+        if a > cursor:
+            gaps.append((a - cursor, previous, (scope, name)))
+        if b > cursor:
+            cursor = min(b, end)
+            previous = (scope, name)
+    if cursor < end:
+        gaps.append((end - cursor, previous, None))
+    return gaps
+
+
 def exclusive_activity_ns(scopes, start, end):
     """Partition the window, prioritizing graph work over overlapping copies."""
     points = collections.defaultdict(collections.Counter)
@@ -142,6 +163,7 @@ def analyze(sqlite_path, benchmark_path, trim=8):
     count = len(next(iter(target_ids.values())))
     assert count > 2 * trim + 2
     rows = []
+    gap_edges = collections.defaultdict(collections.Counter)
     for ordinal in range(trim, count - trim - 1):
         starts = {
             pid: envelopes[pid, ids[ordinal]][0] for pid, ids in target_ids.items()
@@ -169,6 +191,12 @@ def analyze(sqlite_path, benchmark_path, trim=8):
             kernel_intervals = clipped([(a, b) for a, b, _, _ in active], start, end)
             copy_intervals = clipped(copies[pid], start, end)
             busy = union_ns(kernel_intervals + copy_intervals)
+            activities = [(a, b, s, name) for a, b, s, name in active]
+            activities += [(a, b, "copies", "copy") for a, b in copy_intervals]
+            gaps = idle_edges(activities, start, end)
+            assert sum(duration for duration, _, _ in gaps) == end - start - busy
+            for duration, previous, following in gaps:
+                gap_edges[rank][previous, following] += duration
             kernel_busy = union_ns(kernel_intervals)
             service = sum(b - a for a, b in kernel_intervals)
             rank_rows[rank] = {
@@ -227,6 +255,17 @@ def analyze(sqlite_path, benchmark_path, trim=8):
         "target_envelope_ms": stats([r["target_envelope_ms"] for r in rows]),
         "target_entry_skew_ms": stats([r["target_entry_skew_ms"] for r in rows]),
         "per_rank": summaries,
+        "idle_edges": {
+            rank: [
+                {
+                    "from": previous,
+                    "to": following,
+                    "mean_ms_per_round": duration / len(rows) / 1e6,
+                }
+                for (previous, following), duration in edges.most_common(20)
+            ]
+            for rank, edges in gap_edges.items()
+        },
         "rows": rows,
     }
 

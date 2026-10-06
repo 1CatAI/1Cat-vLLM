@@ -7,6 +7,7 @@ from benchmarks.analyze_flashnext_round_ledger import (
     classify,
     clipped,
     exclusive_activity_ns,
+    idle_edges,
     union_ns,
 )
 
@@ -44,6 +45,26 @@ def test_nested_stream_activity_closes_without_double_counting():
         20,
     )
     assert result == {"target": 5, "draft": 3, "copies": 1, "no activity": 1}
+
+
+def test_idle_edge_uses_last_finishing_event_across_streams():
+    activities = [
+        (8, 15, "target", "long"),
+        (11, 13, "copies", "short"),
+        (18, 22, "draft", "next"),
+    ]
+    gaps = idle_edges(activities, 10, 25)
+    assert gaps == [
+        (3, ("target", "long"), ("draft", "next")),
+        (3, ("draft", "next"), None),
+    ]
+    assert sum(row[0] for row in gaps) == 15 - union_ns(
+        clipped([(a, b) for a, b, _, _ in activities], 10, 25)
+    )
+
+
+def test_idle_window_without_activity_is_explicit():
+    assert idle_edges([], 10, 25) == [(15, None, None)]
 
 
 @pytest.mark.parametrize(
