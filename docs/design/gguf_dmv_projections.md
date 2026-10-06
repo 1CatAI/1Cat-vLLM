@@ -21,8 +21,10 @@ reader applies that factor in FP32 together with the local scale and rounds
 only the expanded group coefficient. Canonical restoration retains every
 index and sign and reconstructs the same group coefficient.
 
-Initial operator checks used real TP4 27B rank-0 shards on V100-SXM2-32GB
-with post-run clock readings of 1290 MHz, CUDA 12.8 and Torch 2.10.0.
+Initial format checks used representative quarter-width 27B weight slices
+on V100-SXM2-32GB with post-run clock readings of 1290 MHz, CUDA 12.8
+and Torch 2.10.0. Those GDN slices do not establish loader-equivalent head
+sharding; the corrected-shard ABBA and full model checks below cover it.
 Application clocks were not locked for these operator measurements. With M8, graph replay and rotating
 more than 48 MB of weight planes, down projections measured 20.3–22.3 µs
 and GDN output projections 10.6–11.1 µs. Relative L2 error against official
@@ -208,3 +210,55 @@ alignment does not improve the large-working-set case (18.5–18.7 µs).
 The arena change is rejected. No precision, reader or shape admission was
 changed for these diagnostics. Isolated operator latency is not substituted
 for the measured model projection service.
+
+An unprofiled CUDA-event subtraction confirms that the large-working-set
+cost is not wholly a Nsight artifact: combined sparse-access/projection
+service minus sparse access alone is approximately 16.7 µs, compared with
+9.7 µs for the isolated projection. Repeated graph-node measurements of
+KW4/TN2 with split 1/2/4 and KW2/TN2/split2 give 18.48/18.60/23.91/20.81 µs
+under that pressure. The additional split configurations are rejected.
+
+A paired NCU application-replay capture does not preserve that latency gap:
+the direct normal/wide launches measure 14.98/12.32 µs. Consequently its
+counter differences cannot identify the cause of the graph-context cost.
+They are diagnostic evidence only, not support for a translation bottleneck
+or a new production configuration.
+
+A symmetric-u4 expansion of IQ3_S is being evaluated as a research operator.
+Its codes represent exact odd signed values `v = 2u - 15`; group
+coefficients remain FP16 and MMA accumulation remains FP32. Replacing all
+144 IQ3_S tensors would add at most one bit per weight, or 0.247 GiB per
+TP4 card. This is a storage bound, not a measured model allocation or speed
+claim; the prototype has not been admitted or packaged in the model route.
+
+The first symmetric-u4 research comparison uses a real IQ3_S down shard
+(N5120,K4352,M8). Its output is bitwise equal to the admitted reader; relative
+L2 against official dequantization is 3.54e-4. The expanded plane is
+12.534 MB versus 9.748 MB. Same-process ABBA graph service improves only
+from 22.28 to 21.22 µs in isolation and from 30.47 to 29.01 µs under
+large-address interleaving. Clocks are not locked in this prototype
+(1290–1485 MHz samples); the comparison is exploratory and uses a private
+research extension. It does not qualify a production route or a model-level
+speed claim. The representation is not admitted on this evidence.
+
+A same-preceding-kernel control reads either a repeatedly reused strided
+address range or a 10 GiB range. Both use the identical compiled Torch
+elementwise kernel. Projection service is 11.78 versus 19.47 µs, with
+11.50 µs without the preceding kernel. This strengthens the address/cache
+pressure finding without attributing it to a particular translation cache.
+
+An IQ3_S reader prototype adds code/scale endpoint L2 prefetch hints outside
+the main loop. Outputs remain bitwise equal, but it does not improve the
+large-working-set case. The hint is rejected rather than added to the
+production kernel.
+
+Explicit weight-page reads do not recover isolated latency: the wide case
+measures 18.15 µs and warming code/scale page endpoints measures 18.63 µs.
+Replicating page reads across 80 CTAs still gives 18.37 versus 18.10 µs,
+plus approximately 6.11 µs of warming service. No warming kernel is admitted.
+
+Wider N tiles without split-K also lose in the wide case: KW4/TN2,
+KW4/TN4, KW2/TN4 and KW4/TN1 measure 18.47/20.51/21.35/19.90 µs. A separate
+10/100 µs delay control, with and without a final dummy MMA, leaves
+projection service at approximately 10.1 µs. Neither longer idle time nor
+a tensor-core startup penalty explains the reproduced wide-access cost.
