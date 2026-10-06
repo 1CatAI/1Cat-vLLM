@@ -62,10 +62,79 @@ stress against the replicated reference has block relative maximum error
 checks pass. Clean-process ABI, core hash and loaded-library checks exclude
 private kernel DSOs.
 
-## Next decision
+## Current complete-round baseline
 
-Rebuild the integrated operators as a source-complete installed wheel. Run
-the current-path baseline and trace, then choose ablations from the measured
-critical path. Investigate acceptance failures before comparing affected arms.
-HCX must preserve FP16 norm materialization and avoid keeping duplicate HC
-weight packs before it is eligible for promotion.
+The source-complete control wheel measures 18.531 and 18.516 ms/round in the
+two unobserved C1 cohorts: mean **18.523 ms/round**, **4.886 tokens/round**.
+C4 measures **43.190 ms/round**. The eight-prompt mean acceptance is
+47.630%, with prompt-cluster bootstrap 95% CI [37.225%, 60.005%]. The pooled
+acceptance is 44.305%; it uses a different denominator and must not replace
+the prompt mean. The two short natural completions terminate at EOS.
+
+Historical-wheel long outputs differ on six of eight prompts. Consequently
+this run does not establish historical bit equality. New routes require a
+same-wheel control, teacher-forcing comparisons and matched acceptance data.
+
+### Recorded activity ledger
+
+The node trace retains 37 common TP windows, aligned by target replay ordinal.
+Every target replay contains 1,263 kernels on each rank. Trace window median is
+20.918 ms, versus 18.523 ms unprofiled; profiler durations are composition
+evidence and must not be used as accepted endpoint latency.
+
+The following mean partition closes each common 21.383-ms window. Intervals
+are unioned and assigned once, with target taking priority over draft, graph
+work over outside-graph kernels, and kernels over copies. This is an activity
+partition, not an attribution of causal critical-path savings.
+
+| Rank | Target activity | Draft activity | Outside graphs | Copies only | No recorded activity |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 13.567 | 3.838 | 0.946 | 0.187 | 2.845 |
+| 1 | 14.309 | 4.227 | 0.683 | 0.131 | 2.034 |
+| 2 | 14.312 | 4.219 | 0.673 | 0.132 | 2.048 |
+| 3 | 14.311 | 4.233 | 0.667 | 0.132 | 2.040 |
+
+Units are ms/window. Concurrent kernel overlap totals 1.24–1.30 ms/rank;
+summed kernel durations therefore overstate wall time. Collective spinning
+inside a recorded kernel remains busy in this table. One 39.002-ms window and
+14.801-ms entry-skew outlier remain in the mean, rather than being silently
+removed. Target GPU entry skew median is 0.241 ms and p90 is 0.335 ms.
+
+The principal target kernel-service components, averaged over ranks, are
+HC down/up 2.542 ms, dense projections 2.366 ms, shared gate/up 0.817 ms,
+routed gate/up 1.793 ms, routed down/unroute 0.928 ms, QSA 1.619 ms, router
+projection/top-k 1.128 ms and TP allreduce 1.187 ms. These numbers overlap and
+must not be added to form the round ledger. The routed kernels carry
+`turbomind::gemm::StridedPtr` arguments; that type name does not imply they are
+generic TurboMind GEMMs. Shared down is included in the dense projection
+component. Its exact critical-path contribution requires an ablation because
+shared and routed experts run on different streams.
+
+The CPU observer records 1.35–1.50 ms/rank of attention-metadata preparation.
+The rank-0 output-serialization span includes approximately 9 ms waiting for
+GPU completion; it is not 9 ms of CPU computation. Async scheduling and fused
+GDN metadata for three cache groups already operate in the baseline. Nested
+CPU/GPU envelopes must be inspected before attributing metadata time to an
+unhidden bubble.
+
+## Integrated-route qualification and next decision
+
+The installed integrated wheel passes 50 SM70 operator tests and four-rank
+repeated HCX/HCXO isolation comparisons. Synthetic HCX block/injection relative
+L2 errors are 9.91e-5/7.37e-4; Q6 output-projection HCXO errors are
+5.64e-4/3.63e-4. These tests qualify isolation correctness, not model quality
+or endpoint speed.
+
+Merged GDN alpha/beta weights contain two BF16 shards. The side-projection
+preparation originally admitted only one F16 shard, so it never covered these
+36 layers. It now preserves shard order and the existing FP16 dense contract,
+declines overflow/nonfinite coefficients, and passes CPU and GPU comparisons.
+Its model contribution remains unmeasured.
+
+Measure HCX alone against the integrated wheel's switch-off control, including
+GPU envelopes, target output, teacher-forcing error, acceptance and C4. Keep
+expert MMA and hot-vocabulary changes off during that comparison. The next
+ablation is selected from the observed critical path; single-graph drafting
+and greedy verification are separate hypotheses, not presumed gains. HCX
+promotion also requires resolving redundant HC weight packs and verifying its
+FP16 normalization boundary against the agreed numerical gate.

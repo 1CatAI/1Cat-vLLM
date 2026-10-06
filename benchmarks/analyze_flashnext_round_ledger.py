@@ -24,6 +24,28 @@ def clipped(intervals, start, end):
     return [(max(a, start), min(b, end)) for a, b in intervals if a < end and b > start]
 
 
+def exclusive_activity_ns(scopes, start, end):
+    """Partition the window, prioritizing graph work over overlapping copies."""
+    points = collections.defaultdict(collections.Counter)
+    points[start]
+    points[end]
+    for label, spans in scopes.items():
+        for a, b in clipped(spans, start, end):
+            points[a][label] += 1
+            points[b][label] -= 1
+    active = collections.Counter()
+    totals = collections.Counter()
+    previous = start
+    priority = ("target", "draft", "outside graphs", "copies")
+    for at, changes in sorted(points.items()):
+        label = next((key for key in priority if active[key]), "no activity")
+        totals[label] += at - previous
+        active.update(changes)
+        previous = at
+    assert sum(totals.values()) == end - start
+    return dict(totals)
+
+
 def stats(values):
     ordered = sorted(values)
     return {
@@ -39,6 +61,9 @@ def classify(name):
         ("hcx", "HC complete boundary"),
         ("down3", "HC down"),
         ("up3", "HC up"),
+        ("dense_mv", "GGUF dense MMA"),
+        ("swiglu_mv", "Shared expert gate/up"),
+        ("quantize_q8", "Activation quantization"),
         ("dmvq", "GGUF dense dp4a"),
         ("dmv", "GGUF dense MMA"),
         ("dp4a", "GGUF dp4a"),
@@ -46,6 +71,7 @@ def classify(name):
         ("gdn", "GDN"),
         ("delta_rule", "GDN"),
         ("conv1d", "Convolution"),
+        ("rmsnorm_gated", "Gated normalization"),
         ("top1", "Head/argmax"),
         ("lm_head", "Head/argmax"),
     ):
@@ -134,6 +160,7 @@ def analyze(sqlite_path, benchmark_path, trim=8):
                 for a, b, s, name in kernels[pid]
                 if a < end and b > start
             ]
+
             by_scope = collections.defaultdict(list)
             by_family = collections.defaultdict(list)
             for a, b, s, name in active:
@@ -157,6 +184,12 @@ def analyze(sqlite_path, benchmark_path, trim=8):
                     for k, v in by_family.items()
                 },
                 "kernel_count": len(active),
+                "exclusive_activity_ms": {
+                    k: v / 1e6
+                    for k, v in exclusive_activity_ns(
+                        {**by_scope, "copies": copy_intervals}, start, end
+                    ).items()
+                },
             }
         rows.append(
             {
@@ -177,7 +210,7 @@ def analyze(sqlite_path, benchmark_path, trim=8):
             "kernel_count",
         )
         summaries[rank] = {k: stats([c[k] for c in cells]) for k in fields}
-        for field in ("scope_union_ms", "family_union_ms"):
+        for field in ("scope_union_ms", "family_union_ms", "exclusive_activity_ms"):
             keys = set().union(*(c[field] for c in cells))
             summaries[rank][field] = {
                 k: stats([c[field].get(k, 0) for c in cells]) for k in sorted(keys)

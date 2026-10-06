@@ -3,7 +3,12 @@
 
 import pytest
 
-from benchmarks.analyze_flashnext_round_ledger import clipped, union_ns
+from benchmarks.analyze_flashnext_round_ledger import (
+    classify,
+    clipped,
+    exclusive_activity_ns,
+    union_ns,
+)
 
 
 @pytest.mark.parametrize(
@@ -26,3 +31,29 @@ def test_round_clipping_closes_busy_and_gap_time():
     busy = union_ns(clipped(activity, round_start, round_end))
     assert busy == 10
     assert round_end - round_start - busy == 5
+
+
+def test_nested_stream_activity_closes_without_double_counting():
+    result = exclusive_activity_ns(
+        {
+            "target": [(10, 15)],
+            "draft": [(14, 18)],
+            "copies": [(12, 19)],
+        },
+        10,
+        20,
+    )
+    assert result == {"target": 5, "draft": 3, "copies": 1, "no activity": 1}
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("void <unnamed>::dense_mv<(int)8>(Segs)", "GGUF dense MMA"),
+        ("void <unnamed>::swiglu_mv<(int)8>(SwArgs)", "Shared expert gate/up"),
+        ("void <unnamed>::gate_up(turbomind::gemm::StridedPtr*)", "Expert gate/up"),
+        ("quantize_q8(Q8_1*)", "Activation quantization"),
+    ],
+)
+def test_specialized_kernels_are_not_classified_by_parameter_types(name, expected):
+    assert classify(name) == expected
