@@ -433,6 +433,25 @@ block. The initial row-ready HC screen differs in three FP16 hidden values
 packaged HC build does not. Both next screens use the native math flags.
 Neither is admitted to model dispatch on these failed attempts.
 
+### Precise real-shard follow-up screens
+
+With native math flags, aligned lossless records and original-record metadata
+prefetch each pass nine byte-identical Q8 output checks (M1/M5/M20, three IQ
+types). Alignment has no IQ3_S M5 gain (45.056/45.056 us) and regresses its
+M20 point (116.736/121.856 us). Its IQ3_XXS and IQ2_S M5 savings are 2.048 us
+each. Original-record prefetch saves about 1.024 us on IQ3_S M5 and 2.048 us
+on IQ3_XXS M5. These service estimates are too small to justify another model
+load or dispatch/storage change. They remain unselected.
+
+The repaired wheel's new switch-off control records C1 cohorts of 18.317 and
+18.321 ms/round and C4 45.846 ms/round. Eight-prompt mean acceptance is
+45.864%. Relative to the previous switch-off control's identically conditioned
+64 teacher positions, mean/max KL is 0.000721/0.006947 and top-1 agreement is
+64/64. Long natural sequences differ. Both configurations resolve to page816
+and use the same prompt tokens. The earlier C4 record is 43.211 ms/round;
+this difference is retained for investigation, not discarded as a favorable
+new denominator. The matched HCX arm is still running.
+
 ## Community designs and applicability
 
 [SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)
