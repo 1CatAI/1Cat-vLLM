@@ -700,6 +700,51 @@ its distinct barrier state is separated from the control's counter state.
 It regresses 30.684 to 34.812 us. Mixing those two barrier ABIs initially
 corrupted the control test, so that failed harness run is not timing evidence.
 
+### Native kernel counters and remaining small candidates
+
+Single-pass rank-0 Nsight Compute captures of the communicating HCX kernel
+run with all four peers executing the installed operator. The selected
+no-output-projection specialization uses 92 registers. Active-warp stall
+percentages are 33.87% barrier, 18.47% long scoreboard, 5.00% memory barrier,
+3.61% short scoreboard and 0.063% MIO throttle. These are instruction issue
+statistics, not wall-time fractions or savings estimates. Removing fences
+is neither supported by the small memory-barrier percentage nor safe without
+a proof of cross-CTA publication.
+
+An isolated, noncommunicating IQ3_S gate/up capture uses the real TP4 rank-0
+rows, M5/N160/K2560, top-10 routing and 47 unique experts. The normal operator
+launches 250 CTAs of 512 threads, uses 56 registers and reports 1.56 waves per
+SM. Diagnostic replay gives 383.2 GB/s DRAM traffic, 77.6% L1/TEX throughput
+and 38.2% compute throughput. The corresponding cold-cache logical unique
+payload rate is approximately 363 GB/s. Thus low logical bandwidth alone
+does not establish redundant DRAM traffic or a purely arithmetic bottleneck.
+Long-scoreboard and memory-pipe dependencies remain investigation targets;
+NCU replay duration is not endpoint speed evidence.
+
+Alternative IQ gate/up CTA partitions retain the original decoder. All nine
+M1/M5/M20 real-weight points and changed-input checks agree within decoded-Q8
+relative L2 9.10e-5, but there is no weighted speed improvement. M5 IQ3_XXS is
+45.056/53.248/47.104/47.104 us for R32L16/R32L32/R64L8/R64L16; IQ3_S is
+45.568/53.248/51.712/48.128 us and IQ2_S is
+40.960/45.056/41.984/40.960 us. These research-only partitions are rejected.
+
+The already-packaged native GDN verifier is a smaller positive candidate.
+Against retained Triton, actual TP4 head counts H4/HV12/K128 pass six
+synthetic activation/state cases, each with three changed-input/state checks.
+Maximum output relative L2 is 9.33e-6, FP32 state relative L2 2.16e-8 and
+state maximum absolute difference 5.96e-8. Single-request M5 is
+20.480–21.504/14.336 us, implying only 0.22–0.26 ms of isolated service
+savings over 36 layers. Four-request M20 regresses
+32.768 to 34.816 us, so its existing single-request admission must remain.
+No model improvement or acceptance claim follows from these operator tests.
+
+The integration source now includes main's IQ2 projection and draft-attention
+updates. A normal wheel rebuilt at 3577384357 has core SHA-256
+`784d1447f4f5f5593fa77db525e6b40e841366d654202aab5a56beec67398a0c`.
+A same-wheel control/native-GDN model pair is pending. The preceding
+17.3988-ms HCX and ring endpoints remain measurements of their recorded
+earlier wheels, rather than evidence for this integration build.
+
 ## Community designs and applicability
 
 [SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)
