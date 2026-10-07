@@ -132,3 +132,8 @@ backbone, which imports GPU providers through fusion passes. The offload helper
 now suppresses its unused MoE stream and constructs the discovery-only backbone
 with compilation/graphs disabled on a separate config copy. GPU worker policy
 and CPU-owned PLE execution configuration remain unchanged.
+
+The isolated helper completed real PLE weight discovery/loading without Torch
+CUDA initialization or a NVML allocation. Startup cancellation now also checks
+the parent shutdown event while waiting for GPU registration; a loader failure
+must not leave the helper blocked indefinitely with retained resources.

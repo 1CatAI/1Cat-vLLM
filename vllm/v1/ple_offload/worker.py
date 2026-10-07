@@ -532,7 +532,10 @@ class PleOffloadWorker:
 
             # READY means that the process can immediately serve requests. Wait
             # for every DP/TP worker to register before notifying the parent.
-            runner.accept_registrations(pull_socket, num_workers)
+            if not runner.accept_registrations(
+                pull_socket, num_workers, shutdown_event
+            ):
+                return
             _prefault_module_storage(runner._layers.values())
             ready_writer.send(
                 {
@@ -741,11 +744,18 @@ class PleOffloadRunner:
         self,
         pull_socket: zmq.Socket,
         num_workers: int,
-    ) -> None:
+        shutdown_event: threading.Event | None = None,
+    ) -> bool:
         """Receive every local DP/TP worker's IPC and shared-memory buffers."""
         logger.info("Waiting for %d GPU worker registration(s) ...", num_workers)
         registrations: list[PleOffloadRegistration] = []
         for index in range(num_workers):
+            if shutdown_event is not None:
+                while not shutdown_event.is_set():
+                    if pull_socket.poll(timeout=100):
+                        break
+                else:
+                    return False
             item = ForkingPickler.loads(pull_socket.recv())
             if not isinstance(item, PleOffloadRegistration):
                 raise RuntimeError(
@@ -886,6 +896,8 @@ class PleOffloadRunner:
             tp_size,
             sorted(self.layer_names),
         )
+
+        return True
 
     def _bind_remote_placements(
         self,

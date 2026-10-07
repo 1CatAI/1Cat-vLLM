@@ -14,7 +14,11 @@ import vllm.envs as envs
 import vllm.v1.ple_offload.connector as ple_offload_connector_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from tests.utils import set_lazy_env
-from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config import (
+    CompilationConfig,
+    VllmConfig,
+    get_current_vllm_config_or_none,
+)
 from vllm.config.load import LoadConfig
 from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
@@ -119,6 +123,7 @@ def _load_test_ple_weights(
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32),
         load_config=load_config or LoadConfig(),
+        compilation_config=CompilationConfig(),
     )
     runner._layers = {}
     runner._load_weights()
@@ -1371,3 +1376,26 @@ def test_ple_registration_outlives_its_sender(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     assert "value=7 managers=0" in result.stdout, result.stdout + result.stderr
     assert "released" in result.stdout
+
+
+@pytest.mark.parametrize("already_stopped", [False, True])
+def test_registration_wait_exits_when_parent_stops(already_stopped):
+    import threading
+
+    stopped = threading.Event()
+    if already_stopped:
+        stopped.set()
+
+    class WaitingSocket:
+        def poll(self, timeout):
+            assert timeout <= 100
+            stopped.set()
+            return False
+
+        def recv(self):
+            raise AssertionError(
+                "A stopped worker must not block waiting for registration"
+            )
+
+    runner = object.__new__(ple_offload_worker.PleOffloadRunner)
+    assert not runner.accept_registrations(WaitingSocket(), 4, stopped)
