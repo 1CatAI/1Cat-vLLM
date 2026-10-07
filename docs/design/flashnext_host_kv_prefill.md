@@ -236,7 +236,7 @@ Admission is SM70, FP16 input/weight, at least 512 query rows, 1–16 requests,
 capability report describes these guards and runtime fallback reports its
 reason.
 
-On the same V100-32GB (1290 MHz, CUDA 12.8, Torch 2.10), an eager ABBA test using
+On the same V100-32GB (CUDA 12.8, Torch 2.10), an eager ABBA test using
 the checkpoint's actual layer-1 PLE convolution weight measured:
 
 | Query rows | Existing temporary peak | Direct temporary peak | Existing median | Direct median |
