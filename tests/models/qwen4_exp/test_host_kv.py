@@ -232,12 +232,15 @@ def test_host_attention_empty_padded_rows():
 
 @pytest.mark.parametrize("rows", [1, 5, 20, 32])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
-@pytest.mark.parametrize("short_tail", [False, True])
+@pytest.mark.parametrize("context", [14, 255, 256, 257, 511, 512, 513, 2050])
 def test_direct_host_attention_matches_staging_on_misses_and_replay(
-    rows, dtype, short_tail
+    rows, dtype, context
 ):
     from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
-    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+        expand_qsa_block_indices_cuda,
+        qsa_sparse_paged_attention,
+    )
 
     torch.manual_seed(19)
     device = torch.device("cuda:0")
@@ -247,18 +250,16 @@ def test_direct_host_attention_matches_staging_on_misses_and_replay(
     value = torch.randn_like(key)
     state.write(key, value, torch.arange(3264, device=device))
     direct_state.write(key, value, torch.arange(3264, device=device))
-    indices = torch.arange(2051, device=device, dtype=torch.int32).repeat(rows, 1)
     table = torch.arange(4, dtype=torch.int32, device=device).view(1, -1)
     requests = torch.zeros(rows, dtype=torch.int32, device=device)
     if rows > 1:
         requests[-1] = -1
-    positions = torch.full((rows,), 2049, dtype=torch.int64, device=device)
-    lengths = torch.full((1,), 2050, dtype=torch.int32, device=device)
-    if short_tail:
-        indices[:, 12:] = -1
-        indices[:, 2048:2050] = torch.tensor([12, 13], device=device)
-        positions.fill_(13)
-        lengths.fill_(14)
+    positions = torch.full((rows,), context - 1, dtype=torch.int64, device=device)
+    lengths = torch.full((1,), context, dtype=torch.int32, device=device)
+    blocks = torch.arange(512, device=device, dtype=torch.int32).repeat(rows, 1)
+    indices = expand_qsa_block_indices_cuda(
+        blocks, positions, lengths, requests, compress_ratio=4, token_topk=2048
+    )
     query = torch.randn(rows, 6, 256, dtype=torch.float16, device=device)
     reference, actual = torch.empty_like(query), torch.empty_like(query)
     gate = torch.randn_like(query)

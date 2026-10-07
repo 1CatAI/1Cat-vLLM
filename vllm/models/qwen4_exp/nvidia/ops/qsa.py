@@ -698,23 +698,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     loop_end = split_tile_end
     if HOST_CACHE:
         selected_count = tl.load(HOST_VALID_COUNTS + row)
-        full_tiles = tl.cdiv((selected_count // 4) * 4, BLOCK_N)
-        full_iterations = tl.maximum(
-            tl.minimum(split_tile_end, full_tiles) - split_tile_start, 0
-        )
-        tail_tile = ((TOPK // 4) * 4) // BLOCK_N
-        has_tail = ((selected_count % 4) > 0) & (tail_tile >= split_tile_start)
-        has_tail &= (tail_tile < split_tile_end) & (tail_tile >= full_tiles)
-        loop_start = 0
-        loop_end = full_iterations + has_tail.to(tl.int32)
-    for loop_tile in range(loop_start, loop_end):
-        tile = loop_tile
-        if HOST_CACHE:
-            # Retain the original tile/split assignment and visit order; skip
-            # only known empty middle tiles before the fixed tail columns.
-            tile = tl.where(
-                loop_tile < full_iterations, split_tile_start + loop_tile, tail_tile
-            )
+        # The selector compacts the open group's causal tail immediately after
+        # the selected complete blocks, including at attention tile boundaries.
+        # Keep the original split assignment and only skip empty suffix tiles.
+        loop_end = tl.minimum(split_tile_end, tl.cdiv(selected_count, BLOCK_N))
+    for tile in range(loop_start, loop_end):
         columns = tile * BLOCK_N + column_offsets
         logical_token = tl.load(
             indices_ptr + row * stride_indices_row + columns,

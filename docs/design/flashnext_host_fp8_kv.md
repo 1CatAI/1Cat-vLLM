@@ -142,10 +142,13 @@ four-request selection despite sufficient aggregate capacity. Changing the
 hash alone does not resolve that structural conflict.
 
 The page-slot prototype passes 38 GPU tests, including physical-page aliases,
-tentative rewrites and captured replay. Sixteen direct/staged tests then cover
-short-context holes and fixed tail columns, agreeing exactly. The reader skips
-known empty middle tiles by changing loop bounds while retaining the original
-tile order and split assignment. A conditional around tensor-core arithmetic
+tentative rewrites and captured replay. The initial direct/staged tests used artificial fixed tail columns and missed
+a real selector boundary: the causal tail is compacted immediately after the
+selected complete blocks. A fixed-tail loop drops live tokens at boundaries
+such as 257 and 513. The corrected loop keeps the original split assignment
+and truncates only the empty suffix. Regression tests use the actual QSA
+expansion kernel at contexts 14, 255, 256, 257, 511, 512, 513 and 2050, for
+M1/M5/M20/M32 and FP8/FP16 storage. A conditional around tensor-core arithmetic
 is slower and is rejected.
 
 Same-card synthetic graph timings for the current source prototype:
@@ -164,3 +167,19 @@ not prove model hit rates or endpoint gains. Packaged qualification and an
 FP16 host model reference are the next checks. Teacher capture additionally
 saves small post-RoPE KV samples outside the timed replay for format analysis;
 resident controls do not change their capture behavior.
+
+## Rejected FP16 host model reference
+
+The first slot-cache FP16 model run, before the compact-tail correction, measures
+C1 18.608 ms/round, 4.886 tokens/round and C4 44.332 ms/round. Mean acceptance
+is 45.53%, with paired difference -0.79 percentage points and 95% CI
+[-1.77, +0.29] against the resident control. However, 64 target teacher positions
+show mean/max KL 0.012746/0.222238 and top-1 agreement 62/64. These results
+reject the implementation even with unquantized host storage; the compact-tail
+bug must be corrected before assessing format-induced quality loss.
+
+The reported C1 is the benchmark's arithmetic mean of its before/after probes,
+including the after probe's large outlier. The approximately 18.14 ms median
+is diagnostic only. Whole-workload cache hits are about 98.97–99.11% for target
+owners and 99.02% for the draft; these include prefill and generation rather than
+an isolated C1 cohort. High hit rate does not establish correct attention.
