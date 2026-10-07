@@ -221,6 +221,60 @@ The unused CPU allocator backing is retained to avoid changing block geometry;
 this mode is a placement diagnostic, not a production memory optimization.
 Four new GPU tests verify identical codes, scales and outputs across both
 placements, including misses, M5/M20, compact tails and captured rewrites.
-All 98 source GPU tests pass. Model results remain pending. Optional repeated
+All 98 source and packaged GPU tests pass. Optional repeated
 teacher conditions measure variation within the same process, outside timing
 probes. Both matched model arms use E4M3 target storage and an FP16 draft.
+
+## Matched E4M3 placement results
+
+Source `c1ebacb677` is packaged as `1.5.2.dev1190+gc1ebacb67`, wheel SHA256
+`61d8cb81983ba332e886a60508d8e5a58289b72ce53baa5686e014ded2a81b9c`.
+Both arms use the same wheel and SM70 native members, target per-vector E4M3
+history, FP16 draft history, 8192-token FP16 hot caches and 157 allocator
+blocks on each of four V100-SXM2-32GB GPUs. TP4, FP16 activations, FP32 recurrent
+state, FULL decode graphs, maximum length 9216, prefill batch 512 and maximum
+concurrency four are fixed. Torch is 2.10.0+cu128 with CUDA 12.8.
+
+| History backing | C1 ms/round | Tokens/round | C4 ms/round | Natural acceptance |
+| --- | --- | --- | --- | --- |
+| Device reference | 17.849 | 4.886 | 42.417 | 46.66% |
+| Pinned host | 18.320 | 4.886 | 44.565 | 46.03% |
+
+The host C1 value includes an after-probe outlier: before/after means are
+18.053/18.587 ms, with medians 18.041/18.065 ms. The reported endpoint follows
+the benchmark's unchanged arithmetic-mean contract. Device means are
+17.847/17.852 ms. Host overhead is 0.471 ms for C1 and 2.148 ms for C4; the
+C4 difference is 5.1%, so the performance qualification remains unmet.
+
+Eight prompts with up to 600 output tokens and EOS enabled have a paired
+acceptance difference of -0.63 percentage points, 95% CI [-3.15, +1.86].
+This does not establish equivalence, but the previous significant loss does
+not reproduce in this matched pair. Both short completions terminate normally
+and agree. Sixty-four equally conditioned target positions have mean/max KL
+0.000930/0.009896, top-1 agreement 63/64 and zero bitwise-identical logits.
+Within each process, repeating all 64 conditions produces bitwise-identical
+logits, zero KL and 64/64 top-1 agreement. Placement is therefore not yet
+cleared of model differences; repeated within-process conditions do not
+explain cross-process variation.
+
+The device E4M3 control versus the prior resident FP16 control has acceptance
+46.66% versus 47.11%, paired difference -0.45 percentage points, 95% CI
+[-1.56, +0.82]. Mean/max teacher KL is 0.001681/0.025192, top-1 63/64. This
+comparison also changes reader, geometry and source version, so it is not a
+pure precision ablation. Do not attribute the old host acceptance loss solely
+to E4M3, or attribute the new residual solely to host placement.
+
+The device reference uses 0.867 GiB/rank for complete history and scales,
+with total Torch allocation 28.782 GiB/rank. Host storage removes that device
+history while retaining the same device pools, hot caches and scratch.
+Both arms retain the host allocator backing by design. This diagnostic does
+not measure the minimum achievable resident-memory footprint. Host mode
+remains opt-in pending model correctness and C4 qualification.
+
+A matched-wheel KV sample screen compares the first equally conditioned
+verification row at each owner. The first QSA layer already differs: its
+encoded-history sample is exact at 2/64 conditions, with mean/max relative L2
+0.008739/0.017876. These are reconstructed quantized values, not the original
+FP16 projections or complete prefix history. The screen motivates tracing the
+first divergent input before QSA and checking cross-process upstream variation;
+it does not prove an encoding, backing or projection bug.
