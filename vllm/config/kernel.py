@@ -379,6 +379,9 @@ class Sm70GgufConfig:
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
 
+    prefill_routing: bool = True
+    """Fuse admitted prefill routing copies and ordered FP32 expert reduction."""
+
     lut4_expert_dp4a: bool = True
     """Admit canonical IQ4 gate/up integer dots at calibrated expert shapes."""
 

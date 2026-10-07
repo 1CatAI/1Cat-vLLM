@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.model_executor.layers.fused_moe.sm70_small_routing import (
+    SM70_PREFILL_ROUTING,
     SM70_SMALL_ROUTING,
     _small_route,
     _small_unroute,
@@ -136,3 +137,42 @@ def test_unroute_matches_torch_short_reduction_order(top_k, weight_dtype):
     torch.testing.assert_close(
         _small_unroute(down, inverse, weights), expected, rtol=0, atol=0
     )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(70), reason="CUDA SM70 required"
+)
+@pytest.mark.parametrize("m", [33, 128, 512, 2048, 16384])
+@pytest.mark.parametrize("pattern", ["random", "one_expert"])
+def test_prefill_routing_and_ordered_unroute(m, pattern):
+    torch.manual_seed(7100 + m)
+    x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
+    ids = torch.randint(512, (m, 10), device="cuda", dtype=torch.int64)
+    if pattern == "one_expert":
+        ids.fill_(511)
+    assert SM70_PREFILL_ROUTING.reason(x, ids, 512) is None
+    sorted_reference, order = ids.flatten().int().sort(stable=True)
+    routed, offsets, sorted_ids, inverse = _small_route(x, ids, 512)
+    torch.testing.assert_close(sorted_ids, sorted_reference.long(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        offsets,
+        torch.searchsorted(
+            sorted_reference, torch.arange(513, device="cuda", dtype=torch.int32)
+        ).int(),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(inverse.long(), order.argsort(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        routed[inverse.long()], x.repeat_interleave(10, 0), rtol=0, atol=0
+    )
+    del routed
+    down = torch.randn(m * 10, 2560, device="cuda", dtype=torch.float16)
+    weights = torch.randn(m, 10, device="cuda")
+    actual = _small_unroute(down, inverse, weights)
+    # Bound oracle temporaries independently of the full 16K routed matrix.
+    for start in range(0, m, 128):
+        stop = min(start + 128, m)
+        part = down[inverse[start * 10 : stop * 10].long()].view(stop - start, 10, 2560)
+        expected = (part.float() * weights[start:stop, :, None]).sum(1).half()
+        torch.testing.assert_close(actual[start:stop], expected, rtol=0, atol=0)
