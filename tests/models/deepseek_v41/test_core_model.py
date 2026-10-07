@@ -83,7 +83,8 @@ def _vllm_config(ckpt: Path, max_tokens: int = 32) -> VllmConfig:
 
     hf = get_config(str(ckpt), trust_remote_code=False)
     vc = VllmConfig()
-    object.__setattr__(vc, "model_config", SimpleNamespace(hf_config=hf, dtype=torch.float16, tokenizer=str(ckpt)))
+    object.__setattr__(vc, "model_config", SimpleNamespace(hf_config=hf, dtype=torch.float16, model=str(ckpt),
+                                                                tokenizer=str(ckpt)))
     object.__setattr__(vc, "quant_config", DeepseekV41FP8Config.from_config(dict(hf.quantization_config)))
     vc.scheduler_config.max_num_batched_tokens = max_tokens
     return vc

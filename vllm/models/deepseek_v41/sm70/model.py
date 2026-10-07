@@ -13,6 +13,7 @@ FP16 head with FP32 logits, FP16 GEMMs with FP32 accumulation (reduced-precision
 
 from __future__ import annotations
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
@@ -49,7 +50,6 @@ if TYPE_CHECKING:
 
 # Model knobs (PORT_DESIGN §5.5: "--ds41-*" flags are L-CORE knobs)
 ENGRAM_DIR_KNOB = "VLLM_DS41_CORE_ENGRAM_DIR"
-ENGRAM_DIR_DEFAULT = "/home/mermiges/ds41-engram"
 SPILL_KNOB = "VLLM_DS41_CORE_SPILL_EXPERTS_PER_LAYER"
 LAYER_SUBSET_KNOB = "VLLM_DS41_CORE_LAYER_SUBSET"   # e.g. "0,1,2,3": run only these backbone layers (I1 / smoke)
 LAYER_SUBSET_ALLOW_KNOB = "VLLM_DS41_CORE_ALLOW_LAYER_SUBSET"   # must be 1 too: a subset is a debug-only partial model
@@ -105,6 +105,22 @@ def engram_io_threads(pp_size: int) -> int:
     """Engram pread threads per rank (D11 / AM-12): 2 under PP2, 1 under PP3+ (CPU budget: 12 cores for 8-12
     workers), the service default 4 without PP. VLLM_DS41_ENGRAM_IO_THREADS still overrides inside the service."""
     return 4 if pp_size == 1 else (2 if pp_size == 2 else 1)
+
+
+def engram_row_dir(model_path: str) -> str:
+    """Directory holding the Engram shards (the checkpoint shards that carry ``*.engram.embed.*``).
+
+    VLLM_DS41_CORE_ENGRAM_DIR wins when set (e.g. shards placed on a faster disk); otherwise the model directory
+    itself, which is where a plain Hugging Face snapshot keeps them. A model given as a hub id is not a directory
+    and needs the knob: fail loud rather than guess."""
+    explicit = knobs.env_str(ENGRAM_DIR_KNOB, "")
+    if explicit:
+        return explicit
+    if not os.path.isdir(model_path):
+        raise ValueError(
+            f"DeepSeek-V4.1 Engram rows are read from the checkpoint shards on disk, but the model {model_path!r} is "
+            f"not a local directory; download the checkpoint or set {ENGRAM_DIR_KNOB} to the directory of its shards")
+    return model_path
 
 
 def parse_layer_subset(stage: StagePlan, config: Any) -> frozenset[int] | None:
@@ -247,7 +263,7 @@ class DeepseekV41Model(nn.Module):
 
             self._engram_service = EngramHostService(
                 config, engram_layers, get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size(),
-                knobs.env_str(ENGRAM_DIR_KNOB, ENGRAM_DIR_DEFAULT), vllm_config.model_config.tokenizer,
+                engram_row_dir(vllm_config.model_config.model), vllm_config.model_config.tokenizer,
                 max_tokens, device, io_threads=engram_io_threads(pp.world_size))
         self.spill: ExpertSpillPlan | None = None
         n_spill = knobs.env_int(SPILL_KNOB, 0, minimum=0, maximum=C.N_EXPERTS - 1)
