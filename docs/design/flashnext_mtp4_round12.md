@@ -655,11 +655,38 @@ weight pairs pass byte-exact and changed-input graph checks on four ranks.
 Maximum-rank median increases from 27.300 to 32.616 us. This synchronization
 change is also rejected. Neither private DSO contributes endpoint evidence.
 
-The new same-wheel ring control records C1 17.3962 ms/round and C4
-43.3554 ms/round, with 4.8857 emitted tokens per C1 round. The corresponding
-large-message ring arm is pending. This fresh C4 control is faster than the
-previous 45.6969-ms HCX cohort; the cause is not established, and only the
-matched pair will be used to judge the ring change.
+The completed same-wheel large-message ring pair records:
+
+| Metric | 25,600-byte control | 102,400-byte candidate |
+| --- | ---: | ---: |
+| C1 ms/round | 17.3962 | 17.4357 |
+| C1 tokens/round | 4.8857 | 4.8857 |
+| C4 ms/round | 43.3554 | 38.8115 |
+| C4 tokens/round | 9.4350 | 9.5931 |
+| Eight-prompt mean acceptance | 46.7841% | 45.3465% |
+
+All three C1 probe token sequences match. C4 and natural prompt sequences
+change. Teacher-forcing over 64 matched positions gives mean/max KL
+0.000812/0.008544 and top-1 agreement 63/64. Paired prompt bootstrap gives
+acceptance difference -1.438 percentage points, with 95% interval
+[-3.238, +0.749]. This does not rule out acceptance loss. The larger ceiling
+therefore remains opt-in; its 4.544-ms C4 improvement is not progress toward
+the C1 target. The new control is faster than the preceding 45.6969-ms C4
+HCX cohort; that between-run difference has no established cause.
+
+Raw-packet ping-pong prefetch retains the original lattice decoder and 56
+registers without spills. All nine M1/M5/M20 checks are byte-exact. M5
+IQ3_XXS regresses 40.960 to 41.984 us, IQ3_S 45.056 to 46.592 us, and IQ2_S
+is unchanged at 40.960 us. Earlier issuing of record loads is rejected in
+this form. Early HC up register loads similarly pass byte-exact and
+changed-input checks but increase maximum-rank median 27.344 to 28.176 us.
+
+Packing two adjacent lora FP16 values into each tagged LL word halves this
+phase's packet count and retains FP32 reduction order. Real-weight and
+changed-input graph checks pass byte-exactly, but maximum-rank median is
+29.692 versus 29.740 us. Packet volume alone does not shorten this HC chain;
+the route is not selected. These three screens use private research DSOs,
+not packaged endpoint kernels.
 
 ## Community designs and applicability
 
