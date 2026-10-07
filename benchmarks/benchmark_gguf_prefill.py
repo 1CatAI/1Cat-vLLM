@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Matched GGUF prefill routing comparisons with fixed token inputs."""
+"""Matched GGUF prefill comparisons with fixed token inputs."""
 
 import argparse
 import hashlib
@@ -24,6 +24,10 @@ def main():
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=1610612736)
     parser.add_argument("--kernel-config", type=json.loads, default={})
+    parser.add_argument(
+        "--compare", choices=("routing", "host-prefill"), default="routing"
+    )
+    parser.add_argument("--decode-check", action="store_true")
     args = parser.parse_args()
     if args.input_tokens <= 0 or args.prefill_chunk <= 0:
         parser.error("input and chunk token counts must be positive")
@@ -54,15 +58,24 @@ def main():
             "draft_sample_method": "greedy",
         },
     )
-    report = dict(config=config, version=vllm.__version__, rows=[], complete=False)
+    report = dict(
+        config=config,
+        version=vllm.__version__,
+        origin=vllm.__file__,
+        comparison=args.compare,
+        rows=[],
+        decode_checks=[],
+        complete=False,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
     save()
-    llm = LLM(**config)
+    llm = None
     try:
+        llm = LLM(**config)
         tokenizer = llm.get_tokenizer()
         unit = tokenizer.encode(
             "请阅读以下技术文档，并概括其中的核心观点。模型推理的性能受计算效率、"
@@ -73,15 +86,24 @@ def main():
         report["input_sha256"] = hashlib.sha256(json.dumps(ids).encode()).hexdigest()
         report["input_kind"] = "fixed repeated technical text; not a corpus benchmark"
         params = SamplingParams(temperature=0, max_tokens=1)
-        llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)
+        method = (
+            "set_qsa_host_prefill_policy"
+            if args.compare == "host-prefill"
+            else "set_gguf_prefill_routing_policy"
+        )
+        report["baseline_policy"] = llm.collective_rpc(method, args=(False,))
+        warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
+        report["warmup_output_ids"] = warmup.outputs[0].token_ids
+        save()
         for enabled in (False, True, True, False):
-            llm.collective_rpc("set_gguf_prefill_routing_policy", args=(enabled,))
+            policy = llm.collective_rpc(method, args=(enabled,))
             started = time.perf_counter()
             result = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
             metrics = result.metrics
             report["rows"].append(
                 dict(
-                    routing=enabled,
+                    enabled=enabled,
+                    policy=policy,
                     wall_seconds=time.perf_counter() - started,
                     scheduled_to_first_token_seconds=(
                         metrics.first_token_ts - metrics.scheduled_ts
@@ -91,13 +113,39 @@ def main():
             )
             save()
             print(json.dumps(report["rows"][-1]), flush=True)
+        if args.decode_check:
+            from benchmarks.benchmark_flashnext_acceptance import observed_cohort
+            from benchmarks.benchmark_sm70_qwen38_concurrency import summarize
+
+            for enabled in (False, True):
+                llm.collective_rpc(method, args=(enabled,))
+                for width in (1, 4):
+                    steps, _ = observed_cohort(
+                        llm,
+                        ids[:8192],
+                        SamplingParams(temperature=0, max_tokens=600, ignore_eos=True),
+                        width,
+                    )
+                    report["decode_checks"].append(
+                        dict(
+                            enabled=enabled,
+                            width=width,
+                            summary=summarize(steps, width),
+                        )
+                    )
+                    save()
         report["matching_output_ids"] = (
             len({tuple(row["output_ids"]) for row in report["rows"]}) == 1
         )
         report["complete"] = True
         save()
+    except Exception as error:
+        report["error"] = repr(error)
+        save()
+        raise
     finally:
-        llm.llm_engine.engine_core.shutdown()
+        if llm is not None:
+            llm.llm_engine.engine_core.shutdown()
 
 
 if __name__ == "__main__":
