@@ -661,6 +661,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     HOST_INDICES=None,
     HOST_VALID_COUNTS=None,
     HOST_CACHE: tl.constexpr = False,
+    QUERY_POSITIONS=None,
+    SEQUENCE_LENGTHS=None,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -696,7 +698,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
     loop_start = split_tile_start
     loop_end = split_tile_end
-    if HOST_CACHE:
+    if HOST_VALID_COUNTS is not None:
         selected_count = tl.load(HOST_VALID_COUNTS + row)
         # The selector compacts the open group's causal tail immediately after
         # the selected complete blocks, including at attention tile boundaries.
@@ -713,6 +715,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         logical_page = safe_token // PAGE_SIZE
         page_offset = safe_token % PAGE_SIZE
         valid = (request >= 0) & (request < num_requests) & (logical_token >= 0)
+        if QUERY_POSITIONS is not None:
+            valid &= logical_token <= tl.load(QUERY_POSITIONS + row)
+        if SEQUENCE_LENGTHS is not None:
+            valid &= logical_token < tl.load(SEQUENCE_LENGTHS + safe_request)
         if RESOLVED_INDICES:
             physical_page = logical_page
         else:
@@ -2315,6 +2321,8 @@ def qsa_sparse_paged_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     lse: torch.Tensor | None = None,
+    causal_mask: bool = False,
+    selected_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
@@ -2381,6 +2389,19 @@ def qsa_sparse_paged_attention(
                 "QSA DCP must apply its gate after merging partial outputs"
             )
     output_gate_view = output_gate.view_as(q) if output_gate is not None else None
+    if selected_counts is not None and (
+        selected_counts.shape != (q.shape[0],)
+        or selected_counts.device != q.device
+        or selected_counts.dtype != torch.int32
+    ):
+        raise ValueError("QSA selected counts must be device int32 per query")
+    if causal_mask and (
+        query_positions is None
+        or sequence_lengths is None
+        or query_positions.shape != (q.shape[0],)
+        or sequence_lengths.shape != (block_table.shape[0],)
+    ):
+        raise ValueError("Causal QSA requires per-query positions and request lengths")
     if output_gate_view is not None:
         if output_gate_view.dtype != q.dtype or output_gate_view.device != q.device:
             raise ValueError("QSA output gate must match the query dtype and device")
@@ -2389,15 +2410,19 @@ def qsa_sparse_paged_attention(
     if not q.shape[0]:
         return out
 
-    if lse is None and _use_sm70_qsa_xqa_page4(
-        q,
-        k_cache,
-        v_cache,
-        logical_indices,
-        block_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
+    if (
+        not causal_mask
+        and lse is None
+        and _use_sm70_qsa_xqa_page4(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+        )
     ):
         assert query_positions is not None and sequence_lengths is not None
         xqa_output = _qsa_sparse_paged_attention_sm70_xqa_page4(
@@ -2419,7 +2444,7 @@ def qsa_sparse_paged_attention(
                 _qsa_output_gate(xqa_output, output_gate_view)
             return xqa_output
 
-    resolved_indices = _use_sm70_qsa_resolved_indices(
+    resolved_indices = not causal_mask and _use_sm70_qsa_resolved_indices(
         q, k_cache, logical_indices, kv_cache_dtype
     )
     if resolved_indices:
@@ -2520,6 +2545,9 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         KV_E4M3=kv_e4m3,
         RESOLVED_INDICES=resolved_indices,
+        QUERY_POSITIONS=query_positions if causal_mask else None,
+        SEQUENCE_LENGTHS=sequence_lengths if causal_mask else None,
+        HOST_VALID_COUNTS=selected_counts,
         num_warps=partial_warps,
         num_stages=2,
     )

@@ -622,6 +622,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.host_kv_device_reference = (
             vllm_config.kernel_config.qsa_host_kv_device_reference
         )
+        self.host_kv_prefill_enabled = vllm_config.kernel_config.qsa_host_kv_prefill
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
             if getattr(vllm_config, "is_speculative_draft", False)
@@ -816,6 +817,31 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         from .ops.host_kv_attention import host_qsa_attention
 
         state = self.host_kv
+        if self.host_kv_prefill_enabled:
+            from .ops.host_kv_prefill import (
+                host_qsa_prefill,
+                prefill_staging_reason,
+            )
+
+            reason = prefill_staging_reason(state, table, query.shape[0])
+            if reason is None:
+                logger.info_once(
+                    "QSA host prefill stages request history once in shared scratch."
+                )
+                host_qsa_prefill(
+                    query,
+                    state,
+                    indices,
+                    table,
+                    requests,
+                    positions,
+                    lengths,
+                    output,
+                    gate,
+                )
+                return
+            if query.shape[0] >= 512:
+                logger.info_once("QSA host prefill staging skipped: %s", reason)
         for start in range(0, query.shape[0], state.rows):
             stop = min(start + state.rows, query.shape[0])
             host_qsa_attention(

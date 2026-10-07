@@ -549,6 +549,26 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
         "attention_staging_dtype": "float16",
         "recurrent_state_storage": "device",
+        "prefill_staging": {
+            "enabled": (
+                cfg.kernel_config.qsa_host_kv_active
+                and cfg.kernel_config.qsa_host_kv_prefill
+            ),
+            "reason": (
+                cfg.kernel_config.qsa_host_kv_reason or "host_history_not_admitted"
+                if not cfg.kernel_config.qsa_host_kv_active
+                else None
+                if cfg.kernel_config.qsa_host_kv_prefill
+                else "disabled_by_kernel_policy"
+            ),
+            "operator": "host_qsa_prefill",
+            "min_query_rows": 512,
+            "query_tile_rows": 256,
+            "runtime_guards": (
+                "logical request pages fit the shared FP16 miss workspace"
+            ),
+            "additional_persistent_workspace_bytes": 0,
+        },
     }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {

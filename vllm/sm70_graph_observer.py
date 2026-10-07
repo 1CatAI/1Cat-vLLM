@@ -169,6 +169,28 @@ class GraphParityWorkerExtension:
             config.kernel_config.sm70_gguf.prefill_routing = enabled
         return {"rank": self.rank, "prefill_routing": enabled}
 
+    def set_qsa_host_prefill_policy(self, enabled):
+        """Change only prefill dispatch between completed benchmark cohorts."""
+        if not isinstance(enabled, bool):
+            raise TypeError("Host prefill policy requires a boolean")
+        runner = self.model_runner
+        configs = [runner.vllm_config]
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None:
+            configs.append(speculator.vllm_config)
+        owners = set()
+        for config in configs:
+            for module in config.compilation_config.static_forward_context.values():
+                if getattr(module, "host_kv_enabled", False) and hasattr(
+                    module, "host_kv_prefill_enabled"
+                ):
+                    module.host_kv_prefill_enabled = enabled
+                    owners.add(id(module))
+            config.kernel_config.qsa_host_kv_prefill = enabled
+        if not owners:
+            raise RuntimeError("No admitted host QSA owners")
+        return {"rank": self.rank, "enabled": enabled, "owners": len(owners)}
+
     def set_mtp_execution_policy(self, draft_single_graph, greedy_verify):
         """Benchmark RPC: change host dispatch between completed cohorts.
 
