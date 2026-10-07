@@ -97,7 +97,7 @@ The measured compact target decomposition is:
 | Sharded HC packs | 0.3275 |
 | Packed token embedding | 0.0786 |
 | Packed LM head | 0.1214 |
-| Other tensors | 0.7234 |
+| Other tensors | 0.7224 |
 
 Each GPU exposes 15.766 GiB to CUDA. Before the context-free discovery fix,
 profiling completed with about 0.444 GiB driver-free on ranks 1--3 and only
@@ -132,9 +132,27 @@ of that fix has not yet been measured in a complete model run.
 A separate four-card initialization ledger measured 392 MiB outside PyTorch
 reserved memory for TP communicator creation and 244 MiB for EP communicator
 creation, although EP was disabled. Together with the CUDA context and lazy
-libraries, this explains most of the roughly 0.95 GiB non-PyTorch cost. Smaller
-standard NCCL buffers are an unqualified candidate for capacity; they must be
-measured for both memory and collective latency before adoption.
+libraries, this explains most of the roughly 0.95 GiB non-PyTorch cost.
+
+Pure TP now retains the EP membership and CPU metadata without creating its
+unused device communicator. Actual EP, DP, PCP, EPLB and elastic EP preserve
+device communication. The collective admission report records
+`tp_only_moe_uses_tp_collectives` for this case. Five CPU admission checks pass.
+Installed-wheel checks on four 32 GiB V100s preserve EP ranks, retain TP PyNccl,
+and produce bitwise-identical all-gather/all-reduce results and graph replays
+at M1/M5/M20/M128. Enabling EP still creates its communicator. On that topology
+the initialized EP resource difference is 76 MiB per rank; the reclaimed bytes
+must be measured separately on the 16 GiB topology, whose earlier EP ledger
+was 244 MiB. This is a memory result, not a model latency improvement claim.
+
+An isolated four-card experiment with the existing NCCL buffer setting reduced
+the buffer from the standard 4 MiB to 1 MiB. It saved only 48 MiB per card;
+the rank-0 M20 gather/reduce pair increased from 36.28 to 38.38 microseconds.
+That capacity tradeoff was rejected and is not enabled by this change.
+
+The planned active host-KV route is described in
+[Flash-Next host-backed KV](flashnext_host_kv.md). Native prefix offloading alone
+does not replace persistent attention KV with host-backed active decode.
 
 ## Correctness checks
 
