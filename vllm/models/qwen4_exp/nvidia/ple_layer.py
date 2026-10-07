@@ -1336,6 +1336,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._disk_segments = disk_segments
         self._remote_placements = bound
 
+    def needs_weight_prefault(self) -> bool:
+        # Until placements arrive, retain the full CPU-table contract. A bound
+        # empty disk tier only publishes zero rows; resident pinned/device rows
+        # are already owned by the GPU workers and need no second RAM copy.
+        return not self._remote_placements or bool(self._disk_segments)
+
     def _remote_lookup(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
         """Fill the worker's output with the rows the ranks left to it.
 

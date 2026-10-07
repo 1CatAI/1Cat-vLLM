@@ -181,3 +181,13 @@ device storage per rank against 29.4512 GiB of live Torch allocation. The
 host storage is counted separately; the inventory reports allocator block sizes
 for allocations not reachable through the inspected Python owners. No complete
 32K request or model throughput result is available from the failed attempt.
+
+## PLE initialization residency
+
+After resident GPU row placements are registered, the CPU helper can own no
+disk rows. Prefaulting its entire mapped table then duplicates unnecessary RAM
+residency and delays startup. The placement-aware prefault check from
+`74cfbd380de0dd3695a4507183ab18d7912ba85d` skips tables only after all rows are
+served by registered ranks; unregistered placements and actual disk tiers keep
+the existing prefault contract. Five targeted CPU checks pass. This is a startup
+and host-memory change, not measured prefill throughput.

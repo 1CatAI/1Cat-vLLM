@@ -214,7 +214,16 @@ def _prefault_module_storage(modules: Iterable[torch.nn.Module]) -> int:
     if not envs.VLLM_PLE_OFFLOAD_PREFAULT:
         return 0
 
-    storage_views = list(_iter_unique_module_storage_views(modules))
+    active_modules = []
+    for module in modules:
+        if isinstance(module, PleOffloadLayer) and not module.needs_weight_prefault():
+            logger.info(
+                "Skipping PLE RAM prefault for %s: registered ranks own all rows.",
+                type(module).__name__,
+            )
+        else:
+            active_modules.append(module)
+    storage_views = list(_iter_unique_module_storage_views(active_modules))
     required_bytes = sum(view.numel() for view in storage_views)
     if required_bytes == 0:
         return 0
