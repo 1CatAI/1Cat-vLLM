@@ -39,10 +39,18 @@ _CUDA_GRID_Y_LIMIT = 65535
 _QPN_MAX_M = 16
 
 
-def grouped_splitk(k: int, preferred: int) -> int:
-    """Choose only launch specializations that divide the actual K groups."""
-    for split in dict.fromkeys((preferred, 16, 8, 10)):
-        if k > 0 and k % 64 == 0 and (k // 16) % split == 0:
+def grouped_splitk(k: int, preferred: int, *, extended: bool = False) -> int:
+    """Choose only launch specializations that divide the actual K groups.
+
+    ``extended`` (DeepSeek-V4.1 callers only) also offers the 12/9/6/4/18-way
+    specializations, which serve K/16 = 36 (W2 at TP4, K = 576) and 18 (TP8,
+    K = 288), and accepts K % 32 like the grouped kernel does. The default
+    keeps the oracle's admission for every other model unchanged.
+    """
+    splits = (preferred, 16, 8, 10) + ((12, 9, 6, 4, 18) if extended else ())
+    align = 32 if extended else 64
+    for split in dict.fromkeys(splits):
+        if k > 0 and k % align == 0 and (k // 16) % split == 0:
             return split
     raise ValueError(f"skinny grouped MoE has no split-K specialization for K={k}")
 
@@ -60,7 +68,11 @@ def nvfp4_skinny_scale_reason(g1: torch.Tensor, g2: torch.Tensor) -> str | None:
 
 
 def qpn_prepack(
-    codes: torch.Tensor, scales: torch.Tensor, scale_group: int = 16
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+    scale_group: int = 16,
+    *,
+    k_align: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Permute one weight matrix into the fragment order the QPN kernels read.
 
@@ -76,15 +88,20 @@ def qpn_prepack(
         scale_group: codes per scale, 16 for NVFP4 (fp8-e4m3) and 32 for
             MXFP4 (E8M0). The code layout is the same for both: a 32-code
             MXFP4 block is two adjacent 16-code groups sharing one scale.
+        k_align: required K multiple. 64 serves every kernel (the dense QPN
+            GEMM splits K over four warps); the grouped MoE kernel needs only
+            32, which DeepSeek-V4.1's TP8 W2 (K = 288) relies on.
 
     Returns:
         The permuted codes and scales, both flat and contiguous.
     """
     n, k2 = codes.shape
     k = k2 * 2
-    if n % 32 or k % 64 or k % scale_group:
+    if k_align not in (32, 64):
+        raise ValueError(f"QPN prepack k_align must be 32 or 64, got {k_align}")
+    if n % 32 or k % k_align or k % scale_group:
         raise ValueError(
-            f"QPN prepack needs N % 32 == 0 and K % 64 == 0, got N={n} K={k}"
+            f"QPN prepack needs N % 32 == 0 and K % {k_align} == 0, got N={n} K={k}"
         )
     dev = codes.device
     tiles, groups = n // 32, k // scale_group
