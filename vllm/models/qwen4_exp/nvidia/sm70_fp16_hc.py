@@ -708,13 +708,30 @@ def _blocked_hc_projection(x, down_weight, up_weight, chunk_size):
     return block, injection
 
 
+def _prefill_hc_projection(
+    x: torch.Tensor, down_weight: torch.Tensor, up_weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    chunk_size = _hc_prefill_chunk_size(x.shape[0])
+    if chunk_size and x.is_cuda and x.dtype == torch.float16:
+        return _blocked_hc_projection(x, down_weight, up_weight, chunk_size)
+    block, injection = _dense_hc_projection(x, down_weight, up_weight)
+    return block, injection.contiguous()
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fp16_prefill_hc",
+    op_func=_prefill_hc_projection,
+    fake_impl=_qwen38_sm70_fp16_fused_hc_fake,
+)
+
+
 def maybe_apply_qwen38_sm70_fp16_fused_hc(
     down_layer: nn.Module,
     up_layer: nn.Module,
     x: torch.Tensor,
     enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if not enabled or not use_sm70_decode_graph_semantics():
+    if not enabled:
         return None
     # LoRA wrappers and quantized methods must retain their own forward path.
     # Enabling unrelated FP16 projections must never bypass adapter updates.
@@ -736,6 +753,14 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
         _HC_HIDDEN,
     ) or up_weight.shape != (_HC_HIDDEN, _HC_RANK):
         return None
+    if not use_sm70_decode_graph_semantics():
+        config = get_current_vllm_config_or_none()
+        if config is not None and config.kernel_config.prefill_hc_chunk_size <= 0:
+            return None
+        # The dynamic prefill compiler deliberately omits decode operators.
+        # Keep a distinct opaque boundary so actual rows choose blocking at
+        # runtime, including the first HC which has no pending HCX combine.
+        return torch.ops.vllm.qwen38_sm70_fp16_prefill_hc(x, down_weight, up_weight)
     return torch.ops.vllm.qwen38_sm70_fp16_fused_hc(
         x,
         down_weight,

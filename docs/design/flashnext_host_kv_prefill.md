@@ -163,3 +163,21 @@ capacity fix with a measured operator slowdown; no prefill-throughput gain is
 claimed. Model timing and the 32K throughput target remain pending. Both
 attention policies are now warmed before the timed ABBA sequence to exclude
 first-use compilation from the comparison.
+
+## Prefill compiler boundary
+
+The installed row-blocking candidate still failed at the first HC. The dynamic
+prefill compiler intentionally bypasses decode operators, so the first HC
+retained two external GEMMs and a full gate-mix allocation. A helper-only
+microbenchmark did not exercise that entry point. A separate opaque prefill
+projection now resolves actual row counts at runtime; it retains the existing
+FP16 dense projection below the row limit. Decode compiler dispatch is unchanged.
+The first-HC export and dynamic compiled replay regression cover the production
+entry point, including a short row count after a blocked invocation.
+
+The initialized worker inventory identifies 27.6415 GiB of unique reachable
+device storage per rank against 29.4512 GiB of live Torch allocation. The
+1.8097 GiB difference is unclassified allocation, not proof of a leak. Mapped
+host storage is counted separately; the inventory reports allocator block sizes
+for allocations not reachable through the inspected Python owners. No complete
+32K request or model throughput result is available from the failed attempt.

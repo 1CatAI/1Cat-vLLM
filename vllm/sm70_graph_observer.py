@@ -231,6 +231,23 @@ class GraphParityWorkerExtension:
         walk(self.model_runner, "runner")
         walk(gguf_dense_hmma._workspaces, "gguf_dense_workspaces")
         records = sorted(storages.values(), key=lambda value: -value["bytes"])
+        unreachable = []
+        for segment in torch.cuda.memory_snapshot():
+            address = segment["address"]
+            for block in segment["blocks"]:
+                pointer = block.get("address", address)
+                if (
+                    block["state"] == "active_allocated"
+                    and (segment["device"], pointer) not in storages
+                ):
+                    unreachable.append(
+                        {
+                            "bytes": block["size"],
+                            "requested_bytes": block["requested_size"],
+                            "stream": segment["stream"],
+                        }
+                    )
+                address += block["size"]
         return {
             "rank": self.rank,
             "scope": "reachable Python tensors; excludes native-only allocations",
@@ -248,6 +265,9 @@ class GraphParityWorkerExtension:
             ),
             "storages": records,
             "pointer_errors": errors,
+            "unreachable_allocator_blocks": sorted(
+                unreachable, key=lambda value: -value["bytes"]
+            ),
         }
 
     def set_gguf_prefill_routing_policy(self, enabled: bool):

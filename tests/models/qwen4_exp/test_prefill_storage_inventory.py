@@ -22,6 +22,7 @@ def test_inventory_deduplicates_device_views_and_excludes_host_aliases():
     runner.alias = value[3:]
     host = torch.empty(48, dtype=torch.uint8, pin_memory=True)
     runner.register_buffer("host_alias", get_accelerator_view_from_cpu_tensor(host))
+    native_owned = torch.empty(123457, device="cuda", dtype=torch.uint8)
     worker = GraphParityWorkerExtension()
     worker.model_runner = runner
     worker.rank = 0
@@ -36,5 +37,9 @@ def test_inventory_deduplicates_device_views_and_excludes_host_aliases():
             value for value in report["storages"] if value["memory_type"] == 2
         )
         assert len(device["owners"]) == 2
+        assert any(
+            block["requested_bytes"] == native_owned.numel()
+            for block in report["unreachable_allocator_blocks"]
+        )
     finally:
         gguf_dense_hmma._workspaces.update(before)
