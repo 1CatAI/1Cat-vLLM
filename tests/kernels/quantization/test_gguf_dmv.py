@@ -234,9 +234,10 @@ def test_pair_official_and_changed_input_graph(gate, up, split):
 
 
 @pytest.mark.parametrize("kind", [18, 21, 23])
-def test_gdn_heads_are_loaded_in_original_gguf_order(kind):
-    fmt, buffers, weight, _ = planes(kind, k=1536)
-    x = torch.randn(8, 1536, device="cuda", dtype=torch.float16)
+@pytest.mark.parametrize("k", [1536, 3072])
+def test_gdn_heads_are_loaded_in_original_gguf_order(kind, k):
+    fmt, buffers, weight, _ = planes(kind, k=k)
+    x = torch.randn(8, k, device="cuda", dtype=torch.float16)
     out = torch.empty(8, 64, device="cuda", dtype=torch.float16)
     partials = torch.empty(1024, device="cuda", dtype=torch.float32)
     counters = torch.zeros(1, device="cuda", dtype=torch.int32)
@@ -249,7 +250,7 @@ def test_gdn_heads_are_loaded_in_original_gguf_order(kind):
         [out],
         [fmt],
         [64],
-        1536,
+        k,
         1,
         4,
         partials,
@@ -262,9 +263,34 @@ def test_gdn_heads_are_loaded_in_original_gguf_order(kind):
         None,
         True,
     )
-    tiled = x.reshape(8, 4, 3, 128).transpose(1, 2).reshape(8, 1536)
+    tiled = x.reshape(8, k // (3 * 128), 3, 128).transpose(1, 2).reshape(8, k)
     reference = tiled.float() @ weight.T
     assert (out.float() - reference).norm() / reference.norm() < 0.003
+
+
+@pytest.mark.parametrize("kind", [12, 21])
+def test_tp2_coalesced_bank_restores_large_canonical_fallback(kind):
+    from vllm.model_executor.layers.quantization.gguf_turbomind import (
+        GGUFPreparedProjection,
+    )
+
+    n, k = 17408, 5120
+    size = gguf.GGML_QUANT_SIZES[kind][1]
+    blocks = np.random.default_rng(kind).integers(
+        0, 256, (n, k // 256, size), dtype=np.uint8
+    )
+    blocks[..., :2] = np.array([0.0007], np.float16).view(np.uint8)
+    if kind == 12:
+        blocks[..., 2:4] = np.array([0.0003], np.float16).view(np.uint8)
+    raw = torch.from_numpy(blocks.reshape(n, -1)).cuda()
+    control = GGUFPreparedProjection(raw, kind, torch.float16, True, 512)
+    candidate = GGUFPreparedProjection(
+        raw, kind, torch.float16, True, 512, dmv_enabled=True
+    )
+    assert hasattr(candidate, "dmv_format")
+    for m in (1, 16):
+        x = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        assert torch.equal(candidate(x), control(x))
 
 
 @pytest.mark.parametrize("kind", [18, 21])
