@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import operator
 from importlib.util import find_spec
 from types import ModuleType
 from typing import Any
@@ -523,6 +524,66 @@ def _sm70_tp4_expected_graph_matches(graph: fx.Graph) -> int:
         ):
             count += 1
     return count
+
+
+def _attach_sm70_nvfp4_prefetch(graph: fx.Graph) -> int:
+    """Keep the following native gate/up weight visible to its AR producer.
+
+    Runtime shape/topology checks restrict the hint to M8 TP4 push collectives.
+    Other row counts execute their existing collective and norm unchanged.
+    """
+    native = getattr(torch.ops.vllm, "sm70_nvfp4_native_dispatch", None)
+    if native is None:
+        return 0
+    norm_op = torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm.default
+    views = {
+        torch.ops.aten.view.default,
+        torch.ops.aten.reshape.default,
+        torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.alias.default,
+    }
+    positions = {node: i for i, node in enumerate(graph.nodes)}
+    matched = 0
+    for node in graph.nodes:
+        if node.target is auto_functionalized and node.args[0] == native.default:
+            arguments = dict(node.kwargs)
+        elif node.target == native.default:
+            names = [arg.name for arg in native.default._schema.arguments]
+            arguments = dict(zip(names, node.args)) | dict(node.kwargs)
+        else:
+            continue
+        if arguments.get("gated_silu") is not True or arguments.get("split_k") != 8:
+            continue
+        x, codes = arguments.get("x"), arguments.get("codes")
+        if not isinstance(x, fx.Node) or not isinstance(codes, fx.Node):
+            continue
+        xval, cval = x.meta.get("val"), codes.meta.get("val")
+        if (
+            xval is None
+            or cval is None
+            or xval.dtype != torch.float16
+            or xval.ndim != 2
+            or xval.shape[1] != 5120
+            or cval.dtype != torch.uint8
+            or cval.numel() != 272 * 320 * 256
+            or not cval.is_contiguous()
+        ):
+            continue
+        while x.target in views:
+            x = x.args[0]
+        if x.target is not operator.getitem or x.args[1] != 0:
+            continue
+        norm = x.args[0]
+        if (
+            not isinstance(norm, fx.Node)
+            or norm.target != norm_op
+            or "prefetch_codes" in norm.kwargs
+            or positions[codes] >= positions[norm]
+        ):
+            continue
+        norm.kwargs = dict(norm.kwargs) | {"prefetch_codes": codes}
+        matched += 1
+    return matched
 
 
 class Sm70AllReduceGemmaRMSNormPattern(BasePattern):
@@ -1328,6 +1389,12 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             _sm70_tp4_expected_graph_matches(graph) if self.sm70_tp4_long_mode else 0
         )
         self.matched_count = self.patterns.apply(graph)
+        if self.sm70_tp4_push_mode:
+            prefetched = _attach_sm70_nvfp4_prefetch(graph)
+            logger.info(
+                "SM70 TP4 attached native NVFP4 weight reads to %d AR+norm nodes.",
+                prefetched,
+            )
         if self.sm70_tp4_long_mode and self.matched_count != expected_graph_matches:
             if self.rank == 0:
                 logger.error(

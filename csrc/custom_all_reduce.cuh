@@ -1719,11 +1719,11 @@ static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
 
 // All 40 CTAs fit on SM70. The row leader waits only for four local
 // partial reductions; no grid-wide synchronization is required.
-template <typename WeightT, bool Reference = false>
+template <typename WeightT, bool Reference = false, bool PrefetchCodes = false>
 __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
     vllm::RankData buffers, const half* input, const float* residual,
     const WeightT* weight, half* output, float* residual_out, int rank,
-    float epsilon) {
+    float epsilon, const uint8_t* next_codes = nullptr) {
   constexpr int Threads = 128, Parts = kSm70PushNormParts;
   constexpr int Width = kSm70GemmaRmsNormHiddenSize;
   constexpr int Elements = kSm70PushNormRows * Width;
@@ -1760,6 +1760,22 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
           base + kSm70PushNormMetaBytes +
               (epoch_offset + rank * (Elements / P::size)) * sizeof(P),
           pack);
+    }
+    if constexpr (PrefetchCodes) {
+      // The M8 native QPN2 gate/up consumes 272 N32 tiles with eight
+      // unchanged K partitions. Issue only each partition's first group
+      // after publishing the peer packets, while their replies are pending.
+      constexpr int Sectors = 272 * 8 * 8;
+      for (int i = blockIdx.x * Threads + tid; i < Sectors; i += 40 * Threads) {
+        const int sector = i & 7;
+        const int group = i >> 3;
+        const int partition = group & 7;
+        const int tile = group >> 3;
+        const size_t address =
+            (static_cast<size_t>(tile) * 320 + partition * 40) * 256 +
+            sector * 32;
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(next_codes + address));
+      }
     }
     P peers[4];
     while (true) {
@@ -2344,13 +2360,11 @@ class CustomAllreduce {
   }
 
   template <int ngpus, typename ResidualT, typename WeightT>
-  void sm70_allreduce_gemma_rms_norm(cudaStream_t stream, half* input,
-                                     const ResidualT* residual,
-                                     const WeightT* weight,
-                                     half* normalized_out, float* residual_out,
-                                     int num_tokens, int hidden_size,
-                                     float epsilon,
-                                     bool benchmark_reference = false) {
+  void sm70_allreduce_gemma_rms_norm(
+      cudaStream_t stream, half* input, const ResidualT* residual,
+      const WeightT* weight, half* normalized_out, float* residual_out,
+      int num_tokens, int hidden_size, float epsilon,
+      bool benchmark_reference = false, const uint8_t* next_codes = nullptr) {
     if (world_size_ != ngpus || !custom_allreduce_current_device_is_sm70()) {
       throw std::runtime_error("SM70 Gemma RMSNorm prototype requires TP" +
                                std::to_string(ngpus) + " on an SM70 device.");
@@ -2376,6 +2390,11 @@ class CustomAllreduce {
               <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,
                                        weight, normalized_out, residual_out,
                                        rank_, epsilon);
+        } else if (next_codes != nullptr) {
+          sm70_push_allreduce_gemma_rms_norm<WeightT, false, true>
+              <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,
+                                       weight, normalized_out, residual_out,
+                                       rank_, epsilon, next_codes);
         } else {
           sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
               sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
