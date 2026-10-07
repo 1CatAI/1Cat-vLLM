@@ -28,6 +28,8 @@ assert all(module._is_sm70() for module in (
 ))
 from vllm.models.qwen4_exp.nvidia import model
 assert model.Qwen4ExpForCausalLM is not None
+from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn
+assert qwen_gdn_linear_attn._sm70_current_device_is_volta()
 assert not torch.cuda.is_initialized()
 """
     subprocess.run([sys.executable, "-c", script], check=True, timeout=60)
