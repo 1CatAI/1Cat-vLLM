@@ -223,6 +223,53 @@ def _expert_dp4a(
     # Resolve actual M inside the opaque boundary so range compilation cannot
     # freeze a prefill choice into an MTP verification graph.
     m, top_k = ids.shape
+    config = get_current_vllm_config_or_none()
+    chunk_size = (
+        config.kernel_config.sm70_gguf.prefill_expert_chunk_size
+        if config is not None
+        else 4096
+    )
+    if (
+        chunk_size > 0
+        and m > chunk_size
+        and x.is_cuda
+        and x.dtype == torch.float16
+        and x.shape[1] == 2560
+        and experts == 512
+        and current_platform.is_device_capability(70)
+    ):
+        # Expert FFNs are independent across tokens. Keep the scheduler's
+        # large prefill batch while bounding gathered and down intermediates.
+        output = torch.empty_like(x)
+        for start in range(0, m, chunk_size):
+            stop = min(start + chunk_size, m)
+            part = _expert_dp4a(
+                x[start:stop],
+                ids[start:stop],
+                probabilities[start:stop],
+                raw_gate,
+                raw_up,
+                gate_ptrs,
+                gate_stats,
+                up_ptrs,
+                up_stats,
+                down_ptrs,
+                down_stats,
+                source_type,
+                down_type,
+                down_decoder,
+                experts,
+                group,
+                intermediate,
+                raw_batches,
+                vector_bands,
+                down_vector_batches,
+                [],  # Prefill tails must retain FP16 activations.
+                [],
+            )
+            output[start:stop].copy_(part)
+            del part
+        return output
     if (
         m in dp4a_batches
         and probabilities.dtype == torch.float32

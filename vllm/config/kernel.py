@@ -385,6 +385,16 @@ class Sm70GgufConfig:
     prefill_unroute: bool = True
     """Reduce prefill expert outputs without materializing FP32 contributions."""
 
+    prefill_expert_chunk_size: int = 4096
+    """Bound admitted prefill expert scratch by token rows; zero disables blocking."""
+
+    @field_validator("prefill_expert_chunk_size")
+    @classmethod
+    def _nonnegative_expert_chunk_size(cls, value: int) -> int:
+        if value != 0 and value < 33:
+            raise ValueError("GGUF prefill expert chunk size must be zero or >= 33")
+        return value
+
     lut4_expert_dp4a: bool = True
     """Admit canonical IQ4 gate/up integer dots at calibrated expert shapes."""
 
