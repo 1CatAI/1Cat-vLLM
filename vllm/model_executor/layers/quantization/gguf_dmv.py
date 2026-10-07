@@ -7,7 +7,12 @@ import torch
 from torch.nn import Parameter
 
 from vllm.config import get_current_vllm_config_or_none
-from vllm.model_executor.kernels.gguf import GGUFOperatorCapability, decoder_family
+from vllm.model_executor.kernels.gguf import (
+    DMV_THREE_FORMAT_QKV,
+    GGUFOperatorCapability,
+    decoder_family,
+    three_format_qkv_capabilities,
+)
 from vllm.model_executor.layers.quantization import gguf_dmv_formats as iq
 from vllm.model_executor.layers.quantization.gguf_dense_hmma import workspace
 from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import decode, pack
@@ -43,7 +48,7 @@ def eligible_sources(sources, prefix):
     if scope == "iq3_xxs" and not any(t == 18 for _, t in sources):
         return False
     quantized = [(w, t) for w, t in sources if t not in (1, 30)]
-    if not quantized or len({t for _, t in quantized}) > 2:
+    if not quantized or len({t for _, t in quantized}) > 3:
         return False
     if any(t in iq.IQ2_FORMATS for _, t in quantized):
         if not cfg.kernel_config.sm70_gguf.iq2_signed_nibbles:
@@ -69,6 +74,18 @@ def eligible_sources(sources, prefix):
             (5120, 3072),
             (5120, 256),
         }:
+            return False
+    if len({t for _, t in quantized}) == 3:
+        if not prefix.endswith(".qkv_proj") or len(sources) != 3:
+            return False
+        capabilities = three_format_qkv_capabilities(
+            tuple(t for _, t in quantized),
+            k,
+            tuple(w.shape[0] for w, _ in quantized),
+            torch.float16,
+            enabled=cfg.kernel_config.sm70_gguf.qkv_three_format_planes,
+        )
+        if any(c.reason is not None for c in capabilities):
             return False
     return all(
         t not in (1, 30) or (w.dtype == torch.float16 and w.ndim == 2)
@@ -274,6 +291,23 @@ def prepare_layer(layer, projections):
     # only for an independently launched narrow matrix.
     if not pair and sum(ns) <= 1536:
         split = 2
+    if len(source_types) == 3:
+        cfg = get_current_vllm_config_or_none()
+        kinds = tuple(p.source_type for p in quantized)
+        k = quantized[0].kernel.config.partition_weight_shape[0]
+        capabilities = three_format_qkv_capabilities(
+            kinds,
+            k,
+            tuple(ns),
+            torch.float16,
+            enabled=bool(cfg and cfg.kernel_config.sm70_gguf.qkv_three_format_planes),
+        )
+        if not layer.prefix.endswith(".qkv_proj"):
+            return {"reason": "three_format_qkv_requires_attention_input_projection"}
+        if any(c.reason is not None for c in capabilities):
+            return {"reason": next(c.reason for c in capabilities if c.reason)}
+        names = tuple(quant_type_name(kind) for kind in kinds)
+        kw, tn, split = DMV_THREE_FORMAT_QKV[names]
     tiles = (
         ns[0] // 32 // (tn // 2)
         if pair

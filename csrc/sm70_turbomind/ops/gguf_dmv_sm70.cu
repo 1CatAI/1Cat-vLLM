@@ -507,7 +507,7 @@ __device__ __forceinline__ void ab_row(const Segs& segs,
   }
 }
 
-template <int KW, int TN, int FA, int FB>
+template <int KW, int TN, int FA, int FB, int FC = -1>
 __global__ void __launch_bounds__(32 * KW * TN)
     dense_mv(Segs segs, const half* __restrict__ x, int ldx, int M, int K,
              int S, int G, int split, float* ws, int* cnt) {
@@ -541,10 +541,15 @@ __global__ void __launch_bounds__(32 * KW * TN)
     body6<FA, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx,
                                   M, xs, lut, acc, segs.tab, segs.gdn_heads,
                                   pair);
-  else
+  else if (FC < 0 || sg.fmt == FB)
     body6<FB, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx,
                                   M, xs, lut, acc, segs.tab, segs.gdn_heads,
                                   pair);
+  else {
+    if constexpr (FC >= 0)
+      body6<FC, KW, TN, false>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M,
+                               xs, lut, acc, segs.tab, segs.gdn_heads, pair);
+  }
   __syncthreads();
   float* red = reinterpret_cast<float*>(smem);
 #pragma unroll
@@ -644,7 +649,7 @@ __global__ void __launch_bounds__(32 * KW * TN)
   if (threadIdx.x == 0) cnt[tg] = 0;
 }
 
-template <int KW, int TN, int FA, int FB>
+template <int KW, int TN, int FA, int FB, int FC = -1>
 void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
             int G, int split, float* ws, int* cnt, int tiles, cudaStream_t st) {
   constexpr int W = KW * TN;
@@ -654,11 +659,11 @@ void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
   static bool init = false;
   if (!init) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        dense_mv<KW, TN, FA, FB>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        90 * 1024));
+        dense_mv<KW, TN, FA, FB, FC>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 90 * 1024));
     init = true;
   }
-  dense_mv<KW, TN, FA, FB><<<dim3(tiles, split), 32 * W, smem, st>>>(
+  dense_mv<KW, TN, FA, FB, FC><<<dim3(tiles, split), 32 * W, smem, st>>>(
       segs, x, ldx, M, K, S, G, split, ws, cnt);
   const cudaError_t e = cudaGetLastError();
   TORCH_CHECK(e == cudaSuccess, "dense_mv launch: ", cudaGetErrorString(e));
@@ -819,6 +824,22 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
   }
   segs.main_tiles = tiles;
   if (segs.ab_n > 0) tiles += (segs.ab_n + warps * tp - 1) / (warps * tp);
+  // Only three measured-reader families are needed by the remaining
+  // three-format attention inputs. Keep the existing pair specializations.
+  int family_mask = 0;
+  for (int i = 0; i < segs.nseg; ++i) family_mask |= 1 << segs.s[i].fmt;
+  if (__builtin_popcount(static_cast<unsigned int>(family_mask)) == 3) {
+    TORCH_CHECK(!segs.pair && warps == 4 && tp == 2,
+                "three-format DMV requires single outputs with KW4/TN2");
+    constexpr int kBase = (1 << Q4K) | (1 << LUT4);
+    if (family_mask == (kBase | (1 << IQ3S)))
+      return launch<4, 2, Q4K, LUT4, IQ3S>(segs, xp, ldx, M, K, S, G, split,
+                                           wsp, cp, tiles, st);
+    if (family_mask == (kBase | (1 << IQ3X)))
+      return launch<4, 2, Q4K, LUT4, IQ3X>(segs, xp, ldx, M, K, S, G, split,
+                                           wsp, cp, tiles, st);
+    TORCH_CHECK(false, "unqualified three-format DMV family set");
+  }
   int fa = segs.s[0].fmt, fb = fa;
   for (int i = 1; i < segs.nseg; ++i)
     if (segs.s[i].fmt != fa) fb = segs.s[i].fmt;

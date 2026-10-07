@@ -370,6 +370,9 @@ class Sm70GgufConfig:
     projection_plane_scope: Literal["all", "gated_pair", "iq3_xxs"] = "all"
     """Select all planes, gated pairs, or XXS-containing layers for comparisons."""
 
+    qkv_three_format_planes: bool = True
+    """Admit measured M8 QKV planes mixing Q4_K, IQ4_XS and IQ3 formats."""
+
     iq2_signed_nibbles: bool = True
     """Expand IQ2 grids losslessly for qualified M8 gate/up and down shapes."""
 

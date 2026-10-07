@@ -74,6 +74,53 @@ class GGUFOperatorCapability:
         return m >= self.min_m and (self.max_m is None or m <= self.max_m)
 
 
+DMV_THREE_FORMAT_QKV: dict[tuple[str, ...], tuple[int, int, int]] = {
+    ("IQ3_S", "IQ4_XS", "Q4_K"): (4, 2, 1),
+    ("IQ3_XXS", "IQ4_XS", "Q4_K"): (4, 2, 1),
+    ("Q4_K", "IQ4_XS", "IQ3_S"): (4, 2, 2),
+}
+
+
+def three_format_qkv_capabilities(
+    source_types: tuple[int, ...],
+    k: int,
+    widths: tuple[int, ...],
+    dtype: torch.dtype,
+    enabled: bool = True,
+    compute_capability: int = 70,
+) -> list[GGUFOperatorCapability]:
+    """Measured family combinations, including admission against older wheels."""
+    names = tuple(quant_type_name(kind) for kind in source_types)
+    reason = None
+    if not enabled:
+        reason = "three_format_qkv_disabled_by_kernel_config"
+    elif compute_capability != 70:
+        reason = "three_format_qkv_requires_sm70"
+    elif dtype != torch.float16:
+        reason = "three_format_qkv_requires_fp16_activations"
+    elif names not in DMV_THREE_FORMAT_QKV or (k, widths) != (
+        5120,
+        (3072, 256, 256),
+    ):
+        reason = "three_format_qkv_shape_or_sources_unmeasured"
+    elif not hasattr(torch.ops._C, "gguf_dmv_three_formats_sm70_supported"):
+        reason = "operator_missing:gguf_dmv_three_formats_sm70_supported"
+    elif not torch.ops._C.gguf_dmv_three_formats_sm70_supported():
+        reason = "native_three_format_support_unavailable"
+    return [
+        GGUFOperatorCapability(
+            decoder_family(kind),
+            quant_type_name(kind),
+            "gguf_dmv_sm70_out",
+            True,
+            min_m=8,
+            max_m=8,
+            reason=reason,
+        )
+        for kind in source_types
+    ]
+
+
 def iq3_gated_pair_capability(
     source_types: tuple[int, ...],
     k: int,
