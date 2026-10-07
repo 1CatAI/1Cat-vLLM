@@ -65,6 +65,7 @@ def test_qsa_real_cache_specs_keep_only_target_main_sharded(
 def _bare_qsa_attention(output_width: int) -> Qwen4ExpQSAAttention:
     attention = object.__new__(Qwen4ExpQSAAttention)
     torch.nn.Module.__init__(attention)
+    attention.host_kv_enabled = False
     attention.indexer = SimpleNamespace(output_width=output_width)
     return attention
 
@@ -234,3 +235,42 @@ def test_qsa_e4m3_forward_cannot_bypass_scale_finalization() -> None:
             tensor,
             tensor,
         )
+
+
+@pytest.mark.parametrize("active", [0, 3, 5])
+def test_host_qsa_only_initializes_graph_padding(active: int) -> None:
+    impl = object.__new__(Qwen4ExpQSAFlashAttentionImpl)
+    impl.alibi_slopes = None
+    impl.sinks = None
+    impl.sliding_window = (-1, -1)
+    query = torch.ones(5, 2, 8, dtype=torch.float16)
+    output = torch.full_like(query, float("nan"))
+    calls = []
+
+    def host_forward(q, indices, table, requests, positions, lengths, out, gate):
+        # The producer owns the active output. It must not depend on a fill.
+        assert torch.isnan(out).all()
+        assert out.shape[0] == active
+        out.copy_(q * 2)
+        calls.append(active)
+
+    result = impl.forward_qsa(
+        SimpleNamespace(
+            host_kv_enabled=True,
+            host_kv_forward=host_forward,
+            topk_indices_buffer=torch.zeros(5, 4, dtype=torch.int32),
+        ),
+        query,
+        query[:, :1],
+        query[:, :1],
+        torch.empty(0),
+        SimpleNamespace(num_actual_tokens=active, block_table=torch.zeros(1, 1)),
+        output,
+        torch.zeros(5, dtype=torch.int32),
+        query_positions=torch.arange(5),
+        sequence_lengths=torch.tensor([5]),
+    )
+    assert result is output
+    assert torch.equal(output[:active], query[:active] * 2)
+    assert torch.count_nonzero(output[active:]).item() == 0
+    assert calls == ([active] if active else [])

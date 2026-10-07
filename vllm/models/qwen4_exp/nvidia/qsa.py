@@ -269,7 +269,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("QSA does not support sliding-window attention")
 
         num_tokens = attn_metadata.num_actual_tokens
-        output.zero_()
+        if num_tokens and getattr(layer, "host_kv_enabled", False):
+            # Direct host QSA writes every active row, including empty
+            # selections. Only graph padding requires explicit initialization.
+            output[num_tokens:].zero_()
+        else:
+            output.zero_()
         if num_tokens == 0:
             return output
 

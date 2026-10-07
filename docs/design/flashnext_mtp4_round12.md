@@ -741,7 +741,9 @@ No model improvement or acceptance claim follows from these operator tests.
 The integration source now includes main's IQ2 projection and draft-attention
 updates. A normal wheel rebuilt at 3577384357 has core SHA-256
 `784d1447f4f5f5593fa77db525e6b40e841366d654202aab5a56beec67398a0c`.
-A same-wheel control/native-GDN model pair is pending. The preceding
+The same-wheel control/native-GDN pair is complete and regresses C1
+17.406 to 17.613 ms and C4 45.025 to 46.229 ms; keep the route disabled.
+See [the follow-up screens](flashnext_mtp4_round12_screens_20261008.md). The preceding
 17.3988-ms HCX and ring endpoints remain measurements of their recorded
 earlier wheels, rather than evidence for this integration build.
 
