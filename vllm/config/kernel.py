@@ -364,6 +364,14 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    expert_storage: Literal["canonical", "original"] = "canonical"
+    """Keep canonical expert banks or use the packaged original-block fallback.
+
+    Original storage avoids retaining both canonical and original expert banks.
+    It trades the calibrated TurboMind expert schedules for the native fallback
+    and retains lossless block conversion where a TP boundary needs it.
+    """
+
     projection_planes: bool = True
     """Use measured M8 shared-activation projection planes with canonical fallback."""
 

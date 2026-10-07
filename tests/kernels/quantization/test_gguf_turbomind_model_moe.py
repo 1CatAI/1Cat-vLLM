@@ -52,7 +52,9 @@ def test_canonical_adapter_retains_q2_source_without_expansion():
     assert weights[0].data_ptr() == torch.from_numpy(data[0]).data_ptr()
 
 
-def test_load_model_retains_prepared_adapter(monkeypatch):
+@pytest.mark.parametrize("storage", ["canonical", "original"])
+def test_load_model_retains_prepared_adapter(monkeypatch, storage):
+    from vllm.model_executor.kernels.ple import gguf_pinned
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
     from vllm.model_executor.model_loader import gguf_loader as module
     from vllm.model_executor.model_loader.gguf_adapters.qwen4exp import Qwen4ExpAdapter
@@ -89,6 +91,7 @@ def test_load_model_retains_prepared_adapter(monkeypatch):
     monkeypatch.setattr(loader, "_get_gguf_weight_type", lambda *args: {raw: "Q2_0"})
     monkeypatch.setattr(module, "initialize_model", lambda **kwargs: model)
     monkeypatch.setattr(module, "process_weights_after_loading", lambda *args: None)
+    monkeypatch.setattr(gguf_pinned, "prepare_pinned_gguf_ple", lambda *args: None)
     monkeypatch.setattr(
         module,
         "current_platform",
@@ -103,24 +106,36 @@ def test_load_model_retains_prepared_adapter(monkeypatch):
     cfg = SimpleNamespace(
         device_config=SimpleNamespace(device="cpu"),
         parallel_config=SimpleNamespace(tensor_parallel_size=4),
-        kernel_config=SimpleNamespace(sm70_gguf=SimpleNamespace(enabled=True)),
+        kernel_config=SimpleNamespace(
+            sm70_gguf=SimpleNamespace(enabled=True, expert_storage=storage)
+        ),
         quant_config=GGUFConfig(),
     )
     model_config = SimpleNamespace(dtype=torch.float16, hf_config=SimpleNamespace())
     assert loader.load_model(cfg, model_config) is model
-    assert cfg.quant_config.canonical_expert_storage
+    assert cfg.quant_config.canonical_expert_storage == (storage == "canonical")
     types = [w.item() for n, w in model.entries if n.endswith("qweight_type")]
     weights = [w for n, w in model.entries if n.endswith("qweight")]
-    assert types == [42, 42]
-    assert [tuple(w.shape) for w in weights] == [(64, 180), (64, 180)]
-    assert weights[0].data_ptr() == torch.from_numpy(data[0]).data_ptr()
+    assert types == ([42, 42] if storage == "canonical" else [3, 3])
+    assert [tuple(w.shape) for w in weights] == (
+        [(64, 180), (64, 180)] if storage == "canonical" else [(64, 400), (64, 400)]
+    )
+    if storage == "canonical":
+        assert weights[0].data_ptr() == torch.from_numpy(data[0]).data_ptr()
+    else:
+        # The TP4 K160 boundary cuts a Q2_0 K64 block. The existing Q4_1
+        # conversion keeps its FP16 coefficient and every integer code.
+        for expert, weight in enumerate(weights):
+            np.testing.assert_array_equal(
+                dequantize(weight.numpy(), 3), dequantize(data[expert], 42)
+            )
     assert len(calls) == 1
     assert (
         list(loader.get_all_weights(model_config, model, skip_weight=lambda _: True))
         == []
     )
     retained = list(loader.get_all_weights(model_config, model))
-    assert [w.item() for n, w in retained if n.endswith("qweight_type")] == [42, 42]
+    assert [w.item() for n, w in retained if n.endswith("qweight_type")] == types
     assert len(calls) == 1
 
 
