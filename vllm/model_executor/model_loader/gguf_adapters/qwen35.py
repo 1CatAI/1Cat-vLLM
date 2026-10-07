@@ -181,6 +181,7 @@ class Qwen35Adapter:
         for raw, name in name_map.items():
             packed_embedding = (
                 self.packed_embeddings
+                and not getattr(self.config, "tie_word_embeddings", False)
                 and name.endswith("embed_tokens.weight")
                 and tensors[raw].tensor_type
                 not in (
@@ -206,7 +207,9 @@ class Qwen35Adapter:
                 gguf.GGMLQuantizationType.BF16,
             )
             if quantized and name.endswith("embed_tokens.weight"):
-                if self.packed_embeddings:
+                if self.packed_embeddings and not getattr(
+                    self.config, "tie_word_embeddings", False
+                ):
                     # Validate the same FP16 range as the dense loader, using
                     # only a bounded row chunk. Serving decodes selected rows
                     # from the original GGML bytes through GGUFEmbeddingMethod.
