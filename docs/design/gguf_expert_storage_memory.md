@@ -32,3 +32,12 @@ CPU loader tests cover both policies and compare the Q2_0/Q4_1 reconstruction
 element by element. Actual 4x16GB loading, output quality, available KV memory
 and performance are pending GPU validation. A no-MTP capacity test does not
 qualify MTP4 or the default fast path on that hardware.
+
+On four 16 GiB V100-SXM2 GPUs, the first original-storage MTP4 run exhausted
+memory during target expert preparation, before loading the draft. A safety-tail
+allocation copied an entire expert bank (114--126 MiB) when only about 110 MiB
+remained free. Native expert banks now allocate their zero safety tail before
+checkpoint rows are copied, so preparation reuses the same allocation. The tail
+belongs to the final allocation, rather than every row. Tensor bytes and logical
+shapes are unchanged. This removes the observed transient copy; it does not yet
+establish that the complete MTP4 model fits on those GPUs.

@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.quantization.gguf_native import (
     NATIVE_TYPES,
+    empty_guarded_weight,
     native_available,
     pad_weight_tail,
 )
@@ -39,6 +40,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             config.kernel_config.sm70_gguf.enabled if config is not None else True
         )
         self.weight_types: dict[str, int] = {}
+        self.guarded_shards: set[str] = set()
         self.loaded_experts: dict[str, set[int]] = {
             shard: set() for shard in ("w1", "w3", "w2")
         }
@@ -129,11 +131,12 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         )
         name = "gguf_" + shard_id
         if not hasattr(layer, name):
-            storage = torch.empty(
-                (self.num_experts, rows, packed_k),
-                dtype=weight.dtype,
-                device=param.device,
-            )
+            shape = (self.num_experts, rows, packed_k)
+            if value in NATIVE_TYPES and weight.dtype == torch.uint8:
+                storage = empty_guarded_weight(shape, value, param.device)
+                self.guarded_shards.add(shard_id)
+            else:
+                storage = torch.empty(shape, dtype=weight.dtype, device=param.device)
             layer.register_buffer(name, storage, persistent=False)
         if expert_id in self.loaded_experts[shard_id]:
             raise ValueError(f"Duplicate GGUF {shard_id} expert {expert_id}")
@@ -159,7 +162,9 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             if not weight.is_cuda:
                 raise ValueError("Native GGUF experts require CUDA storage")
             value = self.weight_types[shard]
-            prepared = pad_weight_tail(weight, value)
+            prepared = pad_weight_tail(
+                weight, value, storage_has_zero_tail=shard in self.guarded_shards
+            )
             setattr(layer, "gguf_" + shard, prepared)
             capability = admit_moe_fallback(prepared, value, self.params_dtype)
             self.projection_capabilities[shard] = capability

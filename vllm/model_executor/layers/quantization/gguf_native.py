@@ -51,7 +51,9 @@ def native_available() -> bool:
     return hasattr(torch.ops._C_gguf, "ggml_dense_upstream_capabilities")
 
 
-def pad_weight_tail(weight: torch.Tensor, weight_type: int) -> torch.Tensor:
+def pad_weight_tail(
+    weight: torch.Tensor, weight_type: int, *, storage_has_zero_tail: bool = False
+) -> torch.Tensor:
     """Preserve logical rows, with the upstream MATRIX_ROW_PADDING storage tail.
 
     The storage contract follows vllm-gguf-plugin PR #141 (Apache-2.0); it pads
@@ -70,6 +72,11 @@ def pad_weight_tail(weight: torch.Tensor, weight_type: int) -> torch.Tensor:
     contiguous = weight.contiguous()
     if tail_bytes == 0:
         return contiguous
+    if storage_has_zero_tail:
+        available = contiguous.untyped_storage().nbytes() - contiguous.storage_offset()
+        if contiguous is not weight or available < contiguous.numel() + tail_bytes:
+            raise ValueError("GGUF guarded weight does not own its zero storage tail")
+        return contiguous
     # Extra storage can belong to the next merged projection. Do not assume
     # it is a zero tail or overwrite it: NaN scales there can contaminate even
     # a zero-padded activation. Give this projection its own guarded allocation.
@@ -79,6 +86,23 @@ def pad_weight_tail(weight: torch.Tensor, weight_type: int) -> torch.Tensor:
     logical = storage[: contiguous.numel()].view_as(contiguous)
     logical.copy_(contiguous)
     return logical
+
+
+def empty_guarded_weight(shape, weight_type: int, device) -> torch.Tensor:
+    """Allocate one packed bank and a zero safety tail before filling its rows."""
+    block, size = quant_size(weight_type)
+    if weight_type not in NATIVE_TYPES or shape[-1] % size:
+        raise ValueError(
+            "GGUF guarded bank requires complete native quantization blocks"
+        )
+    k = shape[-1] // size * block
+    tail_bytes = ((-k) % 512) // block * size
+    elements = 1
+    for dimension in shape:
+        elements *= dimension
+    storage = torch.empty(elements + tail_bytes, dtype=torch.uint8, device=device)
+    storage[elements:].zero_()
+    return storage[:elements].view(shape)
 
 
 def native_dense(
