@@ -2344,6 +2344,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         num_prefills: int,
         num_decode_tokens: int,
         num_prefill_tokens: int,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # ``non_spec_query_start_loc`` covers the non-spec (decode + prefill)
         # requests and equals ``query_start_loc`` when spec-decode is inactive.
@@ -2404,6 +2405,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                     state_indices_tensor_p[:num_prefills],
                     has_initial_states_p[:num_prefills],
                     self.short_conv_dilation,
+                    output,
                 )
             logger.debug_once("PLE prefill convolution fallback: %s.", reason)
         positions = torch.arange(
@@ -2664,6 +2666,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         metadata: PleShortConvAttentionMetadata,
         conv_state: torch.Tensor,
         conv_weights: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_prefills = metadata.num_prefills
         num_decodes = metadata.num_decodes
@@ -2743,6 +2746,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                         num_prefills=num_prefills,
                         num_decode_tokens=num_decode_tokens,
                         num_prefill_tokens=num_prefill_tokens,
+                        output=(
+                            output[:num_prefill_tokens]
+                            if output is not None and not has_spec and not has_decode
+                            else None
+                        ),
                     )
                 )
                 # A single part is already the result; vstack would copy it.
@@ -2776,7 +2784,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             return x
         return conv_out_non_spec
 
-    def _short_conv(self, inputs: torch.Tensor) -> torch.Tensor:
+    def _short_conv(
+        self, inputs: torch.Tensor, output: torch.Tensor | None = None
+    ) -> torch.Tensor:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
@@ -2820,6 +2830,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             layer_attn_metadata,
             conv_state,
             conv_weights.to(dtype=inputs.dtype),
+            output,
         )
 
     def forward(
@@ -2888,8 +2899,9 @@ def qwen4_exp_ple_short_conv(
     layer_name: str,
 ) -> None:
     layer = get_forward_context().no_compile_layers[layer_name]
-    result = layer._short_conv(inputs)
-    output[: result.shape[0]].copy_(result)
+    result = layer._short_conv(inputs, output=output)
+    if result.data_ptr() != output.data_ptr():
+        output[: result.shape[0]].copy_(result)
 
 
 def qwen4_exp_ple_short_conv_fake(

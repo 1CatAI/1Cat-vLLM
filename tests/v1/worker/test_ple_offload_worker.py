@@ -1412,3 +1412,67 @@ def test_registration_wait_exits_when_parent_stops(already_stopped):
 
     runner = object.__new__(ple_offload_worker.PleOffloadRunner)
     assert not runner.accept_registrations(WaitingSocket(), 4, stopped)
+
+
+@pytest.mark.parametrize("cuda_inputs", [False, True])
+def test_large_prefill_publishes_before_consumer_can_block_notifier(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_inputs: bool,
+) -> None:
+    import threading
+
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.tp_rank = connector.dp_rank = 0
+    connector.device = SimpleNamespace(index=0)
+    connector._uses_cuda_inputs = cuda_inputs
+    connector._request_publish_required = True
+    connector._request_queue = queue.Queue(maxsize=1)
+    connector._d2h_event_pool = queue.Queue(maxsize=1) if cuda_inputs else None
+    event = Mock()
+    if cuda_inputs:
+        connector._d2h_event_pool.put(event)
+    connector._enqueue_cuda_inputs = Mock()
+    connector._copy_cpu_inputs = Mock()
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.accelerator,
+        "device_index",
+        lambda *_: nullcontext(),
+    )
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.cuda.nvtx, "range", lambda *_: nullcontext()
+    )
+    sent = threading.Event()
+    socket = Mock()
+    socket.send.side_effect = lambda *_: sent.set()
+    errors = []
+
+    def notifier():
+        try:
+            pending = connector._request_queue.get(timeout=5)
+            assert pending.published is not None
+            connector._process_request(pending, socket)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=notifier)
+    thread.start()
+    connector._launch(num_reqs=1, num_tokens=16384, wait_publication=True)
+    # The model may now enter a GIL-holding allocation/stream synchronization.
+    assert sent.is_set()
+    thread.join(timeout=5)
+    assert not thread.is_alive() and not errors
+    if cuda_inputs:
+        event.synchronize.assert_called_once_with()
+        assert connector._d2h_event_pool.get_nowait() is event
+    else:
+        connector._copy_cpu_inputs.assert_called_once()
+
+
+def test_prefill_publication_can_retain_asynchronous_policy():
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.tp_rank = connector.dp_rank = 0
+    connector._uses_cuda_inputs = False
+    connector._request_publish_required = False
+    connector._request_queue = queue.Queue(maxsize=1)
+    connector.prepare_forward(num_reqs=1, num_tokens=16384, dummy_run=False)
+    assert connector._request_queue.get_nowait().published is None

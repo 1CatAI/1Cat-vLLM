@@ -548,6 +548,9 @@ class KernelConfig:
     prefill_hc_chunk_size: int = 4096
     """Bound large SM70 FP16 HC intermediates by rows; zero disables blocking."""
 
+    ple_request_publish_before_wait: bool = True
+    """Publish CPU-owned PLE requests before GPU waits can block the notifier."""
+
     prefill_ple_short_conv: bool = True
     """Use admitted SM70 dilated PLE prefill without padded history buffers."""
 

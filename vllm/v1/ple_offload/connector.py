@@ -38,6 +38,7 @@ class _PendingPleOffloadRequest:
 
     request: PleOffloadRequest
     d2h_done_event: torch.cuda.Event | None
+    published: threading.Event | None = None
 
 
 def _cuda_check(result: Any, operation: str) -> Any:
@@ -88,6 +89,9 @@ class PleOffloadConnector:
         ngram_context_source: torch.Tensor | None,
     ) -> None:
         self.device = device
+        self._request_publish_required = (
+            vllm_config.kernel_config.ple_request_publish_before_wait
+        )
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_rank = get_tp_group().rank_in_group
         self._layers = self._setup_layers(vllm_config, model)
@@ -381,6 +385,8 @@ class PleOffloadConnector:
         if event is not None:
             assert self._d2h_event_pool is not None
             self._d2h_event_pool.put_nowait(event)
+        if pending.published is not None:
+            pending.published.set()
 
     def _copy_cpu_inputs(self, request: PleOffloadRequest) -> None:
         """Stage MRV1's existing CPU mirrors in the notifier thread."""
@@ -469,6 +475,8 @@ class PleOffloadConnector:
         self,
         num_reqs: int,
         num_tokens: int,
+        *,
+        wait_publication: bool = False,
     ) -> None:
         """Queue one batch while keeping staging off the model thread."""
         # Inputs are replicated across TP ranks. One request per DP rank drives
@@ -492,9 +500,15 @@ class PleOffloadConnector:
                     "PLE has more MRV2 requests than configured concurrent batches"
                 ) from exc
             self._enqueue_cuda_inputs(request, d2h_done_event)
+        # A consumer may reclaim allocator cache after the
+        # GPU PLE wait. That synchronization can hold the GIL; the notifier
+        # must publish before the consumer can block it from sending inputs.
+        published = threading.Event() if wait_publication else None
         self._request_queue.put_nowait(
-            _PendingPleOffloadRequest(request, d2h_done_event)
+            _PendingPleOffloadRequest(request, d2h_done_event, published)
         )
+        if published is not None and not published.wait(timeout=30):
+            raise RuntimeError("Timed out publishing the PLE prefill request")
 
     def prepare_forward(
         self,
@@ -511,7 +525,9 @@ class PleOffloadConnector:
             envs.VLLM_SM70_QWEN38_HYBRID_PLE or self._all_pinned_decode
         ):
             return
-        self._launch(num_reqs, num_tokens)
+        self._launch(
+            num_reqs, num_tokens, wait_publication=self._request_publish_required
+        )
 
     def signal_dummy_outputs(self, num_tokens: int) -> None:
         """Locally satisfy PLE waits for dummy and capture forwards."""

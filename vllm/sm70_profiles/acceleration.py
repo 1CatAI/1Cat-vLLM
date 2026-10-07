@@ -528,6 +528,15 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "runtime_guards": "FP16 dense HC; M exceeds chunk rows; HCX for combine",
         "precision": "FP16 materialization and FP32 GEMM accumulation",
     }
+    ple_publish = cfg.kernel_config.ple_request_publish_before_wait
+    report["ple_request_publish_before_wait"] = {
+        "enabled": ple_publish,
+        "reason": None if ple_publish else "disabled_by_kernel_policy",
+        "scope": "cpu_ple_submission",
+        "operator": "publish PLE request before entering the GPU consumer",
+        "runtime_guards": "TP rank0; CPU-owned PLE; local pinned decode bypasses",
+        "precision": "unchanged",
+    }
     ple_conv = cfg.kernel_config.prefill_ple_short_conv
     report["prefill_ple_short_conv"] = {
         "enabled": sm70 and ple_conv,

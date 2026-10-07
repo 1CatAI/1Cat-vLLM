@@ -251,3 +251,36 @@ NULL state rows, initial history, FP32 state storage, channel tails, strided
 inputs, history carried between chunks, and graph replay with changed inputs
 and initial-state flags. These are operator measurements, not full-model
 prefill throughput or quality results. Full 32K model evidence remains pending.
+
+## Prefill request publication and allocator synchronization
+
+The next installed run initialized at 28.748 GiB/rank but stalled before the
+new convolution executed. A native stack shows allocator cache reclamation
+(`ExpandableSegment::unmapHandles` → `cudaStreamSynchronize`) while the model
+thread retains the GIL. The PLE notification thread has finished waiting for
+the input D2H event but is blocked in `PyEval_RestoreThread` before publishing
+the request. The GPU consumer waits for PLE output, and the helper polls
+without receiving work. This is a synchronization cycle under memory pressure,
+not measured slow prefill. The executor eventually times out; retained workers
+were removed after verifying their benchmark process identities.
+
+For CPU-owned PLE, the model thread now waits until the
+notifier has published the request and returned its D2H event. This wait releases
+the GIL and precedes the GPU consumer. It does not wait for the PLE result.
+`ple_request_publish_before_wait=false` retains asynchronous submission. Local
+pinned decode bypasses the CPU helper and this barrier. Six targeted CPU checks
+cover per-batch D2H ownership, CUDA/CPU input publication order and the
+asynchronous control. Complete-model verification remains pending.
+
+The opaque convolution also receives its already allocated output directly
+for a pure prefill batch. Mixed decode/speculative batches retain their existing
+merge and copy path; padded output rows remain zero. The convolution writes
+using output strides, avoiding a second full-sized result allocation and copy.
+Twenty-one targeted GPU/CPU convolution checks pass, including the opaque
+entry, padding, state carry and graph replay.
+
+With the checkpoint's actual weight at M=16384, an eager ABBA comparison of
+opaque output handling measured 320.178 to 0.393 MiB of extra temporary
+allocation, excluding the fixed input/output buffers. Median operator time
+falls from 2.495 to 1.657 ms; outputs and state updates match bitwise. This is
+an operator result. The full-model prefill and decode gates remain pending.

@@ -51,6 +51,8 @@ def _prefill_conv(
     IS2: tl.constexpr,
     WS0: tl.constexpr,
     WS1: tl.constexpr,
+    OS0: tl.constexpr,
+    OS1: tl.constexpr,
     Rows: tl.constexpr,
     Hidden: tl.constexpr,
     Requests: tl.constexpr,
@@ -104,7 +106,7 @@ def _prefill_conv(
     rounded = acc.to(tl.float16).to(tl.float32)
     activated = rounded / (1 + tl.extra.cuda.libdevice.exp(-rounded))
     tl.store(
-        Output + rows[:, None] * Hidden + channels[None, :],
+        Output + rows[:, None] * OS0 + channels[None, :] * OS1,
         tl.where(valid[:, None], activated, 0),
         (rows < Rows)[:, None] & (channels < Hidden)[None, :],
     )
@@ -171,14 +173,18 @@ def _commit_prefill_state(
     )
 
 
-def prefill_conv(x, state, weight, starts, states, has_initial, dilation):
+def prefill_conv(x, state, weight, starts, states, has_initial, dilation, output=None):
     """Preserve null/empty rows and commit base history after reading its snapshot."""
     count = states.numel()
     length = (weight.shape[1] - 1) * dilation
     indices = states.to(device=state.device, dtype=torch.int64)
     indices = torch.where(indices == NULL_BLOCK_ID, 0, indices)
     initial = state.index_select(0, indices)[..., :length].to(x.dtype).contiguous()
-    out = torch.empty_like(x, memory_format=torch.contiguous_format)
+    out = (
+        torch.empty_like(x, memory_format=torch.contiguous_format)
+        if output is None
+        else output
+    )
     _prefill_conv[(triton.cdiv(x.shape[0], 16), triton.cdiv(x.shape[1], 128))](
         x,
         initial,
@@ -190,6 +196,7 @@ def prefill_conv(x, state, weight, starts, states, has_initial, dilation):
         *x.stride(),
         *initial.stride(),
         *weight.stride(),
+        *out.stride(),
         x.shape[0],
         x.shape[1],
         count,
