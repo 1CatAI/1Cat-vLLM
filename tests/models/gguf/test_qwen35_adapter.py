@@ -258,3 +258,41 @@ def test_embedding_decode_keeps_fp16_overflow_rejection(monkeypatch):
     )
     with pytest.raises(ValueError, match="values overflow"):
         _dequantize_embedding(tensor, torch.float16, "embedding")
+
+
+def test_quantized_embedding_keeps_original_bytes_and_type():
+    values = np.linspace(-2, 2, 12 * 256, dtype=np.float32).reshape(12, 256)
+    data = gguf.quants.quantize(values, gguf.GGMLQuantizationType.Q8_0)
+    tensor = SimpleNamespace(
+        data=data, tensor_type=gguf.GGMLQuantizationType.Q8_0, shape=[256, 12]
+    )
+    name = "model.embed_tokens.weight"
+    weights = list(
+        Qwen35Adapter(config()).weights(
+            {"token_embd.weight": tensor}, {"token_embd.weight": name}, torch.float16
+        )
+    )
+    assert [name for name, _ in weights] == [
+        "model.embed_tokens.qweight_type",
+        "model.embed_tokens.qweight",
+    ]
+    assert weights[0][1].item() == int(tensor.tensor_type)
+    assert weights[1][1].dtype == torch.uint8
+    assert weights[1][1].numpy().tobytes() == data.tobytes()
+
+
+def test_packed_embedding_keeps_overflow_rejection():
+    blocks = np.zeros((4, 34), dtype=np.uint8)
+    blocks[:, :2] = np.frombuffer(np.float16(65504).tobytes(), dtype=np.uint8)
+    blocks[:, 2:] = 127
+    tensor = SimpleNamespace(
+        data=blocks, tensor_type=gguf.GGMLQuantizationType.Q8_0, shape=[32, 4]
+    )
+    with pytest.raises(ValueError, match="overflow"):
+        list(
+            Qwen35Adapter(config()).weights(
+                {"token_embd.weight": tensor},
+                {"token_embd.weight": "model.embed_tokens.weight"},
+                torch.float16,
+            )
+        )
