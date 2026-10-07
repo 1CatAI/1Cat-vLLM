@@ -8,6 +8,13 @@
 #include <torch/library.h>
 #include <torch/version.h>
 
+#ifdef ENABLE_SM70_TURBOMIND
+void gguf_dmv_restore_iq2_sm70_out(torch::Tensor weight, torch::Tensor stats,
+                                   torch::Tensor codes, torch::Tensor meta,
+                                   torch::Tensor reverse, int64_t kind,
+                                   int64_t k, int64_t n);
+#endif
+
 namespace {
 
 bool sm70_marlin_available() {
@@ -114,6 +121,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int format, Tensor table, int kw) -> ()");
   ops.impl("gguf_moe_gate_up_sm70_out", torch::kCUDA,
            &gguf_moe_gate_up_sm70_out);
+  ops.def(
+      "gguf_dmv_restore_iq2_sm70_out(Tensor(a!) weight, Tensor(b!) stats, "
+      "Tensor codes, Tensor meta, Tensor reverse, int type, int k, int n) -> "
+      "()");
+  ops.impl("gguf_dmv_restore_iq2_sm70_out", torch::kCUDA,
+           &gguf_dmv_restore_iq2_sm70_out);
   ops.def(
       "gguf_dmv_restore_sm70_out(Tensor(a!) weight, Tensor(b!) stats, "
       "Tensor codes, Tensor scale, int format, int k, int n) -> ()");

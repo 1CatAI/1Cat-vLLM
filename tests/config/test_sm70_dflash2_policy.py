@@ -111,7 +111,8 @@ def _hash_subject(method, policy):
     )
 
 
-def test_graph_options_affect_dflash_hash_and_ignore_unused_mtp_policy():
+@pytest.mark.parametrize("field", ["context_pipeline", "draft_window_split"])
+def test_graph_options_affect_dflash_hash_and_ignore_unused_mtp_policy(field):
     policy = Sm70DFlash2Config()
     mtp = _hash_subject("mtp", policy)
     before = SpeculativeConfig.compute_hash(mtp)
@@ -121,7 +122,7 @@ def test_graph_options_affect_dflash_hash_and_ignore_unused_mtp_policy():
     policy.resolve(qualified=True)
     dflash = _hash_subject("dflash", policy)
     before = SpeculativeConfig.compute_hash(dflash)
-    policy.context_pipeline = False
+    setattr(policy, field, False)
     assert SpeculativeConfig.compute_hash(dflash) != before
 
 

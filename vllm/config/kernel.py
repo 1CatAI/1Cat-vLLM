@@ -370,6 +370,9 @@ class Sm70GgufConfig:
     projection_plane_scope: Literal["all", "gated_pair", "iq3_xxs"] = "all"
     """Select all planes, gated pairs, or XXS-containing layers for comparisons."""
 
+    iq2_signed_nibbles: bool = True
+    """Expand IQ2 grids losslessly for qualified M8 gate/up and down shapes."""
+
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
 
