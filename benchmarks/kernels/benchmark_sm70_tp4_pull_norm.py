@@ -198,13 +198,43 @@ def main():
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--burst", type=int, default=1)
+    parser.add_argument("--norm-partial-packets", action="store_true")
+    parser.add_argument("--versioned-triples", action="store_true")
+    parser.add_argument("--local-buffer-pointer", action="store_true")
+    parser.add_argument("--norm-packet-parts", type=int, choices=(5, 10, 20), default=5)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     source = args.out / "pull_norm.cu"
-    text = generate(args.source_root)
+    if args.norm_partial_packets:
+        from sm70_tp4_norm_partial_packets import generate as packet_source
+
+        if args.local_buffer_pointer:
+            from sm70_tp4_local_buffer_pointer import generate as local_source
+
+            assert not args.versioned_triples
+            text = local_source(args.source_root, args.norm_packet_parts)
+        elif args.versioned_triples:
+            from sm70_tp4_versioned_triples import generate as wire_source
+
+            assert args.norm_packet_parts == 5
+            text = wire_source(args.source_root)
+        else:
+            text = packet_source(args.source_root, args.norm_packet_parts)
+    else:
+        text = generate(args.source_root)
     if not source.exists() or source.read_text() != text:
         source.write_text(text)
-    name = "tp4_pull_norm_screen"
+    name = (
+        f"tp4_norm_local_pointer{args.norm_packet_parts}_screen"
+        if args.local_buffer_pointer
+        else "tp4_norm_versioned_triples_screen"
+        if args.versioned_triples
+        else f"tp4_norm_partial_packets{args.norm_packet_parts}_screen"
+        if args.norm_partial_packets and args.norm_packet_parts != 5
+        else "tp4_norm_partial_packets_screen"
+        if args.norm_partial_packets
+        else "tp4_pull_norm_screen"
+    )
     if args.extension:
         spec = importlib.util.spec_from_file_location(name, args.extension)
         assert spec and spec.loader
@@ -253,6 +283,7 @@ def main():
         y, rout = outputs[arm]
         extension.launch(y, rout, x, residual, weight, buffers, inputs, rank, arm)
 
+    differences = []
     for amplitude in (0.01, 0.125, 1.0, 4.0):
         x.copy_(original * amplitude)
         torch.cuda.synchronize()
@@ -260,10 +291,27 @@ def main():
         for arm in range(3):
             launch(arm)
             torch.cuda.synchronize()
-        for candidate in outputs[1:]:
-            for a, b in zip(outputs[0], candidate):
+        for arm, candidate in enumerate(outputs[1:], start=1):
+            for component, (a, b) in enumerate(zip(outputs[0], candidate)):
                 bits = torch.int16 if a.element_size() == 2 else torch.int32
-                assert torch.equal(a.view(bits), b.view(bits))
+                exact = torch.equal(a.view(bits), b.view(bits))
+                differences.append(
+                    {
+                        "amplitude": amplitude,
+                        "arm": arm,
+                        "component": "normalized" if component == 0 else "residual",
+                        "bitwise": exact,
+                        "max_abs": (a.float() - b.float()).abs().max().item(),
+                    }
+                )
+                assert torch.isfinite(b).all()
+                if not (
+                    args.norm_partial_packets
+                    and args.norm_packet_parts != 5
+                    and arm == 1
+                    and component == 0
+                ):
+                    assert exact
     x.copy_(original * 0.125)
     eviction = torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
     graphs = []
@@ -292,10 +340,19 @@ def main():
         "rank": rank,
         "burst": args.burst,
         "push_mean_us": statistics.mean(samples[0]),
-        "pull_mean_us": statistics.mean(samples[1]),
+        "candidate_mean_us": statistics.mean(samples[1]),
+        "candidate_route": "local_buffer_pointer"
+        if args.local_buffer_pointer
+        else "versioned_triples"
+        if args.versioned_triples
+        else "norm_partial_packets"
+        if args.norm_partial_packets
+        else "direct_pull",
         "local_push_mean_us": statistics.mean(samples[2]),
         "samples_us": samples,
-        "output_and_residual_bitwise": True,
+        "output_and_residual_bitwise": all(d["bitwise"] for d in differences),
+        "differences": differences,
+        "norm_packet_parts": args.norm_packet_parts,
         "kernel_nodes_in_timed_range": args.burst,
         "generated_sha256": hashlib.sha256(text.encode()).hexdigest(),
         "research_only": True,
