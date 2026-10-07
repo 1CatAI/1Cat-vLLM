@@ -37,6 +37,48 @@ def test_runtime_dispatch_uses_actual_rows(monkeypatch):
         assert output.is_contiguous()
 
 
+def test_q8_segment_uses_m8_and_preserves_prefill_policy(monkeypatch):
+    calls: list[tuple[str, int, list[int]]] = []
+    module = "vllm.model_executor.layers.quantization.gguf_dense_hmma"
+
+    def segments(rows, *args, m8_only=False):
+        assert m8_only
+        calls.append(("segments", rows.shape[0], []))
+        args[-2].zero_()
+
+    def restore(rows, *args):
+        calls.append(("restore", rows.shape[0], args[-1]))
+        args[5].zero_()
+
+    monkeypatch.setattr(module + ".apply_segments", segments)
+    monkeypatch.setattr(module + ".restore_and_apply", restore)
+    codes = stats = high = torch.empty(0, dtype=torch.uint8)
+    for m in (512, 8, 1, 20, 8):
+        output = _prepared_gguf_projection(
+            torch.empty(m, 1024, dtype=torch.float16),
+            codes,
+            stats,
+            high,
+            5,
+            4,
+            32,
+            0,
+            0,
+            5120,
+            5120,
+            [],
+            [512, -1],
+        )
+        assert output.shape == (m, 5120)
+    assert calls == [
+        ("restore", 512, [512, -1]),
+        ("segments", 8, []),
+        ("restore", 1, [512, -1]),
+        ("restore", 20, [512, -1]),
+        ("segments", 8, []),
+    ]
+
+
 def test_fake_graph_keeps_runtime_projection_opaque():
     torch._dynamo.reset()
     graphs = []
