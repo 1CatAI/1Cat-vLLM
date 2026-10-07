@@ -141,9 +141,10 @@ device communication. The collective admission report records
 Installed-wheel checks on four 32 GiB V100s preserve EP ranks, retain TP PyNccl,
 and produce bitwise-identical all-gather/all-reduce results and graph replays
 at M1/M5/M20/M128. Enabling EP still creates its communicator. On that topology
-the initialized EP resource difference is 76 MiB per rank; the reclaimed bytes
-must be measured separately on the 16 GiB topology, whose earlier EP ledger
-was 244 MiB. This is a memory result, not a model latency improvement claim.
+the initialized EP resource difference is 76 MiB per rank. The same installed
+wheel subsequently passed all four-rank checks on the 16 GiB NV2 topology and
+reclaimed exactly 244 MiB per rank, matching its earlier EP ledger. This is a
+memory result, not a model latency improvement claim.
 
 An isolated four-card experiment with the existing NCCL buffer setting reduced
 the buffer from the standard 4 MiB to 1 MiB. It saved only 48 MiB per card;

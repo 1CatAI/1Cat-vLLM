@@ -95,6 +95,10 @@ candidate, subject to transfer and graph-lifetime validation.
 
 Initially retain compressed index keys and active GDN/PLE state on GPU.
 Then assess host backing for raw index keys and inactive/checkpoint states.
+The complete host-storage goal also includes historical compressed index keys:
+stage them into bounded layer buffers or scan them in chunks with exact score
+and top-k merging. The initial resident-index variant is an intermediate step,
+not a claim that all historical cache storage has moved off GPU.
 If the fixed active GDN/MTP state still prevents C4, test layer-staged state
 updates without lowering precision. Moving attention KV alone does not prove
 that C4 fits.
