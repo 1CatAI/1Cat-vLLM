@@ -86,18 +86,62 @@ Admission is restricted to measured M8 FP16 TP4 shapes K5120 and widths
 restore the existing canonical representation. The native support query
 rejects a newer Python package paired with an older extension.
 
-Research-only cold-bank graph ABBA on real weights at 1290/877 MHz gives:
+The ordinary installed wheel reproduces cold-bank graph ABBA on real
+weights at 1290/877 MHz:
 
 | Layer | Q/K/V types | Existing us | New us | KW/TN/split |
 | --- | --- | ---: | ---: | --- |
-| 35 | IQ3_S/IQ4_XS/Q4_K | 33.268 | 24.707 | 4/2/1 |
-| 47 | IQ3_XXS/IQ4_XS/Q4_K | 35.196 | 23.407 | 4/2/1 |
-| 63 | Q4_K/IQ4_XS/IQ3_S | 34.343 | 22.602 | 4/2/2 |
+| 35 | IQ3_S/IQ4_XS/Q4_K | 33.254 | 24.691 | 4/2/1 |
+| 47 | IQ3_XXS/IQ4_XS/Q4_K | 35.199 | 23.400 | 4/2/1 |
+| 63 | Q4_K/IQ4_XS/IQ3_S | 34.343 | 22.592 | 4/2/2 |
 
 The weighted operator saving is 0.032 ms/round, not an end-to-end claim.
 Relative L2 against official FP16-dequantized weights and FP64 reference
 products is below 0.000704 across three input amplitudes. Scale precision
-and FP32 accumulation are unchanged. Ordinary-artifact GPU and model checks
-must complete before promotion.
+and FP32 accumulation are unchanged. The ordinary artifact passes 146 targeted GPU, graph, restoration, codec
+and capability tests. All four ranks additionally admit the three new attention inputs in a
+normal-wheel model run. Natural text checks finish normally with correct
+arithmetic and a reasonable unit-test explanation. No model speedup is
+claimed from the isolated weighted increment.
 
 [Portable measurements and evidence hashes](data/gguf_qkv_profile_calibration_20261007.json)
+
+## Rejected signed-grid decoder
+
+A real layer-6 IQ3_S gate/up probe packs index/sign into 13-bit packets and
+uses pre-signed grids. FP16 group scale and FP32 accumulation are unchanged,
+and output bits match the admitted operator at three input amplitudes.
+Neither layout is admitted: a 64 KiB FP16 table measures 51.512 us against
+38.686 us; a 32 KiB byte table measures 40.450 us against 38.633 us.
+
+For the byte-table probe, NCU directly measures DRAM reads of
+22.413 MB versus 19.600 MB and executed warp instructions of 6.248 million
+versus 7.773 million. Despite 19.6% fewer instructions, the MIO-throttle
+stall-per-issue metric rises from 0.515 to 1.627. Shared-load bank conflicts
+rise from 807833 to 881244. Active warp occupancy remains about 25%.
+These captures explain why reducing decoder instructions alone did not win;
+profiled durations are not substituted for the ABBA graph measurements.
+
+## Unprofiled boundary-event diagnostic
+
+A short normal-wheel run records CUDA events only at call boundaries. It
+does not enable Nsight or the runner's per-round profiling fences. The
+workload uses two exact-length synthetic prompts, 128 output tokens, max
+length 32768, max sequences 1, and all fast paths enabled. It differs from
+the matched 16-prompt qualification and adds event/host recording overhead.
+
+| Rank 0 phase | 1K ms | 8K ms |
+| --- | ---: | ---: |
+| Target graph | 12.787 | 13.563 |
+| Target sample including head | 0.560 | 0.563 |
+| Target state update | 0.024 | 0.024 |
+| Draft total including its head | 2.319 | 2.344 |
+| Target start to next target start | 16.077 | 16.888 |
+
+Nested execute/sample envelopes are retained in the data and are not added
+again. The diagnostic confirms that the target graph itself exceeds 12 ms;
+recovering roughly 4 ms there is the principal requirement for a complete
+round below 12 ms. It does not identify individual unprofiled projection
+costs. Two natural prompts terminate normally, answering `391` and giving
+a sensible unit-test explanation. These are text-health checks, not a full
+quality suite or an acceptance-rate comparison.
