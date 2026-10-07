@@ -1359,6 +1359,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and self.sampler is not None
             and self.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
         )
+        sm70_greedy_verify = (
+            sampler_output is None
+            and cached_logits is None
+            and input_batch.num_draft_tokens > 0
+            and grammar_output is None
+            and self.device.type == "cuda"
+            and current_platform.is_device_capability(70)
+            and getattr(self, "lora_config", None) is None
+            and hasattr(self.model, "get_top_tokens")
+            and self.rejection_sampler is not None
+            and self.rejection_sampler.synthetic_conditional_rates is None
+            and self.vllm_config.kernel_config.sm70_greedy_verify
+            and self.rejection_sampler.sampler.can_use_sm70_greedy_token_fastpath(
+                input_batch
+            )
+        )
+        if sm70_greedy_verify:
+            from vllm.v1.worker.gpu.spec_decode.sm70_greedy_verify import (
+                greedy_verify,
+            )
+
+            assert self.rejection_sampler is not None
+            target_ids = self.model.get_top_tokens(sample_hidden_states).view(-1)
+            sampled, num_sampled = greedy_verify(
+                target_ids,
+                input_batch.input_ids[input_batch.logits_indices],
+                input_batch.cu_num_logits,
+                self.rejection_sampler.num_speculative_steps,
+            )
+            sampler_output = SamplerOutput(
+                sampled_token_ids=sampled,
+                logprobs_tensors=None,
+                num_nans=None,
+                num_sampled=num_sampled,
+            )
+            logger.info_once("SM70 greedy MTP verification from TP-local argmax.")
         if sm70_greedy_decode:
             sampled = self.model.get_top_tokens(sample_hidden_states)
             sampler_output = SamplerOutput(

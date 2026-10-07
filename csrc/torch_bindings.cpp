@@ -86,6 +86,54 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("gguf_dmv_three_formats_sm70_supported() -> bool",
           []() { return true; });
   ops.def(
+      "sm70_hcx_out(Tensor p0, Tensor? p1, Tensor res, Tensor inj, Tensor nw,"
+      " float eps, Tensor wd, Tensor wu, Tensor(a!) res_out, Tensor(b!) blk_o"
+      "ut, Tensor(c!) inj_out, Tensor(d!) xn, Tensor(e!) sq, Tensor(f!) dpart"
+      ", Tensor(g!) bar, Tensor(h!) seq, int[] ar, int[] lora, int[] hb, int "
+      "rank, Tensor? dbg, int full, Tensor? ox, Tensor? ocodes, Tensor? ohigh"
+      ", Tensor? oscale, int ofmt, Tensor? gz, Tensor? gw, float geps, Tensor"
+      "(i!)? gscr) -> ()");
+  ops.impl("sm70_hcx_out", torch::kCUDA, &sm70_hcx_out);
+  ops.def(
+      "sm70_dmv13_out(Tensor x, Tensor[] codes, Tensor[] high, Tensor[] scale, "
+      "Tensor(a!)[] out, int[] fmt, int[] n, int K, int split, int warps, "
+      "Tensor(b!) ws, Tensor(c!) cnt, int tp, Tensor? extra_weight, "
+      "Tensor(d!)? extra_out) -> ()");
+  ops.impl("sm70_dmv13_out", torch::kCUDA, &sm70_dmv13_out);
+  ops.def(
+      "qsa_prep_sm70_out(Tensor qkv, Tensor positions, Tensor cos_sin, "
+      "Tensor q_norm_weight, Tensor k_norm_weight, float eps, Tensor(a!) "
+      "query, "
+      "Tensor(b!) key_cache, Tensor(c!) value_cache, Tensor slot_mapping) -> "
+      "()");
+  ops.impl("qsa_prep_sm70_out", torch::kCUDA, &qsa_prep_sm70_out);
+  ops.def(
+      "sm70_top1x_out(Tensor(a!) out, Tensor pairs, int[] buffers, "
+      "Tensor(b!) seq, int rank) -> ()");
+  ops.impl("sm70_top1x_out", torch::kCUDA, &sm70_top1x_out);
+  ops.def(
+      "sm70_gdn_verify_out(Tensor qkv, Tensor a, Tensor b, Tensor A_log, "
+      "Tensor dt_bias, Tensor(a!) state, Tensor(b!) o, Tensor cu, Tensor idx, "
+      "Tensor? nacc, int H, int HV, float scale, int cfg, Tensor? rbuf, "
+      "Tensor? rn, Tensor? ctr, int tmax) -> ()");
+  ops.impl("sm70_gdn_verify_out", torch::kCUDA, &sm70_gdn_verify_out);
+  ops.def(
+      "qsa_dense_decode_sm70_out(Tensor(a!) out, Tensor query, Tensor "
+      "key_cache, "
+      "Tensor value_cache, Tensor block_table, Tensor token_to_req, Tensor "
+      "positions, "
+      "Tensor? gate, Tensor(b!) ws_o, Tensor(c!) ws_ml, int num_requests, int "
+      "splits, "
+      "int warps) -> ()");
+  ops.impl("qsa_dense_decode_sm70_out", torch::kCUDA,
+           &qsa_dense_decode_sm70_out);
+  ops.def(
+      "gguf_moe_gate_up_sm70_out(Tensor(a!) hidden, Tensor input, Tensor ids, "
+      "Tensor gate_codes, Tensor gate_scale, Tensor up_codes, Tensor up_scale, "
+      "int format, Tensor table, int kw) -> ()");
+  ops.impl("gguf_moe_gate_up_sm70_out", torch::kCUDA,
+           &gguf_moe_gate_up_sm70_out);
+  ops.def(
       "gguf_dmv_restore_iq2_sm70_out(Tensor(a!) weight, Tensor(b!) stats, "
       "Tensor codes, Tensor meta, Tensor reverse, int type, int k, int n) -> "
       "()");
@@ -321,21 +369,30 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "sm70_hc_ll_down_out(Tensor x, Tensor wd, Tensor(a!) part, Tensor(b!) "
       "cnt, "
-      "int[] ll, Tensor(c!) seq, int rank, int variant) -> ()");
+      "int[] ll, Tensor(c!) seq, int rank, int variant, bool "
+      "optimized_loads=True) -> ()");
   ops.impl("sm70_hc_ll_down_out", torch::kCUDA, &sm70_hc_ll_down_out);
   ops.def(
       "sm70_hc_ll_up_out(int ll_lora, Tensor wu, Tensor x, Tensor(a!) cnt, "
       "int[] ll, Tensor(b!) seq, Tensor down_seq, int rank, Tensor(c!) out, "
-      "Tensor(d!) lora_out, Tensor(e!) inj_out, int warps) -> ()");
+      "Tensor(d!) lora_out, Tensor(e!) inj_out, int warps, bool "
+      "optimized_loads=True) -> ()");
   ops.impl("sm70_hc_ll_up_out", torch::kCUDA, &sm70_hc_ll_up_out);
 
   ops.def("gguf_quantize_q8_1_sm70_out(Tensor(a!) out, Tensor input) -> ()");
   ops.impl("gguf_quantize_q8_1_sm70_out", torch::kCUDA,
            &gguf_quantize_q8_1_sm70_out);
   ops.def(
+      "gguf_dp4a_scalar_lut_gate_up_sm70_out(Tensor(a!) out, Tensor "
+      "activation, "
+      "Tensor ids, Tensor gate, Tensor up, int source_type, bool activated) -> "
+      "()");
+  ops.impl("gguf_dp4a_scalar_lut_gate_up_sm70_out", torch::kCUDA,
+           &gguf_dp4a_scalar_lut_gate_up_sm70_out);
+  ops.def(
       "gguf_dp4a_gate_up_sm70_out(Tensor(a!) out, Tensor activation, Tensor "
       "ids, Tensor gate, Tensor up, int source_type, bool activated, "
-      "int lanes_per_row=16) -> ()");
+      "int lanes_per_row=16, bool bank_aware=False) -> ()");
   ops.impl("gguf_dp4a_gate_up_sm70_out", torch::kCUDA,
            &gguf_dp4a_gate_up_sm70_out);
   ops.def(

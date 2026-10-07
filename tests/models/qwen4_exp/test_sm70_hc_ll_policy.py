@@ -21,6 +21,13 @@ def test_hc_runtime_reports_do_not_change_graph_hash():
     assert cfg.compute_hash() != before
 
 
+def test_hc_load_policy_changes_graph_hash():
+    cfg = KernelConfig()
+    before = cfg.compute_hash()
+    cfg.hc_ll_optimized_loads = False
+    assert cfg.compute_hash() != before
+
+
 @pytest.mark.parametrize(
     "enabled,reason", [(False, "disabled_by_kernel_config"), (True, "requires_tp4")]
 )
@@ -37,5 +44,7 @@ def test_rejected_owner_does_not_allocate(monkeypatch, enabled, reason):
     owner = sm70_hc_ll.Sm70HcLLCommunicator(None, None, "tp")
     assert owner.status["reason"] == reason
     assert not owner.status["enabled"]
+    assert not owner.status["optimized_loads"]
+    assert owner.status["load_optimization_reason"] == reason
     assert owner.pointers is None
     owner.close()

@@ -422,13 +422,34 @@ class CudagraphDispatcher:
         self,
         batch_descriptor: BatchDescriptor,
     ) -> tuple[int, ...]:
+        if (
+            batch_descriptor.num_reqs is not None
+            and not batch_descriptor.uniform
+            and self.uniform_decode_query_len > 1
+            and "VLLM_SM70_MTP_CONTEXT_BUCKETS" in os.environ
+            and not self.cudagraph_mode.separate_routine()
+        ):
+            # FULL mode keys decode batches as non-uniform descriptors. Buckets
+            # are only dispatched with an attention context, which the runner
+            # supplies for uniform decode batches alone.
+            if batch_descriptor.num_tokens % self.uniform_decode_query_len == 0:
+                return self.sm70_mtp_context_buckets
+            return ()
+
         if not batch_descriptor.uniform or batch_descriptor.num_reqs is None:
             return ()
 
         if self.uniform_decode_query_len > 1:
-            if batch_descriptor.num_tokens == self.uniform_decode_query_len:
-                if "VLLM_SM70_MTP_CONTEXT_BUCKETS" in os.environ:
+            if "VLLM_SM70_MTP_CONTEXT_BUCKETS" in os.environ:
+                # Explicit MTP buckets apply to every uniform verification batch;
+                # the replayed bucket covers the longest request in the batch.
+                if (
+                    batch_descriptor.num_tokens
+                    == batch_descriptor.num_reqs * self.uniform_decode_query_len
+                ):
                     return self.sm70_mtp_context_buckets
+                return ()
+            if batch_descriptor.num_tokens == self.uniform_decode_query_len:
                 return self.sm70_dsv4_decode_context_buckets
             return ()
 
@@ -550,6 +571,8 @@ class CudagraphDispatcher:
                 if cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE:
                     batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
                 self.add_cudagraph_key(cudagraph_mode.mixed_mode(), batch_desc)
+                if cudagraph_mode.mixed_mode() == CUDAGraphMode.FULL:
+                    self._add_context_bucket_keys(batch_desc)
 
         # if decode cudagraph mode is FULL, and we don't already have mixed
         # mode full cudagraphs then add them here.

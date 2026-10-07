@@ -178,6 +178,21 @@ class EagleSpeculator:
         # Share a single pool between prefill and decode since they never
         # execute concurrently.
         self.decode_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
+        # Optionally record every draft decode step in one graph, so the
+        # per-step host work (slot mappings, metadata) leaves the critical path.
+        self.multistep_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
+        if (
+            cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
+            and self.num_speculative_steps > 2
+            and self.vllm_config.kernel_config.sm70_draft_single_graph
+        ):
+            self.multistep_cudagraph_manager = DecodeEagleCudaGraphManager(
+                self.vllm_config,
+                self.device,
+                cudagraph_mode,
+                decode_query_len=1,
+            )
+            self.multistep_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
 
     def load_model(self, target_model: nn.Module) -> None:
         target_attn_layer_names = get_layers_from_vllm_config(
@@ -438,6 +453,16 @@ class EagleSpeculator:
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
     ) -> None:
+        multistep = getattr(self, "multistep_cudagraph_manager", None)
+        if (
+            multistep is not None
+            and self.vllm_config.kernel_config.sm70_draft_single_graph
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and batch_desc in multistep.graphs
+        ):
+            multistep.run_fullgraph(batch_desc)
+            return
+
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
         idx_mapping = self.idx_mapping[:num_reqs]
@@ -481,6 +506,45 @@ class EagleSpeculator:
                     num_tokens_across_dp=num_tokens_across_dp,
                     cudagraph_runtime_mode=batch_desc.cg_mode,
                 )
+
+    def _generate_all_draft_steps(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        """Every draft decode step with its own slot mappings and metadata."""
+        del attn_metadata, slot_mappings
+        positions = self.input_buffers.positions[:num_reqs]
+        query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
+        idx_mapping = self.idx_mapping[:num_reqs]
+        for step in range(1, self.num_speculative_steps):
+            step_slot_mappings = self.block_tables.compute_slot_mappings(
+                idx_mapping,
+                query_start_loc,
+                positions,
+                num_tokens_padded,
+            )
+            step_slot_mappings_by_layer = build_slot_mappings_by_layer(
+                step_slot_mappings, self.kv_cache_config
+            )
+            step_attn_metadata = self._build_draft_attn_metadata(
+                num_reqs=num_reqs,
+                num_reqs_padded=num_reqs,
+                num_tokens_padded=num_tokens_padded,
+            )
+            self.current_draft_step.fill_(step)
+            self.generate_draft(
+                num_reqs,
+                num_tokens_padded,
+                step_attn_metadata,
+                step_slot_mappings_by_layer,
+                num_tokens_across_dp,
+                cudagraph_runtime_mode,
+            )
 
     def generate_draft(
         self,
@@ -604,6 +668,26 @@ class EagleSpeculator:
             )
         finally:
             self._mtp_decode_end()
+
+        multistep = getattr(self, "multistep_cudagraph_manager", None)
+        if multistep is not None:
+            self._mtp_decode_begin()
+            try:
+                multistep.capture(
+                    self._generate_all_draft_steps,
+                    self.model_state,
+                    self.input_buffers,
+                    self.block_tables,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                    progress_bar_desc="Capturing single-graph MTP draft decode",
+                )
+                logger.info(
+                    "Captured %d single-graph MTP draft decode shapes.",
+                    len(multistep.graphs),
+                )
+            finally:
+                self._mtp_decode_end()
 
     @torch.inference_mode()
     def propose(
