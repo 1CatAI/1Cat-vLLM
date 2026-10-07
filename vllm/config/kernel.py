@@ -482,6 +482,9 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    sm70_fp16_grouped_short_splits: bool = True
+    """Use K32 splits for FP16 q8/B1 grouped verification at 129..2048 tokens."""
+
     sm70_rmsnorm_gated_exact: bool | None = None
     """Native gated norm; auto follows the Flash-Next model quality boundary."""
 

@@ -1928,6 +1928,15 @@ __device__ __forceinline__ int grouped_verify_active_splits(
 }
 
 
+// Device lengths keep the short-context policy valid as a captured graph grows.
+__device__ __forceinline__ int fp16_grouped_active_splits(
+    int total_kv, int query_len, int requests) {
+  if (query_len == 8 && requests == 1 && total_kv > 128 && total_kv <= 2048)
+    return min(80, (total_kv + 31) / 32);
+  return grouped_verify_active_splits<8, false>(total_kv);
+}
+
+
 // Same SM70 matrix-A word map as the validated native prefill layout.
 __device__ __forceinline__ int grouped_a_offset(int row, int col, int width) {
   const int local_row = row & 15;
@@ -3322,6 +3331,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
 // FP16 KV verifier: one context read serves all query rows. Keep the
 // softmax probability, PV products, numerator and partition state in FP32.
 // Padded rows retain their explicit zero lengths throughout graph replay.
+template <bool SHORT_SPLITS>
 __global__
 __launch_bounds__(kGroupedVerifyThreads, 1)
 void flash_attention_grouped_verify_fp16_fp32_partial_kernel(
@@ -3338,7 +3348,9 @@ void flash_attention_grouped_verify_fp16_fp32_partial_kernel(
   int total = 0;
   for (int r = 0; r < query_len; r++) total = max(total, lengths[r]);
   if (total <= 0) return;
-  const int active = grouped_verify_active_splits<8, false>(total);
+  const int active = SHORT_SPLITS
+      ? fp16_grouped_active_splits(total, query_len, gridDim.y)
+      : grouped_verify_active_splits<8, false>(total);
   if (split >= active) return;
   const int tiles = (total + 31) / 32, base = tiles / active,
             extra = tiles % active;
@@ -3444,7 +3456,7 @@ void flash_attention_grouped_verify_fp16_fp32_partial_kernel(
   }
 }
 template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY, typename PARTIAL_T = __half,
-          bool ROW_SEQLENS = false>
+          bool ROW_SEQLENS = false, bool FP16_SHORT_SPLITS = false>
 __global__
 __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m2_combine_kernel(
     const PARTIAL_T* __restrict__ partial_out,
@@ -3486,7 +3498,9 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
     }
   }
   const int active_splits =
-      grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(total_kv);
+      FP16_SHORT_SPLITS
+          ? fp16_grouped_active_splits(total_kv, query_len, gridDim.z)
+          : grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(total_kv);
   __shared__ float split_lse[Traits::kSplits];
   __shared__ float split_sum[ROW_SEQLENS ? Traits::kSplits : 1];
   __shared__ float split_weight[Traits::kSplits];
@@ -5201,7 +5215,7 @@ at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
                                            const at::Tensor& block_table,
                                            const at::Tensor& row_lengths,
                                            at::Tensor& partial, at::Tensor& lse,
-                                           float scale) {
+                                           float scale, bool short_splits) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
                   q.is_contiguous() && q.dim() == 3 && q.size(0) >= 2 &&
                   q.size(1) == 6 && q.size(2) == 256,
@@ -5265,11 +5279,14 @@ at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
   TORCH_CHECK(properties->sharedMemPerBlockOptin >= sizeof(GroupedVerifySmem),
               "FP16 grouped workspace exceeds opt-in shared memory");
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto kernel = short_splits
+      ? flash_attention_grouped_verify_fp16_fp32_partial_kernel<true>
+      : flash_attention_grouped_verify_fp16_fp32_partial_kernel<false>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(
-      flash_attention_grouped_verify_fp16_fp32_partial_kernel,
+      kernel,
       cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(GroupedVerifySmem)));
   const int query_len = static_cast<int>(q.size(0) / batch_size);
-  flash_attention_grouped_verify_fp16_fp32_partial_kernel<<<
+  kernel<<<
       dim3(80, static_cast<unsigned>(batch_size)), kGroupedVerifyThreads,
       sizeof(GroupedVerifySmem), stream>>>(
       reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
@@ -5277,13 +5294,23 @@ at::Tensor private_grouped_fp16_fp32_paged(const at::Tensor& q,
       partial.data_ptr<float>(), lse.data_ptr<float>(), query_len,
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale);
-  flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
-      <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
-         kGroupedVerifyHeadDim, 0, stream>>>(
-          partial.data_ptr<float>(), lse.data_ptr<float>(),
-          row_lengths.data_ptr<int>(),
-          reinterpret_cast<__half*>(out.data_ptr()), query_len,
-          row_lengths.data_ptr<int>());
+  if (short_splits) {
+    flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true, true>
+        <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
+           kGroupedVerifyHeadDim, 0, stream>>>(
+            partial.data_ptr<float>(), lse.data_ptr<float>(),
+            row_lengths.data_ptr<int>(),
+            reinterpret_cast<__half*>(out.data_ptr()), query_len,
+            row_lengths.data_ptr<int>());
+  } else {
+    flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
+        <<<dim3(query_len, 6, static_cast<unsigned>(batch_size)),
+           kGroupedVerifyHeadDim, 0, stream>>>(
+            partial.data_ptr<float>(), lse.data_ptr<float>(),
+            row_lengths.data_ptr<int>(),
+            reinterpret_cast<__half*>(out.data_ptr()), query_len,
+            row_lengths.data_ptr<int>());
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
@@ -5309,10 +5336,10 @@ at::Tensor sm70_grouped_fp16_entry(const at::Tensor& q, const at::Tensor& k,
                                    const at::Tensor& block_table,
                                    const at::Tensor& row_lengths,
                                    at::Tensor& partial, at::Tensor& lse,
-                                   double scale) {
+                                   double scale, bool short_splits) {
   return private_grouped_fp16_fp32_paged(q, k, v, out, block_table, row_lengths,
                                          partial, lse,
-                                         static_cast<float>(scale));
+                                         static_cast<float>(scale), short_splits);
 }
 }  // namespace
 
@@ -5320,7 +5347,9 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
   ops.def(
       "sm70_grouped_fp16_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
       "Tensor block_table, Tensor row_lengths, Tensor(b!) partial, "
-      "Tensor(c!) lse, float scale) -> Tensor(a!)");
+      "Tensor(c!) lse, float scale, bool short_splits=True) -> Tensor(a!)");
+  ops.def("sm70_grouped_fp16_short_split_revision() -> int",
+          []() -> int64_t { return 1; });
   // The runtime-page specialization is compiled alongside the fixed pages.
   // Python uses this capability to avoid widening admission for stale DSOs.
   ops.def("sm70_grouped_long_page_revision() -> int",
