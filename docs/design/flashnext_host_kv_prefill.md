@@ -137,3 +137,29 @@ The isolated helper completed real PLE weight discovery/loading without Torch
 CUDA initialization or a NVML allocation. Startup cancellation now also checks
 the parent shutdown event while waiting for GPU registration; a loader failure
 must not leave the helper blocked indefinitely with retained resources.
+
+## HC peak during a real 16K chunk
+
+The memory fixes completed loading and graph initialization, with 29.45 GiB/rank
+of active Torch allocations and about 0.98 GiB device free. The first real 16K
+chunk then reached HC gate-mix and failed allocating its 80 MiB output. Torch
+allocations had risen to 30.45 GiB; attention still had not executed.
+
+For 16K rows, the four-stream hidden, normalized hidden and full gate are each
+320 MiB. `prefill_hc_chunk_size=4096` bounds projection intermediates, and bounds
+combine/norm intermediates inside the existing opaque HCX fallback. It retains
+full outputs, FP16 materialization and FP32 accumulation. M1/M5/M20 dispatch is
+unchanged; zero disables blocking. The scheduling chunk remains 16K.
+
+A same-card real-weight microbenchmark measured:
+
+| 16K rows | Full temporary peak | Blocked temporary peak | Full GPU time | Blocked GPU time |
+| --- | ---: | ---: | ---: | ---: |
+| Projection | 420.50 MiB | 185.25 MiB | 4.56 ms | 5.45 ms |
+| Combine + projection | 1060.50 MiB | 665.25 MiB | 6.32 ms | 8.09 ms |
+
+All returned tensors matched bitwise in this microbenchmark. Blocking is a
+capacity fix with a measured operator slowdown; no prefill-throughput gain is
+claimed. Model timing and the 32K throughput target remain pending. Both
+attention policies are now warmed before the timed ABBA sequence to exclude
+first-use compilation from the comparison.

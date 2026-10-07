@@ -545,6 +545,9 @@ class KernelConfig:
     hc_ll_optimized_loads: bool = True
     """Prefetch HC down weights and pad the up shared-memory rows on SM70."""
 
+    prefill_hc_chunk_size: int = 4096
+    """Bound large SM70 FP16 HC intermediates by rows; zero disables blocking."""
+
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
     collective_kernel_selections: dict[str, Any] = Field(

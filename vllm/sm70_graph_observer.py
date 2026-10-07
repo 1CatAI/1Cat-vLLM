@@ -174,6 +174,78 @@ class GraphParityWorkerExtension:
             torch.accelerator.reset_peak_memory_stats()
         return result
 
+    def read_prefill_storages(self):
+        """Inventory live device storage, separating mapped host aliases."""
+        import torch
+        from cuda.bindings import runtime
+
+        from vllm.model_executor.layers.quantization import gguf_dense_hmma
+
+        seen = set()
+        storages = {}
+        errors = []
+
+        def walk(value, owner, depth=0):
+            if isinstance(value, torch.nn.parameter.UninitializedParameter):
+                return
+            if isinstance(value, torch.Tensor):
+                if value.is_cuda and value.numel():
+                    storage = value.untyped_storage()
+                    key = (value.device.index, storage.data_ptr())
+                    if key not in storages:
+                        error, attributes = runtime.cudaPointerGetAttributes(key[1])
+                        if error != runtime.cudaError_t.cudaSuccess:
+                            errors.append({"owner": owner, "error": int(error)})
+                        else:
+                            storages[key] = {
+                                "bytes": storage.nbytes(),
+                                "memory_type": int(attributes.type),
+                                "owners": [],
+                                "shape": list(value.shape),
+                                "dtype": str(value.dtype),
+                            }
+                    if key in storages and owner not in storages[key]["owners"]:
+                        storages[key]["owners"].append(owner)
+                return
+            if id(value) in seen or depth > 24:
+                return
+            seen.add(id(value))
+            items: Any
+            if isinstance(value, dict):
+                items = value.items()
+            elif isinstance(value, (list, tuple)):
+                items = enumerate(value)
+            elif isinstance(value, torch.nn.Module) or type(
+                value
+            ).__module__.startswith("vllm."):
+                items = vars(value).items() if hasattr(value, "__dict__") else ()
+            else:
+                return
+            for name, child in items:
+                walk(child, owner + "." + str(name), depth + 1)
+
+        walk(self.model_runner, "runner")
+        walk(gguf_dense_hmma._workspaces, "gguf_dense_workspaces")
+        records = sorted(storages.values(), key=lambda value: -value["bytes"])
+        return {
+            "rank": self.rank,
+            "scope": "reachable Python tensors; excludes native-only allocations",
+            "device_storage_bytes": sum(
+                value["bytes"]
+                for value in records
+                if value["memory_type"]
+                == int(runtime.cudaMemoryType.cudaMemoryTypeDevice)
+            ),
+            "mapped_host_storage_bytes": sum(
+                value["bytes"]
+                for value in records
+                if value["memory_type"]
+                == int(runtime.cudaMemoryType.cudaMemoryTypeHost)
+            ),
+            "storages": records,
+            "pointer_errors": errors,
+        }
+
     def set_gguf_prefill_routing_policy(self, enabled: bool):
         """Compare routing between completed requests without reloading weights."""
         if type(enabled) is not bool:

@@ -82,6 +82,8 @@ def main():
             "read_prefill_memory", args=(True,)
         )
         save()
+        report["initialized_storages"] = llm.collective_rpc("read_prefill_storages")
+        save()
         tokenizer = llm.get_tokenizer()
         unit = tokenizer.encode(
             "请阅读以下技术文档，并概括其中的核心观点。模型推理的性能受计算效率、"
@@ -97,13 +99,19 @@ def main():
             if args.compare == "host-prefill"
             else "set_gguf_prefill_routing_policy"
         )
-        report["baseline_policy"] = llm.collective_rpc(method, args=(False,))
-        warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
-        report["warmup_output_ids"] = warmup.outputs[0].token_ids
-        report["warmup_memory"] = llm.collective_rpc(
-            "read_prefill_memory", args=(True,)
-        )
-        save()
+        report["warmups"] = []
+        for enabled in (False, True):
+            policy = llm.collective_rpc(method, args=(enabled,))
+            warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
+            report["warmups"].append(
+                dict(
+                    enabled=enabled,
+                    policy=policy,
+                    output_ids=warmup.outputs[0].token_ids,
+                    memory=llm.collective_rpc("read_prefill_memory", args=(True,)),
+                )
+            )
+            save()
         for enabled in (False, True, True, False):
             policy = llm.collective_rpc(method, args=(enabled,))
             before_memory = llm.collective_rpc("read_prefill_memory", args=(True,))
@@ -150,7 +158,10 @@ def main():
                     )
                     save()
         report["matching_output_ids"] = (
-            len({tuple(row["output_ids"]) for row in report["rows"]}) == 1
+            len(
+                {tuple(row["output_ids"]) for row in report["warmups"] + report["rows"]}
+            )
+            == 1
         )
         report["complete"] = True
         save()

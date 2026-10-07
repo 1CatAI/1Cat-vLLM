@@ -516,6 +516,18 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         else [],
         "paths": paths,
     }
+    hc_rows = cfg.kernel_config.prefill_hc_chunk_size
+    report["prefill_hc_blocking"] = {
+        "enabled": sm70 and hc_rows > 0,
+        "reason": None
+        if sm70 and hc_rows > 0
+        else ("requires_sm70" if not sm70 else "disabled_by_kernel_policy"),
+        "scope": "temporary_hc_allocation",
+        "operator": "FP16 HC projection and opaque combine row blocking",
+        "chunk_rows": hc_rows,
+        "runtime_guards": "FP16 dense HC; M exceeds chunk rows; HCX for combine",
+        "precision": "FP16 materialization and FP32 GEMM accumulation",
+    }
     report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
     report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
     report["moe_kernel_selections"] = cfg.kernel_config.moe_kernel_selections

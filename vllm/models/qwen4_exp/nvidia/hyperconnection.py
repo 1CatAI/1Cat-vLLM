@@ -240,6 +240,37 @@ class GatedResidual(nn.Module):
         prev_block_output: torch.Tensor,
         prev_injection: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # HCX already supplies an opaque runtime boundary for these modules.
+        # Keep full outputs but avoid full-batch norm and gate intermediates.
+        from .sm70_fp16_hc import _hc_prefill_chunk_size
+
+        chunk_size = _hc_prefill_chunk_size(hidden_states.shape[0])
+        if (
+            chunk_size
+            and self.use_combine
+            and getattr(self, "_partial_inputs", False)
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.float16
+        ):
+            hidden = torch.empty_like(hidden_states)
+            block = hidden_states.new_empty((hidden_states.shape[0], self.hidden_size))
+            injection = hidden_states.new_empty((hidden_states.shape[0], self.hc_count))
+            for start in range(0, hidden_states.shape[0], chunk_size):
+                stop = min(start + chunk_size, hidden_states.shape[0])
+                part, xn = hc_combine_norm(
+                    hidden_states[start:stop],
+                    prev_block_output[start:stop],
+                    prev_injection[start:stop],
+                    self.hc_norm.weight,
+                    self.config.rms_norm_eps,
+                    self.hc_count,
+                )
+                block_part, inject_part = self._project(xn)
+                hidden[start:stop].copy_(part)
+                block[start:stop].copy_(block_part)
+                injection[start:stop].copy_(inject_part)
+                del part, xn, block_part, inject_part
+            return hidden, block, injection
         hidden_states, xn = hc_combine_norm(
             hidden_states,
             prev_block_output,

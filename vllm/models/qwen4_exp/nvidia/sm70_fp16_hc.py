@@ -9,7 +9,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -533,14 +533,10 @@ def _qwen38_sm70_fp16_fused_hc(
         # for prefill and any unsupported runtime shape. This fallback lives
         # inside the opaque op so a prefill-first dynamic compile cannot bake
         # the M > 1 decision into subsequent decode graphs.
-        down_and_injection = torch.nn.functional.linear(x, down_weight)
-        lora = torch.ops.vllm.qwen4_exp_hc_silu(
-            down_and_injection[..., :_HC_RANK], _HC_COUNT
-        )
-        injection = down_and_injection[..., _HC_RANK : _HC_RANK + _HC_COUNT]
-        gate = torch.nn.functional.linear(lora, up_weight)
-        block = torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, _HC_COUNT)
-        return block, injection
+        chunk_size = _hc_prefill_chunk_size(x.shape[0])
+        if chunk_size and x.is_cuda and x.dtype == torch.float16:
+            return _blocked_hc_projection(x, down_weight, up_weight, chunk_size)
+        return _dense_hc_projection(x, down_weight, up_weight)
     try:
         from vllm.distributed.parallel_state import get_tp_group
 
@@ -681,6 +677,35 @@ direct_register_custom_op(
     op_func=_qwen38_sm70_fp16_fused_hc,
     fake_impl=_qwen38_sm70_fp16_fused_hc_fake,
 )
+
+
+def _hc_prefill_chunk_size(rows: int) -> int:
+    config = get_current_vllm_config_or_none()
+    size = config.kernel_config.prefill_hc_chunk_size if config is not None else 4096
+    return size if size > 0 and rows > size else 0
+
+
+def _dense_hc_projection(x, down_weight, up_weight):
+    from .ops.hc import hc_gate_mix, hc_silu
+
+    down_and_injection = torch.nn.functional.linear(x, down_weight)
+    lora = hc_silu(down_and_injection[..., :_HC_RANK], _HC_COUNT)
+    injection = down_and_injection[..., _HC_RANK : _HC_RANK + _HC_COUNT]
+    gate = torch.nn.functional.linear(lora, up_weight)
+    block = hc_gate_mix(x, gate, _HC_COUNT)
+    return block, injection
+
+
+def _blocked_hc_projection(x, down_weight, up_weight, chunk_size):
+    block = x.new_empty((x.shape[0], _HC_DIM))
+    injection = x.new_empty((x.shape[0], _HC_COUNT))
+    for start in range(0, x.shape[0], chunk_size):
+        stop = min(start + chunk_size, x.shape[0])
+        part, inject = _dense_hc_projection(x[start:stop], down_weight, up_weight)
+        block[start:stop].copy_(part)
+        injection[start:stop].copy_(inject)
+        del part, inject
+    return block, injection
 
 
 def maybe_apply_qwen38_sm70_fp16_fused_hc(
