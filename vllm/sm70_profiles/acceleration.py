@@ -532,6 +532,15 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": cfg.kernel_config.qsa_auto_e4m3_reason,
         "scope": "calibrated_cache_storage",
     }
+    report["qsa_host_kv"] = {
+        "enabled": cfg.kernel_config.qsa_host_kv_active,
+        "reason": cfg.kernel_config.qsa_host_kv_reason,
+        "scope": "active_attention_history",
+        "host_dtype": "per-vector E4M3 with FP32 scales",
+        "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
+        "attention_staging_dtype": "float16",
+        "recurrent_state_storage": "device",
+    }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {
         "scope": "indexed_sparse_attention",

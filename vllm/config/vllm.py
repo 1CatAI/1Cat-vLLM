@@ -1619,6 +1619,14 @@ class VllmConfig:
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
 
+        from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_host_kv
+
+        if resolve_qsa_host_kv(self):
+            logger.info_once(
+                "QSA host KV enabled: per-vector E4M3 history, bounded device "
+                "hot pages and FP16 staging; active recurrent states stay on GPU."
+            )
+
         from vllm.model_executor.models.config import (
             sm70_dflash2_nvfp4_qualified,
             sm70_flash_next_batch_qualified,

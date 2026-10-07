@@ -15,6 +15,7 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -66,6 +67,8 @@ from ..common.qsa_cache import (
     qsa_dcp_block_geometry,
 )
 from .indexer_qsa import QSAIndexer
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -274,6 +277,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
+        if getattr(layer, "host_kv_enabled", False):
+            if query_positions is None or sequence_lengths is None:
+                raise RuntimeError(
+                    "Host QSA requires exact positions and sequence lengths"
+                )
+            layer.host_kv_forward(
+                query[:num_tokens],
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                query_positions[:num_tokens],
+                sequence_lengths,
+                output[:num_tokens],
+                output_gate,
+            )
+            return output
         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
         # [num_blocks, 2, block_size, num_kv_heads, head_size].
         key_cache, value_cache = kv_cache.unbind(1)
@@ -575,12 +594,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
+        self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
+        self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
         if self.kv_cache_dtype not in ("fp8", "fp8_e4m3") and (
             self.kv_cache_torch_dtype != model_config.dtype
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
             )
+        if self.host_kv_enabled:
+            self.kv_cache_torch_dtype = torch.uint8
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -712,12 +735,63 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if self.host_kv_enabled:
+            from .ops.host_kv import HostQSAKV
+
+            self.host_kv = HostQSAKV(
+                kv_cache.shape[0],
+                kv_cache.shape[2],
+                self.head_dim,
+                kv_cache.device,
+                hot_tokens=self.host_kv_hot_tokens,
+                history=kv_cache,
+                width=self.indexer.output_width,
+            )
+            logger.info_once(
+                "QSA host per-vector E4M3 initialized: hot_tokens=%d; "
+                "FP16 staging shared across serial attention owners.",
+                self.host_kv_hot_tokens,
+            )
+
+    def host_kv_forward(
+        self, query, indices, table, requests, positions, lengths, output, gate
+    ) -> None:
+        from .ops.qsa import qsa_sparse_paged_attention
+
+        state = self.host_kv
+        for start in range(0, query.shape[0], state.rows):
+            stop = min(start + state.rows, query.shape[0])
+            k, v, selected = state.gather(
+                indices[start:stop],
+                table,
+                requests[start:stop],
+                positions[start:stop],
+                lengths,
+            )
+            rows = stop - start
+            qsa_sparse_paged_attention(
+                query[start:stop],
+                k,
+                v,
+                selected,
+                state.table[:rows],
+                state.requests[:rows],
+                output[start:stop],
+                output_gate=gate[start:stop] if gate is not None else None,
+                query_positions=state.positions[:rows],
+                sequence_lengths=state.lengths[:rows],
+                kv_cache_dtype="float16",
+            )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size, _, dcp_sharded = qsa_dcp_block_geometry(
             vllm_config, self.layer_name
         )
         return FullAttentionSpec(
             block_size=block_size,
+            host_backed=self.host_kv_enabled,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
@@ -801,13 +875,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             selected,
         )
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        impl.do_kv_cache_update(
-            self,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata.slot_mapping,
-        )
+        if self.host_kv_enabled:
+            self.host_kv.write(key, value, main_metadata.slot_mapping)
+        else:
+            impl.do_kv_cache_update(
+                self,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata.slot_mapping,
+            )
         impl.forward_qsa(
             self,
             query,

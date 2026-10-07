@@ -556,6 +556,15 @@ class KernelConfig:
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
     """Startup reason when calibrated automatic storage cannot be selected."""
 
+    qsa_host_kv: bool = False
+    """Keep QSA attention history in pinned host E4M3 storage on SM70."""
+    qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
+    """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_active: bool = Field(default=False, init=False)
+    """Whether the host QSA cache geometry has been admitted."""
+    qsa_host_kv_reason: str | None = Field(default=None, init=False)
+    """Reason the requested host QSA storage is unavailable."""
+
     ple_disk_cascade: bool = True
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
     ple_disk_release_pages: bool = False
@@ -630,6 +639,7 @@ class KernelConfig:
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
+            "qsa_host_kv_reason",
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")

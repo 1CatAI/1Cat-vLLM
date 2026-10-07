@@ -10,6 +10,52 @@ from vllm.sm70_graph_observer import GraphParityWorkerExtension
 
 
 class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
+    def read_host_kv_memory(self):
+        """Read storage accounting and cache counters outside timed replay."""
+        runner = self.model_runner
+        config = runner.kv_cache_config
+        owners = []
+        staging = {}
+        for name, module in runner.model.named_modules():
+            state = getattr(module, "host_kv", None)
+            if state is None:
+                continue
+            tensors = [
+                state.codes,
+                state.hot_scales,
+                state.tags,
+                state.stamps,
+                state.locks,
+                state.hands,
+                state.epoch,
+                state._stats,
+            ]
+            staging[state.staging.untyped_storage().data_ptr()] = (
+                state.staging.untyped_storage().nbytes()
+            )
+            owners.append(
+                {
+                    "layer": name,
+                    "host_bytes": state.history.numel() + state.host_scales.nbytes,
+                    "device_hot_bytes": sum(t.nbytes for t in tensors),
+                    "stats": state.stats.cpu().tolist(),
+                }
+            )
+        return {
+            "rank": self.rank,
+            "blocks": config.num_blocks,
+            "host_pool_bytes": sum(
+                t.size for t in config.kv_cache_tensors if t.host_backed
+            ),
+            "device_pool_bytes": sum(
+                t.size for t in config.kv_cache_tensors if not t.host_backed
+            ),
+            "shared_staging_bytes": sum(staging.values()),
+            "owners": owners,
+            "torch_allocated_bytes": torch.accelerator.memory_allocated(),
+            "torch_reserved_bytes": torch.accelerator.memory_reserved(),
+        }
+
     def start_teacher_capture(self, directory: str, key: str):
         if hasattr(self, "_teacher_original_execute"):
             raise RuntimeError("Teacher capture is already active")

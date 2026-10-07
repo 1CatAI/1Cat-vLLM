@@ -182,6 +182,10 @@ def main():
         )
         if any(r["decode_cudagraph_mode"] != "FULL" for r in report["worker_routes"]):
             raise RuntimeError("Actual FULL target decode graph is required")
+        if args.teacher_forcing:
+            report["worker_memory_initial"] = llm.collective_rpc(
+                "read_host_kv_memory", timeout=30
+            )
         if not _metric_snapshot(llm):
             raise RuntimeError("Acceptance counters are unavailable before requests")
         tokenizer = llm.get_tokenizer()
@@ -440,6 +444,10 @@ def main():
                     )
                 )
                 save()
+        if args.teacher_forcing:
+            report["worker_memory_final"] = llm.collective_rpc(
+                "read_host_kv_memory", timeout=30
+            )
         report["complete"] = True
         save()
     finally:
