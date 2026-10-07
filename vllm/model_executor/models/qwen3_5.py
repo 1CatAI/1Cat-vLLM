@@ -693,7 +693,9 @@ class Qwen3_5Model(Qwen3NextModel):
             config.hidden_size,
             quant_config=(
                 quant_config
-                if quant_config is not None and quant_config.get_name() == "gguf"
+                if quant_config is not None
+                and quant_config.get_name() == "gguf"
+                and not config.tie_word_embeddings
                 else None
             ),
             prefix=maybe_prefix(prefix, "embed_tokens"),

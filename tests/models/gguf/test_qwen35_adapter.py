@@ -296,3 +296,25 @@ def test_packed_embedding_keeps_overflow_rejection():
                 torch.float16,
             )
         )
+
+
+def test_tied_quantized_embedding_keeps_dense_head_precision():
+    values = np.linspace(-2, 2, 12 * 256, dtype=np.float32).reshape(12, 256)
+    data = gguf.quants.quantize(values, gguf.GGMLQuantizationType.Q8_0)
+    tensor = SimpleNamespace(
+        data=data, tensor_type=gguf.GGMLQuantizationType.Q8_0, shape=[256, 12]
+    )
+    cfg = config()
+    adapter = Qwen35Adapter(cfg)
+    # GGUFLoader resolves a missing output.weight after adapter construction.
+    cfg.tie_word_embeddings = True
+    weights = list(
+        adapter.weights(
+            {"token_embd.weight": tensor},
+            {"token_embd.weight": "model.embed_tokens.weight"},
+            torch.float16,
+        )
+    )
+    assert len(weights) == 1 and weights[0][0] == "model.embed_tokens.weight"
+    expected = torch.from_numpy(gguf.quants.dequantize(data, tensor.tensor_type)).half()
+    torch.testing.assert_close(weights[0][1], expected, rtol=0, atol=0)
