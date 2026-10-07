@@ -50,3 +50,40 @@ def test_mtp_checkpoint_skip_matches_io_sharing(shared):
         assert model.skip_checkpoint_weight(name) == shared
     assert not model.skip_checkpoint_weight("mtp.fc_embedding.weight")
     assert model.skip_checkpoint_weight("model.layers.1.mlp.experts.w13_weight")
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+@pytest.mark.parametrize("offload_worker", [False, True])
+def test_hc_staging_avoids_replicated_device_allocations(
+    monkeypatch, default_vllm_config, sharded, offload_worker
+):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.model_executor.model_loader.utils import device_loading_context
+    from vllm.models.qwen4_exp.common.hyperconnection import HyperConnectionConfig
+    from vllm.models.qwen4_exp.nvidia import hyperconnection as module
+
+    runtime = SimpleNamespace(
+        kernel_config=SimpleNamespace(
+            hc_weight_storage="sharded" if sharded else "replicated"
+        )
+    )
+    monkeypatch.setattr(module, "get_current_vllm_config_or_none", lambda: runtime)
+    monkeypatch.setattr(module, "is_offload_process", lambda: offload_worker)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(linear, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 4)
+    with torch.device("meta"):
+        hc = module.GatedResidual(
+            HyperConnectionConfig(
+                hidden_size=8, hc_lowrank=4, params_dtype=torch.float16
+            )
+        )
+    staged = sharded and not offload_worker
+    for layer in (hc.input_mix_weight_down_block_inject, hc.input_mix_weight_up):
+        assert layer.weight.device.type == ("cpu" if staged else "meta")
+        assert getattr(layer.weight, "_vllm_keep_on_cpu", False) == staged
+        if staged:
+            with device_loading_context(layer, torch.device("cuda")):
+                assert layer.weight.device.type == "cpu"
