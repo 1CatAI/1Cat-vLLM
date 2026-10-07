@@ -4,6 +4,7 @@
 
 import ast
 import builtins
+import importlib.util
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -71,6 +72,10 @@ def test_page_abi_dispatch(
         Path(__file__).parents[3]
         / "flash-attention-v100/flash_attn_v100/flash_attn_interface.py"
     )
+    if not source.is_file():
+        spec = importlib.util.find_spec("flash_attn_v100")
+        assert spec is not None and spec.origin is not None
+        source = Path(spec.origin).with_name("flash_attn_interface.py")
     parsed = ast.parse(source.read_text())
     functions: list[ast.stmt] = [
         node
