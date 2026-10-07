@@ -533,15 +533,22 @@ class Gemma4MTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
 
 class Gemma4ModelArchConfigConvertor(ModelArchConfigConvertorBase):
     def is_mm_prefix_lm(self) -> bool:
-        return (
-            getattr(self.hf_text_config, "use_bidirectional_attention", None)
-            == "vision"
-        )
+        # use_bidirectional_attention="vision" describes the vision
+        # encoder's self-attention pattern, not the text model's.
+        # Gemma-4 text is standard causal — no mm_prefix_lm.
+        return False
 
     def get_head_size(self) -> int:
         # Gemma4 uses dual head dimensions: head_dim (sliding attention)
         # and global_head_dim (full attention).  Return the largest so
         # that attention backends allocate buffers large enough for both.
+        # transformers >=5.18 treats head_dim as a per-layer attribute and
+        # raises AmbiguousGlobalPerLayerAttributeError on global access;
+        # suppress it by enabling the escape hatch.
+        try:
+            self.hf_text_config.allow_global_per_layer_attribute_access = True
+        except (AttributeError, TypeError):
+            pass
         head_dim = getattr(self.hf_text_config, "head_dim", 0)
         global_head_dim = getattr(self.hf_text_config, "global_head_dim", 0)
         return max(head_dim, global_head_dim) or super().get_head_size()

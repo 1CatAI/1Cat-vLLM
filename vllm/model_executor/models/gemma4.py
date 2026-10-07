@@ -211,7 +211,28 @@ def _get_text_config(config):
     transparently returns the text config regardless of nesting.
     """
     if hasattr(config, "text_config"):
-        return config.text_config
+        tc = config.text_config
+        # transformers >=5.18 intercepts __getattribute__ for per-layer
+        # attrs; set the escape hatch before any other access.
+        try:
+            tc.allow_global_per_layer_attribute_access = True
+        except (AttributeError, TypeError):
+            pass
+        # Gemma4TextConfig dataclass does not declare global_head_dim as a
+        # field, so the value is silently dropped when loading from JSON.
+        # Read it from the raw config.json file.
+        try:
+            import json as _json, os as _os
+            _path = getattr(config, "_name_or_path", None)
+            if _path and _os.path.isdir(_path):
+                with open(_os.path.join(_path, "config.json")) as _f:
+                    _raw = _json.load(_f)
+                _tc_raw = _raw.get("text_config", _raw)
+                if "global_head_dim" in _tc_raw:
+                    tc.global_head_dim = _tc_raw["global_head_dim"]
+        except Exception:
+            pass
+        return tc
     return config
 
 
@@ -556,11 +577,18 @@ class Gemma4DecoderLayer(nn.Module):
         layer_idx = extract_layer_index(prefix)
         self.layer_idx = layer_idx
 
-        # Gemma4 uses different head dimensions for sliding vs full attention
+        # Gemma4 uses different head dimensions for sliding vs full attention.
+        # Set the escape hatch before accessing head_dim (transformers >=5.18
+        # raises AmbiguousGlobalPerLayerAttributeError on global access).
+        try:
+            config.allow_global_per_layer_attribute_access = True
+        except (AttributeError, TypeError):
+            pass
         layer_type = config.layer_types[layer_idx]
         self.is_full_attention = layer_type == "full_attention"
         if self.is_full_attention:
-            head_dim = getattr(config, "global_head_dim", config.head_dim)
+            global_hd = getattr(config, "global_head_dim", None)
+            head_dim = global_hd if global_hd is not None else config.head_dim
         else:
             head_dim = config.head_dim
 
@@ -592,6 +620,7 @@ class Gemma4DecoderLayer(nn.Module):
             attn_logits_soft_cap=getattr(config, "attn_logit_softcapping", None),
             prefix=f"{prefix}.self_attn",
         )
+
 
         # Compute per-layer intermediate_size from config.
         # When use_double_wide_mlp is set, intermediate_size doubles for
@@ -962,6 +991,29 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         self.config = config
+
+        # Gemma4TextConfig dataclass does not declare global_head_dim or
+        # num_global_key_value_heads, so they're silently dropped from the
+        # JSON. Read them from the model's config.json file.
+        try:
+            config.allow_global_per_layer_attribute_access = True
+        except (AttributeError, TypeError):
+            pass
+        _need_ghd = not hasattr(config, "global_head_dim")
+        _need_gkv = not hasattr(config, "num_global_key_value_heads")
+        if _need_ghd or _need_gkv:
+            _model_path = vllm_config.model_config.model
+            import json as _json, os as _os
+            _cfg_file = _os.path.join(_model_path, "config.json")
+            if _os.path.isfile(_cfg_file):
+                with open(_cfg_file) as _f:
+                    _raw = _json.load(_f)
+                _tc_raw = _raw.get("text_config", _raw)
+                if _need_ghd and "global_head_dim" in _tc_raw:
+                    config.global_head_dim = _tc_raw["global_head_dim"]
+                if _need_gkv and "num_global_key_value_heads" in _tc_raw:
+                    config.num_global_key_value_heads = _tc_raw["num_global_key_value_heads"]
+        
         self.quant_config = quant_config
 
         # PLE config values (default to 0 if not present — disables PLE)
