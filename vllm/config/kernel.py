@@ -377,6 +377,8 @@ class Sm70GgufConfig:
 
     embedding_storage: Literal["dense", "original"] = "dense"
     """Keep a dense token embedding or decode its original GGUF rows on lookup."""
+    dequant_workspace_bytes: int = Field(default=32 * 1024**2, ge=1024**2)
+    """Bound dequantized matrix chunks for the original dense storage policy."""
 
     projection_planes: bool = True
     """Use measured M8 shared-activation projection planes with canonical fallback."""

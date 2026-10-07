@@ -236,6 +236,7 @@ def _fused_mul_mat_gguf(
     native_enabled: bool = True,
     prefill_min_m: int = 8,
     prefer_native: bool = False,
+    max_dequant_bytes: int = 0,
 ) -> torch.Tensor:
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
@@ -252,7 +253,9 @@ def _fused_mul_mat_gguf(
     # operators are fallbacks for missing formats and explicit benchmark
     # candidates; TurboMind supplies the primary accelerated GGUF routes.
     if native_enabled and (prefer_native or qweight_type not in DEQUANT_TYPES):
-        native_result = native_dense(x, qweight, qweight_type, prefill_min_m)
+        native_result = native_dense(
+            x, qweight, qweight_type, prefill_min_m, max_dequant_bytes
+        )
         if native_result is not None:
             return native_result
     # enable MMVQ in contiguous batching with batch_size=1
@@ -293,6 +296,7 @@ def _fused_mul_mat_gguf_fake(
     native_enabled: bool = True,
     prefill_min_m: int = 8,
     prefer_native: bool = False,
+    max_dequant_bytes: int = 0,
 ) -> torch.Tensor:
     return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
 
@@ -545,6 +549,11 @@ class GGUFLinearMethod(LinearMethodBase):
         self.native_enabled = policy.enabled if policy is not None else True
         self.prefill_min_m = policy.prefill_min_m if policy is not None else 8
         self.dense_storage = getattr(policy, "dense_storage", "canonical")
+        self.max_dequant_bytes = (
+            getattr(policy, "dequant_workspace_bytes", 32 * 1024**2)
+            if self.dense_storage == "original"
+            else 0
+        )
         self.native_prepared = False
         self.canonical_projections = ()
 
@@ -1055,6 +1064,7 @@ class GGUFLinearMethod(LinearMethodBase):
                         self.native_enabled,
                         self.prefill_min_m,
                         self.dense_storage == "original",
+                        self.max_dequant_bytes,
                     )
                     for weight, weight_type in zip(weights, types)
                 ],
@@ -1081,6 +1091,7 @@ class GGUFLinearMethod(LinearMethodBase):
                         self.native_enabled,
                         self.prefill_min_m,
                         self.dense_storage == "original",
+                        self.max_dequant_bytes,
                     )
                 )
             out = torch.cat(result, axis=1)
@@ -1094,6 +1105,7 @@ class GGUFLinearMethod(LinearMethodBase):
                 self.native_enabled,
                 self.prefill_min_m,
                 self.dense_storage == "original",
+                self.max_dequant_bytes,
             )
         if bias is not None:
             out.add_(bias)

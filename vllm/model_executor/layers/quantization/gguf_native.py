@@ -130,6 +130,7 @@ def native_dense(
     weight: torch.Tensor,
     weight_type: int,
     prefill_min_m: int = 8,
+    max_dequant_bytes: int = 0,
 ) -> torch.Tensor | None:
     if weight_type not in NATIVE_TYPES or not native_available():
         return None
@@ -146,12 +147,30 @@ def native_dense(
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     volta = current_platform.is_device_capability((7, 0), device_id=device_index)
-    if (capabilities & 16) and volta and x.shape[0] >= prefill_min_m:
+
+    def blas():
+        if max_dequant_bytes:
+            block, size = quant_size(weight_type)
+            k = weight.shape[-1] // size * block
+            rows = max(1, max_dequant_bytes // (k * x.element_size()))
+            if rows < weight.shape[0]:
+                output = x.new_empty((x.shape[0], weight.shape[0]))
+                for start in range(0, weight.shape[0], rows):
+                    end = min(start + rows, weight.shape[0])
+                    output[:, start:end].copy_(
+                        native.ggml_dense_blas(
+                            weight[start:end], x, weight_type, end - start
+                        )
+                    )
+                return output
         return native.ggml_dense_blas(weight, x, weight_type, weight.shape[0])
+
+    if (capabilities & 16) and volta and x.shape[0] >= prefill_min_m:
+        return blas()
     if capabilities & 4:
         return native.ggml_dense_mmvq(weight, x, weight_type, weight.shape[0])
     if capabilities & 16:
-        return native.ggml_dense_blas(weight, x, weight_type, weight.shape[0])
+        return blas()
     if (capabilities & 8) and not volta:
         return native.ggml_dense_mmq(weight, x, weight_type, weight.shape[0])
     return None
