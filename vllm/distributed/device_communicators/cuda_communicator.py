@@ -27,6 +27,22 @@ _SEEN_TP_ALLREDUCE_PATHS: set[tuple[str, str, tuple[int, ...], torch.dtype, int]
 )
 
 
+def _sm70_tp4_long_prefill_buffer_bytes() -> int:
+    """Provision the fused collective for this engine's token envelope."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None:
+        return _SM70_TP4_LONG_PREFILL_BUFFER_BYTES
+    max_tokens = max(
+        config.scheduler_config.max_num_batched_tokens,
+        config.compilation_config.max_cudagraph_capture_size or 0,
+    )
+    # Keep ordinary custom-AR's 8-MiB capacity and the fused kernel's existing
+    # 8192-row limit. Capture may pad beyond the scheduler's live token count.
+    return max(8192 * 1024, min(max_tokens, 8192) * 5120 * 2)
+
+
 def _trace_all_reduce_path(
     communicator: "CudaCommunicator",
     backend: str,
@@ -172,7 +188,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     self.symm_mem_comm is not None and not self.symm_mem_comm.disabled
                 ),
                 max_size=(
-                    _SM70_TP4_LONG_PREFILL_BUFFER_BYTES
+                    _sm70_tp4_long_prefill_buffer_bytes()
                     if use_sm70_tp4_long_prefill_fused_norm
                     else 8192 * 1024
                 ),
