@@ -1696,6 +1696,14 @@ def test_ngram_embedding_cascade_worker_keeps_shards_file_backed(
     assert layer.get_offload_output_dtype(torch.float16) == torch.uint8
 
 
+def test_cascade_worker_prefaults_actual_disk_rows(monkeypatch) -> None:
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    placement = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=64)
+    layer.bind_remote_placements([placement])
+    assert layer._disk_segments
+    assert layer.needs_weight_prefault()
+
+
 def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1709,10 +1717,12 @@ def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
     with pytest.raises(TypeError, match="PLERemotePlacement"):
         layer.bind_remote_placements([object()])
 
+    assert layer.needs_weight_prefault()
     resident = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=128)
     layer.bind_remote_placements([resident])
     assert layer._remote_placements == [resident]
     assert layer._disk_segments == []
+    assert not layer.needs_weight_prefault()
 
     input_ids = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int32)
     query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
