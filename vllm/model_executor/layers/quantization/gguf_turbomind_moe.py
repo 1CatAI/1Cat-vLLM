@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.forward_context import get_forward_kernel_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
@@ -223,11 +224,9 @@ def _expert_dp4a(
     # Resolve actual M inside the opaque boundary so range compilation cannot
     # freeze a prefill choice into an MTP verification graph.
     m, top_k = ids.shape
-    config = get_current_vllm_config_or_none()
+    policy = get_forward_kernel_config_or_none()
     chunk_size = (
-        config.kernel_config.sm70_gguf.prefill_expert_chunk_size
-        if config is not None
-        else 4096
+        policy.sm70_gguf.prefill_expert_chunk_size if policy is not None else 4096
     )
     if (
         chunk_size > 0
@@ -238,6 +237,11 @@ def _expert_dp4a(
         and experts == 512
         and current_platform.is_device_capability(70)
     ):
+        logger.info_once(
+            "SM70 GGUF expert prefill row chunks selected (M=%d, chunk_rows=%d).",
+            m,
+            chunk_size,
+        )
         # Expert FFNs are independent across tokens. Keep the scheduler's
         # large prefill batch while bounding gathered and down intermediates.
         output = torch.empty_like(x)

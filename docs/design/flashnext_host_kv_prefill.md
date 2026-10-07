@@ -284,3 +284,33 @@ opaque output handling measured 320.178 to 0.393 MiB of extra temporary
 allocation, excluding the fixed input/output buffers. Median operator time
 falls from 2.495 to 1.657 ms; outputs and state updates match bitwise. This is
 an operator result. The full-model prefill and decode gates remain pending.
+
+## Execution policy and the next memory peak
+
+The installed publication fix reached the direct PLE convolution in a real
+32K/16K run, resolving the notification/allocator synchronization cycle.
+The request subsequently failed allocating an 80 MiB HC projection result;
+initialized allocation remained 28.748 GiB/rank. No 32K throughput was recorded.
+
+A real-weight HC experiment compared 4096 and 2048 row blocks. Temporary peak
+fell from 665.250 to 532.688 MiB; median time increased from 7.676 to 9.210 ms.
+The combined hidden output matched bitwise. Block output relative L2 difference
+was 5.447e-5, maximum absolute difference 0.0078125. Against independent FP32
+projections, relative L2 was 6.734e-5 for 4096 and 5.683e-5 for 2048. Both retain
+FP16 projection boundaries and FP32 accumulation. Two of 41,943,040 block
+values exceeded the initial 2e-3 elementwise tolerance; aggregate and independent
+reference errors are reported rather than treating this as bitwise equivalence.
+These are capacity/operator measurements, not model correctness evidence.
+
+The full-model retry configured 2048 rows and reported it at startup, but still
+allocated 80 MiB: the opaque operator read the construction-only configuration,
+which is absent during forward execution, and silently used 4096. This retry
+is not an effective 2048 model comparison. ForwardContext now carries the
+execution's KernelConfig. HC row blocking, PLE prefill convolution admission,
+and GGUF expert prefill row blocking read that policy before any construction
+fallback. Runtime route logs include the actual row-block size. The generic
+construction accessor and unrelated precision policies remain unchanged.
+Regression tests exercise an expired construction scope, conflicting scopes,
+and a compiled opaque HC call with the execution policy and no construction
+configuration. Another installed-wheel model run is required to qualify capacity,
+throughput, output quality and decode behavior.

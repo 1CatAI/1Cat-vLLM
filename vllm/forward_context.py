@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 import vllm.envs as envs
-from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
+from vllm.config import CUDAGraphMode, KernelConfig, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata
@@ -197,6 +197,9 @@ class ForwardContext:
     all_moe_layers: list[str] | None = None
     moe_layer_index: int = 0
 
+    kernel_config: KernelConfig | None = None
+    """Operator policy for this execution, available outside construction scopes."""
+
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -221,6 +224,16 @@ def is_forward_context_available() -> bool:
     return _forward_context is not None
 
 
+def get_forward_kernel_config_or_none() -> KernelConfig | None:
+    """Read execution policy first, then an active construction/test scope."""
+    if _forward_context is not None and _forward_context.kernel_config is not None:
+        return _forward_context.kernel_config
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    return config.kernel_config if config is not None else None
+
+
 def create_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
@@ -240,6 +253,7 @@ def create_forward_context(
 
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
+        kernel_config=vllm_config.kernel_config,
         all_moe_layers=all_moe_layers,
         attn_metadata=attn_metadata,
         slot_mapping=slot_mapping or {},

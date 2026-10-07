@@ -10,6 +10,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.forward_context import get_forward_kernel_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -680,8 +681,8 @@ direct_register_custom_op(
 
 
 def _hc_prefill_chunk_size(rows: int) -> int:
-    config = get_current_vllm_config_or_none()
-    size = config.kernel_config.prefill_hc_chunk_size if config is not None else 4096
+    policy = get_forward_kernel_config_or_none()
+    size = policy.prefill_hc_chunk_size if policy is not None else 4096
     return size if size > 0 and rows > size else 0
 
 
@@ -713,6 +714,11 @@ def _prefill_hc_projection(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     chunk_size = _hc_prefill_chunk_size(x.shape[0])
     if chunk_size and x.is_cuda and x.dtype == torch.float16:
+        logger.info_once(
+            "SM70 HC prefill row blocking selected (M=%d, chunk_rows=%d).",
+            x.shape[0],
+            chunk_size,
+        )
         return _blocked_hc_projection(x, down_weight, up_weight, chunk_size)
     block, injection = _dense_hc_projection(x, down_weight, up_weight)
     return block, injection.contiguous()

@@ -5,7 +5,12 @@
 import pytest
 import torch
 
-from vllm.config import get_current_vllm_config
+from vllm.config import VllmConfig, get_current_vllm_config, set_current_vllm_config
+from vllm.forward_context import (
+    create_forward_context,
+    get_forward_kernel_config_or_none,
+    override_forward_context,
+)
 from vllm.models.qwen4_exp.nvidia.sm70_fp16_hc import (
     _blocked_hc_projection,
     _dense_hc_projection,
@@ -21,6 +26,32 @@ def test_decode_and_one_block_skip_chunking(default_vllm_config, rows):
     assert _hc_prefill_chunk_size(4097) == 4096
     config.kernel_config.prefill_hc_chunk_size = 0
     assert _hc_prefill_chunk_size(16384) == 0
+
+
+def test_hc_policy_survives_construction_scope():
+    config = VllmConfig()
+    config.kernel_config.prefill_hc_chunk_size = 2048
+    with set_current_vllm_config(config):
+        context = create_forward_context(None, config)
+    with override_forward_context(context):
+        assert get_forward_kernel_config_or_none() is config.kernel_config
+        assert _hc_prefill_chunk_size(16384) == 2048
+        config.kernel_config.prefill_hc_chunk_size = 0
+        assert _hc_prefill_chunk_size(16384) == 0
+    assert get_forward_kernel_config_or_none() is None
+
+
+def test_execution_policy_overrides_construction_policy():
+    config = VllmConfig()
+    config.kernel_config.prefill_hc_chunk_size = 2048
+    context = create_forward_context(None, config)
+    stale = VllmConfig()
+    stale.kernel_config.prefill_hc_chunk_size = 4096
+    with set_current_vllm_config(stale):
+        assert _hc_prefill_chunk_size(16384) == 4096
+        with override_forward_context(context):
+            assert _hc_prefill_chunk_size(16384) == 2048
+        assert _hc_prefill_chunk_size(16384) == 4096
 
 
 def _projection_module(device):
@@ -81,6 +112,7 @@ def test_first_hc_prefill_export_keeps_runtime_boundary(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_first_hc_dynamic_prefill_dispatch(default_vllm_config, monkeypatch):
+    from vllm.config import vllm as config_module
     from vllm.models.qwen4_exp.nvidia import sm70_fp16_hc as hc
 
     monkeypatch.setattr(hc, "use_sm70_decode_graph_semantics", lambda: False)
@@ -97,11 +129,14 @@ def test_first_hc_dynamic_prefill_dispatch(default_vllm_config, monkeypatch):
         with torch.no_grad():
             module.input_mix_weight_down_block_inject.weight.normal_(std=0.003)
             module.input_mix_weight_up.weight.normal_(std=0.03)
+        config = get_current_vllm_config()
+        config.kernel_config.prefill_hc_chunk_size = 2048
+        context = create_forward_context(None, config)
         calls = []
         original = hc._blocked_hc_projection
 
         def record(*args):
-            calls.append(args[0].shape[0])
+            calls.append((args[0].shape[0], args[3]))
             return original(*args)
 
         monkeypatch.setattr(hc, "_blocked_hc_projection", record)
@@ -113,12 +148,17 @@ def test_first_hc_dynamic_prefill_dispatch(default_vllm_config, monkeypatch):
                 module.input_mix_weight_down_block_inject.weight,
                 module.input_mix_weight_up.weight,
             )
-            with torch.no_grad():
+            with (
+                torch.no_grad(),
+                monkeypatch.context() as execution_patch,
+                override_forward_context(context),
+            ):
+                execution_patch.setattr(config_module, "_current_vllm_config", None)
                 actual = compiled(x)
             for value, reference in zip(actual, expected):
                 torch.testing.assert_close(value, reference, rtol=1e-3, atol=1e-4)
             assert actual[1].stride() == (4, 1)
-        assert calls == [4097]
+        assert calls == [(4097, 2048)]
     finally:
         (
             backend.allow_fp16_reduced_precision_reduction,

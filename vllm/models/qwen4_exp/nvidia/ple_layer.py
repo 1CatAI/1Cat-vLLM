@@ -25,7 +25,10 @@ from vllm.config import (
     get_current_vllm_config_or_none,
 )
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import (
+    get_forward_context,
+    get_forward_kernel_config_or_none,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.ple.disk_rows import (
     MappedRowGatherKernel,
@@ -2385,8 +2388,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
         hidden_size = x_p.shape[1]
         state_len = self.conv_state_len
-        config = get_current_vllm_config_or_none()
-        if config is None or config.kernel_config.prefill_ple_short_conv:
+        policy = get_forward_kernel_config_or_none()
+        if policy is None or policy.prefill_ple_short_conv:
             from .ops.ple_prefill_conv import prefill_conv, prefill_conv_reason
 
             reason = prefill_conv_reason(
