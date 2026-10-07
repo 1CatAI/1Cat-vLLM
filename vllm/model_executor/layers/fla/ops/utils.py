@@ -127,6 +127,10 @@ def get_available_device() -> str:
 
 @functools.cache
 def _check_platform() -> Literal["nvidia", "amd", "intel", "musa"]:
+    if current_platform.is_cuda():
+        return "nvidia"
+    if current_platform.is_rocm():
+        return "amd"
     device = get_available_device()
     mapping = {
         "cuda": "nvidia",
@@ -148,10 +152,7 @@ is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
 is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
-is_nvidia_hopper = is_nvidia and (
-    "NVIDIA H" in torch.cuda.get_device_name(0)
-    or torch.cuda.get_device_capability()[0] >= 9
-)
+is_nvidia_hopper = is_nvidia and (current_platform.has_device_capability(90))
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 is_gather_supported = hasattr(triton.language, "gather")
 is_tma_supported = (

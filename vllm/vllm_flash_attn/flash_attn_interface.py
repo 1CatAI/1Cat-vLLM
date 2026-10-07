@@ -11,6 +11,7 @@ import sys
 import torch
 
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -50,7 +51,10 @@ def load_fa2_library(device: torch.device) -> None:
     global _fa2_loaded_capability
     if _fa2_loaded_capability is not None:
         return
-    capability = torch.cuda.get_device_capability(device)
+    capability_info = current_platform.get_device_capability(device.index)
+    if capability_info is None:
+        raise ImportError(f"Cannot determine FA2 device capability for {device}")
+    capability = (capability_info.major, capability_info.minor)
     path = _fa2_library_path(capability)
     if path is None:
         raise ImportError(
@@ -79,7 +83,9 @@ def ensure_fa2_library_loaded() -> None:
     longer loads a library, so those lookups ask here first.
     """
     if _fa2_loaded_capability is None:
-        load_fa2_library(torch.device("cuda", torch.accelerator.current_device_index()))
+        # NVML can identify the architecture before a CUDA context exists.
+        # Initialized workers still select the library for their active device.
+        load_fa2_library(torch.device("cuda"))
 
 
 try:

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from vllm.platforms.interface import DeviceCapability
 from vllm.vllm_flash_attn import flash_attn_interface as fai
 
 
@@ -47,13 +48,13 @@ def test_loader_picks_the_devices_library_once(monkeypatch, tmp_path: Path):
     # module spec it can execute.
     stub = tmp_path / "_vllm_fa2_C_sm75.py"
     stub.write_text("LOADED_FOR = 'sm75'\n")
-    asked: list[torch.device] = []
+    asked: list[int | None] = []
 
-    def capability(device: torch.device) -> tuple[int, int]:
+    def capability(device: int | None) -> DeviceCapability:
         asked.append(device)
-        return (7, 5)
+        return DeviceCapability(7, 5)
 
-    monkeypatch.setattr(fai.torch.cuda, "get_device_capability", capability)
+    monkeypatch.setattr(fai.current_platform, "get_device_capability", capability)
     monkeypatch.setattr(
         fai, "_fa2_library_path", lambda cap: str(stub) if cap == (7, 5) else None
     )
@@ -63,13 +64,17 @@ def test_loader_picks_the_devices_library_once(monkeypatch, tmp_path: Path):
     assert fai._fa2_loaded_capability == (7, 5)
     # The second call does not ask the device again: one library per process.
     fai.load_fa2_library(torch.device("cuda:0"))
-    assert asked == [torch.device("cuda:1")]
+    assert asked == [1]
 
 
 def test_ensure_loads_the_current_devices_library_once(monkeypatch):
     loaded: list[torch.device] = []
     monkeypatch.setattr(fai, "_fa2_loaded_capability", None)
-    monkeypatch.setattr(fai.torch.accelerator, "current_device_index", lambda: 2)
+
+    def forbidden():
+        raise AssertionError("Capability probing must not initialize CUDA")
+
+    monkeypatch.setattr(fai.torch.accelerator, "current_device_index", forbidden)
 
     def load(device: torch.device) -> None:
         loaded.append(device)
@@ -78,12 +83,26 @@ def test_ensure_loads_the_current_devices_library_once(monkeypatch):
     monkeypatch.setattr(fai, "load_fa2_library", load)
     fai.ensure_fa2_library_loaded()
     fai.ensure_fa2_library_loaded()
-    assert loaded == [torch.device("cuda", 2)]
+    assert loaded == [torch.device("cuda")]
 
 
 def test_loader_refuses_a_capability_without_library(monkeypatch):
-    monkeypatch.setattr(fai.torch.cuda, "get_device_capability", lambda device: (7, 5))
+    monkeypatch.setattr(
+        fai.current_platform,
+        "get_device_capability",
+        lambda device: DeviceCapability(7, 5),
+    )
     monkeypatch.setattr(fai, "_fa2_library_path", lambda cap: None)
     with pytest.raises(ImportError, match="7.5"):
         fai.load_fa2_library(torch.device("cuda:0"))
     assert fai._fa2_loaded_capability is None
+
+
+def test_loader_reports_unknown_capability_without_creating_context(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Library selection must not create a CUDA context")
+
+    monkeypatch.setattr(fai.torch.cuda, "_lazy_init", forbidden)
+    monkeypatch.setattr(fai.current_platform, "get_device_capability", lambda _: None)
+    with pytest.raises(ImportError, match="Cannot determine FA2 device capability"):
+        fai.load_fa2_library(torch.device("cuda"))
