@@ -40,3 +40,38 @@ The focused GPU tests compare raw FP16 output bits at three activation amplitude
 repeat CUDA graph replay, check split-K counter reset and timestamp coverage, and
 exercise two/three-format outputs and fused gate/up. Source-complete wheel tests
 and model diagnostics remain pending until the ordinary artifact is rebuilt.
+
+## Installed artifact check
+
+The source-complete wheel built from `aa275f045988bd3977c2ba3c5ba275269ae843dc`
+passes all 156 focused GPU/codec/capability checks, including the ten diagnostic
+cases. All 16 packaged native library hashes match the installed artifact.
+The installed-wheel cold-bank gate/up replay measures 38.805 us for the ordinary
+operator and 37.917 us for the diagnostic, with identical output bits.
+
+Run the focused check with:
+
+```bash
+pytest -q tests/kernels/quantization/test_gguf_dmv_clock.py
+```
+
+## Model diagnostic
+
+The installed artifact completes TP4 graph initialization, a 1K-input/96-output
+request and two natural EOS checks. Its 96 output-token prefix matches the
+previous ordinary boundary-event diagnostic with the same prompt and seed.
+These short requests do not replace the matched sixteen-prompt latency baseline.
+
+For the final target replay, rank0 records 237 resident-plane calls: 62 gate/up,
+63 down, 39 GDN input, 48 GDN output, nine attention QKV and sixteen attention
+output projections. Their warp envelopes sum to 6.781 ms over a 12.859 ms
+first-to-last projection span. Other ranks measure 6.780–6.802 ms. The remaining
+6.078 ms between projections includes attention, recurrent updates, collectives,
+canonical/native projections outside this diagnostic and launch dependencies.
+It is not empty time or a promised recoverable saving. Device durations are
+quantized to 1.024 us on this GPU; per-warp envelopes also exclude retirement.
+
+Within the instrumented last replay, the 39 GDN-input-to-output intervals average
+31.823 us, the nine measured attention-QKV-to-output intervals 96.142 us, and
+46 GDN-output-to-gate/up intervals 18.477 us. Cold isolated timing and traced
+service remain separate cohorts. No end-to-end speedup is claimed.
