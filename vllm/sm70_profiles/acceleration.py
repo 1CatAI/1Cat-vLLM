@@ -528,6 +528,17 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "runtime_guards": "FP16 dense HC; M exceeds chunk rows; HCX for combine",
         "precision": "FP16 materialization and FP32 GEMM accumulation",
     }
+    ple_conv = cfg.kernel_config.prefill_ple_short_conv
+    report["prefill_ple_short_conv"] = {
+        "enabled": sm70 and ple_conv,
+        "reason": None
+        if sm70 and ple_conv
+        else ("requires_sm70" if not sm70 else "disabled_by_kernel_policy"),
+        "scope": "prefill_only",
+        "operator": "direct dilated depthwise PLE convolution and state commit",
+        "runtime_guards": "FP16; M>=512; requests1..16; taps2..8; dilation1..8",
+        "precision": "FP32 accumulation; FP16 conv boundary before FP32 SiLU",
+    }
     report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
     report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
     report["moe_kernel_selections"] = cfg.kernel_config.moe_kernel_selections

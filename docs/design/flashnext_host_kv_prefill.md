@@ -212,5 +212,42 @@ Twenty-two targeted checks pass, including real expert geometry, M1/M5 native
 projection graph checks, changed routes and inputs, and bitwise agreement of
 M33 graph replay with reduced output sharing activation storage. Capacity tests
 cover output sharing, chunked allocation and gated/non-gated activations. The
-worker inventory now includes the global workspace manager. Full-model memory
-peaks and throughput remain pending; predicted savings are not measured peaks.
+worker inventory now includes the global workspace manager. The next installed-wheel run measured 28.7476 GiB/rank of initialized live
+Torch allocation, down from 29.4512 GiB/rank: 720.627 MiB saved. The global
+workspace inventory reports exactly 880 MiB. The unclassified remainder is
+253.232 MiB, including normal native and cuBLAS workspaces. This run passed HC
+and GDN, then failed allocating a 320 MiB PLE convolution output; no complete
+32K request or throughput result was produced.
+
+## PLE prefill convolution peak
+
+The previous dilated short-convolution packs a full channels-first history,
+materializes a full convolution result, and gathers rows into token order. At
+16K tokens and 10240 channels, each FP16 token buffer occupies 320 MiB. A direct
+prefill kernel reads token-order inputs and a small initial-state snapshot,
+computes the dilated depthwise convolution and SiLU, then commits base history
+in a separate kernel. It retains FP32 convolution accumulation and the FP16
+rounding boundary before FP32 SiLU. Short decode and speculative rollback
+paths remain unchanged.
+
+Admission is SM70, FP16 input/weight, at least 512 query rows, 1–16 requests,
+2–8 taps, dilation 1–8, and compatible FP16/FP32 state storage.
+`prefill_ple_short_conv=false` selects the existing implementation. The startup
+capability report describes these guards and runtime fallback reports its
+reason.
+
+On the same V100-32GB (1290 MHz, CUDA 12.8, Torch 2.10), an eager ABBA test using
+the checkpoint's actual layer-1 PLE convolution weight measured:
+
+| Query rows | Existing temporary peak | Direct temporary peak | Existing median | Direct median |
+| --- | ---: | ---: | ---: | ---: |
+| 512 | 20.582 MiB | 10.178 MiB | 0.850 ms | 0.327 ms |
+| 16384 | 640.945 MiB | 320.178 MiB | 15.715 ms | 1.616 ms |
+
+Both results and state updates matched the existing path bitwise in this
+real-weight test. Both also matched an independent FP32 convolution reference
+rounded to FP16 before SiLU. Tests additionally cover ragged and empty requests,
+NULL state rows, initial history, FP32 state storage, channel tails, strided
+inputs, history carried between chunks, and graph replay with changed inputs
+and initial-state flags. These are operator measurements, not full-model
+prefill throughput or quality results. Full 32K model evidence remains pending.

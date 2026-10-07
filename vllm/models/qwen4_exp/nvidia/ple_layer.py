@@ -2384,6 +2384,28 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
         hidden_size = x_p.shape[1]
         state_len = self.conv_state_len
+        config = get_current_vllm_config_or_none()
+        if config is None or config.kernel_config.prefill_ple_short_conv:
+            from .ops.ple_prefill_conv import prefill_conv, prefill_conv_reason
+
+            reason = prefill_conv_reason(
+                x_p, conv_state, conv_weights, num_prefills, self.short_conv_dilation
+            )
+            if reason is None:
+                logger.info_once(
+                    "SM70 PLE prefill uses direct dilated convolution "
+                    "without padded history (FP16 boundary, FP32 accumulation)."
+                )
+                return prefill_conv(
+                    x_p,
+                    conv_state,
+                    conv_weights,
+                    q_starts,
+                    state_indices_tensor_p[:num_prefills],
+                    has_initial_states_p[:num_prefills],
+                    self.short_conv_dilation,
+                )
+            logger.debug_once("PLE prefill convolution fallback: %s.", reason)
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
