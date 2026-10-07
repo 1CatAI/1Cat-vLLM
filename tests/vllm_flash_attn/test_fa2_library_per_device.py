@@ -106,3 +106,26 @@ def test_loader_reports_unknown_capability_without_creating_context(monkeypatch)
     monkeypatch.setattr(fai.current_platform, "get_device_capability", lambda _: None)
     with pytest.raises(ImportError, match="Cannot determine FA2 device capability"):
         fai.load_fa2_library(torch.device("cuda"))
+
+
+@pytest.mark.parametrize("capability, supported", [(70, False), (75, True)])
+def test_support_query_does_not_initialize_cuda(monkeypatch, capability, supported):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Support queries must not create a CUDA context")
+
+    monkeypatch.setattr(fai, "FA2_AVAILABLE", True)
+    monkeypatch.setattr(fai.torch.cuda, "_lazy_init", forbidden)
+    monkeypatch.setattr(fai.torch.accelerator, "current_device_index", forbidden)
+    monkeypatch.setattr(fai.current_platform, "resolve_device_id", lambda _: 2)
+    monkeypatch.setattr(
+        fai.current_platform,
+        "get_device_capability",
+        lambda device_id=None: DeviceCapability(capability // 10, capability % 10),
+    )
+    monkeypatch.setattr(
+        fai.current_platform,
+        "has_device_capability",
+        lambda threshold, device: capability >= threshold,
+    )
+    monkeypatch.setattr(fai, "_fa2_library_path", lambda _: "installed")
+    assert fai._is_fa2_supported()[0] is supported
