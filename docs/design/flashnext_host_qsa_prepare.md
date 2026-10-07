@@ -41,3 +41,23 @@ explicit activation casts and must not replace the FP16 model denominator.
 
 Fresh packaged route checks and matched C1/C4 model gates remain pending.
 The policy remains opt-in and this document claims no endpoint improvement.
+
+## Host partial launch policy
+
+For the admitted SM70 D256/H6 host route, retain two-warp partials through
+32 rows. The previous common device policy stops at 16 rows; other device
+backends, dimensions, heads and larger batches retain their profiles. Tiles,
+split count, decoder and FP32 reduction are unchanged.
+
+Separate-state graph ABBA tests use four distinct physical requests with five
+verification rows each. At M20 and contexts 128/512/1024, four-warp control
+measures 67.968/100.096/176.896 us for complete host resolution plus attention;
+two-warp measures 67.008/89.024/110.592 us. At 8192 tokens per request the pair
+is 342.400/255.104 us. A deliberately undersized 64-token hot cache at context
+128 measures 453.568/451.456 us. Outputs are bitwise equal in every case,
+including changed selections/gates and invalid rows. These synthetic layer
+screens do not establish a C4 endpoint improvement.
+
+The two-warp partial uses 226 registers and 24 KiB shared memory, versus
+165 registers and 24 KiB for four warps; neither spills. More warps consume
+more total registers per CTA and do not improve this small host workload.
