@@ -82,7 +82,7 @@ def test_dflash_batch_matches_serial_with_live_graph_metadata(
     with torch.cuda.graph(graph):
         run()
     route = "prefill_prefix_dflash_noncausal_batch"
-    split = batch == 1 and q_len == 8 and block == 832 and kv_dtype == "auto"
+    split = batch == 1 and q_len == 8 and block in (832, 1648) and kv_dtype == "auto"
     assert (route in routes) == (batch > 1 or split)
     for step in range(3):
         storage.normal_()

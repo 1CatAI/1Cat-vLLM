@@ -48,7 +48,10 @@ class Descriptor:
         (1024, 1, True, True, True, "split"),
         (2048, 1, False, True, True, "native"),
         (1024, 4, True, True, True, "native"),
-        (1648, 1, True, True, True, "fallback"),
+        (1648, 1, True, True, True, "split"),
+        (1648, 1, True, True, False, "split"),
+        (1648, 1, False, True, True, "fallback"),
+        (1648, 4, True, True, True, "fallback"),
     ],
 )
 def test_page_abi_dispatch(

@@ -1,0 +1,125 @@
+{
+  "source": "2b140abbf16b938b7b97a7984abe9befea8ca35e",
+  "wheel_sha256": "3712a30b8d4e16245a842bab1e32a7ed72769197d5ff360d88601676439ae828",
+  "native_libraries_byte_identical_to_source": "2e02630d6ddce4aa56206a00e14a3d4f829b2952",
+  "tests_passed": 37,
+  "contract": {
+    "gpu": "V100-SXM2-32GB",
+    "cuda": "12.8",
+    "torch": "2.10.0+cu128",
+    "sm_mhz": 1290,
+    "memory_mhz": 877,
+    "kv_dtype": "FP16 draft KV",
+    "page": 1648,
+    "query_rows": 8,
+    "q_kv_heads": [
+      8,
+      2
+    ],
+    "head_dim": 128,
+    "window": [
+      2047,
+      2047
+    ],
+    "banks": 16,
+    "measurement": "same-wheel cold graph ABBA; external events; numerical FP64 oracle"
+  },
+  "cases": [
+    {
+      "context": 1091,
+      "general_paged_us": 117.23472118377686,
+      "split_window_us": 56.43976032733917,
+      "max_rel_l2": 0.0003007115037592483,
+      "graph_stable": true,
+      "zero_lengths": true
+    },
+    {
+      "context": 8192,
+      "general_paged_us": 208.0729579925537,
+      "split_window_us": 61.03815972805023,
+      "max_rel_l2": 0.0003039281203144565,
+      "graph_stable": true,
+      "zero_lengths": true
+    }
+  ],
+  "model_gain_claim": true,
+  "model": {
+    "contract": {
+      "target": "Qwen3.8-27B-GSQ-RCO-IQ3_S",
+      "draft": "Qwen3.8-27B-DFlash2-Q8_0",
+      "tp": 4,
+      "interconnect": "full pairwise NVLink2",
+      "target_kv": "fp8_e4m3",
+      "draft_kv": "FP16",
+      "ssm_state": "FP32",
+      "max_len": 262144,
+      "max_sequences": 4,
+      "input_lengths": [
+        1024,
+        8192
+      ],
+      "prompts": 16,
+      "output_tokens_per_prompt": 600,
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 20,
+      "seed": 123,
+      "thinking": false,
+      "timing_ignore_eos": true,
+      "normal_source_complete_wheel": true,
+      "device_timers_or_profiler_during_timing": false
+    },
+    "groups": {
+      "1024": {
+        "control_prompt_mean_round_ms": 16.305058670989208,
+        "prompt_mean_round_ms": 15.86911938173556,
+        "round_saving_ms": 0.43593928925364867,
+        "paired_saving_95pct_t_interval_ms": [
+          0.4196777401127622,
+          0.4522008383945351
+        ],
+        "prompt_mean_tokens_per_round": 2.928597002167303,
+        "pooled_ms_per_output_token": 5.42526980486055,
+        "prompts": 8
+      },
+      "8192": {
+        "control_prompt_mean_round_ms": 17.067483521329315,
+        "prompt_mean_round_ms": 16.29156427694441,
+        "round_saving_ms": 0.7759192443849074,
+        "paired_saving_95pct_t_interval_ms": [
+          0.7501241401106113,
+          0.8017143486592035
+        ],
+        "prompt_mean_tokens_per_round": 2.9681976720021415,
+        "pooled_ms_per_output_token": 5.504409360308123,
+        "prompts": 8
+      }
+    },
+    "timing_clock_samples": {
+      "rows": 556,
+      "sm_mhz": [
+        "1290 MHz"
+      ],
+      "memory_mhz": [
+        "877 MHz"
+      ],
+      "window": "12:37:00 through12:39:20, covers16 timed cases"
+    },
+    "quality": {
+      "comparison": "E4M3 before vs after page1648 draft-window admission. Same normal native libraries, target/draft weights and KV dtype; only equal token prefixes/positions retained.",
+      "prompts": 16,
+      "common_rows": 126,
+      "mean_kl": 4.134287236191133e-05,
+      "max_kl": 0.0006027807504567109,
+      "top1_agreement": 1.0
+    },
+    "natural_eos": true,
+    "natural_answers": [
+      "391",
+      "A unit test verifies that a specific, isolated piece of code (such as a function or method) behaves as expected under given conditions."
+    ],
+    "c4_health_requests": 4,
+    "c4_performance_claim": false,
+    "comparison_note": "Matched sequential sixteen-prompt runs; identical normal native libraries. Change is page1648 draft-window dispatch. Prompt-based confidence interval describes paired cases, not temporal run-to-run reproducibility."
+  }
+}

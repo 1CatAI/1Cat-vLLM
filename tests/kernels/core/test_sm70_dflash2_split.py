@@ -31,7 +31,7 @@ def _dense(q, k, v, table, length, scale):
 
 
 @pytest.mark.parametrize("through_api", [False, True])
-@pytest.mark.parametrize("page", [832, 1024, 2048])
+@pytest.mark.parametrize("page", [832, 1024, 1648, 2048])
 @pytest.mark.parametrize("scale", [1 / math.sqrt(128), 0.1])
 def test_live_window_graph(page, scale, through_api):
     from flash_attn_v100.sm70_dflash2_split import forward
@@ -96,7 +96,8 @@ def test_live_window_graph(page, scale, through_api):
         torch.testing.assert_close(output.double(), truth, atol=0.001, rtol=0.002)
 
 
-def test_page832_split_route_without_native_symbol(monkeypatch):
+@pytest.mark.parametrize("page", [832, 1648])
+def test_hybrid_split_route_without_native_symbol(monkeypatch, page):
     from flash_attn_v100 import flash_attn_interface as interface
     from flash_attn_v100 import sm70_dflash2_split as split
 
@@ -112,7 +113,7 @@ def test_page832_split_route_without_native_symbol(monkeypatch):
         interface.flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd", raising=False
     )
     query = torch.randn(1, 8, 8, 128, dtype=torch.float16, device="cuda")
-    kv = torch.randn(2, 2, 832, 2, 128, dtype=torch.float16, device="cuda")
+    kv = torch.randn(2, 2, page, 2, 128, dtype=torch.float16, device="cuda")
     table = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
     lengths = torch.tensor([1032], dtype=torch.int32, device="cuda")
     output = torch.empty_like(query)
