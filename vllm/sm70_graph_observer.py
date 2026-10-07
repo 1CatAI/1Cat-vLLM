@@ -20,6 +20,9 @@ class CPUStageRecorder:
         self.step = 0
         self.dropped = 0
         self._target = threading.local()
+        self.gpu_timing = False
+        self.gpu_anchor = None
+        self.gpu_events = []
 
     @contextmanager
     def stage(self, label, metadata=None):
@@ -33,6 +36,21 @@ class CPUStageRecorder:
             "start_ns": time.perf_counter_ns(),
             **(metadata or {}),
         }
+        gpu_pair = None
+        if self.gpu_timing and label in (
+            "worker.execute",
+            "worker.sample",
+            "target.replay",
+            "draft.propose",
+            "runner.sample",
+        ):
+            import torch
+
+            gpu_pair = (
+                torch.Event(device="cuda", enable_timing=True),
+                torch.Event(device="cuda", enable_timing=True),
+            )
+            gpu_pair[0].record()
         if self.nvtx:
             import torch
 
@@ -40,6 +58,10 @@ class CPUStageRecorder:
         try:
             yield
         finally:
+            if gpu_pair is not None:
+                gpu_pair[1].record()
+                if len(self.gpu_events) < self.limit:
+                    self.gpu_events.append((event, gpu_pair))
             if self.nvtx:
                 torch.cuda.nvtx.range_pop()
             event["end_ns"] = time.perf_counter_ns()
@@ -101,12 +123,30 @@ class CPUStageRecorder:
     def read(self, stop=True):
         if stop:
             self.enabled = False
+        gpu_records = []
+        if self.gpu_events:
+            import torch
+
+            torch.accelerator.synchronize()
+            assert self.gpu_anchor is not None
+            for event, (begin, end) in self.gpu_events:
+                gpu_records.append(
+                    {
+                        "label": event["label"],
+                        "step": event["step"],
+                        "start_ms": self.gpu_anchor.elapsed_time(begin),
+                        "end_ms": self.gpu_anchor.elapsed_time(end),
+                        "elapsed_ms": begin.elapsed_time(end),
+                    }
+                )
         return {
             "rank": self.rank,
             "pid": os.getpid(),
             "clock": "perf_counter_ns",
             "events": list(self.events),
             "dropped": self.dropped,
+            "gpu_events": gpu_records,
+            "gpu_event_scope": "current-stream envelopes; nested spans overlap",
         }
 
 
@@ -129,6 +169,34 @@ class GraphParityWorkerExtension:
             config.kernel_config.sm70_gguf.prefill_routing = enabled
         return {"rank": self.rank, "prefill_routing": enabled}
 
+    def set_mtp_execution_policy(self, draft_single_graph, greedy_verify):
+        """Benchmark RPC: change host dispatch between completed cohorts.
+
+        Draft graphs must already have been captured during engine startup.
+        Changing this policy neither recaptures graphs nor modifies weights.
+        """
+        if not isinstance(draft_single_graph, bool) or not isinstance(
+            greedy_verify, bool
+        ):
+            raise TypeError("MTP execution policy requires boolean values")
+        runner = self.model_runner
+        speculator = runner.speculator
+        if speculator is None or getattr(speculator, "method", None) != "mtp":
+            raise RuntimeError("Execution policy requires an MTP speculator")
+        manager = getattr(speculator, "multistep_cudagraph_manager", None)
+        if draft_single_graph and (manager is None or not manager.graphs):
+            raise RuntimeError("Single-graph draft shapes were not captured")
+        if greedy_verify and not hasattr(runner.model, "get_top_tokens"):
+            raise RuntimeError("Target model does not expose local argmax")
+        for config in (runner.vllm_config, speculator.vllm_config):
+            config.kernel_config.sm70_draft_single_graph = draft_single_graph
+            config.kernel_config.sm70_greedy_verify = greedy_verify
+        return {
+            "rank": self.rank,
+            "draft_single_graph": draft_single_graph,
+            "greedy_verify": greedy_verify,
+        }
+
     def set_graph_input_preparation(self, early):
         state = self.model_runner.model_state
         declared = type(state).supports_early_input_preparation
@@ -144,7 +212,7 @@ class GraphParityWorkerExtension:
         state._ple_kernel_config.ple_input_prepare = bool(fused)
         return {"rank": self.rank, "ple_input_prepare": bool(fused)}
 
-    def start_graph_parity_observer(self, nvtx=False):
+    def start_graph_parity_observer(self, nvtx=False, gpu_timing=False):
         if not hasattr(self, "_graph_parity_recorder"):
             from vllm.v1.executor.multiproc_executor import WorkerProc
             from vllm.v1.worker.gpu.async_utils import AsyncOutput
@@ -167,6 +235,24 @@ class GraphParityWorkerExtension:
                 rec.wrap(runner, name, "runner." + name)
             for name in ("prepare_inputs", "prepare_attn", "preprocess_state"):
                 rec.wrap(runner.model_state, name, "model_state." + name)
+            seen_builders = set()
+            for group_id, groups in enumerate(runner.attn_groups):
+                for group in groups:
+                    builder = group.get_metadata_builder(0)
+                    if id(builder) not in seen_builders:
+                        seen_builders.add(id(builder))
+                        rec.wrap(
+                            builder,
+                            "build",
+                            f"metadata.{type(builder).__name__}.{group_id}",
+                        )
+            from vllm.v1.worker.gpu.model_states import mamba_hybrid
+
+            rec.wrap(
+                mamba_hybrid,
+                "prepare_dflash2_gdn_group_metadata",
+                "metadata.gdn_shared",
+            )
             rec.wrap(runner.block_tables, "apply_staged_writes", "block_tables.apply")
             rec.wrap(runner.speculator, "propose", "draft.propose")
             rec.wrap(runner._ple_offload_connector, "prepare_forward", "ple.prepare")
@@ -178,9 +264,22 @@ class GraphParityWorkerExtension:
         rec = self._graph_parity_recorder
         rec.events.clear()
         rec.step = rec.dropped = 0
+        rec.gpu_events.clear()
+        rec.gpu_timing = gpu_timing
+        rec.gpu_anchor = None
+        if gpu_timing:
+            import torch
+
+            rec.gpu_anchor = torch.Event(device="cuda", enable_timing=True)
+            rec.gpu_anchor.record()
         rec.nvtx = nvtx
         rec.enabled = True
-        return {"rank": self.rank, "clock": "perf_counter_ns", "nvtx": nvtx}
+        return {
+            "rank": self.rank,
+            "clock": "perf_counter_ns",
+            "nvtx": nvtx,
+            "gpu_timing": gpu_timing,
+        }
 
     def read_graph_parity_observer(self, stop=True):
         return self._graph_parity_recorder.read(stop)

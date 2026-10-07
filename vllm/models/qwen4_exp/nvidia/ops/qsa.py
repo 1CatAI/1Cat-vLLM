@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
 )
+from vllm.models.qwen4_exp.nvidia.ops.host_kv_reader import load_host_kv
 from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
     SM70_QSA_TUNING,
     legacy_qsa_tuning,
@@ -657,6 +658,9 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_N: tl.constexpr,
     KV_E4M3: tl.constexpr,
     RESOLVED_INDICES: tl.constexpr = False,
+    HOST_INDICES=None,
+    HOST_VALID_COUNTS=None,
+    HOST_CACHE: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -690,7 +694,15 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
     split_tile_start = split_id * NUM_TILES // NUM_SPLITS
     split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
-    for tile in range(split_tile_start, split_tile_end):
+    loop_start = split_tile_start
+    loop_end = split_tile_end
+    if HOST_CACHE:
+        selected_count = tl.load(HOST_VALID_COUNTS + row)
+        # The selector compacts the open group's causal tail immediately after
+        # the selected complete blocks, including at attention tile boundaries.
+        # Keep the original split assignment and only skip empty suffix tiles.
+        loop_end = tl.minimum(split_tile_end, tl.cdiv(selected_count, BLOCK_N))
+    for tile in range(loop_start, loop_end):
         columns = tile * BLOCK_N + column_offsets
         logical_token = tl.load(
             indices_ptr + row * stride_indices_row + columns,
@@ -715,24 +727,42 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
+        if HOST_CACHE:
+            hot_tokens = tl.load(
+                HOST_INDICES + row * TOPK + columns, columns < TOPK, other=-2
+            )
+            valid &= hot_tokens >= -1
+        if HOST_CACHE:
+            keys, values = load_host_kv(
+                k_cache_ptr,
+                v_cache_ptr,
+                hot_tokens,
+                row,
+                columns,
+                valid,
+                dim_offsets,
+                tl.cdiv(TOPK, 4) * 4,
+                HEAD_DIM,
+            )
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         if KV_E4M3:
             keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
             values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)

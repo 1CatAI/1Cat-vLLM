@@ -15,6 +15,7 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -66,6 +67,8 @@ from ..common.qsa_cache import (
     qsa_dcp_block_geometry,
 )
 from .indexer_qsa import QSAIndexer
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -255,6 +258,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         sequence_lengths: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        dense_short_context: bool = False,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -274,6 +278,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
+        if getattr(layer, "host_kv_enabled", False):
+            if query_positions is None or sequence_lengths is None:
+                raise RuntimeError(
+                    "Host QSA requires exact positions and sequence lengths"
+                )
+            layer.host_kv_forward(
+                query[:num_tokens],
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                query_positions[:num_tokens],
+                sequence_lengths,
+                output[:num_tokens],
+                output_gate,
+            )
+            return output
         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
         # [num_blocks, 2, block_size, num_kv_heads, head_size].
         key_cache, value_cache = kv_cache.unbind(1)
@@ -288,6 +308,28 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("Qwen4Exp QSA FP16/BF16 cache must match query dtype")
 
         from .ops.qsa import qsa_sparse_paged_attention
+
+        if dense_short_context:
+            from .ops.qsa_dense import qsa_dense_decode
+
+            gate = None
+            if output_gate is not None:
+                gate = output_gate[:num_tokens].reshape(
+                    num_tokens, query.shape[1], query.shape[2]
+                )
+            assert sequence_lengths is not None and query_positions is not None
+            qsa_dense_decode(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                token_to_req,
+                query_positions[:num_tokens],
+                output[:num_tokens],
+                gate,
+                sequence_lengths.shape[0],
+            )
+            return output
 
         if getattr(layer, "qsa_dcp_sharded", False):
             if output_gate is None:
@@ -575,11 +617,25 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
+        self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
+        self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
+        self.host_kv_device_reference = (
+            vllm_config.kernel_config.qsa_host_kv_device_reference
+        )
+        self.host_kv_dtype = (
+            vllm_config.kernel_config.qsa_host_kv_draft_dtype
+            if getattr(vllm_config, "is_speculative_draft", False)
+            else vllm_config.kernel_config.qsa_host_kv_dtype
+        )
         if self.kv_cache_dtype not in ("fp8", "fp8_e4m3") and (
             self.kv_cache_torch_dtype != model_config.dtype
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
+            )
+        if self.host_kv_enabled:
+            self.kv_cache_torch_dtype = (
+                torch.uint8 if self.host_kv_dtype == "fp8_e4m3" else torch.float16
             )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
@@ -615,6 +671,25 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             rotary_emb=self.rotary_emb,
             quant_config=quant_config,
             prefix=f"{prefix}.indexer",
+        )
+        self._dense_short_context = bool(
+            vllm_config.kernel_config.qsa_dense_short_context
+        )
+        self._sm70_qsa_prep = bool(
+            vllm_config.kernel_config.sm70_qsa_prep
+            and not self.host_kv_enabled
+            and getattr(self.rotary_emb, "is_neox_style", False)
+            and self.head_dim == 256
+            and self.num_kv_heads == 1
+            and cache_config.cache_dtype in ("auto", "float16")
+            and model_config.dtype == torch.float16
+            and self.attn_output_gate
+        )
+        speculative = vllm_config.speculative_config
+        # Bucketed graphs are only replayed for uniform decode batches, whose
+        # requests each hold exactly this many query tokens.
+        self._decode_query_len = 1 + (
+            speculative.num_speculative_tokens if speculative is not None else 0
         )
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self._set_topk_indices_buffer(
@@ -712,12 +787,56 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if self.host_kv_enabled:
+            from .ops.host_kv import HostQSAKV
+
+            self.host_kv = HostQSAKV(
+                kv_cache.shape[0],
+                kv_cache.shape[2],
+                self.head_dim,
+                kv_cache.device,
+                hot_tokens=self.host_kv_hot_tokens,
+                history=kv_cache,
+                width=self.indexer.output_width,
+                device_reference=self.host_kv_device_reference,
+            )
+            logger.info_once(
+                "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
+                "attention reads FP16 hot pages; only unresolved misses are staged.",
+                "device_reference" if self.host_kv_device_reference else "host",
+                self.host_kv_dtype,
+                self.host_kv_hot_tokens,
+            )
+
+    def host_kv_forward(
+        self, query, indices, table, requests, positions, lengths, output, gate
+    ) -> None:
+        from .ops.host_kv_attention import host_qsa_attention
+
+        state = self.host_kv
+        for start in range(0, query.shape[0], state.rows):
+            stop = min(start + state.rows, query.shape[0])
+            host_qsa_attention(
+                query[start:stop],
+                state,
+                indices[start:stop],
+                table,
+                requests[start:stop],
+                positions[start:stop],
+                lengths,
+                output[start:stop],
+                gate[start:stop] if gate is not None else None,
+            )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size, _, dcp_sharded = qsa_dcp_block_geometry(
             vllm_config, self.layer_name
         )
         return FullAttentionSpec(
             block_size=block_size,
+            host_backed=self.host_kv_enabled,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
@@ -744,6 +863,43 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         ).reshape(*token_shape, self.kv_size)
         query, key = self.rotary_emb(positions, query, key)
         return query, key, value, gate.reshape(*token_shape, self.q_size)
+
+    def _use_dense_short_context(
+        self, num_tokens: int, side_metadata: QSAForwardMetadata
+    ) -> bool:
+        """True in context-bucketed graphs where QSA would select every token."""
+        if not self._dense_short_context or self.indexer.skip_topk:
+            return False
+        if getattr(self, "qsa_dcp_sharded", False):
+            return False
+        descriptor = get_forward_context().batch_descriptor
+        bucket = getattr(descriptor, "attention_context_bucket", None)
+        if bucket is None or bucket > self.indexer.token_topk:
+            logger.info_once(
+                "QSA dense short-context skipped: tokens=%d bucket=%s budget=%d",
+                num_tokens,
+                bucket,
+                self.indexer.token_topk,
+            )
+            return False
+        from .ops.qsa_dense import qsa_dense_supported
+
+        supported = qsa_dense_supported(
+            self._decode_query_len,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.kv_cache.dtype,
+            side_metadata.seq_lens.shape[0],
+        )
+        logger.info_once(
+            "QSA dense short-context %s: tokens=%d requests=%d bucket=%d",
+            "enabled" if supported else "unsupported",
+            num_tokens,
+            side_metadata.seq_lens.shape[0],
+            bucket,
+        )
+        return supported
 
     def _run_qsa(
         self,
@@ -784,10 +940,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 key[:num_tokens],
                 value[:num_tokens],
             )
+        dense = self._use_dense_short_context(num_tokens, side_metadata)
         selected = self.indexer(
             hidden_states,
             positions,
             self.topk_indices_buffer[:num_tokens],
+            select=not dense,
         )
         if selected.shape != (
             num_tokens,
@@ -801,13 +959,34 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             selected,
         )
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        impl.do_kv_cache_update(
-            self,
-            key,
-            value,
-            self.kv_cache,
-            main_metadata.slot_mapping,
-        )
+        if self.host_kv_enabled:
+            self.host_kv.write(key, value, main_metadata.slot_mapping)
+        elif query.dim() == 2:
+            # SM70 prep: raw qkv rows -> normalized/rotated query + cache write.
+            key_cache, value_cache = self.kv_cache.unbind(1)
+            prepared = query.new_empty((num_tokens, self.num_heads, self.head_dim))
+            text_positions = positions[0] if positions.dim() == 2 else positions
+            torch.ops._C.qsa_prep_sm70_out(
+                query[:num_tokens],
+                text_positions[:num_tokens].to(torch.int64),
+                self.rotary_emb.cos_sin_cache,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                self.q_norm.variance_epsilon,
+                prepared,
+                key_cache,
+                value_cache,
+                main_metadata.slot_mapping[:num_tokens].to(torch.int64),
+            )
+            query = key = value = prepared
+        else:
+            impl.do_kv_cache_update(
+                self,
+                key,
+                value,
+                self.kv_cache,
+                main_metadata.slot_mapping,
+            )
         impl.forward_qsa(
             self,
             query,
@@ -820,6 +999,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             output_gate=output_gate,
             query_positions=side_metadata.logical_positions,
             sequence_lengths=side_metadata.seq_lens,
+            dense_short_context=dense,
         )
         _sm70_dump_qwen_layer_tensor(
             "qsa_core_out",
@@ -834,17 +1014,34 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         output: torch.Tensor | None,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v, gate = self._project_qkv_gate(qkv, positions)
         num_tokens = hidden_states.shape[0]
-        query = q.view(num_tokens, self.num_heads, self.head_dim)
-        key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
-        value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
-        attn_output = torch.empty_like(query)
+        side = getattr(self, "sm70_side_projection", None)
+        indexer_input = hidden_states
+        if side is not None and 1 <= num_tokens <= 8:
+            # The indexer receives its projected q/k instead of hidden states.
+            qkv, indexer_input = side(hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+        if self._sm70_qsa_prep and num_tokens <= 32:
+            # Raw rows go to the attention op, which normalizes, rotates and
+            # caches them in one launch; the gate stays strided in q_gate.
+            q_gate = qkv[:, : self.q_size * 2].view(
+                num_tokens, self.num_heads, 2 * self.head_dim
+            )
+            gate = q_gate[..., self.head_dim :].reshape(num_tokens, self.q_size)
+            query = qkv
+            key = value = qkv
+            attn_output = qkv.new_empty((num_tokens, self.num_heads, self.head_dim))
+        else:
+            q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            query = q.view(num_tokens, self.num_heads, self.head_dim)
+            key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
+            value = v.view(num_tokens, self.num_kv_heads, self.head_dim)
+            attn_output = torch.empty_like(query)
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
             torch.ops.vllm.qwen4_exp_qsa_with_output(
-                hidden_states,
+                indexer_input,
                 positions,
                 query,
                 key,
@@ -855,7 +1052,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         else:
             qwen4_exp_qsa_with_output(
-                hidden_states,
+                indexer_input,
                 positions,
                 query,
                 key,
@@ -865,6 +1062,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 encoded_layer_name,
             )
         flat_output = attn_output.view(num_tokens, -1)
+        hcx_projection = getattr(self, "sm70_hcx_projection_name", None)
+        if hcx_projection is not None:
+            projected_output = torch.ops.vllm.qwen38_sm70_hcx_output_projection(
+                flat_output, hcx_projection
+            )
+            if output is not None:
+                output.copy_(projected_output)
+            return projected_output
         projected_output, _ = self.o_proj(flat_output)
         if output is not None:
             output.copy_(projected_output)

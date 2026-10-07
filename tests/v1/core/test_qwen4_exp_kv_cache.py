@@ -168,6 +168,51 @@ def test_qwen4_exp_csa_linear_cache_layout() -> None:
     )
 
 
+@pytest.mark.parametrize("mixed", [False, True])
+def test_host_qsa_separates_authoritative_history_from_device_state(mixed):
+    config = _vllm_config()
+    config.cache_config.num_gpu_blocks_override = 32
+    resident_specs = _qwen4_exp_cache_specs()
+    resident_groups = get_kv_cache_groups(config, resident_specs)
+    resident = get_kv_cache_config_from_groups(config, resident_groups, 1 << 30)
+    specs = _qwen4_exp_cache_specs()
+    for name, spec in list(specs.items()):
+        if type(spec) is FullAttentionSpec and not (mixed and ".7." in name):
+            specs[name] = replace(spec, host_backed=True, dtype=torch.uint8)
+    groups = get_kv_cache_groups(config, specs)
+    cache = get_kv_cache_config_from_groups(config, groups, 1 << 30)
+    host = [t for t in cache.kv_cache_tensors if t.host_backed]
+    device = [t for t in cache.kv_cache_tensors if not t.host_backed]
+    assert len(host) == (1 if mixed else 2)
+    assert all(len(t.shared_by) == 1 and not t.packed_members for t in host)
+    assert all("linear_attn" not in t.shared_by[0] for t in host)
+    assert sum(t.size for t in device) < sum(t.size for t in resident.kv_cache_tensors)
+    names = [name for t in cache.kv_cache_tensors for name in t.shared_by]
+    assert len(names) == len(set(names)) == len(specs)
+    assert cache.num_blocks == resident.num_blocks == 32
+    assert get_max_concurrency_for_kv_cache_config(config, cache) == (
+        get_max_concurrency_for_kv_cache_config(config, resident)
+    )
+
+
+def test_host_qsa_bounds_unused_device_pages_to_admitted_concurrency():
+    config = _vllm_config()
+    config.cache_config.enable_prefix_caching = False
+    specs = _qwen4_exp_cache_specs()
+    for name, spec in list(specs.items()):
+        if type(spec) is FullAttentionSpec:
+            specs[name] = replace(spec, host_backed=True, dtype=torch.uint8)
+    groups = get_kv_cache_groups(config, specs)
+    bounded = get_kv_cache_config_from_groups(config, groups, 1 << 30)
+    config.cache_config.enable_prefix_caching = True
+    prefix = get_kv_cache_config_from_groups(config, groups, 1 << 30)
+    assert bounded.num_blocks < prefix.num_blocks
+    assert get_max_concurrency_for_kv_cache_config(config, bounded) >= 2
+    assert sum(t.size for t in bounded.kv_cache_tensors if not t.host_backed) < (
+        sum(t.size for t in prefix.kv_cache_tensors if not t.host_backed)
+    )
+
+
 def test_qwen4_exp_circular_cache_stores_keys_without_unused_values() -> None:
     spec = CircularBufferSpec(
         block_size=4,

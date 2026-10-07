@@ -403,6 +403,109 @@ direct_register_custom_op(
 )
 
 
+def _expert_mma(
+    x: torch.Tensor,
+    ids: torch.Tensor,
+    probabilities: torch.Tensor,
+    gate_codes: torch.Tensor,
+    gate_scale: torch.Tensor,
+    up_codes: torch.Tensor,
+    up_scale: torch.Tensor,
+    table: torch.Tensor,
+    down_ptrs: torch.Tensor,
+    down_stats: torch.Tensor,
+    plane_format: int,
+    down_type: int,
+    experts: int,
+    intermediate: int,
+    kw: int,
+    q8_batches: list[int],
+) -> torch.Tensor:
+    m, top_k = ids.shape
+    hidden = (
+        torch.empty(
+            (m, top_k, intermediate // 32, 36), dtype=torch.uint8, device=x.device
+        )
+        if m in q8_batches
+        else x.new_empty((m, top_k, intermediate))
+    )
+    ids32 = ids if ids.dtype == torch.int32 else ids.to(torch.int32)
+    torch.ops._C.gguf_moe_gate_up_sm70_out(
+        hidden,
+        x,
+        ids32.contiguous(),
+        gate_codes,
+        gate_scale,
+        up_codes,
+        up_scale,
+        plane_format,
+        table,
+        kw,
+    )
+    output = torch.empty_like(x)
+    torch.ops._C.gguf_dp4a_down_unroute_sm70_out(
+        output,
+        hidden,
+        ids32,
+        probabilities,
+        down_ptrs,
+        down_stats,
+        down_type,
+        experts,
+    )
+    return output
+
+
+def _expert_mma_fake(
+    x,
+    ids,
+    probabilities,
+    gate_codes,
+    gate_scale,
+    up_codes,
+    up_scale,
+    table,
+    down_ptrs,
+    down_stats,
+    plane_format,
+    down_type,
+    experts,
+    intermediate,
+    kw,
+    q8_batches,
+):
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="gguf_expert_mma",
+    op_func=_expert_mma,
+    fake_impl=_expert_mma_fake,
+)
+
+MMA_MAX_TOKENS = 20
+MMA_TOP_K = 10
+MMA_PLANE_KW = 4
+
+
+def _expert_planes(raw: torch.Tensor, source_type: int, n: int, k: int):
+    """Repack [E, N, stride] original IQ3 rows into dense_mv tile planes."""
+    from vllm.model_executor.layers.quantization.gguf_moe_planes import (
+        BLOCK_BYTES,
+        expert_planes,
+    )
+
+    experts = raw.shape[0]
+    payload = k // 256 * BLOCK_BYTES[source_type]
+    rows = raw[:, :n, :payload].reshape(experts * n, payload).cpu().numpy()
+    fmt, codes, meta = expert_planes(rows, source_type)
+    return (
+        fmt,
+        torch.from_numpy(codes).to(raw.device).view(experts, -1),
+        torch.from_numpy(meta).to(raw.device).view(experts, -1),
+    )
+
+
 class GGUFExpertBank(torch.nn.Module):
     def __init__(self, source_type, experts, device, dtype, retain_raw=False):
         super().__init__()
@@ -633,6 +736,16 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             if config is not None
             else True
         )
+        self.mma_enabled = bool(
+            self.native_enabled
+            and config is not None
+            and config.kernel_config.sm70_gguf.grouped_mma_gate_up
+        )
+        self.mma_release_raw = bool(
+            config is not None
+            and config.kernel_config.sm70_gguf.grouped_mma_release_raw
+        )
+        self.mma_planes = False
         self.q8_intermediate_enabled = self.dp4a_enabled and (
             config.kernel_config.sm70_gguf.q8_expert_intermediate
             if config is not None
@@ -696,6 +809,52 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             and hasattr(gate, "raw_weights")
             and hasattr(up, "raw_weights")
         )
+        down = banks["w2"]
+        if self.mma_enabled and not (
+            self.raw_gate_up
+            and gate.source_type in (18, 21, 22)
+            and down.source_type in (20, 42)
+        ):
+            logger.info_once(
+                "SM70 grouped-MMA GGUF expert gate/up not admitted "
+                "(raw=%s, gate=%d, down=%d).",
+                self.raw_gate_up,
+                gate.source_type,
+                down.source_type,
+            )
+        self.mma_planes = bool(
+            self.mma_enabled
+            and self.raw_gate_up
+            and gate.source_type in (18, 21, 22)
+            and down.source_type in (20, 42)
+            and gate.k % 128 == 0
+            and gate.n % 32 == 0
+            and self.params_dtype == torch.float16
+        )
+        if self.mma_planes:
+            from vllm.model_executor.layers.quantization.gguf_moe_planes import (
+                expert_table,
+            )
+
+            fmt, gate.plane_codes, gate.plane_scale = _expert_planes(
+                gate.raw_weights, gate.source_type, gate.n, gate.k
+            )
+            _, up.plane_codes, up.plane_scale = _expert_planes(
+                up.raw_weights, up.source_type, up.n, up.k
+            )
+            self.plane_format = int(fmt)
+            logger.info_once(
+                "SM70 grouped-MMA GGUF expert gate/up planes enabled "
+                "(type=%d, down=%d, raw released=%s).",
+                gate.source_type,
+                down.source_type,
+                self.mma_release_raw,
+            )
+            gate.plane_table = torch.from_numpy(expert_table(gate.source_type)).to(
+                gate.plane_codes.device
+            )
+            if self.mma_release_raw:
+                self.raw_gate_up = False
         if not self.raw_gate_up:
             for bank in (gate, up):
                 if hasattr(bank, "raw_weights"):
@@ -736,7 +895,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             self.params_dtype,
             is_sm70=current_platform.is_device_capability(70),
             enabled=dp4a_enabled,
-            original_storage_available=self.raw_gate_up,
+            original_storage_available=self.raw_gate_up or self.mma_planes,
             canonical_storage_available=canonical_iq4,
         )
         self.dp4a_batches = [
@@ -751,7 +910,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             self.params_dtype,
             is_sm70=current_platform.is_device_capability(70),
             enabled=self.q8_intermediate_enabled and dp4a_enabled,
-            original_storage_available=self.raw_gate_up,
+            original_storage_available=self.raw_gate_up or self.mma_planes,
             canonical_storage_available=canonical_iq4,
         )
         self.q8_intermediate_batches = [
@@ -840,6 +999,35 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             )
         if x.shape[0] == 0:
             return torch.empty_like(x)
+        if (
+            self.mma_planes
+            and layer.expert_map is None
+            and x.shape[0] <= MMA_MAX_TOKENS
+            and topk_ids.shape[1] == MMA_TOP_K
+            and topk_weights.dtype == torch.float32
+            and x.is_contiguous()
+            and topk_weights.is_contiguous()
+        ):
+            bank = layer.gguf_expert_banks
+            gate, up, down = bank["w1"], bank["w3"], bank["w2"]
+            return torch.ops.vllm.gguf_expert_mma(
+                x,
+                topk_ids,
+                topk_weights,
+                gate.plane_codes,
+                gate.plane_scale,
+                up.plane_codes,
+                up.plane_scale,
+                gate.plane_table,
+                down.weight_ptrs,
+                down.stat_ptrs,
+                self.plane_format,
+                down.source_type,
+                self.num_experts,
+                self.intermediate_size,
+                MMA_PLANE_KW,
+                self.q8_intermediate_batches,
+            )
         if self.dp4a_batches and layer.expert_map is None:
             bank = layer.gguf_expert_banks
             gate, up, down = bank["w1"], bank["w3"], bank["w2"]

@@ -1742,22 +1742,54 @@ def _get_kv_cache_config_csa_linear(
         return None
 
     num_blocks = available_memory // layout.bytes_per_block
+    if (
+        layout.host_main_kv_names
+        and vllm_config.cache_config.num_gpu_blocks_override is None
+        and not getattr(vllm_config.cache_config, "enable_prefix_caching", False)
+    ):
+        # With authoritative host history, filling the remaining device budget
+        # with padded state pages defeats the memory saving. Bound the shared
+        # scheduler pool to all admitted requests at maximum length, including
+        # one extra page per group for lookahead/alignment and the null block.
+        per_request = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            + 1
+            for group in kv_cache_groups
+            if group.layer_names
+        )
+        num_blocks = min(
+            num_blocks, 1 + vllm_config.scheduler_config.max_num_seqs * per_request
+        )
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     kv_cache_tensors = []
     for index, owner in enumerate(layout.main_kv_owners):
         members = [layout.main_kv_names[i] for i in owner]
-        kv_cache_tensors.append(
-            KVCacheTensor(
-                size=layout.owner_page_size(index) * num_blocks,
-                shared_by=members
-                + [
-                    group.layer_names[index]
-                    for group in layout.mamba_groups
-                    if index < len(group.layer_names)
-                ],
-                packed_members=members if len(members) > 1 else None,
+        host_members = [name for name in members if name in layout.host_main_kv_names]
+        for member in host_members:
+            member_index = layout.main_kv_names.index(member)
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=layout.main_kv_page_sizes[member_index] * num_blocks,
+                    shared_by=[member],
+                    host_backed=True,
+                )
             )
-        )
+        device_members = [name for name in members if name not in host_members] + [
+            group.layer_names[index]
+            for group in layout.mamba_groups
+            if index < len(group.layer_names)
+        ]
+        if device_members:
+            kv_cache_tensors.append(
+                KVCacheTensor(
+                    size=layout.owner_page_size(index) * num_blocks,
+                    shared_by=device_members,
+                    packed_members=members if len(members) > 1 else None,
+                )
+            )
     kv_cache_tensors.extend(
         KVCacheTensor(
             size=layout.compressed_page_sizes[index] * num_blocks,
@@ -2061,12 +2093,19 @@ class _CSALinearTensorLayout:
     compressed_page_sizes: list[int]
     # Physical main-KV owners, as indices into ``main_kv_names``.
     main_kv_owners: list[list[int]]
+    host_main_kv_names: tuple[str, ...] = ()
+    device_owner_page_sizes: list[int] | None = None
 
     @property
     def bytes_per_block(self) -> int:
-        return sum(self.main_kv_page_sizes) + sum(self.compressed_page_sizes)
+        pages = self.device_owner_page_sizes
+        return sum(pages if pages is not None else self.main_kv_page_sizes) + sum(
+            self.compressed_page_sizes
+        )
 
     def owner_page_size(self, owner: int) -> int:
+        if self.device_owner_page_sizes is not None:
+            return self.device_owner_page_sizes[owner]
         return sum(self.main_kv_page_sizes[i] for i in self.main_kv_owners[owner])
 
 
@@ -2298,10 +2337,19 @@ def _get_kv_cache_groups_csa_linear(
         KVCacheGroupSpec(list(padded_compressor_specs), compressor_uniform),
     ]
     main_kv_names = [cache.main_kv[0] for cache in tuples]
-    owners = _pack_csa_linear_main_kv(
-        main_kv_pages, _csa_linear_state_page(roles.mamba.values())
-    )
-    owner_pages = [sum(main_kv_pages[i] for i in owner) for owner in owners]
+    host_owners = {cache.main_kv[0] for cache in tuples if cache.main_kv[1].host_backed}
+    state_page = _csa_linear_state_page(roles.mamba.values())
+    if host_owners:
+        # Host attention no longer supplies recurrent-state device storage.
+        # Keep the same scheduler IDs, with independently sized device pools.
+        owners = [[i] for i in range(len(main_kv_names))]
+        owner_pages = [
+            max(state_page, 0 if name in host_owners else main_kv_pages[i])
+            for i, name in enumerate(main_kv_names)
+        ]
+    else:
+        owners = _pack_csa_linear_main_kv(main_kv_pages, state_page)
+        owner_pages = [sum(main_kv_pages[i] for i in owner) for owner in owners]
     # One representative name per physical owner; recurrent states are placed
     # per physical owner, whatever it packs.
     owner_names = [main_kv_names[owner[0]] for owner in owners]
@@ -2400,6 +2448,23 @@ def _get_csa_linear_tensor_layout(
     main_kv_page_sizes = [
         compressed_sparse[name].page_size_bytes for name in main_kv_names
     ]
+    host_owners = tuple(
+        name
+        for name in main_kv_names
+        if cast(FullAttentionSpec, compressed_sparse[name]).host_backed
+    )
+    device_pages = None
+    if host_owners:
+        device_pages = []
+        for index, name in enumerate(main_kv_names):
+            size = 0 if name in host_owners else main_kv_page_sizes[index]
+            for group in mamba_groups:
+                if index < len(group.layer_names):
+                    spec = group.kv_cache_spec
+                    if isinstance(spec, UniformTypeKVCacheSpecs):
+                        spec = spec.kv_cache_specs[group.layer_names[index]]
+                    size = max(size, spec.page_size_bytes)
+            device_pages.append(size)
     return _CSALinearTensorLayout(
         main_kv_names=main_kv_names,
         compressed_names=compressed_names,
@@ -2409,7 +2474,11 @@ def _get_csa_linear_tensor_layout(
         compressed_page_sizes=[
             compressed_sparse[name].page_size_bytes for name in compressed_names
         ],
-        main_kv_owners=_pack_csa_linear_main_kv(
+        host_main_kv_names=host_owners,
+        device_owner_page_sizes=device_pages,
+        main_kv_owners=[[i] for i in range(len(main_kv_names))]
+        if host_owners
+        else _pack_csa_linear_main_kv(
             main_kv_page_sizes,
             _csa_linear_state_page(
                 member

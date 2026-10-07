@@ -404,6 +404,12 @@ class Sm70GgufConfig:
     q8_expert_intermediate: bool = True
     """Encode routed intermediates once in qualified integer expert gate/up."""
 
+    grouped_mma_gate_up: bool = False
+    """Run routed IQ3 gate/up at M1..8 as expert-grouped FP16 MMA on repacked planes."""
+
+    grouped_mma_release_raw: bool = True
+    """Free the original-block IQ3 gate/up banks once the MMA planes replace them."""
+
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
 
@@ -422,7 +428,7 @@ class Sm70RingConfig:
     enabled: bool = True
     """Admit the ring operator when topology and peer atomics are supported."""
 
-    max_bytes: int = Field(default=25600, gt=0, le=25600)
+    max_bytes: int = Field(default=25600, gt=0, le=102400)
     """Largest calibrated input payload; larger messages retain NCCL."""
 
 
@@ -498,6 +504,9 @@ class KernelConfig:
     - "exllama": Use Exllama mixed-precision kernels
     - "emulation": Use slow dequant-to-BF16 emulation (for testing only)"""
 
+    sm70_fp16_grouped_short_splits: bool = True
+    """Use K32 splits for FP16 q8/B1 grouped verification at 129..2048 tokens."""
+
     sm70_rmsnorm_gated_exact: bool | None = None
     """Native gated norm; auto follows the Flash-Next model quality boundary."""
 
@@ -529,6 +538,9 @@ class KernelConfig:
 
     sm70_ring: Sm70RingConfig = Field(default_factory=Sm70RingConfig)
     """SM70 ring collective policy, resolved from actual peer capabilities."""
+
+    hc_ll_optimized_loads: bool = True
+    """Prefetch HC down weights and pad the up shared-memory rows on SM70."""
 
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
@@ -562,12 +574,73 @@ class KernelConfig:
     )
     """Observed selector decisions for loaded local layouts; diagnostic only."""
 
+    sm70_fused_side_projections: bool = False
+    """Compute the GDN a/b and QSA indexer q/k FP16 projections inside the
+    small-M GGUF input projection launch (packed dense_mv planes)."""
+
+    sm70_qsa_prep: bool = False
+    """Fuse QSA q/k GemmaRMSNorm, partial NeoX RoPE and the FP16 K/V cache
+    write into one SM70 launch for decode batches."""
+
+    sm70_draft_hot_vocab: int = 0
+    """Greedy MTP drafts choose among this many lowest token ids (BPE merge
+    order) spread evenly across TP ranks; 0 keeps the full vocabulary. Only
+    the draft proposal changes; verification still uses the full head."""
+
+    sm70_draft_single_graph: bool = False
+    """Capture all MTP draft decode steps, including their slot mappings and
+    attention metadata, as one CUDA graph instead of one replay per step."""
+
+    sm70_top1x: bool = False
+    """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
+    instead of an all-gather."""
+
+    sm70_greedy_verify: bool = False
+    """Verify greedy MTP drafts from TP-local target argmax pairs instead of
+    gathering full-vocabulary logits for the rejection sampler."""
+
+    sm70_gdn_verify: bool = False
+    """Run single-request MTP GDN verification with the SM70 sequential CUDA
+    recurrence instead of the Triton fused kernel."""
+
+    sm70_hcx: bool = False
+    """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
+    HC down and HC up as one SM70 kernel for verification batches up to 8."""
+
+    sm70_hcx_output_projection: bool = True
+    """Fuse eligible output projections into HCX when HCX is enabled. Disable
+    to compare the separate projection and HC boundary with identical weights."""
+
+    sm70_hcx_diagnostics: bool = False
+    """Record M5 HCX inputs and outputs in owned graph buffers for numerical
+    diagnosis. Requires separate output projections; timings are diagnostic."""
+
+    qsa_dense_short_context: bool = False
+    """Attend densely, without index selection, in context-bucketed decode graphs
+    whose bucket does not exceed the indexer budget (where QSA selects every
+    visible token)."""
+
     qsa_auto_e4m3: bool = True
     """Default eligible calibrated QSA caches to E4M3 without speculation."""
     qsa_auto_e4m3_active: bool = Field(default=False, init=False)
     """Whether automatic calibrated QSA storage was selected."""
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
     """Startup reason when calibrated automatic storage cannot be selected."""
+
+    qsa_host_kv: bool = False
+    """Keep QSA attention history in pinned host storage on SM70."""
+    qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
+    """Authoritative target history format; FP16 isolates placement error."""
+    qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "float16"] = "float16"
+    """Preserve speculative cache precision independently of target storage."""
+    qsa_host_kv_device_reference: bool = False
+    """Keep identical encoded history on device for controlled placement A/B."""
+    qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
+    """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_active: bool = Field(default=False, init=False)
+    """Whether the host QSA cache geometry has been admitted."""
+    qsa_host_kv_reason: str | None = Field(default=None, init=False)
+    """Reason the requested host QSA storage is unavailable."""
 
     ple_disk_cascade: bool = True
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
@@ -643,6 +716,7 @@ class KernelConfig:
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
+            "qsa_host_kv_reason",
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")

@@ -58,31 +58,79 @@ __global__ void mtp_moe_fp16_tile_kernel(const half* x, const half* w,
   }
 }
 
-__global__ void mtp_moe_fp16_m1_w13_kernel(const half* x, const half* w,
-                                           const int32_t* ids,
-                                           const int32_t* padded, half* y) {
-  constexpr int kN = 320, kK = 2560, kThreads = 64;
+// M1 W13: one CTA per (route, ROWS-row block) streams double-buffered coalesced
+// tiles into shared memory; the first ROWS threads keep the original sequential
+// FP32 FMA order per output row, so the result is bit-identical to the
+// one-thread-per-row kernel it replaces.
+template <int ROWS, int BK, int NT>
+__global__ __launch_bounds__(NT, 1) void mtp_moe_fp16_m1_w13_staged_kernel(
+    const half* __restrict__ x, const half* __restrict__ w,
+    const int32_t* __restrict__ ids, const int32_t* __restrict__ padded,
+    half* __restrict__ y) {
+  constexpr int kN = 320, kK = 2560, PAD = BK + 8;
+  constexpr int VEC = ROWS * BK / 8;        // uint4 per stage
+  constexpr int PER = (VEC + NT - 1) / NT;  // uint4 per thread per stage
+  constexpr int STAGES = kK / BK;
   __shared__ float input[kK];
-  const int t = threadIdx.x, route = blockIdx.y;
+  __shared__ __align__(16) half tile[2][ROWS][PAD];
+  const int t = threadIdx.x, route = blockIdx.y, row0 = blockIdx.x * ROWS;
   if (route * 2 >= *padded) return;
-  const int expert = ids[route], col = blockIdx.x * kThreads + t;
-  for (int k = t; k < kK; k += kThreads) input[k] = __half2float(x[k]);
+  const int expert = ids[route];
+  const bool ok = expert >= 0 && expert < 512;
+  if (!ok) {
+    for (int r = t; r < ROWS; r += NT)
+      y[route * kN + row0 + r] = __float2half_rn(0.0f);
+    return;
+  }
+  const half* base = w + (int64_t(expert) * kN + row0) * kK;
+  uint4 reg[PER];
+  auto gload = [&](int s) {
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+      const int v = t + i * NT;
+      if (VEC % NT == 0 || v < VEC) {
+        const int r = v / (BK / 8), c = v % (BK / 8) * 8;
+        reg[i] = __ldg(reinterpret_cast<const uint4*>(base + int64_t(r) * kK +
+                                                      s * BK + c));
+      }
+    }
+  };
+  auto sstore = [&](int buf) {
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+      const int v = t + i * NT;
+      if (VEC % NT == 0 || v < VEC) {
+        const int r = v / (BK / 8), c = v % (BK / 8) * 8;
+        *reinterpret_cast<uint4*>(&tile[buf][r][c]) = reg[i];
+      }
+    }
+  };
+  gload(0);
+  for (int k = t; k < kK; k += NT) input[k] = __half2float(x[k]);
+  sstore(0);
   __syncthreads();
   float acc = 0.0f;
-  if (expert >= 0 && expert < 512) {
-    const half* p = w + (int64_t(expert) * kN + col) * kK;
-    for (int k = 0; k < kK; k += 8) {
-      union {
-        uint4 v;
-        half h[8];
-      } data;
-      data.v = *reinterpret_cast<const uint4*>(p + k);
+  for (int s = 0; s < STAGES; ++s) {
+    if (s + 1 < STAGES) gload(s + 1);
+    if (t < ROWS) {
+      const half* tr = tile[s & 1][t];
+      const float* in = input + s * BK;
+#pragma unroll 4
+      for (int k = 0; k < BK; k += 8) {
+        union {
+          uint4 v;
+          half h[8];
+        } d;
+        d.v = *reinterpret_cast<const uint4*>(tr + k);
 #pragma unroll
-      for (int j = 0; j < 8; ++j)
-        acc = __fmaf_rn(input[k + j], __half2float(data.h[j]), acc);
+        for (int j = 0; j < 8; ++j)
+          acc = __fmaf_rn(in[k + j], __half2float(d.h[j]), acc);
+      }
     }
+    if (s + 1 < STAGES) sstore((s + 1) & 1);
+    __syncthreads();
   }
-  y[route * kN + col] = __float2half_rn(acc);
+  if (t < ROWS) y[route * kN + row0 + t] = __float2half_rn(acc);
 }
 
 void mtp_moe_fp16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
@@ -126,8 +174,8 @@ void mtp_moe_fp16_out(torch::Tensor out, torch::Tensor x, torch::Tensor w,
     mtp_moe_fp16_tile_kernel<2560, 160, 64, 64, true>
         <<<dim3(40, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);
   } else if (m == 1) {
-    mtp_moe_fp16_m1_w13_kernel<<<dim3(5, 10), 64, 0, stream>>>(xp, wp, ip, pp,
-                                                               op);
+    mtp_moe_fp16_m1_w13_staged_kernel<40, 128, 320>
+        <<<dim3(8, 10), 320, 0, stream>>>(xp, wp, ip, pp, op);
   } else {
     mtp_moe_fp16_tile_kernel<320, 2560, 32, 128, false>
         <<<dim3(10, m * 10), 128, 0, stream>>>(xp, wp, ip, tp, pp, op);

@@ -12602,9 +12602,18 @@ class GPUModelRunner(
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            tensor = torch.zeros(
-                kv_cache_tensor.size, dtype=torch.int8, device=self.device
-            )
+            if kv_cache_tensor.host_backed:
+                from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+                with torch.accelerator.device_index(self.device.index):
+                    host = torch.zeros(
+                        kv_cache_tensor.size, dtype=torch.int8, pin_memory=True
+                    )
+                    tensor = get_accelerator_view_from_cpu_tensor(host)
+            else:
+                tensor = torch.zeros(
+                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 

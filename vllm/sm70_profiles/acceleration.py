@@ -397,6 +397,9 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
 
     return {
         "fp16_grouped": hasattr(torch.ops._vllm_fa2_C, "sm70_grouped_fp16_fwd"),
+        "fp16_short_splits": hasattr(
+            torch.ops._vllm_fa2_C, "sm70_grouped_fp16_short_split_revision"
+        ),
         "grouped_fp32": bool(flash_attn_grouped_e4m3_fp32_available()),
         "long_operator": builtin_long_attention() is not None,
         "long_enabled": long_attention_enabled(),
@@ -528,6 +531,24 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "enabled": cfg.kernel_config.qsa_auto_e4m3_active,
         "reason": cfg.kernel_config.qsa_auto_e4m3_reason,
         "scope": "calibrated_cache_storage",
+    }
+    report["qsa_host_kv"] = {
+        "enabled": cfg.kernel_config.qsa_host_kv_active,
+        "reason": cfg.kernel_config.qsa_host_kv_reason,
+        "scope": "active_attention_history",
+        "host_dtype": (
+            cfg.kernel_config.qsa_host_kv_draft_dtype
+            if getattr(cfg, "is_speculative_draft", False)
+            else cfg.kernel_config.qsa_host_kv_dtype
+        ),
+        "history_storage": (
+            "device_reference"
+            if cfg.kernel_config.qsa_host_kv_device_reference
+            else "host"
+        ),
+        "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
+        "attention_staging_dtype": "float16",
+        "recurrent_state_storage": "device",
     }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {
@@ -683,6 +704,17 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         runtime_guards="FP16 operands; local Q/KV heads=6/1, D=256; page=832; "
         "causal full context; B1 q2..8 or B2..4 q8; capacity<=266240",
         arithmetic="FP32 probability/PV/numerator/max/sum",
+        short_context_splits=_row(
+            fp16_reason
+            or (
+                "disabled_by_policy"
+                if not cfg.kernel_config.sm70_fp16_grouped_short_splits
+                else "operator_missing:sm70_grouped_fp16_short_split_revision"
+                if not native.get("fp16_short_splits", False)
+                else None
+            ),
+            runtime_guards="FP16 q8/B1 at device context 129..2048; K64 elsewhere",
+        ),
     )
     if release_profile and dtype in ("auto", "float16", "bfloat16") and fp16_shape:
         report["expected_acceleration"] = [

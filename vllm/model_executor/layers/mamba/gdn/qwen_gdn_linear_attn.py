@@ -16,7 +16,11 @@ from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
-from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config import (
+    VllmConfig,
+    get_current_vllm_config,
+    get_current_vllm_config_or_none,
+)
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
@@ -2433,6 +2437,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 1,
                 1 + int(vllm_config.speculative_config.num_speculative_state_tokens()),
             )
+        _cfg = get_current_vllm_config_or_none()
+        self.sm70_gdn_verify_enabled = bool(
+            _cfg is not None
+            and _cfg.kernel_config.sm70_gdn_verify
+            and hasattr(torch.ops._C, "sm70_gdn_verify_out")
+        )
         self.enable_sm70_gdn_rmsnorm_onepass = (
             _sm70_gdn_rmsnorm_onepass_enabled()
             and current_platform.is_device_capability(70)
@@ -4037,7 +4047,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = _sm70_gdn_prefill_profile_start()
-        if output is None:
+        hcx_projection = getattr(self, "sm70_hcx_projection_name", None)
+        if hcx_projection is not None and output is None:
+            proj_out = torch.ops.vllm.qwen38_sm70_hcx_output_projection(
+                core_attn_out, hcx_projection
+            )
+        elif output is None:
             proj_out, _ = self.out_proj(core_attn_out)
         else:
             # The caller guards the bias-free, non-reducing SM70 FP8 route.
@@ -4292,8 +4307,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             z = z.reshape(z.size(0), -1, self.head_v_dim)
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            side = getattr(self, "sm70_side_projection", None)
+            if side is not None and 1 <= hidden_states.shape[0] <= 8:
+                mixed_qkvz, ba = side(hidden_states)
+            else:
+                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+                ba, _ = self.in_proj_ba(hidden_states)
             mixed_qkvz = _sm70_dump_gdn_projection_tensor(
                 "in_proj_qkvz", layer_name, mixed_qkvz
             )
@@ -6090,32 +6109,75 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     and core_attn_out.is_contiguous()
                     and core_attn_out.dtype == mixed_qkv_spec.dtype
                 )
-                core_attn_out_spec, last_recurrent_state = (
-                    fused_sigmoid_gating_delta_rule_update_mixed_qkv(
-                        A_log=self.A_log,
-                        a=a_spec,
-                        b=b_spec,
-                        dt_bias=self.dt_bias,
-                        mixed_qkv=mixed_qkv_spec,
-                        num_q_heads=self.num_k_heads // self.tp_size,
-                        num_v_heads=self.num_v_heads // self.tp_size,
-                        head_k_dim=self.head_k_dim,
-                        head_v_dim=self.head_v_dim,
-                        initial_state=ssm_state,
-                        inplace_final_state=True,
-                        cu_seqlens=spec_query_start_loc[
-                            : attn_metadata.num_spec_decodes + 1
-                        ],
-                        ssm_state_indices=spec_state_indices_tensor,
-                        num_accepted_tokens=spec_state_slot_selectors,
-                        use_qk_l2norm_in_kernel=True,
-                        out=(
-                            core_attn_out[:num_actual_tokens].unsqueeze(0)
-                            if direct_verify_out
-                            else None
-                        ),
-                    )
+                use_cuda_verify = bool(
+                    self.sm70_gdn_verify_enabled
+                    and attn_metadata.num_spec_decodes == 1
+                    and mixed_qkv_spec.dtype == torch.float16
+                    and mixed_qkv_spec.stride(1) == 1
+                    and mixed_qkv_spec.shape[0] <= 8
+                    and ssm_state.dtype == torch.float32
+                    and self.head_k_dim == 128
+                    and self.head_v_dim == 128
                 )
+                if use_cuda_verify:
+                    _log_runtime_route_once(
+                        "SM70 CUDA GDN single-request verification route hit."
+                    )
+                    tokens = mixed_qkv_spec.shape[0]
+                    hv = self.num_v_heads // self.tp_size
+                    verify_out = (
+                        core_attn_out[:num_actual_tokens].unsqueeze(0)
+                        if direct_verify_out
+                        else mixed_qkv_spec.new_empty((1, tokens, hv, 128))
+                    )
+                    torch.ops._C.sm70_gdn_verify_out(
+                        mixed_qkv_spec,
+                        a_spec,
+                        b_spec,
+                        self.A_log,
+                        self.dt_bias,
+                        ssm_state,
+                        verify_out.view(-1, hv, 128),
+                        spec_query_start_loc[: attn_metadata.num_spec_decodes + 1],
+                        spec_state_indices_tensor,
+                        spec_state_slot_selectors,
+                        self.num_k_heads // self.tp_size,
+                        hv,
+                        self.head_k_dim**-0.5,
+                        1,
+                        None,
+                        None,
+                        None,
+                        tokens,
+                    )
+                    core_attn_out_spec, last_recurrent_state = verify_out, ssm_state
+                else:
+                    core_attn_out_spec, last_recurrent_state = (
+                        fused_sigmoid_gating_delta_rule_update_mixed_qkv(
+                            A_log=self.A_log,
+                            a=a_spec,
+                            b=b_spec,
+                            dt_bias=self.dt_bias,
+                            mixed_qkv=mixed_qkv_spec,
+                            num_q_heads=self.num_k_heads // self.tp_size,
+                            num_v_heads=self.num_v_heads // self.tp_size,
+                            head_k_dim=self.head_k_dim,
+                            head_v_dim=self.head_v_dim,
+                            initial_state=ssm_state,
+                            inplace_final_state=True,
+                            cu_seqlens=spec_query_start_loc[
+                                : attn_metadata.num_spec_decodes + 1
+                            ],
+                            ssm_state_indices=spec_state_indices_tensor,
+                            num_accepted_tokens=spec_state_slot_selectors,
+                            use_qk_l2norm_in_kernel=True,
+                            out=(
+                                core_attn_out[:num_actual_tokens].unsqueeze(0)
+                                if direct_verify_out
+                                else None
+                            ),
+                        )
+                    )
                 _log_runtime_route_once(
                     "SM70 mixed-QKV fused GDN target-verification route hit."
                 )

@@ -15,7 +15,19 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize(
     "groups,rows,context",
-    [(1, 2, 1091), (1, 8, 1091), (4, 8, 8192), (1, 8, 131072), (1, 8, 262144)],
+    [
+        (1, 2, 1091),
+        (1, 8, 640),
+        (1, 8, 1024),
+        (1, 8, 1091),
+        (1, 8, 1536),
+        (1, 8, 2048),
+        (1, 8, 2049),
+        (1, 8, 4096),
+        (4, 8, 8192),
+        (1, 8, 131072),
+        (1, 8, 262144),
+    ],
 )
 def test_grouped_fp16_reference_and_graph_metadata(groups, rows, context):
     from vllm.vllm_flash_attn.flash_attn_interface import ensure_fa2_library_loaded
@@ -92,3 +104,35 @@ def test_grouped_fp16_reference_and_graph_metadata(groups, rows, context):
         assert torch.count_nonzero(out) == 0
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
+
+
+def test_short_plan_boundary_replays_match_legacy():
+    from vllm.vllm_flash_attn.flash_attn_interface import ensure_fa2_library_loaded
+
+    ensure_fa2_library_loaded()
+    operator = torch.ops._vllm_fa2_C.sm70_grouped_fp16_fwd
+    storage = torch.randn((3, 2, 832, 1, 264), device="cuda", dtype=torch.float16)
+    k, v = storage[:, 0, :, :, :256], storage[:, 1, :, :, :256]
+    q = torch.randn((8, 6, 256), device="cuda", dtype=torch.float16)
+    out = torch.empty_like(q)
+    table = torch.tensor([[2, 0, 1]], dtype=torch.int32, device="cuda")
+    lengths = torch.arange(2041, 2049, dtype=torch.int32, device="cuda")
+    partial = torch.empty((80, 8, 6, 256), device="cuda")
+    lse = torch.empty((80, 8, 6, 2), device="cuda")
+
+    def run(enabled):
+        operator(q, k, v, out, table, lengths, partial, lse, 1 / 16, enabled)
+
+    run(True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(True)
+    for context in (2049, 2048, 2496, 128):
+        lengths.copy_(torch.arange(context - 7, context + 1, device="cuda"))
+        graph.replay()
+        actual = out.clone()
+        run(False)
+        if context == 2048:
+            torch.testing.assert_close(actual, out, atol=0.0005, rtol=0.01)
+        else:
+            assert torch.equal(actual.view(torch.int16), out.view(torch.int16))

@@ -24,13 +24,14 @@ from vllm.model_executor.layers import layernorm  # noqa: F401
     ],
 )
 @pytest.mark.parametrize("keep_residual", [False, True])
+@pytest.mark.parametrize("tp", [2, 4])
 def test_sm70_push_norm_matches_config_epsilon(
-    monkeypatch, epsilon, pattern_epsilon, expected_matches, keep_residual
+    monkeypatch, epsilon, pattern_epsilon, expected_matches, keep_residual, tp
 ):
     monkeypatch.setattr(
         fusion, "get_tp_group", lambda: SimpleNamespace(unique_name="tp:0")
     )
-    monkeypatch.setattr(fusion, "get_tensor_model_parallel_world_size", lambda: 4)
+    monkeypatch.setattr(fusion, "get_tensor_model_parallel_world_size", lambda: tp)
     monkeypatch.setattr(
         fusion,
         "tensor_model_parallel_all_reduce",
@@ -52,15 +53,16 @@ def test_sm70_push_norm_matches_config_epsilon(
 
         graph = make_fx(model)(*inputs)
         patterns = PatternMatcherPass()
-        fusion.Sm70Tp4PushGemmaRMSNormPattern(
-            torch.float16, "cpu", pattern_epsilon
+        fusion.Sm70PushGemmaRMSNormPattern(
+            torch.float16, "cpu", pattern_epsilon, tp
         ).register(patterns)
         assert patterns.apply(graph.graph) == expected_matches
-        fused = [
-            n
-            for n in graph.graph.nodes
-            if n.target == torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm.default
-        ]
+        collective = (
+            torch.ops.vllm.sm70_tp2_all_reduce_gemma_rms_norm.default
+            if tp == 2
+            else torch.ops.vllm.sm70_tp4_all_reduce_gemma_rms_norm.default
+        )
+        fused = [n for n in graph.graph.nodes if n.target == collective]
         assert len(fused) == expected_matches
         if fused:
             assert fused[0].args[3] == epsilon

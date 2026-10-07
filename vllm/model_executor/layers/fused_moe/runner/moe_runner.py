@@ -946,6 +946,12 @@ class MoERunner(MoERunnerInterface):
             self.layer_name,
         )
 
+        if getattr(self, "sm70_partial_output", False):
+            result = torch.ops.vllm.qwen38_sm70_hcx_moe_output(
+                shared_output, fused_output, self.sm70_hcx_name, og_hidden_dim
+            )
+            return self._maybe_add_zero_expert_output(result)
+
         result = self._maybe_sm70_moe_sum2_allreduce(
             shared_output, fused_output, og_hidden_dim
         )

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import msgspec
 import pytest
+import torch
 
 from vllm.sm70_graph_observer import CPUStageRecorder, GraphParityWorkerExtension
 from vllm.v1.serial_utils import MsgpackEncoder
@@ -75,6 +76,41 @@ def test_bounded_observer_reports_dropped_events():
     assert rec.read()["dropped"] == 1
 
 
+def test_gpu_timing_is_explicit_and_keeps_nested_spans(monkeypatch):
+    tick = 0
+
+    class Event:
+        def __init__(self, **kwargs):
+            self.time = None
+
+        def record(self):
+            nonlocal tick
+            self.time = tick
+            tick += 1
+
+        def elapsed_time(self, other):
+            return float(other.time - self.time)
+
+    monkeypatch.setattr(torch, "Event", Event)
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    rec = CPUStageRecorder(0)
+    rec.enabled = True
+    with rec.stage("target.replay"):
+        pass
+    assert not rec.gpu_events
+    rec.gpu_timing = True
+    rec.gpu_anchor = Event()
+    rec.gpu_anchor.record()
+    with rec.stage("worker.sample"), rec.stage("draft.propose"):
+        pass
+    row = rec.read()
+    spans = {s["label"]: s for s in row["gpu_events"]}
+    assert spans["worker.sample"]["elapsed_ms"] == 3
+    assert spans["draft.propose"]["elapsed_ms"] == 1
+    assert spans["worker.sample"]["start_ms"] < spans["draft.propose"]["start_ms"]
+    assert msgspec.msgpack.encode(row)
+
+
 def test_target_replay_marks_actual_graph_and_excludes_draft():
     class Graph:
         def replay(self):
@@ -135,3 +171,57 @@ def test_phase_rpc_uses_serializable_named_method_and_declared_capability():
     worker.model_runner.model_state = DependentState()
     with pytest.raises(RuntimeError, match="has not declared"):
         worker.set_graph_input_preparation(True)
+
+
+def _mtp_policy_worker(graphs):
+    worker = GraphParityWorkerExtension()
+    worker.rank = 2
+    config = lambda: SimpleNamespace(
+        kernel_config=SimpleNamespace(
+            sm70_draft_single_graph=True, sm70_greedy_verify=True
+        )
+    )
+    worker.model_runner = SimpleNamespace(
+        model=SimpleNamespace(get_top_tokens=lambda x: x),
+        vllm_config=config(),
+        speculator=SimpleNamespace(
+            method="mtp",
+            vllm_config=config(),
+            multistep_cudagraph_manager=SimpleNamespace(graphs=graphs),
+        ),
+    )
+    return worker
+
+
+def test_mtp_policy_rpc_preserves_captured_graphs_across_ablations():
+    graphs = {"c1": object(), "c4": object()}
+    worker = _mtp_policy_worker(graphs)
+    for draft, greedy in ((False, False), (True, False), (False, True), (True, True)):
+        result = worker.set_mtp_execution_policy(draft, greedy)
+        assert result == {
+            "rank": 2,
+            "draft_single_graph": draft,
+            "greedy_verify": greedy,
+        }
+        for config in (
+            worker.model_runner.vllm_config,
+            worker.model_runner.speculator.vllm_config,
+        ):
+            assert config.kernel_config.sm70_draft_single_graph is draft
+            assert config.kernel_config.sm70_greedy_verify is greedy
+        assert (
+            worker.model_runner.speculator.multistep_cudagraph_manager.graphs is graphs
+        )
+        assert MsgpackEncoder().encode(
+            ("set_mtp_execution_policy", (draft, greedy), {})
+        )
+
+
+def test_mtp_policy_rpc_rejects_missing_capture_before_mutating_policy():
+    worker = _mtp_policy_worker({})
+    worker.set_mtp_execution_policy(False, False)
+    with pytest.raises(RuntimeError, match="not captured"):
+        worker.set_mtp_execution_policy(True, True)
+    assert worker.model_runner.vllm_config.kernel_config.sm70_greedy_verify is False
+    with pytest.raises(TypeError, match="boolean"):
+        worker.set_mtp_execution_policy(1, False)

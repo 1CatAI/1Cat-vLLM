@@ -609,7 +609,9 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         if self._sm70_draft_head is None:
             from .sm70_mtp_head import prepare_mtp_qpn8_head
 
-            self._sm70_draft_head = prepare_mtp_qpn8_head(self.lm_head)
+            self._sm70_draft_head = prepare_mtp_qpn8_head(
+                self.lm_head, self.vllm_config.kernel_config.sm70_draft_hot_vocab
+            )
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         # Retain the fallback for callers that do not use the Eagle loader.
