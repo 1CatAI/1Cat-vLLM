@@ -183,3 +183,44 @@ including the after probe's large outlier. The approximately 18.14 ms median
 is diagnostic only. Whole-workload cache hits are about 98.97–99.11% for target
 owners and 99.02% for the draft; these include prefill and generation rather than
 an isolated C1 cohort. High hit rate does not establish correct attention.
+
+## Compact-tail packaged control
+
+The corrected source is `4348f58103d92b7bc24aa473259fe817d4f8c50f`, packaged
+with the unchanged declared native provider. All 16 native members match the
+provider hashes. Ninety-four packaged GPU tests pass, including the real
+selector's compact tail at tile boundaries. The fresh resident control measures
+C1 17.402 ms/round with 4.886 tokens/round and C4 43.932 ms/round. Eight-prompt
+mean acceptance is 47.11%. Device pools remain 2.9344 GiB/rank and total Torch
+allocation 29.1419 GiB/rank.
+
+This resident control itself differs from the older resident teacher record:
+64 equally conditioned positions have mean/max KL 0.000659/0.006215 and
+62/64 top-1 agreement. The paired natural acceptance difference is +0.79
+percentage points, 95% CI [-0.32, +1.93]. This is observed control variation;
+its cause is not yet established. A placement candidate must compare against
+the fresh same-wheel control. Do not describe the older transcript as a bitwise
+oracle, or interpret a confidence interval spanning zero as equivalence.
+
+## Same-format placement diagnostic
+
+The compact-tail FP16 host control measures C1 18.192 ms/round, C4 44.156
+ms/round and acceptance 46.75%. Against the fresh FP16 resident control,
+64 teacher positions have mean/max KL 0.000725/0.008530 and top-1 agreement
+63/64. This does not pass the strict diagnostic gate.
+
+Target E4M3 with an FP16 draft measures C1 18.063 ms/round and C4 44.663
+ms/round. Acceptance is 44.83%, a paired difference of -2.28 percentage points
+against the FP16 resident control, 95% CI [-3.04, -1.54]. Teacher mean/max KL
+is 0.001692/0.025182 and top-1 agreement 63/64. This rejects default promotion.
+
+A device-reference mode retains exactly the encoded history layout, per-vector
+FP32 scales, FP16 hot cache, attention arithmetic and allocation geometry of
+the host path. Only the history and scale backing changes to device memory.
+The unused CPU allocator backing is retained to avoid changing block geometry;
+this mode is a placement diagnostic, not a production memory optimization.
+Four new GPU tests verify identical codes, scales and outputs across both
+placements, including misses, M5/M20, compact tails and captured rewrites.
+All 98 source GPU tests pass. Model results remain pending. Optional repeated
+teacher conditions measure variation within the same process, outside timing
+probes. Both matched model arms use E4M3 target storage and an FP16 draft.

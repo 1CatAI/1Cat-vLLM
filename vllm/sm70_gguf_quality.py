@@ -42,7 +42,19 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
                     "layer": name,
                     "host_dtype": "fp8_e4m3" if state.fp8 else "float16",
                     "attention_reader": "protected_hot_and_staged_misses",
-                    "host_bytes": state.history.nbytes + state.host_scales.nbytes,
+                    "history_storage": (
+                        "device_reference" if state.device_reference else "host"
+                    ),
+                    "host_bytes": (
+                        0
+                        if state.device_reference
+                        else state.history.nbytes + state.host_scales.nbytes
+                    ),
+                    "device_history_bytes": (
+                        state.history.nbytes + state.scales.nbytes
+                        if state.device_reference
+                        else 0
+                    ),
                     "device_hot_bytes": sum(t.nbytes for t in tensors),
                     "stats": state.stats.cpu().tolist(),
                 }

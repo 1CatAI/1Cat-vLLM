@@ -617,6 +617,8 @@ class KernelConfig:
     """Authoritative target history format; FP16 isolates placement error."""
     qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "float16"] = "float16"
     """Preserve speculative cache precision independently of target storage."""
+    qsa_host_kv_device_reference: bool = False
+    """Keep identical encoded history on device for controlled placement A/B."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
     qsa_host_kv_active: bool = Field(default=False, init=False)

@@ -541,6 +541,11 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             if getattr(cfg, "is_speculative_draft", False)
             else cfg.kernel_config.qsa_host_kv_dtype
         ),
+        "history_storage": (
+            "device_reference"
+            if cfg.kernel_config.qsa_host_kv_device_reference
+            else "host"
+        ),
         "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
         "attention_staging_dtype": "float16",
         "recurrent_state_storage": "device",

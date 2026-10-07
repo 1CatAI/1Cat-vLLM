@@ -393,6 +393,7 @@ class HostQSAKV:
         width: int = 2051,
         history: torch.Tensor | None = None,
         dtype: torch.dtype = torch.uint8,
+        device_reference: bool = False,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -406,6 +407,7 @@ class HostQSAKV:
         if dtype not in (torch.uint8, torch.float16):
             raise ValueError("Host history requires E4M3 bytes or FP16 values")
         self.fp8 = dtype == torch.uint8
+        self.device_reference = device_reference
         self.host = None
         if history is None:
             self.host = torch.zeros(
@@ -415,18 +417,28 @@ class HostQSAKV:
             not history.is_contiguous()
         ):
             raise ValueError("Host history must use contiguous page-major E4M3 bytes")
-        self.host_scales = torch.zeros(
-            (blocks * page_size if self.fp8 else 1, 2),
-            dtype=torch.float32,
-            pin_memory=True,
-        )
-        with torch.accelerator.device_index(device.index):
-            self.history = (
-                history
-                if history is not None
-                else (get_accelerator_view_from_cpu_tensor(self.host))
+        scale_shape = (blocks * page_size if self.fp8 else 1, 2)
+        if device_reference:
+            # Preserve the host allocator geometry and byte layout for the
+            # placement experiment; only the writer/reader backing changes.
+            self.history = torch.zeros(
+                (blocks, 2, page_size, 1, dim), dtype=dtype, device=device
             )
-            self.scales = get_accelerator_view_from_cpu_tensor(self.host_scales)
+            self.host_scales = torch.zeros(
+                scale_shape, dtype=torch.float32, device=device
+            )
+            self.scales = self.host_scales
+        else:
+            self.host_scales = torch.zeros(
+                scale_shape, dtype=torch.float32, pin_memory=True
+            )
+            with torch.accelerator.device_index(device.index):
+                self.history = (
+                    history
+                    if history is not None
+                    else get_accelerator_view_from_cpu_tensor(self.host)
+                )
+                self.scales = get_accelerator_view_from_cpu_tensor(self.host_scales)
         self.hot_values = torch.empty(
             (hot_tokens, 2, dim), dtype=torch.float16, device=device
         )

@@ -305,3 +305,68 @@ def test_direct_host_attention_matches_staging_on_misses_and_replay(
     graph.replay()
     torch.accelerator.synchronize()
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rows", [5, 20])
+@pytest.mark.parametrize("context", [257, 2050])
+def test_e4m3_device_reference_matches_host_bytes_attention_and_replay(rows, context):
+    from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import expand_qsa_block_indices_cuda
+
+    torch.manual_seed(37)
+    device = torch.device("cuda:0")
+    requests_count = rows // 5
+    blocks = requests_count * 3
+    cpu = HostQSAKV(blocks, 816, 256, device, hot_tokens=64, rows=rows)
+    gpu = HostQSAKV(
+        blocks, 816, 256, device, hot_tokens=64, rows=rows, device_reference=True
+    )
+    key = torch.randn(blocks * 816, 1, 256, device=device, dtype=torch.float16)
+    value = torch.randn_like(key)
+    slots = torch.arange(blocks * 816, device=device)
+    cpu.write(key, value, slots)
+    gpu.write(key, value, slots)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(cpu.history.cpu(), gpu.history.cpu(), rtol=0, atol=0)
+    torch.testing.assert_close(cpu.scales.cpu(), gpu.scales.cpu(), rtol=0, atol=0)
+    table = torch.arange(blocks, device=device, dtype=torch.int32).view(
+        requests_count, 3
+    )
+    requests = torch.arange(rows, device=device, dtype=torch.int32) // 5
+    positions = context - 5 + torch.arange(rows, device=device, dtype=torch.int64) % 5
+    lengths = torch.full((requests_count,), context, device=device, dtype=torch.int32)
+    compressed = torch.arange(512, device=device, dtype=torch.int32).repeat(rows, 1)
+    indices = expand_qsa_block_indices_cuda(
+        compressed, positions, lengths, requests, 4, 2048
+    )
+    query = torch.randn(rows, 6, 256, device=device, dtype=torch.float16)
+    gate = torch.randn_like(query)
+    actual, expected = torch.empty_like(query), torch.empty_like(query)
+
+    def run():
+        host_qsa_attention(
+            query, cpu, indices, table, requests, positions, lengths, actual, gate
+        )
+        host_qsa_attention(
+            query, gpu, indices, table, requests, positions, lengths, expected, gate
+        )
+
+    for _ in range(2):
+        run()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    rewrite_key, rewrite_value = key[:7].clone().neg_(), value[:7].clone().mul_(0.5)
+    rewrite_slots = torch.arange(3, 10, device=device)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        cpu.write(rewrite_key, rewrite_value, rewrite_slots)
+        gpu.write(rewrite_key, rewrite_value, rewrite_slots)
+        run()
+    for _ in range(3):
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(cpu.history.cpu(), gpu.history.cpu(), rtol=0, atol=0)
+        torch.testing.assert_close(cpu.scales.cpu(), gpu.scales.cpu(), rtol=0, atol=0)

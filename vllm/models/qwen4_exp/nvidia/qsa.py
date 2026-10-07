@@ -619,6 +619,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
         self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
+        self.host_kv_device_reference = (
+            vllm_config.kernel_config.qsa_host_kv_device_reference
+        )
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
             if getattr(vllm_config, "is_speculative_draft", False)
@@ -797,10 +800,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 hot_tokens=self.host_kv_hot_tokens,
                 history=kv_cache,
                 width=self.indexer.output_width,
+                device_reference=self.host_kv_device_reference,
             )
             logger.info_once(
-                "QSA host storage initialized: dtype=%s, hot_tokens=%d; "
+                "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
                 "attention reads FP16 hot pages; only unresolved misses are staged.",
+                "device_reference" if self.host_kv_device_reference else "host",
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,
             )

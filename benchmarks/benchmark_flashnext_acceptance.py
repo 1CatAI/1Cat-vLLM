@@ -118,6 +118,13 @@ def main():
     parser.add_argument("--teacher-forcing", action="store_true")
     parser.add_argument("--teacher-reference", type=Path)
     parser.add_argument("--teacher-positions", type=int, default=8)
+    parser.add_argument(
+        "--teacher-repeats",
+        type=int,
+        choices=(1, 2),
+        default=1,
+        help="Repeat identical teacher conditions to quantify control variation",
+    )
     parser.add_argument("--hcx-diagnose", action="store_true")
     args = parser.parse_args()
     if args.hcx_diagnose and (
@@ -528,43 +535,49 @@ def main():
             report["teacher_forcing"]["reference"] = (
                 str(args.teacher_reference) if args.teacher_reference else None
             )
-            for key, prefix, forced in teacher_conditions(
-                reference, args.teacher_positions
-            ):
-                llm.collective_rpc(
-                    "start_teacher_capture", args=(str(root), key), timeout=30
-                )
-                try:
-                    llm.generate(
-                        {"prompt_token_ids": prefix},
-                        SamplingParams(
-                            temperature=0, max_tokens=6, allowed_token_ids=[forced]
-                        ),
-                        use_tqdm=False,
-                    )
-                finally:
-                    workers = llm.collective_rpc("stop_teacher_capture", timeout=30)
-                if any(w["captured"] != 1 for w in workers):
-                    raise RuntimeError(f"M5 teacher target was not captured: {workers}")
-                captured = torch.load(root / f"{key}.pt", weights_only=True)
-                if (
-                    captured["position"].item() != len(prefix)
-                    or captured["input_ids"].item() != forced
+            for repeat in range(args.teacher_repeats):
+                for base_key, prefix, forced in teacher_conditions(
+                    reference, args.teacher_positions
                 ):
-                    raise RuntimeError(
-                        "Captured distribution has different teacher conditioning"
+                    key = base_key if repeat == 0 else f"{base_key}-repeat{repeat}"
+                    llm.collective_rpc(
+                        "start_teacher_capture", args=(str(root), key), timeout=30
                     )
-                report["teacher_forcing"]["rows"].append(
-                    dict(
-                        key=key,
-                        prefix_sha256=digest(prefix),
-                        prefix_token_ids=list(prefix),
-                        forced=forced,
-                        position=len(prefix),
-                        workers=workers,
+                    try:
+                        llm.generate(
+                            {"prompt_token_ids": prefix},
+                            SamplingParams(
+                                temperature=0, max_tokens=6, allowed_token_ids=[forced]
+                            ),
+                            use_tqdm=False,
+                        )
+                    finally:
+                        workers = llm.collective_rpc("stop_teacher_capture", timeout=30)
+                    if any(w["captured"] != 1 for w in workers):
+                        raise RuntimeError(
+                            f"M5 teacher target was not captured: {workers}"
+                        )
+                    captured = torch.load(root / f"{key}.pt", weights_only=True)
+                    if (
+                        captured["position"].item() != len(prefix)
+                        or captured["input_ids"].item() != forced
+                    ):
+                        raise RuntimeError(
+                            "Captured distribution has different teacher conditioning"
+                        )
+                    report["teacher_forcing"]["rows"].append(
+                        dict(
+                            key=key,
+                            base_key=base_key,
+                            repeat=repeat,
+                            prefix_sha256=digest(prefix),
+                            prefix_token_ids=list(prefix),
+                            forced=forced,
+                            position=len(prefix),
+                            workers=workers,
+                        )
                     )
-                )
-                save()
+                    save()
         if args.teacher_forcing:
             report["worker_memory_final"] = llm.collective_rpc(
                 "read_host_kv_memory", timeout=30
