@@ -612,7 +612,11 @@ class KernelConfig:
     """Startup reason when calibrated automatic storage cannot be selected."""
 
     qsa_host_kv: bool = False
-    """Keep QSA attention history in pinned host E4M3 storage on SM70."""
+    """Keep QSA attention history in pinned host storage on SM70."""
+    qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
+    """Authoritative target history format; FP16 isolates placement error."""
+    qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "float16"] = "float16"
+    """Preserve speculative cache precision independently of target storage."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
     qsa_host_kv_active: bool = Field(default=False, init=False)

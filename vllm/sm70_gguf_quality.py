@@ -36,7 +36,8 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
             owners.append(
                 {
                     "layer": name,
-                    "host_bytes": state.history.numel() + state.host_scales.nbytes,
+                    "host_dtype": "fp8_e4m3" if state.fp8 else "float16",
+                    "host_bytes": state.history.nbytes + state.host_scales.nbytes,
                     "device_hot_bytes": sum(t.nbytes for t in tensors),
                     "stats": state.stats.cpu().tolist(),
                 }

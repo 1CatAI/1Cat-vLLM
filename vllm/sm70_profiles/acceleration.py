@@ -536,7 +536,11 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "enabled": cfg.kernel_config.qsa_host_kv_active,
         "reason": cfg.kernel_config.qsa_host_kv_reason,
         "scope": "active_attention_history",
-        "host_dtype": "per-vector E4M3 with FP32 scales",
+        "host_dtype": (
+            cfg.kernel_config.qsa_host_kv_draft_dtype
+            if getattr(cfg, "is_speculative_draft", False)
+            else cfg.kernel_config.qsa_host_kv_dtype
+        ),
         "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
         "attention_staging_dtype": "float16",
         "recurrent_state_storage": "device",

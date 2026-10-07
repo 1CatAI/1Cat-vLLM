@@ -14,6 +14,12 @@ FP16 on other attention owners. Admission requires SM70, FP16 activations,
 one local KV head, D256 and DCP1/PCP1. The startup report includes the reason
 when the requested route is unavailable. No environment variable is added.
 
+`qsa_host_kv_dtype` defaults to `fp8_e4m3` for target history. Draft history
+uses the independent `qsa_host_kv_draft_dtype`, initially `float16`; this
+preserves speculative precision while target quantization is evaluated.
+Selecting FP16 for both isolates placement and allocator changes from FP8
+rounding. Both host formats reconstruct identical FP16 hot/staging layouts.
+
 The default hot capacity is 8,192 tokens per owner, configurable through
 `qsa_host_kv_hot_tokens`. At D256 this costs 8 MiB of reconstructed FP16 K/V,
 plus tags and metadata. FP8 decoding occurs on misses, rather than every hot
@@ -79,3 +85,37 @@ completion checks end normally. Historical and restored natural token IDs
 differ, so the historical transcript is not a bitwise oracle for a new run.
 Use a fresh matched control and teacher conditions for host-cache qualification.
 These numbers are resident-KV controls; host-KV model results are pending.
+
+## First matched host experiment
+
+A packaged source integrates the qualified HCX implementation with the current
+main Python paths. Both runs use the same wheel and declared native provider.
+Only host storage is enabled in the candidate; in this first experiment both
+target and draft history use per-vector E4M3. The configured 9,216 context and
+four requests are unchanged. The actual attention page is 816 tokens.
+
+| Storage | C1 ms/round | C1 tokens/round | C4 ms/round | Mean draft acceptance |
+| --- | --- | --- | --- | --- |
+| Resident FP16 | 17.396 | 4.886 | 46.009 | 46.32% |
+| Host E4M3, target and draft | 18.825 | 4.886 | 47.389 | 43.46% |
+
+The eight-prompt paired acceptance difference is -2.86 percentage points;
+bootstrap 95% CI [-4.63, -0.79]. This rejects default promotion. On 64 equally
+conditioned target positions, mean/max KL is 0.002121/0.029512 and top-1 agrees
+at 62/64 positions. Every logit is finite; both short completion checks produce
+the same answers and stop normally. Coherent text alone does not meet the
+acceptance requirement.
+
+Device pools fall from 2.9344 to 1.5420 GiB per rank. The candidate additionally
+retains 105.48 MiB of hot-cache buffers/metadata and 64.125 MiB of shared staging.
+Total Torch allocation falls by 1.229 GiB per rank. Authoritative host pools
+occupy 0.7942 GiB per rank, with per-vector scale arrays accounted separately.
+Indexer and recurrent storage remains on device. The physical scheduler pool
+contains 157 blocks rather than 273; it still admits the declared concurrency.
+
+The next precision ablation preserves FP16 in the draft and provides an FP16
+host reference. The next operator experiment removes query-private copying
+from the hot path. Neither result is established by this first experiment.
+On a separate V100-SXM2-16GB, 19 packaged GPU tests pass, including the 816-token
+page, empty padded rows and captured replay. This is operator validation, not
+four-card model capacity evidence.

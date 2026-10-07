@@ -10,12 +10,15 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @pytest.mark.parametrize("rows", [1, 5, 20])
-@pytest.mark.parametrize("page", [256, 1568])
-def test_host_fp8_gather_collisions_rejection_and_graph(rows, page):
+@pytest.mark.parametrize("page", [256, 816, 1568])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+def test_host_gather_collisions_rejection_and_graph(rows, page, dtype):
     torch.manual_seed(17)
     device = torch.device("cuda:0")
     blocks, width = 32, 2051
-    state = HostQSAKV(blocks, page, 256, device, hot_tokens=64, rows=rows, width=width)
+    state = HostQSAKV(
+        blocks, page, 256, device, hot_tokens=64, rows=rows, width=width, dtype=dtype
+    )
     count = blocks * page
     key = torch.randn(count, 1, 256, device=device, dtype=torch.float16)
     value = torch.randn_like(key) * 3
@@ -24,6 +27,9 @@ def test_host_fp8_gather_collisions_rejection_and_graph(rows, page):
     torch.accelerator.synchronize()
     for kind, tensor in enumerate((key, value)):
         original = tensor.cpu().float().reshape(blocks, page, 256)
+        if dtype == torch.float16:
+            assert torch.equal(state.host[:, kind, :, 0], original.half())
+            continue
         scales = original.double().abs().amax(-1).div(448).float().clamp_min(2.0**-126)
         expected = (original / scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
         assert torch.equal(state.host[:, kind, :, 0], expected.view(torch.uint8))
@@ -56,8 +62,13 @@ def test_host_fp8_gather_collisions_rejection_and_graph(rows, page):
         physical = table.cpu()[requests.cpu().long()[:, None], safe // page].long()
         for kind, actual in enumerate((actual_k, actual_v)):
             codes = state.host[physical, kind, safe % page, 0]
-            scales = state.host_scales[physical * page + safe % page, kind]
-            reference = codes.view(torch.float8_e4m3fn).float() * scales.unsqueeze(-1)
+            if dtype == torch.uint8:
+                scales = state.host_scales[physical * page + safe % page, kind]
+                reference = codes.view(torch.float8_e4m3fn).float() * scales.unsqueeze(
+                    -1
+                )
+            else:
+                reference = codes
             reference = reference.masked_fill(~valid.unsqueeze(-1), 0).half()
             assert torch.equal(actual[:, :width, 0].cpu(), reference)
         expected = torch.arange(width).expand(rows, -1).masked_fill(~valid, -1)
@@ -156,3 +167,31 @@ def test_host_attention_causal_boundary_and_padding(visible):
     assert torch.isfinite(output).all()
     assert ((output.float() - reference).norm() / reference.norm()).item() < 0.002
     assert torch.equal(state.lengths, torch.full_like(state.lengths, len(selected)))
+
+
+def test_host_attention_empty_padded_rows():
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
+
+    device = torch.device("cuda:0")
+    state = HostQSAKV(1, 816, 256, device, hot_tokens=64, rows=5)
+    indices = torch.full((5, 2051), -1, dtype=torch.int32, device=device)
+    table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+    requests = torch.tensor([-1, 0, 0, -1, 0], dtype=torch.int32, device=device)
+    positions = torch.full((5,), -1, dtype=torch.int64, device=device)
+    lengths = torch.zeros(1, dtype=torch.int32, device=device)
+    query = torch.randn(5, 6, 256, dtype=torch.float16, device=device)
+    output = torch.empty_like(query)
+    k, v, remapped = state.gather(indices, table, requests, positions, lengths)
+    qsa_sparse_paged_attention(
+        query,
+        k,
+        v,
+        remapped,
+        state.table,
+        state.requests,
+        output,
+        query_positions=state.positions,
+        sequence_lengths=state.lengths,
+    )
+    assert torch.isfinite(output).all()
+    assert torch.count_nonzero(output).item() == 0

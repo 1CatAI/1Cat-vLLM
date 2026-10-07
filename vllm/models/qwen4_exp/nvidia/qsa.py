@@ -619,6 +619,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
         self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
+        self.host_kv_dtype = (
+            vllm_config.kernel_config.qsa_host_kv_draft_dtype
+            if getattr(vllm_config, "is_speculative_draft", False)
+            else vllm_config.kernel_config.qsa_host_kv_dtype
+        )
         if self.kv_cache_dtype not in ("fp8", "fp8_e4m3") and (
             self.kv_cache_torch_dtype != model_config.dtype
         ):
@@ -626,7 +631,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
             )
         if self.host_kv_enabled:
-            self.kv_cache_torch_dtype = torch.uint8
+            self.kv_cache_torch_dtype = (
+                torch.uint8 if self.host_kv_dtype == "fp8_e4m3" else torch.float16
+            )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -792,8 +799,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 width=self.indexer.output_width,
             )
             logger.info_once(
-                "QSA host per-vector E4M3 initialized: hot_tokens=%d; "
+                "QSA host storage initialized: dtype=%s, hot_tokens=%d; "
                 "FP16 staging shared across serial attention owners.",
+                self.host_kv_dtype,
                 self.host_kv_hot_tokens,
             )
 

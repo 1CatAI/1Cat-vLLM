@@ -34,6 +34,7 @@ def _write(
     Page: tl.constexpr,
     Dim: tl.constexpr,
     Sets: tl.constexpr,
+    FP8: tl.constexpr,
 ):
     row = tl.program_id(0)
     if row == 0:
@@ -47,14 +48,17 @@ def _write(
             tl.load(K + row * Ks + dims[None, :]),
             tl.load(V + row * Vs + dims[None, :]),
         ).to(tl.float32)
-        scales = tl.maximum(tl.div_rn(tl.max(tl.abs(values), 1), 448.0), 2.0**-126)
-        codes = fp32_to_fp8_e4m3fn_bits(tl.div_rn(values, scales[:, None]))
+        if FP8:
+            scales = tl.maximum(tl.div_rn(tl.max(tl.abs(values), 1), 448.0), 2.0**-126)
+            codes = fp32_to_fp8_e4m3fn_bits(tl.div_rn(values, scales[:, None]))
+            tl.store(Scales + slot * 2 + kv, scales)
+        else:
+            codes = values.to(tl.float16)
         block, token = slot // Page, slot % Page
         tl.store(
             History + ((block * 2 + kv[:, None]) * Page + token) * Dim + dims[None, :],
             codes,
         )
-        tl.store(Scales + slot * 2 + kv, scales)
         # Writes and gathers are ordered on the execution stream. Invalidate
         # the whole four-token page, including tentative MTP overwrites.
         page = (slot // 4).to(tl.int32)
@@ -148,6 +152,7 @@ def _gather(
     Page: tl.constexpr,
     Dim: tl.constexpr,
     Sets: tl.constexpr,
+    FP8: tl.constexpr,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
     lanes = tl.arange(0, 16)
@@ -242,14 +247,17 @@ def _gather(
         (valid & ~token_hits)[:, None, None],
         other=0,
     )
-    scales = tl.load(
-        Scales + tokens[:, None] * 2 + kv[None, :],
-        (valid & ~token_hits)[:, None],
-        other=0,
-    )
-    decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
-        tl.float16
-    )
+    if FP8:
+        scales = tl.load(
+            Scales + tokens[:, None] * 2 + kv[None, :],
+            (valid & ~token_hits)[:, None],
+            other=0,
+        )
+        decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
+            tl.float16
+        )
+    else:
+        decoded = codes.to(tl.float16)
     values = tl.where(token_hits[:, None, None], cached, decoded)
     token_installs = tl.reshape(tl.broadcast_to(install[:, None], (4, 4)), (16,))
     tl.store(
@@ -299,6 +307,7 @@ class HostQSAKV:
         rows: int = 32,
         width: int = 2051,
         history: torch.Tensor | None = None,
+        dtype: torch.dtype = torch.uint8,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -308,17 +317,23 @@ class HostQSAKV:
         self.rows, self.width = rows, width
         self.padded = triton.cdiv(width, 4) * 4
         self.sets = hot_tokens // 16
+        dtype = history.dtype if history is not None else dtype
+        if dtype not in (torch.uint8, torch.float16):
+            raise ValueError("Host history requires E4M3 bytes or FP16 values")
+        self.fp8 = dtype == torch.uint8
         self.host = None
         if history is None:
             self.host = torch.zeros(
-                (blocks, 2, page_size, 1, dim), dtype=torch.uint8, pin_memory=True
+                (blocks, 2, page_size, 1, dim), dtype=dtype, pin_memory=True
             )
         elif history.shape != (blocks, 2, page_size, 1, dim) or (
-            history.dtype != torch.uint8 or not history.is_contiguous()
+            not history.is_contiguous()
         ):
             raise ValueError("Host history must use contiguous page-major E4M3 bytes")
         self.host_scales = torch.zeros(
-            (blocks * page_size, 2), dtype=torch.float32, pin_memory=True
+            (blocks * page_size if self.fp8 else 1, 2),
+            dtype=torch.float32,
+            pin_memory=True,
         )
         with torch.accelerator.device_index(device.index):
             self.history = (
@@ -374,6 +389,7 @@ class HostQSAKV:
                 self.page_size,
                 self.dim,
                 self.sets,
+                self.fp8,
                 num_warps=4,
             )
 
@@ -432,6 +448,7 @@ class HostQSAKV:
                 self.page_size,
                 self.dim,
                 self.sets,
+                self.fp8,
                 num_warps=4,
             )
         key, value = self.staging[:rows].unbind(1)

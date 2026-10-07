@@ -116,6 +116,8 @@ def resolve_qsa_host_kv(cfg) -> bool:
         reason = "host E4M3 uses separate per-vector scales; keep draft KV FP16"
     elif cfg.cache_config.kv_offloading_size is not None:
         reason = "active host storage cannot share a prefix-offloading connector"
+    elif getattr(getattr(cfg, "kv_transfer_config", None), "kv_connector", None):
+        reason = "active host storage is not qualified with KV transfer connectors"
     policy.qsa_host_kv_reason = reason
     policy.qsa_host_kv_active = reason is None
     return policy.qsa_host_kv_active
