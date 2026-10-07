@@ -57,3 +57,19 @@ def test_candidate_guards_reject_unsupported_layouts(tp: int) -> None:
     assert packed_topk_reason(values, ids, vocab_size=248320, tp_size=8) == (
         "unmeasured_tp_size"
     )
+
+
+def test_explicit_policy_survives_sampling_without_config() -> None:
+    from vllm.config import get_current_vllm_config_or_none
+
+    assert get_current_vllm_config_or_none() is None
+    values = torch.zeros((8, 64), device="cuda", dtype=torch.float32)
+    ids = torch.zeros_like(values, dtype=torch.int64)
+    assert (
+        packed_topk_reason(values, ids, vocab_size=248320, tp_size=4, enabled=False)
+        == "disabled_by_policy"
+    )
+    assert (
+        packed_topk_reason(values, ids, vocab_size=248320, tp_size=4, enabled=True)
+        is None
+    )

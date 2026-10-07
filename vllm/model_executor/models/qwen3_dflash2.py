@@ -509,6 +509,10 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self._packed_topk_enabled = vllm_config.kernel_config.sm70_packed_topk_gather
+        self._packed_topk_selections = (
+            vllm_config.kernel_config.collective_kernel_selections
+        )
         self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
         draft_config = self.config.dflash_config
         self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
@@ -561,7 +565,11 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
         if get_tensor_model_parallel_world_size() > 1:
             packed = gather_topk_pairs(
-                values, ids, vocab_size=self.lm_head.num_embeddings_padded
+                values,
+                ids,
+                vocab_size=self.lm_head.num_embeddings_padded,
+                enabled=self._packed_topk_enabled,
+                selections=self._packed_topk_selections,
             )
             if packed is None:
                 values = tensor_model_parallel_all_gather(values, dim=-1)

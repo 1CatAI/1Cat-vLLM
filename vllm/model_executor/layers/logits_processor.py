@@ -10,6 +10,7 @@ from collections.abc import Callable
 import torch
 
 from vllm import envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -213,6 +214,13 @@ class LogitsProcessor(PluggableLayer):
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
         self.use_all_gather = current_platform.use_all_gather()
+        cfg = get_current_vllm_config_or_none()
+        self._packed_topk_enabled = (
+            cfg is not None and cfg.kernel_config.sm70_packed_topk_gather
+        )
+        self._packed_topk_selections = (
+            cfg.kernel_config.collective_kernel_selections if cfg is not None else None
+        )
 
     def forward(
         self,
@@ -686,6 +694,8 @@ class LogitsProcessor(PluggableLayer):
                 local_vals,
                 local_global_indices,
                 vocab_size=lm_head.num_embeddings_padded,
+                enabled=self._packed_topk_enabled,
+                selections=self._packed_topk_selections,
             )
             if packed is None:
                 gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)

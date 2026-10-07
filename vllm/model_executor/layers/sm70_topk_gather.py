@@ -4,7 +4,6 @@
 
 import torch
 
-from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
@@ -47,11 +46,10 @@ def _unpack(
     tl.store(ids + index, token.to(tl.int64), mask)
 
 
-def packed_topk_reason(values, ids, *, vocab_size: int, tp_size: int):
-    cfg = get_current_vllm_config_or_none()
-    if cfg is not None and not getattr(
-        cfg.kernel_config, "sm70_packed_topk_gather", True
-    ):
+def packed_topk_reason(
+    values, ids, *, vocab_size: int, tp_size: int, enabled: bool = True
+):
+    if not enabled:
         return "disabled_by_policy"
     if not values.is_cuda or not current_platform.is_device_capability(
         70, device_id=values.device.index
@@ -79,7 +77,12 @@ def packed_topk_reason(values, ids, *, vocab_size: int, tp_size: int):
 
 
 def gather_topk_pairs(
-    values: torch.Tensor, ids: torch.Tensor, *, vocab_size: int
+    values: torch.Tensor,
+    ids: torch.Tensor,
+    *,
+    vocab_size: int,
+    enabled: bool = True,
+    selections: dict | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Return rank-major candidates; preserve the caller's global TopK order.
 
@@ -88,10 +91,11 @@ def gather_topk_pairs(
     dtype stays unchanged so the caller retains its TopK tie implementation.
     """
     tp_size = get_tensor_model_parallel_world_size()
-    reason = packed_topk_reason(values, ids, vocab_size=vocab_size, tp_size=tp_size)
-    cfg = get_current_vllm_config_or_none()
-    if cfg is not None and not torch.compiler.is_compiling():
-        cfg.kernel_config.collective_kernel_selections["compact_topk_pairs"] = {
+    reason = packed_topk_reason(
+        values, ids, vocab_size=vocab_size, tp_size=tp_size, enabled=enabled
+    )
+    if selections is not None and not torch.compiler.is_compiling():
+        selections["compact_topk_pairs"] = {
             "enabled": reason is None,
             "reason": reason,
             "scope": "collective_capability",
