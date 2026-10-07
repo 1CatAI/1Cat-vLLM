@@ -951,6 +951,10 @@ class Qwen4ExpForCausalLM(
         from .sm70_fp16_hc import prepare_sharded_hc_storage
 
         prepare_sharded_hc_storage(self, self.vllm_config)
+        if self.vllm_config.kernel_config.hc_weight_storage == "sharded":
+            # Return released replicated-bank pages before draft construction.
+            # This is a loading boundary, never an inference-time operation.
+            torch.accelerator.empty_cache()
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture."""

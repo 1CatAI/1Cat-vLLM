@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.models.qwen4_exp.nvidia.mtp import Qwen4ExpMTP
+from vllm.models.qwen4_exp.nvidia.qsa import _qsa_rope_cache_length
+
+
+@pytest.mark.parametrize("text_only", [False, True])
+@pytest.mark.parametrize("rope_type", ["default", "dynamic"])
+def test_rope_cache_limit_preserves_multimodal_and_dynamic_contract(
+    text_only, rope_type
+):
+    config = SimpleNamespace(
+        max_position_embeddings=262144, rope_parameters={"rope_type": rope_type}
+    )
+    model_config = SimpleNamespace(
+        max_model_len=2048,
+        multimodal_config=SimpleNamespace(language_model_only=text_only),
+    )
+    expected = 2048 if text_only and rope_type == "default" else 262144
+    assert _qsa_rope_cache_length(config, model_config) == expected
+
+
+def test_default_rope_short_cache_has_identical_values(default_vllm_config):
+    short = RotaryEmbedding(64, 64, 2048, 10000, True, torch.float16)
+    full = RotaryEmbedding(64, 64, 4096, 10000, True, torch.float16)
+    torch.testing.assert_close(
+        short.cos_sin_cache, full.cos_sin_cache[:2048], rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_mtp_checkpoint_skip_matches_io_sharing(shared):
+    model = object.__new__(Qwen4ExpMTP)
+    nn.Module.__init__(model)
+    model.share_target_io_weights = shared
+    for name in [
+        "embed_tokens.weight",
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+        "mtp.shared_head.head.weight",
+    ]:
+        assert model.skip_checkpoint_weight(name) == shared
+    assert not model.skip_checkpoint_weight("mtp.fc_embedding.weight")
+    assert model.skip_checkpoint_weight("model.layers.1.mlp.experts.w13_weight")
