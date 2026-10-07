@@ -1,43 +1,59 @@
-# GGUF expert storage and GPU memory
+# GGUF storage and constrained GPU memory
 
-The default SM70 expert route keeps canonical banks for TurboMind and retains
-original IQ blocks for calibrated small-batch operators. Both representations
-occupy GPU memory. A compressed GGUF checkpoint's size divided by TP size does
-not include this duplication, replicated dense parameters, MTP, graph storage
-or temporary workspaces.
+A checkpoint's size divided by TP size omits replicated parameters, expanded
+representations, MTP, CUDA/NCCL state, caches and loading workspaces. PLE's mapped
+host tables must be accounted separately from device allocations.
 
-Flash-Next IQ3_S has 17 IQ3_XXS, 20 IQ2_S and 10 IQ3_S expert gate/up layers.
-With E512, local N160/K2560 and two matrices per layer, their original-block
-banks occupy 6.752 GiB per TP4 rank, in addition to canonical storage. This
-calculation includes the original-row alignment bytes and excludes allocator
-overhead. PLE's large embedding table uses host storage separately.
+On four 16 GiB V100-SXM2 GPUs, Flash-Next IQ3_S target loading initially used
+14.35 GiB of unique device tensor storage per rank. Preparation reached 14.69 GiB
+of PyTorch allocations and exhausted device memory before loading MTP. The main
+GGUF shard is 51.05 GiB. PLE is supplied by its separate host-resident shard.
+CUDA/NCCL and other allocations outside PyTorch reserved storage consumed about
+0.95 GiB on ranks without the PLE helper. These are loading measurements, not
+inference capacity or performance results.
 
-`kernel_config.sm70_gguf.expert_storage` selects the expert representation:
+The checkpoint-loaded per-rank storage ledger was:
 
-- `canonical` is the existing default and retains calibrated TurboMind routes.
-- `original` prepares original-block expert banks and uses the packaged native
-  fallback. It avoids constructing canonical expert banks and their retained
-  original copies. Dense projections keep their existing policy.
+| Storage | GiB |
+| --- | ---: |
+| Original expert gate/up | 6.9305 |
+| Expert down, including expanded Q2_0 | 5.3833 |
+| Replicated HC matrices | 1.2152 |
+| Expanded FP16 token embedding | 0.2960 |
+| Original Q6_K LM head | 0.1214 |
+| Other tensors | 0.3996 |
 
-Keep `sm70_gguf.enabled` enabled: the original path still requires packaged
-operators. Operator capabilities select its supported fallback at preparation
-time. This is a memory tradeoff; it does not imply equal inference speed.
+The kernel configuration supplies optional storage policies. Defaults retain the
+existing accelerated paths:
 
-Q2_0 experts need special handling when TP4 splits K640 into K160. The existing
-adapter converts those blocks losslessly to Q4_1 before slicing. The original
-FP16 coefficient and integer values are preserved. No additional weight
-quantization is introduced.
+- `sm70_gguf.expert_storage="original"` keeps original blocks rather than canonical
+  expert banks and retained original copies. The packaged native fallback runs
+  these banks; this is a memory tradeoff, not an equal-speed claim.
+- `sm70_gguf.dense_storage="original"` keeps original quantized projection rows and
+  skips canonical representations. Floating projections still become ordinary
+  FP16 linear layers. LM heads follow the same storage policy.
+- `sm70_gguf.embedding_storage="original"` retains compressed token embedding rows
+  and dequantizes only requested rows. IQ4_XS embedding storage falls from 303.125
+  MiB to 80.52 MiB per rank without changing integer codes or coefficients.
+- `hc_weight_storage="sharded"` retains only the existing lossless TP4 HC packs.
+  Admission requires qualified HC LL transport, FP16 HC4/H2560/R320 matrices,
+  and no LoRA. Small batches reuse the packaged LL operators. Larger batches
+  gather projected local rows and columns; replicated matrices are not rebuilt.
 
-CPU loader tests cover both policies and compare the Q2_0/Q4_1 reconstruction
-element by element. Actual 4x16GB loading, output quality, available KV memory
-and performance are pending GPU validation. A no-MTP capacity test does not
-qualify MTP4 or the default fast path on that hardware.
+Q2_0 down projections split K640 into K160 at TP4. Instead of expanding to Q4_1,
+original storage retains the three overlapping K64 blocks per rank and pads the
+activation's boundary elements with zeros. Rank 1 and rank 3 have 32 leading
+zeros. Physical K is 192; source integer codes and coefficients are unchanged.
+Nine expert banks shrink from 125 MiB to 67.5 MiB per rank, saving 517.5 MiB.
+The retained boundary blocks slightly duplicate checkpoint bytes across ranks.
 
-On four 16 GiB V100-SXM2 GPUs, the first original-storage MTP4 run exhausted
-memory during target expert preparation, before loading the draft. A safety-tail
-allocation copied an entire expert bank (114--126 MiB) when only about 110 MiB
-remained free. Native expert banks now allocate their zero safety tail before
-checkpoint rows are copied, so preparation reuses the same allocation. The tail
-belongs to the final allocation, rather than every row. Tensor bytes and logical
-shapes are unchanged. This removes the observed transient copy; it does not yet
-establish that the complete MTP4 model fits on those GPUs.
+Native expert banks allocate their zero safety tail before checkpoint rows are
+copied. Preparation reuses the allocation rather than copying a 114--126 MiB
+bank at the memory limit. The safety tail belongs to the final allocation, not
+each row.
+
+CPU tests check original-block retention, exact reconstructed TP boundary
+weights and padded projections, byte-identical packed embedding rows, and exact
+HC shard reconstruction. Complete MTP4 loading, target output quality, available
+KV memory and speed on four 16 GiB GPUs still require device validation. A short
+eager capacity probe does not qualify the existing FULL-graph performance path.

@@ -45,7 +45,10 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
-from .sm70_fp16_hc import maybe_apply_qwen38_sm70_fp16_fused_hc
+from .sm70_fp16_hc import (
+    maybe_apply_qwen38_sm70_fp16_fused_hc,
+    sharded_hc_project,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +132,11 @@ class GatedResidual(nn.Module):
         )
 
     def _project(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if hasattr(self, "hc_shard_down"):
+            block, injection = sharded_hc_project(
+                xn, self.hc_shard_down, self.hc_shard_up
+            )
+            return block, injection if self.use_combine else None
         if self.use_combine:
             fused_fp16 = maybe_apply_qwen38_sm70_fp16_fused_hc(
                 self.input_mix_weight_down_block_inject,

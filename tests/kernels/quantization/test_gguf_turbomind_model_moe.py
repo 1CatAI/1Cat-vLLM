@@ -23,7 +23,8 @@ def packed_weight(source_type, rows, k, seed):
     return data.reshape(rows, -1)
 
 
-def test_canonical_adapter_retains_q2_source_without_expansion():
+@pytest.mark.parametrize("storage", ["canonical", "original"])
+def test_canonical_adapter_retains_q2_source_without_expansion(storage):
     from vllm.model_executor.model_loader.gguf_adapters.qwen4exp import Qwen4ExpAdapter
 
     config = SimpleNamespace(
@@ -36,7 +37,8 @@ def test_canonical_adapter_retains_q2_source_without_expansion():
         linear_value_head_dim=2,
     )
     adapter = Qwen4ExpAdapter(config, tp_size=4)
-    adapter.canonical_expert_storage = True
+    adapter.canonical_expert_storage = storage == "canonical"
+    adapter.preserve_expert_blocks = storage == "original"
     data = np.stack([packed_weight(42, 64, 640, i) for i in range(2)])
     raw = "blk.0.ffn_down_exps.weight"
     tensor = SimpleNamespace(shape=np.array([640, 64, 2]), tensor_type=42, data=data)
@@ -116,19 +118,9 @@ def test_load_model_retains_prepared_adapter(monkeypatch, storage):
     assert cfg.quant_config.canonical_expert_storage == (storage == "canonical")
     types = [w.item() for n, w in model.entries if n.endswith("qweight_type")]
     weights = [w for n, w in model.entries if n.endswith("qweight")]
-    assert types == ([42, 42] if storage == "canonical" else [3, 3])
-    assert [tuple(w.shape) for w in weights] == (
-        [(64, 180), (64, 180)] if storage == "canonical" else [(64, 400), (64, 400)]
-    )
-    if storage == "canonical":
-        assert weights[0].data_ptr() == torch.from_numpy(data[0]).data_ptr()
-    else:
-        # The TP4 K160 boundary cuts a Q2_0 K64 block. The existing Q4_1
-        # conversion keeps its FP16 coefficient and every integer code.
-        for expert, weight in enumerate(weights):
-            np.testing.assert_array_equal(
-                dequantize(weight.numpy(), 3), dequantize(data[expert], 42)
-            )
+    assert types == [42, 42]
+    assert [tuple(w.shape) for w in weights] == [(64, 180), (64, 180)]
+    assert weights[0].data_ptr() == torch.from_numpy(data[0]).data_ptr()
     assert len(calls) == 1
     assert (
         list(loader.get_all_weights(model_config, model, skip_weight=lambda _: True))

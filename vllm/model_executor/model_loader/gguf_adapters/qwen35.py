@@ -109,6 +109,11 @@ class Qwen35Adapter:
             ("norm.weight", "conv1d.weight", "embed_tokens.weight")
         )
 
+    def is_embedding(self, name):
+        return getattr(self, "packed_token_embeddings", False) and name.endswith(
+            "embed_tokens.weight"
+        )
+
     def needs_dense_fallback(self, name, tensor):
         if not name.endswith(
             (".down_proj.weight", ".out_proj.weight", ".o_proj.weight")
@@ -170,7 +175,7 @@ class Qwen35Adapter:
         # All linear type descriptors must arrive before any weight payload,
         # including F16/F32 shards mixed with packed GGML shards.
         for raw, name in name_map.items():
-            if self.is_linear(name):
+            if self.is_linear(name) or self.is_embedding(name):
                 yield (
                     name.removesuffix(".weight") + ".qweight_type",
                     torch.tensor(
@@ -187,6 +192,12 @@ class Qwen35Adapter:
                 gguf.GGMLQuantizationType.BF16,
             )
             if quantized and name.endswith("embed_tokens.weight"):
+                if self.is_embedding(name):
+                    yield (
+                        name.removesuffix(".weight") + ".qweight",
+                        torch.from_numpy(tensor.data),
+                    )
+                    continue
                 # Embedding row order is unchanged by restoration. Keep the
                 # existing global-table contract for the TP weight loader,
                 # without full FP32 decode and boolean temporary tables.
@@ -215,6 +226,6 @@ class Qwen35Adapter:
                         f"GGUF {raw}: values overflow {dtype}; use --dtype float32"
                     )
                 weight = converted
-            if self.is_linear(name):
+            if self.is_linear(name) or self.is_embedding(name):
                 name = name.removesuffix(".weight") + ".qweight"
             yield name, weight

@@ -369,8 +369,14 @@ class Sm70GgufConfig:
 
     Original storage avoids retaining both canonical and original expert banks.
     It trades the calibrated TurboMind expert schedules for the native fallback
-    and retains lossless block conversion where a TP boundary needs it.
+    and covers TP boundaries with original blocks and zero activation padding.
     """
+
+    dense_storage: Literal["canonical", "original"] = "canonical"
+    """Keep calibrated canonical projections or dispatch original packed rows."""
+
+    embedding_storage: Literal["dense", "original"] = "dense"
+    """Keep a dense token embedding or decode its original GGUF rows on lookup."""
 
     projection_planes: bool = True
     """Use measured M8 shared-activation projection planes with canonical fallback."""
@@ -524,6 +530,8 @@ class KernelConfig:
 
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
+    hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
+    """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )

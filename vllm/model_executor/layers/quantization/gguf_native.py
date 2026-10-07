@@ -105,6 +105,26 @@ def empty_guarded_weight(shape, weight_type: int, device) -> torch.Tensor:
     return storage[:elements].view(shape)
 
 
+def packed_tp_span(
+    full_k: int, weight_type: int, tp_size: int, tp_rank: int
+) -> tuple[int, int, int, int]:
+    """Cover a TP slice with whole original blocks and zero activation margins.
+
+    Return packed byte bounds, left activation padding and physical K. Boundary
+    blocks may be shared between ranks; each rank uses only its logical inputs.
+    """
+    block, size = quant_size(weight_type)
+    if full_k <= 0 or tp_size <= 0 or full_k % tp_size or full_k % block:
+        raise ValueError("GGUF TP span requires complete source rows and equal slices")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError("GGUF TP rank is outside the group")
+    local_k = full_k // tp_size
+    start = tp_rank * local_k
+    first = start // block
+    last = (start + local_k + block - 1) // block
+    return first * size, last * size, start - first * block, (last - first) * block
+
+
 def native_dense(
     x: torch.Tensor,
     weight: torch.Tensor,

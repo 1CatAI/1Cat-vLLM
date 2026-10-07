@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization.gguf_native import (
     NATIVE_TYPES,
     empty_guarded_weight,
     native_available,
+    packed_tp_span,
     pad_weight_tail,
 )
 from vllm.model_executor.utils import set_weight_attrs
@@ -41,6 +42,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         )
         self.weight_types: dict[str, int] = {}
         self.guarded_shards: set[str] = set()
+        self.input_padding: dict[str, tuple[int, int]] = {}
         self.loaded_experts: dict[str, set[int]] = {
             shard: set() for shard in ("w1", "w3", "w2")
         }
@@ -108,27 +110,38 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             else (self.intermediate_size, self.hidden_size)
         )
         block, size = quant_size(value)
-        if k % block:
+        if k % block and not (
+            shard_id == "w2" and value in NATIVE_TYPES and weight.dtype == torch.uint8
+        ):
             raise ValueError(
                 f"GGUF {shard_id} local K={k} is not aligned to block {block}; "
                 "convert the checkpoint projection before TP slicing"
             )
-        packed_k = k // block * size if weight.dtype == torch.uint8 else k
         tp_size, tp_rank = layer.tp_size, layer.tp_rank
-        expected = (
-            (rows, packed_k * tp_size)
-            if shard_id == "w2"
-            else (rows * tp_size, packed_k)
-        )
+        if shard_id == "w2" and weight.dtype == torch.uint8:
+            first, last, left, physical_k = packed_tp_span(
+                k * tp_size, value, tp_size, tp_rank
+            )
+            packed_k = last - first
+            expected = (rows, k * tp_size // block * size)
+            local = weight[:, first:last]
+            self.input_padding[shard_id] = (left, physical_k)
+        else:
+            packed_k = k // block * size if weight.dtype == torch.uint8 else k
+            expected = (
+                (rows, packed_k * tp_size)
+                if shard_id == "w2"
+                else (rows * tp_size, packed_k)
+            )
+            local = (
+                weight[:, tp_rank * packed_k : (tp_rank + 1) * packed_k]
+                if shard_id == "w2"
+                else weight[tp_rank * rows : (tp_rank + 1) * rows]
+            )
         if tuple(weight.shape) != expected:
             raise ValueError(
                 f"GGUF {shard_id} shape {tuple(weight.shape)} != {expected}"
             )
-        local = (
-            weight[:, tp_rank * packed_k : (tp_rank + 1) * packed_k]
-            if shard_id == "w2"
-            else weight[tp_rank * rows : (tp_rank + 1) * rows]
-        )
         name = "gguf_" + shard_id
         if not hasattr(layer, name):
             shape = (self.num_experts, rows, packed_k)
@@ -171,6 +184,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             self.native_admission["projections"][shard] = {
                 **asdict(capability),
                 "shape": list(weight.shape),
+                "activation_padding": list(self.input_padding.get(shard, (0, 0))),
             }
 
     def get_fused_moe_quant_config(self, layer):
@@ -218,6 +232,11 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             tokens,
         )
         hidden = torch.nn.functional.silu(gate) * up
+        left, physical_k = self.input_padding.get("w2", (0, self.intermediate_size))
+        if left or physical_k != self.intermediate_size:
+            hidden = torch.nn.functional.pad(
+                hidden, (left, physical_k - left - self.intermediate_size)
+            )
         routed_ids = ids.reshape(-1, 1)
         down = projection("w2")(
             hidden.contiguous(),
