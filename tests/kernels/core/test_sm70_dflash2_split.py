@@ -30,10 +30,11 @@ def _dense(q, k, v, table, length, scale):
     return torch.einsum("bhqk,khd->bqhd", scores.softmax(-1), values)
 
 
+@pytest.mark.parametrize("heads", [8, 16])
 @pytest.mark.parametrize("through_api", [False, True])
 @pytest.mark.parametrize("page", [832, 1024, 1648, 2048])
 @pytest.mark.parametrize("scale", [1 / math.sqrt(128), 0.1])
-def test_live_window_graph(page, scale, through_api):
+def test_live_window_graph(page, scale, through_api, heads):
     from flash_attn_v100.sm70_dflash2_split import forward
 
     if through_api:
@@ -57,10 +58,12 @@ def test_live_window_graph(page, scale, through_api):
     torch.manual_seed(123)
     pages = math.ceil(10240 / page)
     capacity = pages * page
-    q = torch.zeros(1, 8, 8, 128, device="cuda", dtype=torch.float16)
+    q = torch.zeros(1, 8, heads, 128, device="cuda", dtype=torch.float16)
     # Match the model's interleaved K/V allocation, including noncontiguous
     # page strides, instead of testing only independent contiguous caches.
-    kv = torch.zeros(pages, 2, page, 2, 128, device="cuda", dtype=torch.float16)
+    kv = torch.zeros(
+        pages, 2, page, heads // 4, 128, device="cuda", dtype=torch.float16
+    )
     k, v = kv[:, 0], kv[:, 1]
     table = torch.randperm(pages, device="cuda").int()[None]
     lengths = torch.zeros(1, device="cuda", dtype=torch.int32)
@@ -72,7 +75,10 @@ def test_live_window_graph(page, scale, through_api):
         call(q, k, v, table, lengths, scale, output)
     for length in (0, 8, 127, 128, 129, 1024, 2047, 2048, 2055, 4096, 8192):
         logical = torch.full(
-            (capacity, 2, 128), float("nan"), device="cuda", dtype=torch.float16
+            (capacity, heads // 4, 128),
+            float("nan"),
+            device="cuda",
+            dtype=torch.float16,
         )
         logical[:length] = 60000
         logical[max(0, length - 8 - 2047) : length] = 1

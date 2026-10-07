@@ -25,6 +25,7 @@ def part(
     VS2: tl.constexpr,
     TS: tl.constexpr,
     PAGE: tl.constexpr,
+    HEADS_Q: tl.constexpr,
     PARTS: tl.constexpr,
     BK: tl.constexpr,
     SCALE: tl.constexpr,
@@ -41,7 +42,7 @@ def part(
     dim = tl.arange(0, 128)
     valid = (key >= qpos - 2047) & (key <= qpos + 2047) & (key < length) & (key >= 0)
     physical = tl.load(T + b * TS + key // PAGE, valid, other=0)
-    q = tl.load(Q + ((b * 8 + qr) * 8 + h) * 128 + dim).to(tl.float32)
+    q = tl.load(Q + ((b * 8 + qr) * HEADS_Q + h) * 128 + dim).to(tl.float32)
     k = tl.load(
         K
         + physical[:, None] * KS0
@@ -66,7 +67,7 @@ def part(
         other=0,
     ).to(tl.float32)
     pv = tl.sum(prob[:, None] * v, 0)
-    row = ((b * 8 + qr) * 8 + h) * PARTS + part
+    row = ((b * 8 + qr) * HEADS_Q + h) * PARTS + part
     tl.store(P + row * 128 + dim, pv)
     tl.store(MX + row, mx)
     tl.store(SM + row, sm)
@@ -92,7 +93,8 @@ def merge(P, MX, SM, OUTPUT, PARTS: tl.constexpr, BP: tl.constexpr):
 def forward(q, k, v, table, lengths, softmax_scale, out=None):
     bk = 128
     parts = triton.cdiv(2055, bk)
-    rows = q.shape[0] * 64
+    heads = q.shape[2]
+    rows = q.shape[0] * 8 * heads
     workspace = (
         torch.empty(rows, parts, 128, device=q.device, dtype=torch.float32),
         torch.empty(rows, parts, device=q.device, dtype=torch.float32),
@@ -101,7 +103,7 @@ def forward(q, k, v, table, lengths, softmax_scale, out=None):
     if out is None:
         out = torch.empty_like(q)
     p, mx, sm = workspace
-    part[(q.shape[0], 8, 8 * parts)](
+    part[(q.shape[0], heads, 8 * parts)](
         q,
         k,
         v,
@@ -114,6 +116,7 @@ def forward(q, k, v, table, lengths, softmax_scale, out=None):
         *v.stride()[:3],
         table.stride(0),
         k.shape[1],
+        heads,
         parts,
         bk,
         softmax_scale,
