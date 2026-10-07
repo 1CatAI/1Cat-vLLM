@@ -5,6 +5,7 @@
 import argparse
 import hashlib
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -114,6 +115,7 @@ def main():
             save()
             print(json.dumps(report["rows"][-1]), flush=True)
         if args.decode_check:
+            sys.path.append(str(Path(__file__).resolve().parents[1]))
             from benchmarks.benchmark_flashnext_acceptance import observed_cohort
             from benchmarks.benchmark_sm70_qwen38_concurrency import summarize
 
