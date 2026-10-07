@@ -636,6 +636,31 @@ graphs. The larger message allowance is opt-in pending endpoint validation;
 the existing default ceiling remains 25,600 bytes. The calibration uses the
 normal packaged operator, with no private DSO or topology override.
 
+### Rejected multi-row dense Q8 reuse and bitmap HC synchronization
+
+A research-only dense kernel loads each raw Q4_K/Q6_K/IQ4_XS/IQ4_NL packet
+once for up to eight Q8 activation rows and accumulates with FP32 dp4a.
+All eight real-shard points pass the independent official-dequant/Q8 oracle
+(relative L2 0.000206–0.000209, including output FP16 rounding). Against the
+original FP16 activations, relative L2 is 0.0054–0.0156, versus
+0.00033–0.00078 for the retained HMMA path. Activation quantization is
+included in timing. M5 GDN input/output regress from 21.504/12.288 us to
+41.984/19.456 us, and attention input/output from 18.432/11.264 us to
+34.816/17.408 us. M20 also regresses at every point. The formulas pass, but
+this implementation is rejected for speed and is not dispatched in the model.
+
+A separate research-only HCX screen replaces contended grid arrival counters
+with three cache-line-separated atomic readiness bitmaps. Eight actual HC
+weight pairs pass byte-exact and changed-input graph checks on four ranks.
+Maximum-rank median increases from 27.300 to 32.616 us. This synchronization
+change is also rejected. Neither private DSO contributes endpoint evidence.
+
+The new same-wheel ring control records C1 17.3962 ms/round and C4
+43.3554 ms/round, with 4.8857 emitted tokens per C1 round. The corresponding
+large-message ring arm is pending. This fresh C4 control is faster than the
+previous 45.6969-ms HCX cohort; the cause is not established, and only the
+matched pair will be used to judge the ring change.
+
 ## Community designs and applicability
 
 [SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)
