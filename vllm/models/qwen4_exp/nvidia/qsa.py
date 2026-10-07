@@ -682,14 +682,40 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self._sm70_qsa_prep = bool(
             vllm_config.kernel_config.sm70_qsa_prep
-            and not self.host_kv_enabled
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability(70)
+            and hasattr(torch.ops._C, "qsa_prep_sm70_out")
+            and 0 < self.rotary_emb.rotary_dim <= self.head_dim
+            and self.rotary_emb.rotary_dim % 16 == 0
             and getattr(self.rotary_emb, "is_neox_style", False)
             and self.head_dim == 256
             and self.num_kv_heads == 1
             and cache_config.cache_dtype in ("auto", "float16")
             and model_config.dtype == torch.float16
             and self.attn_output_gate
+            and (
+                not self.host_kv_enabled
+                or (
+                    text_only
+                    and not getattr(vllm_config, "is_speculative_draft", False)
+                )
+            )
         )
+        if vllm_config.kernel_config.sm70_qsa_prep:
+            vllm_config.kernel_config.linear_kernel_selections[
+                f"qsa_prepare:{self.layer_name}"
+            ] = {
+                "operator": "qsa_prep_sm70_out",
+                "admitted": self._sm70_qsa_prep,
+                "max_rows": 32,
+                "history": "host" if self.host_kv_enabled else "device",
+                "reason": None
+                if self._sm70_qsa_prep
+                else (
+                    "requires_sm70_fp16_d256_single_kv_head_partial_neox_rope; "
+                    "host_history_requires_text_only_target"
+                ),
+            }
         speculative = vllm_config.speculative_config
         # Bucketed graphs are only replayed for uniform decode batches, whose
         # requests each hold exactly this many query tokens.
@@ -795,6 +821,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
         super().bind_kv_cache(kv_cache)
         if self.host_kv_enabled:
+            if self._sm70_qsa_prep:
+                # Local staging slots stay fixed across graph replays. They
+                # never refer to authoritative history or physical KV pages.
+                self._host_prep_slots = torch.arange(
+                    32, dtype=torch.int64, device=kv_cache.device
+                )
             from .ops.host_kv import HostQSAKV
 
             self.host_kv = HostQSAKV(
@@ -814,6 +846,34 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,
             )
+
+    def _prepare_host_qsa_rows(
+        self, qkv: torch.Tensor, positions: torch.Tensor, num_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reuse native FP16 preparation before the existing history encoder."""
+        if not 0 < num_tokens <= min(32, qkv.shape[0]):
+            raise ValueError("Host QSA preparation requires 1-32 active rows")
+        prepared = qkv.new_empty((num_tokens, self.num_heads, self.head_dim))
+        key = qkv.new_empty((num_tokens, 1, 1, self.head_dim))
+        value = torch.empty_like(key)
+        text_positions = positions[0] if positions.dim() == 2 else positions
+        torch.ops._C.qsa_prep_sm70_out(
+            qkv[:num_tokens],
+            text_positions[:num_tokens].to(torch.int64),
+            self.rotary_emb.cos_sin_cache,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.q_norm.variance_epsilon,
+            prepared,
+            key,
+            value,
+            self._host_prep_slots[:num_tokens],
+        )
+        return (
+            prepared,
+            key.view(num_tokens, 1, self.head_dim),
+            value.view(num_tokens, 1, self.head_dim),
+        )
 
     def host_kv_forward(
         self, query, indices, table, requests, positions, lengths, output, gate
@@ -937,6 +997,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
+        if self.host_kv_enabled and query.dim() == 2:
+            if num_tokens == 0:
+                output.zero_()
+                return
+            query, key, value = self._prepare_host_qsa_rows(
+                query, positions, num_tokens
+            )
         if os.getenv("VLLM_QSA_KV_CALIBRATION_DIR"):
             from .ops.qsa_kv_calibration import observe_qsa_kv
 
@@ -1033,7 +1100,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             q_gate = qkv[:, : self.q_size * 2].view(
                 num_tokens, self.num_heads, 2 * self.head_dim
             )
-            gate = q_gate[..., self.head_dim :].reshape(num_tokens, self.q_size)
+            gate = q_gate[..., self.head_dim :]
             query = qkv
             key = value = qkv
             attn_output = qkv.new_empty((num_tokens, self.num_heads, self.head_dim))

@@ -564,7 +564,8 @@ class KernelConfig:
 
     sm70_qsa_prep: bool = False
     """Fuse QSA q/k GemmaRMSNorm, partial NeoX RoPE and the FP16 K/V cache
-    write into one SM70 launch for decode batches."""
+    write into one SM70 launch for decode batches. Host history reuses the
+    preparation kernel with local FP16 staging before its existing encoder."""
 
     sm70_draft_hot_vocab: int = 0
     """Greedy MTP drafts choose among this many lowest token ids (BPE merge
