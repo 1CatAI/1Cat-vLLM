@@ -41,7 +41,7 @@ def host_qsa_attention(
     _qsa_sparse_paged_gqa_splitk_kernel[(query.shape[0], 1, splits)](
         query,
         state.hot_values,
-        state.history,
+        state.staging,
         indices,
         table,
         requests,
@@ -81,9 +81,8 @@ def host_qsa_attention(
         BLOCK_N=block_n,
         KV_E4M3=False,
         HOST_INDICES=resolved,
-        HOST_SCALES=state.scales,
+        HOST_VALID_COUNTS=state.lengths,
         HOST_CACHE=True,
-        HOST_E4M3=state.fp8,
         num_warps=warps,
         num_stages=2,
     )

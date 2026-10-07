@@ -797,11 +797,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 hot_tokens=self.host_kv_hot_tokens,
                 history=kv_cache,
                 width=self.indexer.output_width,
-                staging=False,
             )
             logger.info_once(
                 "QSA host storage initialized: dtype=%s, hot_tokens=%d; "
-                "attention reads protected FP16 hot pages and host misses directly.",
+                "attention reads FP16 hot pages; only unresolved misses are staged.",
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,
             )

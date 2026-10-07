@@ -198,8 +198,8 @@ def point(context, rows, hot_tokens, iterations):
                 state.hot_values,
                 state.tags,
                 state.stamps,
-                state.locks,
                 state.hands,
+                state.page_slots,
                 state.epoch,
                 state._stats,
             )

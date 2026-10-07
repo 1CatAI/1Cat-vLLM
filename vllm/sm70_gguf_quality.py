@@ -26,8 +26,8 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
                 state.hot_values,
                 state.tags,
                 state.stamps,
-                state.locks,
                 state.hands,
+                state.page_slots,
                 state.epoch,
                 state._stats,
             ]
@@ -41,7 +41,7 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
                 {
                     "layer": name,
                     "host_dtype": "fp8_e4m3" if state.fp8 else "float16",
-                    "direct_attention": not state.has_staging,
+                    "attention_reader": "protected_hot_and_staged_misses",
                     "host_bytes": state.history.nbytes + state.host_scales.nbytes,
                     "device_hot_bytes": sum(t.nbytes for t in tensors),
                     "stats": state.stats.cpu().tolist(),
@@ -263,6 +263,35 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
                     raise RuntimeError("Teacher logits must cover the full vocabulary")
                 self._teacher_count += 1
                 if self.rank == 0:
+                    kv_samples = {}
+                    mappings = state.slot_mappings_by_layer or {}
+                    for (
+                        name,
+                        module,
+                    ) in runner.compilation_config.static_forward_context.items():
+                        cache = getattr(module, "host_kv", None)
+                        slots = mappings.get(name)
+                        if cache is None or slots is None:
+                            continue
+                        slots = slots[:5]
+                        slots = slots[slots >= 0]
+                        blocks, offsets = (
+                            slots // cache.page_size,
+                            slots % cache.page_size,
+                        )
+                        kinds = torch.arange(2, device=slots.device)
+                        values = cache.history[
+                            blocks[:, None], kinds[None, :], offsets[:, None], 0
+                        ].cpu()
+                        if cache.fp8:
+                            scales = cache.scales[slots].cpu()
+                            values = (
+                                values.view(torch.float8_e4m3fn).float()
+                                * scales[:, :, None]
+                            ).half()
+                        kv_samples[name] = values
+                    if kv_samples:
+                        torch.save(kv_samples, root / f"{key}-kv.pt")
                     torch.save(
                         dict(
                             logits=logits.detach().float().cpu(),

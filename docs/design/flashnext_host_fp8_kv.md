@@ -3,9 +3,9 @@
 QSA attention history uses pinned host E4M3 bytes with one FP32 scale per
 token, local KV head and K/V vector. This format does not require checkpoint
 calibration scales. Encoding uses round-to-nearest division and E4M3 conversion.
-The GPU retains a bounded per-layer four-way hot-page cache. Attention reads
-protected FP16 hot entries and decodes host misses directly into its existing
-FP32 accumulation and softmax loop. Indexer history and active GDN/PLE
+The GPU retains a bounded per-layer page-slot cache. Attention reads protected
+FP16 hot entries; unresolved host misses are decoded into shared FP16 scratch
+before entering the existing FP32 accumulation and softmax loop. Indexer history and active GDN/PLE
 states retain their existing storage and arithmetic.
 
 `KernelConfig.qsa_host_kv` selects this route. It is disabled while model-level
@@ -24,9 +24,9 @@ rounding. Both host formats reconstruct identical FP16 hot/staging layouts.
 The default hot capacity is 8,192 tokens per owner, configurable through
 `qsa_host_kv_hot_tokens`. At D256 this costs 8 MiB of reconstructed FP16 K/V,
 plus tags and metadata. FP8 decoding occurs on misses, rather than every hot
-read. Thirty-two query rows share bounded resolution maps; the former
-approximately 64 MiB query-private FP16 staging is unnecessary. Prefill is
-processed in bounded query tiles. Exact
+read. Thirty-two query rows share bounded resolution maps and approximately
+64 MiB of FP16 miss scratch across owners. Hot hits do not copy into that
+scratch. Prefill is processed in bounded query tiles. Exact
 selected positions and causal masks are retained; no new sparsity heuristic
 or draft attention window is introduced.
 
@@ -41,11 +41,11 @@ at maximum context, including recurrent speculative pages and alignment slack.
 Freed memory remains available instead of being consumed by unused state pages.
 An explicit block-count override retains precedence.
 
-New and tentative K/V writes update authoritative host storage and invalidate
-the corresponding four-token hot page. A GPU epoch and protection pass keep
-every current-call cache hit immutable during gathering. Misses use a bucket
-lock with no waiting; contention and full protected sets read authoritative
-host data. This bounds storage without dropping selected positions or
+New and tentative K/V writes update authoritative host storage and any resident
+hot entry from the encoded representation. A GPU epoch and protection pass keep
+every current-call cache hit immutable during gathering. A physical-page-to-slot map deduplicates misses and a bounded clock sweep
+reserves unprotected slots. Pending copies and capacity overflow use decoded
+host data in miss scratch, with no waiting between CTAs. This bounds storage without dropping selected positions or
 overflowing a miss queue. Fixed workspaces and mapped pointers are initialized
 before graph capture. Each CTA owns its diagnostic counters, avoiding global
 counter contention on the replay path.
@@ -124,3 +124,43 @@ the staged reader. Model latency and acceptance for this change remain pending.
 On a separate V100-SXM2-16GB, 19 packaged GPU tests pass, including the 816-token
 page, empty padded rows and captured replay. This is operator validation, not
 four-card model capacity evidence.
+
+## Precision ablation and cache experiments
+
+Keeping the draft in FP16 measures C1 18.735 ms/round with 4.886 tokens/round
+and C4 47.558 ms/round. Target top-1 agrees at all 64 equally conditioned
+positions; mean/max KL is 0.002124/0.036558. Both short completions end normally.
+Eight-prompt acceptance is 44.14% versus 46.32%; paired difference -2.19
+percentage points, 95% CI [-4.07, +0.11]. This does not establish equivalence,
+so FP8 remains unqualified for default promotion. Device pools remain 1.542
+GiB/rank; target-FP8/draft-FP16 host pools occupy 0.855 GiB/rank.
+
+Inlining host FP8 reconstruction in the attention loop is rejected: the
+packaged M5 experiment takes about 196 microseconds versus 107 for the staged
+reader at 8K. Four-way hashing also reaches only 75% hits for the fixed
+four-request selection despite sufficient aggregate capacity. Changing the
+hash alone does not resolve that structural conflict.
+
+The page-slot prototype passes 38 GPU tests, including physical-page aliases,
+tentative rewrites and captured replay. Sixteen direct/staged tests then cover
+short-context holes and fixed tail columns, agreeing exactly. The reader skips
+known empty middle tiles by changing loop bounds while retaining the original
+tile order and split assignment. A conditional around tensor-core arithmetic
+is slower and is rejected.
+
+Same-card synthetic graph timings for the current source prototype:
+
+| Context | Rows | Hot tokens | Resident us | Staged us | Hot/miss reader us | Hit rate |
+| --- | --- | --- | --- | --- | --- | --- |
+| 128 | 5 | 8192 | 57.9 | 68.2 | 41.0 | 100% |
+| 128 | 20 | 8192 | 294.1 | 309.7 | 71.0 | 100% |
+| 8192 | 5 | 8192 | 55.0 | 85.6 | 61.3 | 100% |
+| 8192 | 20 | 8192 | 274.3 | 360.6 | 302.1 | approximately 100% |
+| 32768 | 5 | 32768 | 51.0 | 81.8 | 58.1 | 100% |
+| 32768 | 20 | 32768 | 259.0 | 344.5 | 281.8 | 100% |
+
+These selections are fixed and shared by five queries per request. They do
+not prove model hit rates or endpoint gains. Packaged qualification and an
+FP16 host model reference are the next checks. Teacher capture additionally
+saves small post-RoPE KV samples outside the timed replay for format analysis;
+resident controls do not change their capture behavior.

@@ -27,6 +27,8 @@ def _write(
     History,
     Scales,
     Tags,
+    PageSlots,
+    Hot,
     Epoch,
     Ks: tl.constexpr,
     Vs: tl.constexpr,
@@ -59,14 +61,22 @@ def _write(
             History + ((block * 2 + kv[:, None]) * Page + token) * Dim + dims[None, :],
             codes,
         )
-        # Writes and gathers are ordered on the execution stream. Invalidate
-        # the whole four-token page, including tentative MTP overwrites.
+        # Update an existing hot copy from the encoded representation. Writes
+        # and attention are stream ordered, including tentative overwrites.
         page = (slot // 4).to(tl.int32)
-        ways = tl.arange(0, 4)
-        tl.atomic_cas(
-            Tags + (page % Sets) * 4 + ways,
-            tl.broadcast_to(page, (4,)),
-            tl.full((4,), -1, tl.int32),
+        resident = tl.load(PageSlots + page)
+        tag = tl.load(Tags + tl.maximum(resident, 0), resident >= 0, other=-1)
+        decoded = codes.to(tl.float16)
+        if FP8:
+            decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, None]).to(
+                tl.float16
+            )
+        tl.store(
+            Hot
+            + ((tl.maximum(resident, 0) * 4 + slot % 4) * 2 + kv[:, None]) * Dim
+            + dims[None, :],
+            decoded,
+            (resident >= 0) & (tag == page),
         )
 
 
@@ -78,6 +88,7 @@ def _protect(
     Positions,
     Lengths,
     Tags,
+    PageSlots,
     Stamps,
     Epoch,
     VirtualPositions,
@@ -94,7 +105,6 @@ def _protect(
 ):
     row = tl.program_id(0)
     columns = tl.program_id(1) * 256 + tl.arange(0, 256)
-    ways = tl.arange(0, 4)
     logical = tl.load(Indices + row * IndexStride + columns, columns < Width, other=-1)
     req = tl.load(Requests + row)
     position = tl.load(Positions + row)
@@ -121,15 +131,16 @@ def _protect(
         return
     tokens = tl.maximum(blocks, 0) * Page + tl.maximum(logical, 0) % Page
     pages = tokens // 4
-    slots = (pages[:, None] % Sets) * 4 + ways[None, :]
-    tags = tl.load(Tags + slots)
+    registered = tl.load(PageSlots + pages)
+    slots = tl.maximum(registered, 0)
+    tags = tl.load(Tags + slots, registered >= 0, other=-1)
     epoch = tl.load(Epoch)
-    tl.store(Stamps + slots, epoch, valid[:, None] & (tags == pages[:, None]))
-    way = tl.min(tl.where(tags == pages[:, None], ways[None, :], 4), 1)
-    hot_token = ((pages % Sets) * 4 + tl.minimum(way, 3)) * 4 + tokens % 4
+    matched = (registered >= 0) & (tags == pages)
+    tl.store(Stamps + slots, epoch, valid & matched)
+    hot_token = slots * 4 + tokens % 4
     tl.store(
         Initial + row * Width + columns,
-        tl.where(valid, tl.where(way < 4, hot_token, -1), -2),
+        tl.where(valid, tl.where(matched, hot_token, -1), -2),
         columns < Width,
     )
 
@@ -142,8 +153,8 @@ def _gather(
     Tags,
     Stamps,
     Epoch,
-    Locks,
     Hands,
+    PageSlots,
     Stats,
     Indices,
     Table,
@@ -169,7 +180,6 @@ def _gather(
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
     lanes = tl.arange(0, 16)
-    ways = tl.arange(0, 4)
     dims = tl.arange(0, Dim)
     kv = tl.arange(0, 2)
     columns = tile * 16 + lanes
@@ -201,7 +211,7 @@ def _gather(
         # completes. Its stream dependency supplies visibility; no per-query
         # tag CAS, host decode or bucket lock is needed for an initial hit.
         tl.store(Resolved + row * Width + columns, initial, columns < Width)
-        if STAGE:
+        if STAGE == 1:
             values = tl.load(
                 Hot
                 + (tl.maximum(initial, 0)[:, None, None] * 2 + kv[None, :, None]) * Dim
@@ -237,37 +247,62 @@ def _gather(
         )
         == 4
     )
-    buckets = first % Sets
-    tag_ptrs = Tags + buckets[:, None] * 4 + ways[None, :]
-    tags = tl.load(tag_ptrs)
-    matched = tags == first[:, None]
-    hit = aligned & (tl.sum(matched.to(tl.int32), 1) > 0)
-    selected = tl.min(tl.where(matched, ways[None, :], 4), 1)
-    selected = tl.minimum(selected, 3)
-    acquired = tl.atomic_cas(Tags + buckets * 4 + selected, first, first, sem="acquire")
-    hit &= acquired == first
-    attempt = aligned & ~hit
-    held = (
-        tl.atomic_cas(
-            Locks + buckets, tl.where(attempt, 0, -1), tl.where(attempt, 1, -1)
-        )
-        == 0
-    ) & attempt
-    # Recheck after taking the bucket; another CTA may have just filled it.
-    tags = tl.load(tag_ptrs)
-    matched = tags == first[:, None]
-    found = tl.sum(matched.to(tl.int32), 1) > 0
-    selected = tl.where(
-        held & found, tl.min(tl.where(matched, ways[None, :], 4), 1), selected
+    registered = tl.load(PageSlots + first)
+    slots = tl.maximum(registered, 0)
+    tags = tl.load(Tags + slots, registered >= 0, other=-1)
+    acquired = tl.atomic_cas(
+        PageSlots + first,
+        tl.where(registered >= 0, registered, -3),
+        registered,
+        sem="acquire",
     )
-    hit |= held & found
-    stamps = tl.load(Stamps + buckets[:, None] * 4 + ways[None, :])
-    hand = tl.load(Hands + buckets) % 4
-    priority = (ways[None, :] - hand[:, None] + 4) % 4
-    victim = tl.min(tl.where(stamps != tl.load(Epoch), priority, 4), 1)
-    install = held & ~hit & (victim < 4)
-    selected = tl.where(install, (hand + victim) % 4, selected)
-    slots = buckets * 4 + selected
+    hit = aligned & (registered >= 0) & (acquired == registered) & (tags == first)
+    claim = (
+        aligned
+        & ~hit
+        & (
+            tl.atomic_cas(
+                PageSlots + first,
+                tl.where(aligned & ~hit, -1, -3),
+                tl.full((4,), -2, tl.int32),
+            )
+            == -1
+        )
+    )
+    reserved = tl.full((4,), False, tl.int1)
+    epoch = tl.load(Epoch)
+    probes = tl.arange(0, 16)
+    # Bounded CLOCK probes: never wait for another CTA or evict a selected
+    # page. Pending copies and capacity overflow use the exact host fallback.
+    for _ in range(4):
+        pending = claim & ~reserved
+        if tl.sum(pending.to(tl.int32), 0) > 0:
+            hand = tl.atomic_add(
+                Hands + tl.zeros((4,), tl.int32), tl.where(pending, 16, 0)
+            ).to(tl.uint32)
+            candidates = (hand[:, None] + probes[None, :]) % (Sets * 4)
+            stamps = tl.load(Stamps + candidates)
+            chosen = tl.min(tl.where(stamps != epoch, probes[None, :], 16), 1)
+            candidate = ((hand + tl.minimum(chosen, 15)) % (Sets * 4)).to(tl.int32)
+            observed = tl.load(Stamps + candidate)
+            attempt = pending & (chosen < 16) & (observed != epoch)
+            won = attempt & (
+                tl.atomic_cas(
+                    Stamps + candidate,
+                    tl.where(attempt, observed, -1),
+                    tl.broadcast_to(epoch, (4,)),
+                )
+                == observed
+            )
+            slots = tl.where(won, candidate, slots)
+            reserved |= won
+    install = claim & reserved
+    old_tag = tl.load(Tags + slots)
+    tl.atomic_cas(
+        PageSlots + tl.maximum(old_tag, 0),
+        tl.where(install & (old_tag >= 0), slots, -3),
+        tl.full((4,), -1, tl.int32),
+    )
     hot_tokens = tl.reshape(slots[:, None] * 4 + page_lanes[None, :], (16,))
     token_hits = tl.reshape(tl.broadcast_to(hit[:, None], (4, 4)), (16,))
     cached = tl.load(
@@ -309,40 +344,42 @@ def _gather(
         values,
         token_installs[:, None, None],
     )
-    tl.store(Hands + buckets, selected + 1, install)
-    tl.store(Stamps + slots, tl.load(Epoch), install)
     tl.debug_barrier()
-    old_tag = tl.sum(tl.where(ways[None, :] == selected[:, None], tags, 0), 1)
-    # Tags never use -2. Failed/contended lanes cannot publish or unlock.
     tl.atomic_cas(Tags + slots, tl.where(install, old_tag, -2), first, sem="release")
+    tl.atomic_cas(PageSlots + first, tl.where(install, -2, -3), slots, sem="release")
     tl.atomic_cas(
-        Locks + buckets, tl.where(held, 1, -1), tl.zeros((4,), tl.int32), sem="release"
+        PageSlots + first,
+        tl.where(claim & ~install, -2, -3),
+        tl.full((4,), -1, tl.int32),
     )
     tl.store(
         Resolved + row * Width + columns,
         tl.where(valid, tl.where(token_hits | token_installs, hot_tokens, -1), -2),
         columns < Width,
     )
-    if STAGE:
+    if STAGE > 0:
+        store_values = columns < Padded
+        if STAGE == 2:
+            store_values &= valid & ~(token_hits | token_installs)
         tl.store(
             Out
             + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None]) * Dim
             + dims[None, None, :],
             values,
-            columns[:, None, None] < Padded,
+            store_values[:, None, None],
         )
     counter = (row * tl.cdiv(Width, 16) + tile) * 3
     counters = tl.arange(0, 4)
     hits = tl.sum((valid & token_hits).to(tl.int64), 0)
     misses = tl.sum((valid & ~token_hits).to(tl.int64), 0)
-    contended = tl.sum((attempt & ~held).to(tl.int64), 0)
+    contended = tl.sum((aligned & ~hit & ~install).to(tl.int64), 0)
     delta = tl.where(counters == 0, hits, tl.where(counters == 1, misses, contended))
     old = tl.load(Stats + counter + counters, counters < 3, other=0)
     tl.store(Stats + counter + counters, old + delta, counters < 3)
 
 
 class HostQSAKV:
-    """Own stable host history, a four-way hot cache and bounded staging."""
+    """Own stable host history, protected CLOCK slots and bounded miss staging."""
 
     def __init__(
         self,
@@ -356,7 +393,6 @@ class HostQSAKV:
         width: int = 2051,
         history: torch.Tensor | None = None,
         dtype: torch.dtype = torch.uint8,
-        staging: bool = True,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -364,7 +400,6 @@ class HostQSAKV:
             raise ValueError("Invalid hot cache or staging capacity")
         self.blocks, self.page_size, self.dim = blocks, page_size, dim
         self.rows, self.width = rows, width
-        self.has_staging = staging
         self.padded = triton.cdiv(width, 4) * 4
         self.sets = hot_tokens // 16
         dtype = history.dtype if history is not None else dtype
@@ -398,18 +433,20 @@ class HostQSAKV:
         self.tags = torch.full((self.sets, 4), -1, dtype=torch.int32, device=device)
         self.stamps = torch.zeros_like(self.tags)
         self.epoch = torch.zeros(1, dtype=torch.int32, device=device)
-        self.locks = torch.zeros(self.sets, dtype=torch.int32, device=device)
-        self.hands = torch.zeros_like(self.locks)
+        self.hands = torch.zeros(1, dtype=torch.int32, device=device)
+        self.page_slots = torch.full(
+            (blocks * page_size // 4,), -1, dtype=torch.int32, device=device
+        )
         self._stats = torch.zeros(
             (rows * triton.cdiv(width, 16), 3), dtype=torch.int64, device=device
         )
         # QSA layers execute serially on the model stream. Share staging across
         # owners while keeping each owner's hot pages and scales persistent.
-        workspace_key = (device.index, rows, width, dim, staging)
+        workspace_key = (device.index, rows, width, dim)
         if workspace_key not in _WORKSPACES:
             _WORKSPACES[workspace_key] = (
                 torch.zeros(
-                    (rows, 2, self.padded, 1, dim) if staging else (1, 2, 4, 1, dim),
+                    (rows, 2, self.padded, 1, dim),
                     dtype=torch.float16,
                     device=device,
                 ),
@@ -442,6 +479,8 @@ class HostQSAKV:
                 self.history,
                 self.scales,
                 self.tags,
+                self.page_slots,
+                self.hot_values,
                 self.epoch,
                 key.stride(0),
                 value.stride(0),
@@ -454,14 +493,12 @@ class HostQSAKV:
             )
 
     def gather(self, indices, block_table, token_to_req, positions, lengths):
-        if not self.has_staging:
-            raise ValueError("This host cache was initialized without staging")
-        self._resolve(indices, block_table, token_to_req, positions, lengths, True)
+        self._resolve(indices, block_table, token_to_req, positions, lengths, 1)
         key, value = self.staging[: indices.shape[0]].unbind(1)
         return key, value, self.remapped[: indices.shape[0]]
 
     def resolve(self, indices, block_table, token_to_req, positions, lengths):
-        self._resolve(indices, block_table, token_to_req, positions, lengths, False)
+        self._resolve(indices, block_table, token_to_req, positions, lengths, 2)
         return self.resolved[: indices.shape[0]]
 
     def _resolve(self, indices, block_table, token_to_req, positions, lengths, stage):
@@ -478,6 +515,7 @@ class HostQSAKV:
                 positions,
                 lengths,
                 self.tags,
+                self.page_slots,
                 self.stamps,
                 self.epoch,
                 self.positions,
@@ -500,8 +538,8 @@ class HostQSAKV:
                 self.tags,
                 self.stamps,
                 self.epoch,
-                self.locks,
                 self.hands,
+                self.page_slots,
                 self._stats,
                 indices,
                 block_table,

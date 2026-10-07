@@ -659,9 +659,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     KV_E4M3: tl.constexpr,
     RESOLVED_INDICES: tl.constexpr = False,
     HOST_INDICES=None,
-    HOST_SCALES=None,
+    HOST_VALID_COUNTS=None,
     HOST_CACHE: tl.constexpr = False,
-    HOST_E4M3: tl.constexpr = True,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -695,7 +694,27 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     # Dynamic bounds avoid padded main-loop iterations for uneven splits.
     split_tile_start = split_id * NUM_TILES // NUM_SPLITS
     split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
-    for tile in range(split_tile_start, split_tile_end):
+    loop_start = split_tile_start
+    loop_end = split_tile_end
+    if HOST_CACHE:
+        selected_count = tl.load(HOST_VALID_COUNTS + row)
+        full_tiles = tl.cdiv((selected_count // 4) * 4, BLOCK_N)
+        full_iterations = tl.maximum(
+            tl.minimum(split_tile_end, full_tiles) - split_tile_start, 0
+        )
+        tail_tile = ((TOPK // 4) * 4) // BLOCK_N
+        has_tail = ((selected_count % 4) > 0) & (tail_tile >= split_tile_start)
+        has_tail &= (tail_tile < split_tile_end) & (tail_tile >= full_tiles)
+        loop_start = 0
+        loop_end = full_iterations + has_tail.to(tl.int32)
+    for loop_tile in range(loop_start, loop_end):
+        tile = loop_tile
+        if HOST_CACHE:
+            # Retain the original tile/split assignment and visit order; skip
+            # only known empty middle tiles before the fixed tail columns.
+            tile = tl.where(
+                loop_tile < full_iterations, split_tile_start + loop_tile, tail_tile
+            )
         columns = tile * BLOCK_N + column_offsets
         logical_token = tl.load(
             indices_ptr + row * stride_indices_row + columns,
@@ -725,18 +744,17 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 HOST_INDICES + row * TOPK + columns, columns < TOPK, other=-2
             )
             valid &= hot_tokens >= -1
+        if HOST_CACHE:
             keys, values = load_host_kv(
                 k_cache_ptr,
                 v_cache_ptr,
-                HOST_SCALES,
                 hot_tokens,
-                safe_page,
-                page_offset,
+                row,
+                columns,
                 valid,
                 dim_offsets,
-                PAGE_SIZE,
+                tl.cdiv(TOPK, 4) * 4,
                 HEAD_DIM,
-                HOST_E4M3,
             )
         else:
             keys = tl.load(

@@ -9,6 +9,39 @@ from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+def test_shared_physical_page_rewrite_updates_every_logical_alias(dtype):
+    device = torch.device("cuda:0")
+    state = HostQSAKV(2, 816, 256, device, hot_tokens=64, rows=2, width=4, dtype=dtype)
+    key = torch.randn(1632, 1, 256, device=device, dtype=torch.float16)
+    value = torch.randn_like(key)
+    slots = torch.arange(1632, device=device)
+    state.write(key, value, slots)
+    table = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32, device=device)
+    indices = torch.tensor(
+        [[4, 5, 6, 7], [820, 821, 822, 823]], dtype=torch.int32, device=device
+    )
+    requests = torch.arange(2, dtype=torch.int32, device=device)
+    positions = torch.full((2,), 823, dtype=torch.int64, device=device)
+    lengths = torch.full((2,), 824, dtype=torch.int32, device=device)
+    for _ in range(3):
+        k, v, _ = state.gather(indices, table, requests, positions, lengths)
+    for factor in (-1.0, 0.5):
+        state.write(key[4:8] * factor, value[4:8] * factor, slots[4:8])
+        k, v, _ = state.gather(indices, table, requests, positions, lengths)
+        torch.accelerator.synchronize()
+        for kind, actual in enumerate((k, v)):
+            expected = state.host[0, kind, 4:8, 0]
+            if dtype == torch.uint8:
+                expected = (
+                    expected.view(torch.float8_e4m3fn).float()
+                    * state.host_scales[4:8, kind, None]
+                ).half()
+            torch.testing.assert_close(actual[0, :4, 0].cpu(), expected, rtol=0, atol=0)
+            torch.testing.assert_close(actual[1, :4, 0].cpu(), expected, rtol=0, atol=0)
+        assert torch.count_nonzero(state.page_slots == -2).item() == 0
+
+
 @pytest.mark.parametrize("rows", [1, 5, 20])
 @pytest.mark.parametrize("page", [256, 816, 1568])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
@@ -73,7 +106,7 @@ def test_host_gather_collisions_rejection_and_graph(rows, page, dtype):
             assert torch.equal(actual[:, :width, 0].cpu(), reference)
         expected = torch.arange(width).expand(rows, -1).masked_fill(~valid, -1)
         assert torch.equal(remap.cpu(), expected)
-        assert torch.count_nonzero(state.locks).item() == 0
+        assert torch.count_nonzero(state.page_slots == -2).item() == 0
 
     check()
     check()
@@ -199,21 +232,21 @@ def test_host_attention_empty_padded_rows():
 
 @pytest.mark.parametrize("rows", [1, 5, 20, 32])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
-def test_direct_host_attention_matches_staging_on_misses_and_replay(rows, dtype):
+@pytest.mark.parametrize("short_tail", [False, True])
+def test_direct_host_attention_matches_staging_on_misses_and_replay(
+    rows, dtype, short_tail
+):
     from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
     from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
 
     torch.manual_seed(19)
     device = torch.device("cuda:0")
     state = HostQSAKV(4, 816, 256, device, hot_tokens=64, rows=rows, dtype=dtype)
-    direct_state = HostQSAKV(
-        4, 816, 256, device, hot_tokens=64, rows=rows, dtype=dtype, staging=False
-    )
+    direct_state = HostQSAKV(4, 816, 256, device, hot_tokens=64, rows=rows, dtype=dtype)
     key = torch.randn(3264, 1, 256, device=device, dtype=torch.float16)
     value = torch.randn_like(key)
     state.write(key, value, torch.arange(3264, device=device))
     direct_state.write(key, value, torch.arange(3264, device=device))
-    assert direct_state.staging.nbytes == 2048
     indices = torch.arange(2051, device=device, dtype=torch.int32).repeat(rows, 1)
     table = torch.arange(4, dtype=torch.int32, device=device).view(1, -1)
     requests = torch.zeros(rows, dtype=torch.int32, device=device)
@@ -221,6 +254,11 @@ def test_direct_host_attention_matches_staging_on_misses_and_replay(rows, dtype)
         requests[-1] = -1
     positions = torch.full((rows,), 2049, dtype=torch.int64, device=device)
     lengths = torch.full((1,), 2050, dtype=torch.int32, device=device)
+    if short_tail:
+        indices[:, 12:] = -1
+        indices[:, 2048:2050] = torch.tensor([12, 13], device=device)
+        positions.fill_(13)
+        lengths.fill_(14)
     query = torch.randn(rows, 6, 256, dtype=torch.float16, device=device)
     reference, actual = torch.empty_like(query), torch.empty_like(query)
     gate = torch.randn_like(query)
