@@ -893,18 +893,27 @@ def prepare_sharded_hc_storage(model, vllm_config) -> None:
         up_layer = module.input_mix_weight_up
         down = down_layer.weight
         up = up_layer.weight
-        if not down.is_cuda or down.dtype != torch.float16 or up.dtype != torch.float16:
-            raise ValueError(
-                "Sharded HC storage requires CUDA FP16 checkpoint matrices"
-            )
+        staged = all(
+            getattr(layer, "_hc_cpu_staging", False) for layer in (down_layer, up_layer)
+        )
+        if (
+            (not staged and not down.is_cuda)
+            or down.dtype != torch.float16
+            or up.dtype != torch.float16
+        ):
+            raise ValueError("Sharded HC storage requires FP16 checkpoint matrices")
         if not module.use_combine:
             down = torch.nn.functional.pad(down, (0, 0, 0, 16))
         rank = communicator.logical_rank
         module.register_buffer(
-            "hc_shard_down", _pack_hc_batch_weight(down, "down", rank), persistent=False
+            "hc_shard_down",
+            _pack_hc_batch_weight(down, "down", rank).to(communicator.device),
+            persistent=False,
         )
         module.register_buffer(
-            "hc_shard_up", _pack_hc_batch_weight(up, "up", rank), persistent=False
+            "hc_shard_up",
+            _pack_hc_batch_weight(up, "up", rank).to(communicator.device),
+            persistent=False,
         )
         for layer in (down_layer, up_layer):
             layer.register_parameter(
