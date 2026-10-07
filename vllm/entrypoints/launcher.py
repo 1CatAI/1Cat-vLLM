@@ -19,6 +19,7 @@ from vllm.entrypoints.constants import (
 from vllm.entrypoints.ssl import SSLCertRefresher
 from vllm.logger import init_logger
 from vllm.utils.network_utils import find_process_using_port
+from vllm.v1.engine.exceptions import EngineDeadError
 
 logger = init_logger(__name__)
 
@@ -123,6 +124,10 @@ async def serve_http(
 
     try:
         await server_task
+        if getattr(server, ENGINE_DEAD_ATTR, False):
+            # The server stopped because the engine died: the caller's shutdown
+            # step must fail (non-zero exit), never look like a clean stop.
+            return engine_dead_shutdown()
         return dummy_shutdown()
     except asyncio.CancelledError:
         port = uvicorn_kwargs["port"]
@@ -153,6 +158,20 @@ async def watchdog_loop(server: uvicorn.Server, engine: EngineClient):
         terminate_if_errored(server, engine)
 
 
+# Set on the uvicorn.Server when terminate_if_errored stops it for a dead engine.
+ENGINE_DEAD_ATTR = "vllm_engine_dead"
+
+
+async def engine_dead_shutdown() -> None:
+    """Shutdown step of a server stopped by engine death: log and raise so the
+    process exits non-zero (a clean exit would hide the failure)."""
+    logger.error(
+        "The API server stopped because the vLLM engine died (see the engine "
+        "error above); exiting with an error."
+    )
+    raise EngineDeadError()
+
+
 def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
     """
     See discussions here on shutting down a uvicorn server
@@ -163,4 +182,5 @@ def terminate_if_errored(server: uvicorn.Server, engine: EngineClient):
     """
     engine_errored = engine.errored and not engine.is_running
     if not envs.VLLM_KEEP_ALIVE_ON_ENGINE_DEATH and engine_errored:
+        setattr(server, ENGINE_DEAD_ATTR, True)
         server.should_exit = True

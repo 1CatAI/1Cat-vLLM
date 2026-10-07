@@ -319,6 +319,25 @@ class FullAttentionSpec(AttentionSpec):
         )
 
 
+DEEPSEEK_V41_MODEL_VERSION = "deepseek_v41"
+
+
+def _deepseek_v41_page_size_bytes(spec: MLAAttentionSpec | SlidingWindowMLASpec) -> int:
+    """DeepSeek-V4.1 SM70 caches hold plain rows (PORT_DESIGN A3): FP16 records of the model's QAT
+    values (window KV 512, compressed KV 512, index-K 128) and FP32 compressor state rows (1024).
+    One page = ``storage_block_size`` rows of ``head_size`` elements."""
+    if spec.num_kv_heads != 1:
+        raise ValueError(f"DeepSeek-V4.1 caches are MQA (num_kv_heads=1), got {spec.num_kv_heads}")
+    if spec.dtype not in (torch.float16, torch.float32):
+        raise ValueError(f"DeepSeek-V4.1 cache rows are float16 or float32, got {spec.dtype}")
+    if spec.block_size % spec.compress_ratio:
+        raise ValueError(
+            f"DeepSeek-V4.1 block_size {spec.block_size} is not a multiple of "
+            f"compress_ratio {spec.compress_ratio}"
+        )
+    return spec.storage_block_size * spec.head_size * get_dtype_size(spec.dtype)
+
+
 def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
     if spec.alignment is None:
         return
@@ -373,6 +392,8 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
+        if self.model_version == DEEPSEEK_V41_MODEL_VERSION:
+            return _deepseek_v41_page_size_bytes(self)
         if self.model_version == "glm5_next" and self.cache_dtype_str in {
             "fp8",
             "fp8_e4m3",
@@ -614,6 +635,8 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         if self.model_version == "deepseek_v4":
             # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
             return self.storage_block_size * 584
+        if self.model_version == DEEPSEEK_V41_MODEL_VERSION:
+            return _deepseek_v41_page_size_bytes(self)
         assert self.model_version is None, (
             f"Unsupported model version: {self.model_version}"
         )

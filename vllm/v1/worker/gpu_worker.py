@@ -1168,6 +1168,115 @@ class Worker(WorkerBase):
             )
         return tensor_dict
 
+    # ---- schema-driven static PP transfer (DeepSeek-V4.1, PORT_DESIGN §3.5) ----
+    # A model that declares ``pp_static_schema(num_tokens)`` (receive side) and ``pp_send_schema(num_tokens)``
+    # (send side) gets the metadata-free transfer for decode steps of 1..8 tokens with any PP/TP size. Models
+    # without the declaration keep the exact legacy contract above ([1,4,4096] fp16, PP2xTP4, B1).
+    _SCHEMA_STATIC_PP_MAX_TOKENS = 8
+
+    def _pp_schema_model(self) -> Any | None:
+        cached = getattr(self, "_pp_schema_model_cache", False)
+        if cached is not False:
+            return cached
+        runner = self.model_runner
+        model = runner.get_model() if hasattr(runner, "get_model") else runner.model
+        declares = callable(getattr(model, "pp_static_schema", None)) and callable(
+            getattr(model, "pp_send_schema", None)
+        )
+        self._pp_schema_model_cache = model if declares else None
+        return self._pp_schema_model_cache
+
+    def _use_schema_static_pp_transfer(self, num_tokens: int) -> bool:
+        if not envs.VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER or self._pp_schema_model() is None:
+            return False
+        if not 1 <= num_tokens <= self._SCHEMA_STATIC_PP_MAX_TOKENS:
+            return False
+        config = self.vllm_config
+        parallel_config = config.parallel_config
+        return not (
+            parallel_config.pipeline_parallel_size < 2
+            or parallel_config.enable_dbo
+            or parallel_config.ubatch_size > 1
+            or getattr(config, "speculative_config", None) is not None
+            or config.compilation_config.pass_config.enable_sp
+            or not current_platform.is_cuda()
+            or not current_platform.is_device_capability((7, 0))
+        )
+
+    @staticmethod
+    def _check_schema_tensors(
+        tensors: dict[str, torch.Tensor],
+        schema: dict[str, tuple[tuple[int, ...], torch.dtype]],
+        what: str,
+    ) -> None:
+        if list(tensors) != list(schema):
+            raise RuntimeError(
+                f"static PP {what}: keys {list(tensors)} != model schema {list(schema)}"
+            )
+        for key, (shape, dtype) in schema.items():
+            t = tensors[key]
+            if tuple(t.shape) != tuple(shape) or t.dtype != dtype:
+                raise RuntimeError(
+                    f"static PP {what}: {key} is {tuple(t.shape)} {t.dtype}, "
+                    f"schema {tuple(shape)} {dtype}"
+                )
+            if not (t.is_cuda and t.is_contiguous()):
+                raise RuntimeError(f"static PP {what}: {key} must be a contiguous CUDA tensor")
+
+    def _schema_static_pp_recv(
+        self, num_tokens: int
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]] | None:
+        """(views receiving this step's rows, full persistent buffers handed to the runner) or None."""
+        if not self._use_schema_static_pp_transfer(num_tokens):
+            return None
+        schema = self._pp_schema_model().pp_static_schema(num_tokens)
+        buffers = self.model_runner.intermediate_tensors
+        if buffers is None:
+            raise RuntimeError("schema static PP transfer requires the persistent intermediate buffers")
+        recv = {key: buffers.tensors[key][:num_tokens] for key in schema if key in buffers.tensors}
+        self._check_schema_tensors(recv, schema, "receive buffers")
+        # The runner slices to its padded token count; giving it the whole persistent buffers makes that
+        # slice alias the received rows (no copy). Rows beyond num_tokens hold earlier finite values.
+        return recv, {key: buffers.tensors[key] for key in schema}
+
+    def _schema_static_pp_send(
+        self, output: IntermediateTensors, num_tokens: int
+    ) -> dict[str, torch.Tensor] | None:
+        if not self._use_schema_static_pp_transfer(num_tokens):
+            return None
+        schema = self._pp_schema_model().pp_send_schema(num_tokens)
+        missing = [key for key in schema if key not in output.tensors]
+        if missing or len(output.tensors) != len(schema):
+            raise RuntimeError(
+                f"static PP send: model output keys {list(output.tensors)} != schema {list(schema)}"
+            )
+        send = {key: output.tensors[key][:num_tokens] for key in schema}
+        self._check_schema_tensors(send, schema, "send tensors")
+        return send
+
+    # ---- DeepSeek-V4.1 Engram step plan (PORT_DESIGN §3.6 hook 1) ----
+    def _engram_service(self) -> Any | None:
+        cached = getattr(self, "_engram_service_cache", False)
+        if cached is not False:
+            return cached
+        runner = self.model_runner
+        model = runner.get_model() if hasattr(runner, "get_model") else runner.model
+        service = getattr(model, "engram_service", None)
+        if service is not None:
+            if getattr(self, "use_v2_model_runner", False):
+                raise NotImplementedError(
+                    "DeepSeek-V4.1 Engram hooks (bind_batch, is_dummy_run) exist only in the V1 "
+                    "GPUModelRunner; unset VLLM_USE_V2_MODEL_RUNNER"
+                )
+            if self.vllm_config.scheduler_config.async_scheduling:
+                raise NotImplementedError(
+                    "DeepSeek-V4.1 Engram needs synchronous scheduling at P2 (PORT_DESIGN A9); "
+                    "launch with --no-async-scheduling"
+                )
+            self._engram_planner = _EngramStepPlanner()
+        self._engram_service_cache = service
+        return service
+
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
@@ -1219,11 +1328,31 @@ class Worker(WorkerBase):
                 )
             }
 
+        engram_service = self._engram_service() if forward_pass else None
+        engram_step_id: int | None = None
+        if engram_service is not None:
+            # Before the PP receive: this stage's Engram row gathers overlap the
+            # previous stage's compute (PORT_DESIGN §3.6).
+            plan = self._engram_planner.plan(scheduler_output)
+            self.model_runner._engram_step_id = plan.step_id
+            engram_service.begin_step(plan)
+            engram_step_id = plan.step_id
+
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict = self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
-            if tensor_dict is not None:
-                comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
+            schema_recv = self._schema_static_pp_recv(num_scheduled_tokens)
+            tensor_dict = (
+                None
+                if schema_recv is not None
+                else self._static_pp_hidden_recv_buffers(num_scheduled_tokens)
+            )
+            if schema_recv is not None:
+                recv_views, tensor_dict = schema_recv
+                comm_handles = get_pp_group().irecv_tensor_dict_static(recv_views)
                 comm_postprocess: list[Callable[[], None]] = []
+                logger.info_once("Schema-driven metadata-free PP transfer enabled.")
+            elif tensor_dict is not None:
+                comm_handles = get_pp_group().irecv_tensor_dict_static(tensor_dict)
+                comm_postprocess = []
                 logger.info_once(
                     "Default SM70 metadata-free PP hidden transfer enabled."
                 )
@@ -1241,20 +1370,27 @@ class Worker(WorkerBase):
                 comm_postprocess=comm_postprocess,
             )
 
-        with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
-            if (
-                self.use_v2_model_runner
-                and self.model_runner.is_pooling_model
-                and output is None
-            ):
-                output = self.model_runner.pool()  # type: ignore
-            if isinstance(
-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
-            ):
-                return output
+        try:
+            with self.annotate_profile(scheduler_output):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+                if (
+                    self.use_v2_model_runner
+                    and self.model_runner.is_pooling_model
+                    and output is None
+                ):
+                    output = self.model_runner.pool()  # type: ignore
+                if isinstance(
+                    output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+                ):
+                    return output
+        finally:
+            # D11 ENGRAM F2: the forward (and every wait_rows in it) has been
+            # issued; retire this step's gather so its slot/tickets are free.
+            # Also on an exception, so an aborted step never pins its slot.
+            if engram_step_id is not None:
+                engram_service.end_step(engram_step_id)
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
@@ -1265,7 +1401,11 @@ class Worker(WorkerBase):
 
         # The exact SM70 B1 path sends the replicated tensor directly into
         # the next stage's persistent graph-input buffer without CPU metadata.
-        if self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens):
+        schema_send = self._schema_static_pp_send(output, num_scheduled_tokens)
+        if schema_send is not None:
+            self._pp_send_work = get_pp_group().isend_tensor_dict_static(schema_send)
+            logger.info_once("Schema-driven metadata-free PP transfer enabled.")
+        elif self._use_sm70_static_pp_hidden_transfer(num_scheduled_tokens):
             if not self._is_static_pp_hidden_tensor_dict(
                 output.tensors, num_scheduled_tokens
             ):
@@ -1580,3 +1720,84 @@ def init_worker_distributed_environment(
     # Init ec connector here before KV caches init
     # NOTE: We do not init KV caches for Encoder-only instance in EPD disagg mode
     ensure_ec_transfer_initialized(vllm_config)
+
+
+class _EngramStepPlanner:
+    """EngramStepPlan from SchedulerOutput alone (PORT_DESIGN §3.6 hook 1; DeepSeek-V4.1).
+
+    Under PP with synchronous scheduling, ``scheduled_cached_reqs.new_token_ids[i]`` holds exactly the
+    non-spec tokens this step computes (prompt continuation or the last sampled token), so the step's
+    token ids are known before the forward. Without PP it is empty: prompt continuations come from the
+    prompt this planner keeps per request, decode tokens stay unknown (``token_ids=None``) and are filled
+    by the runner's ``sampled_fill`` in ``bind_batch``.
+    """
+
+    def __init__(self) -> None:
+        self._step = 0
+        self._tokens: dict[str, np.ndarray] = {}
+
+    def plan(self, scheduler_output: "SchedulerOutput") -> Any:
+        from vllm.models.deepseek_v41.common.contracts import EngramReqStep, EngramStepPlan
+
+        new = {r.req_id: r for r in scheduler_output.scheduled_new_reqs}
+        cached = scheduler_output.scheduled_cached_reqs
+        cached_index = {req_id: i for i, req_id in enumerate(cached.req_ids)}
+        steps = []
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            spec = np.asarray(
+                scheduler_output.scheduled_spec_decode_tokens.get(req_id, ()), dtype=np.int32
+            )
+            num_main = num_tokens - len(spec)
+            prompt: np.ndarray | None = None
+            if req_id in new:
+                req = new[req_id]
+                if req.prompt_token_ids is None:
+                    raise ValueError(
+                        f"request {req_id}: Engram hashing needs token ids (prompt embeddings unsupported)"
+                    )
+                prompt = np.asarray(req.prompt_token_ids, dtype=np.int32)
+                self._tokens[req_id] = prompt
+                start = req.num_computed_tokens
+                if start + num_main > len(prompt):
+                    raise ValueError(
+                        f"request {req_id}: new request schedules tokens [{start}, {start + num_main}) "
+                        f"beyond its {len(prompt)}-token prompt"
+                    )
+                main: np.ndarray | None = prompt[start : start + num_main]
+            else:
+                i = cached_index[req_id]
+                start = cached.num_computed_tokens[i]
+                if req_id in cached.resumed_req_ids:
+                    if req_id not in cached.all_token_ids:
+                        raise ValueError(f"resumed request {req_id} arrived without all_token_ids")
+                    prompt = np.asarray(cached.all_token_ids[req_id], dtype=np.int32)
+                    self._tokens[req_id] = prompt
+                if cached.new_token_ids:
+                    main = np.asarray(cached.new_token_ids[i], dtype=np.int32)
+                    if len(main) != num_main:
+                        raise ValueError(
+                            f"request {req_id}: {len(main)} new_token_ids for {num_main} scheduled tokens"
+                        )
+                else:
+                    known = self._tokens.get(req_id)
+                    main = (
+                        known[start : start + num_main]
+                        if known is not None and start + num_main <= len(known)
+                        else None
+                    )
+            if main is None:
+                if len(spec) or num_main != 1:
+                    raise NotImplementedError(
+                        f"request {req_id}: {num_main} unknown tokens (+{len(spec)} spec) before sampling; "
+                        "only single-token decode can be filled by bind_batch"
+                    )
+                token_ids = None
+            else:
+                token_ids = np.concatenate([main, spec]).astype(np.int32, copy=False)
+            steps.append(EngramReqStep(req_id, start, num_tokens, token_ids, prompt))
+        finished = frozenset(scheduler_output.finished_req_ids)
+        for req_id in finished | set(scheduler_output.preempted_req_ids or ()):
+            self._tokens.pop(req_id, None)
+        plan = EngramStepPlan(self._step, tuple(steps), finished)
+        self._step += 1
+        return plan

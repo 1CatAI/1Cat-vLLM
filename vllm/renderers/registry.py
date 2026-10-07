@@ -22,6 +22,9 @@ logger = init_logger(__name__)
 _VLLM_RENDERERS = {
     "deepseek_v32": ("deepseek_v32", "DeepseekV32Renderer"),
     "deepseek_v4": ("deepseek_v4", "DeepseekV4Renderer"),
+    # DeepSeek-V4.1: text-only chat rendering through the tokenizer's own
+    # apply_chat_template (vendored official encoder), same flow as V4.
+    "deepseek_v41": ("deepseek_v4", "DeepseekV4Renderer"),
     "grok2": ("grok2", "Grok2Renderer"),
     "hf": ("hf", "HfRenderer"),
     "gguf": ("hf", "HfRenderer"),
