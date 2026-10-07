@@ -5,6 +5,7 @@
 import torch
 
 from vllm import envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.platforms import current_platform
 
 OPERATOR = "sm70_grouped_fp16_fwd"
@@ -27,6 +28,26 @@ def load_grouped_fp16_fp32():
     return _run if operator is not None else None
 
 
+def short_split_capability():
+    cfg = get_current_vllm_config_or_none()
+    enabled = cfg is None or cfg.kernel_config.sm70_fp16_grouped_short_splits
+    revision = getattr(
+        torch.ops._vllm_fa2_C, "sm70_grouped_fp16_short_split_revision", None
+    )
+    supported = revision is not None and revision() >= 1
+    reason = None
+    if not enabled:
+        reason = "disabled_by_policy"
+    elif not supported:
+        reason = "operator_missing:sm70_grouped_fp16_short_split_revision"
+    return dict(
+        enabled=enabled and supported,
+        reason=reason,
+        supported=supported,
+        runtime_guards="FP16 q8/B1, device context 129..2048; retain K64 elsewhere",
+    )
+
+
 def _run(q, k, v, table, row_lengths, *, out, softmax_scale):
     groups = table.shape[0]
     key = (q.device, torch.cuda.current_stream(q.device).cuda_stream)
@@ -43,9 +64,12 @@ def _run(q, k, v, table, row_lengths, *, out, softmax_scale):
     partial, lse = (
         (partial[0], lse[0]) if groups == 1 else (partial[:groups], lse[:groups])
     )
-    torch.ops._vllm_fa2_C.sm70_grouped_fp16_fwd(
-        q, k, v, out, table, row_lengths, partial, lse, softmax_scale
-    )
+    capability = short_split_capability()
+    arguments = (q, k, v, out, table, row_lengths, partial, lse, softmax_scale)
+    if capability["supported"]:
+        torch.ops._vllm_fa2_C.sm70_grouped_fp16_fwd(*arguments, capability["enabled"])
+    else:
+        torch.ops._vllm_fa2_C.sm70_grouped_fp16_fwd(*arguments)
     return out
 
 
