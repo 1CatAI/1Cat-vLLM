@@ -10,6 +10,25 @@ from vllm.sm70_graph_observer import CPUStageRecorder, GraphParityWorkerExtensio
 from vllm.v1.serial_utils import MsgpackEncoder
 
 
+def test_prefill_policy_rpc_updates_target_and_draft_without_disabling_unroute():
+    from vllm.config import KernelConfig
+
+    target = SimpleNamespace(kernel_config=KernelConfig())
+    draft = SimpleNamespace(kernel_config=KernelConfig())
+    worker = GraphParityWorkerExtension()
+    worker.rank = 2
+    worker.model_runner = SimpleNamespace(
+        vllm_config=target, speculator=SimpleNamespace(vllm_config=draft)
+    )
+    assert worker.set_gguf_prefill_routing_policy(False) == {
+        "rank": 2,
+        "prefill_routing": False,
+    }
+    for config in (target, draft):
+        assert config.kernel_config.sm70_gguf.prefill_routing is False
+        assert config.kernel_config.sm70_gguf.prefill_unroute is True
+
+
 def test_disabled_observer_preserves_results_and_records_nothing():
     owner = SimpleNamespace(f=lambda x: x + 1)
     rec = CPUStageRecorder(0)

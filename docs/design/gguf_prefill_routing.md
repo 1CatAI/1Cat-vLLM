@@ -29,3 +29,16 @@ The original model path exhausts memory during 16K warmup when restoring an
 and its FP32 copies. Releasing the gathered activation matrix before the
 down projection also allows its storage to be reused. The 32K model-level
 comparison remains pending.
+
+The repository benchmark runs a matched A/B/B/A comparison without reloading:
+
+```bash
+python benchmarks/benchmark_gguf_prefill.py "$MODEL" --draft "$DRAFT" \
+  --input-tokens 32768 --prefill-chunk 16384 --output prefill.json
+```
+
+Run it under the GPU lock protocol. The default TP4 memory contract reserves
+1.5 GiB of KV per rank and retains FP16 KV plus FP32 recurrent state. Both
+comparison arms retain fused unroute, since the original restoration path
+cannot fit the 16K chunk. The input is fixed repeated technical text; the
+reported interval is scheduling through first token, not isolated GPU time.

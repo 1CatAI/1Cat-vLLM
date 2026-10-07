@@ -116,6 +116,19 @@ class GraphParityWorkerExtension:
     rank: int
     model_runner: Any
 
+    def set_gguf_prefill_routing_policy(self, enabled: bool):
+        """Compare routing between completed requests without reloading weights."""
+        if type(enabled) is not bool:
+            raise TypeError("GGUF prefill routing requires a boolean policy")
+        runner = self.model_runner
+        configs = [runner.vllm_config]
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None:
+            configs.append(speculator.vllm_config)
+        for config in configs:
+            config.kernel_config.sm70_gguf.prefill_routing = enabled
+        return {"rank": self.rank, "prefill_routing": enabled}
+
     def set_graph_input_preparation(self, early):
         state = self.model_runner.model_state
         declared = type(state).supports_early_input_preparation
