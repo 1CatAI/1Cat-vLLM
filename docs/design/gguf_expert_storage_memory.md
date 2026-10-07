@@ -146,6 +146,29 @@ wheel subsequently passed all four-rank checks on the 16 GiB NV2 topology and
 reclaimed exactly 244 MiB per rank, matching its earlier EP ledger. This is a
 memory result, not a model latency improvement claim.
 
+The complete-model follow-up exposed a placement interaction. With the default
+cascade, the newly available space held 211487850 bytes of PLE rows per rank;
+the resulting profiling peak left a 0.21 GiB KV budget, below the 0.26 GiB
+startup requirement at context 2048. An explicit host budget alone still fills
+the device tier first under cascade. That configuration is rejected.
+
+A subsequent installed-wheel run used the existing 7 GiB PLE host budget per
+rank and disabled `kernel_config.ple_disk_cascade`. It completed loading in
+239.83 seconds, retained about 14.281 GiB of model weights, and held no PLE
+table bytes in device storage. Peak NVML usage was 15869 MiB per card, exactly
+244 MiB below the earlier capacity run. At unchanged utilization 0.938 the
+automatic cache budget remained 0.40 GiB / 3157 tokens; resource reclamation
+did not automatically enlarge that budget.
+
+This follow-up is not accepted as a model performance or correctness result.
+Three natural prompts stopped normally, but their token sequences changed.
+The synthetic arithmetic test with `ignore_eos` measured 69.29 ms/round yet
+fell from 4.676 to 1.009 emitted tokens/round and from 201/220 to 23/928 accepted
+draft tokens. These figures do not establish natural-prompt acceptance parity.
+C4 again had no eligible fixed-width intervals. Isolate EP communicator
+admission, prefault and PLE placement with a matched control before promoting
+the combined configuration. Do not advertise the lower round time as a speedup.
+
 An isolated four-card experiment with the existing NCCL buffer setting reduced
 the buffer from the standard 4 MiB to 1 MiB. It saved only 48 MiB per card;
 the rank-0 M20 gather/reduce pair increased from 36.28 to 38.38 microseconds.

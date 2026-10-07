@@ -8,6 +8,15 @@ document specifies the next implementation; host-backed active decode is not
 implemented or benchmarked yet. Small, bounded GPU buffers remain necessary
 for attention, recurrent updates and CUDA graph replay.
 
+PLE placement must be explicit for a weights-on-GPU, tables-on-host deployment.
+The existing cascade policy fills device headroom before host memory: freeing
+an EP communicator can consequently put PLE rows back into VRAM. A sufficient
+`VLLM_QWEN4EXP_PLE_HOST_GIB` budget alone does not override that ordering when
+cascade is enabled. For the current packed table, use the existing 7 GiB
+per-rank host budget together with `kernel_config.ple_disk_cascade=false`.
+Check the actual row placement and preserve host reserve before admitting KV
+capacity; no additional environment variable is introduced.
+
 The measured TP4 capacity route on four 16 GiB V100s uses 14.281 GiB of model
 weights per rank, approximately 0.95 GiB of non-PyTorch runtime memory and a
 0.40 GiB cache budget. It runs short C1 requests but cannot sustain the measured
@@ -92,6 +101,9 @@ positions. Worst-case union capacity is five times a per-query selection,
 multiplied by active requests; a tiled gather/attention path may be needed to
 bound memory. Reusing one layer buffer across the serial QSA layers is a
 candidate, subject to transfer and graph-lifetime validation.
+That reuse discards each layer's cross-round hot set: it cannot simultaneously
+claim the hit rate of twelve persistent layer caches. Compare both layouts
+with the actual fixed-state memory budget and miss traffic.
 
 Initially retain compressed index keys and active GDN/PLE state on GPU.
 Then assess host backing for raw index keys and inactive/checkpoint states.
@@ -127,7 +139,11 @@ GPU-to-host bandwidth.
 
 Measure mapped gather, DMA staging, D2H write-back and simultaneous four-rank
 traffic on the intended machine before choosing the transfer route. Include
-PLE traffic in the concurrent test. Compute `new host bytes / measured link
+PLE traffic in the concurrent test. Record selected-token unions and actual
+buffer hit/miss rates at 2K, 8K and 32K; worst-case disjoint selections are not
+an observed traffic measurement. Independent per-layer QSA selectors cannot
+reuse another layer's selection as a prefetch prediction without validating
+the original semantics. Compute `new host bytes / measured link
 bandwidth` as a lower bound, not as an end-to-end speed prediction.
 
 ## Implementation and validation order
