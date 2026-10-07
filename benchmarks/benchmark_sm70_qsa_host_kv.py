@@ -15,6 +15,7 @@ import torch
 import vllm
 from vllm import _custom_ops as ops
 from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
+from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
 from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
 
 
@@ -69,6 +70,7 @@ def point(context, rows, hot_tokens, iterations):
     indices = selected.to(torch.int32).repeat(rows, 1)
     query = torch.randn((rows, 6, 256), dtype=torch.float16, device=device)
     output_resident, output_host = torch.empty_like(query), torch.empty_like(query)
+    output_direct = torch.empty_like(query)
     slots = (
         owners.long() * per_request * page
         + context
@@ -110,10 +112,18 @@ def point(context, rows, hot_tokens, iterations):
             sequence_lengths=state.lengths,
         )
 
-    a, b = captured(resident), captured(host)
+    def direct():
+        state.write(new_key, new_value, slots)
+        host_qsa_attention(
+            query, state, indices, table, owners, positions, lengths, output_direct
+        )
+
+    a, b, c = captured(resident), captured(host), captured(direct)
     a.replay()
     b.replay()
+    c.replay()
     torch.cuda.synchronize()
+    torch.testing.assert_close(output_direct, output_host, rtol=0, atol=0)
     if (
         not torch.isfinite(output_resident).all()
         or not torch.isfinite(output_host).all()
@@ -164,10 +174,11 @@ def point(context, rows, hot_tokens, iterations):
     measurements = []
     previous = state.stats.clone()
     for _ in range(3):
-        measurements.append([timing(g, iterations) for g in (a, b, b, a)])
+        measurements.append([timing(g, iterations) for g in (a, b, c, c, b, a)])
     delta = (state.stats - previous).cpu().tolist()
-    resident_us = sum(v[0] + v[3] for v in measurements) / 6
-    host_us = sum(v[1] + v[2] for v in measurements) / 6
+    resident_us = sum(v[0] + v[5] for v in measurements) / 6
+    host_us = sum(v[1] + v[4] for v in measurements) / 6
+    direct_us = sum(v[2] + v[3] for v in measurements) / 6
     return dict(
         context=context,
         rows=rows,
@@ -175,6 +186,8 @@ def point(context, rows, hot_tokens, iterations):
         selection=f"{count} fixed pages per request; five shared queries",
         resident_us=resident_us,
         host_us=host_us,
+        direct_us=direct_us,
+        direct_stage_exactly_equal=True,
         relative_output_l2=error,
         counters=delta,
         hit_rate=delta[0] / max(delta[0] + delta[1], 1),
@@ -192,7 +205,7 @@ def point(context, rows, hot_tokens, iterations):
             )
         ),
         shared_staging_bytes=state.staging.untyped_storage().nbytes(),
-        epochs_abba_us=measurements,
+        epochs_abc_cba_us=measurements,
         diagnostics=diagnostics,
     )
 

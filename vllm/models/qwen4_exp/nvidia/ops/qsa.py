@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops.fp8_software import (
     fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
 )
+from vllm.models.qwen4_exp.nvidia.ops.host_kv_reader import load_host_kv
 from vllm.models.qwen4_exp.nvidia.ops.sm70_qsa_tuning import (
     SM70_QSA_TUNING,
     legacy_qsa_tuning,
@@ -657,6 +658,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     BLOCK_N: tl.constexpr,
     KV_E4M3: tl.constexpr,
     RESOLVED_INDICES: tl.constexpr = False,
+    HOST_INDICES=None,
+    HOST_SCALES=None,
+    HOST_CACHE: tl.constexpr = False,
+    HOST_E4M3: tl.constexpr = True,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -715,24 +720,43 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
         # physical_page * block stride can overflow int32 for large caches.
         safe_page = tl.maximum(physical_page, 0).to(tl.int64)
-        keys = tl.load(
-            k_cache_ptr
-            + safe_page[None, :] * stride_k_block
-            + page_offset[None, :] * stride_k_token
-            + kv_head * stride_k_head
-            + dim_offsets[:, None],
-            mask=valid[None, :],
-            other=0.0,
-        )
-        values = tl.load(
-            v_cache_ptr
-            + safe_page[:, None] * stride_v_block
-            + page_offset[:, None] * stride_v_token
-            + kv_head * stride_v_head
-            + dim_offsets[None, :],
-            mask=valid[:, None],
-            other=0.0,
-        )
+        if HOST_CACHE:
+            hot_tokens = tl.load(
+                HOST_INDICES + row * TOPK + columns, columns < TOPK, other=-2
+            )
+            valid &= hot_tokens >= -1
+            keys, values = load_host_kv(
+                k_cache_ptr,
+                v_cache_ptr,
+                HOST_SCALES,
+                hot_tokens,
+                safe_page,
+                page_offset,
+                valid,
+                dim_offsets,
+                PAGE_SIZE,
+                HEAD_DIM,
+                HOST_E4M3,
+            )
+        else:
+            keys = tl.load(
+                k_cache_ptr
+                + safe_page[None, :] * stride_k_block
+                + page_offset[None, :] * stride_k_token
+                + kv_head * stride_k_head
+                + dim_offsets[:, None],
+                mask=valid[None, :],
+                other=0.0,
+            )
+            values = tl.load(
+                v_cache_ptr
+                + safe_page[:, None] * stride_v_block
+                + page_offset[:, None] * stride_v_token
+                + kv_head * stride_v_head
+                + dim_offsets[None, :],
+                mask=valid[:, None],
+                other=0.0,
+            )
         if KV_E4M3:
             keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
             values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)

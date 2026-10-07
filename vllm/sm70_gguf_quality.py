@@ -17,6 +17,7 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
         config = runner.kv_cache_config
         owners = []
         staging = {}
+        resolution = {}
         for name, module in runner.compilation_config.static_forward_context.items():
             state = getattr(module, "host_kv", None)
             if state is None:
@@ -33,10 +34,14 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
             staging[state.staging.untyped_storage().data_ptr()] = (
                 state.staging.untyped_storage().nbytes()
             )
+            for tensor in (state.initial, state.resolved, state.remapped):
+                storage = tensor.untyped_storage()
+                resolution[storage.data_ptr()] = storage.nbytes()
             owners.append(
                 {
                     "layer": name,
                     "host_dtype": "fp8_e4m3" if state.fp8 else "float16",
+                    "direct_attention": not state.has_staging,
                     "host_bytes": state.history.nbytes + state.host_scales.nbytes,
                     "device_hot_bytes": sum(t.nbytes for t in tensors),
                     "stats": state.stats.cpu().tolist(),
@@ -52,6 +57,7 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
                 t.size for t in config.kv_cache_tensors if not t.host_backed
             ),
             "shared_staging_bytes": sum(staging.values()),
+            "shared_resolution_bytes": sum(resolution.values()),
             "owners": owners,
             "torch_allocated_bytes": torch.accelerator.memory_allocated(),
             "torch_reserved_bytes": torch.accelerator.memory_reserved(),

@@ -195,3 +195,74 @@ def test_host_attention_empty_padded_rows():
     )
     assert torch.isfinite(output).all()
     assert torch.count_nonzero(output).item() == 0
+
+
+@pytest.mark.parametrize("rows", [1, 5, 20, 32])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+def test_direct_host_attention_matches_staging_on_misses_and_replay(rows, dtype):
+    from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
+
+    torch.manual_seed(19)
+    device = torch.device("cuda:0")
+    state = HostQSAKV(4, 816, 256, device, hot_tokens=64, rows=rows, dtype=dtype)
+    direct_state = HostQSAKV(
+        4, 816, 256, device, hot_tokens=64, rows=rows, dtype=dtype, staging=False
+    )
+    key = torch.randn(3264, 1, 256, device=device, dtype=torch.float16)
+    value = torch.randn_like(key)
+    state.write(key, value, torch.arange(3264, device=device))
+    direct_state.write(key, value, torch.arange(3264, device=device))
+    assert direct_state.staging.nbytes == 2048
+    indices = torch.arange(2051, device=device, dtype=torch.int32).repeat(rows, 1)
+    table = torch.arange(4, dtype=torch.int32, device=device).view(1, -1)
+    requests = torch.zeros(rows, dtype=torch.int32, device=device)
+    if rows > 1:
+        requests[-1] = -1
+    positions = torch.full((rows,), 2049, dtype=torch.int64, device=device)
+    lengths = torch.full((1,), 2050, dtype=torch.int32, device=device)
+    query = torch.randn(rows, 6, 256, dtype=torch.float16, device=device)
+    reference, actual = torch.empty_like(query), torch.empty_like(query)
+    gate = torch.randn_like(query)
+
+    def run():
+        k, v, remap = state.gather(indices, table, requests, positions, lengths)
+        qsa_sparse_paged_attention(
+            query,
+            k,
+            v,
+            remap,
+            state.table,
+            state.requests,
+            reference,
+            query_positions=state.positions,
+            sequence_lengths=state.lengths,
+            output_gate=gate,
+        )
+        host_qsa_attention(
+            query,
+            direct_state,
+            indices,
+            table,
+            requests,
+            positions,
+            lengths,
+            actual,
+            gate,
+        )
+
+    for _ in range(2):
+        run()
+    torch.accelerator.synchronize()
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        state.write(key[:8], value[:8], torch.arange(8, device=device))
+        direct_state.write(key[:8], value[:8], torch.arange(8, device=device))
+        run()
+    graph.replay()
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)

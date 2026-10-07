@@ -3,8 +3,9 @@
 QSA attention history uses pinned host E4M3 bytes with one FP32 scale per
 token, local KV head and K/V vector. This format does not require checkpoint
 calibration scales. Encoding uses round-to-nearest division and E4M3 conversion.
-The GPU retains a bounded per-layer four-way hot-page cache; FP16 attention
-staging is shared by serial QSA owners. Indexer history and active GDN/PLE
+The GPU retains a bounded per-layer four-way hot-page cache. Attention reads
+protected FP16 hot entries and decodes host misses directly into its existing
+FP32 accumulation and softmax loop. Indexer history and active GDN/PLE
 states retain their existing storage and arithmetic.
 
 `KernelConfig.qsa_host_kv` selects this route. It is disabled while model-level
@@ -23,8 +24,9 @@ rounding. Both host formats reconstruct identical FP16 hot/staging layouts.
 The default hot capacity is 8,192 tokens per owner, configurable through
 `qsa_host_kv_hot_tokens`. At D256 this costs 8 MiB of reconstructed FP16 K/V,
 plus tags and metadata. FP8 decoding occurs on misses, rather than every hot
-read. Thirty-two query rows share approximately 64 MiB of FP16
-staging across owners. Prefill is processed in bounded query tiles. Exact
+read. Thirty-two query rows share bounded resolution maps; the former
+approximately 64 MiB query-private FP16 staging is unnecessary. Prefill is
+processed in bounded query tiles. Exact
 selected positions and causal masks are retained; no new sparsity heuristic
 or draft attention window is introduced.
 
@@ -84,7 +86,7 @@ The restored eight-prompt mean draft acceptance is 45.59%; both short natural
 completion checks end normally. Historical and restored natural token IDs
 differ, so the historical transcript is not a bitwise oracle for a new run.
 Use a fresh matched control and teacher conditions for host-cache qualification.
-These numbers are resident-KV controls; host-KV model results are pending.
+These numbers are resident-KV controls. The matched host experiment follows.
 
 ## First matched host experiment
 
@@ -114,8 +116,11 @@ Indexer and recurrent storage remains on device. The physical scheduler pool
 contains 157 blocks rather than 273; it still admits the declared concurrency.
 
 The next precision ablation preserves FP16 in the draft and provides an FP16
-host reference. The next operator experiment removes query-private copying
-from the hot path. Neither result is established by this first experiment.
+host reference. Direct reading removes query-private copying from the hot
+path while retaining the staged reference for isolated comparisons. Eight
+FP8/FP16 direct-reader tests cover M1/M5/M20/M32, misses, causal padding,
+output gating and graph replay; the first source-only run agrees exactly with
+the staged reader. Model latency and acceptance for this change remain pending.
 On a separate V100-SXM2-16GB, 19 packaged GPU tests pass, including the 816-token
 page, empty padded rows and captured replay. This is operator validation, not
 four-card model capacity evidence.

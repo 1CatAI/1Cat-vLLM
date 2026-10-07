@@ -82,6 +82,7 @@ def _protect(
     Epoch,
     VirtualPositions,
     VirtualLengths,
+    Initial,
     Width: tl.constexpr,
     TableWidth: tl.constexpr,
     TableStride: tl.constexpr,
@@ -116,12 +117,21 @@ def _protect(
     )
     valid &= (blocks >= 0) & (blocks < Blocks)
     if tl.sum(valid.to(tl.int32), 0) == 0:
+        tl.store(Initial + row * Width + columns, -2, columns < Width)
         return
-    pages = (tl.maximum(blocks, 0) * Page + tl.maximum(logical, 0) % Page) // 4
+    tokens = tl.maximum(blocks, 0) * Page + tl.maximum(logical, 0) % Page
+    pages = tokens // 4
     slots = (pages[:, None] % Sets) * 4 + ways[None, :]
     tags = tl.load(Tags + slots)
     epoch = tl.load(Epoch)
     tl.store(Stamps + slots, epoch, valid[:, None] & (tags == pages[:, None]))
+    way = tl.min(tl.where(tags == pages[:, None], ways[None, :], 4), 1)
+    hot_token = ((pages % Sets) * 4 + tl.minimum(way, 3)) * 4 + tokens % 4
+    tl.store(
+        Initial + row * Width + columns,
+        tl.where(valid, tl.where(way < 4, hot_token, -1), -2),
+        columns < Width,
+    )
 
 
 @triton.jit
@@ -142,6 +152,8 @@ def _gather(
     Lengths,
     Out,
     Remapped,
+    Initial,
+    Resolved,
     Width: tl.constexpr,
     Padded: tl.constexpr,
     TableWidth: tl.constexpr,
@@ -153,6 +165,7 @@ def _gather(
     Dim: tl.constexpr,
     Sets: tl.constexpr,
     FP8: tl.constexpr,
+    STAGE: tl.constexpr,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
     lanes = tl.arange(0, 16)
@@ -179,6 +192,35 @@ def _gather(
         Remapped + row * Width + columns, tl.where(valid, columns, -1), columns < Width
     )
     if tl.sum(valid.to(tl.int32), 0) == 0:
+        tl.store(Resolved + row * Width + columns, -2, columns < Width)
+        return
+    initial = tl.load(Initial + row * Width + columns, columns < Width, other=-2)
+    initial_hit = valid & (initial >= 0)
+    if tl.sum((initial_hit | ~valid).to(tl.int32), 0) == 16:
+        # The preceding protection kernel pins these pages until attention
+        # completes. Its stream dependency supplies visibility; no per-query
+        # tag CAS, host decode or bucket lock is needed for an initial hit.
+        tl.store(Resolved + row * Width + columns, initial, columns < Width)
+        if STAGE:
+            values = tl.load(
+                Hot
+                + (tl.maximum(initial, 0)[:, None, None] * 2 + kv[None, :, None]) * Dim
+                + dims[None, None, :],
+                initial_hit[:, None, None],
+                other=0,
+            )
+            tl.store(
+                Out
+                + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
+                * Dim
+                + dims[None, None, :],
+                values,
+                columns[:, None, None] < Padded,
+            )
+        counter = (row * tl.cdiv(Width, 16) + tile) * 3
+        tl.store(
+            Stats + counter, tl.load(Stats + counter) + tl.sum(valid.to(tl.int64), 0)
+        )
         return
     tokens = tl.maximum(blocks, 0) * Page + tl.maximum(logical, 0) % Page
     pages = tl.reshape(tokens // 4, (4, 4))
@@ -277,12 +319,18 @@ def _gather(
         Locks + buckets, tl.where(held, 1, -1), tl.zeros((4,), tl.int32), sem="release"
     )
     tl.store(
-        Out
-        + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None]) * Dim
-        + dims[None, None, :],
-        values,
-        columns[:, None, None] < Padded,
+        Resolved + row * Width + columns,
+        tl.where(valid, tl.where(token_hits | token_installs, hot_tokens, -1), -2),
+        columns < Width,
     )
+    if STAGE:
+        tl.store(
+            Out
+            + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None]) * Dim
+            + dims[None, None, :],
+            values,
+            columns[:, None, None] < Padded,
+        )
     counter = (row * tl.cdiv(Width, 16) + tile) * 3
     counters = tl.arange(0, 4)
     hits = tl.sum((valid & token_hits).to(tl.int64), 0)
@@ -308,6 +356,7 @@ class HostQSAKV:
         width: int = 2051,
         history: torch.Tensor | None = None,
         dtype: torch.dtype = torch.uint8,
+        staging: bool = True,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -315,6 +364,7 @@ class HostQSAKV:
             raise ValueError("Invalid hot cache or staging capacity")
         self.blocks, self.page_size, self.dim = blocks, page_size, dim
         self.rows, self.width = rows, width
+        self.has_staging = staging
         self.padded = triton.cdiv(width, 4) * 4
         self.sets = hot_tokens // 16
         dtype = history.dtype if history is not None else dtype
@@ -355,20 +405,30 @@ class HostQSAKV:
         )
         # QSA layers execute serially on the model stream. Share staging across
         # owners while keeping each owner's hot pages and scales persistent.
-        workspace_key = (device.index, rows, width, dim)
+        workspace_key = (device.index, rows, width, dim, staging)
         if workspace_key not in _WORKSPACES:
             _WORKSPACES[workspace_key] = (
                 torch.zeros(
-                    (rows, 2, self.padded, 1, dim), dtype=torch.float16, device=device
+                    (rows, 2, self.padded, 1, dim) if staging else (1, 2, 4, 1, dim),
+                    dtype=torch.float16,
+                    device=device,
                 ),
                 torch.empty((rows, width), dtype=torch.int32, device=device),
                 torch.arange(rows, dtype=torch.int32, device=device),
                 torch.full((rows,), width - 1, dtype=torch.int64, device=device),
                 torch.full((rows,), width, dtype=torch.int32, device=device),
+                torch.empty((rows, width), dtype=torch.int32, device=device),
+                torch.empty((rows, width), dtype=torch.int32, device=device),
             )
-        self.staging, self.remapped, self.requests, self.positions, self.lengths = (
-            _WORKSPACES[workspace_key]
-        )
+        (
+            self.staging,
+            self.remapped,
+            self.requests,
+            self.positions,
+            self.lengths,
+            self.initial,
+            self.resolved,
+        ) = _WORKSPACES[workspace_key]
         self.table = self.requests.view(-1, 1)
 
     def write(self, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor):
@@ -394,6 +454,17 @@ class HostQSAKV:
             )
 
     def gather(self, indices, block_table, token_to_req, positions, lengths):
+        if not self.has_staging:
+            raise ValueError("This host cache was initialized without staging")
+        self._resolve(indices, block_table, token_to_req, positions, lengths, True)
+        key, value = self.staging[: indices.shape[0]].unbind(1)
+        return key, value, self.remapped[: indices.shape[0]]
+
+    def resolve(self, indices, block_table, token_to_req, positions, lengths):
+        self._resolve(indices, block_table, token_to_req, positions, lengths, False)
+        return self.resolved[: indices.shape[0]]
+
+    def _resolve(self, indices, block_table, token_to_req, positions, lengths, stage):
         rows = indices.shape[0]
         if indices.shape[1] != self.width or rows > self.rows:
             raise ValueError("Host KV selection exceeds fixed staging capacity")
@@ -411,6 +482,7 @@ class HostQSAKV:
                 self.epoch,
                 self.positions,
                 self.lengths,
+                self.initial,
                 self.width,
                 block_table.shape[1],
                 block_table.stride(0),
@@ -438,6 +510,8 @@ class HostQSAKV:
                 lengths,
                 self.staging,
                 self.remapped,
+                self.initial,
+                self.resolved,
                 self.width,
                 self.padded,
                 block_table.shape[1],
@@ -449,10 +523,9 @@ class HostQSAKV:
                 self.dim,
                 self.sets,
                 self.fp8,
+                stage,
                 num_warps=4,
             )
-        key, value = self.staging[:rows].unbind(1)
-        return key, value, self.remapped[:rows]
 
     @property
     def stats(self):

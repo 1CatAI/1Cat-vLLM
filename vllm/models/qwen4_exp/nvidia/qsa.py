@@ -797,10 +797,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 hot_tokens=self.host_kv_hot_tokens,
                 history=kv_cache,
                 width=self.indexer.output_width,
+                staging=False,
             )
             logger.info_once(
                 "QSA host storage initialized: dtype=%s, hot_tokens=%d; "
-                "FP16 staging shared across serial attention owners.",
+                "attention reads protected FP16 hot pages and host misses directly.",
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,
             )
@@ -808,31 +809,21 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     def host_kv_forward(
         self, query, indices, table, requests, positions, lengths, output, gate
     ) -> None:
-        from .ops.qsa import qsa_sparse_paged_attention
+        from .ops.host_kv_attention import host_qsa_attention
 
         state = self.host_kv
         for start in range(0, query.shape[0], state.rows):
             stop = min(start + state.rows, query.shape[0])
-            k, v, selected = state.gather(
+            host_qsa_attention(
+                query[start:stop],
+                state,
                 indices[start:stop],
                 table,
                 requests[start:stop],
                 positions[start:stop],
                 lengths,
-            )
-            rows = stop - start
-            qsa_sparse_paged_attention(
-                query[start:stop],
-                k,
-                v,
-                selected,
-                state.table[:rows],
-                state.requests[:rows],
                 output[start:stop],
-                output_gate=gate[start:stop] if gate is not None else None,
-                query_positions=state.positions[:rows],
-                sequence_lengths=state.lengths[:rows],
-                kv_cache_dtype="float16",
+                gate[start:stop] if gate is not None else None,
             )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
