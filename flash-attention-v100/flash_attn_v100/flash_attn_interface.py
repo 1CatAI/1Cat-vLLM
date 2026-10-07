@@ -1591,13 +1591,15 @@ def flash_attn_prefill_paged(
         and q.dtype == torch.float16
         and q.ndim == 4
         and 1 <= q.shape[0] <= 4
-        and q.shape[1:] == (8, 8, 128)
+        and q.shape[1] == 8
+        and q.shape[2] in (8, 16)
+        and q.shape[3] == 128
         and k_cache.dtype == v_cache.dtype == torch.float16
         and kv_cache_dtype in ("auto", "fp16")
         and k_cache.ndim == v_cache.ndim == 4
         and k_cache.shape[1] in (832, 1024, 1648, 2048)
         and (dflash2_window_split or k_cache.shape[1] in (1024, 2048))
-        and k_cache.shape[2:] == v_cache.shape[2:] == (2, 128)
+        and k_cache.shape[2:] == v_cache.shape[2:] == (q.shape[2] // 4, 128)
         and k_cache.stride(-1) == v_cache.stride(-1) == 1
         and torch.cuda.get_device_capability(q.device) == (7, 0)
         and (out is None or out.is_contiguous())
@@ -1640,8 +1642,10 @@ def flash_attn_prefill_paged(
         # The split kernel uses the live page size and strides. The native
         # concurrent kernel has a narrower page ABI: never send page832/1648 to it,
         # including when the optional split implementation cannot be imported.
-        if k_cache.shape[1] in (1024, 2048) and hasattr(
-            flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd"
+        if (
+            q.shape[2] == 8
+            and k_cache.shape[1] in (1024, 2048)
+            and hasattr(flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd")
         ):
             return flash_attn_v100_cuda.dflash2_paged_bmhd_fwd(
                 q.contiguous(),
