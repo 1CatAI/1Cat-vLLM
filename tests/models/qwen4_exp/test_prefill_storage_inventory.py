@@ -15,6 +15,10 @@ def test_inventory_deduplicates_device_views_and_excludes_host_aliases():
     runner = torch.nn.Module()
     value = torch.empty(32, device="cuda", dtype=torch.float16)
     runner.register_buffer("value", value)
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        runner.fake_metadata = torch.empty(1024, device="cuda")
     runner.alias = value[3:]
     host = torch.empty(48, dtype=torch.uint8, pin_memory=True)
     runner.register_buffer("host_alias", get_accelerator_view_from_cpu_tensor(host))

@@ -178,6 +178,7 @@ class GraphParityWorkerExtension:
         """Inventory live device storage, separating mapped host aliases."""
         import torch
         from cuda.bindings import runtime
+        from torch._subclasses.fake_tensor import FakeTensor
 
         from vllm.model_executor.layers.quantization import gguf_dense_hmma
 
@@ -186,7 +187,9 @@ class GraphParityWorkerExtension:
         errors = []
 
         def walk(value, owner, depth=0):
-            if isinstance(value, torch.nn.parameter.UninitializedParameter):
+            if isinstance(
+                value, (torch.nn.parameter.UninitializedParameter, FakeTensor)
+            ):
                 return
             if isinstance(value, torch.Tensor):
                 if value.is_cuda and value.numel():
@@ -196,6 +199,7 @@ class GraphParityWorkerExtension:
                         error, attributes = runtime.cudaPointerGetAttributes(key[1])
                         if error != runtime.cudaError_t.cudaSuccess:
                             errors.append({"owner": owner, "error": int(error)})
+                            runtime.cudaGetLastError()
                         else:
                             storages[key] = {
                                 "bytes": storage.nbytes(),
