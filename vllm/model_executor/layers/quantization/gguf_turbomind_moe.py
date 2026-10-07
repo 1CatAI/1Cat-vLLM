@@ -23,6 +23,7 @@ from vllm.model_executor.kernels.gguf import (
     small_grouped_vector_capabilities,
 )
 from vllm.model_executor.layers.fused_moe.sm70_small_routing import (
+    SM70_PREFILL_ROUTING,
     SM70_SMALL_ROUTING,
 )
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
@@ -301,6 +302,9 @@ def _expert_dp4a(
         vector_bands,
     )
     hidden = (torch.nn.functional.silu(gate) * up).contiguous()
+    # These buffers are no longer consumed; release the large gathered matrix
+    # before allocating down so 16K prefill can reuse its storage.
+    del routed, gate, up
     down = x.new_empty((m * top_k, x.shape[1]))
     _expert_down(
         down,
@@ -314,6 +318,7 @@ def _expert_dp4a(
         32,
         down_vector_batches,
     )
+    del hidden
     return torch.ops.vllm.sm70_small_expert_unroute(down, inverse, probabilities)
 
 
@@ -563,6 +568,16 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
         super().__init__(quant_config, moe)
         self.builders: dict[str, GGUFExpertBank] = {}
         config = get_current_vllm_config_or_none()
+        self.prefill_routing_enabled = self.native_enabled and (
+            config.kernel_config.sm70_gguf.prefill_routing
+            if config is not None
+            else True
+        )
+        self.prefill_unroute_enabled = self.native_enabled and (
+            config.kernel_config.sm70_gguf.prefill_unroute
+            if config is not None
+            else True
+        )
         self.dp4a_enabled = self.native_enabled and (
             config.kernel_config.sm70_gguf.small_m_dp4a if config is not None else True
         )
@@ -730,6 +745,27 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 if self.small_routing
                 else "requires_fp16_512_experts_hidden2560_without_ep",
                 "outside_m_band": "legacy_alignment_and_fp32_weighted_sum",
+            },
+            "prefill_routing": {
+                **asdict(SM70_PREFILL_ROUTING),
+                "enabled": self.small_routing and self.prefill_routing_enabled,
+                "outside_m_band": "legacy_alignment",
+                "reason": "unsupported_expert_geometry"
+                if not self.small_routing
+                else "disabled_by_policy"
+                if not self.prefill_routing_enabled
+                else None,
+            },
+            "prefill_unroute": {
+                **asdict(SM70_PREFILL_ROUTING),
+                "operator": "sm70_small_expert_unroute",
+                "enabled": self.small_routing and self.prefill_unroute_enabled,
+                "outside_m_band": "legacy_fp32_weighted_sum",
+                "reason": "unsupported_expert_geometry"
+                if not self.small_routing
+                else "disabled_by_policy"
+                if not self.prefill_unroute_enabled
+                else None,
             },
             "projections": {
                 name: {

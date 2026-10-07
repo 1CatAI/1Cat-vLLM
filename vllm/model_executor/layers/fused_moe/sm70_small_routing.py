@@ -46,6 +46,12 @@ class Sm70PrefillRoutingCapability(Sm70SmallRoutingCapability):
     min_m: int = 33
     max_m: int = 16384
 
+    def reason(self, x, ids, experts):
+        reason = super().reason(x, ids, experts)
+        return (
+            "outside_prefill_band" if reason == "outside_small_batch_band" else reason
+        )
+
 
 SM70_PREFILL_ROUTING = Sm70PrefillRoutingCapability()
 
@@ -53,6 +59,11 @@ SM70_PREFILL_ROUTING = Sm70PrefillRoutingCapability()
 def _prefill_enabled():
     config = get_current_vllm_config_or_none()
     return config is None or config.kernel_config.sm70_gguf.prefill_routing
+
+
+def _prefill_unroute_enabled():
+    config = get_current_vllm_config_or_none()
+    return config is None or config.kernel_config.sm70_gguf.prefill_unroute
 
 
 @triton.jit
@@ -251,7 +262,7 @@ def _small_unroute(
         down.is_cuda
         and current_platform.is_device_capability(70)
         and down.dtype == torch.float16
-        and (1 <= m <= 32 or (33 <= m <= 16384 and _prefill_enabled()))
+        and (1 <= m <= 32 or (33 <= m <= 16384 and _prefill_unroute_enabled()))
         and h == 2560
         and 1 <= top_k <= 16
         and down.is_contiguous()

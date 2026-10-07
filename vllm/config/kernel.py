@@ -382,6 +382,9 @@ class Sm70GgufConfig:
     prefill_routing: bool = True
     """Fuse admitted prefill routing copies and ordered FP32 expert reduction."""
 
+    prefill_unroute: bool = True
+    """Reduce prefill expert outputs without materializing FP32 contributions."""
+
     lut4_expert_dp4a: bool = True
     """Admit canonical IQ4 gate/up integer dots at calibrated expert shapes."""
 
