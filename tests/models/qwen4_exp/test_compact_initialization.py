@@ -87,3 +87,100 @@ def test_gdn_norm_follows_parameter_device(monkeypatch, default_vllm_config, dev
         attention = module.QwenGatedDeltaNetAttention(config, runtime, "layers.0")
     assert attention.norm.weight.device == attention.dt_bias.device
     assert attention.norm.weight.device.type == device
+
+
+@pytest.mark.parametrize("storage", ["dense", "original"])
+def test_flashnext_model_constructs_embedding_for_loader_storage(
+    monkeypatch, default_vllm_config, storage
+):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import vocab_parallel_embedding as vocab
+    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+    from vllm.models.qwen4_exp.nvidia import model as module
+
+    config = SimpleNamespace(
+        vocab_size=512, hidden_size=256, layer_types=[], num_hidden_layers=0, hc_count=4
+    )
+    runtime = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=config, quantization="gguf", dtype=torch.float16
+        ),
+        cache_config=SimpleNamespace(cache_dtype="float16"),
+        parallel_config=SimpleNamespace(
+            eplb_config=SimpleNamespace(num_redundant_experts=0)
+        ),
+        kernel_config=SimpleNamespace(
+            sm70_gguf=SimpleNamespace(embedding_storage=storage)
+        ),
+        quant_config=GGUFConfig(),
+        speculative_config=None,
+        compilation_config=SimpleNamespace(mode=0),
+    )
+    monkeypatch.setattr(
+        module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=False)
+    )
+    monkeypatch.setattr(
+        module, "make_layers", lambda *args, **kwargs: (0, 0, nn.ModuleList())
+    )
+    for source in (vocab, parameter):
+        monkeypatch.setattr(source, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(source, "get_tensor_model_parallel_world_size", lambda: 1)
+    with torch.device("meta"):
+        model = module.Qwen4ExpModel(vllm_config=runtime, prefix="model")
+    parameters = dict(model.embed_tokens.named_parameters())
+    assert ("qweight_type" in parameters) == (storage == "original")
+    assert ("weight" in parameters) == (storage == "dense")
+
+
+def test_cpu_ple_discovery_does_not_create_shared_expert_stream(monkeypatch):
+    from vllm.model_executor.layers.fused_moe.runner import shared_experts as module
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    def forbidden():
+        raise AssertionError("CPU PLE discovery must not create an accelerator stream")
+
+    monkeypatch.setattr(module, "is_offload_process", lambda: True)
+    monkeypatch.setattr(module, "aux_stream", forbidden)
+    expert = module.SharedExperts(
+        nn.Linear(4, 4, device="meta"),
+        SimpleNamespace(),
+        object.__new__(UnquantizedFusedMoEMethod),
+        False,
+    )
+    assert expert._stream is None
+
+
+def test_ple_meta_discovery_skips_compilation_without_mutating_runtime(monkeypatch):
+    from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+    from vllm.v1.ple_offload import worker as module
+
+    compilation = CompilationConfig(mode=3, cudagraph_mode="FULL")
+    sentinel = object()
+    compilation.static_forward_context["original"] = sentinel
+    runtime = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.float16),
+        load_config=SimpleNamespace(safetensors_load_strategy="lazy"),
+        compilation_config=compilation,
+    )
+    runner = object.__new__(module.PleOffloadRunner)
+    runner.vllm_config = runtime
+
+    class StopDiscovery(Exception):
+        pass
+
+    def initialize_model(*, vllm_config, model_config):
+        assert vllm_config.compilation_config.mode == CompilationMode.NONE
+        assert vllm_config.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
+        assert vllm_config.compilation_config.static_forward_context == {}
+        assert model_config is runtime.model_config
+        assert torch.get_default_device().type == "meta"
+        raise StopDiscovery
+
+    monkeypatch.setattr(module, "initialize_model", initialize_model)
+    with pytest.raises(StopDiscovery):
+        runner._load_weights()
+    assert compilation.mode == 3
+    assert compilation.cudagraph_mode == CUDAGraphMode.FULL
+    assert compilation.static_forward_context == {"original": sentinel}

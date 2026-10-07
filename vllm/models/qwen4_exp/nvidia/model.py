@@ -776,7 +776,18 @@ class Qwen4ExpModel(nn.Module):
                 self.dcp_local_indices_buffer = dcp_local_indices_buffer
                 self.dcp_partial_output_buffer = dcp_partial_output_buffer
                 self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        embedding_quant = (
+            vllm_config.quant_config
+            if vllm_config.model_config.quantization == "gguf"
+            and vllm_config.kernel_config.sm70_gguf.embedding_storage == "original"
+            else None
+        )
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+            quant_config=embedding_quant,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
+        )
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)

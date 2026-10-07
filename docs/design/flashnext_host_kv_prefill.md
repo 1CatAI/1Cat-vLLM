@@ -119,3 +119,16 @@ storage as the default and does not change LM-head dispatch. These changes
 must be measured in the same full-model contract before quoting memory or
 throughput savings. The benchmark now snapshots its serializable configuration
 before engine construction so a mutated runtime config cannot hide failures.
+
+A subsequent packed-embedding launch failed during loading because the adapter
+emitted `embed_tokens.qweight_type` while the backbone still constructed a
+plain embedding. The backbone constructor now passes the selected quantization
+method, and construction-level tests cover both policies. This failure has no
+throughput result.
+
+CPU-helper tracing also identified two additional initialization paths: shared
+expert auxiliary streams during meta discovery, and compilation of the meta
+backbone, which imports GPU providers through fusion passes. The offload helper
+now suppresses its unused MoE stream and constructs the discovery-only backbone
+with compilation/graphs disabled on a separate config copy. GPU worker policy
+and CPU-owned PLE execution configuration remain unchanged.

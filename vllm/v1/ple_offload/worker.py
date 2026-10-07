@@ -20,6 +20,7 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
 """
 
 import contextlib
+import copy
 import ctypes
 import multiprocessing.process
 import os
@@ -41,7 +42,12 @@ import zmq
 from cuda.bindings import driver as cuda_driver
 
 import vllm.envs as envs
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import (
+    CompilationMode,
+    CUDAGraphMode,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -605,9 +611,18 @@ class PleOffloadRunner:
         # memory. All transformer, MoE, and vision parameters remain on meta.
         logger.info("Initializing model structure for PLE weight discovery ...")
         model_dtype = cast(torch.dtype, model_config.dtype)
+        # This model only discovers CPU-owned subtrees. Compiling its meta
+        # backbone initializes GPU-only passes and providers unnecessarily.
+        structure_config = copy.copy(self.vllm_config)
+        structure_config.compilation_config = copy.copy(
+            self.vllm_config.compilation_config
+        )
+        structure_config.compilation_config.mode = CompilationMode.NONE
+        structure_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        structure_config.compilation_config.static_forward_context = {}
         with set_default_torch_dtype(model_dtype), torch.device("meta"):
             model = initialize_model(
-                vllm_config=self.vllm_config,
+                vllm_config=structure_config,
                 model_config=model_config,
             )
 

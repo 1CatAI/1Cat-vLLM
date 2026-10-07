@@ -9,6 +9,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
 )
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
@@ -71,7 +72,11 @@ class SharedExperts:
         layer_disables_stream = getattr(
             layer, "_vllm_disable_shared_experts_stream", False
         )
-        if envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM or layer_disables_stream:
+        if (
+            is_offload_process()
+            or envs.VLLM_DISABLE_SHARED_EXPERTS_STREAM
+            or layer_disables_stream
+        ):
             if layer_disables_stream:
                 logger.info_once(
                     "Disabling MoE shared_experts cuda stream for this layer "
