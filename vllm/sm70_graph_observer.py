@@ -156,6 +156,24 @@ class GraphParityWorkerExtension:
     rank: int
     model_runner: Any
 
+    def read_prefill_memory(self, reset_peak: bool = False):
+        """Capture worker allocation admission between benchmark requests."""
+        import torch
+
+        torch.accelerator.synchronize()
+        free, total = torch.accelerator.get_memory_info()
+        result = {
+            "rank": self.rank,
+            "allocated_bytes": torch.accelerator.memory_allocated(),
+            "reserved_bytes": torch.accelerator.memory_reserved(),
+            "peak_allocated_bytes": torch.accelerator.max_memory_allocated(),
+            "device_free_bytes": free,
+            "device_total_bytes": total,
+        }
+        if reset_peak:
+            torch.accelerator.reset_peak_memory_stats()
+        return result
+
     def set_gguf_prefill_routing_policy(self, enabled: bool):
         """Compare routing between completed requests without reloading weights."""
         if type(enabled) is not bool:

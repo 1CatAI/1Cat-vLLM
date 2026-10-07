@@ -91,3 +91,31 @@ followed by target token/logit checks, natural completion and C1/C4 acceptance
 checks. GPU timelines must identify transfer, attention, expert/dense compute,
 host launch gaps and the critical TP rank. No 32K model speed claim or default
 promotion is established by the single-layer measurements above.
+
+## Full-model admission and storage
+
+The first 32K / 16K-chunk FP16 host-KV run did not reach attention: rank 0
+failed allocating the 80 MiB first embedding all-reduce output. Torch had
+29.94 GiB allocated, with only 7.5 MiB device free; a CPU PLE helper also owned
+a 388 MiB CUDA context. This run is an admission failure, not throughput
+or correctness evidence for the staged attention reader.
+
+A prior storage audit identified 14.345 GiB/rank of canonical expert banks
+plus 6.752 GiB/rank of original gate/up blocks. Both serve selected runtime
+routes. Removing one without a replacement would alter the established
+small-batch or prefill route; this duplicate storage remains unresolved.
+
+The memory follow-up ports context-free attention and GDN capability queries,
+CPU/meta GDN norm placement, and TP-only EP communicator admission from the
+compact-storage work. SM70 all-gather reuses the initialized PyNccl
+communicator, avoiding another lazy NCCL allocation. Text-only fixed-frequency
+RoPE uses the engine's position bound; its values inside the admitted range
+remain identical. MTP construction leaves placeholders for target-shared IO
+rather than allocating temporary duplicate embedding/head parameters.
+
+An explicit `sm70_gguf.embedding_storage="original"` policy preserves packed
+token embeddings and dequantizes selected rows per lookup. It retains dense
+storage as the default and does not change LM-head dispatch. These changes
+must be measured in the same full-model contract before quoting memory or
+throughput savings. The benchmark now snapshots its serializable configuration
+before engine construction so a mutated runtime config cannot hide failures.

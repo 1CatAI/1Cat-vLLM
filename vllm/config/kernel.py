@@ -364,6 +364,9 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    embedding_storage: Literal["dense", "original"] = "dense"
+    """Keep dense token embeddings or decode original GGUF rows on lookup."""
+
     projection_planes: bool = True
     """Use measured M8 shared-activation projection planes with canonical fallback."""
 

@@ -3,6 +3,7 @@
 """Matched GGUF prefill comparisons with fixed token inputs."""
 
 import argparse
+import copy
 import hashlib
 import json
 import sys
@@ -60,7 +61,7 @@ def main():
         },
     )
     report = dict(
-        config=config,
+        config=copy.deepcopy(config),
         version=vllm.__version__,
         origin=vllm.__file__,
         comparison=args.compare,
@@ -77,6 +78,10 @@ def main():
     llm = None
     try:
         llm = LLM(**config)
+        report["initialized_memory"] = llm.collective_rpc(
+            "read_prefill_memory", args=(True,)
+        )
+        save()
         tokenizer = llm.get_tokenizer()
         unit = tokenizer.encode(
             "请阅读以下技术文档，并概括其中的核心观点。模型推理的性能受计算效率、"
@@ -95,17 +100,25 @@ def main():
         report["baseline_policy"] = llm.collective_rpc(method, args=(False,))
         warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
         report["warmup_output_ids"] = warmup.outputs[0].token_ids
+        report["warmup_memory"] = llm.collective_rpc(
+            "read_prefill_memory", args=(True,)
+        )
         save()
         for enabled in (False, True, True, False):
             policy = llm.collective_rpc(method, args=(enabled,))
+            before_memory = llm.collective_rpc("read_prefill_memory", args=(True,))
             started = time.perf_counter()
             result = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
+            wall_seconds = time.perf_counter() - started
             metrics = result.metrics
+            after_memory = llm.collective_rpc("read_prefill_memory")
             report["rows"].append(
                 dict(
                     enabled=enabled,
                     policy=policy,
-                    wall_seconds=time.perf_counter() - started,
+                    wall_seconds=wall_seconds,
+                    before_memory=before_memory,
+                    after_memory=after_memory,
                     scheduled_to_first_token_seconds=(
                         metrics.first_token_ts - metrics.scheduled_ts
                     ),

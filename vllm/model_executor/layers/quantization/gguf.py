@@ -1197,6 +1197,33 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         quant_config: The GGUF quantization config.
     """
 
+    def process_weights_after_loading(self, layer):
+        config = get_current_vllm_config_or_none()
+        if (
+            type(self) is GGUFEmbeddingMethod
+            and config is not None
+            and config.kernel_config.sm70_gguf.embedding_storage == "original"
+        ):
+            if self._prepare_dense_weight(layer):
+                return
+            layer.qweight.data = pad_weight_tail(
+                layer.qweight.data, layer.qweight_type.weight_type
+            )
+            self.native_prepared = True
+            self.native_admission = {
+                "canonical_reason": "original_embedding_storage",
+                "projections": [
+                    dense_admission(
+                        layer.qweight,
+                        layer.qweight_type.weight_type,
+                        self.params_dtype,
+                        self.prefill_min_m,
+                    )
+                ],
+            }
+            return
+        super().process_weights_after_loading(layer)
+
     def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         qweight = layer.qweight
         qweight_type = layer.qweight_type.weight_type
