@@ -37,4 +37,17 @@ Splitting heads into three interleaved two-head CTAs improves 1091 from 43.021 t
 It is not admitted. This retains the negative result so head duplication is not
 mistaken for a universally faster plan.
 
-Normal-wheel tests and the same-artifact model comparison remain pending.
+## Installed normal wheel
+
+The source-complete CUDA 12.8 wheel passes 65 GPU/graph/admission/configuration
+checks, including zero rows, device-length changes across 2048/2049 and the
+131K/262K reference boundary. All sixteen native libraries match the artifact
+audit; FA2 is rebuilt through the normal target and no private kernel is loaded.
+
+Cold graph ABBA in this wheel measures 42.922 to 30.863 us at 1091 and 44.682
+to 37.180 us at 2048. Above the admission window, 2049 measures 44.767/44.706,
+8K 84.978/84.813 and 32K 221.904/221.487 us. These retain K64 and show timing
+parity. Numerical and binary details are in
+[data/gguf_fp16_short_context_splits_20261007.json](data/gguf_fp16_short_context_splits_20261007.json).
+
+No complete-model saving is attributed to these operator measurements.
