@@ -1742,6 +1742,27 @@ def _get_kv_cache_config_csa_linear(
         return None
 
     num_blocks = available_memory // layout.bytes_per_block
+    if (
+        layout.host_main_kv_names
+        and vllm_config.cache_config.num_gpu_blocks_override is None
+        and not getattr(vllm_config.cache_config, "enable_prefix_caching", False)
+    ):
+        # With authoritative host history, filling the remaining device budget
+        # with padded state pages defeats the memory saving. Bound the shared
+        # scheduler pool to all admitted requests at maximum length, including
+        # one extra page per group for lookahead/alignment and the null block.
+        per_request = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            + 1
+            for group in kv_cache_groups
+            if group.layer_names
+        )
+        num_blocks = min(
+            num_blocks, 1 + vllm_config.scheduler_config.max_num_seqs * per_request
+        )
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
     kv_cache_tensors = []
     for index, owner in enumerate(layout.main_kv_owners):

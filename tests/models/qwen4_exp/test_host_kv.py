@@ -10,10 +10,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @pytest.mark.parametrize("rows", [1, 5, 20])
-def test_host_fp8_gather_collisions_rejection_and_graph(rows):
+@pytest.mark.parametrize("page", [256, 1568])
+def test_host_fp8_gather_collisions_rejection_and_graph(rows, page):
     torch.manual_seed(17)
     device = torch.device("cuda:0")
-    page, blocks, width = 256, 32, 2051
+    blocks, width = 32, 2051
     state = HostQSAKV(blocks, page, 256, device, hot_tokens=64, rows=rows, width=width)
     count = blocks * page
     key = torch.randn(count, 1, 256, device=device, dtype=torch.float16)
@@ -36,10 +37,14 @@ def test_host_fp8_gather_collisions_rejection_and_graph(rows):
     positions = torch.full((rows,), 2047, device=device, dtype=torch.int64)
     lengths = torch.full((2,), 2048, device=device, dtype=torch.int32)
 
-    def check():
-        actual_k, actual_v, remap = state.gather(
-            indices, table, requests, positions, lengths
-        )
+    def check(gather=True):
+        if gather:
+            actual_k, actual_v, remap = state.gather(
+                indices, table, requests, positions, lengths
+            )
+        else:
+            actual_k, actual_v = state.staging.unbind(1)
+            remap = state.remapped
         torch.accelerator.synchronize()
         cpu_indices = indices.cpu().long()
         valid = (
@@ -80,6 +85,7 @@ def test_host_fp8_gather_collisions_rejection_and_graph(rows):
     indices[:, :4] = torch.tensor([12, 13, 14, 15], device=device)
     for _ in range(3):
         graph.replay()
+    check(gather=False)
     check()
 
 
@@ -106,3 +112,47 @@ def test_invalid_host_geometry(kwargs):
     args = dict(blocks=1, page_size=256, dim=256, device=torch.device("cuda:0"))
     with pytest.raises(ValueError):
         HostQSAKV(**(args | kwargs))
+
+
+@pytest.mark.parametrize("visible", [1, 3, 128, 129, 2053])
+def test_host_attention_causal_boundary_and_padding(visible):
+    from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
+
+    torch.manual_seed(23)
+    device = torch.device("cuda:0")
+    state = HostQSAKV(9, 256, 256, device, hot_tokens=4096, rows=5)
+    key = torch.randn(2304, 1, 256, device=device, dtype=torch.float16)
+    value = torch.randn_like(key)
+    state.write(key, value, torch.arange(2304, device=device))
+    complete = min(512, visible // 4) * 4
+    selected = list(range(complete)) + list(range((visible // 4) * 4, visible))
+    indices = torch.full((5, 2051), -1, dtype=torch.int32, device=device)
+    indices[:, : len(selected)] = torch.tensor(selected, device=device)
+    table = torch.arange(9, dtype=torch.int32, device=device).view(1, -1)
+    requests = torch.zeros(5, dtype=torch.int32, device=device)
+    positions = torch.full((5,), visible - 1, dtype=torch.int64, device=device)
+    lengths = torch.full((1,), visible, dtype=torch.int32, device=device)
+    query = torch.randn(5, 6, 256, dtype=torch.float16, device=device)
+    output = torch.empty_like(query)
+    k, v, remapped = state.gather(indices, table, requests, positions, lengths)
+    qsa_sparse_paged_attention(
+        query,
+        k,
+        v,
+        remapped,
+        state.table,
+        state.requests,
+        output,
+        query_positions=state.positions,
+        sequence_lengths=state.lengths,
+    )
+    scores = (
+        torch.einsum("mhd,mkd->mhk", query.float(), k[:, : len(selected), 0].float())
+        / 16
+    )
+    reference = torch.einsum(
+        "mhk,mkd->mhd", scores.softmax(-1), v[:, : len(selected), 0].float()
+    )
+    assert torch.isfinite(output).all()
+    assert ((output.float() - reference).norm() / reference.norm()).item() < 0.002
+    assert torch.equal(state.lengths, torch.full_like(state.lengths, len(selected)))

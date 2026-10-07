@@ -15,8 +15,9 @@ one local KV head, D256 and DCP1/PCP1. The startup report includes the reason
 when the requested route is unavailable. No environment variable is added.
 
 The default hot capacity is 8,192 tokens per owner, configurable through
-`qsa_host_kv_hot_tokens`. At D256 this costs 4 MiB of E4M3 codes, plus scales,
-tags and metadata. Thirty-two query rows share approximately 64 MiB of FP16
+`qsa_host_kv_hot_tokens`. At D256 this costs 8 MiB of reconstructed FP16 K/V,
+plus tags and metadata. FP8 decoding occurs on misses, rather than every hot
+read. Thirty-two query rows share approximately 64 MiB of FP16
 staging across owners. Prefill is processed in bounded query tiles. Exact
 selected positions and causal masks are retained; no new sparsity heuristic
 or draft attention window is introduced.
@@ -27,6 +28,10 @@ The hybrid allocator separates host attention from device recurrent pools.
 Recurrent pages retain the original scheduler block IDs, but no longer inherit
 the larger attention page's padding solely to share its allocation. Prefix
 and speculative ownership remain under the existing cache managers.
+Without prefix caching, the scheduler pool is bounded by admitted concurrency
+at maximum context, including recurrent speculative pages and alignment slack.
+Freed memory remains available instead of being consumed by unused state pages.
+An explicit block-count override retains precedence.
 
 New and tentative K/V writes update authoritative host storage and invalidate
 the corresponding four-token hot page. A GPU epoch and protection pass keep

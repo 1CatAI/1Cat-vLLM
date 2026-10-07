@@ -21,8 +21,7 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
             if state is None:
                 continue
             tensors = [
-                state.codes,
-                state.hot_scales,
+                state.hot_values,
                 state.tags,
                 state.stamps,
                 state.locks,

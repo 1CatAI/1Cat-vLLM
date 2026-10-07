@@ -102,6 +102,10 @@ def resolve_qsa_host_kv(cfg) -> bool:
         reason = "host staging requires FP16 activations"
     elif getattr(model.hf_text_config, "head_dim", None) != 256:
         reason = "host staging requires D256"
+    elif getattr(model.hf_text_config, "indexer_compress_ratio", None) != 4 or (
+        getattr(model.hf_text_config, "indexer_budget", 0) % 4
+    ):
+        reason = "host staging requires complete four-token selector pages"
     elif model.get_num_kv_heads(cfg.parallel_config) != 1:
         reason = "host writer requires one TP-local KV head"
     elif cfg.parallel_config.decode_context_parallel_size != 1 or (

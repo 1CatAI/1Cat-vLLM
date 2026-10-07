@@ -195,6 +195,24 @@ def test_host_qsa_separates_authoritative_history_from_device_state(mixed):
     )
 
 
+def test_host_qsa_bounds_unused_device_pages_to_admitted_concurrency():
+    config = _vllm_config()
+    config.cache_config.enable_prefix_caching = False
+    specs = _qwen4_exp_cache_specs()
+    for name, spec in list(specs.items()):
+        if type(spec) is FullAttentionSpec:
+            specs[name] = replace(spec, host_backed=True, dtype=torch.uint8)
+    groups = get_kv_cache_groups(config, specs)
+    bounded = get_kv_cache_config_from_groups(config, groups, 1 << 30)
+    config.cache_config.enable_prefix_caching = True
+    prefix = get_kv_cache_config_from_groups(config, groups, 1 << 30)
+    assert bounded.num_blocks < prefix.num_blocks
+    assert get_max_concurrency_for_kv_cache_config(config, bounded) >= 2
+    assert sum(t.size for t in bounded.kv_cache_tensors if not t.host_backed) < (
+        sum(t.size for t in prefix.kv_cache_tensors if not t.host_backed)
+    )
+
+
 def test_qwen4_exp_circular_cache_stores_keys_without_unused_values() -> None:
     spec = CircularBufferSpec(
         block_size=4,

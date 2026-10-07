@@ -76,6 +76,8 @@ def _protect(
     Tags,
     Stamps,
     Epoch,
+    VirtualPositions,
+    VirtualLengths,
     Width: tl.constexpr,
     TableWidth: tl.constexpr,
     TableStride: tl.constexpr,
@@ -94,6 +96,12 @@ def _protect(
     length = tl.load(
         Lengths + tl.maximum(req, 0), (req >= 0) & (req < NumRequests), other=0
     )
+    if tl.program_id(1) == 0:
+        visible = tl.maximum(tl.minimum(position + 1, length), 0)
+        selected_count = tl.minimum(visible // 4, Width // 4) * 4
+        selected_count += tl.minimum(visible % 4, Width % 4)
+        tl.store(VirtualPositions + row, selected_count - 1)
+        tl.store(VirtualLengths + row, selected_count)
     valid = (columns < Width) & (logical >= 0) & (logical <= position)
     valid &= (logical < length) & (req >= 0) & (req < NumRequests)
     valid &= logical // Page < TableWidth
@@ -103,6 +111,8 @@ def _protect(
         other=-1,
     )
     valid &= (blocks >= 0) & (blocks < Blocks)
+    if tl.sum(valid.to(tl.int32), 0) == 0:
+        return
     pages = (tl.maximum(blocks, 0) * Page + tl.maximum(logical, 0) % Page) // 4
     slots = (pages[:, None] % Sets) * 4 + ways[None, :]
     tags = tl.load(Tags + slots)
@@ -114,8 +124,7 @@ def _protect(
 def _gather(
     History,
     Scales,
-    Codes,
-    HotScales,
+    Hot,
     Tags,
     Stamps,
     Epoch,
@@ -140,11 +149,12 @@ def _gather(
     Dim: tl.constexpr,
     Sets: tl.constexpr,
 ):
-    row, group = tl.program_id(0), tl.program_id(1)
-    lanes = tl.arange(0, 4)
+    row, tile = tl.program_id(0), tl.program_id(1)
+    lanes = tl.arange(0, 16)
+    ways = tl.arange(0, 4)
     dims = tl.arange(0, Dim)
     kv = tl.arange(0, 2)
-    columns = group * 4 + lanes
+    columns = tile * 16 + lanes
     logical = tl.load(Indices + row * IndexStride + columns, columns < Width, other=-1)
     req = tl.load(Requests + row)
     position = tl.load(Positions + row)
@@ -153,93 +163,111 @@ def _gather(
     )
     valid = (columns < Width) & (logical >= 0) & (logical <= position)
     valid &= (logical < length) & (req >= 0) & (req < NumRequests)
+    valid &= logical // Page < TableWidth
     blocks = tl.load(
         Table + tl.maximum(req, 0) * TableStride + tl.maximum(logical, 0) // Page,
-        valid & (logical // Page < TableWidth),
+        valid,
         other=-1,
     )
-    valid &= (logical // Page < TableWidth) & (blocks >= 0) & (blocks < Blocks)
-    tokens = tl.maximum(blocks, 0) * Page + tl.maximum(logical, 0) % Page
-    pages = tokens // 4
-    first = tl.sum(tl.where(lanes == 0, pages, 0), 0)
-    aligned = (
-        tl.sum((valid & (pages == first) & (tokens % 4 == lanes)).to(tl.int32), 0) == 4
+    valid &= (blocks >= 0) & (blocks < Blocks)
+    tl.store(
+        Remapped + row * Width + columns, tl.where(valid, columns, -1), columns < Width
     )
-    bucket = first % Sets
-    held = tl.full((), False, tl.int1)
-    hit = tl.full((), False, tl.int1)
-    selected = tl.full((), 0, tl.int32)
-    if aligned:
-        ways = tl.arange(0, 4)
-        epoch = tl.load(Epoch)
-        tags = tl.load(Tags + bucket * 4 + ways)
-        hit = tl.sum((tags == first).to(tl.int32), 0) != 0
-        if hit:
-            selected = tl.min(tl.where(tags == first, ways, 4), 0)
-            # Existing hits were protected before this launch. Acquire a newly
-            # published tag as well, so its bytes are visible across CTAs.
-            hit = (
-                tl.atomic_cas(Tags + bucket * 4 + selected, first, first, sem="acquire")
-                == first
-            )
-        if not hit:
-            # A failed acquisition uses host memory. No CTA waits for a CTA.
-            held = tl.atomic_cas(Locks + bucket, 0, 1) == 0
-            if held:
-                tags = tl.load(Tags + bucket * 4 + ways)
-                hit = tl.sum((tags == first).to(tl.int32), 0) != 0
-                if hit:
-                    selected = tl.min(tl.where(tags == first, ways, 4), 0)
-                else:
-                    stamps = tl.load(Stamps + bucket * 4 + ways)
-                    hand = tl.load(Hands + bucket) % 4
-                    priority = (ways - hand + 4) % 4
-                    victim = tl.min(tl.where(stamps != epoch, priority, 4), 0)
-                    if victim < 4:
-                        selected = (hand + victim) % 4
-                        tl.store(Hands + bucket, selected + 1)
-                    else:
-                        tl.atomic_xchg(Locks + bucket, 0)
-                        held = False
-    hot = bucket * 4 + selected
-    if hit:
-        codes = tl.load(
-            Codes
-            + ((hot * 4 + lanes[:, None, None]) * 2 + kv[None, :, None]) * Dim
-            + dims[None, None, :]
+    if tl.sum(valid.to(tl.int32), 0) == 0:
+        return
+    tokens = tl.maximum(blocks, 0) * Page + tl.maximum(logical, 0) % Page
+    pages = tl.reshape(tokens // 4, (4, 4))
+    page_lanes = tl.arange(0, 4)
+    first = tl.sum(tl.where(page_lanes[None, :] == 0, pages, 0), 1)
+    aligned = (
+        tl.sum(
+            tl.reshape(valid, (4, 4)).to(tl.int32)
+            * (
+                (pages == first[:, None])
+                & (tl.reshape(tokens % 4, (4, 4)) == page_lanes[None, :])
+            ),
+            1,
         )
-        scales = tl.load(HotScales + (hot * 4 + lanes[:, None]) * 2 + kv[None, :])
-    else:
-        codes = tl.load(
-            History
-            + (
-                (
-                    tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2
-                    + kv[None, :, None]
-                )
-                * Page
-                + (tl.maximum(logical, 0) % Page)[:, None, None]
-            )
-            * Dim
-            + dims[None, None, :],
-            valid[:, None, None],
-            other=0,
+        == 4
+    )
+    buckets = first % Sets
+    tag_ptrs = Tags + buckets[:, None] * 4 + ways[None, :]
+    tags = tl.load(tag_ptrs)
+    matched = tags == first[:, None]
+    hit = aligned & (tl.sum(matched.to(tl.int32), 1) > 0)
+    selected = tl.min(tl.where(matched, ways[None, :], 4), 1)
+    selected = tl.minimum(selected, 3)
+    acquired = tl.atomic_cas(Tags + buckets * 4 + selected, first, first, sem="acquire")
+    hit &= acquired == first
+    attempt = aligned & ~hit
+    held = (
+        tl.atomic_cas(
+            Locks + buckets, tl.where(attempt, 0, -1), tl.where(attempt, 1, -1)
         )
-        scales = tl.load(
-            Scales + tokens[:, None] * 2 + kv[None, :], valid[:, None], other=0
+        == 0
+    ) & attempt
+    # Recheck after taking the bucket; another CTA may have just filled it.
+    tags = tl.load(tag_ptrs)
+    matched = tags == first[:, None]
+    found = tl.sum(matched.to(tl.int32), 1) > 0
+    selected = tl.where(
+        held & found, tl.min(tl.where(matched, ways[None, :], 4), 1), selected
+    )
+    hit |= held & found
+    stamps = tl.load(Stamps + buckets[:, None] * 4 + ways[None, :])
+    hand = tl.load(Hands + buckets) % 4
+    priority = (ways[None, :] - hand[:, None] + 4) % 4
+    victim = tl.min(tl.where(stamps != tl.load(Epoch), priority, 4), 1)
+    install = held & ~hit & (victim < 4)
+    selected = tl.where(install, (hand + victim) % 4, selected)
+    slots = buckets * 4 + selected
+    hot_tokens = tl.reshape(slots[:, None] * 4 + page_lanes[None, :], (16,))
+    token_hits = tl.reshape(tl.broadcast_to(hit[:, None], (4, 4)), (16,))
+    cached = tl.load(
+        Hot
+        + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
+        + dims[None, None, :],
+        token_hits[:, None, None],
+        other=0,
+    )
+    codes = tl.load(
+        History
+        + (
+            (tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2 + kv[None, :, None])
+            * Page
+            + (tl.maximum(logical, 0) % Page)[:, None, None]
         )
-        if held:
-            tl.store(
-                Codes
-                + ((hot * 4 + lanes[:, None, None]) * 2 + kv[None, :, None]) * Dim
-                + dims[None, None, :],
-                codes,
-            )
-            tl.store(HotScales + (hot * 4 + lanes[:, None]) * 2 + kv[None, :], scales)
-            tl.debug_barrier()
-            tl.store(Stamps + hot, tl.load(Epoch))
-            tl.atomic_xchg(Tags + hot, first, sem="release")
-    values = fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]
+        * Dim
+        + dims[None, None, :],
+        (valid & ~token_hits)[:, None, None],
+        other=0,
+    )
+    scales = tl.load(
+        Scales + tokens[:, None] * 2 + kv[None, :],
+        (valid & ~token_hits)[:, None],
+        other=0,
+    )
+    decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
+        tl.float16
+    )
+    values = tl.where(token_hits[:, None, None], cached, decoded)
+    token_installs = tl.reshape(tl.broadcast_to(install[:, None], (4, 4)), (16,))
+    tl.store(
+        Hot
+        + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
+        + dims[None, None, :],
+        values,
+        token_installs[:, None, None],
+    )
+    tl.store(Hands + buckets, selected + 1, install)
+    tl.store(Stamps + slots, tl.load(Epoch), install)
+    tl.debug_barrier()
+    old_tag = tl.sum(tl.where(ways[None, :] == selected[:, None], tags, 0), 1)
+    # Tags never use -2. Failed/contended lanes cannot publish or unlock.
+    tl.atomic_cas(Tags + slots, tl.where(install, old_tag, -2), first, sem="release")
+    tl.atomic_cas(
+        Locks + buckets, tl.where(held, 1, -1), tl.zeros((4,), tl.int32), sem="release"
+    )
     tl.store(
         Out
         + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None]) * Dim
@@ -247,26 +275,12 @@ def _gather(
         values,
         columns[:, None, None] < Padded,
     )
-    tl.store(
-        Remapped + row * Width + columns, tl.where(valid, columns, -1), columns < Width
-    )
-    if held:
-        tl.debug_barrier()
-        tl.atomic_xchg(Locks + bucket, 0)
-    # Each CTA owns its counters across ordered forwards. Avoid serializing
-    # every page lookup through three global atomic counters.
-    counter = (row * tl.cdiv(Width, 4) + group) * 3
+    counter = (row * tl.cdiv(Width, 16) + tile) * 3
     counters = tl.arange(0, 4)
-    count = tl.sum(valid.to(tl.int64), 0)
-    delta = tl.where(
-        counters == 0,
-        count * hit.to(tl.int64),
-        tl.where(
-            counters == 1,
-            count * (~hit).to(tl.int64),
-            (aligned & ~held & ~hit).to(tl.int64),
-        ),
-    )
+    hits = tl.sum((valid & token_hits).to(tl.int64), 0)
+    misses = tl.sum((valid & ~token_hits).to(tl.int64), 0)
+    contended = tl.sum((attempt & ~held).to(tl.int64), 0)
+    delta = tl.where(counters == 0, hits, tl.where(counters == 1, misses, contended))
     old = tl.load(Stats + counter + counters, counters < 3, other=0)
     tl.store(Stats + counter + counters, old + delta, counters < 3)
 
@@ -313,9 +327,8 @@ class HostQSAKV:
                 else (get_accelerator_view_from_cpu_tensor(self.host))
             )
             self.scales = get_accelerator_view_from_cpu_tensor(self.host_scales)
-        self.codes = torch.empty((hot_tokens, 2, dim), dtype=torch.uint8, device=device)
-        self.hot_scales = torch.empty(
-            (hot_tokens, 2), dtype=torch.float32, device=device
+        self.hot_values = torch.empty(
+            (hot_tokens, 2, dim), dtype=torch.float16, device=device
         )
         self.tags = torch.full((self.sets, 4), -1, dtype=torch.int32, device=device)
         self.stamps = torch.zeros_like(self.tags)
@@ -323,14 +336,14 @@ class HostQSAKV:
         self.locks = torch.zeros(self.sets, dtype=torch.int32, device=device)
         self.hands = torch.zeros_like(self.locks)
         self._stats = torch.zeros(
-            (rows * triton.cdiv(width, 4), 3), dtype=torch.int64, device=device
+            (rows * triton.cdiv(width, 16), 3), dtype=torch.int64, device=device
         )
         # QSA layers execute serially on the model stream. Share staging across
         # owners while keeping each owner's hot pages and scales persistent.
         workspace_key = (device.index, rows, width, dim)
         if workspace_key not in _WORKSPACES:
             _WORKSPACES[workspace_key] = (
-                torch.empty(
+                torch.zeros(
                     (rows, 2, self.padded, 1, dim), dtype=torch.float16, device=device
                 ),
                 torch.empty((rows, width), dtype=torch.int32, device=device),
@@ -380,6 +393,8 @@ class HostQSAKV:
                 self.tags,
                 self.stamps,
                 self.epoch,
+                self.positions,
+                self.lengths,
                 self.width,
                 block_table.shape[1],
                 block_table.stride(0),
@@ -390,11 +405,10 @@ class HostQSAKV:
                 self.sets,
                 num_warps=4,
             )
-            _gather[(rows, triton.cdiv(self.width, 4))](
+            _gather[(rows, triton.cdiv(self.width, 16))](
                 self.history,
                 self.scales,
-                self.codes,
-                self.hot_scales,
+                self.hot_values,
                 self.tags,
                 self.stamps,
                 self.epoch,
