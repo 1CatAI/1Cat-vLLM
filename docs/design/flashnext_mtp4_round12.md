@@ -688,6 +688,18 @@ changed-input graph checks pass byte-exactly, but maximum-rank median is
 the route is not selected. These three screens use private research DSOs,
 not packaged endpoint kernels.
 
+A resident producer/consumer screen separates 80 down CTAs from 80 up CTAs
+within one kernel. Up weight reads begin independently of the down chain.
+The wrapper checks occupancy for 160 resident CTAs; compilation uses 88
+registers, 13,824 shared bytes and no spills. Real-weight and changed-input
+outputs remain byte-exact, but maximum-rank median is 28.664/29.076 us for
+control/candidate. The extra resident group does not redeem the overlap.
+
+A single-warp readiness aggregation screen also passes byte-exact checks after
+its distinct barrier state is separated from the control's counter state.
+It regresses 30.684 to 34.812 us. Mixing those two barrier ABIs initially
+corrupted the control test, so that failed harness run is not timing evidence.
+
 ## Community designs and applicability
 
 [SGLang's DeepSeek-V4.1 optimization account](https://staging.lmsys.org/blog/2026-09-28-deepseek-v41-optimization)
