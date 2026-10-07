@@ -27,6 +27,7 @@ latency baseline. PLE storage is 26.82 GiB on the host.
 
 | Implementation | Relevant mechanism | Limit for this workload |
 | --- | --- | --- |
+| [Strata](https://github.com/Niko1221/Strata) | Native Flash-Next QSA and MTP; authoritative pinned host KV, persistent per-layer GPU hot pages, GPU-side miss resolution inside CUDA graphs | Published IQ3_S results use INT8 KV and a single GPU; FP16 TP4 and C4 need separate sizing and measurement |
 | [vLLM OffloadingConnector](https://github.com/vllm-project/vllm/blob/main/docs/features/kv_offloading_usage.md) | Pinned CPU block pools, asynchronous DMA, cache keys, group-aware prefix reuse | Promotes reusable blocks back to GPU; does not make active attention consume host-resident history |
 | [SGLang HiCache](https://docs.sglang.io/docs/advanced_features/hicache_design) | Layer-wise load overlap, host page layouts and write-back scheduling | Required attention data is loaded into GPU before computation |
 | [SGLang HiSparse](https://docs.sglang.io/docs/advanced_features/hisparse_guide) | Complete host KV plus bounded device slots; native sparse selection, hit detection, miss gathering and asynchronous backup | Model/backend admission and speculative decoding restrictions prevent direct Flash-Next MTP4 reuse |
@@ -52,6 +53,91 @@ SGLang, vLLM, LMCache, KTransformers and FlexLLMGen repositories declare
 Apache-2.0 licenses. Any source transplant must retain the source's individual
 headers and notices and check transitive dependencies separately. No community
 kernel source is copied by this design document.
+
+### Strata: the closest active-decode reference
+
+The source audit pins upstream commit
+`82f46a8c8f475f001ad76d92f58f4a4f8ffb0253`. Strata declares an MIT license;
+preserve its notice and audit dependency notices before copying source.
+Its implementation directly addresses this model's native sparse attention,
+rather than only storing reusable prefixes outside GPU memory:
+
+- [`kv_stream.hpp`](https://github.com/Niko1221/Strata/blob/82f46a8c8f475f001ad76d92f58f4a4f8ffb0253/include/strata/kernels/kv_stream.hpp)
+  defines authoritative host K/V and a logical-block-to-device-slot page table.
+  Native pages contain four tokens. Resident pages persist across rounds.
+- [`kv_stream.cu`](https://github.com/Niko1221/Strata/blob/82f46a8c8f475f001ad76d92f58f4a4f8ffb0253/src/kernels/cuda/kv_stream.cu)
+  deduplicates selected blocks across all queries of a resolve call, protects
+  current-call hits, and uses CLOCK eviction for remaining slots. A GPU copy
+  kernel reads only missing pages from mapped host memory into resident slots.
+  Resolve and copy are capturable; CPU selection readback is unnecessary.
+  Ordinary vector loads implement the copy, without a TMA dependency.
+- [`verify.cpp`](https://github.com/Niko1221/Strata/blob/82f46a8c8f475f001ad76d92f58f4a4f8ffb0253/src/core/verify.cpp)
+  resolves the batched target selection before existing GPU QSA attention.
+  Writes update authoritative host storage and any resident copy. The draft
+  path uses a windowed ring; preserve our drafter's attention semantics rather
+  than assuming that ring/window policy is interchangeable.
+- [`layer.cpp`](https://github.com/Niko1221/Strata/blob/82f46a8c8f475f001ad76d92f58f4a4f8ffb0253/src/core/layer.cpp)
+  keeps pooled index keys in GPU memory. Active GDN state also stays on GPU.
+  Host attention KV does not imply all historical index/state storage is host
+  backed. FP16 streaming is supported alongside quantized KV formats.
+
+The upstream parity executable covers streamed versus resident attention for
+FP16 and quantized formats, random multi-query batches, eviction, partial pages
+and ring restoration. These are useful test cases, not tests reproduced here.
+Likewise, the [V100 fork](https://github.com/jmnargi/Strata-V100) demonstrates
+a real SM70 integration, but its single-GPU Q2_0/spec8 results are not a
+Flash-Next IQ3_S TP4/MTP4 baseline.
+
+#### Published IQ3_S evidence
+
+[Community report #469](https://github.com/Niko1221/Strata/pull/469) measured an
+RTX 2080 Ti 11 GB on PCIe Gen3 with a Threadripper 3960X, INT8 KV streaming
+and 32,768 resident cells. Engine version was 0.1.33. Fresh prompts have unique
+prefixes; the first three rows are medians of three runs with 400 output tokens
+each. Drafting uses MTP4 plus built-in suffix drafts, so its token throughput
+does not share our acceptance benchmark's round denominator. The report did
+not measure a matched resident-versus-streamed pair.
+
+| Fresh prompt tokens | Decode tokens/s | Draft acceptance |
+| --- | --- | --- |
+| 4,096 | 39.6 | 65.6% |
+| 32,768 | 38.0 | 63.7% |
+| 128,000 | 34.1 | 55.7% |
+| 250,000 (one run) | 31.8 | 53.4% |
+
+KV block reads hitting VRAM were 99.6% at 4K and 94.3% at 250K; peak GPU
+memory remained 10,525 MiB. This is evidence that active host backing can
+retain a high hot-page hit rate even at long contexts. Context length, draft
+acceptance and CPU expert work also vary, so the throughput difference cannot
+be attributed exclusively to KV placement. Their INT8 traffic is not our
+FP16 traffic, and their measured hit rate is not a forecast for TP4/C4.
+The report's [detailed logs](https://github.com/Niko1221/Strata/blob/11aed66e5b00d882e81c483abbad39862c4e796d/bench/results/2026-10-02-community-rtx2080ti-11gb/README.md)
+record about 825 MiB read from host KV over the fresh 250K request's 400-token
+decode, lasting 12.571 seconds. That is approximately 66 MiB/s averaged over
+decode, far below the machine's reported 13.1 GB/s host-to-device probe.
+This average supports low transfer volume; it does not bound individual miss
+bursts, page-resolution overhead or four-rank contention.
+
+Strata is therefore the primary implementation reference for the first QSA
+host-KV route. Start with FP16, persistent per-layer hot pools and graph-safe
+GPU miss resolution. Measure actual selected-page unions and miss bytes before
+choosing a smaller pool. At our geometry, 32,768 resident tokens in each of
+the twelve target QSA layers cost 384 MiB per rank, excluding MTP, indexes,
+state and metadata. This footprint must fit alongside resident weights.
+
+The pinned implementation enforces at least 20,480 resident cells and requires
+that one resolve call's selected-page union fit in its slots. Miss workspaces
+are also sized from slots. Do not copy that sizing assumption into an M20
+call or shrink the pool without enforcing capacity before writes; bound the
+union, enlarge independent workspaces, or tile requests/queries. Current-call
+page protection, overwrite coherence and rejection rollback must be tested
+before model integration.
+
+Strata's prefill staging differs from its sparse decode path. Optional
+next-layer prefetch uses a separate stream with ready/release events and is
+off by default. Its documentation labels older prototype prefill gains as
+historical measurements, not a demonstrated speedup of the final upstream
+port. Do not infer prefill performance from the decode hit rate.
 
 ## Separate the cache owners
 
@@ -133,7 +219,10 @@ the corresponding rank values and lifetimes identical.
 For a miss-only selection of 2048 tokens, attention K/V traffic is about
 2 MiB per QSA layer per query. Twelve layers and five disjoint query selections
 could require roughly 120 MiB per rank per round before boundary positions,
-indexer traffic and writes. Actual unions, hit rates and concurrent transfer
+indexer traffic and writes. This is an all-miss, disjoint-query upper bound,
+not the expected transfer volume or a measured latency. Strata's published
+hit rates show why using that bound as normal traffic is overly conservative.
+Actual unions, page granularity, hit rates and concurrent transfer
 bandwidth determine latency. GPU-to-GPU NVLink topology does not establish
 GPU-to-host bandwidth.
 
