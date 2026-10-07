@@ -73,6 +73,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(d!)? floating_output, Tensor(e!)? pair_output, bool gdn_heads) "
       "-> ()");
   ops.impl("gguf_dmv_sm70_out", torch::kCUDA, &gguf_dmv_sm70_out);
+  ops.def(
+      "gguf_dmv_sm70_clocked_out(Tensor(f!) timestamps, Tensor input, Tensor[] "
+      "codes, Tensor[] high, "
+      "Tensor[] scale, Tensor(a!)[] outputs, int[] formats, int[] widths, "
+      "int k, int split, int kw, Tensor(b!) workspace, Tensor(c!) counters, "
+      "int tn, Tensor? sigmoid_gate, Tensor? table, Tensor? floating_weight, "
+      "Tensor(d!)? floating_output, Tensor(e!)? pair_output, bool gdn_heads) "
+      "-> ()");
+  ops.impl("gguf_dmv_sm70_clocked_out", torch::kCUDA,
+           &gguf_dmv_sm70_clocked_out);
   ops.def("gguf_dmv_three_formats_sm70_supported() -> bool",
           []() { return true; });
   ops.def(
