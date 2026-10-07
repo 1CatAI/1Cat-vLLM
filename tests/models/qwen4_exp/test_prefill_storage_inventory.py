@@ -9,7 +9,7 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_inventory_deduplicates_device_views_and_excludes_host_aliases():
+def test_inventory_deduplicates_device_views_and_excludes_host_aliases(monkeypatch):
     from vllm.model_executor.layers.quantization import gguf_dense_hmma
 
     runner = torch.nn.Module()
@@ -40,6 +40,23 @@ def test_inventory_deduplicates_device_views_and_excludes_host_aliases():
         assert any(
             block["requested_bytes"] == native_owned.numel()
             for block in report["unreachable_allocator_blocks"]
+        )
+        from vllm.v1.worker import workspace
+
+        manager = workspace.WorkspaceManager(torch.device("cuda"))
+        manager._current_workspaces[0] = native_owned
+        monkeypatch.setattr(workspace, "_manager", manager)
+        with_manager = worker.read_prefill_storages()
+        assert with_manager["device_storage_bytes"] == (
+            value.untyped_storage().nbytes() + native_owned.untyped_storage().nbytes()
+        )
+        assert any(
+            "global_workspace_manager._current_workspaces.0" in record["owners"]
+            for record in with_manager["storages"]
+        )
+        assert not any(
+            block["requested_bytes"] == native_owned.numel()
+            for block in with_manager["unreachable_allocator_blocks"]
         )
     finally:
         gguf_dense_hmma._workspaces.update(before)

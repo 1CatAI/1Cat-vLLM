@@ -181,6 +181,10 @@ class GraphParityWorkerExtension:
         from torch._subclasses.fake_tensor import FakeTensor
 
         from vllm.model_executor.layers.quantization import gguf_dense_hmma
+        from vllm.v1.worker.workspace import (
+            current_workspace_manager,
+            is_workspace_manager_initialized,
+        )
 
         seen = set()
         storages = {}
@@ -230,6 +234,8 @@ class GraphParityWorkerExtension:
 
         walk(self.model_runner, "runner")
         walk(gguf_dense_hmma._workspaces, "gguf_dense_workspaces")
+        if is_workspace_manager_initialized():
+            walk(current_workspace_manager(), "global_workspace_manager")
         records = sorted(storages.values(), key=lambda value: -value["bytes"])
         unreachable = []
         for segment in torch.cuda.memory_snapshot():

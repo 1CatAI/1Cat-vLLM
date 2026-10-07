@@ -23,10 +23,10 @@ CONFIG = dict(
 )
 
 
-def test_default_off(monkeypatch):
+def test_default_enabled(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_MTP_MOE_FP16_EXACT", raising=False)
     envs.disable_envs_cache()
-    assert not envs.VLLM_SM70_MTP_MOE_FP16_EXACT
+    assert envs.VLLM_SM70_MTP_MOE_FP16_EXACT
 
 
 @pytest.mark.parametrize("m", [1, 2, 5, 10])
@@ -241,6 +241,66 @@ def test_modular_experts_route_and_graph(cuda_weights, monkeypatch, m):
             workspace.fill_(float("nan"))
         for output in outputs:
             output.fill_(float("nan"))
+        for graph in graphs:
+            graph.replay()
+        assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
+
+
+@torch.inference_mode()
+def test_narrow_prefill_activation_workspace_graph(cuda_weights, monkeypatch):
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import FUSED_MOE_UNQUANTIZED_CONFIG
+    from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+
+    monkeypatch.setenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1")
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    envs.disable_envs_cache()
+    experts = TritonExperts(make_dummy_moe_config(), FUSED_MOE_UNQUANTIZED_CONFIG)
+    m = 33
+    x = torch.randn(m, 2560, device="cuda", dtype=torch.float16)
+    ids = torch.randint(0, 512, (m, 10), device="cuda", dtype=torch.int32)
+    weights = torch.softmax(torch.randn(m, 10, device="cuda"), -1)
+    shapes = experts.workspace_shapes(
+        m, 320, 2560, 10, 512, 512, None, MoEActivation.SILU
+    )
+    old = [x.new_empty((m, 10, 2560)) for _ in range(2)]
+    new = [x.new_empty(shape) for shape in shapes[:2]]
+    outputs = [torch.empty_like(x) for _ in range(2)]
+    common = x.new_empty(max(new[0].numel(), x.numel()))
+    new[0] = common[: new[0].numel()].view(shapes[0])
+    outputs[1] = common[: x.numel()].view_as(x)
+    assert (
+        new[0].untyped_storage().data_ptr() == outputs[1].untyped_storage().data_ptr()
+    )
+
+    def run(arm):
+        experts.apply(
+            outputs[arm],
+            x,
+            *cuda_weights,
+            weights,
+            ids,
+            MoEActivation.SILU,
+            512,
+            None,
+            None,
+            None,
+            *(new if arm else old),
+            None,
+            False,
+        )
+
+    graphs = []
+    for arm in (0, 1):
+        run(arm)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run(arm)
+        graphs.append(graph)
+    for _ in range(3):
+        x.normal_(std=0.125)
+        ids.random_(0, 512)
         for graph in graphs:
             graph.replay()
         assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))

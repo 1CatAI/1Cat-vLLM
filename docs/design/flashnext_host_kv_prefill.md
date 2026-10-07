@@ -191,3 +191,26 @@ residency and delays startup. The placement-aware prefault check from
 served by registered ranks; unregistered placements and actual disk tiers keep
 the existing prefault contract. Five targeted CPU checks pass. This is a startup
 and host-memory change, not measured prefill throughput.
+
+## Generic MoE workspace over-allocation
+
+The corrected prefill HC entry passed the first projection, then the model
+failed on a 96 MiB GDN norm allocation at 30.48 GiB of live Torch memory. The
+initialized allocator snapshot identifies a single 1600 MiB persistent block,
+matching the generic Triton expert workspace for M=16384, top-k=10, K=2560 and
+N=320: two 800 MiB buffers.
+
+The first buffer holds the post-activation expert rows. It need not reserve
+`top-k * K` reduced-output elements: the modular allocator already takes the
+maximum of activation storage and the separate `[M,K]` output shape. Declaring
+activation storage as `[M,top-k,activation_out_dim]` reduces the shared first
+buffer to 80 MiB (50 MiB activation, 80 MiB output). The second buffer remains
+800 MiB, making the total 880 MiB rather than 1600 MiB. This predicts 720 MiB
+less persistent workspace per rank without changing kernels or arithmetic.
+
+Twenty-two targeted checks pass, including real expert geometry, M1/M5 native
+projection graph checks, changed routes and inputs, and bitwise agreement of
+M33 graph replay with reduced output sharing activation storage. Capacity tests
+cover output sharing, chunked allocation and gated/non-gated activations. The
+worker inventory now includes the global workspace manager. Full-model memory
+peaks and throughput remain pending; predicted savings are not measured peaks.
