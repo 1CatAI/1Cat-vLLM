@@ -73,6 +73,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor(d!)? floating_output, Tensor(e!)? pair_output, bool gdn_heads) "
       "-> ()");
   ops.impl("gguf_dmv_sm70_out", torch::kCUDA, &gguf_dmv_sm70_out);
+  ops.def("gguf_dmv_gdn_heads_sm70_supported(int k) -> bool",
+          [](int64_t k) { return k == 1536 || k == 3072; });
   ops.def(
       "gguf_dmv_sm70_clocked_out(Tensor(f!) timestamps, Tensor input, Tensor[] "
       "codes, Tensor[] high, "
