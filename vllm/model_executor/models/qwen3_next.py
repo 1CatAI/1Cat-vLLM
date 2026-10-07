@@ -910,6 +910,13 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=(
+                vllm_config.quant_config
+                if vllm_config.model_config.quantization == "gguf"
+                and vllm_config.kernel_config.sm70_gguf.embedding_storage == "original"
+                else None
+            ),
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):

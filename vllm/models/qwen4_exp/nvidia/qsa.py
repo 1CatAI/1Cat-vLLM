@@ -68,6 +68,15 @@ from ..common.qsa_cache import (
 from .indexer_qsa import QSAIndexer
 
 
+def _qsa_rope_cache_length(config, model_config) -> int:
+    """Bound fixed-frequency text RoPE by the engine's position limit."""
+    mm_config = model_config.multimodal_config
+    text_only = mm_config is None or mm_config.language_model_only
+    if text_only and config.rope_parameters.get("rope_type", "default") == "default":
+        return min(config.max_position_embeddings, model_config.max_model_len)
+    return config.max_position_embeddings
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -526,7 +535,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=_qsa_rope_cache_length(config, model_config),
             rope_parameters=config.rope_parameters,
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)

@@ -22,13 +22,17 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+from contextlib import nullcontext
+
 import torch
 from torch import nn
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
     maybe_apply_fused_hc,
 )
@@ -45,7 +49,10 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
-from .sm70_fp16_hc import maybe_apply_qwen38_sm70_fp16_fused_hc
+from .sm70_fp16_hc import (
+    maybe_apply_qwen38_sm70_fp16_fused_hc,
+    sharded_hc_project,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -96,39 +103,63 @@ class GatedResidual(nn.Module):
         # The merged skinny-GEMM shape is physically padded to 16 rows to ensure
         # good alignment and performant implementation chosen by CuBLAS heuristics.
         self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
-        if use_combine:
-            self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
-                self.hyper_hidden_size,
-                [self.lora_rank, self.hc_count]
-                + ([self.pad_size] if self.pad_size else []),
-                bias=False,
-                params_dtype=config.params_dtype,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
-                return_bias=False,
-                disable_tp=True,
-            )
-        else:
-            self.input_mix_weight_down = ReplicatedLinear(
-                self.hyper_hidden_size,
-                self.lora_rank,
-                bias=False,
-                params_dtype=config.params_dtype,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down"),
-                return_bias=False,
-            )
-        self.input_mix_weight_up = ReplicatedLinear(
-            self.lora_rank,
-            self.hyper_hidden_size,
-            bias=False,
-            params_dtype=config.params_dtype,
-            quant_config=None,
-            prefix=maybe_prefix(prefix, "input_mix_weight_up"),
-            return_bias=False,
+        runtime = get_current_vllm_config_or_none()
+        sharded_storage = bool(
+            runtime is not None
+            and runtime.kernel_config.hc_weight_storage == "sharded"
+            and not is_offload_process()
         )
+        # Loading staging only: pack on CPU and transfer final local shards.
+        # Replicated GPU allocations leave large unreclaimable allocator holes.
+        storage_context = torch.device("cpu") if sharded_storage else nullcontext()
+        with storage_context:
+            if use_combine:
+                self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
+                    self.hyper_hidden_size,
+                    [self.lora_rank, self.hc_count]
+                    + ([self.pad_size] if self.pad_size else []),
+                    bias=False,
+                    params_dtype=config.params_dtype,
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
+                    return_bias=False,
+                    disable_tp=True,
+                )
+            else:
+                self.input_mix_weight_down = ReplicatedLinear(
+                    self.hyper_hidden_size,
+                    self.lora_rank,
+                    bias=False,
+                    params_dtype=config.params_dtype,
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "input_mix_weight_down"),
+                    return_bias=False,
+                )
+            self.input_mix_weight_up = ReplicatedLinear(
+                self.lora_rank,
+                self.hyper_hidden_size,
+                bias=False,
+                params_dtype=config.params_dtype,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "input_mix_weight_up"),
+                return_bias=False,
+            )
+        if sharded_storage:
+            down = (
+                self.input_mix_weight_down_block_inject
+                if use_combine
+                else self.input_mix_weight_down
+            )
+            for layer in (down, self.input_mix_weight_up):
+                layer.weight._vllm_keep_on_cpu = True
+                layer._hc_cpu_staging = True
 
     def _project(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if hasattr(self, "hc_shard_down"):
+            block, injection = sharded_hc_project(
+                xn, self.hc_shard_down, self.hc_shard_up
+            )
+            return block, injection if self.use_combine else None
         if self.use_combine:
             fused_fp16 = maybe_apply_qwen38_sm70_fp16_fused_hc(
                 self.input_mix_weight_down_block_inject,

@@ -23,7 +23,8 @@ def packed_weight(source_type, rows, k, seed):
     return data.reshape(rows, -1)
 
 
-def test_canonical_adapter_retains_q2_source_without_expansion():
+@pytest.mark.parametrize("storage", ["canonical", "original"])
+def test_canonical_adapter_retains_q2_source_without_expansion(storage):
     from vllm.model_executor.model_loader.gguf_adapters.qwen4exp import Qwen4ExpAdapter
 
     config = SimpleNamespace(
@@ -36,7 +37,8 @@ def test_canonical_adapter_retains_q2_source_without_expansion():
         linear_value_head_dim=2,
     )
     adapter = Qwen4ExpAdapter(config, tp_size=4)
-    adapter.canonical_expert_storage = True
+    adapter.canonical_expert_storage = storage == "canonical"
+    adapter.preserve_expert_blocks = storage == "original"
     data = np.stack([packed_weight(42, 64, 640, i) for i in range(2)])
     raw = "blk.0.ffn_down_exps.weight"
     tensor = SimpleNamespace(shape=np.array([640, 64, 2]), tensor_type=42, data=data)
@@ -52,7 +54,9 @@ def test_canonical_adapter_retains_q2_source_without_expansion():
     assert weights[0].data_ptr() == torch.from_numpy(data[0]).data_ptr()
 
 
-def test_load_model_retains_prepared_adapter(monkeypatch):
+@pytest.mark.parametrize("storage", ["canonical", "original"])
+def test_load_model_retains_prepared_adapter(monkeypatch, storage):
+    from vllm.model_executor.kernels.ple import gguf_pinned
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
     from vllm.model_executor.model_loader import gguf_loader as module
     from vllm.model_executor.model_loader.gguf_adapters.qwen4exp import Qwen4ExpAdapter
@@ -89,6 +93,7 @@ def test_load_model_retains_prepared_adapter(monkeypatch):
     monkeypatch.setattr(loader, "_get_gguf_weight_type", lambda *args: {raw: "Q2_0"})
     monkeypatch.setattr(module, "initialize_model", lambda **kwargs: model)
     monkeypatch.setattr(module, "process_weights_after_loading", lambda *args: None)
+    monkeypatch.setattr(gguf_pinned, "prepare_pinned_gguf_ple", lambda *args: None)
     monkeypatch.setattr(
         module,
         "current_platform",
@@ -103,12 +108,14 @@ def test_load_model_retains_prepared_adapter(monkeypatch):
     cfg = SimpleNamespace(
         device_config=SimpleNamespace(device="cpu"),
         parallel_config=SimpleNamespace(tensor_parallel_size=4),
-        kernel_config=SimpleNamespace(sm70_gguf=SimpleNamespace(enabled=True)),
+        kernel_config=SimpleNamespace(
+            sm70_gguf=SimpleNamespace(enabled=True, expert_storage=storage)
+        ),
         quant_config=GGUFConfig(),
     )
     model_config = SimpleNamespace(dtype=torch.float16, hf_config=SimpleNamespace())
     assert loader.load_model(cfg, model_config) is model
-    assert cfg.quant_config.canonical_expert_storage
+    assert cfg.quant_config.canonical_expert_storage == (storage == "canonical")
     types = [w.item() for n, w in model.entries if n.endswith("qweight_type")]
     weights = [w for n, w in model.entries if n.endswith("qweight")]
     assert types == [42, 42]
@@ -120,7 +127,7 @@ def test_load_model_retains_prepared_adapter(monkeypatch):
         == []
     )
     retained = list(loader.get_all_weights(model_config, model))
-    assert [w.item() for n, w in retained if n.endswith("qweight_type")] == [42, 42]
+    assert [w.item() for n, w in retained if n.endswith("qweight_type")] == types
     assert len(calls) == 1
 
 
