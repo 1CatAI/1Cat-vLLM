@@ -35,6 +35,7 @@ class Descriptor:
         return Descriptor(tuple(self.shape[i] for i in dims), self.dtype)
 
 
+@pytest.mark.parametrize("heads", [8, 16])
 @pytest.mark.parametrize(
     "page,batch,split_available,contiguous,native_available,expected",
     [
@@ -55,8 +56,17 @@ class Descriptor:
     ],
 )
 def test_page_abi_dispatch(
-    monkeypatch, page, batch, split_available, contiguous, native_available, expected
+    monkeypatch,
+    page,
+    batch,
+    split_available,
+    contiguous,
+    native_available,
+    expected,
+    heads,
 ):
+    if heads == 16 and expected == "native":
+        expected = "fallback"
     source = (
         Path(__file__).parents[3]
         / "flash-attention-v100/flash_attn_v100/flash_attn_interface.py"
@@ -105,8 +115,8 @@ def test_page_abi_dispatch(
         compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"),
         namespace,
     )
-    query = Descriptor((batch, 8, 8, 128), contiguous=contiguous)
-    cache = Descriptor((40, page, 2, 128))
+    query = Descriptor((batch, 8, heads, 128), contiguous=contiguous)
+    cache = Descriptor((40, page, heads // 4, 128))
     namespace["flash_attn_prefill_paged"](
         query,
         cache,
