@@ -26,6 +26,8 @@ assert not utils.is_nvidia_hopper
 assert all(module._is_sm70() for module in (
     chunk_delta_h, chunk_o, chunk_scaled_dot_kkt, kda,
 ))
+from vllm.models.qwen4_exp.nvidia import model
+assert model.Qwen4ExpForCausalLM is not None
 assert not torch.cuda.is_initialized()
 """
     subprocess.run([sys.executable, "-c", script], check=True, timeout=60)

@@ -127,7 +127,7 @@ def _is_fa2_supported() -> tuple[bool, str | None]:
     # rejected by the C++ entry points.
     # Mixed rigs: ask this worker's own GPU, not device 0 -- otherwise the
     # weakest card in the grid decides for every stage.
-    device = torch.accelerator.current_device_index()
+    device = current_platform.resolve_device_id(None)
     if not current_platform.has_device_capability(75, device):
         return False, "FA2 is only supported on devices with compute capability >= 7.5"
     capability = current_platform.get_device_capability(device)
