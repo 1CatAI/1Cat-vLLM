@@ -16,7 +16,7 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Prerequisite model gates |
 | 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Prerequisite model gates |
 | 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase passed | Private references 390 → 387 | Pending | CPU/rebase and GPU prerequisites |
-| 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase passed | Private references 387 → 380 | Pending | Separate outcome and GPU gates |
+| 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase/native gates passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; named timing gates passed | Model gates pending |
 | 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict passed | Private references 380 → 374; cycles 14 → 13 | Queued after Step 3 | Required GPU gates |
 | 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
 | 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
@@ -26,8 +26,9 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Required | Strict/rebase/GPU gates |
 | 6a: verifier ownership | #1090 | CPU/golden/strict/rebase passed | Cycles 13 → 11; model terms 169 → 158 | Required | Strict/rebase/GPU gates |
 | 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Required | Strict/rebase/GPU gates |
-| 6c: attention policy ownership | — | CPU/golden/strict passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Required | Strict/rebase/GPU gates |
-| 6d: registered features and metadata fields | — | Not started | — | Required | Step 6c gates |
+| 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Required | Strict/rebase/GPU gates |
+| 6d: owned per-request metadata packet | — | CPU/golden passed | Private 333 → 332; final metadata mixin removed | Required | Strict/rebase/GPU gates |
+| 6e: registered speculative features | — | Not started | — | Required | Step 6d gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -794,3 +795,45 @@ exclusions**, with all shim replacements consumed by real calls/reads. Evidence:
 `a3-spec-attention-owner-strict.log` and `a3-spec-attention-owner-shim.json`.
 Pre-commit/mypy/layering passes (`a3-spec-attention-owner-precommit-final.log`).
 No production/source-oracle file changed during the accepted strict run.
+
+## Step 6d per-request metadata packet
+
+PR #1095 is `224119021840522a1860661e8ae2a5f192109053`. Actual pinned
+PR #1028 replay is `3cfa92828870ee90b0fa80b3962d615e112b13c6`, tree
+`94070b3149116d9740aa48b8f07d0fece6c8982f`, equal to the clean merge-tree.
+Three integration suites pass 37 CPU tests with 98 GPU skips. Four GPU queues
+and SHA256-verified source snapshots are staged under `a3-step6c` on 54633.
+
+Mechanical field grouping `1fed2deb4` precedes ownership. The remaining metadata
+field mixin is removed. Common metadata owns a SpecMetadataPacket via spec_state;
+old field reads/writes/deletes forward to that packet. The Triton builder's exact
+metadata class is adopted as the existing Flash subtype in place, preserving
+object identity and all tensor addresses. Other external metadata types retain
+their legacy view. Shallow copies own independent packet containers with shared
+tensors, and packets have no reference back to the metadata object.
+
+The tree attachment operation is now a public owned API, with its old name
+retained as a compatibility alias. All 813 immutable traces and the 14 metadata
+calculation hashes pass. The source oracle maps the public operation's actual
+body to its original name without changing the fixture. Six direct packet tests
+cover in-place adoption, legacy access/deletion, shallow-copy isolation, prompt
+object release, and tree capture's authoritative values and persistent pointers.
+Focused suites pass 24 + 6 tests; evidence: `a3-spec-features-focused.log` and
+`a3-spec-features-packet.log`. The ceiling is 400 / 400 / 332 / 3 / 154 / 0 / 29,
+with no new forbidden edge. Per-method SpecFeature registration is still open.
+
+Step 3b's authorized 54633 regression is complete: 1687 passes and the same
+seven inherited failures, with exactly one new passing workspace case and no
+changed existing outcomes. All 12 native operator cases have max-abs 0.
+Designated timing deltas are FP16 XQA graph 0%, E4M3 XQA graph +0.0127824%,
+and 75T-role prefill -0.0505210%, all within 2%. DDTree eager timing is recorded
+but has no declared performance role; no broader timing acceptance is claimed.
+Evidence: `a3-step3b/logs/regression-parity.json`, `op-compare.log` and
+`regression.done` (2026-10-09 05:32:16 +08:00). Model gates remain pending.
+
+The fixed-source strict suite passes **292 tests / 1 skip / 28 GPU exclusions**,
+with real shim consumption (`a3-spec-features-strict.log`,
+`a3-spec-features-shim.json`). Pre-commit, mypy and layering all pass
+(`a3-spec-features-precommit.log`). Production and source-oracle files remained
+unchanged during the accepted run. GPU completion and feature registration are
+still pending.

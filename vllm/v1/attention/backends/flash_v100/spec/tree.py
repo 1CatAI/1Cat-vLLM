@@ -18,7 +18,7 @@ from vllm.v1.attention.backends.triton_attn import (
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-def _attach_ddtree_metadata(
+def attach_metadata(
     self: Any,
     attn_metadata: TritonAttentionMetadata,
     *,
@@ -80,3 +80,6 @@ def _attach_ddtree_metadata(
                     non_blocking=True,
                 )
             flash_metadata.ddtree_query_start_loc_restored_for_triton = True
+
+
+_attach_ddtree_metadata = attach_metadata

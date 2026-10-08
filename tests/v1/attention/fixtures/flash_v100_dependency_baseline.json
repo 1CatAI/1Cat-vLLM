@@ -2,7 +2,7 @@
   "metrics": {
     "forward": 400,
     "largest_function": 400,
-    "cross_module_private": 333,
+    "cross_module_private": 332,
     "import_cycles": 3,
     "model_names_outside_spec": 154,
     "env_outside_config": 0,
@@ -281,10 +281,6 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.hooks"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.metadata",
       "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
     ],
     [
@@ -414,6 +410,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.spec.draft",
       "vllm.v1.attention.backends.flash_v100.debug"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.hooks",
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts",
@@ -1189,7 +1189,7 @@
     },
     {
       "file": "metadata.py",
-      "line": 94,
+      "line": 128,
       "expression": "_config.registered('VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING')",
       "via_config": true,
       "owner": "__init__",
@@ -1197,7 +1197,7 @@
     },
     {
       "file": "metadata.py",
-      "line": 95,
+      "line": 129,
       "expression": "_config.registered('VLLM_FLASH_V100_DECODE_PARTITION_SIZE')",
       "via_config": true,
       "owner": "__init__",
@@ -1673,11 +1673,14 @@
     "masks.py:_ddtree_triton_parent_ids_for_query": 49,
     "masks.py:_build_ddtree_visibility_mask": 53,
     "masks.py:pool_blocks": 25,
-    "metadata.py:_as_flash_v100_metadata": 6,
-    "metadata.py:__init__": 47,
-    "metadata.py:initialize_spec_state": 18,
+    "metadata.py:_as_flash_v100_metadata": 10,
+    "metadata.py:spec_state": 10,
     "metadata.py:__getattr__": 6,
     "metadata.py:__setattr__": 9,
+    "metadata.py:__delattr__": 5,
+    "metadata.py:__copy__": 6,
+    "metadata.py:__init__": 47,
+    "metadata.py:initialize_spec_state": 18,
     "metadata.py:build": 10,
     "metadata.py:build_for_drafting": 2,
     "metadata.py:_stabilize_draft_graph_metadata": 4,
@@ -1805,7 +1808,7 @@
     "spec/hooks.py:attach_common_legacy": 2,
     "spec/hooks.py:prepare_capture_legacy": 2,
     "spec/hooks.py:register_metadata_hooks": 7,
-    "spec/metadata_contracts.py:metadata_view": 3,
+    "spec/metadata_contracts.py:metadata_view": 4,
     "spec/metadata_state.py:__init__": 4,
     "spec/metadata_state.py:vllm_config": 2,
     "spec/metadata_state.py:device": 2,
@@ -1818,7 +1821,7 @@
     "spec/smallq_metadata.py:_sm70_prepare_grouped_smallq_decode_metadata": 152,
     "spec/smallq_metadata.py:prepare_dflash2_smallq_group_metadata": 178,
     "spec/smallq_metadata.py:fallback": 5,
-    "spec/tree.py:_attach_ddtree_metadata": 62,
+    "spec/tree.py:attach_metadata": 62,
     "spec/verify_metadata.py:_configured_smallq_max_query_len": 4,
     "spec/verify_metadata.py:_configured_smallq_max_model_len": 4,
     "spec/verify_metadata.py:_smallq_buffer_token_capacity": 21,

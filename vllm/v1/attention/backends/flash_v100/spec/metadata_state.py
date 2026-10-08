@@ -48,7 +48,7 @@ class SpecMetadataState:
     _use_sm70_dflash2_fused_smallq_metadata: bool
     metadata_workspace: _workspace.MetadataWorkspace
 
-    _attach_ddtree_metadata = tree._attach_ddtree_metadata
+    _attach_ddtree_metadata = tree.attach_metadata
     _debug_draft_metadata = draft._debug_draft_metadata
     _ensure_flash_draft_graph_buffers = draft._ensure_flash_draft_graph_buffers
     _stabilize_draft_graph_metadata = draft._stabilize_draft_graph_metadata

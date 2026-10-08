@@ -38,8 +38,9 @@ class SmallQueryBuilder(Protocol):
 
 
 def metadata_view(attn_metadata: Any) -> Any:
-    # Triton creates the object; feature fields are attached without copying it.
-    return attn_metadata
+    # Owned packets are canonical. Older external/synthetic metadata retains
+    # its historical duck-typed field interface at this compatibility boundary.
+    return getattr(attn_metadata, "spec_state", attn_metadata)
 
 
 STATE_FIELDS = frozenset(
@@ -58,7 +59,7 @@ INPUT_FIELDS = {
 }
 
 
-class SpecMetadataFields:
+class SpecMetadataPacket:
     ddtree_parent_ids: torch.Tensor | None
     ddtree_parent_ids_cpu: torch.Tensor | None
     ddtree_num_tree_tokens_cpu: torch.Tensor | None
@@ -71,3 +72,8 @@ class SpecMetadataFields:
     smallq_decode_max_seq_len_hint: int | None
     smallq_decode_workspace_seq_capacity_hint: int | None
     smallq_decode_partition_size_hint: int | None
+
+
+METADATA_FIELDS = frozenset(SpecMetadataPacket.__annotations__)
+# The old typing-only name is external compatibility, never an inherited mixin.
+SpecMetadataFields = SpecMetadataPacket

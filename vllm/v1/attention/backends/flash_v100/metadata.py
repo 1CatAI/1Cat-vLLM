@@ -4,8 +4,9 @@
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import replace
-from typing import cast
+from typing import Any, cast
 
 import torch
 
@@ -13,14 +14,13 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.backends.flash_v100.spec.hooks import (
-    SpecMetadataFields,
-)
 from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import (
     INPUT_FIELDS,
+    METADATA_FIELDS,
     STATE_FIELDS,
     MetadataInputs,
     MetadataOps,
+    SpecMetadataPacket,
 )
 from vllm.v1.attention.backends.flash_v100.spec.metadata_state import SpecMetadataState
 from vllm.v1.attention.backends.triton_attn import (
@@ -32,8 +32,8 @@ from vllm.v1.kv_cache_interface import PrefixAnchoredSWASpec
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-class FlashAttnV100Metadata(SpecMetadataFields, TritonAttentionMetadata):
-    """Static view of Flash-V100 fields attached to Triton metadata."""
+class FlashAttnV100Metadata(TritonAttentionMetadata):
+    """Common metadata and a single owned speculative packet."""
 
     query_start_loc_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
@@ -49,12 +49,52 @@ class FlashAttnV100Metadata(SpecMetadataFields, TritonAttentionMetadata):
     flash_v100_static_decode_seq_hint: int | None
     flash_v100_decode_active_num_partitions: torch.Tensor | None
 
+    @property
+    def spec_state(self) -> SpecMetadataPacket:
+        attributes = vars(self)
+        if "_spec_state" not in attributes:
+            packet = SpecMetadataPacket()
+            # Adoption keeps tensor identities and accepts existing legacy fields.
+            for name in METADATA_FIELDS:
+                if name in attributes:
+                    setattr(packet, name, attributes.pop(name))
+            attributes["_spec_state"] = packet
+        return attributes["_spec_state"]
+
+    def __getattr__(self, name: str) -> Any:
+        if name in METADATA_FIELDS:
+            return getattr(self.spec_state, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in METADATA_FIELDS:
+            setattr(self.spec_state, name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in METADATA_FIELDS:
+            delattr(self.spec_state, name)
+        else:
+            super().__delattr__(name)
+
+    def __copy__(self):
+        result = object.__new__(type(self))
+        vars(result).update(vars(self))
+        if "_spec_state" in vars(self):
+            vars(result)["_spec_state"] = copy(self.spec_state)
+        return result
+
 
 def _as_flash_v100_metadata(
     attn_metadata: TritonAttentionMetadata,
 ) -> FlashAttnV100Metadata:
-    # The inherited Triton builder creates the object; this backend attaches
-    # the fields above before any Flash-V100 path consumes them.
+    # The inherited builder creates this exact class. Adopt its object in place
+    # so all existing tensor references and metadata identities remain valid.
+    if type(attn_metadata) is TritonAttentionMetadata:
+        attn_metadata.__class__ = FlashAttnV100Metadata
+    if isinstance(attn_metadata, FlashAttnV100Metadata):
+        _ = attn_metadata.spec_state
     return cast(FlashAttnV100Metadata, attn_metadata)
 
 

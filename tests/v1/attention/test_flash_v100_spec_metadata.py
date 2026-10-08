@@ -91,6 +91,8 @@ class _InlineWorkspace(ast.NodeTransformer):
 
 class _Normalize(ast.NodeTransformer):
     def visit_FunctionDef(self, node):
+        if node.name == "attach_metadata":
+            node.name = "_attach_ddtree_metadata"
         node = self.generic_visit(node)
         if node.args.args and node.args.args[0].arg == "self":
             node.args.args[0].annotation = None
@@ -160,9 +162,17 @@ def test_moved_metadata_calculations_match_parent():
     actual = {}
     for path in Path(metadata.__file__).parent.joinpath("spec").glob("*.py"):
         for fn in ast.parse(path.read_text()).body:
-            if isinstance(fn, ast.FunctionDef) and fn.name in expected:
-                assert fn.name not in actual
-                actual[fn.name] = hashlib.sha256(
+            if isinstance(fn, ast.FunctionDef) and (
+                fn.name in expected
+                or (path.name == "tree.py" and fn.name == "attach_metadata")
+            ):
+                name = (
+                    "_attach_ddtree_metadata"
+                    if fn.name == "attach_metadata"
+                    else fn.name
+                )
+                assert name not in actual
+                actual[name] = hashlib.sha256(
                     ast.dump(_Normalize().visit(_InlineWorkspace().visit(fn))).encode()
                 ).hexdigest()
     assert actual == expected

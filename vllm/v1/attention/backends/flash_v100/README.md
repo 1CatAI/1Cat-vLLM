@@ -75,7 +75,8 @@ base builder and common metadata. The state owns persistent draft/small-query
 buffers and speculative configuration. It neither imports nor receives the
 common builder. The old private calls delegate to this owner for compatibility;
 `METADATA_HOOKS` remains an external compatibility adapter, not the production
-registration path. Metadata field and attention mixins still require removal.
+registration path. The per-request metadata packet also owns feature fields; neither common class
+inherits a speculative mixin.
 
 `spec.builder` preserves the extended build options; `spec.tree` owns tree
 attachment/restoration; `spec.draft` owns drafting refresh; `spec.verify_metadata`
@@ -95,8 +96,7 @@ Legacy method names remain delegates at the common assembly boundary; verifier
 calculations receive only VerificationConfig and VerificationOps. The ordinary
 causality guard bypasses executor construction. Tests inject owned policy and
 operators; the trace recorder observes the actual verifier predicate under its
-original canonical event name. Per-method SpecFeature registration and metadata
-field migration remain separate work.
+original canonical event name. Per-method SpecFeature registration remains separate work.
 
 ## Shared decode strategy
 
@@ -122,3 +122,13 @@ evidence. GPU output error, route traces and timing have not been measured;
 no speedup or numerical-equivalence claim is made. The older p256 measurement
 alone does not describe the current p64/p256/wave source, and wave admission
 also depends on the forwarded context bound. Retain those experimental paths.
+
+## Per-request speculative metadata
+
+Common metadata owns one `spec_state` packet. The Triton builder's result is
+adopted as the existing FlashAttnV100Metadata subtype in place: object identity,
+common fields and tensor references remain unchanged. Old field access forwards
+to the packet; feature names are declared only by its Spec owner. Existing raw
+fields migrate without tensor copies. Shallow copies get independent packets
+while sharing tensors, and packets do not retain the enclosing metadata.
+Older duck-typed external metadata remains accepted at the compatibility view.
