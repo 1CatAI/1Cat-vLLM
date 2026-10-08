@@ -1,7 +1,8 @@
 # Flash-V100 attention
 
 `backend` owns registration, `impl` owns initialization and the forward entry
-point. It binds methods from `decode`, `prefill`, `verify` and `debug_compare`;
+point with registered feature hooks. It binds methods from `decode`, `prefill`,
+`verify` and `debug_compare`;
 `state` owns their shared one-shot flags. `ops` owns
 native loading, `kv_layout` owns cache views/gathers, and `metadata` owns common
 host metadata construction. `spec/` owns speculative feature metadata.
@@ -62,8 +63,8 @@ comparison super call uses the original class object, preserving its old
 The method fixture records normalized parent calculation hashes for all 47
 methods. Normalize docstring indentation, typed-self annotations, moved state
 qualification and the explicit super receiver; other calculation nodes must
-match. Removal of family names from forward orchestration remains the next
-independent scope.
+match. Mechanical feature hook calls are expanded back into their calculation
+bodies, with argument order checked; the same 47 parent hashes still match.
 
 ## Speculative metadata hooks
 
@@ -84,3 +85,12 @@ calls continue after the feature mixin so the Triton builder executes once.
 Fourteen extracted calculation bodies match frozen parent hashes; CPU tests
 exercise tree restoration, hook ordering, capture length guards and persistent
 buffer addresses across refreshes. Native metadata kernels remain unmeasured.
+
+`spec.attention.ATTENTION_HOOKS` registers typed callbacks for scalar-tail
+initialization, verifier ABI/policy, prefill wrapper policy, feature contract
+validation, XQA exclusions, explicit fallback and capture route accounting.
+`SpecAttentionMethods` preserves historical method/field names for external
+callers. Common impl, metadata and backend entrypoints contain no family names;
+the existing route names and compatibility exports remain intact. CPU forward
+tests cover unsupported-layer rejection, allowed fallback and non-causal
+capture, while checking the original route labels and base call count.

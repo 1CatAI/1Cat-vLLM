@@ -49191,3 +49191,35 @@ small-query env reads move to their feature owner; accept-moves records this
 without total growth. GPU validation remains waived by the explicit user
 instruction. Remaining A3b scope: implementation initialization/forward hooks
 and removal of feature names from the backend core. The campaign is ongoing.
+
+## 2026-10-08 — architecture A3b-3 attention feature boundary
+
+Stack on A3b-2 #1056 (`0a38520587c2552b7150907a8f62acc4371b89ec`) in
+`agent/v100-arch-attention-hooks-20261008-091421`, owned worktree
+`/home/ymzx/arch-ws/v100-arch-attention-hooks-20261008-091421`.
+
+Register typed immutable attention callbacks for scalar-tail initialization,
+verifier ABI/policy, prefill wrapper policy, feature contract validation,
+selector XQA exclusions, unsupported-layer fallback and capture accounting.
+Retain legacy methods/fields in a feature compatibility mixin and all existing
+route labels. impl.py drops 1135 to 1021 lines; impl.py, metadata.py and
+backend.py now contain no DFlash/DDTree references. This completes A3b's method
+and metadata extraction plus core feature hooks; A4 grouped-family admission
+and subsequent phases remain outstanding.
+
+After mechanically expanding hook bodies and validating call argument order,
+all 47 calculation hashes still match the original A2 fixture. Seven new
+feature-boundary CPU cases plus nine retained composition/metadata cases pass.
+They exercise the actual forward entrypoint for rejection/fallback/non-causal
+capture, retain route labels/base-call counts and legacy instance patches, and
+check prefill wrapper attributes with both split policies. Initial new tests
+contained an incorrect mock positional index and omitted query_start_loc;
+these test inputs were repaired. Clean evidence: a3c-hooks-tests-final.log.
+
+Existing focused suite: 306 passed. Existing CPU policy suite: 233 passed /
+9 inherited device-inference failures / 1 skipped; all 243 outcomes match
+A3b-2 exactly (a3c_cpu_ab.json and paired JUnit XML). Mypy and the ratchet pass.
+Coupling totals remain model 2325 / platform 3964 / raw env 335; one existing
+env read moves from impl to spec/attention, without total growth. No GPU
+precision, replay or timing evidence is claimed under the user's active
+no-V100 requirement. Root-disk logs are under /home/ymzx/arch-ws/tmp/a3c_*.

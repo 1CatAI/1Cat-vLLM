@@ -9,9 +9,6 @@ import os
 import torch
 
 import vllm.envs as envs
-from vllm.config.sm70_dflash2 import (
-    capture_sm70_dflash2_config,
-)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
@@ -25,6 +22,10 @@ from vllm.v1.attention.backends.flash_v100 import prefill as _prefill
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100 import verify as _verify
+from vllm.v1.attention.backends.flash_v100.spec.attention import (
+    ATTENTION_HOOKS,
+    SpecAttentionMethods,
+)
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionImpl,
     TritonAttentionMetadata,
@@ -46,7 +47,7 @@ from vllm.v1.attention.ops.sm70_fp16_grouped import (
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-class FlashAttnV100Impl(TritonAttentionImpl):
+class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
     def __init__(self, *args, **kwargs):
@@ -83,27 +84,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if self.kv_codec is FP16 and current_platform.is_device_capability(70)
             else None
         )
-        self._sm70_scalar_tail_attention = None
-        from vllm.v1.attention.ops.sm70_e4m3_scalar import (
-            load_scalar_tail_attention,
-            scalar_tail_attention_available,
-        )
-
-        if (
-            use_e4m3_fp32
-            and envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
-            and (
-                envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST
-                or scalar_tail_attention_available()
-            )
-            and not os.environ.get("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
-        ):
-            # An empty name selects the operator compiled into this extension;
-            # a manifest name keeps the explicit experimental override.
-            self._sm70_scalar_tail_attention = load_scalar_tail_attention(
-                envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST or "",
-                torch.device("cuda", torch.accelerator.current_device_index()),
-            )
+        ATTENTION_HOOKS.initialize_scalar_tail(self, use_e4m3_fp32)
         if use_e4m3_fp32 and self.flash_attn_grouped_e4m3_fp32_paged is None:
             logger.warning_once(
                 "E4M3 grouped FP32 requires Flash-V100 precision revision 4; "
@@ -111,12 +92,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "FP32 partial storage. Rebuild the extension and restart workers.",
                 scope="process",
             )
-        self.dflash2_grouped_verify_max_query_tokens = (
-            _ops._flash_attn_grouped_verify_max_query_tokens
-        )
-        self.dflash2_grouped_verify_request_major_abi_version = (
-            _ops._flash_attn_grouped_verify_request_major_abi_version
-        )
+        ATTENTION_HOOKS.initialize_verify_abi(self)
         self.fp8_e5m2_paged_kv_to_fp16 = _ops._get_fp8_e5m2_paged_kv_bridge_op()
         self.fp8_e4m3_paged_kv_to_fp16 = (
             _ops._get_sm70_v37_e4m3_bridge_op() if self.kv_codec is FP8_E4M3 else None
@@ -146,31 +122,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 self.flash_attn_prefill_paged, "anchor_lens"
             )
         )
-        self._flash_prefill_paged_supports_dflash2_bmhd = bool(
-            getattr(self.flash_attn_prefill_paged, "_sm70_dflash2_direct_bmhd", False)
-        )
-        self._flash_prefill_paged_dflash2_split_pages = getattr(
-            self.flash_attn_prefill_paged, "_sm70_dflash2_split_pages", ()
-        )
-        split_enabled = getattr(
-            capture_sm70_dflash2_config(), "draft_window_split", True
-        )
-        if not split_enabled:
-            self._flash_prefill_paged_dflash2_split_pages = ()
-        if self.flash_attn_prefill_paged is not None and _ops._callable_accepts_keyword(
-            self.flash_attn_prefill_paged, "dflash2_window_split"
-        ):
-            from functools import partial
-
-            self.flash_attn_prefill_paged = partial(
-                self.flash_attn_prefill_paged, dflash2_window_split=split_enabled
-            )
-        logger.info_once(
-            "FLASH_ATTN_V100 DFlash single-request window split pages=%s; "
-            "page832 policy=%s; dtype/query/window guards apply at dispatch.",
-            self._flash_prefill_paged_dflash2_split_pages,
-            "enabled" if split_enabled else "disabled_by_configuration",
-        )
+        ATTENTION_HOOKS.configure_prefill(self)
         paged_prefill_enable = os.getenv("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
         paged_prefill_disable = (
             os.getenv("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1"
@@ -266,22 +218,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_decode_xqa
             and os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", "1") == "1"
         )
-        self.use_dflash2_grouped_verify = (
-            self.flash_attn_grouped_verify_paged is not None
-            and envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY
-            and current_platform.is_device_capability(70)
-        )
-        self.use_dflash2_batched_grouped_verify = (
-            self.use_dflash2_grouped_verify
-            and envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY
-        )
-        self.dflash2_grouped_verify_min_model_len = (
-            envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN
-        )
-        if self.dflash2_grouped_verify_min_model_len < 1:
-            raise ValueError(
-                "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN must be positive"
-            )
+        ATTENTION_HOOKS.configure_verifier(self)
         decode_scalar_paged_env = os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
         self.use_decode_scalar_paged = decode_scalar_paged_env != "0"
         self.compare_bhmd_out_dir = os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR")
@@ -400,11 +337,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             key_cache, value_cache
         ):
             return None
-        # The E4M3 XQA wave route retains half partials. A DFlash2 selector
-        # target keeps its dedicated grouped FP32 route instead.
-        if codec is FP8_E4M3 and getattr(
-            attn_metadata, "is_dflash_selector_target", False
-        ):
+        # Feature contracts can require a separate native FP32 verifier route.
+        if ATTENTION_HOOKS.reject_xqa(codec, attn_metadata):
             return None
         return codec
 
@@ -438,13 +372,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             right = left
         return (left, right)
 
-    _validate_dflash_attention_contract = _verify._validate_dflash_attention_contract
-
     _call_flash_attn_decode_paged = _decode._call_flash_attn_decode_paged
-
-    _dflash2_grouped_verify_allowed = _verify._dflash2_grouped_verify_allowed
-
-    _call_dflash2_grouped_verify = _verify._call_dflash2_grouped_verify
 
     _smallq_decode_xqa_allowed = _verify._smallq_decode_xqa_allowed
 
@@ -491,11 +419,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             return output.fill_(0)
 
-        self._validate_dflash_attention_contract(layer, attn_metadata)
+        ATTENTION_HOOKS.validate_contract(self, layer, attn_metadata)
 
         if not self._supports_flash_v100_path():
             layer_info = self._layer_debug_info(layer)
-            is_dflash_draft_attn = bool(layer_info.get("is_dflash_draft_attn"))
+            feature_fallback = ATTENTION_HOOKS.fallback_kind(layer_info)
             message = (
                 "FLASH_ATTN_V100 cannot run this layer/config because a required "
                 "Flash op is unavailable or the attention features/KV cache dtype "
@@ -510,24 +438,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 f"has_sinks={self.sinks is not None}, "
                 f"kv_cache_dtype={self.kv_cache_dtype!r}."
             )
-            if not (self.allow_triton_fallback or is_dflash_draft_attn):
-                raise RuntimeError(message)
-            if self.use_flash_v100 and not _state._warned_feature_fallback:
-                if is_dflash_draft_attn:
-                    logger.warning(
-                        "FLASH_ATTN_V100 falling back to Triton for D-Flash "
-                        "draft attention layer %s because the SM70 Flash-V100 "
-                        "backend does not yet support this layer/config.",
-                        layer_info.get("layer_name"),
-                    )
-                else:
-                    logger.warning("%s", message)
-                _state._warned_feature_fallback = True
-            _routing._record_route(
-                "dflash_draft_triton_fallback"
-                if is_dflash_draft_attn
-                else "unsupported_triton_fallback"
-            )
+            ATTENTION_HOOKS.unsupported(self, layer_info, message, feature_fallback)
             return super().forward(
                 layer,
                 query,
@@ -639,21 +550,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 # look like no-prefix prefill, while replayed MTP verification
                 # is a uniform small-query decode over an existing KV prefix.
                 # Capture the same small-query kernel branch that replay needs.
-                is_dflash_non_causal = bool(
-                    getattr(layer, "is_dflash_draft_attn", False)
-                ) and not bool(getattr(attn_metadata, "causal", True))
-                if is_dflash_non_causal:
-                    # DFlash pre-inserts target context K/V before replay. Its
-                    # dummy capture has seq_len == query_len and would
-                    # otherwise freeze the no-prefix dense branch into the
-                    # graph. Bind directly to the non-causal paged-prefix
-                    # kernel; runtime updates its persistent sequence and
-                    # block-table buffers before every replay.
-                    _routing._record_route(
-                        _routing.ROUTE_SPECS[
-                            "prefill_capture_dflash_noncausal_paged"
-                        ].name
-                    )
+                capture_prefix = ATTENTION_HOOKS.capture_prefix_kind(
+                    layer, attn_metadata
+                )
+                if capture_prefix:
+                    ATTENTION_HOOKS.record_capture_prefix()
                     return self._flash_v100_prefill_with_prefix(
                         layer,
                         query,
@@ -702,18 +603,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     _routing._record_route(
                         _routing.ROUTE_SPECS["prefill_capture_smallq"].name
                     )
-                    if getattr(attn_metadata, "ddtree_parent_ids", None) is None:
-                        _routing._record_route(
-                            _routing.ROUTE_SPECS[
-                                "prefill_capture_smallq_no_ddtree_metadata"
-                            ].name
-                        )
-                    else:
-                        _routing._record_route(
-                            _routing.ROUTE_SPECS[
-                                "prefill_capture_smallq_ddtree_metadata"
-                            ].name
-                        )
+                    ATTENTION_HOOKS.record_capture_layout(attn_metadata)
                     return self._flash_v100_prefill_with_prefix(
                         layer,
                         query,
@@ -1099,10 +989,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     _flash_v100_prefill = _prefill._flash_v100_prefill
 
     _flash_v100_decode = _decode._flash_v100_decode
-
-    _flash_v100_ddtree_small_query_prefill_dense = (
-        _verify._flash_v100_ddtree_small_query_prefill_dense
-    )
 
     _flash_v100_small_query_prefill_as_decode = (
         _verify._flash_v100_small_query_prefill_as_decode
