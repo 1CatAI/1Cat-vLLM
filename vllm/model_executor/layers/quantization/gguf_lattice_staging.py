@@ -5,11 +5,65 @@
 Layouts and scale formulas match gguf_lattice_transcode.py and TurboMind's
 SM70 Converter. Integer packets, signs and FP16 coefficients are preserved;
 this does not dequantize or requantize the weights.
+GGUF layouts follow gguf-py/llama.cpp (MIT), as in the existing transcode layer.
 """
+
+from weakref import WeakValueDictionary
 
 import torch
 
 from vllm.triton_utils import tl, triton
+
+_POOLS: WeakValueDictionary = WeakValueDictionary()
+
+
+class GGUFLatticeStaging(torch.nn.Module):
+    """Two reusable projection slots, independent of layer count or IQ type."""
+
+    def __init__(self, experts: int, n: int, k: int, device):
+        super().__init__()
+        if experts <= 0 or n <= 0 or n % 32 or k <= 0 or k % 256:
+            raise ValueError("IQ staging slots require complete SM70 tiles")
+        self.experts, self.n, self.k = experts, n, k
+        self.handle = id(self)
+        self.register_buffer(
+            "codes",
+            torch.empty((2, experts, k, n // 16), dtype=torch.int32, device=device),
+            persistent=False,
+        )
+        _POOLS[self.handle] = self
+        self.register_buffer(
+            "metadata",
+            torch.empty((2, experts, k // 32, n * 8), dtype=torch.uint8, device=device),
+            persistent=False,
+        )
+
+    def slot(self, shard: str, source_type: int):
+        if shard not in ("w1", "w3") or source_type not in (18, 21, 22):
+            raise ValueError("IQ staging slots are gate/up for IQ3_XXS, IQ3_S, IQ2_S")
+        index = 0 if shard == "w1" else 1
+        group = 16 if source_type == 22 else 32
+        dtype = torch.int32 if source_type == 22 else torch.int64
+        return self.codes[index], self.metadata[index].view(dtype).reshape(
+            self.experts, self.k // group, self.n
+        )
+
+    def stage(self, raw_gate, raw_up, source_type):
+        for shard, raw in (("w1", raw_gate), ("w3", raw_up)):
+            codes, stats = self.slot(shard, source_type)
+            stage_lattice(raw, codes, stats, source_type)
+
+
+def stage_expert_pool(handle: int, raw_gate, raw_up, source_type) -> None:
+    """Private scratch is written and consumed inside one opaque FFN call.
+
+    The owning model keeps the pool alive. Forward calls must be serialized;
+    this policy is not admitted with dual batch overlap. Exposing these scratch
+    views as mutable compiler inputs would clone large banks and invalidate
+    the C++ pointer tables, so they never cross the opaque boundary.
+    """
+    pool = _POOLS[handle]
+    pool.stage(raw_gate, raw_up, source_type)
 
 
 @triton.jit

@@ -52,7 +52,7 @@ def test_canonical_adapter_retains_q2_source_without_expansion():
     assert weights[0].data_ptr() == torch.from_numpy(data[0]).data_ptr()
 
 
-@pytest.mark.parametrize("storage", ["canonical", "original"])
+@pytest.mark.parametrize("storage", ["canonical", "original", "staged"])
 def test_load_model_retains_prepared_adapter(monkeypatch, storage):
     from vllm.model_executor.kernels.ple import gguf_pinned
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
@@ -115,7 +115,7 @@ def test_load_model_retains_prepared_adapter(monkeypatch, storage):
     )
     model_config = SimpleNamespace(dtype=torch.float16, hf_config=SimpleNamespace())
     assert loader.load_model(cfg, model_config) is model
-    assert cfg.quant_config.canonical_expert_storage == (storage == "canonical")
+    assert cfg.quant_config.canonical_expert_storage == (storage != "original")
     types = [w.item() for n, w in model.entries if n.endswith("qweight_type")]
     weights = [w for n, w in model.entries if n.endswith("qweight")]
     assert types == [42, 42]

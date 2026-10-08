@@ -364,12 +364,14 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
-    expert_storage: Literal["canonical", "original"] = "canonical"
+    expert_storage: Literal["canonical", "original", "staged"] = "canonical"
     """Keep accelerated canonical banks or one bank of original GGUF blocks.
 
     Original storage avoids simultaneous canonical and raw expert weights.
     It uses the packaged native fallback and zero-pads activations when a TP
     boundary cuts a source block. It does not change the quantized weights.
+    Staged storage retains original IQ gate/up banks and expands canonical
+    operands into shared scratch for prefill, preserving the small-M routes.
     """
 
     dense_storage: Literal["canonical", "original"] = "canonical"

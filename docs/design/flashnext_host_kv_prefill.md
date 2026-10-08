@@ -705,13 +705,31 @@ Actual device peak, graph allocations and allocator retries must be recorded.
 A separate GPU staging primitive reconstructs the existing canonical IQ3_XXS,
 IQ3_S and IQ2_S packet layouts from original blocks. Its test compares every
 prepared byte against the packaged Converter, including signed zeros, small
-coefficients and replay after replacing the source bank. It is not connected
-to model dispatch until those device checks pass. A shared per-layer working
-area can then replace persistent canonical gate/up copies without changing
-the existing small-M raw/dp4a routes or canonical FP16 prefill arithmetic.
+coefficients and replay after replacing the source bank. All six device cases
+pass in the installed `5d33064de9` wheel on V100-SXM2-32GB. Staged model dispatch
+now retains original IQ banks and borrows one canonical gate/up working area
+for prefill. Small-M raw/dp4a routes and canonical FP16 prefill arithmetic are
+unchanged. The compiled FFN and model checks remain pending.
 
-34 CPU storage/initialization checks pass, including all four Q2_0 TP boundaries,
-exact HC shard reconstruction and CPU staging. This is not yet the installed
+The reusable gate/up pool has two disjoint slots. At 512 experts, local width
+160 and K2560, code storage is 100 MiB and group metadata is 100 MiB. IQ3 uses
+eight-byte group32 metadata and IQ2 uses four-byte group16 metadata, so both
+fit the same backing allocation. A CPU storage test checks the exact 200 MiB
+total, cross-format aliasing and independent gate/up offsets. Nine Triton
+interpreter cases at K256/K512/K2560 agree bytewise with an independent
+canonical-layout oracle. Interpreter agreement is not CUDA qualification.
+
+Prefill dispatch must stage once before the internal expert row chunks and
+consume the workspace inside the opaque operator. Passing large mutable
+scratch views through compilation can introduce clones/copybacks and invalidate
+the prepared pointer tables. The intended workspace is private to the operator,
+retained by the model, and shared only between serialized forward calls. Device
+tests must cover compilation, changed-input replay, and two successive layers
+with different IQ formats before model admission.
+
+39 CPU storage/initialization checks pass, including all four Q2_0 TP boundaries,
+exact HC shard reconstruction, shared staging storage and converter-free original
+IQ bank loading. This is not yet the installed
 32K/FULL memory or throughput result. The existing NVFP4 prefix-prefill report
 records 5409 tokens/s at 32K with TP4/MTP4; its 8K scheduler chunk, cache layout
 and memory budget differ and must be accounted for in a matched comparison.

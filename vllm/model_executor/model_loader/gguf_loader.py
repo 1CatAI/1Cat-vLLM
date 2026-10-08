@@ -518,7 +518,7 @@ class GGUFModelLoader(BaseModelLoader):
                     "expert_storage",
                     "canonical",
                 )
-                == "canonical"
+                in ("canonical", "staged")
                 and model_config.dtype == torch.float16
                 and current_platform.get_device_capability() == (7, 0)
                 and hasattr(torch.ops._C, "gguf_affine_grouped_gemm_sm70_out")

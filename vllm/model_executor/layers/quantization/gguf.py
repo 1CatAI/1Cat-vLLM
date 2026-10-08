@@ -72,6 +72,7 @@ class GGUFConfig(QuantizationConfig):
         self.fallback_reasons: dict[str, str] = {}
         self.native_expert_storage = False
         self.canonical_expert_storage = False
+        self._lattice_staging_pools: dict[tuple, Any] = {}
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
