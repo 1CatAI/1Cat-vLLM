@@ -592,6 +592,19 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": cfg.kernel_config.qsa_auto_e4m3_reason,
         "scope": "calibrated_cache_storage",
     }
+    grouped_workspace_bytes = 0
+    if (
+        cfg.kernel_config.qsa_host_kv_active
+        and cfg.kernel_config.qsa_host_kv_prefill
+        and cfg.kernel_config.qsa_host_kv_prefill_grouped
+    ):
+        from vllm.models.qwen4_exp.nvidia.ops.host_kv_prefill import (
+            grouped_prefill_workspace_bytes,
+        )
+
+        grouped_workspace_bytes = grouped_prefill_workspace_bytes(
+            cfg.scheduler_config.max_num_batched_tokens
+        )
     report["qsa_host_kv"] = {
         "enabled": cfg.kernel_config.qsa_host_kv_active,
         "reason": cfg.kernel_config.qsa_host_kv_reason,
@@ -627,7 +640,12 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             "runtime_guards": (
                 "logical request pages fit the shared FP16 miss workspace"
             ),
-            "additional_persistent_workspace_bytes": 0,
+            "additional_persistent_history_bytes": 0,
+            "additional_persistent_workspace_bytes": grouped_workspace_bytes,
+            "workspace_estimate_scope": (
+                "grouped planner per CUDA stream at scheduler query-row limit; "
+                "existing capacity may already cover the request"
+            ),
             "grouped_attention": {
                 "enabled": (
                     cfg.kernel_config.qsa_host_kv_active

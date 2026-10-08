@@ -16,6 +16,21 @@ PREFILL_MIN_ROWS = 512
 PREFILL_QUERY_ROWS = 256
 
 
+def grouped_prefill_workspace_bytes(rows: int) -> int:
+    """Planner capacity per CUDA stream, excluding borrowed history scratch."""
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+
+    if rows < PREFILL_MIN_ROWS:
+        return 0
+    groups = rows // qsa._SM70_QSA_GROUPED_PAGE4_QUERIES
+    capacity = 1 << (groups - 1).bit_length()
+    return capacity * (
+        qsa._SM70_QSA_GROUPED_PAGE4_OUTPUT_PAGES * 8
+        + 4
+        + qsa._SM70_QSA_GROUPED_PAGE4_QUERIES * 6 * 4
+    )
+
+
 def _grouped_prefill_reason(
     query, key, value, indices, table, requests, positions, lengths
 ):

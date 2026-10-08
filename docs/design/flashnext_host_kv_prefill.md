@@ -42,6 +42,9 @@ after attention. MTP steps that reuse an earlier sparse-index row retain the
 causal fallback: their compact tail may describe the preceding position.
 A stream-scoped planner workspace is reused across layers;
 no second persistent history bank is added.
+At 16384 query rows this workspace adds 65.383 MiB per CUDA stream if no
+existing capacity is available. Startup reports this estimate separately
+from the borrowed history allocation; it is not zero additional workspace.
 
 The benchmark supports an in-process grouped-attention ABBA and an optional
 CUDA profiler capture for Nsight graph-node traces. Integration correctness

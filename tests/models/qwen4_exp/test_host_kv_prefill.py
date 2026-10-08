@@ -52,6 +52,24 @@ def test_grouped_prefill_rejects_reused_mtp_tail(monkeypatch, skip_topk):
     assert calls == [not skip_topk]
 
 
+@pytest.mark.parametrize("rows", [512, 527, 16384])
+def test_grouped_workspace_estimate_matches_allocated_capacity(monkeypatch, rows):
+    from vllm.models.qwen4_exp.nvidia.ops import qsa
+    from vllm.models.qwen4_exp.nvidia.ops.host_kv_prefill import (
+        grouped_prefill_workspace_bytes,
+    )
+
+    # Materialize the allocator's actual capacity on CPU, independent of CUDA.
+    monkeypatch.setattr(qsa, "_SM70_QSA_GROUPED_PAGE4_WORKSPACES", {})
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=123)
+    )
+    workspace = qsa._qsa_grouped_page4_workspace(torch.empty(rows, 6, 256))
+    assert sum(t.untyped_storage().nbytes() for t in workspace) == (
+        grouped_prefill_workspace_bytes(rows)
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 def test_history_staging_matches_official_decode_and_preserves_page_aliases(dtype):
