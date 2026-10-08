@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tests.v1.attention.flash_v100_sequence_oracle import sequence_calculations
 from vllm.v1.attention.backends import flash_attn_v100 as legacy
 from vllm.v1.attention.backends.flash_v100 import decode, impl, state, workspace
 from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
@@ -106,6 +107,44 @@ class _InlineFeatureHooks(ast.NodeTransformer):
                     )
                 )
         return result
+
+    def visit_Assign(self, node):
+        if (
+            isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func) == "execute_prefill_sequence"
+        ):
+            assert (
+                ast.unparse(node.targets[0])
+                == "(out_seq, out_is_destination, skip_debug)"
+            )
+            assert not node.value.keywords
+            helper = next(
+                n
+                for n in ast.parse(
+                    (Path(impl.__file__).parent / "prefill.py").read_text()
+                ).body
+                if isinstance(n, ast.FunctionDef)
+                and n.name == "execute_prefill_sequence"
+            )
+            arguments = [a.arg for a in helper.args.args]
+            assert [ast.unparse(a) for a in node.value.args] == arguments
+            request = next(
+                n
+                for n in ast.walk(helper)
+                if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "_sequence.PrefillRequest"
+            )
+            assert not request.keywords
+            assert [ast.unparse(a) for a in request.args] == arguments[1:]
+            return sequence_calculations()
+        return self.generic_visit(node)
+
+    def visit_If(self, node):
+        if ast.unparse(node.test) == "skip_debug":
+            assert len(node.body) == 1 and isinstance(node.body[0], ast.Continue)
+            assert not node.orelse
+            return []
+        return self.generic_visit(node)
 
     def visit_Return(self, node):
         if (
