@@ -22,7 +22,12 @@ import torch
 from torch.utils.cpp_extension import load
 
 
-def source(root, directory, header_name="gguf_tile_ready_mlp_sm70.cuh"):
+def source(root, directory, task_threads, protocol):
+    header_name = (
+        "gguf_tile_ready_mlp_compact_sm70.cuh"
+        if task_threads == 256
+        else "gguf_tile_ready_mlp_sm70.cuh"
+    )
     original = (root / "csrc/sm70_turbomind/ops/gguf_dmv_sm70.cu").read_text()
     device = original[: original.index("}  // namespace")]
     marker = (
@@ -72,6 +77,36 @@ def source(root, directory, header_name="gguf_tile_ready_mlp_sm70.cuh"):
     # Read producer-written activations through coherent L2, not __ldg's
     # read-only cache. All other arithmetic and reduction orders are retained.
     streamed = streamed.replace("X[jj] = __ldg(", "X[jj] = __ldcg(")
+    if task_threads == 256:
+        streamed = streamed.replace(
+            "while (atomicAdd(ready + gg * 2, 0) != generation) {}\n"
+            "      while (atomicAdd(ready + gg * 2 + 1, 0) != generation) {}",
+            "for (int producer = gg * 4; producer < gg * 4 + 4; ++producer) {\n"
+            "        while (atomicAdd(ready + producer, 0) != generation) {}\n"
+            "      }",
+        )
+    if protocol == "acquire":
+        streamed = streamed.replace(
+            "atomicAdd(ready + gg * 2, 0)", "read_ready(ready + gg * 2)"
+        )
+        streamed = streamed.replace(
+            "atomicAdd(ready + gg * 2 + 1, 0)", "read_ready(ready + gg * 2 + 1)"
+        )
+        streamed = streamed.replace(
+            "atomicAdd(ready + producer, 0)", "read_ready(ready + producer)"
+        )
+        device += """
+__device__ __forceinline__ int read_ready(const int* flag) {
+  int value;
+  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+               : "=r"(value) : "l"(flag) : "memory");
+  return value;
+}
+__device__ __forceinline__ void publish_ready(int* flag, int generation) {
+  asm volatile("st.release.gpu.global.u32 [%0], %1;"
+               :: "l"(flag), "r"(generation) : "memory");
+}
+"""
     ready_tile = body.replace("void dense_tile", "void ready_tile")
     ready_tile = ready_tile.replace(
         "int tg, int sp) {", "int tg, int sp, int* ready, int generation) {"
@@ -94,6 +129,10 @@ def source(root, directory, header_name="gguf_tile_ready_mlp_sm70.cuh"):
     device += streamed + ready_tile
     device += "}  // namespace\n"
     header = (root / "benchmarks/csrc" / header_name).read_text()
+    if protocol == "acquire":
+        header = header.replace(
+            "atomicExch(ready + t, generation)", "publish_ready(ready + t, generation)"
+        )
     target = directory / "persistent_mlp.cu"
     content = device + "\n" + header
     if not target.exists() or target.read_text() != content:
@@ -163,8 +202,12 @@ def worker(rank, args, generated):
         x = torch.randn(8, 5120, device=rank, dtype=torch.float16)
         h = torch.empty(8, 4352, device=rank, dtype=torch.float16)
         out = torch.empty_like(x)
-        epochs = torch.zeros(80, device=rank, dtype=torch.int32)
-        ready = torch.zeros(68, device=rank, dtype=torch.int32)
+        epochs = torch.zeros(
+            160 if args.task_threads == 256 else 80, device=rank, dtype=torch.int32
+        )
+        ready = torch.zeros(
+            136 if args.task_threads == 256 else 68, device=rank, dtype=torch.int32
+        )
         errors = []
         for amplitude in (0.125, 0.5, 1.0):
             x.normal_().mul_(amplitude)
@@ -287,6 +330,8 @@ def worker(rank, args, generated):
         json.dumps(
             dict(
                 research_only=True,
+                task_threads=args.task_threads,
+                task_protocol=args.task_protocol,
                 serving_runtime=False,
                 torch=torch.__version__,
                 source_sha=args.source_sha,
@@ -314,6 +359,10 @@ def launch_worker(rank, args, generated):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--task-protocol", choices=("atomic", "acquire"), default="atomic"
+    )
+    parser.add_argument("--task-threads", type=int, choices=(256, 512), default=512)
     parser.add_argument("--ranks", type=int, default=4)
     parser.add_argument("--numeric-only", action="store_true")
     parser.add_argument("--source-sha", required=True)
@@ -326,7 +375,7 @@ if __name__ == "__main__":
     args.output.mkdir(parents=True, exist_ok=True)
     args.rendezvous = args.output / f"rendezvous-{uuid.uuid4().hex}"
     (args.output / "build").mkdir(exist_ok=True)
-    generated = source(args.root, args.output)
+    generated = source(args.root, args.output, args.task_threads, args.task_protocol)
     load(
         name="gguf_tile_ready_mlp_research",
         sources=[str(generated)],

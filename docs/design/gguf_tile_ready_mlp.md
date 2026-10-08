@@ -23,7 +23,12 @@ The benchmark uses Qwen3.8-27B GSQ-RCO IQ3_S, Q8_0 DFlash2, TP4, four
 V100-SXM2-32GB GPUs with NV2 between every pair, CUDA 12.8, Torch 2.10,
 M=8, FP16 activations, FP32 recurrent state, E4M3 target KV, FP16 draft KV,
 full decode graphs, maximum length 32768, and up to four sequences.
-The fresh trace uses a 1024-token input and 64 output tokens. Both unprofiled
+The fresh trace uses a 1024-token input and 64 output tokens.
+Its one-second clock sampler misses the 260 ms decode interval; immediately
+bracketing SM samples are 1230–1402 MHz before decode and 1530 MHz after.
+The trace therefore has no verified constant SM clock. Memory samples are
+877 MHz throughout. The steady C1 clock claim below belongs to the longer
+unprofiled A/B runs, not this short trace. Both unprofiled
 A/B arms used the same wheel and 16 prompts; steady C1 clocks were 1530 MHz
 SM and 877 MHz memory. No separate baseline run was added.
 
@@ -105,3 +110,44 @@ Missing instruction and actual-traffic fields therefore remain incomplete.
 No new model benefit or accepted after ledger is available yet. The prior full-MLP
 prototype using a global cooperative barrier was slower and is not repeated.
 This experiment tests per-tile dependencies and pre-wait weight loads instead.
+
+## Additional structural screens
+
+The compact task ABI uses 160 cooperatively resident 256-thread CTAs: 136
+N32 gate/up producer tasks and 80 N64 down tasks. The 24 producer-free CTAs
+can start reading down weights immediately. Resource admission requires two
+blocks per SM. Registers fall to 114–122 with zero spills, but the chain
+still regresses to 82.5/82.0/80.1 us against 63.2/63.4/63.6 us controls for
+layers 6/24/51. All four ranks retain bitwise results and changed-input
+replay stability. This does not isolate register pressure from readiness
+traffic and changed activation sharing. It is rejected.
+
+The original 512-thread task ABI was then tested with `ld.acquire.gpu` flag
+reads and `st.release.gpu` publication instead of atomic zero-add polls.
+These instructions are supported on Volta. It remains slower: 75.1/75.3/72.5
+us against 64.3/64.3/64.2 us controls. Bitwise numerical and graph replay
+checks still pass. Eliminating the atomic RMW did not fix the regression,
+so atomic polling is not established as its dominant cause. This is also
+rejected; none of the three variants is taken into a model run.
+
+The [compact](data/gguf_tile_ready_compact_rejected_20261008.json) and
+[acquire](data/gguf_tile_ready_acquire_rejected_20261008.json) records retain
+all paired measurements. No gains are assigned to the model and no accepted
+after ledger exists. The next structural scope needs a new dependency and
+resource analysis; further variations of this two-stage MLP screen are not
+planned.
+
+## Related execution designs
+
+[Cohere's task graph](https://github.com/cohere-ai/cohere-megakernel) uses
+per-tile readiness rather than a full-layer phase barrier. Its H100-specific
+TMA, WGMMA and register repartitioning cannot be assumed on SM70. This
+experiment independently tests the dependency idea using existing readers;
+it does not import those hardware mechanisms.
+
+[Flux's design](https://github.com/bytedance/flux/blob/main/docs/design.md)
+moves communication into tile completion and explains that remote I/O can
+insert pipeline bubbles. Its reported improvements are not a prediction for
+this M8 workload. The already-rejected projection/collective model A/B is
+retained separately, and the current experiment claims no overlapping
+communication benefit.

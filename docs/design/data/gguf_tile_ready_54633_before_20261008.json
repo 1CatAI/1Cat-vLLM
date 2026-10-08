@@ -62,7 +62,7 @@
     "ignore_eos": true
   },
   "machine": "54633: 4x V100-SXM2-32GB, all pairs NV2",
-  "clocks_sm_mhz": 1530,
+  "clocks_sm_mhz": null,
   "clocks_mem_mhz": 877,
   "theoretical_hbm_bytes_per_second": 898048000000,
   "raw_sha256": {
@@ -402,7 +402,8 @@
     "decode instruction counts for hot families",
     "sampling and layout traffic",
     "actual DRAM and activation rereads",
-    "per-collective synchronization lower bounds"
+    "per-collective synchronization lower bounds",
+    "SM clock samples inside the short diagnostic trace"
   ],
   "prototype": {
     "name": "tile_ready_mlp",
@@ -413,6 +414,13 @@
     "preserve_fp32_accumulation": true,
     "global_phase_barrier": false,
     "upper_bound_trace_ms": 2.374376462379357,
-    "estimated_accepted_round_saving_ms": null
+    "estimated_accepted_round_saving_ms": null,
+    "decision": "three screened variants rejected; no model admission"
+  },
+  "unprofiled_c1_clocks_sm_mhz": 1530,
+  "trace_clock_coverage": {
+    "samples_in_decode_interval": 0,
+    "reason": "One-second sampling misses the 260 ms decode interval. Bracketing samples range 1230\u20131402 MHz before decode and 1530 MHz after. No exact trace SM-clock assertion.",
+    "bracketing_memory_mhz": 877
   }
 }
