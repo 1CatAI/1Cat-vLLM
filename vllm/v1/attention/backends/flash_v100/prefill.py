@@ -81,6 +81,8 @@ def _should_use_fp8_prefill_bridge(
 ) -> bool:
     # Eight-byte input loads and 16-byte output stores. Keep layouts
     # outside the native bridge contract on their existing fallback.
+    if getattr(self, "_native_fp8_prefill_supported", False):
+        return False
     if self.kv_codec is FP8_E4M3 and not all(
         tensor.ndim == 4
         and tensor.stride(-1) == 1
@@ -117,6 +119,8 @@ def _run_fp8_prefill_bridge(
     window_size: tuple[int, int],
     out: torch.Tensor,
 ) -> tuple[torch.Tensor, bool] | None:
+    if getattr(self, "_native_fp8_prefill_supported", False):
+        return None
     if block_table.shape[0] != 1:
         return None
     input_block_size = int(key_cache.shape[1])
@@ -1405,6 +1409,9 @@ def _flash_v100_prefill_with_prefix(
                     ),
                 )
             else:
+                _routing._record_route(
+                    _routing.ROUTE_SPECS["prefill_prefix_paged"].name
+                )
                 out_seq = self._run_prefill_paged_call(
                     route="prefill_prefix_paged",
                     q_len=q_len,

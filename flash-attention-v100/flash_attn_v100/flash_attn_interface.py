@@ -1704,6 +1704,9 @@ def flash_attn_prefill_paged(
 
 # Advertise the packaged direct-output ABI to the attention backend. Older
 # extension builds keep their existing single-request publication path.
+flash_attn_prefill_paged.native_kv_codecs = tuple(  # type: ignore[attr-defined]
+    getattr(flash_attn_v100_cuda, "prefill_paged_native_kv_codecs", ())
+)
 flash_attn_prefill_paged._sm70_dflash2_direct_bmhd = hasattr(
     flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd"
 )
