@@ -49325,3 +49325,14 @@ SASS matches after anonymous namespace hashes only. The exact whole artifact
 installs normally on54633; dependency check passes201 packages. The short
 native FP16/E5M2 writer and installed partition/operator gate waits for global
 locks; idle devices do not authorize bypassing another task's reservation.
+
+The capture tool now supports an ordered request corpus with one engine load,
+independent per-request hooks/manifests and a complete aggregate marker.
+Single-request compatibility, request isolation and failed-corpus rejection
+pass33 combined CPU capture/evaluator tests. Real multi-request/ratio128 GPU
+execution remains pending; existing captured tensors are not relabelled.
+The repository's eight natural Flash-Next prompts are tokenized for all three
+models with source/template/token hashes, using only CPU. This prepares a
+broader error corpus without repeating cold model startup per prompt. No KV
+or acceptance result is claimed from tokenization. The active short-gate queue
+retains source860/numericb50 and is not updated while waiting/running.

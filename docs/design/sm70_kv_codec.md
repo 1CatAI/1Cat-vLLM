@@ -681,3 +681,31 @@ long-context sparse-selection, quality or performance admission. The next
 capture selector covers each compression ratio while retaining depth examples;
 nine CPU capture checks pass. Runtime provenance now includes the relocated
 partition-policy module (20 files) when using the new normal sourceb50 wheel.
+
+### Multiple independent requests per diagnostic engine
+
+The capture tool accepts the existing single `prompt_token_ids` object or an
+ordered JSON list with unique directory-safe IDs. A list loads the ordinary
+engine once, then installs/removes capture hooks for each independent request.
+Prefix caching/MTP remain disabled and every request must fit one prefill;
+there is no concatenation or synthetic padding. Each child keeps its own
+manifest and token/sample provenance. The aggregate manifest prefixes tensor
+paths with the request ID and sets `complete=true` only after all requests
+finish. Offline evaluation rejects an incomplete aggregate. Original single
+request output layout remains compatible.
+
+The capture/evaluator suite passes33 CPU tests, including single-engine reuse,
+independent hooks/IDs/path ownership and retention/rejection of a failed corpus.
+These are control-flow tests with a fake engine, not GPU/model evidence. The
+new corpus mode and ratio128 selector still require real installed execution;
+the existing12 QSA samples remain from the earlier single-request tool.
+
+The existing `benchmarks/flashnext_acceptance_prompts.json` supplies eight
+natural prompts. CPU-only preparation freezes exact token IDs with each model's
+installed tokenizer, the existing no-thinking chat rendering, source/individual
+prompt hashes and chat-template hashes. The [request provenance](sm70_kv_natural_request_provenance.json)
+records counts/hashes for27B NVFP4,27B GGUF and Flash-Next; request files stay
+outside Git. Tokenization is preparation, not captured KV or acceptance quality.
+A one-token eager/no-MTP corpus must remain separate from the benchmark's
+full MTP4/natural-output/teacher-forcing protocol. These short prompts also do
+not replace a real long-context or sparse-pruning request.
