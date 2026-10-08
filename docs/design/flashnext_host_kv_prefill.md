@@ -348,3 +348,17 @@ Outputs are bitwise identical; median time is 7.971 versus 8.029 ms. Fifteen
 HC checks pass, including export without a standalone full-row norm allocation,
 compiled runtime policy after construction scope ends, short tails and the
 no-injection final mix. Complete 32K model and decode gates remain pending.
+
+The installed norm/projection wheel passes 42 targeted checks. A real model
+run completes 32K/16K prefill for both the old and staged FP16 host readers;
+both warmups emit token 147113. Live allocation returns to 28.7484 GiB/rank,
+with peak live allocation 30.390 GiB/rank. This establishes capacity for this
+single-request workload; it does not establish natural-answer quality or C4.
+
+The subsequent ABBA measurement completes its first request but the runner
+fails when reading timestamps: LLM statistics default off, so RequestOutput
+metrics is None. No valid scheduled-to-first-token throughput or decode result
+was saved. Enable statistics explicitly and save wall time/output/memory before
+requiring timestamps so a reporting failure retains useful evidence. Re-run
+the matched benchmark with the same installed production wheel; this runner
+change does not alter production modules or native kernels.

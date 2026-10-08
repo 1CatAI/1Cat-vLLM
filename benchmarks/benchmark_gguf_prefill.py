@@ -48,6 +48,7 @@ def main():
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         gpu_memory_utilization=0.95,
         enable_prefix_caching=False,
+        disable_log_stats=False,
         language_model_only=True,
         compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
         worker_extension_cls="vllm.sm70_graph_observer.GraphParityWorkerExtension",
@@ -120,18 +121,23 @@ def main():
             wall_seconds = time.perf_counter() - started
             metrics = result.metrics
             after_memory = llm.collective_rpc("read_prefill_memory")
-            report["rows"].append(
-                dict(
-                    enabled=enabled,
-                    policy=policy,
-                    wall_seconds=wall_seconds,
-                    before_memory=before_memory,
-                    after_memory=after_memory,
-                    scheduled_to_first_token_seconds=(
-                        metrics.first_token_ts - metrics.scheduled_ts
-                    ),
-                    output_ids=result.outputs[0].token_ids,
+            row = dict(
+                enabled=enabled,
+                policy=policy,
+                wall_seconds=wall_seconds,
+                before_memory=before_memory,
+                after_memory=after_memory,
+                scheduled_to_first_token_seconds=None,
+                output_ids=result.outputs[0].token_ids,
+            )
+            report["rows"].append(row)
+            save()
+            if metrics is None or metrics.scheduled_ts <= 0:
+                raise RuntimeError(
+                    "Prefill timestamps missing; request statistics must be enabled"
                 )
+            row["scheduled_to_first_token_seconds"] = (
+                metrics.first_token_ts - metrics.scheduled_ts
             )
             save()
             print(json.dumps(report["rows"][-1]), flush=True)
