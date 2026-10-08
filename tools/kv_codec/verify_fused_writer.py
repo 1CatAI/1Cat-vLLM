@@ -49,7 +49,7 @@ def load_source(path, source, helpers=()):
     return module
 
 
-def compare_gpu(modules, constants):
+def compare_gpu(modules, constants, graph_copies):
     assert torch.cuda.get_device_capability() == (7, 0)
     tokens = constants["TOKENS"]
     generator = torch.Generator(device="cuda").manual_seed(20261008)
@@ -108,7 +108,8 @@ def compare_gpu(modules, constants):
         )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            call()
+            for _ in range(graph_copies):
+                call()
         calls.append(graph)
     assert hashes[0] == hashes[1]
     for _ in range(50):
@@ -123,13 +124,14 @@ def compare_gpu(modules, constants):
                 calls[arm].replay()
             end.record()
             end.synchronize()
-            samples[arm].append(start.elapsed_time(end) * 1000 / 200)
+            samples[arm].append(start.elapsed_time(end) * 1000 / (200 * graph_copies))
     return {
         "bitwise_equal": True,
         "output_sha256": hashes[0],
         "timing_us": samples,
         "median_us": [statistics.median(values) for values in samples],
-        "timing_scope": "paired graph events, warm cache; not model latency",
+        "graph_copies_per_replay": graph_copies,
+        "timing_scope": "paired graph events per kernel, warm cache; not model latency",
     }
 
 
@@ -137,7 +139,29 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--run", action="store_true")
+    parser.add_argument(
+        "--graph-copies",
+        type=int,
+        default=1,
+        help="Kernel nodes per replay to amortize host submission gaps",
+    )
+    parser.add_argument(
+        "--case",
+        type=int,
+        nargs=4,
+        metavar=("TOKENS", "PLANES", "CACHE", "GATE"),
+        help="Select one existing case: tokens=1/8/32, planes=1/3, cache/gate=0/1",
+    )
     args = parser.parse_args()
+    if args.graph_copies < 1:
+        parser.error("--graph-copies must be positive")
+    if args.case and not (
+        args.case[0] in (1, 8, 32)
+        and args.case[1] in (1, 3)
+        and args.case[2] in (0, 1)
+        and args.case[3] in (0, 1)
+    ):
+        parser.error("--case must select an existing shape/write mode")
     root = Path(__file__).resolve().parents[2]
     args.out.mkdir(parents=True, exist_ok=True)
     original = subprocess.check_output(
@@ -167,6 +191,13 @@ def main():
         for planes in (1, 3):
             for store_cache in (False, True):
                 for store_gate in (False, True):
+                    if args.case and tuple(args.case) != (
+                        tokens,
+                        planes,
+                        store_cache,
+                        store_gate,
+                    ):
+                        continue
                     constants = dict(
                         STORE_GATE=store_gate,
                         STORE_CACHE=store_cache,
@@ -224,7 +255,9 @@ def main():
                     assert arms[0] == arms[1], constants
                     row = {"constants": constants, "arms": arms, "code_equal": True}
                     if args.run:
-                        row["gpu"] = compare_gpu((baseline, candidate), constants)
+                        row["gpu"] = compare_gpu(
+                            (baseline, candidate), constants, args.graph_copies
+                        )
                     rows.append(row)
     result = {
         "base_sha": BASE_SHA,

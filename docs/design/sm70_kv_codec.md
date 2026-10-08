@@ -420,9 +420,20 @@ PTX and SASS for24 explicit SM70 combinations:1/8/32 tokens,1D/3-plane RoPE,
 with/without cache writes, with/without gate publication. No register or
 instruction normalization is used. `verify_fused_writer.py --run` additionally
 checks output/cache bytes and alternating paired graph events on an idle,
-locked V100. These GPU and installed-model gates are pending; AOT equality
-is recorded separately. Native/QSA/restore writer unification and the final
+locked V100. All24 source-kernel GPU pairs now preserve output/cache bytes;
+normal installed artifact checks also pass. Installed-model and performance
+equivalence gates remain pending. AOT equality is recorded separately.
+Native/QSA/restore writer unification and the final
 single writer interface remain unfinished.
+
+Single-kernel replay events can include host submission gaps at these short
+durations. Following the unrolled-graph technique in
+[Triton's benchmark helper](https://github.com/triton-lang/triton/blob/main/python/triton/testing.py)
+(also inspected in the installed3.6.0 source), `--graph-copies 200` places200
+kernel nodes in each replay and reports event time per kernel. `--case 8 1 1 0`
+selects the positive timing outlier (eight tokens,one RoPE plane,cache writes,
+no gate) so rechecking it does not repeat all24 comparisons. The original
+single-node mode remains available. Neither mode measures model latency.
 
 Inspection of the current
 [vLLM writer](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py)

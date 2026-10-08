@@ -49244,7 +49244,14 @@ across24 cases, with extrema-5.545%/+5.823%. Identical code does not make these
 event intervals a statistical equivalence test: host replay submission gaps
 can affect such short kernels. Recheck only the positive timing outlier with
 multiple kernel nodes per replay; do not repeat the entire broad GPU suite.
-The one minimal Flash-Next QSA capture is loading under the15-minute TP4 lease.
+The minimal Flash-Next QSA capture reached model loading (736.89 seconds,
+22.01 GiB/rank) and engine profile/cache/warmup (45.95 seconds), but the15-minute
+lease expired before samples were collected. The owned process group and PLE
+worker exited; all GPUs/locks are released. There is no real QSA corpus yet.
+Do not rerun this identical cold initialization without shortening or preparing
+the necessary startup work. The request already retains verified token IDs, so
+the diagnostic token-ID path may skip tokenizer initialization; this must stay
+distinct from text/quality serving and be recorded in its capture contract.
 
 CPU K/V error attribution uses the existing12 real layer/rank samples without
 reloading models. Token/head nearest-even INT8 has roughly twice the V-only
