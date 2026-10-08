@@ -40,6 +40,14 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
+from vllm.v1.attention.kv_codecs import (
+    FP8_E4M3,
+    FP8_E5M2,
+    FP16,
+    KVCodec,
+    canonical_kv_cache_dtype,
+    resolve_kv_codec,
+)
 from vllm.v1.attention.ops.sm70_e4m3_grouped import (
     MAX_GROUPS_PER_CALL,
     grouped_e4m3_fp32_allowed,
@@ -493,8 +501,9 @@ def _batch_context_routing_for_graph_variant(
 
 def _batch_context_routing_cache_dtype_supported(cache_dtype: str | None) -> bool:
     """Admit the exact FP8 XQA formats implemented by Flash-V100."""
-    return cache_dtype == "fp8_e5m2" or (
-        cache_dtype in ("fp8", "fp8_e4m3") and envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+    codec = resolve_kv_codec(cache_dtype)
+    return codec is FP8_E5M2 or (
+        codec is FP8_E4M3 and envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
     )
 
 
@@ -620,9 +629,9 @@ def clear_flash_attn_v100_workspaces() -> None:
 
 
 def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
-    # Newer vLLM resolves an explicit FP16 cache to "float16". The vendored
-    # Flash-V100 extension uses "auto" for the same unquantized FP16 layout.
-    return "auto" if kv_cache_dtype == "float16" else kv_cache_dtype
+    # One spelling per codec: "float16" is the extension's "auto" layout and
+    # the `fp8` shorthand is E4M3, so every route sees the same format name.
+    return canonical_kv_cache_dtype(kv_cache_dtype)
 
 
 def _split_paged_kv_cache(
@@ -783,21 +792,20 @@ def _g6_aligned_page_partition_size_hint(
         and value_cache.dtype == key_cache.dtype
     ):
         return None
-    if (
-        kv_cache_dtype in ("auto", "float16", "bfloat16")
-        and key_cache.dtype == torch.float16
-        and key_cache.shape[1] == 784
-    ):
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec is None or not codec.stores(key_cache, value_cache):
+        return None
+    if codec is FP16 and key_cache.shape[1] == 784:
         # The exact FP16 page-784 graph contains p256 and p1024 nodes and
         # selects between them from device seq_lens. Plan the p256 workspace
         # envelope once.
         return 256
-    if kv_cache_dtype in ("fp8", "fp8_e4m3") and key_cache.dtype == torch.uint8:
+    if codec is FP8_E4M3:
         # Plan a p64 workspace envelope. The native G6 path keeps this captured
         # shape while selecting p64/p256 and long wave partitions from device
         # sequence lengths.
         return 64
-    if kv_cache_dtype == "fp8_e5m2" and key_cache.dtype == torch.uint8:
+    if codec is FP8_E5M2:
         # Plan the largest p256 workspace once. The extension selects p256 or
         # p1024 from device seq_lens, so CUDA graph replay keeps one
         # captured shape while short and long contexts use different kernels.
@@ -2866,14 +2874,6 @@ def _extract_contiguous_kv_from_paged_cache(
     return k_cont, v_cont
 
 
-def _fp8_dtype_from_cache_dtype(kv_cache_dtype: str) -> torch.dtype:
-    if kv_cache_dtype in ("fp8", "fp8_e4m3"):
-        return torch.float8_e4m3fn
-    if kv_cache_dtype == "fp8_e5m2":
-        return torch.float8_e5m2
-    raise ValueError(f"Unsupported FLASH_ATTN_V100 fp8 dtype: {kv_cache_dtype}")
-
-
 def _dequantize_fp8_contiguous_kv(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -2883,10 +2883,13 @@ def _dequantize_fp8_contiguous_kv(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not _uses_fp8_kv_cache(kv_cache_dtype):
         return key, value
-    fp8_dtype = _fp8_dtype_from_cache_dtype(kv_cache_dtype)
-    key = key.view(fp8_dtype).to(torch.float16) * k_scale
-    value = value.view(fp8_dtype).to(torch.float16) * v_scale
-    return key, value
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec is None or not codec.quantized:
+        raise ValueError(f"Unsupported FLASH_ATTN_V100 fp8 dtype: {kv_cache_dtype}")
+    return (
+        codec.dequantize(key, k_scale, torch.float16),
+        codec.dequantize(value, v_scale, torch.float16),
+    )
 
 
 def _contiguous_paged_start_block(
@@ -5034,8 +5037,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             "prefix_anchored_decode_window", None
         )
         super().__init__(*args, **kwargs)
-        self.kv_cache_dtype = _normalize_flash_v100_kv_cache_dtype(self.kv_cache_dtype)
         _log_kv_dtype_contract(self.kv_cache_dtype)
+        self.kv_cache_dtype = _normalize_flash_v100_kv_cache_dtype(self.kv_cache_dtype)
         (
             self.flash_attn_func,
             self.flash_attn_bhmd_func,
@@ -5050,7 +5053,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.flash_attn_grouped_verify_paged = _get_flash_grouped_verify_op()
         use_e4m3_fp32 = (
             envs.VLLM_FLASH_V100_E4M3_GROUPED_FP32
-            and self.kv_cache_dtype == "fp8_e4m3"
+            and self.kv_codec is FP8_E4M3
             and current_platform.is_device_capability(70)
         )
         self.flash_attn_grouped_e4m3_fp32_paged = (
@@ -5058,8 +5061,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         self.flash_attn_grouped_fp16_fp32_paged = (
             load_grouped_fp16_fp32()
-            if self.kv_cache_dtype in ("auto", "float16", "bfloat16")
-            and current_platform.is_device_capability(70)
+            if self.kv_codec is FP16 and current_platform.is_device_capability(70)
             else None
         )
         self._sm70_scalar_tail_attention = None
@@ -5098,9 +5100,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         self.fp8_e5m2_paged_kv_to_fp16 = _get_fp8_e5m2_paged_kv_bridge_op()
         self.fp8_e4m3_paged_kv_to_fp16 = (
-            _get_sm70_v37_e4m3_bridge_op()
-            if self.kv_cache_dtype == "fp8_e4m3"
-            else None
+            _get_sm70_v37_e4m3_bridge_op() if self.kv_codec is FP8_E4M3 else None
         )
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -5161,7 +5161,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         self.use_fp8_prefill_bridge = (
             self.fp8_e4m3_paged_kv_to_fp16 is not None
-            if self.kv_cache_dtype == "fp8_e4m3"
+            if self.kv_codec is FP8_E4M3
             else self.fp8_e5m2_paged_kv_to_fp16 is not None
         ) and os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1") != "0"
         self.use_flash_v100_prefill_splitkv = (
@@ -5290,7 +5290,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if (
                 self.prefix_anchored_decode_window <= 0
                 or self.attn_type != AttentionType.DECODER
-                or self.kv_cache_dtype != "auto"
+                or self.kv_codec is not FP16
             ):
                 raise ValueError(
                     "prefix-anchored SWA requires a positive window, causal "
@@ -5856,6 +5856,31 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             extra,
         )
 
+    @property
+    def kv_codec(self) -> KVCodec | None:
+        """Storage codec of this layer's KV cache."""
+        return resolve_kv_codec(self.kv_cache_dtype)
+
+    def _xqa_kv_codec(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> KVCodec | None:
+        """The codec when the XQA operator reads this cache natively."""
+        codec = self.kv_codec
+        if codec not in (FP16, FP8_E4M3, FP8_E5M2) or not codec.stores(
+            key_cache, value_cache
+        ):
+            return None
+        # The E4M3 XQA wave route retains half partials. A DFlash2 selector
+        # target keeps its dedicated grouped FP32 route instead.
+        if codec is FP8_E4M3 and getattr(
+            attn_metadata, "is_dflash_selector_target", False
+        ):
+            return None
+        return codec
+
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
         supported_kv_dtype = not _uses_fp8_kv_cache(
@@ -6091,7 +6116,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             # This legacy verifier stores normalized partials in FP16.
             # E4M3 must reach the repaired FP32 path below, including when
             # the old native entry advertises E4M3 byte-format support.
-            and self.kv_cache_dtype == "fp8_e5m2"
+            and self.kv_codec is FP8_E5M2
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == num_reqs
@@ -6208,25 +6233,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if q_per_kv not in (6, 8):
             return False
 
-        fp16_kv = (
-            self.kv_cache_dtype in ("auto", "float16", "bfloat16")
-            and key_cache.dtype == torch.float16
-            and value_cache.dtype == torch.float16
-        )
-        fp8_e5m2_kv = (
-            self.kv_cache_dtype == "fp8_e5m2"
-            and key_cache.dtype == torch.uint8
-            and value_cache.dtype == torch.uint8
-        )
-        fp8_e4m3_kv = (
-            self.kv_cache_dtype in ("fp8", "fp8_e4m3")
-            and key_cache.dtype == torch.uint8
-            and value_cache.dtype == torch.uint8
-            and not getattr(attn_metadata, "is_dflash_selector_target", False)
-        )
-        if not (fp16_kv or fp8_e4m3_kv or fp8_e5m2_kv):
+        codec = self._xqa_kv_codec(key_cache, value_cache, attn_metadata)
+        if codec is None:
             return False
-        if fp8_e4m3_kv and (
+        fp8_e5m2_kv = codec is FP8_E5M2
+        if codec is FP8_E4M3 and (
             q_per_kv != 6 or (query.shape[0] > 1 and not _e4m3_batch_xqa_allowed(query))
         ):
             return False
@@ -6349,9 +6360,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     and key_cache.shape[1] == 1616
                     and key_cache.shape[2] > 0
                     and query.shape[1] == 6 * key_cache.shape[2]
-                    and self.kv_cache_dtype == "fp8_e5m2"
-                    and key_cache.dtype == torch.uint8
-                    and value_cache.dtype == torch.uint8
+                    and self.kv_codec is FP8_E5M2
+                    and FP8_E5M2.stores(key_cache, value_cache)
                 )
                 else None
             )
@@ -6429,7 +6439,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         anchor_lens = getattr(attn_metadata, "prefix_anchor_lens", None)
         if (
             self.attn_type != AttentionType.DECODER
-            or self.kv_cache_dtype != "auto"
+            or self.kv_codec is not FP16
             or metadata_window != window
             or anchor_lens is None
         ):
@@ -7526,47 +7536,28 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if key_cache.shape[2] > 0 and query.shape[1] % key_cache.shape[2] == 0
             else 0
         )
-        xqa_kv_supported = (
-            (
-                self.kv_cache_dtype in ("auto", "float16", "bfloat16")
-                and key_cache.dtype == torch.float16
-                and value_cache.dtype == torch.float16
-            )
-            or (
-                self.kv_cache_dtype == "fp8_e5m2"
-                and key_cache.dtype == torch.uint8
-                and value_cache.dtype == torch.uint8
-            )
-            or (
-                self.kv_cache_dtype in ("fp8", "fp8_e4m3")
-                and key_cache.dtype == torch.uint8
-                and value_cache.dtype == torch.uint8
-                # The E4M3 XQA wave route retains half partials. A DFlash2
-                # target q1 must honor the same FP32 state policy as q8.
-                and not getattr(attn_metadata, "is_dflash_selector_target", False)
-            )
-        )
+        xqa_codec = self._xqa_kv_codec(key_cache, value_cache, attn_metadata)
 
         # FP8 G4 XQA had no end-to-end gain on 35B-A3B TP4 and has no accepted
         # sampled-quality advantage. Keep that shape on scalar decode.
         if (
             self.use_decode_xqa
             and self.flash_attn_decode_paged_xqa is not None
-            and xqa_kv_supported
+            and xqa_codec is not None
             and query.shape[0] == attn_metadata.seq_lens.shape[0]
             and query.shape[2] == 256
             and key_cache.shape[2] > 0
             and query.shape[1] % key_cache.shape[2] == 0
             and _decode_xqa_allowed_for_q_per_kv(q_per_kv, attn_metadata)
             and (
-                self.kv_cache_dtype not in ("fp8", "fp8_e4m3")
+                xqa_codec is not FP8_E4M3
                 or (
                     q_per_kv == 6
                     and (query.shape[0] == 1 or _e4m3_batch_xqa_allowed(query))
                 )
             )
             and (
-                self.kv_cache_dtype != "fp8_e5m2"
+                xqa_codec is not FP8_E5M2
                 or (q_per_kv != 4 and _decode_fp8_xqa_allowed(attn_metadata, query))
             )
             and window_size == (-1, -1)
@@ -7588,7 +7579,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             if partition_size_hint is not None:
                 if (
-                    self.kv_cache_dtype in ("fp8", "fp8_e4m3")
+                    xqa_codec is FP8_E4M3
                     and query.shape[0] == 1
                     and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1")
                     != "0"
@@ -8242,7 +8233,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> bool:
         # Eight-byte input loads and 16-byte output stores. Keep layouts
         # outside the native bridge contract on their existing fallback.
-        if self.kv_cache_dtype == "fp8_e4m3" and not all(
+        if self.kv_codec is FP8_E4M3 and not all(
             tensor.ndim == 4
             and tensor.stride(-1) == 1
             and tensor.data_ptr() % 16 == 0
@@ -8253,9 +8244,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         return (
             self.use_fp8_prefill_bridge
             and self.use_flash_v100_prefill_paged
-            and self.kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2")
-            and key_cache.dtype == torch.uint8
-            and value_cache.dtype == torch.uint8
+            and self.kv_codec in (FP8_E4M3, FP8_E5M2)
+            and self.kv_codec.stores(key_cache, value_cache)
             and key_cache.shape == value_cache.shape
             and head_dim == 256
             and q_len >= 32
@@ -8302,7 +8292,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         key_out, value_out, output_block_table = workspace
         bridge = (
             self.fp8_e4m3_paged_kv_to_fp16
-            if self.kv_cache_dtype == "fp8_e4m3"
+            if self.kv_codec is FP8_E4M3
             else self.fp8_e5m2_paged_kv_to_fp16
         )
         if bridge is None:
@@ -8390,7 +8380,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             output_block_table,
             seq_lens,
             softmax_scale=self.scale,
-            kv_cache_dtype="auto",
+            kv_cache_dtype=FP16.name,
             k_scale=1.0,
             v_scale=1.0,
             causal=causal,
@@ -8680,30 +8670,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if num_kv_heads > 0 and num_heads % num_kv_heads == 0
             else 0
         )
-        fp16_kv = (
-            self.kv_cache_dtype in ("auto", "float16", "bfloat16")
-            and key_cache.dtype == torch.float16
-            and value_cache.dtype == torch.float16
-        )
-        fp8_e5m2_kv = (
-            self.kv_cache_dtype == "fp8_e5m2"
-            and key_cache.dtype == torch.uint8
-            and value_cache.dtype == torch.uint8
-        )
-        fp8_e4m3_kv = (
-            self.kv_cache_dtype in ("fp8", "fp8_e4m3")
-            and key_cache.dtype == torch.uint8
-            and value_cache.dtype == torch.uint8
-            # DFlash2 selector rows keep their dedicated grouped FP32 route.
-            and not getattr(attn_metadata, "is_dflash_selector_target", False)
-        )
+        xqa_codec = self._xqa_kv_codec(key_cache, value_cache, attn_metadata)
+        fp8_e4m3_kv = xqa_codec is FP8_E4M3
+        fp8_e5m2_kv = xqa_codec is FP8_E5M2
         # Same selection as the uniform-decode path (_flash_v100_decode), with
         # the sequence hint taken from this batch's rows because build() only
         # attaches decode shape hints when max_query_len == 1.
         use_xqa = (
             self.use_decode_xqa
             and self.flash_attn_decode_paged_xqa is not None
-            and (fp16_kv or fp8_e5m2_kv or fp8_e4m3_kv)
+            and xqa_codec is not None
             and int(query.shape[2]) == 256
             and (
                 q_per_kv in (6, 8)
@@ -8729,7 +8705,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
         )
         if (
-            self.kv_cache_dtype == "fp8_e4m3"
+            self.kv_codec is FP8_E4M3
             and not use_xqa
             and self._run_mixed_rows_grouped_e4m3(
                 layer,
@@ -9499,7 +9475,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             _logged_fp8_prefill_bridge = True
                         _record_route(
                             "prefill_prefix_fp8_e4m3_bridge"
-                            if self.kv_cache_dtype == "fp8_e4m3"
+                            if self.kv_codec is FP8_E4M3
                             else "prefill_prefix_fp8_e5m2_bridge"
                         )
                     else:

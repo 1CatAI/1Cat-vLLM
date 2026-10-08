@@ -6,6 +6,8 @@ import os
 
 import torch
 
+from vllm.v1.attention.kv_codecs import FP8_E4M3, resolve_kv_codec
+
 
 def load_grouped_e4m3_fp32():
     try:
@@ -50,7 +52,7 @@ def grouped_e4m3_fp32_groups_allowed(
             return False
     return bool(
         getattr(instance, "flash_attn_grouped_e4m3_fp32_paged", None) is not None
-        and instance.kv_cache_dtype == "fp8_e4m3"
+        and resolve_kv_codec(instance.kv_cache_dtype) is FP8_E4M3
         and instance.use_smallq_decode_xqa
         and not os.environ.get("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
         and causal
@@ -107,7 +109,7 @@ def grouped_e4m3_fp32_allowed(
     if not (
         getattr(instance, "flash_attn_grouped_e4m3_fp32_paged", None) is not None
         and batch_supported
-        and instance.kv_cache_dtype == "fp8_e4m3"
+        and resolve_kv_codec(instance.kv_cache_dtype) is FP8_E4M3
         and instance.use_smallq_decode_xqa
         and partition_size_hint is None
         and not os.environ.get("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
