@@ -130,5 +130,15 @@
     "_contiguous_paged_start_block": "6443bd6c41dbffd1056f56859de98ac714f09694f642a70387b489671440051e",
     "_contiguous_paged_kv_view": "f353916ca4b704d0c13955606c35882fa4e202b251c4e31443ec8842f1cb17f8",
     "_contiguous_paged_kv_bhmd": "f1f412ae4a01972d164ba56a17649b7922e9a1e74d178d45b430dd2025d802b2"
-  }
+  },
+  "qwen_rope_host_ast": {
+    "qk_norm_rope": "3ad9f64632cf91f1717fb83d02b8d9ec26cc43f13d8456b472eaed1f768f71c9",
+    "_prepare_with_cache": "54af13039e3104dd9e459fb9a940a81328ac792b0973dd19cc009f7ecf469c3c",
+    "sm70_qwen38_qk_norm_rope_cache": "8300bb710da1377e14ec0a5cb36cc1bba26804289bf4cc39f991a4d609a08874",
+    "sm70_qwen38_qk_norm_rope_cache_fake": "6661b25f0d23dc86f1f8072ce5d676098de89ad858ffadbe3195ecc34d268669"
+  },
+  "qwen_rope_encoder_ast": {
+    "_e4m3_satfinite": "43f5b4a71fd085b8b159fce2f386bc0ce0fcf6b928526630dcfaa6af7c476c64"
+  },
+  "qwen_rope_kernel_ast": "5904f612a59f32b539cfdd97c1423e6d93509a8a555cea7a5f6cfb8edc76ba9f"
 }

@@ -70,7 +70,7 @@ include the header.
 
 Python conversion helpers move to `flash_v100/codec.py`; metadata helpers move
 to `flash_v100/metadata.py`. The original backend reexports their names. The
-remaining implementation/builder, routing, native/fused/QSA/restore writers,
+remaining implementation/builder, routing, native/DFlash2/QSA/restore writers,
 host ownership and configuration are **not yet migrated**. Dense page accounting and the existing
 Triton inline scale views now share a storage descriptor as described below. This is an independently revertible
 first review scope, not an uncalled registry claiming the final architecture.
@@ -96,8 +96,9 @@ production and using the same source for both arms. No instruction or register
 names are stripped from PTX comparison. The normally built complete SM70 FA2
 extension also retains identical SASS, including instruction encodings; only
 compiler anonymous-namespace source-path hashes are normalized. GPU output and
-performance gates for this continuation remain pending. Earlier scalar-reader
-GPU measurements must not be relabeled as packed-reader runtime measurements.
+performance gates remain separate. Subsequent authorized 54633 execution
+compares all scalar and packed probe bytes successfully; those are reader
+gates, not model or end-to-end performance qualification.
 
 ## Mask and reference boundaries
 
@@ -339,6 +340,34 @@ rejections remain unsupported; this does not admit new accelerated INT8 paths.
 The same normal installed wheel passes 197 policy and four GPU metadata tests
 with source-tree imports excluded and native extensions loaded normally.
 
+### Fused Qwen norm/RoPE writer
+
+The existing Qwen fused writer's E4M3 software byte encoder now lives in the
+same tile-codec module. Its old import name remains available. Scaling uses
+the original precise FP32 division, then the original satfinite/RNE bit
+conversion. Host admission, Q/K normalization, rotary math, gate/output stores,
+cache addressing, padding and launches are guarded against immutable source.
+There is no new format admission or changed default.
+
+This preserves the existing local implementation rather than adopting a new
+cast: [Triton's precise division](https://triton-lang.org/main/python-api/generated/triton.language.div_rn.html)
+and [CUDA's FP8 conversion contract](https://docs.nvidia.com/cuda/cuda-math-api/cuda_math_api/group__CUDA__MATH__FP8__MISC.html)
+make rounding and saturation explicit. Generic typed E4M3 stores remain
+unsupported in the existing SM70 Triton compiler; moving this already-supported
+manual encoder does not silently replace or admit those compiler paths.
+
+Keep K scaling and byte conversion as two codec operations. The first attempt
+combined them inside the store expression, moving pointer calculations in PTX;
+ptxas then changed the preceding RMSNorm FMA accumulation order in SASS.
+That variant is rejected. Preserving the evaluation boundary gives identical
+PTX and SASS for24 explicit SM70 combinations:1/8/32 tokens,1D/3-plane RoPE,
+with/without cache writes, with/without gate publication. No register or
+instruction normalization is used. `verify_fused_writer.py --run` additionally
+checks output/cache bytes and alternating paired graph events on an idle,
+locked V100. These GPU and installed-model gates are pending; AOT equality
+is recorded separately. Native/QSA/restore writer unification and the final
+single writer interface remain unfinished.
+
 Inspection of the current
 [vLLM writer](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py)
 found newer integer rounding logic. The immutable local writer instead truncates
@@ -486,9 +515,10 @@ No setup source change or private extension copy is required. Optional Rust
 frontend compilation is skipped by the existing normal workflow because the
 Rust compiler is absent; this wheel exercises the Python/SM70 path.
 
-The local PCIe/GPU outage remains; the user requested continued source/CPU work
-without waiting for V100. Native writer/model/graph/route/performance and real
-request format-selection gates remain pending. Source and package success do
+The local PCIe/GPU outage remains; the user subsequently authorized 54633.
+Reader/writer and installed policy/metadata execution there is recorded above.
+Full writer/model/graph/route/performance and three-model request format-selection
+gates remain pending. Source and package success do
 not complete the full refactor or admit INT8. The inventory now reports both
 physical backend counts and backend-plus-module counts: 89 environment names,
 134 dtype tokens, 26 dtype predicates and 52 route calls remain. No switch has

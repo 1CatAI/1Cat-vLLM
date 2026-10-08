@@ -6,23 +6,10 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
-
-
-@triton.jit
-def _e4m3_satfinite(value):
-    bits = value.to(tl.uint32, bitcast=True)
-    sign = (bits >> 24) & 0x80
-    absolute_bits = bits & 0x7FFFFFFF
-    absolute = absolute_bits.to(tl.float32, bitcast=True)
-    limited = tl.minimum(absolute, 448.0)
-    limited_bits = limited.to(tl.uint32, bitcast=True)
-    # RNE to three fraction bits. The normal exponent bias is 7.
-    normal = (limited_bits - 0x3C000000 + 0x7FFFF + ((limited_bits >> 20) & 1)) >> 20
-    # Adding 2**14 gives an FP32 ULP of 2**-9, the FP8 subnormal step.
-    subnormal = (limited + 16384.0).to(tl.uint32, bitcast=True) - 0x46800000
-    code = tl.where(limited < 0.015625, subnormal, normal)
-    code = tl.where(absolute_bits > 0x7F800000, 0x7F, code)
-    return (code | sign).to(tl.uint8)
+from vllm.v1.attention.ops.kv_codec import (
+    _e4m3_satfinite,
+    scale_kv_e4m3_per_tensor,
+)
 
 
 @triton.jit
@@ -109,12 +96,13 @@ def _qk_norm_rope(
                 + col
             )
             if head == 6:
-                scaled = tl.div_rn(processed.to(tl.float32), tl.load(KScale))
+                scaled = scale_kv_e4m3_per_tensor(processed, KScale)
                 tl.store(KCache + offset, _e4m3_satfinite(scaled))
             elif head == 0:
                 value = tl.load(QKV + token * ROW + 3328 + col).to(tl.float32)
                 tl.store(
-                    VCache + offset, _e4m3_satfinite(tl.div_rn(value, tl.load(VScale)))
+                    VCache + offset,
+                    _e4m3_satfinite(scale_kv_e4m3_per_tensor(value, VScale)),
                 )
 
 

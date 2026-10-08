@@ -90,6 +90,7 @@ CHECK_IMPORTS = {
             # no active driver. The runtime shim supplies non-JIT placeholders
             # in that environment and does not export compiler/backend APIs.
             "tools/kv_codec/verify_triton_writer.py",
+            "tools/kv_codec/verify_fused_writer.py",
             # Standalone source-built kernel screen: run before installing a
             # vLLM runtime, including CPU-only layout tests and compilation.
             "benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py",

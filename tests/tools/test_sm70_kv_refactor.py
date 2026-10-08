@@ -25,6 +25,7 @@ MASKING = BACKEND.parent / "flash_v100/masking.py"
 REFERENCE = BACKEND.parent / "flash_v100/reference.py"
 CACHE_VIEW = BACKEND.parent / "flash_v100/cache_view.py"
 TRITON_WRITER = ROOT / "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py"
+FUSED_WRITER = ROOT / "vllm/model_executor/layers/attention/sm70_qwen38_qk_rope.py"
 
 
 @pytest.mark.parametrize(
@@ -37,6 +38,8 @@ TRITON_WRITER = ROOT / "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py"
         ("reference_ast", REFERENCE),
         ("cache_view_ast", CACHE_VIEW),
         ("triton_writer_host_ast", TRITON_WRITER),
+        ("qwen_rope_host_ast", FUSED_WRITER),
+        ("qwen_rope_encoder_ast", TRITON_WRITER.parent / "kv_codec.py"),
     ],
 )
 def test_original_numerics_and_dispatch_are_unchanged(group, path):
@@ -191,6 +194,43 @@ def test_triton_writer_addressing_and_typed_stores_are_preserved():
         hashlib.sha256(ast.dump(ranges, include_attributes=False).encode()).hexdigest()
         == FIXTURE["triton_writer_range_ast"]
     )
+
+
+class _EraseFusedCodecExpressions(ast.NodeTransformer):
+    """Only the two legacy cache-scaling expressions move to the codec."""
+
+    def visit_Call(self, node):
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "scale_kv_e4m3_per_tensor"
+        ):
+            values, scale = (ast.unparse(arg) for arg in node.args)
+            assert values in {"processed", "value"}
+            # K first becomes FP32; V was already FP32 in the original writer.
+            if values == "processed":
+                values += ".to(tl.float32)"
+            return ast.parse(f"tl.div_rn({values}, tl.load({scale}))", mode="eval").body
+        return self.generic_visit(node)
+
+
+def test_fused_writer_math_addresses_stores_and_launch_are_preserved():
+    tree = ast.parse(FUSED_WRITER.read_text())
+    kernel = next(n for n in tree.body if getattr(n, "name", None) == "_qk_norm_rope")
+    restored = _EraseFusedCodecExpressions().visit(kernel)
+    assert (
+        hashlib.sha256(
+            ast.dump(restored, include_attributes=False).encode()
+        ).hexdigest()
+        == FIXTURE["qwen_rope_kernel_ast"]
+    )
+    imports = {
+        name.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "vllm.v1.attention.ops.kv_codec"
+        for name in node.names
+    }
+    assert "_e4m3_satfinite" in imports
 
 
 def test_path_matrix_covers_static_and_dynamic_route_sites():

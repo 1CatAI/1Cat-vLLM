@@ -937,5 +937,33 @@
     "route_log_assertions_passed": true,
     "format_results": "sm70_kv_initial_request_errors.json",
     "scope": "initial arithmetic data; not three-model format selection, calibrated E4M3 admission, speed or quality qualification"
+  },
+  "fused_qwen_writer_extraction": {
+    "status": "source/compiler gate only; GPU and installed model pending",
+    "immutable_base_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+    "sm70_compiler_pairs": 24,
+    "tokens": [
+      1,
+      8,
+      32
+    ],
+    "rope_planes": [
+      1,
+      3
+    ],
+    "cache_write_modes": [
+      false,
+      true
+    ],
+    "gate_write_modes": [
+      false,
+      true
+    ],
+    "ptx_equal": true,
+    "sass_equal": true,
+    "original_encoder_ast_preserved": true,
+    "host_and_kernel_math_addressing_guarded": true,
+    "rejected_variant": "Scaling and byte encoding combined inside K store expression changes pointer evaluation and ptxas RMSNorm FMA order; retain separate codec scale and byte operations.",
+    "scope": "No new INT8/default/unsupported compiler admission or performance claim"
   }
 }

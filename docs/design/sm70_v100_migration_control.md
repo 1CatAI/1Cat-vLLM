@@ -49178,3 +49178,12 @@ byte-identical to source477; complete SM70 FA2 SASS matches with only namespace
 path hashes normalized. An absent `patchelf` on PATH caused the first packaging
 failure; the normal retry with declared environment tools completed. No setup
 patch, borrowed DSO or runtime-library override was used.
+
+The fused Qwen norm/RoPE writer now shares the Triton codec's software E4M3
+encoder and precise scale operation. All24 SM70 AOT pairs retain identical
+PTX/SASS; host and reconstructed kernel ASTs preserve original math, addresses
+and launches. Do not combine K scaling/casting inside its store expression:
+that rejected form changed pointer evaluation and ptxas RMSNorm FMA order.
+GPU/operator and installed-model gates remain pending while another TP4 job
+occupies the authorized host. Page448 wheel has installed normally with
+compatible declared dependencies; no occupied GPU was used for validation.
