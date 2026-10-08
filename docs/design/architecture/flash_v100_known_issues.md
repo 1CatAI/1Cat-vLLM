@@ -37,3 +37,13 @@ Baseline: #1060 `8c96e32e56c09d4a3e3112cb5d1a367571f69476`.
   with `git diff` over CMakeLists.txt and csrc; both comparison arms must use
   the same rebuilt artifact. The original #1060 eight-argument workloads retain
   their original binary contract.
+
+- DFlash2's first real-model baseline with compile mode 3, FULL graphs and a
+  1024-token budget fails in compiled warmup: the existing SM70 profile extends
+  a compile range to 1025 while DFlash's hidden-state buffer has capacity 1024.
+  This is reproduced on #1060 before A3 changes. Preserve
+  `dflash-parent-compile-range-failure.log` and its exact engine JSON on 54633.
+  The parity workload now explicitly requests compile mode 0 with FULL CUDA
+  Graphs and capture size 8 on both arms; the buffer-capacity bug is not repaired
+  here. This establishes a separate contract, not success of the failed compile
+  configuration. Backend graph replay remains a mandatory numerical/pointer gate.
