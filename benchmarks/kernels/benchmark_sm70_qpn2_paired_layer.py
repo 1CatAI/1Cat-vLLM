@@ -80,6 +80,7 @@ def main():
     parser.add_argument("--warp-publish", action="store_true")
     parser.add_argument("--dump-gdn-inputs", type=Path)
     parser.add_argument("--hybrid-snapshot", action="store_true")
+    parser.add_argument("--hybrid-snapshots", type=int, choices=(1, 4), default=4)
     parser.add_argument("--inline-conv", action="store_true")
     parser.add_argument("--ba-order-extension", type=Path)
     parser.add_argument("--epilogue-scale-extension", type=Path)
@@ -92,6 +93,8 @@ def main():
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     rank = int(os.environ["LOCAL_RANK"])
+    rank_source = args.out / f"rank{rank}-source"
+    rank_source.mkdir(parents=True, exist_ok=True)
     torch.cuda.set_device(rank)
     torch.set_num_threads(1)
     torch.set_grad_enabled(False)
@@ -304,6 +307,7 @@ def main():
     conv_indices = torch.zeros(1, device="cuda", dtype=torch.int32)
     eviction = torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
 
+    hybrid_source_sha256 = None
     state_seeds = None
     prime_hybrid = False
     factor_caches = None
@@ -311,7 +315,9 @@ def main():
         from benchmark_sm70_gdn_hybrid_snapshot import candidate_module, launch, recover
 
         assert not args.prepared_qk and fused_projection is None and args.mode == 0
-        hybrid_kernel, _ = candidate_module(args.out)
+        hybrid_kernel, hybrid_source_sha256 = candidate_module(
+            rank_source, args.hybrid_snapshots
+        )
         factor_caches = [
             [torch.empty(8, 12, 128, device=x.device) for _ in range(2)]
             + [torch.empty(8, 12, device=x.device)]
@@ -319,6 +325,7 @@ def main():
         ]
 
         def hybrid_delta(a_log, a, b, bias, qkv, h, hv, k, v, out, **kwargs):
+            seen_routes.add("hybrid_snapshot")
             assert (h, hv, k, v) == (4, 12, 128, 128)
             launch(
                 hybrid_kernel,
@@ -349,7 +356,7 @@ def main():
         assert args.mode == 0 and not args.hybrid_snapshot and not args.prepared_qk
         assert cooperative is None and packet_norm is None and fused_projection is None
         assert args.dump_gdn_inputs is None
-        inline_kernel, inline_source_sha256 = candidate_module(args.out)
+        inline_kernel, inline_source_sha256 = candidate_module(rank_source)
         inline_ready = torch.zeros(4, 192, device=x.device, dtype=torch.uint32)
 
     def reset(arm=0):
@@ -600,6 +607,7 @@ def main():
             *factor_caches[1],
             recovered,
             state.stride(0),
+            SNAPSHOTS=args.hybrid_snapshots,
             num_warps=1,
         )
         reconstructed = state.clone()
@@ -720,6 +728,7 @@ def main():
         "prepared_qk": args.prepared_qk,
         "projection_conv": fused_projection is not None,
         "hybrid_snapshot": args.hybrid_snapshot,
+        "hybrid_snapshots": args.hybrid_snapshots,
         "cooperative_core": cooperative is not None,
         "cooperative_qk_cache": not args.cooperative_no_qk_cache,
         "norm_partial_packets": packet_norm is not None,
@@ -734,12 +743,19 @@ def main():
         "head_local_core": head_local is not None,
         "head_local_convolution": args.head_local_convolution,
         "inline_source_sha256": inline_source_sha256,
+        "hybrid_source_sha256": hybrid_source_sha256,
         "accepted": args.accepted,
         "four_amplitudes": [0.01, 0.125, 1.0, 4.0],
         "scope": (
             "Complete real-weight TP4 layer0 GDN graph; "
             + (
-                "unchanged projections/BV2 recurrence; inline conv/gating/history/zero."
+                "unchanged projections/BV2 recurrence; exact factor replay with "
+                f"{args.hybrid_snapshots} state snapshots."
+                if args.hybrid_snapshot
+                else (
+                    "unchanged projections/BV2 recurrence; "
+                    "inline conv/gating/history/zero."
+                )
                 if inline_kernel is not None
                 else "unchanged projections/core; per-part variance-generation packets."
                 if packet_norm is not None

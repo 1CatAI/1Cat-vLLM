@@ -23,7 +23,8 @@ from vllm.model_executor.layers.fla.ops.op import exp
 from vllm.triton_utils import tl, triton
 
 
-def candidate_module(directory):
+def candidate_module(directory, snapshots=4):
+    assert snapshots in (1, 4)
     source = Path(gdn.__file__).read_text()
     begin = source.index("@triton.heuristics(")
     end = source.index("\ndef fused_sigmoid_gating_delta_rule_update(", begin)
@@ -87,14 +88,19 @@ def candidate_module(directory):
         + "\n\n"
         + kernel[end:]
     )
-    generated = directory / "hybrid_snapshot_generated.py"
+    if snapshots == 1:
+        kernel = kernel.replace("tl.minimum(i_t, 3)", "tl.minimum(i_t, 0)")
+        kernel = kernel.replace("range(4, count)", "range(1, count)")
+        kernel = kernel.replace("if i_t >= 4:", "if i_t >= 1:")
+        kernel = kernel.replace("if i_t < 4:", "if i_t < 1:")
+    generated = directory / f"hybrid_snapshot_generated{snapshots}.py"
     text = (
         "from vllm.triton_utils import triton, tl\n"
         "from vllm.model_executor.layers.fla.ops.op import exp\n\n" + kernel
     )
     generated.write_text(text)
     spec = importlib.util.spec_from_file_location(
-        "hybrid_snapshot_generated", generated
+        f"hybrid_snapshot_generated{snapshots}", generated
     )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -103,16 +109,25 @@ def candidate_module(directory):
 
 
 @triton.jit
-def recover(State, Indices, KCache, VCache, GCache, Out, STRIDE: tl.constexpr):
+def recover(
+    State,
+    Indices,
+    KCache,
+    VCache,
+    GCache,
+    Out,
+    STRIDE: tl.constexpr,
+    SNAPSHOTS: tl.constexpr = 4,
+):
     tile, sequence_head = tl.program_id(0), tl.program_id(1)
     snapshot, head = sequence_head // 12, sequence_head % 12
     k = tl.arange(0, 128)
     v = tile * 2 + tl.arange(0, 2)
-    slot = tl.load(Indices + tl.minimum(snapshot, 3))
+    slot = tl.load(Indices + tl.minimum(snapshot, SNAPSHOTS - 1))
     value = tl.load(
         State + slot * STRIDE + head * 16384 + v[:, None] * 128 + k[None, :]
     )
-    for step in range(4, snapshot + 1):
+    for step in range(SNAPSHOTS, snapshot + 1):
         rk = tl.load(KCache + (step * 12 + head) * 128 + k)
         rv = tl.load(VCache + (step * 12 + head) * 128 + v)
         rg = tl.load(GCache + step * 12 + head)

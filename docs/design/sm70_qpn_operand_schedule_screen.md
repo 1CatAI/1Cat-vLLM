@@ -326,6 +326,29 @@ kernel uses 54 registers and 10144 shared bytes without spills but loses
 one removed node; its node-count guard failed before timing. The corrected
 guard requires two. Reject the implementation, not the numerical gate.
 
+## Exact factor replay and dead-output removal
+
+The hybrid snapshot screen now supports one or four retained full states. The
+one-state variant preserves the state after the first token, caches exact FP32
+rank-1 factors for later tokens, and reconstructs the accepted prefix in the
+next invocation. All accepted lengths 1--8 and all four input amplitudes
+recover output/history/state bitwise on all TP4 ranks.
+
+Critical-rank paired layer savings for accepted lengths 1--8 are respectively
+1.464, -0.087, 0.066, -0.522, -1.203, -1.577, -1.249 and -2.729 us. Applying
+the accepted-length histograms from the admitted eight-prompt 1K/8K fixture
+predicts -0.0039/+0.0005 ms across 48 GDN layers. Reject this latency route:
+replay cancels the eliminated writes. The screen retains the original physical
+state allocation; it proves neither a deployed memory reduction nor request
+reuse/prefill transitions. A first run raced on a shared generated Python
+file before timing. Per-rank source directories fix that harness race.
+
+The head-local vectorized core also supports eliminating unused raw-output
+stores and cooperative initialization of its small shared value vector. The
+whole-layer result is 159.427 to 159.114 us, a 0.312-us saving with 95% CI
+[-0.251, 0.896]. Its interval crosses zero; this does not justify promotion or
+another service benchmark. Retain the result as a rejected screen.
+
 ## Reproduction and evidence
 
 Benchmarks are under `benchmarks/kernels/`:

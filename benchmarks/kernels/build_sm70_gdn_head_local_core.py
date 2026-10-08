@@ -228,6 +228,27 @@ def vector_state_source():
     return text.replace(old, new)
 
 
+def remove_raw_stores(text):
+    old = """  if(lane==0) {
+#pragma unroll
+    for(int t=0;t<8;++t) {
+      values[t][warp*2]=__float2half(0.f);
+      values[t][warp*2+1]=__float2half(0.f);
+      raw[t*1536+head*128+vbase]=__float2half(0.f);
+      raw[t*1536+head*128+vbase+1]=__float2half(0.f);
+    }
+  }"""
+    assert text.count(old) == 1
+    text = text.replace(
+        old,
+        "  if(threadIdx.x<128)\n"
+        "    values[threadIdx.x/16][threadIdx.x%16]=__float2half(0.f);",
+    )
+    old = "          raw[t*1536+head*128+vbase+v]=value;\n"
+    assert text.count(old) == 1
+    return text.replace(old, "")
+
+
 CONV_HELPERS = r"""
 __device__ __forceinline__ half head_conv_value(const half* input,
     const half* old, const half* weights, int t, int feature, int old_feature) {
@@ -390,6 +411,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--vector-state", action="store_true")
     parser.add_argument("--convolution", action="store_true")
+    parser.add_argument("--no-raw-stores", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     source = args.out / "head_local_core.cu"
@@ -400,11 +422,16 @@ def main():
         if args.vector_state
         else SOURCE
     )
+    if args.no_raw_stores:
+        assert args.vector_state and not args.convolution
+        text = remove_raw_stores(text)
     if not source.exists() or source.read_text() != text:
         source.write_text(text)
     load(
         name="gdn_head_local_convolution_screen"
         if args.convolution
+        else "gdn_head_local_no_raw_screen"
+        if args.no_raw_stores
         else "gdn_head_local_vector_state_screen"
         if args.vector_state
         else "gdn_head_local_core_screen",
