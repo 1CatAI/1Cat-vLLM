@@ -1,0 +1,1912 @@
+{
+  "status": "operator_screen_only_not_end_to_end",
+  "source_base": "c4f6245f841466782752a8c3283e4727565cf17a",
+  "hardware": "4xV100-SXM2-32GB all-pair NV2",
+  "sm_clock_mhz": 1290,
+  "memory_clock_mhz": 877,
+  "torch": "2.10.0+cu128",
+  "cuda": "12.8",
+  "round_goal_ms": 12,
+  "lower_bounds": {
+    "base_source": "c4f6245f841466782752a8c3283e4727565cf17a",
+    "memory_clock_mhz": 877,
+    "sm_clock_mhz": 1290.0,
+    "peak_hbm_gbps": 898.048,
+    "warp_issue_slots_per_second": 412800000000.0,
+    "timing_policy": "No new baseline run. Old resident/trace data is reference only; 54633 gains require same-wheel A/B.",
+    "rows": [
+      {
+        "role": "target.in_proj_qkvz",
+        "payload_read_bytes": 476364800,
+        "peak_hbm_floor_ms": 0.5304446978335233,
+        "logical_weight_values": 1007738880,
+        "mma_flops": 16123822080,
+        "measured_resident_chain_ms": 1.3204992055892943,
+        "measured_scope": "Isolated shipped projection operators on actual resident model banks; existing non-DMV gate pairs include separate silu_and_mul. Excludes intervening attention, state, collectives and graph gaps; byte count excludes non-DMV banks",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "target.out_proj",
+        "payload_read_bytes": 188743680,
+        "peak_hbm_floor_ms": 0.2101710376282782,
+        "logical_weight_values": 377487360,
+        "mma_flops": 6039797760,
+        "measured_resident_chain_ms": 0.48209919929504397,
+        "measured_scope": "Isolated shipped projection operators on actual resident model banks; existing non-DMV gate pairs include separate silu_and_mul. Excludes intervening attention, state, collectives and graph gaps; byte count excludes non-DMV banks",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "target.gate_up_proj",
+        "payload_read_bytes": 1345848352,
+        "peak_hbm_floor_ms": 1.4986374358608894,
+        "logical_weight_values": 2807562240,
+        "mma_flops": 44920995840,
+        "measured_resident_chain_ms": 2.61332483291626,
+        "measured_scope": "Isolated shipped projection operators on actual resident model banks; existing non-DMV gate pairs include separate silu_and_mul. Excludes intervening attention, state, collectives and graph gaps; byte count excludes non-DMV banks",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "target.down_proj",
+        "payload_read_bytes": 723568334,
+        "peak_hbm_floor_ms": 0.8057123160454676,
+        "logical_weight_values": 1426063360,
+        "mma_flops": 22817013760,
+        "measured_resident_chain_ms": 1.3867519855499268,
+        "measured_scope": "Isolated shipped projection operators on actual resident model banks; existing non-DMV gate pairs include separate silu_and_mul. Excludes intervening attention, state, collectives and graph gaps; byte count excludes non-DMV banks",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "target.qkv_proj",
+        "payload_read_bytes": 141117440,
+        "peak_hbm_floor_ms": 0.15713797035347776,
+        "logical_weight_values": 293601280,
+        "mma_flops": 4697620480,
+        "measured_resident_chain_ms": 0.4444671988487244,
+        "measured_scope": "Isolated shipped projection operators on actual resident model banks; existing non-DMV gate pairs include separate silu_and_mul. Excludes intervening attention, state, collectives and graph gaps; byte count excludes non-DMV banks",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "target.o_proj",
+        "payload_read_bytes": 61194240,
+        "peak_hbm_floor_ms": 0.06814139110604334,
+        "logical_weight_values": 125829120,
+        "mma_flops": 2013265920,
+        "measured_resident_chain_ms": 0.15528959929943087,
+        "measured_scope": "Isolated shipped projection operators on actual resident model banks; existing non-DMV gate pairs include separate silu_and_mul. Excludes intervening attention, state, collectives and graph gaps; byte count excludes non-DMV banks",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "target_head",
+        "payload_read_bytes": 198656000,
+        "peak_hbm_floor_ms": 0.22120866590649943,
+        "profiled_reference_service_ms": 0.25261664285714286,
+        "measured_scope": "old diagnostic trace; not 54633 A/B",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "draft_shared_head",
+        "payload_read_bytes": 198656000,
+        "peak_hbm_floor_ms": 0.22120866590649943,
+        "profiled_reference_service_ms": 0.2562875,
+        "measured_scope": "old diagnostic trace; not 54633 A/B",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "draft.context_fc.u8",
+        "payload_read_bytes": 36864000,
+        "peak_hbm_floor_ms": 0.04104903078677309,
+        "provenance": "source shapes and current u8/fp16 loader layout; not measured DRAM traffic",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "draft.selector_hidden.fp16",
+        "payload_read_bytes": 2621440,
+        "peak_hbm_floor_ms": 0.002919042189281642,
+        "provenance": "source shapes and current u8/fp16 loader layout; not measured DRAM traffic",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "draft.replicated_convolution_projection.fp16",
+        "payload_read_bytes": 131072000,
+        "peak_hbm_floor_ms": 0.1459521094640821,
+        "provenance": "source shapes and current u8/fp16 loader layout; not measured DRAM traffic",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "draft.query_projections.u8",
+        "payload_read_bytes": 449740800,
+        "peak_hbm_floor_ms": 0.5007981755986317,
+        "provenance": "source shapes and current u8/fp16 loader layout; not measured DRAM traffic",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "draft.fused_context_kv.fp16",
+        "payload_read_bytes": 26214400,
+        "peak_hbm_floor_ms": 0.02919042189281642,
+        "provenance": "source shapes and current u8/fp16 loader layout; not measured DRAM traffic",
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "target.GDN_state",
+        "mandatory_state_read_bytes": 37748736,
+        "speculative_state_write_bytes": 301989888,
+        "total_state_bytes": 339738624,
+        "peak_hbm_floor_ms": 0.3783078677309008,
+        "provenance": "fused_recurrent.py: one FP32 initial state and a full FP32 snapshot per live token; M8/C1",
+        "profiled_reference_service_ms": 1.0481098571428573,
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "target_attention.unique_kv_1k",
+        "unique_read_bytes": 8388608,
+        "peak_hbm_floor_ms": 0.009340935005701254,
+        "actual_dram_bytes": null,
+        "decode_warp_instructions": null
+      },
+      {
+        "role": "draft_attention.unique_kv_1k",
+        "unique_read_bytes": 5242880,
+        "peak_hbm_floor_ms": 0.005838084378563284,
+        "actual_dram_bytes": null,
+        "decode_warp_instructions": null
+      }
+    ],
+    "communication": {
+      "target_layer_collectives": 128,
+      "bytes_per_collective": 81920,
+      "remote_bytes_sent_per_card_per_collective": 245760,
+      "pair_nv2_one_way_peak_gbps": 50,
+      "aggregate_three_peer_peak_gbps": 150,
+      "serialization_floor_ms": 0.2097152,
+      "synchronization_latency_floor_ms": null,
+      "profiled_reference_category_calls": 130,
+      "profiled_reference_service_ms": 1.5694151428571428,
+      "note": "128 layer reductions; trace category also includes other reductions; peak link floor excludes protocol and dependencies"
+    },
+    "recovered_missing_banks": [
+      {
+        "module": "model.layers.3.self_attn.qkv_proj",
+        "bytes": 5181440,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.7.self_attn.qkv_proj",
+        "bytes": 9123840,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.9.linear_attn.in_proj_qkvz",
+        "bytes": 10219520,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.10.linear_attn.in_proj_qkvz",
+        "bytes": 9605120,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.11.self_attn.qkv_proj",
+        "bytes": 8785920,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.12.linear_attn.in_proj_qkvz",
+        "bytes": 9605120,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.13.linear_attn.in_proj_qkvz",
+        "bytes": 9605120,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.13.mlp.gate_up_proj",
+        "bytes": 12011520,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.14.linear_attn.in_proj_qkvz",
+        "bytes": 7454720,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.15.self_attn.qkv_proj",
+        "bytes": 9246720,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.16.mlp.down_proj",
+        "bytes": 11141120,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.17.linear_attn.in_proj_qkvz",
+        "bytes": 8806400,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.18.linear_attn.in_proj_qkvz",
+        "bytes": 10219520,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.19.self_attn.qkv_proj",
+        "bytes": 8929280,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.28.mlp.gate_up_proj",
+        "bytes": 16885760,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.31.self_attn.qkv_proj",
+        "bytes": 9379840,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.48.linear_attn.in_proj_qkvz",
+        "bytes": 8192000,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.58.linear_attn.in_proj_qkvz",
+        "bytes": 8212480,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      },
+      {
+        "module": "model.layers.59.self_attn.qkv_proj",
+        "bytes": 9123840,
+        "provenance": "prior loaded-bank inventory; verify current storage at model A/B"
+      }
+    ],
+    "target_projection_payload_bytes": 2936836846,
+    "target_projection_peak_floor_ms": 3.2702448488276796,
+    "known_instruction_counter": {
+      "role": "IQ3_S GDN out M8/N5120/K1536",
+      "executed_warp_instructions": 1513280,
+      "ideal_issue_floor_us": 3.6658914728682173,
+      "note": "Prior NCU observation; do not extrapolate to other readers or kernels"
+    },
+    "unresolved": [
+      "Dynamic instruction counts for other target/draft/head kernels",
+      "Sampling/handoff actual reads and synchronization latency",
+      "Current 54633 installed-model bank footprints and graph ledger",
+      "Actual DRAM traffic, including activation and table cache hits"
+    ],
+    "input_evidence": {
+      "model-on.json": "1cce0e42aa70f3a758260a6d604161ca5975744822da0e01708e3b3877f0e912",
+      "trace64-projections.json": "03a45776e69734768271083062845683bb5c4fb838e322c6879ce4907c3a407f"
+    }
+  },
+  "pipeline_screen": [
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "cases": [
+        {
+          "rank": 0,
+          "layer": 6,
+          "format": 5,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 29.521663904190063,
+          "pipeline_us": 27.101439952850342,
+          "samples_us": {
+            "False": [
+              29.5961594581604,
+              29.58591938018799,
+              29.619200229644775,
+              29.570560455322266,
+              29.49376106262207,
+              29.49887990951538,
+              29.475839138031006,
+              29.460480213165283,
+              29.465599060058594,
+              29.45024013519287
+            ],
+            "True": [
+              27.13599920272827,
+              27.161600589752197,
+              27.148799896240234,
+              27.12831974029541,
+              27.07200050354004,
+              27.097599506378174,
+              27.059199810028076,
+              27.0796799659729,
+              27.059199810028076,
+              27.07200050354004
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "rank": 0,
+          "layer": 24,
+          "format": 3,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 30.305279970169067,
+          "pipeline_us": 27.595263719558716,
+          "samples_us": {
+            "False": [
+              30.28991937637329,
+              30.34111976623535,
+              30.27456045150757,
+              30.297598838806152,
+              30.297598838806152,
+              30.28736114501953,
+              30.318078994750977,
+              30.343680381774902,
+              30.27712106704712,
+              30.32576084136963
+            ],
+            "True": [
+              27.607040405273438,
+              27.596800327301025,
+              27.578880786895752,
+              27.58143901824951,
+              27.5711989402771,
+              27.6147198677063,
+              27.640318870544434,
+              27.596800327301025,
+              27.57375955581665,
+              27.591679096221924
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "rank": 0,
+          "layer": 51,
+          "format": 0,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 32.89292812347412,
+          "pipeline_us": 30.487552165985107,
+          "samples_us": {
+            "False": [
+              32.83200025558472,
+              32.84991979598999,
+              32.95488119125366,
+              32.865281105041504,
+              32.91136026382446,
+              32.967679500579834,
+              32.913920879364014,
+              32.90623903274536,
+              32.85759925842285,
+              32.870399951934814
+            ],
+            "True": [
+              30.499839782714844,
+              30.43584108352661,
+              30.504961013793945,
+              30.43584108352661,
+              30.47679901123047,
+              30.48959970474243,
+              30.43071985244751,
+              30.520319938659668,
+              30.504961013793945,
+              30.57663917541504
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "96d9e66261b80f4c13ff017d8cbcaf380d8953e8681ac97fffb5233fcaec1214"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "cases": [
+        {
+          "rank": 1,
+          "layer": 6,
+          "format": 5,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 29.52243208885193,
+          "pipeline_us": 27.101439952850342,
+          "samples_us": {
+            "False": [
+              29.59872007369995,
+              29.58336114883423,
+              29.624319076538086,
+              29.570560455322266,
+              29.49120044708252,
+              29.49887990951538,
+              29.475839138031006,
+              29.460480213165283,
+              29.470720291137695,
+              29.45024013519287
+            ],
+            "True": [
+              27.13344097137451,
+              27.164158821105957,
+              27.151360511779785,
+              27.12575912475586,
+              27.07200050354004,
+              27.097599506378174,
+              27.059199810028076,
+              27.0796799659729,
+              27.059199810028076,
+              27.07200050354004
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "rank": 1,
+          "layer": 24,
+          "format": 3,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 30.305279970169067,
+          "pipeline_us": 27.596287965774536,
+          "samples_us": {
+            "False": [
+              30.28991937637329,
+              30.34111976623535,
+              30.27712106704712,
+              30.297598838806152,
+              30.297598838806152,
+              30.28480052947998,
+              30.320639610290527,
+              30.34111976623535,
+              30.27712106704712,
+              30.32576084136963
+            ],
+            "True": [
+              27.60960102081299,
+              27.596800327301025,
+              27.58143901824951,
+              27.583999633789062,
+              27.57375955581665,
+              27.61728048324585,
+              27.640318870544434,
+              27.596800327301025,
+              27.57375955581665,
+              27.589120864868164
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "rank": 1,
+          "layer": 51,
+          "format": 0,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 32.893184185028076,
+          "pipeline_us": 30.488320350646973,
+          "samples_us": {
+            "False": [
+              32.83200025558472,
+              32.84991979598999,
+              32.95488119125366,
+              32.865281105041504,
+              32.91136026382446,
+              32.967679500579834,
+              32.91647911071777,
+              32.90623903274536,
+              32.85504102706909,
+              32.872960567474365
+            ],
+            "True": [
+              30.502400398254395,
+              30.43584108352661,
+              30.504961013793945,
+              30.43584108352661,
+              30.47935962677002,
+              30.48959970474243,
+              30.43328046798706,
+              30.520319938659668,
+              30.504961013793945,
+              30.57663917541504
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "96d9e66261b80f4c13ff017d8cbcaf380d8953e8681ac97fffb5233fcaec1214"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "cases": [
+        {
+          "rank": 2,
+          "layer": 6,
+          "format": 5,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 29.521920204162598,
+          "pipeline_us": 27.101439714431763,
+          "samples_us": {
+            "False": [
+              29.59872007369995,
+              29.58591938018799,
+              29.621760845184326,
+              29.570560455322266,
+              29.49376106262207,
+              29.49631929397583,
+              29.473280906677246,
+              29.460480213165283,
+              29.470720291137695,
+              29.44767951965332
+            ],
+            "True": [
+              27.13599920272827,
+              27.164158821105957,
+              27.148799896240234,
+              27.12831974029541,
+              27.06943988800049,
+              27.100160121917725,
+              27.059199810028076,
+              27.0796799659729,
+              27.059199810028076,
+              27.06943988800049
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "rank": 2,
+          "layer": 24,
+          "format": 3,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 30.303231954574585,
+          "pipeline_us": 27.595263957977295,
+          "samples_us": {
+            "False": [
+              30.28736114501953,
+              30.3385591506958,
+              30.27712106704712,
+              30.297598838806152,
+              30.295040607452393,
+              30.28223991394043,
+              30.318078994750977,
+              30.34111976623535,
+              30.27456045150757,
+              30.320639610290527
+            ],
+            "True": [
+              27.607040405273438,
+              27.599360942840576,
+              27.578880786895752,
+              27.58143901824951,
+              27.5711989402771,
+              27.61728048324585,
+              27.637760639190674,
+              27.596800327301025,
+              27.5711989402771,
+              27.591679096221924
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "rank": 2,
+          "layer": 51,
+          "format": 0,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 32.893184185028076,
+          "pipeline_us": 30.48857569694519,
+          "samples_us": {
+            "False": [
+              32.83200025558472,
+              32.84991979598999,
+              32.95232057571411,
+              32.867839336395264,
+              32.913920879364014,
+              32.970240116119385,
+              32.91647911071777,
+              32.90112018585205,
+              32.85504102706909,
+              32.872960567474365
+            ],
+            "True": [
+              30.502400398254395,
+              30.43839931488037,
+              30.507519245147705,
+              30.43584108352661,
+              30.47679901123047,
+              30.48959970474243,
+              30.43071985244751,
+              30.517759323120117,
+              30.507519245147705,
+              30.57919979095459
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "96d9e66261b80f4c13ff017d8cbcaf380d8953e8681ac97fffb5233fcaec1214"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "cases": [
+        {
+          "rank": 3,
+          "layer": 6,
+          "format": 5,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 29.52191996574402,
+          "pipeline_us": 27.101183891296387,
+          "samples_us": {
+            "False": [
+              29.5961594581604,
+              29.58591938018799,
+              29.624319076538086,
+              29.570560455322266,
+              29.49376106262207,
+              29.49887990951538,
+              29.473280906677246,
+              29.460480213165283,
+              29.468159675598145,
+              29.44767951965332
+            ],
+            "True": [
+              27.13344097137451,
+              27.164158821105957,
+              27.151360511779785,
+              27.12575912475586,
+              27.07200050354004,
+              27.097599506378174,
+              27.056639194488525,
+              27.0796799659729,
+              27.059199810028076,
+              27.07200050354004
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "rank": 3,
+          "layer": 24,
+          "format": 3,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 30.304768085479736,
+          "pipeline_us": 27.59552001953125,
+          "samples_us": {
+            "False": [
+              30.292479991912842,
+              30.3385591506958,
+              30.27712106704712,
+              30.297598838806152,
+              30.295040607452393,
+              30.28480052947998,
+              30.318078994750977,
+              30.343680381774902,
+              30.27712106704712,
+              30.323200225830078
+            ],
+            "True": [
+              27.607040405273438,
+              27.596800327301025,
+              27.578880786895752,
+              27.58143901824951,
+              27.57375955581665,
+              27.61728048324585,
+              27.640318870544434,
+              27.596800327301025,
+              27.57375955581665,
+              27.589120864868164
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "rank": 3,
+          "layer": 51,
+          "format": 0,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 32.89344000816345,
+          "pipeline_us": 30.488320350646973,
+          "samples_us": {
+            "False": [
+              32.83200025558472,
+              32.84991979598999,
+              32.95743942260742,
+              32.86272048950195,
+              32.91136026382446,
+              32.970240116119385,
+              32.913920879364014,
+              32.90623903274536,
+              32.85759925842285,
+              32.872960567474365
+            ],
+            "True": [
+              30.502400398254395,
+              30.43584108352661,
+              30.504961013793945,
+              30.43584108352661,
+              30.47935962677002,
+              30.48959970474243,
+              30.43328046798706,
+              30.520319938659668,
+              30.504961013793945,
+              30.57663917541504
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "96d9e66261b80f4c13ff017d8cbcaf380d8953e8681ac97fffb5233fcaec1214"
+    }
+  ],
+  "rejected_persistent_mlp": [
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "torch": "2.10.0+cu128",
+      "generated_cuda_sha256": "5a7f0c6eb978e771953c1094de1a3d75109ddd579afc34dc12f53e670130e71a",
+      "cases": [
+        {
+          "layer": 6,
+          "source_types": [
+            21,
+            21,
+            21
+          ],
+          "rank": 0,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0006741578108631074,
+            0.0006758528179489076,
+            0.0007133446051739156
+          ],
+          "separate_us": 59.23404788970947,
+          "persistent_us": 97.28178405761719,
+          "samples_us": {
+            "False": [
+              59.212799072265625,
+              59.10016059875488,
+              59.156479835510254,
+              59.118080139160156,
+              59.059200286865234,
+              59.458560943603516,
+              59.58655834197998,
+              59.310078620910645,
+              59.19487953186035,
+              59.14368152618408
+            ],
+            "True": [
+              97.36703872680664,
+              97.1878433227539,
+              97.0956802368164,
+              97.00096130371094,
+              97.05216407775879,
+              97.08024024963379,
+              97.91999816894531,
+              97.5436782836914,
+              97.25695610046387,
+              97.31328010559082
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "layer": 24,
+          "source_types": [
+            21,
+            21,
+            23
+          ],
+          "rank": 0,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0006965649663470685,
+            0.0006986871012486517,
+            0.0007358829025179148
+          ],
+          "separate_us": 59.03052806854248,
+          "persistent_us": 102.47065544128418,
+          "samples_us": {
+            "False": [
+              59.24863815307617,
+              58.99263858795166,
+              58.967041969299316,
+              58.93119812011719,
+              58.94656181335449,
+              59.161601066589355,
+              59.1871976852417,
+              58.964481353759766,
+              58.964481353759766,
+              58.94144058227539
+            ],
+            "True": [
+              102.77631759643555,
+              102.6534366607666,
+              102.29248046875,
+              102.22847938537598,
+              102.15423583984375,
+              102.98368453979492,
+              102.60224342346191,
+              102.48448371887207,
+              102.30015754699707,
+              102.23103523254395
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "layer": 51,
+          "source_types": [
+            21,
+            21,
+            12
+          ],
+          "rank": 0,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0009231684962287545,
+            0.0009242368978448212,
+            0.0009382970747537911
+          ],
+          "separate_us": 59.86560010910034,
+          "persistent_us": 101.87571239471436,
+          "samples_us": {
+            "False": [
+              60.400638580322266,
+              59.809279441833496,
+              59.801602363586426,
+              59.763197898864746,
+              59.72224235534668,
+              59.752960205078125,
+              59.696640968322754,
+              60.006399154663086,
+              59.952640533447266,
+              59.750399589538574
+            ],
+            "True": [
+              102.2822380065918,
+              102.13376045227051,
+              101.85983657836914,
+              101.71392440795898,
+              101.63200378417969,
+              101.62176132202148,
+              101.72160148620605,
+              102.1132755279541,
+              101.82656288146973,
+              101.85215950012207
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        }
+      ]
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "torch": "2.10.0+cu128",
+      "generated_cuda_sha256": "5a7f0c6eb978e771953c1094de1a3d75109ddd579afc34dc12f53e670130e71a",
+      "cases": [
+        {
+          "layer": 6,
+          "source_types": [
+            21,
+            21,
+            21
+          ],
+          "rank": 1,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0006495604757219553,
+            0.000673801579978317,
+            0.000679758726619184
+          ],
+          "separate_us": 59.27884912490845,
+          "persistent_us": 97.30406284332275,
+          "samples_us": {
+            "False": [
+              59.33824062347412,
+              59.205121994018555,
+              59.22304153442383,
+              59.19487953186035,
+              59.20000076293945,
+              59.16672229766846,
+              59.159040451049805,
+              59.52000141143799,
+              59.54048156738281,
+              59.2409610748291
+            ],
+            "True": [
+              97.41824150085449,
+              97.51551628112793,
+              97.1827220916748,
+              97.11359977722168,
+              97.07263946533203,
+              97.10847854614258,
+              96.9983959197998,
+              97.77407646179199,
+              97.40032196044922,
+              97.45663642883301
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "layer": 24,
+          "source_types": [
+            21,
+            21,
+            23
+          ],
+          "rank": 1,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0007026030216366053,
+            0.0006909962394274771,
+            0.0007278610137291253
+          ],
+          "separate_us": 59.077120780944824,
+          "persistent_us": 102.53363227844238,
+          "samples_us": {
+            "False": [
+              59.404802322387695,
+              59.112958908081055,
+              59.08736228942871,
+              58.99775981903076,
+              58.95423889160156,
+              58.967041969299316,
+              59.008002281188965,
+              58.964481353759766,
+              58.972158432006836,
+              59.302401542663574
+            ],
+            "True": [
+              103.06303977966309,
+              103.04512023925781,
+              102.55871772766113,
+              102.3744010925293,
+              102.25919723510742,
+              102.26176261901855,
+              102.2208023071289,
+              102.19264030456543,
+              102.27456092834473,
+              103.08608055114746
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "layer": 51,
+          "source_types": [
+            21,
+            21,
+            12
+          ],
+          "rank": 1,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0009446977637708187,
+            0.0009319562814198434,
+            0.0009459603461436927
+          ],
+          "separate_us": 59.816959381103516,
+          "persistent_us": 101.70726585388184,
+          "samples_us": {
+            "False": [
+              60.2239990234375,
+              59.94495868682861,
+              59.796481132507324,
+              59.74783897399902,
+              59.76831912994385,
+              59.752960205078125,
+              59.74271774291992,
+              59.74271774291992,
+              59.7324800491333,
+              59.71712112426758
+            ],
+            "True": [
+              102.20288276672363,
+              101.99551582336426,
+              101.71392440795898,
+              101.73184394836426,
+              101.62176132202148,
+              101.59616470336914,
+              101.51424407958984,
+              101.61151885986328,
+              101.55263900756836,
+              101.53216361999512
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        }
+      ]
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "torch": "2.10.0+cu128",
+      "generated_cuda_sha256": "5a7f0c6eb978e771953c1094de1a3d75109ddd579afc34dc12f53e670130e71a",
+      "cases": [
+        {
+          "layer": 6,
+          "source_types": [
+            21,
+            21,
+            21
+          ],
+          "rank": 2,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0006521348259411752,
+            0.0006586679955944419,
+            0.0006786349695175886
+          ],
+          "separate_us": 59.52179145812988,
+          "persistent_us": 97.40646362304688,
+          "samples_us": {
+            "False": [
+              59.52511787414551,
+              59.28703784942627,
+              59.315199851989746,
+              59.258880615234375,
+              59.210238456726074,
+              60.41855812072754,
+              60.42367935180664,
+              59.261441230773926,
+              59.2844820022583,
+              59.23327922821045
+            ],
+            "True": [
+              97.64863967895508,
+              97.42591857910156,
+              97.13664054870605,
+              97.1724796295166,
+              97.09312438964844,
+              97.7843189239502,
+              97.77407646179199,
+              97.6307201385498,
+              97.27231979370117,
+              97.12639808654785
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "layer": 24,
+          "source_types": [
+            21,
+            21,
+            23
+          ],
+          "rank": 2,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.000696744245942682,
+            0.000694005866535008,
+            0.0006953124538995326
+          ],
+          "separate_us": 58.99417591094971,
+          "persistent_us": 102.22617816925049,
+          "samples_us": {
+            "False": [
+              58.959360122680664,
+              58.99007797241211,
+              59.008002281188965,
+              58.99519920349121,
+              58.97471904754639,
+              59.018239974975586,
+              58.99775981903076,
+              58.99775981903076,
+              59.008002281188965,
+              58.99263858795166
+            ],
+            "True": [
+              102.20288276672363,
+              102.24384307861328,
+              102.19008445739746,
+              102.18496322631836,
+              102.23872184753418,
+              102.24639892578125,
+              102.25664138793945,
+              102.24896430969238,
+              102.22335815429688,
+              102.22592353820801
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "layer": 51,
+          "source_types": [
+            21,
+            21,
+            12
+          ],
+          "rank": 2,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.000932150986045599,
+            0.0009271926246583462,
+            0.0009450075449422002
+          ],
+          "separate_us": 59.77881669998169,
+          "persistent_us": 101.63072109222412,
+          "samples_us": {
+            "False": [
+              59.7811222076416,
+              59.79135990142822,
+              59.7708797454834,
+              59.75808143615723,
+              59.752960205078125,
+              59.804158210754395,
+              59.7811222076416,
+              59.77856159210205,
+              59.76831912994385,
+              59.801602363586426
+            ],
+            "True": [
+              101.61408424377441,
+              101.6806411743164,
+              101.63455963134766,
+              101.66015625,
+              101.64735794067383,
+              101.58080101013184,
+              101.59104347229004,
+              101.59104347229004,
+              101.68576240539551,
+              101.62176132202148
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        }
+      ]
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "torch": "2.10.0+cu128",
+      "generated_cuda_sha256": "5a7f0c6eb978e771953c1094de1a3d75109ddd579afc34dc12f53e670130e71a",
+      "cases": [
+        {
+          "layer": 6,
+          "source_types": [
+            21,
+            21,
+            21
+          ],
+          "rank": 3,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0006910180090926588,
+            0.0006971398834139109,
+            0.0007109601865522563
+          ],
+          "separate_us": 59.150848388671875,
+          "persistent_us": 97.13587188720703,
+          "samples_us": {
+            "False": [
+              59.2793607711792,
+              59.18208122253418,
+              59.13599967956543,
+              59.14112091064453,
+              59.14368152618408,
+              59.1539192199707,
+              59.13599967956543,
+              59.118080139160156,
+              59.102721214294434,
+              59.115519523620605
+            ],
+            "True": [
+              97.26719856262207,
+              97.20576286315918,
+              97.05216407775879,
+              97.0751953125,
+              97.1622371673584,
+              97.10335731506348,
+              97.15200424194336,
+              97.05471992492676,
+              97.11615562438965,
+              97.16992378234863
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "layer": 24,
+          "source_types": [
+            21,
+            21,
+            23
+          ],
+          "rank": 3,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0007056931499391794,
+            0.0007009161054156721,
+            0.0007115195621736348
+          ],
+          "separate_us": 58.91276741027832,
+          "persistent_us": 102.30067157745361,
+          "samples_us": {
+            "False": [
+              58.913278579711914,
+              58.89023780822754,
+              58.94656181335449,
+              58.90048027038574,
+              58.913278579711914,
+              58.913278579711914,
+              58.91071796417236,
+              58.91071796417236,
+              58.920960426330566,
+              58.908162117004395
+            ],
+            "True": [
+              102.2054386138916,
+              102.25664138793945,
+              102.2719955444336,
+              102.34880447387695,
+              102.26943969726562,
+              102.3692798614502,
+              102.33599662780762,
+              102.33087539672852,
+              102.29248046875,
+              102.32576370239258
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        },
+        {
+          "layer": 51,
+          "source_types": [
+            21,
+            21,
+            12
+          ],
+          "rank": 3,
+          "bitwise_equal": true,
+          "changed_input_graph_replays": 20,
+          "official_relative_l2": [
+            0.0009228713461197913,
+            0.0009457397391088307,
+            0.0009587632375769317
+          ],
+          "separate_us": 59.631104469299316,
+          "persistent_us": 101.69728088378906,
+          "samples_us": {
+            "False": [
+              59.62240219116211,
+              59.64799880981445,
+              59.62240219116211,
+              59.607038497924805,
+              59.599361419677734,
+              59.66080188751221,
+              59.62495803833008,
+              59.6454381942749,
+              59.63776111602783,
+              59.642882347106934
+            ],
+            "True": [
+              101.74464225769043,
+              101.68576240539551,
+              101.63968086242676,
+              101.78048133850098,
+              101.65760040283203,
+              101.63455963134766,
+              101.69088363647461,
+              101.68576240539551,
+              101.77023887634277,
+              101.68319702148438
+            ]
+          },
+          "clocks": "1290 MHz, 877 MHz"
+        }
+      ]
+    }
+  ],
+  "shared_packet_pipeline_screen": [
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "shared_production_packet_buffer": true,
+      "cases": [
+        {
+          "rank": 0,
+          "layer": 6,
+          "format": 5,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 25.76255965232849,
+          "pipeline_us": 23.661312103271484,
+          "samples_us": {
+            "False": [
+              25.809919834136963,
+              25.79456090927124,
+              25.779199600219727,
+              25.727999210357666,
+              25.738239288330078,
+              25.75615882873535,
+              25.725440979003906,
+              25.717759132385254,
+              25.710079669952393,
+              25.866239070892334
+            ],
+            "True": [
+              23.695359230041504,
+              23.703041076660156,
+              23.641600608825684,
+              23.639039993286133,
+              23.654398918151855,
+              23.639039993286133,
+              23.62368106842041,
+              23.610880374908447,
+              23.654398918151855,
+              23.751680850982666
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 0,
+          "layer": 24,
+          "format": 3,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 29.73798370361328,
+          "pipeline_us": 26.812416076660156,
+          "samples_us": {
+            "False": [
+              29.831678867340088,
+              29.73952054977417,
+              29.68575954437256,
+              29.760000705718994,
+              29.672958850860596,
+              29.754879474639893,
+              29.726719856262207,
+              29.777920246124268,
+              29.678080081939697,
+              29.752318859100342
+            ],
+            "True": [
+              26.805760860443115,
+              26.77759885787964,
+              26.8339204788208,
+              26.746881008148193,
+              26.851840019226074,
+              26.813440322875977,
+              26.816000938415527,
+              26.82368040084839,
+              26.798079013824463,
+              26.856958866119385
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 0,
+          "layer": 51,
+          "format": 0,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 31.776000022888184,
+          "pipeline_us": 29.124095916748047,
+          "samples_us": {
+            "False": [
+              31.86176061630249,
+              31.749119758605957,
+              31.774721145629883,
+              31.80288076400757,
+              31.746559143066406,
+              31.76703929901123,
+              31.81567907333374,
+              31.738879680633545,
+              31.679999828338623,
+              31.823360919952393
+            ],
+            "True": [
+              29.084160327911377,
+              29.132800102233887,
+              29.14815902709961,
+              29.160959720611572,
+              29.137918949127197,
+              29.122560024261475,
+              29.119999408721924,
+              29.112319946289062,
+              29.114880561828613,
+              29.107201099395752
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "9e6dd2a3513dbbc9625c1bd85b7c93f943c2f9f92f08326b17279b0a8116c718"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "shared_production_packet_buffer": true,
+      "cases": [
+        {
+          "rank": 1,
+          "layer": 6,
+          "format": 5,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 25.76307201385498,
+          "pipeline_us": 23.661312103271484,
+          "samples_us": {
+            "False": [
+              25.809919834136963,
+              25.79456090927124,
+              25.781760215759277,
+              25.727999210357666,
+              25.738239288330078,
+              25.75615882873535,
+              25.725440979003906,
+              25.720319747924805,
+              25.712640285491943,
+              25.863680839538574
+            ],
+            "True": [
+              23.695359230041504,
+              23.703041076660156,
+              23.639039993286133,
+              23.639039993286133,
+              23.654398918151855,
+              23.639039993286133,
+              23.62368106842041,
+              23.610880374908447,
+              23.656959533691406,
+              23.751680850982666
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 1,
+          "layer": 24,
+          "format": 3,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 29.738751888275146,
+          "pipeline_us": 26.811903953552246,
+          "samples_us": {
+            "False": [
+              29.831678867340088,
+              29.73952054977417,
+              29.68575954437256,
+              29.760000705718994,
+              29.672958850860596,
+              29.757440090179443,
+              29.729280471801758,
+              29.777920246124268,
+              29.678080081939697,
+              29.754879474639893
+            ],
+            "True": [
+              26.803200244903564,
+              26.77759885787964,
+              26.8339204788208,
+              26.744320392608643,
+              26.851840019226074,
+              26.813440322875977,
+              26.816000938415527,
+              26.82368040084839,
+              26.798079013824463,
+              26.856958866119385
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 1,
+          "layer": 51,
+          "format": 0,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 31.77574372291565,
+          "pipeline_us": 29.123839855194092,
+          "samples_us": {
+            "False": [
+              31.85920000076294,
+              31.749119758605957,
+              31.774721145629883,
+              31.800320148468018,
+              31.749119758605957,
+              31.76703929901123,
+              31.81567907333374,
+              31.736319065093994,
+              31.679999828338623,
+              31.825919151306152
+            ],
+            "True": [
+              29.086720943450928,
+              29.132800102233887,
+              29.14815902709961,
+              29.15839910507202,
+              29.137918949127197,
+              29.122560024261475,
+              29.119999408721924,
+              29.112319946289062,
+              29.112319946289062,
+              29.107201099395752
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "9e6dd2a3513dbbc9625c1bd85b7c93f943c2f9f92f08326b17279b0a8116c718"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "shared_production_packet_buffer": true,
+      "cases": [
+        {
+          "rank": 2,
+          "layer": 6,
+          "format": 5,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 25.761791944503784,
+          "pipeline_us": 23.66156816482544,
+          "samples_us": {
+            "False": [
+              25.809919834136963,
+              25.79200029373169,
+              25.781760215759277,
+              25.727999210357666,
+              25.73568105697632,
+              25.75615882873535,
+              25.725440979003906,
+              25.717759132385254,
+              25.710079669952393,
+              25.861120223999023
+            ],
+            "True": [
+              23.697919845581055,
+              23.703041076660156,
+              23.639039993286133,
+              23.641600608825684,
+              23.654398918151855,
+              23.636479377746582,
+              23.62368106842041,
+              23.610880374908447,
+              23.656959533691406,
+              23.751680850982666
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 2,
+          "layer": 24,
+          "format": 3,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 29.738239765167236,
+          "pipeline_us": 26.81164789199829,
+          "samples_us": {
+            "False": [
+              29.831678867340088,
+              29.73952054977417,
+              29.68575954437256,
+              29.760000705718994,
+              29.672958850860596,
+              29.754879474639893,
+              29.726719856262207,
+              29.78048086166382,
+              29.675519466400146,
+              29.754879474639893
+            ],
+            "True": [
+              26.805760860443115,
+              26.77759885787964,
+              26.83135986328125,
+              26.744320392608643,
+              26.849279403686523,
+              26.813440322875977,
+              26.816000938415527,
+              26.82368040084839,
+              26.798079013824463,
+              26.856958866119385
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 2,
+          "layer": 51,
+          "format": 0,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 31.77574396133423,
+          "pipeline_us": 29.124608039855957,
+          "samples_us": {
+            "False": [
+              31.85920000076294,
+              31.749119758605957,
+              31.774721145629883,
+              31.800320148468018,
+              31.746559143066406,
+              31.76703929901123,
+              31.81567907333374,
+              31.738879680633545,
+              31.682560443878174,
+              31.823360919952393
+            ],
+            "True": [
+              29.086720943450928,
+              29.135360717773438,
+              29.14815902709961,
+              29.15839910507202,
+              29.137918949127197,
+              29.122560024261475,
+              29.119999408721924,
+              29.114880561828613,
+              29.114880561828613,
+              29.107201099395752
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "9e6dd2a3513dbbc9625c1bd85b7c93f943c2f9f92f08326b17279b0a8116c718"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "shared_production_packet_buffer": true,
+      "cases": [
+        {
+          "rank": 3,
+          "layer": 6,
+          "format": 5,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 25.763327598571777,
+          "pipeline_us": 23.66259217262268,
+          "samples_us": {
+            "False": [
+              25.809919834136963,
+              25.797119140625,
+              25.781760215759277,
+              25.727999210357666,
+              25.74079990386963,
+              25.75615882873535,
+              25.725440979003906,
+              25.717759132385254,
+              25.710079669952393,
+              25.866239070892334
+            ],
+            "True": [
+              23.697919845581055,
+              23.703041076660156,
+              23.641600608825684,
+              23.641600608825684,
+              23.656959533691406,
+              23.639039993286133,
+              23.62623929977417,
+              23.610880374908447,
+              23.656959533691406,
+              23.751680850982666
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 3,
+          "layer": 24,
+          "format": 3,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 29.739263772964478,
+          "pipeline_us": 26.81164789199829,
+          "samples_us": {
+            "False": [
+              29.831678867340088,
+              29.73952054977417,
+              29.68575954437256,
+              29.765119552612305,
+              29.675519466400146,
+              29.754879474639893,
+              29.729280471801758,
+              29.777920246124268,
+              29.678080081939697,
+              29.754879474639893
+            ],
+            "True": [
+              26.805760860443115,
+              26.77759885787964,
+              26.83135986328125,
+              26.744320392608643,
+              26.851840019226074,
+              26.813440322875977,
+              26.816000938415527,
+              26.821119785308838,
+              26.798079013824463,
+              26.856958866119385
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 3,
+          "layer": 51,
+          "format": 0,
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 31.77574396133423,
+          "pipeline_us": 29.124351978302002,
+          "samples_us": {
+            "False": [
+              31.86431884765625,
+              31.746559143066406,
+              31.774721145629883,
+              31.80288076400757,
+              31.749119758605957,
+              31.76703929901123,
+              31.81312084197998,
+              31.738879680633545,
+              31.679999828338623,
+              31.820800304412842
+            ],
+            "True": [
+              29.086720943450928,
+              29.132800102233887,
+              29.14815902709961,
+              29.15839910507202,
+              29.137918949127197,
+              29.122560024261475,
+              29.119999408721924,
+              29.114880561828613,
+              29.114880561828613,
+              29.107201099395752
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "9e6dd2a3513dbbc9625c1bd85b7c93f943c2f9f92f08326b17279b0a8116c718"
+    }
+  ]
+}

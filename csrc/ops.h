@@ -1068,6 +1068,13 @@ void gguf_dmv_sm70_clocked_out(
     std::optional<torch::Tensor> floating_output,
     std::optional<torch::Tensor> pair_output, bool gdn_heads);
 
+void gguf_dmv_allreduce_norm_sm70_out(
+    torch::Tensor input, torch::Tensor codes, torch::Tensor scales,
+    torch::Tensor table, torch::Tensor partial,
+    const std::vector<int64_t>& pointers, int64_t rank, torch::Tensor residual,
+    torch::Tensor weight, torch::Tensor normalized, torch::Tensor residual_out,
+    int64_t format, double epsilon);
+
 void gguf_dmv_restore_sm70_out(torch::Tensor weight, torch::Tensor stats,
                                torch::Tensor codes, torch::Tensor scale,
                                int64_t fmt, int64_t k, int64_t n);

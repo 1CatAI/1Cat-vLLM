@@ -543,6 +543,151 @@ struct WarpTimer<true> {
 };
 
 template <int KW, int TN, int FA, int FB, int FC = -1, bool Clocked = false>
+__device__ __forceinline__ void dense_tile(const Segs& segs,
+                                           const half* __restrict__ x, int ldx,
+                                           int M, int K, int S, int G,
+                                           int split, float* ws, int* cnt,
+                                           uint64_t* timestamps, int tg,
+                                           int sp) {
+  constexpr int W = KW * TN;
+  extern __shared__ uint4 smem[];
+  __shared__ int last;
+  if (segs.ab_n > 0 && tg >= segs.main_tiles) {
+    const int row = (tg - segs.main_tiles) * W + threadIdx.x / 32;
+    if (sp == 0 && row < segs.ab_n) ab_row(segs, x, ldx, M, K, row);
+    return;
+  }
+  int si = 0;
+#pragma unroll
+  for (int i = 1; i < MAXSEG; ++i)
+    if (i < segs.nseg && tg >= segs.s[i].tile0) si = i;
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+  const int tin = warp % TN, kslot = warp / TN;
+  const bool pair = segs.pair != 0;
+  constexpr int PP = TN / 2 > 0 ? TN / 2 : 1;
+  const Seg& sg = pair ? segs.s[tin / PP] : segs.s[si];
+  const int t = pair ? tg * PP + tin % PP : (tg - sg.tile0) * TN + tin;
+  const bool on = t * 32 < sg.n;
+  const int gps = (G + split - 1) / split;
+  const int g0 = min(G, sp * gps), g1 = min(G, g0 + gps);
+  uint4* xs = smem;
+  half2* lut = reinterpret_cast<half2*>(smem + KW * 256);
+  float acc[8] = {};
+  constexpr bool legacy_iq2 = KW == 8 && TN == 2 && (FA == LUT6 || FB == LUT6);
+  if (FA == FB || sg.fmt == FA)
+    body6<FA, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, warp < W ? g1 : 0,
+                                  S, G, x, ldx, M, xs, lut, acc, segs.tab,
+                                  segs.gdn_heads, pair);
+  else if (FC < 0 || sg.fmt == FB)
+    body6<FB, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, warp < W ? g1 : 0,
+                                  S, G, x, ldx, M, xs, lut, acc, segs.tab,
+                                  segs.gdn_heads, pair);
+  else {
+    if constexpr (FC >= 0)
+      body6<FC, KW, TN, false>(sg, t, on, kslot, tin, g0, warp < W ? g1 : 0, S,
+                               G, x, ldx, M, xs, lut, acc, segs.tab,
+                               segs.gdn_heads, pair);
+  }
+  __syncthreads();
+  float* red = reinterpret_cast<float*>(smem);
+#pragma unroll
+  for (int e = 0; e < 8; ++e) red[warp * 256 + lane * 8 + e] = acc[e];
+  __syncthreads();
+  if (pair) {
+    auto write_h = [&](int v, float g, float u) {
+      const int e = v & 255, pt = tg * PP + (v >> 8);
+      const int lv = e >> 3, i = e & 7;
+      const int token = (i & 2) | ((lv & 16) ? 4 : 0) | (lv & 1);
+      const int col = (i & 1) | (((lv >> 1) & 1) << 1) | ((i >> 2) << 2);
+      const int row = pt * 32 + ((lv >> 2) & 3) * 8 + col;
+      if (token < M && row < segs.s[0].n) {
+        const float gf = __half2float(__float2half_rn(g));
+        const float uf = __half2float(__float2half_rn(u));
+        if constexpr (legacy_iq2) {
+          const half activated = __float2half_rn(gf / (1.0f + expf(-gf)));
+          segs.hout[(size_t)token * segs.hld + row] =
+              __hmul(activated, __float2half_rn(uf));
+        } else {
+          segs.hout[(size_t)token * segs.hld + row] =
+              __float2half_rn(gf / (1.0f + __expf(-gf)) * uf);
+        }
+      }
+    };
+    for (int v = threadIdx.x; v < PP * 256; v += 32 * W) {
+      const int pt = v >> 8, e = v & 255;
+      float g = 0.f, u = 0.f;
+#pragma unroll
+      for (int k = 0; k < KW; ++k) {
+        g += red[(k * TN + pt) * 256 + e];
+        u += red[(k * TN + PP + pt) * 256 + e];
+      }
+      if (split == 1)
+        write_h(v, g, u);
+      else {
+        __stcg(ws + (static_cast<size_t>(tg) * split + sp) * PP * 512 + v, g);
+        __stcg(ws + (static_cast<size_t>(tg) * split + sp) * PP * 512 +
+                   PP * 256 + v,
+               u);
+      }
+    }
+    if (split == 1) return;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      __threadfence();
+      last = atomicAdd(cnt + tg, 1) == split - 1;
+      if (last) __threadfence();
+    }
+    __syncthreads();
+    if (!last) return;
+    for (int v = threadIdx.x; v < PP * 256; v += 32 * W) {
+      float g = 0.f, u = 0.f;
+      for (int p = 0; p < split; ++p) {
+        g += __ldcg(ws + (static_cast<size_t>(tg) * split + p) * PP * 512 + v);
+        u += __ldcg(ws + (static_cast<size_t>(tg) * split + p) * PP * 512 +
+                    PP * 256 + v);
+      }
+      write_h(v, g, u);
+    }
+    if (threadIdx.x == 0) cnt[tg] = 0;
+    return;
+  }
+  const int tbase = (tg - sg.tile0) * TN;
+  for (int v = threadIdx.x; v < TN * 256; v += 32 * W) {
+    const int i = v / 256, e = v % 256;
+    float s = 0.f;
+#pragma unroll
+    for (int k = 0; k < KW; ++k) s += red[(k * TN + i) * 256 + e];
+    if (split == 1)
+      write_out(sg, tbase + i, e, s, M, segs.sgate);
+    else
+      __stcg(ws + (static_cast<size_t>(tg) * split + sp) * TN * 256 + v, s);
+  }
+  if (split == 1) return;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    last = atomicAdd(cnt + tg, 1) == split - 1;
+    if (last) __threadfence();
+  }
+  __syncthreads();
+  if (!last) return;
+  for (int v = threadIdx.x; v < TN * 256; v += 32 * W) {
+    float pv[8];
+#pragma unroll
+    for (int p = 0; p < 8; ++p)
+      pv[p] = p < split
+                  ? __ldcg(ws +
+                           (static_cast<size_t>(tg) * split + p) * TN * 256 + v)
+                  : 0.f;
+    float s = 0.f;
+#pragma unroll
+    for (int p = 0; p < 8; ++p) s += pv[p];
+    write_out(sg, tbase + v / 256, v % 256, s, M, segs.sgate);
+  }
+  if (threadIdx.x == 0) cnt[tg] = 0;
+}
+
+template <int KW, int TN, int FA, int FB, int FC = -1, bool Clocked = false>
 __global__ void __launch_bounds__(32 * KW * TN)
     dense_mv(Segs segs, const half* __restrict__ x, int ldx, int M, int K,
              int S, int G, int split, float* ws, int* cnt,
@@ -709,6 +854,8 @@ void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
 }
 
 }  // namespace
+
+#include "gguf_projection_collective_pipeline_sm70.cuh"
 
 // codes/high/scale: per segment planes; out: per segment [M, n] views.
 template <bool Clocked>
@@ -1139,4 +1286,74 @@ void gguf_dmv_restore_iq2_sm70_out(torch::Tensor weight, torch::Tensor stats,
       reinterpret_cast<uint16_t*>(weight.data_ptr()),
       reinterpret_cast<uint32_t*>(stats.data_ptr()), kind, k, n);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gguf_dmv_allreduce_norm_sm70_out(
+    torch::Tensor input, torch::Tensor codes, torch::Tensor scales,
+    torch::Tensor table, torch::Tensor partial,
+    const std::vector<int64_t>& pointers, int64_t rank, torch::Tensor residual,
+    torch::Tensor weight, torch::Tensor normalized, torch::Tensor residual_out,
+    int64_t format, double epsilon) {
+  TORCH_CHECK(input.is_cuda() && input.scalar_type() == at::kHalf &&
+                  input.is_contiguous() &&
+                  input.sizes() == at::IntArrayRef({8, 4352}),
+              "GGUF projection collective requires M8/K4352");
+  const c10::cuda::CUDAGuard guard(input.device());
+  auto storage = [&](const torch::Tensor& tensor, at::ScalarType dtype) {
+    TORCH_CHECK(tensor.device() == input.device() && tensor.is_contiguous() &&
+                    tensor.scalar_type() == dtype,
+                "invalid GGUF collective operand");
+  };
+  storage(codes, at::kByte);
+  storage(scales, at::kByte);
+  storage(table, at::kByte);
+  storage(partial, at::kHalf);
+  storage(normalized, at::kHalf);
+  storage(residual, at::kFloat);
+  storage(residual_out, at::kFloat);
+  storage(weight, at::kFloat);
+  TORCH_CHECK(pointers.size() == 4 && rank >= 0 && rank < 4 &&
+                  (format == IQ3S || format == LUT4 || format == Q4K) &&
+                  epsilon > 0.0,
+              "unqualified GGUF collective");
+  TORCH_CHECK(partial.sizes() == at::IntArrayRef({8, 5120}) &&
+                  normalized.sizes() == partial.sizes() &&
+                  residual.sizes() == partial.sizes() &&
+                  residual_out.sizes() == partial.sizes() &&
+                  weight.sizes() == at::IntArrayRef({5120}),
+              "invalid GGUF collective output/norm geometry");
+  TORCH_CHECK(codes.numel() == 160 * 34 * 512 * (format == IQ3S ? 3 : 4) &&
+                  scales.numel() == 160 * 34 * (format == Q4K ? 512 : 256) &&
+                  (format != IQ3S || table.numel() == TAB_VECS * 16),
+              "invalid GGUF collective planes");
+  Segs down{};
+  down.nseg = 1;
+  down.tab = format == IQ3S ? reinterpret_cast<const uint4*>(table.data_ptr())
+                            : nullptr;
+  auto& segment = down.s[0];
+  segment.codes = reinterpret_cast<const uint4*>(codes.data_ptr());
+  segment.scale = reinterpret_cast<const uint4*>(scales.data_ptr());
+  segment.out = reinterpret_cast<half*>(partial.data_ptr());
+  segment.out_ld = segment.n = 5120;
+  segment.fmt = static_cast<int>(format);
+  vllm::RankData buffers{};
+  for (int peer = 0; peer < 4; ++peer) {
+    TORCH_CHECK(pointers[peer] != 0, "missing GGUF peer packet buffer");
+    buffers.ptrs[peer] = reinterpret_cast<void*>(pointers[peer]);
+  }
+  auto x = reinterpret_cast<const half*>(input.data_ptr());
+  auto out = reinterpret_cast<half*>(normalized.data_ptr());
+  const float eps = static_cast<float>(epsilon);
+#define PIPE(F)                                                              \
+  run_pipeline<F>(down, x, buffers, static_cast<int>(rank),                  \
+                  residual.data_ptr<float>(), weight.data_ptr<float>(), out, \
+                  residual_out.data_ptr<float>(), eps, true)
+  if (format == IQ3S) {
+    PIPE(IQ3S);
+  } else if (format == LUT4) {
+    PIPE(LUT4);
+  } else {
+    PIPE(Q4K);
+  }
+#undef PIPE
 }

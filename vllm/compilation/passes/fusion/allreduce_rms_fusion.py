@@ -1063,6 +1063,12 @@ class AllReduceFusedAddRMSNormStaticQuantNVFP4Pattern(BasePattern):
 class AllReduceFusionPass(VllmPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
+        self.gguf_projection_pipeline_enabled = bool(
+            config.model_config is not None
+            and config.model_config.quantization == "gguf"
+            and config.kernel_config.sm70_gguf.projection_collective_pipeline
+            and not config.parallel_config.enable_dbo
+        )
         self.disabled = True
         self.tp_size = get_tensor_model_parallel_world_size()
         if self.tp_size <= 1:
@@ -1328,6 +1334,17 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             _sm70_tp4_expected_graph_matches(graph) if self.sm70_tp4_long_mode else 0
         )
         self.matched_count = self.patterns.apply(graph)
+        if (
+            getattr(self, "sm70_mode", False)
+            and self.tp_size == 4
+            and self.gguf_projection_pipeline_enabled
+        ):
+            from vllm.model_executor.layers.quantization import (
+                gguf_projection_collective,
+            )
+
+            pipelines = gguf_projection_collective.fuse_projection_collectives(graph)
+            logger.info("SM70 GGUF projection/TP4/norm fused %d boundaries.", pipelines)
         if self.sm70_tp4_long_mode and self.matched_count != expected_graph_matches:
             if self.rank == 0:
                 logger.error(
