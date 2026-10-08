@@ -46,6 +46,78 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
+    allow_triton_fallback = _config.ConfigField[bool]("allow_triton_fallback")
+    compare_bhmd_out_dir = _config.ConfigField[str | None]("compare_bhmd_out_dir")
+    compare_bhmd_out_max_calls = _config.ConfigField[int]("compare_bhmd_out_max_calls")
+    compare_triton_out_dir = _config.ConfigField[str | None]("compare_triton_out_dir")
+    compare_triton_out_max_calls = _config.ConfigField[int](
+        "compare_triton_out_max_calls"
+    )
+    compare_triton_tensor_dump_dir = _config.ConfigField[str | None](
+        "compare_triton_tensor_dump_dir"
+    )
+    compare_triton_tensor_dump_max_tokens = _config.ConfigField[int](
+        "compare_triton_tensor_dump_max_tokens"
+    )
+    decode_strategy = _config.ConfigField[str]("decode_strategy")
+    prefill_bfla_mask_block_n = _config.ConfigField[int]("prefill_bfla_mask_block_n")
+    prefill_bfla_min_kv = _config.ConfigField[int]("prefill_bfla_min_kv")
+    prefill_bfla_min_q = _config.ConfigField[int]("prefill_bfla_min_q")
+    prefill_contig_dense_allow_copy = _config.ConfigField[bool](
+        "prefill_contig_dense_allow_copy"
+    )
+    prefill_contig_dense_min_kv = _config.ConfigField[int](
+        "prefill_contig_dense_min_kv"
+    )
+    prefill_contig_dense_min_q = _config.ConfigField[int]("prefill_contig_dense_min_q")
+    prefill_gather_dense_min_kv = _config.ConfigField[int](
+        "prefill_gather_dense_min_kv"
+    )
+    prefill_gather_dense_min_q = _config.ConfigField[int]("prefill_gather_dense_min_q")
+    prefill_split_kv_max_q = _config.ConfigField[int]("prefill_split_kv_max_q")
+    prefill_split_kv_min_kv = _config.ConfigField[int]("prefill_split_kv_min_kv")
+    prefill_split_kv_min_q = _config.ConfigField[int]("prefill_split_kv_min_q")
+    prefill_split_kv_tokens = _config.ConfigField[int]("prefill_split_kv_tokens")
+    prefix_anchored_decode_window = _config.ConfigField[int | None](
+        "prefix_anchored_decode_window"
+    )
+    smallq_decode_max_model_len = _config.ConfigField[int](
+        "smallq_decode_max_model_len"
+    )
+    smallq_decode_max_query_len = _config.ConfigField[int](
+        "smallq_decode_max_query_len"
+    )
+    use_decode_dense_cache = _config.ConfigField[bool]("use_decode_dense_cache")
+    use_decode_dense_reference = _config.ConfigField[bool]("use_decode_dense_reference")
+    use_decode_paged_prefill = _config.ConfigField[bool]("use_decode_paged_prefill")
+    use_decode_paged_prefill_bhmd_out = _config.ConfigField[bool](
+        "use_decode_paged_prefill_bhmd_out"
+    )
+    use_decode_scalar_paged = _config.ConfigField[bool]("use_decode_scalar_paged")
+    use_decode_wmma_wrapper = _config.ConfigField[bool]("use_decode_wmma_wrapper")
+    use_decode_xqa = _config.ConfigField[bool]("use_decode_xqa")
+    use_flash_v100 = _config.ConfigField[bool]("use_flash_v100")
+    use_flash_v100_decode = _config.ConfigField[bool]("use_flash_v100_decode")
+    use_flash_v100_prefill_bfla = _config.ConfigField[bool](
+        "use_flash_v100_prefill_bfla"
+    )
+    use_flash_v100_prefill_contig_dense = _config.ConfigField[bool](
+        "use_flash_v100_prefill_contig_dense"
+    )
+    use_flash_v100_prefill_gather_dense = _config.ConfigField[bool](
+        "use_flash_v100_prefill_gather_dense"
+    )
+    use_flash_v100_prefill_paged = _config.ConfigField[bool](
+        "use_flash_v100_prefill_paged"
+    )
+    use_flash_v100_prefill_splitkv = _config.ConfigField[bool](
+        "use_flash_v100_prefill_splitkv"
+    )
+    use_fp8_prefill_bridge = _config.ConfigField[bool]("use_fp8_prefill_bridge")
+    use_prefill_paged_cache = _config.ConfigField[bool]("use_prefill_paged_cache")
+    use_smallq_decode_xqa = _config.ConfigField[bool]("use_smallq_decode_xqa")
+    use_triton_prefill = _config.ConfigField[bool]("use_triton_prefill")
+
     def __init__(self, *args, **kwargs):
         self.prefix_anchored_decode_window = kwargs.pop(
             "prefix_anchored_decode_window", None
@@ -304,6 +376,8 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             self.use_flash_v100_prefill_bfla = False
             self.use_flash_v100_prefill_contig_dense = False
             self.use_flash_v100_prefill_gather_dense = False
+
+        self.config = _config.V100AttnConfig.take_legacy_attributes(vars(self))
 
     _reset_decode_cache = _decode._reset_decode_cache
 
