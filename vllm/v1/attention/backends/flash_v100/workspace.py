@@ -417,3 +417,28 @@ class MetadataWorkspace:
 
     draft: DraftBuffers = field(default_factory=DraftBuffers)
     smallq: SmallQueryBuffers = field(default_factory=SmallQueryBuffers)
+
+
+def _allocate_growing_workspace(
+    allocate: Callable[[], tuple[torch.Tensor, ...]],
+    *,
+    on_cuda: bool,
+) -> tuple[torch.Tensor, ...] | None:
+    """Allocate a grown workspace, retrying once after releasing cached blocks.
+
+    The caller must drop its reference to the previous workspace *before*
+    calling this, otherwise the old and the new buffer are resident at the same
+    time and the growth can fail on memory its own predecessor is holding.
+    Freed segments are smaller than the grown request, so a retry after
+    ``empty_cache`` is what actually recovers the fragmented headroom.
+    """
+    try:
+        return allocate()
+    except torch.OutOfMemoryError:
+        pass
+    if on_cuda:
+        torch.accelerator.empty_cache()
+    try:
+        return allocate()
+    except torch.OutOfMemoryError:
+        return None

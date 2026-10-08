@@ -7,11 +7,11 @@ from __future__ import annotations
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.flash_v100 import dense_prefill as _dense_prefill
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
+from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -423,7 +423,7 @@ def _get_prefill_gather_dense_workspace(
 
     workspace = None
     _prefill_gather_dense_workspaces.pop(cache_key, None)
-    allocated = _dense_prefill._allocate_growing_workspace(
+    allocated = _workspace._allocate_growing_workspace(
         _allocate, on_cuda=key_cache.is_cuda
     )
     if allocated is None:
