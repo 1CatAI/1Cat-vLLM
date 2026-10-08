@@ -31,6 +31,18 @@ equality on every rank. Alternating timing order amortizes initial CPU entry
 skew over 512 HC boundaries. Each sample reports the maximum rank envelope;
 protocol service times must not be added across ranks.
 
-The protocol screen has no model dispatch changes. GPU measurements are
-pending. A protocol change requires the isolated numerical gate, complete
-chain timing and same-wheel model C1/C4, teacher-forcing and acceptance gates.
+The protocol screen passes exact eager and graph output checks on all four
+ranks. Both arms use the frozen native module with SHA256 prefix `784d1447`.
+At M5, eight real weight pairs, 64 chain repeats and 32 timing samples per
+protocol, the critical medians are:
+
+| Protocol | Maximum-rank coupled graph envelope per boundary |
+| --- | ---: |
+| Direct three-peer exchange | 23.650 us |
+| Recursive doubling and XOR forwarding | 24.892 us |
+
+Changing to XOR forwarding loses 1.242 us/boundary in this screen. The
+existing full-mesh choice is retained. This experiment does not identify the
+cause of the model target's cross-host latency increase. There is no protocol
+change or model gain to admit; a future change still requires same-wheel model
+C1/C4, teacher-forcing and acceptance checks.
