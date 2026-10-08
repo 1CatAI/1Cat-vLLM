@@ -73,15 +73,16 @@ def main():
     )
     trace_directory = args.output.parent / "prefill-trace"
     if args.profile_once:
-        config["profiler_config"] = dict(
-            profiler=args.profile_kind,
-            torch_profiler_dir=str(trace_directory.resolve()),
-            torch_profiler_with_stack=False,
-            torch_profiler_with_memory=False,
-            torch_profiler_record_shapes=False,
-            torch_profiler_dump_cuda_time_total=False,
-            torch_profiler_use_gzip=True,
-        )
+        config["profiler_config"] = dict(profiler=args.profile_kind)
+        if args.profile_kind == "torch":
+            config["profiler_config"].update(
+                torch_profiler_dir=str(trace_directory.resolve()),
+                torch_profiler_with_stack=False,
+                torch_profiler_with_memory=False,
+                torch_profiler_record_shapes=False,
+                torch_profiler_dump_cuda_time_total=False,
+                torch_profiler_use_gzip=True,
+            )
     report = dict(
         config=copy.deepcopy(config),
         version=vllm.__version__,
