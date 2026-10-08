@@ -67,6 +67,12 @@ def test_decode_executor_runs_with_independent_operators(monkeypatch, use_xqa):
                 reserve_bhmd_compare=unused,
                 write_bhmd_compare=unused,
                 compare_bhmd=unused,
+                compare_triton=unused,
+                triton_forward=unused,
+                profile_trace=unused,
+                draft_debug_enabled=unused,
+                draft_debug_log=unused,
+                format_debug=unused,
             ),
             V100Workspace(),
         )

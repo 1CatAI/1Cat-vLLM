@@ -13,13 +13,13 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 1a: immutable CPU trace and owner guard | #1071 | Gates passed; ready | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
 | 1b: patch efficacy + dependency ratchet | #1072 | Gates passed; ready | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
 | 1c: route/token/output parity tools | #1073 | Draft; host/spec model records pending | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Host/spec model gates |
-| 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | Pending complete outcome map | Prerequisite model and outcome gates |
-| 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | Pending complete outcome map | Prerequisite gates |
+| 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Prerequisite model gates |
+| 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Prerequisite model gates |
 | 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase passed | Private references 390 → 387 | Pending | CPU/rebase and GPU prerequisites |
 | 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase passed | Private references 387 → 380 | Pending | Separate outcome and GPU gates |
 | 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict passed | Private references 380 → 374; cycles 14 → 13 | Queued after Step 3 | Required GPU gates |
-| 4b: native decode candidates | — | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
-| 4c: outer decode dispatch candidates | — | Split from unpublished prototype | — | Required | Step 4b gates |
+| 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
+| 4c: outer decode dispatch candidates | — | CPU/golden/strict passed | Forward 597 → 402; private 370 → 358 | Required | Parent and GPU gates |
 | 5a: per-sequence prefill candidates | — | Not started | — | Required | Step 4 gates |
 | 5b: batch prefill candidates | — | Not started | — | Required | Step 5a gates |
 | 5c: debug observer | — | Not started | — | Required | Step 5b gates |
@@ -421,3 +421,44 @@ Pre-commit including mypy/layering passes. Private references fall 374 to 370;
 cycles remain 13 and no new forbidden edge is added. Evidence:
 `a3-decode-candidates-{strict,final-precommit}.log` and
 `a3-decode-candidates-shim.json`. GPU and final rebase evidence remain separate.
+
+## Step 4c outer decode dispatch
+
+Step 4b is Draft PR #1081 at `2b6fc00a6e614dd3dbda491a8999e2d8d88c9a34`.
+Its pinned PR #1028 integration is `b0efeed09fbdb2046d6e81690401644b69adad28`,
+tree `1e6ec72c42585c55e2444471fdce14ca88074cb0`, exactly the clean merge-tree,
+with 37 CPU passes / 98 GPU skips. Its source-verified snapshots and GPU queues
+are under `a3-step4b` on 54633. A transient SSH interruption was retried before
+staging; hashes were verified before its dependent runners were started.
+
+Step 4c extracts the outer block mechanically in `55905d068`, then replaces it
+with six real ordered candidates: unavailable decode, paged-prefill bridge,
+dense cache, dense reference, scalar-disabled fallback and native paged decode.
+Each admit is pure and retains its original short-circuit expression. Runs use
+the existing executor/config/ops/workspace boundary. Native XQA/scalar selection
+remains inside Step 4b's loop. No executor imports or receives Impl; explicit
+Triton/diagnostic callables retain compatibility until debug event extraction.
+
+The trace observes actual candidate policy reads at their new owner, without
+fabricating decisions or updating any golden. The original forward AST hash
+also remains unchanged after expanding the actual declared candidate order,
+predicates and bodies and normalizing explicit request/dependency paths. The
+adapter validates the real delegation and selection expressions; it does not
+substitute saved branch bodies. The generic loop's decline/order tests remain.
+
+The focused and full strict checks pass: **242 tests / 1 skip / 28 GPU
+exclusions**, including all 813 immutable traces and the original calculation
+hashes. Pre-commit with mypy/layering passes. Evidence is in
+`a3-outer-decode-{owned-check,strict,precommit}.log` and
+`a3-outer-decode-shim.json`. Forward shrinks 597 to 402 lines and private module
+references 370 to 358. Cycles remain 13, maximum function 977, model hits 169,
+outside-config environment reads 0, state flags 29; no new forbidden edge or
+cycle appears. The lower ceilings are locked. GPU and final rebase remain gates.
+
+Step 2's complete GPU maps are now final: dynamic 1684 passes / 7 inherited
+failures versus the same parent outcomes; frozen 1685 passes / the same 7,
+with only the new frozen-policy test added and passing. Both 12-case native
+comparisons have max-abs zero. The run ended with exit 0 and is recorded in
+`a3-step2/logs/outcome-parity.json` on 54633, copied locally as
+`a3-config-gpu-outcome-parity.json`. PRs #1075/#1076 have updated evidence and
+remain Draft while Step 1c model prerequisites are pending.

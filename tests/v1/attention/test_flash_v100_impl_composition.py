@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from vllm.v1.attention.backends import flash_attn_v100 as legacy
-from vllm.v1.attention.backends.flash_v100 import impl, state, workspace
+from vllm.v1.attention.backends.flash_v100 import decode, impl, state, workspace
 from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
 
 pytestmark = pytest.mark.cpu_test
@@ -50,6 +50,63 @@ class _InlineFeatureHooks(ast.NodeTransformer):
             return hook
         return None
 
+    def _decode_branches(self, helper):
+        assert len(helper.body) == 1 and isinstance(helper.body[0], ast.Return)
+        dispatch = helper.body[0].value
+        assert isinstance(dispatch, ast.Call)
+        assert ast.unparse(dispatch.func) == "self._new_decode_executor().forward"
+        assert len(dispatch.args) == 1 and not dispatch.keywords
+        request = dispatch.args[0]
+        assert isinstance(request, ast.Call)
+        assert ast.unparse(request.func) == "_decode.DecodeRequest"
+        assert [ast.unparse(a) for a in request.args] == [
+            a.arg for a in helper.args.args[1:]
+        ]
+        tree = ast.parse(Path(decode.__file__).read_text())
+        classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+        executor = classes["DecodeExecutor"]
+        forward = next(
+            n
+            for n in executor.body
+            if isinstance(n, ast.FunctionDef) and n.name == "forward"
+        )
+        assert len(forward.body) == 1 and isinstance(forward.body[0], ast.Return)
+        assert forward.body[0].value is not None
+        assert ast.unparse(forward.body[0].value) == (
+            "_plan.execute(request, (candidate(self) "
+            "for candidate in DECODE_CANDIDATES))"
+        )
+        order = next(
+            n.value
+            for n in tree.body
+            if isinstance(n, ast.Assign)
+            and ast.unparse(n.targets[0]) == "DECODE_CANDIDATES"
+        )
+        assert isinstance(order, ast.Tuple)
+        result = []
+        for index, name in enumerate(order.elts):
+            methods = {
+                n.name: n
+                for n in classes[ast.unparse(name)].body
+                if isinstance(n, ast.FunctionDef)
+            }
+            admit, run = methods["admit"], methods["run"]
+            assert len(admit.body) == 1 and isinstance(admit.body[0], ast.Return)
+            condition = admit.body[0].value
+            assert condition is not None
+            if index == len(order.elts) - 1:
+                assert ast.unparse(condition) == "True"
+                result.extend(copy.deepcopy(run.body))
+            else:
+                result.append(
+                    ast.If(
+                        test=copy.deepcopy(condition),
+                        body=copy.deepcopy(run.body),
+                        orelse=[],
+                    )
+                )
+        return result
+
     def visit_Return(self, node):
         if (
             isinstance(node.value, ast.Call)
@@ -69,7 +126,7 @@ class _InlineFeatureHooks(ast.NodeTransformer):
             assert [ast.unparse(a) for a in node.value.args] == [
                 a.arg for a in helper.args.args[1:]
             ]
-            return copy.deepcopy(helper.body)
+            return self._decode_branches(helper)
         return self.generic_visit(node)
 
     def visit_Expr(self, node):
@@ -124,7 +181,7 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_FunctionDef(self, node):
         self.in_cache = node.name in _CACHE_METHODS
-        if node.name == "_call_flash_attn_decode_paged":
+        if node.name in ("_call_flash_attn_decode_paged", "_flash_v100_decode"):
             pairs = list(zip(node.args.kwonlyargs, node.args.kw_defaults))
             for argument, default in pairs:
                 if argument.arg == "record":
@@ -156,6 +213,28 @@ class _Normalize(ast.NodeTransformer):
         return node
 
     def visit_Attribute(self, node):
+        expression = ast.unparse(node)
+        if expression.startswith("self.executor."):
+            node = ast.parse(
+                expression.replace("self.executor.", "self.", 1), mode="eval"
+            ).body
+            assert isinstance(node, ast.Attribute)
+        if ast.unparse(node.value) == "request":
+            return ast.Name(id=node.attr, ctx=node.ctx)
+        if ast.unparse(node) == "self.ops.triton_forward":
+            return ast.parse("super().forward", mode="eval").body
+        debug_ops = {
+            "profile_trace": "_sm70_profile_trace",
+            "draft_debug_enabled": "_draft_graph_debug_enabled",
+            "draft_debug_log": "_draft_graph_debug_log",
+            "format_debug": "_format_tensor_debug",
+        }
+        if ast.unparse(node.value) == "self.ops" and node.attr in debug_ops:
+            return ast.Attribute(
+                value=ast.Name(id="_debug", ctx=ast.Load()),
+                attr=debug_ops[node.attr],
+                ctx=node.ctx,
+            )
         if ast.unparse(node) == "self.config.policy":
             return ast.Name(id="self", ctx=ast.Load())
         owner = ast.unparse(node.value)
@@ -174,6 +253,7 @@ class _Normalize(ast.NodeTransformer):
                 "reserve_bhmd_compare": "_reserve_bhmd_compare_call",
                 "write_bhmd_compare": "_write_bhmd_compare_report",
                 "compare_bhmd": "_maybe_compare_bhmd_out",
+                "compare_triton": "_maybe_compare_triton_output",
             }.get(node.attr, node.attr)
         node = self.generic_visit(node)
         if ast.unparse(node) == "self.scalar_tail":
@@ -202,7 +282,16 @@ class _Normalize(ast.NodeTransformer):
         node = self.generic_visit(node)
         if ast.unparse(node.func) == "record":
             node.func = ast.parse("_routing._record_route", mode="eval").body
-
+        if ast.unparse(node.func) in (
+            "self._flash_v100_decode",
+            "_routing._log_fp8_kv_cache_route",
+        ):
+            for keyword in node.keywords:
+                if keyword.arg == "record":
+                    assert ast.unparse(keyword.value) == "record"
+            node.keywords = [
+                keyword for keyword in node.keywords if keyword.arg != "record"
+            ]
         if self.in_cache and ast.unparse(node.func) == "extract":
             node.func = ast.parse(
                 "_kv_layout._extract_contiguous_kv_from_paged_cache", mode="eval"
@@ -258,7 +347,11 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                     "__init__",
                     "_flash_v100_window_size",
                     "_xqa_kv_codec",
+                    "forward",
                 ):
+                    continue
+                if fn.name == "_forward_decode":
+                    # Expanded and validated with the forward body above.
                     continue
                 if any(
                     isinstance(n, ast.Call)
