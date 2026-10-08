@@ -949,7 +949,7 @@ class precompiled_wheel_utils:
                     r"flash_qla/ops/gated_delta_rule/chunk/sm70/[^/]+\.so"
                 )
                 sm70_ext_regex = re.compile(
-                    r"vllm/_sm70_(?:sampler|exact_reduce|sparse_attention)_C"
+                    r"vllm/_sm70_(?:sampler|exact_reduce|sparse_attention|gguf_persistent)_C"
                     r"(?:\.[^/]+)?\.so$"
                 )
                 h3_ext_regex = re.compile(
@@ -1343,6 +1343,9 @@ if _is_cuda():
             CMakeExtension(name="vllm._sm70_exact_reduce_C", py_limited_api=False)
         )
         ext_modules.append(
+            CMakeExtension(name="vllm._sm70_gguf_persistent_C", py_limited_api=False)
+        )
+        ext_modules.append(
             CMakeExtension(name="vllm._h3_w8a16_C", py_limited_api=False)
         )
         ext_modules.append(
@@ -1474,6 +1477,8 @@ if PRECOMPILED_RUST_FRONTEND_PATH.exists():
 # installed module in the final wheel, rather than a task-cache sidecar.
 if USE_PRECOMPILED_EXTENSIONS and (ROOT_DIR / "vllm/_C_gguf.abi3.so").is_file():
     package_data.setdefault("vllm", []).append("_C_gguf.abi3.so")
+if USE_PRECOMPILED_EXTENSIONS:
+    package_data.setdefault("vllm", []).append("_sm70_gguf_persistent_C*.so")
 package_data.setdefault("vllm", []).append("third_party/gguf_native/*")
 
 if _no_device():
