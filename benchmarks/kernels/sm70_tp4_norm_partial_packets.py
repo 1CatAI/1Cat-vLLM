@@ -19,6 +19,13 @@ def generate(root, parts=5):
     kernel = native[begin:end].replace(
         "sm70_push_allreduce_gemma_rms_norm", "partial_packet_norm"
     )
+    # Keep this screen's original dynamic-pointer control ABI. The independent
+    # local-pointer generator applies that one change separately, including
+    # when extracting from a production source that already contains it.
+    kernel = kernel.replace(
+        "const void* local_buffer, float epsilon)", "float epsilon)"
+    )
+    kernel = kernel.replace("local_buffer", "buffers.ptrs[rank]")
     begin = kernel.index("  using Meta =")
     end = kernel.index("  const uint32_t generation", begin)
     kernel = (
@@ -95,9 +102,18 @@ static_assert(sizeof(PartialPacketMeta)==352,"Aligned packet metadata");
         "return kSm70Tp4PushAllreduceBufferBytes + sizeof(PullSignals) +\n"
         "      sizeof(PartialPacketMeta);",
     )
-    text = text.replace(
+    original_call = (
         "if (mode == 1) direct_pull_norm<float><<<40,128,0,stream>>>(\n"
-        "      peers(buffers),peers(inputs),x,r,w,y,ro,rank,1e-6f);",
+        "      peers(buffers),peers(inputs),x,r,w,y,ro,rank,1e-6f);"
+    )
+    if original_call not in text:
+        original_call = original_call.replace(
+            "rank,1e-6f)",
+            "rank,reinterpret_cast<const void*>(buffers.at(rank)),1e-6f)",
+        )
+    assert text.count(original_call) == 1
+    text = text.replace(
+        original_call,
         f"if (mode == 1) partial_packet_norm<float><<<{8 * parts},{640 // parts},"
         "0,stream>>>(\n"
         "      peers(buffers),x,r,w,y,ro,rank,1e-6f);",

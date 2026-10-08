@@ -6,6 +6,13 @@ extracted from the owned source and checked against the installed operators.
 
 ## Measurement contract
 
+The structural-flow screens below use the admitted `c4f6245f8414` ordinary
+wheel as the control, at **1530/877 MHz** and 300 W on the same TP4 machine.
+The older sections retain their original 1290/877-MHz contract. Do not compare
+absolute layer times across these clock settings or add savings from separate
+paired runs. The admitted whole-round C1 remains 13.456 ms at 1K and 13.860 ms
+at 8K; none of the new research extensions has changed that result.
+
 V100-SXM2-32GB on a fully NV2-connected TP4 group, 300 W, 1290 MHz SM and
 877 MHz memory; Torch 2.10/cu128, CUDA toolkit 12.8. Original unsloth target
 weights, rank-local layer 0, M8 FP16 activations and FP32 residual/state.
@@ -432,6 +439,83 @@ spills. Full TP4 layer output/residual/state/history match at four amplitudes.
 Nevertheless, critical-rank timing is 156.313 to 157.153 us, saving -0.839 us
 with CI [-2.124, 0.082]. Do not promote weight reuse or the smaller grid as a
 latency gain; the longer per-CTA row work does not clear the layer gate.
+
+## Structural weight-flow screens at 1530 MHz
+
+These measurements use the current ordinary wheel, real layer-0 weights,
+cold L2 and complete TP4 layer graphs. Times are the maximum over four ranks
+for each paired sample; intervals bootstrap 200 paired samples. All rows below
+match output/residual/state/history bits at four input amplitudes.
+
+| Complete layer screen | Control us | Candidate us | Saving us, 95% interval | Kernels |
+| --- | ---: | ---: | ---: | --- |
+| Two-group register queue, gate and down | 147.645 | 150.441 | -2.796, -3.272 to -2.324 | 10 to 10 |
+| Register queue, gate only | 150.886 | 154.132 | -3.246, -4.332 to -1.869 | 10 to 10 |
+| Register queue, down only | 148.588 | 148.173 | 0.415, -0.282 to 1.116 | 10 to 10 |
+| Resident gate/up and down tasks | 147.174 | 146.186 | 0.988, 0.481 to 1.490 | 10 to 9 |
+| Resident out/down norm plus gate L2 prefix | 148.910 | 144.517 | 4.393, 3.702 to 5.105 | 10 to 8 |
+| L2 prefix increment against the same resident fusions | 149.115 | 146.652 | 2.463, 1.556 to 3.354 | 8 to 8 |
+| Late-token GDN prefetch of FP8 out | 151.020 | 152.796 | -1.777, -2.555 to -1.085 | 10 to 10 |
+| Norm and shared-memory gate-weight staging | 152.458 | 182.441 | -29.983, -30.935 to -29.015 | 10 to 9 |
+
+Counts exclude the cold-L2 fill, state reset and timing events. Smaller graphs
+are not automatically faster. The resident MLP saving extrapolates to only
+about 0.055 ms over 56 gates. The L2 prefix increment extrapolates to about
+0.138 ms; it is not a 4.393-us independent prefetch improvement. Neither
+clears a 0.3-ms whole-round implementation threshold on its own. No complete
+wheel or C1/C4 rerun is justified by these screens yet.
+
+The two-group queue issues future raw-code/scale loads before the current
+decode and MMA. It preserves the ordered accumulation and FP16 boundaries.
+Gate uses 78 registers versus the ordinary paired kernel's 80; down uses 56.
+There are no spills. NCU gate duration is 42.912/42.720 us and down is
+22.752/22.880 us for control/candidate. Down long-scoreboard percentage drops
+65.59% to 44.25% without a whole-layer speed gain. Reject the schedule rather
+than treating a stall percentage as an admitted improvement.
+
+Resident MLP uses 160 cooperative CTAs and versioned readiness per gate chunk;
+down tasks consume only their required chunks. It uses 64 registers, 16 KiB
+shared memory and no spills. Norm/weight staging instead separates publisher
+warps from weight-loader warps and stages 6.267 MB of raw gate/up prefixes.
+Both the standalone raw copy and staged GEMM pass bit checks. The combined
+kernel initially consumed stale activations from other CTAs; mutable input,
+volatile loads/stores and release/acquire publication resolve those checks.
+It still regresses by about 30 us. A subsequent teardown error came from
+freeing aliased native communicator buffers twice; the harness now frees only
+owned buffers. Do not deploy this slower research candidate.
+
+The unchanged GDN recurrence's NCU DRAM traffic is 8.041 MB in 17.696 us;
+adding its late prefetch raises it to 9.851 MB and 20.928 us. State and
+activation traffic must be included in the HBM ledger: a weight-byte lower
+bound does not prove that half of all physical DRAM time is idle. The actual
+gate allocation is 80 registers; 136 CTAs may coexist at two CTAs per SM, so
+136/80 alone does not prove two serialized waves. The fused qkvz grid's 224
+CTAs comprise 128 FP8 tasks and 96 much smaller b/a tasks. They are not equal
+weight-reading tasks. Existing complete-target graph samples show four rank
+means within 2.7 us on this machine; the old machine's rank skew is not an
+additional recoverable budget here.
+
+`summarize_sm70_weight_windows.py` produces a CUDA-kernel interval ledger and
+optional plot from the TP4 Nsight SQLite capture. Projection, communication,
+state and mixed intervals are labelled separately. This is an observed kernel
+timeline with per-kernel NCU traffic, **not** instantaneous HBM telemetry:
+Nsight Systems GPU metrics are unavailable on Volta. Profiling also introduces
+launch skew and is not used for the accepted absolute layer saving.
+
+The next resident screen retains 768 state-column tasks and stages FP8 out
+weights in other warps before activation readiness. It targets roughly
+0.35–0.45 ms across 48 GDN layers, pending a complete-layer result. Its
+head-local arithmetic is numerical, so a speed pass would still require
+teacher-forcing KL against a dense high-precision oracle before admission.
+
+The dataflow design is informed by
+[No Bubbles](https://hazyresearch.stanford.edu/blog/2025-05-27-no-bubbles),
+[Mirage's persistent scheduler](https://github.com/mirage-project/mirage)
+and [CUTLASS software pipelining](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/threadblock/mma_pipelined.h).
+The screens use SM70 loads and explicit readiness; modern asynchronous copy,
+TMA and PDL mechanisms are not assumed. Raw samples, build/SASS evidence,
+NCU reports and the timeline are retained under the campaign's
+`qwen38-structural-pipeline-20261008` artifact directory.
 
 Benchmarks are under `benchmarks/kernels/`:
 

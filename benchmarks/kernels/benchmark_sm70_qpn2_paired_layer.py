@@ -70,14 +70,32 @@ def main():
     parser.add_argument("--extension", type=Path, required=True)
     parser.add_argument("--mode", type=int, choices=(0, 1, 2), default=1)
     parser.add_argument("--paired-control-extension", type=Path)
+    parser.add_argument("--wheel-paired-control", action="store_true")
+    parser.add_argument("--pipeline-extension", type=Path)
+    parser.add_argument("--resident-mlp-extension", type=Path)
+    parser.add_argument(
+        "--pipeline-arm", choices=("both", "gate", "down"), default="both"
+    )
     parser.add_argument("--prepared-qk", action="store_true")
     parser.add_argument("--projection-conv-extension", type=Path)
     parser.add_argument("--cooperative-core-extension", type=Path)
     parser.add_argument("--head-local-core-extension", type=Path)
+    parser.add_argument("--gdn-out-stage-extension", type=Path)
     parser.add_argument("--head-local-convolution", action="store_true")
     parser.add_argument("--cooperative-no-qk-cache", action="store_true")
     parser.add_argument("--norm-partial-extension", type=Path)
     parser.add_argument("--norm-gate-extension", type=Path)
+    parser.add_argument("--norm-weight-stage-extension", type=Path)
+    parser.add_argument("--dump-weight-stage", action="store_true")
+    parser.add_argument("--debug-weight-stage", action="store_true")
+    parser.add_argument("--resident-down-norm-extension", type=Path)
+    parser.add_argument("--resident-out-norm", action="store_true")
+    parser.add_argument("--resident-out-only", action="store_true")
+    parser.add_argument("--resident-weight-window", action="store_true")
+    parser.add_argument("--resident-control-extension", type=Path)
+    parser.add_argument("--resident-native-ca-buffers", action="store_true")
+    parser.add_argument("--resident-fp16-norm-weights", action="store_true")
+    parser.add_argument("--packed-input-extension", type=Path)
     parser.add_argument("--norm-packet-parts", type=int, choices=(5, 10, 20), default=5)
     parser.add_argument("--warp-publish", action="store_true")
     parser.add_argument("--dump-gdn-inputs", type=Path)
@@ -94,6 +112,11 @@ def main():
     parser.add_argument("--iters", type=int, default=150)
     parser.add_argument("--ncu-direct", action="store_true")
     parser.add_argument("--ncu-graph", action="store_true")
+    parser.add_argument("--ncu-candidate", action="store_true")
+    parser.add_argument("--cuda-profiler-capture", action="store_true")
+    parser.add_argument("--delta-bv", type=int, choices=(1, 2, 4))
+    parser.add_argument("--gdn-weight-window", action="store_true")
+    parser.add_argument("--gdn-prefetch-token", type=int, choices=range(8), default=6)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     rank = int(os.environ["LOCAL_RANK"])
@@ -117,6 +140,26 @@ def main():
     extension = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(extension)
     paired_control = None
+    pipeline = None
+    resident_mlp = None
+    mlp_ready = None
+    if args.resident_mlp_extension:
+        assert args.wheel_paired_control
+        spec = importlib.util.spec_from_file_location(
+            args.resident_mlp_extension.name.split(".")[0], args.resident_mlp_extension
+        )
+        assert spec and spec.loader
+        resident_mlp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(resident_mlp)
+        mlp_ready = torch.zeros(296, device="cuda", dtype=torch.int32)
+    if args.pipeline_extension:
+        assert args.wheel_paired_control
+        spec = importlib.util.spec_from_file_location(
+            args.pipeline_extension.name.split(".")[0], args.pipeline_extension
+        )
+        assert spec and spec.loader
+        pipeline = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pipeline)
     if args.paired_control_extension:
         spec = importlib.util.spec_from_file_location(
             args.paired_control_extension.name.split(".")[0],
@@ -194,13 +237,14 @@ def main():
         epilogue_scale = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(epilogue_scale)
     head_local = None
-    if args.head_local_core_extension:
+    head_extension = args.head_local_core_extension or args.gdn_out_stage_extension
+    if head_extension:
         assert args.mode == 0 and not args.inline_conv and not args.hybrid_snapshot
         assert fused_projection is None and cooperative is None and packet_norm is None
         assert ba_order is None and epilogue_scale is None
         spec = importlib.util.spec_from_file_location(
-            args.head_local_core_extension.name.split(".")[0],
-            args.head_local_core_extension,
+            head_extension.name.split(".")[0],
+            head_extension,
         )
         assert spec and spec.loader
         head_local = importlib.util.module_from_spec(spec)
@@ -208,6 +252,9 @@ def main():
         head_packets = torch.zeros(12, 8, 8, device=rank, dtype=torch.int64)
         head_generations = torch.zeros(12, device=rank, dtype=torch.int32)
         head_conv_ready = torch.zeros(4, 24, device=rank, dtype=torch.int32)
+        if args.gdn_out_stage_extension:
+            assert args.resident_out_norm and args.resident_native_ca_buffers
+            head_out_ready = torch.zeros(256, device=rank, dtype=torch.int32)
     assert not args.head_local_convolution or head_local is not None
     with safe_open(
         str(args.model / "model.safetensors"), framework="pt", device="cpu"
@@ -297,6 +344,145 @@ def main():
         candidate_gate_bundle = (
             mlp[0][2].view(2, 136, 320, 288).permute(1, 2, 0, 3).contiguous()
         )
+    resident_down_norm = None
+    resident_control = None
+    if args.resident_control_extension:
+        assert args.resident_out_norm and not args.resident_out_only
+        spec = importlib.util.spec_from_file_location(
+            args.resident_control_extension.name.split(".")[0],
+            args.resident_control_extension,
+        )
+        assert spec and spec.loader
+        resident_control = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(resident_control)
+    packed_input = None
+    if args.packed_input_extension:
+        assert args.resident_out_norm and not args.resident_out_only
+        spec = importlib.util.spec_from_file_location(
+            args.packed_input_extension.name.split(".")[0], args.packed_input_extension
+        )
+        assert spec and spec.loader
+        packed_input = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packed_input)
+    if args.resident_down_norm_extension:
+        assert (
+            paired_control is not None or args.wheel_paired_control
+        ) and args.mode == 0
+        assert packet_norm is None and norm_gate is None
+        spec = importlib.util.spec_from_file_location(
+            args.resident_down_norm_extension.name.split(".")[0],
+            args.resident_down_norm_extension,
+        )
+        assert spec and spec.loader
+        resident_down_norm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(resident_down_norm)
+        if not hasattr(resident_down_norm, "fused"):
+            resident_down_norm.fused = resident_down_norm.fused_packed
+        if args.resident_native_ca_buffers:
+            # Alternate ordinary and resident kernels in the actual
+            # communicator's packet generations, with no private metadata.
+            down_norm_buffers = ca.sm70_tp4_push_buffer_ptrs
+        else:
+            down_norm_group = dist.new_group(backend="gloo")
+            down_norm_buffers = CustomAllreduce.create_shared_buffer(
+                resident_down_norm.buffer_bytes(), down_norm_group
+            )
+            resident_down_norm.initialize(down_norm_buffers, rank)
+        down_norm_output = torch.empty(8, 5120, device=rank, dtype=torch.float16)
+        down_norm_residual = torch.empty(8, 5120, device=rank, dtype=torch.float32)
+        down_norm_weight = (
+            inputnorm if args.resident_fp16_norm_weights else inputnorm.float()
+        ).contiguous()
+        out_norm_weight = (
+            postnorm if args.resident_fp16_norm_weights else postnorm.float()
+        ).contiguous()
+        out_norm_output = torch.empty_like(down_norm_output)
+        out_norm_residual = torch.empty_like(down_norm_residual)
+        if args.resident_out_norm:
+            assert hasattr(resident_down_norm, "out")
+    assert not args.resident_out_norm or resident_down_norm is not None
+    assert not args.resident_out_only or args.resident_out_norm
+    norm_weight_stage = None
+    norm_stage_epochs = None
+    stage_debug_prefix = None
+    stage_debug_input = None
+    if args.norm_weight_stage_extension:
+        assert args.wheel_paired_control and args.mode == 0
+        assert norm_gate is None and not args.resident_out_norm
+        spec = importlib.util.spec_from_file_location(
+            args.norm_weight_stage_extension.name.split(".")[0],
+            args.norm_weight_stage_extension,
+        )
+        assert spec and spec.loader
+        norm_weight_stage = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(norm_weight_stage)
+        norm_gate_buffers = ca.sm70_tp4_push_buffer_ptrs
+        norm_gate_input = torch.empty(8, 5120, device=rank, dtype=torch.float16)
+        norm_gate_residual = torch.empty(8, 5120, device=rank, dtype=torch.float32)
+        norm_gate_weight = postnorm.float()
+        norm_stage_epochs = torch.zeros(176, device=rank, dtype=torch.int32)
+        if args.debug_weight_stage:
+            stage_debug_prefix = torch.empty(
+                2 * 2 * 8 * 10 * 288 + 2 * 2 * 8 * 40 * 32 * 32,
+                device=rank,
+                dtype=torch.uint8,
+            )
+            stage_debug_input = torch.full(
+                (2, 8, 40, 32, 16), float("nan"), device=rank, dtype=torch.float16
+            )
+            stage_debug_pure_prefix = torch.empty_like(stage_debug_prefix)
+            stage_debug_pure_input = torch.empty_like(stage_debug_input)
+            stage_debug_pure_gate = torch.empty(
+                8, 4352, device=rank, dtype=torch.float16
+            )
+        if args.dump_weight_stage:
+            codes = mlp[0][2]
+            expected = (
+                codes.view(2, 136, 8, 40, 288)[:, :, :, :10]
+                .permute(1, 0, 2, 3, 4)
+                .contiguous()
+            )
+            dumped = torch.empty_like(expected)
+            diagnostics = []
+            for workers in (128, 256):
+                norm_weight_stage.dump_stage(dumped, codes, workers)
+                error = dumped != expected
+                diagnostics.append(
+                    {
+                        "workers": workers,
+                        "errors": error.sum().item(),
+                        "bitwise": torch.equal(dumped, expected),
+                    }
+                )
+                if error.any():
+                    torch.save(
+                        {"expected": expected.cpu(), "actual": dumped.cpu()},
+                        args.out / f"rank{rank}-stage-{workers}.pt",
+                    )
+            (args.out / f"rank{rank}-staging.json").write_text(
+                json.dumps(diagnostics, indent=2)
+            )
+            assert all(d["bitwise"] for d in diagnostics), diagnostics
+            golden = torch.empty(8, 4352, device=rank, dtype=torch.float16)
+            candidate = torch.empty_like(golden)
+            operand = torch.empty(8, 5120, device=rank, dtype=torch.float16)
+            for amplitude in (0.01, 0.125, 1.0, 4.0):
+                operand.normal_().mul_(amplitude)
+                ops.nvfp4_qpn2_gated_sm70_out(
+                    golden, operand, codes[..., :256], codes[..., 256:], mlp[0][3], 8, 1
+                )
+                norm_weight_stage.gate(candidate, operand, codes, mlp[0][1], mlp[0][3])
+                errors = (
+                    (golden.view(torch.int16) != candidate.view(torch.int16))
+                    .sum()
+                    .item()
+                )
+                diagnostics.append({"amplitude": amplitude, "gate_errors": errors})
+            (args.out / f"rank{rank}-staging.json").write_text(
+                json.dumps(diagnostics, indent=2)
+            )
+            assert not any(d.get("gate_errors", 0) for d in diagnostics), diagnostics
+            return
     layer = SimpleNamespace(
         in_proj_qkvz=Projection(qpn, qs),
         in_proj_ba=Projection(baweight),
@@ -305,6 +491,20 @@ def main():
         gqa_interleaved_layout=False,
         disable_tp_for_ba_proj=False,
     )
+    gdn_window_hash = None
+    gdn_window_kernel = None
+    if args.gdn_weight_window:
+        from sm70_gdn_weight_window_screen import candidate_module
+
+        gdn_window_kernel, gdn_window_hash = candidate_module(rank_source)
+
+    def delta_weight_window(*values, **kwargs):
+        from sm70_gdn_weight_window_screen import launch
+
+        return launch(
+            gdn_window_kernel, outq, args.gdn_prefetch_token, *values, **kwargs
+        )
+
     x = torch.randn(8, 5120, device="cuda", dtype=torch.float16) * 0.125
     residual = torch.randn(8, 5120, device="cuda") * 0.125
     core_out = x.new_empty(8, 1536)
@@ -391,6 +591,22 @@ def main():
         inline_kernel, inline_source_sha256 = candidate_module(rank_source)
         inline_ready = torch.zeros(4, 192, device=x.device, dtype=torch.uint32)
 
+    def delta_bv(*values, **kwargs):
+        from vllm.model_executor.layers.fla.ops import fused_sigmoid_gating
+
+        selector = fused_sigmoid_gating._select_fused_sigmoid_launch
+
+        def select(*positional, **named):
+            _, warps, stages = selector(*positional, **named)
+            assert warps == 1
+            return args.delta_bv, warps, stages
+
+        fused_sigmoid_gating._select_fused_sigmoid_launch = select
+        try:
+            return delta_update(*values, **kwargs)
+        finally:
+            fused_sigmoid_gating._select_fused_sigmoid_launch = selector
+
     def reset(arm=0):
         state.copy_(initial if state_seeds is None else state_seeds[arm])
         hist.copy_(history)
@@ -421,7 +637,10 @@ def main():
 
     seen_routes = set()
 
+    last_mlp_input = None
+
     def run(mode, prepare=False, capture_inputs=False, reference=False):
+        nonlocal last_mlp_input
         normalized, _ = input_norm(x, residual, inputnorm, 1e-6)
         if prepare and fused_projection is not None:
             q, z = x.new_empty(8, 2560), x.new_empty(8, 1536)
@@ -461,6 +680,12 @@ def main():
         else:
             q, z, b, a = apply_gdn_ba_verify(layer, normalized)
         conv_fn, delta_fn = conv_gate_zero, delta_update
+        if prepare and args.gdn_weight_window:
+            seen_routes.add("gdn_weight_window")
+            delta_fn = delta_weight_window
+        if prepare and args.delta_bv is not None:
+            seen_routes.add(f"delta_bv{args.delta_bv}")
+            delta_fn = delta_bv
         if prepare and args.prepared_qk:
             from sm70_gdn_prepared_qk_screen import conv_prepare, prepared_delta
 
@@ -511,22 +736,49 @@ def main():
                 if args.head_local_convolution
                 else ()
             )
-            head_local.launch(
-                core,
-                core_out,
-                transformed,
-                z,
-                g.view(8, 12),
-                beta.view(8, 12),
-                norm,
-                state,
-                indices,
-                accepted,
-                cu,
-                head_packets,
-                head_generations,
-                *extra,
-            )
+            if args.gdn_out_stage_extension:
+                seen_routes.add("gdn_out_stage")
+                head_local.launch(
+                    out_norm_output,
+                    out_norm_residual,
+                    core,
+                    residual,
+                    out_norm_weight,
+                    outq,
+                    outs,
+                    down_norm_buffers,
+                    rank,
+                    transformed,
+                    z,
+                    g.view(8, 12),
+                    beta.view(8, 12),
+                    norm,
+                    state,
+                    indices,
+                    accepted,
+                    cu,
+                    core_out,
+                    head_packets,
+                    head_generations,
+                    head_out_ready,
+                )
+            else:
+                head_local.launch(
+                    core,
+                    core_out,
+                    transformed,
+                    z,
+                    g.view(8, 12),
+                    beta.view(8, 12),
+                    norm,
+                    state,
+                    indices,
+                    accepted,
+                    cu,
+                    head_packets,
+                    head_generations,
+                    *extra,
+                )
         elif prepare and cooperative is not None:
             core = torch.empty_like(core_out)
             cooperative.launch(
@@ -592,11 +844,68 @@ def main():
                 eps=1e-6,
                 norm_before_gate=True,
             ).view(8, 1536)
-        if prepare and epilogue_scale is not None:
+        resident_module = resident_control if reference else resident_down_norm
+        resident_prepare = (reference and resident_control is not None) or prepare
+        if prepare and args.gdn_out_stage_extension:
+            seen_routes.add("resident_out_norm")
+        elif resident_prepare and args.resident_out_norm:
+            seen_routes.add("resident_out_norm")
+            out_args = (
+                out_norm_output,
+                out_norm_residual,
+                core,
+                residual,
+                out_norm_weight,
+                outq,
+                outs,
+                down_norm_buffers,
+                rank,
+            )
+            if args.resident_weight_window and not reference:
+                out_args += (mlp[0][2],)
+                seen_routes.add("resident_weight_window")
+            resident_module.out(*out_args)
+        elif prepare and epilogue_scale is not None:
             epilogue_scale.out(projected, core, outq, outs)
         else:
             ops.fp8_qpn8_gemm_sm70_out(projected, core, outq, outs, 12, 2, True, False)
-        if prepare and norm_gate is not None:
+        if prepare and norm_weight_stage is not None:
+            seen_routes.add("norm_weight_stage")
+            _, scales, bundle, scale, _ = mlp[0]
+            stage_function = (
+                norm_weight_stage.fused_debug
+                if args.debug_weight_stage
+                else norm_weight_stage.fused
+            )
+            stage_args = (
+                up,
+                norm_gate_input,
+                norm_gate_residual,
+                projected,
+                residual,
+                norm_gate_weight,
+                bundle,
+                scales,
+                scale,
+                norm_gate_buffers,
+                rank,
+                norm_stage_epochs,
+            )
+            if args.debug_weight_stage:
+                stage_args += (stage_debug_prefix, stage_debug_input)
+            stage_function(*stage_args)
+            if args.debug_weight_stage:
+                norm_weight_stage.gate_debug(
+                    stage_debug_pure_gate,
+                    norm_gate_input,
+                    bundle,
+                    scales,
+                    scale,
+                    stage_debug_pure_prefix,
+                    stage_debug_pure_input,
+                )
+            p, r = norm_gate_input, norm_gate_residual
+        elif prepare and norm_gate is not None:
             seen_routes.add("resident_norm_gate")
             _, scales, bundle, scale, _ = mlp[0]
             norm_gate.fused(
@@ -613,13 +922,74 @@ def main():
                 rank,
             )
             p, r = norm_gate_input, norm_gate_residual
+        elif resident_prepare and args.resident_out_norm:
+            p, r = out_norm_output, out_norm_residual
         else:
             p, r = boundary(projected, residual, postnorm, 0, prepare)
+        last_mlp_input = (p, r)
+        if prepare and resident_mlp is not None:
+            seen_routes.add("resident_mlp")
+            resident_mlp.mlp(
+                down, up, p, mlp[0][2], mlp[1][2], mlp_ready, mlp[0][3], mlp[1][3]
+            )
+            return boundary(down, r, inputnorm, 1, prepare)
         for item, operand, result in ((mlp[0], p, up), (mlp[1], up, down)):
             w, s, bundle, scale, gated = item
-            if gated and prepare and norm_gate is not None:
+            if (
+                gated
+                and prepare
+                and (norm_gate is not None or norm_weight_stage is not None)
+            ):
                 continue
-            if not gated and prepare and args.warp_publish:
+            if gated and prepare and packed_input is not None:
+                seen_routes.add("packed_gate_input")
+                packed_input.warp_input(result, operand, bundle, s, scale, True, False)
+                continue
+            if (
+                not gated
+                and resident_prepare
+                and resident_module is not None
+                and not args.resident_out_only
+            ):
+                seen_routes.add("resident_down_norm")
+                resident_module.fused(
+                    down_norm_output,
+                    down_norm_residual,
+                    operand,
+                    r,
+                    down_norm_weight,
+                    bundle,
+                    s,
+                    scale,
+                    down_norm_buffers,
+                    rank,
+                )
+                return down_norm_output, down_norm_residual
+            if (
+                prepare
+                and pipeline is not None
+                and (
+                    args.pipeline_arm == "both"
+                    or args.pipeline_arm == ("gate" if gated else "down")
+                )
+            ):
+                seen_routes.add("pipeline_gate" if gated else "pipeline_down")
+                if gated:
+                    pipeline.pair(result, operand, bundle, s, scale, 1)
+                else:
+                    pipeline.down(result, operand, bundle, s, scale)
+            elif args.wheel_paired_control:
+                seen_routes.add("wheel_gate" if gated else "wheel_down")
+                codes, scales = bundle[..., :256], bundle[..., 256:]
+                if gated:
+                    ops.nvfp4_qpn2_gated_sm70_out(
+                        result, operand, codes, scales, scale, 8, 1
+                    )
+                else:
+                    ops.nvfp4_qpn2_gemm_sm70_out(
+                        result, operand, codes, scales, scale, 16, 2
+                    )
+            elif not gated and prepare and args.warp_publish:
                 packet_norm.project(
                     result, operand, bundle, s, scale, packet_buffers, rank
                 )
@@ -672,12 +1042,24 @@ def main():
         return reconstructed
 
     if args.ncu_direct or args.ncu_graph:
-        assert paired_control is not None
+        assert paired_control is not None or args.wheel_paired_control
+        assert (
+            not args.ncu_candidate
+            or pipeline is not None
+            or resident_mlp is not None
+            or args.gdn_weight_window
+            or resident_down_norm is not None
+            or norm_weight_stage is not None
+        )
+
+        def profiled_run():
+            return run(args.mode, args.ncu_candidate, reference=not args.ncu_candidate)
+
         reset()
         eviction.fill_(1)
         torch.cuda.synchronize()
         dist.barrier()
-        run(1, reference=True)
+        profiled_run()
         torch.cuda.synchronize()
         dist.barrier()
         if args.ncu_graph:
@@ -685,9 +1067,10 @@ def main():
             with ca.capture(), torch.cuda.graph(graph):
                 reset()
                 eviction.fill_(1)
-                run(1, reference=True)
+                profiled_run()
             torch.cuda.synchronize()
             dist.barrier()
+            graph.replay()
             graph.replay()
             torch.cuda.synchronize()
             dist.barrier()
@@ -703,6 +1086,10 @@ def main():
             reference=True,
         )
         golden = [v.clone() for v in control_out] + [state.clone(), hist.clone()]
+        if resident_mlp is not None or norm_weight_stage is not None:
+            golden.extend((up.clone(), down.clone()))
+        if norm_weight_stage is not None:
+            golden.extend(v.clone() for v in last_mlp_input)
         reset(1)
         candidate_out = run(
             args.mode,
@@ -715,10 +1102,21 @@ def main():
             or ba_order is not None
             or epilogue_scale is not None
             or head_local is not None
-            or norm_gate is not None,
+            or norm_gate is not None
+            or args.delta_bv is not None
+            or resident_down_norm is not None
+            or pipeline is not None
+            or resident_mlp is not None
+            or args.gdn_weight_window
+            or norm_weight_stage is not None,
         )
-        for result, reference in zip(
-            list(candidate_out) + [candidate_state(), hist], golden
+        candidate_values = list(candidate_out) + [candidate_state(), hist]
+        if resident_mlp is not None or norm_weight_stage is not None:
+            candidate_values.extend((up, down))
+        if norm_weight_stage is not None:
+            candidate_values.extend(last_mlp_input)
+        for value_index, (result, reference) in enumerate(
+            zip(candidate_values, golden)
         ):
             bits = torch.int16 if result.element_size() == 2 else torch.int32
             exact = torch.equal(result.view(bits), reference.view(bits))
@@ -728,6 +1126,7 @@ def main():
                     "bitwise": exact,
                     "finite": bool(torch.isfinite(result).all()),
                     "max_abs": (result.float() - reference.float()).abs().max().item(),
+                    "value_index": value_index,
                 }
             )
             assert torch.isfinite(result).all(), "Nonfinite candidate output"
@@ -742,8 +1141,39 @@ def main():
                 and args.paired_accumulators is None
                 and not (packet_norm is not None and args.norm_packet_parts != 5)
             ):
-                assert exact
+                if not exact:
+                    (args.out / f"rank{rank}-failure.json").write_text(
+                        json.dumps(differences, indent=2)
+                    )
+                    failure = {
+                        "reference": [v.cpu() for v in golden],
+                        "candidate": [v.cpu() for v in candidate_values],
+                    }
+                    if args.debug_weight_stage:
+                        failure["prefix"] = stage_debug_prefix.cpu()
+                        failure["prefix_expected"] = (
+                            mlp[0][2]
+                            .view(2, 136, 8, 40, 288)[:, [0, 40], :, :10]
+                            .permute(1, 0, 2, 3, 4)
+                            .cpu()
+                        )
+                        failure["observed_input"] = stage_debug_input.cpu()
+                        failure["pure_prefix"] = stage_debug_pure_prefix.cpu()
+                        failure["pure_input"] = stage_debug_pure_input.cpu()
+                        failure["pure_gate"] = stage_debug_pure_gate.cpu()
+                        failure["stage_epochs"] = norm_stage_epochs.cpu()
+                    torch.save(
+                        failure,
+                        args.out / f"rank{rank}-failure.pt",
+                    )
+                assert exact, f"value {value_index}: {differences[-1]}"
+    if args.debug_weight_stage:
+        (args.out / f"rank{rank}-debug-quality.json").write_text(
+            json.dumps(differences, indent=2)
+        )
+        return
     graphs = []
+    graph_outputs = []
     counts = []
     for arm in range(2):
         mode, prepare = (
@@ -758,7 +1188,13 @@ def main():
                 or ba_order is not None
                 or epilogue_scale is not None
                 or head_local is not None
-                or norm_gate is not None,
+                or norm_gate is not None
+                or args.delta_bv is not None
+                or resident_down_norm is not None
+                or pipeline is not None
+                or resident_mlp is not None
+                or args.gdn_weight_window
+                or norm_weight_stage is not None,
             )
             if arm
             else (
@@ -776,6 +1212,27 @@ def main():
             assert "epilogue_scale" in seen_routes
         if arm and ba_order is not None:
             assert "ba_order" in seen_routes, "CTA-order candidate was not selected"
+        if arm and args.delta_bv is not None:
+            assert f"delta_bv{args.delta_bv}" in seen_routes
+        if arm and resident_down_norm is not None:
+            assert (
+                "resident_out_norm" if args.resident_out_only else "resident_down_norm"
+            ) in seen_routes
+        if arm and args.resident_out_norm:
+            assert "resident_out_norm" in seen_routes
+        if arm and pipeline is not None:
+            for role in (
+                ("gate", "down")
+                if args.pipeline_arm == "both"
+                else (args.pipeline_arm,)
+            ):
+                assert "pipeline_" + role in seen_routes
+        if arm and resident_mlp is not None:
+            assert "resident_mlp" in seen_routes
+        if arm and args.gdn_weight_window:
+            assert "gdn_weight_window" in seen_routes
+        if arm and norm_weight_stage is not None:
+            assert "norm_weight_stage" in seen_routes
         torch.cuda.synchronize()
         dist.barrier()
         graph = torch.cuda.CUDAGraph(keep_graph=True)
@@ -785,34 +1242,93 @@ def main():
             reset(arm)
             eviction.fill_(1)
             start.record()
-            run(mode, prepare, reference=not arm)
+            graph_output = run(mode, prepare, reference=not arm)
             end.record()
         counts.append(nodes(graph))
         graph.instantiate()
         graphs.append((graph, start, end))
-    difference = int(
-        fused_projection is not None
-        or cooperative is not None
-        or inline_kernel is not None
-        or head_local is not None
-        or norm_gate is not None
-    ) + int(args.head_local_convolution)
+        graph_outputs.append(graph_output)
+    difference = (
+        int(
+            fused_projection is not None
+            or cooperative is not None
+            or inline_kernel is not None
+            or head_local is not None
+            or norm_gate is not None
+            or resident_down_norm is not None
+        )
+        + int(args.head_local_convolution)
+        + int(args.resident_out_norm and not args.resident_out_only)
+    )
+    if resident_control is not None:
+        difference -= 2
+    if resident_mlp is not None:
+        difference += 1
+    if norm_weight_stage is not None:
+        difference += 1
+    if args.gdn_out_stage_extension:
+        difference += 2
     assert counts[0]["types"].get("0") - difference == counts[1]["types"].get("0")
+    replay_quality = []
+    if norm_weight_stage is not None or args.gdn_out_stage_extension:
+        # Cross-CTA publication must also survive changing inputs and graph
+        # generations; eager checks alone can miss stale activation reads.
+        for replay in range(20):
+            x.normal_().mul_((0.01, 0.125, 1.0, 4.0)[replay % 4])
+            graphs[0][0].replay()
+            control_values = [v.clone() for v in (*graph_outputs[0], state, hist)]
+            graphs[1][0].replay()
+            for value_index, (candidate, reference) in enumerate(
+                zip((*graph_outputs[1], state, hist), control_values)
+            ):
+                bits = torch.int16 if candidate.element_size() == 2 else torch.int32
+                exact = torch.equal(candidate.view(bits), reference.view(bits))
+                finite = bool(torch.isfinite(candidate).all())
+                replay_quality.append(
+                    {
+                        "replay": replay,
+                        "value_index": value_index,
+                        "bitwise": exact,
+                        "finite": finite,
+                        "max_abs": (candidate.float() - reference.float())
+                        .abs()
+                        .max()
+                        .item(),
+                    }
+                )
+                assert finite, "Nonfinite graph replay"
+                if norm_weight_stage is not None:
+                    assert exact, f"Stale graph publication: {replay_quality[-1]}"
     samples = [[], []]
     for iteration in range(args.iters + 20):
+        if args.cuda_profiler_capture and iteration == 20:
+            torch.cuda.cudart().cudaProfilerStart()
         for index in (iteration % 2, 1 - iteration % 2):
             graph, start, end = graphs[index]
+            if args.cuda_profiler_capture:
+                torch.cuda.nvtx.range_push(
+                    "layer/candidate" if index else "layer/control"
+                )
             graph.replay()
             end.synchronize()
+            if args.cuda_profiler_capture:
+                torch.cuda.nvtx.range_pop()
             if iteration >= 20:
                 samples[index].append(start.elapsed_time(end) * 1000)
+    if args.cuda_profiler_capture:
+        torch.cuda.cudart().cudaProfilerStop()
     result = {
         "rank": rank,
         "mode": args.mode,
         "paired_control": paired_control is not None,
+        "wheel_paired_control": args.wheel_paired_control,
+        "pipeline_arm": args.pipeline_arm if pipeline is not None else None,
+        "resident_mlp": resident_mlp is not None,
+        "norm_weight_stage": norm_weight_stage is not None,
         "control_mean_us": statistics.mean(samples[0]),
         "candidate_mean_us": statistics.mean(samples[1]),
         "samples_us": samples,
+        "changed_input_graph_quality": replay_quality,
         "graph_nodes": counts,
         "output_and_state_bitwise": all(d["bitwise"] for d in differences),
         "differences": differences,
@@ -832,14 +1348,27 @@ def main():
         "gate_group_layout": args.gate_group_layout,
         "epilogue_scale": epilogue_scale is not None,
         "head_local_core": head_local is not None,
+        "gdn_out_stage": args.gdn_out_stage_extension is not None,
         "head_local_convolution": args.head_local_convolution,
         "resident_norm_gate": norm_gate is not None,
+        "resident_down_norm": resident_down_norm is not None,
+        "resident_out_norm": args.resident_out_norm,
+        "resident_out_only": args.resident_out_only,
+        "resident_weight_window": args.resident_weight_window,
+        "resident_control": resident_control is not None,
+        "resident_native_ca_buffers": args.resident_native_ca_buffers,
+        "resident_fp16_norm_weights": args.resident_fp16_norm_weights,
+        "packed_gate_input": packed_input is not None,
         "resident_norm_gate_single_ready": (
             bool(norm_gate.single_ready) if norm_gate is not None else None
         ),
         "inline_source_sha256": inline_source_sha256,
         "hybrid_source_sha256": hybrid_source_sha256,
         "accepted": args.accepted,
+        "delta_bv": args.delta_bv,
+        "gdn_weight_window": args.gdn_weight_window,
+        "gdn_prefetch_token": args.gdn_prefetch_token,
+        "gdn_window_source_sha256": gdn_window_hash,
         "four_amplitudes": [0.01, 0.125, 1.0, 4.0],
         "scope": (
             "Complete real-weight TP4 layer0 GDN graph; "
@@ -881,7 +1410,7 @@ def main():
         dist.barrier()
         CustomAllreduce.free_shared_buffer(packet_inputs, rank=rank)
         CustomAllreduce.free_shared_buffer(packet_buffers, rank=rank)
-    if norm_gate_buffers is not None:
+    if norm_gate_buffers is not None and norm_weight_stage is None:
         torch.cuda.synchronize()
         dist.barrier()
         CustomAllreduce.free_shared_buffer(norm_gate_buffers, rank=rank)

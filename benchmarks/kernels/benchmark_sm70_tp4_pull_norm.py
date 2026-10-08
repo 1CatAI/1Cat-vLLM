@@ -28,6 +28,7 @@ from vllm.platforms import current_platform
 
 def generate(root):
     text = (root / "csrc/custom_all_reduce.cuh").read_text()
+    has_local_pointer = "const void* local_buffer, float epsilon)" in text
     begin = text.index("template <typename WeightT, bool Reference = false>")
     end = text.index("\nclass CustomAllreduce", begin)
     local = text[begin:end].replace(
@@ -114,7 +115,7 @@ def generate(root):
 """
         + norm[end:]
     )
-    return (
+    generated = (
         r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -187,6 +188,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
 }
 """
     )
+    if has_local_pointer:
+        for name in (
+            "direct_pull_norm",
+            "push_local_norm",
+            "sm70_push_allreduce_gemma_rms_norm",
+        ):
+            start = generated.index(name + "<float><<<")
+            finish = generated.index(";", start)
+            call = generated[start:finish]
+            assert call.count("rank,1e-6f)") == 1
+            updated = call.replace(
+                "rank,1e-6f)",
+                "rank,reinterpret_cast<const void*>(buffers.at(rank)),1e-6f)",
+            )
+            generated = generated[:start] + updated + generated[finish:]
+    return generated
 
 
 def main():
