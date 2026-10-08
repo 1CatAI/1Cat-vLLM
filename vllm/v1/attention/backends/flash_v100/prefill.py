@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import fields
 from types import SimpleNamespace
@@ -23,6 +22,7 @@ from vllm.v1.attention.backends.flash_v100 import prefill_candidates as _sequenc
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
+from vllm.v1.attention.backends.flash_v100.plan import events as _events
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -1207,201 +1207,36 @@ def observe_prefill_reference(
     query_start_loc,
     seq_lens,
     debug_compare,
-    dflash_dump,
+    dump_enabled,
 ):
-    k_cont, v_cont = _kv_layout._extract_contiguous_kv_from_paged_cache(
-        kv_cache=kv_cache,
-        block_table=attn_metadata.block_table[i : i + 1],
-        seq_lens=attn_metadata.seq_lens[i : i + 1],
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        block_size=block_size,
-        total_tokens=seq_len,
-    )
-    k_cont, v_cont = _kv_layout._dequantize_fp8_contiguous_kv(
-        k_cont,
-        v_cont,
-        self.kv_cache_dtype,
-        float(layer._k_scale_float),
-        float(layer._v_scale_float),
-    )
-    if bool(getattr(layer, "is_dflash_draft_attn", False)):
-        ref_out = _masks._torch_attention_reference(
-            query[start:end],
-            k_cont,
-            v_cont,
-            causal=causal,
-            softmax_scale=self.scale,
-            window_size=window_size,
-        )
-    else:
-        ref_out = self.flash_attn_func(
-            query[start:end].unsqueeze(0),
-            k_cont.unsqueeze(0),
-            v_cont.unsqueeze(0),
-            causal=causal,
-            softmax_scale=self.scale,
-            window_size=window_size,
-        )
-    diff = (out_seq - ref_out).abs()
-    nan_count = int(torch.isnan(out_seq).sum().item())
-    if debug_compare and not _state._logged_prefill_compare:
-        logger.warning(
-            "FLASH_ATTN_V100 debug prefix compare: "
-            "query_len=%d seq_len=%d max_diff=%.8f mean_diff=%.8f "
-            "nan_count=%d q_absmax=%.6f k_absmax=%.6f "
-            "v_absmax=%.6f kv_cache_shape=%s key_shape=%s "
-            "key_stride=%s value_stride=%s key_contig=%s "
-            "value_contig=%s",
-            end - start,
+    _events.prefill_debug.emit(
+        _events.PrefillDebugEvent(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            out_seq,
+            i,
+            start,
+            end,
             seq_len,
-            float(diff.max().item()),
-            float(diff.mean().item()),
-            nan_count,
-            float(query[start:end].abs().max().item()),
-            float(k_cont.abs().max().item()),
-            float(v_cont.abs().max().item()),
-            tuple(kv_cache.shape),
-            tuple(key_cache.shape),
-            tuple(key_cache.stride()),
-            tuple(value_cache.stride()),
-            str(key_cache.is_contiguous()),
-            str(value_cache.is_contiguous()),
+            num_kv_heads,
+            head_dim,
+            block_size,
+            causal,
+            window_size,
+            query_start_loc,
+            seq_lens,
+            debug_compare,
+            dump_enabled,
+            self.kv_cache_dtype,
+            self.scale,
+            self.flash_attn_func,
+            _masks._torch_attention_reference,
+            self._layer_debug_info,
         )
-    if dflash_dump:
-        slot_mapping = getattr(attn_metadata, "slot_mapping", None)
-        slot_slice = None
-        cache_k_by_slot = None
-        cache_v_by_slot = None
-        key_input = None
-        value_input = None
-        slot_k_diff = None
-        slot_v_diff = None
-        tail_k_diff = None
-        tail_v_diff = None
-        if (
-            slot_mapping is not None
-            and key is not None
-            and value is not None
-            and key_cache.dtype != torch.uint8
-        ):
-            slot_slice = slot_mapping[start:end].to(torch.long)
-            valid_slots = slot_slice >= 0
-            if bool(valid_slots.all().item()):
-                slot_blocks = torch.div(
-                    slot_slice,
-                    block_size,
-                    rounding_mode="floor",
-                )
-                slot_offsets = torch.remainder(slot_slice, block_size)
-                cache_k_by_slot = key_cache[slot_blocks, slot_offsets]
-                cache_v_by_slot = value_cache[
-                    slot_blocks,
-                    slot_offsets,
-                ]
-                cache_k_by_slot, cache_v_by_slot = (
-                    _kv_layout._dequantize_fp8_contiguous_kv(
-                        cache_k_by_slot,
-                        cache_v_by_slot,
-                        self.kv_cache_dtype,
-                        float(layer._k_scale_float),
-                        float(layer._v_scale_float),
-                    )
-                )
-                key_input = key[start:end]
-                value_input = value[start:end]
-                slot_k_diff = (cache_k_by_slot - key_input).abs()
-                slot_v_diff = (cache_v_by_slot - value_input).abs()
-                tail_start = max(0, seq_len - (end - start))
-                tail_k = k_cont[tail_start:seq_len]
-                tail_v = v_cont[tail_start:seq_len]
-                if tail_k.shape == key_input.shape:
-                    tail_k_diff = (tail_k - key_input).abs()
-                    tail_v_diff = (tail_v - value_input).abs()
-
-        dump_path = f"/tmp/flash_v100_dflash_prefix_dump_pid{os.getpid()}_seq{i}.pt"
-        torch.save(
-            {
-                "layer_name": self._layer_debug_info(layer).get("layer_name"),
-                "causal": causal,
-                "window_size": window_size,
-                "query_start_loc": query_start_loc.detach().cpu(),
-                "seq_lens": seq_lens.detach().cpu(),
-                "attn_seq_lens": attn_metadata.seq_lens.detach().cpu(),
-                "block_table": attn_metadata.block_table[i : i + 1].detach().cpu(),
-                "slot_mapping": None
-                if slot_slice is None
-                else slot_slice.detach().cpu(),
-                "query": query[start:end].detach().cpu(),
-                "key_input": None if key_input is None else key_input.detach().cpu(),
-                "value_input": None
-                if value_input is None
-                else value_input.detach().cpu(),
-                "cache_k_by_slot": None
-                if cache_k_by_slot is None
-                else cache_k_by_slot.detach().cpu(),
-                "cache_v_by_slot": None
-                if cache_v_by_slot is None
-                else cache_v_by_slot.detach().cpu(),
-                "k_cont_tail": k_cont[max(0, seq_len - (end - start)) : seq_len]
-                .detach()
-                .cpu(),
-                "v_cont_tail": v_cont[max(0, seq_len - (end - start)) : seq_len]
-                .detach()
-                .cpu(),
-                "k_cont": k_cont.detach().cpu(),
-                "v_cont": v_cont.detach().cpu(),
-                "out_seq": out_seq.detach().cpu(),
-                "ref_out": ref_out.detach().cpu(),
-                "paged_vs_dense_max": float(diff.max().item()),
-                "paged_vs_dense_mean": float(diff.mean().item()),
-                "slot_k_max": None
-                if slot_k_diff is None
-                else float(slot_k_diff.max().item()),
-                "slot_v_max": None
-                if slot_v_diff is None
-                else float(slot_v_diff.max().item()),
-                "tail_k_max": None
-                if tail_k_diff is None
-                else float(tail_k_diff.max().item()),
-                "tail_v_max": None
-                if tail_v_diff is None
-                else float(tail_v_diff.max().item()),
-                "kv_cache_shape": tuple(kv_cache.shape),
-                "key_cache_shape": tuple(key_cache.shape),
-                "key_cache_stride": tuple(key_cache.stride()),
-                "value_cache_stride": tuple(value_cache.stride()),
-            },
-            dump_path,
-        )
-        logger.warning(
-            "FLASH_ATTN_V100 saved DFlash prefix dump to %s "
-            "(paged_vs_dense_max=%.8f slot_k_max=%s tail_k_max=%s)",
-            dump_path,
-            float(diff.max().item()),
-            "n/a" if slot_k_diff is None else f"{float(slot_k_diff.max().item()):.8f}",
-            "n/a" if tail_k_diff is None else f"{float(tail_k_diff.max().item()):.8f}",
-        )
-        _state._logged_dflash_prefix_dump = True
-    if debug_compare and not _state._logged_prefill_compare and nan_count > 0:
-        dump_path = f"/tmp/flash_v100_prefill_nan_dump_pid{os.getpid()}.pt"
-        torch.save(
-            {
-                "query": query[start:end].detach().cpu(),
-                "key_cache": key_cache.detach().cpu(),
-                "value_cache": value_cache.detach().cpu(),
-                "block_table": attn_metadata.block_table[i : i + 1].detach().cpu(),
-                "seq_lens": attn_metadata.seq_lens[i : i + 1].detach().cpu(),
-                "k_cont": k_cont.detach().cpu(),
-                "v_cont": v_cont.detach().cpu(),
-                "out_seq": out_seq.detach().cpu(),
-                "ref_out": ref_out.detach().cpu(),
-            },
-            dump_path,
-        )
-        logger.warning(
-            "FLASH_ATTN_V100 saved failing prefix prefill dump to %s",
-            dump_path,
-        )
-    if debug_compare and not _state._logged_prefill_compare:
-        _state._logged_prefill_compare = True
+    )

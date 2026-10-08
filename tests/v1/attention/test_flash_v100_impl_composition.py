@@ -16,6 +16,7 @@ import torch
 
 from tests.v1.attention.flash_v100_sequence_oracle import (
     batch_calculations,
+    prefill_debug_calculations,
     sequence_calculations,
 )
 from vllm.v1.attention.backends import flash_attn_v100 as legacy
@@ -181,6 +182,11 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Expr(self, node):
+        if (
+            isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func) == "observe_prefill_reference"
+        ):
+            return prefill_debug_calculations(node.value)
         hook = self._hook(node.value)
         if hook is not None:
             # Statement hooks use the original local names; predicate hooks

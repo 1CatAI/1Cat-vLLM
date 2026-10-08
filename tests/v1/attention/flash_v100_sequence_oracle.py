@@ -298,3 +298,92 @@ def batch_calculations():
         if isinstance(n, ast.FunctionDef) and n.name.startswith("log_")
     }
     return SequenceLocals(logs).visit(ast.Module(result, [])).body
+
+
+class DebugLocals(ast.NodeTransformer):
+    def visit_Attribute(self, node):
+        if ast.unparse(node.value) == "event":
+            callback = {
+                "dense": "self.flash_attn_func",
+                "torch_reference": "_masks._torch_attention_reference",
+                "layer_info": "self._layer_debug_info",
+                "scale": "self.scale",
+                "kv_cache_dtype": "self.kv_cache_dtype",
+            }.get(node.attr)
+            if callback:
+                return parse(callback)
+            return ast.Name(
+                "dflash_dump" if node.attr == "dump_enabled" else node.attr, node.ctx
+            )
+        return self.generic_visit(node)
+
+
+def prefill_debug_calculations(call):
+    from pathlib import Path
+
+    from vllm.v1.attention.backends.flash_v100 import debug_compare
+
+    helper = next(
+        n
+        for n in ast.parse(Path(prefill.__file__).read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name == "observe_prefill_reference"
+    )
+    parameters = [a.arg for a in helper.args.args]
+    assert not call.keywords
+    assert [ast.unparse(a) for a in call.args] == [
+        "dflash_dump" if a == "dump_enabled" else a for a in parameters
+    ]
+    assert len(helper.body) == 1 and isinstance(helper.body[0], ast.Expr)
+    emit = helper.body[0].value
+    assert (
+        isinstance(emit, ast.Call)
+        and ast.unparse(emit.func) == "_events.prefill_debug.emit"
+    )
+    assert len(emit.args) == 1 and not emit.keywords
+    event = emit.args[0]
+    assert (
+        isinstance(event, ast.Call)
+        and ast.unparse(event.func) == "_events.PrefillDebugEvent"
+    )
+    assert not event.keywords
+    assert [ast.unparse(a) for a in event.args] == parameters[1:] + [
+        "self.kv_cache_dtype",
+        "self.scale",
+        "self.flash_attn_func",
+        "_masks._torch_attention_reference",
+        "self._layer_debug_info",
+    ]
+    tree = ast.parse(Path(debug_compare.__file__).read_text())
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    subscribers = []
+    for statement in tree.body:
+        if not isinstance(statement, ast.Expr) or not isinstance(
+            statement.value, ast.Call
+        ):
+            continue
+        registration = statement.value
+        if ast.unparse(registration.func) == "_events.prefill_debug.subscribe":
+            assert len(registration.args) == 1 and not registration.keywords
+            subscribers.append(ast.unparse(registration.args[0]))
+    assert subscribers == ["PrefixReferenceObserver()", "PrefixReportObserver()"]
+    reference = next(
+        n
+        for n in classes["PrefixReferenceObserver"].body
+        if isinstance(n, ast.FunctionDef) and n.name == "__call__"
+    )
+    report = next(
+        n
+        for n in classes["PrefixReportObserver"].body
+        if isinstance(n, ast.FunctionDef) and n.name == "__call__"
+    )
+    assert ast.unparse(reference.body[-1]) == (
+        "event.reference = _events.PrefillReference("
+        "k_cont, v_cont, ref_out, diff, nan_count)"
+    )
+    assert [ast.unparse(n) for n in report.body[:3]] == [
+        "reference = event.reference",
+        "assert reference is not None",
+        "k_cont, v_cont, ref_out, diff, nan_count = reference",
+    ]
+    body = copy.deepcopy(reference.body[:-1] + report.body[3:])
+    return DebugLocals().visit(ast.Module(body, [])).body
