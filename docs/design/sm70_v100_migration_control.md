@@ -49213,3 +49213,20 @@ after restoring the helper/type spelling and include. Normal CMake rebuild
 passes; full `_C_stable_libtorch` SM70 SASS is identical without normalization.
 Final-wheel GPU/operator/model gates remain pending; no format/default or
 dispatch change. The following other TP4 job again fills all four GPUs.
+
+Source120 normal whole wheel has now passed remote SHA256 verification,
+ordinary installation and `uv pip check` (201 compatible packages). Its
+SHA256 is `a4ce2018bfa82d158d2d779511f48db87e6a75b623eb974f530f32e381f5524b`.
+The capture provenance check covers19 runtime files, including the separately
+registered stable-libtorch writer and QSA preparation; an altered native-writer
+archive is rejected without changing installed files. No numerical source or
+runtime default changed in this tooling continuation.
+
+User resource policy: use available locked GPUs, otherwise wait, and avoid long
+reservations. The targeted operator/tests have a10-minute lease limit and the
+single first Flash-Next TP4 capture a15-minute limit; timeout terminates only
+the owned process group. Retries hold no GPUs. The global lock remains binding
+when another job uses only GPU0. Authentic local Git objects now provide the
+immutable baseline offline, avoiding network access while holding a GPU lease.
+INT8 implementation/format selection and the three-model quality/performance
+gates remain pending.

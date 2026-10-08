@@ -254,11 +254,24 @@ def verify_runtime_wheel(wheel, vllm_root):
         "vllm/_C.abi3.so": vllm_root / "_C.abi3.so",
         f"flash_attn_v100/{Path(extension.__file__).name}": Path(extension.__file__),
     }
+    # The native cache writer is registered in stable-libtorch, separately
+    # from _C. A matching distribution version alone cannot detect a stale DSO.
     for name in (
+        "_C_stable_libtorch.abi3.so",
+        "vllm_flash_attn/_vllm_fa2_C.abi3.so",
+        "v1/kv_cache_codec.py",
+        "v1/kv_cache_interface.py",
+        "v1/attention/backends/flash_v100/cache_view.py",
+        "v1/attention/backends/flash_v100/codec.py",
+        "v1/attention/backends/flash_v100/masking.py",
+        "v1/attention/backends/flash_v100/metadata.py",
+        "v1/attention/backends/flash_v100/reference.py",
         "models/qwen4_exp/nvidia/qsa.py",
         "models/qwen4_exp/nvidia/ops/qsa.py",
+        "models/qwen4_exp/nvidia/ops/qsa_pre_indexer.py",
         "models/qwen4_exp/nvidia/indexer_qsa.py",
         "v1/attention/ops/kv_codec.py",
+        "v1/attention/ops/triton_reshape_and_cache_flash.py",
         "model_executor/layers/attention/sm70_qwen38_qk_rope.py",
     ):
         paths[f"vllm/{name}"] = vllm_root / name

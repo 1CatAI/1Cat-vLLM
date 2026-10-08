@@ -321,12 +321,22 @@ Diagnostic observers delegate to the existing installed native grouped/page4
 XQA helpers and Triton split-K launch, recording only successful executed calls;
 per-layer samples require a positive executed-route delta. Finish restores the
 original methods/launch objects. No scheduling or kernel arithmetic is replaced.
-The manifest now also retains the capture-tool hash and byte-checks installed
-QSA owner/indexer/attention source against the normal wheel. Eight CPU checks
+The manifest retains the capture-tool hash and byte-checks 19 installed runtime
+files against the normal wheel: native attention/cache-writer libraries, shared
+storage/page/metadata/codec modules and QSA owner/indexer/preparation source.
+The stable-libtorch writer DSO must be checked independently of `_C`; matching
+distribution metadata does not detect a stale native writer. An isolated check
+of the normally installed source120 wheel passes, and a diagnostic archive with
+one altered stable-libtorch entry is rejected without modifying the runtime.
+This is artifact provenance evidence, not GPU/model qualification. Eight CPU checks
 cover sparse-oracle equality, rejected selection semantics, addressed/strided
 state rows and unchanged observed launch arguments/failures. These checks do
 not qualify the real QSA adapter: its first model capture remains pending an
-idle locked TP4 lease and checksum-verified Flash-Next weights.
+idle locked TP4 lease. Both fixed Flash-Next shards are size/SHA256 verified.
+The current resource policy permits idle locked GPUs only and requires short
+leases: 10 minutes for the targeted operator/tests and 15 minutes for one minimal
+TP4 capture, with automatic termination of the owned process group on timeout.
+No GPU is held during lock retries, and completion/failure releases the lease.
 
 ## Triton writer tile interface
 
