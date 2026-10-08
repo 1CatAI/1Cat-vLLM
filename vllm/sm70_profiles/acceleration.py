@@ -569,7 +569,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "runtime_guards": (
             "device E4M3/FP16 history; FP16 query; M1..20, H6, D256; width<=4096"
         ),
-        "arithmetic": "FP32 QK/probability/PV/numerator/max/sum",
+        "arithmetic": "FP32 accumulation/softmax/merge; protected FP16 PV operands",
         "fallback": "protected hot-page reader",
     }
     sparse_policy = cfg.kernel_config.sm70_sparse

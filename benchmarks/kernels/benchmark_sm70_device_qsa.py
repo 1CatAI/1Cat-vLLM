@@ -57,6 +57,7 @@ def make_inputs(rows, context, owners, dtype=torch.uint8):
             rows=rows,
             width=width,
             device_reference=True,
+            direct_device=True,
             dtype=dtype,
         )
         key = torch.randn(blocks * page, 1, 256, device=device, dtype=torch.float16)
@@ -81,7 +82,7 @@ def make_inputs(rows, context, owners, dtype=torch.uint8):
 
 def call(record, metadata, candidate):
     indices, table, requests, positions, lengths = record.get("metadata", metadata)
-    if candidate:
+    if candidate and record.get("research_library", False):
         state = record["state"]
         torch.ops.round15_device_qsa.run(
             record["q"],
@@ -98,17 +99,26 @@ def call(record, metadata, candidate):
             record["sums"],
         )
     else:
-        host_qsa_attention(
-            record["q"],
-            record["state"],
-            indices,
-            table,
-            requests,
-            positions,
-            lengths,
-            record["control"],
-            record["gate"],
-        )
+        state = record["state"]
+        workspace = state.device_history_workspace
+        if not candidate:
+            state.device_history_workspace = None
+        elif workspace is None:
+            raise RuntimeError(state.device_history_reason)
+        try:
+            host_qsa_attention(
+                record["q"],
+                state,
+                indices,
+                table,
+                requests,
+                positions,
+                lengths,
+                record["control"],
+                record["gate"],
+            )
+        finally:
+            state.device_history_workspace = workspace
 
 
 def oracle(record, metadata):
@@ -180,7 +190,7 @@ def graph_time(graph, repeats):
 @torch.inference_mode()
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--library", type=Path, help="Optional research-only DSO")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rows", type=int, default=5, choices=[1, 5, 20])
     parser.add_argument("--context", type=int, default=8448)
@@ -196,8 +206,10 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(123)
-    library_sha256 = hashlib.sha256(args.library.read_bytes()).hexdigest()
-    torch.ops.load_library(str(args.library))
+    library_sha256 = None
+    if args.library is not None:
+        library_sha256 = hashlib.sha256(args.library.read_bytes()).hexdigest()
+        torch.ops.load_library(str(args.library))
     records, *metadata = make_inputs(
         args.rows,
         args.context,
@@ -229,6 +241,8 @@ def main():
             )
             drafts.append(r)
         records.extend(drafts)
+    for record in records:
+        record["research_library"] = args.library is not None
     # Warm the same cache ownership route before graph capture; both arms read
     # identical authoritative E4M3 bytes and per-vector FP32 scales.
     for _ in range(16):
@@ -248,6 +262,10 @@ def main():
             )
         )
         torch.testing.assert_close(record["candidate"], ref, rtol=0.005, atol=0.0003)
+        if args.library is None:
+            torch.testing.assert_close(
+                record["candidate"], record["control"], rtol=0, atol=0
+            )
     print(json.dumps({"numerical": checks}), flush=True)
     edge = records[0]
     original_q = edge["q"].clone()
@@ -284,6 +302,10 @@ def main():
             torch.testing.assert_close(
                 record["candidate"], oracle(record, metadata), rtol=0.005, atol=0.0003
             )
+            if args.library is None:
+                torch.testing.assert_close(
+                    record["candidate"], record["control"], rtol=0, atol=0
+                )
     for record, original in zip(records, original_queries):
         record["q"].copy_(original)
     control.replay()
@@ -303,6 +325,9 @@ def main():
         include_draft=args.include_draft,
         history_dtype="fp16" if args.fp16_history else "e4m3fn",
         library_sha256=library_sha256,
+        candidate_backend="research_dso"
+        if args.library
+        else "installed_device_history",
         checks=checks,
         graph_changed_inputs=2,
         edge_checks=["q_std8", "invalid_request", "position_minus1"],

@@ -79,10 +79,9 @@ def device_history_attention(
         state.device_history_reason = "metadata_layout"
         return False
     gate = gate.view_as(query) if gate is not None else None
-    torch.ops.vllm_sm70_qsa_device.run(
+    _direct_history_triton(
         query,
-        state.history,
-        state.scales,
+        state,
         indices,
         table,
         requests,
@@ -90,7 +89,107 @@ def device_history_attention(
         lengths,
         out,
         gate,
-        *workspace,
+        workspace,
     )
     state.device_history_reason = None
     return True
+
+
+def _direct_history_triton(
+    query, state, indices, table, requests, positions, lengths, out, gate, workspace
+):
+    """Remove placement dependencies while retaining protected QSA arithmetic."""
+    from vllm.triton_utils import triton
+
+    from .qsa import (
+        _qsa_merge_splitk_kernel,
+        _qsa_sparse_launch_profile,
+        _qsa_sparse_paged_gqa_splitk_kernel,
+        _use_sm70_qsa_two_warp_partial,
+    )
+
+    rows, heads, dim = query.shape
+    block_m = triton.next_power_of_2(heads)
+    block_n, target, warps = _qsa_sparse_launch_profile(rows, block_m, True)
+    if _use_sm70_qsa_two_warp_partial(rows, heads, dim):
+        warps = 2
+    tiles = triton.cdiv(indices.shape[1], block_n)
+    splits = min(1 << (tiles.bit_length() - 1), target)
+    if splits == 1:
+        partial = lse = out
+    else:
+        partial = workspace[0][: splits * query.numel()].view(splits, *query.shape)
+        lse = workspace[1][: splits * rows * heads].view(splits, rows, heads)
+    # Views only change the base address; both planes retain page-major strides.
+    keys, values = state.history[:, 0], state.history[:, 1]
+    _qsa_sparse_paged_gqa_splitk_kernel[(rows, 1, splits)](
+        query,
+        keys,
+        values,
+        indices,
+        table,
+        requests,
+        partial,
+        lse,
+        out,
+        None,
+        gate,
+        query.stride(0),
+        query.stride(1),
+        keys.stride(0),
+        keys.stride(1),
+        keys.stride(2),
+        values.stride(0),
+        values.stride(1),
+        values.stride(2),
+        indices.stride(0),
+        table.stride(0),
+        out.stride(0),
+        out.stride(1),
+        gate.stride(0) if gate is not None else 0,
+        gate.stride(1) if gate is not None else 0,
+        rows,
+        state.blocks,
+        table.shape[0],
+        1.0,
+        1.0,
+        TOPK=indices.shape[1],
+        PAGE_SIZE=state.page_size,
+        PAGE_TABLE_WIDTH=table.shape[1],
+        GROUP_SIZE=heads,
+        HEAD_DIM=dim,
+        NUM_QUERY_HEADS=heads,
+        NUM_SPLITS=splits,
+        NUM_TILES=tiles,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        KV_E4M3=False,
+        HISTORY_SCALES=state.scales,
+        HISTORY_POSITIONS=positions,
+        HISTORY_LENGTHS=lengths,
+        DEVICE_HISTORY=True,
+        HISTORY_E4M3=state.fp8,
+        num_warps=warps,
+        num_stages=2,
+    )
+    if splits > 1:
+        _qsa_merge_splitk_kernel[(rows, heads)](
+            partial,
+            lse,
+            out,
+            None,
+            gate,
+            out.stride(0),
+            out.stride(1),
+            gate.stride(0) if gate is not None else 0,
+            gate.stride(1) if gate is not None else 0,
+            rows,
+            1.0,
+            HEAD_DIM=dim,
+            NUM_QUERY_HEADS=heads,
+            NUM_SPLITS=splits,
+            BLOCK_SPLITS=triton.next_power_of_2(splits),
+            KV_E4M3=False,
+            num_warps=2,
+            num_stages=1,
+        )
