@@ -120,15 +120,36 @@ The combined resident kernel uses 72--80 registers/thread, compared with
 many down phases activate only a subset of its warps. Removing launches alone
 does not solve that resource and dependency structure.
 
-The next experiment uses 128-thread workers, six independent expert sequences
+The third experiment uses 128-thread workers, six independent expert sequences
 per output stripe and one readiness word per completed expert. Eight-row
 gate/up tasks combine through four-producer FP16 chunk joins before the
 existing Q8_1 quantization boundary. Input quantization and routing preparation
 share an initial kernel; weighted unroute remains a final kernel. Both kernels
 give ordered workspace reset and output reduction without polling between
 invocations. The worker pool retains shared integer decoders and checks that
-all workers can reside before launching. It has compiled without spills but
-requires the same numerical and complete-chain gates before model admission.
+all workers can reside before launching. It compiles without spills and passes
+the real-weight changing-route numerical screen, including exact hidden Q8
+bytes. Its final relative L2 error remains below 1.28e-5. It also loses the
+complete-chain comparison and is rejected for model admission:
+
+| TP4 rank-0 weights, M5 | Existing chain | Six-worker task pool |
+| --- | ---: | ---: |
+| Layer 17, IQ3_S / IQ4_NL | 61.08 us | 80.88 us |
+| Layer 0, IQ3_XXS / IQ4_NL | 57.07 us | 81.19 us |
+| Layer 1, IQ2_S / Q2_0 | 57.92 us | 86.49 us |
+
+These measurements use the same GPU and alternating graph timing protocol as
+the earlier screens. Each comparison uses its own matched control; controls
+from different runs must not be used to infer gains. The smaller workers
+improve the resident prototype substantially but do not recover the original
+chain's performance. Fewer kernel boundaries and fewer logical weight reads
+are insufficient admission criteria. Further scheduler changes require
+instruction, memory and dependency counter evidence from this failed chain.
+
+The experimental module is included in the normal CMake and wheel build. The
+clean-wheel audit preserves all 16 previous native modules byte-for-byte and
+adds only the resident MoE module. This packaging check does not promote the
+experimental operators to model dispatch or establish an end-to-end gain.
 
 ## References
 
