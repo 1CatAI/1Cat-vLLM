@@ -43,6 +43,7 @@ from vllm.model_executor.layers.mhc import (
     hc_contract,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.exl3 import Exl3Config
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     arm_dflash_nvfp4_trace,
 )
@@ -795,12 +796,37 @@ def _dflash_aux_hidden_state_key(layer_boundary: int) -> str:
     return f"{_DFLASH_AUX_HIDDEN_STATE_PREFIX}{layer_boundary}"
 
 
+def exl3_checkpoint_weights(
+    weights: Iterable[tuple], quant_config: QuantizationConfig | None
+) -> Iterable[tuple]:
+    """exllamav3 checkpoints: dequantize the dense EXL3 linears and split the
+    fused KDA tensors exllamav3 writes (self_attn.qkv_proj / self_attn.conv1d,
+    q | k | v along dim 0) back into the HF names."""
+    if not isinstance(quant_config, Exl3Config):
+        yield from weights
+        return
+    fused = {
+        ".self_attn.qkv_proj.weight": ("q_proj", "k_proj", "v_proj"),
+        ".self_attn.conv1d.weight": ("q_conv1d", "k_conv1d", "v_conv1d"),
+    }
+    for item in quant_config.dequantize_dense(weights):
+        name = item[0]
+        suffix = next((s for s in fused if name.endswith(s)), None)
+        if suffix is None:
+            yield item
+            continue
+        base = name[: -len(suffix)] + ".self_attn."
+        for part, tensor in zip(fused[suffix], item[1].chunk(3, dim=0)):
+            yield (base + part + ".weight", tensor.contiguous(), *item[2:])
+
+
 class Glm5NextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        self.quant_config = vllm_config.quant_config
 
         self.vocab_size = config.vocab_size
         self.device = current_platform.device_type
@@ -1150,6 +1176,7 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = exl3_checkpoint_weights(weights, self.quant_config)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
