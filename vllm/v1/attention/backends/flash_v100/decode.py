@@ -14,13 +14,7 @@ from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100.workspace import (
-    _ensure_decode_cache_capacity as _ensure_decode_cache_capacity,
-)
-from vllm.v1.attention.backends.flash_v100.workspace import (
-    _get_decode_kv_single_seq as _get_decode_kv_single_seq,
-)
-from vllm.v1.attention.backends.flash_v100.workspace import (
-    _reset_decode_cache as _reset_decode_cache,
+    V100Workspace as V100Workspace,
 )
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
@@ -430,7 +424,7 @@ def _flash_v100_decode_dense_cache(
     block_size = key_cache.shape[1]
     head_dim = key_cache.shape[3]
     seq_len = int(seq_lens_host[0].item())
-    k_cont, v_cont = self._get_decode_kv_single_seq(
+    k_cont, v_cont = self.workspace.decode_cache.get_kv_single_seq(
         key,
         value,
         kv_cache,
@@ -438,6 +432,7 @@ def _flash_v100_decode_dense_cache(
         attn_metadata.seq_lens[:1],
         block_size,
         head_dim,
+        extract=_kv_layout._extract_contiguous_kv_from_paged_cache,
     )
     out_seq = self.flash_attn_func(
         query.unsqueeze(0),

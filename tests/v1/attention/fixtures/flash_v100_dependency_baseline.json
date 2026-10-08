@@ -2,7 +2,7 @@
   "metrics": {
     "forward": 597,
     "largest_function": 977,
-    "cross_module_private": 390,
+    "cross_module_private": 387,
     "import_cycles": 14,
     "model_names_outside_spec": 169,
     "env_outside_config": 0,
@@ -161,6 +161,10 @@
       "vllm.v1.attention.backends.flash_v100.verify"
     ],
     [
+      "vllm.v1.attention.backends.flash_v100.__init__",
+      "vllm.v1.attention.backends.flash_v100.workspace"
+    ],
+    [
       "vllm.v1.attention.backends.flash_v100.backend",
       "vllm.v1.attention.backends.flash_v100.config"
     ],
@@ -203,6 +207,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.decode",
       "vllm.v1.attention.backends.flash_v100.state"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.decode",
+      "vllm.v1.attention.backends.flash_v100.workspace"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.dense_prefill",
@@ -694,7 +702,7 @@
     },
     {
       "file": "decode.py",
-      "line": 711,
+      "line": 594,
       "expression": "_config.raw('VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO', '1')",
       "via_config": true,
       "owner": "_flash_v100_decode",
@@ -1633,13 +1641,10 @@
     "debug_compare.py:_tensor_compare_stats": 35,
     "debug_compare.py:_prefill_raw_kv_cache_compare_stats": 53,
     "debug_compare.py:_maybe_compare_triton_output": 76,
-    "decode.py:_reset_decode_cache": 5,
-    "decode.py:_ensure_decode_cache_capacity": 46,
-    "decode.py:_get_decode_kv_single_seq": 64,
     "decode.py:_call_flash_attn_decode_paged": 83,
     "decode.py:_anchored_swa_params": 27,
     "decode.py:_flash_v100_decode_as_paged_prefill": 206,
-    "decode.py:_flash_v100_decode_dense_cache": 93,
+    "decode.py:_flash_v100_decode_dense_cache": 94,
     "decode.py:_flash_v100_decode_dense_reference": 73,
     "decode.py:_flash_v100_decode": 160,
     "dense_prefill.py:clear_flash_attn_v100_workspaces": 9,
@@ -1661,7 +1666,7 @@
     "dense_prefill.py:flash_v100_dense_prefill_lse_available": 2,
     "dense_prefill.py:flash_v100_dense_prefill_lse": 156,
     "dense_prefill.py:_allocate": 3,
-    "impl.py:__init__": 260,
+    "impl.py:__init__": 257,
     "impl.py:kv_codec": 3,
     "impl.py:_xqa_kv_codec": 16,
     "impl.py:_supports_flash_v100_path": 13,
@@ -1809,6 +1814,9 @@
     "verify.py:_call_flash_attn_smallq_decode_paged": 167,
     "verify.py:_small_query_decode_enabled": 27,
     "verify.py:_flash_v100_ddtree_small_query_prefill_dense": 305,
-    "verify.py:_flash_v100_small_query_prefill_as_decode": 235
+    "verify.py:_flash_v100_small_query_prefill_as_decode": 235,
+    "workspace.py:invalidate": 5,
+    "workspace.py:ensure_capacity": 38,
+    "workspace.py:get_kv_single_seq": 66
   }
 }

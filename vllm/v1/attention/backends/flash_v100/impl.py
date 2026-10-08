@@ -326,10 +326,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             _config.raw("VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS", "64")
         )
         self._compare_triton_out_calls = 0
-        self._decode_cache_k: torch.Tensor | None = None
-        self._decode_cache_v: torch.Tensor | None = None
-        self._decode_cache_len = 0
-        self._decode_cache_capacity = 0
+        self.workspace = _decode.V100Workspace()
 
         if self.prefix_anchored_decode_window is not None:
             if (
@@ -378,12 +375,6 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             self.use_flash_v100_prefill_gather_dense = False
 
         self.config = _config.V100AttnConfig.take_legacy_attributes(vars(self))
-
-    _reset_decode_cache = _decode._reset_decode_cache
-
-    _ensure_decode_cache_capacity = _decode._ensure_decode_cache_capacity
-
-    _get_decode_kv_single_seq = _decode._get_decode_kv_single_seq
 
     _maybe_compare_bhmd_out = _debug_compare._maybe_compare_bhmd_out
 
@@ -621,7 +612,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                     "forward branch=prefill_triton_safe layer=%s",
                     layer_name,
                 )
-                self._reset_decode_cache()
+                self.workspace.decode_cache.invalidate()
                 _routing._record_route(_routing.ROUTE_SPECS["prefill_triton_safe"].name)
                 return super().forward(
                     layer,
@@ -766,7 +757,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                 _routing._log_fp8_kv_cache_route(
                     "prefill", self.kv_cache_dtype, "prefix"
                 )
-                self._reset_decode_cache()
+                self.workspace.decode_cache.invalidate()
                 result = self._flash_v100_prefill_with_prefix(
                     layer,
                     query,
@@ -797,7 +788,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                     "FLASH_ATTN_V100 prefill path active (no prefix/chunked context)."
                 )
                 _state._logged_prefill_flash = True
-            self._reset_decode_cache()
+            self.workspace.decode_cache.invalidate()
             if self.use_prefill_paged_cache and self.use_flash_v100_prefill_paged:
                 _debug._sm70_profile_trace(
                     "forward branch=prefill_no_prefix_paged_cache layer=%s",
