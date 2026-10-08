@@ -49442,3 +49442,38 @@ weighted reduce, logging/compare, format GEMM codecs and AWQ/NVFP4/MXFP4/GGUF/
 skinny integration remain required B1 work. Do not claim the full B1 or overall
 architecture campaign complete. Preserve differing buffer/capture contracts
 when adding those consumers.
+
+## 2026-10-08 — architecture B1b FP8 stage and weight codec
+
+Stack on B1a #1065 (`cc2ba90d4e7508082dc977cc26f6e90dd0a0be34`) in
+/home/ymzx/arch-ws/v100-arch-moe-fp8-stages-20261008-111202, branch
+agent/v100-arch-moe-fp8-stages-20261008-111202. The shared Sm70MoEMethodBase now
+owns the FP8 apply pipeline (permutation, indexed/compact W13, W2 stage choice
+and weighted reduction). Sm70MoEWeightCodec declares prepare_weights,
+gemm_w13/gemm_w2 and transitional policy/capability/log bindings; the FP8
+codec owns preparation and maps compute-order modes to the unchanged native
+operators. Layer is passed so later formats can bind their own zero/scale
+metadata. Legacy globals and logger/native-module patches resolve through the
+original module owner; old apply/loading methods remain compatible wrappers.
+No environment policy or native arithmetic changed.
+
+Focused CPU checks: 56 passed (28 existing buffer/AST/compiler cases, 20 new
+stage traces across empty/single/batched/per-expert/dense/indexed/compact routes,
+two weight preparation/lifecycle cases, six retained AOT workspace cases).
+Two additional legacy-compact/native-module-rebinding cases pass with the AST
+check in a three-case rerun. All 14 original FP8 method hashes still match
+when the mechanical wrappers/codec calls are expanded, including unchanged
+log messages and exact native argument expressions. A first test normalizer
+incorrectly removed logger.info_once qualification; fixing the narrow owner
+match restored the original hash without changing production code.
+
+The native calls in numerical CPU tests are stubs: identical CPU stub outputs
+and call traces are not CUDA precision evidence. GPU numerical error, replay,
+routes and latency remain unmeasured under the no-V100 instruction. Layering
+totals stay model 2325 / platform 3964 / raw env 334. Evidence under
+/home/ymzx/arch-ws/tmp/b1b-*. Weight codecs contain no new hidden/private DSO.
+
+Legacy compact and comparison implementations remain adapter callbacks;
+AWQ/NVFP4/MXFP4/GGUF/skinny consumers remain to be migrated. Typed MoE policy
+and removal of hot-path legacy env helpers are subsequent B2/D work. This
+scope does not complete B1 or the overall campaign.

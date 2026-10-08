@@ -1,12 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Shared SM70 MoE buffer lifecycle; format-specific stages migrate separately."""
+"""Shared SM70 MoE buffers and execution stages parameterized by weight codec."""
+
+from collections.abc import Callable
 
 import torch
 
-from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe import RoutedExperts, SharedExperts
 from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
     FusedMoEMethodBase,
+)
+from vllm.model_executor.layers.fused_moe.sm70.weight_codec import Sm70MoEWeightCodec
+from vllm.model_executor.layers.quantization.sm70_moe_router import (
+    Sm70MoeStageRoute,
+    select_sm70_quantized_moe_route,
 )
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     LayerWorkspaceView,
@@ -14,14 +21,22 @@ from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import 
 
 
 class Sm70MoEMethodBase(FusedMoEMethodBase):
-    """Persistent and overflow buffers shared independently of weight encoding.
+    """Buffer lifecycle and stage scheduling independent of weight encoding.
 
     Legacy attributes stay on the layer, so graph addresses and patches keep
-    their original owner. FP8 is the first consumer; stage kernels, compare
-    and other formats are migrated in subsequent review scopes.
+    their original owner. FP8 is the first consumer. Native GEMM bindings and
+    weight preparation belong to the codec; comparison and legacy compact
+    callbacks plus other format migrations are subsequent review scopes.
     """
 
     use_permute_with_scratch: bool
+    weight_codec: Sm70MoEWeightCodec
+    group_size: int
+    compact_compare_reference: bool
+    _get_buffers: Callable[..., dict[str, torch.Tensor]]
+    _apply_legacy_single_token_compact: Callable[..., torch.Tensor]
+    _apply_compact_reference_for_compare: Callable[..., dict[str, torch.Tensor]]
+    _maybe_report_compare: Callable[..., None]
 
     def _allocate_moe_buffers(
         self,
@@ -247,3 +262,352 @@ class Sm70MoEMethodBase(FusedMoEMethodBase):
             "empty_weight": buffers.empty_weight,
             "empty_scale": buffers.empty_scale,
         }
+
+    def _apply_moe(
+        self,
+        layer: RoutedExperts,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts: SharedExperts | None,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor:
+        codec = self.weight_codec
+        policy = codec.policy(layer)
+        del shared_experts, shared_experts_input
+        if layer.apply_router_weight_on_input:
+            raise NotImplementedError(
+                codec.message("MoE does not support apply_router_weight_on_input yet.")
+            )
+        num_tokens = x.shape[0]
+        top_k = topk_ids.shape[1]
+        total_slots = num_tokens * top_k
+        buffers = self._get_buffers(layer, total_slots, num_tokens)
+        output = buffers["output"]
+        output.zero_()
+        if total_slots == 0:
+            return output
+        topk_ids_i32 = buffers["topk_ids"]
+        topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        if (
+            num_tokens == 1
+            and policy.batched_gemm
+            and codec.enabled("legacy_single_token_compact")
+        ):
+            return self._apply_legacy_single_token_compact(
+                layer, x, topk_weights, topk_ids_i32, buffers, top_k, output
+            )
+        if num_tokens == 1 and (not policy.batched_gemm):
+            use_compact_w13 = codec.enabled("single_token_compact_w13")
+            use_indexed_w13 = not use_compact_w13 and codec.enabled(
+                "single_token_indexed_w13"
+            )
+            use_indexed_w2 = codec.enabled("single_token_indexed_w2")
+            codec.log(
+                "MoE single-token active-expert dense path enabled "
+                "(top_k=%d, experts=%d).",
+                top_k,
+                layer.sm70_num_experts,
+            )
+            if use_indexed_w13 or use_indexed_w2:
+                codec.log(
+                    "MoE single-token indexed dense-stage path enabled "
+                    "(top_k=%d, w13=%s, w2=%s).",
+                    top_k,
+                    use_indexed_w13,
+                    use_indexed_w2,
+                )
+            if use_compact_w13:
+                codec.log(
+                    "MoE single-token compact grouped W13 path enabled (top_k=%d).",
+                    top_k,
+                )
+                codec.gemm_w13(
+                    "compact",
+                    layer,
+                    buffers["gate_up"],
+                    buffers["permuted_input"],
+                    x,
+                    topk_ids_i32,
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    buffers["compact_w13_ptrs_w"],
+                    buffers["compact_w13_ptrs_s"],
+                    buffers["expert_offsets"],
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["sorted_expert_ids"],
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                    layer.sm70_hidden_logical_size,
+                )
+            elif use_indexed_w13:
+                codec.gemm_w13(
+                    "indexed",
+                    layer,
+                    buffers["gate_up"],
+                    buffers["permuted_input"],
+                    x,
+                    topk_ids_i32,
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    buffers["expert_offsets"],
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["sorted_expert_ids"],
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                    layer.sm70_hidden_logical_size,
+                )
+            else:
+                codec.gemm_w13(
+                    "active_dense",
+                    layer,
+                    buffers["gate_up"],
+                    buffers["permuted_input"],
+                    x,
+                    topk_ids_i32,
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    buffers["expert_offsets"],
+                    buffers["expert_offsets64"],
+                    buffers["inv_permuted_idx"],
+                    buffers["sorted_expert_ids"],
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                    layer.sm70_hidden_logical_size,
+                )
+            torch.ops._C.silu_and_mul(buffers["intermediate"], buffers["gate_up"])
+            if use_indexed_w2:
+                codec.gemm_w2(
+                    "indexed",
+                    layer,
+                    buffers["sorted_output"],
+                    buffers["intermediate"],
+                    buffers["expert_offsets"],
+                    buffers["sorted_expert_ids"],
+                    layer.w2_strided_ptrs_w,
+                    layer.w2_strided_ptrs_s,
+                    top_k,
+                    layer.sm70_w2_k_dim,
+                    layer.sm70_w2_n_dim,
+                    self.group_size,
+                )
+            else:
+                codec.gemm_w2(
+                    "active_dense",
+                    layer,
+                    buffers["sorted_output"],
+                    buffers["intermediate"],
+                    buffers["expert_offsets"],
+                    buffers["sorted_expert_ids"],
+                    layer.w2_strided_ptrs_w,
+                    layer.w2_strided_ptrs_s,
+                    top_k,
+                    layer.sm70_w2_k_dim,
+                    layer.sm70_w2_n_dim,
+                    self.group_size,
+                )
+            if codec.enabled("single_token_weighted_reduce"):
+                codec.log(
+                    "MoE single-token weighted-reduce path enabled (top_k=%d).", top_k
+                )
+                codec.native_ops.awq_moe_single_token_weighted_reduce_out(
+                    buffers["sorted_output"],
+                    topk_weights,
+                    buffers["inv_permuted_idx"],
+                    output,
+                    top_k,
+                    layer.sm70_hidden_logical_size,
+                )
+            else:
+                torch.ops._moe_C.moe_unpermute(
+                    buffers["sorted_output"],
+                    topk_weights,
+                    buffers["inv_permuted_idx"],
+                    buffers["expert_offsets64"][: top_k + 1],
+                    top_k,
+                    output,
+                )
+            return output
+        if policy.permute_with_scratch:
+            buffers["permuted_idx"].fill_(total_slots)
+            torch.ops._moe_C.moe_permute_with_scratch(
+                x,
+                topk_ids_i32,
+                buffers["token_expert_indices"],
+                layer.expert_map,
+                layer.global_num_experts,
+                layer.local_num_experts,
+                top_k,
+                buffers["permuted_input"],
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_idx"],
+                buffers["sort_workspace"],
+                buffers["permuted_experts_id"],
+                buffers["sorted_row_idx"],
+                buffers["topk_ids_for_sort"],
+            )
+        else:
+            torch.ops._moe_C.moe_permute(
+                x,
+                topk_ids_i32,
+                buffers["token_expert_indices"],
+                layer.expert_map,
+                layer.global_num_experts,
+                layer.local_num_experts,
+                top_k,
+                buffers["permuted_input"],
+                buffers["expert_offsets64"],
+                buffers["inv_permuted_idx"],
+                buffers["permuted_idx"],
+            )
+        buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
+        route_plan = select_sm70_quantized_moe_route(
+            batched_enabled=policy.batched_gemm,
+            num_tokens=num_tokens,
+            total_slots=total_slots,
+            w13_per_expert_dispatch=policy.batched_w13_per_expert_dispatch,
+            w2_per_expert_dispatch=policy.batched_w2_per_expert_dispatch,
+        )
+        if route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
+            codec.log(
+                "MoE batched W13 using per-expert dispatch selection (experts=%d).",
+                layer.sm70_num_experts,
+            )
+            codec.gemm_w13(
+                "per_expert",
+                layer,
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                buffers["expert_offsets"],
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w13_k_dim,
+                layer.sm70_w13_n_dim,
+                self.group_size,
+                False,
+            )
+        elif route_plan.w13 == Sm70MoeStageRoute.BATCHED:
+            codec.gemm_w13(
+                "batched",
+                layer,
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                buffers["expert_offsets"],
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w13_k_dim,
+                layer.sm70_w13_n_dim,
+                self.group_size,
+                False,
+            )
+        else:
+            codec.log(
+                "MoE CUDA-graph-safe dense-stage path enabled (experts=%d).",
+                layer.sm70_num_experts,
+            )
+            codec.gemm_w13(
+                "dense",
+                layer,
+                buffers["gate_up"],
+                buffers["permuted_input"],
+                buffers["expert_offsets"],
+                codec.buffer(layer, "dense_expert_ids"),
+                layer.w13_strided_ptrs_w,
+                layer.w13_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w13_k_dim,
+                layer.sm70_w13_n_dim,
+                self.group_size,
+            )
+        torch.ops._C.silu_and_mul(buffers["intermediate"], buffers["gate_up"])
+        if route_plan.w2 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
+            codec.log(
+                "MoE batched W2 using per-expert dispatch selection (experts=%d).",
+                layer.sm70_num_experts,
+            )
+            codec.gemm_w2(
+                "per_expert",
+                layer,
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                buffers["expert_offsets"],
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w2_k_dim,
+                layer.sm70_w2_n_dim,
+                self.group_size,
+                False,
+            )
+        elif route_plan.w2 == Sm70MoeStageRoute.BATCHED:
+            codec.gemm_w2(
+                "batched",
+                layer,
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                buffers["expert_offsets"],
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w2_k_dim,
+                layer.sm70_w2_n_dim,
+                self.group_size,
+                False,
+            )
+        else:
+            codec.gemm_w2(
+                "dense",
+                layer,
+                buffers["sorted_output"],
+                buffers["intermediate"],
+                buffers["expert_offsets"],
+                codec.buffer(layer, "dense_expert_ids"),
+                layer.w2_strided_ptrs_w,
+                layer.w2_strided_ptrs_s,
+                layer.sm70_num_experts,
+                layer.sm70_w2_k_dim,
+                layer.sm70_w2_n_dim,
+                self.group_size,
+            )
+        torch.ops._moe_C.moe_unpermute(
+            buffers["sorted_output"],
+            topk_weights,
+            buffers["inv_permuted_idx"],
+            buffers["expert_offsets64"],
+            top_k,
+            output,
+        )
+        if (
+            num_tokens == 1
+            and policy.batched_gemm
+            and self.compact_compare_reference
+            and hasattr(torch.ops._C, "awq_moe_single_token_exact_layout_prepare")
+        ):
+            reference_tensors = self._apply_compact_reference_for_compare(
+                layer, x, topk_weights, topk_ids_i32, buffers, top_k
+            )
+            self._maybe_report_compare(
+                layer,
+                "noncompact",
+                reference_tensors,
+                {
+                    "permuted_input": buffers["permuted_input"],
+                    "expert_offsets": buffers["expert_offsets"],
+                    "expert_offsets64": buffers["expert_offsets64"],
+                    "inv_permuted_idx": buffers["inv_permuted_idx"],
+                    "gate_up": buffers["gate_up"],
+                    "intermediate": buffers["intermediate"],
+                    "sorted_output": buffers["sorted_output"],
+                    "output": output,
+                },
+                topk_ids_i32,
+            )
+        return output
