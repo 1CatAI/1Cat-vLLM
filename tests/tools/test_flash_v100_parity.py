@@ -120,3 +120,83 @@ def test_route_rejects_changes(field):
     candidate[field] = {} if field == "contract" else []
     with pytest.raises((AssertionError, ValueError)):
         compare_routes(report, candidate)
+
+
+def test_route_record_freezes_nested_requested_engine_options(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    import vllm
+    from tools.sm70 import route_parity
+    from tools.sm70.parity_common import digest, read_json, write_json
+
+    options = dict(
+        model="target",
+        tensor_parallel_size=1,
+        dtype="half",
+        kv_cache_dtype="auto",
+        max_model_len=128,
+        max_num_batched_tokens=32,
+        enforce_eager=False,
+        speculative_config=dict(
+            method="dflash", model="draft", num_speculative_tokens=7
+        ),
+        compilation_config=dict(cudagraph_capture_sizes=[8]),
+    )
+
+    class Engine:
+        def __init__(self, **received):
+            # Reproduce runtime enrichment with an object JSON cannot encode,
+            # plus an in-place mutation below a second nested container.
+            received["speculative_config"]["draft_model_config"] = object()
+            received["compilation_config"]["cudagraph_capture_sizes"].append(16)
+
+        def collective_rpc(self, name):
+            if name == "parity_native_provenance":
+                return [dict(rank=0, libraries={"native": dict(sha256="fixed")})]
+            assert name == "parity_snapshot"
+            return [dict(rank=0, routes={"decode_scalar_paged": 1}, host_kv={})]
+
+        def generate(self, prompts, sampling, *, use_tqdm):
+            assert prompts == ["fixed prompt"] and not use_tqdm
+            assert sampling.temperature == 0.0 and not sampling.ignore_eos
+            return [
+                SimpleNamespace(
+                    prompt_token_ids=[3],
+                    outputs=[
+                        SimpleNamespace(
+                            token_ids=[7, 9], text="answer", finish_reason="stop"
+                        )
+                    ],
+                )
+            ]
+
+    monkeypatch.setattr(vllm, "LLM", Engine)
+    monkeypatch.setattr(
+        vllm, "SamplingParams", lambda **kwargs: SimpleNamespace(**kwargs)
+    )
+    monkeypatch.setattr(route_parity, "runtime", lambda: {"test": True})
+    monkeypatch.setattr(route_parity, "provenance", lambda sha: dict(source_sha=sha))
+    monkeypatch.setenv("VLLM_NO_USAGE_STATS", "1")
+    monkeypatch.setenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "1")
+    model = tmp_path / "model.bin"
+    model.write_bytes(b"fixed model identity")
+    args = SimpleNamespace(
+        engine_args=tmp_path / "engine.json",
+        prompts=tmp_path / "prompts.json",
+        model_identity=tmp_path / "identity.json",
+        output=tmp_path / "result.json",
+        source_sha="a" * 40,
+        max_tokens=8,
+        require_route=["decode_scalar_paged"],
+        require_host_fp8=False,
+    )
+    write_json(args.engine_args, options)
+    write_json(args.prompts, ["fixed prompt"])
+    write_json(args.model_identity, {"files": {str(model): digest(model)}})
+    route_parity.record(args)
+    result = read_json(args.output)
+    recorded = result["contract"]["engine"]
+    assert recorded["speculative_config"] == options["speculative_config"]
+    assert recorded["compilation_config"] == options["compilation_config"]
+    assert result["requests"][0]["token_ids"] == [7, 9]
+    assert result["contract"]["native_sha256"] == [{"native": "fixed"}]

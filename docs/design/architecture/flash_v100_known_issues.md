@@ -47,3 +47,11 @@ Baseline: #1060 `8c96e32e56c09d4a3e3112cb5d1a367571f69476`.
   Graphs and capture size 8 on both arms; the buffer-capacity bug is not repaired
   here. This establishes a separate contract, not success of the failed compile
   configuration. Backend graph replay remains a mandatory numerical/pointer gate.
+
+- The A3 parity recorder initially aliased the requested engine-options
+  dictionary. DFlash2 initialization inserted a `ModelConfig` into its nested
+  speculative configuration, so saving the result raised `TypeError` after
+  successful generation. This is a validation-tool defect, not a passing
+  model gate or a backend failure. Snapshot the JSON options before engine
+  construction, test nested mutation explicitly, retain the failed log and
+  rerun both model arms with the same versioned tool.
