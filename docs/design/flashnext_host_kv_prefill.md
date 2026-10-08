@@ -398,3 +398,21 @@ The 6000 tokens/s goal remains unmet: the candidate still needs about 2.43x
 throughput improvement. C1/C4 checks and post-measurement GPU tracing follow
 this comparison. Those results, natural-output checks and the critical-rank
 latency account are required before promotion.
+
+The first C1 check reports 18.471 ms/round on the existing reader at 8K input.
+The C4 check then finds no eligible four-request intervals: scheduler logs show
+three running requests, one waiting, and 96% GPU KV/state-pool usage. Its
+failure terminates that attempt before the candidate decode checks and trace.
+This is not a C4 pass or regression measurement. Retain raw cohort records,
+output IDs and the admission failure, and allow subsequent diagnostic capture
+to proceed. A new matched run increases the GPU KV/state budget by 384 MiB
+to 1.375 GiB; its capacity and performance must be measured separately.
+
+An offline audit of seven cached SM70 QSA partial-kernel PTX variants finds
+no `mma.sync` or `wmma` instructions; they contain 513 or 1026 static FP32 FMA
+instructions. Source `tl.dot` therefore does not establish Tensor Core use
+for this route. This identifies a candidate for native prefill attention, not
+its share of model latency. The existing source rounds probabilities to FP16
+before P.V and accumulates in FP32; preserve those boundaries when evaluating
+a native implementation. Attribute the actual route in the model trace before
+choosing its implementation or quoting an expected end-to-end gain.
