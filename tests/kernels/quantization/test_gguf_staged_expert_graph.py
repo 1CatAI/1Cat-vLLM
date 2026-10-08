@@ -56,6 +56,7 @@ def prepared_bank(kind, n, k, seed):
 
 def operands(pool, kind, gate, up, down, staged, dp4a):
     if staged:
+        pool.bind(gate[4])
         gc, gs = pool.slot("w1", kind)
         uc, us = pool.slot("w3", kind)
         gw, gst = torch.ops._C.awq_moe_build_strided_ptrs(gc, gs, 2560 * 32, 160, 512)
@@ -82,7 +83,7 @@ def operands(pool, kind, gate, up, down, staged, dp4a):
         [],
         dp4a,
         [],
-        pool.handle if staged else 0,
+        staged,
     )
 
 

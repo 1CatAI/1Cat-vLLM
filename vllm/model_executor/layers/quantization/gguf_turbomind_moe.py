@@ -224,7 +224,7 @@ def _expert_dp4a(
     down_vector_batches: list[int],
     dp4a_batches: list[int],
     q8_intermediate_batches: list[int],
-    staging_handle: int = 0,
+    staged: bool = False,
 ) -> torch.Tensor:
     # Resolve actual M inside the opaque boundary so range compilation cannot
     # freeze a prefill choice into an MTP verification graph.
@@ -236,10 +236,10 @@ def _expert_dp4a(
         and ids.is_contiguous()
         and probabilities.is_contiguous()
     )
-    if staging_handle and not dp4a and m not in raw_batches:
+    if staged and not dp4a and m not in raw_batches:
         # One shared canonical bank serves all internal prefill row chunks.
         # Small-M original/dp4a kernels never touch this scratch.
-        stage_expert_pool(staging_handle, raw_gate, raw_up, source_type)
+        stage_expert_pool(raw_gate, raw_up, source_type)
     policy = get_forward_kernel_config_or_none()
     chunk_size = (
         policy.sm70_gguf.prefill_expert_chunk_size if policy is not None else 4096
@@ -406,7 +406,7 @@ def _expert_dp4a_fake(
     down_vector_batches,
     dp4a_batches,
     q8_intermediate_batches,
-    staging_handle=0,
+    staged=False,
 ):
     return torch.empty_like(x)
 
@@ -697,6 +697,8 @@ class GGUFExpertBank(torch.nn.Module):
                 persistent=False,
             )
             self.raw_pending.clear()
+            if self.staging_pool is not None and self.staging_shard == "w1":
+                self.staging_pool.bind(self.raw_weights)
         if not any(c.reason is None for c in self.capabilities):
             raise ValueError("No admitted canonical GGUF expert operator")
 
@@ -785,7 +787,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             and config.kernel_config.sm70_gguf.grouped_mma_release_raw
         )
         self.mma_planes = False
-        self.staging_handle = 0
+        self.staging_enabled = False
         self.staging_requested = bool(
             config is not None
             and config.kernel_config.sm70_gguf.expert_storage == "staged"
@@ -892,7 +894,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 raise ValueError(
                     "Staged expert gate/up requires one pool and matching formats"
                 )
-            self.staging_handle = gate.staging_pool.handle
+            self.staging_enabled = True
             logger.info_once(
                 "SM70 GGUF original IQ storage with shared 200 MiB canonical "
                 "gate/up workspace enabled; small-M kernels retain original blocks."
@@ -1011,7 +1013,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             c.min_m for c in q8_capabilities if c.reason is None
         ]
         staging_reason = None
-        if not self.staging_handle:
+        if not self.staging_enabled:
             staging_reason = (
                 self.staging_reason or "expert_formats_or_geometry_not_admitted"
                 if self.staging_requested
@@ -1023,10 +1025,10 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             "ep_size": layer.ep_size,
             "canonical_staging": {
                 "requested": self.staging_requested,
-                "enabled": bool(self.staging_handle),
+                "enabled": self.staging_enabled,
                 "reason": staging_reason,
-                "workspace_bytes": 200 * 1024**2 if self.staging_handle else 0,
-                "shared_across_layers": bool(self.staging_handle),
+                "workspace_bytes": 200 * 1024**2 if self.staging_enabled else 0,
+                "shared_across_layers": self.staging_enabled,
             },
             "small_m_dp4a": {
                 "enabled": bool(self.dp4a_batches),
@@ -1136,7 +1138,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 MMA_PLANE_KW,
                 self.q8_intermediate_batches,
             )
-        if (self.dp4a_batches or self.staging_handle) and layer.expert_map is None:
+        if (self.dp4a_batches or self.staging_enabled) and layer.expert_map is None:
             bank = layer.gguf_expert_banks
             gate, up, down = bank["w1"], bank["w3"], bank["w2"]
             return torch.ops.vllm.gguf_expert_dp4a(
@@ -1162,7 +1164,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 down.down_vector_batches,
                 self.dp4a_batches,
                 self.q8_intermediate_batches,
-                self.staging_handle,
+                self.staging_enabled,
             )
         ids = topk_ids
         mask = None

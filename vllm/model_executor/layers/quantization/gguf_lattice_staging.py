@@ -25,13 +25,11 @@ class GGUFLatticeStaging(torch.nn.Module):
         if experts <= 0 or n <= 0 or n % 32 or k <= 0 or k % 256:
             raise ValueError("IQ staging slots require complete SM70 tiles")
         self.experts, self.n, self.k = experts, n, k
-        self.handle = id(self)
         self.register_buffer(
             "codes",
             torch.empty((2, experts, k, n // 16), dtype=torch.int32, device=device),
             persistent=False,
         )
-        _POOLS[self.handle] = self
         self.register_buffer(
             "metadata",
             torch.empty((2, experts, k // 32, n * 8), dtype=torch.uint8, device=device),
@@ -53,8 +51,11 @@ class GGUFLatticeStaging(torch.nn.Module):
             codes, stats = self.slot(shard, source_type)
             stage_lattice(raw, codes, stats, source_type)
 
+    def bind(self, raw_gate):
+        _POOLS[(raw_gate.device, raw_gate.data_ptr())] = self
 
-def stage_expert_pool(handle: int, raw_gate, raw_up, source_type) -> None:
+
+def stage_expert_pool(raw_gate, raw_up, source_type) -> None:
     """Private scratch is written and consumed inside one opaque FFN call.
 
     The owning model keeps the pool alive. Forward calls must be serialized;
@@ -62,7 +63,9 @@ def stage_expert_pool(handle: int, raw_gate, raw_up, source_type) -> None:
     views as mutable compiler inputs would clone large banks and invalidate
     the C++ pointer tables, so they never cross the opaque boundary.
     """
-    pool = _POOLS[handle]
+    # Resolve storage identity at runtime, keeping process-specific handles out
+    # of the compiled graph and its disk-cache key.
+    pool = _POOLS[(raw_gate.device, raw_gate.data_ptr())]
     pool.stage(raw_gate, raw_up, source_type)
 
 
