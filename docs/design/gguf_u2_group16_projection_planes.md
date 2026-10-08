@@ -27,6 +27,11 @@ operator. The measured M8 candidates use KW4/TN2/split1:
 | GDN qkvz | 5120 | 2560, 1536 | IQ3_S, Q2_K |
 | GDN qkvz | 5120 | 2560, 1536 | IQ3_XXS, Q2_K |
 
+Mixed lattice operands retain the original-record reader's single final
+FP16 rounding: the grid times the local scale is exactly representable, then
+the original block coefficient is applied. Changing the K schedule does not
+introduce an extra FP16 rounding of the combined lattice coefficient.
+
 GDN beta/alpha FP16 weights share the input launch. Adjacent source rows may
 be coalesced without changing their output order. Unmeasured shapes,
 three-format attention inputs, and TP2 shapes retain their existing paths.
@@ -45,7 +50,9 @@ weights, and same-process ABBA ordering:
 | IQ3_S + Q2_K qkvz and beta/alpha | 28.870 | 21.379 | 4.84e-4 |
 | IQ3_XXS + Q2_K qkvz and beta/alpha | 30.612 | 20.866 | 4.90e-4 |
 
-These prototype measurements establish candidate shapes; they do not
+These prototype measurements used canonical rounded lattice coefficients.
+The mixed-source production implementation retains the original-record
+operand precision and requires a new comparison. The numbers do not
 establish installed-wheel or end-to-end gains. Promotion requires a normal
 native build, exact canonical restoration, changed-input graph tests, and
 same-wheel model distribution comparisons. Complete-round latency must be

@@ -156,6 +156,63 @@ def test_u2_group16_decoded_operands_and_graph_replay():
         assert not counters.any()
 
 
+@pytest.mark.parametrize("kind", [18, 21])
+def test_u2_mixed_lattice_preserves_single_final_operand_rounding(kind):
+    qa, qb, _, raw = planes(10)
+    la, lb, lattice, _ = planes(kind)
+    affine = transcode_affine(raw, 10)
+    indices = [0, 7, 15, 16, 31, 32, 256, 511]
+    x = torch.zeros(8, 512, device="cuda", dtype=torch.float16)
+    x[torch.arange(8, device="cuda"), indices] = 1
+    output = torch.empty(8, 144, device="cuda", dtype=torch.float16)
+    qout, lout, fout = output.split((64, 64, 16), dim=1)
+    floating = torch.randn(16, 512, device="cuda", dtype=torch.float16)
+    partials = torch.empty(2048, device="cuda", dtype=torch.float32)
+    counters = torch.zeros(2, device="cuda", dtype=torch.int32)
+    table = torch.from_numpy(iq.tables()).cuda()
+
+    def call():
+        torch.ops._C.gguf_dmv_sm70_out(
+            x,
+            [qb[0], lb[0]],
+            [qb[1], lb[1]],
+            [qb[2], lb[2]],
+            [qout, lout],
+            [qa, la],
+            [64, 64],
+            512,
+            1,
+            4,
+            partials,
+            counters,
+            2,
+            None,
+            table,
+            floating,
+            fout,
+            None,
+            False,
+        )
+
+    call()
+    expected_affine = torch.from_numpy(
+        affine.dequantize().astype(np.float16)[:, indices].T.copy()
+    ).cuda()
+    assert torch.equal(qout, expected_affine)
+    assert torch.equal(lout, lattice.half()[:, indices].T)
+    assert torch.equal(fout, floating[:, indices].T)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    for _ in range(10):
+        x.normal_()
+        call()
+        expected = output.clone()
+        graph.replay()
+        assert torch.equal(output, expected)
+        assert not counters.any()
+
+
 @pytest.mark.parametrize(
     "gate,up", [(17, 16), (22, 21), (17, 18), (16, 22), (22, 17), (18, 22), (21, 22)]
 )

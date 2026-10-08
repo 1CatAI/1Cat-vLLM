@@ -391,7 +391,8 @@ __device__ __forceinline__ void decode(const Ld<FMT>& L, int st,
 __device__ __constant__ int8_t kIQ4[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
-template <int FMT, int KW, int TN, bool LegacyIq2 = false>
+template <int FMT, int KW, int TN, bool LegacyIq2 = false,
+          bool ExactLattice = LegacyIq2>
 __device__ __forceinline__ void body6(
     const Seg& sg, int t, bool on, int kslot, int pid, int g0, int g1, int S,
     int G, const half* __restrict__ x, int ldx, int M, uint4* xs, half2* lut,
@@ -470,7 +471,7 @@ __device__ __forceinline__ void body6(
 #pragma unroll
         for (int j = 0; j < 4; ++j) xa[j] = xp[j * 8];
         uint32_t hw[16];
-        decode<FMT, LegacyIq2>(A, st, hw, lut);
+        decode<FMT, ExactLattice>(A, st, hw, lut);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           mma(acc, xa[j].x, xa[j].y, hw[4 * j], hw[4 * j + 1]);
@@ -603,14 +604,19 @@ __global__ void __launch_bounds__(32 * KW * TN)
   half2* lut = reinterpret_cast<half2*>(smem + KW * 256);
   float acc[8] = {};
   constexpr bool legacy_iq2 = KW == 8 && TN == 2 && (FA == LUT6 || FB == LUT6);
+  // Keep operand rounding separate from the legacy contiguous K schedule.
+  // Mixed Q2_K inputs replace original-record readers whose lattice operands
+  // round only after applying both levels of scale.
+  constexpr bool exact_lattice =
+      FA == LUT6 || FB == LUT6 || FA == U2G16 || FB == U2G16;
   if (FA == FB || sg.fmt == FA)
-    body6<FA, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx,
-                                  M, xs, lut, acc, segs.tab, segs.gdn_heads,
-                                  pair);
+    body6<FA, KW, TN, legacy_iq2, exact_lattice>(
+        sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut, acc, segs.tab,
+        segs.gdn_heads, pair);
   else if (FC < 0 || sg.fmt == FB)
-    body6<FB, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx,
-                                  M, xs, lut, acc, segs.tab, segs.gdn_heads,
-                                  pair);
+    body6<FB, KW, TN, legacy_iq2, exact_lattice>(
+        sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M, xs, lut, acc, segs.tab,
+        segs.gdn_heads, pair);
   else {
     if constexpr (FC >= 0)
       body6<FC, KW, TN, false>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M,
