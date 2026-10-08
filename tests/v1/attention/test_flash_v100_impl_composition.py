@@ -181,7 +181,7 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
             candidates = (
                 node.body
                 if isinstance(node, ast.ClassDef)
-                and node.name in ("FlashAttnV100Impl", "DecodeCache")
+                and node.name in ("FlashAttnV100Impl", "DecodeCache", "DecodeExecutor")
                 else [node]
             )
             for fn in candidates:

@@ -452,13 +452,13 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             right = left
         return (left, right)
 
-    _call_flash_attn_decode_paged = _decode._call_flash_attn_decode_paged
+    _call_flash_attn_decode_paged = _decode.DecodeExecutor._call_flash_attn_decode_paged
 
     _smallq_decode_xqa_allowed = _verify._smallq_decode_xqa_allowed
 
     _call_flash_attn_smallq_decode_paged = _verify._call_flash_attn_smallq_decode_paged
 
-    _anchored_swa_params = _decode._anchored_swa_params
+    _anchored_swa_params = _decode.DecodeExecutor._anchored_swa_params
 
     _small_query_decode_enabled = _verify._small_query_decode_enabled
 
@@ -1060,15 +1060,21 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
         )
         return result
 
-    _flash_v100_decode_as_paged_prefill = _decode._flash_v100_decode_as_paged_prefill
+    _flash_v100_decode_as_paged_prefill = (
+        _decode.DecodeExecutor._flash_v100_decode_as_paged_prefill
+    )
 
-    _flash_v100_decode_dense_cache = _decode._flash_v100_decode_dense_cache
+    _flash_v100_decode_dense_cache = (
+        _decode.DecodeExecutor._flash_v100_decode_dense_cache
+    )
 
-    _flash_v100_decode_dense_reference = _decode._flash_v100_decode_dense_reference
+    _flash_v100_decode_dense_reference = (
+        _decode.DecodeExecutor._flash_v100_decode_dense_reference
+    )
 
     _flash_v100_prefill = _prefill._flash_v100_prefill
 
-    _flash_v100_decode = _decode._flash_v100_decode
+    _flash_v100_decode = _decode.DecodeExecutor._flash_v100_decode
 
     _flash_v100_small_query_prefill_as_decode = (
         _verify._flash_v100_small_query_prefill_as_decode
