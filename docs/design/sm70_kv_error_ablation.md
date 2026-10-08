@@ -37,3 +37,15 @@ The byte figures include candidate payload, scale and feature/token-group paddin
 The original ten-scheme metrics match exactly when the old and new tools run on the same local CPU/Torch/thread contract. Cross-host FP32 attention rounding slightly differs from the older ledger; this document retains its own evaluation provenance rather than silently replacing old values. All twelve schemes and per-sample hashes/metrics are in [the JSON ledger](sm70_kv_error_ablation.json).
 
 Next decisions require Flash-Next/QSA and longer real requests, independently calibrated E4M3, native reader staging/throughput and the model quality gates. Short-request RMSE cannot admit a default or establish decode performance.
+
+## Decoded FP16 tile check
+
+`--simulate-fp16-staging` casts reconstructed K/V to FP16 before the FP32 masked oracle. This checks one proposed reader staging contract; it does not model native QK scale epilogues, FP16 probabilities or tensor-core/split-K accumulation order. All12 real samples stay finite across the12 schemes. The [staging ledger](sm70_kv_fp16_staging.json) retains per-layer hashes, errors and counts.
+
+| Candidate | NVFP4 staged RMSE | GGUF staged RMSE |
+| --- | ---: | ---: |
+| `int8_token_head_fp32` | 0.0159953 | 0.0158901 |
+| `int8_token_head_fp16` | 0.0159958 | 0.0158754 |
+| `int8_k_token_fp32_v_feature_group32_fp16` | 0.0111747 | 0.0112875 |
+
+A finite-extreme regression exposes an encoder/reader contract that these short requests do not exercise:65504/127 rounds to stored FP16 scale516, and decoded127×516=65532 becomes infinity in a FP16 tile. The FP32-scale candidate stays finite. A FP16-scale codec needs an explicit scale-rounding or saturating-decoder rule before native admission; neither change is implemented or silently applied to the existing arithmetic candidates. Invalid simulated tiles report nonfinite counts without evaluating infinite attention or emitting NaN JSON. The regression is synthetic contract coverage, not format-selection data.

@@ -99,6 +99,31 @@ def test_e4m3_reports_saturation_and_layer_scale_cost():
     assert result.storage_bytes == 3
 
 
+def test_fp16_tile_staging_reports_overflow_from_rounded_scale():
+    sample = {
+        "q": torch.ones(1, 1, 4, dtype=torch.float16),
+        "k": torch.ones(2, 1, 4, dtype=torch.float16),
+        "v": torch.tensor([[[65504.0, -65504.0, 0.0, 1.0]]] * 2, dtype=torch.float16),
+        "allowed": torch.ones(1, 2, dtype=torch.bool),
+        "attention_scale": 0.5,
+        "k_scale": 1.0,
+        "v_scale": 1.0,
+    }
+    results = {
+        row["scheme"]: row
+        for row in evaluate.evaluate_sample(sample, simulate_fp16_staging=True)
+    }
+    # 65504/127 rounds to stored FP16 scale516;127*516=65532 is finite
+    # in FP32 but becomes infinity when a reader stages the decoded tile in FP16.
+    bad = results["int8_token_head_fp16"]["fp16_tile_staging"]
+    assert bad == {"nonfinite_k": 0, "nonfinite_v": 4}
+    assert "attention" not in bad
+    for name in ("fp16", "int8_token_head_fp32"):
+        staged = results[name]["fp16_tile_staging"]
+        assert staged["nonfinite_k"] == staged["nonfinite_v"] == 0
+        assert staged["attention"]["max_abs"] == (0 if name == "fp16" else 1)
+
+
 def test_encoded_input_cannot_be_an_fp16_oracle():
     sample = {
         "q": torch.ones(1, 1, 16, dtype=torch.float16),

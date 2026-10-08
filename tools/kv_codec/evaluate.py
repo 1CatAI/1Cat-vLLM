@@ -118,7 +118,9 @@ def attention(q, k, v, allowed, scale):
     return torch.einsum("hgqk,khd->qhgd", probs, v.float()).reshape(nq, nh, v.shape[-1])
 
 
-def evaluate_sample(sample: dict, *, ablate_kv: bool = False) -> list[dict]:
+def evaluate_sample(
+    sample: dict, *, ablate_kv: bool = False, simulate_fp16_staging: bool = False
+) -> list[dict]:
     q, k, v, allowed = (sample[name] for name in ("q", "k", "v", "allowed"))
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.dtype != torch.float16 or tensor.ndim != 3 or tensor.numel() == 0:
@@ -214,6 +216,22 @@ def evaluate_sample(sample: dict, *, ablate_kv: bool = False) -> list[dict]:
                 measurement[f"attention_{side}_only"] = error_metrics(output, reference)
                 del output
             del decoded_k, decoded_v
+        if simulate_fp16_staging:
+            staged_k = key.values.to(torch.float16).float()
+            staged_v = value.values.to(torch.float16).float()
+            staging: dict[str, object] = {
+                "nonfinite_k": int((~torch.isfinite(staged_k)).sum()),
+                "nonfinite_v": int((~torch.isfinite(staged_v)).sum()),
+            }
+            if not staging["nonfinite_k"] and not staging["nonfinite_v"]:
+                output = attention(q, staged_k, staged_v, allowed, scale)
+                staging["attention"] = error_metrics(output, reference)
+                del output
+            # Report invalid staging without feeding infinity to the oracle or
+            # emitting NaN JSON. This is not a simulation of a native kernel's
+            # QK scale epilogue, FP16 probabilities or split-K summation order.
+            measurement["fp16_tile_staging"] = staging
+            del staged_k, staged_v
         results.append(measurement)
         del key, value
     return results
@@ -228,6 +246,11 @@ def main() -> None:
         "--ablate-kv",
         action="store_true",
         help="Also measure attention error with only K or only V quantized",
+    )
+    parser.add_argument(
+        "--simulate-fp16-staging",
+        action="store_true",
+        help="Cast decoded K/V tiles to FP16; report overflows and FP32 oracle error",
     )
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
@@ -287,7 +310,11 @@ def main() -> None:
             {
                 "provenance": entry,
                 "sample_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                "measurements": evaluate_sample(sample, ablate_kv=args.ablate_kv),
+                "measurements": evaluate_sample(
+                    sample,
+                    ablate_kv=args.ablate_kv,
+                    simulate_fp16_staging=args.simulate_fp16_staging,
+                ),
             }
         )
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -300,6 +327,7 @@ def main() -> None:
                 "reference": "FP32 masked attention over captured FP16 Q/K/V",
                 "runtime_default_selected": False,
                 "kv_ablation": args.ablate_kv,
+                "fp16_tile_staging_simulated": args.simulate_fp16_staging,
                 "samples": results,
             },
             indent=2,

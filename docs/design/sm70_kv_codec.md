@@ -472,6 +472,14 @@ arithmetic. Evaluate FP16 staging of dequantized INT8 V against the captured
 reference before optimizing it. Do not declare template instantiation alone
 as proof that a format is supported by the path.
 
+The offline tool's `--simulate-fp16-staging` checks decoded FP16 tiles with the
+same masked FP32 oracle. The current12 real samples stay finite, but a finite
+FP16 maximum exposes overflow when a nearest-rounded FP16 scale is stored:
+65504/127 becomes516,then127×516=65532 overflows FP16. Scale-rounding or
+saturating decode must be specified before admitting that reader contract.
+See the [staging measurements](sm70_kv_error_ablation.md#decoded-fp16-tile-check).
+This simulation does not substitute for native QK/PV/reduction or quality gates.
+
 ## Research and decisions
 
 | Reference inspected | Adopt / evaluate | Avoid / reason |
