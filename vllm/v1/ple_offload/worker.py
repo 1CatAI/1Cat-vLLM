@@ -717,6 +717,18 @@ class PleOffloadRunner:
         # the remainder of the model is still on meta and must not be visited.
         for layer in offload_layers.values():
             process_weights_after_loading(layer, model_config, torch.device("cpu"))
+            layout = getattr(layer, "_packed_result_layout", None)
+            if layout is not None:
+                reader = layer.ngram_embedding._cpu_reader
+                if (
+                    reader is None
+                    or reader.source_type != layout["source_type"]
+                    or reader.hidden_size != layout["row_width"]
+                    or layer.ngram_heads != layout["heads"]
+                ):
+                    raise ValueError(
+                        "CPU PLE row storage disagrees with result decoder"
+                    )
 
         self._layers.update(offload_layers)
         del model
@@ -804,7 +816,9 @@ class PleOffloadRunner:
                     or cpu_buffer.shape[0]
                     < self.vllm_config.scheduler_config.max_num_batched_tokens
                     or cpu_buffer.shape[1]
-                    != int(self.vllm_config.model_config.hf_text_config.ple_embed_dim)
+                    != self._layers[layer_name].get_offload_output_dim(
+                        int(self.vllm_config.model_config.hf_text_config.ple_embed_dim)
+                    )
                     or cpu_buffer.dtype
                     != self._layers[layer_name].get_offload_output_dtype(
                         self.vllm_config.model_config.dtype
@@ -859,7 +873,7 @@ class PleOffloadRunner:
                     continue
                 self._pinned_bufs[dp_rank][layer_name] = torch.empty(
                     max_tokens,
-                    embedding_dim,
+                    self._layers[layer_name].get_offload_output_dim(embedding_dim),
                     dtype=self._layers[layer_name].get_offload_output_dtype(
                         self.vllm_config.model_config.dtype
                     ),

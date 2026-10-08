@@ -1,0 +1,243 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from types import SimpleNamespace
+
+import gguf
+import numpy as np
+import pytest
+import torch
+
+from vllm.model_executor.kernels.ple.host_result import (
+    HostResultRegion,
+    publish_host_flag,
+    wait_host_resets,
+)
+from vllm.model_executor.kernels.ple.packed_result import (
+    packed_result_capability,
+    prepare_packed_gguf_results,
+)
+from vllm.model_executor.layers.ple_offload_layer import CpuGpuSemaphore
+from vllm.models.qwen4_exp.nvidia import ple_layer
+from vllm.transformers_utils.gguf_rows import PackedGGUFRowReader
+
+
+def rows(count=41, k=160):
+    rng = np.random.default_rng(1710)
+    data = rng.integers(0, 256, (count, k // 32, 18), dtype=np.uint8)
+    scales = rng.uniform(-0.1, 0.1, (count, k // 32)).astype("<f2")
+    data[:, :, :2] = scales.view(np.uint8).reshape(count, k // 32, 2)
+    return data.reshape(count, -1)
+
+
+def layout(**changes):
+    options = dict(
+        enabled=True,
+        source_type=20,
+        row_width=160,
+        heads=16,
+        fp16=True,
+        sm70=True,
+        offloaded=True,
+        local_tables=False,
+    )
+    options.update(changes)
+    return packed_result_capability(**options)
+
+
+@pytest.mark.parametrize(
+    "changes,reason",
+    [
+        ({"enabled": False}, "disabled_by_kernel_config"),
+        ({"source_type": 23}, "requires_iq4nl_source"),
+        ({"row_width": 159}, "requires_complete_iq4nl_rows"),
+        ({"heads": 0}, "requires_complete_iq4nl_rows"),
+        ({"fp16": False}, "requires_sm70_fp16_output"),
+        ({"sm70": False}, "requires_sm70_fp16_output"),
+        ({"offloaded": False}, "cpu_result_transport_not_active"),
+        ({"local_tables": True}, "local_table_decode_takes_precedence"),
+    ],
+)
+def test_capability_preserves_other_result_paths(changes, reason):
+    status = layout(**changes)
+    assert not status["enabled"] and status["reason"] == reason
+
+
+def test_metadata_plan_names_the_registered_offload_layer(monkeypatch):
+    import vllm.envs as envs
+    from vllm.model_executor.layers import ple_offload_layer
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_device_capability", lambda value: True)
+    monkeypatch.setattr(ple_offload_layer, "ple_offload_enabled", lambda: True)
+    monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "0")
+    envs.disable_envs_cache()
+    name = "model.layers.1.ple.ple_embedding"
+    policy = SimpleNamespace(
+        ple_packed_gguf_results=True,
+        ple_packed_result_decoders={},
+        ple_pinned_decode_active=False,
+        ple_disk_cascade_active=False,
+    )
+    config = SimpleNamespace(
+        kernel_config=policy,
+        model_config=SimpleNamespace(
+            dtype=torch.float16, hf_text_config=SimpleNamespace(ple_embed_dim=2560)
+        ),
+    )
+    tensor = SimpleNamespace(shape=[160, 320001536], tensor_type=20)
+    prepare_packed_gguf_results(
+        config, {"table": tensor}, {"table": name + ".ngram_embedding.weight"}
+    )
+    assert policy.ple_packed_result_decoders == {name: layout()}
+    policy.ple_pinned_decode_active = True
+    prepare_packed_gguf_results(
+        config, {"table": tensor}, {"table": name + ".ngram_embedding.weight"}
+    )
+    assert (
+        policy.ple_packed_result_decoders[name]["reason"]
+        == "local_table_decode_takes_precedence"
+    )
+
+
+@pytest.mark.parametrize("m", [1, 5, 20])
+def test_cpu_producer_keeps_raw_rows_order_and_padding(monkeypatch, m):
+    data = rows()
+    reader = PackedGGUFRowReader(data, 20, 160)
+    module = ple_layer.Qwen4ExpNGramEmbedding.__new__(ple_layer.Qwen4ExpNGramEmbedding)
+    torch.nn.Module.__init__(module)
+    module.layer_name = "ple"
+    module._packed_result_layout = layout()
+    module.ngram_embedding = SimpleNamespace(_cpu_reader=reader)
+    indices = torch.arange(m * 16).reshape(m, 16).remainder(41)
+    module.compute_ngram_ids = lambda *args: indices
+    monkeypatch.setattr(ple_layer, "is_offload_process", lambda: True)
+    output = torch.full((m + 3, 1440), 0xEE, dtype=torch.uint8)
+    ids = torch.zeros(m, dtype=torch.int32)
+    result = module.forward_impl(
+        ids, ids, torch.tensor([0, m]), torch.zeros(1, 2), output
+    )
+    np.testing.assert_array_equal(result.numpy(), data[indices.numpy()].reshape(m, -1))
+    assert output[m:].eq(0xEE).all()
+    assert module.get_offload_output_dim(2560) == 1440
+    assert module.get_offload_output_dtype(torch.float16) == torch.uint8
+
+
+def test_packed_rows_preserve_bounds_empty_and_value_checks():
+    data = rows(3)
+    reader = PackedGGUFRowReader(data, 20, 160, logical_rows=2)
+    assert reader.lookup_packed_iq4nl(np.empty((0, 4), np.int64)).shape == (0, 4, 90)
+    for ids in (np.array([-1]), np.array([2]), np.array([2**63], np.uint64)):
+        with pytest.raises(IndexError):
+            reader.lookup_packed_iq4nl(ids)
+    with pytest.raises(TypeError):
+        reader.lookup_packed_iq4nl(np.array([1.5]))
+    blocks = data.reshape(3, 5, 18)
+    for scale, code, raises in [
+        (np.inf, 0, True),
+        (np.nan, 0, True),
+        (1024, 0xFF, True),
+        (1024, 0x88, False),
+    ]:
+        blocks[0, :, :2] = np.array([scale], dtype="<f2").view(np.uint8)
+        blocks[0, :, 2:] = code
+        if raises:
+            with pytest.raises(ValueError):
+                reader.lookup_packed_iq4nl(np.array([0]))
+            with pytest.raises(ValueError):
+                reader.lookup(np.array([0]))
+        else:
+            packed = reader.lookup_packed_iq4nl(np.array([0]))
+            expected = reader.lookup(np.array([0]))
+            actual = gguf.quants.dequantize(
+                packed, gguf.GGMLQuantizationType.IQ4_NL
+            ).astype(np.float16)
+            np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("m", [1, 5, 20, 512])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_gpu_decoder_matches_official_and_changed_graph_replays(m):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 qualification")
+    data = rows()
+    indices = np.arange(m * 16).reshape(m, 16) % 41
+    packed = torch.from_numpy(data[indices].reshape(m, -1).copy()).cuda()
+    book = torch.tensor(gguf.quants.IQ4_NL.kvalues, dtype=torch.float32, device="cuda")
+    decode = lambda: torch.ops.vllm.ple_decode_iq4nl_result(packed, book, 160)
+    expected = torch.from_numpy(
+        gguf.quants.dequantize(data, gguf.GGMLQuantizationType.IQ4_NL)[indices]
+        .astype(np.float16)
+        .reshape(m, -1)
+    ).cuda()
+    torch.testing.assert_close(decode(), expected, rtol=0, atol=0)
+    warmup = torch.cuda.Stream()
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            decode()
+    warmup.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = decode()
+    for step in range(3):
+        changed = rows(count=47)
+        ids = (indices + 7 * step) % 47
+        packed.copy_(torch.from_numpy(changed[ids].reshape(m, -1)))
+        expected = torch.from_numpy(
+            gguf.quants.dequantize(changed, gguf.GGMLQuantizationType.IQ4_NL)[ids]
+            .astype(np.float16)
+            .reshape(m, -1)
+        ).cuda()
+        graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m", [5, 20])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mapped_packet_consumer_decodes_before_releasing_result(m):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 qualification")
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    packet = torch.empty((m, 1440), dtype=torch.uint8, device=device)
+    region = HostResultRegion.create(packet)
+    try:
+        module = ple_layer.Qwen4ExpNGramEmbedding.__new__(
+            ple_layer.Qwen4ExpNGramEmbedding
+        )
+        torch.nn.Module.__init__(module)
+        module._packed_result_layout = layout()
+        module._packed_result_codebook = torch.tensor(
+            gguf.quants.IQ4_NL.kvalues, dtype=torch.float32, device=device
+        )
+        module._cpu_output_buffer = region.result
+        module.setup_cross_process_offload(
+            packet, CpuGpuSemaphore(device, host_region=region)
+        )
+        hidden = torch.empty((m, 2560), dtype=torch.float16, device=device)
+        # Compile the decoder before capture. The semaphore itself is captured
+        # without executing a wait on the zero-valued producer flag.
+        torch.ops.vllm.ple_decode_iq4nl_result(
+            packet, module._packed_result_codebook, 160
+        )
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = module.wait_offloaded_output(hidden, m)
+            module.release_offloaded_output()
+        for step in range(4):
+            wait_host_resets([region.flag], timeout_s=1)
+            data = rows()
+            ids = (np.arange(m * 16).reshape(m, 16) + step * 7) % 41
+            region.result.copy_(torch.from_numpy(data[ids].reshape(m, -1)))
+            publish_host_flag(region.flag)
+            graph.replay()
+            torch.accelerator.synchronize()
+            expected = (
+                gguf.quants.dequantize(data, gguf.GGMLQuantizationType.IQ4_NL)[ids]
+                .astype(np.float16)
+                .reshape(m, -1)
+            )
+            np.testing.assert_array_equal(output.cpu().numpy(), expected)
+            wait_host_resets([region.flag], timeout_s=1)
+    finally:
+        region.close()

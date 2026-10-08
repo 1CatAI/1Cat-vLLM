@@ -1538,7 +1538,13 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         if (
             is_offload_process()
-            and num_tokens <= 16
+            and (
+                num_tokens <= 16
+                or (
+                    num_tokens <= 32
+                    and getattr(self, "_packed_result_layout", None) is not None
+                )
+            )
             and self.ngram_size == 3
             and self.heads_per_ngram == 8
             and self.ngram_heads == 16
@@ -1809,6 +1815,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             getattr(self, "_sm70_hcx_diagnostics", False),
         )
         if output_buffer is not None:
+            if getattr(self, "_packed_result_layout", None) is not None:
+                reader = self.ngram_embedding._cpu_reader
+                if reader is None or not is_offload_process():
+                    raise RuntimeError("Packed PLE result requires the CPU row owner")
+                packed = reader.lookup_packed_iq4nl(ngram_ids.numpy())
+                output = output_buffer[:num_tokens]
+                output.copy_(torch.from_numpy(packed.reshape(num_tokens, -1)))
+                return output
             output = output_buffer[:num_tokens, : self.embedding_dim]
             # Cross-process FP8 results travel as raw bytes. Keeping the IPC
             # buffers uint8 prevents TorchInductor from treating their graph
@@ -1849,6 +1863,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
     def get_offload_output_dtype(self, default_dtype: torch.dtype) -> torch.dtype:
         """Transport quantized lookup results as opaque E4M3FN bytes."""
+        if getattr(self, "_packed_result_layout", None) is not None:
+            return torch.uint8
         embedding = getattr(self, "ngram_embedding", None)
         if getattr(self, "_packed_gguf", False):
             assert embedding is not None
@@ -1861,6 +1877,18 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if weight is not None:
             return weight.dtype
         return default_dtype
+
+    def get_offload_output_dim(self, default_dim: int) -> int:
+        layout = getattr(self, "_packed_result_layout", None)
+        return layout["packed_width"] if layout is not None else default_dim
+
+    def decode_offloaded_output(self, output: torch.Tensor) -> torch.Tensor:
+        layout = getattr(self, "_packed_result_layout", None)
+        if layout is None:
+            return output
+        return torch.ops.vllm.ple_decode_iq4nl_result(
+            output, self._packed_result_codebook, layout["row_width"]
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -2082,6 +2110,22 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # workers, so preserve the model-dtype scale contract explicitly for
         # its checkpoint-only load path.
         self.ple_embedding._offload_model_dtype = model_config.dtype
+        from vllm.model_executor.kernels.ple.packed_result import packed_result_layout
+
+        self.ple_embedding._packed_result_layout = packed_result_layout(
+            f"{prefix}.ple_embedding"
+        )
+        if (
+            self.ple_embedding._packed_result_layout is not None
+            and not is_offload_process()
+        ):
+            import gguf
+
+            self.ple_embedding.register_buffer(
+                "_packed_result_codebook",
+                torch.tensor(gguf.quants.IQ4_NL.kvalues, dtype=torch.float32),
+                persistent=False,
+            )
         self._sm70_hcx_diagnostics = vllm_config.kernel_config.sm70_hcx_diagnostics
         self.ple_embedding._sm70_hcx_diagnostics = self._sm70_hcx_diagnostics
         self.key_proj = ReplicatedLinear(
