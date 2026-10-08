@@ -419,7 +419,7 @@ class MetadataWorkspace:
     smallq: SmallQueryBuffers = field(default_factory=SmallQueryBuffers)
 
 
-def _allocate_growing_workspace(
+def allocate_growing_workspace(
     allocate: Callable[[], tuple[torch.Tensor, ...]],
     *,
     on_cuda: bool,

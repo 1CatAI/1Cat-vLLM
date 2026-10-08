@@ -2,18 +2,13 @@
   "metrics": {
     "forward": 400,
     "largest_function": 400,
-    "cross_module_private": 309,
-    "import_cycles": 1,
+    "cross_module_private": 308,
+    "import_cycles": 0,
     "model_names_outside_spec": 151,
     "env_outside_config": 0,
     "state_flags": 29
   },
-  "cycles": [
-    [
-      "vllm.v1.attention.backends.flash_v100.dense_prefill",
-      "vllm.v1.attention.backends.flash_v100.kv_layout"
-    ]
-  ],
+  "cycles": [],
   "edges": [
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
@@ -180,6 +175,10 @@
       "vllm.v1.attention.backends.flash_v100.routing"
     ],
     [
+      "vllm.v1.attention.backends.flash_v100.dense_prefill",
+      "vllm.v1.attention.backends.flash_v100.workspace"
+    ],
+    [
       "vllm.v1.attention.backends.flash_v100.impl",
       "vllm.v1.attention.backends.flash_v100.config"
     ],
@@ -229,10 +228,6 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.kv_layout",
-      "vllm.v1.attention.backends.flash_v100.dense_prefill"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.kv_layout",
       "vllm.v1.attention.backends.flash_v100.masks"
     ],
     [
@@ -246,6 +241,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.kv_layout",
       "vllm.v1.attention.backends.flash_v100.routing"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.kv_layout",
+      "vllm.v1.attention.backends.flash_v100.workspace"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.masks",
@@ -649,7 +648,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 193,
+      "line": 194,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_should_use_prefill_d256_gqa_architecture",
@@ -657,7 +656,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 159,
+      "line": 160,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3')",
       "via_config": true,
       "owner": "_should_use_prefill_dense_splitkv3",
@@ -665,7 +664,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 207,
+      "line": 208,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL')",
       "via_config": true,
       "owner": "_should_use_prefill_d256_gqa_architecture",
@@ -673,7 +672,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 245,
+      "line": 246,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_profile_sm70_prefill_workspace",
@@ -681,7 +680,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 485,
+      "line": 486,
       "expression": "_config.registered('VLLM_FLASH_V100_FA2_D256_PREFILL')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -689,7 +688,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 176,
+      "line": 177,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV')",
       "via_config": true,
       "owner": "_should_use_prefill_dense_splitkv3",
@@ -697,7 +696,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 241,
+      "line": 242,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL')",
       "via_config": true,
       "owner": "_profile_sm70_prefill_workspace",
@@ -705,7 +704,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 244,
+      "line": 245,
       "expression": "_config.registered('VLLM_FLASH_V100_FA2_D256_PREFILL')",
       "via_config": true,
       "owner": "_profile_sm70_prefill_workspace",
@@ -713,7 +712,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 560,
+      "line": 561,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -721,7 +720,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 164,
+      "line": 165,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL')",
       "via_config": true,
       "owner": "_should_use_prefill_dense_splitkv3",
@@ -729,7 +728,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 512,
+      "line": 513,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -737,7 +736,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 610,
+      "line": 611,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -745,7 +744,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 633,
+      "line": 634,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -753,7 +752,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 690,
+      "line": 691,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -761,7 +760,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 618,
+      "line": 619,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -769,7 +768,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 679,
+      "line": 680,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -1545,6 +1544,7 @@
     }
   ],
   "functions": {
+    "__init__.py:_compatibility_bindings": 4,
     "__init__.py:__getattr__": 6,
     "backend.py:get_impl_cls": 2,
     "backend.py:get_builder_cls": 2,
@@ -1611,7 +1611,6 @@
     "dense_prefill.py:_get_sm70_79t_q8192_padding_workspace": 30,
     "dense_prefill.py:_run_sm70_d256_gqa_79t_q8192_dispatch": 48,
     "dense_prefill.py:_try_sm70_fa2_d256_prefill": 303,
-    "dense_prefill.py:_allocate_growing_workspace": 23,
     "dense_prefill.py:_get_fp8_prefill_bridge_workspace": 73,
     "dense_prefill.py:_get_fp8_prefill_bridge_tail_workspace": 51,
     "dense_prefill.py:flash_v100_dense_prefill_available": 3,
@@ -1845,6 +1844,7 @@
     "verify.py:tree_prefill": 318,
     "verify.py:small_query_prefill": 239,
     "workspace.py:mixed_decode_rows_plan": 33,
+    "workspace.py:allocate_growing_workspace": 23,
     "workspace.py:invalidate": 5,
     "workspace.py:ensure_capacity": 38,
     "workspace.py:get_kv_single_seq": 66,

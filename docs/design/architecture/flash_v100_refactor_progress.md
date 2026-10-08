@@ -16,7 +16,7 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Prerequisite model gates |
 | 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Prerequisite model gates |
 | 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Host/spec model gates |
-| 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase/native gates passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; named timing gates passed | Model gates pending |
+| 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native gates passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; named timing gates passed | Model gates pending |
 | 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
 | 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
@@ -30,7 +30,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Required | Strict/rebase/GPU gates |
 | 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Required | Strict/rebase/GPU gates |
 | 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Required | Strict/rebase/GPU gates |
-| 6g: owned comparison diagnostics | — | CPU/golden passed | Private 318 → 309; cycles 2 → 1 | Required | Strict/rebase/GPU gates |
+| 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Required | Strict/rebase/GPU gates |
+| 6h: shared allocation ownership | — | CPU/golden/strict passed | Private 309 → 308; final cycle 1 → 0 | Required | Strict/rebase/GPU gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -959,3 +960,39 @@ exclusions**, with real shim consumption (`a3-debug-owner-strict.log`,
 `a3-debug-owner-shim.json`). Pre-commit, mypy and layering pass
 (`a3-debug-owner-precommit.log`). Production and source-oracle files remain
 unchanged throughout the accepted strict run.
+
+## Step 6h shared allocation ownership
+
+PR #1103 is `d75b5f17297fd5330a836274a7f4af176e62219e`. Actual #1028
+replay is `d1519318e057d75644fa2ef35a47cbaab9090b0f`, tree
+`e208f1bbe0efc2ddf9c1e8d8849280d86beef783`, equal to clean merge-tree;
+37 CPU integration tests pass with 98 GPU skips. Four source-verified durable
+queues are staged as `a3-step6g` on 54633.
+
+Growing allocation belongs to workspace. KV gather and dense prefill both
+consume its public allocation API, removing the last package import cycle.
+A separate mechanical commit preserves the original allocation body before
+the public-name rewrite. Legacy shim names resolve to the actual module and
+attribute, so a patch through the old private name reaches both real consumers;
+no stale function-value alias is retained. Strict patch auditing follows this
+canonical binding while still requiring callable invocation from production.
+
+The nine new cases cover initial success, OOM retry with CPU/CUDA cache-release
+ordering, second OOM decline, non-OOM error propagation, real gather/bridge
+allocation through the legacy patch, cache pointer reuse and alias deletion
+and restoration. The initial 19-case focused selection passed its tests but
+failed the suite-wide patch-consumption gate for a pre-existing dense-prefill
+patch; it is retained as a failed run, not accepted as validation. The complete
+strict suite is the gate. Metrics are 400 / 400 / 308 / 0 / 151 / 0 / 29.
+
+Step 3b Qwen model validation completes on 54633 at 2026-10-09 06:35 +08:00:
+FP16/E4M3 crossed with eager/graph, three requests each, all four comparisons
+report equal route/token records. Evidence is `a3-step3b/logs/qwen-*-compare.log`
+and `qwen.done`. Host/spec baseline issues still block complete model gates.
+
+The complete fixed-source strict suite passes **330 tests / 1 skip / 28 GPU
+exclusions**, with unchanged 813 golden traces and original calculation hashes.
+Every audited patch is consumed; the legacy allocator patch reaches both real
+production consumers. Evidence: `a3-allocation-owner-strict.log` and
+`a3-allocation-owner-shim.json`. Production/source-oracle files stay fixed
+throughout the accepted run.

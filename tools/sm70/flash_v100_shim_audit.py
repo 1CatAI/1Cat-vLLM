@@ -57,6 +57,7 @@ def audit_legacy_patches(request):
         targets = {}
         c_targets = []
         globals_targets = {}
+        lookup_names = {}
         last_read = {}
         instructions = {}
         report = getattr(request.config, "_flash_shim_report", {})
@@ -73,9 +74,14 @@ def audit_legacy_patches(request):
                     dict(patched_in=[], called_from=[], read_from=[], requires_call=[]),
                 )
                 record["patched_in"].append(request.node.nodeid)
-                if inspect.isfunction(original) and original.__name__ == name:
+                canonical = legacy._canonical_name(name)
+                if inspect.isfunction(original) and original.__name__ in (
+                    name,
+                    canonical,
+                ):
                     record["requires_call"].append(request.node.nodeid)
                 globals_targets[name] = value
+                lookup_names[canonical] = name
                 if callable(original):
                     code = getattr(value, "__code__", None)
                     if code is not None:
@@ -117,8 +123,9 @@ def audit_legacy_patches(request):
             if event == "call" and (
                 not production(frame)
                 or not any(
-                    name in globals_targets
-                    and frame.f_globals.get(name) is globals_targets[name]
+                    lookup_names.get(name, name) in globals_targets
+                    and frame.f_globals.get(name)
+                    is globals_targets[lookup_names.get(name, name)]
                     for name in frame.f_code.co_names
                 )
             ):
@@ -132,10 +139,11 @@ def audit_legacy_patches(request):
                 code = instructions[frame.f_code]
                 instruction = code.get(frame.f_lasti)
                 if instruction and instruction.opname == "LOAD_GLOBAL":
-                    name = instruction.argval
+                    actual = instruction.argval
+                    name = lookup_names.get(actual, actual)
                     if (
                         name in globals_targets
-                        and frame.f_globals.get(name) is globals_targets[name]
+                        and frame.f_globals.get(actual) is globals_targets[name]
                     ):
                         last_read[id(frame)] = name
                         report[name]["read_from"].append(
@@ -146,6 +154,7 @@ def audit_legacy_patches(request):
         class ObservedOwner(types.ModuleType):
             def __getattribute__(self, name):
                 value = super().__getattribute__(name)
+                name = lookup_names.get(name, name)
                 if name in globals_targets and value is globals_targets[name]:
                     caller = sys._getframe(1)
                     module_name = caller.f_globals.get("__name__", "")

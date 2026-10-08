@@ -24,38 +24,46 @@ __all__ = sorted(
 
 
 def _owners(name: str) -> list[types.ModuleType]:
-    return [module for module in _package.SUBMODULES if name in vars(module)]
+    return [module for module, _ in _package._compatibility_bindings(name)]
+
+
+def _canonical_name(name: str) -> str:
+    bindings = _package._compatibility_bindings(name)
+    return bindings[0][1] if bindings else name
+
+
+_MISSING = object()
 
 
 class _ForwardingModule(types.ModuleType):
     def __getattr__(self, name: str):
-        owners = _owners(name)
-        if not owners:
+        bindings = _package._compatibility_bindings(name)
+        if not bindings:
             raise AttributeError(f"module {self.__name__!r} has no attribute {name!r}")
-        return getattr(owners[0], name)
+        module, target = bindings[0]
+        return getattr(module, target)
 
     def __setattr__(self, name: str, value) -> None:
-        owners = _owners(name)
-        if not owners or name.startswith("__"):
+        bindings = _package._compatibility_bindings(name)
+        if not bindings or name.startswith("__"):
             super().__setattr__(name, value)
             return
-        # A shared import (torch, envs, ...) is patched wherever it is the
-        # same object; a backend name has exactly one owner.
-        current = getattr(owners[0], name)
-        for module in owners:
-            if getattr(module, name) is current:
-                setattr(module, name, value)
+        module, target = bindings[0]
+        current = getattr(module, target, _MISSING)
+        for module, target in bindings:
+            if getattr(module, target, _MISSING) is current:
+                setattr(module, target, value)
 
     def __delattr__(self, name: str) -> None:
-        owners = _owners(name)
-        if not owners:
+        bindings = _package._compatibility_bindings(name)
+        if not bindings:
             super().__delattr__(name)
             return
-        for module in owners:
-            delattr(module, name)
+        for module, target in bindings:
+            delattr(module, target)
 
     def __dir__(self):
-        names = set(super().__dir__())
+        names = set(super().__dir__()) | set(_package.COMPATIBILITY_ALIASES)
         for module in _package.SUBMODULES:
             names.update(vars(module))
         return sorted(names)

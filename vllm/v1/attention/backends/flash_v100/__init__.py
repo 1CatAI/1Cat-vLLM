@@ -110,6 +110,19 @@ SUBMODULES = (
     spec_attention_policy,
 )
 
+# Renamed compatibility bindings resolve to their actual owner. Do not copy
+# function values: old-name writes must also affect the public execution path.
+COMPATIBILITY_ALIASES = {
+    "_allocate_growing_workspace": (workspace, "allocate_growing_workspace"),
+}
+
+
+def _compatibility_bindings(name: str):
+    if name in COMPATIBILITY_ALIASES:
+        return [COMPATIBILITY_ALIASES[name]]
+    return [(module, name) for module in SUBMODULES if name in vars(module)]
+
+
 __all__ = [
     "DFlash2SmallQGroupDescriptor",
     "DFlash2SmallQPreparedMetadata",

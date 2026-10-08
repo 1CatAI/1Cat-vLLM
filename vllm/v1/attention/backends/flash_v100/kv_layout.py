@@ -423,7 +423,7 @@ def _get_prefill_gather_dense_workspace(
 
     workspace = None
     _prefill_gather_dense_workspaces.pop(cache_key, None)
-    allocated = _workspace._allocate_growing_workspace(
+    allocated = _workspace.allocate_growing_workspace(
         _allocate, on_cuda=key_cache.is_cuda
     )
     if allocated is None:

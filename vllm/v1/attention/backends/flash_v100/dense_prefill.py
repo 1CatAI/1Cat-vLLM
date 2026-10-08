@@ -15,7 +15,7 @@ from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.backends.flash_v100.workspace import _allocate_growing_workspace
+from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
 from vllm.v1.attention.ops.sm70_grouped import (
     clear_grouped_fp16_workspaces,
 )
@@ -824,7 +824,7 @@ def _get_fp8_prefill_bridge_workspace(
     # inheriting a doubled capacity that already failed once.
     workspace = None
     _fp8_prefill_bridge_workspaces.pop(cache_key, None)
-    allocated = _allocate_growing_workspace(
+    allocated = _workspace.allocate_growing_workspace(
         _allocate,
         on_cuda=key_cache.is_cuda,
     )
@@ -882,7 +882,7 @@ def _get_fp8_prefill_bridge_tail_workspace(
 
     workspace = None
     _fp8_prefill_bridge_tail_workspaces.pop(cache_key, None)
-    allocated = _allocate_growing_workspace(_allocate, on_cuda=query.is_cuda)
+    allocated = _workspace.allocate_growing_workspace(_allocate, on_cuda=query.is_cuda)
     if allocated is None:
         return None
     padded_query, padded_output = allocated
