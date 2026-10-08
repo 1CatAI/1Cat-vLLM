@@ -49270,3 +49270,56 @@ routing/mixed-row/compatibility/cleanup/FlashInfer suite: 306 passed. Existing
 policy suite: 233 passed / 9 inherited DeviceConfig inference failures /
 1 skipped, identical across all 243 parent/new outcomes (a4a_cpu_ab.json).
 No new runtime policy failure was introduced.
+
+## 2026-10-08 — architecture A4b shared decode strategy
+
+Stack on A4a #1059 (`58511ea2bc617ef904a0578b6004a58a1479a203`) in
+`agent/v100-arch-decode-strategy-20261008-095916`, owned worktree
+`/home/ymzx/arch-ws/v100-arch-decode-strategy-20261008-095916`.
+
+Audit found the original fixed-p256 observation is stale as a source description:
+current E4M3 plans p64 and has p64/p256 and p512/p896/p1664 wave dispatch;
+wave selection additionally needs the forwarded context bound. E4M3 XQA
+requires FP32 partials by a native static assertion and runtime dtype check.
+Do not force the FP16 partial dtype or claim the old timing describes current
+route hits without a matched artifact.
+
+KernelConfig.sm70_decode_strategy requests shared by default or retained
+legacy. Capture it at impl initialization. New native shared-strategy revision
+1 advertises existing D256/GQA6/B1 p256/p1024 support with the PARTIAL_T
+standard launch/reducer. The Python wrapper propagates the marker once.
+Older artifacts keep legacy planning with explicit counted/logged fallback;
+disabled/unavailable XQA avoids irrelevant warnings. Shared E4M3 uses the
+FP16 shape hint (page784 p256 envelope, otherwise ordinary context planner),
+while keeping uint8 storage, FP32 partials and existing batch/small-query/
+explicit partition guards. Legacy wave and experimental paths are retained.
+Observers no longer mislabel shared p256 as the adaptive p64/p256 route.
+
+This scope intentionally changes partition boundaries/reduction order for new
+qualified artifacts. No CUDA kernel arithmetic is edited; no bitwise or speed
+claim follows from that. Three implementation calculation hashes (init and
+the two policy consumers) are deliberately excluded from the old invariant;
+the other 44 and all descriptor kinds stay protected. E4M3/FP16 hints match
+across six page shapes; mock native interface calls at 4097/32K/128K/256K
+check actual source planning arguments, storage and FP32 workspace. Config
+hash differences and revision/missing/legacy/disabled cases pass. New strategy
+plus retained composition suite: 21 passed. A fixture root-path error was
+corrected; the clean run passes. Host binding syntax check g++ -std=c++17
+-fsyntax-only passed, using the authorized runtime's Torch/Python includes.
+Full pre-commit/mypy on implementation files passed.
+
+GPU numerical error, timing and real route traces are unmeasured under the
+user's explicit no-V100 instruction. The C++ syntax check does not build or
+qualify a linked FA2 wheel. The installed older artifact remains in legacy
+mode; shared-mode CPU tests use the declared native marker and mocked calls.
+Coupling totals stay model 2325 / platform 3964 / raw env 334. The campaign
+continues with A5, avoiding overlap with #1048's newly extended KV tile/storage
+work. Evidence is under /home/ymzx/arch-ws/tmp/a4b_*.
+
+A4b retained backend/mixed-row/compatibility/cleanup/FlashInfer plus feature
+suites: 323 passed, including four generated codec cases for the new policy
+fallback observer. Existing CPU policy suite: 233 passed / 9 inherited device
+inference failures / 1 skipped, identical across all 243 parent/new outcomes
+(a4b_cpu_ab.json). This validates retained old-ABI decisions, not new-ABI GPU
+output or speed. The clean strategy suite has 21 passes and host binding
+syntax exit 0. No CUDA driver repair or GPU execution was attempted.

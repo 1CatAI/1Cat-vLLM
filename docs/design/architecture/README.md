@@ -126,7 +126,8 @@ performance regression), lands as its own PR and can be reverted alone.
    verify / prefill / KV-codec modules. *(KV codecs and the module split done;
    declarative route table and shared XQA admission introduced;
    grouped FP16/E4M3 admission and native-family ownership consolidated;
-   next: decode policy, CUDA codec traits and MoE,
+   shared E4M3/FP16 planning introduced with a native revision gate;
+   next: CUDA codec traits and MoE,
    metadata and implementation feature hooks plus method composition done;
    common attention entrypoints contain no family names.)*
 5. **Kernels and build** — consolidate extension modules, mark retired variant files deprecated,

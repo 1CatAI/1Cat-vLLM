@@ -95,3 +95,28 @@ callers. Common impl, metadata and backend entrypoints contain no family names;
 the existing route names and compatibility exports remain intact. CPU forward
 tests cover unsupported-layer rejection, allowed fallback and non-causal
 capture, while checking the original route labels and base call count.
+
+## Shared decode strategy
+
+`KernelConfig.sm70_decode_strategy` requests `shared` (default) or the retained
+`legacy` strategy. The implementation captures the effective strategy once.
+E4M3 D256/GQA6 single-row XQA requires native shared-strategy revision 1;
+older artifacts select and count `decode_strategy_legacy_revision` explicitly.
+Disabled or unavailable XQA does not produce an irrelevant strategy warning.
+FP16/E5M2 retain their existing planning.
+
+The shared E4M3 shape hint is the FP16 hint: page784 plans a p256 envelope,
+other admitted aligned pages use the ordinary context planner (p256 below
+32K, p1024 at/above 32K). Batch/small-query/explicit partition restrictions
+remain in the existing native contracts. The standard native launch/reducer
+already accepts `PARTIAL_T`; E4M3 continues using FP32 partials and uint8 cache
+storage. Shared planning changes partition boundaries and disables the legacy
+p64 envelope/automatic wave choice for these single-row calls. Numerical
+outputs and performance can change. `--kernel-config
+'{"sm70_decode_strategy":"legacy"}'` restores the retained policy.
+
+This is a strategy change with CPU planning/ABI/workspace and host C++ syntax
+evidence. GPU output error, route traces and timing have not been measured;
+no speedup or numerical-equivalence claim is made. The older p256 measurement
+alone does not describe the current p64/p256/wave source, and wave admission
+also depends on the forwarded context bound. Retain those experimental paths.

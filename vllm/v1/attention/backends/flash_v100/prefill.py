@@ -582,7 +582,11 @@ def _run_prefill_prefix_decode_rows(
     seq_lens_rows = plan.token_lengths(attn_metadata.seq_lens)
     partition_size_hint = (
         _routing._g6_aligned_page_partition_size_hint(
-            q_rows, key_cache, value_cache, self.kv_cache_dtype
+            q_rows,
+            key_cache,
+            value_cache,
+            self.kv_cache_dtype,
+            strategy=getattr(self, "decode_strategy", "legacy"),
         )
         if use_xqa
         else None

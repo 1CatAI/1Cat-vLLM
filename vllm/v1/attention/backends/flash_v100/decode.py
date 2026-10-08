@@ -702,10 +702,12 @@ def _flash_v100_decode(
             key_cache,
             value_cache,
             self.kv_cache_dtype,
+            strategy=getattr(self, "decode_strategy", "legacy"),
         )
         if partition_size_hint is not None:
             if (
                 xqa_codec is FP8_E4M3
+                and getattr(self, "decode_strategy", "legacy") == "legacy"
                 and query.shape[0] == 1
                 and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1") != "0"
             ):
