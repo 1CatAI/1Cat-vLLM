@@ -72,3 +72,9 @@ CPU producer checks, GPU decoder/transport replay checks and same-wheel model
 C1/C4/teacher-forcing/acceptance are separate gates. No model improvement is
 admitted until the last gate passes. Both model arms must have identical
 actual PLE placement; requested kernel flags alone do not establish that.
+
+The normally installed wheel passes all 19 packed-result tests on V100,
+including M1/5/20/512 official decoder comparisons, changing graph inputs,
+and M5/20 mapped-buffer consumption followed by acknowledgement. The model
+A/B disables direct QSA and complete-table pinned decode in both arms, and
+changes only the packed-result capability.
