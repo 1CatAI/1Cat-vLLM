@@ -1,18 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Flash-V100 verify methods, bound by impl."""
+"""Verifier calculations with explicit policy and operator dependencies."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any, cast
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
-from vllm.v1.attention.backends.flash_v100 import impl as _impl
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
@@ -22,6 +21,8 @@ from vllm.v1.attention.backends.triton_attn import (
 )
 from vllm.v1.attention.kv_codecs import (
     FP8_E5M2,
+    KVCodec,
+    resolve_kv_codec,
 )
 from vllm.v1.attention.ops.sm70_grouped import (
     grouped_e4m3_fp32_allowed,
@@ -31,66 +32,144 @@ from vllm.v1.attention.ops.sm70_grouped import (
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-class VerificationCalculations:
-    @staticmethod
-    def _validate_dflash_attention_contract(
-        self: _impl.FlashAttnV100Impl,
-        layer: torch.nn.Module,
-        attn_metadata: TritonAttentionMetadata,
-    ) -> None:
-        if not getattr(layer, "is_dflash_draft_attn", False):
-            return
+@dataclass(frozen=True)
+class VerificationConfig:
+    policy: _config.V100AttnConfig
+    scale: float
+    kv_cache_dtype: str
+    alibi_slopes: Any
+    logits_soft_cap: float
+    grouped_enabled: bool
+    grouped_batch_enabled: bool
+    grouped_max_query: int
+    grouped_request_major_abi: int
+    grouped_min_model_len: int
 
-        actual_causal = bool(getattr(attn_metadata, "causal", True))
-        expected_causal = getattr(layer, "dflash_expected_causal", None)
-        if expected_causal is None:
-            raise RuntimeError(
-                "FLASH_ATTN_V100 DFlash attention is missing its declared "
-                "causality contract."
-            )
-        expected_causal = bool(expected_causal)
-        if actual_causal != expected_causal:
-            raise RuntimeError(
-                "FLASH_ATTN_V100 DFlash causality mismatch: "
-                f"model={expected_causal} metadata={actual_causal}."
-            )
+    @property
+    def kv_codec(self) -> KVCodec | None:
+        return resolve_kv_codec(self.kv_cache_dtype)
 
-        declared_window = getattr(layer, "dflash_expected_sliding_window", None)
-        expected_window = (
-            (-1, -1)
-            if declared_window is None
-            else (
-                int(declared_window) - 1,
-                0 if expected_causal else int(declared_window) - 1,
-            )
+
+@dataclass(frozen=True)
+class VerificationOps:
+    grouped: Any
+    fp16_grouped: Any
+    e4m3_grouped: Any
+    xqa: Any
+    window_size: Any
+    layer_info: Any
+    xqa_codec: Any
+    decode: Any
+    admit_grouped_override: Any = None
+    run_grouped_override: Any = None
+    admit_xqa_override: Any = None
+    run_smallq_override: Any = None
+
+
+@dataclass(frozen=True)
+class GroupedAdmission:
+    """Exact legacy grouped-kernel input contract, without a backend receiver."""
+
+    kv_cache_dtype: str
+    use_smallq_decode_xqa: bool
+    flash_attn_grouped_fp16_fp32_paged: Any
+    flash_attn_grouped_e4m3_fp32_paged: Any
+    _flash_v100_window_size: Any
+
+
+def validate_contract(
+    layer: torch.nn.Module,
+    attn_metadata: TritonAttentionMetadata,
+    window_size: Any,
+) -> None:
+    if not getattr(layer, "is_dflash_draft_attn", False):
+        return
+
+    actual_causal = bool(getattr(attn_metadata, "causal", True))
+    expected_causal = getattr(layer, "dflash_expected_causal", None)
+    if expected_causal is None:
+        raise RuntimeError(
+            "FLASH_ATTN_V100 DFlash attention is missing its declared "
+            "causality contract."
         )
-        actual_window = self._flash_v100_window_size(actual_causal)
-        if actual_window != expected_window:
-            raise RuntimeError(
-                "FLASH_ATTN_V100 DFlash sliding-window mismatch: "
-                f"model={expected_window} backend={actual_window}."
-            )
+    expected_causal = bool(expected_causal)
+    if actual_causal != expected_causal:
+        raise RuntimeError(
+            "FLASH_ATTN_V100 DFlash causality mismatch: "
+            f"model={expected_causal} metadata={actual_causal}."
+        )
 
-        signature = (
-            getattr(layer, "layer_name", None),
+    declared_window = getattr(layer, "dflash_expected_sliding_window", None)
+    expected_window = (
+        (-1, -1)
+        if declared_window is None
+        else (
+            int(declared_window) - 1,
+            0 if expected_causal else int(declared_window) - 1,
+        )
+    )
+    actual_window = window_size(actual_causal)
+    if actual_window != expected_window:
+        raise RuntimeError(
+            "FLASH_ATTN_V100 DFlash sliding-window mismatch: "
+            f"model={expected_window} backend={actual_window}."
+        )
+
+    signature = (
+        getattr(layer, "layer_name", None),
+        actual_causal,
+        actual_window,
+        getattr(layer, "dflash_rope_is_neox_style", None),
+    )
+    if signature not in _state._logged_dflash_attention_contracts:
+        _state._logged_dflash_attention_contracts.add(signature)
+        logger.info(
+            "FLASH_ATTN_V100 DFlash attention contract: layer=%s "
+            "causal=%s window=%s rope_neox=%s.",
+            signature[0],
             actual_causal,
             actual_window,
-            getattr(layer, "dflash_rope_is_neox_style", None),
+            signature[3],
         )
-        if signature not in _state._logged_dflash_attention_contracts:
-            _state._logged_dflash_attention_contracts.add(signature)
-            logger.info(
-                "FLASH_ATTN_V100 DFlash attention contract: layer=%s "
-                "causal=%s window=%s rope_neox=%s.",
-                signature[0],
-                actual_causal,
-                actual_window,
-                signature[3],
-            )
 
-    @staticmethod
-    def _dflash2_grouped_verify_allowed(
-        self: _impl.FlashAttnV100Impl,
+
+class VerificationExecutor:
+    def __init__(self, config: VerificationConfig, ops: VerificationOps):
+        self.config = config
+        self.ops = ops
+        self.grouped_admission = GroupedAdmission(
+            config.kv_cache_dtype,
+            getattr(config.policy, "use_smallq_decode_xqa", False),
+            ops.fp16_grouped,
+            ops.e4m3_grouped,
+            ops.window_size,
+        )
+        self.admit_grouped = (
+            self.grouped_verify_allowed
+            if ops.admit_grouped_override is None
+            else ops.admit_grouped_override
+        )
+        self.run_grouped = (
+            self.call_grouped_verify
+            if ops.run_grouped_override is None
+            else ops.run_grouped_override
+        )
+        self.admit_xqa = (
+            self.smallq_xqa_allowed
+            if ops.admit_xqa_override is None
+            else ops.admit_xqa_override
+        )
+        self.run_smallq = (
+            self.call_smallq_decode_paged
+            if ops.run_smallq_override is None
+            else ops.run_smallq_override
+        )
+
+    def validate_contract(self, layer, attn_metadata) -> None:
+        validate_contract(layer, attn_metadata, self.ops.window_size)
+
+    def grouped_verify_allowed(
+        self,
         query: torch.Tensor,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -118,24 +197,24 @@ class VerificationCalculations:
         single_request_shape = bool(
             num_reqs == 1
             and num_query_tokens in (8, 16)
-            and num_query_tokens <= self.dflash2_grouped_verify_max_query_tokens
+            and num_query_tokens <= self.config.grouped_max_query
         )
         batched_request_shape = bool(
-            self.use_dflash2_batched_grouped_verify
-            and self.dflash2_grouped_verify_request_major_abi_version >= 1
+            self.config.grouped_batch_enabled
+            and self.config.grouped_request_major_abi >= 1
             and num_reqs in (2, 4, 8)
             and max_query_len == 8
             and num_query_tokens == num_reqs * 8
         )
         allowed = bool(
-            self.use_dflash2_grouped_verify
+            self.config.grouped_enabled
             and (single_request_shape or batched_request_shape)
-            and self.flash_attn_grouped_verify_paged is not None
+            and self.ops.grouped is not None
             and getattr(attn_metadata, "is_dflash_selector_target", False)
             and getattr(attn_metadata, "max_model_len", 0)
-            >= self.dflash2_grouped_verify_min_model_len
+            >= self.config.grouped_min_model_len
             and getattr(attn_metadata, "causal", True)
-            and self._flash_v100_window_size(causal=True) == (-1, -1)
+            and self.ops.window_size(causal=True) == (-1, -1)
             and tuple(query.shape) == (num_query_tokens, 6, 256)
             and query.dtype == torch.float16
             and query.is_contiguous()
@@ -156,7 +235,7 @@ class VerificationCalculations:
             # This legacy verifier stores normalized partials in FP16.
             # E4M3 must reach the repaired FP32 path below, including when
             # the old native entry advertises E4M3 byte-format support.
-            and self.kv_codec is FP8_E5M2
+            and self.config.kv_codec is FP8_E5M2
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == num_reqs
@@ -171,7 +250,7 @@ class VerificationCalculations:
             and seq_lens.is_contiguous()
         )
         if (
-            self.use_dflash2_grouped_verify
+            self.config.grouped_enabled
             and not allowed
             and not _state._logged_prefill_smallq_grouped_verify_gate
         ):
@@ -182,23 +261,23 @@ class VerificationCalculations:
                 "native_max_q=%d q=%s/%s "
                 "k=%s/%s v=%s/%s kv_dtype=%s block_table=%s/%s "
                 "seq_lens=%s/%s.",
-                self.flash_attn_grouped_verify_paged is not None,
+                self.ops.grouped is not None,
                 getattr(attn_metadata, "is_dflash_selector_target", False),
                 getattr(attn_metadata, "max_model_len", None),
-                self.dflash2_grouped_verify_min_model_len,
+                self.config.grouped_min_model_len,
                 getattr(attn_metadata, "causal", True),
-                self._flash_v100_window_size(causal=True),
+                self.ops.window_size(causal=True),
                 num_reqs,
                 max_query_len,
                 num_query_tokens,
-                self.dflash2_grouped_verify_max_query_tokens,
+                self.config.grouped_max_query,
                 tuple(query.shape),
                 query.dtype,
                 tuple(key_cache.shape),
                 key_cache.dtype,
                 tuple(value_cache.shape),
                 value_cache.dtype,
-                self.kv_cache_dtype,
+                self.config.kv_cache_dtype,
                 None if block_table is None else tuple(block_table.shape),
                 None if block_table is None else block_table.dtype,
                 None if seq_lens is None else tuple(seq_lens.shape),
@@ -207,9 +286,8 @@ class VerificationCalculations:
             _state._logged_prefill_smallq_grouped_verify_gate = True
         return allowed
 
-    @staticmethod
-    def _call_dflash2_grouped_verify(
-        self: _impl.FlashAttnV100Impl,
+    def call_grouped_verify(
+        self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         key_cache: torch.Tensor,
@@ -225,32 +303,31 @@ class VerificationCalculations:
                 "(request-major B%d/q%d/H6/Hkv1/D256, %s KV, one-pass).",
                 num_reqs,
                 query.shape[0] // num_reqs,
-                self.kv_cache_dtype,
+                self.config.kv_cache_dtype,
             )
             _state._logged_prefill_smallq_grouped_verify = True
-        self.flash_attn_grouped_verify_paged(
+        self.ops.grouped(
             query,
             key_cache,
             value_cache,
             attn_metadata.block_table[:num_reqs],
             attn_metadata.seq_lens[:num_reqs],
-            softmax_scale=self.scale,
+            softmax_scale=self.config.scale,
             out=out,
-            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype=self.config.kv_cache_dtype,
             k_scale=float(layer._k_scale_float),
             v_scale=float(layer._v_scale_float),
             one_pass=True,
         )
         _routing._log_fp8_kv_cache_route(
-            "decode", self.kv_cache_dtype, "dflash2_grouped_verify"
+            "decode", self.config.kv_cache_dtype, "dflash2_grouped_verify"
         )
         _routing._record_route(
             _routing.ROUTE_SPECS["prefill_smallq_dflash2_grouped_verify"].name
         )
 
-    @staticmethod
-    def _smallq_decode_xqa_allowed(
-        self: _impl.FlashAttnV100Impl,
+    def smallq_xqa_allowed(
+        self,
         query: torch.Tensor,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -264,7 +341,7 @@ class VerificationCalculations:
     ) -> bool:
         context = _routing.RouteContext(
             stage="verify",
-            codec=self._xqa_kv_codec(key_cache, value_cache, attn_metadata),
+            codec=self.ops.xqa_codec(key_cache, value_cache, attn_metadata),
             shape=_routing.RouteShape(
                 query.shape[0],
                 query.shape[1],
@@ -272,8 +349,8 @@ class VerificationCalculations:
                 query.shape[2],
                 key_cache.shape[1],
             ),
-            enabled=self.use_smallq_decode_xqa,
-            available=self.flash_attn_decode_paged_xqa is not None,
+            enabled=self.config.policy.use_smallq_decode_xqa,
+            available=self.ops.xqa is not None,
             query=query,
             metadata=attn_metadata,
             seq_rows=seq_lens.shape[0],
@@ -289,9 +366,8 @@ class VerificationCalculations:
             is None
         )
 
-    @staticmethod
-    def _call_flash_attn_smallq_decode_paged(
-        self: _impl.FlashAttnV100Impl,
+    def call_smallq_decode_paged(
+        self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         key_cache: torch.Tensor,
@@ -305,11 +381,11 @@ class VerificationCalculations:
         workspace_seq_capacity_hint: int | None,
         partition_size_hint: int | None,
     ) -> None:
-        fp16_grouped = getattr(self, "flash_attn_grouped_fp16_fp32_paged", None)
+        fp16_grouped = self.ops.fp16_grouped
         if (
             fp16_grouped is not None
             and grouped_fp16_fp32_reason(
-                self,
+                self.grouped_admission,
                 query,
                 key_cache,
                 value_cache,
@@ -328,7 +404,7 @@ class VerificationCalculations:
                 attn_metadata.block_table,
                 seq_lens,
                 out=out,
-                softmax_scale=self.scale,
+                softmax_scale=self.config.scale,
             )
             logger.info_once(
                 "FLASH_ATTN_V100 FP16 KV grouped verifier active "
@@ -340,9 +416,9 @@ class VerificationCalculations:
                 _routing.ROUTE_SPECS["prefill_smallq_fp16_grouped_fp32"].name
             )
             return
-        grouped_op = getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None)
+        grouped_op = self.ops.e4m3_grouped
         if grouped_op is not None and grouped_e4m3_fp32_allowed(
-            self,
+            self.grouped_admission,
             query,
             key_cache,
             value_cache,
@@ -361,7 +437,7 @@ class VerificationCalculations:
                 attn_metadata.block_table,
                 seq_lens,
                 out=out,
-                softmax_scale=self.scale,
+                softmax_scale=self.config.scale,
                 k_scale=float(layer._k_scale_float),
                 v_scale=float(layer._v_scale_float),
             )
@@ -373,14 +449,14 @@ class VerificationCalculations:
                 scope="process",
             )
             _routing._log_fp8_kv_cache_route(
-                "decode", self.kv_cache_dtype, "grouped_fp32"
+                "decode", self.config.kv_cache_dtype, "grouped_fp32"
             )
             _routing._record_route(
                 _routing.ROUTE_SPECS["prefill_smallq_e4m3_grouped_fp32"].name
             )
             return
-        window_size = self._flash_v100_window_size(causal=True)
-        if self._smallq_decode_xqa_allowed(
+        window_size = self.ops.window_size(causal=True)
+        if self.admit_xqa(
             query,
             key_cache,
             value_cache,
@@ -399,7 +475,7 @@ class VerificationCalculations:
                     and key_cache.shape[1] == 1616
                     and key_cache.shape[2] > 0
                     and query.shape[1] == 6 * key_cache.shape[2]
-                    and self.kv_codec is FP8_E5M2
+                    and self.config.kv_codec is FP8_E5M2
                     and FP8_E5M2.stores(key_cache, value_cache)
                 )
                 else None
@@ -415,16 +491,18 @@ class VerificationCalculations:
                     verifier_partition_size_hint is not None,
                 )
                 _state._logged_prefill_smallq_decode_xqa = True
-            _routing._log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "xqa_paged")
-            self.flash_attn_decode_paged_xqa(
+            _routing._log_fp8_kv_cache_route(
+                "decode", self.config.kv_cache_dtype, "xqa_paged"
+            )
+            self.ops.xqa(
                 query,
                 key_cache,
                 value_cache,
                 block_table,
                 seq_lens,
-                softmax_scale=self.scale,
+                softmax_scale=self.config.scale,
                 out=out,
-                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype=self.config.kv_cache_dtype,
                 k_scale=float(layer._k_scale_float),
                 v_scale=float(layer._v_scale_float),
                 window_size=window_size,
@@ -444,15 +522,15 @@ class VerificationCalculations:
             )
             return
 
-        self._call_flash_attn_decode_paged(
+        self.ops.decode(
             query,
             key_cache,
             value_cache,
             block_table,
             seq_lens,
-            softmax_scale=self.scale,
+            softmax_scale=self.config.scale,
             out=out,
-            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype=self.config.kv_cache_dtype,
             k_scale=float(layer._k_scale_float),
             v_scale=float(layer._v_scale_float),
             window_size=window_size,
@@ -464,15 +542,14 @@ class VerificationCalculations:
             _routing.ROUTE_SPECS["prefill_smallq_decode_scalar"].name
         )
 
-    @staticmethod
-    def _small_query_decode_enabled(
-        self: _impl.FlashAttnV100Impl,
+    def small_query_enabled(
+        self,
         attn_metadata: TritonAttentionMetadata,
     ) -> bool:
         if (
             not getattr(attn_metadata, "causal", True)
-            or not self.use_flash_v100_decode
-            or self.smallq_decode_max_query_len <= 0
+            or not self.config.policy.use_flash_v100_decode
+            or self.config.policy.smallq_decode_max_query_len <= 0
         ):
             return False
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
@@ -488,14 +565,16 @@ class VerificationCalculations:
         max_query_len = int(query_lens.max().item())
         max_model_len = getattr(attn_metadata, "max_model_len", 0)
         model_len_supported = (
-            self.smallq_decode_max_model_len <= 0
-            or max_model_len <= self.smallq_decode_max_model_len
+            self.config.policy.smallq_decode_max_model_len <= 0
+            or max_model_len <= self.config.policy.smallq_decode_max_model_len
         )
-        return max_query_len <= self.smallq_decode_max_query_len and model_len_supported
+        return (
+            max_query_len <= self.config.policy.smallq_decode_max_query_len
+            and model_len_supported
+        )
 
-    @staticmethod
-    def _flash_v100_ddtree_small_query_prefill_dense(
-        self: _impl.FlashAttnV100Impl,
+    def tree_prefill(
+        self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -517,7 +596,7 @@ class VerificationCalculations:
             int(parent_ids.shape[0]) if parent_ids is not None else 0,
             int(num_tree_tokens_cpu.numel()) if num_tree_tokens_cpu is not None else 0,
         )
-        window_size = self._flash_v100_window_size(causal=True)
+        window_size = self.ops.window_size(causal=True)
         if (
             _debug._dflash_ddtree_triton_branch_attn_enabled()
             and parent_ids is not None
@@ -545,7 +624,7 @@ class VerificationCalculations:
                     )
 
                     ddtree_branch_attention_correction(
-                        impl=self,
+                        impl=self.config,
                         query=query,
                         key=key,
                         value=value,
@@ -718,7 +797,7 @@ class VerificationCalculations:
                             _kv_layout._dequantize_fp8_contiguous_kv(
                                 cache_k_by_slot,
                                 cache_v_by_slot,
-                                self.kv_cache_dtype,
+                                self.config.kv_cache_dtype,
                                 float(layer._k_scale_float),
                                 float(layer._v_scale_float),
                             )
@@ -729,7 +808,7 @@ class VerificationCalculations:
                             "flash_ddtree_kv_cache_diff",
                             {
                                 "layer": str(
-                                    self._layer_debug_info(layer).get("layer_name")
+                                    self.ops.layer_info(layer).get("layer_name")
                                 ),
                                 "req_idx": req_idx,
                                 "query_start": start,
@@ -756,7 +835,7 @@ class VerificationCalculations:
             k_cont, v_cont = _kv_layout._dequantize_fp8_contiguous_kv(
                 k_cont,
                 v_cont,
-                self.kv_cache_dtype,
+                self.config.kv_cache_dtype,
                 float(layer._k_scale_float),
                 float(layer._v_scale_float),
             )
@@ -778,7 +857,7 @@ class VerificationCalculations:
                 k_f = k_f.repeat_interleave(repeat, dim=1)
                 v_f = v_f.repeat_interleave(repeat, dim=1)
 
-            scores = torch.einsum("mhd,nhd->hmn", q_f, k_f) * self.scale
+            scores = torch.einsum("mhd,nhd->hmn", q_f, k_f) * self.config.scale
             visible = _masks._build_ddtree_visibility_mask(
                 q_len=q_len,
                 seq_len=seq_len,
@@ -801,7 +880,7 @@ class VerificationCalculations:
                 "elapsed_ms=%.3f query_tokens=%d tree_tokens=%d max_seq_len=%d "
                 "heads_q=%d heads_kv=%d head_dim=%d",
                 "prefill_ddtree_dense",
-                self._layer_debug_info(layer).get("layer_name"),
+                self.ops.layer_info(layer).get("layer_name"),
                 float(profile_start.elapsed_time(profile_end)),
                 total_query_tokens,
                 total_tree_tokens,
@@ -813,9 +892,8 @@ class VerificationCalculations:
 
         return output
 
-    @staticmethod
-    def _flash_v100_small_query_prefill_as_decode(
-        self: _impl.FlashAttnV100Impl,
+    def small_query_prefill(
+        self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         key_cache: torch.Tensor,
@@ -842,7 +920,7 @@ class VerificationCalculations:
             int(query.shape[0]),
             int(output.shape[0]),
         )
-        if self.use_dflash2_grouped_verify and self._dflash2_grouped_verify_allowed(
+        if self.config.grouped_enabled and self.admit_grouped(
             query,
             key_cache,
             value_cache,
@@ -851,7 +929,7 @@ class VerificationCalculations:
         ):
             query = query[:num_query_tokens]
             out_view = output[:num_query_tokens]
-            self._call_dflash2_grouped_verify(
+            self.run_grouped(
                 layer,
                 query,
                 key_cache,
@@ -893,7 +971,7 @@ class VerificationCalculations:
                 _debug._graph_metadata_debug_log(
                     "smallq_call",
                     "layer=%s num_query_tokens=%s %s %s %s %s %s",
-                    self._layer_debug_info(layer).get("layer_name"),
+                    self.ops.layer_info(layer).get("layer_name"),
                     num_query_tokens,
                     _debug._format_tensor_debug(query, "query"),
                     _debug._format_tensor_debug(out_view, "out"),
@@ -909,7 +987,7 @@ class VerificationCalculations:
                         persistent_query_start_loc, "smallq_qsl"
                     ),
                 )
-            self._call_flash_attn_smallq_decode_paged(
+            self.run_smallq(
                 layer,
                 query,
                 key_cache,
@@ -1039,7 +1117,7 @@ class VerificationCalculations:
         else:
             eager_max_seq_len = None
             eager_workspace_seq_capacity_hint = None
-        self._call_flash_attn_smallq_decode_paged(
+        self.run_smallq(
             layer,
             query,
             key_cache,
@@ -1055,29 +1133,148 @@ class VerificationCalculations:
         return output
 
 
-_validate_dflash_attention_contract = cast(
-    Callable[..., Any], VerificationCalculations._validate_dflash_attention_contract
-)
-_dflash2_grouped_verify_allowed = cast(
-    Callable[..., Any], VerificationCalculations._dflash2_grouped_verify_allowed
-)
-_call_dflash2_grouped_verify = cast(
-    Callable[..., Any], VerificationCalculations._call_dflash2_grouped_verify
-)
-_smallq_decode_xqa_allowed = cast(
-    Callable[..., Any], VerificationCalculations._smallq_decode_xqa_allowed
-)
-_call_flash_attn_smallq_decode_paged = cast(
-    Callable[..., Any], VerificationCalculations._call_flash_attn_smallq_decode_paged
-)
-_small_query_decode_enabled = cast(
-    Callable[..., Any], VerificationCalculations._small_query_decode_enabled
-)
-_flash_v100_ddtree_small_query_prefill_dense = cast(
-    Callable[..., Any],
-    VerificationCalculations._flash_v100_ddtree_small_query_prefill_dense,
-)
-_flash_v100_small_query_prefill_as_decode = cast(
-    Callable[..., Any],
-    VerificationCalculations._flash_v100_small_query_prefill_as_decode,
-)
+def _validate_dflash_attention_contract(
+    self: Any, layer: torch.nn.Module, attn_metadata: TritonAttentionMetadata
+) -> None:
+    return validate_contract(layer, attn_metadata, self._flash_v100_window_size)
+
+
+def _dflash2_grouped_verify_allowed(
+    self: Any,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    *,
+    num_query_tokens: int,
+) -> bool:
+    return self._new_verification_executor().grouped_verify_allowed(
+        query, key_cache, value_cache, attn_metadata, num_query_tokens=num_query_tokens
+    )
+
+
+def _call_dflash2_grouped_verify(
+    self: Any,
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    *,
+    out: torch.Tensor,
+) -> None:
+    return self._new_verification_executor().call_grouped_verify(
+        layer, query, key_cache, value_cache, attn_metadata, out=out
+    )
+
+
+def _smallq_decode_xqa_allowed(
+    self: Any,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    *,
+    window_size: tuple[int, int],
+    max_seq_len_hint: int | None,
+    workspace_seq_capacity_hint: int | None,
+    partition_size_hint: int | None,
+) -> bool:
+    return self._new_verification_executor().smallq_xqa_allowed(
+        query,
+        key_cache,
+        value_cache,
+        seq_lens,
+        attn_metadata,
+        window_size=window_size,
+        max_seq_len_hint=max_seq_len_hint,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+        partition_size_hint=partition_size_hint,
+    )
+
+
+def _call_flash_attn_smallq_decode_paged(
+    self: Any,
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    *,
+    out: torch.Tensor,
+    max_seq_len_hint: int | None,
+    workspace_seq_capacity_hint: int | None,
+    partition_size_hint: int | None,
+) -> None:
+    return self._new_verification_executor().call_smallq_decode_paged(
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        attn_metadata,
+        out=out,
+        max_seq_len_hint=max_seq_len_hint,
+        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+        partition_size_hint=partition_size_hint,
+    )
+
+
+def _small_query_decode_enabled(
+    self: Any, attn_metadata: TritonAttentionMetadata
+) -> bool:
+    return self._new_verification_executor().small_query_enabled(attn_metadata)
+
+
+def _flash_v100_ddtree_small_query_prefill_dense(
+    self: Any,
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    output: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> torch.Tensor:
+    return self._new_verification_executor().tree_prefill(
+        layer,
+        query,
+        key,
+        value,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        output,
+        query_start_loc,
+        seq_lens,
+    )
+
+
+def _flash_v100_small_query_prefill_as_decode(
+    self: Any,
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    output: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    _seq_lens: torch.Tensor,
+) -> torch.Tensor:
+    return self._new_verification_executor().small_query_prefill(
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        output,
+        query_start_loc,
+        _seq_lens,
+    )

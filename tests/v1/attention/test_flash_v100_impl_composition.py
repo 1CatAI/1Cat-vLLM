@@ -225,6 +225,18 @@ _CACHE_FIELDS = {
 }
 
 
+_VERIFY_METHODS = {
+    "validate_contract": "_validate_dflash_attention_contract",
+    "grouped_verify_allowed": "_dflash2_grouped_verify_allowed",
+    "call_grouped_verify": "_call_dflash2_grouped_verify",
+    "smallq_xqa_allowed": "_smallq_decode_xqa_allowed",
+    "call_smallq_decode_paged": "_call_flash_attn_smallq_decode_paged",
+    "small_query_enabled": "_small_query_decode_enabled",
+    "tree_prefill": "_flash_v100_ddtree_small_query_prefill_dense",
+    "small_query_prefill": "_flash_v100_small_query_prefill_as_decode",
+}
+
+
 class _Normalize(ast.NodeTransformer):
     in_cache = False
 
@@ -237,6 +249,14 @@ class _Normalize(ast.NodeTransformer):
         return None
 
     def visit_FunctionDef(self, node):
+        if node.name == "validate_contract":
+            assert [a.arg for a in node.args.args] == [
+                "layer",
+                "attn_metadata",
+                "window_size",
+            ]
+            node.args.args = [ast.arg(arg="self"), *node.args.args[:-1]]
+        node.name = _VERIFY_METHODS.get(node.name, node.name)
         self.in_cache = node.name in _CACHE_METHODS
         if node.name in ("_call_flash_attn_decode_paged", "_flash_v100_decode"):
             pairs = list(zip(node.args.kwonlyargs, node.args.kw_defaults))
@@ -271,6 +291,40 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Attribute(self, node):
         expression = ast.unparse(node)
+        verification = {
+            "self.config.grouped_max_query": (
+                "self.dflash2_grouped_verify_max_query_tokens"
+            ),
+            "self.config.grouped_request_major_abi": (
+                "self.dflash2_grouped_verify_request_major_abi_version"
+            ),
+            "self.config.grouped_min_model_len": (
+                "self.dflash2_grouped_verify_min_model_len"
+            ),
+            "self.config.grouped_enabled": "self.use_dflash2_grouped_verify",
+            "self.config.grouped_batch_enabled": (
+                "self.use_dflash2_batched_grouped_verify"
+            ),
+            "self.ops.grouped": "self.flash_attn_grouped_verify_paged",
+            "self.ops.fp16_grouped": (
+                'getattr(self, "flash_attn_grouped_fp16_fp32_paged", None)'
+            ),
+            "self.ops.e4m3_grouped": (
+                'getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None)'
+            ),
+            "self.ops.xqa": "self.flash_attn_decode_paged_xqa",
+            "self.ops.window_size": "self._flash_v100_window_size",
+            "self.ops.layer_info": "self._layer_debug_info",
+            "self.ops.xqa_codec": "self._xqa_kv_codec",
+            "self.ops.decode": "self._call_flash_attn_decode_paged",
+            "self.admit_grouped": "self._dflash2_grouped_verify_allowed",
+            "self.run_grouped": "self._call_dflash2_grouped_verify",
+            "self.admit_xqa": "self._smallq_decode_xqa_allowed",
+            "self.run_smallq": "self._call_flash_attn_smallq_decode_paged",
+            "self.grouped_admission": "self",
+        }
+        if expression in verification:
+            return ast.parse(verification[expression], mode="eval").body
         if expression.startswith("self.executor."):
             node = ast.parse(
                 expression.replace("self.executor.", "self.", 1), mode="eval"
@@ -337,6 +391,12 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
+        if ast.unparse(node.func) == "ddtree_branch_attention_correction":
+            argument = next(k for k in node.keywords if k.arg == "impl")
+            assert ast.unparse(argument.value) == "self.config"
+            argument.value = ast.Name(id="self", ctx=ast.Load())
+        if ast.unparse(node.func) == "window_size":
+            node.func = ast.parse("self._flash_v100_window_size", mode="eval").body
         if ast.unparse(node.func) == "record":
             node.func = ast.parse("_routing._record_route", mode="eval").body
         if ast.unparse(node.func) in (
@@ -399,7 +459,7 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                     "FlashAttnV100Impl",
                     "DecodeCache",
                     "DecodeExecutor",
-                    "VerificationCalculations",
+                    "VerificationExecutor",
                 )
                 else [node]
             )
@@ -412,6 +472,46 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                     "_xqa_kv_codec",
                     "forward",
                 ):
+                    continue
+                if (
+                    path.name == "verify.py"
+                    and fn.name
+                    in ("validate_contract", "_validate_dflash_attention_contract")
+                    and fn.args.args[0].arg == "self"
+                ):
+                    assert len(fn.body) == 1
+                    statement = fn.body[0]
+                    assert isinstance(statement, (ast.Expr, ast.Return))
+                    call = statement.value
+                    assert isinstance(call, ast.Call)
+                    assert ast.unparse(call.func) == "validate_contract"
+                    assert not call.keywords
+                    assert [ast.unparse(a) for a in call.args] == [
+                        "layer",
+                        "attn_metadata",
+                        "self.ops.window_size"
+                        if fn.name == "validate_contract"
+                        else "self._flash_v100_window_size",
+                    ]
+                    continue
+                if path.name == "verify.py" and fn.name == "__init__":
+                    continue
+                if any(
+                    isinstance(n, ast.Call)
+                    and ast.unparse(n.func) == "self._new_verification_executor"
+                    for n in ast.walk(fn)
+                ):
+                    assert len(fn.body) == 1 and isinstance(fn.body[0], ast.Return)
+                    call = fn.body[0].value
+                    assert isinstance(call, ast.Call)
+                    assert isinstance(call.func, ast.Attribute)
+                    assert _VERIFY_METHODS[call.func.attr] == fn.name
+                    assert [ast.unparse(a) for a in call.args] == [
+                        a.arg for a in fn.args.args[1:]
+                    ]
+                    assert [(k.arg, ast.unparse(k.value)) for k in call.keywords] == [
+                        (a.arg, a.arg) for a in fn.args.kwonlyargs
+                    ]
                     continue
                 if fn.name == "_forward_decode":
                     # Expanded and validated with the forward body above.
@@ -429,7 +529,9 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                         == "self._new_decode_executor()." + fn.name
                     )
                     continue
-                name = _CACHE_METHODS.get(fn.name, fn.name)
+                name = _VERIFY_METHODS.get(
+                    fn.name, _CACHE_METHODS.get(fn.name, fn.name)
+                )
                 if name not in fixture:
                     continue
                 assert name not in actual

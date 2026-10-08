@@ -3,8 +3,8 @@
     "forward": 402,
     "largest_function": 402,
     "cross_module_private": 347,
-    "import_cycles": 13,
-    "model_names_outside_spec": 169,
+    "import_cycles": 11,
+    "model_names_outside_spec": 158,
     "env_outside_config": 0,
     "state_flags": 29
   },
@@ -24,15 +24,6 @@
     [
       "vllm.v1.attention.backends.flash_v100.impl",
       "vllm.v1.attention.backends.flash_v100.spec.attention"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.impl",
-      "vllm.v1.attention.backends.flash_v100.spec.attention",
-      "vllm.v1.attention.backends.flash_v100.verify"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.impl",
-      "vllm.v1.attention.backends.flash_v100.verify"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.metadata",
@@ -617,10 +608,6 @@
     [
       "vllm.v1.attention.backends.flash_v100.verify",
       "vllm.v1.attention.backends.flash_v100.debug"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.verify",
-      "vllm.v1.attention.backends.flash_v100.impl"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.verify",
