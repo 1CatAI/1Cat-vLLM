@@ -27,6 +27,19 @@ def test_symmetric_int8_uses_the_stored_fp16_scale():
     assert result.storage_bytes == 5
 
 
+def test_legacy_int8_truncation_is_separate_from_nearest_even_candidate():
+    x = torch.tensor([[[127.0, 1.75, -1.75, 2.5, -2.5]]], dtype=torch.float16)
+    legacy = evaluate.legacy_token_head_int8(x)
+    nearest = evaluate.symmetric_int8(x, group=5)
+    torch.testing.assert_close(
+        legacy.values, torch.tensor([[[127.0, 1.0, -1.0, 2.0, -2.0]]]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        nearest.values, torch.tensor([[[127.0, 2.0, -2.0, 2.0, -2.0]]]), rtol=0, atol=0
+    )
+    assert legacy.storage_bytes == nearest.storage_bytes == 9
+
+
 @pytest.mark.parametrize("constant", [0.0, 100.0, -100.0])
 def test_affine_int8_keeps_constant_heads_exact(constant):
     x = torch.full((2, 1, 16), constant, dtype=torch.float16)

@@ -42,6 +42,20 @@ def symmetric_int8(
     )
 
 
+def legacy_token_head_int8(x: torch.Tensor) -> Reconstruction:
+    """FP32 token/head scales and integer truncation of the existing writer.
+
+    This is an offline arithmetic model, not native-kernel bitwise evidence.
+    Keep it separate from nearest-even candidates when comparing real samples.
+    """
+    values = x.float()
+    scales = (values.abs().amax(-1, keepdim=True) / 127).clamp_min(1e-6)
+    encoded = (values * scales.reciprocal()).clamp(-128, 127).to(torch.int8)
+    return Reconstruction(
+        encoded.float() * scales, encoded.numel() + 4 * scales.numel()
+    )
+
+
 def asymmetric_int8(x: torch.Tensor) -> Reconstruction:
     """Token/head affine u8, FP32 scale and minimum (8 metadata bytes/head)."""
     x = x.float()
@@ -147,6 +161,11 @@ def evaluate_sample(sample: dict) -> list[dict]:
                 symmetric_int8(k, group=k.shape[-1], scale_dtype=scale_dtype),
                 symmetric_int8(v, group=v.shape[-1], scale_dtype=scale_dtype),
             )
+        yield (
+            "int8_token_head_legacy_trunc_fp32",
+            legacy_token_head_int8(k),
+            legacy_token_head_int8(v),
+        )
         yield "int8_token_head_affine_fp32", asymmetric_int8(k), asymmetric_int8(v)
         for group in (32, 64):
             yield (

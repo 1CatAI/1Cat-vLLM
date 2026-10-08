@@ -116,5 +116,17 @@
   },
   "reference_ast": {
     "_torch_attention_reference": "65666317b9a71e8a53a2a712d2f293c3142b4d61319107db463031ec09878fcc"
+  },
+  "triton_writer_host_ast": {
+    "_is_supported_kv_cache_dtype": "6658c47b3bfd3acfd9db8bf4f7661492f21479d6eb732968d0d1862e4bdce26a",
+    "triton_reshape_and_cache_flash_per_token_head_quant": "ae21d23cf4d74d6df23e60ef5e332adb25cf86f97bae62c5ba57d86b93384fde",
+    "triton_reshape_and_cache_flash": "a66d8b6f80afba3c0843858a2e6ef6c00f896601bcb46bd2094f39ad5f929270",
+    "triton_reshape_and_cache_flash_diffkv": "2923e96fb33a645fe22c23b194526290aac7945e6d15219df2c6e50567265d40"
+  },
+  "triton_writer_range_ast": "813f86b0d5b3df256b94fae6127bb5c9508293180b0a23fa4eb544f2d7663af8",
+  "triton_writer_address_ast": {
+    "reshape_and_cache_kernel_flash": "44540d98ab5f273427607099a8496d910f991d3fdc04333df7547c836e2f6cc6",
+    "_reshape_cache_per_token_head": "ec77495ff4633e22c1ef75eba62486fcb742e1ba5c119efb2ae25adb9a879a51",
+    "reshape_and_cache_kernel_flash_diffkv": "09c41d52e21fd401e21e1c9b73677d4f7bca9022e6d882b914d3615749943f14"
   }
 }

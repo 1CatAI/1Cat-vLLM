@@ -773,9 +773,10 @@
     "scope": "storage descriptor only; GPU writes and model gates pending"
   },
   "offline_comparison_tool": {
-    "numerical_self_tests_passed": 8,
+    "numerical_self_tests_passed": 9,
     "real_request_dataset_collected": false,
-    "runtime_default_selected": false
+    "runtime_default_selected": false,
+    "schemes": 10
   },
   "normal_fa2_build": {
     "built": true,
@@ -828,5 +829,14 @@
       "_torch_attention_reference": 18
     },
     "scope": "CPU masks/reference extraction; no native attention/model/performance gate"
+  },
+  "triton_writer_extraction": {
+    "baseline": "c4f6245f841466782752a8c3283e4727565cf17a",
+    "triton": "3.6.0",
+    "target": "cuda/sm70/warp32; explicit target, no driver/device opened",
+    "ptx_and_sass_equal_pairs": 16,
+    "same_sm70_e4m3_compiler_rejection_pairs": 8,
+    "gpu_writer_gate": "pending",
+    "scope": "existing Triton writer encoders; host admission/addressing/typed stores unchanged; legacy INT8 truncation retained"
   }
 }

@@ -49108,3 +49108,16 @@ BFLA/tree masks and the FP32 debug reference now have independent modules;
 hashes and backend reexports remain guarded. Environment inventory tests scan
 all moved modules; no switch has been retired merely by moving it. Complete
 standalone SM70 Flash-V100 SASS also matches after packed-reader extraction.
+
+### KV codec continuation: first shared writer family
+
+Triton normal/diff-KV/per-token-head writers consume tile encoders in
+`attention/ops/kv_codec.py`. Host admission, addressing, typed stores and launch
+parameters remain guarded against the immutable baseline. Sixteen explicit
+SM70 compiler pairs have identical PTX/SASS; eight E4M3 pairs fail the existing
+compiler support check in both arms. No compiler override or GPU acceptance.
+FP8 Triton interpreter values disagree with the PyTorch oracle; retain that
+negative result and do not use interpreter output to qualify FP8. Local existing
+INT8 truncation differs from newer upstream rounding; keep it during extraction
+and compare it separately in the ten-scheme offline tool (nine CPU self-tests).
+Native/fused/QSA/restore writers and the new accelerated INT8 path remain pending.

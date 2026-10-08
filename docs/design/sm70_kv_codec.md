@@ -236,9 +236,9 @@ It refuses encoded K/V as an FP16 oracle and empty masked attention rows.
 
 Run `.venv/bin/python tools/kv_codec/evaluate.py --manifest DATA/manifest.json
 --out DATA/comparison.json`, with both paths on the task data disk. If using
-`--device cuda`, acquire the normal GPU locks first. The tool compares nine
+`--device cuda`, acquire the normal GPU locks first. The tool compares ten
 schemes: FP16, E4M3 with captured layer scales, signed token/head INT8 with
-FP32/FP16 scales, affine token/head u8 with FP32 scale/minimum, feature groups
+FP32/FP16 scales, existing FP32-scale truncation, affine token/head u8 with FP32 scale/minimum, feature groups
 32/64 with FP16 scales, and channel-wise K over token groups 32/64 with
 FP32 scales plus token/head V. Partial groups include padded storage in the
 reported bytes. FP16 scale candidates quantize against the stored rounded scale.
@@ -246,9 +246,49 @@ Results retain each sample separately, K/V and attention errors, clipping and
 physical storage cost. Candidates stream one pair at a time; percentiles use
 order statistics so long arrays exceed neither the `torch.quantile` size limit
 nor the memory cost of retaining every reconstructed format. The reference is FP32 masked attention over captured
-FP16 tensors, not a claim of bitwise native-kernel output. Eight numerical
+FP16 tensors, not a claim of bitwise native-kernel output. Nine numerical
 self-tests pass; they are synthetic tool checks and **not format-selection data**.
 No real three-model dataset has been collected yet; no default is selected.
+
+## Triton writer tile interface
+
+`vllm/v1/attention/ops/kv_codec.py` now owns calibrated per-tensor tile encoding,
+dynamic token/head scale computation, dynamic tile encoding and the existing
+range table. The normal and unequal-K/V reshape kernels use the same per-tensor
+encoder; the existing token/head writer uses the dynamic encoders. Typed stores,
+page/slot strides, scale stores, shape scheduling and host dtype admission retain
+their original bodies/contracts. Existing imports are reexported. FP16 and
+already-encoded FP8 tiles pass through as before; calibrated FP8 divides by the
+layer scale. Dynamic writers preserve the FP32 `absmax / max` scale, 1e-6 floor,
+reciprocal multiplication, clamp and implicit typed cast.
+
+The source fixture freezes all host launch/admission bodies and the kernel
+addressing/stores after erasing only the declared encoding expressions. Offline
+compilation uses the exact original/new kernel/helper ASTs with real Triton
+3.6.0 and an explicit SM70 target; production platform behavior is not patched.
+Sixteen FP16/E5M2/existing INT8 kernel combinations have identical executable
+PTX and SASS, including warp/shared-memory usage. Eight E4M3 combinations are
+rejected in both arms by the current compiler's SM70 FP8 dtype support. These
+are existing compiler limits, not passing format/path cells. PTX comparison
+excludes only source/debug sections and unreferenced debug labels; instructions,
+registers and control-flow labels remain. The result ledger separates these
+compiler checks from GPU writer/reference, model and performance gates.
+
+Inspection of the current
+[vLLM writer](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py)
+found newer integer rounding logic. The immutable local writer instead truncates
+at its INT8 typed store (`cvt.rzi`). Extraction intentionally preserves this
+local behavior. The offline comparison therefore includes a separate
+`int8_token_head_legacy_trunc_fp32` arithmetic candidate beside nearest-even
+schemes. Its CPU comparison is not a bitwise GPU writer oracle. Switching
+rounding during the refactor would violate the old-output gate; any later
+change needs its own data/quality decision.
+
+Triton interpreter probing showed FP16 passthrough working, but its E4M3
+conversion disagreed with PyTorch even on integers such as 17 and 31. Do not use
+interpreter FP8 results as numerical admission evidence. Native CUDA, fused
+QK/RoPE, QSA and restore writer migration remain pending; this interface is an
+implemented first writer family, not completion of unified writes.
 
 ### Constraints for the INT8 tile reader
 

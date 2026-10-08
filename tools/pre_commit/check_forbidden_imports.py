@@ -86,6 +86,10 @@ CHECK_IMPORTS = {
             # AOT inspection needs compiler/backend modules that the vLLM
             # runtime shim deliberately does not export.
             "benchmarks/kernels/deepseek_v4_sm70_aot_check.py",
+            # Offline SM70 source parity uses an explicit compiler target with
+            # no active driver. The runtime shim supplies non-JIT placeholders
+            # in that environment and does not export compiler/backend APIs.
+            "tools/kv_codec/verify_triton_writer.py",
             # Standalone source-built kernel screen: run before installing a
             # vLLM runtime, including CPU-only layout tests and compilation.
             "benchmarks/kernels/benchmark_sm70_hc_batch_reuse.py",

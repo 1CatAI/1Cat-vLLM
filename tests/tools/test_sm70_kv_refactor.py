@@ -23,6 +23,7 @@ METADATA = BACKEND.parent / "flash_v100/metadata.py"
 CODEC = BACKEND.parent / "flash_v100/codec.py"
 MASKING = BACKEND.parent / "flash_v100/masking.py"
 REFERENCE = BACKEND.parent / "flash_v100/reference.py"
+TRITON_WRITER = ROOT / "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py"
 
 
 @pytest.mark.parametrize(
@@ -33,6 +34,7 @@ REFERENCE = BACKEND.parent / "flash_v100/reference.py"
         ("codec_ast", CODEC),
         ("masking_ast", MASKING),
         ("reference_ast", REFERENCE),
+        ("triton_writer_host_ast", TRITON_WRITER),
     ],
 )
 def test_original_numerics_and_dispatch_are_unchanged(group, path):
@@ -128,6 +130,65 @@ def test_packed_converters_have_one_preserved_implementation():
         assert "fp8_e4m3fn_pair_to_half2_bits(" not in attention
         assert "KVReader<KV_DTYPE>::template load_half8" in attention
         assert "KVReader<KV_DTYPE>::template half8_from_packed" in attention
+
+
+class _EraseCodecExpressions(ast.NodeTransformer):
+    """Guard address/scale stores and launch ABI while extracting encoding math."""
+
+    targets = {"key_tile", "value_tile", "k_scale", "v_scale", "k_q", "v_q"}
+
+    def visit_Assign(self, node):
+        if (
+            len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in self.targets
+        ):
+            node.value = ast.Name(id="_codec_expression", ctx=ast.Load())
+        return self.generic_visit(node)
+
+    def visit_If(self, node):
+        if isinstance(node.test, ast.Name) and node.test.id == "FP8_KV_CACHE":
+            targets = {
+                target.id
+                for item in ast.walk(node)
+                if isinstance(item, ast.Assign)
+                for target in item.targets
+                if isinstance(target, ast.Name)
+            }
+            if targets in ({"key_tile"}, {"value_tile"}):
+                return ast.Assign(
+                    targets=[ast.Name(id=next(iter(targets)), ctx=ast.Store())],
+                    value=ast.Name(id="_codec_expression", ctx=ast.Load()),
+                )
+        return self.generic_visit(node)
+
+
+def test_triton_writer_addressing_and_typed_stores_are_preserved():
+    nodes = {
+        n.name: n
+        for n in ast.parse(TRITON_WRITER.read_text()).body
+        if isinstance(n, ast.FunctionDef)
+    }
+    for name, expected in FIXTURE["triton_writer_address_ast"].items():
+        node = _EraseCodecExpressions().visit(nodes[name])
+        assert (
+            hashlib.sha256(
+                ast.dump(node, include_attributes=False).encode()
+            ).hexdigest()
+            == expected
+        )
+    codec = ast.parse((TRITON_WRITER.parent / "kv_codec.py").read_text())
+    ranges = next(
+        n
+        for n in codec.body
+        if isinstance(n, ast.AnnAssign)
+        and isinstance(n.target, ast.Name)
+        and n.target.id == "_PER_TOKEN_HEAD_QUANT_PARAMS"
+    )
+    assert (
+        hashlib.sha256(ast.dump(ranges, include_attributes=False).encode()).hexdigest()
+        == FIXTURE["triton_writer_range_ast"]
+    )
 
 
 def test_path_matrix_covers_static_and_dynamic_route_sites():
