@@ -71,7 +71,7 @@ def _clear_smallq_decode_metadata(
     flash_metadata.smallq_decode_partition_size_hint = None
 
 
-def _attach_prepared_dflash2_smallq_metadata(
+def attach_prepared_metadata(
     self: Any,
     attn_metadata: TritonAttentionMetadata,
     prepared: _smallq_metadata.DFlash2SmallQPreparedMetadata,
@@ -108,7 +108,7 @@ def _attach_prepared_dflash2_smallq_metadata(
     flash_metadata.smallq_decode_partition_size_hint = prepared.partition_size_hint
 
 
-def _update_smallq_decode_metadata(
+def update_decode_metadata(
     self: Any,
     attn_metadata: TritonAttentionMetadata,
     common_attn_metadata,
@@ -418,3 +418,8 @@ def _ensure_smallq_decode_buffers(
         required_reqs,
         self.device,
     )
+
+
+# External compatibility; state owners bind the public calculations.
+_attach_prepared_dflash2_smallq_metadata = attach_prepared_metadata
+_update_smallq_decode_metadata = update_decode_metadata

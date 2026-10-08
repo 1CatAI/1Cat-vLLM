@@ -27,8 +27,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 6a: verifier ownership | #1090 | CPU/golden/strict/rebase passed | Cycles 13 → 11; model terms 169 → 158 | Required | Strict/rebase/GPU gates |
 | 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Required | Strict/rebase/GPU gates |
 | 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Required | Strict/rebase/GPU gates |
-| 6d: owned per-request metadata packet | — | CPU/golden passed | Private 333 → 332; final metadata mixin removed | Required | Strict/rebase/GPU gates |
-| 6e: registered speculative features | — | Not started | — | Required | Step 6d gates |
+| 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Required | Strict/rebase/GPU gates |
+| 6e: registered speculative features | — | CPU/golden passed | Private 332 → 330 | Required | Strict/rebase/GPU gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -837,3 +837,46 @@ with real shim consumption (`a3-spec-features-strict.log`,
 (`a3-spec-features-precommit.log`). Production and source-oracle files remained
 unchanged during the accepted run. GPU completion and feature registration are
 still pending.
+
+## Step 6e method-specific verification providers
+
+PR #1096 is `f92fbed160516cfa6da47680505d3d35826da1e5`. Pinned #1028
+replay is `3f5cf2a6190460ccd6f2194fde63c2b5e5b3409c`, tree
+`0c81e04abe81e1800775ce051e33f9a984abf341`, equal to clean merge-tree;
+37 CPU integration cases pass with 98 GPU skips. Four source-verified queues
+are staged as `a3-step6d` on 54633.
+
+Mechanical extraction `59f4c9c9e` precedes registration. A proposer-side
+SpecFeature protocol and immutable method registry select independent per-builder
+DFlash2Feature, DDTreeFeature or MTPFeature instances. The tree provider preserves
+verification suppression, the parallel provider consumes prepared metadata, and
+the linear provider expands small queries. Explicit tree/prepared inputs retain
+their precedence even when supplied with another configured method. Unknown or
+absent methods retain the original linear fallback; initialization/config reads
+remain before method selection.
+
+The 16-case method/payload matrix verifies actual preparation calls, order and
+lazy capacity reads. Two registry cases check distinct provider instances,
+unknown methods, immutable registrations and external provider injection.
+All 813 golden traces and 14 calculation hashes remain unchanged; the metadata
+oracle expands the actual complete tree-provider body, and the independent
+matrix covers all registered providers. The first focused run caught an
+accidental abbreviated prepared-method name in the extracted tree provider;
+that production call was corrected without changing fixtures or expectations.
+The accepted focused suite has 42 passes (`a3-feature-registration-focused-final.log`).
+Public metadata calculation APIs replace two cross-module private references,
+locking the ceiling at 400 / 400 / 330 / 3 / 154 / 0 / 29.
+
+Host-FP8's unchanged-parent repeat has now failed to reproduce the original
+parent Chinese output at the same token 21 (96378 versus 99505). France is
+identical. This diagnoses baseline non-reproducibility for this workload,
+not its numerical cause and not candidate acceptance. The original and repeat
+artifacts remain separate; no host completion marker is written. See
+`a3-step1c/logs/host-parent-repeat-report.json`. DDTree baseline clarification
+and the complete model gates remain open.
+
+The fixed-source complete strict suite passes **310 tests / 1 skip / 28 GPU
+exclusions**, including actual shim consumption (`a3-feature-registration-strict.log`
+and `a3-feature-registration-shim.json`). No production/source-oracle file
+changed during the run. Subsequent lint corrections only wrap a dictionary value
+and annotate the new test's mixed event list; the affected tests are rerun.

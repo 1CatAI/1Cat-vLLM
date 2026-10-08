@@ -96,7 +96,13 @@ Legacy method names remain delegates at the common assembly boundary; verifier
 calculations receive only VerificationConfig and VerificationOps. The ordinary
 causality guard bypasses executor construction. Tests inject owned policy and
 operators; the trace recorder observes the actual verifier predicate under its
-original canonical event name. Per-method SpecFeature registration remains separate work.
+original canonical event name. The proposer-side `SpecFeatureRegistry` selects per-builder implementations by
+speculative method. The tree provider suppresses query expansion for tree
+verification, the parallel provider consumes prepared grouped metadata, and the
+linear provider expands query rows. All preserve explicit cross-method payloads
+for existing callers. New features implement `SpecFeature.prepare` and register
+a factory in `spec.features.FEATURES`; the common builder has no method names.
+Registration does not alter config read timing or own persistent tensors.
 
 ## Shared decode strategy
 

@@ -81,3 +81,9 @@ Baseline: #1060 `8c96e32e56c09d4a3e3112cb5d1a367571f69476`.
   not a passing host gate or evidence that an A3 production edit caused it.
   An unchanged-parent repeat writes separate `host-parent-repeat` artifacts;
   it must not overwrite the original records or produce `host.done`.
+
+  The unchanged-parent repeat also diverged at token 21 under the same contract
+  (96378 versus 99505). France remained identical. This confirms failure to
+  reproduce the frozen parent's original output, without establishing the
+  numerical cause. Evidence: `host-parent-repeat-report.json` and
+  `host-parent-repeat.log`; no acceptance result or original record was changed.

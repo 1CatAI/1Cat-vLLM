@@ -2,7 +2,7 @@
   "metrics": {
     "forward": 400,
     "largest_function": 400,
-    "cross_module_private": 332,
+    "cross_module_private": 330,
     "import_cycles": 3,
     "model_names_outside_spec": 154,
     "env_outside_config": 0,
@@ -397,6 +397,10 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.builder",
+      "vllm.v1.attention.backends.flash_v100.spec.features"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.builder",
       "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
     ],
     [
@@ -426,6 +430,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
       "vllm.v1.attention.backends.flash_v100.spec.draft"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
+      "vllm.v1.attention.backends.flash_v100.spec.features"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
@@ -1795,7 +1803,7 @@
     "spec/attention_policy.py:configure_prefill": 4,
     "spec/attention_policy.py:configure_verifier": 3,
     "spec/attention_policy.py:__init__": 2,
-    "spec/builder.py:build": 67,
+    "spec/builder.py:build": 50,
     "spec/builder.py:initialize_builder": 29,
     "spec/builder.py:prepare_capture": 36,
     "spec/builder.py:attach_common": 4,
@@ -1804,12 +1812,14 @@
     "spec/draft.py:build_for_drafting": 79,
     "spec/draft.py:_ensure_flash_draft_graph_buffers": 14,
     "spec/draft.py:copy_dflash_graph_metadata": 8,
+    "spec/features.py:prepare_verification": 14,
+    "spec/features.py:prepare": 13,
     "spec/hooks.py:initialize_legacy": 2,
     "spec/hooks.py:attach_common_legacy": 2,
     "spec/hooks.py:prepare_capture_legacy": 2,
     "spec/hooks.py:register_metadata_hooks": 7,
     "spec/metadata_contracts.py:metadata_view": 4,
-    "spec/metadata_state.py:__init__": 4,
+    "spec/metadata_state.py:__init__": 7,
     "spec/metadata_state.py:vllm_config": 2,
     "spec/metadata_state.py:device": 2,
     "spec/metadata_state.py:block_size": 2,
@@ -1826,8 +1836,8 @@
     "spec/verify_metadata.py:_configured_smallq_max_model_len": 4,
     "spec/verify_metadata.py:_smallq_buffer_token_capacity": 21,
     "spec/verify_metadata.py:_clear_smallq_decode_metadata": 11,
-    "spec/verify_metadata.py:_attach_prepared_dflash2_smallq_metadata": 35,
-    "spec/verify_metadata.py:_update_smallq_decode_metadata": 284,
+    "spec/verify_metadata.py:attach_prepared_metadata": 35,
+    "spec/verify_metadata.py:update_decode_metadata": 284,
     "spec/verify_metadata.py:_ensure_smallq_decode_buffers": 24,
     "verify.py:validate_contract": 2,
     "verify.py:kv_codec": 2,

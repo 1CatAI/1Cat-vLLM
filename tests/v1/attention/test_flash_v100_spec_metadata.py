@@ -89,10 +89,44 @@ class _InlineWorkspace(ast.NodeTransformer):
         return self.inline(node.value) or self.generic_visit(node)
 
 
+class _InlineFeature(ast.NodeTransformer):
+    def visit_Expr(self, node):
+        if not isinstance(node.value, ast.Call):
+            return self.generic_visit(node)
+        call = node.value
+        if ast.unparse(call.func) != "prepare_verification":
+            return self.generic_visit(node)
+        from vllm.v1.attention.backends.flash_v100.spec import features
+
+        tree = ast.parse(Path(features.__file__).read_text())
+        provider = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "DDTreeFeature"
+        )
+        method = next(
+            n
+            for n in provider.body
+            if isinstance(n, ast.FunctionDef) and n.name == "prepare"
+        )
+        assert not call.keywords and len(call.args) == len(method.args.args)
+        substitutions = dict(zip([a.arg for a in method.args.args], call.args))
+
+        class Substitute(ast.NodeTransformer):
+            def visit_Name(self, node):
+                return copy.deepcopy(substitutions.get(node.id, node))
+
+        return [Substitute().visit(copy.deepcopy(n)) for n in method.body]
+
+
 class _Normalize(ast.NodeTransformer):
     def visit_FunctionDef(self, node):
-        if node.name == "attach_metadata":
-            node.name = "_attach_ddtree_metadata"
+        renames = {
+            "attach_metadata": "_attach_ddtree_metadata",
+            "attach_prepared_metadata": ("_attach_prepared_dflash2_smallq_metadata"),
+            "update_decode_metadata": "_update_smallq_decode_metadata",
+        }
+        node.name = renames.get(node.name, node.name)
         node = self.generic_visit(node)
         if node.args.args and node.args.args[0].arg == "self":
             node.args.args[0].annotation = None
@@ -165,15 +199,26 @@ def test_moved_metadata_calculations_match_parent():
             if isinstance(fn, ast.FunctionDef) and (
                 fn.name in expected
                 or (path.name == "tree.py" and fn.name == "attach_metadata")
-            ):
-                name = (
-                    "_attach_ddtree_metadata"
-                    if fn.name == "attach_metadata"
-                    else fn.name
+                or (
+                    path.name == "verify_metadata.py"
+                    and fn.name
+                    in {"attach_prepared_metadata", "update_decode_metadata"}
                 )
+            ):
+                name = {
+                    "attach_metadata": "_attach_ddtree_metadata",
+                    "attach_prepared_metadata": (
+                        "_attach_prepared_dflash2_smallq_metadata"
+                    ),
+                    "update_decode_metadata": "_update_smallq_decode_metadata",
+                }.get(fn.name, fn.name)
                 assert name not in actual
                 actual[name] = hashlib.sha256(
-                    ast.dump(_Normalize().visit(_InlineWorkspace().visit(fn))).encode()
+                    ast.dump(
+                        _Normalize().visit(
+                            _InlineWorkspace().visit(_InlineFeature().visit(fn))
+                        )
+                    ).encode()
                 ).hexdigest()
     assert actual == expected
 
