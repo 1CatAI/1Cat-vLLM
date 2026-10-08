@@ -49029,3 +49029,29 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+### SM70 KV codec migration: first extraction (2026-10-08)
+
+- Freeze `onecat/main` at `c4f6245f841466782752a8c3283e4727565cf17a`.
+  [Design](sm70_kv_codec.md), [source inventory](sm70_kv_source_inventory.md),
+  [format matrix](sm70_kv_path_matrix.md) and
+  [environment plan](sm70_kv_environment_inventory.md) cover the campaign.
+- Extract 539 original metadata lines and 25 conversion-helper lines without
+  changing their ASTs. Reexport original symbols. Share the scalar KV reader
+  between Flash-V100 and grouped/scalar source kernels; keep launch ABIs.
+- FP16 exhaustive storage bits and all E4M3/E5M2 bytes match on local V100 GPU0;
+  reader PTX and complete standalone Flash-V100 SM70 SASS are unchanged. Four
+  isolated metadata GPU tests and 48 direct operator comparisons pass. The
+  initial two long-FP16 timing outliers were rechecked with ABBA, not repeated
+  across unrelated shapes. See [measured results](sm70_kv_first_extraction_results.json).
+- The paired policy suite has the same 186 passes / 11 failures in each arm,
+  because the source-only tree lacks the built SM70 FA2 library. Pure-source
+  tests also need package version metadata, CUDA bindings and Flash-V100: do
+  not reinterpret missing dependencies as a numerical regression or repeatedly
+  run the unprepared test environment. No final-wheel/model admission yet.
+- This is **not completion of the FP16/E4M3 refactor**. Routing, writers, scale
+  accounting, host transport and typed configuration migration remain pending.
+  Do not enable INT8, change E4M3 partitions, choose a default format or claim
+  75T/three-model/35B admission before their gates pass. Next: normal complete
+  FA2/vLLM build and model route gates, then real-request FP16 Q/K/V selection
+  data and subsequent independently revertible codec migration scopes.

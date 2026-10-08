@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Source-preservation gates for the first SM70 KV codec extraction.
+
+These run without importing vLLM, Torch, Triton, or optional extensions.
+GPU and model gates are recorded separately; AST equality cannot replace them.
+"""
+
+import ast
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+FIXTURE = json.loads(
+    (Path(__file__).parent / "fixtures/flash_v100_kv_refactor.json").read_text()
+)
+BACKEND = ROOT / "vllm/v1/attention/backends/flash_attn_v100.py"
+METADATA = BACKEND.parent / "flash_v100/metadata.py"
+CODEC = BACKEND.parent / "flash_v100/codec.py"
+
+
+@pytest.mark.parametrize(
+    ("group", "path"),
+    [("backend_ast", BACKEND), ("metadata_ast", METADATA), ("codec_ast", CODEC)],
+)
+def test_original_numerics_and_dispatch_are_unchanged(group, path):
+    nodes = {
+        node.name: node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    }
+    for name, expected in FIXTURE[group].items():
+        assert name in nodes, f"Removed original symbol {name}"
+        actual = hashlib.sha256(
+            ast.dump(nodes[name], include_attributes=False).encode()
+        ).hexdigest()
+        assert actual == expected, f"Original numerical/dispatch body changed: {name}"
+
+
+def test_metadata_reexports_keep_existing_imports_working():
+    imports = {
+        name.asname or name.name
+        for node in ast.parse(BACKEND.read_text()).body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "vllm.v1.attention.backends.flash_v100.metadata"
+        for name in node.names
+    }
+    assert set(FIXTURE["metadata_ast"]) <= imports
+
+
+def test_codec_reexports_keep_existing_imports_working():
+    imports = {
+        name.asname or name.name
+        for node in ast.parse(BACKEND.read_text()).body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "vllm.v1.attention.backends.flash_v100.codec"
+        for name in node.names
+    }
+    assert set(FIXTURE["codec_ast"]) <= imports
+
+
+def test_shared_codec_include_is_source_complete():
+    canonical = ROOT / "flash-attention-v100/kernel/kv_codec.cuh"
+    for path in (
+        ROOT / "flash-attention-v100/kernel/fp8_kv_utils.cuh",
+        ROOT / "csrc/attention/sm70_grouped_long/kernel/fp8_kv_utils.cuh",
+    ):
+        directive = next(
+            line
+            for line in path.read_text().splitlines()
+            if line.startswith("#include")
+        )
+        target = directive.split('"')[1]
+        assert (path.parent / target).resolve() == canonical
+        assert "__device__" not in path.read_text(), (
+            "Duplicated converter implementation"
+        )
+    assert (
+        "recursive-include flash-attention-v100/kernel *.cu *.cuh *.h"
+        in (ROOT / "MANIFEST.in").read_text()
+    )
+    assert (
+        "recursive-include kernel *.cu *.cuh *.h"
+        in (ROOT / "flash-attention-v100/MANIFEST.in").read_text()
+    )
+
+
+def test_path_matrix_covers_static_and_dynamic_route_sites():
+    matrix = json.loads((ROOT / "docs/design/sm70_kv_path_matrix.json").read_text())
+    tree = ast.parse(BACKEND.read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_record_route"
+    ]
+    static = {
+        node.args[0].value for node in calls if isinstance(node.args[0], ast.Constant)
+    }
+    dynamic = {
+        ast.unparse(node.args[0])
+        for node in calls
+        if not isinstance(node.args[0], ast.Constant)
+    }
+    assert static == {row["legacy_route"] for row in matrix["literal_routes"]}
+    assert dynamic == set(matrix["dynamic_route_expressions"])
+    for row in matrix["literal_routes"] + matrix["additional_paths"]:
+        assert set(row["formats"]) == {"fp16", "e4m3", "e5m2", "int8"}
+        assert all(
+            status
+            in {
+                "native",
+                "bridge",
+                "reference",
+                "metadata",
+                "fallback",
+                "unsupported",
+                "pending",
+                "upstream_only",
+                "review",
+            }
+            for status in row["formats"].values()
+        )
+        assert row["formats"]["int8"] in {"pending", "upstream_only"}
+        assert not any(
+            name in row["route"] for name in ("fp8", "e4m3", "e5m2", "fp16", "int8")
+        )
+    assert all((ROOT / row["source"]).exists() for row in matrix["additional_paths"])
+    table = {
+        tuple(cell.strip() for cell in line.strip().strip("|").split("|"))
+        for line in (ROOT / "docs/design/sm70_kv_path_matrix.md")
+        .read_text()
+        .splitlines()
+        if line.startswith("|")
+    }
+    for row in matrix["literal_routes"]:
+        assert (
+            row["route"],
+            f"`{row['legacy_route']}`",
+            *(row["formats"][fmt] for fmt in ("fp16", "e4m3", "e5m2", "int8")),
+        ) in table
+
+
+def test_environment_inventory_covers_backend_reads():
+    tree = ast.parse(BACKEND.read_text())
+    names = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "envs"
+        and node.attr.startswith("VLLM_")
+    }
+    names.update(
+        node.args[0].value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"getenv", "get"}
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and node.args[0].value.startswith("VLLM_")
+    )
+    document = (ROOT / "docs/design/sm70_kv_environment_inventory.md").read_text()
+    assert len(names) == 89
+    assert all(f"`{name}`" in document for name in names)

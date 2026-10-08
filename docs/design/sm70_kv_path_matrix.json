@@ -1,0 +1,656 @@
+{
+  "base_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+  "meaning": "source coverage ledger; native/bridge describe existing source, not GPU qualification; review needs per-shape audit; INT8 not enabled",
+  "literal_routes": [
+    {
+      "legacy_route": "decode_dense_cache",
+      "route": "decode_dense_cache",
+      "formats": {
+        "fp16": "native",
+        "e4m3": "unsupported",
+        "e5m2": "unsupported",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "decode_dense_reference",
+      "route": "decode_dense_reference",
+      "formats": {
+        "fp16": "reference",
+        "e4m3": "reference",
+        "e5m2": "reference",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "decode_e4m3_compact_scalar_tail",
+      "route": "decode_compact_scalar_tail",
+      "formats": {
+        "fp16": "unsupported",
+        "e4m3": "native",
+        "e5m2": "unsupported",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "decode_paged_prefill",
+      "route": "decode_paged_prefill",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "decode_scalar_paged",
+      "route": "decode_scalar_paged",
+      "formats": {
+        "fp16": "native",
+        "e4m3": "native",
+        "e5m2": "native",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "decode_triton_no_flash_decode",
+      "route": "decode_triton_no_flash_decode",
+      "formats": {
+        "fp16": "fallback",
+        "e4m3": "fallback",
+        "e5m2": "fallback",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "decode_triton_scalar_disabled",
+      "route": "decode_triton_scalar_disabled",
+      "formats": {
+        "fp16": "fallback",
+        "e4m3": "fallback",
+        "e5m2": "fallback",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "decode_xqa_paged",
+      "route": "decode_xqa_paged",
+      "formats": {
+        "fp16": "native",
+        "e4m3": "native",
+        "e5m2": "native",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "metadata_none_zero_output",
+      "route": "metadata_none_zero_output",
+      "formats": {
+        "fp16": "metadata",
+        "e4m3": "metadata",
+        "e5m2": "metadata",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_capture_dflash_noncausal_paged",
+      "route": "prefill_capture_dflash_noncausal_paged",
+      "formats": {
+        "fp16": "metadata",
+        "e4m3": "metadata",
+        "e5m2": "metadata",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_capture_smallq",
+      "route": "prefill_capture_smallq",
+      "formats": {
+        "fp16": "metadata",
+        "e4m3": "metadata",
+        "e5m2": "metadata",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_capture_smallq_ddtree_metadata",
+      "route": "prefill_capture_smallq_ddtree_metadata",
+      "formats": {
+        "fp16": "metadata",
+        "e4m3": "metadata",
+        "e5m2": "metadata",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_capture_smallq_no_ddtree_metadata",
+      "route": "prefill_capture_smallq_no_ddtree_metadata",
+      "formats": {
+        "fp16": "metadata",
+        "e4m3": "metadata",
+        "e5m2": "metadata",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_ddtree_dense",
+      "route": "prefill_ddtree_dense",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_ddtree_triton",
+      "route": "prefill_ddtree_triton",
+      "formats": {
+        "fp16": "fallback",
+        "e4m3": "fallback",
+        "e5m2": "fallback",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_dense_d256_gqa_79t_fp32",
+      "route": "prefill_dense_d256_gqa_79t_fp32",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_dense_d256_gqa_79t_fp32_fringe_fallback",
+      "route": "prefill_dense_d256_gqa_79t_fp32_fringe_fallback",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_dense_d256_gqa_79t_fp32_q8192",
+      "route": "prefill_dense_d256_gqa_79t_fp32_q8192",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_dense_d256_gqa_79t_fp32_q8192_pad",
+      "route": "prefill_dense_d256_gqa_79t_fp32_q8192_pad",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_dense_d256_gqa_arch_long",
+      "route": "prefill_dense_d256_gqa_arch_long",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_dense_d256_gqa_v37",
+      "route": "prefill_dense_d256_gqa_v37",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_dense_splitd_d256",
+      "route": "prefill_dense_splitd_d256",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_dense_splitd_d256_splitkv3_kernel",
+      "route": "prefill_dense_splitd_d256_splitkv3_kernel",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_no_prefix_dense_flash",
+      "route": "prefill_no_prefix_dense_flash",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_no_prefix_paged_cache_flash",
+      "route": "prefill_no_prefix_paged_cache_flash",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_bfla",
+      "route": "prefill_prefix_bfla",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_contig_dense",
+      "route": "prefill_prefix_contig_dense",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_contig_dense_bhmd",
+      "route": "prefill_prefix_contig_dense_bhmd",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_contig_dense_fa2_d256",
+      "route": "prefill_prefix_contig_dense_fa2_d256",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_decode_rows_e4m3_grouped_fp32",
+      "route": "prefill_prefix_decode_rows_grouped_fp32",
+      "formats": {
+        "fp16": "unsupported",
+        "e4m3": "native",
+        "e5m2": "unsupported",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_dflash_noncausal_batch",
+      "route": "prefill_prefix_dflash_noncausal_batch",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_flash",
+      "route": "prefill_prefix_flash",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_fp8_bridge_exact_d256",
+      "route": "prefill_prefix_kv_bridge_exact_d256",
+      "formats": {
+        "fp16": "unsupported",
+        "e4m3": "bridge",
+        "e5m2": "bridge",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_fp8_bridge_exact_d256_tailpad",
+      "route": "prefill_prefix_kv_bridge_exact_d256_tailpad",
+      "formats": {
+        "fp16": "unsupported",
+        "e4m3": "bridge",
+        "e5m2": "bridge",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_fp8_bridge_exact_dense_d256",
+      "route": "prefill_prefix_kv_bridge_exact_dense_d256",
+      "formats": {
+        "fp16": "unsupported",
+        "e4m3": "bridge",
+        "e5m2": "bridge",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad",
+      "route": "prefill_prefix_kv_bridge_exact_dense_d256_tailpad",
+      "formats": {
+        "fp16": "unsupported",
+        "e4m3": "bridge",
+        "e5m2": "bridge",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_paged_anchored",
+      "route": "prefill_prefix_paged_anchored",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_prefix_splitkv",
+      "route": "prefill_prefix_splitkv",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_smallq_decode_scalar",
+      "route": "verify_decode_scalar",
+      "formats": {
+        "fp16": "native",
+        "e4m3": "native",
+        "e5m2": "native",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_smallq_decode_xqa",
+      "route": "verify_decode_xqa",
+      "formats": {
+        "fp16": "native",
+        "e4m3": "native",
+        "e5m2": "native",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_smallq_dflash2_grouped_verify",
+      "route": "verify_dflash2_grouped_verify",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_smallq_e4m3_grouped_fp32",
+      "route": "verify_grouped_fp32",
+      "formats": {
+        "fp16": "unsupported",
+        "e4m3": "native",
+        "e5m2": "unsupported",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_smallq_fp16_grouped_fp32",
+      "route": "verify_grouped_fp32",
+      "formats": {
+        "fp16": "native",
+        "e4m3": "unsupported",
+        "e5m2": "unsupported",
+        "int8": "pending"
+      }
+    },
+    {
+      "legacy_route": "prefill_triton_safe",
+      "route": "prefill_triton_safe",
+      "formats": {
+        "fp16": "fallback",
+        "e4m3": "fallback",
+        "e5m2": "fallback",
+        "int8": "pending"
+      }
+    }
+  ],
+  "dynamic_route_expressions": [
+    "'dflash_draft_triton_fallback' if is_dflash_draft_attn else 'unsupported_triton_fallback'",
+    "'prefill_prefix_fp8_e4m3_bridge' if self.kv_cache_dtype == 'fp8_e4m3' else 'prefill_prefix_fp8_e5m2_bridge'",
+    "f'decode_xqa_e4m3_dynamic_page{key_cache.shape[1]}'",
+    "f'decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}'",
+    "f'fp8_kv_{stage}'",
+    "f'fp8_kv_{stage}_{route}'",
+    "fa2_route or 'prefill_prefix_splitd_d256'",
+    "route"
+  ],
+  "additional_paths": [
+    {
+      "route": "verify_grouped",
+      "description": "DFlash2 grouped verify and combined-copy layouts",
+      "source": "vllm/v1/attention/ops/sm70_fp16_grouped.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "prefix_decode_rows",
+      "description": "variable scalar/XQA mixed rows",
+      "source": "vllm/v1/attention/backends/flash_attn_v100.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "decode_dynamic",
+      "description": "dynamic page/partition route counters",
+      "source": "flash-attention-v100/kernel/flash_decode_paged.cu",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "kv_write_cuda",
+      "description": "reshape_and_cache_flash",
+      "source": "csrc/libtorch_stable/cache_kernels.cu",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "kv_write_triton",
+      "description": "reshape_and_cache_flash Triton / per-token-head writer",
+      "source": "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "upstream_only"
+      }
+    },
+    {
+      "route": "kv_write_fused_rope",
+      "description": "DFlash fused QK RoPE cache writes",
+      "source": "csrc/libtorch_stable",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "qsa_prepare",
+      "description": "Flash-Next fused preparation / MTP4",
+      "source": "vllm/models/qwen4_exp/nvidia/qsa.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "qsa_attention",
+      "description": "sparse QSA attention / indexer",
+      "source": "vllm/models/qwen4_exp/nvidia/ops/qsa.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "qsa_policy",
+      "description": "automatic cache policy and calibration",
+      "source": "vllm/models/qwen4_exp/common/kv_policy.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "host_transport",
+      "description": "host offload, pinned history, hot cache restoration",
+      "source": "vllm/models/qwen4_exp/common/qsa_cache.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "cache_budget",
+      "description": "page size, asymmetric K/V dimensions, scale bytes",
+      "source": "vllm/v1/kv_cache_interface.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "upstream_only"
+      }
+    },
+    {
+      "route": "hybrid_alignment",
+      "description": "Mamba grid, hybrid cache page uniformity",
+      "source": "vllm/v1/core/kv_cache_utils.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "cache_allocate",
+      "description": "payload and scale tensor allocation",
+      "source": "vllm/v1/worker/gpu_model_runner.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "upstream_only"
+      }
+    },
+    {
+      "route": "prefix_restore",
+      "description": "hash/cache groups and offload restore",
+      "source": "vllm/v1/core/kv_cache_manager.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "graph_variants",
+      "description": "graph workspace/active partition envelopes",
+      "source": "vllm/v1/cudagraph_dispatcher.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "draft_cache",
+      "description": "target/draft cache dtype configuration",
+      "source": "vllm/config/speculative.py",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "packed_decode",
+      "description": "existing K8V4 codec and attention",
+      "source": "flash-attention-v100/kernel/flash_decode_turboquant.cu",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    },
+    {
+      "route": "prefill_dense_8192",
+      "description": "75T/79T and FA2 D256 after conversion",
+      "source": "csrc/attention/sm70_v37/bridge.cu",
+      "formats": {
+        "fp16": "review",
+        "e4m3": "review",
+        "e5m2": "review",
+        "int8": "pending"
+      }
+    }
+  ]
+}

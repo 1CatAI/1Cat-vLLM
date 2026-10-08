@@ -1,0 +1,3 @@
+include LICENSE
+recursive-include kernel *.cu *.cuh *.h
+recursive-include include *.h *.cuh

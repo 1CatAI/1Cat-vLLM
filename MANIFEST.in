@@ -9,3 +9,4 @@ recursive-include cmake *
 recursive-include csrc *
 recursive-include flash_qla *.py *.cu LICENSE
 recursive-include flash-attention-v100/kernel/h3 *.cu *.h *.md
+recursive-include flash-attention-v100/kernel *.cu *.cuh *.h
