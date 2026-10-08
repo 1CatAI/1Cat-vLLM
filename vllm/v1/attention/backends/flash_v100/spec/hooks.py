@@ -8,21 +8,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import torch
+from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import (
+    SpecMetadataFields as SpecMetadataFields,
+)
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
     from vllm.v1.attention.backend import CommonAttentionMetadata
     from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
-
-
-class SpecMetadataFields:
-    ddtree_parent_ids: torch.Tensor | None
-    ddtree_parent_ids_cpu: torch.Tensor | None
-    ddtree_num_tree_tokens_cpu: torch.Tensor | None
-    ddtree_seq_lens_restored_for_triton: bool
-    ddtree_query_start_loc_restored_for_triton: bool
-    is_dflash_selector_target: bool
 
 
 @dataclass(frozen=True)

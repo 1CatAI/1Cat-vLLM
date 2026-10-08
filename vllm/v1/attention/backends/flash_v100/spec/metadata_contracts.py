@@ -56,3 +56,18 @@ INPUT_FIELDS = {
     "block_size": "block_size",
     "_is_speculative_draft_model": "is_draft",
 }
+
+
+class SpecMetadataFields:
+    ddtree_parent_ids: torch.Tensor | None
+    ddtree_parent_ids_cpu: torch.Tensor | None
+    ddtree_num_tree_tokens_cpu: torch.Tensor | None
+    ddtree_seq_lens_restored_for_triton: bool
+    ddtree_query_start_loc_restored_for_triton: bool
+    is_dflash_selector_target: bool
+    smallq_decode_block_table: torch.Tensor | None
+    smallq_decode_seq_lens: torch.Tensor | None
+    smallq_query_start_loc: torch.Tensor | None
+    smallq_decode_max_seq_len_hint: int | None
+    smallq_decode_workspace_seq_capacity_hint: int | None
+    smallq_decode_partition_size_hint: int | None

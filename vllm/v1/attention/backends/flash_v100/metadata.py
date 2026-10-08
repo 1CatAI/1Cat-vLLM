@@ -48,12 +48,6 @@ class FlashAttnV100Metadata(SpecMetadataFields, TritonAttentionMetadata):
     flash_v100_decode_workspace_seq_capacity_hint: int | None
     flash_v100_static_decode_seq_hint: int | None
     flash_v100_decode_active_num_partitions: torch.Tensor | None
-    smallq_decode_block_table: torch.Tensor | None
-    smallq_decode_seq_lens: torch.Tensor | None
-    smallq_query_start_loc: torch.Tensor | None
-    smallq_decode_max_seq_len_hint: int | None
-    smallq_decode_workspace_seq_capacity_hint: int | None
-    smallq_decode_partition_size_hint: int | None
 
 
 def _as_flash_v100_metadata(
