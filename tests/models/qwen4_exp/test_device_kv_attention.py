@@ -20,7 +20,8 @@ def decoded_history(state):
 
 @pytest.mark.parametrize("rows", [1, 5, 20])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
-def test_direct_history_matches_protected_arithmetic_and_replay(rows, dtype):
+@pytest.mark.parametrize("strided", [False, True])
+def test_direct_history_matches_protected_arithmetic_and_replay(rows, dtype, strided):
     """Check the actual FP16 probability boundary, not only an FP32 oracle."""
     torch.manual_seed(104)
     state = HostQSAKV(
@@ -48,8 +49,12 @@ def test_direct_history_matches_protected_arithmetic_and_replay(rows, dtype):
     selected = (groups[:, None] * 4 + torch.arange(4, device="cuda")).flatten()
     indices = torch.cat([selected, torch.tensor([3788, 3789, 3790], device="cuda")])
     indices = indices.int().repeat(rows, 1)
-    q = torch.randn(rows, 6, 256, dtype=torch.float16, device="cuda")
-    gate = torch.randn_like(q)
+    if strided:
+        packed = torch.randn(rows, 6, 512, dtype=torch.float16, device="cuda")
+        q, gate = packed.tensor_split(2, dim=-1)
+    else:
+        q = torch.randn(rows, 6, 256, dtype=torch.float16, device="cuda")
+        gate = torch.randn_like(q)
     direct, protected = torch.empty_like(q), torch.empty_like(q)
     workspace = state.device_history_workspace
     assert workspace is not None, state.device_history_reason
