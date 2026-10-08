@@ -49268,6 +49268,25 @@ and sets the prefill budget to157 actual request tokens. The existing15-minute
 lease/lock/idle checks and ordinary source120 wheel remain in force. These
 diagnostic changes do not alter model weights,KV dtype or text-quality defaults.
 
+The CUDA format-name extraction now centralizes three host parsers in the
+reader header without widening admission. Compiled comparisons preserve18
+known/unknown names and each entry's explicit-float16 spelling policy; whole
+translation-unit reconstruction guards all remaining bodies. The source suite
+passes22 cases. Clean source69a17c985b builds a complete normal wheel:
+SHA256 `c7261b7d38fb4f1f876e8b3ad0fc13a0e9d363b7e811146d8d78f81de03f559a`.
+Sixteen libraries have no private dynamic paths;14 are byte-identical to
+source120. Complete Flash-V100 and FA2 SM70 SASS matches after anonymous
+namespace hashes only,with instruction bytes retained. Installed GPU/model
+gates for this wheel remain pending. The earlier build began before a mypy
+commit gate passed; its dirty-metadata artifact is retained as compiler evidence
+and is not installed or admitted. The clean committed retry is the artifact.
+
+The new wheel is SHA-verified on54633,but runtime replacement is deferred:
+the token-ID capture acquired its idle locked TP4 lease before the planned
+update. Its active runtime stays source120/tool7dc for provenance consistency;
+no active worker was stopped and no environment/source was changed beneath it.
+The15-minute timeout remains. Replace the runtime only after that task releases.
+
 CPU K/V error attribution uses the existing12 real layer/rank samples without
 reloading models. Token/head nearest-even INT8 has roughly twice the V-only
 attention RMSE of K-only in both27B models. Two mixed K/V arithmetic candidates

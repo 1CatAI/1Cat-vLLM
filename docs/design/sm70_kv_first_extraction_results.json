@@ -1066,5 +1066,34 @@
     "owned_gpu_and_ple_workers_released": true,
     "qsa_data_qualified": false,
     "quality_qualified": false
+  },
+  "cuda_format_alias_extraction": {
+    "source_sha": "69a17c985b2de53c5712988d153055c82e9ca2fb",
+    "status": "compiled host-parser/source/full-wheel SASS gates pass; new installed GPU/model pending",
+    "canonical_definition": "flash-attention-v100/kernel/kv_codec.cuh",
+    "entry_points": [
+      "decode",
+      "grouped",
+      "paged_prefill"
+    ],
+    "known_and_unknown_names_compared": 18,
+    "baseline_parser_bodies_preserved": true,
+    "other_translation_unit_bodies_guarded": true,
+    "explicit_float16_alias_policy": {
+      "decode": true,
+      "grouped": true,
+      "paged_prefill": false
+    },
+    "bf16_tensor_admitted": false,
+    "new_int8_admitted": false,
+    "wheel_sha256": "c7261b7d38fb4f1f876e8b3ad0fc13a0e9d363b7e811146d8d78f81de03f559a",
+    "wheel_bytes": 241982275,
+    "native_libraries": 16,
+    "native_libraries_byte_identical_to_source120": 14,
+    "private_dynamic_paths": false,
+    "complete_sm70_sass_equal": true,
+    "sass_normalization": "anonymous namespace source hashes only; instruction bytes retained",
+    "flash_v100_sass_sha256": "7cd655a36281854463d4f342686d3cec0a63093e32095f7cda05972d36271491",
+    "fa2_sass_sha256": "85f89ff0716e73ed1ba81161d5e028c7bc496a718a1943dddb487160cf704605"
   }
 }
