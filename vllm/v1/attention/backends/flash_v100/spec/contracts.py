@@ -9,10 +9,11 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
+
+seen_contracts: set[tuple[object, ...]] = set()
 
 
 def validate_contract(
@@ -59,8 +60,8 @@ def validate_contract(
         actual_window,
         getattr(layer, "dflash_rope_is_neox_style", None),
     )
-    if signature not in _state._logged_dflash_attention_contracts:
-        _state._logged_dflash_attention_contracts.add(signature)
+    if signature not in seen_contracts:
+        seen_contracts.add(signature)
         logger.info(
             "FLASH_ATTN_V100 DFlash attention contract: layer=%s "
             "causal=%s window=%s rope_neox=%s.",
@@ -69,3 +70,9 @@ def validate_contract(
             actual_window,
             signature[3],
         )
+
+
+COMPATIBILITY_ALIASES = {
+    "validate_contract": "validate_contract",
+    "_logged_dflash_attention_contracts": "seen_contracts",
+}

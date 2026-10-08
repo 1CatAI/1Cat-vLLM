@@ -16,7 +16,6 @@ from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import state as _state
-from vllm.v1.attention.backends.flash_v100.spec.contracts import validate_contract
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -69,6 +68,7 @@ class VerificationOps:
     run_grouped_override: Any = None
     admit_xqa_override: Any = None
     run_smallq_override: Any = None
+    validate_contract: Any = None
 
 
 @dataclass(frozen=True)
@@ -115,7 +115,7 @@ class VerificationExecutor:
         )
 
     def validate_contract(self, layer, attn_metadata) -> None:
-        validate_contract(layer, attn_metadata, self.ops.window_size)
+        self.ops.validate_contract(layer, attn_metadata, self.ops.window_size)
 
     def grouped_verify_allowed(
         self,

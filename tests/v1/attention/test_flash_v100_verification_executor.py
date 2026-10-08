@@ -11,6 +11,7 @@ import torch
 
 from vllm.v1.attention.backends.flash_v100 import routing, state, verify
 from vllm.v1.attention.backends.flash_v100.config import V100AttnConfig
+from vllm.v1.attention.backends.flash_v100.spec import contracts
 
 pytestmark = pytest.mark.cpu_test
 
@@ -22,7 +23,7 @@ def test_ordinary_decode_contract_does_not_construct_verifier():
     receiver = SimpleNamespace(
         _new_verification_executor=unexpected, _flash_v100_window_size=unexpected
     )
-    verify.validate_contract(
+    contracts.validate_contract(
         SimpleNamespace(), SimpleNamespace(), receiver._flash_v100_window_size
     )
 
@@ -60,6 +61,7 @@ def operators(native):
         layer_info=lambda layer: {},
         xqa_codec=lambda *args: None,
         decode=native("scalar"),
+        validate_contract=contracts.validate_contract,
     )
 
 
@@ -191,7 +193,7 @@ def test_persistent_small_query_rows_and_falsey_injection():
 
 @pytest.mark.parametrize("causal", [False, True])
 def test_contract_validation_without_backend(monkeypatch, causal):
-    monkeypatch.setattr(state, "_logged_dflash_attention_contracts", set())
+    monkeypatch.setattr(contracts, "seen_contracts", set())
     executor = verify.VerificationExecutor(policy(), operators(lambda name: None))
     layer = SimpleNamespace(is_dflash_draft_attn=True, dflash_expected_causal=False)
     metadata = SimpleNamespace(causal=causal)
@@ -201,4 +203,4 @@ def test_contract_validation_without_backend(monkeypatch, causal):
     else:
         executor.validate_contract(layer, metadata)
         executor.validate_contract(layer, metadata)
-        assert len(state._logged_dflash_attention_contracts) == 1
+        assert len(contracts.seen_contracts) == 1

@@ -33,4 +33,3 @@ _logged_dflash_prefix_dump = False
 _logged_prefill_ddtree_dense = False
 _logged_prefill_ddtree_triton = False
 _logged_prefill_ddtree_triton_fallback = False
-_logged_dflash_attention_contracts: set[tuple[object, ...]] = set()

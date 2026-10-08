@@ -18,7 +18,7 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native/Qwen passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
-| 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
+| 4b: native decode candidates | #1081 | CPU/golden/strict/native passed | Private references 374 → 370 | Corrected head: 1691 passes / same 7 failures; 12 outputs exact; named timings passed | Model gates pending |
 | 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
 | 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
 | 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | GPU gates |
@@ -33,7 +33,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Required | Strict/rebase/GPU gates |
 | 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Required | Strict/rebase/GPU gates |
 | 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Required | Strict/rebase/GPU gates |
-| 6j: tree visibility feature ownership | — | CPU/golden/strict passed | Private 308 → 303; model terms 151 → 137 | Required | Strict/rebase/GPU gates |
+| 6j: tree visibility feature ownership | #1107 | CPU/golden/strict/rebase passed | Private 308 → 303; model terms 151 → 137 | Required | Strict/rebase/GPU gates |
+| 6k: feature contract ownership | — | CPU/golden and boundary passed | Private 303 → 301; model terms 137 → 126 | Required | Strict/rebase/GPU gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -1113,3 +1114,47 @@ boundary cases plus the already existing 44-name inventory now included in
 this CPU selection. All golden/calculation oracles and real patch consumption
 pass. Pre-commit, mypy and layering pass (`a3-tree-masks-precommit-final.log`).
 No production/source-oracle file changes during the accepted strict run.
+
+## Step 6k declared feature contracts
+
+PR #1107 is `4d892123e96e4dcca8f9d40ee012cbf6b225f4d2`. Its actual
+integration with #1028 is `1c9f2fe07fc654ccfc7c5c7e6bdd574b1266eb33`, tree
+`9817ffd2415f7dcf3dbfbf2661753e28d8985258`, equal to clean merge-tree.
+The integration CPU suites pass 37 tests / 98 GPU skips. Four source-verified
+queues are staged as `a3-step6j` on 54633.
+
+Declared causality/window validation and its process-shared signature set now
+belong to spec/contracts.py. Common assembly and VerificationOps inject the
+validation callback; neither the common verifier nor shared state keeps the
+model-specific contract body/record. The legacy facade resolves both the
+validator and observation-set aliases to the live Spec owner. The fast path
+still performs contract checks without constructing a verifier.
+
+The first focused run passes its golden cases but fails the original contract
+hash because the AST projection left a qualified state name where the existing
+normalizer expects an unqualified global name. Only that projection was
+corrected; the immutable hash and production body were not changed. The next
+8-case run passes all calculation hashes and the five new boundaries under
+strict shim consumption (`a3-spec-contract-boundary.log`,
+`a3-spec-contract-boundary-shim.json`). Cases verify process-wide deduplication
+across two instances/layers, the unchanged layer/causal/window/RoPE signature,
+real legacy validator/set consumption, and causal/window failures before
+observation or premature window evaluation. Metrics reduce to
+153 / 318 / 301 / 0 / 126 / 0 / 29 without new forbidden edges.
+
+The corrected Step 4b GPU run completes at 2026-10-09 07:31:45 +08:00:
+1691 passes / the same seven inherited failures, two new passing cases and
+no changed old outcomes. All 12 native outputs have max-abs 0. Designated
+timing deltas are FP16 XQA graph +0.0168462%, E4M3 XQA graph +0.00916205%,
+and 75T-role eager prefill +0.183613%, within 2%. DDTree eager records
++5.36524%; it is not one of the designated timing cases and no broad speed
+acceptance is claimed. Evidence is under `a3-step4b-v2/logs/`:
+`regression-parity.json`, `op-compare.log` and `regression.done`.
+Model gates remain pending; the original failed Step 4b run stays preserved.
+
+The complete fixed-source strict suite passes **349 tests / 1 skip / 28 GPU
+exclusions** (`a3-spec-contract-strict.log`, `a3-spec-contract-shim.json`),
+including the unchanged 813 golden traces, original calculation hashes and
+real legacy patch consumption. Pre-commit, mypy and layering pass
+(`a3-spec-contract-precommit.log`). No production or source-oracle files
+changed during the accepted run.

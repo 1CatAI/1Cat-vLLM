@@ -2,9 +2,9 @@
   "metrics": {
     "forward": 153,
     "largest_function": 318,
-    "cross_module_private": 303,
+    "cross_module_private": 301,
     "import_cycles": 0,
-    "model_names_outside_spec": 137,
+    "model_names_outside_spec": 126,
     "env_outside_config": 0,
     "state_flags": 29
   },
@@ -73,6 +73,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
       "vllm.v1.attention.backends.flash_v100.spec.builder"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.__init__",
+      "vllm.v1.attention.backends.flash_v100.spec.contracts"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
@@ -357,6 +361,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.spec.attention",
       "vllm.v1.attention.backends.flash_v100.spec.attention_policy"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.attention",
+      "vllm.v1.attention.backends.flash_v100.spec.contracts"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.attention",
@@ -1520,7 +1528,7 @@
     },
     {
       "file": "verify.py",
-      "line": 744,
+      "line": 689,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE')",
       "via_config": true,
       "owner": "tree_prefill",
@@ -1528,7 +1536,7 @@
     },
     {
       "file": "verify.py",
-      "line": 742,
+      "line": 687,
       "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF', '0')",
       "via_config": true,
       "owner": "tree_prefill",
@@ -1781,7 +1789,8 @@
     "spec/attention.py:record_capture_prefix": 10,
     "spec/attention.py:record_capture_layout": 9,
     "spec/attention.py:prefill_dependencies": 8,
-    "spec/attention.py:verification_dependencies": 7,
+    "spec/attention.py:verification_dependencies": 8,
+    "spec/attention.py:validate_layer_contract": 2,
     "spec/attention_policy.py:initialize_scalar_tail": 22,
     "spec/attention_policy.py:initialize_verify_abi": 3,
     "spec/attention_policy.py:configure_prefill": 4,
@@ -1791,6 +1800,7 @@
     "spec/builder.py:initialize_builder": 29,
     "spec/builder.py:prepare_capture": 36,
     "spec/builder.py:attach_common": 4,
+    "spec/contracts.py:validate_contract": 54,
     "spec/draft.py:_debug_draft_metadata": 46,
     "spec/draft.py:_stabilize_draft_graph_metadata": 38,
     "spec/draft.py:build_for_drafting": 79,
@@ -1828,9 +1838,9 @@
     "spec/verify_metadata.py:attach_prepared_metadata": 35,
     "spec/verify_metadata.py:update_decode_metadata": 284,
     "spec/verify_metadata.py:_ensure_smallq_decode_buffers": 24,
-    "verify.py:validate_contract": 2,
     "verify.py:kv_codec": 2,
     "verify.py:__init__": 30,
+    "verify.py:validate_contract": 2,
     "verify.py:grouped_verify_allowed": 117,
     "verify.py:call_grouped_verify": 39,
     "verify.py:smallq_xqa_allowed": 39,

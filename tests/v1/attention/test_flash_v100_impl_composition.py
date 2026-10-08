@@ -294,6 +294,11 @@ _VERIFY_METHODS = {
 class _Normalize(ast.NodeTransformer):
     in_cache = False
 
+    def visit_Name(self, node):
+        if node.id == "seen_contracts":
+            return ast.Name(id="_logged_dflash_attention_contracts", ctx=node.ctx)
+        return node
+
     def visit_ImportFrom(self, node):
         if node.module == "vllm.v1.attention.ops.sm70_grouped_scalar":
             node.module = "vllm.v1.attention.ops.sm70_e4m3_scalar"
@@ -516,7 +521,10 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
         (Path(__file__).parent / "fixtures/flash_v100_impl_methods.json").read_text()
     )["methods"]
     actual = {}
-    for path in Path(impl.__file__).parent.glob("*.py"):
+    for path in (
+        *Path(impl.__file__).parent.glob("*.py"),
+        Path(impl.__file__).parent / "spec/contracts.py",
+    ):
         for node in ast.parse(path.read_text()).body:
             candidates = (
                 node.body
@@ -554,7 +562,7 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                     assert isinstance(statement, (ast.Expr, ast.Return))
                     call = statement.value
                     assert isinstance(call, ast.Call)
-                    assert ast.unparse(call.func) == "validate_contract"
+                    assert ast.unparse(call.func) == "self.ops.validate_contract"
                     assert not call.keywords
                     assert [ast.unparse(a) for a in call.args] == [
                         "layer",

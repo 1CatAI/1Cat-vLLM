@@ -940,7 +940,7 @@ def _verification_method(method):
     if method == "validate_contract":
 
         def validate(instance, layer, metadata):
-            return _verify.validate_contract(
+            return _feature.validate_layer_contract(
                 layer, metadata, instance._flash_v100_window_size
             )
 
