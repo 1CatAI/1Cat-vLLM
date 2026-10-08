@@ -55,8 +55,8 @@ def test_replay_changes_routes_and_inputs(source_type, down_type, shared_routes)
     ]
     out, expected = [torch.empty_like(x) for _ in range(2)]
     routes = torch.empty((5, topk, k), device="cuda", dtype=torch.float16)
-    ready = torch.zeros(5 * topk * (n // 32), device="cuda", dtype=torch.int64)
-    epochs = torch.zeros(k // 32, device="cuda", dtype=torch.int64)
+    activated = torch.empty((5, topk, n), device="cuda", dtype=torch.float16)
+    work = torch.empty(4096, device="cuda", dtype=torch.uint8)
 
     def refresh():
         x.copy_((torch.randn_like(x.float()) * 0.15).half())
@@ -81,7 +81,7 @@ def test_replay_changes_routes_and_inputs(source_type, down_type, shared_routes)
         )
 
     def candidate():
-        torch.ops.sm70_gguf_persistent.run(
+        torch.ops.sm70_gguf_persistent.queued(
             out,
             x,
             ids,
@@ -90,10 +90,11 @@ def test_replay_changes_routes_and_inputs(source_type, down_type, shared_routes)
             up,
             bank.weight_ptrs,
             bank.stat_ptrs,
+            q8,
+            activated,
             hidden,
             routes,
-            ready,
-            epochs,
+            work,
             source_type,
             down_type,
         )
@@ -110,13 +111,13 @@ def test_replay_changes_routes_and_inputs(source_type, down_type, shared_routes)
         refresh()
         hidden.fill_(127)
         routes.fill_(float("nan"))
-        ready.fill_(-1)
+        work.fill_(255)
         control()
         graph.replay()
         torch.accelerator.synchronize()
         torch.testing.assert_close(hidden, expected_hidden, rtol=0, atol=0)
         torch.testing.assert_close(out, expected, rtol=0.002, atol=0.002)
-    # Empty routing still writes every output and advances the epoch. Resuming
+    # Empty routing still writes every output and resets readiness. Resuming
     # active routing on the same captured graph must not reuse old readiness.
     ids.fill_(-1)
     graph.replay()
@@ -128,7 +129,7 @@ def test_replay_changes_routes_and_inputs(source_type, down_type, shared_routes)
     torch.accelerator.synchronize()
     torch.testing.assert_close(out, expected, rtol=0.002, atol=0.002)
     with pytest.raises(RuntimeError, match="requires M5"):
-        torch.ops.sm70_gguf_persistent.run(
+        torch.ops.sm70_gguf_persistent.queued(
             out,
             x.repeat(4, 1),
             ids,
@@ -137,10 +138,11 @@ def test_replay_changes_routes_and_inputs(source_type, down_type, shared_routes)
             up,
             bank.weight_ptrs,
             bank.stat_ptrs,
+            q8,
+            activated,
             hidden,
             routes,
-            ready,
-            epochs,
+            work,
             source_type,
             down_type,
         )
