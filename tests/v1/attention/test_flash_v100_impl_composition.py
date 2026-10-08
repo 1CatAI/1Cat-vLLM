@@ -33,7 +33,8 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         source = Path(impl.__file__).parent / "spec/attention.py"
         self.hooks = {
             node.name: node
-            for node in ast.parse(source.read_text()).body
+            for path in (source, source.with_name("attention_policy.py"))
+            for node in ast.parse(path.read_text()).body
             if isinstance(node, ast.FunctionDef)
         }
 

@@ -10,17 +10,23 @@ from typing import Any
 
 import torch
 
-from vllm.config.sm70_dflash2 import (
-    capture_sm70_dflash2_config,
-)
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
-from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import impl as _impl
-from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100 import verify as _verify
+from vllm.v1.attention.backends.flash_v100.spec.attention_policy import (
+    configure_prefill as configure_prefill,
+)
+from vllm.v1.attention.backends.flash_v100.spec.attention_policy import (
+    configure_verifier as configure_verifier,
+)
+from vllm.v1.attention.backends.flash_v100.spec.attention_policy import (
+    initialize_scalar_tail as initialize_scalar_tail,
+)
+from vllm.v1.attention.backends.flash_v100.spec.attention_policy import (
+    initialize_verify_abi as initialize_verify_abi,
+)
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -30,84 +36,6 @@ from vllm.v1.attention.kv_codecs import (
 )
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
-
-
-def initialize_scalar_tail(self: _impl.FlashAttnV100Impl, use_e4m3_fp32: bool) -> None:
-    self._sm70_scalar_tail_attention = None
-    from vllm.v1.attention.ops.sm70_grouped_scalar import (
-        load_scalar_tail_attention,
-        scalar_tail_attention_available,
-    )
-
-    if (
-        use_e4m3_fp32
-        and _config.registered("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS")
-        and (
-            _config.registered("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST")
-            or scalar_tail_attention_available()
-        )
-        and not _config.raw("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
-    ):
-        # An empty name selects the operator compiled into this extension;
-        # a manifest name keeps the explicit experimental override.
-        self._sm70_scalar_tail_attention = load_scalar_tail_attention(
-            _config.registered("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST") or "",
-            torch.device("cuda", torch.accelerator.current_device_index()),
-        )
-
-
-def initialize_verify_abi(self: _impl.FlashAttnV100Impl) -> None:
-    self.dflash2_grouped_verify_max_query_tokens = (
-        _ops._flash_attn_grouped_verify_max_query_tokens
-    )
-    self.dflash2_grouped_verify_request_major_abi_version = (
-        _ops._flash_attn_grouped_verify_request_major_abi_version
-    )
-
-
-def configure_prefill(self: _impl.FlashAttnV100Impl) -> None:
-    self._flash_prefill_paged_supports_dflash2_bmhd = bool(
-        getattr(self.flash_attn_prefill_paged, "_sm70_dflash2_direct_bmhd", False)
-    )
-    self._flash_prefill_paged_dflash2_split_pages = getattr(
-        self.flash_attn_prefill_paged, "_sm70_dflash2_split_pages", ()
-    )
-    split_enabled = getattr(capture_sm70_dflash2_config(), "draft_window_split", True)
-    if not split_enabled:
-        self._flash_prefill_paged_dflash2_split_pages = ()
-    if self.flash_attn_prefill_paged is not None and _ops._callable_accepts_keyword(
-        self.flash_attn_prefill_paged, "dflash2_window_split"
-    ):
-        from functools import partial
-
-        self.flash_attn_prefill_paged = partial(
-            self.flash_attn_prefill_paged, dflash2_window_split=split_enabled
-        )
-    logger.info_once(
-        "FLASH_ATTN_V100 DFlash single-request window split pages=%s; "
-        "page832 policy=%s; dtype/query/window guards apply at dispatch.",
-        self._flash_prefill_paged_dflash2_split_pages,
-        "enabled" if split_enabled else "disabled_by_configuration",
-    )
-
-
-def configure_verifier(self: _impl.FlashAttnV100Impl) -> None:
-    self.use_dflash2_grouped_verify = (
-        self.flash_attn_grouped_verify_paged is not None
-        and _config.registered("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY")
-        and current_platform.is_device_capability(70)
-    )
-    self.use_dflash2_batched_grouped_verify = (
-        self.use_dflash2_grouped_verify
-        and _config.registered("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY")
-    )
-    self.dflash2_grouped_verify_min_model_len = _config.registered(
-        "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN"
-    )
-    if self.dflash2_grouped_verify_min_model_len < 1:
-        raise ValueError(
-            "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN must be positive"
-        )
 
 
 def reject_xqa(codec: KVCodec | None, attn_metadata: TritonAttentionMetadata) -> bool:
