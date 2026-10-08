@@ -45,7 +45,7 @@ def test_unregistered_packed_operand_and_workspace_are_inventoried():
 def test_cpu_offload_gate_does_not_create_cuda_recorder(monkeypatch):
     import vllm.config
     import vllm.sm70_round_cost
-    from vllm.model_executor.layers.fused_moe.runner.moe_runner import FusedMoERunner
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
     config = SimpleNamespace(
         kernel_config=SimpleNamespace(sm70_round_cost_diagnostics=True)
@@ -58,8 +58,8 @@ def test_cpu_offload_gate_does_not_create_cuda_recorder(monkeypatch):
     monkeypatch.setattr(
         vllm.sm70_round_cost, "attach_route_recorder", reject_allocation
     )
-    monkeypatch.setattr(FusedMoERunner, "_select_forward", lambda self: None)
-    FusedMoERunner(
+    monkeypatch.setattr(MoERunner, "_select_forward", lambda self: None)
+    MoERunner(
         "cpu_offload",
         object(),
         object(),
