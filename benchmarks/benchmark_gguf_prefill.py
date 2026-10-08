@@ -33,6 +33,12 @@ def main():
     )
     parser.add_argument("--decode-check", action="store_true")
     parser.add_argument("--completion-check", action="store_true")
+    parser.add_argument(
+        "--completion-context",
+        action="store_true",
+        help="Run completion checks after the full fixed technical-text context",
+    )
+    parser.add_argument("--acceptance-check", action="store_true")
     parser.add_argument("--profile-once", action="store_true")
     parser.add_argument("--profile-kind", choices=("torch", "cuda"), default="torch")
     parser.add_argument(
@@ -43,6 +49,8 @@ def main():
     args = parser.parse_args()
     if args.input_tokens <= 0 or args.prefill_chunk <= 0:
         parser.error("input and chunk token counts must be positive")
+    if args.completion_context and not args.completion_check:
+        parser.error("--completion-context requires --completion-check")
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
     config = dict(
@@ -91,6 +99,7 @@ def main():
         candidate_only=args.candidate_only,
         rows=[],
         decode_checks=[],
+        acceptance_checks=[],
         completions=[],
         complete=False,
     )
@@ -213,14 +222,23 @@ def main():
             for enabled in policies:
                 llm.collective_rpc(method, args=(enabled,))
                 for prompt in prompts:
+                    content = prompt
+                    if args.completion_context:
+                        content = (
+                            "以下技术资料仅作背景，请回答最后的问题。\n"
+                            + tokenizer.decode(ids)
+                            + "\n问题："
+                            + prompt
+                        )
                     rendered = tokenizer.apply_chat_template(
-                        [{"role": "user", "content": prompt}],
+                        [{"role": "user", "content": content}],
                         tokenize=False,
                         add_generation_prompt=True,
                         enable_thinking=False,
                     )
+                    prompt_ids = tokenizer.encode(rendered, add_special_tokens=False)
                     output = llm.generate(
-                        rendered,
+                        {"prompt_token_ids": prompt_ids},
                         SamplingParams(temperature=0, max_tokens=512),
                         use_tqdm=False,
                     )[0].outputs[0]
@@ -228,11 +246,40 @@ def main():
                         dict(
                             enabled=enabled,
                             prompt=prompt,
+                            input_tokens=len(prompt_ids),
+                            full_context=args.completion_context,
                             output_ids=list(output.token_ids),
                             text=output.text,
                             finish_reason=output.finish_reason,
                         )
                     )
+                    save()
+        if args.acceptance_check:
+            sys.path.append(str(Path(__file__).resolve().parents[1]))
+            from benchmarks.benchmark_flashnext_acceptance import natural_row
+
+            prompts = json.loads(
+                Path(__file__)
+                .with_name("flashnext_acceptance_prompts.json")
+                .read_text()
+            )
+            if len(prompts) != 8 or len({p["id"] for p in prompts}) != 8:
+                raise RuntimeError("Acceptance requires eight distinct prompts")
+            sampling = SamplingParams(
+                temperature=0, max_tokens=600, ignore_eos=False, seed=20261005
+            )
+            for enabled in policies:
+                llm.collective_rpc(method, args=(enabled,))
+                for prompt in prompts:
+                    rendered = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": prompt["prompt"]}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                    prompt_ids = tokenizer.encode(rendered, add_special_tokens=False)
+                    row = natural_row(llm, prompt, prompt_ids, sampling)
+                    report["acceptance_checks"].append(dict(enabled=enabled, **row))
                     save()
         report["matching_output_ids"] = (
             len(
