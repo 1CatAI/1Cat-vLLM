@@ -142,5 +142,16 @@
   },
   "qwen_rope_kernel_ast": "5904f612a59f32b539cfdd97c1423e6d93509a8a555cea7a5f6cfb8edc76ba9f",
   "native_writer_helpers_sha256": "d50bbbe8dd8759ce95d0e5a0d00928dfe3b5a9a8cefc5fdb441ef048fe693b89",
-  "native_cache_kernels_sha256": "d1a79ec1fe1c1247337607fa00171f57f30a5df968137b338ecb7f00ae6c918f"
+  "native_cache_kernels_sha256": "d1a79ec1fe1c1247337607fa00171f57f30a5df968137b338ecb7f00ae6c918f",
+  "original_cuda_dtype_parsers": {
+    "flash-attention-v100/kernel/flash_decode_paged.cu": "int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {\n  if (kv_cache_dtype == \"auto\" || kv_cache_dtype == \"float16\" ||\n      kv_cache_dtype == \"bfloat16\") {\n    return flash_v100::KV_CACHE_DTYPE_FP16;\n  }\n  if (kv_cache_dtype == \"fp8\" || kv_cache_dtype == \"fp8_e4m3\") {\n    return flash_v100::KV_CACHE_DTYPE_FP8_E4M3;\n  }\n  if (kv_cache_dtype == \"fp8_e5m2\") {\n    return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;\n  }\n  return -1;\n}",
+    "flash-attention-v100/kernel/fused_mha_forward_paged.cu": "int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {\n  if (kv_cache_dtype == \"auto\" || kv_cache_dtype == \"bfloat16\") {\n    return flash_v100::KV_CACHE_DTYPE_FP16;\n  }\n  if (kv_cache_dtype == \"fp8\" || kv_cache_dtype == \"fp8_e4m3\") {\n    return flash_v100::KV_CACHE_DTYPE_FP8_E4M3;\n  }\n  if (kv_cache_dtype == \"fp8_e5m2\") {\n    return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;\n  }\n  return -1;\n}",
+    "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu": "int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {\n  if (kv_cache_dtype == \"auto\" || kv_cache_dtype == \"float16\" ||\n      kv_cache_dtype == \"bfloat16\") {\n    return flash_v100::KV_CACHE_DTYPE_FP16;\n  }\n  if (kv_cache_dtype == \"fp8\" || kv_cache_dtype == \"fp8_e4m3\") {\n    return flash_v100::KV_CACHE_DTYPE_FP8_E4M3;\n  }\n  if (kv_cache_dtype == \"fp8_e5m2\") {\n    return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;\n  }\n  return -1;\n}"
+  },
+  "cuda_dtype_parser_parent_sha": "3434656183746cf0c46f9852b4df2d0ba4d8853d",
+  "cuda_dtype_parser_parent_sources_sha256": {
+    "flash-attention-v100/kernel/flash_decode_paged.cu": "f1386d7b532a99695064d8262dd097f02982c6568eca681a8c727d443609f0bb",
+    "flash-attention-v100/kernel/fused_mha_forward_paged.cu": "c56a122a561724f0744150ca2d05773af32a482fb4a55d98a6f9ca5bc1efe279",
+    "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu": "ede28927196301f0a24fd6a96637f82e1e66c731dc2b155455937626b9a37a41"
+  }
 }

@@ -37,16 +37,7 @@ using namespace nvcuda::wmma;
 namespace {
 
 int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
-  if (kv_cache_dtype == "auto" || kv_cache_dtype == "bfloat16") {
-    return flash_v100::KV_CACHE_DTYPE_FP16;
-  }
-  if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
-    return flash_v100::KV_CACHE_DTYPE_FP8_E4M3;
-  }
-  if (kv_cache_dtype == "fp8_e5m2") {
-    return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;
-  }
-  return -1;
+  return flash_v100::kv_cache_dtype_code_from_string(kv_cache_dtype, false);
 }
 
 }  // namespace

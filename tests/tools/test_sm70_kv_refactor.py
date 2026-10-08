@@ -9,6 +9,8 @@ GPU and model gates are recorded separately; AST equality cannot replace them.
 import ast
 import hashlib
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -113,6 +115,86 @@ def test_shared_codec_include_is_source_complete():
     assert (
         "recursive-include kernel *.cu *.cuh *.h"
         in (ROOT / "flash-attention-v100/MANIFEST.in").read_text()
+    )
+
+
+def test_cuda_dtype_aliases_preserve_each_entry_point(tmp_path):
+    header = (ROOT / "flash-attention-v100/kernel/kv_codec.cuh").read_text()
+    start = header.index("inline int kv_cache_dtype_code_from_string(")
+    end = header.index("\n}\n", start) + 2
+    parser = header[start:end]
+    constants = re.findall(r"constexpr int KV_CACHE_DTYPE_\w+ = \d+;", header)
+    assert len(constants) == 3
+    original = FIXTURE["original_cuda_dtype_parsers"]
+    sources = []
+    policies = []
+    for index, (name, body) in enumerate(original.items()):
+        source = (ROOT / name).read_text()
+        pattern = (
+            r"int kv_cache_dtype_code_from_string\(const std::string& kv_cache_dtype\) "
+            r"\{.*?\n\}"
+        )
+        match = re.search(pattern, source, re.DOTALL)
+        assert match is not None
+        policy = "false" if "fused_mha_forward_paged" in name else "true"
+        expected = (
+            "int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {\n"
+            "  return flash_v100::kv_cache_dtype_code_from_string(kv_cache_dtype, "
+            f"{policy});\n}}"
+        )
+        assert re.sub(r"\s+", "", match.group()) == re.sub(r"\s+", "", expected)
+        restored = source[: match.start()] + body + source[match.end() :]
+        assert (
+            hashlib.sha256(re.sub(r"\s+", "", restored).encode()).hexdigest()
+            == FIXTURE["cuda_dtype_parser_parent_sources_sha256"][name]
+        )
+        sources.append(f"namespace baseline{index} {{\n{body}\n}}")
+        policies.append(
+            f"if (baseline{index}::kv_cache_dtype_code_from_string(name) != "
+            f"flash_v100::kv_cache_dtype_code_from_string(name, {policy})) return 1;"
+        )
+    compiler = shutil.which("c++")
+    if compiler is None:
+        pytest.skip("C++ compiler required for the CUDA host-parser gate")
+    assert compiler is not None
+    path = tmp_path / "aliases.cpp"
+    path.write_text(
+        "#include <string>\n#include <iostream>\nnamespace flash_v100 {\n"
+        + "\n".join(constants)
+        + "\n"
+        + parser
+        + "\n}\n"
+        + "\n".join(sources)
+        + "\nint main() { std::string name; while (std::getline(std::cin, name)) {\n"
+        + "\n".join(policies)
+        + "\n} }\n"
+    )
+    executable = tmp_path / "aliases"
+    subprocess.run(
+        [compiler, "-std=c++17", str(path), "-o", str(executable)], check=True
+    )
+    names = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        "",
+        "float32",
+        "fp8_ds_mla",
+        "fp8_per_token_head",
+        "int8",
+        "int8_per_token_head",
+        "nvfp4",
+        "turboquant_k8v4",
+        "FP8",
+        " auto",
+        "auto\0",
+        "未知",
+    ]
+    subprocess.run(
+        [str(executable)], input="\n".join(names) + "\n", text=True, check=True
     )
 
 

@@ -75,6 +75,25 @@ host ownership and configuration are **not yet migrated**. Dense page accounting
 Triton inline scale views now share a storage descriptor as described below. This is an independently revertible
 first review scope, not an uncalled registry claiming the final architecture.
 
+### CUDA format-name boundary
+
+The three Flash-V100 decode,grouped and paged-prefill host parsers now delegate
+to `kv_codec.cuh`. Known format names and IDs have one CUDA definition.
+Their historical spelling policies differ: decode/grouped accept explicit
+`float16`,while paged prefill accepts `auto`/`bfloat16` and rejects `float16`.
+An explicit compatibility argument preserves that distinction; operand dtype,
+shape checks and dispatch remain in the original entry points. This does not
+admit BF16 tensors or any new INT8 path. Backend normalization still maps
+configured `float16` to `auto` before these calls.
+
+The existing native vLLM `dtype_fp8.cuh` centralizes a broader set of aliases,
+including MLA. Reusing that broader helper here would widen existing admission;
+the extraction therefore preserves the narrower local format set. Immutable
+baseline parser bodies and whole pre-extraction translation-unit digests guard
+this scope. A compiled CPU comparison checks18 known/unknown names,including
+whitespace,case,embedded NUL and non-ASCII inputs,against each original parser.
+GPU SASS and final-artifact/model gates remain separate.
+
 ## Packed reader extraction
 
 The eight packed E4M3/E5M2 converters previously duplicated in standalone

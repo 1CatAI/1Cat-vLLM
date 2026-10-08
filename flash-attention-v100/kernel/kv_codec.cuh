@@ -8,12 +8,31 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include <string>
 
 namespace flash_v100 {
 
 constexpr int KV_CACHE_DTYPE_FP16 = 0;
 constexpr int KV_CACHE_DTYPE_FP8_E4M3 = 1;
 constexpr int KV_CACHE_DTYPE_FP8_E5M2 = 2;
+
+// Preserve the legacy entry-point spelling policy. Paged prefill historically
+// accepts auto/bfloat16, while decode/grouped also accept explicit float16.
+// Tensor dtype and shape checks remain in those entry points.
+inline int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype,
+                                           bool allow_float16_alias = true) {
+  if (kv_cache_dtype == "auto" || kv_cache_dtype == "bfloat16" ||
+      (allow_float16_alias && kv_cache_dtype == "float16")) {
+    return KV_CACHE_DTYPE_FP16;
+  }
+  if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
+    return KV_CACHE_DTYPE_FP8_E4M3;
+  }
+  if (kv_cache_dtype == "fp8_e5m2") {
+    return KV_CACHE_DTYPE_FP8_E5M2;
+  }
+  return -1;
+}
 
 __device__ __forceinline__ float quiet_nan_f() {
   return __int_as_float(0x7fffffff);
