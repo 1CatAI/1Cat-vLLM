@@ -6,7 +6,7 @@ from __future__ import annotations
 import copy
 from collections import Counter
 from dataclasses import dataclass, field, fields, replace
-from enum import Enum, IntEnum
+from enum import Enum
 from math import prod
 from typing import TYPE_CHECKING
 
@@ -15,67 +15,20 @@ from typing_extensions import Self
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
-from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.kv_cache_codec import (
+    KVCacheCodec,
+    KVQuantMode,
+    get_kv_quant_mode,  # noqa: F401
+    is_quantized_kv_cache,  # noqa: F401
+    kv_cache_uses_per_token_head_scales,  # noqa: F401
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# KV cache quantization mode
-# ---------------------------------------------------------------------------
-
-
-class KVQuantMode(IntEnum):
-    """KV cache quantization mode.
-
-    Used by attention backends and kernels to dispatch quantization logic
-    without string matching on ``kv_cache_dtype``.
-    """
-
-    NONE = 0
-    FP8_PER_TENSOR = 1  # per-tensor scales (current fp8 path)
-    INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
-    FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
-    NVFP4 = 4  # packed fp4 data + fp8 block scales
-
-    @property
-    def is_per_token_head(self) -> bool:
-        """True for any per-token-head quantization mode."""
-        return self in (
-            KVQuantMode.INT8_PER_TOKEN_HEAD,
-            KVQuantMode.FP8_PER_TOKEN_HEAD,
-        )
-
-    @property
-    def is_nvfp4(self) -> bool:
-        """True for NVFP4 packed quantization mode."""
-        return self == KVQuantMode.NVFP4
-
-
-def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
-    """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
-    if kv_cache_dtype == "int8_per_token_head":
-        return KVQuantMode.INT8_PER_TOKEN_HEAD
-    if kv_cache_dtype == "fp8_per_token_head":
-        return KVQuantMode.FP8_PER_TOKEN_HEAD
-    if kv_cache_dtype == "nvfp4":
-        return KVQuantMode.NVFP4
-    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
-        return KVQuantMode.FP8_PER_TENSOR
-    return KVQuantMode.NONE
-
-
-def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
-    return get_kv_quant_mode(kv_cache_dtype) != KVQuantMode.NONE
-
-
-def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
-    """Return True if *kv_cache_dtype* needs per-token-head scales."""
-    return get_kv_quant_mode(kv_cache_dtype).is_per_token_head
 
 
 class KVCacheSpecKind(str, Enum):
@@ -171,36 +124,23 @@ class AttentionSpec(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         real_page_size = self.real_page_size_bytes
-        # Per-token-head scales are stored in separate tensors managed
-        # by the attention backend, but the memory is carved from the
-        # raw KV cache allocation so it must be budgeted here.
-        if self.kv_quant_mode.is_per_token_head:
-            real_page_size += (
-                2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
-            )
+        # Token/head scale bytes are inline in each head's padding.
+        real_page_size += self.block_size * self.codec.scale_bytes_per_token(
+            self.num_kv_heads
+        )
         if self.page_size_padded is not None:
             assert self.page_size_padded >= real_page_size
             return self.page_size_padded
         return real_page_size
 
     @property
+    def codec(self) -> KVCacheCodec:
+        return KVCacheCodec(self.dtype, self.kv_quant_mode)
+
+    @property
     def real_page_size_bytes(self) -> int:
-        if self.kv_quant_mode.is_nvfp4:
-            # Packed layout: fp4 data + fp8 block scales per head.
-            full_dim = nvfp4_kv_cache_full_dim(self.head_size)
-            return (
-                2
-                * self.block_size
-                * self.num_kv_heads
-                * full_dim
-                * get_dtype_size(self.dtype)
-            )
-        return (
-            2
-            * self.block_size
-            * self.num_kv_heads
-            * self.head_size
-            * get_dtype_size(self.dtype)
+        return self.block_size * self.codec.payload_bytes_per_token(
+            self.num_kv_heads, self.head_size
         )
 
 
@@ -298,24 +238,8 @@ class FullAttentionSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        if self.kv_quant_mode.is_nvfp4:
-            # Packed layout per head: fp4 data + fp8 block scales.
-            # fp4 data: head_size//2 bytes (2 fp4 values per byte)
-            # fp8 block scale: head_size//16 bytes (1 scale per 16 elements)
-            last_dim = nvfp4_kv_cache_full_dim(
-                self.head_size
-            ) + nvfp4_kv_cache_full_dim(self.head_size_v)
-            return (
-                self.block_size
-                * self.num_kv_heads
-                * last_dim
-                * get_dtype_size(self.dtype)
-            )
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
-            * get_dtype_size(self.dtype)
+        return self.block_size * self.codec.payload_bytes_per_token(
+            self.num_kv_heads, self.head_size, self.head_size_v
         )
 
 
@@ -518,22 +442,8 @@ class SlidingWindowSpec(AttentionSpec):
 
     @property
     def real_page_size_bytes(self) -> int:
-        # Mirror ``FullAttentionSpec.real_page_size_bytes`` for NVFP4 KV cache.
-        if self.kv_quant_mode.is_nvfp4:
-            last_dim = nvfp4_kv_cache_full_dim(
-                self.head_size
-            ) + nvfp4_kv_cache_full_dim(self.head_size_v)
-            return (
-                self.block_size
-                * self.num_kv_heads
-                * last_dim
-                * get_dtype_size(self.dtype)
-            )
-        return (
-            self.block_size
-            * self.num_kv_heads
-            * (self.head_size + self.head_size_v)
-            * get_dtype_size(self.dtype)
+        return self.block_size * self.codec.payload_bytes_per_token(
+            self.num_kv_heads, self.head_size, self.head_size_v
         )
 
     def max_admission_blocks_per_request(

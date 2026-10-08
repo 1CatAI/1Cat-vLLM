@@ -49029,3 +49029,322 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+### SM70 KV codec migration: first extraction (2026-10-08)
+
+- Freeze `onecat/main` at `c4f6245f841466782752a8c3283e4727565cf17a`.
+  [Design](sm70_kv_codec.md), [source inventory](sm70_kv_source_inventory.md),
+  [format matrix](sm70_kv_path_matrix.md) and
+  [environment plan](sm70_kv_environment_inventory.md) cover the campaign.
+- Extract 539 original metadata lines and 25 conversion-helper lines without
+  changing their ASTs. Reexport original symbols. Share the scalar KV reader
+  between Flash-V100 and grouped/scalar source kernels; keep launch ABIs.
+- FP16 exhaustive storage bits and all E4M3/E5M2 bytes match on local V100 GPU0;
+  reader PTX and complete standalone Flash-V100 SM70 SASS are unchanged. Four
+  isolated metadata GPU tests and 48 direct operator comparisons pass. The
+  initial two long-FP16 timing outliers were rechecked with ABBA, not repeated
+  across unrelated shapes. See [measured results](sm70_kv_first_extraction_results.json).
+- The paired policy suite has the same 186 passes / 11 failures in each arm,
+  because the source-only tree lacks the built SM70 FA2 library. Pure-source
+  tests also need package version metadata, CUDA bindings and Flash-V100: do
+  not reinterpret missing dependencies as a numerical regression or repeatedly
+  run the unprepared test environment. No final-wheel/model admission yet.
+- This is **not completion of the FP16/E4M3 refactor**. Routing, writers, scale
+  accounting, host transport and typed configuration migration remain pending.
+  Do not enable INT8, change E4M3 partitions, choose a default format or claim
+  75T/three-model/35B admission before their gates pass. Next: normal complete
+  FA2/vLLM build and model route gates, then real-request FP16 Q/K/V selection
+  data and subsequent independently revertible codec migration scopes.
+
+### KV codec continuation: dense accounting and offline candidates
+
+The same owned Draft PR now centralizes dense payload/inline-scale byte costs
+and the Triton scale-view layout in `vllm/v1/kv_cache_codec.py`. Public mode/helper
+imports remain compatible. Against immutable `c4f6245f8`, all 2646 CPU storage
+configurations match; 17 layout/budget tests and eight offline-candidate numerical
+self-tests pass. No native INT8 reader/writer/default or common scheduler is
+admitted. The offline tool rejects encoded K/V reference inputs, retains real
+request provenance, and compares masked attention and storage cost per sample.
+No three-model selection dataset has been collected yet.
+
+Normal parent CMake SM70 FA2 builds with CUDA 12.8/Torch 2.10. It includes
+installed grouped/scalar and q8192 75T kernels. The rest of the complete source
+artifact and the installed model gate are pending. Do not repeat CUDA-hidden
+policy tests to qualify FA2: its loader initializes CUDA, so missing-device
+errors cannot establish route correctness. Keep the earlier 186/11 paired
+source-policy result as historical evidence, not a passing promotion gate.
+The local GPU locks became occupied during compilation; no other process was
+stopped and no remote GPU was used.
+
+Local host rebooted at 15:06 (Asia/Shanghai) during the continuation. Afterwards
+`lspci` enumerated no NVIDIA devices, `/dev/nvidia*` was absent and `nvidia-smi`
+could not communicate with the driver. No driver/module/reboot actions were
+performed by this task. Necessary passwordless read-only SSH checks to 54304
+and 54633 both timed out at banner exchange; no remote job was launched.
+The interrupted baseline FA2 linker output was invalid and was rebuilt cleanly.
+The rebuilt original/new complete SM70 FA2 SASS matches after normalizing only
+anonymous-namespace path hashes, retaining instruction bytes. Reboot also
+corrupted a mypy cache; validation uses a fresh task-owned cache. GPU gates and
+real-request captures remain pending resource restoration/access.
+
+### KV codec continuation: packed readers and CPU-only work
+
+User requested continued development without waiting for V100 restoration.
+Do not retry the crowded remote hosts or interpret this as GPU/model acceptance.
+The duplicated eight packed converters moved unchanged to the shared codec;
+XQA vector loads/panels use its reader interface. SM70 packed-probe PTX and
+complete normal FA2 SASS match the baseline. Packed-reader GPU byte comparison,
+operator speed and model routes remain pending. A probe-only unused-LUT
+initialization caused dead-store/codegen differences; initializing only actual
+LUT specializations fixed the harness, without normalizing instructions away.
+
+The interrupted full native build had two non-ELF objects. Those owned corrupt
+outputs were removed, their resulting missing-object link failure retained,
+and normal CMake rebuilt both objects and linked all native targets successfully.
+Complete normal wheel packaging is now in progress; no borrowed private DSO.
+
+BFLA/tree masks and the FP32 debug reference now have independent modules;
+96 CPU baseline comparisons match bitwise. Original numerical/dispatch AST
+hashes and backend reexports remain guarded. Environment inventory tests scan
+all moved modules; no switch has been retired merely by moving it. Complete
+standalone SM70 Flash-V100 SASS also matches after packed-reader extraction.
+
+### KV codec continuation: first shared writer family
+
+Triton normal/diff-KV/per-token-head writers consume tile encoders in
+`attention/ops/kv_codec.py`. Host admission, addressing, typed stores and launch
+parameters remain guarded against the immutable baseline. Sixteen explicit
+SM70 compiler pairs have identical PTX/SASS; eight E4M3 pairs fail the existing
+compiler support check in both arms. No compiler override or GPU acceptance.
+FP8 Triton interpreter values disagree with the PyTorch oracle; retain that
+negative result and do not use interpreter output to qualify FP8. Local existing
+INT8 truncation differs from newer upstream rounding; keep it during extraction
+and compare it separately in the ten-scheme offline tool (nine CPU self-tests).
+Native/fused/QSA/restore writers and the new accelerated INT8 path remain pending.
+
+### KV codec continuation: complete normal artifact
+
+Normal source wheel built at source `477e79507b09498b011ebcfa625b8b67aad321e7`:
+SHA256 `e6253cbfef64ec87af46572ce52e2590f93efb7fcb6220fc7249dea86dded4ec`.
+Torch 2.10+cu128, toolkit12.8.93, normal RelWithDebInfo. All relocated Python
+sources match;16 native libraries have no private path/RPATH. Fresh isolated
+installed-wheel process imports/loads _C/stable/GGUF/MOE/FA2/Flash-V100/FlashQLA
+without preload/library/Python path overrides. Complete final-wheel FA2 and
+Flash-V100 SASS matches matching baseline; GPU execution remains pending.
+Optional Rust frontend skipped normally because Rust compiler is absent.
+
+Retain the failed packaging command: an explicit build_ext build_temp option
+was lost during setuptools install reinitialization, giving missing CMakeCache.
+The normal build command's build_temp option fixes command inheritance. No
+borrowed DSO or setup-code workaround. CPU tests:32 source/tool/build +17 storage;
+96 mask/reference and2646 accounting comparisons pass. Inventory aggregates
+backend/new modules to prevent moved reads being misreported as retired flags.
+All89 environment names and26 dtype predicates remain; convergence is pending.
+
+### KV codec continuation: authorized 54633 validation and request data
+
+The user explicitly authorized 54633 after the local GPU outage. Four V100
+SXM2-32GB GPUs have NVLink connections; the P400 display device is excluded.
+Use nonblocking GPU locks and idle UUIDs, never preempt existing workloads.
+The ordinary installed source477 wheel passes exhaustive scalar/packed reader
+GPU byte comparisons and sixteen original/extracted Triton writer pairs.
+Eight E4M3 Triton pairs retain the existing SM70 compiler rejection. Installed
+policy/metadata tests pass:197 policy plus4 GPU metadata cases, with no source
+or private-library overlay. New accelerated INT8 admission is still pending.
+
+Two27B models (NVFP4 and GGUF IQ3_S) now provide12 real-request layer/rank
+samples:157 chat tokens, three dense layers per TP2 rank, FP16 KV, eager,
+no MTP or prefix reuse. Both ranks/model execute the Flash-V100 first-prefill
+route. The ten-scheme offline comparison and its limitations are retained in
+[the initial data ledger](sm70_kv_initial_request_errors.md). Captured FP16
+layer scalars do not prove production E4M3 calibration. Flash-Next/QSA masks,
+longer real requests, native arithmetic/cost and all quality gates remain
+required before selecting a default. A one-token capture is not a speed,
+acceptance, natural-EOS or C4 result.
+
+Retain capture setup failures: system Python lacked development headers;
+the task uses uv-managed Python3.12.15. The current multiprocess queue cannot
+pickle a callable nested inside `apply_model` arguments; the public
+`collective_rpc` method accepts a callable with plain arguments. Its local
+serialization flag is diagnostic only. Do not repeat seven-minute GGUF loads
+without a new gate or implementation question.
+
+Five page-view helpers were extracted unchanged at4480016446. All102 CPU
+cases preserve values, strides, offsets, aliases and memoized admission.
+The backend is8826 lines; aggregate89 environment reads/26 dtype predicates
+and legacy routes remain unchanged. Normal source448 wheel built successfully;
+installed GPU page/model verification is pending. Its Flash-V100 library is
+byte-identical to source477; complete SM70 FA2 SASS matches with only namespace
+path hashes normalized. An absent `patchelf` on PATH caused the first packaging
+failure; the normal retry with declared environment tools completed. No setup
+patch, borrowed DSO or runtime-library override was used.
+
+The fused Qwen norm/RoPE writer now shares the Triton codec's software E4M3
+encoder and precise scale operation. All24 SM70 AOT pairs retain identical
+PTX/SASS; host and reconstructed kernel ASTs preserve original math, addresses
+and launches. Do not combine K scaling/casting inside its store expression:
+that rejected form changed pointer evaluation and ptxas RMSNorm FMA order.
+GPU/operator and installed-model gates remain pending while another TP4 job
+occupies the authorized host. Page448 wheel has installed normally with
+compatible declared dependencies; no occupied GPU was used for validation.
+
+The QSA capture adapter now records actual indexer selections and addressed
+compression state, and asserts executed native/grouped/Triton attention calls.
+Eight CPU semantic checks pass; no real Flash-Next/QSA dataset is claimed yet.
+The fixed IQ3_XXS second shard has passed its manifest checksum on54633; the
+first shard is still downloading into the owned NVMe task directory. Retain
+TP4 and packed PLE handling; never materialize the full PLE table in FP16.
+Normal source8794 wheel is built, native15/16 libraries are byte-identical to
+page448 and the remaining complete FA2 SM70 SASS matches. GPU locks remain
+occupied by another task even when GPUs1/2 are idle; do not bypass global locks.
+
+Both fixed Flash-Next shards are now size/SHA256 verified. Single-connection
+first-shard transfer slowed; eight mature curl ranges validate Content-Range
+and length before merge/full checksum. Only the verified task-owned download
+child was stopped; existing prefix and failed logs were retained. GPU validation
+first reached a lease but stopped before comparisons when the shallow clone
+tried to lazily fetch an immutable baseline blob and GitHub timed out. Transfer
+authentic baseline Git blobs from the owned local object store and preflight
+their availability outside the lease; do not regenerate numerical baselines.
+
+Native calibrated reshape/Flash writers now use the extracted `KVWriter`
+interface. Entire cache-kernel reconstruction matches the immutable baseline
+after restoring the helper/type spelling and include. Normal CMake rebuild
+passes; full `_C_stable_libtorch` SM70 SASS is identical without normalization.
+Final-wheel GPU/operator/model gates remain pending; no format/default or
+dispatch change. The following other TP4 job again fills all four GPUs.
+
+Source120 normal whole wheel has now passed remote SHA256 verification,
+ordinary installation and `uv pip check` (201 compatible packages). Its
+SHA256 is `a4ce2018bfa82d158d2d779511f48db87e6a75b623eb974f530f32e381f5524b`.
+The capture provenance check covers19 runtime files, including the separately
+registered stable-libtorch writer and QSA preparation; an altered native-writer
+archive is rejected without changing installed files. No numerical source or
+runtime default changed in this tooling continuation.
+
+User resource policy: use available locked GPUs, otherwise wait, and avoid long
+reservations. The targeted operator/tests have a10-minute lease limit and the
+single first Flash-Next TP4 capture a15-minute limit; timeout terminates only
+the owned process group. Retries hold no GPUs. The global lock remains binding
+when another job uses only GPU0. Authentic local Git objects now provide the
+immutable baseline offline, avoiding network access while holding a GPU lease.
+INT8 implementation/format selection and the three-model quality/performance
+gates remain pending.
+
+The source120 normal installed artifact now passes209 targeted tests on an idle
+locked V100 (197 policy,4 metadata,8 fused/native cache-writer checks). The
+102 page-view GPU cases preserve values/strides/offsets/aliases and admission;
+24 immutable/extracted fused Qwen source-kernel pairs preserve all output/cache
+bytes and PTX/SASS. The native E4M3 writer is checked against the software
+encoder over all65536 FP16 codes at five scales. These are targeted operator
+gates; FP16/E5M2 native-writer coverage and full installed-model gates remain.
+
+Paired warm-cache single-kernel graph timing has a median delta of-0.299%
+across24 cases, with extrema-5.545%/+5.823%. Identical code does not make these
+event intervals a statistical equivalence test: host replay submission gaps
+can affect such short kernels. Recheck only the positive timing outlier with
+multiple kernel nodes per replay; do not repeat the entire broad GPU suite.
+The minimal Flash-Next QSA capture reached model loading (736.89 seconds,
+22.01 GiB/rank) and engine profile/cache/warmup (45.95 seconds), but the15-minute
+lease expired before samples were collected. The owned process group and PLE
+worker exited; all GPUs/locks are released. There is no real QSA corpus yet.
+Do not rerun this identical cold initialization without shortening or preparing
+the necessary startup work. The request already retains verified token IDs, so
+the diagnostic token-ID path may skip tokenizer initialization; this must stay
+distinct from text/quality serving and be recorded in its capture contract.
+
+The focused fused-writer recheck (eight tokens,one RoPE plane,cache writes,no
+gate) uses200 kernel nodes per replay, preserving byte/PTX/SASS equality.
+Baseline/candidate median per kernel is2.40009/2.40271 microseconds (+0.1093%),
+compared with the earlier single-node interval's+5.823%. This resolves the
+large observed timing outlier for this warm-cache case; it does not establish
+cold-L2/all-route/model performance equivalence. The short3-minute-bounded
+lease completed and released; no repeat of the209-test suite was needed.
+
+The capture tool now emits engine/hook/request/finish milestones and retains
+diagnostic stage durations with `performance_evidence=false`. A later single
+Flash-Next lease uses already-verified token IDs,skips tokenizer initialization
+and sets the prefill budget to157 actual request tokens. The existing15-minute
+lease/lock/idle checks and ordinary source120 wheel remain in force. These
+diagnostic changes do not alter model weights,KV dtype or text-quality defaults.
+
+The CUDA format-name extraction now centralizes three host parsers in the
+reader header without widening admission. Compiled comparisons preserve18
+known/unknown names and each entry's explicit-float16 spelling policy; whole
+translation-unit reconstruction guards all remaining bodies. The source suite
+passes22 cases. Clean source69a17c985b builds a complete normal wheel:
+SHA256 `c7261b7d38fb4f1f876e8b3ad0fc13a0e9d363b7e811146d8d78f81de03f559a`.
+Sixteen libraries have no private dynamic paths;14 are byte-identical to
+source120. Complete Flash-V100 and FA2 SM70 SASS matches after anonymous
+namespace hashes only,with instruction bytes retained. Installed GPU/model
+gates for this wheel remain pending. The earlier build began before a mypy
+commit gate passed; its dirty-metadata artifact is retained as compiler evidence
+and is not installed or admitted. The clean committed retry is the artifact.
+
+The new wheel is SHA-verified on54633,but runtime replacement is deferred:
+the token-ID capture acquired its idle locked TP4 lease before the planned
+update. Its active runtime stays source120/tool7dc for provenance consistency;
+no active worker was stopped and no environment/source was changed beneath it.
+The15-minute timeout remains. Replace the runtime only after that task releases.
+
+CPU K/V error attribution uses the existing12 real layer/rank samples without
+reloading models. Token/head nearest-even INT8 has roughly twice the V-only
+attention RMSE of K-only in both27B models. Two mixed K/V arithmetic candidates
+measure V-group32/64 with token/head K. V-group32 reduces initial combined
+attention RMSE by about30% for2.31% more candidate bytes; physical packing and
+reader cost remain unimplemented. The original ten-scheme metrics match
+exactly under the same local CPU/Torch/thread contract. See the separate
+ablation ledger; no runtime codec/default is selected from this short corpus.
+
+Six decode workspace/partition helpers and two constants now live in
+`flash_v100/decode_policy.py`, with original bodies, backend reexports and
+legacy dtype envelopes unchanged. Source/matrix/environment checks pass25;
+five CPU partition tests pass. One broader device-config case cannot infer a
+GPU on this host and remains pending on V100. Backend8712 lines; aggregate89
+environment names/26 dtype predicates/52 route calls unchanged. The common
+format-independent schedule and reduction remain separate, unqualified work.
+
+The shortened Flash-Next token-ID attempt succeeds with12 real QSA samples,
+source120 ordinary wheel, TP4,157 tokens, FP16 KV/eager/no-MTP/no-prefix. Every
+rank executes12 grouped-page4 and12 XQA-page4 calls; each sample sees one of
+each. Actual masks and addressed compressor state are captured; own GPU/PLE
+workers exit normally and release the15-minute lease. Initialization803.17s
+and hooked request1.35s are diagnostic durations, not serving speed.
+All sampled layers3/27/47 have ratio4 and select the entire causal short
+history; ratio128 and actual top-k pruning remain uncovered. Future capture
+selection adds each distinct ratio, and9 CPU semantic checks pass. No repeat
+cold Flash-Next load is justified until a longer/ratio128 gate is prepared.
+Twelve-scheme K/V ablation and FP16 staging are retained in the new Flash-Next
+ledger; no native INT8/default/quality acceptance is implied.
+
+The normal sourceb50 partition-policy wheel SHA256 is
+`2720c79b9beae241748bfe7e3cfd0860c21eac1c6c68c186837fa57f57ce74a0`.
+All2090 packaged Python sources match;16 native libraries exclude private
+paths,15 are byte-identical to source69 and the remaining FA2 complete SM70
+SASS matches after anonymous namespace hashes only. The exact whole artifact
+installs normally on54633; dependency check passes201 packages. The short
+native FP16/E5M2 writer and installed partition/operator gate waits for global
+locks; idle devices do not authorize bypassing another task's reservation.
+
+The capture tool now supports an ordered request corpus with one engine load,
+independent per-request hooks/manifests and a complete aggregate marker.
+Single-request compatibility, request isolation and failed-corpus rejection
+pass33 combined CPU capture/evaluator tests. Real multi-request/ratio128 GPU
+execution remains pending; existing captured tensors are not relabelled.
+The repository's eight natural Flash-Next prompts are tokenized for all three
+models with source/template/token hashes, using only CPU. This prepares a
+broader error corpus without repeating cold model startup per prompt. No KV
+or acceptance result is claimed from tokenization. The active short-gate queue
+retains source860/numericb50 and is not updated while waiting/running.
+
+The sourceb50 installed native writer/partition lease now passes12 tests with
+no skips:6 FP16 layout/bit-pattern/padded-slot cases and6 policy/metadata cases,
+including the formerly GPU-less device-config case. The existing E5M2 unit-scale
+oracle passes all65536 FP16 encodings. Stable library SHA remains
+`f0a16df8cb05e3b7953ab811c9a3abbf91c465df7aa3d64d544f48640c433ff1`.
+The following operator harness fails before launching attention because it
+imports the obsolete top-level `flash_attn_v100_cuda` name. Fix only its import
+to the normal nested package; do not introduce a runtime alias/library overlay.
+Retain the failed lease log. Workers/locks release; the remaining operator,
+Q8192 route and matched NVFP4 model gates requeue without repeating these12
+already-passing tests. Real multi-request/quality and INT8 gates remain pending.

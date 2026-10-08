@@ -1,0 +1,147 @@
+{
+  "scope": "CPU tokenization only; no captured KV, generation or quality evidence",
+  "prompt_source_sha256": "c805fa82f23c24fba10c323fc5edbce3a451d1e9ffae61fa0d843a6221fe9abd",
+  "models": {
+    "nvfp4": {
+      "vocab_size": 248077,
+      "chat_template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+      "request_file_sha256": "41ae863db7897f340c5af83d2c64139c0c2164d711cc41a5c63edf18fa5ee542",
+      "requests": [
+        {
+          "id": "zh_story",
+          "tokens": 63,
+          "request_tokens_sha256": "fb38bc38357c39e1e934cd50d41fb8aaf1705f586e27bf5d4cd8c348b0bef3a0"
+        },
+        {
+          "id": "en_story",
+          "tokens": 68,
+          "request_tokens_sha256": "cdeb5384355204f6eb71c957efa8efb02270b9e79711ae52b4e368cb14b7a466"
+        },
+        {
+          "id": "zh_science",
+          "tokens": 66,
+          "request_tokens_sha256": "07512a7e3e633ce031920c3ca9808eb860fe035fb15fd5eaaed176805c3c77ca"
+        },
+        {
+          "id": "en_science",
+          "tokens": 66,
+          "request_tokens_sha256": "015a3ac940ffc66231e541ed71b16f430aaea5b8034357f249f23938c5e58527"
+        },
+        {
+          "id": "python_cache",
+          "tokens": 68,
+          "request_tokens_sha256": "9f0f27fdfb40f8c311ba964b29807b3ac6f9f4f8d88b67e90e3578607d084c68"
+        },
+        {
+          "id": "python_graph",
+          "tokens": 66,
+          "request_tokens_sha256": "75a2e94e4023743a23faa1a69b9291d09972e7fc0290e5f24a0c01415e19e445"
+        },
+        {
+          "id": "zh_reasoning",
+          "tokens": 72,
+          "request_tokens_sha256": "232db9d2e6431b50d6fa33fb4b1ea3ae4801eac98ac449c9f63829c929f748e8"
+        },
+        {
+          "id": "en_reasoning",
+          "tokens": 78,
+          "request_tokens_sha256": "e0db869bb65fb0f7b6bcfa807fb2519c2cd5f39ced1460b1066f1ff1f518adeb"
+        }
+      ]
+    },
+    "gguf": {
+      "vocab_size": 248320,
+      "chat_template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+      "request_file_sha256": "b80af2984b98e15469126d17e53ea0ddfb75c523a194099a82722c9940679589",
+      "requests": [
+        {
+          "id": "zh_story",
+          "tokens": 63,
+          "request_tokens_sha256": "fb38bc38357c39e1e934cd50d41fb8aaf1705f586e27bf5d4cd8c348b0bef3a0"
+        },
+        {
+          "id": "en_story",
+          "tokens": 68,
+          "request_tokens_sha256": "cdeb5384355204f6eb71c957efa8efb02270b9e79711ae52b4e368cb14b7a466"
+        },
+        {
+          "id": "zh_science",
+          "tokens": 66,
+          "request_tokens_sha256": "07512a7e3e633ce031920c3ca9808eb860fe035fb15fd5eaaed176805c3c77ca"
+        },
+        {
+          "id": "en_science",
+          "tokens": 66,
+          "request_tokens_sha256": "015a3ac940ffc66231e541ed71b16f430aaea5b8034357f249f23938c5e58527"
+        },
+        {
+          "id": "python_cache",
+          "tokens": 68,
+          "request_tokens_sha256": "9f0f27fdfb40f8c311ba964b29807b3ac6f9f4f8d88b67e90e3578607d084c68"
+        },
+        {
+          "id": "python_graph",
+          "tokens": 66,
+          "request_tokens_sha256": "75a2e94e4023743a23faa1a69b9291d09972e7fc0290e5f24a0c01415e19e445"
+        },
+        {
+          "id": "zh_reasoning",
+          "tokens": 72,
+          "request_tokens_sha256": "232db9d2e6431b50d6fa33fb4b1ea3ae4801eac98ac449c9f63829c929f748e8"
+        },
+        {
+          "id": "en_reasoning",
+          "tokens": 78,
+          "request_tokens_sha256": "e0db869bb65fb0f7b6bcfa807fb2519c2cd5f39ced1460b1066f1ff1f518adeb"
+        }
+      ]
+    },
+    "flashnext": {
+      "vocab_size": 248320,
+      "chat_template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+      "request_file_sha256": "41ae863db7897f340c5af83d2c64139c0c2164d711cc41a5c63edf18fa5ee542",
+      "requests": [
+        {
+          "id": "zh_story",
+          "tokens": 63,
+          "request_tokens_sha256": "fb38bc38357c39e1e934cd50d41fb8aaf1705f586e27bf5d4cd8c348b0bef3a0"
+        },
+        {
+          "id": "en_story",
+          "tokens": 68,
+          "request_tokens_sha256": "cdeb5384355204f6eb71c957efa8efb02270b9e79711ae52b4e368cb14b7a466"
+        },
+        {
+          "id": "zh_science",
+          "tokens": 66,
+          "request_tokens_sha256": "07512a7e3e633ce031920c3ca9808eb860fe035fb15fd5eaaed176805c3c77ca"
+        },
+        {
+          "id": "en_science",
+          "tokens": 66,
+          "request_tokens_sha256": "015a3ac940ffc66231e541ed71b16f430aaea5b8034357f249f23938c5e58527"
+        },
+        {
+          "id": "python_cache",
+          "tokens": 68,
+          "request_tokens_sha256": "9f0f27fdfb40f8c311ba964b29807b3ac6f9f4f8d88b67e90e3578607d084c68"
+        },
+        {
+          "id": "python_graph",
+          "tokens": 66,
+          "request_tokens_sha256": "75a2e94e4023743a23faa1a69b9291d09972e7fc0290e5f24a0c01415e19e445"
+        },
+        {
+          "id": "zh_reasoning",
+          "tokens": 72,
+          "request_tokens_sha256": "232db9d2e6431b50d6fa33fb4b1ea3ae4801eac98ac449c9f63829c929f748e8"
+        },
+        {
+          "id": "en_reasoning",
+          "tokens": 78,
+          "request_tokens_sha256": "e0db869bb65fb0f7b6bcfa807fb2519c2cd5f39ced1460b1066f1ff1f518adeb"
+        }
+      ]
+    }
+  }
+}

@@ -3,15 +3,19 @@
 
 import torch
 
-from vllm.model_executor.layers.quantization.utils.quant_utils import (
-    FP8_DTYPE,
-    get_fp8_min_max,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import is_quantized_kv_cache
-
-FP8_MIN, FP8_MAX = get_fp8_min_max()
+from vllm.v1.attention.ops.kv_codec import (
+    _PER_TOKEN_HEAD_QUANT_PARAMS,
+    FP8_DTYPE,  # noqa: F401
+    FP8_MAX,  # noqa: F401
+    FP8_MIN,  # noqa: F401
+    encode_kv_per_tensor,
+    encode_kv_per_token_head,
+    get_fp8_min_max,  # noqa: F401
+    kv_token_head_scale,
+)
 
 _NATIVE_KV_CACHE_DTYPES = {"auto", "float16", "bfloat16", "float32", "half", "float"}
 
@@ -98,26 +102,13 @@ def reshape_and_cache_kernel_flash(
     key_load = tl.load(
         key_ptr + src_key_idx + tile_pos, mask=tile_pos < (num_heads * head_size)
     )
-    if FP8_KV_CACHE:
-        # tl.store will do the correct implicit cast to fp8,
-        # based on the key_cache_ptr.dtype.element_ty
-        key_tile = key_load if key_load.dtype.is_fp8() else key_load / tl.load(k_scale)
-    else:
-        key_tile = key_load
+    key_tile = encode_kv_per_tensor(key_load, k_scale, FP8_KV_CACHE)
 
     # [TILE_SIZE]
     value_load = tl.load(
         value_ptr + src_value_idx + tile_pos, mask=tile_pos < (num_heads * head_size)
     )
-    if FP8_KV_CACHE:
-        if value_load.dtype.is_fp8():
-            value_tile = value_load
-        else:
-            # tl.store will do the correct implicit cast to fp8,
-            #  based on the value_cache_ptr.dtype.element_ty
-            value_tile = value_load / tl.load(v_scale)
-    else:
-        value_tile = value_load
+    value_tile = encode_kv_per_tensor(value_load, v_scale, FP8_KV_CACHE)
 
     tl.store(
         key_cache_ptr + tgt_idx_k,
@@ -195,7 +186,7 @@ def _reshape_cache_per_token_head(
         other=0.0,
     ).to(tl.float32)
 
-    k_scale = tl.maximum(tl.max(tl.abs(k_h)) / QUANT_MAX, 1e-6)
+    k_scale = kv_token_head_scale(k_h, QUANT_MAX)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -204,7 +195,7 @@ def _reshape_cache_per_token_head(
         k_scale,
     )
 
-    k_q = tl.clamp(k_h * (1.0 / k_scale), QUANT_MIN, QUANT_MAX)
+    k_q = encode_kv_per_token_head(k_h, k_scale, QUANT_MIN, QUANT_MAX)
     tl.store(
         key_cache_ptr
         + blk * stride_kc_blk
@@ -223,7 +214,7 @@ def _reshape_cache_per_token_head(
         other=0.0,
     ).to(tl.float32)
 
-    v_scale = tl.maximum(tl.max(tl.abs(v_h)) / QUANT_MAX, 1e-6)
+    v_scale = kv_token_head_scale(v_h, QUANT_MAX)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -232,7 +223,7 @@ def _reshape_cache_per_token_head(
         v_scale,
     )
 
-    v_q = tl.clamp(v_h * (1.0 / v_scale), QUANT_MIN, QUANT_MAX)
+    v_q = encode_kv_per_token_head(v_h, v_scale, QUANT_MIN, QUANT_MAX)
     tl.store(
         value_cache_ptr
         + blk * stride_vc_blk
@@ -242,14 +233,6 @@ def _reshape_cache_per_token_head(
         v_q,
         mask=v_mask,
     )
-
-
-# Mapping from cache torch dtype to (QUANT_MAX, QUANT_MIN) for the
-# per-token-head quantization kernel.
-_PER_TOKEN_HEAD_QUANT_PARAMS: dict[torch.dtype, tuple[float, float]] = {
-    torch.int8: (127.0, -128.0),
-    FP8_DTYPE: (FP8_MAX, FP8_MIN),
-}
 
 
 def triton_reshape_and_cache_flash_per_token_head_quant(
@@ -483,26 +466,13 @@ def reshape_and_cache_kernel_flash_diffkv(
 
     # [TILE_SIZE]
     key_load = tl.load(key_ptr + src_key_idx + tile_offs, mask=tile_offs < head_size_k)
-    if FP8_KV_CACHE:
-        # tl.store will do the correct implicit cast to fp8,
-        # based on the key_cache_ptr.dtype.element_ty
-        key_tile = key_load if key_load.dtype.is_fp8() else key_load / tl.load(k_scale)
-    else:
-        key_tile = key_load
+    key_tile = encode_kv_per_tensor(key_load, k_scale, FP8_KV_CACHE)
 
     # [TILE_SIZE]
     value_load = tl.load(
         value_ptr + src_value_idx + tile_offs, mask=tile_offs < head_size_v
     )
-    if FP8_KV_CACHE:
-        if value_load.dtype.is_fp8():
-            value_tile = value_load
-        else:
-            # tl.store will do the correct implicit cast to fp8,
-            #  based on the value_cache_ptr.dtype.element_ty
-            value_tile = value_load / tl.load(v_scale)
-    else:
-        value_tile = value_load
+    value_tile = encode_kv_per_tensor(value_load, v_scale, FP8_KV_CACHE)
 
     tl.store(
         kv_cache_ptr + tgt_idx + tile_offs,

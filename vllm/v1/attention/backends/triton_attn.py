@@ -40,6 +40,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.kv_cache_codec import KVCacheCodec
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -478,13 +479,13 @@ class TritonAttentionBackend(AttentionBackend):
             # Pad head_size by sizeof(float32)/sizeof(cache_dtype) so
             # the per-head scale fits inline.  The backend extracts
             # data[:head_size] and scale[head_size:] via typed views.
-            from vllm.utils.torch_utils import (
-                STR_DTYPE_TO_TORCH_DTYPE,
-                get_dtype_size,
-            )
+            from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 
-            cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str]
-            scale_pad = get_dtype_size(torch.float32) // get_dtype_size(cache_dtype)
+            codec = KVCacheCodec(
+                STR_DTYPE_TO_TORCH_DTYPE[cache_dtype_str],
+                get_kv_quant_mode(cache_dtype_str),
+            )
+            scale_pad = codec.scale_padding_elements
             return (num_blocks, 2, block_size, num_kv_heads, head_size + scale_pad)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
@@ -565,43 +566,31 @@ class TritonAttentionImpl(AttentionImpl):
         """
         if self._k_scale_cache is not None:
             return
-        from vllm.utils.torch_utils import get_dtype_size
-
         num_blocks, _, block_size, nkv, padded_hs = kv_cache.shape
-        dtype_sz = kv_cache.element_size()
-        scale_pad = get_dtype_size(torch.float32) // dtype_sz  # e.g. 4
-        hs = padded_hs - scale_pad
+        codec = KVCacheCodec(kv_cache.dtype, self._kv_quant_mode)
+        hs = padded_hs - codec.scale_padding_elements
+        layout = codec.per_token_head_scale_layout(block_size, nkv, hs)
 
         raw = kv_cache.untyped_storage()
         base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
             raw
         )
 
-        # In the raw bytes, each (block, kv_half, slot, head) occupies
-        # padded_hs * dtype_sz bytes.  The scale float32 sits at byte
-        # offset hs * dtype_sz within that region.
-        kv_half_bytes = block_size * nkv * padded_hs * dtype_sz
-        full_block_f32 = 2 * kv_half_bytes // 4  # stride between blocks
-        slot_f32 = nkv * padded_hs * dtype_sz // 4  # stride between slots
-        head_f32 = padded_hs * dtype_sz // 4  # stride between heads
-        scale_off_f32 = hs * dtype_sz // 4  # offset to scale within head
-
         # K scales: kv_half=0
         self._k_scale_cache = torch.as_strided(
             base_f32,
             size=(num_blocks, block_size, nkv),
-            stride=(full_block_f32, slot_f32, head_f32),
-            storage_offset=scale_off_f32,
+            stride=layout.strides,
+            storage_offset=layout.k_offset,
         )
         self._k_scale_cache.fill_(1.0)
 
-        # V scales: kv_half=1, offset by kv_half_bytes
-        v_base_f32 = kv_half_bytes // 4
+        # V scales: kv_half=1, after the K half of the physical block
         self._v_scale_cache = torch.as_strided(
             base_f32,
             size=(num_blocks, block_size, nkv),
-            stride=(full_block_f32, slot_f32, head_f32),
-            storage_offset=v_base_f32 + scale_off_f32,
+            stride=layout.strides,
+            storage_offset=layout.v_offset,
         )
         self._v_scale_cache.fill_(1.0)
 
