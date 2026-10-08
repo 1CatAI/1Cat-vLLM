@@ -134,3 +134,18 @@ VERIFICATION_METHODS = {
     "_flash_v100_small_query_prefill_as_decode": "small_query_prefill",
 }
 VALIDATION_METHOD = "_validate_dflash_attention_contract"
+
+
+PREFILL_CALLBACK_FIELDS = {
+    "tree_prefill": "_flash_v100_ddtree_small_query_prefill_dense",
+    "small_query": "_flash_v100_small_query_prefill_as_decode",
+}
+
+
+def prefill_dependencies(state):
+    return {
+        "supports_bmhd": getattr(
+            state, "_flash_prefill_paged_supports_dflash2_bmhd", False
+        ),
+        "split_pages": getattr(state, "_flash_prefill_paged_dflash2_split_pages", ()),
+    }

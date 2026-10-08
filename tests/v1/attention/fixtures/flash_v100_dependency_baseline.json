@@ -2,9 +2,9 @@
   "metrics": {
     "forward": 400,
     "largest_function": 400,
-    "cross_module_private": 330,
-    "import_cycles": 3,
-    "model_names_outside_spec": 154,
+    "cross_module_private": 318,
+    "import_cycles": 2,
+    "model_names_outside_spec": 151,
     "env_outside_config": 0,
     "state_flags": 29
   },
@@ -16,10 +16,6 @@
     [
       "vllm.v1.attention.backends.flash_v100.dense_prefill",
       "vllm.v1.attention.backends.flash_v100.kv_layout"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.impl",
-      "vllm.v1.attention.backends.flash_v100.prefill"
     ]
   ],
   "edges": [
@@ -309,10 +305,6 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.prefill",
-      "vllm.v1.attention.backends.flash_v100.impl"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.prefill",
       "vllm.v1.attention.backends.flash_v100.kv_layout"
     ],
     [
@@ -556,10 +548,6 @@
     [
       "vllm.v1.attention.backends.flash_v100.prefill",
       "vllm.v1.attention.backends.flash_v100.dense_prefill"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.prefill",
-      "vllm.v1.attention.backends.flash_v100.impl"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.prefill",
@@ -1636,6 +1624,7 @@
     "dense_prefill.py:flash_v100_dense_prefill_lse": 156,
     "dense_prefill.py:_allocate": 3,
     "impl.py:_verification_method": 14,
+    "impl.py:_prefill_method": 5,
     "impl.py:spec_attention": 7,
     "impl.py:__getattr__": 4,
     "impl.py:__setattr__": 5,
@@ -1649,6 +1638,7 @@
     "impl.py:_flash_v100_window_size": 9,
     "impl.py:_new_decode_executor": 34,
     "impl.py:_call_flash_attn_decode_paged": 40,
+    "impl.py:_new_prefill_executor": 34,
     "impl.py:_new_verification_executor": 32,
     "impl.py:_anchored_swa_params": 4,
     "impl.py:forward": 400,
@@ -1741,11 +1731,16 @@
     "prefill.py:log_fp8_bridge": 9,
     "prefill.py:log_splitkv": 11,
     "prefill.py:execute_prefill_sequence": 45,
-    "prefill.py:create_prefill_executor": 52,
+    "prefill.py:create_prefill_executor": 36,
     "prefill.py:log_noncausal": 8,
     "prefill.py:log_small_query": 8,
     "prefill.py:execute_prefill_batch": 52,
     "prefill.py:observe_prefill_reference": 56,
+    "prefill.py:__init__": 9,
+    "prefill.py:scale": 2,
+    "prefill.py:kv_cache_dtype": 2,
+    "prefill.py:kv_codec": 2,
+    "prefill.py:__getattr__": 4,
     "prefill.py:run": 16,
     "prefill_candidates.py:kv_codec": 2,
     "prefill_candidates.py:__init__": 2,
@@ -1798,6 +1793,7 @@
     "spec/attention.py:capture_prefix_kind": 6,
     "spec/attention.py:record_capture_prefix": 10,
     "spec/attention.py:record_capture_layout": 9,
+    "spec/attention.py:prefill_dependencies": 7,
     "spec/attention_policy.py:initialize_scalar_tail": 22,
     "spec/attention_policy.py:initialize_verify_abi": 3,
     "spec/attention_policy.py:configure_prefill": 4,

@@ -138,3 +138,14 @@ to the packet; feature names are declared only by its Spec owner. Existing raw
 fields migrate without tensor copies. Shallow copies get independent packets
 while sharing tensors, and packets do not retain the enclosing metadata.
 Older duck-typed external metadata remains accepted at the compatibility view.
+
+## Prefill owner boundary
+
+`prefill.PrefillExecutor` owns per-layer policy/geometry, explicit
+`PrefillDriverOps` and the existing `V100Workspace`. Its calculations never
+receive Impl. Common assembly constructs the owner and preserves legacy method
+facades/instance overrides. The inner candidate executor receives native and
+admission callbacks from this owner. Snapshot construction is per legacy call,
+so later operator or policy changes affect subsequent calls without changing an
+already created owner. Speculative callback names and capabilities belong to
+`spec.attention`; no entire attention implementation is passed there.

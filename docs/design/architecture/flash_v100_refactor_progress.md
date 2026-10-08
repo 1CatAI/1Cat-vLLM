@@ -15,9 +15,9 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 1c: route/token/output parity tools | #1073 | Draft; host/spec model records pending | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Host/spec model gates |
 | 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Prerequisite model gates |
 | 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Prerequisite model gates |
-| 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase passed | Private references 390 → 387 | Pending | CPU/rebase and GPU prerequisites |
+| 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase/native gates passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; named timing gates passed | Model gates pending |
-| 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict passed | Private references 380 → 374; cycles 14 → 13 | Queued after Step 3 | Required GPU gates |
+| 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native gates passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; named timing gates passed | Model gates pending |
 | 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
 | 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
 | 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
@@ -28,7 +28,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Required | Strict/rebase/GPU gates |
 | 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Required | Strict/rebase/GPU gates |
 | 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Required | Strict/rebase/GPU gates |
-| 6e: registered speculative features | — | CPU/golden passed | Private 332 → 330 | Required | Strict/rebase/GPU gates |
+| 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Required | Strict/rebase/GPU gates |
+| 6f: complete prefill execution ownership | — | CPU/golden passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Required | Strict/rebase/GPU gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -880,3 +881,47 @@ exclusions**, including actual shim consumption (`a3-feature-registration-strict
 and `a3-feature-registration-shim.json`). No production/source-oracle file
 changed during the run. Subsequent lint corrections only wrap a dictionary value
 and annotate the new test's mixed event list; the affected tests are rerun.
+
+## Step 6f complete prefill execution ownership
+
+PR #1097 is `bad1ad1d0cbce85a3744202d009e4cb92b87e19d`. Actual #1028
+replay is `69cbc10d8e10d5e19a1e247d1c07d633d552d43c`, tree
+`f2228c98f0bf5700774d6ba1ba68d6296ce56144`, equal to clean merge-tree;
+37 CPU integration tests pass with 98 GPU skips. Four source-verified GPU queues
+are staged as `a3-step6e`. Pinned #1028/#1048 heads remain unchanged.
+
+Prefill calculation functions now receive an owned PrefillExecutor configured
+with immutable policy/geometry, explicit native operators and narrow callbacks,
+and the existing workspace. Common assembly retains the external method
+facades and instance overrides, including falsey callables. The candidate
+executor uses this owner; prefill neither imports nor receives Impl. No
+calculation body is moved or rewritten in this slice; ownership adapters and
+dependency construction are the change.
+
+The initial golden run caught one omitted grouped native operator dependency,
+previously retrieved with getattr in mixed-row preparation. The operator is
+now injected and the unchanged golden passes. The 38-case focused suite covers
+all 813 traces and original method hashes (`a3-prefill-owner-focused-final.log`).
+Five boundary cases exercise real bound/unbound profile calls on the owner,
+falsey overrides, native refresh/feature overrides and policy snapshot isolation
+(`a3-prefill-owner-boundary.log`). Metrics tighten to
+400 / 400 / 318 / 2 / 151 / 0 / 29 without new forbidden edges.
+
+Step 4a GPU regression/native gates finish on 54633: 1689 passes / the same
+seven inherited failures, exactly two new passing cases and no changed old
+outcomes. All 12 attention outputs have max-abs 0. Designated timing deltas are
+FP16 XQA graph 0%, E4M3 XQA graph +0.0236434%, and 75T-role prefill +0.778561%,
+all within 2%. Other timings are recorded without broadening their acceptance
+role. Evidence: `a3-step4a/logs/{regression-parity.json,op-compare.log,regression.done}`
+(completed 2026-10-09 06:09:34 +08:00). Complete model gates remain pending.
+
+The complete fixed-source strict suite passes **315 tests / 1 skip / 28 GPU
+exclusions**, including real shim use (`a3-prefill-owner-strict.log` and
+`a3-prefill-owner-shim.json`). Pre-commit/mypy/layering pass
+(`a3-prefill-owner-precommit-final.log`). No production/source-oracle file
+changed during the accepted run.
+
+Step 3a's small Qwen model gate is also complete: FP16/E4M3 crossed with
+eager/graph, three requests each, all token/route records equal. The four
+`a3-step3a/logs/qwen-*-compare.log` files report `equal=True, requests=3`;
+`qwen.done` is dated 2026-10-09 05:16:38 +08:00. Host/spec gates still remain.

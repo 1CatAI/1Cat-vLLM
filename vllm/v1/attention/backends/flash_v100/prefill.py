@@ -1,13 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Flash-V100 prefill methods, bound by impl."""
+"""Prefill execution with owned policy, operators and workspace."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import fields
-from types import SimpleNamespace
-from typing import cast
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -15,7 +14,6 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import dense_prefill as _dense_prefill
-from vllm.v1.attention.backends.flash_v100 import impl as _impl
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import prefill_candidates as _sequence
@@ -36,11 +34,13 @@ from vllm.v1.attention.ops.sm70_grouped import (
     grouped_e4m3_fp32_groups_allowed,
 )
 
+PrefillConfig = _sequence.PrefillConfig
+
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
 def _flash_v100_prefill(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -72,7 +72,7 @@ def _flash_v100_prefill(
 
 
 def _should_use_fp8_prefill_bridge(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     *,
     q_len: int,
     head_dim: int,
@@ -105,7 +105,7 @@ def _should_use_fp8_prefill_bridge(
 
 
 def _run_fp8_prefill_bridge(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     *,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -253,7 +253,7 @@ def _run_fp8_prefill_bridge(
 
 
 def _should_use_prefill_splitkv(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     *,
     q_len: int,
     seq_len: int,
@@ -281,7 +281,7 @@ def _should_use_prefill_splitkv(
 
 
 def _should_use_prefill_bfla(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     *,
     q_len: int,
     seq_len: int,
@@ -308,7 +308,7 @@ def _should_use_prefill_bfla(
 
 
 def _should_use_prefill_contig_dense(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     *,
     q_len: int,
     seq_len: int,
@@ -331,7 +331,7 @@ def _should_use_prefill_contig_dense(
 
 
 def _should_use_prefill_gather_dense(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     *,
     q_len: int,
     seq_len: int,
@@ -392,7 +392,7 @@ def _should_use_prefill_gather_dense(
 
 
 def _prefill_prefix_decode_rows_allowed(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     *,
     causal: bool,
     anchor_lens: torch.Tensor | None,
@@ -416,7 +416,7 @@ def _prefill_prefix_decode_rows_allowed(
 
 
 def _run_mixed_rows_grouped_e4m3(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     layer: torch.nn.Module,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -498,7 +498,7 @@ def _run_mixed_rows_grouped_e4m3(
 
 
 def _run_prefill_prefix_decode_rows(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     layer: torch.nn.Module,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -671,7 +671,7 @@ def _run_prefill_prefix_decode_rows(
 
 
 def _run_prefill_paged_call(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     *,
     route: str,
     q_len: int,
@@ -708,7 +708,7 @@ def _run_prefill_paged_call(
 
 
 def _flash_v100_prefill_with_prefix(
-    self: _impl.FlashAttnV100Impl,
+    self: PrefillExecutor,
     layer: torch.nn.Module,
     query: torch.Tensor,
     key: torch.Tensor | None,
@@ -1057,19 +1057,7 @@ def execute_prefill_sequence(
 
 
 def create_prefill_executor(self):
-    policy = getattr(self, "config", None)
-    if policy is None:
-        attributes = vars(self)
-        policy = SimpleNamespace(
-            **{
-                field.name: attributes[field.name]
-                for field in fields(_config.V100AttnConfig)
-                if field.name in attributes
-            }
-        )
-    config = _sequence.PrefillConfig(
-        cast(_config.V100AttnConfig, policy), self.scale, self.kv_cache_dtype
-    )
+    config = self.settings
     ops = _sequence.PrefillOps(
         bridge=getattr(self, "_run_fp8_prefill_bridge", None),
         run_paged=getattr(self, "_run_prefill_paged_call", None),
@@ -1092,14 +1080,10 @@ def create_prefill_executor(self):
         log_dense_fa2=log_dense_fa2,
         log_fp8_bridge=log_fp8_bridge,
         log_splitkv=log_splitkv,
-        supports_bmhd=getattr(
-            self, "_flash_prefill_paged_supports_dflash2_bmhd", False
-        ),
-        split_pages=getattr(self, "_flash_prefill_paged_dflash2_split_pages", ()),
-        tree_prefill=getattr(
-            self, "_flash_v100_ddtree_small_query_prefill_dense", None
-        ),
-        small_query=getattr(self, "_flash_v100_small_query_prefill_as_decode", None),
+        supports_bmhd=self.ops.supports_bmhd,
+        split_pages=self.ops.split_pages,
+        tree_prefill=self.ops.tree_prefill,
+        small_query=self.ops.small_query,
         allow_rows=getattr(self, "_prefill_prefix_decode_rows_allowed", None),
         decode_rows=getattr(self, "_run_prefill_prefix_decode_rows", None),
         log_noncausal=log_noncausal,
@@ -1240,3 +1224,105 @@ def observe_prefill_reference(
             self._layer_debug_info,
         )
     )
+
+
+@dataclass(frozen=True)
+class PrefillDriverOps:
+    dense: Any = None
+    bhmd: Any = None
+    paged: Any = None
+    bfla: Any = None
+    splitkv: Any = None
+    bridge_e4: Any = None
+    bridge_e5: Any = None
+    xqa: Any = None
+    grouped_e4m3: Any = None
+    window: Any = None
+    anchored: Any = None
+    decode: Any = None
+    xqa_codec: Any = None
+    layer_info: Any = None
+    tree_prefill: Any = None
+    small_query: Any = None
+    supports_anchor: bool = False
+    supports_bmhd: bool = False
+    split_pages: tuple[int, ...] = ()
+
+
+# Calculation bodies keep their old local spelling. Each binding below resolves
+# to a bounded native operator/callback rather than an attention implementation.
+OPERATOR_FIELDS = {
+    "flash_attn_func": "dense",
+    "flash_attn_bhmd_func": "bhmd",
+    "flash_attn_prefill_paged": "paged",
+    "flash_attn_prefill_paged_bfla": "bfla",
+    "flash_attn_prefill_paged_splitkv": "splitkv",
+    "fp8_e4m3_paged_kv_to_fp16": "bridge_e4",
+    "fp8_e5m2_paged_kv_to_fp16": "bridge_e5",
+    "flash_attn_decode_paged_xqa": "xqa",
+    "flash_attn_grouped_e4m3_fp32_paged": "grouped_e4m3",
+    "_flash_v100_window_size": "window",
+    "_anchored_swa_params": "anchored",
+    "_call_flash_attn_decode_paged": "decode",
+    "_xqa_kv_codec": "xqa_codec",
+    "_layer_debug_info": "layer_info",
+    "_flash_prefill_paged_supports_anchor": "supports_anchor",
+}
+
+
+class PrefillExecutor:
+    def __init__(self, settings, ops, workspace, overrides=None):
+        self.settings = settings
+        self.config = settings.policy
+        self.ops = ops
+        self.workspace = workspace
+        # Preserve explicit instance-level compatibility overrides, including
+        # falsey callables. Default methods execute on this owner.
+        if overrides:
+            vars(self).update(overrides)
+
+    @property
+    def scale(self):
+        return self.settings.scale
+
+    @property
+    def kv_cache_dtype(self):
+        return self.settings.kv_cache_dtype
+
+    @property
+    def kv_codec(self):
+        return self.settings.kv_codec
+
+    def __getattr__(self, name):
+        if name in OPERATOR_FIELDS:
+            return getattr(self.ops, OPERATOR_FIELDS[name])
+        return getattr(self.config, name)
+
+    _flash_v100_prefill = _flash_v100_prefill
+    _should_use_fp8_prefill_bridge = _should_use_fp8_prefill_bridge
+    _run_fp8_prefill_bridge = _run_fp8_prefill_bridge
+    _should_use_prefill_splitkv = _should_use_prefill_splitkv
+    _should_use_prefill_bfla = _should_use_prefill_bfla
+    _should_use_prefill_contig_dense = _should_use_prefill_contig_dense
+    _should_use_prefill_gather_dense = _should_use_prefill_gather_dense
+    _prefill_prefix_decode_rows_allowed = _prefill_prefix_decode_rows_allowed
+    _run_mixed_rows_grouped_e4m3 = _run_mixed_rows_grouped_e4m3
+    _run_prefill_prefix_decode_rows = _run_prefill_prefix_decode_rows
+    _run_prefill_paged_call = _run_prefill_paged_call
+    _flash_v100_prefill_with_prefix = _flash_v100_prefill_with_prefix
+
+
+LEGACY_METHODS = (
+    "_flash_v100_prefill",
+    "_should_use_fp8_prefill_bridge",
+    "_run_fp8_prefill_bridge",
+    "_should_use_prefill_splitkv",
+    "_should_use_prefill_bfla",
+    "_should_use_prefill_contig_dense",
+    "_should_use_prefill_gather_dense",
+    "_prefill_prefix_decode_rows_allowed",
+    "_run_mixed_rows_grouped_e4m3",
+    "_run_prefill_prefix_decode_rows",
+    "_run_prefill_paged_call",
+    "_flash_v100_prefill_with_prefix",
+)

@@ -570,6 +570,41 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             anchored_window=anchored_window,
         )
 
+    def _new_prefill_executor(self):
+        policy = self._policy()
+        settings = _prefill.PrefillConfig(
+            cast(_config.V100AttnConfig, policy),
+            getattr(self, "scale", 1.0),
+            getattr(self, "kv_cache_dtype", "auto"),
+        )
+        native: dict[str, Any] = {
+            field: getattr(self, legacy_name, None)
+            for legacy_name, field in _prefill.OPERATOR_FIELDS.items()
+            if field != "supports_anchor"
+        }
+        callbacks: dict[str, Any] = {
+            field: getattr(self, legacy_name, None)
+            for field, legacy_name in _feature.PREFILL_CALLBACK_FIELDS.items()
+        }
+        ops = _prefill.PrefillDriverOps(
+            **native,
+            supports_anchor=getattr(
+                self, "_flash_prefill_paged_supports_anchor", False
+            ),
+            **_feature.prefill_dependencies(self.spec_attention),
+            **callbacks,
+        )
+        return _prefill.PrefillExecutor(
+            settings,
+            ops,
+            getattr(self, "workspace", None) or _decode.V100Workspace(),
+            {
+                name: vars(self)[name]
+                for name in _prefill.LEGACY_METHODS
+                if name in vars(self)
+            },
+        )
+
     def _new_verification_executor(self) -> _verify.VerificationExecutor:
         policy = self._policy()
         limits: dict[str, Any] = {
@@ -1077,8 +1112,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             layer, query, kv_cache, attn_metadata, output
         )
 
-    _flash_v100_prefill = _prefill._flash_v100_prefill
-
     def _flash_v100_decode(
         self,
         layer: torch.nn.Module,
@@ -1092,28 +1125,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         return self._new_decode_executor()._flash_v100_decode(
             layer, query, key, value, kv_cache, attn_metadata, output
         )
-
-    _should_use_fp8_prefill_bridge = _prefill._should_use_fp8_prefill_bridge
-
-    _run_fp8_prefill_bridge = _prefill._run_fp8_prefill_bridge
-
-    _should_use_prefill_splitkv = _prefill._should_use_prefill_splitkv
-
-    _should_use_prefill_bfla = _prefill._should_use_prefill_bfla
-
-    _should_use_prefill_contig_dense = _prefill._should_use_prefill_contig_dense
-
-    _should_use_prefill_gather_dense = _prefill._should_use_prefill_gather_dense
-
-    _prefill_prefix_decode_rows_allowed = _prefill._prefill_prefix_decode_rows_allowed
-
-    _run_mixed_rows_grouped_e4m3 = _prefill._run_mixed_rows_grouped_e4m3
-
-    _run_prefill_prefix_decode_rows = _prefill._run_prefill_prefix_decode_rows
-
-    _run_prefill_paged_call = _prefill._run_prefill_paged_call
-
-    _flash_v100_prefill_with_prefix = _prefill._flash_v100_prefill_with_prefix
 
 
 # Preserve the original __class__ cell semantics of the extracted super call.
@@ -1142,3 +1153,15 @@ for _legacy_name, _method in _feature.VERIFICATION_METHODS.items():
     _compatibility_method = _verification_method(_method)
     setattr(FlashAttnV100Impl, _legacy_name, _compatibility_method)
     globals()[_legacy_name] = _compatibility_method
+
+
+def _prefill_method(method):
+    def call(instance, *args, **kwargs):
+        return getattr(instance._new_prefill_executor(), method)(*args, **kwargs)
+
+    return call
+
+
+for _legacy_name in _prefill.LEGACY_METHODS:
+    _compatibility_method = _prefill_method(_legacy_name)
+    setattr(FlashAttnV100Impl, _legacy_name, _compatibility_method)
