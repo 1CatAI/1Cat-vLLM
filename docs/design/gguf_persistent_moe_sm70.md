@@ -69,7 +69,8 @@ both shared-book layouts, random/zero/ones source bytes and finite FP16 scale
 boundaries. Reconstruction is elementwise exact. Six CUDA format pairs compile
 for SM70 with no register spills; this is compilation evidence only.
 
-GPU tests change routes, inputs and probabilities between replays, poison
+Twelve GPU tests in the normally installed wheel pass. They change routes,
+inputs and probabilities between replays, poison
 intermediates and readiness, exercise expert sharing and empty routing, then
 resume on the same graph. They compare the quantized hidden bytes with the
 previous chain and the final projection with its FP32-accumulating output.
