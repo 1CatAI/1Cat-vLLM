@@ -1226,8 +1226,277 @@ def observe_prefill_reference(
     )
 
 
+def forward(
+    self: PrefillExecutor,
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    output: torch.Tensor,
+    output_scale: torch.Tensor | None,
+    output_block_scale: torch.Tensor | None,
+    is_capturing: bool,
+    layer_name: object,
+) -> torch.Tensor:
+    available_query_tokens = min(
+        int(query.shape[0]),
+        int(key.shape[0]),
+        int(value.shape[0]),
+        int(output.shape[0]),
+    )
+    metadata_live_token_mismatch = (
+        _kv_layout._metadata_expects_more_query_tokens_than_available(
+            attn_metadata,
+            available_query_tokens,
+        )
+    )
+    if self.use_triton_prefill:
+        if not _state._logged_prefill_triton_safe:
+            logger.info(
+                "FLASH_ATTN_V100 prefill uses explicit Triton diagnostic "
+                "fallback because VLLM_FLASH_V100_PREFILL_USE_TRITON=1; "
+                "this mixed route is not a final performance path."
+            )
+            _state._logged_prefill_triton_safe = True
+        _debug._sm70_profile_trace(
+            "forward branch=prefill_triton_safe layer=%s",
+            layer_name,
+        )
+        self.workspace.decode_cache.invalidate()
+        _routing._record_route(_routing.ROUTE_SPECS["prefill_triton_safe"].name)
+        return self.ops.triton_forward(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+        )
+    if is_capturing:
+        # CUDA graph capture uses dummy metadata whose seq_lens can
+        # look like no-prefix prefill, while replayed MTP verification
+        # is a uniform small-query decode over an existing KV prefix.
+        # Capture the same small-query kernel branch that replay needs.
+        capture_prefix = self.ops.capture_prefix_kind(layer, attn_metadata)
+        if capture_prefix:
+            self.ops.record_capture_prefix()
+            return self._flash_v100_prefill_with_prefix(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
+        smallq_decode = self.ops.small_query_enabled(attn_metadata)
+        if smallq_decode:
+            if _debug._draft_graph_debug_enabled():
+                _debug._draft_graph_debug_log(
+                    "forward:prefill_capture_smallq",
+                    "layer=%s %s %s %s",
+                    layer_name,
+                    _debug._format_tensor_debug(
+                        getattr(
+                            attn_metadata,
+                            "smallq_decode_block_table",
+                            None,
+                        ),
+                        "smallq_bt",
+                    ),
+                    _debug._format_tensor_debug(
+                        getattr(
+                            attn_metadata,
+                            "smallq_decode_seq_lens",
+                            None,
+                        ),
+                        "smallq_seq",
+                    ),
+                    _debug._format_tensor_debug(
+                        getattr(
+                            attn_metadata,
+                            "smallq_query_start_loc",
+                            None,
+                        ),
+                        "smallq_qsl",
+                    ),
+                )
+            _debug._sm70_profile_trace(
+                "forward branch=prefill_capture_smallq layer=%s",
+                layer_name,
+            )
+            _routing._record_route(_routing.ROUTE_SPECS["prefill_capture_smallq"].name)
+            self.ops.record_capture_layout(attn_metadata)
+            return self._flash_v100_prefill_with_prefix(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
+        _debug._sm70_profile_trace(
+            "forward branch=prefill_capture_full_flash layer=%s",
+            layer_name,
+        )
+    has_prefix_context = metadata_live_token_mismatch or _kv_layout._has_prefix_context(
+        attn_metadata
+    )
+    smallq_decode = has_prefix_context and self.ops.small_query_enabled(attn_metadata)
+    if has_prefix_context:
+        if _debug._draft_graph_debug_enabled():
+            _debug._draft_graph_debug_log(
+                "forward:prefill_prefix",
+                "layer=%s smallq=%s metadata_live_token_mismatch=%s %s %s %s",
+                layer_name,
+                smallq_decode,
+                metadata_live_token_mismatch,
+                _debug._format_tensor_debug(
+                    getattr(attn_metadata, "smallq_decode_block_table", None),
+                    "smallq_bt",
+                ),
+                _debug._format_tensor_debug(
+                    getattr(attn_metadata, "smallq_decode_seq_lens", None),
+                    "smallq_seq",
+                ),
+                _debug._format_tensor_debug(
+                    getattr(attn_metadata, "smallq_query_start_loc", None),
+                    "smallq_qsl",
+                ),
+            )
+        _debug._sm70_profile_trace(
+            "forward branch=prefill_prefix layer=%s smallq=%s",
+            layer_name,
+            smallq_decode,
+        )
+        if not _state._logged_prefill_prefix_flash:
+            if smallq_decode:
+                logger.info(
+                    "FLASH_ATTN_V100 prefill path active "
+                    "(prefix/chunked via small-query paged decode)."
+                )
+            elif self.use_flash_v100_prefill_paged:
+                logger.info(
+                    "FLASH_ATTN_V100 prefill path active "
+                    "(prefix/chunked via direct paged prefill kernel)."
+                )
+            else:
+                logger.info(
+                    "FLASH_ATTN_V100 prefill path active "
+                    "(prefix/chunked via paged-KV gather)."
+                )
+            _state._logged_prefill_prefix_flash = True
+        if metadata_live_token_mismatch:
+            logger.info(
+                "FLASH_ATTN_V100 prefill switched to prefix/live-token "
+                "path because layer QKV tokens (%d) are shorter than "
+                "query metadata span.",
+                available_query_tokens,
+            )
+        _routing._log_fp8_kv_cache_route("prefill", self.kv_cache_dtype, "prefix")
+        self.workspace.decode_cache.invalidate()
+        result = self._flash_v100_prefill_with_prefix(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+        )
+        self.ops.compare_triton(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+            "prefill_prefix",
+        )
+        _routing._record_route(_routing.ROUTE_SPECS["prefill_prefix_flash"].name)
+        return result
+    if not _state._logged_prefill_flash:
+        logger.info("FLASH_ATTN_V100 prefill path active (no prefix/chunked context).")
+        _state._logged_prefill_flash = True
+    self.workspace.decode_cache.invalidate()
+    if self.use_prefill_paged_cache and self.use_flash_v100_prefill_paged:
+        _debug._sm70_profile_trace(
+            "forward branch=prefill_no_prefix_paged_cache layer=%s",
+            layer_name,
+        )
+        if not _state._logged_prefill_paged_cache:
+            logger.warning(
+                "FLASH_ATTN_V100 no-prefix prefill is reading paged "
+                "KV cache for strict input-source diagnostics. This "
+                "may be slower than dense raw-KV prefill."
+            )
+            _state._logged_prefill_paged_cache = True
+        _routing._log_fp8_kv_cache_route(
+            "prefill", self.kv_cache_dtype, "no_prefix_paged_cache"
+        )
+        result = self._flash_v100_prefill_with_prefix(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+        )
+        self.ops.compare_triton(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+            "prefill_no_prefix_paged_cache",
+        )
+        _routing._record_route(
+            _routing.ROUTE_SPECS["prefill_no_prefix_paged_cache_flash"].name
+        )
+        return result
+    _debug._sm70_profile_trace(
+        "forward branch=prefill_no_prefix_dense layer=%s",
+        layer_name,
+    )
+    result = self._flash_v100_prefill(query, key, value, attn_metadata, output)
+    self.ops.compare_triton(
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+        output_scale,
+        output_block_scale,
+        "prefill_no_prefix",
+    )
+    _routing._record_route(_routing.ROUTE_SPECS["prefill_no_prefix_dense_flash"].name)
+    return result
+
+
 @dataclass(frozen=True)
 class PrefillDriverOps:
+    triton_forward: Any = None
+    compare_triton: Any = None
+    small_query_enabled: Any = None
+    capture_prefix_kind: Any = None
+    record_capture_prefix: Any = None
+    record_capture_layout: Any = None
     dense: Any = None
     bhmd: Any = None
     paged: Any = None
@@ -1298,6 +1567,7 @@ class PrefillExecutor:
             return getattr(self.ops, OPERATOR_FIELDS[name])
         return getattr(self.config, name)
 
+    forward = forward
     _flash_v100_prefill = _flash_v100_prefill
     _should_use_fp8_prefill_bridge = _should_use_fp8_prefill_bridge
     _run_fp8_prefill_bridge = _run_fp8_prefill_bridge

@@ -42,8 +42,18 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         if (
             isinstance(call, ast.Call)
             and isinstance(call.func, ast.Attribute)
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "_feature"
+            and (
+                ast.unparse(call.func.value) == "_feature"
+                or (
+                    ast.unparse(call.func.value) == "self.ops"
+                    and call.func.attr
+                    in (
+                        "capture_prefix_kind",
+                        "record_capture_prefix",
+                        "record_capture_layout",
+                    )
+                )
+            )
         ):
             hook = self.hooks[call.func.attr]
             names = {
@@ -68,6 +78,33 @@ class _InlineFeatureHooks(ast.NodeTransformer):
 
             return Inputs().visit(copy.deepcopy(hook))
         return None
+
+    def _prefill_branches(self, helper):
+        assert len(helper.body) == 1 and isinstance(helper.body[0], ast.Return)
+        dispatch = helper.body[0].value
+        assert isinstance(dispatch, ast.Call)
+        assert ast.unparse(dispatch.func) == "self._new_prefill_executor().forward"
+        assert not dispatch.keywords
+        arguments = [a.arg for a in helper.args.args]
+        assert [ast.unparse(a) for a in dispatch.args] == arguments[1:]
+        tree = ast.parse((Path(impl.__file__).parent / "prefill.py").read_text())
+        forward = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "forward"
+        )
+        assert [a.arg for a in forward.args.args] == arguments
+        executor = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "PrefillExecutor"
+        )
+        assert any(
+            isinstance(n, ast.Assign) and ast.unparse(n) == "forward = forward"
+            for n in executor.body
+        )
+        block = ast.Module(body=copy.deepcopy(forward.body), type_ignores=[])
+        return self.visit(block).body
 
     def _decode_branches(self, helper):
         assert len(helper.body) == 1 and isinstance(helper.body[0], ast.Return)
@@ -174,10 +211,11 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Return(self, node):
-        if (
-            isinstance(node.value, ast.Call)
-            and ast.unparse(node.value.func) == "self._forward_decode"
+        if isinstance(node.value, ast.Call) and ast.unparse(node.value.func) in (
+            "self._forward_decode",
+            "self._forward_prefill",
         ):
+            assert isinstance(node.value.func, ast.Attribute)
             cls = next(
                 n
                 for n in ast.parse(Path(impl.__file__).read_text()).body
@@ -186,12 +224,14 @@ class _InlineFeatureHooks(ast.NodeTransformer):
             helper = next(
                 n
                 for n in cls.body
-                if isinstance(n, ast.FunctionDef) and n.name == "_forward_decode"
+                if isinstance(n, ast.FunctionDef) and n.name == node.value.func.attr
             )
             assert not node.value.keywords
             assert [ast.unparse(a) for a in node.value.args] == [
                 a.arg for a in helper.args.args[1:]
             ]
+            if helper.name == "_forward_prefill":
+                return self._prefill_branches(helper)
             return self._decode_branches(helper)
         return self.generic_visit(node)
 
@@ -306,6 +346,8 @@ class _Normalize(ast.NodeTransformer):
     def visit_Attribute(self, node):
         expression = ast.unparse(node)
         verification = {
+            "self.ops.compare_triton": "self._maybe_compare_triton_output",
+            "self.ops.small_query_enabled": "self._small_query_decode_enabled",
             "self.config.grouped_max_query": (
                 "self.dflash2_grouped_verify_max_query_tokens"
             ),
@@ -485,6 +527,9 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
             for fn in candidates:
                 if not isinstance(fn, ast.FunctionDef):
                     continue
+                if path.name == "prefill.py" and fn.name == "forward":
+                    # Expanded and checked through the common forward above.
+                    continue
                 if path.name == "decode.py" and fn.name in (
                     "__init__",
                     "_flash_v100_window_size",
@@ -532,7 +577,7 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                         (a.arg, a.arg) for a in fn.args.kwonlyargs
                     ]
                     continue
-                if fn.name == "_forward_decode":
+                if fn.name in ("_forward_decode", "_forward_prefill"):
                     # Expanded and validated with the forward body above.
                     continue
                 if any(

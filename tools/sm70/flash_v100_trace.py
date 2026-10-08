@@ -257,7 +257,7 @@ def persistent_tensors(builder):
 
 
 def install_ops(monkeypatch, recorder, legacy, case):
-    from vllm.v1.attention.backends.flash_v100 import config, decode
+    from vllm.v1.attention.backends.flash_v100 import config, decode, prefill
 
     original_policy_read = config.V100AttnConfig.__getattribute__
 
@@ -272,6 +272,15 @@ def install_ops(monkeypatch, recorder, legacy, case):
     monkeypatch.setattr(
         config.V100AttnConfig, "__getattribute__", read_candidate_policy
     )
+    original_prefill_read = prefill.PrefillExecutor.__getattr__
+
+    def read_prefill_predicate(instance, name):
+        value = original_prefill_read(instance, name)
+        if name.startswith("use_") and sys._getframe(1).f_code.co_name == "forward":
+            recorder.events.append(["predicate", name, value])
+        return value
+
+    monkeypatch.setattr(prefill.PrefillExecutor, "__getattr__", read_prefill_predicate)
     original_read = legacy.FlashAttnV100Impl.__getattribute__
 
     def read_predicate(instance, name):

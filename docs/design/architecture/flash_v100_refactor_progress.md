@@ -31,7 +31,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Required | Strict/rebase/GPU gates |
 | 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Required | Strict/rebase/GPU gates |
 | 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Required | Strict/rebase/GPU gates |
-| 6h: shared allocation ownership | — | CPU/golden/strict passed | Private 309 → 308; final cycle 1 → 0 | Required | Strict/rebase/GPU gates |
+| 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Required | Strict/rebase/GPU gates |
+| 6i: outer prefill dispatch | — | CPU/golden/strict passed | Forward 400 → 153; largest function 400 → 318 | Required | Strict/rebase/GPU gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -996,3 +997,49 @@ Every audited patch is consumed; the legacy allocator patch reaches both real
 production consumers. Evidence: `a3-allocation-owner-strict.log` and
 `a3-allocation-owner-shim.json`. Production/source-oracle files stay fixed
 throughout the accepted run.
+
+## Step 6i outer prefill dispatch ownership
+
+PR #1104 is `73b8fba61904aa631132b983d21083b026032102`. Actual #1028
+replay is `55c52e03db41716cb192a1bea10f474e8f9cc6f1`, tree
+`7c1827808dceb04f27308f2a6bbeca5972e4c035`, equal to clean merge-tree;
+37 CPU integration tests pass with 98 GPU skips. Four verified durable queues
+are staged as `a3-step6h` on 54633. Pre-commit/mypy/layering passed for #1104.
+
+The common forward now delegates prefill dispatch to PrefillExecutor, which
+owns policy, native/callback dependencies and workspace. A mechanical commit
+extracts the unchanged branch body first. The ownership commit transfers it
+with explicit Triton reference, comparison, small-query admission and capture
+feature callbacks; no Impl receiver/import is added to prefill. Per-instance
+calculation overrides still resolve when the owner is assembled.
+
+All three decode-cache invalidations remain at their original branch positions
+inside the executed prefill forward. Capture's two early returns still preserve
+resident cache state. The trace observer reads real owned policy lookups and
+reset calls; the calculation oracle expands the actual helper/executor body,
+checks its arguments and binding, then compares the unchanged original hashes.
+The initial 20-case focused suite passes all 813 golden traces and calculation
+hashes (`a3-prefill-dispatch-focused.log`). Metrics tighten to
+153 / 318 / 308 / 0 / 151 / 0 / 29, with no new forbidden edges. The final
+150/200 line targets and remaining Spec/private/logging gates are still open.
+
+Seven direct dispatch cases verify invalidation-before-execution at all three
+reset sites, completed None results without a fallback attempt, both capture
+early returns preserving resident cache, the original Triton super binding,
+and refresh/isolation of feature callback overrides. Evidence:
+`a3-prefill-dispatch-boundary.log` (7 passed). Pre-commit removed two unused
+imports and required an explicit AST type assertion; the final pre-commit,
+mypy and layering checks pass (`a3-prefill-dispatch-precommit-final.log`).
+The fixed-source strict suite then passes **337 tests / 1 skip / 28 GPU
+exclusions**, including unchanged traces/hashes and real shim consumption
+(`a3-prefill-dispatch-strict.log`, `a3-prefill-dispatch-shim.json`).
+
+Step 4b's first full GPU regression stopped with 1690 passes / eight failures:
+the seven inherited failures plus the literal-accounting source inventory.
+That checker recognized only attribute `_record_route` calls, missing the
+three typed injected decode calls (41 versus the required 44). Production route
+names are unchanged: all 14 affected published PR source trees have exactly
+the same 44 static accounting names as #1060 when injected calls are included.
+The original failed snapshot/logs remain intact. A test-only correction keeps
+the 44-name requirement and validates the injected parameter's RecordRoute
+type; corrected-head GPU regression is required before the queue proceeds.
