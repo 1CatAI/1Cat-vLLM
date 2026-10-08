@@ -1111,7 +1111,7 @@
     "native_byte_identical_to_source69": 15,
     "remaining_complete_fa2_sm70_sass_equal": true,
     "standard_install_and_dependency_check": "passed on54633;201 compatible packages",
-    "installed_gpu_and_model_gate": "pending global GPU lock availability"
+    "installed_gpu_and_model_gate": "12 installed checks passed:6 native FP16 writer layouts plus6 partition/metadata cases; whole-model gate pending"
   },
   "flashnext_qsa_real_request": {
     "runtime_source_sha": "120ac713a67f252d8b52bdb54c69a708b52dee95",
@@ -1138,5 +1138,42 @@
     "ledger": "sm70_kv_flashnext_request_errors.json",
     "format_selected": false,
     "model_quality_or_speed_admission": false
+  },
+  "normal_sourceb50_native_writer_gate": {
+    "fp16_half_encoding_layout_cases": 6,
+    "covers_all_65536_half_codes_in_live_rows": true,
+    "layouts": [
+      "NHD",
+      "HND",
+      "paged"
+    ],
+    "heads_and_dims": [
+      [
+        1,
+        256
+      ],
+      [
+        2,
+        80
+      ]
+    ],
+    "checks": [
+      "bitwise K/V writes",
+      "NaN payloads",
+      "negative slot exclusion",
+      "untouched cache regions",
+      "noncompact QKV token stride",
+      "cross-page addresses"
+    ],
+    "e5m2_unit_scale_half_codes": 65536,
+    "installed_policy_and_metadata_cases": 6,
+    "skips": 0,
+    "errors": 0,
+    "stable_library_sha256": "f0a16df8cb05e3b7953ab811c9a3abbf91c465df7aa3d64d544f48640c433ff1",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "scope": "installed writer correctness and policy/metadata; not whole-model or speed qualification",
+    "followup_failure": "operator harness used obsolete top-level extension import; no attention operators ran before failure",
+    "fix": "d7df9cee43 loads normal nested package; only remaining operators/prefill/model queued"
   }
 }

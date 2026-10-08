@@ -49336,3 +49336,15 @@ models with source/template/token hashes, using only CPU. This prepares a
 broader error corpus without repeating cold model startup per prompt. No KV
 or acceptance result is claimed from tokenization. The active short-gate queue
 retains source860/numericb50 and is not updated while waiting/running.
+
+The sourceb50 installed native writer/partition lease now passes12 tests with
+no skips:6 FP16 layout/bit-pattern/padded-slot cases and6 policy/metadata cases,
+including the formerly GPU-less device-config case. The existing E5M2 unit-scale
+oracle passes all65536 FP16 encodings. Stable library SHA remains
+`f0a16df8cb05e3b7953ab811c9a3abbf91c465df7aa3d64d544f48640c433ff1`.
+The following operator harness fails before launching attention because it
+imports the obsolete top-level `flash_attn_v100_cuda` name. Fix only its import
+to the normal nested package; do not introduce a runtime alias/library overlay.
+Retain the failed lease log. Workers/locks release; the remaining operator,
+Q8192 route and matched NVFP4 model gates requeue without repeating these12
+already-passing tests. Real multi-request/quality and INT8 gates remain pending.
