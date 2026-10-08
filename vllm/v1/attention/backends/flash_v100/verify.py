@@ -22,10 +22,8 @@ from vllm.v1.attention.backends.triton_attn import (
 from vllm.v1.attention.kv_codecs import (
     FP8_E5M2,
 )
-from vllm.v1.attention.ops.sm70_e4m3_grouped import (
+from vllm.v1.attention.ops.sm70_grouped import (
     grouped_e4m3_fp32_allowed,
-)
-from vllm.v1.attention.ops.sm70_fp16_grouped import (
     grouped_fp16_fp32_reason,
 )
 

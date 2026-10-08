@@ -26,7 +26,8 @@ decode, mixed resident rows and small-query XQA use one admission implementation
 with their existing stage-specific hint/window rules. Native operator ABI,
 stride, metadata and availability checks remain required; a codec declaration
 alone does not prove an operator exists. More detailed grouped contracts are
-owned by the attention ops and will be consolidated in the grouped family.
+owned by `ops/sm70_grouped.py`, whose codec contracts preserve FP16/E4M3
+limits and expose rejection reasons.
 
 Dense prefill declarations describe prepared FP16 K/V; bridge declarations
 describe their quantized input storage. Supporting a codec through a bridge is

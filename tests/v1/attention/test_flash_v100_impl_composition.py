@@ -77,6 +77,11 @@ class _InlineFeatureHooks(ast.NodeTransformer):
 
 
 class _Normalize(ast.NodeTransformer):
+    def visit_ImportFrom(self, node):
+        if node.module == "vllm.v1.attention.ops.sm70_grouped_scalar":
+            node.module = "vllm.v1.attention.ops.sm70_e4m3_scalar"
+        return node
+
     def visit_Global(self, node):
         return None
 

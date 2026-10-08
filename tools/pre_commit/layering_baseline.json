@@ -446,8 +446,8 @@
  "vllm/v1/attention/ops/prefix_prefill.py": {
   "model": 1
  },
- "vllm/v1/attention/ops/sm70_e4m3_grouped.py": {
-  "env": 2
+ "vllm/v1/attention/ops/sm70_grouped.py": {
+  "env": 1
  },
  "vllm/v1/attention/ops/triton_decode_attention.py": {
   "platform": 9

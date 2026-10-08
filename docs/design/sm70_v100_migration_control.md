@@ -49223,3 +49223,50 @@ Coupling totals remain model 2325 / platform 3964 / raw env 335; one existing
 env read moves from impl to spec/attention, without total growth. No GPU
 precision, replay or timing evidence is claimed under the user's active
 no-V100 requirement. Root-disk logs are under /home/ymzx/arch-ws/tmp/a3c_*.
+
+## 2026-10-08 — architecture A4a codec-parameterized grouped admission
+
+Stack on A3b-3 #1057 (`71b5fe54aac37d91bc2521b44aab4c4345bfc514`) in
+`agent/v100-arch-grouped-codecs-20261008-092507`, owned worktree
+`/home/ymzx/arch-ws/v100-arch-grouped-codecs-20261008-092507`.
+
+One grouped_fp32_reason(codec, ...) owns FP16/E4M3 request-row and E4M3
+explicit-group admission, returning rejection strings. Declarative contracts
+own native providers/revisions and format-specific measured shape/layout
+limits; compatibility wrappers preserve old signatures and FP16 reason
+precedence. Backend imports use the shared owner. Move scalar/long family
+modules to codec-neutral grouped paths, retaining true old-module aliases and
+original logger names. Native arithmetic/manifests/workspace/launch code stays
+unchanged: 22 normalized function hashes match the parent. Scalar/long remain
+E4M3-only; this PR does not expand their admitted codecs.
+
+Differential CPU evidence: 2940 shape/device/revision combinations plus 98
+policy/layout cases match frozen legacy predicates, including FP16 rejection
+strings. Preserve the old raw partition-env "0" vs typed-zero distinction and
+E4M3 CPU descriptor admission. Declared group boundaries generate additional
+cases. Old-module alias/patch identity, provider dispatch, missing batch
+revision ImportError and sole workspace cleanup are checked. A first import
+run exposed an omitted common cleanup export; restored it. Ruff split a mixed
+compatibility import and removed two unused exports; explicit self-alias
+reexports now survive formatting and the clean admission tests.
+
+Paired family suite: all 86 outcomes match, 71 passed / 15 failed in both
+branches (a4a_family_ab.json, paired XML/logs). Nine scalar tests leave the real
+long native dependency unresolved, yielding None; six existing runner mocks
+lack the device attribute. Do not repeat these as new native regressions.
+Coupling: model 2325 → 2325, platform 3964 → 3964, raw env 335 → 334, from
+consolidating two identical E4M3 reads into one. GPU numerical/replay/timing
+validation remains waived by the user; no precision or speed claim is made.
+Evidence under /home/ymzx/arch-ws/tmp/a4a_*. Next scope: audit the current E4M3
+decode partition/reduce state before implementing A4b; do not assume the
+original p256 observation still describes the current source.
+
+A4a final CPU checks: 13 new shared-family cases pass (3038 differential
+admission comparisons, declaration-generated boundaries, native source/alias
+and workspace/provider checks). The combined admission/implementation/feature
+suite passed 57 cases before two declaration-generated cases were added; the
+final shared-family file includes and passes those two. Retained backend
+routing/mixed-row/compatibility/cleanup/FlashInfer suite: 306 passed. Existing
+policy suite: 233 passed / 9 inherited DeviceConfig inference failures /
+1 skipped, identical across all 243 parent/new outcomes (a4a_cpu_ab.json).
+No new runtime policy failure was introduced.
