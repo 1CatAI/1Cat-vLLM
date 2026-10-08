@@ -75,6 +75,55 @@ configuration are **not yet migrated**. Dense page accounting and the existing
 Triton inline scale views now share a storage descriptor as described below. This is an independently revertible
 first review scope, not an uncalled registry claiming the final architecture.
 
+## Packed reader extraction
+
+The eight packed E4M3/E5M2 converters previously duplicated in standalone
+`flash_decode_paged.cu` and installed `grouped-attention.cu` now live once in
+`kv_codec.cuh`. Their original function bodies are preserved, including NaN,
+subnormal and fast half2 behavior; a source digest checks this against the
+immutable baseline. XQA vector loads and prefetched panels call
+`KVReader::load_half8` / `half8_from_packed`. Page-table lookup, base/column
+addressing, scale staging and launch ABIs retain their existing behavior.
+The E5M2 packed-panel path still ignores its unused LUT hint, whereas the
+E5M2 global-vector reader still rejects an E4M3 LUT at compile time.
+
+The standalone packed probe compiles all FP16 storage encodings and all 65536
+FP8 byte pairs for standard, fast and shared-LUT conversion. Baseline/candidate
+SM70 PTX is identical. The first probe initialized an unused LUT unconditionally;
+the extra nested interface prevented its dead-store elimination in one arm.
+The probe now initializes LUTs only for the real LUT specialization, matching
+production and using the same source for both arms. No instruction or register
+names are stripped from PTX comparison. The normally built complete SM70 FA2
+extension also retains identical SASS, including instruction encodings; only
+compiler anonymous-namespace source-path hashes are normalized. GPU output and
+performance gates for this continuation remain pending. Earlier scalar-reader
+GPU measurements must not be relabeled as packed-reader runtime measurements.
+
+## Mask and reference boundaries
+
+`flash_v100/masking.py` owns the original BFLA sparse prefill mask and DFlash
+parent-tree visibility mask; `reference.py` owns the small FP32 debug attention
+oracle. These operations consume decoded tensors and logical positions, not KV
+format strings. Original functions, operation ordering and backend reexports
+are preserved. Routing and CUDA-graph capture predicates remain in their
+original owner, so extraction does not redirect diagnostic monkeypatches or
+change capture decisions. Source fixtures transfer the four existing hashes
+to their destination modules; no numerical hash is regenerated.
+
+This boundary follows the explicit mask-mode separation in
+[FlashInfer](https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/attention/mask.cuh)
+and the mask/window parameters of
+[vLLM unified attention](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_unified_attention.py).
+Only local implementations move; adopting external mask arithmetic would risk
+changing BFLA/tree semantics and is unnecessary for this refactor.
+`python -m tools.kv_codec.verify_masking --out DATA/masking.json` runs the
+immutable baseline and relocated functions on CPU: 24 BFLA configurations
+(pool modes, keep rules and invalid inputs), 54 tree/window configurations and
+18 GQA/window reference cases. All 96 match bitwise. Backend line count is now
+8996, compared with 9870 at the baseline; the large implementation and builder
+still need further decomposition. Environment coverage checks scan the backend
+and its new modules, so moving a read cannot masquerade as retiring a switch.
+
 ## Scheduling and compatibility
 
 The eventual planner accepts a format-free `AttentionProblem` and produces an

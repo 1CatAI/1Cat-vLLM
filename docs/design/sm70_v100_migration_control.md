@@ -49086,3 +49086,25 @@ The rebuilt original/new complete SM70 FA2 SASS matches after normalizing only
 anonymous-namespace path hashes, retaining instruction bytes. Reboot also
 corrupted a mypy cache; validation uses a fresh task-owned cache. GPU gates and
 real-request captures remain pending resource restoration/access.
+
+### KV codec continuation: packed readers and CPU-only work
+
+User requested continued development without waiting for V100 restoration.
+Do not retry the crowded remote hosts or interpret this as GPU/model acceptance.
+The duplicated eight packed converters moved unchanged to the shared codec;
+XQA vector loads/panels use its reader interface. SM70 packed-probe PTX and
+complete normal FA2 SASS match the baseline. Packed-reader GPU byte comparison,
+operator speed and model routes remain pending. A probe-only unused-LUT
+initialization caused dead-store/codegen differences; initializing only actual
+LUT specializations fixed the harness, without normalizing instructions away.
+
+The interrupted full native build had two non-ELF objects. Those owned corrupt
+outputs were removed, their resulting missing-object link failure retained,
+and normal CMake rebuilt both objects and linked all native targets successfully.
+Complete normal wheel packaging is now in progress; no borrowed private DSO.
+
+BFLA/tree masks and the FP32 debug reference now have independent modules;
+96 CPU baseline comparisons match bitwise. Original numerical/dispatch AST
+hashes and backend reexports remain guarded. Environment inventory tests scan
+all moved modules; no switch has been retired merely by moving it. Complete
+standalone SM70 Flash-V100 SASS also matches after packed-reader extraction.

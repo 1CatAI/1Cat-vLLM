@@ -83,6 +83,109 @@ __device__ __forceinline__ float fp8_e5m2_to_float(uint8_t raw) {
   return __half2float(fp8_e5m2_to_half(raw));
 }
 
+__device__ __forceinline__ uint32_t
+fp8_e5m2_pair_to_half2_bits(const uint16_t raw_pair) {
+  return (static_cast<uint32_t>(raw_pair & 0x00ffu) << 8) |
+         (static_cast<uint32_t>(raw_pair & 0xff00u) << 16);
+}
+
+__device__ __forceinline__ uint4 fp8_e5m2_vector_to_half8(const uint64_t raw) {
+  return make_uint4(
+      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw)),
+      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
+      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
+      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
+}
+
+__device__ __forceinline__ uint16_t fp8_e4m3fn_to_half_bits(const uint8_t raw) {
+  const uint16_t sign = static_cast<uint16_t>(raw & 0x80u) << 8;
+  const uint8_t magnitude = raw & 0x7fu;
+  const uint8_t exponent = magnitude >> 3;
+  const uint8_t mantissa = magnitude & 0x07u;
+  if (magnitude == 0) {
+    return sign;
+  }
+  if (exponent == 0) {
+    // E4M3 subnormals are exact fp16 normals: mantissa * 2^-9.
+    const uint16_t magnitude_bits =
+        mantissa < 2
+            ? 0x1800u
+            : (mantissa < 4
+                   ? static_cast<uint16_t>(0x1c00u | ((mantissa - 2) << 9))
+                   : static_cast<uint16_t>(0x2000u | ((mantissa - 4) << 8)));
+    return sign | magnitude_bits;
+  }
+  if (magnitude == 0x7fu) {
+    return sign | 0x7e00u;
+  }
+  return sign | static_cast<uint16_t>((exponent + 8) << 10) |
+         static_cast<uint16_t>(mantissa << 7);
+}
+
+__device__ __forceinline__ uint32_t
+fp8_e4m3fn_pair_to_half2_bits(const uint16_t raw_pair) {
+  return static_cast<uint32_t>(
+             fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw_pair))) |
+         (static_cast<uint32_t>(
+              fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw_pair >> 8)))
+          << 16);
+}
+
+__device__ __forceinline__ uint32_t
+fp8_e4m3fn_pair_to_half2_bits_fast(const uint16_t raw_pair) {
+  const uint8_t raw0 = static_cast<uint8_t>(raw_pair);
+  const uint8_t raw1 = static_cast<uint8_t>(raw_pair >> 8);
+  if ((raw0 & 0x7fu) == 0x7fu || (raw1 & 0x7fu) == 0x7fu) {
+    return fp8_e4m3fn_pair_to_half2_bits(raw_pair);
+  }
+
+  // Moving a finite E4M3 encoding into the corresponding fp16 sign,
+  // exponent, and mantissa fields represents exactly value / 256. A packed
+  // half2 multiply restores both values without per-byte exponent branches.
+  const uint32_t expanded = (static_cast<uint32_t>(raw_pair & 0x0080u) << 8) |
+                            (static_cast<uint32_t>(raw_pair & 0x007fu) << 7) |
+                            (static_cast<uint32_t>(raw_pair & 0x8000u) << 16) |
+                            (static_cast<uint32_t>(raw_pair & 0x7f00u) << 15);
+  union {
+    uint32_t u;
+    __half2 h2;
+  } converter;
+  converter.u = expanded;
+  converter.h2 = __hmul2(converter.h2, __float2half2_rn(256.0f));
+  return converter.u;
+}
+
+__device__ __forceinline__ uint4
+fp8_e4m3fn_vector_to_half8(const uint64_t raw) {
+  return make_uint4(
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw)),
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
+      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
+}
+
+__device__ __forceinline__ uint4
+fp8_e4m3fn_vector_to_half8_fast(const uint64_t raw) {
+  return make_uint4(
+      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw)),
+      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 16)),
+      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 32)),
+      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 48)));
+}
+
+__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
+    const uint64_t raw, const uint16_t* __restrict__ lut) {
+  return make_uint4(
+      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw)]) |
+          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 8)]) << 16),
+      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 16)]) |
+          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 24)]) << 16),
+      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 32)]) |
+          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 40)]) << 16),
+      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 48)]) |
+          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 56)]) << 16));
+}
+
 template <int KV_DTYPE, bool E4M3_BITS = false>
 struct KVReader {
   static_assert(KV_DTYPE == KV_CACHE_DTYPE_FP16 ||
@@ -90,6 +193,45 @@ struct KVReader {
                     KV_DTYPE == KV_CACHE_DTYPE_FP8_E5M2,
                 "KV format has no Flash-V100 reader");
   static constexpr int element_bytes = KV_DTYPE == KV_CACHE_DTYPE_FP16 ? 2 : 1;
+
+  // Eight unscaled half values. Scale placement/rounding remains the existing
+  // caller's contract; per-token codecs need their own staged tile policy.
+  template <bool PACKED_FAST = false, bool SHARED_LUT = false>
+  __device__ __forceinline__ static uint4 half8_from_packed(
+      const uint64_t raw, const uint16_t* __restrict__ lut = nullptr) {
+    static_assert(KV_DTYPE != KV_CACHE_DTYPE_FP16,
+                  "Eight FP16 values require sixteen payload bytes");
+    if constexpr (KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3) {
+      if constexpr (SHARED_LUT) {
+        return fp8_e4m3fn_vector_to_half8_lut(raw, lut);
+      } else if constexpr (PACKED_FAST) {
+        return fp8_e4m3fn_vector_to_half8_fast(raw);
+      } else {
+        return fp8_e4m3fn_vector_to_half8(raw);
+      }
+    } else {
+      // Packed panels historically allow an unused LUT hint for E5M2.
+      return fp8_e5m2_vector_to_half8(raw);
+    }
+  }
+
+  // Keep base and vector column separate: old formats divide the base by
+  // eight, while a future inline-scale reader must retain the byte offset.
+  template <bool SHARED_LUT = false>
+  __device__ __forceinline__ static uint4 load_half8(
+      const void* __restrict__ cache, const int64_t physical_offset,
+      const int vec_col, const uint16_t* __restrict__ lut = nullptr) {
+    if constexpr (KV_DTYPE == KV_CACHE_DTYPE_FP16) {
+      const uint4* cache_vec = reinterpret_cast<const uint4*>(cache);
+      return __ldg(&cache_vec[physical_offset / 8 + vec_col]);
+    } else {
+      static_assert(KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3 || !SHARED_LUT,
+                    "The E4M3 conversion LUT requires E4M3 KV");
+      const uint64_t* cache_vec = reinterpret_cast<const uint64_t*>(cache);
+      const uint64_t raw = __ldg(&cache_vec[physical_offset / 8 + vec_col]);
+      return half8_from_packed<false, SHARED_LUT>(raw, lut);
+    }
+  }
 
   __device__ __forceinline__ static float unscaled(
       const void* __restrict__ cache, const int64_t index) {

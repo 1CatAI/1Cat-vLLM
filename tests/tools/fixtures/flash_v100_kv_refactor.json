@@ -92,15 +92,11 @@
     "_contiguous_paged_kv_bhmd": "f1f412ae4a01972d164ba56a17649b7922e9a1e74d178d45b430dd2025d802b2",
     "_get_prefill_gather_dense_workspace": "17c2a40d3e8ec6fc44b5211c707c8fac7c153f09639be7375ba8c2859bb1b0d9",
     "_gather_paged_kv_to_exact_dense": "ea25e690d92a27b55f892fe7ee1823f8d686f1aa57dfa76eb01362b4bd87c825",
-    "_cdiv_int": "1c2610e32c9a89a8442fab89783b9cdb9fa6a01ae7aa952bebda53a0409e2e11",
-    "_build_bfla_block_mask_for_seq": "853e1e65cef7f5e51757ad82fd0baae9f170d99baf72a0a2ae6395f6f6832e9b",
-    "_torch_attention_reference": "65666317b9a71e8a53a2a712d2f293c3142b4d61319107db463031ec09878fcc",
     "_ddtree_parent_ids_cpu": "f4ee8ba15a0ec946e36ab87ade62a18084ab2e0b64df4bc0e46a7b575769879e",
     "_ddtree_parent_metadata_requires_branch": "da95910d796babd746085f0288529540f62beaedcfa3b32dcdd5e23378cf4883",
     "_ddtree_triton_seq_lens_match": "7b1cdc58f6ec64f39ccaf175cec45d20da39555bb805bdfcf25b3cc0df13d574",
     "_ddtree_triton_query_start_loc_match": "f6f86f1d8e83185aac2b7eb59abdda6fd3833b68ec8bcebaeb2ced491e88a2e8",
     "_ddtree_triton_parent_ids_for_query": "09d6ab9f69c12bed1d41bab5f04021f0375a3c6c85e0a11928ff53c8f127a8be",
-    "_build_ddtree_visibility_mask": "56b1574ea0e24b41c664798ea3b765cb110c0d202f530c5f40a8ac59821db75e",
     "FlashAttnV100MetadataBuilder": "3abc9b874d78d2667a4472e85eceeffac7416e46a99df68e5414c36b65a24d4c",
     "prepare_dflash2_smallq_group_metadata": "1fe1fb7165e397490e81a73bc12fca355ddeaa2f8c4d1a0828b242097f8c8d05",
     "FlashAttnV100Impl": "32176db3f0fd985cb117d60fbd8a6f3555c65cff7a5e4446bc1b4d0c3e0c2d98",
@@ -111,5 +107,14 @@
     "_uses_fp8_kv_cache": "0c036b0badb11b8ac98f27f7ffb61fe5987ab44af9ab4101e484d610fb2b6607",
     "_fp8_dtype_from_cache_dtype": "11cb063fdd432534f08df0d9818157009d3c1888fba1b67a65dfd71672336304",
     "_dequantize_fp8_contiguous_kv": "fe51939fd1a6d5d49bddd0dc8a560abaed21193c701029ebccb5339a2688c796"
+  },
+  "packed_converters_sha256": "96e3461b8f1eed9ed6b99bdf965d59cad9ac8c0cc805be4b1ce0ee9a70f50f15",
+  "masking_ast": {
+    "_cdiv_int": "1c2610e32c9a89a8442fab89783b9cdb9fa6a01ae7aa952bebda53a0409e2e11",
+    "_build_bfla_block_mask_for_seq": "853e1e65cef7f5e51757ad82fd0baae9f170d99baf72a0a2ae6395f6f6832e9b",
+    "_build_ddtree_visibility_mask": "56b1574ea0e24b41c664798ea3b765cb110c0d202f530c5f40a8ac59821db75e"
+  },
+  "reference_ast": {
+    "_torch_attention_reference": "65666317b9a71e8a53a2a712d2f293c3142b4d61319107db463031ec09878fcc"
   }
 }

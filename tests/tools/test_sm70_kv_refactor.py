@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
+import regex as re
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = json.loads(
@@ -20,11 +21,19 @@ FIXTURE = json.loads(
 BACKEND = ROOT / "vllm/v1/attention/backends/flash_attn_v100.py"
 METADATA = BACKEND.parent / "flash_v100/metadata.py"
 CODEC = BACKEND.parent / "flash_v100/codec.py"
+MASKING = BACKEND.parent / "flash_v100/masking.py"
+REFERENCE = BACKEND.parent / "flash_v100/reference.py"
 
 
 @pytest.mark.parametrize(
     ("group", "path"),
-    [("backend_ast", BACKEND), ("metadata_ast", METADATA), ("codec_ast", CODEC)],
+    [
+        ("backend_ast", BACKEND),
+        ("metadata_ast", METADATA),
+        ("codec_ast", CODEC),
+        ("masking_ast", MASKING),
+        ("reference_ast", REFERENCE),
+    ],
 )
 def test_original_numerics_and_dispatch_are_unchanged(group, path):
     nodes = {
@@ -62,6 +71,18 @@ def test_codec_reexports_keep_existing_imports_working():
     assert set(FIXTURE["codec_ast"]) <= imports
 
 
+@pytest.mark.parametrize("module", ["masking", "reference"])
+def test_mask_and_reference_reexports_keep_existing_imports_working(module):
+    imports = {
+        name.asname or name.name
+        for node in ast.parse(BACKEND.read_text()).body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == f"vllm.v1.attention.backends.flash_v100.{module}"
+        for name in node.names
+    }
+    assert set(FIXTURE[f"{module}_ast"]) <= imports
+
+
 def test_shared_codec_include_is_source_complete():
     canonical = ROOT / "flash-attention-v100/kernel/kv_codec.cuh"
     for path in (
@@ -86,6 +107,27 @@ def test_shared_codec_include_is_source_complete():
         "recursive-include kernel *.cu *.cuh *.h"
         in (ROOT / "flash-attention-v100/MANIFEST.in").read_text()
     )
+
+
+def test_packed_converters_have_one_preserved_implementation():
+    source = (ROOT / "flash-attention-v100/kernel/kv_codec.cuh").read_text()
+    start = source.index(
+        "__device__ __forceinline__ uint32_t\nfp8_e5m2_pair_to_half2_bits"
+    )
+    end = source.index("\ntemplate <int KV_DTYPE", start)
+    preserved = re.sub(r"\s+", "", source[start:end])
+    assert (
+        hashlib.sha256(preserved.encode()).hexdigest()
+        == FIXTURE["packed_converters_sha256"]
+    )
+    for path in (
+        ROOT / "flash-attention-v100/kernel/flash_decode_paged.cu",
+        ROOT / "csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu",
+    ):
+        attention = path.read_text()
+        assert "fp8_e4m3fn_pair_to_half2_bits(" not in attention
+        assert "KVReader<KV_DTYPE>::template load_half8" in attention
+        assert "KVReader<KV_DTYPE>::template half8_from_packed" in attention
 
 
 def test_path_matrix_covers_static_and_dynamic_route_sites():
@@ -146,7 +188,14 @@ def test_path_matrix_covers_static_and_dynamic_route_sites():
 
 
 def test_environment_inventory_covers_backend_reads():
-    tree = ast.parse(BACKEND.read_text())
+    tree = ast.Module(
+        body=[
+            node
+            for path in [BACKEND, *sorted((BACKEND.parent / "flash_v100").glob("*.py"))]
+            for node in ast.parse(path.read_text()).body
+        ],
+        type_ignores=[],
+    )
     names = {
         node.attr
         for node in ast.walk(tree)

@@ -793,5 +793,40 @@
       "baseline_extension_sha256": "5302d0139cead9bb1af081d73a1e04803840d8d862e431337bc3904b0e9f2b22",
       "candidate_extension_sha256": "a56a1dce7bd19517cdbed6aa0e05e9178e73e44c03fea3ca2f294d7546c28ab9"
     }
+  },
+  "packed_reader_extraction": {
+    "baseline": "c4f6245f841466782752a8c3283e4727565cf17a",
+    "packed_byte_pairs_per_fp8_format": 65536,
+    "sm70_ptx_equal": true,
+    "gpu_bitwise_equal": null,
+    "normal_fa2_sass": {
+      "equal": true,
+      "baseline_sha256": "44e48c90fa761cf4ffa396c4d5d8547cd583c1c426904a1da1c90552d0a5cfe4",
+      "candidate_sha256": "44e48c90fa761cf4ffa396c4d5d8547cd583c1c426904a1da1c90552d0a5cfe4",
+      "normalization": "anonymous namespace source-path hash only; instruction encodings retained",
+      "candidate_extension_sha256": "3708f33a0580f9be307c9df06ee38ca8571e7d88f3eb92cbcbdcb1103835b18f"
+    },
+    "scope": "standard/fast/LUT conversions and XQA vector reader; page addressing, scale order, launch ABI and scheduling unchanged",
+    "runtime_gate": "pending; user requested continued CPU/build work without waiting for V100",
+    "normal_standalone_sass": {
+      "equal": true,
+      "baseline_sha256": "49edbd2c158112201311d310c264d84070d98741d0f984772175bb4de74af4b6",
+      "candidate_sha256": "49edbd2c158112201311d310c264d84070d98741d0f984772175bb4de74af4b6",
+      "normalization": "anonymous namespace source-path hash only; instruction encodings retained"
+    }
+  },
+  "mask_reference_extraction": {
+    "base_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+    "torch": "2.10.0+cu128",
+    "device": "cpu",
+    "seed": 1048,
+    "cases": 96,
+    "all_bitwise_equal": true,
+    "functions": {
+      "_build_bfla_block_mask_for_seq": 24,
+      "_build_ddtree_visibility_mask": 54,
+      "_torch_attention_reference": 18
+    },
+    "scope": "CPU masks/reference extraction; no native attention/model/performance gate"
   }
 }
