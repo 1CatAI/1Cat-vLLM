@@ -96,6 +96,7 @@ entirely.
 | KV-cache storage formats | `vllm/v1/attention/kv_codecs.py` (`KVCodec`: FP16, BF16, FP8-E4M3, FP8-E5M2). Routes admit codecs, never `kv_cache_dtype` strings. |
 | CUDA KV readers and storage traits | `flash-attention-v100/kernel/{kv_codec,kv_codec_traits}.cuh`; XQA and grouped attention share scalar/vector conversion. Old `fp8_kv_utils.cuh` paths forward to this owner. See [traits contracts](kv_codec_traits.md). |
 | INT8-G64 extension contract | [Interface handoff](int8_g64_codec.md): proposed storage/scales, reader and launch ABI gaps, route reuse matrix. Documentation only; G64 is not implemented. See also `vllm/v1/attention/kv_codecs.README.md`. |
+| Shared SM70 MoE buffers | `vllm/model_executor/layers/fused_moe/sm70/base.py::Sm70MoEMethodBase`, using the layer-owned workspace view. FP8 migrated first; other formats and stage/weight-codec extraction remain in progress. See the adjacent component README. |
 | Flash-V100 attention | `vllm/v1/attention/backends/flash_v100/`: `ops` (native operator loading), `routing` (route accounting, decode partition/XQA admission), `kv_layout`, `masks`, `dense_prefill`, `spec/` (feature metadata hooks and device preparation), `metadata` (common metadata), `impl` (initialization/forward with registered feature hooks), `decode`, `prefill`, `verify`, `debug_compare`, `state` (shared flags), `backend`. Modules reach each other through the module object (`_routing._record_route`), so rebound globals and monkeypatches have one owner. `flash_attn_v100.py` is a compatibility module that forwards reads and writes, including wildcard imports. Public package re-exports resolve the owning module dynamically. The original logger name and shared one-shot flags are retained. |
 
 The grouped attention family lives in `vllm/v1/attention/ops/sm70_grouped.py`
@@ -132,7 +133,8 @@ performance regression), lands as its own PR and can be reverted alone.
    CUDA storage traits reuse #1048's reader and remove native-family copies;
    explicit native-prefill codec capability now gates the counted bridge fallback;
    INT8-G64 interface handoff documents shared seams and current ABI gaps;
-   next: MoE,
+   FP8 buffer lifecycle now uses the shared SM70 MoE base;
+   next: MoE stage/weight codecs and remaining format adapters,
    metadata and implementation feature hooks plus method composition done;
    common attention entrypoints contain no family names.)*
 5. **Kernels and build** — consolidate extension modules, mark retired variant files deprecated,

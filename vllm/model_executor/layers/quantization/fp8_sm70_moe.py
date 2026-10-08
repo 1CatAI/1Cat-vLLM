@@ -12,12 +12,12 @@ from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
     RoutedExperts,
     SharedExperts,
 )
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
+from vllm.model_executor.layers.fused_moe.sm70.base import Sm70MoEMethodBase
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
     Sm70MoeStageRoute,
     select_sm70_quantized_moe_route,
@@ -85,7 +85,7 @@ def _single_token_indexed_w2_enabled() -> bool:
     return hasattr(torch.ops._C, "fp8_moe_single_token_indexed_dense_stage_sm70_out")
 
 
-class Fp8SM70MoEMethod(FusedMoEMethodBase):
+class Fp8SM70MoEMethod(Sm70MoEMethodBase):
     """SM70 FP8 MoE path backed by TurboMind kernels.
 
     The default production lane is native batched FP8 MoE. Extra decode
@@ -362,104 +362,13 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
             )
 
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
-        device = layer.w13_tm_weight.device
-        top_k = self.moe.experts_per_token
-        persistent_tokens = _DEFAULT_PERSISTENT_MAX_TOKENS
-        max_slots = persistent_tokens * top_k
-        hidden_size = layer.sm70_hidden_logical_size
-        num_experts = layer.sm70_num_experts
-        layer._fp8_buf_max_tokens = persistent_tokens
-        layer._fp8_buf_max_slots = max_slots
-        layer._fp8_buf_top_k = top_k
-        layer._fp8_buf_output = torch.empty(
-            persistent_tokens, hidden_size, dtype=torch.float16, device=device
+        self._allocate_moe_buffers(
+            layer,
+            buffer_prefix="_fp8_buf_",
+            persistent_max_tokens=_DEFAULT_PERSISTENT_MAX_TOKENS,
+            empty_weight_dtype=torch.float8_e4m3fn,
+            empty_scale_dtype=torch.float32,
         )
-        layer._fp8_buf_permuted_input = torch.empty(
-            max_slots, hidden_size, dtype=torch.float16, device=device
-        )
-        layer._fp8_buf_intermediate = torch.empty(
-            max_slots, layer.sm70_intermediate_size, dtype=torch.float16, device=device
-        )
-        layer._fp8_buf_gate_up = torch.empty(
-            max_slots, layer.sm70_w13_n_dim, dtype=torch.float16, device=device
-        )
-        layer._fp8_buf_sorted_output = torch.empty(
-            max_slots, hidden_size, dtype=torch.float16, device=device
-        )
-        layer._fp8_buf_expert_offsets = torch.empty(
-            num_experts + 1, dtype=torch.int32, device=device
-        )
-        layer._fp8_buf_expert_offsets64 = torch.empty(
-            num_experts + 1, dtype=torch.int64, device=device
-        )
-        layer._fp8_buf_inv_permuted_idx = torch.empty(
-            persistent_tokens, top_k, dtype=torch.int32, device=device
-        )
-        layer._fp8_buf_topk_ids = torch.empty(
-            persistent_tokens, top_k, dtype=torch.int32, device=device
-        )
-        layer._fp8_buf_token_expert_indices = torch.arange(
-            max_slots, dtype=torch.int32, device=device
-        ).view(persistent_tokens, top_k)
-        layer._fp8_buf_permuted_idx = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._fp8_buf_sorted_expert_ids = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        if self.use_permute_with_scratch:
-            sort_workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
-                max_slots, layer.global_num_experts
-            )
-        else:
-            sort_workspace_size = 0
-        layer._fp8_buf_sort_workspace = torch.empty(
-            sort_workspace_size, dtype=torch.int8, device=device
-        )
-        layer._fp8_buf_permuted_experts_id = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._fp8_buf_sorted_row_idx = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._fp8_buf_topk_ids_for_sort = torch.empty(
-            max_slots, dtype=torch.int32, device=device
-        )
-        layer._fp8_buf_active_expert_offsets = torch.arange(
-            max_slots + 1, dtype=torch.int32, device=device
-        )
-        layer._fp8_buf_sorted_weights = torch.empty(
-            top_k, dtype=torch.float32, device=device
-        )
-        layer._fp8_buf_broadcast_input_indices = torch.empty(
-            top_k, dtype=torch.int32, device=device
-        )
-        layer._fp8_buf_dense_expert_ids = torch.arange(
-            num_experts, dtype=torch.int32, device=device
-        )
-        ptr_row_bytes = int(layer.sm70_ptr_row_bytes)
-        layer._fp8_buf_compact_w13_ptrs_w = torch.empty(
-            top_k * ptr_row_bytes, dtype=torch.uint8, device=device
-        )
-        layer._fp8_buf_compact_w13_ptrs_s = torch.empty(
-            top_k * ptr_row_bytes, dtype=torch.uint8, device=device
-        )
-        layer._fp8_buf_legacy_w13_ptrs_w = torch.empty(
-            top_k, ptr_row_bytes, dtype=torch.uint8, device=device
-        )
-        layer._fp8_buf_legacy_w13_ptrs_s = torch.empty(
-            top_k, ptr_row_bytes, dtype=torch.uint8, device=device
-        )
-        layer._fp8_buf_legacy_w2_ptrs_w = torch.empty(
-            top_k, ptr_row_bytes, dtype=torch.uint8, device=device
-        )
-        layer._fp8_buf_legacy_w2_ptrs_s = torch.empty(
-            top_k, ptr_row_bytes, dtype=torch.uint8, device=device
-        )
-        layer._fp8_buf_empty_weight = torch.empty(
-            0, dtype=torch.float8_e4m3fn, device=device
-        )
-        layer._fp8_buf_empty_scale = torch.empty(0, dtype=torch.float32, device=device)
 
     def _apply_batched_reference_for_compare(
         self,
@@ -744,125 +653,9 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
     def _get_buffers(
         self, layer: RoutedExperts, total_slots: int, num_tokens: int
     ) -> dict[str, torch.Tensor]:
-        if (
-            total_slots <= layer._fp8_buf_max_slots
-            and num_tokens <= layer._fp8_buf_max_tokens
-        ):
-            return {
-                "output": layer._fp8_buf_output[:num_tokens],
-                "permuted_input": layer._fp8_buf_permuted_input[:total_slots],
-                "intermediate": layer._fp8_buf_intermediate[:total_slots],
-                "gate_up": layer._fp8_buf_gate_up[:total_slots],
-                "sorted_output": layer._fp8_buf_sorted_output[:total_slots],
-                "expert_offsets": layer._fp8_buf_expert_offsets,
-                "expert_offsets64": layer._fp8_buf_expert_offsets64,
-                "inv_permuted_idx": layer._fp8_buf_inv_permuted_idx[:num_tokens],
-                "topk_ids": layer._fp8_buf_topk_ids[:num_tokens],
-                "token_expert_indices": layer._fp8_buf_token_expert_indices[
-                    :num_tokens
-                ],
-                "permuted_idx": layer._fp8_buf_permuted_idx[:total_slots],
-                "sorted_expert_ids": layer._fp8_buf_sorted_expert_ids[:total_slots],
-                "sort_workspace": layer._fp8_buf_sort_workspace,
-                "permuted_experts_id": layer._fp8_buf_permuted_experts_id[:total_slots],
-                "sorted_row_idx": layer._fp8_buf_sorted_row_idx[:total_slots],
-                "topk_ids_for_sort": layer._fp8_buf_topk_ids_for_sort[:total_slots],
-                "active_expert_offsets": (
-                    layer._fp8_buf_active_expert_offsets[: total_slots + 1]
-                ),
-                "sorted_weights": layer._fp8_buf_sorted_weights,
-                "broadcast_input_indices": layer._fp8_buf_broadcast_input_indices,
-                "compact_w13_ptrs_w": layer._fp8_buf_compact_w13_ptrs_w,
-                "compact_w13_ptrs_s": layer._fp8_buf_compact_w13_ptrs_s,
-                "legacy_w13_ptrs_w": layer._fp8_buf_legacy_w13_ptrs_w,
-                "legacy_w13_ptrs_s": layer._fp8_buf_legacy_w13_ptrs_s,
-                "legacy_w2_ptrs_w": layer._fp8_buf_legacy_w2_ptrs_w,
-                "legacy_w2_ptrs_s": layer._fp8_buf_legacy_w2_ptrs_s,
-                "empty_weight": layer._fp8_buf_empty_weight,
-                "empty_scale": layer._fp8_buf_empty_scale,
-            }
-
-        device = layer._fp8_buf_output.device
-        top_k = layer._fp8_buf_top_k
-        hidden_size = layer.sm70_hidden_logical_size
-        if self.use_permute_with_scratch:
-            sort_workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
-                total_slots, layer.global_num_experts
-            )
-            sort_workspace = torch.empty(
-                sort_workspace_size, dtype=torch.int8, device=device
-            )
-            active_expert_offsets = torch.arange(
-                total_slots + 1, dtype=torch.int32, device=device
-            )
-        else:
-            sort_workspace = layer._fp8_buf_sort_workspace
-            active_expert_offsets = layer._fp8_buf_active_expert_offsets[
-                : total_slots + 1
-            ]
-        return {
-            "output": torch.empty(
-                num_tokens, hidden_size, dtype=torch.float16, device=device
-            ),
-            "permuted_input": torch.empty(
-                total_slots, hidden_size, dtype=torch.float16, device=device
-            ),
-            "intermediate": torch.empty(
-                total_slots,
-                layer.sm70_intermediate_size,
-                dtype=torch.float16,
-                device=device,
-            ),
-            "gate_up": torch.empty(
-                total_slots,
-                layer.sm70_w13_n_dim,
-                dtype=torch.float16,
-                device=device,
-            ),
-            "sorted_output": torch.empty(
-                total_slots, hidden_size, dtype=torch.float16, device=device
-            ),
-            "expert_offsets": torch.empty(
-                layer.sm70_num_experts + 1, dtype=torch.int32, device=device
-            ),
-            "expert_offsets64": torch.empty(
-                layer.sm70_num_experts + 1, dtype=torch.int64, device=device
-            ),
-            "inv_permuted_idx": torch.empty(
-                num_tokens, top_k, dtype=torch.int32, device=device
-            ),
-            "topk_ids": torch.empty(
-                num_tokens, top_k, dtype=torch.int32, device=device
-            ),
-            "token_expert_indices": torch.arange(
-                total_slots, dtype=torch.int32, device=device
-            ).view(num_tokens, top_k),
-            "permuted_idx": torch.empty(total_slots, dtype=torch.int32, device=device),
-            "sorted_expert_ids": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
-            "sort_workspace": sort_workspace,
-            "permuted_experts_id": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
-            "sorted_row_idx": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
-            "topk_ids_for_sort": torch.empty(
-                total_slots, dtype=torch.int32, device=device
-            ),
-            "active_expert_offsets": active_expert_offsets,
-            "sorted_weights": layer._fp8_buf_sorted_weights,
-            "broadcast_input_indices": layer._fp8_buf_broadcast_input_indices,
-            "compact_w13_ptrs_w": layer._fp8_buf_compact_w13_ptrs_w,
-            "compact_w13_ptrs_s": layer._fp8_buf_compact_w13_ptrs_s,
-            "legacy_w13_ptrs_w": layer._fp8_buf_legacy_w13_ptrs_w,
-            "legacy_w13_ptrs_s": layer._fp8_buf_legacy_w13_ptrs_s,
-            "legacy_w2_ptrs_w": layer._fp8_buf_legacy_w2_ptrs_w,
-            "legacy_w2_ptrs_s": layer._fp8_buf_legacy_w2_ptrs_s,
-            "empty_weight": layer._fp8_buf_empty_weight,
-            "empty_scale": layer._fp8_buf_empty_scale,
-        }
+        return self._get_moe_buffers(
+            layer, total_slots, num_tokens, buffer_prefix="_fp8_buf_"
+        )
 
     @property
     def supports_eplb(self) -> bool:

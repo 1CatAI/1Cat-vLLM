@@ -49413,3 +49413,32 @@ remain model 2325 / platform 3964 / raw env 334. A0–A6 source/doc work is now
 published in the stack, but GPU numerical/performance qualification is absent
 and the full architecture campaign remains incomplete. Next scope: B1 shared
 SM70 MoE skeleton, starting with FP8. Artifacts: /home/ymzx/arch-ws/tmp/a6-*.
+
+## 2026-10-08 — architecture B1a shared FP8 MoE buffers
+
+Stack on A6 #1064 (`9428cb02ad71688a262788ec2a7fccb6b4bbc274`) in
+/home/ymzx/arch-ws/v100-arch-moe-buffers-20261008-110041, branch
+agent/v100-arch-moe-buffers-20261008-110041. Sm70MoEMethodBase owns the existing
+FP8 persistent/overflow allocation and slicing. The FP8 adapter passes its
+legacy prefix, capacity and empty weight/scale dtypes. LayerWorkspaceView in
+the existing sm70_layer_workspaces helper resolves the real layer attributes
+without copying bindings or registering them into the opaque linear registry.
+Old FP8 method signatures and capacity-constant rebinding remain compatible.
+The original class retains all weight preparation and stage/compare methods.
+
+Focused CPU checks: 34 passed, comprising 28 new cases (24 differential buffer
+cases plus layer rebinding, capacity rebinding, fullgraph CPU tracing and all
+method-body AST parity) and six retained opaque-workspace AOT reload checks.
+The frozen parent oracle compares shape/dtype/stride/device and storage-alias
+relationships including empty buffers, top-k 1/2/8, token counts 0/1/32/33 and
+scratch on/off. The CPU compiler check uses backend=eager, not a GPU graph.
+No CUDA arithmetic changed; GPU numerical/replay/timing data remain unmeasured
+under the user's no-V100 instruction. No shared-runtime installs or NVMe
+writes. Layering totals remain model 2325 / platform 3964 / raw env 334.
+Evidence: /home/ymzx/arch-ws/tmp/b1a-*.
+
+This completes only the buffer-lifecycle review scope. Indexed/compact W13/W2,
+weighted reduce, logging/compare, format GEMM codecs and AWQ/NVFP4/MXFP4/GGUF/
+skinny integration remain required B1 work. Do not claim the full B1 or overall
+architecture campaign complete. Preserve differing buffer/capture contracts
+when adding those consumers.
