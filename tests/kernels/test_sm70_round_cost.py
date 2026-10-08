@@ -90,3 +90,80 @@ def test_changed_route_graph_replays_and_reset():
     assert result["total"] == 3 and result["dropped"] == 0
     assert [r["ids"][0][0] for r in result["records"]] == [10, 20, 30]
     assert all(r["unique_experts"] == 50 for r in result["records"])
+
+
+def test_selection_counts_mask_causality_and_request_union():
+    from vllm.sm70_round_cost import ordered_selection_records
+
+    ids = torch.tensor(
+        [[[0, 1, 1, -1], [1, 2, 3, 10]], [[0, 1, -1, -1], [0, 2, -1, -1]]]
+    )
+    rows = torch.tensor([2, 2])
+    positions = torch.tensor([[2, 3], [1, 2]])
+    requests = torch.tensor([[0, 0], [0, 1]])
+    cumulative = torch.tensor([[3, 2, 0], [6, 3, 1]])
+    result = ordered_selection_records(ids, rows, 2, cumulative, requests, positions)
+    first, second = result["records"]
+    assert first["valid_per_row"] == [3, 3]
+    assert first["unique_per_row"] == [2, 3]
+    assert first["logical_union_single_request"] == 4
+    assert second["logical_union_single_request"] is None
+    assert second["cache_hit_miss_contention_delta"] == [3, 1, 1]
+
+
+def test_selection_ring_loss_has_unknown_initial_cache_delta():
+    from vllm.sm70_round_cost import ordered_selection_records
+
+    ids = torch.ones(2, 1, 4, dtype=torch.int32)
+    rows = torch.ones(2, dtype=torch.int32)
+    requests = torch.zeros(2, 1, dtype=torch.int32)
+    positions = torch.full((2, 1), 5)
+    # Ordinal 2 wraps to slot 0; only ordinals 1 and 2 remain.
+    cumulative = torch.tensor([[12, 2, 0], [8, 2, 0]])
+    result = ordered_selection_records(ids, rows, 3, cumulative, requests, positions)
+    assert result["dropped"] == 1
+    assert result["records"][0]["cache_hit_miss_contention_delta"] is None
+    assert result["records"][1]["cache_hit_miss_contention_delta"] == [4, 0, 0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_selection_and_cache_counter_graph_replay():
+    from vllm.sm70_round_cost import SelectionRecorder, ordered_selection_records
+
+    recorder = SelectionRecorder("test_selection", 2051, "cuda")
+    ids = (
+        torch.arange(5 * 2051, device="cuda", dtype=torch.int32).reshape(5, 2051) % 4096
+    )
+    requests = torch.zeros(5, dtype=torch.int32, device="cuda")
+    positions = torch.full((5,), 8192, dtype=torch.int64, device="cuda")
+    stats = torch.zeros(20 * 129, 3, dtype=torch.int64, device="cuda")
+    recorder.capture(ids, requests, positions)
+    recorder.capture_cache(stats, 5)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        recorder.capture(ids, requests, positions)
+        stats.add_(1)
+        recorder.capture_cache(stats, 5)
+    recorder.counter.zero_()
+    stats.zero_()
+    for _ in range(3):
+        ids.add_(1)
+        graph.replay()
+    torch.accelerator.synchronize()
+    result = ordered_selection_records(
+        recorder.ids.cpu(),
+        recorder.rows.cpu(),
+        3,
+        recorder.cache_totals.cpu(),
+        recorder.requests.cpu(),
+        recorder.positions.cpu(),
+    )
+    assert [r["logical_union_single_request"] for r in result["records"]] == [
+        4096,
+        4096,
+        4096,
+    ]
+    assert all(
+        r["cache_hit_miss_contention_delta"] == [2580, 2580, 2580]
+        for r in result["records"]
+    )

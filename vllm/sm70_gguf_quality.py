@@ -19,7 +19,7 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
 
     def read_round_cost_ledger(self):
         """Read actual routes and loaded tensor storage outside replay."""
-        from vllm.sm70_round_cost import read_routes, tensor_inventory
+        from vllm.sm70_round_cost import read_routes, read_selections, tensor_inventory
 
         runner = self.model_runner
         models = {"target": runner.model}
@@ -34,6 +34,7 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
             "rank": self.rank,
             "scope": "diagnostic routing and storage; not a latency result",
             "routes": read_routes(),
+            "selections": read_selections(),
             "tensors": {
                 name: tensor_inventory(model) for name, model in models.items()
             },
