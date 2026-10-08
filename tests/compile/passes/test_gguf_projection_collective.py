@@ -20,7 +20,16 @@ from vllm.model_executor.layers.quantization.gguf_projection_collective import (
 )
 
 
-def trace(rows, functional, *, kind=5, k=4352, kw=4, extra_consumer=False):
+def trace(
+    rows,
+    functional,
+    *,
+    kind=5,
+    k=4352,
+    kw=4,
+    extra_consumer=False,
+    norm_dtype=torch.float32,
+):
     with FakeTensorMode():
         inputs = (
             torch.empty(rows, k, dtype=torch.float16),
@@ -28,7 +37,7 @@ def trace(rows, functional, *, kind=5, k=4352, kw=4, extra_consumer=False):
             torch.empty(1, dtype=torch.float32),
             torch.empty(1, dtype=torch.int32),
             torch.empty(rows, 5120, dtype=torch.float32),
-            torch.empty(5120, dtype=torch.float32),
+            torch.empty(5120, dtype=norm_dtype),
         )
 
         def model(x, codes, partials, counters, residual, weight):
@@ -84,13 +93,16 @@ def trace(rows, functional, *, kind=5, k=4352, kw=4, extra_consumer=False):
         return make_fx(model)(*inputs)
 
 
+@pytest.mark.parametrize("norm_dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("rows", [1, 8, 32])
 @pytest.mark.parametrize("kind", [0, 3, 5])
 @pytest.mark.parametrize(
     "functional", [None, auto_functionalized, auto_functionalized_v2]
 )
-def test_rewrite_preserves_live_m_and_mutable_outputs(rows, kind, functional):
-    module = trace(rows, functional, kind=kind)
+def test_rewrite_preserves_live_m_and_mutable_outputs(
+    rows, kind, functional, norm_dtype
+):
+    module = trace(rows, functional, kind=kind, norm_dtype=norm_dtype)
     original_outputs = tuple(module.graph.nodes)[-1].args[0]
     shapes = [tuple(n.meta["val"].shape) for n in original_outputs]
     assert fuse_projection_collectives(module.graph) == 1

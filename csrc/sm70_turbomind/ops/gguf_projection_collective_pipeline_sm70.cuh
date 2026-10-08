@@ -8,11 +8,11 @@ namespace {
 constexpr int PipeParts = vllm::kSm70PushNormParts;
 constexpr int PipePacks = vllm::kSm70PushNormRows * 640;
 
-template <int Format>
+template <int Format, typename Weight = float>
 __global__ __launch_bounds__(256) void projection_collective_pipeline(
     const __grid_constant__ Segs down, const half* x,
     const __grid_constant__ vllm::RankData buffers, int rank,
-    const float* residual, const float* weight, half* normalized,
+    const float* residual, const Weight* weight, half* normalized,
     float* residual_out, float epsilon) {
   using P = typename vllm::packed_t<half>::P;
   using A = typename vllm::packed_t<half>::A;
@@ -143,26 +143,28 @@ __global__ __launch_bounds__(256) void projection_collective_pipeline(
     for (int i = 0; i < P::size; ++i)
       value.data[i] =
           __float2half_rn(values[i] * inverse *
-                          (weight[(part * 128 + tid) * P::size + i] + 1.f));
+                          (vllm::sm70_gemma_rms_norm_to_float(
+                               weight[(part * 128 + tid) * P::size + i]) +
+                           1.f));
     reinterpret_cast<P*>(normalized)[pack] = value;
   }
 }
 
-template <int Format>
+template <int Format, typename Weight = float>
 void run_pipeline(Segs down, const half* x, vllm::RankData buffers, int rank,
-                  const float* residual, const float* weight, half* normalized,
+                  const float* residual, const Weight* weight, half* normalized,
                   float* residual_out, float epsilon, bool fused) {
   auto stream = at::cuda::getCurrentCUDAStream();
   if (!fused) {
     launch<4, 2, Format, Format>(down, x, 4352, 8, 4352, 136, 34, 1, nullptr,
                                  nullptr, 80, stream, nullptr);
-    vllm::sm70_push_allreduce_gemma_rms_norm<float><<<40, 128, 0, stream>>>(
+    vllm::sm70_push_allreduce_gemma_rms_norm<Weight><<<40, 128, 0, stream>>>(
         buffers, down.s[0].out, residual, weight, normalized, residual_out,
         rank, buffers.ptrs[rank], epsilon);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
-  const auto kernel = projection_collective_pipeline<Format>;
+  const auto kernel = projection_collective_pipeline<Format, Weight>;
   constexpr int shared = 4 * 256 * 16 + TAB_VECS * 16;
   int active = 0, device = 0;
   C10_CUDA_CHECK(cudaGetDevice(&device));

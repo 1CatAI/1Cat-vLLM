@@ -102,7 +102,7 @@ The native operator is part of the normal CMake `_C` extension. It reuses
 the existing TP4 push/norm packets and preserves their generation protocol.
 No new weight representation or communication-buffer allocation is needed.
 Admission covers M8/K4352/N5120, KW4/TN2/split1, one Q4_K, IQ4_XS or IQ3_S
-segment, FP16 input, FP32 residual/norm and full NVLink TP4. Other rows and
+segment, FP16 input, FP32 residual, FP16/FP32 norm weights and full NVLink TP4. Other rows and
 formats use the original projection followed by the original collective
 and norm. Compile-time matching deliberately does not specialize on M.
 
@@ -115,8 +115,8 @@ At 1530/877 MHz, rank 0 measures 29.738 to 26.812 us for IQ4_XS and 31.776
 to 29.124 us for Q4_K; these numbers are compared only within this new run,
 not against the earlier 1290 MHz screen.
 
-Thirty-nine CPU fake-tensor cases cover direct, functionalized and v2 graphs,
-M1/M8/M32, metadata epsilon and nonqualified consumers/shapes. Packaged GPU
+Sixty-six CPU fake-tensor cases cover direct, functionalized and v2 graphs,
+M1/M8/M32, metadata epsilon, both norm-weight dtypes and nonqualified consumers/shapes. Packaged GPU
 and model results are pending; the route is not approved for integration yet.
 
 ## External implementations
@@ -134,3 +134,8 @@ provides the scheduler, memory and residency constraints used above.
 explains `__grid_constant__` on Volta and later GPUs. Measurements, hashes and
 explicitly unresolved bounds are in
 [data/gguf_structural_pipeline_20261008.json](data/gguf_structural_pipeline_20261008.json).
+
+The loaded model stores Gemma norm parameters in FP16. The pipeline accepts
+these values directly and uses the existing exact half-to-FP32 conversion;
+it does not lower scale, residual or accumulation precision. The earlier
+FP32-weight-only admission would have silently fallen back in the model.

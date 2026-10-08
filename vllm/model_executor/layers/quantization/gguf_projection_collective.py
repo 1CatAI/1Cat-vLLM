@@ -79,12 +79,12 @@ def _project_norm(
         not x.is_cuda
         or x.dtype != torch.float16
         or residual.dtype != torch.float32
-        or weight.dtype != torch.float32
+        or weight.dtype not in (torch.float16, torch.float32)
         or not all(t.is_contiguous() for t in (x, residual, weight))
         or tuple(residual.shape) != (8, 5120)
         or tuple(weight.shape) != (5120,)
     ):
-        reason = "requires_contiguous_fp16_input_and_fp32_residual_norm"
+        reason = "requires_fp16_input_fp32_residual_and_fp16_or_fp32_norm"
     elif torch.cuda.get_device_capability(x.device) != (7, 0):
         reason = "requires_sm70"
     cfg = get_current_vllm_config_or_none()

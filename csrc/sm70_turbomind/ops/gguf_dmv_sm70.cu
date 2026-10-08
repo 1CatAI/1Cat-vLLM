@@ -1311,7 +1311,10 @@ void gguf_dmv_allreduce_norm_sm70_out(
   storage(normalized, at::kHalf);
   storage(residual, at::kFloat);
   storage(residual_out, at::kFloat);
-  storage(weight, at::kFloat);
+  TORCH_CHECK(weight.device() == input.device() && weight.is_contiguous() &&
+                  (weight.scalar_type() == at::kFloat ||
+                   weight.scalar_type() == at::kHalf),
+              "norm weight must be contiguous FP16 or FP32");
   TORCH_CHECK(pointers.size() == 4 && rank >= 0 && rank < 4 &&
                   (format == IQ3S || format == LUT4 || format == Q4K) &&
                   epsilon > 0.0,
@@ -1344,16 +1347,24 @@ void gguf_dmv_allreduce_norm_sm70_out(
   auto x = reinterpret_cast<const half*>(input.data_ptr());
   auto out = reinterpret_cast<half*>(normalized.data_ptr());
   const float eps = static_cast<float>(epsilon);
-#define PIPE(F)                                                              \
-  run_pipeline<F>(down, x, buffers, static_cast<int>(rank),                  \
-                  residual.data_ptr<float>(), weight.data_ptr<float>(), out, \
-                  residual_out.data_ptr<float>(), eps, true)
-  if (format == IQ3S) {
-    PIPE(IQ3S);
-  } else if (format == LUT4) {
-    PIPE(LUT4);
-  } else {
-    PIPE(Q4K);
-  }
+  auto dispatch = [&](auto* weight_tag) {
+    using Weight = std::remove_pointer_t<decltype(weight_tag)>;
+#define PIPE(F)                                                               \
+  run_pipeline<F, Weight>(down, x, buffers, static_cast<int>(rank),           \
+                          residual.data_ptr<float>(),                         \
+                          reinterpret_cast<const Weight*>(weight.data_ptr()), \
+                          out, residual_out.data_ptr<float>(), eps, true)
+    if (format == IQ3S) {
+      PIPE(IQ3S);
+    } else if (format == LUT4) {
+      PIPE(LUT4);
+    } else {
+      PIPE(Q4K);
+    }
 #undef PIPE
+  };
+  if (weight.scalar_type() == at::kHalf)
+    dispatch(static_cast<half*>(nullptr));
+  else
+    dispatch(static_cast<float*>(nullptr));
 }

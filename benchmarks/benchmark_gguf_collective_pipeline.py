@@ -67,7 +67,9 @@ def worker(rank, args, generated):
     cases = []
     torch.manual_seed(123)
     residual = torch.randn(8, 5120, device=rank, dtype=torch.float32)
-    weight = torch.randn(5120, device=rank, dtype=torch.float32) * 0.01
+    weight = (
+        torch.randn(5120, device=rank, dtype=getattr(torch, args.norm_dtype)) * 0.01
+    )
     for layer in (6, 24, 51):
         tensor = tensors[f"blk.{layer}.ffn_down.weight"]
         k, n = map(int, tensor.shape)
@@ -211,6 +213,7 @@ def worker(rank, args, generated):
                 rank=rank,
                 layer=layer,
                 format=fmt,
+                norm_dtype=args.norm_dtype,
                 partial_bitwise=True,
                 residual_bitwise=True,
                 norm_relative_l2=norm_relative,
@@ -253,6 +256,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--norm-dtype", choices=("float16", "float32"), default="float16"
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "build").mkdir(exist_ok=True)

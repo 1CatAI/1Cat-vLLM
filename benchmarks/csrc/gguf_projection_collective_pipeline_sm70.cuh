@@ -47,8 +47,9 @@ void pipeline_research(torch::Tensor x, torch::Tensor codes,
               "invalid pipeline workload");
   c10::cuda::CUDAGuard guard(x.device());
   TORCH_CHECK(residual.scalar_type() == at::kFloat &&
-                  weight.scalar_type() == at::kFloat,
-              "FP32 residual and norm weight required");
+                  (weight.scalar_type() == at::kFloat ||
+                   weight.scalar_type() == at::kHalf),
+              "FP32 residual and FP16/FP32 norm weight required");
   Segs down{};
   down.nseg = 1;
   down.tab = format == IQ3S ? reinterpret_cast<const uint4*>(table.data_ptr())
@@ -64,18 +65,26 @@ void pipeline_research(torch::Tensor x, torch::Tensor codes,
     buffers.ptrs[i] = reinterpret_cast<void*>(pointers[i]);
   auto xp = reinterpret_cast<const half*>(x.data_ptr());
   auto norm = reinterpret_cast<half*>(normalized.data_ptr());
-  if (format == IQ3S)
-    run_pipeline<IQ3S>(down, xp, buffers, rank, residual.data_ptr<float>(),
-                       weight.data_ptr<float>(), norm,
-                       residual_out.data_ptr<float>(), 1e-6f, fused);
-  else if (format == LUT4)
-    run_pipeline<LUT4>(down, xp, buffers, rank, residual.data_ptr<float>(),
-                       weight.data_ptr<float>(), norm,
-                       residual_out.data_ptr<float>(), 1e-6f, fused);
+  auto dispatch = [&](auto* weight_tag) {
+    using Weight = std::remove_pointer_t<decltype(weight_tag)>;
+    auto weight_ptr = reinterpret_cast<const Weight*>(weight.data_ptr());
+    if (format == IQ3S)
+      run_pipeline<IQ3S, Weight>(down, xp, buffers, rank,
+                                 residual.data_ptr<float>(), weight_ptr, norm,
+                                 residual_out.data_ptr<float>(), 1e-6f, fused);
+    else if (format == LUT4)
+      run_pipeline<LUT4, Weight>(down, xp, buffers, rank,
+                                 residual.data_ptr<float>(), weight_ptr, norm,
+                                 residual_out.data_ptr<float>(), 1e-6f, fused);
+    else
+      run_pipeline<Q4K, Weight>(down, xp, buffers, rank,
+                                residual.data_ptr<float>(), weight_ptr, norm,
+                                residual_out.data_ptr<float>(), 1e-6f, fused);
+  };
+  if (weight.scalar_type() == at::kHalf)
+    dispatch(static_cast<half*>(nullptr));
   else
-    run_pipeline<Q4K>(down, xp, buffers, rank, residual.data_ptr<float>(),
-                      weight.data_ptr<float>(), norm,
-                      residual_out.data_ptr<float>(), 1e-6f, fused);
+    dispatch(static_cast<float*>(nullptr));
 }
 }  // namespace
 
