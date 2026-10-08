@@ -72,6 +72,7 @@ def fixture(case):
         head_size=head,
         scale=head**-0.5,
         alibi_slopes=None,
+        sliding_window=None,
         kv_cache_dtype=case["codec"],
     )
     spec_case = dict(
@@ -83,10 +84,20 @@ def fixture(case):
     )
     builder, update = prepare_spec(spec_case, backend, metadata, layer, [q])
     update()
-    buffers = [v for v in vars(builder).values() if isinstance(v, torch.Tensor)]
-    if case["spec"] in ("dflash2", "mtp") and not buffers:
+    if case["spec"] in ("dflash2", "mtp") and not any(
+        isinstance(v, torch.Tensor) for v in vars(builder).values()
+    ):
         raise AssertionError("Speculative case did not create persistent buffers")
-    buffers += [v for v in vars(metadata).values() if isinstance(v, torch.Tensor)]
+
+    def buffers(refresh=False):
+        if refresh and case["spec"] in ("dflash2", "mtp"):
+            update()
+        return {
+            f"{owner}.{name}": value.data_ptr()
+            for owner, obj in (("builder", builder), ("metadata", metadata))
+            for name, value in vars(obj).items()
+            if isinstance(value, torch.Tensor)
+        }
 
     def forward():
         result = implementation.forward(
@@ -102,7 +113,7 @@ def measure(forward, output, buffers, *, graph, iterations, repeats):
     for _ in range(5):
         forward()
     torch.accelerator.synchronize()
-    pointers = [v.data_ptr() for v in buffers]
+    pointers = buffers()
     if graph:
         replay = torch.cuda.CUDAGraph()
         with torch.cuda.graph(replay):
@@ -113,12 +124,16 @@ def measure(forward, output, buffers, *, graph, iterations, repeats):
     call()
     torch.accelerator.synchronize()
     first = output.detach().cpu().clone()
+    if pointers != buffers(refresh=True):
+        raise AssertionError(
+            "Persistent buffer pointers changed during metadata update"
+        )
     call()
     torch.accelerator.synchronize()
     second = output.detach().cpu().clone()
     if not torch.equal(first, second) or not torch.isfinite(first).all():
         raise AssertionError("Baseline forward is nonfinite or not replay-exact")
-    if pointers != [v.data_ptr() for v in buffers]:
+    if pointers != buffers():
         raise AssertionError("Persistent buffer pointers changed")
     times = []
     for _ in range(repeats):
@@ -197,6 +212,7 @@ def record(args):
     if args.iterations < 1 or args.repeats < 1:
         raise ValueError("Timing iterations and repeats must be positive")
     for case in cases:
+        print(f"Running {case['name']}", flush=True)
         if not 0 < case["query"] <= case["context"] or not case["required_routes"]:
             raise ValueError("Every case needs valid lengths and an observed route")
     report = dict(
