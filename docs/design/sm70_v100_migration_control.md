@@ -49055,3 +49055,34 @@ separate and disabled in these arms.
   75T/three-model/35B admission before their gates pass. Next: normal complete
   FA2/vLLM build and model route gates, then real-request FP16 Q/K/V selection
   data and subsequent independently revertible codec migration scopes.
+
+### KV codec continuation: dense accounting and offline candidates
+
+The same owned Draft PR now centralizes dense payload/inline-scale byte costs
+and the Triton scale-view layout in `vllm/v1/kv_cache_codec.py`. Public mode/helper
+imports remain compatible. Against immutable `c4f6245f8`, all 2646 CPU storage
+configurations match; 17 layout/budget tests and eight offline-candidate numerical
+self-tests pass. No native INT8 reader/writer/default or common scheduler is
+admitted. The offline tool rejects encoded K/V reference inputs, retains real
+request provenance, and compares masked attention and storage cost per sample.
+No three-model selection dataset has been collected yet.
+
+Normal parent CMake SM70 FA2 builds with CUDA 12.8/Torch 2.10. It includes
+installed grouped/scalar and q8192 75T kernels. The rest of the complete source
+artifact and the installed model gate are pending. Do not repeat CUDA-hidden
+policy tests to qualify FA2: its loader initializes CUDA, so missing-device
+errors cannot establish route correctness. Keep the earlier 186/11 paired
+source-policy result as historical evidence, not a passing promotion gate.
+The local GPU locks became occupied during compilation; no other process was
+stopped and no remote GPU was used.
+
+Local host rebooted at 15:06 (Asia/Shanghai) during the continuation. Afterwards
+`lspci` enumerated no NVIDIA devices, `/dev/nvidia*` was absent and `nvidia-smi`
+could not communicate with the driver. No driver/module/reboot actions were
+performed by this task. Necessary passwordless read-only SSH checks to 54304
+and 54633 both timed out at banner exchange; no remote job was launched.
+The interrupted baseline FA2 linker output was invalid and was rebuilt cleanly.
+The rebuilt original/new complete SM70 FA2 SASS matches after normalizing only
+anonymous-namespace path hashes, retaining instruction bytes. Reboot also
+corrupted a mypy cache; validation uses a fresh task-owned cache. GPU gates and
+real-request captures remain pending resource restoration/access.

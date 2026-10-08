@@ -1,6 +1,6 @@
 # Decouple SM70 attention schedules from KV storage
 
-Status: first extraction, **not completion of the refactor or INT8 admission**.
+Status: staged FP16/E4M3 refactor, **not completion or INT8 admission**.
 Integration line: `onecat/main`; immutable baseline:
 `c4f6245f841466782752a8c3283e4727565cf17a`.
 
@@ -70,8 +70,9 @@ include the header.
 
 Python conversion helpers move to `flash_v100/codec.py`; metadata helpers move
 to `flash_v100/metadata.py`. The original backend reexports their names. The
-remaining implementation/builder, routing, writers, memory ownership and
-configuration are **not yet migrated**. This is an independently revertible
+remaining implementation/builder, routing, writers, host ownership and
+configuration are **not yet migrated**. Dense page accounting and the existing
+Triton inline scale views now share a storage descriptor as described below. This is an independently revertible
 first review scope, not an uncalled registry claiming the final architecture.
 
 ## Scheduling and compatibility
@@ -141,6 +142,85 @@ are separate fields: FP16 and INT8 cannot occupy identical bytes for an identica
 number of tokens. Hybrid groups need exact divisibility/alignment proofs and
 padding accounting; forcing all formats to the historical FP16 page geometry
 without measuring is not justified. Include scale storage in host/CPU budget.
+
+## Dense storage descriptor migration
+
+`vllm/v1/kv_cache_codec.py` owns the existing `KVQuantMode` enumeration and
+helpers, reexported from `kv_cache_interface.py` to preserve callers. Its
+`KVCacheCodec` describes payload dtype, quantization granularity, payload/token
+bytes, inline scale/token bytes, head padding, and FP32 scale-view offsets.
+This is the storage portion of the eventual codec, not a claim that writers,
+readers and every consumer have completed migration.
+
+`AttentionSpec`, `FullAttentionSpec` and `SlidingWindowSpec` consume its payload
+and scale accounting. The existing allocator/page-unification/Mamba alignment
+code therefore receives the same sizes through these specs. Triton cache shapes
+and `_ensure_scale_caches` consume the same descriptor for head padding and
+scale strides. Inspection corrected the earlier interpretation: these scales
+are physically **inline after each head**, not separate allocation tails;
+kernels receive separate typed strided views. Per-tensor FP8 scales remain
+outside the token pool. Unequal K/V dimensions and NVFP4 retain their existing
+formulas; specialized MLA, circular QSA and TurboQuant payload overrides retain
+their own contracts. Host hot-cache transport and QSA codec migration are pending.
+
+The decision follows the existing mainline-compatible storage protocol and
+FlashInfer's explicit layout/stride boundary, avoiding an additional INT8
+allocation protocol. No format/default or numerical kernel changes occur.
+`tools/kv_codec/verify_storage.py` compares the immutable original source's
+payload and page sizes over 2646 configurations on CPU. All match; 17 tests
+cover unequal K/V, NVFP4, inline scale aliasing, page padding, specialized-layout
+preservation and compatibility reexports. GPU cache-write/graph and model gates
+remain required before promotion.
+
+## Offline comparison tool
+
+`tools/kv_codec/evaluate.py` consumes a version-1 JSON manifest with `samples`.
+Each entry must identify `model`, `layer`, `rank`, `tp`, `role`, `source_sha`,
+`wheel_sha256`, `request_tokens_sha256`, relative `tensor_path`,
+`request_origin: "real"`, and `capture_stage: "post_rope_pre_quantization"`.
+Tensor archives contain FP16 `q`, `k`, `v` in token/head/dimension order,
+Boolean `allowed` (query/key or query/query-head/key), `attention_scale`,
+`k_scale`, `v_scale`, and int64 `request_token_ids`, `query_positions`,
+`key_positions`. The tool verifies request token hashes and positional bounds;
+QSA compression/indexer/window selections must be reflected in the actual mask.
+It refuses encoded K/V as an FP16 oracle and empty masked attention rows.
+
+Run `.venv/bin/python tools/kv_codec/evaluate.py --manifest DATA/manifest.json
+--out DATA/comparison.json`, with both paths on the task data disk. If using
+`--device cuda`, acquire the normal GPU locks first. The tool compares nine
+schemes: FP16, E4M3 with captured layer scales, signed token/head INT8 with
+FP32/FP16 scales, affine token/head u8 with FP32 scale/minimum, feature groups
+32/64 with FP16 scales, and channel-wise K over token groups 32/64 with
+FP32 scales plus token/head V. Partial groups include padded storage in the
+reported bytes. FP16 scale candidates quantize against the stored rounded scale.
+Results retain each sample separately, K/V and attention errors, clipping and
+physical storage cost. Candidates stream one pair at a time; percentiles use
+order statistics so long arrays exceed neither the `torch.quantile` size limit
+nor the memory cost of retaining every reconstructed format. The reference is FP32 masked attention over captured
+FP16 tensors, not a claim of bitwise native-kernel output. Eight numerical
+self-tests pass; they are synthetic tool checks and **not format-selection data**.
+No real three-model dataset has been collected yet; no default is selected.
+
+### Constraints for the INT8 tile reader
+
+The existing token/head INT8 head spans `D + 4` bytes. At D256, successive
+heads start 260 bytes apart: every second start is only 4-byte aligned. The
+current XQA FP8 loader reinterprets the payload as `uint64_t` and divides
+the element offset by eight. Reusing that loader for inline-scale INT8 would
+both misalign loads and truncate offsets. Keep the existing protocol as a
+candidate, but implement its packed reader with alignment-safe loads (for
+example two 32-bit loads); do not change its budget to an 8-byte padded layout
+without treating that as a separate format/layout decision. A smaller FP16
+inline scale would change alignment again and is not the existing protocol.
+
+Per-token scales also cannot reuse global-scale epilogues blindly. Moving a
+small token-specific V scale into FP16 softmax probabilities can underflow at
+128K/256K, whereas the current global V scale can be applied after the PV
+accumulation. The reader interface must own how a tile is staged and which
+scale remains for QK/output epilogues, preserving the existing FP16/E4M3
+arithmetic. Evaluate FP16 staging of dequantized INT8 V against the captured
+reference before optimizing it. Do not declare template instantiation alone
+as proof that a format is supported by the path.
 
 ## Research and decisions
 

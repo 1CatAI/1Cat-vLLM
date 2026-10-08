@@ -1,5 +1,5 @@
 {
-  "status": "first extraction only; refactor/model/INT8 gates incomplete",
+  "status": "staged FP16/E4M3 refactor; model/INT8 gates incomplete",
   "base_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
   "device": "Tesla V100-SXM2-32GB / SM70; GPU0 on ymzx-001",
   "gpu_uuid": "GPU-6d23ab90-d6d2-b22b-8486-7fec517f07b9",
@@ -764,5 +764,34 @@
     ]
   },
   "source_guard_tests_passed": 16,
-  "precommit": "passed on all owned files"
+  "precommit": "passed on all owned files",
+  "storage_accounting": {
+    "baseline": "c4f6245f841466782752a8c3283e4727565cf17a",
+    "cpu_configurations": 2646,
+    "payload_and_page_sizes_equal": true,
+    "layout_tests_passed": 17,
+    "scope": "storage descriptor only; GPU writes and model gates pending"
+  },
+  "offline_comparison_tool": {
+    "numerical_self_tests_passed": 8,
+    "real_request_dataset_collected": false,
+    "runtime_default_selected": false
+  },
+  "normal_fa2_build": {
+    "built": true,
+    "architecture": "SM70",
+    "torch": "2.10.0+cu128",
+    "toolkit": "12.8.93",
+    "scope": "normal parent CMake _vllm_fa2_C component, including grouped/scalar and q8192 75T",
+    "private_dso_or_preload": false,
+    "runtime_gate": "pending: local reboot at 15:06 removed NVIDIA devices from PCIe enumeration; GPU-hidden loader initializes CUDA and cannot qualify dispatch",
+    "sass_comparison": {
+      "equal": true,
+      "baseline_sha256": "f199c3e5d7bfccff367a601e3e2f300a3b28aebb360b85acaf6e202597ce4dc6",
+      "candidate_sha256": "f199c3e5d7bfccff367a601e3e2f300a3b28aebb360b85acaf6e202597ce4dc6",
+      "normalization": "anonymous namespace source-path hash only; instruction encodings retained",
+      "baseline_extension_sha256": "5302d0139cead9bb1af081d73a1e04803840d8d862e431337bc3904b0e9f2b22",
+      "candidate_extension_sha256": "a56a1dce7bd19517cdbed6aa0e05e9178e73e44c03fea3ca2f294d7546c28ab9"
+    }
+  }
 }
