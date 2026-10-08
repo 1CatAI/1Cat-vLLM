@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from vllm.v1.attention.backends.flash_v100 import (  # noqa: F401
     backend,
+    config,
     debug,
     debug_compare,
     decode,
@@ -80,6 +81,7 @@ if TYPE_CHECKING:
 
 # Modules searched by the flash_attn_v100 compatibility module.
 SUBMODULES = (
+    config,
     ops,
     routing,
     debug,

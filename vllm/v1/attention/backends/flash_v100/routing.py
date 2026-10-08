@@ -13,10 +13,10 @@ from typing import Literal
 import regex as re
 import torch
 
-import vllm.envs as envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -379,7 +379,7 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
         # The legacy small-Q guard accepts zero rows, whereas uniform and
         # mixed decode require one row or an explicitly enabled batch.
         if (shape.rows > 1 if smallq else shape.rows != 1) and not (
-            shape.rows > 1 and envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+            shape.rows > 1 and _config.registered("VLLM_FLASH_V100_E4M3_BATCH_XQA")
         ):
             return "e4m3_batch"
     if smallq:
@@ -391,7 +391,7 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
             int(context.workspace_seq_capacity_hint or 0) if capture else 0,
         )
         minimum = int(
-            os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN", "4096")
+            _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN", "4096")
         )
         if context.codec is FP8_E5M2:
             minimum = max(minimum, _decode_fp8_xqa_min_seq_len())
@@ -460,7 +460,7 @@ def _batch_context_routing_cache_dtype_supported(cache_dtype: str | None) -> boo
     """Admit the exact FP8 XQA formats implemented by Flash-V100."""
     codec = resolve_kv_codec(cache_dtype)
     return codec is FP8_E5M2 or (
-        codec is FP8_E4M3 and envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+        codec is FP8_E4M3 and _config.registered("VLLM_FLASH_V100_E4M3_BATCH_XQA")
     )
 
 
@@ -484,13 +484,13 @@ def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
 
 
 def _decode_dynamic_partitions_enabled() -> bool:
-    return os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
+    return _config.raw("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
 
 
 def _decode_partition_size_for_metadata(
     max_seq_len_hint: int | None = None,
 ) -> int:
-    raw = os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
+    raw = _config.raw("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
     if raw is None:
         return _select_default_decode_partition_size(max_seq_len_hint)
     try:
@@ -535,9 +535,9 @@ def _g6_aligned_page_partition_size_hint(
     *,
     strategy: Literal["shared", "legacy"] = "legacy",
 ) -> int | None:
-    if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
+    if _config.raw("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
         return None
-    if os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
+    if _config.raw("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
         return None
     if not (
         query.ndim == 3
@@ -605,7 +605,7 @@ def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
 
 
 def _mtp_context_bucket_partition_size_hint() -> int | None:
-    raw = os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE")
+    raw = _config.raw("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE")
     if raw is None:
         return None
     try:
@@ -624,9 +624,9 @@ def _mtp_context_bucket_partition_size_hint() -> int | None:
 
 
 def _mtp5_xqa_dual_cta_partition_size_hint() -> int | None:
-    if os.getenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "1") != "1":
+    if _config.raw("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "1") != "1":
         return None
-    raw = os.getenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "1024")
+    raw = _config.raw("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "1024")
     try:
         value = int(raw)
     except ValueError as exc:
@@ -655,7 +655,7 @@ def _select_default_decode_partition_size(
 
 
 def _decode_xqa_q4_min_seq_len() -> int:
-    raw = os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN")
+    raw = _config.raw("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN")
     if raw is None:
         return _DEFAULT_Q4_XQA_MIN_SEQ_LEN
     try:
@@ -667,7 +667,7 @@ def _decode_xqa_q4_min_seq_len() -> int:
 
 
 def _decode_fp8_xqa_min_seq_len() -> int:
-    raw = os.getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN")
+    raw = _config.raw("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN")
     if raw is None:
         return _DEFAULT_FP8_XQA_MIN_SEQ_LEN
     try:
@@ -739,7 +739,7 @@ def _decode_xqa_allowed_for_q_per_kv(
 def _e4m3_batch_xqa_allowed(query: torch.Tensor) -> bool:
     """Admit GQA6 batches independently of the number of local KV heads."""
     return (
-        envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+        _config.registered("VLLM_FLASH_V100_E4M3_BATCH_XQA")
         and query.ndim == 3
         and query.shape[0] > 1
         and query.shape[1] > 0
@@ -757,11 +757,11 @@ def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
 
 
 def _route_summary_enabled() -> bool:
-    if "VLLM_SM70_DEBUG" in os.environ:
-        return "routing" in envs.VLLM_SM70_DEBUG
+    if _config.env_is_set("VLLM_SM70_DEBUG"):
+        return "routing" in _config.registered("VLLM_SM70_DEBUG")
     return (
-        os.getenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "0") == "1"
-        or os.getenv("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY", "0") == "1"
+        _config.raw("VLLM_FLASH_V100_ROUTE_SUMMARY", "0") == "1"
+        or _config.raw("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY", "0") == "1"
     )
 
 
@@ -801,7 +801,7 @@ def _record_route(route: str) -> None:
 
 
 def _ddtree_trace_event(event: str, payload: dict[str, object]) -> None:
-    trace_path = os.getenv("VLLM_DFLASH_DDTREE_TRACE_JSONL")
+    trace_path = _config.raw("VLLM_DFLASH_DDTREE_TRACE_JSONL")
     if not trace_path:
         return
     record = {"event": event, "pid": os.getpid(), **payload}
@@ -814,11 +814,11 @@ def _ddtree_trace_event(event: str, payload: dict[str, object]) -> None:
 
 
 def _ddtree_trace_enabled() -> bool:
-    return bool(os.getenv("VLLM_DFLASH_DDTREE_TRACE_JSONL"))
+    return bool(_config.raw("VLLM_DFLASH_DDTREE_TRACE_JSONL"))
 
 
 def _decode_active_trace_enabled() -> bool:
-    return os.getenv("VLLM_FLASH_V100_TRACE_DECODE_ACTIVE", "0") == "1"
+    return _config.raw("VLLM_FLASH_V100_TRACE_DECODE_ACTIVE", "0") == "1"
 
 
 def _decode_active_value(active_num_partitions: object) -> int | None:

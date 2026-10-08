@@ -107,6 +107,18 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
+        if ast.unparse(node.func) == "_config.registered":
+            assert len(node.args) == 1 and isinstance(node.args[0], ast.Constant)
+            assert isinstance(node.args[0].value, str)
+            return ast.Attribute(
+                value=ast.Name(id="envs", ctx=ast.Load()),
+                attr=node.args[0].value,
+                ctx=ast.Load(),
+            )
+        if ast.unparse(node.func) == "_config.raw":
+            node.func = ast.Attribute(
+                value=ast.Name(id="os", ctx=ast.Load()), attr="getenv", ctx=ast.Load()
+            )
         if isinstance(node.func, ast.Name) and node.func.id == "super" and node.args:
             assert [ast.unparse(a) for a in node.args] == ["_impl._super_owner", "self"]
             node.args = []

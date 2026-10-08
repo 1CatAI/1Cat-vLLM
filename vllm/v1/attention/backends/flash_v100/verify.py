@@ -4,12 +4,10 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import impl as _impl
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
@@ -637,8 +635,8 @@ def _flash_v100_ddtree_small_query_prefill_dense(
                 "tree_tokens": num_tree_tokens_cpu.detach().cpu().tolist(),
             },
         )
-    trace_kv_diff = os.getenv("VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF", "0") == "1"
-    profile_enabled = envs.VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE
+    trace_kv_diff = _config.raw("VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF", "0") == "1"
+    profile_enabled = _config.registered("VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE")
     profile_start: torch.cuda.Event | None = None
     profile_end: torch.cuda.Event | None = None
     if profile_enabled:
