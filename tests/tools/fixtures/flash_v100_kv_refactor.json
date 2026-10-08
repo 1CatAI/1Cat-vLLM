@@ -18,7 +18,6 @@
     "_batch_context_routing_cache_dtype_supported": "44d7766f20ef1a83b3c81c4e8e0b31b5497483c39ba466dfd4f18cd60cd5aaad",
     "_sm70_profile_trace": "85377d7a2129f887072478deb860f5dbac17a1649d19b77ab42e82abaa3f2259",
     "clear_flash_attn_v100_workspaces": "db8592d6c8261420261f8b4a4bb99c1206b28edccc855902df2329e2b28914ad",
-    "_split_paged_kv_cache": "593697a19a3608f4ed90b794db22df222b7b52d6dfd326ac008db71637b770d3",
     "_draft_graph_debug_enabled": "9bf544f3a48c36f547b09a8b347d3b7d206d4968944a6a3b08425d7b88dd01d8",
     "_draft_graph_debug_limit": "e4392fbe2cd9ec0238fbc49f0c970f0e4e0b82d98047a5e03e6cdacebee699f1",
     "_dflash_prefix_dump_enabled": "728103be21bf22d2a80a804a0a5f1beac673d8a6a9486cc7ef416f80efa3f6ba",
@@ -40,7 +39,6 @@
     "_decode_fp8_xqa_allowed": "32a51549b83c7f1b05e390d66194594bf2cb8a4669656ec5fc2a7ca599fa422a",
     "_decode_xqa_allowed_for_q_per_kv": "31f8d40e92354460b4acd762daa8623fac27d41d582304a7e833335f89aced40",
     "_e4m3_batch_xqa_allowed": "b630f8b86d83d40271d44fc091022a119942b8ac333cacf147ff6b325a95ac9c",
-    "_same_storage": "6e201b070d9f8c1274b54d8b5a721ebce204ae60b3fe16d46d07f01b9b078a91",
     "_is_cuda_graph_capturing": "73e36234d0515acd0ab341804483a0afc4a101d2170665bf8eb2b9800e3c97ef",
     "_route_summary_enabled": "f825d0e2977c3e32736270b902b183ac92324d9cf52e4967495d59ea9cbd6277",
     "_log_route_summary": "7c594c2af86f6540abbd075e80a7a05ec0f8642dff37a7abd298115ca92fbfcb",
@@ -87,9 +85,6 @@
     "_metadata_expects_more_query_tokens_than_available": "e97682f8bdc8e7378408493c74384f2fbd2558bdf8f5c0e43fc1814ab87765be",
     "_normalize_query_start_loc_for_available_tokens": "f4c874641bfd8c8a3d03a329b3cad80b83b6487d1ca54c307a05370a64844a2a",
     "_extract_contiguous_kv_from_paged_cache": "f3c25d5c757268fb4d12003e5a9df340cf4e3288d45e1b0946f503faeda98717",
-    "_contiguous_paged_start_block": "6443bd6c41dbffd1056f56859de98ac714f09694f642a70387b489671440051e",
-    "_contiguous_paged_kv_view": "f353916ca4b704d0c13955606c35882fa4e202b251c4e31443ec8842f1cb17f8",
-    "_contiguous_paged_kv_bhmd": "f1f412ae4a01972d164ba56a17649b7922e9a1e74d178d45b430dd2025d802b2",
     "_get_prefill_gather_dense_workspace": "17c2a40d3e8ec6fc44b5211c707c8fac7c153f09639be7375ba8c2859bb1b0d9",
     "_gather_paged_kv_to_exact_dense": "ea25e690d92a27b55f892fe7ee1823f8d686f1aa57dfa76eb01362b4bd87c825",
     "_ddtree_parent_ids_cpu": "f4ee8ba15a0ec946e36ab87ade62a18084ab2e0b64df4bc0e46a7b575769879e",
@@ -128,5 +123,12 @@
     "reshape_and_cache_kernel_flash": "44540d98ab5f273427607099a8496d910f991d3fdc04333df7547c836e2f6cc6",
     "_reshape_cache_per_token_head": "ec77495ff4633e22c1ef75eba62486fcb742e1ba5c119efb2ae25adb9a879a51",
     "reshape_and_cache_kernel_flash_diffkv": "09c41d52e21fd401e21e1c9b73677d4f7bca9022e6d882b914d3615749943f14"
+  },
+  "cache_view_ast": {
+    "_split_paged_kv_cache": "593697a19a3608f4ed90b794db22df222b7b52d6dfd326ac008db71637b770d3",
+    "_same_storage": "6e201b070d9f8c1274b54d8b5a721ebce204ae60b3fe16d46d07f01b9b078a91",
+    "_contiguous_paged_start_block": "6443bd6c41dbffd1056f56859de98ac714f09694f642a70387b489671440051e",
+    "_contiguous_paged_kv_view": "f353916ca4b704d0c13955606c35882fa4e202b251c4e31443ec8842f1cb17f8",
+    "_contiguous_paged_kv_bhmd": "f1f412ae4a01972d164ba56a17649b7922e9a1e74d178d45b430dd2025d802b2"
   }
 }

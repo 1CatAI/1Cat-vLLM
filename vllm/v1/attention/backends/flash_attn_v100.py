@@ -31,6 +31,13 @@ from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
+from vllm.v1.attention.backends.flash_v100.cache_view import (
+    _contiguous_paged_kv_bhmd,
+    _contiguous_paged_kv_view,
+    _contiguous_paged_start_block,  # noqa: F401
+    _same_storage,
+    _split_paged_kv_cache,
+)
 from vllm.v1.attention.backends.flash_v100.codec import (
     _dequantize_fp8_contiguous_kv,
     _fp8_dtype_from_cache_dtype,  # noqa: F401
@@ -222,35 +229,6 @@ def clear_flash_attn_v100_workspaces() -> None:
     _prefill_gather_dense_workspaces.clear()
     _prefill_dense_splitkv3_workspaces.clear()
     _sm70_79t_q8192_padding_workspaces.clear()
-
-
-def _split_paged_kv_cache(
-    kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if isinstance(kv_cache, (list, tuple)):
-        if len(kv_cache) != 2:
-            raise ValueError(
-                f"Unexpected KV cache tuple/list length {len(kv_cache)}; expected 2"
-            )
-        return kv_cache[0], kv_cache[1]
-
-    if kv_cache.ndim < 2:
-        raise ValueError(
-            f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
-            "expected dimension 2 at axis 0 or 1"
-        )
-
-    # Standard vLLM paged KV layout is [num_blocks, 2, block_size, heads, dim].
-    # Prefer axis 1 so num_blocks == 2 does not get mistaken for K/V.
-    if kv_cache.shape[1] == 2:
-        return kv_cache.unbind(1)
-    if kv_cache.shape[0] == 2:
-        return kv_cache.unbind(0)
-
-    raise ValueError(
-        f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
-        "expected dimension 2 at axis 0 or 1"
-    )
 
 
 def _draft_graph_debug_enabled() -> bool:
@@ -573,10 +551,6 @@ def _e4m3_batch_xqa_allowed(query: torch.Tensor) -> bool:
         and query.shape[1] % 6 == 0
         and query.shape[2] == 256
     )
-
-
-def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
-    return left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
 
 
 def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
@@ -2459,150 +2433,6 @@ def _extract_contiguous_kv_from_paged_cache(
             token_offset += n
 
     return k_cont, v_cont
-
-
-def _contiguous_paged_start_block(
-    key_cache: torch.Tensor,
-    block_table_row: torch.Tensor,
-    seq_len: int,
-    block_size: int,
-    attn_metadata: TritonAttentionMetadata,
-    seq_idx: int,
-) -> tuple[int, int] | None:
-    if seq_len <= 0 or block_size <= 0:
-        return None
-    num_blocks = (seq_len + block_size - 1) // block_size
-    if num_blocks <= 0 or num_blocks > int(block_table_row.shape[0]):
-        return None
-
-    cache_key = (
-        int(seq_idx),
-        int(seq_len),
-        int(block_size),
-        int(block_table_row.data_ptr()),
-        int(key_cache.data_ptr()),
-    )
-    contig_cache = getattr(attn_metadata, "flash_v100_contig_dense_cache", None)
-    if contig_cache is None:
-        contig_cache = {}
-        _as_flash_v100_metadata(
-            attn_metadata
-        ).flash_v100_contig_dense_cache = contig_cache
-
-    start_block = contig_cache.get(cache_key)
-    if start_block is None:
-        blocks_cpu = block_table_row[:num_blocks].detach().cpu()
-        if int(blocks_cpu[0].item()) < 0:
-            contig_cache[cache_key] = -1
-            return None
-        if num_blocks > 1:
-            expected = blocks_cpu[0] + torch.arange(
-                num_blocks,
-                dtype=blocks_cpu.dtype,
-                device=blocks_cpu.device,
-            )
-            if not bool(torch.equal(blocks_cpu, expected)):
-                contig_cache[cache_key] = -1
-                return None
-        start_block = int(blocks_cpu[0].item())
-        contig_cache[cache_key] = start_block
-
-    if start_block < 0:
-        return None
-    if start_block + num_blocks > int(key_cache.shape[0]):
-        return None
-
-    return start_block, num_blocks
-
-
-def _contiguous_paged_kv_view(
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table_row: torch.Tensor,
-    seq_len: int,
-    block_size: int,
-    attn_metadata: TritonAttentionMetadata,
-    seq_idx: int,
-    allow_copy: bool,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return a dense [1, N, Hkv, D] K/V view for physically contiguous pages."""
-    if key_cache.dtype != torch.float16 or value_cache.dtype != torch.float16:
-        return None
-    if key_cache.shape != value_cache.shape:
-        return None
-    if not allow_copy and (
-        not key_cache.is_contiguous() or not value_cache.is_contiguous()
-    ):
-        return None
-
-    start_info = _contiguous_paged_start_block(
-        key_cache,
-        block_table_row,
-        seq_len,
-        block_size,
-        attn_metadata,
-        seq_idx,
-    )
-    if start_info is None:
-        return None
-    start_block, num_blocks = start_info
-
-    num_kv_heads = key_cache.shape[2]
-    head_dim = key_cache.shape[3]
-    end_block = start_block + num_blocks
-    key_block_slice = key_cache[start_block:end_block]
-    value_block_slice = value_cache[start_block:end_block]
-    key_flat = key_block_slice.reshape(-1, num_kv_heads, head_dim)
-    value_flat = value_block_slice.reshape(-1, num_kv_heads, head_dim)
-    return (
-        key_flat[:seq_len].unsqueeze(0),
-        value_flat[:seq_len].unsqueeze(0),
-    )
-
-
-def _contiguous_paged_kv_bhmd(
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table_row: torch.Tensor,
-    seq_len: int,
-    block_size: int,
-    attn_metadata: TritonAttentionMetadata,
-    seq_idx: int,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Return dense [1, Hkv, N, D] K/V tensors for contiguous paged cache."""
-    if key_cache.dtype != torch.float16 or value_cache.dtype != torch.float16:
-        return None
-    if key_cache.shape != value_cache.shape:
-        return None
-
-    start_info = _contiguous_paged_start_block(
-        key_cache,
-        block_table_row,
-        seq_len,
-        block_size,
-        attn_metadata,
-        seq_idx,
-    )
-    if start_info is None:
-        return None
-    start_block, num_blocks = start_info
-
-    num_kv_heads = key_cache.shape[2]
-    head_dim = key_cache.shape[3]
-    end_block = start_block + num_blocks
-    key_blocks = key_cache[start_block:end_block]
-    value_blocks = value_cache[start_block:end_block]
-    key_bhmd = (
-        key_blocks.permute(2, 0, 1, 3)
-        .reshape(1, num_kv_heads, -1, head_dim)[:, :, :seq_len, :]
-        .contiguous()
-    )
-    value_bhmd = (
-        value_blocks.permute(2, 0, 1, 3)
-        .reshape(1, num_kv_heads, -1, head_dim)[:, :, :seq_len, :]
-        .contiguous()
-    )
-    return key_bhmd, value_bhmd
 
 
 def _get_prefill_gather_dense_workspace(

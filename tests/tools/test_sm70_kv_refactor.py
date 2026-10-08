@@ -23,6 +23,7 @@ METADATA = BACKEND.parent / "flash_v100/metadata.py"
 CODEC = BACKEND.parent / "flash_v100/codec.py"
 MASKING = BACKEND.parent / "flash_v100/masking.py"
 REFERENCE = BACKEND.parent / "flash_v100/reference.py"
+CACHE_VIEW = BACKEND.parent / "flash_v100/cache_view.py"
 TRITON_WRITER = ROOT / "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py"
 
 
@@ -34,6 +35,7 @@ TRITON_WRITER = ROOT / "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py"
         ("codec_ast", CODEC),
         ("masking_ast", MASKING),
         ("reference_ast", REFERENCE),
+        ("cache_view_ast", CACHE_VIEW),
         ("triton_writer_host_ast", TRITON_WRITER),
     ],
 )
@@ -73,7 +75,7 @@ def test_codec_reexports_keep_existing_imports_working():
     assert set(FIXTURE["codec_ast"]) <= imports
 
 
-@pytest.mark.parametrize("module", ["masking", "reference"])
+@pytest.mark.parametrize("module", ["masking", "reference", "cache_view"])
 def test_mask_and_reference_reexports_keep_existing_imports_working(module):
     imports = {
         name.asname or name.name

@@ -120,9 +120,36 @@ changing BFLA/tree semantics and is unnecessary for this refactor.
 immutable baseline and relocated functions on CPU: 24 BFLA configurations
 (pool modes, keep rules and invalid inputs), 54 tree/window configurations and
 18 GQA/window reference cases. All 96 match bitwise. Backend line count is now
-8996, compared with 9870 at the baseline; the large implementation and builder
+8826 after the page-view extraction, compared with 9870 at the baseline; the large implementation and builder
 still need further decomposition. Environment coverage checks scan the backend
 and its new modules, so moving a read cannot masquerade as retiring a switch.
+
+## Page views and address ownership
+
+`flash_v100/cache_view.py` owns splitting packed K/V tensors, storage-alias
+checks, contiguous page admission/memoization, and dense NHD/BHMD views.
+Five original function AST hashes move to this module without regeneration;
+backend reexports preserve callers. Native gather loading and allocation stay
+with their existing dispatch/workspace owner in this step. FP16 view admission,
+invalid-page rejection, and the distinction between a zero-copy view and a
+permitted copy retain their original behavior.
+
+The boundary follows [FlashInfer's paged cache descriptor](https://github.com/flashinfer-ai/flashinfer/blob/main/include/flashinfer/page.cuh),
+which makes page indices/strides explicit independently of the payload type,
+and [SGLang's memory pool](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/memory_pool.py),
+which separates token allocation from physical KV storage. We keep the local
+page/cache implementation instead of importing either library's allocation
+protocol; replacing strides or token maps is unnecessary for an exact refactor.
+Encoded cache tensors still require codec decoding before a dense FP16 view;
+this extraction does not admit INT8 or change route selection.
+
+`python -m tools.kv_codec.verify_cache_view --out DATA/cache-view.json` compares
+102 immutable-baseline cases on CPU: both packed K/V axes, list/tuple views,
+FP16/uint8 payloads, interleaved/separate storage, contiguous/noncontiguous,
+negative/out-of-range/insufficient pages, empty sequences, repeated metadata
+cache hits/rejections, allow-copy admission, strides/offsets and aliasing.
+All outputs and aliasing decisions match. GPU/model/performance gates remain
+separate.
 
 ## Scheduling and compatibility
 
