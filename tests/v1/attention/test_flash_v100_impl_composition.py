@@ -346,6 +346,12 @@ class _Normalize(ast.NodeTransformer):
     def visit_Attribute(self, node):
         expression = ast.unparse(node)
         verification = {
+            "self.ops.tree_seq_lens_match": "_masks._ddtree_triton_seq_lens_match",
+            "self.ops.tree_query_start_match": (
+                "_masks._ddtree_triton_query_start_loc_match"
+            ),
+            "self.ops.tree_parent_ids": "_masks._ddtree_triton_parent_ids_for_query",
+            "self.ops.tree_visibility": "_masks._build_ddtree_visibility_mask",
             "self.ops.compare_triton": "self._maybe_compare_triton_output",
             "self.ops.small_query_enabled": "self._small_query_decode_enabled",
             "self.config.grouped_max_query": (

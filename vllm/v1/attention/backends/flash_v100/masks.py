@@ -9,13 +9,6 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
-from vllm.v1.attention.backends.flash_v100.spec.tree_masks import (  # noqa: F401
-    _build_ddtree_visibility_mask,
-    _ddtree_parent_metadata_requires_branch,
-    _ddtree_triton_parent_ids_for_query,
-    _ddtree_triton_query_start_loc_match,
-    _ddtree_triton_seq_lens_match,
-)
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )

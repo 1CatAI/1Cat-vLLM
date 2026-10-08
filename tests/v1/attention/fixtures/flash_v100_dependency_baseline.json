@@ -2,9 +2,9 @@
   "metrics": {
     "forward": 153,
     "largest_function": 318,
-    "cross_module_private": 308,
+    "cross_module_private": 303,
     "import_cycles": 0,
-    "model_names_outside_spec": 151,
+    "model_names_outside_spec": 137,
     "env_outside_config": 0,
     "state_flags": 29
   },
@@ -85,6 +85,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
       "vllm.v1.attention.backends.flash_v100.spec.tree"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.__init__",
+      "vllm.v1.attention.backends.flash_v100.spec.tree_masks"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
@@ -247,10 +251,6 @@
       "vllm.v1.attention.backends.flash_v100.metadata"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.masks",
-      "vllm.v1.attention.backends.flash_v100.routing"
-    ],
-    [
       "vllm.v1.attention.backends.flash_v100.metadata",
       "vllm.v1.attention.backends.flash_v100.config"
     ],
@@ -360,6 +360,10 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.attention",
+      "vllm.v1.attention.backends.flash_v100.spec.tree_masks"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.attention",
       "vllm.v1.attention.backends.flash_v100.state"
     ],
     [
@@ -437,6 +441,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.spec.tree",
       "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.tree_masks",
+      "vllm.v1.attention.backends.flash_v100.routing"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.verify_metadata",
@@ -1072,7 +1080,7 @@
     },
     {
       "file": "masks.py",
-      "line": 42,
+      "line": 41,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_POOL').lower()",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1080,7 +1088,7 @@
     },
     {
       "file": "masks.py",
-      "line": 125,
+      "line": 124,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_THRESHOLD')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1088,7 +1096,7 @@
     },
     {
       "file": "masks.py",
-      "line": 126,
+      "line": 125,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_KEEP_MASS')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1096,7 +1104,7 @@
     },
     {
       "file": "masks.py",
-      "line": 127,
+      "line": 126,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_KEEP_RATIO')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1104,7 +1112,7 @@
     },
     {
       "file": "masks.py",
-      "line": 128,
+      "line": 127,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1112,7 +1120,7 @@
     },
     {
       "file": "masks.py",
-      "line": 181,
+      "line": 180,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_SPEC_STRIDE')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1120,7 +1128,7 @@
     },
     {
       "file": "masks.py",
-      "line": 198,
+      "line": 197,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_SPEC_PROB')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1128,7 +1136,7 @@
     },
     {
       "file": "masks.py",
-      "line": 42,
+      "line": 41,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_POOL')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1136,7 +1144,7 @@
     },
     {
       "file": "masks.py",
-      "line": 174,
+      "line": 173,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1144,7 +1152,7 @@
     },
     {
       "file": "masks.py",
-      "line": 192,
+      "line": 191,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_SPEC_SEED')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1152,7 +1160,7 @@
     },
     {
       "file": "masks.py",
-      "line": 218,
+      "line": 217,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_SPEC_SEED')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1264,7 +1272,7 @@
     },
     {
       "file": "prefill_candidates.py",
-      "line": 422,
+      "line": 423,
       "expression": "_config.registered('VLLM_FLASH_V100_FA2_D256_PREFILL')",
       "via_config": true,
       "owner": "run",
@@ -1272,7 +1280,7 @@
     },
     {
       "file": "prefill_candidates.py",
-      "line": 210,
+      "line": 211,
       "expression": "_config.registered('VLLM_FLASH_V100_FA2_D256_PREFILL')",
       "via_config": true,
       "owner": "admit",
@@ -1512,7 +1520,7 @@
     },
     {
       "file": "verify.py",
-      "line": 740,
+      "line": 744,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE')",
       "via_config": true,
       "owner": "tree_prefill",
@@ -1520,7 +1528,7 @@
     },
     {
       "file": "verify.py",
-      "line": 738,
+      "line": 742,
       "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF', '0')",
       "via_config": true,
       "owner": "tree_prefill",
@@ -1621,7 +1629,7 @@
     "impl.py:_call_flash_attn_decode_paged": 40,
     "impl.py:_new_comparison_executor": 19,
     "impl.py:_new_prefill_executor": 40,
-    "impl.py:_new_verification_executor": 32,
+    "impl.py:_new_verification_executor": 33,
     "impl.py:_anchored_swa_params": 4,
     "impl.py:forward": 153,
     "impl.py:_forward_prefill": 27,
@@ -1648,11 +1656,6 @@
     "masks.py:_build_bfla_block_mask_for_seq": 200,
     "masks.py:_torch_attention_reference": 44,
     "masks.py:_ddtree_parent_ids_cpu": 13,
-    "masks.py:_ddtree_parent_metadata_requires_branch": 17,
-    "masks.py:_ddtree_triton_seq_lens_match": 22,
-    "masks.py:_ddtree_triton_query_start_loc_match": 30,
-    "masks.py:_ddtree_triton_parent_ids_for_query": 49,
-    "masks.py:_build_ddtree_visibility_mask": 53,
     "masks.py:pool_blocks": 25,
     "metadata.py:_as_flash_v100_metadata": 10,
     "metadata.py:spec_state": 10,
@@ -1714,7 +1717,7 @@
     "prefill.py:log_fp8_bridge": 9,
     "prefill.py:log_splitkv": 11,
     "prefill.py:execute_prefill_sequence": 45,
-    "prefill.py:create_prefill_executor": 36,
+    "prefill.py:create_prefill_executor": 37,
     "prefill.py:log_noncausal": 8,
     "prefill.py:log_small_query": 8,
     "prefill.py:execute_prefill_batch": 52,
@@ -1777,7 +1780,8 @@
     "spec/attention.py:capture_prefix_kind": 6,
     "spec/attention.py:record_capture_prefix": 10,
     "spec/attention.py:record_capture_layout": 9,
-    "spec/attention.py:prefill_dependencies": 7,
+    "spec/attention.py:prefill_dependencies": 8,
+    "spec/attention.py:verification_dependencies": 7,
     "spec/attention_policy.py:initialize_scalar_tail": 22,
     "spec/attention_policy.py:initialize_verify_abi": 3,
     "spec/attention_policy.py:configure_prefill": 4,
@@ -1812,6 +1816,11 @@
     "spec/smallq_metadata.py:prepare_dflash2_smallq_group_metadata": 178,
     "spec/smallq_metadata.py:fallback": 5,
     "spec/tree.py:attach_metadata": 62,
+    "spec/tree_masks.py:parent_metadata_requires_branch": 17,
+    "spec/tree_masks.py:triton_seq_lens_match": 22,
+    "spec/tree_masks.py:triton_query_start_loc_match": 30,
+    "spec/tree_masks.py:triton_parent_ids_for_query": 49,
+    "spec/tree_masks.py:build_visibility_mask": 53,
     "spec/verify_metadata.py:_configured_smallq_max_query_len": 4,
     "spec/verify_metadata.py:_configured_smallq_max_model_len": 4,
     "spec/verify_metadata.py:_smallq_buffer_token_capacity": 21,

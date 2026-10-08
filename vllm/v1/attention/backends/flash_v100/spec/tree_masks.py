@@ -10,7 +10,7 @@ from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 
 
-def _ddtree_parent_metadata_requires_branch(
+def parent_metadata_requires_branch(
     attn_metadata: TritonAttentionMetadata,
     query_start_loc: torch.Tensor,
 ) -> bool:
@@ -29,7 +29,7 @@ def _ddtree_parent_metadata_requires_branch(
     return bool(torch.any(num_tree_tokens_cpu[:num_reqs] > 0).item())
 
 
-def _ddtree_triton_seq_lens_match(
+def triton_seq_lens_match(
     attn_metadata: TritonAttentionMetadata,
     seq_lens: torch.Tensor,
     num_reqs: int,
@@ -53,7 +53,7 @@ def _ddtree_triton_seq_lens_match(
     )
 
 
-def _ddtree_triton_query_start_loc_match(
+def triton_query_start_loc_match(
     attn_metadata: TritonAttentionMetadata,
     query_start_loc: torch.Tensor,
     num_reqs: int,
@@ -85,7 +85,7 @@ def _ddtree_triton_query_start_loc_match(
     )
 
 
-def _ddtree_triton_parent_ids_for_query(
+def triton_parent_ids_for_query(
     parent_ids: torch.Tensor,
     num_tree_tokens_cpu: torch.Tensor | None,
     query_start_loc: torch.Tensor,
@@ -136,7 +136,7 @@ def _ddtree_triton_parent_ids_for_query(
     return triton_parent_ids
 
 
-def _build_ddtree_visibility_mask(
+def build_visibility_mask(
     *,
     q_len: int,
     seq_len: int,
@@ -189,3 +189,13 @@ def _build_ddtree_visibility_mask(
         if right >= 0:
             visible &= k_pos.unsqueeze(0) <= q_pos.unsqueeze(1) + right
     return visible
+
+
+# The facade resolves old names to live public bindings, not copied values.
+COMPATIBILITY_ALIASES = {
+    "_ddtree_parent_metadata_requires_branch": "parent_metadata_requires_branch",
+    "_ddtree_triton_seq_lens_match": "triton_seq_lens_match",
+    "_ddtree_triton_query_start_loc_match": "triton_query_start_loc_match",
+    "_ddtree_triton_parent_ids_for_query": "triton_parent_ids_for_query",
+    "_build_ddtree_visibility_mask": "build_visibility_mask",
+}

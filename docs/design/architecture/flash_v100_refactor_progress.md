@@ -17,7 +17,7 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Prerequisite model gates |
 | 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
-| 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native gates passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; named timing gates passed | Model gates pending |
+| 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native/Qwen passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
 | 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
 | 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
@@ -32,7 +32,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Required | Strict/rebase/GPU gates |
 | 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Required | Strict/rebase/GPU gates |
 | 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Required | Strict/rebase/GPU gates |
-| 6i: outer prefill dispatch | — | CPU/golden/strict passed | Forward 400 → 153; largest function 400 → 318 | Required | Strict/rebase/GPU gates |
+| 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Required | Strict/rebase/GPU gates |
+| 6j: tree visibility feature ownership | — | CPU/golden/strict passed | Private 308 → 303; model terms 151 → 137 | Required | Strict/rebase/GPU gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -1043,3 +1044,72 @@ the same 44 static accounting names as #1060 when injected calls are included.
 The original failed snapshot/logs remain intact. A test-only correction keeps
 the 44-name requirement and validates the injected parameter's RecordRoute
 type; corrected-head GPU regression is required before the queue proceeds.
+
+## Step 6j tree visibility feature ownership
+
+PR #1105 is `4d653b7ec13ad0c38959fc52db1199c85b8b0919`; its actual
+the #1028 replay is `c0edaf9c64e1eb0a77a400f3ff25b2fdd2821769`, clean tree
+`ef848e6e438b3e340a61a9a19e4bad8943978c9c`. The integration CPU suites
+pass 37 tests / 98 GPU skips. Four verified queues are staged as `a3-step6i`.
+
+Five tree visibility/metadata-contract calculations move mechanically into
+spec/tree_masks.py, then expose public feature APIs. Common verification and
+batch prefill receive explicit callbacks from common assembly. Generic masks
+no longer owns or exports those five algorithms; old facade names resolve to
+the live Spec bindings. No whole Impl receiver or new forbidden import edge
+is introduced. The remaining parent-CPU-cache adapter is still in generic masks
+and remains tracked for the next boundary work.
+
+The focused suite passes 44 cases, including all 813 immutable golden traces
+and original calculation hashes (`a3-tree-masks-focused.log`). Six direct cases
+check sibling exclusion/window visibility, capture restoration without host
+comparison, mixed linear/tree parent-copy behavior and no capture allocation,
+and real batch-admission use of a legacy patch. The latter passes strict shim
+consumption (`a3-tree-masks-boundary.log`, `a3-tree-masks-boundary-shim.json`).
+Maximum-function measurement now considers every AST function, including names
+repeated within one file; the diagnostic name map can no longer hide a larger
+function by overwriting its key. The measured maximum remains 318. Metrics
+reduce to 153 / 318 / 303 / 0 / 137 / 0 / 29.
+
+## Corrected route inventory and preserved GPU evidence
+
+The test-only correction `26db013963221a67d083a76bd28ede9765906067`
+was propagated through ordinary merges into the existing Draft stack; no
+published history was rewritten. Every changed tree differs only in
+`test_flash_v100_routes.py`. Each updated head was actually replayed with the
+pinned #1028, matched clean merge-tree, and passed 37 integration CPU tests
+with 98 GPU skips. The exact 44 original accounting names remain unchanged.
+All tracked source files in the new GPU candidate/host snapshots were checked
+against manifests generated from the corresponding Git commits. New roots
+use the -v2 suffix; only the obsolete owned waiting queues were retired.
+Original snapshots, the Step 4b eight-failure log and all baseline failures
+remain intact. No old failure was turned into a passing marker.
+
+| PR | Corrected head | #1028 replay | GPU root |
+| --- | --- | --- | --- |
+| #1081 | `26db013963221a67d083a76bd28ede9765906067` | `fea00216224b081965cb13e2429eb2fd16c8abc5` | `a3-step4b-v2` |
+| #1083 | `43f17967333b3f6b309533c1ad0e75a0c0b5f3ec` | `cd88482803dc07e3ae7feeca805df47350fb3717` | `a3-step4c-v2` |
+| #1084 | `dd655ad13324b23836b65f6da662ce4230bbfec0` | `672bac94a9d509840b813023daa8ba9b83bbbd88` | `a3-snapshot-v2` |
+| #1085 | `6a3615c0a63403ca808f16dbe3d3030a286d9d48` | `2a1d9701568ecd7cdf9aac9de197a508c0fcad0e` | `a3-step5a-v2` |
+| #1086 | `b020db66b6165b7833b4bed58c2b540fd18132be` | `15e3f84becea3a211401751fa22acc58bf30979a` | `a3-step5b-v2` |
+| #1088 | `aa175e1d079165da40ae06ab63d169b06cd3e899` | `585d607f998eda96c93dee1200aae1a0ef9b7ba0` | `a3-step5c-v2` |
+| #1090 | `33d85a9c9e926ccc151872637418d29668e360db` | `b1c0988d1bc45b44ed027b0a0375aaad1e2c0d90` | `a3-step6a-v2` |
+| #1093 | `94d0b247497d4c6621ebae8725d82325df4e6271` | `79c442a222f4e34cfad88775f966fc80b793aecf` | `a3-step6b-v2` |
+| #1095 | `7ae8924e9936dd45a0935c722e444ee85d5ac319` | `24e614aaeac254781a318256c57d490c49934fb4` | `a3-step6c-v2` |
+| #1096 | `541f156de2ce2f1b286565230047366557d1fec7` | `3c9112ee6ef2cda6943ee508b1ee11636db66fdb` | `a3-step6d-v2` |
+| #1097 | `668bb6972f14f878276afdfa99829d369dea4ad3` | `7a7afa7bf7dd021d3bf5e49131ce2501592ffa0a` | `a3-step6e-v2` |
+| #1101 | `ee9ae8a03373614261528c242e2ebd24803268ee` | `3cdb59e051f3913a4daabb1a2c79ed3749fbec0a` | `a3-step6f-v2` |
+| #1103 | `0fc3e7fe66f65ddd35840a929615bf785c65069a` | `1542ef8d20ca37d64cbb773226576998570d864a` | `a3-step6g-v2` |
+| #1104 | `5bbcf47ccb99489edd4d81790356c8d836304a6a` | `16d4df3ef003b368505d6fee13e80899ec008495` | `a3-step6h-v2` |
+
+Step 4a Qwen model validation completes at 2026-10-09 07:16 +08:00:
+all four FP16/E4M3 × eager/graph contracts report equal route/token records
+for three requests each (`a3-step4a/logs/qwen-*-compare.log`, `qwen.done`).
+Host/spec baseline failures remain separate; no complete model gate is claimed.
+
+The complete fixed-source strict suite passes **344 tests / 1 skip / 28 GPU
+exclusions** (`a3-tree-masks-strict.log`, `a3-tree-masks-shim.json`): six new
+boundary cases plus the already existing 44-name inventory now included in
+this CPU selection. All golden/calculation oracles and real patch consumption
+pass. Pre-commit, mypy and layering pass (`a3-tree-masks-precommit-final.log`).
+No production/source-oracle file changes during the accepted strict run.

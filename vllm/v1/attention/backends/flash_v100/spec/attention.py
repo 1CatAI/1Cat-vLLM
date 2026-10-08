@@ -12,6 +12,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import state as _state
+from vllm.v1.attention.backends.flash_v100.spec import tree_masks
 from vllm.v1.attention.backends.flash_v100.spec.attention_policy import (
     POLICY_FIELDS as POLICY_FIELDS,
 )
@@ -144,8 +145,18 @@ PREFILL_CALLBACK_FIELDS = {
 
 def prefill_dependencies(state):
     return {
+        "tree_requires_branch": tree_masks.parent_metadata_requires_branch,
         "supports_bmhd": getattr(
             state, "_flash_prefill_paged_supports_dflash2_bmhd", False
         ),
         "split_pages": getattr(state, "_flash_prefill_paged_dflash2_split_pages", ()),
+    }
+
+
+def verification_dependencies():
+    return {
+        "tree_seq_lens_match": tree_masks.triton_seq_lens_match,
+        "tree_query_start_match": tree_masks.triton_query_start_loc_match,
+        "tree_parent_ids": tree_masks.triton_parent_ids_for_query,
+        "tree_visibility": tree_masks.build_visibility_mask,
     }

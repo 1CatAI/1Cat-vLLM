@@ -1082,6 +1082,7 @@ def create_prefill_executor(self):
         log_splitkv=log_splitkv,
         supports_bmhd=self.ops.supports_bmhd,
         split_pages=self.ops.split_pages,
+        tree_requires_branch=self.ops.tree_requires_branch,
         tree_prefill=self.ops.tree_prefill,
         small_query=self.ops.small_query,
         allow_rows=getattr(self, "_prefill_prefix_decode_rows_allowed", None),
@@ -1511,6 +1512,7 @@ class PrefillDriverOps:
     decode: Any = None
     xqa_codec: Any = None
     layer_info: Any = None
+    tree_requires_branch: Any = None
     tree_prefill: Any = None
     small_query: Any = None
     supports_anchor: bool = False

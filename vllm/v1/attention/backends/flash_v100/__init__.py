@@ -55,6 +55,7 @@ from vllm.v1.attention.backends.flash_v100.spec import (
 from vllm.v1.attention.backends.flash_v100.spec import (
     tree as spec_tree,
 )
+from vllm.v1.attention.backends.flash_v100.spec import tree_masks as spec_tree_masks
 from vllm.v1.attention.backends.flash_v100.spec import (
     verify_metadata as spec_verify_metadata,
 )
@@ -105,6 +106,7 @@ SUBMODULES = (
     spec_builder,
     spec_draft,
     spec_tree,
+    spec_tree_masks,
     spec_verify_metadata,
     spec_attention,
     spec_attention_policy,
@@ -114,6 +116,10 @@ SUBMODULES = (
 # function values: old-name writes must also affect the public execution path.
 COMPATIBILITY_ALIASES = {
     "_allocate_growing_workspace": (workspace, "allocate_growing_workspace"),
+    **{
+        name: (spec_tree_masks, target)
+        for name, target in spec_tree_masks.COMPATIBILITY_ALIASES.items()
+    },
 }
 
 

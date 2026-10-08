@@ -60,6 +60,10 @@ class VerificationOps:
     layer_info: Any
     xqa_codec: Any
     decode: Any
+    tree_seq_lens_match: Any = None
+    tree_query_start_match: Any = None
+    tree_parent_ids: Any = None
+    tree_visibility: Any = None
     admit_grouped_override: Any = None
     run_grouped_override: Any = None
     admit_xqa_override: Any = None
@@ -600,18 +604,18 @@ class VerificationExecutor:
         if (
             _debug._dflash_ddtree_triton_branch_attn_enabled()
             and parent_ids is not None
-            and _masks._ddtree_triton_seq_lens_match(
+            and self.ops.tree_seq_lens_match(
                 attn_metadata,
                 seq_lens,
                 num_reqs,
             )
-            and _masks._ddtree_triton_query_start_loc_match(
+            and self.ops.tree_query_start_match(
                 attn_metadata,
                 query_start_loc,
                 num_reqs,
             )
         ):
-            triton_parent_ids = _masks._ddtree_triton_parent_ids_for_query(
+            triton_parent_ids = self.ops.tree_parent_ids(
                 parent_ids,
                 num_tree_tokens_cpu,
                 query_start_loc,
@@ -858,7 +862,7 @@ class VerificationExecutor:
                 v_f = v_f.repeat_interleave(repeat, dim=1)
 
             scores = torch.einsum("mhd,nhd->hmn", q_f, k_f) * self.config.scale
-            visible = _masks._build_ddtree_visibility_mask(
+            visible = self.ops.tree_visibility(
                 q_len=q_len,
                 seq_len=seq_len,
                 prefix_len=prefix_len,

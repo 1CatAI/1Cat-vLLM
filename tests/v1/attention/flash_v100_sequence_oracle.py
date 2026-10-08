@@ -12,6 +12,7 @@ import copy
 from vllm.v1.attention.backends.flash_v100 import prefill, prefill_candidates
 
 OPS = {
+    "tree_requires_branch": "_masks._ddtree_parent_metadata_requires_branch",
     "supports_bmhd": "self._flash_prefill_paged_supports_dflash2_bmhd",
     "split_pages": "self._flash_prefill_paged_dflash2_split_pages",
     "tree_prefill": "self._flash_v100_ddtree_small_query_prefill_dense",

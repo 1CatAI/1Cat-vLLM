@@ -249,11 +249,6 @@ def test_batch_candidates_with_independent_operators(monkeypatch, choice):
         output[:2].fill_(9)
         return {0}
 
-    monkeypatch.setattr(
-        sequence._masks,
-        "_ddtree_parent_metadata_requires_branch",
-        lambda *args: choice in {"tree", "terminal_none"},
-    )
     monkeypatch.setattr(sequence._routing, "_record_route", lambda name: None)
     ops = sequence.PrefillOps(
         bridge=None,
@@ -277,6 +272,7 @@ def test_batch_candidates_with_independent_operators(monkeypatch, choice):
         log_dense_fa2=None,
         log_fp8_bridge=None,
         log_splitkv=None,
+        tree_requires_branch=lambda *args: choice in {"tree", "terminal_none"},
         tree_prefill=complete("tree"),
         small_query=complete("small"),
         allow_rows=lambda **kwargs: choice == "rows",

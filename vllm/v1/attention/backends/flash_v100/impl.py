@@ -652,6 +652,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             layer_info=getattr(self, "_layer_debug_info", None),
             xqa_codec=getattr(self, "_xqa_kv_codec", None),
             decode=getattr(self, "_call_flash_attn_decode_paged", None),
+            **_feature.verification_dependencies(),
             **{
                 name: vars(self).get(legacy_name)
                 for name, legacy_name in _feature.VERIFICATION_OVERRIDES.items()

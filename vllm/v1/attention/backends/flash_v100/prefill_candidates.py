@@ -59,6 +59,7 @@ class PrefillOps:
 
     supports_bmhd: bool = False
     split_pages: tuple[int, ...] = ()
+    tree_requires_branch: Any = None
     tree_prefill: Any = None
     small_query: Any = None
     allow_rows: Any = None
@@ -729,7 +730,7 @@ class NoncausalBatch(BatchCandidate):
 
 class TreeBatch(BatchCandidate):
     def admit(self, request: PrefillBatchRequest) -> bool:
-        return request.causal and _masks._ddtree_parent_metadata_requires_branch(
+        return request.causal and self.executor.ops.tree_requires_branch(
             request.attn_metadata, request.query_start_loc
         )
 
