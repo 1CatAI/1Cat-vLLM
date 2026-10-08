@@ -118,7 +118,7 @@ def attention(q, k, v, allowed, scale):
     return torch.einsum("hgqk,khd->qhgd", probs, v.float()).reshape(nq, nh, v.shape[-1])
 
 
-def evaluate_sample(sample: dict) -> list[dict]:
+def evaluate_sample(sample: dict, *, ablate_kv: bool = False) -> list[dict]:
     q, k, v, allowed = (sample[name] for name in ("q", "k", "v", "allowed"))
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.dtype != torch.float16 or tensor.ndim != 3 or tensor.numel() == 0:
@@ -178,24 +178,44 @@ def evaluate_sample(sample: dict) -> list[dict]:
                 symmetric_int8(k, group=group, axis=0),
                 symmetric_int8(v, group=v.shape[-1]),
             )
+        # The initial real-request ablation shows larger V-only than K-only
+        # error for token/head INT8. Evaluate narrower V groups without charging
+        # both sides for that metadata; no runtime codec is selected here.
+        for group in (32, 64):
+            yield (
+                f"int8_k_token_fp32_v_feature_group{group}_fp16",
+                symmetric_int8(k, group=k.shape[-1]),
+                symmetric_int8(v, group=group, scale_dtype=torch.float16),
+            )
 
     results = []
     for name, key, value in candidates():
         output = attention(q, key.values, value.values, allowed, scale)
-        results.append(
-            {
-                "scheme": name,
-                "k": error_metrics(key.values, k),
-                "v": error_metrics(value.values, v),
-                "attention": error_metrics(output, reference),
-                "payload_and_inline_metadata_bytes": key.storage_bytes
-                + value.storage_bytes,
-                "fixed_layer_scale_bytes": 8 if name == "e4m3_layer_scale" else 0,
-                "k_clipped_elements": key.clipped_elements,
-                "v_clipped_elements": value.clipped_elements,
-            }
-        )
-        del key, value, output
+        measurement = {
+            "scheme": name,
+            "k": error_metrics(key.values, k),
+            "v": error_metrics(value.values, v),
+            "attention": error_metrics(output, reference),
+            "payload_and_inline_metadata_bytes": key.storage_bytes
+            + value.storage_bytes,
+            "fixed_layer_scale_bytes": 8 if name == "e4m3_layer_scale" else 0,
+            "k_clipped_elements": key.clipped_elements,
+            "v_clipped_elements": value.clipped_elements,
+        }
+        del output
+        if ablate_kv:
+            # Change one cache side at a time with the same actual request mask.
+            # These errors are not additive: quantized K changes the softmax.
+            for side, decoded_k, decoded_v in (
+                ("k", key.values, v),
+                ("v", k, value.values),
+            ):
+                output = attention(q, decoded_k, decoded_v, allowed, scale)
+                measurement[f"attention_{side}_only"] = error_metrics(output, reference)
+                del output
+            del decoded_k, decoded_v
+        results.append(measurement)
+        del key, value
     return results
 
 
@@ -204,6 +224,11 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--ablate-kv",
+        action="store_true",
+        help="Also measure attention error with only K or only V quantized",
+    )
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
     if manifest.get("version") != 1 or not manifest.get("samples"):
@@ -262,7 +287,7 @@ def main() -> None:
             {
                 "provenance": entry,
                 "sample_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                "measurements": evaluate_sample(sample),
+                "measurements": evaluate_sample(sample, ablate_kv=args.ablate_kv),
             }
         )
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -274,6 +299,7 @@ def main() -> None:
                 "device": args.device,
                 "reference": "FP32 masked attention over captured FP16 Q/K/V",
                 "runtime_default_selected": False,
+                "kv_ablation": args.ablate_kv,
                 "samples": results,
             },
             indent=2,

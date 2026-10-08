@@ -280,6 +280,12 @@ Initial real-request NVFP4/GGUF samples have been collected; the three-model cor
 and independent E4M3 scale check remain incomplete. No default is selected.
 See [the initial request-data comparison](sm70_kv_initial_request_errors.md).
 
+`--ablate-kv` measures each side separately with the same captured request mask.
+The [K/V ablation ledger](sm70_kv_error_ablation.md) motivates two additional
+mixed-granularity arithmetic candidates: token/head FP32 K scales with
+feature-group FP16 V scales at widths32/64. Candidate byte savings require an
+implemented physical K/V layout; they do not select or admit a runtime codec.
+
 ## Real-request capture adapters
 
 `tools/kv_codec/capture.py` uses vLLM's public `LLM.collective_rpc` API to install

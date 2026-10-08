@@ -63,3 +63,8 @@ Before choosing an INT8 codec, collect Flash-Next with its actual QSA/indexer
 mask and compression state, expand the real prompts and context lengths,
 recheck production E4M3 scales, and measure native-kernel arithmetic and cost.
 All format/path and model quality/performance gates remain required.
+
+The later [K/V error ablation](sm70_kv_error_ablation.md) evaluates which side
+drives attention error and adds two mixed K/V granularity candidates. This
+initial ten-scheme ledger remains unchanged; the new measurements have their
+own CPU evaluation provenance.

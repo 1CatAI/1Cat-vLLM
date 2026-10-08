@@ -939,7 +939,7 @@
     "scope": "initial arithmetic data; not three-model format selection, calibrated E4M3 admission, speed or quality qualification"
   },
   "fused_qwen_writer_extraction": {
-    "status": "source/compiler gate only; GPU and installed model pending",
+    "status": "source/compiler/GPU byte gates pass; operator timing provisional; installed model pending",
     "immutable_base_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
     "sm70_compiler_pairs": 24,
     "tokens": [
@@ -964,15 +964,75 @@
     "original_encoder_ast_preserved": true,
     "host_and_kernel_math_addressing_guarded": true,
     "rejected_variant": "Scaling and byte encoding combined inside K store expression changes pointer evaluation and ptxas RMSNorm FMA order; retain separate codec scale and byte operations.",
-    "scope": "No new INT8/default/unsupported compiler admission or performance claim"
+    "scope": "No new INT8/default/unsupported compiler admission or performance claim",
+    "gpu_gate": {
+      "source_sha": "50cbed1a4cefceff6cdaae6ef7dff5432af1a3cd",
+      "numeric_wheel_source_sha": "120ac713a67f252d8b52bdb54c69a708b52dee95",
+      "wheel_sha256": "a4ce2018bfa82d158d2d779511f48db87e6a75b623eb974f530f32e381f5524b",
+      "device": "Tesla V100-SXM2-32GB / SM70; authorized54633",
+      "gpu_uuid": "GPU-69178791-a3ca-ebf7-48cd-513dbd4f9892",
+      "driver": "580.173.02",
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "runtime_overlay": false,
+      "cases": 24,
+      "bitwise_equal": true,
+      "ptx_equal": true,
+      "sass_equal": true,
+      "scope": "explicit source-kernel pairs; normal installed artifact/model gates separate"
+    },
+    "operator_timing": {
+      "scope": "warm-cache paired CUDA Graph events; one kernel per replay; host submission gaps can affect event intervals",
+      "cold_l2": false,
+      "alternating_rounds": 8,
+      "replays_per_sample": 200,
+      "median_delta_percent_across_cases": -0.29923819518165584,
+      "minimum_delta_percent": -5.544683966200825,
+      "maximum_delta_percent": 5.822618512495881,
+      "statistical_equivalence_established": false,
+      "next_gate": "repeat only timing outliers with multiple kernel nodes per replay to amortize host submission; do not claim end-to-end performance"
+    }
   },
   "native_calibrated_writer_extraction": {
-    "status": "source/compiler gate only; final installed GPU/model pending",
+    "status": "source/compiler and installed E4M3 write gate pass; broader format/operator/model gates pending",
     "source_guard": "entire immutable cache-kernel reconstruction including helpers, type spelling, math, addresses, host dispatch and launches",
     "interface": "KVWriter<cache_t, scalar_t, kv_dt>",
     "native_cmake_build_passed": true,
     "complete_sm70_sass_equal_without_normalization": true,
     "sass_sha256": "db0199dc0df559bf842dff93cfaa36cb78f9a683ae634c67a4bc708ed7770a75",
     "scope": "calibrated reshape/Flash-cache writers; dynamic/MLA/QSA auxiliary/restore and reader ABI unification remain pending; no INT8/default changes"
+  },
+  "page_view_gpu_gate": {
+    "source_sha": "50cbed1a4cefceff6cdaae6ef7dff5432af1a3cd",
+    "numeric_wheel_source_sha": "120ac713a67f252d8b52bdb54c69a708b52dee95",
+    "wheel_sha256": "a4ce2018bfa82d158d2d779511f48db87e6a75b623eb974f530f32e381f5524b",
+    "device": "Tesla V100-SXM2-32GB / SM70; authorized54633",
+    "gpu_uuid": "GPU-69178791-a3ca-ebf7-48cd-513dbd4f9892",
+    "driver": "580.173.02",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "runtime_overlay": false,
+    "cases": 102,
+    "bitwise_values_and_aliasing_equal": true,
+    "scope": "page views, offsets, strides and cached admission; not attention/model speed"
+  },
+  "normal_source120_installed_gpu_checks": {
+    "source_sha": "50cbed1a4cefceff6cdaae6ef7dff5432af1a3cd",
+    "numeric_wheel_source_sha": "120ac713a67f252d8b52bdb54c69a708b52dee95",
+    "wheel_sha256": "a4ce2018bfa82d158d2d779511f48db87e6a75b623eb974f530f32e381f5524b",
+    "device": "Tesla V100-SXM2-32GB / SM70; authorized54633",
+    "gpu_uuid": "GPU-69178791-a3ca-ebf7-48cd-513dbd4f9892",
+    "driver": "580.173.02",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "runtime_overlay": false,
+    "policy_tests": 197,
+    "metadata_tests": 4,
+    "fused_and_native_cache_writer_tests": 8,
+    "total_passed": 209,
+    "errors": 0,
+    "failures": 0,
+    "private_library_overrides": false,
+    "scope": "targeted installed artifact correctness; not all-route performance/model admission"
   }
 }

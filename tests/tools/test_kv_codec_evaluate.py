@@ -57,6 +57,41 @@ def test_gqa_oracle_obeys_head_specific_masks():
     torch.testing.assert_close(output, torch.tensor([[[3.0], [7.0], [11.0], [5.0]]]))
 
 
+def test_kv_ablation_distinguishes_the_softmax_from_value_error():
+    sample = {
+        "q": torch.ones(1, 2, 4, dtype=torch.float16),
+        "k": torch.ones(2, 1, 4, dtype=torch.float16),
+        "v": torch.tensor([[[17.0] * 4], [[30.0] * 4]], dtype=torch.float16),
+        "allowed": torch.ones(1, 2, dtype=torch.bool),
+        "attention_scale": 0.5,
+        "k_scale": 1.0,
+        "v_scale": 1.0,
+    }
+    plain = evaluate.evaluate_sample(sample)
+    ablated = evaluate.evaluate_sample(sample, ablate_kv=True)
+    for old, new in zip(plain, ablated):
+        assert old == {
+            key: value
+            for key, value in new.items()
+            if key not in ("attention_k_only", "attention_v_only")
+        }
+    e4m3 = next(row for row in ablated if row["scheme"] == "e4m3_layer_scale")
+    assert e4m3["attention_k_only"]["max_abs"] == 0
+    assert e4m3["attention_v_only"]["max_abs"] == 0.5
+    assert e4m3["attention"] == e4m3["attention_v_only"]
+
+    # Constant V makes every softmax distribution yield the same output.
+    sample["k"] = sample["v"]
+    sample["v"] = torch.full_like(sample["v"], 17.0)
+    e4m3 = next(
+        row
+        for row in evaluate.evaluate_sample(sample, ablate_kv=True)
+        if row["scheme"] == "e4m3_layer_scale"
+    )
+    assert e4m3["attention_k_only"]["max_abs"] == 0
+    assert e4m3["attention_v_only"]["max_abs"] == 1
+
+
 def test_e4m3_reports_saturation_and_layer_scale_cost():
     result = evaluate.e4m3(torch.tensor([500.0, -500.0, 1.0]), 1.0)
     torch.testing.assert_close(result.values, torch.tensor([448.0, -448.0, 1.0]))

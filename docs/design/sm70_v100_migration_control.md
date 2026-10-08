@@ -49230,3 +49230,27 @@ when another job uses only GPU0. Authentic local Git objects now provide the
 immutable baseline offline, avoiding network access while holding a GPU lease.
 INT8 implementation/format selection and the three-model quality/performance
 gates remain pending.
+
+The source120 normal installed artifact now passes209 targeted tests on an idle
+locked V100 (197 policy,4 metadata,8 fused/native cache-writer checks). The
+102 page-view GPU cases preserve values/strides/offsets/aliases and admission;
+24 immutable/extracted fused Qwen source-kernel pairs preserve all output/cache
+bytes and PTX/SASS. The native E4M3 writer is checked against the software
+encoder over all65536 FP16 codes at five scales. These are targeted operator
+gates; FP16/E5M2 native-writer coverage and full installed-model gates remain.
+
+Paired warm-cache single-kernel graph timing has a median delta of-0.299%
+across24 cases, with extrema-5.545%/+5.823%. Identical code does not make these
+event intervals a statistical equivalence test: host replay submission gaps
+can affect such short kernels. Recheck only the positive timing outlier with
+multiple kernel nodes per replay; do not repeat the entire broad GPU suite.
+The one minimal Flash-Next QSA capture is loading under the15-minute TP4 lease.
+
+CPU K/V error attribution uses the existing12 real layer/rank samples without
+reloading models. Token/head nearest-even INT8 has roughly twice the V-only
+attention RMSE of K-only in both27B models. Two mixed K/V arithmetic candidates
+measure V-group32/64 with token/head K. V-group32 reduces initial combined
+attention RMSE by about30% for2.31% more candidate bytes; physical packing and
+reader cost remain unimplemented. The original ten-scheme metrics match
+exactly under the same local CPU/Torch/thread contract. See the separate
+ablation ledger; no runtime codec/default is selected from this short corpus.
