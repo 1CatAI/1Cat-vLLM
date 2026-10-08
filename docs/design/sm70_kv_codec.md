@@ -640,3 +640,16 @@ not complete the full refactor or admit INT8. The inventory now reports both
 physical backend counts and backend-plus-module counts: 89 environment names,
 134 dtype tokens, 26 dtype predicates and 52 route calls remain. No switch has
 been retired by this code movement.
+
+## Flash-Next request continuation
+
+The [Flash-Next QSA ledger](sm70_kv_flashnext_request_errors.md) adds12 actual
+layer/rank captures from a successful bounded TP4 lease using the ordinary
+source120 wheel. Actual indexer masks and addressed raw/compressed state are
+retained; grouped-page4 and XQA-page4 calls are asserted per sample/rank.
+All captured layers use ratio4 and the157-token history is below top-k pruning.
+The data therefore closes the initial real QSA capture gap, not ratio128,
+long-context sparse-selection, quality or performance admission. The next
+capture selector covers each compression ratio while retaining depth examples;
+nine CPU capture checks pass. Runtime provenance now includes the relocated
+partition-policy module (20 files) when using the new normal sourceb50 wheel.

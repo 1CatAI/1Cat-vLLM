@@ -79,6 +79,18 @@ def capture_qsa_state(cache, slots):
     }
 
 
+def select_qsa_capture_layers(layers):
+    """Keep depth representatives and cover every executed compression ratio."""
+    indices = {0, len(layers) // 2, len(layers) - 1}
+    ratios = set()
+    for index, layer in enumerate(layers):
+        ratio = layer.indexer.compress_ratio
+        if ratio not in ratios:
+            indices.add(index)
+            ratios.add(ratio)
+    return [layers[index] for index in sorted(indices)]
+
+
 def install_qsa_capture(model, directory, token_ids, provenance):
     from vllm.distributed import (
         get_tensor_model_parallel_rank,
@@ -91,7 +103,7 @@ def install_qsa_capture(model, directory, token_ids, provenance):
     layers = [m for m in model.modules() if isinstance(m, owner.Qwen4ExpQSAAttention)]
     if not layers:
         raise ValueError("No NVIDIA Qwen4Exp QSA layers")
-    selected = [layers[i] for i in sorted({0, len(layers) // 2, len(layers) - 1})]
+    selected = select_qsa_capture_layers(layers)
     if any(m.qsa_dcp_sharded or m.impl.dcp_world_size != 1 for m in selected):
         raise ValueError("Context-sharded QSA needs a separate capture adapter")
     rank = get_tensor_model_parallel_rank()
@@ -264,6 +276,7 @@ def verify_runtime_wheel(wheel, vllm_root):
         "v1/kv_cache_interface.py",
         "v1/attention/backends/flash_v100/cache_view.py",
         "v1/attention/backends/flash_v100/codec.py",
+        "v1/attention/backends/flash_v100/decode_policy.py",
         "v1/attention/backends/flash_v100/masking.py",
         "v1/attention/backends/flash_v100/metadata.py",
         "v1/attention/backends/flash_v100/reference.py",

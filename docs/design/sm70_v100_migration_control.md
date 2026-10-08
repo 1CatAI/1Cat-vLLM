@@ -49303,3 +49303,25 @@ five CPU partition tests pass. One broader device-config case cannot infer a
 GPU on this host and remains pending on V100. Backend8712 lines; aggregate89
 environment names/26 dtype predicates/52 route calls unchanged. The common
 format-independent schedule and reduction remain separate, unqualified work.
+
+The shortened Flash-Next token-ID attempt succeeds with12 real QSA samples,
+source120 ordinary wheel, TP4,157 tokens, FP16 KV/eager/no-MTP/no-prefix. Every
+rank executes12 grouped-page4 and12 XQA-page4 calls; each sample sees one of
+each. Actual masks and addressed compressor state are captured; own GPU/PLE
+workers exit normally and release the15-minute lease. Initialization803.17s
+and hooked request1.35s are diagnostic durations, not serving speed.
+All sampled layers3/27/47 have ratio4 and select the entire causal short
+history; ratio128 and actual top-k pruning remain uncovered. Future capture
+selection adds each distinct ratio, and9 CPU semantic checks pass. No repeat
+cold Flash-Next load is justified until a longer/ratio128 gate is prepared.
+Twelve-scheme K/V ablation and FP16 staging are retained in the new Flash-Next
+ledger; no native INT8/default/quality acceptance is implied.
+
+The normal sourceb50 partition-policy wheel SHA256 is
+`2720c79b9beae241748bfe7e3cfd0860c21eac1c6c68c186837fa57f57ce74a0`.
+All2090 packaged Python sources match;16 native libraries exclude private
+paths,15 are byte-identical to source69 and the remaining FA2 complete SM70
+SASS matches after anonymous namespace hashes only. The exact whole artifact
+installs normally on54633; dependency check passes201 packages. The short
+native FP16/E5M2 writer and installed partition/operator gate waits for global
+locks; idle devices do not authorize bypassing another task's reservation.

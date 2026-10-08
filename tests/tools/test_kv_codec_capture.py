@@ -5,6 +5,7 @@
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -23,6 +24,17 @@ def load_tool(name):
 
 
 capture = load_tool("capture")
+
+
+def test_qsa_layers_cover_rare_compression_ratios_without_losing_depths():
+    layers = [
+        SimpleNamespace(indexer=SimpleNamespace(compress_ratio=ratio))
+        for ratio in (4, 4, 128, 4, 4, 4, 4, 4, 128, 4, 4, 4)
+    ]
+    selected = capture.select_qsa_capture_layers(layers)
+    assert selected == [layers[i] for i in (0, 2, 6, 11)]
+    assert {layer.indexer.compress_ratio for layer in selected} == {4, 128}
+    assert capture.select_qsa_capture_layers(layers[:1]) == layers[:1]
 
 
 def test_actual_qsa_selection_matches_sparse_attention_oracle():

@@ -877,8 +877,8 @@
     "precommit": "passed on all changed files"
   },
   "current_inventory": {
-    "backend_lines": 8826,
-    "decode_lines": 6243,
+    "backend_lines": 8712,
+    "decode_lines": 6233,
     "backend_and_modules": {
       "kv_dtype_tokens": 134,
       "kv_dtype_predicates": 26,
@@ -1095,5 +1095,48 @@
     "sass_normalization": "anonymous namespace source hashes only; instruction bytes retained",
     "flash_v100_sass_sha256": "7cd655a36281854463d4f342686d3cec0a63093e32095f7cda05972d36271491",
     "fa2_sass_sha256": "85f89ff0716e73ed1ba81161d5e028c7bc496a718a1943dddb487160cf704605"
+  },
+  "decode_policy_extraction": {
+    "source_sha": "b50c02da46a910d359f57eb2ce3dc337c5afb4f1",
+    "functions": 6,
+    "constants": 2,
+    "source_matrix_environment_tests_passed": 25,
+    "cpu_partition_tests_passed": 5,
+    "legacy_format_envelopes_unchanged": true,
+    "common_schedule_retuning": false,
+    "normal_wheel_sha256": "2720c79b9beae241748bfe7e3cfd0860c21eac1c6c68c186837fa57f57ce74a0",
+    "wheel_bytes": 241983156,
+    "packaged_python_sources_equal": 2090,
+    "native_libraries": 16,
+    "native_byte_identical_to_source69": 15,
+    "remaining_complete_fa2_sm70_sass_equal": true,
+    "standard_install_and_dependency_check": "passed on54633;201 compatible packages",
+    "installed_gpu_and_model_gate": "pending global GPU lock availability"
+  },
+  "flashnext_qsa_real_request": {
+    "runtime_source_sha": "120ac713a67f252d8b52bdb54c69a708b52dee95",
+    "capture_tool_sha256": "218c3c214d9b075a327263559fee1e415bc0a33e27587d8d3795f3f069df3d1a",
+    "samples": 12,
+    "tp": 4,
+    "request_tokens": 157,
+    "layers": [
+      3,
+      27,
+      47
+    ],
+    "compression_ratios": [
+      4
+    ],
+    "actual_selection": "all causal history at this short length; no top-k pruning",
+    "executed_routes_per_rank": {
+      "qsa_sparse_grouped_page4": 12,
+      "qsa_sparse_xqa_page4": 12
+    },
+    "19_installed_runtime_files_verified": true,
+    "lease_minutes_cap": 15,
+    "own_workers_and_locks_released": true,
+    "ledger": "sm70_kv_flashnext_request_errors.json",
+    "format_selected": false,
+    "model_quality_or_speed_admission": false
   }
 }
