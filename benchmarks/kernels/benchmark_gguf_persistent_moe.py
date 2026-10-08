@@ -75,6 +75,9 @@ def main():
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--profile-only", action="store_true")
     parser.add_argument(
+        "--profile-operation", choices=("legacy", "candidate"), default="candidate"
+    )
+    parser.add_argument(
         "--variants",
         nargs="+",
         choices=("gate_reuse", "resident_batch", "queued"),
@@ -301,7 +304,8 @@ def main():
         torch.testing.assert_close(candidate, oracle, rtol=0.003, atol=0.003)
         if args.profile_only:
             torch.cuda.cudart().cudaProfilerStart()
-            operations[args.variants[0]]()
+            name = "legacy" if args.profile_operation == "legacy" else args.variants[0]
+            operations[name]()
             torch.accelerator.synchronize()
             torch.cuda.cudart().cudaProfilerStop()
             print("PROFILE_DONE; no accepted timing", flush=True)
