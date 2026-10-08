@@ -1206,6 +1206,18 @@ class OffloadingConnectorScheduler:
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
             if not req_status.transfer_jobs and req_status.req.is_finished():
+                # All store jobs for this finished request are complete.
+                # Emit finished_sending so the main scheduler frees the GPU
+                # blocks that request_finished held back (delay_free_blocks).
+                # A finished request generates no new store jobs, so an
+                # empty transfer_jobs here means every job that will ever
+                # exist for this request has already completed — a complete
+                # condition the worker side cannot see (store jobs are
+                # created incrementally across engine steps).
+                connector_output.finished_sending = (
+                    connector_output.finished_sending or set()
+                )
+                connector_output.finished_sending.add(job_status.req_id)
                 del self._req_status[job_status.req_id]
 
     def request_finished(
@@ -1247,7 +1259,13 @@ class OffloadingConnectorScheduler:
             job_status = self._jobs[job_id]
             for bid in job_status.non_sliding_window_block_ids or ():
                 self._block_id_to_pending_jobs.setdefault(bid, set()).add(job_id)
-        return False, None
+        # Hold the request's GPU blocks until all pending store jobs
+        # complete. Without this, the next admitted request allocates on
+        # top of the not-yet-stored blocks, pinning the KV pool at 100%
+        # and throttling the store to the prefill's consumption rate.
+        # Blocks are released via finished_sending in
+        # update_connector_output once the last store job completes.
+        return True, None
 
     # Replay boundaries (resend and extension) sit within this many blocks of
     # the request's last full block; older positions only held checkpoints of
@@ -1306,6 +1324,13 @@ class OffloadingConnectorScheduler:
         for status in self._req_status.values():
             for group_state in status.group_states:
                 group_state.next_stored_block_idx = 0
+            # The jobs just discarded are gone from _jobs and their worker
+            # reports are skipped as stale, so nothing else would ever clear
+            # these IDs. Left behind, they trip `assert not
+            # req_status.transfer_jobs` in update_state_after_alloc when the
+            # request next allocates blocks -- a bare AssertionError, fatal to
+            # EngineCore. Upstream vLLM main clears the set here.
+            status.transfer_jobs.clear()
 
         # Discard jobs and save job_counter to be able to discard worker responses
         self._stale_job_threshold = self._job_counter
