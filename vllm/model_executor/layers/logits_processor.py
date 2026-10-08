@@ -10,6 +10,7 @@ from collections.abc import Callable
 import torch
 
 from vllm import envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -18,6 +19,7 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers.sm70_topk_gather import gather_topk_pairs
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.platforms import current_platform
 
@@ -212,6 +214,13 @@ class LogitsProcessor(PluggableLayer):
         self.soft_cap = soft_cap
         # Whether to use gather or all-gather to gather the logits.
         self.use_all_gather = current_platform.use_all_gather()
+        cfg = get_current_vllm_config_or_none()
+        self._packed_topk_enabled = (
+            cfg is not None and cfg.kernel_config.sm70_packed_topk_gather
+        )
+        self._packed_topk_selections = (
+            cfg.kernel_config.collective_kernel_selections if cfg is not None else None
+        )
 
     def forward(
         self,
@@ -681,15 +690,24 @@ class LogitsProcessor(PluggableLayer):
         merge_topk_ms = 0.0
         if tp_size > 1:
             stage_start = _cuda_stage_start(profile_enabled)
-            gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)
-            gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
-
-            stage_start = _cuda_stage_start(profile_enabled)
-            gathered_indices = tensor_model_parallel_all_gather(
+            packed = gather_topk_pairs(
+                local_vals,
                 local_global_indices,
-                dim=-1,
+                vocab_size=lm_head.num_embeddings_padded,
+                enabled=self._packed_topk_enabled,
+                selections=self._packed_topk_selections,
             )
-            gather_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            if packed is None:
+                gathered_vals = tensor_model_parallel_all_gather(local_vals, dim=-1)
+                gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
+                stage_start = _cuda_stage_start(profile_enabled)
+                gathered_indices = tensor_model_parallel_all_gather(
+                    local_global_indices, dim=-1
+                )
+                gather_indices_ms = _cuda_stage_ms(profile_enabled, stage_start)
+            else:
+                gathered_vals, gathered_indices = packed
+                gather_vals_ms = _cuda_stage_ms(profile_enabled, stage_start)
 
             effective_k = min(top_k, gathered_vals.shape[-1])
             stage_start = _cuda_stage_start(profile_enabled)
