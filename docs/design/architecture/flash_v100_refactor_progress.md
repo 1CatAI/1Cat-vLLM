@@ -17,8 +17,9 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | Pending complete outcome map | Prerequisite gates |
 | 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase passed | Private references 390 → 387 | Pending | CPU/rebase and GPU prerequisites |
 | 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase passed | Private references 387 → 380 | Pending | Separate outcome and GPU gates |
-| 4a: explicit decode executor dependencies | — | CPU/golden/strict passed | Private references 380 → 374; cycles 14 → 13 | Queued after Step 3 | Required GPU gates |
-| 4b: ordered decode selection loop | — | Not started | — | Required | Step 4a gates |
+| 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict passed | Private references 380 → 374; cycles 14 → 13 | Queued after Step 3 | Required GPU gates |
+| 4b: native decode candidates | — | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
+| 4c: outer decode dispatch candidates | — | Split from unpublished prototype | — | Required | Step 4b gates |
 | 5a: per-sequence prefill candidates | — | Not started | — | Required | Step 4 gates |
 | 5b: batch prefill candidates | — | Not started | — | Required | Step 5a gates |
 | 5c: debug observer | — | Not started | — | Required | Step 5b gates |
@@ -372,3 +373,51 @@ task artifact directory. The owned adapter's type narrowing and AST assertion
 were corrected; the final mypy/layering run passes. The diagnostic callbacks
 retain their old state owner pending Step 5c, rather than claiming that debug
 state has already been decoupled.
+
+## Step 4b native selection after reducing scope
+
+Step 4a is Draft PR #1080 at `4b72df3b10418d5d10190e3b80f4d8183c36a923`.
+Its pinned PR #1028 integration is `ee202528b9d1843553d8cbe0207f2b1bb16632d0`,
+tree `09e77321a1534e5666d99f583b645daf2aebd3b3`, matching the clean merge-tree.
+Host-KV/QSA CPU tests pass 37 / 98 GPU skips. Its verified snapshots and
+GPU queues are under `a3-step4a` on 54633. PR #1048 advanced to
+`847bb3d8eb66b395f3e7910c3ac66953eb6bd619`; it has no file overlap with 4a.
+
+The combined dispatch prototype passed all 813 traces but encountered three
+check failures: the extracted layer-name annotation was narrower than the
+existing metadata type, the expanded AST adapter lacked its decode import,
+and it initially treated the new outer delegate as an old named delegate.
+Under the retry rule, work returned to exact parent PR #1080 and was split.
+The unpublished prototype remains in `v100-a3-decode-dispatch-20261008-180444`
+at move commit `677d5f068` plus saved patch/plan artifacts; it is not pushed.
+No golden, original calculation hash or acceptance gate was relaxed.
+
+Reduced Step 4b introduces real XQA and scalar candidates behind the same
+existing structural admission. Their run methods execute the original native
+calculations. `plan/routing.execute` consumes candidates in order, calls
+admit before run, and continues only on None. Its recorder preserves each
+observation's exact position around native calls. A temporary observation
+adapter supports private legacy calls outside forward. The generic driver
+is shared by both actual decode implementations, not an empty registry.
+Step 4c will move the outer diagnostic/fallback choices separately.
+
+Mechanical extraction `8e72dc14a` retains the calculations before ownership
+wiring. The focused trace/calculation/executor/selection suite passes 19 tests,
+including all 813 traces. The two new cases prove that preparation and route
+observations survive decline, rejected candidates do no work, falsey results
+complete, and later candidates are not evaluated after success. Original
+calculation hashes remain fixed. Complete strict CPU, rebase and GPU gates
+remain pending.
+
+Step 2a's complete GPU regression reports 1684 passes and the same seven
+inherited failures. Its 12 native cases have max-abs zero. Step 2b is running;
+full parent/candidate outcome maps are emitted after both finish. DDTree eager
+timing in this diagnostic run is not a designated XQA/prefill performance gate.
+
+Reduced Step 4b passes **242 tests / 1 skip / 28 GPU deselections** under the
+strict patch-use plugin. The immutable 813-case trace and original calculation
+hashes pass, and all consumed patch names retain real call/read evidence.
+Pre-commit including mypy/layering passes. Private references fall 374 to 370;
+cycles remain 13 and no new forbidden edge is added. Evidence:
+`a3-decode-candidates-{strict,final-precommit}.log` and
+`a3-decode-candidates-shim.json`. GPU and final rebase evidence remain separate.

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import torch
@@ -16,6 +17,7 @@ from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import state as _state
+from vllm.v1.attention.backends.flash_v100.plan import routing as _plan
 from vllm.v1.attention.backends.flash_v100.workspace import (
     V100Workspace as V100Workspace,
 )
@@ -72,6 +74,22 @@ class DecodeOps:
     scalar_override: Callable[..., None] | None = None
 
 
+@dataclass(frozen=True)
+class NativeDecodeRequest:
+    layer: torch.nn.Module
+    query: torch.Tensor
+    key_cache: torch.Tensor
+    value_cache: torch.Tensor
+    attn_metadata: TritonAttentionMetadata
+    out_view: torch.Tensor
+    output: torch.Tensor
+    window_size: tuple[int, int]
+    xqa_codec: KVCodec | None
+    anchor_lens: torch.Tensor | None
+    anchored_window: int
+    selection: _routing.RouteSpec | None
+
+
 class DecodeExecutor:
     """Execute decode without importing or receiving the attention Impl."""
 
@@ -120,6 +138,7 @@ class DecodeExecutor:
         partition_size_hint: int | None = None,
         anchor_lens: torch.Tensor | None = None,
         anchored_window: int = 0,
+        record: _plan.RecordRoute = _plan.record_legacy,
     ) -> None:
         scalar_tail = self.ops.scalar_tail
         if scalar_tail is not None and scalar_tail(
@@ -139,9 +158,7 @@ class DecodeExecutor:
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
         ):
-            _routing._record_route(
-                _routing.ROUTE_SPECS["decode_e4m3_compact_scalar_tail"].name
-            )
+            record(_routing.ROUTE_SPECS["decode_e4m3_compact_scalar_tail"].name)
             return
         kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,
@@ -644,19 +661,7 @@ class DecodeExecutor:
             ("decode_xqa_paged",),
             fallback="decode_scalar_paged",
         )
-        if selection is _routing.ROUTE_SPECS["decode_xqa_paged"]:
-            return self.xqa(
-                layer,
-                query,
-                key_cache,
-                value_cache,
-                attn_metadata,
-                out_view,
-                output,
-                window_size,
-                xqa_codec,
-            )
-        return self.scalar(
+        request = NativeDecodeRequest(
             layer,
             query,
             key_cache,
@@ -665,9 +670,12 @@ class DecodeExecutor:
             out_view,
             output,
             window_size,
+            xqa_codec,
             anchor_lens,
             anchored_window,
+            selection,
         )
+        return _plan.execute(request, (XqaDecode(self), ScalarDecode(self)))
 
     def xqa(
         self,
@@ -680,9 +688,11 @@ class DecodeExecutor:
         output: torch.Tensor,
         window_size: tuple[int, int],
         xqa_codec: KVCodec | None,
+        *,
+        record: _plan.RecordRoute = _plan.record_legacy,
     ) -> torch.Tensor:
         _routing._log_fp8_kv_cache_route(
-            "decode", self.config.kv_cache_dtype, "xqa_paged"
+            "decode", self.config.kv_cache_dtype, "xqa_paged", record=record
         )
         _routing._trace_decode_active(
             route="decode_xqa_paged",
@@ -706,13 +716,9 @@ class DecodeExecutor:
                 and query.shape[0] == 1
                 and _config.raw("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1") != "0"
             ):
-                _routing._record_route(
-                    f"decode_xqa_e4m3_dynamic_page{key_cache.shape[1]}"
-                )
+                record(f"decode_xqa_e4m3_dynamic_page{key_cache.shape[1]}")
             else:
-                _routing._record_route(
-                    f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}"
-                )
+                record(f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}")
         self.ops.xqa(
             query,
             key_cache,
@@ -749,7 +755,7 @@ class DecodeExecutor:
                 )
             ),
         )
-        _routing._record_route(_routing.ROUTE_SPECS["decode_xqa_paged"].name)
+        record(_routing.ROUTE_SPECS["decode_xqa_paged"].name)
         return output
 
     def scalar(
@@ -764,9 +770,11 @@ class DecodeExecutor:
         window_size: tuple[int, int],
         anchor_lens: torch.Tensor | None,
         anchored_window: int,
+        *,
+        record: _plan.RecordRoute = _plan.record_legacy,
     ) -> torch.Tensor:
         _routing._log_fp8_kv_cache_route(
-            "decode", self.config.kv_cache_dtype, "scalar_paged"
+            "decode", self.config.kv_cache_dtype, "scalar_paged", record=record
         )
         _routing._trace_decode_active(
             route="decode_scalar_paged",
@@ -776,7 +784,10 @@ class DecodeExecutor:
             attn_metadata=attn_metadata,
             window_size=window_size,
         )
-        (self.ops.scalar_override or self._call_flash_attn_decode_paged)(
+        (
+            self.ops.scalar_override
+            or partial(self._call_flash_attn_decode_paged, record=record)
+        )(
             query,
             key_cache,
             value_cache,
@@ -806,5 +817,54 @@ class DecodeExecutor:
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
         )
-        _routing._record_route(_routing.ROUTE_SPECS["decode_scalar_paged"].name)
+        record(_routing.ROUTE_SPECS["decode_scalar_paged"].name)
         return output
+
+
+class XqaDecode:
+    def __init__(self, executor: DecodeExecutor):
+        self.executor = executor
+
+    def admit(self, request: NativeDecodeRequest) -> bool:
+        return request.selection is _routing.ROUTE_SPECS["decode_xqa_paged"]
+
+    def run(
+        self, request: NativeDecodeRequest, record: _plan.RecordRoute
+    ) -> torch.Tensor:
+        return self.executor.xqa(
+            request.layer,
+            request.query,
+            request.key_cache,
+            request.value_cache,
+            request.attn_metadata,
+            request.out_view,
+            request.output,
+            request.window_size,
+            request.xqa_codec,
+            record=record,
+        )
+
+
+class ScalarDecode:
+    def __init__(self, executor: DecodeExecutor):
+        self.executor = executor
+
+    def admit(self, request: NativeDecodeRequest) -> bool:
+        return True
+
+    def run(
+        self, request: NativeDecodeRequest, record: _plan.RecordRoute
+    ) -> torch.Tensor:
+        return self.executor.scalar(
+            request.layer,
+            request.query,
+            request.key_cache,
+            request.value_cache,
+            request.attn_metadata,
+            request.out_view,
+            request.output,
+            request.window_size,
+            request.anchor_lens,
+            request.anchored_window,
+            record=record,
+        )
