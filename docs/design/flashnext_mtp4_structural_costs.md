@@ -225,10 +225,13 @@ and clock variation explain why it must not be compared as a speed gain.
    miss staging for the already device-resident E4M3 reference. Reconstruct
    precisely the same FP16 key/value operands, use FP16 QK with FP32 MMA
    accumulation, and retain FP32 probabilities and PV accumulation. The
-   current target partial/merge plus gather service is about 1.08 ms; a
-   projected 0.5-0.8 ms chain gain must pass an isolated numerical and chain
-   gate. This is a hypothesis, not a measured speedup. Host history remains
-   a separate placement path.
+   current target partial/merge plus gather service is about 1.08 ms. The
+   direct reader passes nine clean-wheel GPU tests; isolated synthetic
+   target-plus-draft chains save 0.515 ms for C1 shapes and 0.448 ms for C4
+   shapes. The model control failed while serializing compiler artifacts
+   because storage filled, and the candidate has no round measurements.
+   These chain results are not measured endpoint savings. Host history
+   remains a separate placement path.
 2. **HC-to-input-projection pipeline.** Group four HC CTAs, publish their
    output-column readiness, and accumulate the next dense projection over
    each available 128-column K slice. Twenty deterministic split-K partials
@@ -258,11 +261,18 @@ and clock variation explain why it must not be compared as a speed gain.
    with top-k/input quantization. The current projection/top-k/input-quant
    chain has about 1.22 ms service; a 0.5-0.8 ms proposal is plausible only if
    the added HC tail does not consume that saving.
-5. **Read/decode once per repeated expert.** Share decoded IQ words among
-   tokens of the same expert and preserve the down FP16 boundary and ordered
-   weighted reduction. The 28% compulsory/issued gap is an upper opportunity,
-   not an expected endpoint gain. Register occupancy and single-token expert
-   efficiency can reject this design.
+5. **Persistent weight-major routed MoE.** Keep workers active across unique
+   expert gate/up, intermediate production, down and ordered unroute. Share
+   decoded IQ words among the tokens that actually selected the expert and
+   use chunk readiness instead of phase-wide barriers. Preserve the FP16
+   intermediate boundaries and FP32 weighted reduction. The 28%
+   compulsory/issued gap is an upper opportunity, not an expected endpoint
+   gain. Register occupancy, publication latency and single-token expert
+   efficiency can reject this design. The
+   [persistent execution review](flashnext_persistent_execution.md) compares
+   MonoMoE, Hazy Megakernels, Mirage MPK, FLUTE and EcoSpec with this ledger,
+   defines a first implementation boundary, and separates scheduling from
+   decoder reuse in the proposed ablation.
 
 These ideas follow tile readiness and dependency-graph scheduling, rather
 than assuming a faster launch changes the round. [Mirage MPK](https://github.com/mirage-project/mirage/tree/mpk)
