@@ -11,6 +11,7 @@ See ``docs/design/architecture/README.md`` for the layering rules.
     python tools/pre_commit/check_layering.py            # check (pre-commit)
     python tools/pre_commit/check_layering.py --update   # accept reductions
     python tools/pre_commit/check_layering.py --report   # print the debt
+    python tools/pre_commit/check_layering.py --accept-moves  # code moved files
 """
 
 from __future__ import annotations
@@ -93,19 +94,30 @@ def collect() -> dict[str, dict[str, int]]:
     return result
 
 
+def totals_of(counts_by_file: dict[str, dict[str, int]]) -> dict[str, int]:
+    totals: dict[str, int] = {}
+    for counts in counts_by_file.values():
+        for kind, n in counts.items():
+            totals[kind] = totals.get(kind, 0) + n
+    return totals
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--update", action="store_true")
     parser.add_argument("--report", action="store_true")
+    parser.add_argument(
+        "--accept-moves",
+        action="store_true",
+        help="record per-file growth when no coupling kind grows in total "
+        "(code moved between files)",
+    )
     parser.add_argument("files", nargs="*")
     args = parser.parse_args()
 
     current = collect()
     if args.report:
-        totals: dict[str, int] = {}
-        for counts in current.values():
-            for kind, n in counts.items():
-                totals[kind] = totals.get(kind, 0) + n
+        totals = totals_of(current)
         print(json.dumps({"files": len(current), "totals": totals}, indent=1))
         for path, counts in sorted(
             current.items(), key=lambda item: -sum(item[1].values())
@@ -125,6 +137,20 @@ def main() -> int:
         for kind, n in counts.items():
             if n > old.get(kind, 0):
                 errors.append(f"{path}: {kind} coupling {old.get(kind, 0)} -> {n}")
+    if args.accept_moves:
+        old_totals = totals_of(baseline)
+        new_totals = totals_of(current)
+        grown = {
+            kind: (old_totals.get(kind, 0), n)
+            for kind, n in new_totals.items()
+            if n > old_totals.get(kind, 0)
+        }
+        if grown:
+            print(f"total coupling grew, not a move: {grown}")
+            return 1
+        BASELINE.write_text(json.dumps(current, indent=1, sort_keys=True) + "\n")
+        print(f"baseline updated after a move: {new_totals}")
+        return 0
     if args.update and not errors:
         # Only reductions can be recorded; growth must be fixed instead.
         BASELINE.write_text(json.dumps(current, indent=1, sort_keys=True) + "\n")

@@ -384,7 +384,7 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
     )
 
     # isort: split
-    from vllm.v1.attention.backends.flash_attn_v100 import (
+    from vllm.v1.attention.backends.flash_v100.ops import (
         _get_sm70_d256_gqa_architecture_q8192_op,
     )
     from vllm.v1.attention.ops.sm70_e4m3_long import (

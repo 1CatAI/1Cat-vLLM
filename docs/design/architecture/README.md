@@ -62,8 +62,9 @@ Rules:
    silent. The "path x format x shape" matrix is generated from the
    declarations and checked by tests.
 5. **Experiments do not live in `main` forever.** A default-off path either
-   graduates (becomes the default, with data) or is deleted together with its
-   negative result in the design log. No `_old` / `_fixed` / `_vN` copies.
+   graduates (becomes the default, with data) or is marked deprecated with its
+   negative result linked in the design log. Retain experimental and `_old` /
+   `_fixed` / `_vN` paths for reproducibility; do not delete them.
 6. **One home per concept.** A behaviour is implemented once; variants are
    template/codec parameters, not copied files.
 
@@ -88,6 +89,17 @@ files whose path names their platform or feature (`*sm70*`, `*turbomind*`,
 and `vllm/config/kernel.py` are configuration registries and are excluded
 entirely.
 
+## Where things live
+
+| Concept | Home |
+| --- | --- |
+| KV-cache storage formats | `vllm/v1/attention/kv_codecs.py` (`KVCodec`: FP16, BF16, FP8-E4M3, FP8-E5M2). Routes admit codecs, never `kv_cache_dtype` strings. |
+| Flash-V100 attention | `vllm/v1/attention/backends/flash_v100/`: `ops` (native operator loading), `routing` (route accounting, decode partition/XQA admission), `kv_layout`, `masks`, `dense_prefill`, `smallq_metadata`, `metadata`, `impl`, `backend`. Modules reach each other through the module object (`_routing._record_route`), so rebound globals and monkeypatches have one owner. `flash_attn_v100.py` is a compatibility module that forwards reads and writes, including wildcard imports. Public package re-exports resolve the owning module dynamically. The original logger name and shared one-shot flags are retained. |
+
+A pure move between files keeps every coupling total constant; record it with
+`python tools/pre_commit/check_layering.py --accept-moves`, which refuses to
+run if any total grows.
+
 ## Refactor roadmap
 
 Every step is behaviour-preserving (bitwise outputs, identical route hits, no
@@ -95,8 +107,8 @@ performance regression), lands as its own PR and can be reverted alone.
 
 1. **Guardrails** — this document, the ratchet, the debt report. *(done)*
 2. **Configuration** — finish moving runtime `os.getenv` reads in generic modules
-   into `KernelConfig` / `envs` captured at init; delete default-off
-   experiments whose negative results are recorded.
+   into `KernelConfig` / `envs` captured at init; mark default-off
+   experiments deprecated when their negative results are recorded.
 3. **Extract platform and model code from generic modules**, largest first:
    `gpu_model_runner.py`, `qwen_gdn_linear_attn.py`, `config/vllm.py`,
    `vocab_parallel_embedding.py`, `gdn_attn.py`, `config/speculative.py`,
@@ -105,8 +117,10 @@ performance regression), lands as its own PR and can be reverted alone.
 4. **Format codecs and dispatch registries** — KV formats first (FP16, E4M3,
    then INT8 on the same interface), then weight formats and the SM70 MoE
    family; split the Flash-V100 backend into routing / metadata / decode /
-   verify / prefill / KV-codec modules.
-5. **Kernels and build** — consolidate extension modules, remove variant files,
+   verify / prefill / KV-codec modules. *(KV codecs and the module split done;
+   next: declarative route table, one grouped/XQA operator family per codec,
+   decode/prefill/verify split of `impl`.)*
+5. **Kernels and build** — consolidate extension modules, mark retired variant files deprecated,
    split multi-thousand-line kernels by responsibility.
 6. **Process** — PRs state their coverage in the generated matrix; new knobs go
    into `KernelConfig`; design notes become one overview plus per-component

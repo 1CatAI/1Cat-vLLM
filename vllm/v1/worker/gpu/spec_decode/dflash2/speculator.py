@@ -834,7 +834,7 @@ class DFlash2Speculator(DFlashSpeculator):
         self._capture_draft_metadata_graph(shapes)
 
     def _capture_draft_metadata_graph(self, shapes: list[tuple[int, int]]) -> None:
-        from vllm.v1.attention.backends.flash_attn_v100 import (
+        from vllm.v1.attention.backends.flash_v100 import (
             FlashAttnV100Impl,
             FlashAttnV100MetadataBuilder,
         )

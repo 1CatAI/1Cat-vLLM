@@ -49029,3 +49029,54 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+## 2026-10-08 — architecture A0 Flash-V100 package split: validation pending
+
+Continue `agent/arch-flash-v100-split-20261008` from #1049
+(`cd081f4aec77f18362759985081cb9c384815aee`) in
+`/home/ymzx/arch-ws/refactor`. Source and private Git metadata now both live
+on the root disk; the handed-off worktree's Git directory originally pointed
+at full `/mnt/nvme3`. Retain original metadata and data, and do not install
+anything in the shared runtime.
+
+Static extraction audit found 194 original symbols with unchanged normalized
+AST bodies, but a duplicated prefill log flag, distinct module loggers and
+frozen public re-exports broke shared state/old-path monkeypatches. Restore
+one-owner flag access, the original shared logger and dynamic package exports;
+retain wildcard compatibility. Focused CPU compatibility/cleanup/MLA suite:
+11 passed. Coupling totals stay model 2325 / platform 3964 / env 335.
+
+GPU acceptance is pending, not waived. The handed-off base test process
+exhausted its GPU3 lock wait and never executed tests. The original A/B helper
+could mistake two incomplete logs for matching empty failure sets; use
+`/home/ymzx/arch-ws/tmp/ab_checked.sh` instead, which records exit codes and
+JUnit XML and refuses missing completion summaries. The 54-file base/new
+suite and the route/output/timing gate were queued under the GPU3 lock while
+an unrelated TP4 model owned all GPUs; neither job was stopped. A machine
+reboot then interrupted the queued runners. After reboot, `nvidia-smi` cannot
+connect and `lspci -d 10de:` lists no NVIDIA devices. Current static checks and
+the 11-case CPU suite pass again; GPU access must be restored before rerunning
+the paired gates. The checked runner also requires an available SM70 device
+before pytest and compares every JUnit outcome, so skipped/no-GPU runs cannot
+be counted as acceptance. Tests use the
+user-specified `gguf-round-cost-20261008` runtime with task caches under
+`/home/ymzx/arch-ws/tmp/a0-caches` and `VLLM_NO_USAGE_STATS=1`.
+
+Retain evidence at `/home/ymzx/arch-ws/tmp/a0-handoff.md`,
+`split_checked_ab.log`, `operator_gate.log`, `a0-compatibility.txt` and
+`a0-precommit-restart.log`, `a0-compatibility-restart.txt` and
+`no_gpu_probe.log`. Require executed matching GPU failure sets,
+`VLLM_SM70_DEBUG=routing` route equality, bitwise operator equality and the
+requested decode/long-prefill timing within ±2% before accepted commit/push.
+A2 and the remaining campaign are not complete. #1048 overlaps partial
+metadata extraction and provides a useful route inventory, but its CUDA
+reader changes are outside this full Python backend split.
+
+### Campaign validation override
+
+The user explicitly instructed continuation without V100 on 2026-10-08.
+Proceed with CPU/static validation and stacked Draft PRs; do not represent
+unrun GPU failure-set, route, numerical or timing checks as passed. A0 has
+11 passing CPU regressions, 194 matching normalized extracted symbols and
+passing pre-commit/mypy/layering checks. This override supersedes the GPU
+publication gate above; hardware qualification remains unmeasured.
