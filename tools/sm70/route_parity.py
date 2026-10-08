@@ -24,6 +24,16 @@ from tools.sm70.parity_common import (
 )
 
 
+class ParityWorkerExtension:
+    """Named, read-only RPCs compatible with secure engine serialization."""
+
+    def parity_snapshot(self):
+        return snapshot(self)
+
+    def parity_native_provenance(self):
+        return native_provenance(self)
+
+
 def snapshot(worker):
     import torch
 
@@ -81,6 +91,9 @@ def record(args):
     options.setdefault("attention_backend", "FLASH_ATTN_V100")
     options.setdefault("seed", 1701)
     options.setdefault("enable_prefix_caching", False)
+    extension = "tools.sm70.route_parity.ParityWorkerExtension"
+    if options.setdefault("worker_extension_cls", extension) != extension:
+        raise ValueError("Route parity requires its named worker extension")
     identity = read_json(args.model_identity)
     if not identity.get("files"):
         raise ValueError("Model identity must contain actual file paths and SHA256s")
@@ -106,9 +119,9 @@ def record(args):
         prompt_file_sha256=digest(args.prompts),
     )
     engine = LLM(**options)
-    startup = engine.collective_rpc(snapshot)
+    startup = engine.collective_rpc("parity_snapshot")
     outputs = engine.generate(prompts, SamplingParams(**sampling), use_tqdm=False)
-    after = engine.collective_rpc(snapshot)
+    after = engine.collective_rpc("parity_snapshot")
     workers = options["tensor_parallel_size"] * options.get("pipeline_parallel_size", 1)
     if len(startup) != workers or len(after) != workers:
         raise AssertionError("Incomplete worker route snapshots")
@@ -125,7 +138,7 @@ def record(args):
             ]
             if not active:
                 raise AssertionError("No actual host-FP8 QSA cache activity on worker")
-    native = engine.collective_rpc(native_provenance)
+    native = engine.collective_rpc("parity_native_provenance")
     contract["native_sha256"] = [
         {name: item["sha256"] for name, item in worker["libraries"].items()}
         for worker in native
