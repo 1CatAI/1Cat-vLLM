@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tools.sm70.flash_v100_audit import audit
 from tools.sm70.flash_v100_trace import BASELINE, cases, run_case, strict_shim
 
 pytestmark = pytest.mark.cpu_test
@@ -39,6 +40,21 @@ def test_matrix_and_coverage_are_complete():
     for function in coverage["functions"].values():
         assert function["required_sites"]
         assert function["missing_sites"] == []
+
+
+def test_dependency_and_coupling_ratchet():
+    baseline = json.loads(
+        (FIXTURES / "flash_v100_dependency_baseline.json").read_text()
+    )
+    current = audit()
+    for metric, value in current["metrics"].items():
+        assert value <= baseline["metrics"][metric], (metric, value)
+    assert {tuple(c) for c in current["cycles"]} <= {
+        tuple(c) for c in baseline["cycles"]
+    }
+    assert set(map(tuple, current["forbidden_edges"])) <= set(
+        map(tuple, baseline["forbidden_edges"])
+    )
 
 
 def test_strict_shim_rejects_orphan_even_if_local_attribute_exists():
