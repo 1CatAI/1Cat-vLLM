@@ -382,9 +382,6 @@
  "vllm/v1/attention/backends/fa_utils.py": {
   "platform": 3
  },
- "vllm/v1/attention/backends/flash_v100/impl.py": {
-  "env": 22
- },
  "vllm/v1/attention/backends/flex_attention.py": {
   "model": 25
  },
