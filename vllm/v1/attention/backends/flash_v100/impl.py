@@ -1061,7 +1061,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
         ):
-            _routing._record_route("decode_e4m3_compact_scalar_tail")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["decode_e4m3_compact_scalar_tail"].name
+            )
             return
         kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,
@@ -1260,7 +1262,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         _routing._log_fp8_kv_cache_route(
             "decode", self.kv_cache_dtype, "dflash2_grouped_verify"
         )
-        _routing._record_route("prefill_smallq_dflash2_grouped_verify")
+        _routing._record_route(
+            _routing.ROUTE_SPECS["prefill_smallq_dflash2_grouped_verify"].name
+        )
 
     def _smallq_decode_xqa_allowed(
         self,
@@ -1275,45 +1279,32 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         workspace_seq_capacity_hint: int | None,
         partition_size_hint: int | None,
     ) -> bool:
-        if (
-            not self.use_smallq_decode_xqa
-            or self.flash_attn_decode_paged_xqa is None
-            or partition_size_hint is not None
-            or window_size != (-1, -1)
-            or query.shape[0] != seq_lens.shape[0]
-            or query.shape[2] != 256
-            or key_cache.shape[2] <= 0
-            or query.shape[1] % key_cache.shape[2] != 0
-        ):
-            return False
-
-        q_per_kv = query.shape[1] // key_cache.shape[2]
-        if q_per_kv not in (6, 8):
-            return False
-
-        codec = self._xqa_kv_codec(key_cache, value_cache, attn_metadata)
-        if codec is None:
-            return False
-        fp8_e5m2_kv = codec is FP8_E5M2
-        if codec is FP8_E4M3 and (
-            q_per_kv != 6
-            or (query.shape[0] > 1 and not _routing._e4m3_batch_xqa_allowed(query))
-        ):
-            return False
-
-        graph_capture = bool(
-            getattr(attn_metadata, "flash_v100_cudagraph_capture", False)
-        ) or _routing._is_cuda_graph_capturing(query)
-        effective_seq_hint = max(
-            int(max_seq_len_hint or 0),
-            int(workspace_seq_capacity_hint or 0) if graph_capture else 0,
+        context = _routing.RouteContext(
+            stage="verify",
+            codec=self._xqa_kv_codec(key_cache, value_cache, attn_metadata),
+            shape=_routing.RouteShape(
+                query.shape[0],
+                query.shape[1],
+                key_cache.shape[2],
+                query.shape[2],
+                key_cache.shape[1],
+            ),
+            enabled=self.use_smallq_decode_xqa,
+            available=self.flash_attn_decode_paged_xqa is not None,
+            query=query,
+            metadata=attn_metadata,
+            seq_rows=seq_lens.shape[0],
+            max_seq_len_hint=max_seq_len_hint,
+            workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+            partition_size_hint=partition_size_hint,
+            window_size=window_size,
         )
-        min_seq_len = int(
-            os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN", "4096")
+        return (
+            _routing.route_reason(
+                _routing.ROUTE_SPECS["prefill_smallq_decode_xqa"], context
+            )
+            is None
         )
-        if fp8_e5m2_kv:
-            min_seq_len = max(min_seq_len, _routing._decode_fp8_xqa_min_seq_len())
-        return effective_seq_hint >= max(1, min_seq_len)
 
     def _call_flash_attn_smallq_decode_paged(
         self,
@@ -1362,7 +1353,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 key_cache.shape[1],
                 scope="process",
             )
-            _routing._record_route("prefill_smallq_fp16_grouped_fp32")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_smallq_fp16_grouped_fp32"].name
+            )
             return
         grouped_op = getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None)
         if grouped_op is not None and grouped_e4m3_fp32_allowed(
@@ -1399,7 +1392,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             _routing._log_fp8_kv_cache_route(
                 "decode", self.kv_cache_dtype, "grouped_fp32"
             )
-            _routing._record_route("prefill_smallq_e4m3_grouped_fp32")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_smallq_e4m3_grouped_fp32"].name
+            )
             return
         window_size = self._flash_v100_window_size(causal=True)
         if self._smallq_decode_xqa_allowed(
@@ -1461,7 +1456,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     )
                 ),
             )
-            _routing._record_route("prefill_smallq_decode_xqa")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_smallq_decode_xqa"].name
+            )
             return
 
         self._call_flash_attn_decode_paged(
@@ -1480,7 +1477,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             workspace_seq_capacity_hint=workspace_seq_capacity_hint,
             partition_size_hint=partition_size_hint,
         )
-        _routing._record_route("prefill_smallq_decode_scalar")
+        _routing._record_route(
+            _routing.ROUTE_SPECS["prefill_smallq_decode_scalar"].name
+        )
 
     def _anchored_swa_params(
         self,
@@ -1576,7 +1575,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 and abs(self.scale - 0.0625) <= 1.0e-8
             ):
                 _dense_prefill._profile_sm70_prefill_workspace(query, self.num_kv_heads)
-            _routing._record_route("metadata_none_zero_output")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["metadata_none_zero_output"].name
+            )
             return output.fill_(0)
 
         self._validate_dflash_attention_contract(layer, attn_metadata)
@@ -1710,7 +1711,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     layer_name,
                 )
                 self._reset_decode_cache()
-                _routing._record_route("prefill_triton_safe")
+                _routing._record_route(_routing.ROUTE_SPECS["prefill_triton_safe"].name)
                 return super().forward(
                     layer,
                     query,
@@ -1737,7 +1738,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     # graph. Bind directly to the non-causal paged-prefix
                     # kernel; runtime updates its persistent sequence and
                     # block-table buffers before every replay.
-                    _routing._record_route("prefill_capture_dflash_noncausal_paged")
+                    _routing._record_route(
+                        _routing.ROUTE_SPECS[
+                            "prefill_capture_dflash_noncausal_paged"
+                        ].name
+                    )
                     return self._flash_v100_prefill_with_prefix(
                         layer,
                         query,
@@ -1783,13 +1788,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         "forward branch=prefill_capture_smallq layer=%s",
                         layer_name,
                     )
-                    _routing._record_route("prefill_capture_smallq")
+                    _routing._record_route(
+                        _routing.ROUTE_SPECS["prefill_capture_smallq"].name
+                    )
                     if getattr(attn_metadata, "ddtree_parent_ids", None) is None:
                         _routing._record_route(
-                            "prefill_capture_smallq_no_ddtree_metadata"
+                            _routing.ROUTE_SPECS[
+                                "prefill_capture_smallq_no_ddtree_metadata"
+                            ].name
                         )
                     else:
-                        _routing._record_route("prefill_capture_smallq_ddtree_metadata")
+                        _routing._record_route(
+                            _routing.ROUTE_SPECS[
+                                "prefill_capture_smallq_ddtree_metadata"
+                            ].name
+                        )
                     return self._flash_v100_prefill_with_prefix(
                         layer,
                         query,
@@ -1885,7 +1898,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     output_block_scale,
                     "prefill_prefix",
                 )
-                _routing._record_route("prefill_prefix_flash")
+                _routing._record_route(
+                    _routing.ROUTE_SPECS["prefill_prefix_flash"].name
+                )
                 return result
             if not _logged_prefill_flash:
                 logger.info(
@@ -1929,7 +1944,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     output_block_scale,
                     "prefill_no_prefix_paged_cache",
                 )
-                _routing._record_route("prefill_no_prefix_paged_cache_flash")
+                _routing._record_route(
+                    _routing.ROUTE_SPECS["prefill_no_prefix_paged_cache_flash"].name
+                )
                 return result
             _debug._sm70_profile_trace(
                 "forward branch=prefill_no_prefix_dense layer=%s",
@@ -1948,7 +1965,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 output_block_scale,
                 "prefill_no_prefix",
             )
-            _routing._record_route("prefill_no_prefix_dense_flash")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_no_prefix_dense_flash"].name
+            )
             return result
 
         if not self.use_flash_v100_decode:
@@ -1967,7 +1986,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "forward branch=decode_triton_no_flash_decode layer=%s",
                 layer_name,
             )
-            _routing._record_route("decode_triton_no_flash_decode")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["decode_triton_no_flash_decode"].name
+            )
             return super().forward(
                 layer,
                 query,
@@ -2011,7 +2032,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 output_block_scale,
                 "decode_paged_prefill",
             )
-            _routing._record_route("decode_paged_prefill")
+            _routing._record_route(_routing.ROUTE_SPECS["decode_paged_prefill"].name)
             return result
         if self.use_decode_dense_cache and not is_capturing:
             _routing._log_fp8_kv_cache_route(
@@ -2042,7 +2063,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 output_block_scale,
                 "decode_dense_cache",
             )
-            _routing._record_route("decode_dense_cache")
+            _routing._record_route(_routing.ROUTE_SPECS["decode_dense_cache"].name)
             return result
         if self.use_decode_dense_reference and not is_capturing:
             _routing._log_fp8_kv_cache_route(
@@ -2071,7 +2092,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 output_block_scale,
                 "decode_dense_reference",
             )
-            _routing._record_route("decode_dense_reference")
+            _routing._record_route(_routing.ROUTE_SPECS["decode_dense_reference"].name)
             return result
         if not self.use_decode_scalar_paged:
             message = (
@@ -2092,7 +2113,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "forward branch=decode_triton_scalar_disabled layer=%s",
                 layer_name,
             )
-            _routing._record_route("decode_triton_scalar_disabled")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["decode_triton_scalar_disabled"].name
+            )
             return super().forward(
                 layer,
                 query,
@@ -2599,40 +2622,32 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return output
 
         key_cache, value_cache = _kv_layout._split_paged_kv_cache(kv_cache)
-        q_per_kv = (
-            query.shape[1] // key_cache.shape[2]
-            if key_cache.shape[2] > 0 and query.shape[1] % key_cache.shape[2] == 0
-            else 0
-        )
         xqa_codec = self._xqa_kv_codec(key_cache, value_cache, attn_metadata)
 
         # FP8 G4 XQA had no end-to-end gain on 35B-A3B TP4 and has no accepted
         # sampled-quality advantage. Keep that shape on scalar decode.
-        if (
-            self.use_decode_xqa
-            and self.flash_attn_decode_paged_xqa is not None
-            and xqa_codec is not None
-            and query.shape[0] == attn_metadata.seq_lens.shape[0]
-            and query.shape[2] == 256
-            and key_cache.shape[2] > 0
-            and query.shape[1] % key_cache.shape[2] == 0
-            and _routing._decode_xqa_allowed_for_q_per_kv(q_per_kv, attn_metadata)
-            and (
-                xqa_codec is not FP8_E4M3
-                or (
-                    q_per_kv == 6
-                    and (query.shape[0] == 1 or _routing._e4m3_batch_xqa_allowed(query))
-                )
-            )
-            and (
-                xqa_codec is not FP8_E5M2
-                or (
-                    q_per_kv != 4
-                    and _routing._decode_fp8_xqa_allowed(attn_metadata, query)
-                )
-            )
-            and window_size == (-1, -1)
-        ):
+        selection = _routing.select_route(
+            _routing.RouteContext(
+                stage="decode",
+                codec=xqa_codec,
+                shape=_routing.RouteShape(
+                    query.shape[0],
+                    query.shape[1],
+                    key_cache.shape[2],
+                    query.shape[2],
+                    key_cache.shape[1],
+                ),
+                enabled=self.use_decode_xqa,
+                available=self.flash_attn_decode_paged_xqa is not None,
+                query=query,
+                metadata=attn_metadata,
+                seq_rows=attn_metadata.seq_lens.shape[0],
+                window_size=window_size,
+            ),
+            ("decode_xqa_paged",),
+            fallback="decode_scalar_paged",
+        )
+        if selection is _routing.ROUTE_SPECS["decode_xqa_paged"]:
             _routing._log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "xqa_paged")
             _routing._trace_decode_active(
                 route="decode_xqa_paged",
@@ -2698,7 +2713,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     )
                 ),
             )
-            _routing._record_route("decode_xqa_paged")
+            _routing._record_route(_routing.ROUTE_SPECS["decode_xqa_paged"].name)
             return output
 
         _routing._log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "scalar_paged")
@@ -2740,7 +2755,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
         )
-        _routing._record_route("decode_scalar_paged")
+        _routing._record_route(_routing.ROUTE_SPECS["decode_scalar_paged"].name)
         return output
 
     def _flash_v100_ddtree_small_query_prefill_dense(
@@ -2847,7 +2862,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             "(Triton paged-KV ancestor mask)."
                         )
                     _logged_prefill_ddtree_triton = True
-                    _routing._record_route("prefill_ddtree_triton")
+                    _routing._record_route(
+                        _routing.ROUTE_SPECS["prefill_ddtree_triton"].name
+                    )
                     if _routing._ddtree_trace_enabled():
                         _routing._ddtree_trace_event(
                             "flash_ddtree_attention_route",
@@ -2890,7 +2907,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _logged_prefill_ddtree_dense = True
 
-        _routing._record_route("prefill_ddtree_dense")
+        _routing._record_route(_routing.ROUTE_SPECS["prefill_ddtree_dense"].name)
         if _routing._ddtree_trace_enabled():
             _routing._ddtree_trace_event(
                 "flash_ddtree_attention_route",
@@ -3428,10 +3445,14 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if tail_prefix:
                 out.copy_(exact_result[:, tail_prefix:])
                 _routing._record_route(
-                    "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad"
+                    _routing.ROUTE_SPECS[
+                        "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad"
+                    ].name
                 )
                 return out, True
-            _routing._record_route("prefill_prefix_fp8_bridge_exact_dense_d256")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_prefix_fp8_bridge_exact_dense_d256"].name
+            )
             return exact_result, True
         exact_result = _dense_prefill._try_sm70_fa2_d256_prefill(
             exact_query,
@@ -3451,9 +3472,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if exact_result is not None:
             if tail_prefix:
                 out.copy_(exact_result[:, tail_prefix:])
-                _routing._record_route("prefill_prefix_fp8_bridge_exact_d256_tailpad")
+                _routing._record_route(
+                    _routing.ROUTE_SPECS[
+                        "prefill_prefix_fp8_bridge_exact_d256_tailpad"
+                    ].name
+                )
                 return out, True
-            _routing._record_route("prefill_prefix_fp8_bridge_exact_d256")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_prefix_fp8_bridge_exact_d256"].name
+            )
             return exact_result, True
         paged_result = self.flash_attn_prefill_paged(
             query,
@@ -3705,7 +3732,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _logged_prefill_prefix_decode_rows_grouped = True
         _routing._log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "grouped_fp32")
-        _routing._record_route("prefill_prefix_decode_rows_e4m3_grouped_fp32")
+        _routing._record_route(
+            _routing.ROUTE_SPECS["prefill_prefix_decode_rows_e4m3_grouped_fp32"].name
+        )
         return True
 
     def _run_prefill_prefix_decode_rows(
@@ -3751,50 +3780,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         max_query_len_rows = plan.max_query_len
         num_heads = int(query.shape[1])
         num_kv_heads = int(key_cache.shape[2])
-        q_per_kv = (
-            num_heads // num_kv_heads
-            if num_kv_heads > 0 and num_heads % num_kv_heads == 0
-            else 0
-        )
         xqa_codec = self._xqa_kv_codec(key_cache, value_cache, attn_metadata)
-        fp8_e4m3_kv = xqa_codec is FP8_E4M3
-        fp8_e5m2_kv = xqa_codec is FP8_E5M2
         # Same selection as the uniform-decode path (_flash_v100_decode), with
         # the sequence hint taken from this batch's rows because build() only
         # attaches decode shape hints when max_query_len == 1.
         use_xqa = (
-            self.use_decode_xqa
-            and self.flash_attn_decode_paged_xqa is not None
-            and xqa_codec is not None
-            and int(query.shape[2]) == 256
-            and (
-                q_per_kv in (6, 8)
-                or (
-                    q_per_kv == 4
-                    and max_seq_len_hint >= _routing._decode_xqa_q4_min_seq_len()
-                )
+            _routing.select_route(
+                _routing.RouteContext(
+                    stage="mixed_decode",
+                    codec=xqa_codec,
+                    shape=_routing.RouteShape(
+                        num_rows,
+                        num_heads,
+                        num_kv_heads,
+                        int(query.shape[2]),
+                        int(key_cache.shape[1]),
+                    ),
+                    enabled=self.use_decode_xqa,
+                    available=self.flash_attn_decode_paged_xqa is not None,
+                    max_seq_len_hint=max_seq_len_hint,
+                ),
+                ("prefill_prefix_decode_rows_xqa",),
             )
-            and (
-                not fp8_e4m3_kv
-                or (
-                    q_per_kv == 6
-                    and (
-                        num_rows == 1
-                        or (
-                            envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
-                            and num_rows > 1
-                            and num_heads % 6 == 0
-                        )
-                    )
-                )
-            )
-            and (
-                not fp8_e5m2_kv
-                or (
-                    q_per_kv != 4
-                    and max_seq_len_hint >= _routing._decode_fp8_xqa_min_seq_len()
-                )
-            )
+            is not None
         )
         if (
             self.kv_codec is FP8_E4M3
@@ -4046,7 +4054,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 max_query_len,
                 block_size,
             )
-            _routing._record_route("prefill_prefix_dflash_noncausal_batch")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_prefix_dflash_noncausal_batch"].name
+            )
             self._run_prefill_paged_call(
                 route="prefill_prefix_dflash_noncausal_batch",
                 q_len=max_query_len,
@@ -4160,7 +4170,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 if anchor_lens is not None:
                     # Anchored decode-window mask: single masked paged
                     # prefill route; every unmasked fast path is bypassed.
-                    _routing._record_route("prefill_prefix_paged_anchored")
+                    _routing._record_route(
+                        _routing.ROUTE_SPECS["prefill_prefix_paged_anchored"].name
+                    )
                     out_seq = self._run_prefill_paged_call(
                         route="prefill_prefix_paged_anchored",
                         q_len=q_len,
@@ -4391,7 +4403,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             envs.VLLM_FLASH_V100_BFLA_POOL,
                         )
                         _logged_prefill_prefix_bfla = True
-                    _routing._record_route("prefill_prefix_bfla")
+                    _routing._record_route(
+                        _routing.ROUTE_SPECS["prefill_prefix_bfla"].name
+                    )
                     out_seq = self._run_prefill_paged_call(
                         route="prefill_prefix_bfla",
                         q_len=q_len,
@@ -4440,7 +4454,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         _logged_prefill_prefix_contig_dense = True
                     k_bhmd, v_bhmd = contig_dense_kv_bhmd
                     q_bhmd = q_seq.permute(0, 2, 1, 3).contiguous()
-                    _routing._record_route("prefill_prefix_contig_dense_bhmd")
+                    _routing._record_route(
+                        _routing.ROUTE_SPECS["prefill_prefix_contig_dense_bhmd"].name
+                    )
                     out_bhmd = self._run_prefill_paged_call(
                         route="prefill_prefix_contig_dense_bhmd",
                         q_len=q_len,
@@ -4519,11 +4535,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                                 "software-pipelined dense prefill path active."
                             )
                             _dense_prefill._logged_prefill_fa2_d256 = True
-                        _routing._record_route("prefill_prefix_contig_dense_fa2_d256")
+                        _routing._record_route(
+                            _routing.ROUTE_SPECS[
+                                "prefill_prefix_contig_dense_fa2_d256"
+                            ].name
+                        )
                         out_seq = fa2_out
                         out_is_destination = True
                     else:
-                        _routing._record_route("prefill_prefix_contig_dense")
+                        _routing._record_route(
+                            _routing.ROUTE_SPECS["prefill_prefix_contig_dense"].name
+                        )
                         out_seq = self._run_prefill_paged_call(
                             route="prefill_prefix_contig_dense",
                             q_len=q_len,
@@ -4598,7 +4620,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                             self.prefill_split_kv_min_kv,
                         )
                         _logged_prefill_prefix_splitkv = True
-                    _routing._record_route("prefill_prefix_splitkv")
+                    _routing._record_route(
+                        _routing.ROUTE_SPECS["prefill_prefix_splitkv"].name
+                    )
                     out_seq = self._run_prefill_paged_call(
                         route="prefill_prefix_splitkv",
                         q_len=q_len,

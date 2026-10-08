@@ -673,23 +673,39 @@ def _try_sm70_fa2_d256_prefill(
                                 else "Q8000 core / Q8192 QK+PV FP32 dispatch",
                             )
                             _logged_prefill_d256_gqa_architecture = True
-                        _routing._record_route("prefill_dense_d256_gqa_arch_long")
+                        _routing._record_route(
+                            _routing.ROUTE_SPECS[
+                                "prefill_dense_d256_gqa_arch_long"
+                            ].name
+                        )
                         if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
-                            _routing._record_route("prefill_dense_d256_gqa_v37")
+                            _routing._record_route(
+                                _routing.ROUTE_SPECS["prefill_dense_d256_gqa_v37"].name
+                            )
                         else:
-                            _routing._record_route("prefill_dense_d256_gqa_79t_fp32")
+                            _routing._record_route(
+                                _routing.ROUTE_SPECS[
+                                    "prefill_dense_d256_gqa_79t_fp32"
+                                ].name
+                            )
                             if max_seqlen_q > _SM70_79T_CORE_QUERY_LEN:
                                 if architecture_q8192_op is not None:
                                     _routing._record_route(
-                                        "prefill_dense_d256_gqa_79t_fp32_q8192"
+                                        _routing.ROUTE_SPECS[
+                                            "prefill_dense_d256_gqa_79t_fp32_q8192"
+                                        ].name
                                     )
                                     if max_seqlen_q < _SM70_79T_MAX_QUERY_LEN:
                                         _routing._record_route(
-                                            "prefill_dense_d256_gqa_79t_fp32_q8192_pad"
+                                            _routing.ROUTE_SPECS[
+                                                "prefill_dense_d256_gqa_79t_fp32_q8192_pad"
+                                            ].name
                                         )
                                 else:
                                     _routing._record_route(
-                                        "prefill_dense_d256_gqa_79t_fp32_fringe_fallback"
+                                        _routing.ROUTE_SPECS[
+                                            "prefill_dense_d256_gqa_79t_fp32_fringe_fallback"
+                                        ].name
                                     )
                 if splitd_result is None and _should_use_prefill_dense_splitkv3(
                     query,
@@ -722,7 +738,9 @@ def _try_sm70_fa2_d256_prefill(
                             )
                             _logged_prefill_dense_splitkv3 = True
                         _routing._record_route(
-                            "prefill_dense_splitd_d256_splitkv3_kernel"
+                            _routing.ROUTE_SPECS[
+                                "prefill_dense_splitd_d256_splitkv3_kernel"
+                            ].name
                         )
                 if (
                     splitd_result is None
@@ -963,7 +981,9 @@ def flash_v100_dense_prefill(
                     "software-pipelined dense prefill path active."
                 )
                 _logged_prefill_fa2_d256 = True
-            _routing._record_route("prefill_dense_splitd_d256")
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_dense_splitd_d256"].name
+            )
             return output
 
     run_start = 0
