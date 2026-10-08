@@ -217,12 +217,38 @@ def test_every_literal_accounting_site_uses_a_declared_spec():
         name = str(path.relative_to(package))
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
-            if not (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_record_route"
-            ):
+            if not isinstance(node, ast.Call):
                 continue
+            direct = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_record_route"
+            )
+            injected = isinstance(node.func, ast.Name) and node.func.id == "record"
+            if not (direct or injected):
+                continue
+            if injected:
+                # Candidate callbacks use the same accounting sink. Require the
+                # typed injected argument, not just an unrelated function name.
+                owner = max(
+                    (
+                        fn
+                        for fn in ast.walk(tree)
+                        if isinstance(fn, ast.FunctionDef)
+                        and fn.end_lineno is not None
+                        and fn.lineno <= node.lineno <= fn.end_lineno
+                    ),
+                    key=lambda fn: fn.lineno,
+                )
+                parameter = next(
+                    a
+                    for a in (*owner.args.args, *owner.args.kwonlyargs)
+                    if a.arg == "record"
+                )
+                assert parameter.annotation is not None
+                assert ast.unparse(parameter.annotation) in (
+                    "RecordRoute",
+                    "_plan.RecordRoute",
+                ), (name, node.lineno)
             arg = node.args[0]
             assert not isinstance(arg, ast.Constant), (name, node.lineno)
             if isinstance(arg, ast.Attribute) and arg.attr == "name":
