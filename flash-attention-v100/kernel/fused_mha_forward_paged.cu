@@ -18,7 +18,7 @@
 using namespace nvcuda::wmma;
 
 #include "flash_v100_traits.cuh"
-#include "fp8_kv_utils.cuh"
+#include "kv_codec_traits.cuh"
 
 #define WMMA_M 16
 #define WMMA_N 16

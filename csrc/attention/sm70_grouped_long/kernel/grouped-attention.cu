@@ -17,7 +17,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <cub/block/block_radix_sort.cuh>
 
-#include "fp8_kv_utils.cuh"
+#include "../../../../flash-attention-v100/kernel/kv_codec_traits.cuh"
 #include "fused_mma.h"
 
 namespace {
@@ -631,109 +631,6 @@ __device__ __forceinline__ float block_reduce_max(float val) {
   return result;
 }
 
-__device__ __forceinline__ uint32_t
-fp8_e5m2_pair_to_half2_bits(const uint16_t raw_pair) {
-  return (static_cast<uint32_t>(raw_pair & 0x00ffu) << 8) |
-         (static_cast<uint32_t>(raw_pair & 0xff00u) << 16);
-}
-
-__device__ __forceinline__ uint4 fp8_e5m2_vector_to_half8(const uint64_t raw) {
-  return make_uint4(
-      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw)),
-      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
-      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
-      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
-}
-
-__device__ __forceinline__ uint16_t fp8_e4m3fn_to_half_bits(const uint8_t raw) {
-  const uint16_t sign = static_cast<uint16_t>(raw & 0x80u) << 8;
-  const uint8_t magnitude = raw & 0x7fu;
-  const uint8_t exponent = magnitude >> 3;
-  const uint8_t mantissa = magnitude & 0x07u;
-  if (magnitude == 0) {
-    return sign;
-  }
-  if (exponent == 0) {
-    // E4M3 subnormals are exact fp16 normals: mantissa * 2^-9.
-    const uint16_t magnitude_bits =
-        mantissa < 2
-            ? 0x1800u
-            : (mantissa < 4
-                   ? static_cast<uint16_t>(0x1c00u | ((mantissa - 2) << 9))
-                   : static_cast<uint16_t>(0x2000u | ((mantissa - 4) << 8)));
-    return sign | magnitude_bits;
-  }
-  if (magnitude == 0x7fu) {
-    return sign | 0x7e00u;
-  }
-  return sign | static_cast<uint16_t>((exponent + 8) << 10) |
-         static_cast<uint16_t>(mantissa << 7);
-}
-
-__device__ __forceinline__ uint32_t
-fp8_e4m3fn_pair_to_half2_bits(const uint16_t raw_pair) {
-  return static_cast<uint32_t>(
-             fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw_pair))) |
-         (static_cast<uint32_t>(
-              fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw_pair >> 8)))
-          << 16);
-}
-
-__device__ __forceinline__ uint32_t
-fp8_e4m3fn_pair_to_half2_bits_fast(const uint16_t raw_pair) {
-  const uint8_t raw0 = static_cast<uint8_t>(raw_pair);
-  const uint8_t raw1 = static_cast<uint8_t>(raw_pair >> 8);
-  if ((raw0 & 0x7fu) == 0x7fu || (raw1 & 0x7fu) == 0x7fu) {
-    return fp8_e4m3fn_pair_to_half2_bits(raw_pair);
-  }
-
-  // Moving a finite E4M3 encoding into the corresponding fp16 sign,
-  // exponent, and mantissa fields represents exactly value / 256. A packed
-  // half2 multiply restores both values without per-byte exponent branches.
-  const uint32_t expanded = (static_cast<uint32_t>(raw_pair & 0x0080u) << 8) |
-                            (static_cast<uint32_t>(raw_pair & 0x007fu) << 7) |
-                            (static_cast<uint32_t>(raw_pair & 0x8000u) << 16) |
-                            (static_cast<uint32_t>(raw_pair & 0x7f00u) << 15);
-  union {
-    uint32_t u;
-    __half2 h2;
-  } converter;
-  converter.u = expanded;
-  converter.h2 = __hmul2(converter.h2, __float2half2_rn(256.0f));
-  return converter.u;
-}
-
-__device__ __forceinline__ uint4
-fp8_e4m3fn_vector_to_half8(const uint64_t raw) {
-  return make_uint4(
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw)),
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
-}
-
-__device__ __forceinline__ uint4
-fp8_e4m3fn_vector_to_half8_fast(const uint64_t raw) {
-  return make_uint4(
-      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw)),
-      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 16)),
-      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 32)),
-      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 48)));
-}
-
-__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
-    const uint64_t raw, const uint16_t* __restrict__ lut) {
-  return make_uint4(
-      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw)]) |
-          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 8)]) << 16),
-      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 16)]) |
-          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 24)]) << 16),
-      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 32)]) |
-          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 40)]) << 16),
-      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 48)]) |
-          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 56)]) << 16));
-}
-
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP16,
           bool E4M3_SHARED_LUT = false>
@@ -798,27 +695,8 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
                       static_cast<int64_t>(kv_head_idx) * head_stride +
                       panel_offset;
   }
-  if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
-    const uint4* cache_vec = reinterpret_cast<const uint4*>(kv_cache);
-    return __ldg(&cache_vec[physical_offset / 8 + vec_col]);
-  } else {
-    static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
-                      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-                  "XQA only supports fp16, FP8 E4M3, and FP8 E5M2 KV");
-    const uint64_t* cache_vec = reinterpret_cast<const uint64_t*>(kv_cache);
-    const uint64_t raw = __ldg(&cache_vec[physical_offset / 8 + vec_col]);
-    if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
-      if constexpr (E4M3_SHARED_LUT) {
-        return fp8_e4m3fn_vector_to_half8_lut(raw, e4m3_lut);
-      } else {
-        return fp8_e4m3fn_vector_to_half8(raw);
-      }
-    } else {
-      static_assert(!E4M3_SHARED_LUT,
-                    "The E4M3 conversion LUT requires E4M3 KV");
-      return fp8_e5m2_vector_to_half8(raw);
-    }
-  }
+  return flash_v100::KVCodecTraits<KV_DTYPE>::template load_half8<
+      E4M3_SHARED_LUT>(kv_cache, physical_offset, vec_col, e4m3_lut);
 }
 
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT, int NUM_THREADS,
@@ -896,19 +774,13 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
       const uint64_t raw_lo =
           static_cast<uint64_t>(raw.x) | (static_cast<uint64_t>(raw.y) << 32);
       shared_vec[shared_offset] =
-          KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
-              ? (E4M3_SHARED_LUT
-                     ? fp8_e4m3fn_vector_to_half8_lut(raw_lo, e4m3_lut)
-                     : fp8_e4m3fn_vector_to_half8_fast(raw_lo))
-              : fp8_e5m2_vector_to_half8(raw_lo);
+          flash_v100::KVCodecTraits<KV_DTYPE>::template half8_from_packed<
+              true, E4M3_SHARED_LUT>(raw_lo, e4m3_lut);
       const uint64_t raw_hi =
           static_cast<uint64_t>(raw.z) | (static_cast<uint64_t>(raw.w) << 32);
       shared_vec[shared_offset + 1] =
-          KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
-              ? (E4M3_SHARED_LUT
-                     ? fp8_e4m3fn_vector_to_half8_lut(raw_hi, e4m3_lut)
-                     : fp8_e4m3fn_vector_to_half8_fast(raw_hi))
-              : fp8_e5m2_vector_to_half8(raw_hi);
+          flash_v100::KVCodecTraits<KV_DTYPE>::template half8_from_packed<
+              true, E4M3_SHARED_LUT>(raw_hi, e4m3_lut);
     }
   } else {
     const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
@@ -1392,7 +1264,7 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   if constexpr (E4M3_SHARED_LUT) {
     e4m3_lut = reinterpret_cast<uint16_t*>(smem_raw + sizeof(SmemLayout));
     for (int raw = tid; raw < 256; raw += NUM_THREADS) {
-      e4m3_lut[raw] = fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw));
+      e4m3_lut[raw] = flash_v100::fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw));
     }
   }
   __half* sQ = smem.q;
@@ -2183,7 +2055,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
 
   __shared__ uint16_t e4m3_lut[256];
   if (tid < 256)
-    e4m3_lut[tid] = fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(tid));
+    e4m3_lut[tid] = flash_v100::fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(tid));
   extern __shared__ char grouped_verify_smem_raw[];
   GroupedVerifySmem& smem =
       *reinterpret_cast<GroupedVerifySmem*>(grouped_verify_smem_raw);
@@ -2768,7 +2640,7 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
 
   __shared__ uint16_t e4m3_lut[256];
   if (tid < 256)
-    e4m3_lut[tid] = fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(tid));
+    e4m3_lut[tid] = flash_v100::fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(tid));
   extern __shared__ char grouped_verify_smem_raw[];
   GroupedVerifySmem& smem =
       *reinterpret_cast<GroupedVerifySmem*>(grouped_verify_smem_raw);
@@ -2987,9 +2859,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                             (static_cast<uint64_t>(prefetched_k.w) << 32);
         uint4* dst = reinterpret_cast<uint4*>(shared_kv);
         dst[row * kSharedStrideVec + pair * 2] =
-            fp8_e4m3fn_vector_to_half8_lut(lo, e4m3_lut);
+            flash_v100::KVCodecTraits<flash_v100::KV_CACHE_DTYPE_FP8_E4M3>::
+                half8_from_packed<false, true>(lo, e4m3_lut);
         dst[row * kSharedStrideVec + pair * 2 + 1] =
-            fp8_e4m3fn_vector_to_half8_lut(hi, e4m3_lut);
+            flash_v100::KVCodecTraits<flash_v100::KV_CACHE_DTYPE_FP8_E4M3>::
+                half8_from_packed<false, true>(hi, e4m3_lut);
       }
     } else {
       load_xqa_tc_kv_panel<PAGE_BLOCK_SIZE, CONTIGUOUS_HKV1_LAYOUT,
