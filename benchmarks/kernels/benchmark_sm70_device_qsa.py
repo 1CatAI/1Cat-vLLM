@@ -114,7 +114,7 @@ def call(record, metadata, candidate):
                 requests,
                 positions,
                 lengths,
-                record["control"],
+                record["candidate" if candidate else "control"],
                 record["gate"],
             )
         finally:
