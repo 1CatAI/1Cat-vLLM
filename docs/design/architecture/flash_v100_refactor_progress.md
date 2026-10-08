@@ -16,8 +16,9 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | Pending complete outcome map | Prerequisite model and outcome gates |
 | 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | Pending complete outcome map | Prerequisite gates |
 | 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase passed | Private references 390 → 387 | Pending | CPU/rebase and GPU prerequisites |
-| 3b: step plan and persistent metadata buffers | — | Rebuilt on 3a; CPU/golden passed | Private references 387 → 380 | Pending | Separate outcome and GPU gates |
-| 4: decode executor and ordered candidates | — | Not started | — | Required | Step 3 gates |
+| 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase passed | Private references 387 → 380 | Pending | Separate outcome and GPU gates |
+| 4a: explicit decode executor dependencies | — | CPU/golden/strict passed | Private references 380 → 374; cycles 14 → 13 | Queued after Step 3 | Required GPU gates |
+| 4b: ordered decode selection loop | — | Not started | — | Required | Step 4a gates |
 | 5a: per-sequence prefill candidates | — | Not started | — | Required | Step 4 gates |
 | 5b: batch prefill candidates | — | Not started | — | Required | Step 5a gates |
 | 5c: debug observer | — | Not started | — | Required | Step 5b gates |
@@ -329,3 +330,45 @@ while warming the #1028 integration. A source-matching integration `_C` build is
 running under `a3-native-abi` on 54633, without changing the shared runtime.
 Host model parity remains failed/pending, with failed logs retained. See the
 known-issues document; no model gate or merge is claimed from the CPU results.
+
+## Step 4a decode dependency boundary
+
+Step 3b is Draft PR #1079 at `7b061e4e168f19820e3f400e454baf9c567148d4`.
+Its final pinned PR #1028 rebase has head
+`b13f5027c1321c791c25163cafe77663f517f1c5`, tree
+`5c76785cc4ca73452e574dbb254d72ccc0190670`, equal to the clean merge-tree,
+and 37 CPU passes / 98 GPU skips. Verified snapshots and dependent GPU queues
+are under `a3-step3b` on 54633. Model fixtures remain identical to Step 1c.
+
+Step 4 is split into executor ownership and the selection loop so each boundary
+has an independent rollback scope. The unchanged calculations were grouped
+in commit `d6efe5a69`. The initial class receiver annotations conflicted with
+mypy's bound-method rules; the extraction retains an untyped receiver only
+until ownership wiring. The final executor imports and receives no Impl.
+It accepts `DecodeConfig` (frozen policy plus geometry), explicit native ABI
+callables and `V100Workspace`. Legacy entry points delegate through a narrow
+adapter that preserves post-construction operator replacement and partial
+legacy fixtures. Diagnostic callbacks are explicit; their migration to event
+subscribers belongs to Step 5c. They do not change debug capture behavior.
+
+The original window/codec calculations are repeated locally with explicit
+inputs pending shared planning in Step 4b; no feature policy is reimplemented.
+The existing feature predicate is supplied as a callable. Original method hashes
+are preserved by normalizing actual dependency paths and typed delegates;
+no hash or trace fixture is regenerated. The new standalone executor test
+injects separate scalar/XQA operators and verifies the output, selection and
+shape/scale hints without invoking the backend's operators.
+
+The immutable 813-case trace and calculation suite pass. Private module references
+drop 380 to 374, cycles 14 to 13; no new forbidden edge or cycle is introduced.
+The reduced dependency ceiling is locked. Full strict CPU, final rebase,
+complete GPU outcome maps and model/performance gates remain required.
+
+Step 4a's strict focused suite passes **240 tests / 1 skip / 28 GPU deselections**,
+including all 813 traces, the two standalone executor cases and 40 consumed
+legacy patch names. Original calculation hashes remain fixed. Evidence is
+`a3-decode-executor-strict.log` and `a3-decode-executor-shim.json` in the local
+task artifact directory. The owned adapter's type narrowing and AST assertion
+were corrected; the final mypy/layering run passes. The diagnostic callbacks
+retain their old state owner pending Step 5c, rather than claiming that debug
+state has already been decoupled.

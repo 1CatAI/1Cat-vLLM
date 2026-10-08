@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
+from types import SimpleNamespace
+from typing import cast
+
 import torch
 
 from vllm.logger import init_logger
@@ -452,13 +456,94 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             right = left
         return (left, right)
 
-    _call_flash_attn_decode_paged = _decode.DecodeExecutor._call_flash_attn_decode_paged
+    def _new_decode_executor(self) -> _decode.DecodeExecutor:
+        policy = getattr(self, "config", None)
+        if policy is None:
+            # Compatibility for deliberately partial legacy fixtures only.
+            attributes = vars(self)
+            policy = SimpleNamespace(
+                **{
+                    field.name: attributes[field.name]
+                    for field in fields(_config.V100AttnConfig)
+                    if field.name in attributes
+                }
+            )
+        config = _decode.DecodeConfig(
+            cast(_config.V100AttnConfig, policy),
+            getattr(self, "scale", 1.0),
+            self.kv_cache_dtype,
+            getattr(self, "attn_type", AttentionType.DECODER),
+            getattr(self, "sliding_window", None),
+        )
+        ops = _decode.DecodeOps(
+            dense=getattr(self, "flash_attn_func", None),
+            paged=getattr(self, "flash_attn_decode_paged", None),
+            xqa=getattr(self, "flash_attn_decode_paged_xqa", None),
+            wmma=getattr(self, "flash_attn_decode_paged_wmma", None),
+            prefill=getattr(self, "flash_attn_prefill_paged", None),
+            prefill_bhmd=getattr(self, "flash_attn_prefill_paged_bhmd", None),
+            paged_keywords=getattr(self, "_flash_decode_paged_kwargs", set()),
+            scalar_tail=getattr(self, "_sm70_scalar_tail_attention", None),
+            reject_xqa=ATTENTION_HOOKS.reject_xqa,
+            reserve_bhmd_compare=self._reserve_bhmd_compare_call,
+            write_bhmd_compare=self._write_bhmd_compare_report,
+            compare_bhmd=self._maybe_compare_bhmd_out,
+            scalar_override=vars(self).get("_call_flash_attn_decode_paged"),
+        )
+        workspace = getattr(self, "workspace", None)
+        if workspace is None:
+            workspace = _decode.V100Workspace()
+        return _decode.DecodeExecutor(config, ops, workspace)
+
+    def _call_flash_attn_decode_paged(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        softmax_scale: float,
+        out: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: float,
+        v_scale: float,
+        window_size: tuple[int, int] = (-1, -1),
+        max_seq_len_hint: int | None = None,
+        workspace_seq_capacity_hint: int | None = None,
+        active_num_partitions: int | None = None,
+        partition_size_hint: int | None = None,
+        anchor_lens: torch.Tensor | None = None,
+        anchored_window: int = 0,
+    ) -> None:
+        return self._new_decode_executor()._call_flash_attn_decode_paged(
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            softmax_scale=softmax_scale,
+            out=out,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            window_size=window_size,
+            max_seq_len_hint=max_seq_len_hint,
+            workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+            active_num_partitions=active_num_partitions,
+            partition_size_hint=partition_size_hint,
+            anchor_lens=anchor_lens,
+            anchored_window=anchored_window,
+        )
 
     _smallq_decode_xqa_allowed = _verify._smallq_decode_xqa_allowed
 
     _call_flash_attn_smallq_decode_paged = _verify._call_flash_attn_smallq_decode_paged
 
-    _anchored_swa_params = _decode.DecodeExecutor._anchored_swa_params
+    def _anchored_swa_params(
+        self, attn_metadata: TritonAttentionMetadata
+    ) -> tuple[torch.Tensor | None, int]:
+        return self._new_decode_executor()._anchored_swa_params(attn_metadata)
 
     _small_query_decode_enabled = _verify._small_query_decode_enabled
 
@@ -1060,21 +1145,59 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
         )
         return result
 
-    _flash_v100_decode_as_paged_prefill = (
-        _decode.DecodeExecutor._flash_v100_decode_as_paged_prefill
-    )
+    def _flash_v100_decode_as_paged_prefill(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._new_decode_executor()._flash_v100_decode_as_paged_prefill(
+            layer, query, kv_cache, attn_metadata, output
+        )
 
-    _flash_v100_decode_dense_cache = (
-        _decode.DecodeExecutor._flash_v100_decode_dense_cache
-    )
+    def _flash_v100_decode_dense_cache(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._new_decode_executor()._flash_v100_decode_dense_cache(
+            layer, query, key, value, kv_cache, attn_metadata, output
+        )
 
-    _flash_v100_decode_dense_reference = (
-        _decode.DecodeExecutor._flash_v100_decode_dense_reference
-    )
+    def _flash_v100_decode_dense_reference(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._new_decode_executor()._flash_v100_decode_dense_reference(
+            layer, query, kv_cache, attn_metadata, output
+        )
 
     _flash_v100_prefill = _prefill._flash_v100_prefill
 
-    _flash_v100_decode = _decode.DecodeExecutor._flash_v100_decode
+    def _flash_v100_decode(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._new_decode_executor()._flash_v100_decode(
+            layer, query, key, value, kv_cache, attn_metadata, output
+        )
 
     _flash_v100_small_query_prefill_as_decode = (
         _verify._flash_v100_small_query_prefill_as_decode

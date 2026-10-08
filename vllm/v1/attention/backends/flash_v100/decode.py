@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Flash-V100 decode methods, bound by impl."""
+"""Decode execution over explicit policy, operators and per-layer workspace."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -22,15 +24,84 @@ from vllm.v1.attention.backends.triton_attn import (
 )
 from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
+    FP8_E5M2,
     FP16,
+    KVCodec,
+    resolve_kv_codec,
 )
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
+@dataclass(frozen=True)
+class DecodeConfig:
+    """Layer geometry and the frozen policy used by decode execution."""
+
+    policy: _config.V100AttnConfig
+    scale: float
+    kv_cache_dtype: str
+    attn_type: str
+    sliding_window: tuple[int, int] | None
+
+    @property
+    def kv_codec(self) -> KVCodec | None:
+        return resolve_kv_codec(self.kv_cache_dtype)
+
+
+@dataclass(frozen=True)
+class DecodeOps:
+    """Native ABI callables; no backend receiver or mutable tensor storage.
+
+    Diagnostic callbacks remain explicit while the debug observer is extracted.
+    ``scalar_override`` preserves the old private injection point during migration.
+    Native optional signatures are inspected by the loader, so they are typed Any.
+    """
+
+    dense: Any
+    paged: Any
+    xqa: Any
+    wmma: Any
+    prefill: Any
+    prefill_bhmd: Any
+    paged_keywords: set[str]
+    scalar_tail: Any
+    reject_xqa: Callable[[KVCodec, TritonAttentionMetadata], bool]
+    reserve_bhmd_compare: Callable[[], int | None]
+    write_bhmd_compare: Callable[..., None]
+    compare_bhmd: Callable[..., None]
+    scalar_override: Callable[..., None] | None = None
+
+
 class DecodeExecutor:
+    """Execute decode without importing or receiving the attention Impl."""
+
+    def __init__(self, config: DecodeConfig, ops: DecodeOps, workspace: V100Workspace):
+        self.config = config
+        self.ops = ops
+        self.workspace = workspace
+
+    def _flash_v100_window_size(self, causal: bool) -> tuple[int, int]:
+        window = self.config.sliding_window
+        if window is None or tuple(window) == (-1, -1):
+            return (-1, -1)
+        left, right = tuple(window)
+        left, right = int(left), int(right)
+        if not causal and left >= 0 and right == 0:
+            right = left
+        return (left, right)
+
+    def _xqa_kv_codec(self, key_cache, value_cache, attn_metadata) -> KVCodec | None:
+        codec = self.config.kv_codec
+        if codec not in (FP16, FP8_E4M3, FP8_E5M2) or not codec.stores(
+            key_cache, value_cache
+        ):
+            return None
+        if self.ops.reject_xqa(codec, attn_metadata):
+            return None
+        return codec
+
     def _call_flash_attn_decode_paged(
-        self: Any,
+        self,
         query: torch.Tensor,
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
@@ -50,7 +121,7 @@ class DecodeExecutor:
         anchor_lens: torch.Tensor | None = None,
         anchored_window: int = 0,
     ) -> None:
-        scalar_tail = getattr(self, "_sm70_scalar_tail_attention", None)
+        scalar_tail = self.ops.scalar_tail
         if scalar_tail is not None and scalar_tail(
             query,
             key_cache,
@@ -79,7 +150,7 @@ class DecodeExecutor:
             "k_scale": k_scale,
             "v_scale": v_scale,
         }
-        if "window_size" in self._flash_decode_paged_kwargs:
+        if "window_size" in self.ops.paged_keywords:
             kwargs["window_size"] = window_size
         elif tuple(window_size) != (-1, -1):
             raise RuntimeError(
@@ -87,7 +158,7 @@ class DecodeExecutor:
                 "attention with this extension build."
             )
         if anchor_lens is not None and anchored_window > 0:
-            if "anchor_lens" not in self._flash_decode_paged_kwargs:
+            if "anchor_lens" not in self.ops.paged_keywords:
                 raise RuntimeError(
                     "FLASH_ATTN_V100 decode op does not support the anchored "
                     "decode-window mask with this extension build; rebuild "
@@ -102,9 +173,9 @@ class DecodeExecutor:
             "partition_size_hint": partition_size_hint,
         }
         for name, value in optional_kwargs.items():
-            if name in self._flash_decode_paged_kwargs:
+            if name in self.ops.paged_keywords:
                 kwargs[name] = value
-        self.flash_attn_decode_paged(
+        self.ops.paged(
             query,
             key_cache,
             value_cache,
@@ -114,7 +185,7 @@ class DecodeExecutor:
         )
 
     def _anchored_swa_params(
-        self: Any,
+        self,
         attn_metadata: TritonAttentionMetadata,
     ) -> tuple[torch.Tensor | None, int]:
         """Anchored decode-window mask parameters, when active.
@@ -123,15 +194,15 @@ class DecodeExecutor:
         decoder cache group carries the engine's prefix-anchored spec and
         per-request prompt lengths; otherwise ``(None, 0)``.
         """
-        window = self.prefix_anchored_decode_window
+        window = self.config.policy.prefix_anchored_decode_window
         if window is None:
             return None, 0
 
         metadata_window = getattr(attn_metadata, "decode_sliding_window", None)
         anchor_lens = getattr(attn_metadata, "prefix_anchor_lens", None)
         if (
-            self.attn_type != AttentionType.DECODER
-            or self.kv_codec is not FP16
+            self.config.attn_type != AttentionType.DECODER
+            or self.config.kv_codec is not FP16
             or metadata_window != window
             or anchor_lens is None
         ):
@@ -142,7 +213,7 @@ class DecodeExecutor:
         return anchor_lens, int(window)
 
     def _flash_v100_decode_as_paged_prefill(
-        self: Any,
+        self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
@@ -209,8 +280,8 @@ class DecodeExecutor:
                 out_bhmd = out_batch_view.permute(0, 2, 1, 3)
                 if (
                     first_query_len == 1
-                    and self.use_decode_wmma_wrapper
-                    and self.flash_attn_decode_paged_wmma is not None
+                    and self.config.policy.use_decode_wmma_wrapper
+                    and self.ops.wmma is not None
                 ):
                     if not _state._logged_decode_wmma_wrapper:
                         logger.info(
@@ -220,23 +291,23 @@ class DecodeExecutor:
                         _state._logged_decode_wmma_wrapper = True
                     q_wmma = q_batch[:, 0].contiguous()
                     out_wmma = out_batch_view[:, 0]
-                    self.flash_attn_decode_paged_wmma(
+                    self.ops.wmma(
                         q_wmma,
                         key_cache,
                         value_cache,
                         attn_metadata.block_table[:num_seqs],
                         attn_metadata.seq_lens[:num_seqs],
-                        softmax_scale=self.scale,
+                        softmax_scale=self.config.scale,
                         out=out_wmma,
-                        kv_cache_dtype=self.kv_cache_dtype,
+                        kv_cache_dtype=self.config.kv_cache_dtype,
                         k_scale=float(layer._k_scale_float),
                         v_scale=float(layer._v_scale_float),
                     )
                     return output
                 if (
                     first_query_len == 1
-                    and self.use_decode_paged_prefill_bhmd_out
-                    and self.flash_attn_prefill_paged_bhmd is not None
+                    and self.config.policy.use_decode_paged_prefill_bhmd_out
+                    and self.ops.prefill_bhmd is not None
                     and q_bhmd.is_contiguous()
                     and out_bhmd.is_contiguous()
                 ):
@@ -246,17 +317,17 @@ class DecodeExecutor:
                             "BHMD out path active."
                         )
                         _state._logged_decode_paged_prefill_bhmd = True
-                    compare_call_idx = self._reserve_bhmd_compare_call()
+                    compare_call_idx = self.ops.reserve_bhmd_compare()
                     safe_bmhd = None
                     if compare_call_idx is not None:
-                        safe_bmhd = self.flash_attn_prefill_paged(
+                        safe_bmhd = self.ops.prefill(
                             q_batch,
                             key_cache,
                             value_cache,
                             attn_metadata.block_table[:num_seqs],
                             attn_metadata.seq_lens[:num_seqs],
-                            softmax_scale=self.scale,
-                            kv_cache_dtype=self.kv_cache_dtype,
+                            softmax_scale=self.config.scale,
+                            kv_cache_dtype=self.config.kv_cache_dtype,
                             k_scale=float(layer._k_scale_float),
                             v_scale=float(layer._v_scale_float),
                             causal=True,
@@ -271,22 +342,22 @@ class DecodeExecutor:
                             )
                             _state._logged_decode_paged_prefill_bhmd_q_clone = True
                         raw_q_bhmd = q_bhmd.clone()
-                    self.flash_attn_prefill_paged_bhmd(
+                    self.ops.prefill_bhmd(
                         raw_q_bhmd,
                         key_cache,
                         value_cache,
                         attn_metadata.block_table[:num_seqs],
                         attn_metadata.seq_lens[:num_seqs],
-                        softmax_scale=self.scale,
+                        softmax_scale=self.config.scale,
                         out=out_bhmd,
-                        kv_cache_dtype=self.kv_cache_dtype,
+                        kv_cache_dtype=self.config.kv_cache_dtype,
                         k_scale=float(layer._k_scale_float),
                         v_scale=float(layer._v_scale_float),
                         causal=True,
                     )
                     if safe_bmhd is not None:
                         assert compare_call_idx is not None
-                        self._write_bhmd_compare_report(
+                        self.ops.write_bhmd_compare(
                             out_batch_view,
                             safe_bmhd,
                             compare_call_idx,
@@ -299,20 +370,20 @@ class DecodeExecutor:
                             },
                         )
                     return output
-                out_batch = self.flash_attn_prefill_paged(
+                out_batch = self.ops.prefill(
                     q_batch,
                     key_cache,
                     value_cache,
                     attn_metadata.block_table[:num_seqs],
                     attn_metadata.seq_lens[:num_seqs],
-                    softmax_scale=self.scale,
-                    kv_cache_dtype=self.kv_cache_dtype,
+                    softmax_scale=self.config.scale,
+                    kv_cache_dtype=self.config.kv_cache_dtype,
                     k_scale=float(layer._k_scale_float),
                     v_scale=float(layer._v_scale_float),
                     causal=True,
                 )
                 if first_query_len == 1 and q_bhmd.is_contiguous():
-                    self._maybe_compare_bhmd_out(
+                    self.ops.compare_bhmd(
                         layer,
                         q_bhmd,
                         key_cache,
@@ -335,14 +406,14 @@ class DecodeExecutor:
             end = int(query_start_loc[i + 1].item())
             if end <= start:
                 continue
-            out_seq = self.flash_attn_prefill_paged(
+            out_seq = self.ops.prefill(
                 query[start:end].unsqueeze(0),
                 key_cache,
                 value_cache,
                 attn_metadata.block_table[i : i + 1],
                 attn_metadata.seq_lens[i : i + 1],
-                softmax_scale=self.scale,
-                kv_cache_dtype=self.kv_cache_dtype,
+                softmax_scale=self.config.scale,
+                kv_cache_dtype=self.config.kv_cache_dtype,
                 k_scale=float(layer._k_scale_float),
                 v_scale=float(layer._v_scale_float),
                 causal=True,
@@ -352,7 +423,7 @@ class DecodeExecutor:
         return output
 
     def _flash_v100_decode_dense_cache(
-        self: Any,
+        self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -367,8 +438,8 @@ class DecodeExecutor:
         avoids full paged-KV gather after the first step, but it is still an
         oracle path rather than the final paged decode kernel.
         """
-        if _routing._uses_fp8_kv_cache(self.kv_cache_dtype):
-            if self.use_flash_v100_prefill_paged:
+        if _routing._uses_fp8_kv_cache(self.config.kv_cache_dtype):
+            if self.config.policy.use_flash_v100_prefill_paged:
                 return self._flash_v100_decode_as_paged_prefill(
                     layer,
                     query,
@@ -408,7 +479,7 @@ class DecodeExecutor:
         )
         num_seqs = min(len(query_start_loc) - 1, len(seq_lens_host))
         if num_seqs != 1:
-            if self.use_flash_v100_prefill_paged:
+            if self.config.policy.use_flash_v100_prefill_paged:
                 return self._flash_v100_decode_as_paged_prefill(
                     layer,
                     query,
@@ -438,18 +509,18 @@ class DecodeExecutor:
             head_dim,
             extract=_kv_layout._extract_contiguous_kv_from_paged_cache,
         )
-        out_seq = self.flash_attn_func(
+        out_seq = self.ops.dense(
             query.unsqueeze(0),
             k_cont[:seq_len].unsqueeze(0),
             v_cont[:seq_len].unsqueeze(0),
             causal=True,
-            softmax_scale=self.scale,
+            softmax_scale=self.config.scale,
         )
         out_view.copy_(out_seq.squeeze(0))
         return output
 
     def _flash_v100_decode_dense_reference(
-        self: Any,
+        self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         kv_cache: torch.Tensor,
@@ -510,22 +581,22 @@ class DecodeExecutor:
             k_cont, v_cont = _kv_layout._dequantize_fp8_contiguous_kv(
                 k_cont,
                 v_cont,
-                self.kv_cache_dtype,
+                self.config.kv_cache_dtype,
                 float(layer._k_scale_float),
                 float(layer._v_scale_float),
             )
-            out_seq = self.flash_attn_func(
+            out_seq = self.ops.dense(
                 query[start:end].unsqueeze(0),
                 k_cont.unsqueeze(0),
                 v_cont.unsqueeze(0),
                 causal=True,
-                softmax_scale=self.scale,
+                softmax_scale=self.config.scale,
             )
             out_view[start:end].copy_(out_seq.squeeze(0))
         return output
 
     def _flash_v100_decode(
-        self: Any,
+        self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -536,7 +607,7 @@ class DecodeExecutor:
     ) -> torch.Tensor:
         """Decode path using Flash V100 directly over paged KV cache."""
         window_size = self._flash_v100_window_size(causal=True)
-        if self.prefix_anchored_decode_window is None:
+        if self.config.policy.prefix_anchored_decode_window is None:
             anchor_lens, anchored_window = None, 0
         else:
             anchor_lens, anchored_window = self._anchored_swa_params(attn_metadata)
@@ -563,8 +634,8 @@ class DecodeExecutor:
                     query.shape[2],
                     key_cache.shape[1],
                 ),
-                enabled=self.use_decode_xqa,
-                available=self.flash_attn_decode_paged_xqa is not None,
+                enabled=self.config.policy.use_decode_xqa,
+                available=self.ops.xqa is not None,
                 query=query,
                 metadata=attn_metadata,
                 seq_rows=attn_metadata.seq_lens.shape[0],
@@ -574,7 +645,9 @@ class DecodeExecutor:
             fallback="decode_scalar_paged",
         )
         if selection is _routing.ROUTE_SPECS["decode_xqa_paged"]:
-            _routing._log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "xqa_paged")
+            _routing._log_fp8_kv_cache_route(
+                "decode", self.config.kv_cache_dtype, "xqa_paged"
+            )
             _routing._trace_decode_active(
                 route="decode_xqa_paged",
                 query=query,
@@ -587,13 +660,14 @@ class DecodeExecutor:
                 query,
                 key_cache,
                 value_cache,
-                self.kv_cache_dtype,
-                strategy=getattr(self, "decode_strategy", "legacy"),
+                self.config.kv_cache_dtype,
+                strategy=getattr(self.config.policy, "decode_strategy", "legacy"),
             )
             if partition_size_hint is not None:
                 if (
                     xqa_codec is FP8_E4M3
-                    and getattr(self, "decode_strategy", "legacy") == "legacy"
+                    and getattr(self.config.policy, "decode_strategy", "legacy")
+                    == "legacy"
                     and query.shape[0] == 1
                     and _config.raw("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1")
                     != "0"
@@ -605,15 +679,15 @@ class DecodeExecutor:
                     _routing._record_route(
                         f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}"
                     )
-            self.flash_attn_decode_paged_xqa(
+            self.ops.xqa(
                 query,
                 key_cache,
                 value_cache,
                 attn_metadata.block_table,
                 attn_metadata.seq_lens,
-                softmax_scale=self.scale,
+                softmax_scale=self.config.scale,
                 out=out_view,
-                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype=self.config.kv_cache_dtype,
                 k_scale=float(layer._k_scale_float),
                 v_scale=float(layer._v_scale_float),
                 window_size=window_size,
@@ -644,7 +718,9 @@ class DecodeExecutor:
             _routing._record_route(_routing.ROUTE_SPECS["decode_xqa_paged"].name)
             return output
 
-        _routing._log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "scalar_paged")
+        _routing._log_fp8_kv_cache_route(
+            "decode", self.config.kv_cache_dtype, "scalar_paged"
+        )
         _routing._trace_decode_active(
             route="decode_scalar_paged",
             query=query,
@@ -653,15 +729,15 @@ class DecodeExecutor:
             attn_metadata=attn_metadata,
             window_size=window_size,
         )
-        self._call_flash_attn_decode_paged(
+        (self.ops.scalar_override or self._call_flash_attn_decode_paged)(
             query,
             key_cache,
             value_cache,
             attn_metadata.block_table,
             attn_metadata.seq_lens,
-            softmax_scale=self.scale,
+            softmax_scale=self.config.scale,
             out=out_view,
-            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype=self.config.kv_cache_dtype,
             k_scale=float(layer._k_scale_float),
             v_scale=float(layer._v_scale_float),
             window_size=window_size,
