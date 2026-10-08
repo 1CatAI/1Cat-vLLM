@@ -49323,3 +49323,30 @@ inference failures / 1 skipped, identical across all 243 parent/new outcomes
 (a4b_cpu_ab.json). This validates retained old-ABI decisions, not new-ABI GPU
 output or speed. The clean strategy suite has 21 passes and host binding
 syntax exit 0. No CUDA driver repair or GPU execution was attempted.
+
+## 2026-10-08 — architecture A5a CUDA codec traits
+
+Stack on A4b #1060 (`8c96e32e56c09d4a3e3112cb5d1a367571f69476`) in
+/home/ymzx/arch-ws/v100-arch-codec-traits-20261008-103644, branch
+agent/v100-arch-codec-traits-20261008-103644. Reuse #1048's shared reader at
+c0737e46210ac5b1273b78d622de1eefa71fd4de and preserve its credit. The new work
+adds storage traits, adopts them in XQA and grouped-long vectors, and preserves
+legacy include/scalar APIs. Duplicate native bit helpers are removed; payload
+formats, scheduling, scale placement and accumulation remain unchanged. This
+is not a competing storage-accounting or writer implementation.
+
+The first combined-vector probe incorrectly shared a raw load outside the old
+helper's restrict scope. Scalar and packed PTX already matched; moving the
+frozen vector oracle back into the original helper boundary restores exact
+PTX instruction parity. Do not weaken comparison to instruction counts or
+ignore register/dataflow changes. Final focused checks: 12 passed, including
+NVCC 12.0 static SM70 scalar/packed/addressing parity, source-manifest checks
+and eight existing build-architecture tests. No GPU execution, driver repair,
+GPU arithmetic/timing/replay evidence or linked-extension build was attempted.
+The standalone compiler is CUDA 12.0 while the shared Torch runtime is CUDA
+12.8; it is used only for independent reader probes.
+
+Experimental paged_to_contiguous_old/fixed files are retained with deprecation
+headers. FP8 bridge route priority is unchanged here; its fallback policy is
+an intentional separate A5b scope. Layering totals remain model 2325 /
+platform 3964 / raw env 334. Artifacts: /home/ymzx/arch-ws/tmp/a5-*.

@@ -1,3 +1,5 @@
+// DEPRECATED: retained experimental variant. Use paged_to_contiguous.cu
+// in production builds; see docs/design/architecture/kv_codec_traits.md.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
