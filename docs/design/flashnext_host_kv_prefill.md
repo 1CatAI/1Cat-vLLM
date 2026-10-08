@@ -48,8 +48,11 @@ from the borrowed history allocation; it is not zero additional workspace.
 
 The benchmark supports an in-process grouped-attention ABBA and an optional
 CUDA profiler capture for Nsight graph-node traces. Integration correctness
-and full-model speed remain pending; existing synthetic ABI microbenchmarks
-are not used as end-to-end speed evidence.
+passes all 32 host-prefill tests under the installed `3c0791f40` wheel.
+These cover native route selection, FP16/E4M3 history, early causal tails,
+invalid requests/pages and changed-input graph replay. Full-model speed
+remains pending; existing synthetic ABI microbenchmarks are not used as
+end-to-end speed evidence.
 
 ## Large-batch gated norm admission
 
@@ -78,6 +81,42 @@ values are bitwise equal. These are synthetic operator measurements, not
 model throughput. Full-model measurements remain pending. The benchmark
 supports an in-process norm-only ABBA comparison and records profiled request
 timing separately from its unprofiled rows.
+
+The corrected standalone GPU suite passes all five new norm checks: FP32
+reference comparisons, peak allocation and changed-input compiled graph replay.
+An existing small-M compiled exact-norm check differs at one of 3072 FP16
+elements, index `(13,30)`, with maximum absolute error `7.62939453125e-6`.
+Both the unchanged `4967ee9d18` wheel and `250a317024` candidate reproduce
+the identical discrepancy. Its exact tolerance is unchanged.
+
+## Persistent weight layouts and CPU lookup review
+
+The baseline's initialized Python-reachable device inventory accounts for
+28.501 GiB per rank; native-only allocations are outside this inventory.
+Across 48 target expert layers, canonical gate/up codes occupy 4.785 GiB,
+their metadata 4.614 GiB, and the down banks 4.944 GiB. Another 6.752 GiB
+holds original packed gate/up weights across 47 layers. These original blocks
+serve small-M raw/dp4a kernels while canonical banks serve large prefill.
+This is simultaneous storage for two execution routes, not proof of a leak.
+Removing a bank requires a replacement that covers both routes and a matched
+decode/concurrency comparison. File size alone therefore understates current
+device weight storage.
+
+An isolated CPU diagnostic uses the exact tokenizer and repeated technical-text
+input hash from the 32K baseline. Its two 16K chunks contain 568 and 544 unique
+ngram IDs. On warm reads, the existing ngram implementation takes 5.7--6.5 ms
+and full-table GGUF lookup 30.4--33.3 ms per chunk; each materialized FP16
+result is 80 MiB. The first read takes 166 ms with 609 major faults. These
+measurements exclude resident-tier masking, IPC, copy/publication and model
+contention. They cannot attribute the multi-second trace residual to CPU lookup.
+
+Nsight Systems 2024.6.2 with CUDA and NVTX tracing fails during NCCL 2.27.5
+extended-NVTX enum registration before model computation. Disabling NCCL NVTX
+passes a single-process smoke but does not resolve multiprocess model startup.
+CUDA-only tracing passes a four-process PyNccl initialization/allreduce check;
+the model diagnostic uses that mode. Torch-specific profiler options are
+provided only to the Torch profiler. Failed profiler starts supply no model
+speed evidence.
 
 The host QSA reader batches 32 queries in a protected hot-page cache. A 16,384
 query prefill therefore executes 512 protection, resolution and attention
