@@ -157,7 +157,10 @@ class GraphParityWorkerExtension:
     model_runner: Any
 
     def read_prefill_memory(
-        self, reset_peak: bool = False, release_unused_cache: bool = False
+        self,
+        reset_peak: bool = False,
+        release_unused_cache: bool = False,
+        include_segments: bool = False,
     ):
         """Capture worker allocation admission between benchmark requests."""
         import torch
@@ -176,6 +179,46 @@ class GraphParityWorkerExtension:
             "device_free_bytes": free,
             "device_total_bytes": total,
         }
+        stats = torch.accelerator.memory_stats()
+        result["allocator"] = {
+            key: stats[key]
+            for key in (
+                "num_alloc_retries",
+                "num_ooms",
+                "num_sync_all_streams",
+                "num_device_alloc",
+                "num_device_free",
+                "allocated_bytes.all.current",
+                "reserved_bytes.all.current",
+                "reserved_bytes.all.peak",
+                "inactive_split_bytes.all.current",
+                "requested_bytes.all.current",
+            )
+            if key in stats
+        }
+        if include_segments:
+            result["segments"] = [
+                {
+                    "address": segment["address"],
+                    "total_size": segment["total_size"],
+                    "allocated_size": segment["allocated_size"],
+                    "active_size": segment["active_size"],
+                    "stream": segment["stream"],
+                    "segment_type": segment["segment_type"],
+                    "segment_pool_id": segment.get("segment_pool_id"),
+                    "is_expandable": segment.get("is_expandable"),
+                    "largest_inactive_block_bytes": max(
+                        (
+                            block["size"]
+                            for block in segment["blocks"]
+                            if block["state"] == "inactive"
+                        ),
+                        default=0,
+                    ),
+                }
+                for segment in torch.cuda.memory_snapshot()
+                if segment["device"] == torch.accelerator.current_device_index()
+            ]
         if reset_peak:
             torch.accelerator.reset_peak_memory_stats()
         return result

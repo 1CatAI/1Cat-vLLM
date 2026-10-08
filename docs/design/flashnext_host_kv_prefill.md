@@ -1,6 +1,6 @@
 # Flash-Next host KV prefill on SM70
 
-## Current TP4 diagnostic
+## Initial TP4 diagnostic
 
 The installed `4967ee9d18` wheel completes a 32768-token request with a
 16384-token scheduler chunk, IQ3_S target, FP16 MTP4, FP16 host QSA history
@@ -26,6 +26,64 @@ and a long compiled-graph GPU annotation. Kernel records alone therefore do
 not establish that the GPU is idle throughout this interval. A CUDA graph-node
 Nsight trace is required before counting this residual as recoverable time.
 Several other residuals overlap large `aten::empty` allocations.
+
+## CUDA timeline and memory admission
+
+A subsequent same-process norm-only ABBA on the installed `250a317024`
+wheel measures 23.743/22.343 s for the control and 26.428/18.173 s for the
+candidate. Variation exceeds the mean difference; these rows do not establish
+a norm throughput improvement. All measured first tokens match. Arithmetic
+and Python natural completions match and reach EOS; the explanatory completion
+differs, so full-output parity and C4 remain unqualified. Both arms have the
+same 30.207 GiB whole-model Torch allocation peak despite the isolated norm's
+smaller temporary allocation.
+
+CUDA-only Nsight capture observes the profiled candidate's 18.781 s request.
+Rank 0's device envelope is 18.776 s, with 14.133 s covered by kernels/copies
+and 4.644 s between recorded activities. It contains 26,892 kernels, including
+384 recorded graph nodes. Initial four-rank entry skew is 0.744 ms.
+
+| Rank 0 activity family | Recorded service, s |
+| --- | ---: |
+| QSA named attention/history | 5.140 |
+| Grouped expert GEMM | 3.195 |
+| cuBLAS and TurboMind projections, role unresolved | 2.389 |
+| TP communication | 0.902 |
+| Other kernels | 1.147 |
+| HC named glue | 0.554 |
+| MoE routing/generic | 0.433 |
+| Copies/fills | 0.314 |
+| Remaining named GDN/norm/PLE | 0.060 |
+
+Name families are not layer attribution or independent critical-path savings.
+The other-kernel bucket includes 0.282 s of fused GDN recurrence, 0.207 s of
+prefill inverse routing, 0.197 s of host-history staging, 0.133 s of KV block
+zeroing and 0.113 s of host-history writing. These useful operations are not
+automatically removable overhead.
+
+Intersecting each rank's CUDA allocator API intervals with that rank's device
+gaps accounts for 4.377 of rank 0's 4.644 s (94.25%). Ranks 1--3 account for
+4.808/5.063, 4.545/4.787 and 4.768/5.016 s respectively (94.94--95.06%).
+Long gaps repeatedly follow MoE unroute/add/allreduce and precede HC
+combine/norm. The same worker unmaps and releases physical CUDA memory, then
+creates, maps and sets access for new memory. This is allocation work on the
+launch dependency, not unidentified GPU arithmetic or seconds of entry skew.
+No allocator call stacks were recorded; API overlap alone does not distinguish
+an allocation retry from another cache-release caller. The benchmark therefore
+records retry/OOM/synchronization counters before and after each request, plus
+initialized and post-profile segment summaries with graph pool IDs and largest
+inactive blocks. These distinguish capacity pressure from memory retained in a
+different stream or private graph pool before choosing a storage change.
+
+The immediate throughput milestone is 4000 input tokens/s, or 8.192 s for
+32768 tokens with the same 16K scheduler chunk; 6000 remains a later goal.
+Even removing all observed gaps and all QSA named attention plus staging would
+leave about 8.80 s in this profiled request. Thus allocator relief and grouped
+attention are necessary candidates but cannot by themselves establish the
+milestone. Grouped expert scheduling and projection attribution must be
+revisited after their measured model A/B. The 3.195 s expert service is an
+upper bound on that direction, not a promised speedup. No implementation is
+promoted from an operator ratio or this subtraction.
 
 ## Native grouped staged attention
 
@@ -78,7 +136,7 @@ sigmoid gating, Torch 2.10.0+cu128 and CUDA 12.8. CUDA-event medians are
 Temporary peaks are 576.75 and 48.75 MiB. Relative L2 difference is
 4.613e-6, maximum absolute difference 0.001953125, and 99.9951% of output
 values are bitwise equal. These are synthetic operator measurements, not
-model throughput. Full-model measurements remain pending. The benchmark
+model throughput. The noisy full-model comparison above is inconclusive. The benchmark
 supports an in-process norm-only ABBA comparison and records profiled request
 timing separately from its unprofiled rows.
 
@@ -201,8 +259,9 @@ rejected cold-cache comparison.
 
 The prefill contract is Flash-Next IQ3_S, FP16 MTP4, TP4 on four V100 32GB,
 16K scheduler chunks and 32K input without prefix-cache reuse. Report scheduled
-to first token, total request wall and pure decode separately. The requested
-6000 input tokens/s corresponds to 5.461 seconds for 32768 tokens.
+to first token, total request wall and pure decode separately. The immediate
+4000 input tokens/s milestone corresponds to 8.192 seconds; 6000 input tokens/s
+corresponds to 5.461 seconds for 32768 tokens.
 
 Obtain a matched host-cache baseline, then an in-process prefill-only A/B,
 followed by target token/logit checks, natural completion and C1/C4 acceptance

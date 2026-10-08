@@ -113,7 +113,7 @@ def main():
     try:
         llm = LLM(**config)
         report["initialized_memory"] = llm.collective_rpc(
-            "read_prefill_memory", args=(True,)
+            "read_prefill_memory", args=(True, False, True)
         )
         save()
         report["initialized_storages"] = llm.collective_rpc("read_prefill_storages")
@@ -332,6 +332,9 @@ def main():
                 files=[
                     dict(path=str(path), bytes=path.stat().st_size) for path in files
                 ],
+            )
+            report["profile_memory"] = llm.collective_rpc(
+                "read_prefill_memory", args=(False, False, True)
             )
         report["complete"] = True
         save()
