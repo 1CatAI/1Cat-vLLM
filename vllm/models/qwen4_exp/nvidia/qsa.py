@@ -632,6 +632,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             vllm_config.kernel_config.qsa_host_kv_device_reference
         )
         self.host_kv_prefill_enabled = vllm_config.kernel_config.qsa_host_kv_prefill
+        self.host_kv_prefill_grouped = (
+            vllm_config.kernel_config.qsa_host_kv_prefill_grouped
+        )
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
             if getattr(vllm_config, "is_speculative_draft", False)
@@ -847,6 +850,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     lengths,
                     output,
                     gate,
+                    grouped_page4=self.host_kv_prefill_grouped,
                 )
                 return
             if query.shape[0] >= 512:

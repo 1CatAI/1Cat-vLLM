@@ -628,6 +628,30 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
                 "logical request pages fit the shared FP16 miss workspace"
             ),
             "additional_persistent_workspace_bytes": 0,
+            "grouped_attention": {
+                "enabled": (
+                    cfg.kernel_config.qsa_host_kv_active
+                    and cfg.kernel_config.qsa_host_kv_prefill
+                    and cfg.kernel_config.qsa_host_kv_prefill_grouped
+                ),
+                "reason": (
+                    cfg.kernel_config.qsa_host_kv_reason or "host_history_not_admitted"
+                    if not cfg.kernel_config.qsa_host_kv_active
+                    else "prefill_staging_disabled"
+                    if not cfg.kernel_config.qsa_host_kv_prefill
+                    else None
+                    if cfg.kernel_config.qsa_host_kv_prefill_grouped
+                    else "disabled_by_kernel_policy"
+                ),
+                "operator": "grouped_sparse_page4_fwd",
+                "runtime_guards": (
+                    "SM70; FP16 staged history; six 256-wide query heads; "
+                    "canonical four-token groups and causal tail; "
+                    "Flash-V100 grouped ABI available"
+                ),
+                "workspace": "shared per device and CUDA stream, sized by query rows",
+                "fallback": "256-row causal Triton split-K attention",
+            },
         },
     }
     sparse_policy = cfg.kernel_config.sm70_sparse

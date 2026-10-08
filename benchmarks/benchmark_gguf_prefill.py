@@ -28,12 +28,13 @@ def main():
     parser.add_argument("--kernel-config", type=json.loads, default={})
     parser.add_argument(
         "--compare",
-        choices=("routing", "host-prefill", "prefill-norm"),
+        choices=("routing", "host-prefill", "host-prefill-grouped", "prefill-norm"),
         default="routing",
     )
     parser.add_argument("--decode-check", action="store_true")
     parser.add_argument("--completion-check", action="store_true")
     parser.add_argument("--profile-once", action="store_true")
+    parser.add_argument("--profile-kind", choices=("torch", "cuda"), default="torch")
     parser.add_argument(
         "--candidate-only",
         action="store_true",
@@ -73,7 +74,7 @@ def main():
     trace_directory = args.output.parent / "prefill-trace"
     if args.profile_once:
         config["profiler_config"] = dict(
-            profiler="torch",
+            profiler=args.profile_kind,
             torch_profiler_dir=str(trace_directory.resolve()),
             torch_profiler_with_stack=False,
             torch_profiler_with_memory=False,
@@ -120,6 +121,7 @@ def main():
         method = {
             "routing": "set_gguf_prefill_routing_policy",
             "host-prefill": "set_qsa_host_prefill_policy",
+            "host-prefill-grouped": "set_qsa_host_prefill_grouped_policy",
             "prefill-norm": "set_prefill_rmsnorm_gated_policy",
         }[args.compare]
         report["warmups"] = []
@@ -243,10 +245,12 @@ def main():
             # Use named RPCs and the built-in profiler; callable RPC transport
             # requires unsafe serialization in the multiprocess engine.
             llm.collective_rpc("read_prefill_memory", args=(False, True))
-            llm.start_profile("prefill32k")
-            warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
-            llm.stop_profile()
-            warm_files = set(trace_directory.glob("*.pt.trace.json.gz"))
+            warm_files = set()
+            if args.profile_kind == "torch":
+                llm.start_profile("prefill32k")
+                llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)
+                llm.stop_profile()
+                warm_files = set(trace_directory.glob("*.pt.trace.json.gz"))
             llm.start_profile("prefill32k")
             started = time.perf_counter()
             profiled = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[
@@ -255,7 +259,7 @@ def main():
             profile_wall_seconds = time.perf_counter() - started
             llm.stop_profile()
             files = sorted(set(trace_directory.glob("*.pt.trace.json.gz")) - warm_files)
-            if len(files) != args.tp:
+            if args.profile_kind == "torch" and len(files) != args.tp:
                 raise RuntimeError(
                     f"Expected {args.tp} worker traces, got {len(files)}"
                 )
@@ -267,7 +271,7 @@ def main():
                     if profiled.metrics is not None
                     else None
                 ),
-                warmup_output_ids=warmup.outputs[0].token_ids,
+                profiler=args.profile_kind,
                 output_ids=profiled.outputs[0].token_ids,
                 files=[
                     dict(path=str(path), bytes=path.stat().st_size) for path in files

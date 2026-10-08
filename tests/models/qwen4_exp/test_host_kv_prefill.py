@@ -88,12 +88,33 @@ def test_history_staging_matches_official_decode_and_preserves_page_aliases(dtyp
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("rows", [512, 527, 544])
 @pytest.mark.parametrize("context", [257, 2050])
+@pytest.mark.parametrize("grouped_page4", [False, True])
 def test_batched_prefill_matches_32_row_reader_with_causal_tails_and_rewrites(
-    dtype, rows, context
+    dtype, rows, context, grouped_page4, monkeypatch
 ):
     from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
     from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
     from vllm.models.qwen4_exp.nvidia.ops.qsa import expand_qsa_block_indices_cuda
+
+    native_calls = []
+    if grouped_page4:
+        if torch.cuda.get_device_capability() != (7, 0):
+            pytest.skip("Requires SM70 grouped attention")
+        from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
+        from vllm.models.qwen4_exp.nvidia.ops import qsa
+
+        if not qsa._qsa_grouped_page4_supported(flash_attn_v100_cuda, "auto"):
+            pytest.skip("Requires the Flash-V100 grouped ABI")
+        original = qsa._qsa_sparse_paged_attention_sm70_grouped_page4
+
+        def native(*args, **kwargs):
+            native_calls.append(args[0].shape[0])
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            qsa, "_qsa_sparse_paged_attention_sm70_grouped_page4", native
+        )
 
     torch.manual_seed(41)
     device = torch.device("cuda:0")
@@ -105,6 +126,8 @@ def test_batched_prefill_matches_32_row_reader_with_causal_tails_and_rewrites(
     table = torch.tensor([[0, 2, 4], [0, 3, -1]], device=device, dtype=torch.int32)
     requests = torch.arange(rows, device=device, dtype=torch.int32) % 2
     positions = context - 5 + torch.arange(rows, device=device) % 5
+    positions[:8] = torch.tensor([-1, 0, 1, 2, 3, 14, 31, 63], device=device)
+    requests[8:16] = -1
     lengths = torch.full((2,), context, device=device, dtype=torch.int32)
     compressed = torch.arange(512, device=device, dtype=torch.int32).repeat(rows, 1)
     indices = expand_qsa_block_indices_cuda(
@@ -129,12 +152,35 @@ def test_batched_prefill_matches_32_row_reader_with_causal_tails_and_rewrites(
                 gate[start:stop],
             )
         host_qsa_prefill(
-            query, state, indices, table, requests, positions, lengths, actual, gate
+            query,
+            state,
+            indices,
+            table,
+            requests,
+            positions,
+            lengths,
+            actual,
+            gate,
+            grouped_page4=grouped_page4,
         )
+
+    def compare():
+        if not grouped_page4:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            assert torch.isfinite(actual).all()
+            error = actual.float() - expected.float()
+            relative = torch.linalg.vector_norm(error) / torch.linalg.vector_norm(
+                expected.float()
+            )
+            assert relative < 1e-3
+            assert error.abs().max() < 4e-3
 
     run()
     torch.accelerator.synchronize()
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if grouped_page4:
+        assert native_calls == [rows // 8 * 8]
+    compare()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
@@ -144,4 +190,4 @@ def test_batched_prefill_matches_32_row_reader_with_causal_tails_and_rewrites(
     for _ in range(2):
         graph.replay()
         torch.accelerator.synchronize()
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        compare()

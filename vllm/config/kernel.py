@@ -652,6 +652,8 @@ class KernelConfig:
     """Keep identical encoded history on device for controlled placement A/B."""
     qsa_host_kv_prefill: bool = True
     """Stage admitted prefill histories once in the existing miss workspace."""
+    qsa_host_kv_prefill_grouped: bool = True
+    """Use native SM70 grouped attention for staged canonical QSA selections."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
     qsa_host_kv_active: bool = Field(default=False, init=False)

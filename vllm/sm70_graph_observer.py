@@ -317,6 +317,28 @@ class GraphParityWorkerExtension:
             raise RuntimeError("No admitted host QSA owners")
         return {"rank": self.rank, "enabled": enabled, "owners": len(owners)}
 
+    def set_qsa_host_prefill_grouped_policy(self, enabled):
+        """Compare staged attention dispatch without changing KV placement."""
+        if not isinstance(enabled, bool):
+            raise TypeError("Grouped host prefill policy requires a boolean")
+        runner = self.model_runner
+        configs = [runner.vllm_config]
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None:
+            configs.append(speculator.vllm_config)
+        owners = set()
+        for config in configs:
+            for module in config.compilation_config.static_forward_context.values():
+                if getattr(module, "host_kv_enabled", False) and hasattr(
+                    module, "host_kv_prefill_grouped"
+                ):
+                    module.host_kv_prefill_grouped = enabled
+                    owners.add(id(module))
+            config.kernel_config.qsa_host_kv_prefill_grouped = enabled
+        if not owners:
+            raise RuntimeError("No admitted host QSA owners")
+        return {"rank": self.rank, "enabled": enabled, "owners": len(owners)}
+
     def set_prefill_rmsnorm_gated_policy(self, enabled):
         """Change large gated-norm dispatch between completed cohorts."""
         if not isinstance(enabled, bool):
