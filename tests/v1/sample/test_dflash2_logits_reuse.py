@@ -120,3 +120,44 @@ def test_cutoff_fallback_records_completed_projection_on_every_rank(
     assert isinstance(result, sparse_rejection.DFlash2LogitsFallback)
     assert result.logits is logits
     fallback.assert_called_once()
+
+
+@pytest.mark.parametrize("scale,soft_cap", [(1.0, None), (0.5, 3.0)])
+def test_compact_candidate_fallback_projects_only_when_called(
+    monkeypatch, scale, soft_cap
+):
+    torch.manual_seed(64)
+    local = torch.randn(16, 128)
+    values, ids = local.topk(64)
+    project = Mock(side_effect=lambda *args, **kwargs: local.clone())
+    head = SimpleNamespace(
+        maybe_get_sm70_dflash2_top20=lambda *args: (values, ids),
+        quant_method=SimpleNamespace(apply=project),
+        weight=torch.empty(128, 4),
+        shard_indices=SimpleNamespace(num_org_vocab_padding=0, org_vocab_start_index=0),
+    )
+    monkeypatch.setattr(
+        logits_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    processor = LogitsProcessor(128, scale=scale, soft_cap=soft_cap)
+    gather = Mock(side_effect=lambda logits: logits)
+    monkeypatch.setattr(processor, "_gather_logits", gather)
+    hidden = torch.empty(16, 4)
+    expected = processor.forward(head, hidden)
+    project.reset_mock()
+    gather.reset_mock()
+
+    actual_ids, actual_values, fallback = (
+        processor.get_compact_target_probe_with_fallback(head, hidden, 64)
+    )
+    assert torch.equal(actual_ids, ids)
+    transformed = values
+    if soft_cap is not None:
+        transformed = torch.tanh(transformed / soft_cap) * soft_cap
+    assert torch.equal(actual_values, transformed * scale)
+    project.assert_not_called()
+    gather.assert_not_called()
+    assert fallback is not None
+    assert torch.equal(fallback(), expected)
+    project.assert_called_once_with(head, hidden, bias=None)
+    gather.assert_called_once()

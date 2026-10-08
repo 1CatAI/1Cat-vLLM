@@ -49029,3 +49029,71 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+## Concurrent DFlash2 head admission, 2026-10-05
+
+The QPN8 candidate head was limited to eight rows even when verification
+required M16-M64. The new admission uses the configured verifier width up to
+64 rows for FP32 rerank, retaining eight rows for the legacy FP16 reranker.
+Existing M16/M32 kernels provide the support search; final scores still use
+original head weights. No new runtime switch or C1 reduction is introduced.
+
+The cold-cache real-weight operator screen covers dense FP32 top-21 at
+M8/M16/M32/M64 on Gaussian inputs. Maximum selected logit error is 4.53e-6;
+maximum post-top-k/top-p probability error is 4.03e-7. This is a local
+operator check, not teacher-forcing qualification. Raw FP8 scores are not
+admitted as a replacement for final logits: their M16/M32 top-1 agreement
+was only 93.75% on this fixture. Keep the original-weight rerank.
+
+Operator timings suggest a useful concurrent gain; matched model timing,
+acceptance and clean wheel checks remain mandatory before promotion.
+
+The target sampler requests top-64. Extending buffer capacity alone did not
+activate that target route. The batched FP32 probe now admits top-64 and keeps
+an on-demand original-weight dense callback; C1 and legacy FP16 probes retain
+their previous route. The updated normal wheel passes 44 focused tests and
+release/dependency checks.
+
+However, the top-64 probe is **not qualified for promotion**. An identical-input
+FP32 dense comparison over 128 real target rounds (8056 positions) found two
+missing tokens in the top-k20/top-p0.95 sampling support. Top-1 agreed at every
+position, but maximum probability error was 0.0117282 and support KL was
+infinite. The Gaussian support screen had missed this failure. Larger batches
+must preserve the dense reference route until candidate coverage is repaired.
+
+A same-wheel target-only A/B, with the draft graph fixed, measured these complete
+rounds at 8K input (milliseconds; two surrounding controls averaged):
+
+| Concurrency | Dense target probe | Candidate target probe |
+| --- | ---: | ---: |
+| C1 | 14.835 | 14.832 |
+| C2 | 20.366 | 20.054 |
+| C4 | 27.973 | 27.739 |
+| C8 | 45.869 | 46.100 |
+
+These results are not accepted acceleration evidence. Original head weights
+remain the final-score source; raw QPN8 scores are used only for support search.
+The next operator screen uses retained real hidden states and wider candidate
+support rather than another Gaussian-only coverage test.
+
+The raw-probe failure above needs a correction: all global top-20 tokens were
+present at every one of the 8056 positions. The two apparent support misses
+are nucleus-boundary rounding cases. Reproducing the existing reference guard
+on CPU marks both for the unchanged dense callback (distance to top-p:
+5.96e-7 and 1.91e-6; guard margin: 1.22e-4). The first analysis omitted this
+fallback. GPU flag confirmation and the effective sampling comparison are
+pending; do not describe those raw-probe diagnostics as a demonstrated failure
+of the complete sampler. The measured C8 timing still requires investigation.
+
+GPU replay of the actual guard confirms both nucleus-boundary cases take the
+reference path. The effective sampling comparison has zero missing support,
+mean/p99/max KL 4.88e-10/3.88e-9/1.05e-8 and top-1 agreement100%, with maximum
+retained-logit error0.000816. This measures filtered sampling probabilities,
+not a full-vocabulary teacher-forcing KL. The maximum probability difference
+on retained support is7.22e-5. Keep the raw diagnostics alongside this result.
+
+A fresh32K service with max-num-seqs4 and the same688 KV blocks completes C4.
+The target-only same-wheel comparison measures C2 23.334→22.757ms and
+C4 32.938→32.698ms, averaging the surrounding dense controls. The larger
+8K C8 target route remains slower on its complete-round mean. Do not promote
+that shape based on its positive cold operator timing or median alone.

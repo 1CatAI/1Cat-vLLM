@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
+from vllm.config import get_current_vllm_config_or_none
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
@@ -181,6 +182,42 @@ def _is_sm70_dflash2_qpn8_rerank_eligible(layer: torch.nn.Module) -> bool:
     return True
 
 
+def _sm70_dflash2_qpn8_row_capacity() -> int:
+    config = get_current_vllm_config_or_none()
+    spec = getattr(config, "speculative_config", None)
+    scheduler = getattr(config, "scheduler_config", None)
+    if spec is None or spec.method not in ("dflash", "dflash2") or scheduler is None:
+        return _SM70_DFLASH2_QPN8_MAX_ROWS
+    verify_rows = scheduler.max_num_seqs * (spec.num_speculative_tokens + 1)
+    return min(64, max(_SM70_DFLASH2_QPN8_MAX_ROWS, verify_rows))
+
+
+def _sm70_dflash2_qpn8_candidate_logits(
+    layer: torch.nn.Module, x: torch.Tensor, out: torch.Tensor
+) -> None:
+    # Preserve the qualified C1 reduction. Wider batches use the existing
+    # channel-FP8 M16/M32 kernels; M64 needs two M32 calls, not a dense head.
+    chunk_rows = 32 if x.shape[1] % 256 == 0 else 16
+    for begin in range(0, x.shape[0], chunk_rows):
+        end = min(begin + chunk_rows, x.shape[0])
+        rows = end - begin
+        split_k, chains, fast_decoder = (
+            (_SM70_DFLASH2_QPN8_SPLIT_K, _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS, False)
+            if rows <= 16
+            else (16, 2, True)
+        )
+        sm70_ops.fp8_qpn8_gemm_sm70_out(
+            out[begin:end],
+            x[begin:end],
+            layer._sm70_dflash2_qpn8_codes,
+            layer._sm70_dflash2_qpn8_scales,
+            split_k,
+            chains,
+            fast_decoder,
+            False,
+        )
+
+
 @torch.inference_mode()
 def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     if getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
@@ -214,7 +251,11 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     fp32_logits = _sm70_dflash2_option("fp32_logits", layer)
     layer._sm70_dflash2_fp32_logits = fp32_logits
     rerank_dtype = torch.float32 if fp32_logits else torch.float16
-    max_rows = _SM70_DFLASH2_QPN8_MAX_ROWS
+    max_rows = (
+        getattr(layer, "_sm70_dflash2_qpn8_row_capacity", _SM70_DFLASH2_QPN8_MAX_ROWS)
+        if fp32_logits
+        else _SM70_DFLASH2_QPN8_MAX_ROWS
+    )
     # Keep the accepted support density when a worker owns more vocabulary.
     # A wider shard screens 64 candidates per original-sized vocabulary chunk,
     # preserving every candidate that separate TP4 shards would have retained.
@@ -289,7 +330,7 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     # [max_rows, 20] allocation for top-16 leaves a row stride of 20 and makes
     # the result non-contiguous.  The TP all-gather requires contiguous inputs,
     # and inserting a runtime contiguous() copy would add work to both graphs.
-    for selector_k in (16, 20, 21):
+    for selector_k in (16, 20, 21, 64):
         layer.register_buffer(
             f"_sm70_dflash2_rerank_values_{selector_k}",
             torch.empty((max_rows, selector_k), dtype=rerank_dtype, device=device),
@@ -313,10 +354,11 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     layer._sm70_dflash2_qpn8_rerank_prepared = True
     logger.info_once(
         "SM70 DFlash2 QPN8 rerank layout prepared: %d vocabulary chunks, "
-        "%d candidates (%s logits).",
+        "%d candidates (%s logits), capacity %d rows.",
         len(groups),
         candidates,
         "FP32" if fp32_logits else "FP16",
+        max_rows,
     )
     return True
 
@@ -339,6 +381,10 @@ def _sm70_dflash2_rerank_output_buffers(
         values = layer._sm70_dflash2_rerank_values_21[:num_rows]
         positions = layer._sm70_dflash2_rerank_positions_21[:num_rows]
         ids = layer._sm70_dflash2_rerank_ids_21[:num_rows]
+    elif selector_k == 64:
+        values = layer._sm70_dflash2_rerank_values_64[:num_rows]
+        positions = layer._sm70_dflash2_rerank_positions_64[:num_rows]
+        ids = layer._sm70_dflash2_rerank_ids_64[:num_rows]
     else:
         raise ValueError(f"Unsupported DFlash2 rerank top-k: {selector_k}")
     return values, positions, ids
@@ -572,7 +618,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
         return None
     if not getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
         return None
-    if selector_k not in (16, 20, 21) or bias is not None:
+    if selector_k not in (16, 20, 21, 64) or bias is not None:
         return None
     if (
         selector_k == 21
@@ -587,7 +633,12 @@ def _maybe_sm70_dflash2_qpn8_rerank(
 
     x_2d = x.reshape(-1, x.shape[-1])
     num_rows = x_2d.size(0)
-    if not 1 <= num_rows <= _SM70_DFLASH2_QPN8_MAX_ROWS:
+    if selector_k == 64 and (
+        num_rows <= 8 or not getattr(layer, "_sm70_dflash2_fp32_logits", False)
+    ):
+        # Preserve the C1 conditional sampler's existing dense probe/callback.
+        return None
+    if not 1 <= num_rows <= layer._sm70_dflash2_qpn8_logits.shape[0]:
         return None
     if not x_2d.is_contiguous():
         x_2d = x_2d.contiguous()
@@ -595,16 +646,7 @@ def _maybe_sm70_dflash2_qpn8_rerank(
     qpn8_logits = layer._sm70_dflash2_qpn8_logits[:num_rows]
     qpn8_values = layer._sm70_dflash2_qpn8_values[:num_rows]
     qpn8_ids = layer._sm70_dflash2_qpn8_ids[:num_rows]
-    sm70_ops.fp8_qpn8_gemm_sm70_out(
-        qpn8_logits,
-        x_2d,
-        layer._sm70_dflash2_qpn8_codes,
-        layer._sm70_dflash2_qpn8_scales,
-        _SM70_DFLASH2_QPN8_SPLIT_K,
-        _SM70_DFLASH2_QPN8_ACCUMULATOR_CHAINS,
-        False,
-        False,
-    )
+    _sm70_dflash2_qpn8_candidate_logits(layer, x_2d, qpn8_logits)
     # The exact FP16 rerank is permutation-invariant over this approximate
     # support, so skip the unnecessary 64-element result sort. This keeps the
     # official PyTorch multiblock selector while avoiding its final bitonic
@@ -948,6 +990,7 @@ class VocabParallelEmbedding(PluggableLayer):
     ):
         super().__init__()
         self._sm70_dflash2_policy = capture_sm70_dflash2_config()
+        self._sm70_dflash2_qpn8_row_capacity = _sm70_dflash2_qpn8_row_capacity()
         self.prefix = prefix
 
         # Keep the input dimensions.

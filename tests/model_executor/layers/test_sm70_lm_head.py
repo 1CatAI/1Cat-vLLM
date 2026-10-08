@@ -202,3 +202,57 @@ def test_disabled_lm_head_routes_prepare_nothing(monkeypatch) -> None:
     assert not vocab_embedding.maybe_prepare_sm70_lm_head_top1(layer)
     assert not hasattr(layer, "_sm70_f16_raw_top1_ready")
     assert not hasattr(layer, "_sm70_f16_prepared")
+
+
+@pytest.mark.parametrize(
+    ("max_seqs", "expected"), [(1, 8), (2, 16), (4, 32), (8, 64), (16, 64)]
+)
+@pytest.mark.parametrize("method", ["dflash", "dflash2"])
+def test_qpn8_capacity_follows_dflash_verifier_width(
+    monkeypatch, max_seqs, expected, method
+):
+    config = SimpleNamespace(
+        speculative_config=SimpleNamespace(method=method, num_speculative_tokens=7),
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
+    )
+    monkeypatch.setattr(
+        vocab_embedding, "get_current_vllm_config_or_none", lambda: config
+    )
+    assert vocab_embedding._sm70_dflash2_qpn8_row_capacity() == expected
+
+
+@pytest.mark.parametrize("config", [None, SimpleNamespace(speculative_config=None)])
+def test_qpn8_unconfigured_capacity_retains_small_head(monkeypatch, config):
+    monkeypatch.setattr(
+        vocab_embedding, "get_current_vllm_config_or_none", lambda: config
+    )
+    assert vocab_embedding._sm70_dflash2_qpn8_row_capacity() == 8
+
+
+@pytest.mark.parametrize("rows,fp32", [(8, True), (16, False), (64, False)])
+def test_top64_rerank_retains_c1_and_legacy_dense_probe(monkeypatch, rows, fp32):
+    monkeypatch.setattr(
+        vocab_embedding, "_sm70_dflash2_qpn8_rerank_requested", lambda **kw: True
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
+    layer = SimpleNamespace(
+        _sm70_dflash2_qpn8_rerank_prepared=True,
+        _sm70_dflash2_fp32_logits=fp32,
+    )
+    assert (
+        vocab_embedding._maybe_sm70_dflash2_qpn8_rerank(
+            layer, _FakeCudaTensor((rows, 5120)), 64
+        )
+        is None
+    )
+
+
+def test_top64_rerank_output_has_contiguous_tp_layout():
+    layer = SimpleNamespace(
+        _sm70_dflash2_rerank_values_64=torch.empty(64, 64),
+        _sm70_dflash2_rerank_positions_64=torch.empty(64, 64, dtype=torch.int64),
+        _sm70_dflash2_rerank_ids_64=torch.empty(64, 64, dtype=torch.int64),
+    )
+    for rows in (16, 32, 64):
+        buffers = vocab_embedding._sm70_dflash2_rerank_output_buffers(layer, rows, 64)
+        assert all(x.shape == (rows, 64) and x.is_contiguous() for x in buffers)

@@ -750,6 +750,13 @@ class LogitsProcessor(PluggableLayer):
         fallback = None
         if local_logits is not None:
             fallback = lambda: self._gather_cached_logits(local_logits)
+        elif compact_target_probe and retain_local_logits:
+            # A candidate projection has no dense logits to cache. Recompute
+            # original-weight scores only if the sampler needs its reference
+            # branch (for example, an unbounded cutoff tie).
+            fallback = lambda: self._gather_cached_logits(
+                lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
+            )
         return top_indices.to(torch.int64), top_vals.float(), fallback
 
     def _maybe_dump_top_token_margin(
