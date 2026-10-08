@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
-from tools.sm70.flash_v100_trace import prepare_spec
+from tools.sm70.flash_v100_trace import persistent_tensors, prepare_spec
 from tools.sm70.parity_common import (
     digest,
     provenance,
@@ -84,9 +84,7 @@ def fixture(case):
     )
     builder, update = prepare_spec(spec_case, backend, metadata, layer, [q])
     update()
-    if case["spec"] in ("dflash2", "mtp") and not any(
-        isinstance(v, torch.Tensor) for v in vars(builder).values()
-    ):
+    if case["spec"] in ("dflash2", "mtp") and not dict(persistent_tensors(builder)):
         raise AssertionError("Speculative case did not create persistent buffers")
 
     def buffers(refresh=False):
@@ -95,7 +93,7 @@ def fixture(case):
         return {
             f"{owner}.{name}": value.data_ptr()
             for owner, obj in (("builder", builder), ("metadata", metadata))
-            for name, value in vars(obj).items()
+            for name, value in persistent_tensors(obj)
             if isinstance(value, torch.Tensor)
         }
 

@@ -7,14 +7,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import torch
 
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
-
-if TYPE_CHECKING:
-    from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 
 
 @dataclass
@@ -147,10 +144,10 @@ class V100Workspace:
 
 
 _MIXED_ROWS_PLAN_ATTR = "_flash_v100_mixed_decode_rows_plan"
-_MIXED_ROWS_GROUP = 8
+MIXED_ROWS_GROUP = 8
 
 
-class _MixedDecodeRowsPlan:
+class MixedDecodeRowsPlan:
     """Layout of the small-query rows of one mixed prefill/decode step.
 
     The host side depends only on ``query_start_loc`` and the sequence-length
@@ -199,8 +196,8 @@ class _MixedDecodeRowsPlan:
             q_len = qsl[i + 1] - qsl[i]
             max_query_len = max(max_query_len, q_len)
             max_seq_len = max(max_seq_len, int(seq_lens_host[i]))
-            base = len(group_req) * _MIXED_ROWS_GROUP
-            group_req.extend([i] * -(-q_len // _MIXED_ROWS_GROUP))
+            base = len(group_req) * MIXED_ROWS_GROUP
+            group_req.extend([i] * -(-q_len // MIXED_ROWS_GROUP))
             for j in range(q_len):
                 src.append(qsl[i] + j)
                 req.append(i)
@@ -239,7 +236,7 @@ class _MixedDecodeRowsPlan:
         """Row lengths of the padded eight-row groups (zero on padding rows)."""
         if self._group_lengths is None:
             lengths = torch.zeros(
-                self.num_groups * _MIXED_ROWS_GROUP,
+                self.num_groups * MIXED_ROWS_GROUP,
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
@@ -254,13 +251,13 @@ class _MixedDecodeRowsPlan:
         return self._group_table
 
 
-def _mixed_decode_rows_plan(
+def mixed_decode_rows_plan(
     attn_metadata: TritonAttentionMetadata,
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
     max_query_len: int,
     device: torch.device,
-) -> _MixedDecodeRowsPlan | None:
+) -> MixedDecodeRowsPlan | None:
     """Select the resident decode/verification rows of a mixed batch.
 
     Returns ``None`` when the batch has no such row, or only such rows (that
@@ -269,7 +266,7 @@ def _mixed_decode_rows_plan(
     """
     cached = getattr(attn_metadata, _MIXED_ROWS_PLAN_ATTR, False)
     if cached is not False:
-        return cast(_MixedDecodeRowsPlan | None, cached)
+        return cast(MixedDecodeRowsPlan | None, cached)
     num_seqs = len(query_start_loc) - 1
     qsl = query_start_loc[: num_seqs + 1].tolist()
     seq_lens_host = seq_lens[:num_seqs].tolist()
@@ -280,7 +277,7 @@ def _mixed_decode_rows_plan(
         and int(seq_lens_host[i]) > qsl[i + 1] - qsl[i]
     )
     plan = (
-        _MixedDecodeRowsPlan(rows, qsl, seq_lens_host, device)
+        MixedDecodeRowsPlan(rows, qsl, seq_lens_host, device)
         if rows and len(rows) != num_seqs
         else None
     )
@@ -289,113 +286,134 @@ def _mixed_decode_rows_plan(
     return plan
 
 
-def _ensure_flash_draft_graph_buffers(
-    self: _metadata.FlashAttnV100MetadataBuilder,
-    required_reqs: int,
-    block_table: torch.Tensor,
-) -> bool:
-    req_capacity = max(
-        int(self.vllm_config.scheduler_config.max_num_seqs),
-        int(required_reqs),
-        1,
-    )
-    block_cols = int(block_table.shape[1])
-    shape = (req_capacity, block_cols)
-    if self._flash_draft_buffer_shape == shape:
+# Compatibility exports for the legacy forwarding module.
+_MixedDecodeRowsPlan = MixedDecodeRowsPlan
+_MIXED_ROWS_GROUP = MIXED_ROWS_GROUP
+_mixed_decode_rows_plan = mixed_decode_rows_plan
+
+
+@dataclass
+class DraftBuffers:
+    """Persistent metadata allocation; a captured allocation never moves."""
+
+    block_table: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+    query_start_loc: torch.Tensor | None = None
+    shape: tuple[int, int] | None = None
+
+    def ensure(
+        self,
+        req_capacity: int,
+        block_cols: int,
+        required_reqs: int,
+        device: torch.device,
+    ) -> bool:
+        shape = (req_capacity, block_cols)
+        if self.shape == shape:
+            return True
+
+        if self.shape is not None:
+            old_reqs, old_block_cols = self.shape
+            return required_reqs <= old_reqs and block_cols == old_block_cols
+
+        self.block_table = torch.empty(
+            (req_capacity, block_cols),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.seq_lens = torch.empty(
+            (req_capacity,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.query_start_loc = torch.empty(
+            (req_capacity + 1,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.shape = shape
         return True
 
-    if self._flash_draft_buffer_shape is not None:
-        old_reqs, old_block_cols = self._flash_draft_buffer_shape
-        return required_reqs <= old_reqs and block_cols == old_block_cols
-
-    self._draft_block_table = torch.empty(
-        (req_capacity, block_cols),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._draft_seq_lens = torch.empty(
-        (req_capacity,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._draft_query_start_loc = torch.empty(
-        (req_capacity + 1,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._flash_draft_buffer_shape = shape
-    return True
-
-
-def copy_dflash_graph_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    query_start_loc: torch.Tensor,
-) -> None:
-    """Refresh the three persistent inputs of a non-causal DFlash graph."""
-    num_reqs = seq_lens.numel()
-    assert self._draft_block_table is not None
-    assert self._draft_seq_lens is not None
-    assert self._draft_query_start_loc is not None
-    self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
-    self._draft_seq_lens[:num_reqs].copy_(
-        seq_lens,
-        non_blocking=True,
-    )
-    self._draft_query_start_loc[: num_reqs + 1].copy_(
-        query_start_loc,
-        non_blocking=True,
-    )
-
-
-def _ensure_smallq_decode_buffers(
-    self: _metadata.FlashAttnV100MetadataBuilder,
-    required_tokens: int,
-    required_reqs: int,
-    block_table: torch.Tensor,
-) -> bool:
-    token_capacity = self._smallq_buffer_token_capacity(required_tokens)
-    req_capacity = max(
-        min(
-            int(self.vllm_config.scheduler_config.max_num_seqs),
-            token_capacity,
-        ),
-        int(required_reqs),
-        1,
-    )
-    block_cols = int(block_table.shape[1])
-    shape = (token_capacity, req_capacity, block_cols)
-    if self._smallq_buffer_shape == shape:
-        return True
-
-    if self._smallq_buffer_shape is not None:
-        old_tokens, old_reqs, old_block_cols = self._smallq_buffer_shape
-        return (
-            required_tokens <= old_tokens
-            and required_reqs <= old_reqs
-            and block_cols == old_block_cols
+    def copy_metadata(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        """Refresh the three persistent inputs of a non-causal graph."""
+        num_reqs = seq_lens.numel()
+        assert self.block_table is not None
+        assert self.seq_lens is not None
+        assert self.query_start_loc is not None
+        self.block_table[:num_reqs].copy_(block_table, non_blocking=True)
+        self.seq_lens[:num_reqs].copy_(
+            seq_lens,
+            non_blocking=True,
+        )
+        self.query_start_loc[: num_reqs + 1].copy_(
+            query_start_loc,
+            non_blocking=True,
         )
 
-    self._smallq_decode_block_table = torch.empty(
-        (token_capacity, block_cols),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_decode_seq_lens = torch.empty(
-        (token_capacity,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_query_start_loc = torch.empty(
-        (req_capacity + 1,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_token_indices = torch.arange(
-        token_capacity,
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_buffer_shape = shape
-    return True
+
+@dataclass
+class SmallQueryBuffers:
+    """Persistent metadata allocation; a captured allocation never moves."""
+
+    block_table: torch.Tensor | None = None
+    seq_lens: torch.Tensor | None = None
+    query_start_loc: torch.Tensor | None = None
+    token_indices: torch.Tensor | None = None
+    shape: tuple[int, int, int] | None = None
+
+    def ensure(
+        self,
+        token_capacity: int,
+        req_capacity: int,
+        block_cols: int,
+        required_tokens: int,
+        required_reqs: int,
+        device: torch.device,
+    ) -> bool:
+        shape = (token_capacity, req_capacity, block_cols)
+        if self.shape == shape:
+            return True
+
+        if self.shape is not None:
+            old_tokens, old_reqs, old_block_cols = self.shape
+            return (
+                required_tokens <= old_tokens
+                and required_reqs <= old_reqs
+                and block_cols == old_block_cols
+            )
+
+        self.block_table = torch.empty(
+            (token_capacity, block_cols),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.seq_lens = torch.empty(
+            (token_capacity,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.query_start_loc = torch.empty(
+            (req_capacity + 1,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.token_indices = torch.arange(
+            token_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
+        self.shape = shape
+        return True
+
+
+@dataclass
+class MetadataWorkspace:
+    """Persistent inputs owned by one builder across capture and replay."""
+
+    draft: DraftBuffers = field(default_factory=DraftBuffers)
+    smallq: SmallQueryBuffers = field(default_factory=SmallQueryBuffers)

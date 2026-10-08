@@ -861,7 +861,7 @@ class DFlash2Speculator(DFlashSpeculator):
                 if (
                     not isinstance(builder, FlashAttnV100MetadataBuilder)
                     or not builder._is_dflash_draft_model
-                    or builder._flash_draft_buffer_shape is None
+                    or builder.metadata_workspace.draft.shape is None
                 ):
                     return
                 builders.append((gid, builder))

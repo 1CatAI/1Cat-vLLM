@@ -15,8 +15,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 1c: route/token/output parity tools | #1073 | Draft; host/spec model records pending | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Host/spec model gates |
 | 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | Pending complete outcome map | Prerequisite model and outcome gates |
 | 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | Pending complete outcome map | Prerequisite gates |
-| 3a: per-layer decode cache | — | CPU/golden and pre-commit passed | Private references 390 → 387 | Pending | CPU/rebase and GPU prerequisites |
-| 3b: step plan and persistent metadata buffers | — | Prototype retained; rebuild on 3a next | Expected private references 387 → 380 | Required | Separate scope after retry split |
+| 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase passed | Private references 390 → 387 | Pending | CPU/rebase and GPU prerequisites |
+| 3b: step plan and persistent metadata buffers | — | Rebuilt on 3a; CPU/golden passed | Private references 387 → 380 | Pending | Separate outcome and GPU gates |
 | 4: decode executor and ordered candidates | — | Not started | — | Required | Step 3 gates |
 | 5a: per-sequence prefill candidates | — | Not started | — | Required | Step 4 gates |
 | 5b: batch prefill candidates | — | Not started | — | Required | Step 5a gates |
@@ -285,3 +285,39 @@ including all 813 immutable traces, strict shim use and parity-tool controls.
 Pre-commit including mypy/layering passes. Evidence:
 `a3-decode-cache-{strict,precommit}.log` and `a3-decode-cache-shim.json` in the
 local task artifact directory. GPU and #1028 checks remain separate gates.
+
+## Step 3a integration and Step 3b ownership
+
+Step 3a is Draft PR #1077 at `f08a7711ad0e4931c32cb10f5ec2470e429d9505`.
+Pinned #1028 was rebased onto it: head
+`04f6758c1e50b20743ea0843d946e52766a83410`, tree
+`ceecc15881a683f87a0a61e702ac8d405978b51d`, exactly equal to the clean merge-tree.
+Host-KV/QSA CPU tests pass 37 with 98 GPU-only skips. Its source-verified
+candidate, host integration and queued runners are in `a3-step3a` on 54633;
+all GPU and prerequisite gates remain required before promotion.
+
+Step 3b is rebuilt on that published head. `MixedDecodeRowsPlan` retains
+per-step sharing across attention layers, the original metadata cache key and
+lazy authoritative device-length gathers. `MetadataWorkspace` owns persistent
+`DraftBuffers` and `SmallQueryBuffers` for each builder; capacity is explicit
+and captured allocations never resize. Builder adapters retain the original
+policy/evaluation points and supply plain values to workspace. The proposer
+reads the actual workspace shape. Workspace receives neither Impl nor builder.
+
+Mechanical extraction (`e3859c1d0`) is separate from ownership wiring.
+The original metadata calculation hashes are unchanged; the comparison adapter
+inlines delegation and normalizes explicit receiver names. Trace and GPU parity
+observers enumerate the current nested owners on every observation, retaining
+baseline labels without replacing the actual pointers. Focused tests cover
+capacity refusal, alias retention and refreshed copy contents. Private module
+references fall from 387 to 380, with no new cycles or forbidden edges.
+
+PR #1048 now points at `860c126c15b244601faca9a66cc651c17cbe7234`.
+Its Step 3b overlap is metadata; future readers/accounting adaptation must use
+PR #1049's sole Python codec API. Neither its branch nor QSA native calls is changed.
+
+The rebuilt 3b scope passes **238 tests / 1 skip / 28 GPU deselections**,
+including the immutable 813-case trace, strict shim use, original calculation
+hashes, capacity/pointer contracts and parity-tool controls. Evidence:
+`a3-metadata-workspace-strict.log` and `a3-metadata-workspace-shim.json`.
+GPU route/token/output/performance and complete outcome maps are pending.

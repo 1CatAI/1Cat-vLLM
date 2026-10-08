@@ -421,7 +421,7 @@ def _run_mixed_rows_grouped_e4m3(
     value_cache: torch.Tensor,
     attn_metadata: TritonAttentionMetadata,
     out_view: torch.Tensor,
-    plan: _workspace._MixedDecodeRowsPlan,
+    plan: _workspace.MixedDecodeRowsPlan,
 ) -> bool:
     """Run the resident rows of a mixed batch on the grouped E4M3 operator.
 
@@ -438,7 +438,7 @@ def _run_mixed_rows_grouped_e4m3(
         return False
     table = plan.group_table(attn_metadata.block_table)
     lengths = plan.group_lengths(attn_metadata.seq_lens)
-    total_rows = plan.num_groups * _workspace._MIXED_ROWS_GROUP
+    total_rows = plan.num_groups * _workspace.MIXED_ROWS_GROUP
     q_pad = query.new_zeros((total_rows, query.shape[1], query.shape[2]))
     out_pad = torch.empty_like(q_pad)
     chunks = [
@@ -446,7 +446,7 @@ def _run_mixed_rows_grouped_e4m3(
         for g0 in range(0, plan.num_groups, MAX_GROUPS_PER_CALL)
     ]
     for g0, g1 in chunks:
-        r0, r1 = g0 * _workspace._MIXED_ROWS_GROUP, g1 * _workspace._MIXED_ROWS_GROUP
+        r0, r1 = g0 * _workspace.MIXED_ROWS_GROUP, g1 * _workspace.MIXED_ROWS_GROUP
         if not grouped_e4m3_fp32_groups_allowed(
             self,
             q_pad[r0:r1],
@@ -462,7 +462,7 @@ def _run_mixed_rows_grouped_e4m3(
     k_scale = float(layer._k_scale_float)
     v_scale = float(layer._v_scale_float)
     for g0, g1 in chunks:
-        r0, r1 = g0 * _workspace._MIXED_ROWS_GROUP, g1 * _workspace._MIXED_ROWS_GROUP
+        r0, r1 = g0 * _workspace.MIXED_ROWS_GROUP, g1 * _workspace.MIXED_ROWS_GROUP
         # Row lengths are authoritative: padding rows have length zero and
         # produce zero output, so no row can read an unwritten KV entry.
         grouped_op(
@@ -523,7 +523,7 @@ def _run_prefill_prefix_decode_rows(
     other layouts use XQA or the scalar decoder. Returns the row indices
     consumed here; the caller's per-sequence loop skips them.
     """
-    plan = _workspace._mixed_decode_rows_plan(
+    plan = _workspace.mixed_decode_rows_plan(
         attn_metadata,
         query_start_loc,
         seq_lens,
