@@ -191,9 +191,12 @@ __device__ __forceinline__ void consume_fragment(const consdmv::Seg& sg, int nt,
   consdmv::Ld<F> w;
   w.c[ks][0] = __ldcs(sg.codes + (tg * 4 + ks) * 32 + lane);
   if constexpr (F == consdmv::LUT4) {
-    reinterpret_cast<unsigned*>(&w.sc)[ks >> 1] =
-        __ldcs(reinterpret_cast<const unsigned*>(sg.scale) +
-               (tg * 32 + lane) * 2 + (ks >> 1));
+    // Keep the actual segment bank's 16-byte scale record. Adapt its
+    // duplicated half scale to the common register-only LUT decoder.
+    const unsigned sc = __ldcs(reinterpret_cast<const unsigned*>(sg.scale) +
+                               (tg * 32 + lane) * 4 + ks);
+    reinterpret_cast<unsigned*>(&w.sc)[ks >> 1] = (sc & 0xffffu)
+                                                  << (16 * (ks & 1));
   } else {
     reinterpret_cast<unsigned*>(&w.sc)[ks] =
         __ldcs(reinterpret_cast<const unsigned*>(sg.scale) +

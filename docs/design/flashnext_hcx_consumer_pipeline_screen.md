@@ -37,21 +37,44 @@ has 3.97e-4 error against canonical FP32 matmul.
 
 | Chain | Maximum rank median us |
 | --- | ---: |
-| Packaged HC plus packaged dense | 49.380 |
-| Copied HC control plus packaged dense | 48.936 |
+| Packaged HC plus packaged DMV13 dense | 49.380 |
+| Copied HC control plus packaged DMV13 dense | 48.936 |
 | HC with chunk-ready dense partials and reduction | 58.224 |
 
-The candidate loses 8.84 us per chain. The copied control rules out a large
+The candidate loses 8.84 us per isolated DMV13 chain. This control is present
+in the wheel but differs from the model's selected segment projection and
+its LUT scale layout. These numbers do not decide model-route admission;
+the matching segment-bank control is reported below. The copied control rules out a large
 baseline-copy difference. The consumer kernel has a 112-byte local stack
 frame and an extra split-K partial/reduction chain; these are possible causes,
-not independently measured attributions. The numerical gate passes, but the
-chain gate fails. It is rejected without a model restart or an endpoint claim.
-M1/M8 and C4 promotion checks are unnecessary for this rejected version.
+not independently measured attributions. The numerical gate passes, but this
+DMV13 chain comparison loses. No model restart or endpoint claim is made.
+The matching segment control also loses, so this version is rejected.
+M1/M8 and C4 model promotion are not run for the rejected version.
 
 Both timing arms share one canonical set of dense codes and coefficients.
 All partials, counters and ready flags have fixed addresses before graph
 capture. The research DSO is built separately for this screen and is not part
 of the production wheel; its results cannot qualify a production route.
+
+## Selected segment-route control
+
+The follow-up uses the model-selected `gguf_dense_segments_sm70_out` with
+its original 16-byte LUT scale records. Both arms retain this storage;
+the consumer adapts coefficients in registers, without a second scale bank.
+The NPZ input contains the same eight input groups, with attention KV heads
+restored from the GGUF. This is a corrected control, not a second tuning trial.
+
+| Chain | Maximum rank median us |
+| --- | ---: |
+| Packaged HC plus selected segment projection | 46.688 |
+| Copied HC plus selected segment projection | 45.028 |
+| Chunk-ready HC plus projection partials/reduction | 58.660 |
+
+The candidate loses 11.972 us per chain. Numerical checks and two changed-input
+replays pass. It is not admitted into the model. The earlier DMV13 result and
+this measurement run have different clocks/conditions and must not be compared
+as a change in control speed.
 
 ## Reproduce
 

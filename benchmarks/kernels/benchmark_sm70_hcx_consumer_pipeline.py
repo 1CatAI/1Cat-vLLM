@@ -22,7 +22,6 @@ import torch.distributed as dist
 import vllm._C as core
 
 from vllm.model_executor.layers.quantization import gguf_dmv13_dense as dense
-from vllm.model_executor.layers.quantization.gguf_dmv_formats import compact_lut4_scale
 from vllm.models.qwen4_exp.nvidia.sm70_hcx import Sm70HcxRuntime, pack_down, pack_up
 from vllm.transformers_utils.gguf_tensor_reader import GGUFReader, dequantize
 
@@ -97,8 +96,6 @@ def main():
                 dense.LUT4,
             )
             planes = list(dense.pack(fmt, q, sc, minimum, gs))
-            if fmt == dense.LUT4:
-                planes[2] = compact_lut4_scale(planes[2])
             for name, plane in zip(("codes", "high", "scale"), planes):
                 group[name].append(torch.from_numpy(np.ascontiguousarray(plane)).cuda())
             group["fmts"].append(fmt)
@@ -189,7 +186,7 @@ def main():
                 arm == "pipeline",
             )
         if arm != "pipeline":
-            torch.ops._C.sm70_dmv13_out(
+            torch.ops._C.gguf_dense_segments_sm70_out(
                 block,
                 g["codes"],
                 g["high"],
@@ -202,8 +199,6 @@ def main():
                 4,
                 g["ws"],
                 g["cnt"],
-                1,
-                None,
                 None,
             )
 
