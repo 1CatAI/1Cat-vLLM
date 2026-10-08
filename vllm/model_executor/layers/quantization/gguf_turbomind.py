@@ -424,7 +424,8 @@ def prepare_gguf_projections(
         projection.source_output_sizes = tuple(weight.shape[0] for weight in weights)
         projections.append(projection)
     if dmv_enabled and any(
-        p.source_type in (12, 16, 17, 18, 21, 22, 23) and not hasattr(p, "dmv_format")
+        p.source_type in (10, 12, 16, 17, 18, 21, 22, 23)
+        and not hasattr(p, "dmv_format")
         for p in projections
     ):
         reasons = [

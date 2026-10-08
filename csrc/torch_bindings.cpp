@@ -85,6 +85,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> ()");
   ops.impl("gguf_dmv_sm70_clocked_out", torch::kCUDA,
            &gguf_dmv_sm70_clocked_out);
+  ops.def("gguf_dmv_u2_group16_sm70_supported() -> bool",
+          []() { return true; });
   ops.def("gguf_dmv_three_formats_sm70_supported() -> bool",
           []() { return true; });
   ops.def(

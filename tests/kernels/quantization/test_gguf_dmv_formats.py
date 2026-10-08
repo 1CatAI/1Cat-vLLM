@@ -18,6 +18,37 @@ _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 
 
+@pytest.mark.parametrize("k", [128, 512, 4352, 5120])
+def test_u2_group16_preserves_codes_and_all_coefficient_bits(k):
+    n = 64
+    rng = np.random.default_rng(20261008)
+    q = rng.integers(0, 4, (n, k), dtype=np.uint8)
+    # Storage must preserve even signed zero, subnormals and NaN payloads.
+    s = rng.integers(0, 65536, (n, k // 16), dtype=np.uint16).view(np.float16)
+    m = rng.integers(0, 65536, (n, k // 16), dtype=np.uint16).view(np.float16)
+    fmt, codes, scale = _module.pack_u2_group16(q, s, m)
+    assert fmt == _module.U2_GROUP16
+    assert codes.size == n * k // 4
+    assert scale.size == n * k // 4
+    words = codes.view(np.uint32).reshape(n // 32, k // 32, 32, 2)
+    words = words.transpose(0, 2, 1, 3)[:, np.argsort(_module.ROWMAP)]
+    restored = np.empty((n // 32, 32, k // 32, 32), np.uint8)
+    for c in range(2):
+        for j in range(8):
+            restored[..., c * 16 + j * 2] = (words[..., c] >> (2 * j)) & 3
+            restored[..., c * 16 + j * 2 + 1] = (words[..., c] >> (16 + 2 * j)) & 3
+    np.testing.assert_array_equal(restored.reshape(n, k), q)
+    coefficients = scale.view(np.uint32).reshape(n // 32, k // 128, 2, 32, 4)
+    coefficients = coefficients.transpose(0, 3, 1, 2, 4)
+    coefficients = coefficients[:, np.argsort(_module.ROWMAP)].reshape(n, k // 16)
+    np.testing.assert_array_equal(
+        (coefficients & 65535).astype(np.uint16), s.view(np.uint16)
+    )
+    np.testing.assert_array_equal(
+        (coefficients >> 16).astype(np.uint16), m.view(np.uint16)
+    )
+
+
 @pytest.mark.parametrize("kind,size", [(18, 98), (21, 110)])
 def test_indices_signs_and_subnormal_scales(kind, size):
     rng = np.random.default_rng(123)

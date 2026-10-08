@@ -14,9 +14,43 @@ import gguf.quants as Q
 import numpy as np
 
 IQ3S, IQ3X = 5, 6
+U2_GROUP16 = 13
 ROWMAP = np.array(
     [((L >> 2) & 3) * 8 + (L & 3) + (4 if L & 16 else 0) for L in range(32)]
 )
+
+
+def pack_u2_group16(codes, scales, mins):
+    """Reorder canonical u2/group16 operands without changing coefficient bits.
+
+    A lane loads two 16-code words per K32 step. Eight scale/min words
+    cover a K128 group; coefficients retain the canonical FP16 rounding.
+    """
+    n, k = codes.shape
+    if n % 32 or k % 128 or codes.dtype != np.uint8 or np.any(codes > 3):
+        raise ValueError("u2 planes require N32/K128 aligned two-bit codes")
+    if any(a.dtype != np.float16 or a.shape != (n, k // 16) for a in (scales, mins)):
+        raise ValueError("u2 planes require canonical FP16 group16 scale/min")
+    tiles, groups, steps = n // 32, k // 128, k // 32
+    q = codes.reshape(tiles, 32, steps, 32)[:, ROWMAP].astype(np.uint32)
+    words = np.zeros((tiles, 32, steps, 2), np.uint32)
+    for c in range(2):
+        for j in range(8):
+            words[..., c] |= q[..., c * 16 + j * 2] << (2 * j)
+            words[..., c] |= q[..., c * 16 + j * 2 + 1] << (16 + 2 * j)
+    packed = np.ascontiguousarray(words.transpose(0, 2, 1, 3))
+    coefficients = scales.view(np.uint16).astype(np.uint32) | (
+        mins.view(np.uint16).astype(np.uint32) << 16
+    )
+    coefficients = coefficients.reshape(tiles, 32, groups, 8)[:, ROWMAP]
+    metadata = np.ascontiguousarray(
+        coefficients.reshape(tiles, 32, groups, 2, 4).transpose(0, 2, 3, 1, 4)
+    )
+    return (
+        U2_GROUP16,
+        packed.view(np.uint8).reshape(-1),
+        metadata.view(np.uint8).reshape(-1),
+    )
 
 
 def _grid(cls):

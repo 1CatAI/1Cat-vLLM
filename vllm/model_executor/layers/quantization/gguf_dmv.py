@@ -12,6 +12,7 @@ from vllm.model_executor.kernels.gguf import (
     GGUFOperatorCapability,
     decoder_family,
     three_format_qkv_capabilities,
+    u2_group16_plane_capability,
 )
 from vllm.model_executor.layers.quantization import gguf_dmv_formats as iq
 from vllm.model_executor.layers.quantization.gguf_dense_hmma import workspace
@@ -19,7 +20,7 @@ from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import deco
 from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
-FORMATS = {12: 0, 23: 3, 21: 5, 18: 6, **iq.IQ2_FORMATS}
+FORMATS = {10: iq.U2_GROUP16, 12: 0, 23: 3, 21: 5, 18: 6, **iq.IQ2_FORMATS}
 _tables = {}
 _reverse_tables = {}
 
@@ -50,6 +51,18 @@ def eligible_sources(sources, prefix):
     quantized = [(w, t) for w, t in sources if t not in (1, 30)]
     if not quantized or len({t for _, t in quantized}) > 3:
         return False
+    if any(t == 10 for _, t in quantized):
+        w, kind = quantized[0]
+        block, size = quant_size(kind)
+        capability = u2_group16_plane_capability(
+            tuple(t for _, t in quantized),
+            w.shape[1] // size * block,
+            tuple(w.shape[0] for w, _ in quantized),
+            prefix,
+            enabled=cfg.kernel_config.sm70_gguf.u2_group16_planes,
+        )
+        if capability.reason is not None:
+            return False
     if any(t in iq.IQ2_FORMATS for _, t in quantized):
         if not cfg.kernel_config.sm70_gguf.iq2_signed_nibbles:
             return False
@@ -135,7 +148,16 @@ def prepare_bank(projection, raw_weight, canonical):
     ):
         return False
     raw = raw_weight.detach().cpu().numpy()
-    if kind in iq.IQ2_FORMATS:
+    if kind == 10:
+        supported = getattr(torch.ops._C, "gguf_dmv_u2_group16_sm70_supported", None)
+        if supported is None or not supported():
+            projection.dmv_rejection_reason = "native_u2_group16_support_unavailable"
+            return False
+        fmt, codes, scale = iq.pack_u2_group16(
+            canonical.codes, canonical.scales, canonical.mins
+        )
+        high = np.empty(0, dtype=np.uint8)
+    elif kind in iq.IQ2_FORMATS:
         fmt, codes, scale = iq.pack_iq2(raw, kind)
         high = None
     elif kind in (18, 21):
@@ -148,7 +170,7 @@ def prepare_bank(projection, raw_weight, canonical):
             scale = iq.compact_lut4_scale(scale)
     # GDN's input heads are permuted in units of 128, matching plane K groups.
     layout = projection.input_layout
-    if layout is not None:
+    if layout is not None and kind != 10:
         order = (
             layout.weight_to_vllm(
                 torch.arange(k // 128).reshape(1, -1),
@@ -190,9 +212,13 @@ def prepare_bank(projection, raw_weight, canonical):
     # A TP2 coalesced gate/up has twice as many rows as TP4. Size the
     # restoration buffers during loading, before graph capture; only one
     # resident plane bank is retained for both M8 and canonical fallback.
-    group = 16 if kind in (17, 22) else 32
+    group = 16 if kind in (10, 17, 22) else 32
     stats_element_size = (
-        2 if fmt == 3 else 4 if fmt == 0 or kind in iq.IQ2_FORMATS else 8
+        2
+        if fmt == 3
+        else 4
+        if fmt in (0, iq.U2_GROUP16) or kind in iq.IQ2_FORMATS
+        else 8
     )
     weight_size = k * n // (2 if fmt in (0, 3) else 4)
     stats_size = k // group * n * stats_element_size
@@ -216,11 +242,15 @@ def restore(
     count = k * n // (8 if fmt in (0, 3) else 16)
     weight = scratch["weight"][: count * 4].view(torch.int32).view(k, -1)
     kind = {7: 16, 8: 17, 9: 22}.get(fmt)
-    group = 16 if kind in (17, 22) else 32
+    group = 16 if fmt == iq.U2_GROUP16 or kind in (17, 22) else 32
     dtype = (
-        torch.int16 if fmt == 3 else torch.int32 if fmt == 0 or kind else torch.int64
+        torch.int16
+        if fmt == 3
+        else torch.int32
+        if fmt in (0, iq.U2_GROUP16) or kind
+        else torch.int64
     )
-    size = 2 if fmt == 3 else 4 if fmt == 0 or kind else 8
+    size = 2 if fmt == 3 else 4 if fmt in (0, iq.U2_GROUP16) or kind else 8
     stats = scratch["stats"][: k // group * n * size].view(dtype).view(k // group, n)
     if kind is not None:
         torch.ops._C.gguf_dmv_restore_iq2_sm70_out(
@@ -241,10 +271,12 @@ def restore(
         torch.ops._C.gguf_dmv_restore_sm70_out(weight, stats, codes, scales, fmt, k, n)
     from .gguf_turbomind import _prepared_gguf_projection
 
-    family = 0 if fmt == 0 else 1 if fmt == 3 else 2
+    family = 0 if fmt in (0, iq.U2_GROUP16) else 1 if fmt == 3 else 2
     decoder = (
         kind
         if kind is not None
+        else 2
+        if fmt == iq.U2_GROUP16
         else 4
         if fmt == 0
         else 0
@@ -274,6 +306,15 @@ def restore(
 def prepare_layer(layer, projections):
     quantized = [p for p in projections if p.kernel is not None]
     source_types = {p.source_type for p in quantized}
+    if 10 in source_types:
+        capability = u2_group16_plane_capability(
+            tuple(p.source_type for p in quantized),
+            quantized[0].kernel.config.partition_weight_shape[0],
+            tuple(p.logical_output_size for p in quantized),
+            layer.prefix,
+        )
+        if capability.reason is not None:
+            return {"reason": capability.reason}
     if 23 in source_types and source_types.intersection(iq.IQ2_FORMATS):
         return {"reason": "iq2_mixed_iq4_requires_original_scale_precision"}
     if not quantized or not all(hasattr(p, "dmv_format") for p in quantized):
@@ -292,9 +333,25 @@ def prepare_layer(layer, projections):
     for p in quantized:
         tile = 0
         groups = p.kernel.config.partition_weight_shape[0] // 128
-        cstride = groups * 512 * (3 if p.dmv_format in (5, 6) else 4)
+        cstride = (
+            groups
+            * 512
+            * (
+                2
+                if p.dmv_format == iq.U2_GROUP16
+                else 3
+                if p.dmv_format in (5, 6)
+                else 4
+            )
+        )
         sstride = groups * (
-            128 if p.dmv_format == 6 else 512 if p.dmv_format == 0 else 256
+            1024
+            if p.dmv_format == iq.U2_GROUP16
+            else 128
+            if p.dmv_format == 6
+            else 512
+            if p.dmv_format == 0
+            else 256
         )
         for n in p.source_output_sizes:
             end = tile + n // 32

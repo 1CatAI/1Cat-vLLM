@@ -729,6 +729,31 @@ class GGUFLinearMethod(LinearMethodBase):
                 "max_m": 8,
                 "fallback": "canonical",
             }
+            if (
+                config is not None
+                and plane_policy
+                and not excluded
+                and not dmv_enabled
+                and any(kind == 10 for _, kind in sources)
+            ):
+                from vllm.model_executor.kernels.gguf import (
+                    u2_group16_plane_capability,
+                )
+
+                quantized = [(w, t) for w, t in sources if t not in (1, 30)]
+                weight, kind = quantized[0]
+                block, size = quant_size(kind)
+                capability = u2_group16_plane_capability(
+                    tuple(t for _, t in quantized),
+                    weight.shape[1] // size * block,
+                    tuple(w.shape[0] for w, _ in quantized),
+                    layer.prefix,
+                    enabled=config.kernel_config.sm70_gguf.u2_group16_planes,
+                )
+                if capability.reason is not None:
+                    self.native_admission["projection_planes"]["reason"] = (
+                        capability.reason
+                    )
             projections = prepare_gguf_projections(
                 sources,
                 self.params_dtype,

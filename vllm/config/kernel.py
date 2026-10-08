@@ -376,6 +376,9 @@ class Sm70GgufConfig:
     iq2_signed_nibbles: bool = True
     """Expand IQ2 grids losslessly for qualified M8 gate/up and down shapes."""
 
+    u2_group16_planes: bool = True
+    """Use measured Q2_K M8 projection planes without changing FP16 coefficients."""
+
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
 

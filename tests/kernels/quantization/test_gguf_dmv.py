@@ -13,6 +13,7 @@ from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     transcode_lattice,
 )
 from vllm.model_executor.layers.quantization.gguf_lut_transcode import transcode_lut4
+from vllm.model_executor.layers.quantization.gguf_transcode import transcode_affine
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -27,11 +28,20 @@ def planes(kind, k=512):
     raw = np.random.default_rng(kind).integers(
         0, 256, (n, k // 256, size), dtype=np.uint8
     )
-    raw[..., :2] = np.array([0.0007], np.float16).view(np.uint8)
+    offset = 80 if kind == 10 else 0
+    raw[..., offset : offset + 2] = np.array([0.0007], np.float16).view(np.uint8)
+    if kind == 10:
+        raw[..., 82:84] = np.array([0.0003], np.float16).view(np.uint8)
     if kind == 12:
         raw[..., 2:4] = np.array([0.0003], np.float16).view(np.uint8)
     raw = raw.reshape(n, -1)
-    if kind in iq.IQ2_FORMATS:
+    if kind == 10:
+        converted = transcode_affine(raw, kind)
+        fmt, codes, scale = iq.pack_u2_group16(
+            converted.codes, converted.scales, converted.mins
+        )
+        high = np.empty(0, np.uint8)
+    elif kind in iq.IQ2_FORMATS:
         fmt, codes, scale = iq.pack_iq2(raw, kind)
         high = iq.iq2_reverse_table(kind)
     elif kind in (18, 21):
@@ -48,10 +58,19 @@ def planes(kind, k=512):
     return fmt, buffers, reference, raw
 
 
-@pytest.mark.parametrize("kind", [16, 17, 18, 21, 22, 23])
+@pytest.mark.parametrize("kind", [10, 16, 17, 18, 21, 22, 23])
 def test_restore_canonical_storage_exactly(kind):
     fmt, (codes, high, scale), reference, raw = planes(kind)
-    if kind in (16, 17, 18, 21, 22):
+    if kind == 10:
+        converted = transcode_affine(raw, kind)
+        original = torch.ops._C.gguf_affine_sm70_prepare(
+            torch.from_numpy(converted.codes).cuda(),
+            torch.from_numpy(converted.scales).cuda(),
+            torch.from_numpy(converted.mins).cuda(),
+            2,
+            16,
+        )
+    elif kind in (16, 17, 18, 21, 22):
         converted = transcode_lattice(raw, kind)
         c, s = converted.mma884_storage()
         original = torch.ops._C.gguf_lattice_sm70_prepare(
@@ -80,6 +99,61 @@ def test_restore_canonical_storage_exactly(kind):
         )
     assert torch.equal(weight, restored_weight)
     assert torch.equal(stats, restored_stats)
+
+
+def test_u2_group16_decoded_operands_and_graph_replay():
+    fmt, (codes, high, scale), _, raw = planes(10)
+    canonical = transcode_affine(raw, 10)
+    indices = [0, 7, 15, 16, 31, 32, 256, 511]
+    x = torch.zeros(8, 512, device="cuda", dtype=torch.float16)
+    x[torch.arange(8, device="cuda"), indices] = 1
+    out = torch.empty(8, 64, device="cuda", dtype=torch.float16)
+    partials = torch.empty(1024, device="cuda", dtype=torch.float32)
+    counters = torch.zeros(1, device="cuda", dtype=torch.int32)
+
+    def call():
+        torch.ops._C.gguf_dmv_sm70_out(
+            x,
+            [codes],
+            [high],
+            [scale],
+            [out],
+            [fmt],
+            [64],
+            512,
+            1,
+            4,
+            partials,
+            counters,
+            2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+        )
+
+    call()
+    reference = torch.from_numpy(
+        canonical.dequantize().astype(np.float16)[:, indices].T.copy()
+    ).cuda()
+    assert torch.equal(out, reference)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    weights = torch.from_numpy(canonical.dequantize().astype(np.float16)).cuda()
+    for _ in range(10):
+        x.normal_()
+        call()
+        expected = out.clone()
+        graph.replay()
+        assert torch.equal(out, expected)
+        reference = (x.float() @ weights.float().T).half()
+        assert (
+            out.float() - reference.float()
+        ).norm() / reference.float().norm() < 0.001
+        assert not counters.any()
 
 
 @pytest.mark.parametrize(
@@ -355,7 +429,7 @@ def test_iq2_plane_policy_changes_graph_hash():
     assert enabled.compute_hash() != disabled.compute_hash()
 
 
-@pytest.mark.parametrize("kind", [16, 17, 22])
+@pytest.mark.parametrize("kind", [10, 16, 17, 22])
 def test_iq2_non_m8_retains_canonical_output_bitwise(kind):
     from vllm.model_executor.layers.quantization.gguf_turbomind import (
         GGUFPreparedProjection,
@@ -367,7 +441,9 @@ def test_iq2_non_m8_retains_canonical_output_bitwise(kind):
     candidate = GGUFPreparedProjection(
         weight, kind, torch.float16, True, 512, dmv_enabled=True
     )
-    assert candidate.dmv_format == iq.IQ2_FORMATS[kind]
+    assert candidate.dmv_format == (
+        iq.U2_GROUP16 if kind == 10 else iq.IQ2_FORMATS[kind]
+    )
     for m in (1, 2, 4, 16, 32, 512):
         x = torch.randn(m, 512, device="cuda", dtype=torch.float16)
         assert torch.equal(baseline(x), candidate(x)), (kind, m)

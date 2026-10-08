@@ -35,7 +35,8 @@ enum Fmt {
   Q8 = 4,
   IQ3S = 5,
   IQ3X = 6,
-  LUT6 = 7
+  LUT6 = 7,
+  U2G16 = 13
 };
 constexpr bool is_iq3(int f) { return f == IQ3S || f == IQ3X; }
 constexpr bool is_iq2(int f) { return f >= 7 && f <= 9; }
@@ -125,6 +126,18 @@ template <int FMT>
 __device__ __forceinline__ void load(Ld<FMT>& L, const Seg& s, int t, int g,
                                      int S, int G, int lane) {
   const size_t tg = static_cast<size_t>(t) * G + g;
+  if constexpr (FMT == U2G16) {
+#pragma unroll
+    for (int st = 0; st < 4; ++st) {
+      const uint2 q = __ldcs(reinterpret_cast<const uint2*>(s.codes) +
+                             (tg * 4 + st) * 32 + lane);
+      L.c[st][0].x = q.x;
+      L.c[st][0].y = q.y;
+    }
+    L.sc = __ldcs(s.scale + (tg * 2) * 32 + lane);
+    L.hi[0] = __ldcs(s.scale + (tg * 2 + 1) * 32 + lane);
+    return;
+  }
   if constexpr (is_iq3(FMT)) {
 #pragma unroll
     for (int j = 0; j < 3; ++j)
@@ -177,6 +190,22 @@ template <int FMT, bool ExactLattice = false>
 __device__ __forceinline__ void decode(const Ld<FMT>& L, int st,
                                        uint32_t (&hw)[16], const half2* lut) {
   const uint32_t MAGIC = 0x64006400u;
+  if constexpr (FMT == U2G16) {
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      const int index = 2 * st + c;
+      const uint32_t ds =
+          index < 4 ? word(L.sc, index) : word(L.hi[0], index - 4);
+      const uint32_t cr = c == 0 ? L.c[st][0].x : L.c[st][0].y;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const uint32_t v = lop_or(cr >> (2 * j), 0x00030003u, MAGIC);
+        hw[c * 8 + j] =
+            u32(__hfma2(__hsub2(h2(v), h2(MAGIC)), lo2(ds), hi2(ds)));
+      }
+    }
+    return;
+  }
   if constexpr (is_iq3(FMT)) {
     const uint32_t* grid =
         reinterpret_cast<const uint32_t*>(lut) + (FMT == IQ3X ? 512 : 0);
@@ -750,22 +779,25 @@ void gguf_dmv_dispatch(torch::Tensor x, std::vector<torch::Tensor> codes,
   bool needs_table = false;
   int64_t main_tiles = 0;
   for (size_t i = 0; i < codes.size(); ++i) {
-    TORCH_CHECK(
-        fmt[i] == Q4K || fmt[i] == LUT4 || is_iq2(fmt[i]) || is_iq3(fmt[i]),
-        "unqualified DMV format");
+    TORCH_CHECK(fmt[i] == U2G16 || fmt[i] == Q4K || fmt[i] == LUT4 ||
+                    is_iq2(fmt[i]) || is_iq3(fmt[i]),
+                "unqualified DMV format");
     TORCH_CHECK(n[i] > 0 && n[i] % 32 == 0, "DMV N must align to 32");
     storage(codes[i], at::kByte);
     storage(scale[i], at::kByte);
     storage(high[i], at::kByte);
     const int64_t tiles = n[i] / 32;
-    TORCH_CHECK(
-        codes[i].numel() == tiles * groups * 512 * (is_iq3(fmt[i]) ? 3 : 4) &&
-            high[i].numel() == (is_iq2(fmt[i]) ? 2 * 6561 : 0) &&
-            scale[i].numel() == tiles * groups *
-                                    (fmt[i] == IQ3X  ? 128
-                                     : fmt[i] == Q4K ? 512
-                                                     : 256),
-        "DMV plane size mismatch");
+    TORCH_CHECK(codes[i].numel() == tiles * groups * 512 *
+                                        (fmt[i] == U2G16  ? 2
+                                         : is_iq3(fmt[i]) ? 3
+                                                          : 4) &&
+                    high[i].numel() == (is_iq2(fmt[i]) ? 2 * 6561 : 0) &&
+                    scale[i].numel() == tiles * groups *
+                                            (fmt[i] == IQ3X    ? 128
+                                             : fmt[i] == U2G16 ? 1024
+                                             : fmt[i] == Q4K   ? 512
+                                                               : 256),
+                "DMV plane size mismatch");
     TORCH_CHECK(out[i].device() == x.device() &&
                     out[i].scalar_type() == at::kHalf && out[i].dim() == 2 &&
                     out[i].size(0) == 8 && out[i].size(1) == n[i] &&
@@ -925,6 +957,12 @@ void gguf_dmv_dispatch(torch::Tensor x, std::vector<torch::Tensor> codes,
   CFG(A, B, IQ3X, LUT6); \
   CFG(A, B, LUT6, LUT4); \
   CFG(A, B, LUT4, LUT6);
+  // U2/group16 shares the QPN main loop and the canonical half2 affine FMA.
+  CFG(4, 2, U2G16, U2G16);
+  CFG(4, 2, U2G16, IQ3S);
+  CFG(4, 2, IQ3S, U2G16);
+  CFG(4, 2, U2G16, IQ3X);
+  CFG(4, 2, IQ3X, U2G16);
   IQ2_FMTS(4, 2);
   IQ2_FMTS(4, 4);
   IQ2_FMTS(8, 2);
@@ -986,6 +1024,31 @@ __global__ void dmv_restore(const uint4* codes, const uint8_t* scale,
   const int t = col / 32, g = step / 4, st = step % 4;
   const int lane = (col % 4) | (((col % 32) / 8) << 2) | ((col & 4) << 2);
   const int64_t tg = int64_t{t} * (k / 128) + g;
+  if (fmt == U2G16) {
+    const uint2 v =
+        reinterpret_cast<const uint2*>(codes)[(tg * 4 + st) * 32 + lane];
+    const int64_t offset = (int64_t{t} * (k / 8) + step * 4) * 32 + col % 32;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const uint32_t src = c < 2 ? v.x : v.y;
+      uint16_t result = 0;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int pos = (c % 2) * 8 + j;
+        const int shift = 2 * (pos / 2) + (pos % 2) * 16;
+        result |= ((src >> shift) & 3) << (2 * (j / 2 + (j % 2) * 4));
+      }
+      weight[offset + c * 32] = result;
+    }
+    const uint4* meta = reinterpret_cast<const uint4*>(scale);
+#pragma unroll
+    for (int c = 0; c < 2; ++c) {
+      const int group = st * 2 + c;
+      static_cast<uint32_t*>(stats)[int64_t{step * 2 + c} * n + col] =
+          word(meta[(tg * 2 + group / 4) * 32 + lane], group % 4);
+    }
+    return;
+  }
   if (fmt == LUT4) {
     const uint4 v = codes[((int64_t{t} * (k / 32) + step) * 32 + lane)];
     uint32_t* dst = reinterpret_cast<uint32_t*>(weight);
@@ -1031,28 +1094,35 @@ __global__ void dmv_restore(const uint4* codes, const uint8_t* scale,
 void gguf_dmv_restore_sm70_out(torch::Tensor weight, torch::Tensor stats,
                                torch::Tensor codes, torch::Tensor scale,
                                int64_t fmt, int64_t k, int64_t n) {
-  TORCH_CHECK(fmt == LUT4 || is_iq3(fmt), "unsupported DMV restore format");
+  TORCH_CHECK(fmt == U2G16 || fmt == LUT4 || is_iq3(fmt),
+              "unsupported DMV restore format");
   TORCH_CHECK(k > 0 && k % 128 == 0 && n > 0 && n % 32 == 0,
               "invalid DMV restore geometry");
   TORCH_CHECK(codes.is_cuda() && codes.scalar_type() == at::kByte &&
                   codes.is_contiguous(),
               "invalid DMV restore codes");
   const c10::cuda::CUDAGuard guard(codes.device());
-  TORCH_CHECK(
-      scale.device() == codes.device() && scale.scalar_type() == at::kByte &&
-          scale.is_contiguous() &&
-          codes.numel() == n / 32 * (k / 128) * 512 * (fmt == LUT4 ? 4 : 3) &&
-          scale.numel() == n / 32 * (k / 128) * (fmt == IQ3X ? 128 : 256),
-      "invalid DMV restore planes");
+  TORCH_CHECK(scale.device() == codes.device() &&
+                  scale.scalar_type() == at::kByte && scale.is_contiguous() &&
+                  codes.numel() == n / 32 * (k / 128) * 512 *
+                                       (fmt == U2G16  ? 2
+                                        : fmt == LUT4 ? 4
+                                                      : 3) &&
+                  scale.numel() == n / 32 * (k / 128) *
+                                       (fmt == U2G16  ? 1024
+                                        : fmt == IQ3X ? 128
+                                                      : 256),
+              "invalid DMV restore planes");
   TORCH_CHECK(weight.device() == codes.device() &&
                   weight.scalar_type() == at::kInt && weight.is_contiguous() &&
                   weight.numel() == n * k / (fmt == LUT4 ? 8 : 16),
               "invalid DMV transient weight");
-  TORCH_CHECK(
-      stats.device() == codes.device() && stats.is_contiguous() &&
-          stats.scalar_type() == (fmt == LUT4 ? at::kShort : at::kLong) &&
-          stats.numel() == n * (k / 32),
-      "invalid DMV transient stats");
+  TORCH_CHECK(stats.device() == codes.device() && stats.is_contiguous() &&
+                  stats.scalar_type() == (fmt == U2G16  ? at::kInt
+                                          : fmt == LUT4 ? at::kShort
+                                                        : at::kLong) &&
+                  stats.numel() == n * (k / (fmt == U2G16 ? 16 : 32)),
+              "invalid DMV transient stats");
   const int64_t count = n * (k / 32);
   dmv_restore<<<(count + 255) / 256, 256, 0,
                 at::cuda::getCurrentCUDAStream()>>>(

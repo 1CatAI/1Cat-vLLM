@@ -81,6 +81,41 @@ DMV_THREE_FORMAT_QKV: dict[tuple[str, ...], tuple[int, int, int]] = {
 }
 
 
+def u2_group16_plane_capability(source_types, k, widths, prefix, enabled=True):
+    """Only admit measured Q2_K projections and a matching native decoder."""
+    groups: list[tuple[int, int]] = []
+    for kind, width in zip(source_types, widths):
+        if groups and groups[-1][0] == kind:
+            groups[-1] = (kind, groups[-1][1] + width)
+        else:
+            groups.append((kind, width))
+    measured = (
+        prefix.endswith(".down_proj") and k == 4352 and groups == [(10, 5120)]
+    ) or (
+        prefix.endswith(".in_proj_qkvz")
+        and k == 5120
+        and groups in ([(21, 2560), (10, 1536)], [(18, 2560), (10, 1536)])
+    )
+    reason = None
+    if not enabled:
+        reason = "u2_group16_planes_disabled_by_kernel_config"
+    elif not measured:
+        reason = "u2_group16_projection_shape_or_sources_unmeasured"
+    elif not hasattr(torch.ops._C, "gguf_dmv_u2_group16_sm70_supported"):
+        reason = "operator_missing:gguf_dmv_u2_group16_sm70_supported"
+    elif not torch.ops._C.gguf_dmv_u2_group16_sm70_supported():
+        reason = "native_u2_group16_support_unavailable"
+    return GGUFOperatorCapability(
+        GGUFDecoderFamily.AFFINE,
+        "Q2_K",
+        "gguf_dmv_sm70_out",
+        True,
+        min_m=8,
+        max_m=8,
+        reason=reason,
+    )
+
+
 def three_format_qkv_capabilities(
     source_types: tuple[int, ...],
     k: int,
