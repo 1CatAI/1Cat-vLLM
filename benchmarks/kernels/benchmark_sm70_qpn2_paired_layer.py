@@ -69,6 +69,7 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--extension", type=Path, required=True)
     parser.add_argument("--mode", type=int, choices=(0, 1, 2), default=1)
+    parser.add_argument("--paired-control-extension", type=Path)
     parser.add_argument("--prepared-qk", action="store_true")
     parser.add_argument("--projection-conv-extension", type=Path)
     parser.add_argument("--cooperative-core-extension", type=Path)
@@ -76,6 +77,7 @@ def main():
     parser.add_argument("--head-local-convolution", action="store_true")
     parser.add_argument("--cooperative-no-qk-cache", action="store_true")
     parser.add_argument("--norm-partial-extension", type=Path)
+    parser.add_argument("--norm-gate-extension", type=Path)
     parser.add_argument("--norm-packet-parts", type=int, choices=(5, 10, 20), default=5)
     parser.add_argument("--warp-publish", action="store_true")
     parser.add_argument("--dump-gdn-inputs", type=Path)
@@ -90,6 +92,8 @@ def main():
     parser.add_argument("--accepted", type=int, choices=range(1, 9), default=4)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--iters", type=int, default=150)
+    parser.add_argument("--ncu-direct", action="store_true")
+    parser.add_argument("--ncu-graph", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     rank = int(os.environ["LOCAL_RANK"])
@@ -112,6 +116,15 @@ def main():
     assert spec and spec.loader
     extension = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(extension)
+    paired_control = None
+    if args.paired_control_extension:
+        spec = importlib.util.spec_from_file_location(
+            args.paired_control_extension.name.split(".")[0],
+            args.paired_control_extension,
+        )
+        assert spec and spec.loader
+        paired_control = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(paired_control)
     if args.paired_accumulators is not None:
         assert args.extension.name.split(".")[0] in (
             "qpn2_paired_acc_screen",
@@ -147,6 +160,15 @@ def main():
         assert spec and spec.loader
         packet_norm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(packet_norm)
+    norm_gate = None
+    if args.norm_gate_extension:
+        assert args.mode == 1 and packet_norm is None and cooperative is None
+        assert fused_projection is None and not args.hybrid_snapshot
+        name = args.norm_gate_extension.name.split(".")[0]
+        spec = importlib.util.spec_from_file_location(name, args.norm_gate_extension)
+        assert spec and spec.loader
+        norm_gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(norm_gate)
     if args.warp_publish:
         assert packet_norm is not None and args.norm_packet_parts == 20
         assert args.mode == 0
@@ -155,7 +177,7 @@ def main():
         assert args.mode == 0 and not args.inline_conv and not args.hybrid_snapshot
         assert fused_projection is None and cooperative is None and packet_norm is None
         spec = importlib.util.spec_from_file_location(
-            "qpn8_ba_order_screen", args.ba_order_extension
+            args.ba_order_extension.name.split(".")[0], args.ba_order_extension
         )
         assert spec and spec.loader
         ba_order = importlib.util.module_from_spec(spec)
@@ -258,6 +280,16 @@ def main():
         mlp.append(
             (w, s, bundle, projection.inverse_global_scale, projection.gated_silu)
         )
+    norm_gate_buffers = None
+    if norm_gate is not None:
+        norm_gate_group = dist.new_group(backend="gloo")
+        norm_gate_buffers = CustomAllreduce.create_shared_buffer(
+            norm_gate.buffer_bytes(), norm_gate_group
+        )
+        norm_gate.initialize(norm_gate_buffers, rank)
+        norm_gate_input = torch.empty(8, 5120, device="cuda", dtype=torch.float16)
+        norm_gate_residual = torch.empty(8, 5120, device="cuda")
+        norm_gate_weight = postnorm.float()
     candidate_gate_bundle = None
     if args.gate_group_layout:
         assert args.mode in (1, 2) and args.paired_accumulators is None
@@ -389,7 +421,7 @@ def main():
 
     seen_routes = set()
 
-    def run(mode, prepare=False, capture_inputs=False):
+    def run(mode, prepare=False, capture_inputs=False, reference=False):
         normalized, _ = input_norm(x, residual, inputnorm, 1e-6)
         if prepare and fused_projection is not None:
             q, z = x.new_empty(8, 2560), x.new_empty(8, 1536)
@@ -564,21 +596,46 @@ def main():
             epilogue_scale.out(projected, core, outq, outs)
         else:
             ops.fp8_qpn8_gemm_sm70_out(projected, core, outq, outs, 12, 2, True, False)
-        p, r = boundary(projected, residual, postnorm, 0, prepare)
+        if prepare and norm_gate is not None:
+            seen_routes.add("resident_norm_gate")
+            _, scales, bundle, scale, _ = mlp[0]
+            norm_gate.fused(
+                up,
+                norm_gate_input,
+                norm_gate_residual,
+                projected,
+                residual,
+                norm_gate_weight,
+                bundle,
+                scales,
+                scale,
+                norm_gate_buffers,
+                rank,
+            )
+            p, r = norm_gate_input, norm_gate_residual
+        else:
+            p, r = boundary(projected, residual, postnorm, 0, prepare)
         for item, operand, result in ((mlp[0], p, up), (mlp[1], up, down)):
             w, s, bundle, scale, gated = item
+            if gated and prepare and norm_gate is not None:
+                continue
             if not gated and prepare and args.warp_publish:
                 packet_norm.project(
                     result, operand, bundle, s, scale, packet_buffers, rank
                 )
-            elif gated and mode:
+            elif gated and (mode or paired_control is not None):
                 pair_bundle = (
                     candidate_gate_bundle
-                    if candidate_gate_bundle is not None
+                    if candidate_gate_bundle is not None and not reference
                     else bundle
                 )
                 seen_routes.add("paired_gate")
-                extension.pair(result, operand, pair_bundle, s, scale, mode)
+                pair_extension = (
+                    paired_control
+                    if reference and paired_control is not None
+                    else extension
+                )
+                pair_extension.pair(result, operand, pair_bundle, s, scale, mode or 1)
             else:
                 extension.launch(result, operand, bundle, s, table, scale, gated, 0)
         return boundary(down, r, inputnorm, 1, prepare)
@@ -614,12 +671,36 @@ def main():
         reconstructed.index_copy_(0, indices.long(), recovered)
         return reconstructed
 
+    if args.ncu_direct or args.ncu_graph:
+        assert paired_control is not None
+        reset()
+        eviction.fill_(1)
+        torch.cuda.synchronize()
+        dist.barrier()
+        run(1, reference=True)
+        torch.cuda.synchronize()
+        dist.barrier()
+        if args.ncu_graph:
+            graph = torch.cuda.CUDAGraph()
+            with ca.capture(), torch.cuda.graph(graph):
+                reset()
+                eviction.fill_(1)
+                run(1, reference=True)
+            torch.cuda.synchronize()
+            dist.barrier()
+            graph.replay()
+            torch.cuda.synchronize()
+            dist.barrier()
+        return
+
     differences = []
     for amplitude in (0.01, 0.125, 1.0, 4.0):
         x.normal_().mul_(amplitude)
         reset(0)
         control_out = run(
-            0, capture_inputs=args.dump_gdn_inputs is not None and amplitude == 0.125
+            1 if paired_control is not None else 0,
+            capture_inputs=args.dump_gdn_inputs is not None and amplitude == 0.125,
+            reference=True,
         )
         golden = [v.clone() for v in control_out] + [state.clone(), hist.clone()]
         reset(1)
@@ -633,7 +714,8 @@ def main():
             or inline_kernel is not None
             or ba_order is not None
             or epilogue_scale is not None
-            or head_local is not None,
+            or head_local is not None
+            or norm_gate is not None,
         )
         for result, reference in zip(
             list(candidate_out) + [candidate_state(), hist], golden
@@ -655,6 +737,7 @@ def main():
                 and cooperative is None
                 and inline_kernel is None
                 and head_local is None
+                and norm_gate is None
                 and epilogue_scale is None
                 and args.paired_accumulators is None
                 and not (packet_norm is not None and args.norm_packet_parts != 5)
@@ -674,13 +757,19 @@ def main():
                 or inline_kernel is not None
                 or ba_order is not None
                 or epilogue_scale is not None
-                or head_local is not None,
+                or head_local is not None
+                or norm_gate is not None,
             )
             if arm
-            else (0, False)
+            else (
+                1 if norm_gate is not None or paired_control is not None else 0,
+                False,
+            )
         )
         reset(arm)
-        run(mode, prepare)
+        run(mode, prepare, reference=not arm)
+        if arm and norm_gate is not None:
+            assert "resident_norm_gate" in seen_routes
         if arm and head_local is not None:
             assert "head_local_core" in seen_routes
         if arm and epilogue_scale is not None:
@@ -696,7 +785,7 @@ def main():
             reset(arm)
             eviction.fill_(1)
             start.record()
-            run(mode, prepare)
+            run(mode, prepare, reference=not arm)
             end.record()
         counts.append(nodes(graph))
         graph.instantiate()
@@ -706,6 +795,7 @@ def main():
         or cooperative is not None
         or inline_kernel is not None
         or head_local is not None
+        or norm_gate is not None
     ) + int(args.head_local_convolution)
     assert counts[0]["types"].get("0") - difference == counts[1]["types"].get("0")
     samples = [[], []]
@@ -719,6 +809,7 @@ def main():
     result = {
         "rank": rank,
         "mode": args.mode,
+        "paired_control": paired_control is not None,
         "control_mean_us": statistics.mean(samples[0]),
         "candidate_mean_us": statistics.mean(samples[1]),
         "samples_us": samples,
@@ -742,6 +833,10 @@ def main():
         "epilogue_scale": epilogue_scale is not None,
         "head_local_core": head_local is not None,
         "head_local_convolution": args.head_local_convolution,
+        "resident_norm_gate": norm_gate is not None,
+        "resident_norm_gate_single_ready": (
+            bool(norm_gate.single_ready) if norm_gate is not None else None
+        ),
         "inline_source_sha256": inline_source_sha256,
         "hybrid_source_sha256": hybrid_source_sha256,
         "accepted": args.accepted,
@@ -749,7 +844,9 @@ def main():
         "scope": (
             "Complete real-weight TP4 layer0 GDN graph; "
             + (
-                "unchanged projections/BV2 recurrence; exact factor replay with "
+                "unchanged paired-gate operands/BV2 recurrence; resident norm prefix."
+                if norm_gate is not None
+                else "unchanged projections/BV2 recurrence; exact factor replay with "
                 f"{args.hybrid_snapshots} state snapshots."
                 if args.hybrid_snapshot
                 else (
@@ -784,6 +881,10 @@ def main():
         dist.barrier()
         CustomAllreduce.free_shared_buffer(packet_inputs, rank=rank)
         CustomAllreduce.free_shared_buffer(packet_buffers, rank=rank)
+    if norm_gate_buffers is not None:
+        torch.cuda.synchronize()
+        dist.barrier()
+        CustomAllreduce.free_shared_buffer(norm_gate_buffers, rank=rank)
     ca.close()
     dist.destroy_process_group()
 

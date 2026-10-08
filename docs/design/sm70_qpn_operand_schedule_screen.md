@@ -351,6 +351,88 @@ another service benchmark. Retain the result as a rejected screen.
 
 ## Reproduction and evidence
 
+### Resident norm/gate prefix and product-table screens
+
+A cooperative, fully resident norm/gate kernel reduces the timed layer from
+ten compute nodes to nine. The first forty CTAs publish the original five
+variance parts and finish the unchanged residual/norm arithmetic; all paired
+gate CTAs then consume the normalized input. Four input amplitudes reproduce
+output, residual, state and history bitwise on all four ranks. Nevertheless,
+the critical-rank layer regresses from 160.461 to 162.273 us, a saving of
+-1.812 us with 95% CI [-3.221, -0.712]. Joining the forty completion flags in
+one CTA before broadcasting a single ready flag improves the candidate but
+still regresses: 158.976 to 159.806 us, saving -0.830 us with CI
+[-1.746, -0.057]. Reject both. Fewer graph nodes do not prove lower latency.
+
+A separate native-bundle code transformation keeps the original 288 bytes
+per K16/N32 block but indexes exact half2 scale/code products from a 256-KiB
+table. Both M8 projections match the original products and outputs bitwise
+at four amplitudes. The cold-L2 MLP graph regresses from 66.058 to 169.472 us;
+the saving is -103.414 us with CI [-103.624, -103.153]. Reject global product
+lookup. CUDA-event graph timing and NCU kernel timing are separate evidence.
+
+NCU direct-launch measurements at 1290/877 MHz confirm why the large table
+fails. DRAM bytes remain nearly constant but the scattered lookup multiplies
+L1/TEX traffic. Values below are decimal MB and GB/s, with NCU replay/cache
+control enabled; they are not end-to-end latency measurements.
+
+| Kernel | DRAM MB | DRAM GB/s | L1/TEX MB | L2 MB | Active CTA/SM | Active warps/SM | Long scoreboard |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Paired gate control | 25.603 | 545.761 | 40.864 | 32.511 | 1.677 | 13.399 | 37.00% |
+| Down control | 13.135 | 513.089 | 31.862 | 18.330 | 1.946 | 30.864 | 47.77% |
+| Global product gate | 25.636 | 228.045 | 718.525 | 42.427 | 1.807 | 14.449 | 19.22% |
+| Global product down | 13.204 | 237.816 | 368.369 | 21.714 | 1.760 | 28.044 | 14.94% |
+
+Long-scoreboard percentage decreases in the rejected candidate while total
+time more than doubles. It must not be read as a performance improvement.
+The follow-up uses magnitude-only products, reconstructs signs with PRMT,
+and stages only the real layer's scale-code range into shared memory. The
+table rows have 65 entries to avoid aligning every scale row to the same
+shared-memory banks. Layer 0 uses 44 and 60 scale-code entries; shared staging
+adds about 11/15 KiB per CTA. All four amplitude checks remain bitwise.
+It still regresses: 66.135 to 103.977 us, saving -37.842 us with CI
+[-38.113, -37.575]. Compressed global lookup regresses 66.463 to 135.982 us,
+saving -69.519 us with CI [-69.750, -69.253]. Reject both; reducing the
+arithmetic and table footprint does not compensate for the lookup chain.
+The first harness run tried a min reduction on Float8 rather than its raw
+scale codes, failed before timing, and was corrected to a uint8 view.
+
+### Comparisons against the admitted paired and packet controls
+
+The layer harness can now name a separate paired control extension. Its
+reference graph uses the original bundle with sequential paired warps; the
+candidate uses its own layout or schedule. Adjacent gate/up groups no longer
+show a distinct benefit: 161.439 to 161.300 us, saving 0.138 us with CI
+[-0.661, 0.911]. All four ranks retain bitwise results. The earlier apparent
+gain included the shared-activation paired-kernel benefit; do not count it
+again after admission.
+
+Twenty-part norm with paired projections improves the old artifact's complete
+layer by 1.300 us, CI [0.844, 1.813]. Against the admitted ordinary artifact,
+the old twenty-part extension regresses by 1.449 us, CI [-2.929, -0.261].
+Passing the local pointer independently restores a small 0.379-us saving,
+but CI [-0.015, 0.799] crosses zero. The combined twenty-part norm and down
+publisher changes the admitted layer by -0.323 us, CI [-1.008, 0.359]. No
+further collective or publisher speed admission follows from these screens.
+
+A resident-slice screen divides the same eight K slices between two
+four-warp CTAs per output tile. Cooperative occupancy is checked before
+launch. The final FP32 sums retain their original order, and four amplitudes
+match gate/down bits. It adds a 2,228,224-byte intermediate buffer and release
+flags. The complete cold MLP regresses 65.833 to 73.856 us, saving -8.023 us
+with CI [-8.305, -7.778]. Reject: redistribution does not compensate for its
+cross-CTA partial communication. There is no deployed workspace or graph-node
+reduction from this experiment.
+
+The b/a all-rows screen reduces its appended CTAs from 96 to 12, reusing each
+weight pair across eight token rows while retaining each row's original FMA
+and two-level warp reduction order. The fused launch drops from 224 to 140
+CTAs; compiler allocation stays at 56 registers and 16 KiB shared without
+spills. Full TP4 layer output/residual/state/history match at four amplitudes.
+Nevertheless, critical-rank timing is 156.313 to 157.153 us, saving -0.839 us
+with CI [-2.124, 0.082]. Do not promote weight reuse or the smaller grid as a
+latency gain; the longer per-CTA row work does not clear the layer gate.
+
 Benchmarks are under `benchmarks/kernels/`:
 
 - `benchmark_sm70_qpn2_effective_scale.py`
@@ -371,6 +453,11 @@ Benchmarks are under `benchmarks/kernels/`:
 - `sm70_gdn_inline_conv_screen.py`
 - `build_sm70_qpn8_ba_order.py`
 - `build_sm70_qpn2_paired_accumulators.py`
+- `build_sm70_norm_gate_screen.py`
+- `benchmark_sm70_qpn2_product_lookup.py`
+- `benchmark_sm70_qpn2_shared_product.py`
+- `benchmark_sm70_qpn2_resident_slices.py`
+- `build_sm70_qpn8_ba_allrows.py`
 
 The layer benchmark loads the extension generated by the paired-gate benchmark.
 `--mode 1` selects sequential paired warps; `--mode 0 --prepared-qk` isolates
