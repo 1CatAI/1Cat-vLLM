@@ -120,6 +120,11 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                 self.flash_attn_prefill_paged, "anchor_lens"
             )
         )
+        # Feature hooks can wrap the callable in functools.partial. Capture the
+        # packaged native contract before those wrappers hide its attributes.
+        self._native_fp8_prefill_supported = _routing.native_prefill_supports_codec(
+            self.flash_attn_prefill_paged, self.kv_codec
+        )
         ATTENTION_HOOKS.configure_prefill(self)
         paged_prefill_enable = os.getenv("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
         paged_prefill_disable = (

@@ -129,7 +129,8 @@ performance regression), lands as its own PR and can be reverted alone.
    grouped FP16/E4M3 admission and native-family ownership consolidated;
    shared E4M3/FP16 planning introduced with a native revision gate;
    CUDA storage traits reuse #1048's reader and remove native-family copies;
-   next: FP8 bridge fallback policy, INT8 interface and MoE,
+   explicit native-prefill codec capability now gates the counted bridge fallback;
+   next: INT8 interface and MoE,
    metadata and implementation feature hooks plus method composition done;
    common attention entrypoints contain no family names.)*
 5. **Kernels and build** — consolidate extension modules, mark retired variant files deprecated,

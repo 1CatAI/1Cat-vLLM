@@ -268,7 +268,12 @@ _declare(
     codecs=frozenset((FP8_E4M3, FP8_E5M2)),
     head_dims=(256,),
 )
-_declare("prefill_prefix_fp8_e4m3_bridge", "prefill", codecs=frozenset((FP8_E4M3,)))
+_declare(
+    "prefill_prefix_fp8_e4m3_bridge",
+    "prefill",
+    codecs=frozenset((FP8_E4M3,)),
+    fallback=True,
+)
 _declare(
     "decode_strategy_legacy_revision",
     "decode",
@@ -276,7 +281,18 @@ _declare(
     fallback=True,
     observer=True,
 )
-_declare("prefill_prefix_fp8_e5m2_bridge", "prefill", codecs=frozenset((FP8_E5M2,)))
+_declare(
+    "prefill_prefix_fp8_e5m2_bridge",
+    "prefill",
+    codecs=frozenset((FP8_E5M2,)),
+    fallback=True,
+)
+_declare(
+    "prefill_prefix_paged",
+    "prefill",
+    codecs=_NATIVE_CODECS,
+    head_dims=(16, 32, 64, 128, 256),
+)
 _declare(
     "prefill_no_prefix_dense_flash prefill_no_prefix_paged_cache_flash "
     "prefill_prefix_bfla prefill_prefix_contig_dense "
@@ -470,6 +486,23 @@ _logged_kv_dtype_contracts: set[str] = set()
 _route_summary_registered = False
 _route_counts: dict[str, int] = {}
 _fallback_counts: dict[str, int] = {}
+
+
+def native_prefill_supports_codec(operator: object, codec: KVCodec | None) -> bool:
+    """Explicit general-prefill capability, captured once by the backend.
+
+    A Python signature or an FP16 FA2 kernel does not prove a native FP8 reader
+    is installed. Older artifacts keep the counted bridge fallback.
+    """
+    names = getattr(operator, "native_kv_codecs", ())
+    return (
+        codec in _NATIVE_CODECS
+        and isinstance(names, tuple)
+        and codec is not None
+        and codec.name in names
+    )
+
+
 _decode_active_trace_signatures: set[tuple[object, ...]] = set()
 _DEFAULT_DECODE_PARTITION_SIZE = 256
 _VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)

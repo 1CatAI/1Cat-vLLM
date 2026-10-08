@@ -230,7 +230,9 @@ def test_every_literal_accounting_site_uses_a_declared_spec():
                 route = ast.literal_eval(arg.value.slice)
                 assert route in r.ROUTE_SPECS
                 hits.append(route)
-    assert len(set(hits)) == 44
+    # Retain the original 44 counters and the A5b general native-prefill route.
+    assert "prefill_prefix_paged" in hits
+    assert len(set(hits) - {"prefill_prefix_paged"}) == 44
 
 
 @pytest.mark.parametrize(

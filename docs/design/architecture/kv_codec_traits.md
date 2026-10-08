@@ -29,9 +29,32 @@ ABI. BF16 payloads are not a native reader specialization.
 
 `paged_to_contiguous_old.cu` and `paged_to_contiguous_fixed.cu` are deprecated
 experimental variants retained for reproduction. Production builds use
-`paged_to_contiguous.cu`. The FP8 bridge remains available; changing its route
-priority and making every bridge selection an explicit fallback is a separate
-behavior-change scope.
+`paged_to_contiguous.cu`.
+
+## Native prefill and bridge fallback
+
+The packaged general paged-prefill function advertises `native_kv_codecs`,
+copied from the loaded extension's `prefill_paged_native_kv_codecs` declaration.
+The declaration covers FP16/E4M3/E5M2 in that entry point only; FA2 and split-KV
+have narrower contracts. Backend initialization captures this capability
+before feature hooks wrap the callable in `functools.partial`.
+
+When the installed general operator supports the selected codec, prefix
+prefill reads the original compressed cache and bypasses the bridge. Its
+selection is visible as `prefill_prefix_paged`. The existing FP8 bridge is
+eligible only without a declared native reader and within its original
+shape/layout/policy contract. Older extensions lacking the declaration retain
+their previous selection. The two existing outer bridge route names are now
+declared fallbacks, logged once and counted even without debug routing enabled;
+the nested exact-route details do not double-count the fallback. Direct helper
+calls also reject bridge execution when native support has been captured.
+
+This is an intentional routing change for rebuilt extensions, separate from
+the reader extraction. It can select the general paged kernel instead of
+bridge plus FA2. Output error and performance relative to the bridge are
+unmeasured; no speedup or latency acceptance is claimed. The legacy environment
+adapter still disables bridge eligibility when set to zero, and does not
+override the native-reader preference when set to one.
 
 ## Static validation
 

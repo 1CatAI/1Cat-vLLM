@@ -49350,3 +49350,39 @@ Experimental paged_to_contiguous_old/fixed files are retained with deprecation
 headers. FP8 bridge route priority is unchanged here; its fallback policy is
 an intentional separate A5b scope. Layering totals remain model 2325 /
 platform 3964 / raw env 334. Artifacts: /home/ymzx/arch-ws/tmp/a5-*.
+
+## 2026-10-08 — architecture A5b native-reader bridge fallback
+
+Stack on A5a #1061 (`1b81240416c8e65df24b396a3ecc730e5eeb4277`) in
+/home/ymzx/arch-ws/v100-arch-fp8-bridge-20261008-104806, branch
+agent/v100-arch-fp8-bridge-20261008-104806. Intentional policy change: the general
+native paged-prefill entry point advertises its FP16/E4M3/E5M2 readers; backend
+initialization captures that declaration before feature hooks hide callable
+attributes inside functools.partial. A first constructor test found this
+wrapper issue and localized the fix. Do not infer native support from an
+operator's Python signature or apply the declaration to FA2/split-KV.
+
+Native-supported FP8 prefix prefill uses compressed uint8 K/V with unchanged
+scalar scales and the declared prefill_prefix_paged route. Bridge admission
+and direct helper execution are disabled when native support is captured.
+Old extensions without the declaration retain bridge selection. The existing
+outer E4M3/E5M2 bridge counters are explicit fallbacks, counted once independently
+of debug-route enablement; nested exact-route details do not count again.
+The legacy bridge disable switch remains honored.
+
+Focused CPU tests: 46 passed (25 capability/constructor/dispatch/interface cases,
+three method compatibility cases, 18 existing prefill cases). The preserved
+method-body oracle now protects 41 of 47 unaffected methods; its six exceptions
+are intentional A4b/A5b policy changes, with dedicated tests. GPU numerical
+error, timing, replay and actual routes are unmeasured by user instruction.
+This may replace bridge + FA2 with the general paged kernel; no performance
+acceptance is claimed. Remains Draft. No native arithmetic changed in this
+scope. Layering totals remain model 2325 / platform 3964 / raw env 334.
+Evidence: /home/ymzx/arch-ws/tmp/a5b-*.
+
+A5b retained routing matrix plus focused bridge/legacy checks: 318 passed;
+the sole initial failure was the frozen literal-counter count (44), now
+updated to require the original 44 plus prefill_prefix_paged. That counter
+check passes separately. Host C++ binding syntax exits 0 with the proper
+flash-attention-v100/include path. Applicable pre-commit/mypy/layering hooks
+pass; newly added route accounting changes telemetry intentionally.

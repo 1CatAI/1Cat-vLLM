@@ -66,6 +66,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Small noncausal DFlash2 paged attention in direct BMHD layout");
   m.def("prefill_paged_fwd", &flash_attention_prefill_paged,
         "FlashAttention prefill over paged KV cache (Volta)");
+  // Only the general paged-prefill entry point has all three readers. FA2 and
+  // split-KV have narrower contracts and must not inherit this declaration.
+  m.attr("prefill_paged_native_kv_codecs") =
+      pybind11::make_tuple("auto", "fp8_e4m3", "fp8_e5m2");
   m.def("prefill_paged_d256_bm32_allp_pair_scratch_fwd",
         &flash_attention_prefill_paged_d256_bm32_allp_pair_scratch,
         "Fixed causal D256 BM32 ALL_P pair-scratch paged prefill (SM70)");

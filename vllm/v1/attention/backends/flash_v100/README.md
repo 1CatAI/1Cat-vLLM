@@ -65,7 +65,10 @@ The method fixture records normalized parent calculation hashes for all 47
 methods. Normalize docstring indentation, typed-self annotations, moved state
 qualification and the explicit super receiver; other calculation nodes must
 match. Mechanical feature hook calls are expanded back into their calculation
-bodies, with argument order checked; the same 47 parent hashes still match.
+bodies, with argument order checked. All 47 method descriptors remain checked;
+41 unchanged calculation bodies still match. Initialization, decode and mixed
+decode hints, bridge admission/execution and prefix dispatch have intentional
+A4b/A5b policy changes covered by dedicated tests.
 
 ## Speculative metadata hooks
 
@@ -120,3 +123,18 @@ evidence. GPU output error, route traces and timing have not been measured;
 no speedup or numerical-equivalence claim is made. The older p256 measurement
 alone does not describe the current p64/p256/wave source, and wave admission
 also depends on the forwarded context bound. Retain those experimental paths.
+
+## FP8 bridge fallback
+
+The loaded general paged-prefill operator declares `native_kv_codecs`.
+Initialization captures it before feature hooks wrap the callable. Declared
+FP8 readers bypass bridge allocation/conversion and receive compressed uint8
+cache tensors with the original scales. Older extensions retain the existing
+bridge admission. Each outer E4M3/E5M2 bridge route is logged and counted as one
+fallback, including when debug routing is disabled; nested exact-route details
+remain separate. General native dispatch is recorded as `prefill_prefix_paged`.
+
+This policy changes the route for rebuilt extensions and may replace bridge
+plus FA2 with a general kernel. GPU output error, timing and replay are
+unmeasured. See [native codec contracts](../../../../../docs/design/architecture/kv_codec_traits.md)
+for ownership and compatibility details.

@@ -134,12 +134,15 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                         _Normalize().visit(_InlineFeatureHooks().visit(fn))
                     ).encode()
                 ).hexdigest()
-    # A4b deliberately changes policy capture and the two hint consumers.
+    # A4b changes policy capture/hints; A5b gates the bridge on native readers.
     # Preserve every other calculation body; route planning has its own oracle.
     changed_policy = {
         "__init__",
         "_flash_v100_decode",
         "_run_prefill_prefix_decode_rows",
+        "_should_use_fp8_prefill_bridge",
+        "_run_fp8_prefill_bridge",
+        "_flash_v100_prefill_with_prefix",
     }
     assert actual.keys() == fixture.keys()
     assert {k: v for k, v in actual.items() if k not in changed_policy} == {
