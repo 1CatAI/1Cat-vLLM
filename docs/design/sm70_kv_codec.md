@@ -262,6 +262,34 @@ number of tokens. Hybrid groups need exact divisibility/alignment proofs and
 padding accounting; forcing all formats to the historical FP16 page geometry
 without measuring is not justified. Include scale storage in host/CPU budget.
 
+### Packed-load alignment before native INT8 admission
+
+The existing inline token/head FP32 scale gives a D256 byte-payload head a
+260-byte stride. For consecutive physical heads/rows, alternate bases are
+4 modulo8. `KVReader::load_half8` currently divides the row offset by8 to
+address an aligned64-bit word, which is valid for admitted FP8 layouts. Adding
+an INT8 template without changing that load would round such an offset down
+and read four bytes from the preceding scale/payload. INT8 is currently
+rejected by its template assertion; this is a future-admission constraint,
+not an observed defect in supported FP8 paths.
+
+The [CUDA12.8 size/alignment contract](https://docs.nvidia.com/cuda/archive/12.8.1/cuda-c-programming-guide/index.html#device-memory-accesses)
+requires naturally aligned8/16-byte accesses. Keep the reader's physical row
+base separate from its vector column. Evaluate exact-address aligned32-bit
+loads for the existing260-byte protocol before adding allocator padding;
+measure their instruction/bandwidth cost on SM70. Do not silently truncate a
+physical offset or add unbudgeted padding to reuse a64-bit FP8 load.
+
+For D256 and one KV head, token/head FP32 K/V needs520 candidate bytes/token.
+Mixed token/head FP32 K with feature-group32 FP16 V needs260+272=532. A shared
+272-byte head stride for both sides would require544 bytes, erasing that
+mixed candidate's storage advantage over grouping both sides by32. An
+8-byte-aligned264-byte token/head stride would require528 bytes. These are
+layout projections, not implemented codecs or measured performance results.
+The codec must explicitly own chosen alignment, distinct K/V strides and scale
+regions so page/Mamba/prefix/offload accounting uses the physical cost. Retain
+the current layout until a measured change qualifies an alternative.
+
 ## Dense storage descriptor migration
 
 `vllm/v1/kv_cache_codec.py` owns the existing `KVQuantMode` enumeration and
