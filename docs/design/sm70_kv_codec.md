@@ -280,7 +280,7 @@ Initial real-request NVFP4/GGUF samples have been collected; the three-model cor
 and independent E4M3 scale check remain incomplete. No default is selected.
 See [the initial request-data comparison](sm70_kv_initial_request_errors.md).
 
-## Real-request dense capture adapter
+## Real-request capture adapters
 
 `tools/kv_codec/capture.py` uses vLLM's public `LLM.collective_rpc` API to install
 short-lived diagnostic pre/post hooks on the first/middle/last dense attention
@@ -293,8 +293,9 @@ FP16 KV, eager execution, no prefix reuse or draft/MTP. Chunked prefill remains
 enabled for hybrid-model compatibility, but the request must fit in a single
 batch and its actual query boundaries/sequence lengths must prove a complete
 first prefill. Any padded, partial, shared-cache or unsupported attention
-capture fails explicitly. QSA/MLA masks need a separate adapter; a dense mask
-must not be substituted for their selected keys.
+capture fails explicitly. Dense and QSA use separate adapters; a dense mask
+must not be substituted for selected QSA keys. MLA, DCP-sharded QSA and draft
+capture remain unsupported.
 
 The adapter saves unquantized post-RoPE Q/K and V, the final 16 query positions,
 all prompt keys/values, causal/window masks and complete int64 request token IDs.
@@ -307,6 +308,25 @@ scalars are labeled as such: they do not prove independent production E4M3
 calibration. Recheck E4M3 scales before format selection. No default is selected
 until all three model/request corpora and the required quality/performance gates
 are complete.
+
+`--adapter qsa` observes the first/middle/last NVIDIA QSA layer after its real
+indexer has run. It retains the actual selected logical indices, compression
+ratio, addressed raw/compressed state rows and compressed sequence lengths.
+The first-prefill physical main-cache mapping must match unencoded FP16 K/V.
+Empty, duplicate, future and out-of-range selections fail explicitly; a Boolean
+mask must not silently collapse repeated keys and change their softmax weight.
+The masked FP32 oracle evaluates precisely these selected keys.
+
+Diagnostic observers delegate to the existing installed native grouped/page4
+XQA helpers and Triton split-K launch, recording only successful executed calls;
+per-layer samples require a positive executed-route delta. Finish restores the
+original methods/launch objects. No scheduling or kernel arithmetic is replaced.
+The manifest now also retains the capture-tool hash and byte-checks installed
+QSA owner/indexer/attention source against the normal wheel. Eight CPU checks
+cover sparse-oracle equality, rejected selection semantics, addressed/strided
+state rows and unchanged observed launch arguments/failures. These checks do
+not qualify the real QSA adapter: its first model capture remains pending an
+idle locked TP4 lease and checksum-verified Flash-Next weights.
 
 ## Triton writer tile interface
 

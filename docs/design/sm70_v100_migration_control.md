@@ -49187,3 +49187,13 @@ that rejected form changed pointer evaluation and ptxas RMSNorm FMA order.
 GPU/operator and installed-model gates remain pending while another TP4 job
 occupies the authorized host. Page448 wheel has installed normally with
 compatible declared dependencies; no occupied GPU was used for validation.
+
+The QSA capture adapter now records actual indexer selections and addressed
+compression state, and asserts executed native/grouped/Triton attention calls.
+Eight CPU semantic checks pass; no real Flash-Next/QSA dataset is claimed yet.
+The fixed IQ3_XXS second shard has passed its manifest checksum on54633; the
+first shard is still downloading into the owned NVMe task directory. Retain
+TP4 and packed PLE handling; never materialize the full PLE table in FP16.
+Normal source8794 wheel is built, native15/16 libraries are byte-identical to
+page448 and the remaining complete FA2 SM70 SASS matches. GPU locks remain
+occupied by another task even when GPUs1/2 are idle; do not bypass global locks.
