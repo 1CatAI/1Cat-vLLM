@@ -85,3 +85,12 @@ including M1/5/20/512 official decoder comparisons, changing graph inputs,
 and M5/20 mapped-buffer consumption followed by acknowledgement. The model
 A/B disables direct QSA and complete-table pinned decode in both arms, and
 changes only the packed-result capability.
+
+The post-spawn registration revision is `6bca559d35`; its normally installed
+wheel SHA-256 is
+`ba8eba58ed6fb4ad79b341a7e53a82cf3b5ff284d9cebd312dcb5afded4417b7`.
+All 17 native modules and the GPU result decoder retain the initial measured
+implementation. Six added CPU tests pass in this wheel, including real
+four-rank mapped-buffer registrations from a frozen configuration snapshot.
+Both pending model arms use this revision; earlier producer timings and GPU
+replay checks remain isolated evidence, not model qualification.
