@@ -79,7 +79,15 @@ without protected page resolution or miss staging. It uses the same compact
 page4 count, split assignment, online softmax and FP16 PV boundary. New
 isolated tests compare directly with the protected reader in addition to the
 FP32 oracle, including long and short contexts, E4M3 and FP16 histories and
-changed-input graph replay. GPU qualification for this revision is pending.
+changed-input graph replay. The arithmetic-preserving revision passes 21
+normally installed-wheel GPU cases, including strided queries and gates.
+Direct/protected outputs match bit-exactly. A matched, synthetic-selector
+chain with 12 target and four draft calls measures M5 1077.568→885.920 us and
+M20 1527.008→1380.992 us, with 64→32 kernels. All 16 calls and changed-query
+replays match the control exactly; both retain the same FP32-oracle error.
+These 0.192/0.146 ms reductions are below the structural optimization budget,
+so this revision has no new model timing or acceptance claim. Model tests of
+the independent packed PLE result change keep direct QSA disabled.
 
 A probability-decomposition variant replaces scalar PV with three tensor-core
 products and an FP32 residual. Independent power-of-two scaling preserves
