@@ -12,6 +12,12 @@ import copy
 from vllm.v1.attention.backends.flash_v100 import prefill, prefill_candidates
 
 OPS = {
+    "supports_bmhd": "self._flash_prefill_paged_supports_dflash2_bmhd",
+    "split_pages": "self._flash_prefill_paged_dflash2_split_pages",
+    "tree_prefill": "self._flash_v100_ddtree_small_query_prefill_dense",
+    "small_query": "self._flash_v100_small_query_prefill_as_decode",
+    "allow_rows": "self._prefill_prefix_decode_rows_allowed",
+    "decode_rows": "self._run_prefill_prefix_decode_rows",
     "bridge": "self._run_fp8_prefill_bridge",
     "run_paged": "self._run_prefill_paged_call",
     "should_bridge": "self._should_use_fp8_prefill_bridge",
@@ -45,7 +51,17 @@ class SequenceLocals(ast.NodeTransformer):
                 assert ast.unparse(call.func.value) == "self.executor.ops"
                 assert [ast.unparse(a) for a in call.args] == [
                     "self.executor.config",
-                    *(["fa2_route"] if name == "log_fa2" else []),
+                    *(
+                        ["fa2_route"]
+                        if name == "log_fa2"
+                        else [
+                            "request.num_seqs",
+                            "request.max_query_len",
+                            "request.block_size",
+                        ]
+                        if name == "log_noncausal"
+                        else []
+                    ),
                 ]
                 assert not call.keywords
                 return [self.visit(copy.deepcopy(n)) for n in self.logs[name].body]
@@ -56,7 +72,9 @@ class SequenceLocals(ast.NodeTransformer):
         if owner in ("self.executor.ops", "self.ops"):
             return parse(OPS[node.attr])
         if owner == "request":
-            return ast.Name(node.attr, node.ctx)
+            return ast.Name(
+                "dflash_dump" if node.attr == "dump_enabled" else node.attr, node.ctx
+            )
         if owner in (
             "config",
             "config.policy",
@@ -218,3 +236,65 @@ def sequence_calculations():
     ):
         chain = [ast.If(test, body, chain)]
     return normalize(result + chain)
+
+
+def batch_calculations():
+    from pathlib import Path
+
+    tree = ast.parse(Path(prefill_candidates.__file__).read_text())
+    classes = {
+        n.name: {f.name: f for f in n.body if isinstance(f, ast.FunctionDef)}
+        for n in tree.body
+        if isinstance(n, ast.ClassDef)
+    }
+    order = next(
+        n.value
+        for n in tree.body
+        if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == "BATCH_CANDIDATES"
+    )
+    assert isinstance(order, ast.Tuple)
+    names = [ast.unparse(n) for n in order.elts]
+    assert names == [
+        "NoncausalBatch",
+        "TreeBatch",
+        "SmallQueryBatch",
+        "DecodeRowsBatch",
+    ]
+    assert [ast.unparse(n) for n in classes["PrefillExecutor"]["batch"].body] == [
+        "result = _plan.try_execute(request, (candidate(self) "
+        "for candidate in BATCH_CANDIDATES))",
+        "return PrefillBatchResult(False, None, set()) if result is None else result",
+    ]
+    result = []
+    for index, name in enumerate(names):
+        admit = classes[name]["admit"].body
+        assert len(admit) == 1 and isinstance(admit[0], ast.Return)
+        condition = copy.deepcopy(admit[0].value)
+        assert condition is not None
+        body = copy.deepcopy(classes[name]["run"].body)
+        returned = body.pop()
+        assert isinstance(returned, ast.Return)
+        value = returned.value
+        assert (
+            isinstance(value, ast.Call)
+            and ast.unparse(value.func) == "PrefillBatchResult"
+        )
+        assert not value.keywords and len(value.args) == 3
+        if index < 3:
+            assert ast.unparse(value.args[0]) == "True"
+            assert ast.unparse(value.args[2]) == "set()"
+            body.append(ast.Return(value.args[1]))
+        else:
+            assert [ast.unparse(a) for a in value.args] == [
+                "False",
+                "None",
+                "decode_rows",
+            ]
+            result += ast.parse("decode_rows: set[int] = set()").body
+        result.append(ast.If(condition, body, []))
+    logs = {
+        n.name: n
+        for n in ast.parse(Path(prefill.__file__).read_text()).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("log_")
+    }
+    return SequenceLocals(logs).visit(ast.Module(result, [])).body

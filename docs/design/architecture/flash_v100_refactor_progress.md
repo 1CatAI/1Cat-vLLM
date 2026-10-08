@@ -21,8 +21,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
 | 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
 | 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
-| 5a: per-sequence prefill candidates | — | CPU/golden/strict passed | Largest function 977 → 529; private 358 → 348 | Required after prerequisites | Rebase and GPU gates |
-| 5b: batch prefill candidates | — | Not started | — | Required | Step 5a gates |
+| 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | GPU gates |
+| 5b: batch prefill candidates | — | CPU/golden/strict passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
 | 5c: debug observer | — | Not started | — | Required | Step 5b gates |
 | 6: registered speculative features | — | Not started | — | Required | Step 5c gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
@@ -558,3 +558,53 @@ accepted as final evidence. The final focused 25-test suite also passes.
 The four existing Qwen baseline JSON contracts were checked against their
 requested engine JSON and match exactly, so the recorder snapshot repair does
 not invalidate those completed baselines.
+
+## Step 5b batch candidates
+
+PR #1085 is `fb0cfe6697d352d372bb85b07c3f1b518b969afe`. Its actual pinned
+PR #1028 integration is `a218b5b1d70aff3b041bbac041a23fc717bb5f12`, tree
+`275d756f178d1577339f9519c718834cd4e8a8fc`, matching the clean merge-tree;
+37 CPU tests pass and 98 GPU cases are skipped locally. Its verified source,
+host integration and four dependent GPU queues are under `a3-step5a` on 54633.
+
+Mechanical extraction `e51840dd7` precedes ownership changes. The same explicit
+PrefillExecutor now selects noncausal batch, tree verification, small-query
+decode and mixed decode rows in their original order. A partial selection
+returns no completed result when every candidate declines, allowing ordinary
+sequence work to proceed. Complete batch results are distinct from partial
+row sets, including an explicitly completed callback returning None. The
+required selection wrapper still raises when no candidate completes and still
+accepts falsey non-None results.
+
+All 813 immutable traces and the original calculation hashes pass. The source
+oracle projects actual batch admission/run statements and validates both the
+driver and legacy request arguments; no old branch body or new golden is used.
+Six independent batch cases cover all four winners, remaining sequence rows
+and the terminal-None distinction. One additional driver case proves preparation
+survives a complete decline, while required dispatch still rejects it. The
+focused executor/driver/calculation run reports 22 passes; combined with the
+trace check, evidence is in `a3-prefill-batch-{trace,composition,injection}.log`.
+
+The metric ceiling becomes 402 / 414 / 347 / 13 / 169 / 0 / 29. Existing
+policy, profiling and speculative callbacks are still explicit temporary
+dependencies; their extraction remains assigned to Steps 5c/6. No new import
+cycle or forbidden edge appears. GPU model and complete outcome gates remain
+pending; the prior DFlash2 baseline is now capturing FULL graphs with the fixed
+recorder, and the host integration's private native build is still progressing.
+
+The complete strict run passes **260 tests / 1 skip / 28 GPU exclusions** with
+all consumed shim patches. Pre-commit including mypy/layering passes after a
+test-local empty-list type annotation was added. Evidence:
+`a3-prefill-batch-strict.log`, `a3-prefill-batch-shim.json` and
+`a3-prefill-batch-precommit-final.log`. Production code was held fixed throughout
+this full run.
+
+The fixed recorder has saved the DFlash2 baseline on 54633 as
+`a3-step1c/artifacts/dflash-parent.json`, copied locally as
+`a3-dflash-parent-v2.json`. FULL graph capture completed; all four workers hit
+`prefill_smallq_fp16_grouped_fp32`. Prompts have 25/21 input tokens and 2/64
+output tokens: Paris stops naturally; the Chinese Rayleigh explanation reaches
+the requested limit. This is a baseline route/token record, not a finished
+comparison or long-output quality claim. The recorded harness SHA256 is
+`e38d6bebda6a495703fba53d326caec5e553a03f859a192eca1a32b00ad3eebf`.
+DDTree, candidate and host-FP8 model gates remain pending.

@@ -1,8 +1,8 @@
 {
   "metrics": {
     "forward": 402,
-    "largest_function": 529,
-    "cross_module_private": 348,
+    "largest_function": 414,
+    "cross_module_private": 347,
     "import_cycles": 13,
     "model_names_outside_spec": 169,
     "env_outside_config": 0,

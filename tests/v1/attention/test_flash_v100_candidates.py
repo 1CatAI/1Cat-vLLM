@@ -48,3 +48,22 @@ def test_selection_retains_attempt_order_and_falsey_results(monkeypatch, prepare
         if prepare
         else ["compute", "decode_scalar_paged"]
     )
+
+
+def test_partial_selection_can_leave_all_rows_for_sequence_dispatch():
+    from vllm.v1.attention.backends.flash_v100.plan.routing import execute, try_execute
+
+    class Decline:
+        def admit(self, request):
+            return True
+
+        def run(self, request, record):
+            request.append("prepared")
+            return None
+
+    prepared: list[str] = []
+    assert try_execute(prepared, (Decline(),)) is None
+    assert prepared == ["prepared"]
+    with pytest.raises(RuntimeError, match="No attention candidate completed"):
+        execute(prepared, (Decline(),))
+    assert prepared == ["prepared", "prepared"]

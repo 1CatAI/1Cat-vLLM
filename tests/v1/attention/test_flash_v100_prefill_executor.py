@@ -178,3 +178,122 @@ def test_prefill_candidates_with_independent_operators(monkeypatch, choice):
         assert "should_contig" not in calls
     if choice == "mask_decline":
         assert calls.index("mask") < calls.index("should_contig") < calls.index("paged")
+
+
+@pytest.mark.parametrize(
+    "choice", ["noncausal", "tree", "small", "rows", "sequences", "terminal_none"]
+)
+def test_batch_candidates_with_independent_operators(monkeypatch, choice):
+    calls = []
+    query = torch.zeros((4, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    cache = torch.zeros((2, 8, 1, 256), dtype=torch.float16)
+    lengths = torch.tensor([2, 2])
+    metadata = SimpleNamespace(block_table=torch.tensor([[0], [1]]), seq_lens=lengths)
+    request = sequence.PrefillBatchRequest(
+        SimpleNamespace(
+            is_dflash_draft_attn=True, _k_scale_float=1.0, _v_scale_float=1.0
+        ),
+        query,
+        None,
+        None,
+        cache,
+        cache,
+        metadata,
+        output,
+        output,
+        torch.tensor([0, 2, 4]),
+        lengths,
+        lengths,
+        2,
+        2,
+        1,
+        256,
+        8,
+        choice != "noncausal",
+        (-1, -1),
+        None,
+        False,
+        False,
+    )
+    policy = cast(
+        V100AttnConfig,
+        SimpleNamespace(
+            use_flash_v100_prefill_paged=True,
+            use_flash_v100_decode=True,
+            smallq_decode_max_query_len=4 if choice == "small" else 0,
+            smallq_decode_max_model_len=0,
+            use_decode_paged_prefill=False,
+        ),
+    )
+
+    def complete(name):
+        def execute(*args, **kwargs):
+            calls.append(name)
+            assert choice == name or (name == "tree" and choice == "terminal_none")
+            if choice == "terminal_none":
+                return None
+            return output.fill_(9)
+
+        return execute
+
+    def paged(*args, **kwargs):
+        calls.append("noncausal")
+        assert choice == "noncausal"
+        kwargs["out"].fill_(9)
+        return kwargs["out"]
+
+    def rows(*args):
+        calls.append("rows")
+        assert choice == "rows"
+        output[:2].fill_(9)
+        return {0}
+
+    monkeypatch.setattr(
+        sequence._masks,
+        "_ddtree_parent_metadata_requires_branch",
+        lambda *args: choice in {"tree", "terminal_none"},
+    )
+    monkeypatch.setattr(sequence._routing, "_record_route", lambda name: None)
+    ops = sequence.PrefillOps(
+        bridge=None,
+        run_paged=lambda *, fn, **kwargs: fn(),
+        should_bridge=None,
+        should_bfla=None,
+        should_contig=None,
+        should_gather=None,
+        should_split=None,
+        bhmd=None,
+        dense=None,
+        paged=paged,
+        bfla=None,
+        splitkv=None,
+        uniform=None,
+        try_fa2=None,
+        log_bfla=None,
+        log_fa2=None,
+        log_contiguous_bhmd=None,
+        log_contiguous_dense=None,
+        log_dense_fa2=None,
+        log_fp8_bridge=None,
+        log_splitkv=None,
+        tree_prefill=complete("tree"),
+        small_query=complete("small"),
+        allow_rows=lambda **kwargs: choice == "rows",
+        decode_rows=rows,
+        log_noncausal=lambda *args: None,
+        log_small_query=lambda *args: None,
+    )
+    result = sequence.PrefillExecutor(
+        sequence.PrefillConfig(policy, 0.0625, "auto"), ops, V100Workspace()
+    ).batch(request)
+    if choice in {"noncausal", "tree", "small"}:
+        assert result.complete and result.output is output
+        assert torch.all(output == 9) and calls == [choice]
+    elif choice == "terminal_none":
+        assert result.complete and result.output is None and calls == ["tree"]
+    else:
+        assert not result.complete and result.output is None
+        assert result.rows == ({0} if choice == "rows" else set())
+        assert calls == (["rows"] if choice == "rows" else [])
+        assert torch.all(output[2:] == 0)
