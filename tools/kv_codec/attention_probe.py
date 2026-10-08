@@ -119,7 +119,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     import flash_attn_v100 as fa
-    import flash_attn_v100_cuda as extension
+    from flash_attn_v100 import flash_attn_v100_cuda as extension
 
     assert torch.cuda.get_device_capability() == (7, 0)
     assert fa.flash_attn_decode_paged_xqa_available()
