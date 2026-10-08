@@ -43,6 +43,21 @@ def test_prefill_log_flag_has_one_owner(monkeypatch):
     from vllm.v1.attention.backends.flash_v100 import dense_prefill, impl
 
     monkeypatch.setattr(legacy, "_logged_prefill_fa2_d256", True)
+    from tools.sm70.flash_v100_trace import run_case
+
+    trace = run_case(
+        dict(
+            stage="prefix",
+            codec="auto",
+            head=256,
+            gqa=6,
+            capture=False,
+            spec="none",
+            mask="none",
+            qlen=1024,
+        )
+    )
+    assert ["route", "prefill_prefix_paged_splitd_d256"] in trace["events"]
     assert dense_prefill._logged_prefill_fa2_d256
     assert "_logged_prefill_fa2_d256" not in vars(impl)
     dense_prefill._logged_prefill_fa2_d256 = False
