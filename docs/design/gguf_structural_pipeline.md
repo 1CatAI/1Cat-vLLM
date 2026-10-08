@@ -2,8 +2,9 @@
 
 The complete-round objective is 12 ms for Qwen3.8-27B IQ3_S with a Q8_0
 DFlash2 draft, TP4, E4M3 target KV, FP16 draft KV and FP32 GDN state.
-No complete-round improvement is claimed here until the packaged-wheel
-comparison, acceptance check and C4 comparison finish. The previously
+The packaged-wheel comparison rejects the projection/collective pipeline:
+complete rounds become slower and model logits differ. It is not approved
+for integration. The previously
 recorded 14.307 ms is a different host's reference, not a baseline to subtract
 from the new host's latency. Every model comparison uses one wheel and
 changes only `sm70_gguf.projection_collective_pipeline`.
@@ -116,8 +117,62 @@ to 29.124 us for Q4_K; these numbers are compared only within this new run,
 not against the earlier 1290 MHz screen.
 
 Seventy CPU fake-tensor cases cover direct, functionalized and v2 graphs,
-M1/M8/M32, metadata epsilon, both norm-weight dtypes and nonqualified consumers/shapes. Packaged GPU
-and model results are pending; the route is not approved for integration yet.
+M1/M8/M32, metadata epsilon, both norm-weight dtypes and nonqualified
+consumers/shapes. The normal packaged operator passes all four ranks and
+three formats over 20 changed-input graph replays with bitwise projection,
+residual and norm results. Rank 0 at 1530/877 MHz measures:
+
+| Actual down shard | Separate down + AR/norm, us | Packaged tile pipeline, us |
+| --- | ---: | ---: |
+| IQ3_S, layer 6 | 25.799 | 23.603 |
+| IQ4_XS, layer 24 | 30.198 | 27.067 |
+| Q4_K, layer 51 | 31.811 | 29.116 |
+
+A compiled single-layer test uses real four-rank weights and the installed
+wheel's graph rewrite and native operator. All ranks pass compilation and
+20 changed-input captured graph replays bitwise. The corrected wheel keeps
+the same native `_C` binary as the packaged screen; its Python graph rewrite
+fixes the functionalization metadata described below. The full model A/B
+below rejects the path despite these operator results.
+
+## Same-wheel model result: rejected
+
+The normal wheel built from `2b00cc8a38` compares the pipeline disabled and
+enabled on the same four V100s with pairwise NV2. The sixteen prompts,
+sampling and all other configuration are identical. Each request generates
+600 tokens for timing, excluding its first twenty round observations.
+The control arm is the baseline; no additional baseline request is run.
+Steady C1 clock samples are 1530/877 MHz on all ranks in both arms.
+
+| Input cohort | Control ms/round | Pipeline ms/round | Extra ms/round | Control ms/output token | Pipeline ms/output token |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Eight 1K prompts | 14.431 | 14.592 | 0.161 | 4.968 | 4.856 |
+| Eight 8K prompts | 14.804 | 14.986 | 0.182 | 5.058 | 5.105 |
+
+The prompt-paired 95% t intervals for the regression are 0.138--0.185 ms
+at 1K and 0.154--0.210 ms at 8K. These intervals describe this paired sample,
+not all possible thermal or workload variation. Steady emitted tokens per
+round change from 2.905 to 3.005 at 1K and 2.927 to 2.935 at 8K. The 1K
+ms/token improvement therefore does not establish a faster verifier.
+
+The first verifier logits for all sixteen prompts have identical top-1,
+but they are not bitwise identical: maximum absolute difference is 0.1758
+and maximum KL is 2.921e-4. Natural requests still answer `391` and explain
+unit testing, both stopping normally. Sampled long outputs and acceptance
+counters differ. This model result contradicts extending the single-layer
+bitwise claim to the whole model; the source of that difference remains
+unresolved, not attributed to a deliberate precision reduction.
+
+C4 request intervals change from 109.784 to 99.508 ms at 1K and 141.578 to
+150.042 ms at 8K. Total request wall changes from 31.216 to 30.739 seconds
+and 107.477 to 100.206 seconds respectively. Since outputs and request
+completion dynamics differ, these are mixed C4 observations, not evidence
+that the no-regression gate passes.
+
+This narrow boundary fusion is rejected for model admission. A fresh trace
+of the disabled control route will reconcile the current execution ledger
+before another structural design is chosen. The single-layer result is
+retained as a counterexample to extrapolating microbenchmark savings.
 
 ## External implementations
 
@@ -127,6 +182,14 @@ Its default shared-memory budgets exceed SM70's 96 KiB and cannot be used
 unchanged. [NanoFlow](https://arxiv.org/abs/2408.12757) studies overlapping
 work with different resource demands. These motivate tile readiness and
 communication overlap; no external kernel implementation is copied here.
+
+[Cohere's task-based decode engine](https://cohere.com/blog/megakernels)
+provides another concrete example: tile readiness counters replace whole-grid
+boundaries, and immutable weight reads can precede activation readiness.
+Its H100 producer/TMA/WGMMA implementation is not portable to SM70. Its
+parallel attention/FFN model also has independent work that this sequential
+Qwen layer does not have. The transferable part is explicit task dependencies
+and weight publication; its speedup is not an estimate for this TP4 model.
 
 [NVIDIA's Volta tuning guide](https://docs.nvidia.com/cuda/archive/12.8.1/volta-tuning-guide/index.html)
 provides the scheduler, memory and residency constraints used above.

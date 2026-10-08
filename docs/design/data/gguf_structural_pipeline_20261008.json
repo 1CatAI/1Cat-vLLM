@@ -1,5 +1,5 @@
 {
-  "status": "operator_screen_only_not_end_to_end",
+  "status": "model_pipeline_rejected_no_end_to_end_gain",
   "source_base": "c4f6245f841466782752a8c3283e4727565cf17a",
   "hardware": "4xV100-SXM2-32GB all-pair NV2",
   "sm_clock_mhz": 1290,
@@ -1908,5 +1908,1228 @@
       "torch": "2.10.0+cu128",
       "cuda_sha256": "9e6dd2a3513dbbc9625c1bd85b7c93f943c2f9f92f08326b17279b0a8116c718"
     }
-  ]
+  ],
+  "packaged_pipeline_screen": [
+    {
+      "research_only": false,
+      "serving_runtime": false,
+      "shared_production_packet_buffer": true,
+      "cases": [
+        {
+          "rank": 0,
+          "layer": 6,
+          "format": 5,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 25.798912048339844,
+          "pipeline_us": 23.603456258773804,
+          "samples_us": {
+            "False": [
+              25.817599296569824,
+              25.825281143188477,
+              25.8406400680542,
+              25.781760215759277,
+              25.776638984680176,
+              25.8022403717041,
+              25.774080753326416,
+              25.797119140625,
+              25.79967975616455,
+              25.774080753326416
+            ],
+            "True": [
+              23.62112045288086,
+              23.610880374908447,
+              23.613440990447998,
+              23.603200912475586,
+              23.590400218963623,
+              23.58272075653076,
+              23.595519065856934,
+              23.62368106842041,
+              23.587839603424072,
+              23.605759143829346
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 0,
+          "layer": 24,
+          "format": 3,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 30.198015451431274,
+          "pipeline_us": 27.067391872406006,
+          "samples_us": {
+            "False": [
+              30.23871898651123,
+              30.12608051300049,
+              30.218238830566406,
+              30.120959281921387,
+              30.13887882232666,
+              30.14143943786621,
+              30.23103952407837,
+              30.259199142456055,
+              30.205440521240234,
+              30.300159454345703
+            ],
+            "True": [
+              27.115519046783447,
+              27.056639194488525,
+              27.089920043945312,
+              27.005441188812256,
+              27.07711935043335,
+              27.107839584350586,
+              27.0796799659729,
+              27.02336072921753,
+              27.08479881286621,
+              27.03360080718994
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 0,
+          "layer": 51,
+          "format": 0,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 31.811327934265137,
+          "pipeline_us": 29.116415977478027,
+          "samples_us": {
+            "False": [
+              31.846399307250977,
+              31.787519454956055,
+              31.76959991455078,
+              31.744000911712646,
+              31.848959922790527,
+              31.846399307250977,
+              31.797759532928467,
+              31.833600997924805,
+              31.831040382385254,
+              31.80799961090088
+            ],
+            "True": [
+              29.127678871154785,
+              29.137918949127197,
+              29.05855894088745,
+              29.15584087371826,
+              29.079039096832275,
+              29.107201099395752,
+              29.09696102142334,
+              29.09696102142334,
+              29.19424057006836,
+              29.10975933074951
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "840abc6a1bc1a15266bc020100fb6af6e738646d82350b479dc7799b291c8eae",
+      "installed_operator": true,
+      "source_sha": "ab3b84f55b28d5b497844dfb95398ef0aeb1d6a8",
+      "wheel_version": "1.5.2.dev0+gab3b84f55b",
+      "native_sha256": "2f73362d50ec8c92c7c4ebc1323ee7b1fe56b9775513573b5d1a4ec6737ccbe8"
+    },
+    {
+      "research_only": false,
+      "serving_runtime": false,
+      "shared_production_packet_buffer": true,
+      "cases": [
+        {
+          "rank": 1,
+          "layer": 6,
+          "format": 5,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 25.798656225204468,
+          "pipeline_us": 23.60320019721985,
+          "samples_us": {
+            "False": [
+              25.815041065216064,
+              25.825281143188477,
+              25.8406400680542,
+              25.779199600219727,
+              25.779199600219727,
+              25.8022403717041,
+              25.774080753326416,
+              25.797119140625,
+              25.8022403717041,
+              25.771520137786865
+            ],
+            "True": [
+              23.61855983734131,
+              23.610880374908447,
+              23.613440990447998,
+              23.603200912475586,
+              23.590400218963623,
+              23.58272075653076,
+              23.595519065856934,
+              23.62368106842041,
+              23.587839603424072,
+              23.605759143829346
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 1,
+          "layer": 24,
+          "format": 3,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 30.196991443634033,
+          "pipeline_us": 27.06764817237854,
+          "samples_us": {
+            "False": [
+              30.23871898651123,
+              30.123519897460938,
+              30.218238830566406,
+              30.118401050567627,
+              30.13887882232666,
+              30.14143943786621,
+              30.22847890853882,
+              30.259199142456055,
+              30.205440521240234,
+              30.297598838806152
+            ],
+            "True": [
+              27.112960815429688,
+              27.056639194488525,
+              27.092480659484863,
+              27.002880573272705,
+              27.07711935043335,
+              27.112960815429688,
+              27.0796799659729,
+              27.02336072921753,
+              27.08479881286621,
+              27.03360080718994
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 1,
+          "layer": 51,
+          "format": 0,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 31.811327934265137,
+          "pipeline_us": 29.115392208099365,
+          "samples_us": {
+            "False": [
+              31.843841075897217,
+              31.787519454956055,
+              31.76959991455078,
+              31.746559143066406,
+              31.848959922790527,
+              31.846399307250977,
+              31.797759532928467,
+              31.833600997924805,
+              31.833600997924805,
+              31.805438995361328
+            ],
+            "True": [
+              29.127678871154785,
+              29.135360717773438,
+              29.05855894088745,
+              29.15839910507202,
+              29.076480865478516,
+              29.107201099395752,
+              29.09440040588379,
+              29.09440040588379,
+              29.19424057006836,
+              29.107201099395752
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "840abc6a1bc1a15266bc020100fb6af6e738646d82350b479dc7799b291c8eae",
+      "installed_operator": true,
+      "source_sha": "ab3b84f55b28d5b497844dfb95398ef0aeb1d6a8",
+      "wheel_version": "1.5.2.dev0+gab3b84f55b",
+      "native_sha256": "2f73362d50ec8c92c7c4ebc1323ee7b1fe56b9775513573b5d1a4ec6737ccbe8"
+    },
+    {
+      "research_only": false,
+      "serving_runtime": false,
+      "shared_production_packet_buffer": true,
+      "cases": [
+        {
+          "rank": 2,
+          "layer": 6,
+          "format": 5,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 25.79967999458313,
+          "pipeline_us": 23.60268807411194,
+          "samples_us": {
+            "False": [
+              25.820159912109375,
+              25.825281143188477,
+              25.8406400680542,
+              25.779199600219727,
+              25.779199600219727,
+              25.8022403717041,
+              25.776638984680176,
+              25.79967975616455,
+              25.79967975616455,
+              25.774080753326416
+            ],
+            "True": [
+              23.61855983734131,
+              23.608319759368896,
+              23.610880374908447,
+              23.603200912475586,
+              23.590400218963623,
+              23.58272075653076,
+              23.595519065856934,
+              23.62368106842041,
+              23.587839603424072,
+              23.605759143829346
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 2,
+          "layer": 24,
+          "format": 3,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 30.196735858917236,
+          "pipeline_us": 27.067904472351074,
+          "samples_us": {
+            "False": [
+              30.23616075515747,
+              30.123519897460938,
+              30.218238830566406,
+              30.118401050567627,
+              30.13887882232666,
+              30.14143943786621,
+              30.23103952407837,
+              30.256640911102295,
+              30.205440521240234,
+              30.297598838806152
+            ],
+            "True": [
+              27.112960815429688,
+              27.059199810028076,
+              27.089920043945312,
+              27.005441188812256,
+              27.0796799659729,
+              27.110400199890137,
+              27.08224058151245,
+              27.02336072921753,
+              27.08224058151245,
+              27.03360080718994
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 2,
+          "layer": 51,
+          "format": 0,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 31.811328172683716,
+          "pipeline_us": 29.115904092788696,
+          "samples_us": {
+            "False": [
+              31.846399307250977,
+              31.787519454956055,
+              31.76959991455078,
+              31.744000911712646,
+              31.848959922790527,
+              31.843841075897217,
+              31.800320148468018,
+              31.833600997924805,
+              31.831040382385254,
+              31.80799961090088
+            ],
+            "True": [
+              29.127678871154785,
+              29.132800102233887,
+              29.061119556427002,
+              29.15839910507202,
+              29.076480865478516,
+              29.107201099395752,
+              29.09440040588379,
+              29.09696102142334,
+              29.19424057006836,
+              29.10975933074951
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "840abc6a1bc1a15266bc020100fb6af6e738646d82350b479dc7799b291c8eae",
+      "installed_operator": true,
+      "source_sha": "ab3b84f55b28d5b497844dfb95398ef0aeb1d6a8",
+      "wheel_version": "1.5.2.dev0+gab3b84f55b",
+      "native_sha256": "2f73362d50ec8c92c7c4ebc1323ee7b1fe56b9775513573b5d1a4ec6737ccbe8"
+    },
+    {
+      "research_only": false,
+      "serving_runtime": false,
+      "shared_production_packet_buffer": true,
+      "cases": [
+        {
+          "rank": 3,
+          "layer": 6,
+          "format": 5,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 25.79865598678589,
+          "pipeline_us": 23.602944135665894,
+          "samples_us": {
+            "False": [
+              25.817599296569824,
+              25.825281143188477,
+              25.8406400680542,
+              25.779199600219727,
+              25.776638984680176,
+              25.8022403717041,
+              25.774080753326416,
+              25.797119140625,
+              25.8022403717041,
+              25.771520137786865
+            ],
+            "True": [
+              23.61855983734131,
+              23.610880374908447,
+              23.613440990447998,
+              23.603200912475586,
+              23.587839603424072,
+              23.58272075653076,
+              23.595519065856934,
+              23.62368106842041,
+              23.587839603424072,
+              23.605759143829346
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 3,
+          "layer": 24,
+          "format": 3,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 30.197759866714478,
+          "pipeline_us": 27.067903995513916,
+          "samples_us": {
+            "False": [
+              30.23871898651123,
+              30.12608051300049,
+              30.220799446105957,
+              30.118401050567627,
+              30.13887882232666,
+              30.14143943786621,
+              30.23103952407837,
+              30.256640911102295,
+              30.208001136779785,
+              30.297598838806152
+            ],
+            "True": [
+              27.112960815429688,
+              27.059199810028076,
+              27.092480659484863,
+              27.002880573272705,
+              27.0796799659729,
+              27.107839584350586,
+              27.0796799659729,
+              27.02336072921753,
+              27.08479881286621,
+              27.0361590385437
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        },
+        {
+          "rank": 3,
+          "layer": 51,
+          "format": 0,
+          "norm_dtype": "float16",
+          "partial_bitwise": true,
+          "residual_bitwise": true,
+          "norm_relative_l2": 0.0,
+          "norm_max_ulp": 0,
+          "graph_replays": 20,
+          "max_graph_norm_relative_l2": 0.0,
+          "max_graph_norm_ulp": 0,
+          "control_us": 31.8123517036438,
+          "pipeline_us": 29.115392208099365,
+          "samples_us": {
+            "False": [
+              31.846399307250977,
+              31.790080070495605,
+              31.76959991455078,
+              31.746559143066406,
+              31.848959922790527,
+              31.848959922790527,
+              31.795198917388916,
+              31.836159229278564,
+              31.833600997924805,
+              31.80799961090088
+            ],
+            "True": [
+              29.127678871154785,
+              29.135360717773438,
+              29.05855894088745,
+              29.15839910507202,
+              29.076480865478516,
+              29.107201099395752,
+              29.09440040588379,
+              29.09440040588379,
+              29.19424057006836,
+              29.107201099395752
+            ]
+          },
+          "clocks": "1530 MHz, 877 MHz"
+        }
+      ],
+      "torch": "2.10.0+cu128",
+      "cuda_sha256": "840abc6a1bc1a15266bc020100fb6af6e738646d82350b479dc7799b291c8eae",
+      "installed_operator": true,
+      "source_sha": "ab3b84f55b28d5b497844dfb95398ef0aeb1d6a8",
+      "wheel_version": "1.5.2.dev0+gab3b84f55b",
+      "native_sha256": "2f73362d50ec8c92c7c4ebc1323ee7b1fe56b9775513573b5d1a4ec6737ccbe8"
+    }
+  ],
+  "compiled_layer_screen": {
+    "source_sha": "2b00cc8a38f214bba01e417627f9e9348ae70109",
+    "wheel_sha256": "00dc33e66c12bbf885480fa6cd25fd72cf2e2168caf9559eb843cdd4669373cd",
+    "ranks": [
+      {
+        "compilation_passed": true,
+        "bitwise": true,
+        "graph_replays": 20,
+        "fused_boundaries": [
+          1
+        ]
+      },
+      {
+        "compilation_passed": true,
+        "bitwise": true,
+        "graph_replays": 20,
+        "fused_boundaries": [
+          1
+        ]
+      },
+      {
+        "compilation_passed": true,
+        "bitwise": true,
+        "graph_replays": 20,
+        "fused_boundaries": [
+          1
+        ]
+      },
+      {
+        "compilation_passed": true,
+        "bitwise": true,
+        "graph_replays": 20,
+        "fused_boundaries": [
+          1
+        ]
+      }
+    ]
+  },
+  "corrected_artifact": {
+    "source_sha": "2b00cc8a38f214bba01e417627f9e9348ae70109",
+    "wheel_sha256": "00dc33e66c12bbf885480fa6cd25fd72cf2e2168caf9559eb843cdd4669373cd",
+    "native_C_sha256": "2f73362d50ec8c92c7c4ebc1323ee7b1fe56b9775513573b5d1a4ec6737ccbe8",
+    "native_C_unchanged_from_packaged_screen": true,
+    "native_audit_libraries": 16,
+    "cpu_graph_tests_passed": 70
+  },
+  "model_same_wheel_ab": {
+    "source_sha": "2b00cc8a38f214bba01e417627f9e9348ae70109",
+    "wheel_sha256": "00dc33e66c12bbf885480fa6cd25fd72cf2e2168caf9559eb843cdd4669373cd",
+    "runtime": "1.5.2.dev0+g2b00cc8a38",
+    "same_wheel": true,
+    "hardware": "4xV100-SXM2-32GB all-pair NV2",
+    "cohorts": [
+      {
+        "input_group": 1024,
+        "control": {
+          "prompt_count": 8,
+          "mean_of_prompt_round_ms": 14.430750955465312,
+          "pooled_mean_round_ms": 14.431111160172623,
+          "p50_ms": 14.399551902897656,
+          "p90_ms": 14.442734164185822,
+          "p99_ms": 16.440455298870802,
+          "steady_emitted_tokens_per_round": 2.9048257372654156,
+          "steady_ms_per_output_token": 4.967978276644567,
+          "accepted_draft_tokens": 3156,
+          "draft_rounds": 1652,
+          "acceptance_fraction": 0.2729159460394327,
+          "interval_count": 1492
+        },
+        "candidate": {
+          "prompt_count": 8,
+          "mean_of_prompt_round_ms": 14.592199844606242,
+          "pooled_mean_round_ms": 14.592779842701965,
+          "p50_ms": 14.560202485881746,
+          "p90_ms": 14.606228843331337,
+          "p99_ms": 16.586796455085278,
+          "steady_emitted_tokens_per_round": 3.0048476454293627,
+          "steady_ms_per_output_token": 4.856412558852647,
+          "accepted_draft_tokens": 3198,
+          "draft_rounds": 1604,
+          "acceptance_fraction": 0.2848236551478447,
+          "interval_count": 1444
+        },
+        "paired_mean_delta_ms": -0.16144888914092959,
+        "paired_95pct_t_interval_ms": [
+          -0.1845235576259287,
+          -0.13837422065593047
+        ],
+        "acceptance_counts_equal": false
+      },
+      {
+        "input_group": 8192,
+        "control": {
+          "prompt_count": 8,
+          "mean_of_prompt_round_ms": 14.803885631365727,
+          "pooled_mean_round_ms": 14.803898841125118,
+          "p50_ms": 14.767782064154744,
+          "p90_ms": 14.807534264400601,
+          "p99_ms": 16.8246408412233,
+          "steady_emitted_tokens_per_round": 2.9266980497646267,
+          "steady_ms_per_output_token": 5.058225546128917,
+          "accepted_draft_tokens": 3157,
+          "draft_rounds": 1647,
+          "acceptance_fraction": 0.2738312082574378,
+          "interval_count": 1487
+        },
+        "candidate": {
+          "prompt_count": 8,
+          "mean_of_prompt_round_ms": 14.98599468125499,
+          "pooled_mean_round_ms": 14.985124769805607,
+          "p50_ms": 14.962242916226387,
+          "p90_ms": 14.997958345338702,
+          "p99_ms": 16.97118050418794,
+          "steady_emitted_tokens_per_round": 2.9353535353535354,
+          "steady_ms_per_output_token": 5.105049388199433,
+          "accepted_draft_tokens": 3155,
+          "draft_rounds": 1645,
+          "acceptance_fraction": 0.27399044724272686,
+          "interval_count": 1485
+        },
+        "paired_mean_delta_ms": -0.18210904988926235,
+        "paired_95pct_t_interval_ms": [
+          -0.20976494330500953,
+          -0.15445315647351518
+        ],
+        "acceptance_counts_equal": false
+      }
+    ],
+    "c4": [
+      {
+        "input_len": 1024,
+        "ids_equal": false,
+        "control_wall_s": 31.216107606189325,
+        "candidate_wall_s": 30.739293445833027,
+        "control_steady_ms": 109.78429096916965,
+        "candidate_steady_ms": 99.50763554979262
+      },
+      {
+        "input_len": 8192,
+        "ids_equal": false,
+        "control_wall_s": 107.47732507297769,
+        "candidate_wall_s": 100.20562654710375,
+        "control_steady_ms": 141.57775016432043,
+        "candidate_steady_ms": 150.042349931514
+      }
+    ],
+    "quality": {
+      "bitwise": false,
+      "logit_prompts": 16,
+      "max_abs": 0.17578125,
+      "max_kl": 0.00029210314387366834,
+      "min_top1": 1.0,
+      "natural_output_equal": true,
+      "natural_outputs": [
+        {
+          "text": "391",
+          "finish_reason": "stop"
+        },
+        {
+          "text": "A unit test verifies that a specific, isolated piece of code (such as a function or method) behaves as expected under given conditions.",
+          "finish_reason": "stop"
+        }
+      ]
+    },
+    "contract": {
+      "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf",
+      "quantization": "gguf",
+      "dtype": "half",
+      "tensor_parallel_size": 4,
+      "max_model_len": 32768,
+      "max_num_batched_tokens": 1024,
+      "max_num_seqs": 4,
+      "gpu_memory_utilization": 0.9,
+      "kv_cache_dtype": "fp8_e4m3",
+      "mamba_ssm_cache_dtype": "float32",
+      "attention_backend": "FLASH_ATTN_V100",
+      "enable_prefix_caching": false,
+      "enforce_eager": false,
+      "language_model_only": true,
+      "speculative_config": {
+        "method": "dflash",
+        "model": "Qwen3.8-27B-DFlash2-Q8_0.gguf",
+        "num_speculative_tokens": 7,
+        "draft_tensor_parallel_size": 4,
+        "kv_cache_dtype": "auto",
+        "attention_backend": "FLASH_ATTN_V100",
+        "draft_sample_method": "probabilistic",
+        "enforce_eager": false,
+        "quantization": "gguf"
+      },
+      "disable_log_stats": false,
+      "kernel_config": {
+        "sm70_gguf": {
+          "projection_planes": true,
+          "projection_plane_scope": "all",
+          "projection_collective_pipeline": false
+        }
+      },
+      "worker_extension_cls": "dmv_quality_worker.DmvQualityWorker",
+      "compilation_config": {
+        "pass_config": {
+          "fuse_allreduce_rms": true
+        }
+      }
+    },
+    "sampling": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "top_k": 20,
+      "seed": 123,
+      "max_tokens": 600,
+      "thinking": false,
+      "ignore_eos": true
+    },
+    "steady_c1_clock_samples": {
+      "off": {
+        "1024": {
+          "0": {
+            "samples": 21,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "1": {
+            "samples": 21,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "2": {
+            "samples": 21,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "3": {
+            "samples": 21,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          }
+        },
+        "8192": {
+          "0": {
+            "samples": 20,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "1": {
+            "samples": 20,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "2": {
+            "samples": 20,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "3": {
+            "samples": 20,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          }
+        }
+      },
+      "on": {
+        "1024": {
+          "0": {
+            "samples": 21,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "1": {
+            "samples": 21,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "2": {
+            "samples": 21,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "3": {
+            "samples": 21,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          }
+        },
+        "8192": {
+          "0": {
+            "samples": 23,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "1": {
+            "samples": 23,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "2": {
+            "samples": 23,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          },
+          "3": {
+            "samples": 23,
+            "sm_mhz": [
+              1530
+            ],
+            "memory_mhz": [
+              877
+            ],
+            "mean_sm_mhz": 1530
+          }
+        }
+      }
+    },
+    "decision": "rejected",
+    "reason": "C1 full rounds regress at matching steady clocks; logits diverge despite operator screens; C4 request intervals are mixed and outputs differ. Do not promote.",
+    "clocks_per_rank_includes_initialization_and_idle": {
+      "0": [
+        [
+          "135 MHz",
+          "877 MHz"
+        ],
+        [
+          "1365 MHz",
+          "877 MHz"
+        ],
+        [
+          "1372 MHz",
+          "877 MHz"
+        ],
+        [
+          "1380 MHz",
+          "877 MHz"
+        ],
+        [
+          "1395 MHz",
+          "877 MHz"
+        ],
+        [
+          "1417 MHz",
+          "877 MHz"
+        ],
+        [
+          "1447 MHz",
+          "877 MHz"
+        ],
+        [
+          "1462 MHz",
+          "877 MHz"
+        ],
+        [
+          "1470 MHz",
+          "877 MHz"
+        ],
+        [
+          "1477 MHz",
+          "877 MHz"
+        ],
+        [
+          "1485 MHz",
+          "877 MHz"
+        ],
+        [
+          "1492 MHz",
+          "877 MHz"
+        ],
+        [
+          "1500 MHz",
+          "877 MHz"
+        ],
+        [
+          "1507 MHz",
+          "877 MHz"
+        ],
+        [
+          "1515 MHz",
+          "877 MHz"
+        ],
+        [
+          "1522 MHz",
+          "877 MHz"
+        ],
+        [
+          "1530 MHz",
+          "877 MHz"
+        ],
+        [
+          "397 MHz",
+          "877 MHz"
+        ]
+      ],
+      "1": [
+        [
+          "1290 MHz",
+          "877 MHz"
+        ],
+        [
+          "135 MHz",
+          "877 MHz"
+        ],
+        [
+          "1365 MHz",
+          "877 MHz"
+        ],
+        [
+          "1387 MHz",
+          "877 MHz"
+        ],
+        [
+          "1410 MHz",
+          "877 MHz"
+        ],
+        [
+          "1432 MHz",
+          "877 MHz"
+        ],
+        [
+          "1440 MHz",
+          "877 MHz"
+        ],
+        [
+          "1462 MHz",
+          "877 MHz"
+        ],
+        [
+          "1470 MHz",
+          "877 MHz"
+        ],
+        [
+          "1485 MHz",
+          "877 MHz"
+        ],
+        [
+          "1492 MHz",
+          "877 MHz"
+        ],
+        [
+          "1500 MHz",
+          "877 MHz"
+        ],
+        [
+          "1507 MHz",
+          "877 MHz"
+        ],
+        [
+          "1515 MHz",
+          "877 MHz"
+        ],
+        [
+          "1522 MHz",
+          "877 MHz"
+        ],
+        [
+          "1530 MHz",
+          "877 MHz"
+        ],
+        [
+          "285 MHz",
+          "877 MHz"
+        ]
+      ],
+      "2": [
+        [
+          "135 MHz",
+          "877 MHz"
+        ],
+        [
+          "1372 MHz",
+          "877 MHz"
+        ],
+        [
+          "1395 MHz",
+          "877 MHz"
+        ],
+        [
+          "1410 MHz",
+          "877 MHz"
+        ],
+        [
+          "1425 MHz",
+          "877 MHz"
+        ],
+        [
+          "1432 MHz",
+          "877 MHz"
+        ],
+        [
+          "1455 MHz",
+          "877 MHz"
+        ],
+        [
+          "1462 MHz",
+          "877 MHz"
+        ],
+        [
+          "1470 MHz",
+          "877 MHz"
+        ],
+        [
+          "1485 MHz",
+          "877 MHz"
+        ],
+        [
+          "1492 MHz",
+          "877 MHz"
+        ],
+        [
+          "1500 MHz",
+          "877 MHz"
+        ],
+        [
+          "1507 MHz",
+          "877 MHz"
+        ],
+        [
+          "1515 MHz",
+          "877 MHz"
+        ],
+        [
+          "1522 MHz",
+          "877 MHz"
+        ],
+        [
+          "1530 MHz",
+          "877 MHz"
+        ],
+        [
+          "337 MHz",
+          "877 MHz"
+        ]
+      ],
+      "3": [
+        [
+          "135 MHz",
+          "877 MHz"
+        ],
+        [
+          "1365 MHz",
+          "877 MHz"
+        ],
+        [
+          "1402 MHz",
+          "877 MHz"
+        ],
+        [
+          "1417 MHz",
+          "877 MHz"
+        ],
+        [
+          "1425 MHz",
+          "877 MHz"
+        ],
+        [
+          "1470 MHz",
+          "877 MHz"
+        ],
+        [
+          "1492 MHz",
+          "877 MHz"
+        ],
+        [
+          "1500 MHz",
+          "877 MHz"
+        ],
+        [
+          "1507 MHz",
+          "877 MHz"
+        ],
+        [
+          "1515 MHz",
+          "877 MHz"
+        ],
+        [
+          "1522 MHz",
+          "877 MHz"
+        ],
+        [
+          "1530 MHz",
+          "877 MHz"
+        ],
+        [
+          "180 MHz",
+          "877 MHz"
+        ],
+        [
+          "795 MHz",
+          "877 MHz"
+        ]
+      ]
+    }
+  }
 }
