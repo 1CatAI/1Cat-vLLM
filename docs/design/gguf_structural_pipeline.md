@@ -169,6 +169,15 @@ and 107.477 to 100.206 seconds respectively. Since outputs and request
 completion dynamics differ, these are mixed C4 observations, not evidence
 that the no-regression gate passes.
 
+The observation records further limit that C4 interpretation. At 1K there
+are 70/72 post-warmup observations with all four request intervals; these
+average 46.345/46.129 ms for control/candidate. At 8K there is no observation
+with four decoding requests: the four submitted requests decode serially
+while other prompts are being admitted or prefetched. That run is a
+four-request workload, not a saturated C4 steady-decode test. A future
+C4 gate must report the live request count and use the actually concurrent
+part of the measurements.
+
 This narrow boundary fusion is rejected for model admission. A fresh trace
 of the disabled control route will reconcile the current execution ledger
 before another structural design is chosen. The single-layer result is
