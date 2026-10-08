@@ -36,7 +36,7 @@ def main():
     parser.add_argument(
         "--completion-context",
         action="store_true",
-        help="Run completion checks after the full fixed technical-text context",
+        help="Run completion/acceptance checks after the full fixed text context",
     )
     parser.add_argument("--acceptance-check", action="store_true")
     parser.add_argument("--profile-once", action="store_true")
@@ -271,8 +271,16 @@ def main():
             for enabled in policies:
                 llm.collective_rpc(method, args=(enabled,))
                 for prompt in prompts:
+                    content = prompt["prompt"]
+                    if args.completion_context:
+                        content = (
+                            "以下技术资料仅作背景，请回答最后的问题。\n"
+                            + tokenizer.decode(ids)
+                            + "\n问题："
+                            + content
+                        )
                     rendered = tokenizer.apply_chat_template(
-                        [{"role": "user", "content": prompt["prompt"]}],
+                        [{"role": "user", "content": content}],
                         tokenize=False,
                         add_generation_prompt=True,
                         enable_thinking=False,
