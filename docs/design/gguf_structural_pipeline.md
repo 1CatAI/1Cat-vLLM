@@ -115,7 +115,7 @@ At 1530/877 MHz, rank 0 measures 29.738 to 26.812 us for IQ4_XS and 31.776
 to 29.124 us for Q4_K; these numbers are compared only within this new run,
 not against the earlier 1290 MHz screen.
 
-Sixty-six CPU fake-tensor cases cover direct, functionalized and v2 graphs,
+Seventy CPU fake-tensor cases cover direct, functionalized and v2 graphs,
 M1/M8/M32, metadata epsilon, both norm-weight dtypes and nonqualified consumers/shapes. Packaged GPU
 and model results are pending; the route is not approved for integration yet.
 
@@ -139,3 +139,10 @@ The loaded model stores Gemma norm parameters in FP16. The pipeline accepts
 these values directly and uses the existing exact half-to-FP32 conversion;
 it does not lower scale, residual or accumulation precision. The earlier
 FP32-weight-only admission would have silently fallen back in the model.
+
+The first model compile exposed stale `eager_input_vals` on rewritten
+functionalized nodes: the old 21-argument tree was reused for the new
+25-argument operator. Invalidate that input-tree metadata and let Inductor
+reconstruct it. Four additional CPU cases run Inductor decomposition for
+both functionalization versions and both norm-weight dtypes. The failure
+produced no candidate model timing or acceptance result.

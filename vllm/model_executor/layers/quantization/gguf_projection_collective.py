@@ -267,6 +267,7 @@ def fuse_projection_collectives(graph: fx.Graph) -> int:
                     fused_op, args=(*args, *norm.args[1:4], group_name)
                 )
                 replacement.meta = norm.meta.copy()
+                replacement.meta.pop("eager_input_vals", None)
                 norm.replace_all_uses_with(replacement)
             else:
                 kwargs = dict(functional.kwargs)
@@ -280,6 +281,9 @@ def fuse_projection_collectives(graph: fx.Graph) -> int:
                     functional.target, args=(fused_op,), kwargs=kwargs
                 )
                 replacement.meta = functional.meta.copy()
+                # The recorded eager argument tree has the projection schema.
+                # Inductor must rebuild it for the added norm operands.
+                replacement.meta.pop("eager_input_vals", None)
                 norm_values = norm.meta.get("val")
                 original_values = functional.meta.get("val")
                 if norm_values is not None and original_values is not None:

@@ -146,3 +146,24 @@ def test_reject_unmeasured_shapes_and_auxiliary_projection_consumers(
     module = trace(8, functional, **change)
     assert fuse_projection_collectives(module.graph) == 0
     module.graph.lint()
+
+
+@pytest.mark.parametrize("functional", [auto_functionalized, auto_functionalized_v2])
+@pytest.mark.parametrize("norm_dtype", [torch.float16, torch.float32])
+def test_decompose_functionalized_node_after_rewrite(functional, norm_dtype):
+    from torch._inductor.fx_passes.post_grad import decompose_auto_functionalized
+    from torch._inductor.virtualized import V
+
+    module = trace(8, functional, norm_dtype=norm_dtype)
+    call = next(n for n in module.graph.nodes if n.target == functional)
+    # Inductor records this argument tree before post-grad rewriting. It must
+    # not retain the original 21-argument schema after adding the norm inputs.
+    call.meta["eager_input_vals"] = torch.fx.map_arg(
+        (call.args, call.kwargs), lambda n: n.meta["val"]
+    )
+    mode = call.meta["val"][0].fake_mode
+    assert fuse_projection_collectives(module.graph) == 1
+    with mode, V.set_fake_mode(mode):
+        decompose_auto_functionalized(module.graph)
+    module.graph.lint()
+    assert all(n.target != functional for n in module.graph.nodes)
