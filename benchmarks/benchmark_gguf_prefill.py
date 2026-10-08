@@ -6,6 +6,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -41,10 +42,16 @@ def main():
     parser.add_argument("--acceptance-check", action="store_true")
     parser.add_argument("--profile-once", action="store_true")
     parser.add_argument("--profile-kind", choices=("torch", "cuda"), default="torch")
-    parser.add_argument(
+    fixed_policy = parser.add_mutually_exclusive_group()
+    fixed_policy.add_argument(
         "--candidate-only",
         action="store_true",
         help="Measure the candidate after a separately recorded matched comparison",
+    )
+    fixed_policy.add_argument(
+        "--control-only",
+        action="store_true",
+        help="Measure the control for a separate-process memory admission comparison",
     )
     args = parser.parse_args()
     if args.input_tokens <= 0 or args.prefill_chunk <= 0:
@@ -97,6 +104,16 @@ def main():
         origin=vllm.__file__,
         comparison=args.compare,
         candidate_only=args.candidate_only,
+        control_only=args.control_only,
+        runtime_settings={
+            "fused_moe_activation_chunking": (
+                vllm.envs.VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING
+            ),
+            "fused_moe_chunk_rows": vllm.envs.VLLM_FUSED_MOE_CHUNK_SIZE,
+            "pytorch_alloc_conf": os.environ.get(
+                "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+            ),
+        },
         rows=[],
         decode_checks=[],
         acceptance_checks=[],
@@ -135,7 +152,13 @@ def main():
             "prefill-norm": "set_prefill_rmsnorm_gated_policy",
         }[args.compare]
         report["warmups"] = []
-        policies = (True,) if args.candidate_only else (False, True)
+        policies = (
+            (False,)
+            if args.control_only
+            else (True,)
+            if args.candidate_only
+            else (False, True)
+        )
         for enabled in policies:
             policy = llm.collective_rpc(method, args=(enabled,))
             warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
@@ -149,7 +172,11 @@ def main():
             )
             save()
         measured_policies = (
-            (True, True) if args.candidate_only else (False, True, True, False)
+            (False, False)
+            if args.control_only
+            else (True, True)
+            if args.candidate_only
+            else (False, True, True, False)
         )
         for enabled in measured_policies:
             policy = llm.collective_rpc(method, args=(enabled,))
@@ -297,7 +324,7 @@ def main():
         )
         save()
         if args.profile_once:
-            llm.collective_rpc(method, args=(True,))
+            llm.collective_rpc(method, args=(not args.control_only,))
             # Use named RPCs and the built-in profiler; callable RPC transport
             # requires unsafe serialization in the multiprocess engine.
             llm.collective_rpc("read_prefill_memory", args=(False, True))

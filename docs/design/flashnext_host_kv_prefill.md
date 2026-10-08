@@ -68,12 +68,29 @@ Long gaps repeatedly follow MoE unroute/add/allreduce and precede HC
 combine/norm. The same worker unmaps and releases physical CUDA memory, then
 creates, maps and sets access for new memory. This is allocation work on the
 launch dependency, not unidentified GPU arithmetic or seconds of entry skew.
-No allocator call stacks were recorded; API overlap alone does not distinguish
-an allocation retry from another cache-release caller. The benchmark therefore
+Each rank records 16 failed `cuMemCreate` calls returning CUDA error 2
+(`CUDA_ERROR_OUT_OF_MEMORY`), followed by cache release and successful new
+allocations. The request completes after these allocation retries. No allocator
+call stacks were recorded to identify every requesting tensor. The benchmark
 records retry/OOM/synchronization counters before and after each request, plus
 initialized and post-profile segment summaries with graph pool IDs and largest
 inactive blocks. These distinguish capacity pressure from memory retained in a
 different stream or private graph pool before choosing a storage change.
+
+The initialized global modular MoE workspace is 880 MiB. With the real MTP TP4
+expert geometry (512 experts, top10, K2560, local gate/up width 320) and 16K
+rows, the installed allocation code requires 880 MiB for a full-row operation
+or 292.5 MiB for 4K-row chunks, a 587.5 MiB reduction. This preserves the full
+16K scheduler batch and output; only independent expert rows are chunked. The
+existing modular activation chunking controls are default-off. Before selecting
+this mode, compare full and chunked FFNs on the real FP16 MTP shard, including
+M5/M20 changed-input graph replay. Separate-process model controls are required
+because the initialized workspace is locked for graph use. Reducing its shape
+in place would not reclaim the original graph-owned allocation. The benchmark
+records these registered settings and supports a fixed control alongside the
+existing fixed candidate, so storage and grouped-attention changes can be
+measured separately in the same wheel. No numerical or model gain is claimed
+from the capacity calculation alone.
 
 The immediate throughput milestone is 4000 input tokens/s, or 8.192 s for
 32768 tokens with the same 16K scheduler chunk; 6000 remains a later goal.
