@@ -24,14 +24,19 @@ from typing import TYPE_CHECKING
 from vllm.v1.attention.backends.flash_v100 import (  # noqa: F401
     backend,
     debug,
+    debug_compare,
+    decode,
     dense_prefill,
     impl,
     kv_layout,
     masks,
     metadata,
     ops,
+    prefill,
     routing,
     smallq_metadata,
+    state,
+    verify,
 )
 
 if TYPE_CHECKING:
@@ -70,6 +75,11 @@ SUBMODULES = (
     metadata,
     impl,
     backend,
+    state,
+    decode,
+    prefill,
+    verify,
+    debug_compare,
 )
 
 __all__ = [

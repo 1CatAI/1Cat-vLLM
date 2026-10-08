@@ -49124,3 +49124,37 @@ passes. Pre-commit and mypy pass on all nine owned paths. The table contains
 56 concrete declarations plus four observer families; 1,560 differential
 legacy decisions cover boundaries, availability/window/partition/graph hints
 and disabled E4M3 batch. GPU measurements remain unrun per the user override.
+
+## 2026-10-08 — architecture A3b-1 implementation method extraction
+
+Stack on A2 #1053 (`c7e4baf3c214ecedb6356fb19cd6c80ec94978ea`) in
+`agent/v100-arch-impl-split-20261008-084930`, root-disk worktree
+`/home/ymzx/arch-ws/v100-arch-impl-split-20261008-084930`.
+
+Extract 40 methods into decode (798 lines), prefill (1680), verify (1031)
+and debug_compare (428); core impl drops from 4930 to 1135 lines. Bind the
+same method names on the original class with unchanged inheritance and
+staticmethod descriptors. Move 30 global one-shot states to one state owner
+and register the owners with the compatibility shim. Preserve the original
+class receiver for the extracted comparison super call; a rebound public
+class export must not change the old `__class__` cell semantics.
+
+All 47 normalized calculation bodies match frozen A2 hashes. Normalization
+accounts only for state qualification/global declarations, typed-self
+annotations, docstring dedent and the explicit original-class super receiver.
+The initial seven hash differences were docstring indentation, not algorithm
+changes. The clean hash comparison has zero differences. New descriptor,
+state rebinding and patched-export/super tests: 3 passed. Existing focused
+matrix/mixed-row/compatibility/cleanup/FlashInfer suite: 306 passed. CPU policy
+candidate: 233 passed / 9 inherited device-inference failures / 1 skipped;
+all 243 JUnit case/status outcomes match the retained A2 parent result exactly
+(`a3_cpu_ab.json`). No GPU test is required by the user's active override;
+GPU numerical equivalence, replay and performance remain unmeasured.
+
+Coupling totals stay model 2325 / platform 3964 / env 335; accept per-file
+moves without any total growth. Pre-commit/mypy on moved implementation files
+passed. Raw logs and the source-normalization helper are under
+`/home/ymzx/arch-ws/tmp/a3_*`. This PR only extracts method responsibilities.
+A3b feature metadata hooks and removing family references from the remaining
+initialization/forward orchestration are still pending and must be a separate
+review scope; do not mark the full A3b or the architecture campaign complete.

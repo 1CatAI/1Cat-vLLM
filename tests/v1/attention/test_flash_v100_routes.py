@@ -213,8 +213,9 @@ def test_generated_path_codec_shape_matrix(spec, codec):
 def test_every_literal_accounting_site_uses_a_declared_spec():
     package = Path(r.__file__).parent
     hits = []
-    for name in ("impl.py", "dense_prefill.py"):
-        tree = ast.parse((package / name).read_text())
+    for path in package.rglob("*.py"):
+        name = str(path.relative_to(package))
+        tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.Call)
