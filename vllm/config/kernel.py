@@ -587,6 +587,10 @@ class KernelConfig:
     """Run single-request MTP GDN verification with the SM70 sequential CUDA
     recurrence instead of the Triton fused kernel."""
 
+    sm70_round_cost_diagnostics: bool = False
+    """Record bounded decode routing histories for a byte/instruction cost
+    ledger. Extra diagnostic kernels invalidate latency measurements."""
+
     sm70_hcx: bool = False
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""
