@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, fields, is_dataclass
@@ -549,6 +550,27 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
         "attention_staging_dtype": "float16",
         "recurrent_state_storage": "device",
+    }
+    device_history_reason = None
+    if not cfg.kernel_config.sm70_qsa_device_history:
+        device_history_reason = "user_override"
+    elif not cfg.kernel_config.qsa_host_kv_active:
+        device_history_reason = "qsa_history_inactive"
+    elif not cfg.kernel_config.qsa_host_kv_device_reference:
+        device_history_reason = "history_on_host"
+    elif not sm70:
+        device_history_reason = "requires_SM70"
+    elif importlib.util.find_spec("vllm._sm70_qsa_device_C") is None:
+        device_history_reason = "native_extension_unavailable"
+    report["qsa_device_history"] = {
+        "enabled": device_history_reason is None,
+        "reason": device_history_reason,
+        "scope": "configured_native_capability",
+        "runtime_guards": (
+            "device E4M3/FP16 history; FP16 query; M1..20, H6, D256; width<=4096"
+        ),
+        "arithmetic": "FP32 QK/probability/PV/numerator/max/sum",
+        "fallback": "protected hot-page reader",
     }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {

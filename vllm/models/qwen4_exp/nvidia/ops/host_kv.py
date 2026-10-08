@@ -394,6 +394,7 @@ class HostQSAKV:
         history: torch.Tensor | None = None,
         dtype: torch.dtype = torch.uint8,
         device_reference: bool = False,
+        direct_device: bool | None = None,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -479,6 +480,12 @@ class HostQSAKV:
             self.resolved,
         ) = _WORKSPACES[workspace_key]
         self.table = self.requests.view(-1, 1)
+
+        from .device_kv_attention import initialize_device_history_attention
+
+        self.device_history_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.device_history_reason: str | None = None
+        initialize_device_history_attention(self, direct_device)
 
     def write(self, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor):
         if key.shape[1:] != (1, self.dim) or value.shape != key.shape:

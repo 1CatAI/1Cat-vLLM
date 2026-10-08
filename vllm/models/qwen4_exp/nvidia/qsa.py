@@ -809,10 +809,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
             logger.info_once(
                 "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
-                "attention reads FP16 hot pages; only unresolved misses are staged.",
+                "direct device M1..20/H6/D256=%s, fallback_reason=%s; "
+                "other shapes use protected FP16 hot pages and miss staging.",
                 "device_reference" if self.host_kv_device_reference else "host",
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,
+                self.host_kv.device_history_workspace is not None,
+                self.host_kv.device_history_reason,
             )
 
     def host_kv_forward(

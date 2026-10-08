@@ -20,6 +20,12 @@ def host_qsa_attention(
         raise ValueError("Direct host QSA requires FP16 queries matching D256")
     if out.shape != query.shape or indices.shape[0] != query.shape[0]:
         raise ValueError("Direct host QSA row counts disagree")
+    from .device_kv_attention import device_history_attention
+
+    if device_history_attention(
+        query, state, indices, table, requests, positions, lengths, out, gate
+    ):
+        return out
     resolved = state.resolve(indices, table, requests, positions, lengths)
     group = query.shape[1]  # Host admission requires one TP-local KV head.
     block_m = triton.next_power_of_2(group)
