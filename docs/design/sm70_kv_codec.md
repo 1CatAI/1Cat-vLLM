@@ -275,7 +275,37 @@ order statistics so long arrays exceed neither the `torch.quantile` size limit
 nor the memory cost of retaining every reconstructed format. The reference is FP32 masked attention over captured
 FP16 tensors, not a claim of bitwise native-kernel output. Nine numerical
 self-tests pass; they are synthetic tool checks and **not format-selection data**.
-No real three-model dataset has been collected yet; no default is selected.
+Initial real-request NVFP4/GGUF samples have been collected; the three-model corpus
+and independent E4M3 scale check remain incomplete. No default is selected.
+See [the initial request-data comparison](sm70_kv_initial_request_errors.md).
+
+## Real-request dense capture adapter
+
+`tools/kv_codec/capture.py` uses vLLM's public `LLM.collective_rpc` API to install
+short-lived diagnostic pre/post hooks on the first/middle/last dense attention
+layers of each TP rank. Callable serialization is enabled only in the isolated
+capture process (`VLLM_ALLOW_INSECURE_SERIALIZATION=1`), not a serving default.
+`collective_rpc` carries the callback as a method and plain data as arguments;
+`apply_model` nests a callable in arguments and the current multiprocess queue
+cannot pickle its local closure. Capture runs from an ordinary installed wheel with
+FP16 KV, eager execution, no prefix reuse or draft/MTP. Chunked prefill remains
+enabled for hybrid-model compatibility, but the request must fit in a single
+batch and its actual query boundaries/sequence lengths must prove a complete
+first prefill. Any padded, partial, shared-cache or unsupported attention
+capture fails explicitly. QSA/MLA masks need a separate adapter; a dense mask
+must not be substituted for their selected keys.
+
+The adapter saves unquantized post-RoPE Q/K and V, the final 16 query positions,
+all prompt keys/values, causal/window masks and complete int64 request token IDs.
+The version-1 manifest records layer/rank/TP, target role, source/wheel/request
+hashes and the selected attention backend. Captures require the Flash-V100
+backend and an executed first-prefill route delta, excluding warmup metadata
+counters. Diagnostic synchronization/copying
+invalidates timing; its output is data evidence only. Captured FP16-cache layer
+scalars are labeled as such: they do not prove independent production E4M3
+calibration. Recheck E4M3 scales before format selection. No default is selected
+until all three model/request corpora and the required quality/performance gates
+are complete.
 
 ## Triton writer tile interface
 
@@ -300,6 +330,14 @@ are existing compiler limits, not passing format/path cells. PTX comparison
 excludes only source/debug sections and unreferenced debug labels; instructions,
 registers and control-flow labels remain. The result ledger separates these
 compiler checks from GPU writer/reference, model and performance gates.
+
+On the authorized 54633 host, `verify_triton_writer --run` executes all sixteen
+compiled original/extracted pairs on SM70. Cache payload and FP32 scale bytes
+match, including strided inputs, page boundaries, negative padding slots,
+zero-head scale floors and untouched cache bytes. The eight E4M3 compiler
+rejections remain unsupported; this does not admit new accelerated INT8 paths.
+The same normal installed wheel passes 197 policy and four GPU metadata tests
+with source-tree imports excluded and native extensions loaded normally.
 
 Inspection of the current
 [vLLM writer](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_reshape_and_cache_flash.py)

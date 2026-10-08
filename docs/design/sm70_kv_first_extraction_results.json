@@ -877,7 +877,7 @@
     "precommit": "passed on all changed files"
   },
   "current_inventory": {
-    "backend_lines": 8996,
+    "backend_lines": 8826,
     "decode_lines": 6243,
     "backend_and_modules": {
       "kv_dtype_tokens": 134,
@@ -887,5 +887,55 @@
     },
     "retired_environment_switches": 0,
     "note": "physical code moves do not retire dtype decisions or environment switches"
+  },
+  "page_view_extraction": {
+    "source_sha": "4480016446bfa0aee67100fb84f15f479bee4ba9",
+    "functions_moved": 5,
+    "backend_lines": 8826,
+    "cpu_cases": 102,
+    "bitwise_and_aliasing_equal": true,
+    "gpu_gate": "pending"
+  },
+  "remote_54633_reader_writer_gate": {
+    "host": "YMZX",
+    "source_sha": "c0737e46210ac5b1273b78d622de1eefa71fd4de",
+    "runtime_source_sha": "477e79507b09498b011ebcfa625b8b67aad321e7",
+    "wheel_sha256": "e6253cbfef64ec87af46572ce52e2590f93efb7fcb6220fc7249dea86dded4ec",
+    "gpu": "Tesla V100-SXM2-32GB",
+    "locks": "nonblocking global and selected GPU locks; occupied GPUs excluded",
+    "scalar_reader_bitwise_equal": true,
+    "packed_reader_bitwise_equal": true,
+    "scalar_ptx_equal": true,
+    "packed_ptx_equal": true,
+    "triton_writer_compiled_pairs_bitwise_equal": 16,
+    "triton_writer_e4m3_same_compiler_rejections": 8,
+    "installed_wheel_policy_tests_passed": 197,
+    "installed_wheel_smallq_metadata_tests_passed": 4,
+    "scope": "reader/writer parity and installed-wheel policy/metadata; no new model, speed, INT8 admission or E4M3 compiler support claim",
+    "environment_recovery": "System Python lacked Python.h; use task-local uv managed Python 3.12.15 with standard Torch 2.10.0+cu128/Triton 3.6.0. Initial test staging lacked tests.v1.attention.utils; unchanged helper staged, full 201 tests pass.",
+    "declared_runtime_dependencies": "uv pip check passes after full ordinary wheel dependency installation"
+  },
+  "initial_real_request_corpus": {
+    "models": [
+      "27B NVFP4",
+      "27B GGUF IQ3_S"
+    ],
+    "samples_per_model": 6,
+    "layers": [
+      3,
+      35,
+      63
+    ],
+    "tp": 2,
+    "request_chat_tokens": 157,
+    "query_positions": "last 16 prompt positions",
+    "kv_dtype": "float16",
+    "graph": false,
+    "mtp": false,
+    "executed_prefill_route": "prefill_no_prefix_dense_flash",
+    "executed_route_calls_per_rank_per_model": 16,
+    "route_log_assertions_passed": true,
+    "format_results": "sm70_kv_initial_request_errors.json",
+    "scope": "initial arithmetic data; not three-model format selection, calibrated E4M3 admission, speed or quality qualification"
   }
 }

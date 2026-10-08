@@ -49140,3 +49140,41 @@ borrowed DSO or setup-code workaround. CPU tests:32 source/tool/build +17 storag
 96 mask/reference and2646 accounting comparisons pass. Inventory aggregates
 backend/new modules to prevent moved reads being misreported as retired flags.
 All89 environment names and26 dtype predicates remain; convergence is pending.
+
+### KV codec continuation: authorized 54633 validation and request data
+
+The user explicitly authorized 54633 after the local GPU outage. Four V100
+SXM2-32GB GPUs have NVLink connections; the P400 display device is excluded.
+Use nonblocking GPU locks and idle UUIDs, never preempt existing workloads.
+The ordinary installed source477 wheel passes exhaustive scalar/packed reader
+GPU byte comparisons and sixteen original/extracted Triton writer pairs.
+Eight E4M3 Triton pairs retain the existing SM70 compiler rejection. Installed
+policy/metadata tests pass:197 policy plus4 GPU metadata cases, with no source
+or private-library overlay. New accelerated INT8 admission is still pending.
+
+Two27B models (NVFP4 and GGUF IQ3_S) now provide12 real-request layer/rank
+samples:157 chat tokens, three dense layers per TP2 rank, FP16 KV, eager,
+no MTP or prefix reuse. Both ranks/model execute the Flash-V100 first-prefill
+route. The ten-scheme offline comparison and its limitations are retained in
+[the initial data ledger](sm70_kv_initial_request_errors.md). Captured FP16
+layer scalars do not prove production E4M3 calibration. Flash-Next/QSA masks,
+longer real requests, native arithmetic/cost and all quality gates remain
+required before selecting a default. A one-token capture is not a speed,
+acceptance, natural-EOS or C4 result.
+
+Retain capture setup failures: system Python lacked development headers;
+the task uses uv-managed Python3.12.15. The current multiprocess queue cannot
+pickle a callable nested inside `apply_model` arguments; the public
+`collective_rpc` method accepts a callable with plain arguments. Its local
+serialization flag is diagnostic only. Do not repeat seven-minute GGUF loads
+without a new gate or implementation question.
+
+Five page-view helpers were extracted unchanged at4480016446. All102 CPU
+cases preserve values, strides, offsets, aliases and memoized admission.
+The backend is8826 lines; aggregate89 environment reads/26 dtype predicates
+and legacy routes remain unchanged. Normal source448 wheel built successfully;
+installed GPU page/model verification is pending. Its Flash-V100 library is
+byte-identical to source477; complete SM70 FA2 SASS matches with only namespace
+path hashes normalized. An absent `patchelf` on PATH caused the first packaging
+failure; the normal retry with declared environment tools completed. No setup
+patch, borrowed DSO or runtime-library override was used.

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Compile original/extracted cache writers without opening a CUDA device.
+"""Compare original/extracted cache writers, optionally executing on SM70.
 
 Target SM70 explicitly. A compiler rejection remains an unsupported compiler
 path in both arms, not runtime KV support or a waived quality/performance gate.
@@ -29,6 +29,122 @@ KERNELS = (
 )
 
 
+def compare_gpu_outputs(row, modules):
+    """Exercise strided inputs, page boundaries, padding and untouched bytes."""
+    import torch
+
+    assert torch.cuda.get_device_capability() == (7, 0)
+    name, dim = row["kernel"], row["dim"]
+    dtype = {"fp16": torch.float16, "fp8e5": torch.float8_e5m2, "i8": torch.int8}[
+        row["output_type"]
+    ]
+    heads, page, blocks = 2, 16, 3
+    slots = torch.tensor([1, 15, 16, 31, 32, -1, 7, 3, 24], device="cuda")
+    generator = torch.Generator(device="cuda").manual_seed(20261008)
+    value_dim = dim // 2 if name == KERNELS[1] else dim
+    key = torch.randn(
+        (18, heads, dim), device="cuda", dtype=torch.float16, generator=generator
+    )[::2]
+    value = torch.randn(
+        (18, heads, value_dim),
+        device="cuda",
+        dtype=torch.float16,
+        generator=generator,
+    )[::2]
+    key[0].zero_()  # Dynamic scale floor; leave other tokens nonzero.
+    k_scale = torch.tensor(0.75, device="cuda")
+    v_scale = torch.tensor(1.25, device="cuda")
+    results = []
+
+    def cache(shape, cache_dtype=dtype):
+        # Check all unaddressed cache/scale bytes, not only live slots.
+        count = 1
+        for extent in shape:
+            count *= extent
+        item_size = torch.empty((), dtype=cache_dtype).element_size()
+        return (
+            torch.full((count * item_size,), 0xA5, device="cuda", dtype=torch.uint8)
+            .view(cache_dtype)
+            .reshape(shape)
+        )
+
+    for module in modules:
+        kwargs = dict(
+            key_ptr=key,
+            value_ptr=value,
+            slot_mapping_ptr=slots,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            key_stride=key.stride(0),
+            value_stride=value.stride(0),
+            **row["constexprs"],
+        )
+        outputs = []
+        if name == KERNELS[1]:
+            output = cache((blocks, page, heads, dim + value_dim))
+            kwargs.update(
+                kv_cache_ptr=output,
+                block_stride=output.stride(0),
+                page_stride=output.stride(1),
+            )
+            outputs.append(output)
+            grid = (slots.numel(), heads)
+        else:
+            if row["head_major"]:
+                kc = cache((blocks, heads, dim // 8, page, 8))
+                vc = cache((blocks, heads, dim, page))
+            else:
+                kc = cache((blocks, page, heads, dim))
+                vc = cache((blocks, page, heads, value_dim))
+            kwargs.update(key_cache_ptr=kc, value_cache_ptr=vc)
+            outputs.extend((kc, vc))
+            if name == KERNELS[0]:
+                kwargs.update(
+                    block_stride=kc.stride(0),
+                    head_stride=kc.stride(1 if row["head_major"] else 2),
+                    dim_stride_k=kc.stride(2) if row["head_major"] else 0,
+                    dim_stride_v=vc.stride(2) if row["head_major"] else 0,
+                    page_stride=kc.stride(1),
+                )
+                grid = (slots.numel(), triton.cdiv(heads * dim, 256))
+            else:
+                ks = cache((blocks, page, heads), torch.float32)
+                vs = cache((blocks, page, heads), torch.float32)
+                kwargs.update(k_scale_cache_ptr=ks, v_scale_cache_ptr=vs)
+                outputs.extend((ks, vs))
+                for prefix, tensor, axes in (
+                    ("key", key, ("tok", "head")),
+                    ("val", value, ("tok", "head")),
+                    ("kc", kc, ("blk", "slot", "head")),
+                    ("vc", vc, ("blk", "slot", "head")),
+                    ("ks", ks, ("blk", "slot", "head")),
+                    ("vs", vs, ("blk", "slot", "head")),
+                ):
+                    kwargs.update(
+                        {
+                            f"stride_{prefix}_{axis}": tensor.stride(i)
+                            for i, axis in enumerate(axes)
+                        }
+                    )
+                grid = (slots.numel(), heads)
+        fn = getattr(module, name)
+        fn[grid](
+            **{p.name: kwargs[p.name] for p in fn.params},
+            num_warps=min(16, max(1, dim // 32)),
+        )
+        torch.accelerator.synchronize()
+        results.append(
+            [
+                hashlib.sha256(
+                    t.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+                ).hexdigest()
+                for t in outputs
+            ]
+        )
+    assert results[0] == results[1], row
+    return {"bitwise_equal": True, "output_sha256": results[0], "tokens": 9}
+
+
 def normalize_ptx(text):
     # Only non-executable source/debug metadata; retain all instructions.
     text = re.sub(r"//[^\n]*|/\*.*?\*/", "", text, flags=re.DOTALL)
@@ -49,6 +165,9 @@ def normalize_ptx(text):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--run", action="store_true", help="Execute compiled pairs on SM70"
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
     args.out.mkdir(parents=True, exist_ok=True)
@@ -201,6 +320,10 @@ def main():
                             same_unsupported_e4m3=same_rejection,
                         )
                     )
+                    if args.run and equal:
+                        rows[-1]["gpu_outputs"] = compare_gpu_outputs(
+                            rows[-1], (baseline, candidate)
+                        )
     result = {
         "base_sha": BASE_SHA,
         "source_sha": subprocess.check_output(
@@ -215,13 +338,22 @@ def main():
             p.name: hashlib.sha256(p.read_bytes()).hexdigest()
             for p in (source_path, codec_path)
         },
-        "target": "cuda/sm70/warp32; explicit target, no driver/device opened",
-        "gpu_gate": "pending",
+        "target": "cuda/sm70/warp32; explicit compilation target",
+        "device_execution": args.run,
+        "gpu_gate": "compiled pairs bitwise equal" if args.run else "pending",
         "rows": rows,
         "all_compiled_pairs_equal": all(
             row["ptx_equal"] or row["same_unsupported_e4m3"] for row in rows
         ),
     }
+    if args.run:
+        import torch
+
+        result["runtime"] = {
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+            "device": str(torch.cuda.get_device_properties(0)),
+        }
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps({k: v for k, v in result.items() if k != "rows"}))
     if not result["all_compiled_pairs_equal"]:
