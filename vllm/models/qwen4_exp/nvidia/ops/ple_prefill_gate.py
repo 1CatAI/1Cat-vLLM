@@ -6,9 +6,12 @@ import math
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -100,6 +103,10 @@ def _prepare_op(
     gates: torch.Tensor,
     eps: float,
 ) -> None:
+    logger.info_once(
+        "SM70 PLE prefill retains scalar gates and reuses key/output "
+        "storage (FP32 gate/norm, FP16 materialized values)."
+    )
     rows, groups = gates.shape
     hidden = value.shape[1]
     _prepare[(rows, groups)](
@@ -171,6 +178,11 @@ direct_register_custom_op(
 @torch.compiler.assume_constant_result
 def _is_sm70():
     return current_platform.is_device_capability(70)
+
+
+@torch.compiler.assume_constant_result
+def report_prefill_gate_fallback(reason):
+    logger.debug_once("PLE compact prefill gate fallback: %s.", reason)
 
 
 def prefill_gate_reason(key, query, value, norms, groups):

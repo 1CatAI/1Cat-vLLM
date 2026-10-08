@@ -174,7 +174,8 @@ def test_graph_replay_recomputes_changed_inputs():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_compiled_ple_entry_and_residual_boundary(monkeypatch):
+@pytest.mark.parametrize("groups", [4, 3])
+def test_compiled_ple_entry_and_residual_boundary(monkeypatch, groups):
     from types import MethodType
 
     import vllm.models.qwen4_exp.nvidia.ple_layer as ple_module
@@ -207,11 +208,12 @@ def test_compiled_ple_entry_and_residual_boundary(monkeypatch):
     nn.Module.__init__(module)
     module.prefix = "test_ple"
     module._sm70_hcx_diagnostics = False
-    module.hidden_size, module.hc_count = 2560, 4
+    width = groups * 2560
+    module.hidden_size, module.hc_count = 2560, groups
     module.ple_embedding = Embedding()
-    module.key_proj, module.value_proj = Projection(10240), Projection(2560)
+    module.key_proj, module.value_proj = Projection(width), Projection(2560)
     for name in ("norm_key", "norm_query", "norm_conv"):
-        norm = Qwen4ExpPLEGroupedNorm(10240, 1e-6, 2560, torch.float16).cuda()
+        norm = Qwen4ExpPLEGroupedNorm(width, 1e-6, 2560, torch.float16).cuda()
         module.add_module(name, norm)
 
     def short_conv(self, inputs, output=None):
@@ -223,22 +225,22 @@ def test_compiled_ple_entry_and_residual_boundary(monkeypatch):
     config.compilation_config.static_forward_context[module.prefix] = module
     context = create_forward_context(None, config)
     args = (
-        torch.randn(rows, 10240, device="cuda", dtype=torch.float16),
+        torch.randn(rows, width, device="cuda", dtype=torch.float16),
         torch.arange(rows, device="cuda"),
         torch.tensor([0, rows], device="cuda"),
         torch.empty(1, 0, device="cuda", dtype=torch.int64),
     )
     with torch.inference_mode(), override_forward_context(context):
         config.kernel_config.prefill_ple_compact_gate = False
-        control = torch.compile(module, dynamic=False)
+        control = torch.compile(module, dynamic=False, fullgraph=True)
         expected = control(*args, add_residual=True)
         config.kernel_config.prefill_ple_compact_gate = True
         exported = torch.export.export(
             module, args, kwargs={"add_residual": True}, strict=True
         )
-        assert "qwen4_exp_ple_prefill_gate" in str(exported.graph)
-        assert "qwen4_exp_ple_prefill_finish" in str(exported.graph)
-        candidate = torch.compile(module, dynamic=False)
+        assert ("qwen4_exp_ple_prefill_gate" in str(exported.graph)) == (groups == 4)
+        assert ("qwen4_exp_ple_prefill_finish" in str(exported.graph)) == (groups == 4)
+        candidate = torch.compile(module, dynamic=False, fullgraph=True)
         actual = candidate(*args, add_residual=True)
         torch.testing.assert_close(actual, expected, atol=3e-3, rtol=3e-3)
         # Direct eager execution retains its original materialized semantics.

@@ -115,6 +115,7 @@ from .ops.ple_prefill_gate import (
     finish_prefill_gate,
     prefill_gate_reason,
     prepare_prefill_gate,
+    report_prefill_gate_fallback,
 )
 
 _MASK64 = (1 << 64) - 1
@@ -2895,10 +2896,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             if len({norm.eps for norm in norms}) != 1:
                 reason = "different_norm_eps"
             if reason is None:
-                logger.info_once(
-                    "SM70 PLE prefill retains scalar gates and reuses key/output "
-                    "storage (FP32 gate/norm, FP16 materialized values)."
-                )
                 normalized, gates = prepare_prefill_gate(
                     key,
                     hidden_states,
@@ -2919,7 +2916,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                     gates,
                     hidden_states if add_residual else None,
                 )
-            logger.debug_once("PLE compact prefill gate fallback: %s.", reason)
+            report_prefill_gate_fallback(reason)
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)

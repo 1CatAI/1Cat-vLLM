@@ -459,3 +459,11 @@ verifies named-RPC serialization, restart, and CUDA events in both trace files.
 Three natural chat prompts complete with EOS, including arithmetic, a Chinese
 explanation, and Python code. These health checks do not substitute for the
 pending model-level logit and C4 acceptance comparisons.
+
+The first installed compact-gate model attempt fails before request timing:
+`logger.info_once` inside PLE forward is unsupported by production fullgraph
+compilation. The earlier numerical test permitted graph breaks. Logging now
+runs inside the opaque operator boundary, and static fallback reporting is
+excluded from graph tracing. Two strict fullgraph/export regressions cover both
+HC4 admission and HC3 fallback, including residual and eager output comparison.
+No model memory or speed claim is taken from that failed initialization.
