@@ -115,3 +115,14 @@ This fails the model quality gate; the measured 1.797 ms C1 reduction is not
 an admitted improvement. The packed result path must not be promoted until
 the source of the difference is localized and corrected. Decoder byte
 checks alone do not establish compiled model equivalence.
+
+An isolated consumer check with real IQ4_NL rows and PLE projection weights
+passes all 144 comparisons at M5/20/512: eager, compiled and graph execution,
+both allocating and fixed-output decoder interfaces. Embeddings, projections,
+normalization and gate stages are identical. This does not locate the model
+difference or establish model equivalence. The fixed-output revision returns
+a view of an owned, preallocated FP16 workspace rather than a graph-pool
+allocation; its additional activation storage is 2.5 MiB per rank at the
+512-token workload. It requires another matched model test. Teacher capture
+also retains the actual transported packet, decoded rows and codebook after
+replay so the model boundary can be checked independently of logits.

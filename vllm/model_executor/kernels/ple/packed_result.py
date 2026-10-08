@@ -28,7 +28,7 @@ def packed_result_capability(
     return dict(
         enabled=reason is None,
         reason=reason,
-        operator="ple_decode_iq4nl_result",
+        operator="ple_decode_iq4nl_result_out",
         source_type=source_type,
         row_width=row_width,
         heads=heads,

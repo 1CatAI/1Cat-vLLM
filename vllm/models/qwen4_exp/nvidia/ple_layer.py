@@ -1893,7 +1893,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         if (
             reader is None
             or not layout.get("enabled")
-            or layout.get("operator") != "ple_decode_iq4nl_result"
+            or layout.get("operator") != "ple_decode_iq4nl_result_out"
             or layout.get("source_type") != 20
             or reader.source_type != 20
             or reader.hidden_size != layout.get("row_width")
@@ -1910,9 +1910,14 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         layout = getattr(self, "_packed_result_layout", None)
         if layout is None:
             return output
-        return torch.ops.vllm.ple_decode_iq4nl_result(
-            output, self._packed_result_codebook, layout["row_width"]
+        workspace = self._packed_result_output
+        if output.shape[0] > workspace.shape[0]:
+            raise ValueError("Packed PLE result exceeds decoded workspace capacity")
+        decoded = workspace[: output.shape[0]]
+        torch.ops.vllm.ple_decode_iq4nl_result_out(
+            output, self._packed_result_codebook, layout["row_width"], decoded
         )
+        return decoded
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load hash buffers and checkpoint-split embedding rows."""
@@ -2148,6 +2153,17 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             self.ple_embedding.register_buffer(
                 "_packed_result_codebook",
                 torch.tensor(gguf.quants.IQ4_NL.kvalues, dtype=torch.float32),
+                persistent=False,
+            )
+            self.ple_embedding.register_buffer(
+                "_packed_result_output",
+                torch.empty(
+                    (
+                        vllm_config.scheduler_config.max_num_batched_tokens,
+                        int(config.ple_embed_dim),
+                    ),
+                    dtype=torch.float16,
+                ),
                 persistent=False,
             )
         self._sm70_hcx_diagnostics = vllm_config.kernel_config.sm70_hcx_diagnostics

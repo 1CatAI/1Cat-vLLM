@@ -396,6 +396,9 @@ def test_mapped_packet_consumer_decodes_before_releasing_result(m):
         module._packed_result_codebook = torch.tensor(
             gguf.quants.IQ4_NL.kvalues, dtype=torch.float32, device=device
         )
+        module._packed_result_output = torch.empty(
+            (m + 3, 2560), dtype=torch.float16, device=device
+        )
         module._cpu_output_buffer = region.result
         module.setup_cross_process_offload(
             packet, CpuGpuSemaphore(device, host_region=region)
@@ -411,6 +414,7 @@ def test_mapped_packet_consumer_decodes_before_releasing_result(m):
         with torch.cuda.graph(graph):
             output = module.wait_offloaded_output(hidden, m)
             module.release_offloaded_output()
+        assert output.data_ptr() == module._packed_result_output.data_ptr()
         for step in range(4):
             wait_host_resets([region.flag], timeout_s=1)
             data = rows()
