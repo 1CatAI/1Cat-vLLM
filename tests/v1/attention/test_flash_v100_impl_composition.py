@@ -50,6 +50,28 @@ class _InlineFeatureHooks(ast.NodeTransformer):
             return hook
         return None
 
+    def visit_Return(self, node):
+        if (
+            isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func) == "self._forward_decode"
+        ):
+            cls = next(
+                n
+                for n in ast.parse(Path(impl.__file__).read_text()).body
+                if isinstance(n, ast.ClassDef) and n.name == "FlashAttnV100Impl"
+            )
+            helper = next(
+                n
+                for n in cls.body
+                if isinstance(n, ast.FunctionDef) and n.name == "_forward_decode"
+            )
+            assert not node.value.keywords
+            assert [ast.unparse(a) for a in node.value.args] == [
+                a.arg for a in helper.args.args[1:]
+            ]
+            return copy.deepcopy(helper.body)
+        return self.generic_visit(node)
+
     def visit_Expr(self, node):
         hook = self._hook(node.value)
         if hook is not None:

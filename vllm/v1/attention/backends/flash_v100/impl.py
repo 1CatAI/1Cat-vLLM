@@ -936,6 +936,34 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             )
             return result
 
+        return self._forward_decode(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+            is_capturing,
+            layer_name,
+        )
+
+    def _forward_decode(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None,
+        output_block_scale: torch.Tensor | None,
+        is_capturing: bool,
+        layer_name: object,
+    ) -> torch.Tensor:
         if not self.use_flash_v100_decode:
             message = (
                 "FLASH_ATTN_V100 decode cannot run because the paged decode op "

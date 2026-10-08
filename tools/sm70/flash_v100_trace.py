@@ -256,7 +256,10 @@ def install_ops(monkeypatch, recorder, legacy, case):
 
     def read_predicate(instance, name):
         value = original_read(instance, name)
-        if name.startswith("use_") and sys._getframe(1).f_code.co_name == "forward":
+        if name.startswith("use_") and sys._getframe(1).f_code.co_name in (
+            "forward",
+            "_forward_decode",
+        ):
             recorder.events.append(["predicate", name, value])
         return value
 
