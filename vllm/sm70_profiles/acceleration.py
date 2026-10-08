@@ -548,6 +548,21 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "runtime_guards": "FP16; M>=512; requests1..16; taps2..8; dilation1..8",
         "precision": "FP32 accumulation; FP16 conv boundary before FP32 SiLU",
     }
+    prefill_norm = cfg.kernel_config.prefill_rmsnorm_gated
+    report["prefill_rmsnorm_gated"] = {
+        "enabled": sm70 and prefill_norm,
+        "reason": None
+        if sm70 and prefill_norm
+        else ("requires_sm70" if not sm70 else "disabled_by_kernel_policy"),
+        "scope": "large_batch_norm",
+        "operator": "one-pass FLA gated RMSNorm",
+        "runtime_guards": (
+            "contiguous FP16 input/gate/weight; N128; rows>=4096; "
+            "ungrouped normalization before SiLU/sigmoid gate; "
+            "batch-invariant mode excluded"
+        ),
+        "precision": "FP32 normalization/gating; FP16 output",
+    }
     ple_gate = cfg.kernel_config.prefill_ple_compact_gate
     report["prefill_ple_compact_gate"] = {
         "enabled": sm70 and ple_gate,

@@ -659,6 +659,9 @@ class KernelConfig:
     qsa_host_kv_reason: str | None = Field(default=None, init=False)
     """Reason the requested host QSA storage is unavailable."""
 
+    prefill_rmsnorm_gated: bool = True
+    """Use the existing FP32-compute FLA gated norm for large SM70 FP16 batches."""
+
     ple_disk_cascade: bool = True
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
     ple_disk_release_pages: bool = False

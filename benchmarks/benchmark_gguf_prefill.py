@@ -27,7 +27,9 @@ def main():
     parser.add_argument("--kv-cache-memory-bytes", type=int, default=1610612736)
     parser.add_argument("--kernel-config", type=json.loads, default={})
     parser.add_argument(
-        "--compare", choices=("routing", "host-prefill"), default="routing"
+        "--compare",
+        choices=("routing", "host-prefill", "prefill-norm"),
+        default="routing",
     )
     parser.add_argument("--decode-check", action="store_true")
     parser.add_argument("--completion-check", action="store_true")
@@ -115,11 +117,11 @@ def main():
         report["input_sha256"] = hashlib.sha256(json.dumps(ids).encode()).hexdigest()
         report["input_kind"] = "fixed repeated technical text; not a corpus benchmark"
         params = SamplingParams(temperature=0, max_tokens=1)
-        method = (
-            "set_qsa_host_prefill_policy"
-            if args.compare == "host-prefill"
-            else "set_gguf_prefill_routing_policy"
-        )
+        method = {
+            "routing": "set_gguf_prefill_routing_policy",
+            "host-prefill": "set_qsa_host_prefill_policy",
+            "prefill-norm": "set_prefill_rmsnorm_gated_policy",
+        }[args.compare]
         report["warmups"] = []
         policies = (True,) if args.candidate_only else (False, True)
         for enabled in policies:
@@ -246,9 +248,11 @@ def main():
             llm.stop_profile()
             warm_files = set(trace_directory.glob("*.pt.trace.json.gz"))
             llm.start_profile("prefill32k")
+            started = time.perf_counter()
             profiled = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[
                 0
             ]
+            profile_wall_seconds = time.perf_counter() - started
             llm.stop_profile()
             files = sorted(set(trace_directory.glob("*.pt.trace.json.gz")) - warm_files)
             if len(files) != args.tp:
@@ -257,6 +261,12 @@ def main():
                 )
             report["profile"] = dict(
                 scope="profiled candidate; excluded from unprofiled throughput",
+                wall_seconds=profile_wall_seconds,
+                scheduled_to_first_token_seconds=(
+                    profiled.metrics.first_token_ts - profiled.metrics.scheduled_ts
+                    if profiled.metrics is not None
+                    else None
+                ),
                 warmup_output_ids=warmup.outputs[0].token_ids,
                 output_ids=profiled.outputs[0].token_ids,
                 files=[

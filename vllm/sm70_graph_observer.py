@@ -317,6 +317,27 @@ class GraphParityWorkerExtension:
             raise RuntimeError("No admitted host QSA owners")
         return {"rank": self.rank, "enabled": enabled, "owners": len(owners)}
 
+    def set_prefill_rmsnorm_gated_policy(self, enabled):
+        """Change large gated-norm dispatch between completed cohorts."""
+        if not isinstance(enabled, bool):
+            raise TypeError("Prefill gated norm policy requires a boolean")
+        runner = self.model_runner
+        configs = [runner.vllm_config]
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None:
+            configs.append(speculator.vllm_config)
+        owners = set()
+        for config in configs:
+            for module in config.compilation_config.static_forward_context.values():
+                norm = getattr(module, "norm", None)
+                if norm is not None and hasattr(norm, "_sm70_prefill_rmsnorm_gated"):
+                    norm._sm70_prefill_rmsnorm_gated = enabled
+                    owners.add(id(norm))
+            config.kernel_config.prefill_rmsnorm_gated = enabled
+        if not owners:
+            raise RuntimeError("No gated norm owners")
+        return {"rank": self.rank, "enabled": enabled, "owners": len(owners)}
+
     def set_mtp_execution_policy(self, draft_single_graph, greedy_verify):
         """Benchmark RPC: change host dispatch between completed cohorts.
 

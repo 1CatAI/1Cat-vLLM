@@ -1,5 +1,33 @@
 # Flash-Next host KV prefill on SM70
 
+## Large-batch gated norm admission
+
+A TP4 IQ3_S run with FP16 MTP4, 32K input, a 16K scheduler chunk and a
+1.375 GiB KV pool failed on the first real prefill. Initialization used
+29.13 GiB of active Torch storage per rank. GDN's gated norm then attempted
+another 96 MiB FP32 allocation with only 62.75 MiB device memory free.
+No throughput is recorded for this failed request.
+
+The opaque GDN forward selects `RMSNormGated.forward_native`. Its exact SM70
+decode kernel admits at most 192 N128 rows; prefill falls back to separate
+FP32 casts, square/mean, normalization, activation and multiplication tensors.
+The new `prefill_rmsnorm_gated` capability reuses the existing FLA one-pass
+implementation for contiguous FP16 input, gate and N128 weights with at least
+4096 rows, normalization before gating and no group normalization. It retains
+FP32 normalization/gating and FP16 output. Small decode dispatch is unchanged.
+
+This route can change FP32 reduction/activation rounding and is checked against
+the native FP32 reference; it does not claim bitwise equality. An installed
+operator ABBA test on V100-SXM2-32GB uses 196608 N128 rows, FP16 operands,
+sigmoid gating, Torch 2.10.0+cu128 and CUDA 12.8. CUDA-event medians are
+2.159/2.159 ms for the native decomposition and 0.333/0.340 ms for FLA.
+Temporary peaks are 576.75 and 48.75 MiB. Relative L2 difference is
+4.613e-6, maximum absolute difference 0.001953125, and 99.9951% of output
+values are bitwise equal. These are synthetic operator measurements, not
+model throughput. Full-model measurements remain pending. The benchmark
+supports an in-process norm-only ABBA comparison and records profiled request
+timing separately from its unprofiled rows.
+
 The host QSA reader batches 32 queries in a protected hot-page cache. A 16,384
 query prefill therefore executes 512 protection, resolution and attention
 groups per owner. Decode-sized groups repeatedly resolve overlapping history,
