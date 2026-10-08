@@ -96,9 +96,7 @@ def _decode(
     tl.store(OUTPUT + row * K + col, scale * value, valid)
 
 
-def decode_iq4nl_result(
-    packet: torch.Tensor, codebook: torch.Tensor, row_width: int
-) -> torch.Tensor:
+def _result_shape(packet: torch.Tensor, codebook: torch.Tensor, row_width: int):
     if row_width <= 0 or row_width % 32:
         raise ValueError("Packed PLE result requires complete IQ4_NL rows")
     width = row_width // 32 * 18
@@ -117,10 +115,27 @@ def decode_iq4nl_result(
         raise ValueError(
             "Packed PLE result has incompatible packet or codebook storage"
         )
-    heads = packet.shape[1] // width
-    output = torch.empty(
-        (packet.shape[0], heads * row_width), device=packet.device, dtype=torch.float16
-    )
+    return packet.shape[0], packet.shape[1] // width * row_width
+
+
+def decode_iq4nl_result_out(
+    packet: torch.Tensor,
+    codebook: torch.Tensor,
+    row_width: int,
+    output: torch.Tensor,
+) -> None:
+    shape = _result_shape(packet, codebook, row_width)
+    if (
+        output.shape != shape
+        or output.dtype != torch.float16
+        or output.device != packet.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError("Packed PLE decoded output has incompatible storage")
+    if not packet.shape[0]:
+        return
+    heads = shape[1] // row_width
+    width = row_width // 32 * 18
     _decode[(packet.shape[0] * heads,)](
         packet,
         codebook,
@@ -130,6 +145,17 @@ def decode_iq4nl_result(
         triton.next_power_of_2(row_width),
         num_warps=4,
     )
+
+
+def decode_iq4nl_result(
+    packet: torch.Tensor, codebook: torch.Tensor, row_width: int
+) -> torch.Tensor:
+    output = torch.empty(
+        _result_shape(packet, codebook, row_width),
+        device=packet.device,
+        dtype=torch.float16,
+    )
+    decode_iq4nl_result_out(packet, codebook, row_width, output)
     return output
 
 
@@ -146,4 +172,21 @@ direct_register_custom_op(
     op_name="ple_decode_iq4nl_result",
     op_func=decode_iq4nl_result,
     fake_impl=_decode_fake,
+)
+
+
+def _decode_out_fake(
+    packet: torch.Tensor,
+    codebook: torch.Tensor,
+    row_width: int,
+    output: torch.Tensor,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="ple_decode_iq4nl_result_out",
+    op_func=decode_iq4nl_result_out,
+    mutates_args=["output"],
+    fake_impl=_decode_out_fake,
 )

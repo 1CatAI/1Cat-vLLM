@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from types import SimpleNamespace
 
 import gguf
@@ -291,6 +292,91 @@ def test_gpu_decoder_matches_official_and_changed_graph_replays(m):
         ).cuda()
         graph.replay()
         torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("m", [5, 20])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_compiled_ple_consumer_preserves_fp16_result_boundary(m):
+    """Compare decoder storage policies through the PLE projection/gate chain."""
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 qualification")
+    from vllm.models.qwen4_exp.nvidia.ple_layer import Qwen4ExpPLEGroupedNorm
+
+    torch.manual_seed(1094)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    packet = torch.empty((m, 1440), dtype=torch.uint8, device=device)
+    reference = torch.empty((m, 2560), dtype=torch.float16, device=device)
+    decoded = torch.empty_like(reference)
+    book = torch.tensor(gguf.quants.IQ4_NL.kvalues, dtype=torch.float32, device=device)
+    hidden = torch.randn(m, 10240, dtype=torch.float16, device=device)
+    key = torch.nn.Linear(2560, 10240, bias=False, dtype=torch.float16, device=device)
+    value = torch.nn.Linear(2560, 2560, bias=False, dtype=torch.float16, device=device)
+    norms = [
+        Qwen4ExpPLEGroupedNorm(10240, 1e-6, 2560, torch.float16).to(device)
+        for _ in range(3)
+    ]
+
+    def consume(embeddings):
+        projected_key = key(embeddings).reshape(m, 4, 2560)
+        projected_value = value(embeddings)
+        normalized_key = norms[0](projected_key.flatten(-2)).reshape(m, 4, 2560)
+        normalized_query = norms[1](hidden).reshape(m, 4, 2560)
+        gate = (normalized_key * normalized_query).sum(dim=-1, keepdim=True)
+        gate = gate / math.sqrt(2560)
+        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+        gated = gate * projected_value.unsqueeze(-2)
+        normalized = norms[2](gated.flatten(-2))
+        return (
+            embeddings,
+            projected_key,
+            projected_value,
+            normalized_key,
+            gate,
+            normalized,
+        )
+
+    def allocate():
+        return consume(torch.ops.vllm.ple_decode_iq4nl_result(packet, book, 160))
+
+    def fixed():
+        torch.ops.vllm.ple_decode_iq4nl_result_out(packet, book, 160, decoded)
+        return consume(decoded)
+
+    compiled = [
+        torch.compile(fn, fullgraph=True)
+        for fn in (lambda: consume(reference), allocate, fixed)
+    ]
+    with torch.inference_mode():
+        for step in range(3):
+            data = rows(count=47)
+            ids = (np.arange(m * 16).reshape(m, 16) + step * 7) % 47
+            packet.copy_(torch.from_numpy(data[ids].reshape(m, -1)))
+            official = gguf.quants.dequantize(data, gguf.GGMLQuantizationType.IQ4_NL)
+            reference.copy_(
+                torch.from_numpy(official[ids].astype(np.float16).reshape(m, -1))
+            )
+            control = compiled[0]()
+            for fn in compiled[1:]:
+                for actual, expected in zip(fn(), control):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_decoder_out_keeps_workspace_tail_and_rejects_bad_storage():
+    packet = torch.from_numpy(rows()[np.arange(80) % 41].reshape(5, -1)).cuda()
+    book = torch.tensor(gguf.quants.IQ4_NL.kvalues, dtype=torch.float32, device="cuda")
+    output = torch.full((8, 2560), 1094, dtype=torch.float16, device="cuda")
+    torch.ops.vllm.ple_decode_iq4nl_result_out(packet, book, 160, output[:5])
+    torch.testing.assert_close(
+        output[:5],
+        torch.ops.vllm.ple_decode_iq4nl_result(packet, book, 160),
+        rtol=0,
+        atol=0,
+    )
+    assert output[5:].eq(1094).all()
+    for bad in (output, output[:5].float(), output[:5, ::2]):
+        with pytest.raises(ValueError, match="output"):
+            torch.ops.vllm.ple_decode_iq4nl_result_out(packet, book, 160, bad)
 
 
 @pytest.mark.parametrize("m", [5, 20])

@@ -92,5 +92,26 @@ wheel SHA-256 is
 All 17 native modules and the GPU result decoder retain the initial measured
 implementation. Six added CPU tests pass in this wheel, including real
 four-rank mapped-buffer registrations from a frozen configuration snapshot.
-Both pending model arms use this revision; earlier producer timings and GPU
-replay checks remain isolated evidence, not model qualification.
+Both model arms use this revision; earlier producer timings and GPU replay
+checks remain isolated evidence, not model qualification.
+
+The completed matched A/B holds device E4M3 target history, FP16 draft history,
+MTP4, TP4, FULL graphs, complete-table pinned decode disabled and direct QSA
+disabled in both arms. All other reported worker routes match.
+
+| Measurement | FP16 results | Packed results |
+| --- | ---: | ---: |
+| C1 mean ms/round, two probes | 19.886 | 18.089 |
+| C4 ms/round | 43.256 | 41.111 |
+| Probe tokens/round | 4.886 | 4.886 |
+| Eight-prompt mean acceptance | 46.655% | 44.310% |
+
+The 256-token probe and all four C4 outputs are identical, but all eight
+natural completions diverge. Paired acceptance changes by -2.344 percentage
+points, with a 95% interval of [-5.758, +1.103]. At 64 identical teacher-forcing
+conditions, mean KL is 0.001032, maximum KL is 0.010656 and top-1 agrees at
+63/64 positions. Repeated captures within the candidate are identical.
+This fails the model quality gate; the measured 1.797 ms C1 reduction is not
+an admitted improvement. The packed result path must not be promoted until
+the source of the difference is localized and corrected. Decoder byte
+checks alone do not establish compiled model equivalence.
