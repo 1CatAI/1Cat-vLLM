@@ -49029,3 +49029,71 @@ but regressed every measured width. Neither variant is admitted. The next
 structural prototype must remove synchronization/phase overhead or include a
 larger reduction segment, rather than repeat this schedule. Dense 8-bit remains
 separate and disabled in these arms.
+
+## Batched NVFP4 activation reuse screen, 2026-10-05
+
+An isolated M16-M64 projection screen freezes QUASAR layer 55 TP rank 0
+weights and compares installed dispatch with an N128 prototype. On V100
+SXM2 16GB at a 300W limit, M32 gate/up requests 201.915 MB at L1TEX,
+54.786 MB total at L2 and 25.395 MB from DRAM. Down requests 101.762 MB,
+36.082 MB and 12.813 MB respectively. Aggregate counters establish excess
+cache traffic; they do not identify all excess bytes as activation reads.
+
+A shared-B WMMA tile regresses M32 gate/up and down and exceeds the
+96-register limit for some shapes. The direct HMMA884 shared-A tile reduces
+gate/up L1TEX requests to 71.811 MB but still regresses: barrier waits account
+for 34.687% of active warp cycles and FP32 partial output adds traffic. The
+next screen groups K loads to reduce barriers and coalesces partial output.
+These are rejected or pending standalone prototypes, not production speed
+claims. No M8 dispatcher or attention route changes.
+
+### M64 activation-sharing follow-up
+
+A four-group in-flight weight load schedule reduced the cold-L2 real-weight
+M64 MLP sublayer graph from 358.400 to 282.624 microseconds (gate/up followed
+by down, unchanged TP collective excluded). The N128 gate/up grid is 170
+CTAs; down uses 160. Direct activation loading eliminates the separate K16
+pack for these two calls. Registers are capped at 96 in the normal build.
+The source dispatcher changes only M64 and the two measured TP4 MLP shapes.
+Two basis-vector and graph-scratch reuse GPU tests passed on the normal wheel.
+This is not full-model admission: teacher-forced logits, actual captured
+route counts, complete concurrent rounds and acceptance remain pending.
+M16/M32 prototypes still regress and are not selected.
+
+The concurrent head capacity screen exposed a separate route gap: the target
+sampler requests top-64, while the candidate reranker supports top-16/20/21.
+Prepared 64-row buffers do not demonstrate target head selection. Runtime
+buffer-view swaps also cannot replace already captured kernels. Do not use
+that screen as a qualified head speedup or repeat it without route evidence.
+
+### Normal M64 model gate: rejected pending attribution
+
+The source-built M64 route completes 8K C8 after gate/up and down share one
+fixed per-stream FP32 scratch allocation. Two GPU basis/graph tests pass,
+and normal/standalone real-weight MLP outputs are bitwise equal with equal
+250.880 microsecond cold graph medians. Compiler differences do not explain
+the model discrepancy.
+
+The matched complete verify round regresses from 46.910 to 53.441 ms.
+C1 remains 14.842 versus 14.856 ms. Eight fixed-seed prompts with 600 outputs
+have overlapping acceptance intervals: 3.228 [3.156, 3.290] versus 3.243
+[3.120, 3.359] tokens per returned decode chunk. Worker graph-only records
+omit initial mixed-prefill progression and are not used as the full-prompt
+acceptance estimator. The initial profile began during prefill and is invalid
+for decode accounting. A corrected pure-decode capture confirms 64 gate/up
+and 64 down calls per round, plus 140 two-stage collectives. Their matched
+baseline attribution remains pending. Do not promote this route based on the
+local MLP gain; full-model speed and teacher-forcing gates are not passed.
+
+### Correct the M64 microbenchmark control
+
+The serving profile enables existing TurboMind dense tuning through M64;
+the original standalone process left its default limit at M16. Its control
+therefore selected a different, slower M64 kernel. With the serving tuning
+capacity, the real-weight cold MLP graph is 208.896 microseconds for the
+control and 251.904 for the prototype: the candidate regresses. The matched
+model traces show about 175 versus 262 microseconds per MLP including its
+postprocessing, accounting for most of the full-round regression. The
+prototype is retained only as a standalone benchmark; its serving dispatch,
+normal-build source entry and serving-only tests have been removed. Future
+candidates must match the serving baseline's tuned route before model tests.
