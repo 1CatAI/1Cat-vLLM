@@ -22,8 +22,8 @@ def test_ordinary_decode_contract_does_not_construct_verifier():
     receiver = SimpleNamespace(
         _new_verification_executor=unexpected, _flash_v100_window_size=unexpected
     )
-    verify._validate_dflash_attention_contract(
-        receiver, SimpleNamespace(), SimpleNamespace()
+    verify.validate_contract(
+        SimpleNamespace(), SimpleNamespace(), receiver._flash_v100_window_size
     )
 
 

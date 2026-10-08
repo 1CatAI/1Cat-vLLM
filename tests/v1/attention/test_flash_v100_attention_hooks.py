@@ -39,19 +39,16 @@ def _instance():
 
 def test_registration_matches_mechanically_inlined_callbacks():
     tree = ast.parse(Path(attention.__file__).read_text())
-    register = next(
-        n
+    assert not any(
+        isinstance(n, ast.ClassDef)
+        and n.name in ("AttentionHooks", "SpecAttentionMethods")
         for n in tree.body
-        if isinstance(n, ast.FunctionDef) and n.name == "register_attention_hooks"
     )
-    registration = register.body[0]
-    assert isinstance(registration, ast.Return)
-    assert isinstance(registration.value, ast.Call)
-    for keyword in registration.value.keywords:
-        assert keyword.arg == ast.unparse(keyword.value)
-        assert getattr(attention.ATTENTION_HOOKS, keyword.arg) is getattr(
-            attention, keyword.arg
-        )
+    assert impl.FlashAttnV100Impl.__bases__ == (TritonAttentionImpl,)
+    for legacy_name, method in attention.VERIFICATION_METHODS.items():
+        delegate = getattr(impl.FlashAttnV100Impl, legacy_name)
+        assert delegate is getattr(impl, legacy_name)
+        assert callable(delegate)
     for name in ("impl.py", "metadata.py", "backend.py"):
         text = Path(impl.__file__).with_name(name).read_text().lower()
         assert "dflash" not in text and "ddtree" not in text
@@ -137,7 +134,9 @@ def test_prefill_configuration_retains_legacy_split_attributes(monkeypatch, enab
         "capture_sm70_dflash2_config",
         lambda: SimpleNamespace(draft_window_split=enabled),
     )
-    attention.ATTENTION_HOOKS.configure_prefill(instance)
+    instance.flash_attn_prefill_paged = instance.spec_attention.configure_prefill(
+        instance.flash_attn_prefill_paged
+    )
     instance.flash_attn_prefill_paged()
     assert calls == [enabled]
     assert instance._flash_prefill_paged_supports_dflash2_bmhd

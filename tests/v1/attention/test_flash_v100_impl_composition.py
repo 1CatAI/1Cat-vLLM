@@ -43,17 +43,30 @@ class _InlineFeatureHooks(ast.NodeTransformer):
             isinstance(call, ast.Call)
             and isinstance(call.func, ast.Attribute)
             and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "ATTENTION_HOOKS"
+            and call.func.value.id == "_feature"
         ):
             hook = self.hooks[call.func.attr]
             names = {
                 "feature_fallback": "is_dflash_draft_attn",
                 "capture_prefix": "is_dflash_non_causal",
+                "self._policy()": "policy",
+                "self._contract_validator()": "validator",
             }
             arguments = [names.get(ast.unparse(a), ast.unparse(a)) for a in call.args]
             assert not call.keywords
             assert arguments == [a.arg for a in hook.args.args]
-            return hook
+
+            class Inputs(ast.NodeTransformer):
+                def visit_Name(self, node):
+                    if node.id == "policy":
+                        return ast.Name(id="self", ctx=node.ctx)
+                    if node.id == "validator":
+                        return ast.parse(
+                            "self._validate_dflash_attention_contract", mode="eval"
+                        ).body
+                    return node
+
+            return Inputs().visit(copy.deepcopy(hook))
         return None
 
     def _decode_branches(self, helper):
@@ -446,6 +459,11 @@ class _Normalize(ast.NodeTransformer):
 
 
 def test_all_method_bodies_and_static_descriptors_match_parent():
+    from vllm.v1.attention.backends.flash_v100.spec import attention
+
+    assert {
+        legacy_name: method for method, legacy_name in _VERIFY_METHODS.items()
+    } == attention.VERIFICATION_METHODS
     fixture = json.loads(
         (Path(__file__).parent / "fixtures/flash_v100_impl_methods.json").read_text()
     )["methods"]

@@ -85,14 +85,18 @@ Prepared grouped metadata validates the original common-builder identity from
 immutable inputs. Persistent storage belongs to the same workspace across
 replays. Fourteen calculation hashes remain identical to the frozen parent.
 
-`spec.attention.ATTENTION_HOOKS` registers typed callbacks for scalar-tail
-initialization, verifier ABI/policy, prefill wrapper policy, feature contract
-validation, XQA exclusions, explicit fallback and capture route accounting.
-`SpecAttentionMethods` preserves historical method/field names for external
-callers. Common impl, metadata and backend entrypoints contain no family names;
-the existing route names and compatibility exports remain intact. CPU forward
-tests cover unsupported-layer rejection, allowed fallback and non-causal
-capture, while checking the original route labels and base call count.
+`SpecAttentionState` owns construction-time feature policy. Common assembly
+injects the two native ABI limits and keyword-support probe, and receives the
+configured prefill operator. Dispatch policies consume frozen common policy,
+metadata or an explicit validation callback. Attention no longer inherits a
+feature method mixin or invokes a single-provider hooks registry.
+
+Legacy method names remain delegates at the common assembly boundary; verifier
+calculations receive only VerificationConfig and VerificationOps. The ordinary
+causality guard bypasses executor construction. Tests inject owned policy and
+operators; the trace recorder observes the actual verifier predicate under its
+original canonical event name. Per-method SpecFeature registration and metadata
+field migration remain separate work.
 
 ## Shared decode strategy
 

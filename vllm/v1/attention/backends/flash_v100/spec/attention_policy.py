@@ -12,7 +12,6 @@ from vllm.config.sm70_dflash2 import capture_sm70_dflash2_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_v100 import config as _config
-from vllm.v1.attention.backends.flash_v100 import ops as _ops
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
@@ -41,13 +40,9 @@ def initialize_scalar_tail(self: Any, use_e4m3_fp32: bool) -> None:
         )
 
 
-def initialize_verify_abi(self: Any) -> None:
-    self.dflash2_grouped_verify_max_query_tokens = (
-        _ops._flash_attn_grouped_verify_max_query_tokens
-    )
-    self.dflash2_grouped_verify_request_major_abi_version = (
-        _ops._flash_attn_grouped_verify_request_major_abi_version
-    )
+def initialize_verify_abi(self: Any, max_query_tokens, request_major_abi) -> None:
+    self.dflash2_grouped_verify_max_query_tokens = max_query_tokens
+    self.dflash2_grouped_verify_request_major_abi_version = request_major_abi
 
 
 def configure_prefill(self: Any) -> None:
@@ -60,7 +55,7 @@ def configure_prefill(self: Any) -> None:
     split_enabled = getattr(capture_sm70_dflash2_config(), "draft_window_split", True)
     if not split_enabled:
         self._flash_prefill_paged_dflash2_split_pages = ()
-    if self.flash_attn_prefill_paged is not None and _ops._callable_accepts_keyword(
+    if self.flash_attn_prefill_paged is not None and self.accepts_keyword(
         self.flash_attn_prefill_paged, "dflash2_window_split"
     ):
         from functools import partial
@@ -93,3 +88,36 @@ def configure_verifier(self: Any) -> None:
         raise ValueError(
             "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN must be positive"
         )
+
+
+POLICY_FIELDS = frozenset(
+    {
+        "_sm70_scalar_tail_attention",
+        "dflash2_grouped_verify_max_query_tokens",
+        "dflash2_grouped_verify_request_major_abi_version",
+        "_flash_prefill_paged_supports_dflash2_bmhd",
+        "_flash_prefill_paged_dflash2_split_pages",
+        "use_dflash2_grouped_verify",
+        "use_dflash2_batched_grouped_verify",
+        "dflash2_grouped_verify_min_model_len",
+    }
+)
+
+
+class SpecAttentionState:
+    """Own feature policy and its two construction-time operator inputs."""
+
+    def __init__(self, accepts_keyword):
+        self.accepts_keyword = accepts_keyword
+
+    initialize_scalar_tail = initialize_scalar_tail
+    initialize_verify_abi = initialize_verify_abi
+
+    def configure_prefill(self, operator):
+        self.flash_attn_prefill_paged = operator
+        configure_prefill(self)
+        return self.flash_attn_prefill_paged
+
+    def configure_verifier(self, operator):
+        self.flash_attn_grouped_verify_paged = operator
+        configure_verifier(self)

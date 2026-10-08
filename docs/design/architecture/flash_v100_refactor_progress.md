@@ -25,8 +25,9 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
 | 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Required | Strict/rebase/GPU gates |
 | 6a: verifier ownership | #1090 | CPU/golden/strict/rebase passed | Cycles 13 → 11; model terms 169 → 158 | Required | Strict/rebase/GPU gates |
-| 6b: metadata builder ownership | — | CPU/golden/strict passed | Cycles 11 → 4; private 347 → 341 | Required | Strict/rebase/GPU gates |
-| 6c: registered speculative features and remaining mixins | — | Not started | — | Required | Step 6b gates |
+| 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Required | Strict/rebase/GPU gates |
+| 6c: attention policy ownership | — | CPU/golden/strict passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Required | Strict/rebase/GPU gates |
+| 6d: registered features and metadata fields | — | Not started | — | Required | Step 6c gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -745,3 +746,51 @@ including actual consumed shim patches. Evidence:
 `a3-spec-metadata-owner-strict.log` and `a3-spec-metadata-owner-shim.json`.
 Pre-commit including mypy/layering passes; no production or oracle file changed
 during the accepted full run. Four GPU queues and #1028 replay are next.
+
+## Step 6c attention policy ownership
+
+PR #1093 is `21b38c8d0436dec88ed5cfe4aed46eacfbc9c3cf`. Actual pinned
+PR #1028 replay produces `1fc3f8c1711d304292ce47ea12c994574b949c0d`, tree
+`980392578b6f0a01eff4eb8814fdbdd95e2597a5`, identical to clean merge-tree.
+Its three integration suites pass 37 CPU cases with 98 GPU skips. Four queues
+and verified source snapshots are staged under `a3-step6b` on 54633.
+
+Mechanical extraction `e5feb51a5` precedes ownership. SpecAttentionState owns
+construction policy and receives native ABI values, a keyword probe and native
+operators. It neither imports nor receives Impl. The attention mixin and
+single-provider AttentionHooks are removed. Fallback dispatch takes common
+policy; contract validation takes a callback. Legacy methods bind at the common
+assembly boundary, preserving bound/unbound calls and instance overrides;
+VerificationExecutor no longer contains adapters receiving an Impl receiver.
+Ordinary validation retains its lightweight guard without executor construction.
+
+All 813 immutable traces and original calculation hashes pass. The recorder
+observes the real verifier predicate, retaining the frozen canonical event name.
+The source oracle checks original method-to-executor bindings and actual narrow
+callback/policy arguments. Six direct owner tests cover layer-local state,
+short-circuit configuration reads with/without an operator, native ABI injection,
+prefill keyword wrapping, the allocation-free ordinary guard and bound/unbound
+compatibility arguments. Focused suites pass 30 + 6 tests.
+
+The first focused run failed only the dependency ratchet: mechanical extraction
+introduced a policy-to-ops import and a second assembly-to-policy edge. Native
+values/probes are now injected, and assembly uses its existing feature boundary.
+The passing run retains the original limits; no new forbidden edge is allowed.
+Evidence: `a3-spec-attention-owner-focused-final.log` and
+`a3-spec-attention-owner-injection.log`. Current metrics are
+400 / 400 / 333 / 3 / 154 / 0 / 29; remaining metadata field mixin and per-method
+feature registration are not complete.
+
+Step 1c host-FP8's first complete comparison fails greedy token identity.
+Both model arms complete and pass 135 native host unit cases each. France is
+identical; the 64-token Chinese answer first diverges at zero-based token 21.
+Both arms have identical 2,705 production source hashes, native-library hashes,
+workload, recorder and GPU state. Only declared private cache/IPC paths differ.
+The failed gate is retained, and an unchanged-parent repeat is queued to test
+baseline reproducibility. No host completion marker or merge approval is inferred.
+
+The complete fixed-source strict suite passes **286 tests / 1 skip / 28 GPU
+exclusions**, with all shim replacements consumed by real calls/reads. Evidence:
+`a3-spec-attention-owner-strict.log` and `a3-spec-attention-owner-shim.json`.
+Pre-commit/mypy/layering passes (`a3-spec-attention-owner-precommit-final.log`).
+No production/source-oracle file changed during the accepted strict run.

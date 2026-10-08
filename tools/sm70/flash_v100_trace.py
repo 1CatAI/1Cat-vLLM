@@ -196,6 +196,11 @@ class Recorder:
         if not frame.f_globals.get("__name__", "").startswith(PACKAGE):
             return
         name = frame.f_code.co_name
+        if name == "small_query_enabled" and frame.f_globals["__name__"] == (
+            PACKAGE + ".verify"
+        ):
+            # The executed predicate now belongs to the injected verifier.
+            name = "_small_query_decode_enabled"
         if event == "call" and name == "_record_route":
             self.events.append(
                 ["route", frame.f_locals.get("name", frame.f_locals.get("route"))]
