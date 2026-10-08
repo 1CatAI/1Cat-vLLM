@@ -47,6 +47,15 @@ M20. The protected reader's FP16 probability boundary produces larger oracle
 error in these samples. Model teacher-forcing, acceptance and same-wheel C1/C4
 measurements remain required before promotion.
 
+The clean wheel passes nine GPU cases, including all E4M3 encodings, rewritten
+history and aliased pages. Its 16 previous native modules retain their exact
+hashes. On a full TP4 NV2 V100 mesh, the capability-disabled model control
+measures C1 19.809 ms/round at I8192/O256 and C4 43.113 ms/round at I128/O600.
+The C1 probe emits 4.886 tokens/round. Sixty-four repeated, aligned
+teacher-forcing positions have identical logits and top-1 decisions within
+that engine. The capability-enabled model run is pending; no endpoint gain
+or acceptance result for the direct reader is claimed by these controls.
+
 A probability-decomposition variant replaces scalar PV with three tensor-core
 products and an FP32 residual. Independent power-of-two scaling preserves
 probability bits, including values not representable by a normal half. CPU
