@@ -645,79 +645,126 @@ class DecodeExecutor:
             fallback="decode_scalar_paged",
         )
         if selection is _routing.ROUTE_SPECS["decode_xqa_paged"]:
-            _routing._log_fp8_kv_cache_route(
-                "decode", self.config.kv_cache_dtype, "xqa_paged"
-            )
-            _routing._trace_decode_active(
-                route="decode_xqa_paged",
-                query=query,
-                key_cache=key_cache,
-                seq_lens=attn_metadata.seq_lens,
-                attn_metadata=attn_metadata,
-                window_size=window_size,
-            )
-            partition_size_hint = _routing._g6_aligned_page_partition_size_hint(
+            return self.xqa(
+                layer,
                 query,
                 key_cache,
                 value_cache,
-                self.config.kv_cache_dtype,
-                strategy=getattr(self.config.policy, "decode_strategy", "legacy"),
+                attn_metadata,
+                out_view,
+                output,
+                window_size,
+                xqa_codec,
             )
-            if partition_size_hint is not None:
-                if (
-                    xqa_codec is FP8_E4M3
-                    and getattr(self.config.policy, "decode_strategy", "legacy")
-                    == "legacy"
-                    and query.shape[0] == 1
-                    and _config.raw("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1")
-                    != "0"
-                ):
-                    _routing._record_route(
-                        f"decode_xqa_e4m3_dynamic_page{key_cache.shape[1]}"
-                    )
-                else:
-                    _routing._record_route(
-                        f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}"
-                    )
-            self.ops.xqa(
-                query,
-                key_cache,
-                value_cache,
-                attn_metadata.block_table,
-                attn_metadata.seq_lens,
-                softmax_scale=self.config.scale,
-                out=out_view,
-                kv_cache_dtype=self.config.kv_cache_dtype,
-                k_scale=float(layer._k_scale_float),
-                v_scale=float(layer._v_scale_float),
-                window_size=window_size,
-                max_seq_len_hint=getattr(
-                    attn_metadata,
-                    "flash_v100_decode_max_seq_len_hint",
-                    None,
-                ),
-                workspace_seq_capacity_hint=getattr(
-                    attn_metadata,
-                    "flash_v100_decode_workspace_seq_capacity_hint",
-                    None,
-                ),
-                active_num_partitions=getattr(
-                    attn_metadata,
-                    "flash_v100_decode_active_num_partitions",
-                    None,
-                ),
-                partition_size_hint=partition_size_hint,
-                batch_context_routing=bool(
-                    getattr(
-                        attn_metadata,
-                        "flash_v100_batch_context_routing",
-                        False,
-                    )
-                ),
-            )
-            _routing._record_route(_routing.ROUTE_SPECS["decode_xqa_paged"].name)
-            return output
+        return self.scalar(
+            layer,
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            out_view,
+            output,
+            window_size,
+            anchor_lens,
+            anchored_window,
+        )
 
+    def xqa(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        out_view: torch.Tensor,
+        output: torch.Tensor,
+        window_size: tuple[int, int],
+        xqa_codec: KVCodec | None,
+    ) -> torch.Tensor:
+        _routing._log_fp8_kv_cache_route(
+            "decode", self.config.kv_cache_dtype, "xqa_paged"
+        )
+        _routing._trace_decode_active(
+            route="decode_xqa_paged",
+            query=query,
+            key_cache=key_cache,
+            seq_lens=attn_metadata.seq_lens,
+            attn_metadata=attn_metadata,
+            window_size=window_size,
+        )
+        partition_size_hint = _routing._g6_aligned_page_partition_size_hint(
+            query,
+            key_cache,
+            value_cache,
+            self.config.kv_cache_dtype,
+            strategy=getattr(self.config.policy, "decode_strategy", "legacy"),
+        )
+        if partition_size_hint is not None:
+            if (
+                xqa_codec is FP8_E4M3
+                and getattr(self.config.policy, "decode_strategy", "legacy") == "legacy"
+                and query.shape[0] == 1
+                and _config.raw("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1") != "0"
+            ):
+                _routing._record_route(
+                    f"decode_xqa_e4m3_dynamic_page{key_cache.shape[1]}"
+                )
+            else:
+                _routing._record_route(
+                    f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}"
+                )
+        self.ops.xqa(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            softmax_scale=self.config.scale,
+            out=out_view,
+            kv_cache_dtype=self.config.kv_cache_dtype,
+            k_scale=float(layer._k_scale_float),
+            v_scale=float(layer._v_scale_float),
+            window_size=window_size,
+            max_seq_len_hint=getattr(
+                attn_metadata,
+                "flash_v100_decode_max_seq_len_hint",
+                None,
+            ),
+            workspace_seq_capacity_hint=getattr(
+                attn_metadata,
+                "flash_v100_decode_workspace_seq_capacity_hint",
+                None,
+            ),
+            active_num_partitions=getattr(
+                attn_metadata,
+                "flash_v100_decode_active_num_partitions",
+                None,
+            ),
+            partition_size_hint=partition_size_hint,
+            batch_context_routing=bool(
+                getattr(
+                    attn_metadata,
+                    "flash_v100_batch_context_routing",
+                    False,
+                )
+            ),
+        )
+        _routing._record_route(_routing.ROUTE_SPECS["decode_xqa_paged"].name)
+        return output
+
+    def scalar(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        out_view: torch.Tensor,
+        output: torch.Tensor,
+        window_size: tuple[int, int],
+        anchor_lens: torch.Tensor | None,
+        anchored_window: int,
+    ) -> torch.Tensor:
         _routing._log_fp8_kv_cache_route(
             "decode", self.config.kv_cache_dtype, "scalar_paged"
         )
