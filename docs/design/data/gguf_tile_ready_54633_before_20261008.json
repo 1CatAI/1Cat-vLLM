@@ -1,0 +1,418 @@
+{
+  "schema_version": 1,
+  "scope": "diagnostic profiler ledger; not unprofiled A/B speed evidence",
+  "source_sha": "2b00cc8a38f214bba01e417627f9e9348ae70109",
+  "integration_base_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+  "wheel_sha256": "00dc33e66c12bbf885480fa6cd25fd72cf2e2168caf9559eb843cdd4669373cd",
+  "contract": {
+    "model": "Qwen3.8-27B-GSQ-RCO-IQ3_S.gguf",
+    "quantization": "gguf",
+    "dtype": "half",
+    "tensor_parallel_size": 4,
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 1024,
+    "max_num_seqs": 4,
+    "gpu_memory_utilization": 0.9,
+    "kv_cache_dtype": "fp8_e4m3",
+    "mamba_ssm_cache_dtype": "float32",
+    "attention_backend": "FLASH_ATTN_V100",
+    "enable_prefix_caching": false,
+    "enforce_eager": false,
+    "language_model_only": true,
+    "speculative_config": {
+      "method": "dflash",
+      "model": "Qwen3.8-27B-DFlash2-Q8_0.gguf",
+      "num_speculative_tokens": 7,
+      "draft_tensor_parallel_size": 4,
+      "kv_cache_dtype": "auto",
+      "attention_backend": "FLASH_ATTN_V100",
+      "draft_sample_method": "probabilistic",
+      "enforce_eager": false,
+      "quantization": "gguf",
+      "sm70_dflash2": {
+        "draft_window_split": true
+      }
+    },
+    "disable_log_stats": false,
+    "kernel_config": {
+      "sm70_gguf": {
+        "projection_planes": true,
+        "projection_plane_scope": "all",
+        "iq2_signed_nibbles": true,
+        "projection_collective_pipeline": false
+      }
+    },
+    "worker_extension_cls": "gguf_profile_worker.ProfileWorker",
+    "compilation_config": {
+      "pass_config": {
+        "fuse_allreduce_rms": true
+      }
+    },
+    "profiler_config": {
+      "profiler": "cuda"
+    }
+  },
+  "sampling": {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 20,
+    "seed": 123,
+    "max_tokens": 64,
+    "thinking": false,
+    "ignore_eos": true
+  },
+  "machine": "54633: 4x V100-SXM2-32GB, all pairs NV2",
+  "clocks_sm_mhz": 1530,
+  "clocks_mem_mhz": 877,
+  "theoretical_hbm_bytes_per_second": 898048000000,
+  "raw_sha256": {
+    "off.sqlite": "543c92cd6a6b11a5a9c07419ad94f3c8ed493814cb0c1e2d3beec0c32b8ce1fd",
+    "off.json": "838f7f20413ea084254a32bf4c29b122895dbd5c56d754d48867b56f19cad1d0",
+    "off-linked.json": "610ee94f692805794410104dbbc465311576afc98a6632af26951eca3408dc72",
+    "off-projections.json": "328985b92f21798e00a6c4b3a08746b3f1365a78ef996e8235141211a6009842"
+  },
+  "unprofiled_control_round_ms": {
+    "1K": 14.430750955,
+    "8K": 14.803885631
+  },
+  "rank0_steady_mean": {
+    "round_ms": 16.146186857142858,
+    "target_graph_ms": 12.825723928571428,
+    "target_kernel_union_ms": 11.712082,
+    "target_inter_kernel_gap_ms": 1.1136419285714285,
+    "after_target_ms": 3.3204629285714287,
+    "after_target_kernel_union_ms": 2.7946028571428574,
+    "after_target_inter_kernel_gap_ms": 0.5258600714285715,
+    "tail_kernel_count": 196,
+    "tail_last_kernel_to_next_target_us": 9.577142857142857,
+    "graph_boundary_idle_us": 321.77635714285714,
+    "last_tail_graph_to_next_target_us": 194.47214285714287
+  },
+  "target_projection_roles": {
+    "qkvz+a_b": {
+      "calls_per_round": 48.0,
+      "us_per_call": 31.749044642857143,
+      "service_ms_per_round": 1.5239541428571428,
+      "weight_stream_bytes_per_call": 9924266.666666666,
+      "effective_weight_gbps": 312.58473375511204
+    },
+    "gdn_out": {
+      "calls_per_round": 48.0,
+      "us_per_call": 18.661736607142856,
+      "service_ms_per_round": 0.8957633571428572,
+      "weight_stream_bytes_per_call": 3932160.0,
+      "effective_weight_gbps": 210.70707848780532
+    },
+    "gate_up.planes": {
+      "calls_per_round": 62.0,
+      "us_per_call": 46.14283870967741,
+      "service_ms_per_round": 2.8608559999999996,
+      "weight_stream_bytes_per_call": 21241146.322580647,
+      "effective_weight_gbps": 460.33462432223087
+    },
+    "down": {
+      "calls_per_round": 64.0,
+      "us_per_call": 26.279698660714285,
+      "service_ms_per_round": 1.6819007142857143,
+      "weight_stream_bytes_per_call": 11305755.21875,
+      "effective_weight_gbps": 430.20870842979093
+    },
+    "attention.q+k+v": {
+      "calls_per_round": 16.0,
+      "us_per_call": 32.019075892857146,
+      "service_ms_per_round": 0.5123052142857143,
+      "weight_stream_bytes_per_call": 8819840.0,
+      "effective_weight_gbps": 275.4557948365881
+    },
+    "attention.o": {
+      "calls_per_round": 16.0,
+      "us_per_call": 17.34888392857143,
+      "service_ms_per_round": 0.27758214285714283,
+      "weight_stream_bytes_per_call": 3824640.0,
+      "effective_weight_gbps": 220.4545269739974
+    },
+    "gate_up.native": {
+      "calls_per_round": 2.0,
+      "us_per_call": 67.98475,
+      "service_ms_per_round": 0.13596950000000002,
+      "weight_stream_bytes_per_call": 14448640.0,
+      "effective_weight_gbps": 212.52766245371203
+    }
+  },
+  "target_aux_categories": {
+    "other_target": {
+      "calls_per_round": 131.0,
+      "us_per_call": 5.115990730643403,
+      "service_ms_per_round": 0.6701947857142858
+    },
+    "communication_or_reduction": {
+      "calls_per_round": 130.0,
+      "us_per_call": 10.028497252747252,
+      "service_ms_per_round": 1.303704642857143
+    },
+    "rms_norm": {
+      "calls_per_round": 7.0,
+      "us_per_call": 5.551642857142857,
+      "service_ms_per_round": 0.0388615
+    },
+    "GDN_state_or_gating": {
+      "calls_per_round": 144.0,
+      "us_per_call": 7.8237113095238096,
+      "service_ms_per_round": 1.1266144285714286
+    },
+    "layout_or_copy": {
+      "calls_per_round": 21.0,
+      "us_per_call": 4.205455782312925,
+      "service_ms_per_round": 0.08831457142857142
+    },
+    "attention": {
+      "calls_per_round": 32.0,
+      "us_per_call": 19.016904017857144,
+      "service_ms_per_round": 0.6085409285714286
+    }
+  },
+  "tail_categories": {
+    "other_tail": {
+      "calls_per_round": 121.0,
+      "us_per_call": 5.970931523022432,
+      "service_ms_per_round": 0.7224827142857142
+    },
+    "draft_GEMM": {
+      "calls_per_round": 23.0,
+      "us_per_call": 41.847211180124226,
+      "service_ms_per_round": 0.9624858571428571
+    },
+    "communication_or_reduction": {
+      "calls_per_round": 17.0,
+      "us_per_call": 8.586957983193278,
+      "service_ms_per_round": 0.1459782857142857
+    },
+    "target_head": {
+      "calls_per_round": 1.0,
+      "us_per_call": 267.635,
+      "service_ms_per_round": 0.267635
+    },
+    "sampling_and_sorting": {
+      "calls_per_round": 23.0,
+      "us_per_call": 6.776521739130435,
+      "service_ms_per_round": 0.15586
+    },
+    "draft_attention": {
+      "calls_per_round": 10.0,
+      "us_per_call": 26.667914285714286,
+      "service_ms_per_round": 0.26667914285714284
+    },
+    "draft_shared_head": {
+      "calls_per_round": 1.0,
+      "us_per_call": 273.68985714285714,
+      "service_ms_per_round": 0.27368985714285715
+    }
+  },
+  "lower_bound_entries": [
+    {
+      "name": "qkvz+a_b",
+      "payload_bytes_per_card_round": 476364800,
+      "bandwidth_floor_ms": 0.5304446978335234,
+      "observed_trace_service_ms": 1.5239541428571428,
+      "calls": 48.0,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "reason": "Payload from selected loaded weight streams; not measured DRAM. NCU instruction count remains unmeasured."
+    },
+    {
+      "name": "gdn_out",
+      "payload_bytes_per_card_round": 188743680,
+      "bandwidth_floor_ms": 0.2101710376282782,
+      "observed_trace_service_ms": 0.8957633571428572,
+      "calls": 48.0,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "reason": "Payload from selected loaded weight streams; not measured DRAM. NCU instruction count remains unmeasured."
+    },
+    {
+      "name": "gate_up.planes",
+      "payload_bytes_per_card_round": 1316951072,
+      "bandwidth_floor_ms": 1.46645955672748,
+      "observed_trace_service_ms": 2.8608559999999996,
+      "calls": 62.0,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "reason": "Payload from selected loaded weight streams; not measured DRAM. NCU instruction count remains unmeasured."
+    },
+    {
+      "name": "down",
+      "payload_bytes_per_card_round": 723568334,
+      "bandwidth_floor_ms": 0.8057123160454674,
+      "observed_trace_service_ms": 1.6819007142857143,
+      "calls": 64.0,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "reason": "Payload from selected loaded weight streams; not measured DRAM. NCU instruction count remains unmeasured."
+    },
+    {
+      "name": "attention.q+k+v",
+      "payload_bytes_per_card_round": 141117440,
+      "bandwidth_floor_ms": 0.15713797035347776,
+      "observed_trace_service_ms": 0.5123052142857143,
+      "calls": 16.0,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "reason": "Payload from selected loaded weight streams; not measured DRAM. NCU instruction count remains unmeasured."
+    },
+    {
+      "name": "attention.o",
+      "payload_bytes_per_card_round": 61194240,
+      "bandwidth_floor_ms": 0.06814139110604332,
+      "observed_trace_service_ms": 0.27758214285714283,
+      "calls": 16.0,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "reason": "Payload from selected loaded weight streams; not measured DRAM. NCU instruction count remains unmeasured."
+    },
+    {
+      "name": "gate_up.native",
+      "payload_bytes_per_card_round": 28897280,
+      "bandwidth_floor_ms": 0.032177879133409346,
+      "observed_trace_service_ms": 0.13596950000000002,
+      "calls": 2.0,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "reason": "Payload from selected loaded weight streams; not measured DRAM. NCU instruction count remains unmeasured."
+    },
+    {
+      "name": "draft.query_projections",
+      "payload_bytes_per_card_round": 449740800,
+      "bandwidth_floor_ms": 0.5007981755986317,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null
+    },
+    {
+      "name": "draft.convolution_projections",
+      "payload_bytes_per_card_round": 131072000,
+      "bandwidth_floor_ms": 0.14595210946408207,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null
+    },
+    {
+      "name": "draft.context_fc",
+      "payload_bytes_per_card_round": 36864000,
+      "bandwidth_floor_ms": 0.041049030786773084,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null
+    },
+    {
+      "name": "draft.selector_hidden_projection",
+      "payload_bytes_per_card_round": 2621440,
+      "bandwidth_floor_ms": 0.0029190421892816417,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null
+    },
+    {
+      "name": "target_head",
+      "payload_bytes_per_card_round": 198656000,
+      "bandwidth_floor_ms": 0.22120866590649943,
+      "observed_trace_service_ms": 0.267635,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null
+    },
+    {
+      "name": "draft_shared_head",
+      "payload_bytes_per_card_round": 198656000,
+      "bandwidth_floor_ms": 0.22120866590649943,
+      "observed_trace_service_ms": 0.27368985714285715,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null
+    },
+    {
+      "name": "target.GDN_state_initial_read_and_eight_snapshots",
+      "payload_bytes_per_card_round": 339738624,
+      "bandwidth_floor_ms": 0.3783078677309008,
+      "observed_trace_service_ms": 0.7180550714285706,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null
+    },
+    {
+      "name": "target.KV_unique_1K",
+      "payload_bytes_per_card_round": 8388608,
+      "bandwidth_floor_ms": 0.009340935005701255,
+      "dram_bytes": null,
+      "reason": "Unique K/V payload only; partition rereads and cache stores not yet counted."
+    },
+    {
+      "name": "draft.KV_unique_1K",
+      "payload_bytes_per_card_round": 5242880,
+      "bandwidth_floor_ms": 0.0058380843785632835,
+      "dram_bytes": null,
+      "reason": "Unique K/V payload only; partition rereads and cache stores not yet counted."
+    },
+    {
+      "name": "sampling_and_sorting",
+      "payload_bytes_per_card_round": null,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "observed_trace_service_ms": 0.15586,
+      "reason": "Trace service attributed; byte and instruction floor requires selective NCU."
+    },
+    {
+      "name": "other_tail",
+      "payload_bytes_per_card_round": null,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "observed_trace_service_ms": 0.7224827142857142,
+      "reason": "Trace service attributed; byte and instruction floor requires selective NCU."
+    },
+    {
+      "name": "other_target",
+      "payload_bytes_per_card_round": null,
+      "dram_bytes": null,
+      "executed_warp_instructions": null,
+      "instruction_floor_ms": null,
+      "observed_trace_service_ms": 0.6701947857142858,
+      "reason": "Trace service attributed; byte and instruction floor requires selective NCU."
+    }
+  ],
+  "communication": {
+    "target_kernel_calls": 130,
+    "tail_kernel_calls": 17,
+    "layer_collectives": 128,
+    "layer_payload_bytes": 81920,
+    "remote_peers": 3,
+    "ideal_peer_write_floor_ms": 0.20971520000000002,
+    "peer_protocol_handshake_latency": null,
+    "reason": "128 layer collective payload floor; additional gathers and barriers excluded, NVLink protocol floor incomplete"
+  },
+  "measurement_complete": false,
+  "missing": [
+    "decode instruction counts for hot families",
+    "sampling and layout traffic",
+    "actual DRAM and activation rereads",
+    "per-collective synchronization lower bounds"
+  ],
+  "prototype": {
+    "name": "tile_ready_mlp",
+    "research_only": true,
+    "gate_ctas": 68,
+    "down_ctas": 80,
+    "cooperatively_resident_ctas": 80,
+    "preserve_fp32_accumulation": true,
+    "global_phase_barrier": false,
+    "upper_bound_trace_ms": 2.374376462379357,
+    "estimated_accepted_round_saving_ms": null
+  }
+}
