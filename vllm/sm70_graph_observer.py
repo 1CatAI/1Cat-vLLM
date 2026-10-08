@@ -156,11 +156,17 @@ class GraphParityWorkerExtension:
     rank: int
     model_runner: Any
 
-    def read_prefill_memory(self, reset_peak: bool = False):
+    def read_prefill_memory(
+        self, reset_peak: bool = False, release_unused_cache: bool = False
+    ):
         """Capture worker allocation admission between benchmark requests."""
         import torch
 
         torch.accelerator.synchronize()
+        if release_unused_cache:
+            # Diagnostic-only: make room for CUPTI after unprofiled requests.
+            # Live tensors and captured graph allocations remain owned.
+            torch.accelerator.empty_cache()
         free, total = torch.accelerator.get_memory_info()
         result = {
             "rank": self.rank,

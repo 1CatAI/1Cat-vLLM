@@ -548,6 +548,19 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "runtime_guards": "FP16; M>=512; requests1..16; taps2..8; dilation1..8",
         "precision": "FP32 accumulation; FP16 conv boundary before FP32 SiLU",
     }
+    ple_gate = cfg.kernel_config.prefill_ple_compact_gate
+    report["prefill_ple_compact_gate"] = {
+        "enabled": sm70 and ple_gate,
+        "reason": None
+        if sm70 and ple_gate
+        else ("requires_sm70" if not sm70 else "disabled_by_kernel_policy"),
+        "scope": "compiled_prefill_only",
+        "operator": "scalar PLE gates with key and convolution-output storage reuse",
+        "runtime_guards": (
+            "FP16 operands; HC4/H2560; compatible norms; decode graph excluded"
+        ),
+        "precision": "FP32 gate/norm; FP16 gated-value and convolution boundaries",
+    }
     report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
     report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
     report["moe_kernel_selections"] = cfg.kernel_config.moe_kernel_selections

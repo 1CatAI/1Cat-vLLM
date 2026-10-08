@@ -9,43 +9,11 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 import torch
 
 import vllm
 from vllm import LLM, SamplingParams
-
-
-def _start_prefill_trace(worker: Any) -> None:
-    # Tracing starts after the unprofiled measurements. Release unused cached
-    # allocations to admit CUPTI buffers, then warm again before recording.
-    torch.accelerator.empty_cache()
-    worker._gguf_prefill_trace = torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-    )
-    worker._gguf_prefill_trace.start()
-
-
-def _activate_prefill_trace(worker: Any) -> None:
-    worker._gguf_prefill_trace.step()
-
-
-def _finish_prefill_trace(worker: Any, directory: str) -> dict:
-    profile = worker._gguf_prefill_trace
-    profile.stop()
-    output = Path(directory) / f"rank{worker.rank}.json"
-    output.parent.mkdir(parents=True, exist_ok=True)
-    profile.export_chrome_trace(str(output))
-    worker._gguf_prefill_trace = None
-    return dict(rank=worker.rank, path=str(output), bytes=output.stat().st_size)
 
 
 def main():
@@ -100,6 +68,17 @@ def main():
             "draft_sample_method": "greedy",
         },
     )
+    trace_directory = args.output.parent / "prefill-trace"
+    if args.profile_once:
+        config["profiler_config"] = dict(
+            profiler="torch",
+            torch_profiler_dir=str(trace_directory.resolve()),
+            torch_profiler_with_stack=False,
+            torch_profiler_with_memory=False,
+            torch_profiler_record_shapes=False,
+            torch_profiler_dump_cuda_time_total=False,
+            torch_profiler_use_gzip=True,
+        )
     report = dict(
         config=copy.deepcopy(config),
         version=vllm.__version__,
@@ -259,20 +238,30 @@ def main():
         save()
         if args.profile_once:
             llm.collective_rpc(method, args=(True,))
-            llm.collective_rpc(_start_prefill_trace)
+            # Use named RPCs and the built-in profiler; callable RPC transport
+            # requires unsafe serialization in the multiprocess engine.
+            llm.collective_rpc("read_prefill_memory", args=(False, True))
+            llm.start_profile("prefill32k")
             warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
-            llm.collective_rpc(_activate_prefill_trace)
+            llm.stop_profile()
+            warm_files = set(trace_directory.glob("*.pt.trace.json.gz"))
+            llm.start_profile("prefill32k")
             profiled = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[
                 0
             ]
-            files = llm.collective_rpc(
-                _finish_prefill_trace, args=(str(args.output.parent / "prefill-trace"),)
-            )
+            llm.stop_profile()
+            files = sorted(set(trace_directory.glob("*.pt.trace.json.gz")) - warm_files)
+            if len(files) != args.tp:
+                raise RuntimeError(
+                    f"Expected {args.tp} worker traces, got {len(files)}"
+                )
             report["profile"] = dict(
                 scope="profiled candidate; excluded from unprofiled throughput",
                 warmup_output_ids=warmup.outputs[0].token_ids,
                 output_ids=profiled.outputs[0].token_ids,
-                files=files,
+                files=[
+                    dict(path=str(path), bytes=path.stat().st_size) for path in files
+                ],
             )
         report["complete"] = True
         save()

@@ -450,11 +450,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            hidden_states = hidden_states + self.ple(
+            hidden_states = self.ple(
                 hidden_states,
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                add_residual=True,
             )
             hidden_states = snapshot_ple_diagnostic(
                 hidden_states, self.ple.prefix + ":09_after_add", diagnostic

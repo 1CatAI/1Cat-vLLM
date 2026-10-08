@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -109,6 +110,11 @@ from ..common.ple import (
     ple_host_reserve_bytes,
     ple_vram_reserve_bytes,
     total_host_bytes,
+)
+from .ops.ple_prefill_gate import (
+    finish_prefill_gate,
+    prefill_gate_reason,
+    prepare_prefill_gate,
 )
 
 _MASK64 = (1 << 64) - 1
@@ -2842,6 +2848,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        *,
+        add_residual: bool = False,
     ) -> torch.Tensor:
         diagnostic = self._sm70_hcx_diagnostics
         input_ids = input_ids.reshape(-1)
@@ -2868,6 +2876,50 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         value, _ = self.value_proj(embeddings)
         key = snapshot_ple_diagnostic(key, self.prefix + ":03_key", diagnostic)
         value = snapshot_ple_diagnostic(value, self.prefix + ":04_value", diagnostic)
+        policy = get_forward_kernel_config_or_none()
+        compact_gate = (
+            torch.compiler.is_compiling()
+            and not diagnostic
+            and not use_sm70_decode_graph_semantics()
+            and (policy is None or policy.prefill_ple_compact_gate)
+        )
+        if compact_gate:
+            norms = (self.norm_key, self.norm_query, self.norm_conv)
+            reason = prefill_gate_reason(
+                key,
+                hidden_states,
+                value,
+                tuple(norm.weight for norm in norms),
+                self.hc_count,
+            )
+            if len({norm.eps for norm in norms}) != 1:
+                reason = "different_norm_eps"
+            if reason is None:
+                logger.info_once(
+                    "SM70 PLE prefill retains scalar gates and reuses key/output "
+                    "storage (FP32 gate/norm, FP16 materialized values)."
+                )
+                normalized, gates = prepare_prefill_gate(
+                    key,
+                    hidden_states,
+                    value,
+                    tuple(norm.weight for norm in norms),
+                    self.hc_count,
+                    self.norm_conv.eps,
+                )
+                conv_output = torch.zeros_like(normalized)
+                torch.ops.vllm.qwen4_exp_ple_short_conv(
+                    normalized,
+                    conv_output,
+                    self.prefix,
+                )
+                return finish_prefill_gate(
+                    conv_output,
+                    value,
+                    gates,
+                    hidden_states if add_residual else None,
+                )
+            logger.debug_once("PLE compact prefill gate fallback: %s.", reason)
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
@@ -2893,7 +2945,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         conv_output = snapshot_ple_diagnostic(
             conv_output, self.prefix + ":08_conv_output", diagnostic
         )
-        return gated_value.flatten(-2) + conv_output
+        contribution = gated_value.flatten(-2) + conv_output
+        return hidden_states + contribution if add_residual else contribution
 
 
 def qwen4_exp_ple_short_conv(

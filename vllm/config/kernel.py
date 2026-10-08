@@ -554,6 +554,9 @@ class KernelConfig:
     prefill_ple_short_conv: bool = True
     """Use admitted SM70 dilated PLE prefill without padded history buffers."""
 
+    prefill_ple_compact_gate: bool = True
+    """Reuse PLE key/output storage and retain scalar gates during SM70 prefill."""
+
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
     collective_kernel_selections: dict[str, Any] = Field(

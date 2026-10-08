@@ -416,3 +416,46 @@ its share of model latency. The existing source rounds probabilities to FP16
 before P.V and accumulates in FP32; preserve those boundaries when evaluating
 a native implementation. Attribute the actual route in the model trace before
 choosing its implementation or quoting an expected end-to-end gain.
+
+## Compact PLE prefill gate
+
+Increasing the device KV/state pool from 1 GiB to 1.375 GiB fails on a
+320 MiB expanded PLE gated-value allocation during the first 16K chunk. The
+compiled prefill route now retains FP32 scalar gates, reuses the uniquely owned
+projected key for normalized convolution input, and reuses the convolution
+output for the residual sum. Eager execution, decode compilation, and diagnostic
+snapshots retain their existing path. The capability is enabled by default and
+controlled through `KernelConfig.prefill_ple_compact_gate`.
+
+The numerical reference follows actual compiled prefill boundaries: gate and
+variance calculations remain FP32, gated values are materialized in FP16 before
+convolution normalization, and the residual epilogue accumulates in FP32 before
+FP16 storage. A prototype that inserted additional FP16 gate/norm boundaries was
+rejected. On 16384 rows with official GGUF norm weights, relative L2 error is
+8.79e-6 for normalized convolution input and 4.43e-6 for the final PLE output;
+maximum absolute errors are 0.00390625 and 0.00048828125. All values are finite.
+
+A source-only ABBA microbenchmark of the gate/normalization and output phases,
+excluding projections and convolution, measures median 3.374 ms versus 2.843 ms.
+Standalone temporary allocation changes from 960.25 MiB to 0.25 MiB. The existing
+compiled model already reuses some buffers, so this is not a model-level memory
+or latency claim. Installed-wheel peak allocation, four-request admission, and
+full-model throughput remain to be measured.
+
+The compiled-entry regression explicitly selects the prefill compiler phase and
+verifies both custom operators occur in the exported graph. GPU checks cover
+strided inputs, FP16/FP32 norm weights, optional residuals, and replay with changed
+inputs. Disk/offload fixtures now initialize the required layer name and config;
+invalid disk rows must fail in both the native and Python reader.
+
+## Profiling transport
+
+The first full-model profiling attempt failed before recording because callable
+RPC transport requires unsafe serialization. The benchmark now uses the built-in
+Torch profiler through named worker RPCs, preserving default serialization
+policy. Two profiling cycles warm CUPTI before the recorded request; compressed
+worker traces are excluded from unprofiled throughput. A normal-wheel smoke
+verifies named-RPC serialization, restart, and CUDA events in both trace files.
+Three natural chat prompts complete with EOS, including arithmetic, a Chinese
+explanation, and Python code. These health checks do not substitute for the
+pending model-level logit and C4 acceptance comparisons.
