@@ -40,11 +40,17 @@ def require_sm70():
         pytest.skip("Requires SM70")
 
 
+@pytest.fixture
+def sm70_norm_config():
+    require_sm70()
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cuda"))):
+        yield
+
+
 @pytest.mark.parametrize("activation", ["sigmoid", "silu"])
 @pytest.mark.parametrize("rows", [4096, 196608])
 @torch.inference_mode()
-def test_prefill_norm_fp32_reference_and_peak(rows, activation):
-    require_sm70()
+def test_prefill_norm_fp32_reference_and_peak(rows, activation, sm70_norm_config):
     torch.manual_seed(1023)
     x = torch.randn(rows, 128, device="cuda", dtype=torch.float16)
     z = torch.randn_like(x)
@@ -80,8 +86,7 @@ def test_prefill_norm_fp32_reference_and_peak(rows, activation):
 
 
 @torch.inference_mode()
-def test_prefill_norm_fullgraph_and_changed_input_replay():
-    require_sm70()
+def test_prefill_norm_fullgraph_and_changed_input_replay(sm70_norm_config):
     norm = RMSNormGated(
         128,
         eps=1e-6,
