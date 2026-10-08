@@ -304,6 +304,11 @@ class PleOffloadConnector:
                 for name, layer in self._layers.items()
                 if (placement := layer.remote_placement()) is not None
             },
+            result_layouts={
+                name: layout
+                for name, layer in self._layers.items()
+                if (layout := layer.offload_result_layout()) is not None
+            },
         )
 
         payload = _dump_registration(registration)

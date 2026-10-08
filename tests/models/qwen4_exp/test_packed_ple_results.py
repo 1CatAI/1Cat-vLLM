@@ -155,6 +155,107 @@ def test_packed_rows_preserve_bounds_empty_and_value_checks():
             np.testing.assert_array_equal(actual, expected)
 
 
+def cpu_owner_without_postload_configuration():
+    module = ple_layer.Qwen4ExpNGramEmbedding.__new__(ple_layer.Qwen4ExpNGramEmbedding)
+    torch.nn.Module.__init__(module)
+    module._packed_result_layout = None
+    module.head_dim, module.ngram_heads = 160, 16
+    module.ngram_embedding = SimpleNamespace(
+        _cpu_reader=PackedGGUFRowReader(rows(), 20, 160),
+        _output_dtype=torch.float16,
+    )
+    return module
+
+
+def test_cpu_spawn_configuration_binds_gpu_result_geometry_later():
+    from vllm.v1.ple_offload.worker import PleOffloadRunner
+
+    module = cpu_owner_without_postload_configuration()
+    runner = PleOffloadRunner.__new__(PleOffloadRunner)
+    runner._layers = {"ple": module}
+    runner.vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(
+            ple_packed_gguf_results=True, ple_packed_result_decoders={}
+        )
+    )
+    assert module.get_offload_output_dtype(torch.float16) == torch.float16
+    registrations = [
+        SimpleNamespace(result_layouts={"ple": layout()}) for _ in range(4)
+    ]
+    runner._bind_result_layouts(registrations)
+    assert module.get_offload_output_dtype(torch.float16) == torch.uint8
+    assert module.get_offload_output_dim(2560) == 1440
+    assert module.offload_result_layout() == layout()
+
+
+def test_mapped_registration_binds_geometry_before_buffer_validation():
+    from multiprocessing.reduction import ForkingPickler
+
+    from vllm.v1.ple_offload.protocol import PleOffloadRegistration
+    from vllm.v1.ple_offload.worker import PleOffloadRunner
+
+    module = cpu_owner_without_postload_configuration()
+    runner = PleOffloadRunner.__new__(PleOffloadRunner)
+    runner._layers = {"ple": module}
+    runner._worker_targets, runner._input_bufs, runner._pinned_bufs = {}, {}, {}
+    runner.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(data_parallel_size=1, tensor_parallel_size=4),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        model_config=SimpleNamespace(
+            dtype=torch.float16, hf_text_config=SimpleNamespace(ple_embed_dim=2560)
+        ),
+        kernel_config=SimpleNamespace(ple_packed_gguf_results=True),
+    )
+    registrations = []
+    for rank in range(4):
+        result = torch.empty(8, 1440, dtype=torch.uint8).share_memory_()
+        flag = torch.zeros(16, dtype=torch.int32).share_memory_()
+        registrations.append(
+            PleOffloadRegistration(
+                worker_id=rank,
+                tp_rank=rank,
+                dp_rank=0,
+                gpu_output_buffers={},
+                cpu_output_buffers={"ple": result},
+                sem_flag_tensors={"ple": flag},
+                input_ids_buf=torch.zeros(8, dtype=torch.int32).share_memory_(),
+                query_start_loc_buf=torch.zeros(5, dtype=torch.int32).share_memory_(),
+                ngram_context_buf=torch.zeros(4, 2, dtype=torch.int32).share_memory_(),
+                result_layouts={"ple": layout()},
+            )
+        )
+    payloads = iter(bytes(ForkingPickler.dumps(item)) for item in registrations)
+    runner.accept_registrations(SimpleNamespace(recv=lambda: next(payloads)), 4)
+    assert module.offload_result_layout() == layout()
+    assert runner._pinned_bufs[0]["ple"].shape == (8, 1440)
+    assert runner._pinned_bufs[0]["ple"].dtype == torch.uint8
+    assert len(runner._worker_targets[0]["ple"]) == 4
+
+
+@pytest.mark.parametrize(
+    "failure", ["mixed_ranks", "bad_source", "disabled", "unknown_layer"]
+)
+def test_result_negotiation_rejects_inconsistent_consumers_or_cpu_rows(failure):
+    from vllm.v1.ple_offload.worker import PleOffloadRunner
+
+    module = cpu_owner_without_postload_configuration()
+    runner = PleOffloadRunner.__new__(PleOffloadRunner)
+    runner._layers = {"ple": module}
+    runner.vllm_config = SimpleNamespace(
+        kernel_config=SimpleNamespace(ple_packed_gguf_results=failure != "disabled")
+    )
+    status = layout()
+    name = "missing" if failure == "unknown_layer" else "ple"
+    if failure == "bad_source":
+        status["source_type"] = 23
+    registrations = [SimpleNamespace(result_layouts={name: status}) for _ in range(4)]
+    if failure == "mixed_ranks":
+        registrations[-1].result_layouts = {}
+    with pytest.raises(ValueError):
+        runner._bind_result_layouts(registrations)
+    assert module.offload_result_layout() is None
+
+
 @pytest.mark.parametrize("m", [1, 5, 20, 512])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_gpu_decoder_matches_official_and_changed_graph_replays(m):

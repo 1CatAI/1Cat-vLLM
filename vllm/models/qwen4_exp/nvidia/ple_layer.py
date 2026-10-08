@@ -1882,6 +1882,30 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         layout = getattr(self, "_packed_result_layout", None)
         return layout["packed_width"] if layout is not None else default_dim
 
+    def offload_result_layout(self):
+        return getattr(self, "_packed_result_layout", None)
+
+    def bind_offload_result_layout(self, layout):
+        if layout is None:
+            self._packed_result_layout = None
+            return
+        reader = getattr(getattr(self, "ngram_embedding", None), "_cpu_reader", None)
+        if (
+            reader is None
+            or not layout.get("enabled")
+            or layout.get("operator") != "ple_decode_iq4nl_result"
+            or layout.get("source_type") != 20
+            or reader.source_type != 20
+            or reader.hidden_size != layout.get("row_width")
+            or self.head_dim != layout.get("row_width")
+            or self.ngram_heads != layout.get("heads")
+            or layout.get("packed_width") != self.ngram_heads * reader.data.shape[1]
+            or layout.get("output_dtype") != "float16"
+            or self.ngram_embedding._output_dtype != torch.float16
+        ):
+            raise ValueError("CPU PLE row storage disagrees with result decoder")
+        self._packed_result_layout = dict(layout)
+
     def decode_offloaded_output(self, output: torch.Tensor) -> torch.Tensor:
         layout = getattr(self, "_packed_result_layout", None)
         if layout is None:

@@ -307,6 +307,15 @@ class PleOffloadLayer(nn.Module, ABC):
         """Convert a transported result to the owning model's embedding dtype."""
         return output
 
+    def offload_result_layout(self) -> dict[str, Any] | None:
+        """Describe an encoded result to the separately spawned CPU owner."""
+        return None
+
+    def bind_offload_result_layout(self, layout: dict[str, Any] | None) -> None:
+        """Validate the consumers' result geometry against loaded CPU rows."""
+        if layout is not None:
+            raise ValueError("This PLE layer does not support encoded result layouts")
+
     def setup_cross_process_offload(
         self,
         gpu_output_buffer: torch.Tensor,

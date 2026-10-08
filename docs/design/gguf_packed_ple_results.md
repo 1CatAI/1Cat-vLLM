@@ -27,6 +27,13 @@ is introduced. Output buffers retain fixed graph addresses, and consumers
 acknowledge them only after decoding and using the result. CUDA and mapped
 transports share the same negotiated result shape.
 
+The CPU process is spawned from a configuration snapshot taken before GPU
+weight loading. Result geometry therefore travels in each GPU registration,
+after loading resolves capabilities. The CPU checks agreement across all
+DP/TP consumers and validates the descriptor against its actual loaded row
+type and dimensions before validating or allocating transport buffers. No
+live model or loader closure crosses the spawn boundary.
+
 ## Measurement
 
 The initial four-V100 control uses TP4, device E4M3 target history, FP16 draft
