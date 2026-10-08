@@ -49295,3 +49295,11 @@ attention RMSE by about30% for2.31% more candidate bytes; physical packing and
 reader cost remain unimplemented. The original ten-scheme metrics match
 exactly under the same local CPU/Torch/thread contract. See the separate
 ablation ledger; no runtime codec/default is selected from this short corpus.
+
+Six decode workspace/partition helpers and two constants now live in
+`flash_v100/decode_policy.py`, with original bodies, backend reexports and
+legacy dtype envelopes unchanged. Source/matrix/environment checks pass25;
+five CPU partition tests pass. One broader device-config case cannot infer a
+GPU on this host and remains pending on V100. Backend8712 lines; aggregate89
+environment names/26 dtype predicates/52 route calls unchanged. The common
+format-independent schedule and reduction remain separate, unqualified work.

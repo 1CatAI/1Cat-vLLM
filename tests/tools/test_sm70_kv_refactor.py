@@ -39,6 +39,7 @@ FUSED_WRITER = ROOT / "vllm/model_executor/layers/attention/sm70_qwen38_qk_rope.
         ("masking_ast", MASKING),
         ("reference_ast", REFERENCE),
         ("cache_view_ast", CACHE_VIEW),
+        ("decode_policy_ast", BACKEND.parent / "flash_v100/decode_policy.py"),
         ("triton_writer_host_ast", TRITON_WRITER),
         ("qwen_rope_host_ast", FUSED_WRITER),
         ("qwen_rope_encoder_ast", TRITON_WRITER.parent / "kv_codec.py"),
@@ -80,7 +81,9 @@ def test_codec_reexports_keep_existing_imports_working():
     assert set(FIXTURE["codec_ast"]) <= imports
 
 
-@pytest.mark.parametrize("module", ["masking", "reference", "cache_view"])
+@pytest.mark.parametrize(
+    "module", ["masking", "reference", "cache_view", "decode_policy"]
+)
 def test_mask_and_reference_reexports_keep_existing_imports_working(module):
     imports = {
         name.asname or name.name
@@ -90,6 +93,35 @@ def test_mask_and_reference_reexports_keep_existing_imports_working(module):
         for name in node.names
     }
     assert set(FIXTURE[f"{module}_ast"]) <= imports
+
+
+def test_decode_policy_constants_match_immutable_source():
+    baseline = subprocess.check_output(
+        [
+            "git",
+            "show",
+            f"{FIXTURE['base_sha']}:vllm/v1/attention/backends/flash_attn_v100.py",
+        ],
+        cwd=ROOT,
+        text=True,
+    )
+    names = {"_DEFAULT_DECODE_PARTITION_SIZE", "_VALID_DECODE_PARTITION_SIZES"}
+    values = []
+    for source in (
+        baseline,
+        (BACKEND.parent / "flash_v100/decode_policy.py").read_text(),
+    ):
+        values.append(
+            {
+                target.id: ast.literal_eval(node.value)
+                for node in ast.parse(source).body
+                if isinstance(node, ast.Assign)
+                for target in node.targets
+                if isinstance(target, ast.Name) and target.id in names
+            }
+        )
+    assert set(values[0]) == names
+    assert values[0] == values[1]
 
 
 def test_shared_codec_include_is_source_complete():

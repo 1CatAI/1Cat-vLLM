@@ -144,6 +144,29 @@ immutable baseline and relocated functions on CPU: 24 BFLA configurations
 still need further decomposition. Environment coverage checks scan the backend
 and its new modules, so moving a read cannot masquerade as retiring a switch.
 
+## Decode partition policy boundary
+
+`flash_v100/decode_policy.py` owns the six existing workspace/partition helpers
+and their two constants. Their original AST hashes move unchanged to the module;
+backend reexports preserve callers. The legacy G6 FP16/E4M3/E5M2 envelopes,
+context thresholds, experimental overrides and exception messages remain intact.
+This is a reversible relocation, not the shared schedule/reduction retuning.
+The backend now has8712 lines; aggregate environment names89, dtype predicates26
+and route calls52 are unchanged. No experiment switch is retired by moving it.
+
+The separation follows planning/execution boundaries in
+[vLLM's Triton backend](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/triton_attn.py)
+and [SGLang's FlashInfer backend](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/flashinfer_backend.py).
+SGLang passes split planning and KV access/dtype as separate arguments. Adopt
+that ownership separation; do not copy its current split thresholds or graph
+planner into SM70, which would change unqualified scheduling and arithmetic.
+
+The source/reexport/constant/matrix/environment suite passes25 tests; five
+existing CPU partition tests pass. The broader selected run additionally
+fails one device-config test on the GPU-less local host, before metadata
+construction. Its installed V100 check and the new artifact/model gate remain
+pending. No AST or CPU check establishes graph replay or performance parity.
+
 ## Page views and address ownership
 
 `flash_v100/cache_view.py` owns splitting packed K/V tensors, storage-alias

@@ -44,6 +44,16 @@ from vllm.v1.attention.backends.flash_v100.codec import (
     _normalize_flash_v100_kv_cache_dtype,
     _uses_fp8_kv_cache,
 )
+from vllm.v1.attention.backends.flash_v100.decode_policy import (
+    _DEFAULT_DECODE_PARTITION_SIZE,  # noqa: F401
+    _VALID_DECODE_PARTITION_SIZES,  # noqa: F401
+    _decode_dynamic_partitions_enabled,  # noqa: F401
+    _decode_partition_size_for_metadata,  # noqa: F401
+    _g6_aligned_page_partition_size_hint,  # noqa: F401
+    _mtp5_xqa_dual_cta_partition_size_hint,  # noqa: F401
+    _mtp_context_bucket_partition_size_hint,  # noqa: F401
+    _select_default_decode_partition_size,  # noqa: F401
+)
 from vllm.v1.attention.backends.flash_v100.masking import (
     _build_bfla_block_mask_for_seq,  # noqa: F401
     _build_ddtree_visibility_mask,  # noqa: F401
@@ -188,8 +198,6 @@ _route_summary_registered = False
 _route_counts: dict[str, int] = {}
 _decode_active_trace_signatures: set[tuple[object, ...]] = set()
 _draft_graph_debug_counts: dict[str, int] = {}
-_DEFAULT_DECODE_PARTITION_SIZE = 256
-_VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _DEFAULT_Q4_XQA_MIN_SEQ_LEN = 32768
 _DEFAULT_FP8_XQA_MIN_SEQ_LEN = 16384
 _FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
@@ -311,78 +319,6 @@ def _graph_metadata_debug_log(key: str, message: str, *args: object) -> None:
     )
 
 
-def _decode_dynamic_partitions_enabled() -> bool:
-    return os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
-
-
-def _decode_partition_size_for_metadata(
-    max_seq_len_hint: int | None = None,
-) -> int:
-    raw = os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
-    if raw is None:
-        return _select_default_decode_partition_size(max_seq_len_hint)
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in _VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
-
-
-def _g6_aligned_page_partition_size_hint(
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    kv_cache_dtype: str,
-) -> int | None:
-    if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
-        return None
-    if os.getenv("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
-        return None
-    if not (
-        query.ndim == 3
-        and query.shape[0] == 1
-        and query.shape[2] == 256
-        and key_cache.ndim == 4
-        and key_cache.shape[1] >= _DEFAULT_DECODE_PARTITION_SIZE
-        and key_cache.shape[1] % 16 == 0
-        and key_cache.shape[2] > 0
-        and key_cache.shape[3] == 256
-        and query.shape[1] == 6 * key_cache.shape[2]
-        and value_cache.shape == key_cache.shape
-        and value_cache.dtype == key_cache.dtype
-    ):
-        return None
-    if (
-        kv_cache_dtype in ("auto", "float16", "bfloat16")
-        and key_cache.dtype == torch.float16
-        and key_cache.shape[1] == 784
-    ):
-        # The exact FP16 page-784 graph contains p256 and p1024 nodes and
-        # selects between them from device seq_lens. Plan the p256 workspace
-        # envelope once.
-        return 256
-    if kv_cache_dtype in ("fp8", "fp8_e4m3") and key_cache.dtype == torch.uint8:
-        # Plan a p64 workspace envelope. The native G6 path keeps this captured
-        # shape while selecting p64/p256 and long wave partitions from device
-        # sequence lengths.
-        return 64
-    if kv_cache_dtype == "fp8_e5m2" and key_cache.dtype == torch.uint8:
-        # Plan the largest p256 workspace once. The extension selects p256 or
-        # p1024 from device seq_lens, so CUDA graph replay keeps one
-        # captured shape while short and long contexts use different kernels.
-        # Keep this layout-driven rather than using model-name allowlists.
-        return 256
-    return None
-
-
 def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
     if kv_cache_dtype in _logged_kv_dtype_contracts:
         return
@@ -407,56 +343,6 @@ def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
             "KV storage only; model weight quantization is configured "
             "separately."
         )
-
-
-def _mtp_context_bucket_partition_size_hint() -> int | None:
-    raw = os.getenv("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE")
-    if raw is None:
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in _VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
-
-
-def _mtp5_xqa_dual_cta_partition_size_hint() -> int | None:
-    if os.getenv("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "1") != "1":
-        return None
-    raw = os.getenv("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "1024")
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in _VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
-
-
-def _select_default_decode_partition_size(
-    max_seq_len_hint: int | None,
-) -> int:
-    if max_seq_len_hint is None:
-        return _DEFAULT_DECODE_PARTITION_SIZE
-
-    seq_len = max(1, int(max_seq_len_hint))
-    if seq_len >= 32768:
-        return 1024
-    return _DEFAULT_DECODE_PARTITION_SIZE
 
 
 def _decode_xqa_q4_min_seq_len() -> int:
