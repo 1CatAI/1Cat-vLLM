@@ -646,7 +646,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
                 "operator": "grouped_sparse_page4_fwd",
                 "runtime_guards": (
                     "SM70; FP16 staged history; six 256-wide query heads; "
-                    "canonical four-token groups and causal tail; "
+                    "freshly selected canonical four-token groups and causal tail; "
                     "Flash-V100 grouped ABI available"
                 ),
                 "workspace": "shared per device and CUDA stream, sized by query rows",

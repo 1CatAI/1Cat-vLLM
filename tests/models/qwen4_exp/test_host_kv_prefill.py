@@ -27,6 +27,31 @@ def test_prefill_admission_preserves_decode_and_workspace_bound():
         )
 
 
+@pytest.mark.parametrize("skip_topk", [False, True])
+def test_grouped_prefill_rejects_reused_mtp_tail(monkeypatch, skip_topk):
+    from vllm.models.qwen4_exp.nvidia.ops import host_kv_prefill
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
+
+    calls = []
+    monkeypatch.setattr(host_kv_prefill, "prefill_staging_reason", lambda *args: None)
+    monkeypatch.setattr(
+        host_kv_prefill,
+        "host_qsa_prefill",
+        lambda *args, **kwargs: calls.append(kwargs["grouped_page4"]),
+    )
+    owner = SimpleNamespace(
+        host_kv=object(),
+        host_kv_prefill_enabled=True,
+        host_kv_prefill_grouped=True,
+        indexer=SimpleNamespace(skip_topk=skip_topk),
+    )
+    query = torch.empty(512, 6, 256, dtype=torch.float16)
+    Qwen4ExpQSAAttention.host_kv_forward(
+        owner, query, None, None, None, None, None, None, None
+    )
+    assert calls == [not skip_topk]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 def test_history_staging_matches_official_decode_and_preserves_page_aliases(dtype):

@@ -840,6 +840,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 logger.info_once(
                     "QSA host prefill stages request history once in shared scratch."
                 )
+                if self.host_kv_prefill_grouped and self.indexer.skip_topk:
+                    logger.info_once(
+                        "QSA host prefill grouped route skipped: reused_mtp_selection"
+                    )
                 host_qsa_prefill(
                     query,
                     state,
@@ -850,7 +854,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     lengths,
                     output,
                     gate,
-                    grouped_page4=self.host_kv_prefill_grouped,
+                    # Reused MTP indices may carry the preceding step's
+                    # compact tail. Only freshly selected rows satisfy the
+                    # native planner's current-position tail contract.
+                    grouped_page4=(
+                        self.host_kv_prefill_grouped and not self.indexer.skip_topk
+                    ),
                 )
                 return
             if query.shape[0] >= 512:

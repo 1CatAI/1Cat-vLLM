@@ -38,7 +38,9 @@ retain the generic sparse attention route. Admission checks SM70, FP16 staged
 K/V, G6D256 layout, 2051 selection columns and the native grouped ABI; rejected
 layouts log their reason and retain the 256-row fallback. The final fewer
 than eight queries also retain the causal fallback. Output gating is applied
-after attention. A stream-scoped planner workspace is reused across layers;
+after attention. MTP steps that reuse an earlier sparse-index row retain the
+causal fallback: their compact tail may describe the preceding position.
+A stream-scoped planner workspace is reused across layers;
 no second persistent history bank is added.
 
 The benchmark supports an in-process grouped-attention ABBA and an optional
