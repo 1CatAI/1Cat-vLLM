@@ -314,3 +314,13 @@ Regression tests exercise an expired construction scope, conflicting scopes,
 and a compiled opaque HC call with the execution policy and no construction
 configuration. Another installed-wheel model run is required to qualify capacity,
 throughput, output quality and decode behavior.
+
+The next installed wheel passed 39 targeted checks. The model logs confirmed
+HC 2048-row and expert 4096-row blocking with construction scope absent.
+Initialized allocation was 28.7484 GiB/rank. The first 16K query chunk progressed
+through the decoder layers and QSA attention, then failed in the final HC mix:
+its no-injection variant was excluded from the combine/projection row loop and
+requested a full 320 MiB gate result with only 221–247 MiB device memory free.
+This is another bounded-work coverage gap, not a completed 32K throughput run.
+The existing HC row loop now also handles the final no-injection variant,
+retaining its `None` injection result and the same FP16 projection boundaries.

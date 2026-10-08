@@ -194,7 +194,8 @@ def test_projection_short_tail_preserves_fp16_boundaries(rows):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_combine_short_tail_matches_full_rows(default_vllm_config):
+@pytest.mark.parametrize("use_combine", [True, False])
+def test_combine_short_tail_matches_full_rows(default_vllm_config, use_combine):
     from types import SimpleNamespace
 
     from torch import nn
@@ -214,13 +215,18 @@ def test_combine_short_tail_matches_full_rows(default_vllm_config):
         module = object.__new__(GatedResidual)
         nn.Module.__init__(module)
         module.config = SimpleNamespace(rms_norm_eps=1e-6)
-        module.use_combine = True
+        module.use_combine = use_combine
         module.hc_count, module.hidden_size = 4, 2560
         module.lora_rank, module.pad_size = 320, 12
         module._partial_inputs = True
-        module.input_mix_weight_down_block_inject = nn.Linear(
-            10240, 336, bias=False, device="cuda", dtype=torch.float16
-        )
+        if use_combine:
+            module.input_mix_weight_down_block_inject = nn.Linear(
+                10240, 336, bias=False, device="cuda", dtype=torch.float16
+            )
+        else:
+            module.input_mix_weight_down = nn.Linear(
+                10240, 320, bias=False, device="cuda", dtype=torch.float16
+            )
         module.input_mix_weight_up = nn.Linear(
             320, 10240, bias=False, device="cuda", dtype=torch.float16
         )
@@ -239,7 +245,10 @@ def test_combine_short_tail_matches_full_rows(default_vllm_config):
         actual = module._combine_and_mix_reduced(hidden, block, inject)
         torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
         for value, reference in zip(actual[1:], expected[1:]):
-            torch.testing.assert_close(value, reference, rtol=1e-3, atol=1e-4)
+            if reference is None:
+                assert value is None
+            else:
+                torch.testing.assert_close(value, reference, rtol=1e-3, atol=1e-4)
     finally:
         (
             backend.allow_fp16_reduced_precision_reduction,
