@@ -956,477 +956,29 @@ def _flash_v100_prefill_with_prefix(
                 )
                 out_view[start:end].copy_(out_seq.squeeze(0))
                 continue
-            bfla_block_mask = None
-            use_bfla = self._should_use_prefill_bfla(
-                q_len=q_len,
-                seq_len=seq_len,
-                head_dim=head_dim,
-                key_cache=key_cache,
-                causal=causal,
-                window_size=window_size,
+            out_seq, out_is_destination, skip_debug = _run_prefill_sequence(
+                self,
+                layer,
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                out_view,
+                i,
+                start,
+                end,
+                q_len,
+                seq_len,
+                q_seq,
+                num_seqs,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                causal,
+                window_size,
             )
-            if use_bfla:
-                bfla_block_mask = _masks._build_bfla_block_mask_for_seq(
-                    q_seq,
-                    key_cache,
-                    attn_metadata.block_table[i],
-                    seq_len=seq_len,
-                    block_size=block_size,
-                    mask_block_n=self.prefill_bfla_mask_block_n,
-                    softmax_scale=self.scale,
-                )
-            fa2_paged_out = None
-            fa2_route = None
-            if (
-                bfla_block_mask is None
-                and _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL")
-                and key_cache.dtype == torch.float16
-                and value_cache.dtype == torch.float16
-                and q_len >= 1024
-                and head_dim == 256
-                and causal
-                and window_size == (-1, -1)
-            ):
-                cu_q, cu_k = _dense_prefill._uniform_cu_seqlens(
-                    q_seq,
-                    batch_size=1,
-                    query_len=q_len,
-                    kv_len=seq_len,
-                )
-                fa2_out_dest = out_view[start:end].unsqueeze(0)
-                fa2_dense_kv = _kv_layout._contiguous_paged_kv_view(
-                    key_cache,
-                    value_cache,
-                    attn_metadata.block_table[i],
-                    seq_len,
-                    block_size,
-                    attn_metadata,
-                    i,
-                    False,
-                )
-                fa2_dense_route = "prefill_prefix_contig_splitd_d256"
-                if (
-                    fa2_dense_kv is None
-                    and self._should_use_prefill_gather_dense(
-                        q_len=q_len,
-                        seq_len=seq_len,
-                        head_dim=head_dim,
-                        key_cache=key_cache,
-                        value_cache=value_cache,
-                        causal=causal,
-                        window_size=window_size,
-                        num_seqs=num_seqs,
-                    )
-                    and _ops._get_sm70_splitd_d256_ops() is not None
-                ):
-                    fa2_dense_kv = _kv_layout._gather_paged_kv_to_exact_dense(
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table[i],
-                        seq_len,
-                    )
-                    fa2_dense_route = "prefill_prefix_gather_splitd_d256"
-                if fa2_dense_kv is not None:
-                    fa2_route = fa2_dense_route
-                    fa2_key, fa2_value = fa2_dense_kv
-                    fa2_paged_out = self._run_prefill_paged_call(
-                        route=fa2_route,
-                        q_len=q_len,
-                        seq_len=seq_len,
-                        heads_q=query.shape[1],
-                        heads_kv=num_kv_heads,
-                        head_dim=head_dim,
-                        block_size=block_size,
-                        fn=lambda q_seq=q_seq,  # type: ignore[misc]
-                        fa2_key=fa2_key,
-                        fa2_value=fa2_value,
-                        cu_q=cu_q,
-                        cu_k=cu_k,
-                        q_len=q_len,
-                        seq_len=seq_len,
-                        out_dest=fa2_out_dest: (
-                            _dense_prefill._try_sm70_fa2_d256_prefill(
-                                q_seq,
-                                fa2_key,
-                                fa2_value,
-                                cu_seqlens_q=cu_q,
-                                cu_seqlens_k=cu_k,
-                                max_seqlen_q=q_len,
-                                max_seqlen_k=seq_len,
-                                softmax_scale=self.scale,
-                                causal=causal,
-                                window_size=window_size,
-                                out=out_dest,
-                            )
-                        ),
-                    )
-                else:
-                    fa2_route = "prefill_prefix_paged_splitd_d256"
-                    fa2_paged_out = self._run_prefill_paged_call(
-                        route=fa2_route,
-                        q_len=q_len,
-                        seq_len=seq_len,
-                        heads_q=query.shape[1],
-                        heads_kv=num_kv_heads,
-                        head_dim=head_dim,
-                        block_size=block_size,
-                        fn=lambda q_seq=q_seq,  # type: ignore[misc]
-                        key_cache=key_cache,
-                        value_cache=value_cache,
-                        cu_q=cu_q,
-                        q_len=q_len,
-                        seq_len=seq_len,
-                        out_dest=fa2_out_dest,
-                        i=i: _dense_prefill._try_sm70_fa2_d256_prefill(
-                            q_seq,
-                            key_cache,
-                            value_cache,
-                            cu_seqlens_q=cu_q,
-                            cu_seqlens_k=None,
-                            max_seqlen_q=q_len,
-                            max_seqlen_k=seq_len,
-                            softmax_scale=self.scale,
-                            causal=causal,
-                            window_size=window_size,
-                            out=out_dest,
-                            seqused_k=attn_metadata.seq_lens[i : i + 1],
-                            block_table=attn_metadata.block_table[i : i + 1],
-                        ),
-                    )
-            contig_dense_kv = None
-            contig_dense_kv_bhmd = None
-            if (
-                bfla_block_mask is None
-                and fa2_paged_out is None
-                and self._should_use_prefill_contig_dense(
-                    q_len=q_len,
-                    seq_len=seq_len,
-                    head_dim=head_dim,
-                    key_cache=key_cache,
-                    causal=causal,
-                    window_size=window_size,
-                )
-            ):
-                if (
-                    self.prefill_contig_dense_allow_copy
-                    and self.flash_attn_bhmd_func is not None
-                ):
-                    contig_dense_kv_bhmd = _kv_layout._contiguous_paged_kv_bhmd(
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table[i],
-                        seq_len,
-                        block_size,
-                        attn_metadata,
-                        i,
-                    )
-                if contig_dense_kv_bhmd is None:
-                    contig_dense_kv = _kv_layout._contiguous_paged_kv_view(
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table[i],
-                        seq_len,
-                        block_size,
-                        attn_metadata,
-                        i,
-                        self.prefill_contig_dense_allow_copy,
-                    )
-            use_splitkv = self._should_use_prefill_splitkv(
-                q_len=q_len,
-                seq_len=seq_len,
-                head_dim=head_dim,
-                key_cache=key_cache,
-                causal=causal,
-            )
-            use_fp8_bridge = self._should_use_fp8_prefill_bridge(
-                q_len=q_len,
-                head_dim=head_dim,
-                key_cache=key_cache,
-                value_cache=value_cache,
-                causal=causal,
-                window_size=window_size,
-            )
-            if bfla_block_mask is not None:
-                if not _state._logged_prefill_prefix_bfla:
-                    logger.info(
-                        "FLASH_ATTN_V100 prefix prefill BFLA sparse path "
-                        "active (min_q=%d min_kv=%d mask_block_n=%d "
-                        "keep_mass=%.4f local_blocks=%d pool=%s).",
-                        self.prefill_bfla_min_q,
-                        self.prefill_bfla_min_kv,
-                        self.prefill_bfla_mask_block_n,
-                        _config.registered("VLLM_FLASH_V100_BFLA_KEEP_MASS"),
-                        _config.registered("VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS"),
-                        _config.registered("VLLM_FLASH_V100_BFLA_POOL"),
-                    )
-                    _state._logged_prefill_prefix_bfla = True
-                _routing._record_route(_routing.ROUTE_SPECS["prefill_prefix_bfla"].name)
-                out_seq = self._run_prefill_paged_call(
-                    route="prefill_prefix_bfla",
-                    q_len=q_len,
-                    seq_len=seq_len,
-                    heads_q=query.shape[1],
-                    heads_kv=num_kv_heads,
-                    head_dim=head_dim,
-                    block_size=block_size,
-                    fn=partial(
-                        self.flash_attn_prefill_paged_bfla,
-                        q_seq,
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table[i : i + 1],
-                        attn_metadata.seq_lens[i : i + 1],
-                        bfla_block_mask,
-                        self.prefill_bfla_mask_block_n,
-                        softmax_scale=self.scale,
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        k_scale=float(layer._k_scale_float),
-                        v_scale=float(layer._v_scale_float),
-                        causal=causal,
-                        window_size=window_size,
-                    ),
-                )
-            elif fa2_paged_out is not None:
-                if not _dense_prefill._logged_prefill_fa2_d256:
-                    logger.info(
-                        "FLASH_ATTN_V100 SM70 Split-D D256 software-pipelined "
-                        "prefill path active (route=%s).",
-                        fa2_route,
-                    )
-                    _dense_prefill._logged_prefill_fa2_d256 = True
-                _routing._record_route(fa2_route or "prefill_prefix_splitd_d256")
-                out_seq = fa2_paged_out
-                out_is_destination = True
-            elif contig_dense_kv_bhmd is not None:
-                if not _state._logged_prefill_prefix_contig_dense:
-                    logger.info(
-                        "FLASH_ATTN_V100 prefix prefill contiguous dense "
-                        "BHMD path active (min_q=%d min_kv=%d allow_copy=%s).",
-                        self.prefill_contig_dense_min_q,
-                        self.prefill_contig_dense_min_kv,
-                        str(self.prefill_contig_dense_allow_copy),
-                    )
-                    _state._logged_prefill_prefix_contig_dense = True
-                k_bhmd, v_bhmd = contig_dense_kv_bhmd
-                q_bhmd = q_seq.permute(0, 2, 1, 3).contiguous()
-                _routing._record_route(
-                    _routing.ROUTE_SPECS["prefill_prefix_contig_dense_bhmd"].name
-                )
-                out_bhmd = self._run_prefill_paged_call(
-                    route="prefill_prefix_contig_dense_bhmd",
-                    q_len=q_len,
-                    seq_len=seq_len,
-                    heads_q=query.shape[1],
-                    heads_kv=num_kv_heads,
-                    head_dim=head_dim,
-                    block_size=block_size,
-                    fn=lambda q_bhmd=q_bhmd,  # type: ignore[misc]
-                    k_bhmd=k_bhmd,
-                    v_bhmd=v_bhmd: self.flash_attn_bhmd_func(
-                        q_bhmd,
-                        k_bhmd,
-                        v_bhmd,
-                        causal=causal,
-                        softmax_scale=self.scale,
-                        window_size=window_size,
-                    ),
-                )
-                out_view[start:end].copy_(out_bhmd.squeeze(0).permute(1, 0, 2))
+            if skip_debug:
                 continue
-            elif contig_dense_kv is not None:
-                if not _state._logged_prefill_prefix_contig_dense:
-                    logger.info(
-                        "FLASH_ATTN_V100 prefix prefill contiguous dense "
-                        "path active (min_q=%d min_kv=%d).",
-                        self.prefill_contig_dense_min_q,
-                        self.prefill_contig_dense_min_kv,
-                    )
-                    _state._logged_prefill_prefix_contig_dense = True
-                k_dense, v_dense = contig_dense_kv
-                fa2_out = None
-                if _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL"):
-                    cu_q, cu_k = _dense_prefill._uniform_cu_seqlens(
-                        q_seq,
-                        batch_size=1,
-                        query_len=q_len,
-                        kv_len=seq_len,
-                    )
-                    fa2_out_dest = out_view[start:end].unsqueeze(0)
-                    fa2_out = self._run_prefill_paged_call(
-                        route="prefill_prefix_contig_dense_fa2_d256",
-                        q_len=q_len,
-                        seq_len=seq_len,
-                        heads_q=query.shape[1],
-                        heads_kv=num_kv_heads,
-                        head_dim=head_dim,
-                        block_size=block_size,
-                        fn=lambda q_seq=q_seq,  # type: ignore[misc]
-                        k_dense=k_dense,
-                        v_dense=v_dense,
-                        cu_q=cu_q,
-                        cu_k=cu_k,
-                        q_len=q_len,
-                        seq_len=seq_len,
-                        out_dest=fa2_out_dest: (
-                            _dense_prefill._try_sm70_fa2_d256_prefill(
-                                q_seq,
-                                k_dense,
-                                v_dense,
-                                cu_seqlens_q=cu_q,
-                                cu_seqlens_k=cu_k,
-                                max_seqlen_q=q_len,
-                                max_seqlen_k=seq_len,
-                                softmax_scale=self.scale,
-                                causal=causal,
-                                window_size=window_size,
-                                out=out_dest,
-                            )
-                        ),
-                    )
-                if fa2_out is not None:
-                    if not _dense_prefill._logged_prefill_fa2_d256:
-                        logger.info(
-                            "FLASH_ATTN_V100 SM70 FA2 D256 "
-                            "software-pipelined dense prefill path active."
-                        )
-                        _dense_prefill._logged_prefill_fa2_d256 = True
-                    _routing._record_route(
-                        _routing.ROUTE_SPECS[
-                            "prefill_prefix_contig_dense_fa2_d256"
-                        ].name
-                    )
-                    out_seq = fa2_out
-                    out_is_destination = True
-                else:
-                    _routing._record_route(
-                        _routing.ROUTE_SPECS["prefill_prefix_contig_dense"].name
-                    )
-                    out_seq = self._run_prefill_paged_call(
-                        route="prefill_prefix_contig_dense",
-                        q_len=q_len,
-                        seq_len=seq_len,
-                        heads_q=query.shape[1],
-                        heads_kv=num_kv_heads,
-                        head_dim=head_dim,
-                        block_size=block_size,
-                        fn=lambda q_seq=q_seq,  # type: ignore[misc]
-                        k_dense=k_dense,
-                        v_dense=v_dense: self.flash_attn_func(
-                            q_seq,
-                            k_dense,
-                            v_dense,
-                            causal=causal,
-                            softmax_scale=self.scale,
-                            window_size=window_size,
-                        ),
-                    )
-            elif use_fp8_bridge:
-                bridge_result = self._run_fp8_prefill_bridge(
-                    query=q_seq,
-                    key_cache=key_cache,
-                    value_cache=value_cache,
-                    block_table=attn_metadata.block_table[i : i + 1],
-                    seq_lens=attn_metadata.seq_lens[i : i + 1],
-                    seq_len=seq_len,
-                    k_scale=float(layer._k_scale_float),
-                    v_scale=float(layer._v_scale_float),
-                    causal=causal,
-                    window_size=window_size,
-                    out=out_view[start:end].unsqueeze(0),
-                )
-                if bridge_result is not None:
-                    out_seq, out_is_destination = bridge_result
-                    if not _state._logged_fp8_prefill_bridge:
-                        logger.info(
-                            "FLASH_ATTN_V100 %s prefill bridge "
-                            "active (one-pass dequant, shared FP16 page-%d "
-                            "workspace).",
-                            self.kv_cache_dtype,
-                            _dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE,
-                        )
-                        _state._logged_fp8_prefill_bridge = True
-                    _routing._record_route(
-                        "prefill_prefix_fp8_e4m3_bridge"
-                        if self.kv_codec is FP8_E4M3
-                        else "prefill_prefix_fp8_e5m2_bridge"
-                    )
-                else:
-                    out_seq = self.flash_attn_prefill_paged(
-                        q_seq,
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table[i : i + 1],
-                        attn_metadata.seq_lens[i : i + 1],
-                        softmax_scale=self.scale,
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        k_scale=float(layer._k_scale_float),
-                        v_scale=float(layer._v_scale_float),
-                        causal=causal,
-                        window_size=window_size,
-                    )
-            elif use_splitkv:
-                if not _state._logged_prefill_prefix_splitkv:
-                    logger.info(
-                        "FLASH_ATTN_V100 prefix prefill split-KV path active "
-                        "(split_kv_tokens=%d min_q=%d max_q=%d min_kv=%d).",
-                        self.prefill_split_kv_tokens,
-                        self.prefill_split_kv_min_q,
-                        self.prefill_split_kv_max_q,
-                        self.prefill_split_kv_min_kv,
-                    )
-                    _state._logged_prefill_prefix_splitkv = True
-                _routing._record_route(
-                    _routing.ROUTE_SPECS["prefill_prefix_splitkv"].name
-                )
-                out_seq = self._run_prefill_paged_call(
-                    route="prefill_prefix_splitkv",
-                    q_len=q_len,
-                    seq_len=seq_len,
-                    heads_q=query.shape[1],
-                    heads_kv=num_kv_heads,
-                    head_dim=head_dim,
-                    block_size=block_size,
-                    fn=lambda q_seq=q_seq,  # type: ignore[misc]
-                    i=i,
-                    seq_len=seq_len: self.flash_attn_prefill_paged_splitkv(
-                        q_seq,
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table[i : i + 1],
-                        attn_metadata.seq_lens[i : i + 1],
-                        softmax_scale=self.scale,
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        k_scale=float(layer._k_scale_float),
-                        v_scale=float(layer._v_scale_float),
-                        causal=causal,
-                        window_size=window_size,
-                        split_kv_tokens=self.prefill_split_kv_tokens,
-                        max_seq_len_hint=seq_len,
-                    ),
-                )
-            else:
-                out_seq = self._run_prefill_paged_call(
-                    route="prefill_prefix_paged",
-                    q_len=q_len,
-                    seq_len=seq_len,
-                    heads_q=query.shape[1],
-                    heads_kv=num_kv_heads,
-                    head_dim=head_dim,
-                    block_size=block_size,
-                    fn=lambda q_seq=q_seq, i=i: self.flash_attn_prefill_paged(  # type: ignore[misc]
-                        q_seq,
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table[i : i + 1],
-                        attn_metadata.seq_lens[i : i + 1],
-                        softmax_scale=self.scale,
-                        kv_cache_dtype=self.kv_cache_dtype,
-                        k_scale=float(layer._k_scale_float),
-                        v_scale=float(layer._v_scale_float),
-                        causal=causal,
-                        window_size=window_size,
-                    ),
-                )
             need_dense_debug = (
                 debug_compare and not _state._logged_prefill_compare
             ) or dflash_dump
@@ -1682,3 +1234,495 @@ def _flash_v100_prefill_with_prefix(
             out_view[start:end].copy_(out_seq.squeeze(0))
 
     return output
+
+
+def _run_prefill_sequence(
+    self,
+    layer,
+    query,
+    key_cache,
+    value_cache,
+    attn_metadata,
+    out_view,
+    i,
+    start,
+    end,
+    q_len,
+    seq_len,
+    q_seq,
+    num_seqs,
+    num_kv_heads,
+    head_dim,
+    block_size,
+    causal,
+    window_size,
+):
+    out_is_destination = False
+    bfla_block_mask = None
+    use_bfla = self._should_use_prefill_bfla(
+        q_len=q_len,
+        seq_len=seq_len,
+        head_dim=head_dim,
+        key_cache=key_cache,
+        causal=causal,
+        window_size=window_size,
+    )
+    if use_bfla:
+        bfla_block_mask = _masks._build_bfla_block_mask_for_seq(
+            q_seq,
+            key_cache,
+            attn_metadata.block_table[i],
+            seq_len=seq_len,
+            block_size=block_size,
+            mask_block_n=self.prefill_bfla_mask_block_n,
+            softmax_scale=self.scale,
+        )
+    fa2_paged_out = None
+    fa2_route = None
+    if (
+        bfla_block_mask is None
+        and _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL")
+        and key_cache.dtype == torch.float16
+        and value_cache.dtype == torch.float16
+        and q_len >= 1024
+        and head_dim == 256
+        and causal
+        and window_size == (-1, -1)
+    ):
+        cu_q, cu_k = _dense_prefill._uniform_cu_seqlens(
+            q_seq,
+            batch_size=1,
+            query_len=q_len,
+            kv_len=seq_len,
+        )
+        fa2_out_dest = out_view[start:end].unsqueeze(0)
+        fa2_dense_kv = _kv_layout._contiguous_paged_kv_view(
+            key_cache,
+            value_cache,
+            attn_metadata.block_table[i],
+            seq_len,
+            block_size,
+            attn_metadata,
+            i,
+            False,
+        )
+        fa2_dense_route = "prefill_prefix_contig_splitd_d256"
+        if (
+            fa2_dense_kv is None
+            and self._should_use_prefill_gather_dense(
+                q_len=q_len,
+                seq_len=seq_len,
+                head_dim=head_dim,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                causal=causal,
+                window_size=window_size,
+                num_seqs=num_seqs,
+            )
+            and _ops._get_sm70_splitd_d256_ops() is not None
+        ):
+            fa2_dense_kv = _kv_layout._gather_paged_kv_to_exact_dense(
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[i],
+                seq_len,
+            )
+            fa2_dense_route = "prefill_prefix_gather_splitd_d256"
+        if fa2_dense_kv is not None:
+            fa2_route = fa2_dense_route
+            fa2_key, fa2_value = fa2_dense_kv
+            fa2_paged_out = self._run_prefill_paged_call(
+                route=fa2_route,
+                q_len=q_len,
+                seq_len=seq_len,
+                heads_q=query.shape[1],
+                heads_kv=num_kv_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                fa2_key=fa2_key,
+                fa2_value=fa2_value,
+                cu_q=cu_q,
+                cu_k=cu_k,
+                q_len=q_len,
+                seq_len=seq_len,
+                out_dest=fa2_out_dest: (
+                    _dense_prefill._try_sm70_fa2_d256_prefill(
+                        q_seq,
+                        fa2_key,
+                        fa2_value,
+                        cu_seqlens_q=cu_q,
+                        cu_seqlens_k=cu_k,
+                        max_seqlen_q=q_len,
+                        max_seqlen_k=seq_len,
+                        softmax_scale=self.scale,
+                        causal=causal,
+                        window_size=window_size,
+                        out=out_dest,
+                    )
+                ),
+            )
+        else:
+            fa2_route = "prefill_prefix_paged_splitd_d256"
+            fa2_paged_out = self._run_prefill_paged_call(
+                route=fa2_route,
+                q_len=q_len,
+                seq_len=seq_len,
+                heads_q=query.shape[1],
+                heads_kv=num_kv_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                key_cache=key_cache,
+                value_cache=value_cache,
+                cu_q=cu_q,
+                q_len=q_len,
+                seq_len=seq_len,
+                out_dest=fa2_out_dest,
+                i=i: _dense_prefill._try_sm70_fa2_d256_prefill(
+                    q_seq,
+                    key_cache,
+                    value_cache,
+                    cu_seqlens_q=cu_q,
+                    cu_seqlens_k=None,
+                    max_seqlen_q=q_len,
+                    max_seqlen_k=seq_len,
+                    softmax_scale=self.scale,
+                    causal=causal,
+                    window_size=window_size,
+                    out=out_dest,
+                    seqused_k=attn_metadata.seq_lens[i : i + 1],
+                    block_table=attn_metadata.block_table[i : i + 1],
+                ),
+            )
+    contig_dense_kv = None
+    contig_dense_kv_bhmd = None
+    if (
+        bfla_block_mask is None
+        and fa2_paged_out is None
+        and self._should_use_prefill_contig_dense(
+            q_len=q_len,
+            seq_len=seq_len,
+            head_dim=head_dim,
+            key_cache=key_cache,
+            causal=causal,
+            window_size=window_size,
+        )
+    ):
+        if (
+            self.prefill_contig_dense_allow_copy
+            and self.flash_attn_bhmd_func is not None
+        ):
+            contig_dense_kv_bhmd = _kv_layout._contiguous_paged_kv_bhmd(
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[i],
+                seq_len,
+                block_size,
+                attn_metadata,
+                i,
+            )
+        if contig_dense_kv_bhmd is None:
+            contig_dense_kv = _kv_layout._contiguous_paged_kv_view(
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[i],
+                seq_len,
+                block_size,
+                attn_metadata,
+                i,
+                self.prefill_contig_dense_allow_copy,
+            )
+    use_splitkv = self._should_use_prefill_splitkv(
+        q_len=q_len,
+        seq_len=seq_len,
+        head_dim=head_dim,
+        key_cache=key_cache,
+        causal=causal,
+    )
+    use_fp8_bridge = self._should_use_fp8_prefill_bridge(
+        q_len=q_len,
+        head_dim=head_dim,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        causal=causal,
+        window_size=window_size,
+    )
+    if bfla_block_mask is not None:
+        if not _state._logged_prefill_prefix_bfla:
+            logger.info(
+                "FLASH_ATTN_V100 prefix prefill BFLA sparse path "
+                "active (min_q=%d min_kv=%d mask_block_n=%d "
+                "keep_mass=%.4f local_blocks=%d pool=%s).",
+                self.prefill_bfla_min_q,
+                self.prefill_bfla_min_kv,
+                self.prefill_bfla_mask_block_n,
+                _config.registered("VLLM_FLASH_V100_BFLA_KEEP_MASS"),
+                _config.registered("VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS"),
+                _config.registered("VLLM_FLASH_V100_BFLA_POOL"),
+            )
+            _state._logged_prefill_prefix_bfla = True
+        _routing._record_route(_routing.ROUTE_SPECS["prefill_prefix_bfla"].name)
+        out_seq = self._run_prefill_paged_call(
+            route="prefill_prefix_bfla",
+            q_len=q_len,
+            seq_len=seq_len,
+            heads_q=query.shape[1],
+            heads_kv=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            fn=partial(
+                self.flash_attn_prefill_paged_bfla,
+                q_seq,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[i : i + 1],
+                attn_metadata.seq_lens[i : i + 1],
+                bfla_block_mask,
+                self.prefill_bfla_mask_block_n,
+                softmax_scale=self.scale,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                causal=causal,
+                window_size=window_size,
+            ),
+        )
+    elif fa2_paged_out is not None:
+        if not _dense_prefill._logged_prefill_fa2_d256:
+            logger.info(
+                "FLASH_ATTN_V100 SM70 Split-D D256 software-pipelined "
+                "prefill path active (route=%s).",
+                fa2_route,
+            )
+            _dense_prefill._logged_prefill_fa2_d256 = True
+        _routing._record_route(fa2_route or "prefill_prefix_splitd_d256")
+        out_seq = fa2_paged_out
+        out_is_destination = True
+    elif contig_dense_kv_bhmd is not None:
+        if not _state._logged_prefill_prefix_contig_dense:
+            logger.info(
+                "FLASH_ATTN_V100 prefix prefill contiguous dense "
+                "BHMD path active (min_q=%d min_kv=%d allow_copy=%s).",
+                self.prefill_contig_dense_min_q,
+                self.prefill_contig_dense_min_kv,
+                str(self.prefill_contig_dense_allow_copy),
+            )
+            _state._logged_prefill_prefix_contig_dense = True
+        k_bhmd, v_bhmd = contig_dense_kv_bhmd
+        q_bhmd = q_seq.permute(0, 2, 1, 3).contiguous()
+        _routing._record_route(
+            _routing.ROUTE_SPECS["prefill_prefix_contig_dense_bhmd"].name
+        )
+        out_bhmd = self._run_prefill_paged_call(
+            route="prefill_prefix_contig_dense_bhmd",
+            q_len=q_len,
+            seq_len=seq_len,
+            heads_q=query.shape[1],
+            heads_kv=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            fn=lambda q_bhmd=q_bhmd,  # type: ignore[misc]
+            k_bhmd=k_bhmd,
+            v_bhmd=v_bhmd: self.flash_attn_bhmd_func(
+                q_bhmd,
+                k_bhmd,
+                v_bhmd,
+                causal=causal,
+                softmax_scale=self.scale,
+                window_size=window_size,
+            ),
+        )
+        out_view[start:end].copy_(out_bhmd.squeeze(0).permute(1, 0, 2))
+        return None, False, True
+    elif contig_dense_kv is not None:
+        if not _state._logged_prefill_prefix_contig_dense:
+            logger.info(
+                "FLASH_ATTN_V100 prefix prefill contiguous dense "
+                "path active (min_q=%d min_kv=%d).",
+                self.prefill_contig_dense_min_q,
+                self.prefill_contig_dense_min_kv,
+            )
+            _state._logged_prefill_prefix_contig_dense = True
+        k_dense, v_dense = contig_dense_kv
+        fa2_out = None
+        if _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL"):
+            cu_q, cu_k = _dense_prefill._uniform_cu_seqlens(
+                q_seq,
+                batch_size=1,
+                query_len=q_len,
+                kv_len=seq_len,
+            )
+            fa2_out_dest = out_view[start:end].unsqueeze(0)
+            fa2_out = self._run_prefill_paged_call(
+                route="prefill_prefix_contig_dense_fa2_d256",
+                q_len=q_len,
+                seq_len=seq_len,
+                heads_q=query.shape[1],
+                heads_kv=num_kv_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                k_dense=k_dense,
+                v_dense=v_dense,
+                cu_q=cu_q,
+                cu_k=cu_k,
+                q_len=q_len,
+                seq_len=seq_len,
+                out_dest=fa2_out_dest: (
+                    _dense_prefill._try_sm70_fa2_d256_prefill(
+                        q_seq,
+                        k_dense,
+                        v_dense,
+                        cu_seqlens_q=cu_q,
+                        cu_seqlens_k=cu_k,
+                        max_seqlen_q=q_len,
+                        max_seqlen_k=seq_len,
+                        softmax_scale=self.scale,
+                        causal=causal,
+                        window_size=window_size,
+                        out=out_dest,
+                    )
+                ),
+            )
+        if fa2_out is not None:
+            if not _dense_prefill._logged_prefill_fa2_d256:
+                logger.info(
+                    "FLASH_ATTN_V100 SM70 FA2 D256 "
+                    "software-pipelined dense prefill path active."
+                )
+                _dense_prefill._logged_prefill_fa2_d256 = True
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_prefix_contig_dense_fa2_d256"].name
+            )
+            out_seq = fa2_out
+            out_is_destination = True
+        else:
+            _routing._record_route(
+                _routing.ROUTE_SPECS["prefill_prefix_contig_dense"].name
+            )
+            out_seq = self._run_prefill_paged_call(
+                route="prefill_prefix_contig_dense",
+                q_len=q_len,
+                seq_len=seq_len,
+                heads_q=query.shape[1],
+                heads_kv=num_kv_heads,
+                head_dim=head_dim,
+                block_size=block_size,
+                fn=lambda q_seq=q_seq,  # type: ignore[misc]
+                k_dense=k_dense,
+                v_dense=v_dense: self.flash_attn_func(
+                    q_seq,
+                    k_dense,
+                    v_dense,
+                    causal=causal,
+                    softmax_scale=self.scale,
+                    window_size=window_size,
+                ),
+            )
+    elif use_fp8_bridge:
+        bridge_result = self._run_fp8_prefill_bridge(
+            query=q_seq,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_table=attn_metadata.block_table[i : i + 1],
+            seq_lens=attn_metadata.seq_lens[i : i + 1],
+            seq_len=seq_len,
+            k_scale=float(layer._k_scale_float),
+            v_scale=float(layer._v_scale_float),
+            causal=causal,
+            window_size=window_size,
+            out=out_view[start:end].unsqueeze(0),
+        )
+        if bridge_result is not None:
+            out_seq, out_is_destination = bridge_result
+            if not _state._logged_fp8_prefill_bridge:
+                logger.info(
+                    "FLASH_ATTN_V100 %s prefill bridge "
+                    "active (one-pass dequant, shared FP16 page-%d "
+                    "workspace).",
+                    self.kv_cache_dtype,
+                    _dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE,
+                )
+                _state._logged_fp8_prefill_bridge = True
+            _routing._record_route(
+                "prefill_prefix_fp8_e4m3_bridge"
+                if self.kv_codec is FP8_E4M3
+                else "prefill_prefix_fp8_e5m2_bridge"
+            )
+        else:
+            out_seq = self.flash_attn_prefill_paged(
+                q_seq,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[i : i + 1],
+                attn_metadata.seq_lens[i : i + 1],
+                softmax_scale=self.scale,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                causal=causal,
+                window_size=window_size,
+            )
+    elif use_splitkv:
+        if not _state._logged_prefill_prefix_splitkv:
+            logger.info(
+                "FLASH_ATTN_V100 prefix prefill split-KV path active "
+                "(split_kv_tokens=%d min_q=%d max_q=%d min_kv=%d).",
+                self.prefill_split_kv_tokens,
+                self.prefill_split_kv_min_q,
+                self.prefill_split_kv_max_q,
+                self.prefill_split_kv_min_kv,
+            )
+            _state._logged_prefill_prefix_splitkv = True
+        _routing._record_route(_routing.ROUTE_SPECS["prefill_prefix_splitkv"].name)
+        out_seq = self._run_prefill_paged_call(
+            route="prefill_prefix_splitkv",
+            q_len=q_len,
+            seq_len=seq_len,
+            heads_q=query.shape[1],
+            heads_kv=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            fn=lambda q_seq=q_seq,  # type: ignore[misc]
+            i=i,
+            seq_len=seq_len: self.flash_attn_prefill_paged_splitkv(
+                q_seq,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[i : i + 1],
+                attn_metadata.seq_lens[i : i + 1],
+                softmax_scale=self.scale,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                causal=causal,
+                window_size=window_size,
+                split_kv_tokens=self.prefill_split_kv_tokens,
+                max_seq_len_hint=seq_len,
+            ),
+        )
+    else:
+        out_seq = self._run_prefill_paged_call(
+            route="prefill_prefix_paged",
+            q_len=q_len,
+            seq_len=seq_len,
+            heads_q=query.shape[1],
+            heads_kv=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            fn=lambda q_seq=q_seq, i=i: self.flash_attn_prefill_paged(  # type: ignore[misc]
+                q_seq,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table[i : i + 1],
+                attn_metadata.seq_lens[i : i + 1],
+                softmax_scale=self.scale,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                causal=causal,
+                window_size=window_size,
+            ),
+        )
+    return out_seq, out_is_destination, False
