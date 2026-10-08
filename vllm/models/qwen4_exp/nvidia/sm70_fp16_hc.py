@@ -731,6 +731,83 @@ direct_register_custom_op(
 )
 
 
+def _prefill_hc_mix(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from .ops.hc import grouped_gemma_rmsnorm
+
+    chunk_size = _hc_prefill_chunk_size(x.shape[0])
+    if not chunk_size:
+        xn = grouped_gemma_rmsnorm(x, norm_weight, eps, _HC_COUNT)
+        block, injection = _dense_hc_projection(xn, down_weight, up_weight)
+        return block, injection.contiguous()
+    logger.info_once(
+        "SM70 HC prefill norm/projection row blocking selected (M=%d, chunk_rows=%d).",
+        x.shape[0],
+        chunk_size,
+    )
+    block = x.new_empty((x.shape[0], _HC_DIM))
+    injection = x.new_empty((x.shape[0], _HC_COUNT))
+    for start in range(0, x.shape[0], chunk_size):
+        stop = min(start + chunk_size, x.shape[0])
+        xn = grouped_gemma_rmsnorm(x[start:stop], norm_weight, eps, _HC_COUNT)
+        part, inject = _dense_hc_projection(xn, down_weight, up_weight)
+        block[start:stop].copy_(part)
+        injection[start:stop].copy_(inject)
+        del xn, part, inject
+    return block, injection
+
+
+def _prefill_hc_mix_fake(x, norm_weight, down_weight, up_weight, eps):
+    return _qwen38_sm70_fp16_fused_hc_fake(x, down_weight, up_weight)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fp16_prefill_hc_mix",
+    op_func=_prefill_hc_mix,
+    fake_impl=_prefill_hc_mix_fake,
+)
+
+
+def maybe_apply_qwen38_sm70_fp16_prefill_hc_mix(
+    down_layer: nn.Module,
+    up_layer: nn.Module,
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    enabled: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not enabled or use_sm70_decode_graph_semantics():
+        return None
+    if not all(
+        isinstance(layer, LinearBase)
+        and type(layer.quant_method)
+        in (UnquantizedLinearMethod, Qwen38SM70FP16LinearMethod)
+        for layer in (down_layer, up_layer)
+    ):
+        return None
+    down_weight, up_weight = down_layer.weight, up_layer.weight
+    if (
+        x.ndim != 2
+        or x.shape[1] != _HC_HIDDEN
+        or x.dtype != torch.float16
+        or down_weight.dtype != x.dtype
+        or up_weight.dtype != x.dtype
+        or down_weight.shape != (_HC_RANK + _HC_COUNT + 12, _HC_HIDDEN)
+        or up_weight.shape != (_HC_HIDDEN, _HC_RANK)
+        or norm_weight.numel() != _HC_HIDDEN
+        or not norm_weight.is_contiguous()
+    ):
+        return None
+    return torch.ops.vllm.qwen38_sm70_fp16_prefill_hc_mix(
+        x, norm_weight, down_weight, up_weight, eps
+    )
+
+
 def maybe_apply_qwen38_sm70_fp16_fused_hc(
     down_layer: nn.Module,
     up_layer: nn.Module,

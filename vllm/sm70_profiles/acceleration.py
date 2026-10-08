@@ -523,7 +523,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         if sm70 and hc_rows > 0
         else ("requires_sm70" if not sm70 else "disabled_by_kernel_policy"),
         "scope": "temporary_hc_allocation",
-        "operator": "FP16 HC projection and opaque combine row blocking",
+        "operator": "FP16 HC norm/projection and opaque combine row blocking",
         "chunk_rows": hc_rows,
         "runtime_guards": "FP16 dense HC; M exceeds chunk rows; HCX for combine",
         "precision": "FP16 materialization and FP32 GEMM accumulation",

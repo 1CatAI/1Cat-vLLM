@@ -46,7 +46,10 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
-from .sm70_fp16_hc import maybe_apply_qwen38_sm70_fp16_fused_hc
+from .sm70_fp16_hc import (
+    maybe_apply_qwen38_sm70_fp16_fused_hc,
+    maybe_apply_qwen38_sm70_fp16_prefill_hc_mix,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +165,17 @@ class GatedResidual(nn.Module):
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self.use_combine:
+            blocked = maybe_apply_qwen38_sm70_fp16_prefill_hc_mix(
+                self.input_mix_weight_down_block_inject,
+                self.input_mix_weight_up,
+                hidden_states,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                getattr(self, "_sm70_qwen38_fp16_fused_hc", False),
+            )
+            if blocked is not None:
+                return hidden_states, blocked[0], blocked[1]
         xn = grouped_gemma_rmsnorm(
             hidden_states,
             self.hc_norm.weight,

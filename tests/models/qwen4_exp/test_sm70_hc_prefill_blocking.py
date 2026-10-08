@@ -55,6 +55,8 @@ def test_execution_policy_overrides_construction_policy():
 
 
 def _projection_module(device):
+    from types import SimpleNamespace
+
     from torch import nn
 
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -65,6 +67,11 @@ def _projection_module(device):
     module.use_combine = True
     module._sm70_qwen38_fp16_fused_hc = True
     module.lora_rank, module.hc_count, module.pad_size = 320, 4, 12
+    module.config = SimpleNamespace(rms_norm_eps=1e-6)
+    module.hc_norm = nn.Module()
+    module.hc_norm.weight = nn.Parameter(
+        torch.zeros(10240, dtype=torch.float16, device=device), False
+    )
     for name, shape in (
         ("input_mix_weight_down_block_inject", (336, 10240)),
         ("input_mix_weight_up", (10240, 320)),
@@ -77,6 +84,80 @@ def _projection_module(device):
         linear.quant_method = UnquantizedLinearMethod()
         module.add_module(name, linear)
     return module
+
+
+def test_first_hc_mix_export_bounds_norm_and_projection(
+    default_vllm_config, monkeypatch
+):
+    from torch import nn
+
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_hc as hc
+
+    monkeypatch.setattr(hc, "use_sm70_decode_graph_semantics", lambda: False)
+
+    class FirstMix(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hc = _projection_module("meta")
+
+        def forward(self, x):
+            return self.hc.mix(x)
+
+    exported = torch.export.export(
+        FirstMix(), (torch.empty(16384, 10240, device="meta", dtype=torch.float16),)
+    )
+    calls = [node.target for node in exported.graph.nodes]
+    assert calls.count(torch.ops.vllm.qwen38_sm70_fp16_prefill_hc_mix.default) == 1
+    assert torch.ops.vllm.qwen4_exp_grouped_gemma_rmsnorm.default not in calls
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_first_hc_mix_dynamic_prefill_dispatch(default_vllm_config, monkeypatch):
+    from vllm.config import vllm as config_module
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_hc as hc
+    from vllm.models.qwen4_exp.nvidia.ops.hc import grouped_gemma_rmsnorm
+
+    monkeypatch.setattr(hc, "use_sm70_decode_graph_semantics", lambda: False)
+    config = get_current_vllm_config()
+    config.kernel_config.prefill_hc_chunk_size = 2048
+    context = create_forward_context(None, config)
+    backend = torch.backends.cuda.matmul
+    before = (
+        backend.allow_fp16_reduced_precision_reduction,
+        backend.allow_fp16_accumulation,
+    )
+    backend.allow_fp16_reduced_precision_reduction = False
+    backend.allow_fp16_accumulation = False
+    try:
+        torch.manual_seed(1023)
+        module = _projection_module("cuda")
+        with torch.no_grad():
+            module.input_mix_weight_down_block_inject.weight.normal_(std=0.003)
+            module.input_mix_weight_up.weight.normal_(std=0.03)
+        compiled = torch.compile(module.mix, fullgraph=True, dynamic=True)
+        for rows in (4097, 513):
+            x = torch.randn(rows, 10240, device="cuda", dtype=torch.float16) * 0.125
+            with (
+                torch.no_grad(),
+                monkeypatch.context() as execution_patch,
+                override_forward_context(context),
+            ):
+                execution_patch.setattr(config_module, "_current_vllm_config", None)
+                xn = grouped_gemma_rmsnorm(x, module.hc_norm.weight, 1e-6, 4)
+                expected = hc._prefill_hc_projection(
+                    xn,
+                    module.input_mix_weight_down_block_inject.weight,
+                    module.input_mix_weight_up.weight,
+                )
+                actual = compiled(x)
+            assert actual[0].data_ptr() == x.data_ptr()
+            for value, reference in zip(actual[1:], expected):
+                torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    finally:
+        (
+            backend.allow_fp16_reduced_precision_reduction,
+            backend.allow_fp16_accumulation,
+        ) = before
 
 
 def test_first_hc_prefill_export_keeps_runtime_boundary(

@@ -324,3 +324,27 @@ requested a full 320 MiB gate result with only 221–247 MiB device memory free.
 This is another bounded-work coverage gap, not a completed 32K throughput run.
 The existing HC row loop now also handles the final no-injection variant,
 retaining its `None` injection result and the same FP16 projection boundaries.
+
+A real final-HC weight source-only comparison at M=16384 reduces temporary
+peak from 1050 to 531.25 MiB; median time changes from 6.004 to 7.616 ms.
+The hidden output matches bitwise, and block relative L2 difference is
+5.148e-5 with maximum absolute difference 0.010742. Independent FP32 projection
+relative L2 is 6.348e-5 for the unblocked path and 5.716e-5 for 2048 rows.
+Thirteen of 41,943,040 block elements exceed 2e-3 absolute-plus-relative
+comparison tolerance. This is an operator capacity result, not a model gate.
+The next installed wheel passes 40 targeted checks.
+
+That model attempt exposes another peak in the compiled HC mix: after the
+PLE hidden-state additions, norm materializes all 320 MiB before the already
+blocked projection. Its 40 MiB gate allocation fails with 21.5 MiB free on
+rank0. Add an opaque prefill norm/projection boundary and normalize each row
+block immediately before projecting it. The common norm/projection operators
+and their FP16 boundaries are unchanged. Decode compilation retains its
+existing route; unsupported layouts and methods retain their own forward path.
+
+With real HC weights at M=16384 and 2048 projection rows, the source-only
+ABBA comparison reduces extra temporary peak from 452.688 to 172.688 MiB.
+Outputs are bitwise identical; median time is 7.971 versus 8.029 ms. Fifteen
+HC checks pass, including export without a standalone full-row norm allocation,
+compiled runtime policy after construction scope ends, short tails and the
+no-injection final mix. Complete 32K model and decode gates remain pending.
