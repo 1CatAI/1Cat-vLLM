@@ -990,7 +990,21 @@
       "minimum_delta_percent": -5.544683966200825,
       "maximum_delta_percent": 5.822618512495881,
       "statistical_equivalence_established": false,
-      "next_gate": "repeat only timing outliers with multiple kernel nodes per replay to amortize host submission; do not claim end-to-end performance"
+      "next_gate": "Focused warm-cache outlier rechecked; retain cold-L2 and whole-model performance gates.",
+      "focused_recheck": {
+        "source_sha": "f4b0aefd5775c6ceeb8f665d2038311ee8fa028c",
+        "tokens": 8,
+        "rope_planes": 1,
+        "store_cache": true,
+        "store_gate": false,
+        "graph_copies_per_replay": 200,
+        "bitwise_equal": true,
+        "ptx_and_sass_equal": true,
+        "baseline_median_us": 2.4000896453857425,
+        "candidate_median_us": 2.402713584899902,
+        "delta_percent": 0.10932672949131028,
+        "scope": "warm-cache source-kernel graph events; not cold-L2/all-route/model admission"
+      }
     }
   },
   "native_calibrated_writer_extraction": {
@@ -1034,5 +1048,23 @@
     "failures": 0,
     "private_library_overrides": false,
     "scope": "targeted installed artifact correctness; not all-route performance/model admission"
+  },
+  "flashnext_qsa_capture_attempt": {
+    "status": "bounded lease expired after engine initialization; no samples captured",
+    "numeric_source_sha": "120ac713a67f252d8b52bdb54c69a708b52dee95",
+    "tp": 4,
+    "kv_cache_dtype": "float16",
+    "eager": true,
+    "max_model_len": 4096,
+    "max_num_batched_tokens": 1024,
+    "prompt_tokens": 157,
+    "model_load_seconds": 736.887958,
+    "model_gib_per_rank": 22.01,
+    "engine_profile_cache_warmup_seconds": 45.95,
+    "lease_limit_seconds": 900,
+    "exit_status": 124,
+    "owned_gpu_and_ple_workers_released": true,
+    "qsa_data_qualified": false,
+    "quality_qualified": false
   }
 }

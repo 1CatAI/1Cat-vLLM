@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import time
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -513,17 +514,44 @@ def main() -> None:
             args.wheel, Path(vllm.__file__).parent
         ),
     }
+    durations = {}
+
+    def begin_stage(stage):
+        print(json.dumps({"capture_stage": stage, "status": "started"}), flush=True)
+        return time.perf_counter()
+
+    def end_stage(stage, started):
+        durations[stage] = time.perf_counter() - started
+        print(
+            json.dumps(
+                {
+                    "capture_stage": stage,
+                    "status": "finished",
+                    "seconds": durations[stage],
+                }
+            ),
+            flush=True,
+        )
+
+    started = begin_stage("engine_initialization")
     llm = LLM(**config)
+    end_stage("engine_initialization", started)
     args.out.mkdir(parents=True)
+    started = begin_stage("install_hooks")
     llm.collective_rpc(
         start_capture_on_worker, args=(str(args.out), ids, provenance, args.adapter)
     )
+    end_stage("install_hooks", started)
+    started = begin_stage("real_request")
     outputs = llm.generate(
         [{"prompt_token_ids": ids}],
         SamplingParams(temperature=0, max_tokens=1),
         use_tqdm=False,
     )
+    end_stage("real_request", started)
+    started = begin_stage("finish_capture")
     captured = llm.collective_rpc(finish_capture_on_worker)
+    end_stage("finish_capture", started)
     samples = [row for rank in captured for row in rank["samples"]]
     manifest = {
         "version": 1,
@@ -533,6 +561,7 @@ def main() -> None:
         "torch": torch.__version__,
         "diagnostic_eager_capture": True,
         "performance_evidence": False,
+        "diagnostic_stage_seconds": durations,
         "output_token_ids": outputs[0].outputs[0].token_ids,
         "sampling": {"temperature": 0, "max_tokens": 1, "ignore_eos": False},
         "executed_route_deltas": [

@@ -49253,6 +49253,21 @@ the necessary startup work. The request already retains verified token IDs, so
 the diagnostic token-ID path may skip tokenizer initialization; this must stay
 distinct from text/quality serving and be recorded in its capture contract.
 
+The focused fused-writer recheck (eight tokens,one RoPE plane,cache writes,no
+gate) uses200 kernel nodes per replay, preserving byte/PTX/SASS equality.
+Baseline/candidate median per kernel is2.40009/2.40271 microseconds (+0.1093%),
+compared with the earlier single-node interval's+5.823%. This resolves the
+large observed timing outlier for this warm-cache case; it does not establish
+cold-L2/all-route/model performance equivalence. The short3-minute-bounded
+lease completed and released; no repeat of the209-test suite was needed.
+
+The capture tool now emits engine/hook/request/finish milestones and retains
+diagnostic stage durations with `performance_evidence=false`. A later single
+Flash-Next lease uses already-verified token IDs,skips tokenizer initialization
+and sets the prefill budget to157 actual request tokens. The existing15-minute
+lease/lock/idle checks and ordinary source120 wheel remain in force. These
+diagnostic changes do not alter model weights,KV dtype or text-quality defaults.
+
 CPU K/V error attribution uses the existing12 real layer/rank samples without
 reloading models. Token/head nearest-even INT8 has roughly twice the V-only
 attention RMSE of K-only in both27B models. Two mixed K/V arithmetic candidates
