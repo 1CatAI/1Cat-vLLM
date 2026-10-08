@@ -49386,3 +49386,30 @@ updated to require the original 44 plus prefill_prefix_paged. That counter
 check passes separately. Host C++ binding syntax exits 0 with the proper
 flash-attention-v100/include path. Applicable pre-commit/mypy/layering hooks
 pass; newly added route accounting changes telemetry intentionally.
+
+## 2026-10-08 — architecture A6 INT8-G64 interface handoff
+
+Stack on A5b #1063 (`240b9ac66cc2bfcbbe0ab45a80623977f608dd8e`) in
+/home/ymzx/arch-ws/v100-arch-int8-contract-20261008-105652, branch
+agent/v100-arch-int8-contract-20261008-105652. Documentation-only contract at
+docs/design/architecture/int8_g64_codec.md plus the KV codec component README.
+No INT8 implementation or runtime policy change.
+
+Source inspection shows a Python codec plus a storage typedef alone cannot
+automatically enable every route: KVCodec reference dequantization takes a
+scalar scale; the native reader lacks separate group-scale context; native
+launch dtype switches and XQA admission whitelist three formats; grouped
+providers admit two; FP16 dense/75T kernels and the FP8 bridge do not inherit
+G64 support. The handoff documents these shared seams and a family-by-family
+reuse matrix. Existing int8_per_token_head uses FP32 per-token/head scales and
+is not an alias for int8_g64. G64 byte accounting, writer and bindings remain
+required work for the INT8 implementation. Separate-scale FP16 layout is a
+proposal, not an accepted ABI. #1048's broader storage/writer work is not
+already integrated wholesale into this chain.
+
+Markdown/pre-commit and repository-link checks only; no new tests or benchmark
+for documentation. GPU evidence omitted by user instruction. Layering totals
+remain model 2325 / platform 3964 / raw env 334. A0–A6 source/doc work is now
+published in the stack, but GPU numerical/performance qualification is absent
+and the full architecture campaign remains incomplete. Next scope: B1 shared
+SM70 MoE skeleton, starting with FP8. Artifacts: /home/ymzx/arch-ws/tmp/a6-*.
