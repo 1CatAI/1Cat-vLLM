@@ -106,6 +106,12 @@ def collect(root: Path) -> dict:
             }
         )
     backend_source = (root / BACKEND).read_text()
+    attention_modules = {
+        path.relative_to(root).as_posix(): scan_python(path.read_text())
+        for path in sorted((root / BACKEND).parent.joinpath("flash_v100").glob("*.py"))
+    }
+    backend = scan_python(backend_source)
+    related = [backend, *attention_modules.values()]
     return {
         "source_sha": subprocess.check_output(
             ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
@@ -113,7 +119,16 @@ def collect(root: Path) -> dict:
         "scope": "tracked source; broad matches are candidates, not confirmed KV use",
         "backend_lines": len(backend_source.splitlines()),
         "decode_lines": len((root / DECODE).read_text().splitlines()),
-        "backend": scan_python(backend_source),
+        "backend": backend,
+        "attention_modules": attention_modules,
+        "backend_and_modules": {
+            "env_reads": sorted(
+                {name for item in related for name in item["env_reads"]}
+            ),
+            "dtype_mentions": sum(item["dtype_mentions"] for item in related),
+            "dtype_tests": sum(len(item["dtype_tests"]) for item in related),
+            "route_calls": sum(len(item["route_calls"]) for item in related),
+        },
         "files": files,
     }
 
@@ -138,6 +153,10 @@ def main() -> None:
                 "dtype_mentions": backend["dtype_mentions"],
                 "dtype_tests": len(backend["dtype_tests"]),
                 "env_reads": len(backend["env_reads"]),
+                "backend_and_modules": {
+                    **result["backend_and_modules"],
+                    "env_reads": len(result["backend_and_modules"]["env_reads"]),
+                },
                 "literal_routes": len(backend["literal_routes"]),
                 "route_calls": len(backend["route_calls"]),
                 "candidate_files": len(result["files"]),

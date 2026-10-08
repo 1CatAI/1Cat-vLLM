@@ -731,7 +731,7 @@
     ]
   },
   "qualification_pending": [
-    "complete grouped/scalar FA2 build and installed vLLM wheel",
+    "installed GPU route/model execution of the normally built complete wheel",
     "backend/model route hits incl 8192-chunk 75T",
     "real-request FP16 Q/K/V data and INT8 format choice",
     "unified writers/accounting/host offload/scheduling",
@@ -838,5 +838,54 @@
     "same_sm70_e4m3_compiler_rejection_pairs": 8,
     "gpu_writer_gate": "pending",
     "scope": "existing Triton writer encoders; host admission/addressing/typed stores unchanged; legacy INT8 truncation retained"
+  },
+  "normal_complete_wheel": {
+    "source_sha": "477e79507b09498b011ebcfa625b8b67aad321e7",
+    "wheel": "1cat_vllm-1.5.2.dev1163+g477e79507.d20261008.cu128-cp312-cp312-linux_x86_64.whl",
+    "wheel_sha256": "e6253cbfef64ec87af46572ce52e2590f93efb7fcb6220fc7249dea86dded4ec",
+    "bytes": 241981960,
+    "cuda": "12.8.93",
+    "torch": "2.10.0+cu128",
+    "cmake_build_type": "RelWithDebInfo",
+    "rust_frontend": "not shipped: standard optional Rust build skipped because compiler absent",
+    "gpu_runtime_gate": "pending",
+    "native_library_count": 16,
+    "python_sources_match": true,
+    "no_private_dependency_or_rpath": true,
+    "isolated_cold_import_and_load_passed": true,
+    "library_override_used": false,
+    "final_wheel_sass_comparison": {
+      "fa2": {
+        "equal": true,
+        "sass_sha256": "44e48c90fa761cf4ffa396c4d5d8547cd583c1c426904a1da1c90552d0a5cfe4",
+        "extension_sha256": "57be5917a68548bf44061201d584b48906694b6976f181b05e5e0c8a92c97eea",
+        "normalization": "anonymous namespace path hash only; instruction encodings retained"
+      },
+      "flash": {
+        "equal": true,
+        "sass_sha256": "49edbd2c158112201311d310c264d84070d98741d0f984772175bb4de74af4b6",
+        "extension_sha256": "9277eed8e3fb9bebcea860bbda0ddcc2f0ce6f6069541cc4456d66f12492f512",
+        "normalization": "anonymous namespace path hash only; instruction encodings retained"
+      }
+    }
+  },
+  "continuation_cpu_tests": {
+    "source_build_tool_tests_passed": 32,
+    "storage_layout_tests_passed": 17,
+    "mask_reference_bitwise_cases": 96,
+    "accounting_baseline_cases": 2646,
+    "precommit": "passed on all changed files"
+  },
+  "current_inventory": {
+    "backend_lines": 8996,
+    "decode_lines": 6243,
+    "backend_and_modules": {
+      "kv_dtype_tokens": 134,
+      "kv_dtype_predicates": 26,
+      "environment_names": 89,
+      "route_call_sites": 52
+    },
+    "retired_environment_switches": 0,
+    "note": "physical code moves do not retire dtype decisions or environment switches"
   }
 }

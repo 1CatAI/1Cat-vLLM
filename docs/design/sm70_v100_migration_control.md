@@ -49121,3 +49121,22 @@ negative result and do not use interpreter output to qualify FP8. Local existing
 INT8 truncation differs from newer upstream rounding; keep it during extraction
 and compare it separately in the ten-scheme offline tool (nine CPU self-tests).
 Native/fused/QSA/restore writers and the new accelerated INT8 path remain pending.
+
+### KV codec continuation: complete normal artifact
+
+Normal source wheel built at source `477e79507b09498b011ebcfa625b8b67aad321e7`:
+SHA256 `e6253cbfef64ec87af46572ce52e2590f93efb7fcb6220fc7249dea86dded4ec`.
+Torch 2.10+cu128, toolkit12.8.93, normal RelWithDebInfo. All relocated Python
+sources match;16 native libraries have no private path/RPATH. Fresh isolated
+installed-wheel process imports/loads _C/stable/GGUF/MOE/FA2/Flash-V100/FlashQLA
+without preload/library/Python path overrides. Complete final-wheel FA2 and
+Flash-V100 SASS matches matching baseline; GPU execution remains pending.
+Optional Rust frontend skipped normally because Rust compiler is absent.
+
+Retain the failed packaging command: an explicit build_ext build_temp option
+was lost during setuptools install reinitialization, giving missing CMakeCache.
+The normal build command's build_temp option fixes command inheritance. No
+borrowed DSO or setup-code workaround. CPU tests:32 source/tool/build +17 storage;
+96 mask/reference and2646 accounting comparisons pass. Inventory aggregates
+backend/new modules to prevent moved reads being misreported as retired flags.
+All89 environment names and26 dtype predicates remain; convergence is pending.

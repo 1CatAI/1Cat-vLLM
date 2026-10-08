@@ -70,8 +70,8 @@ include the header.
 
 Python conversion helpers move to `flash_v100/codec.py`; metadata helpers move
 to `flash_v100/metadata.py`. The original backend reexports their names. The
-remaining implementation/builder, routing, writers, host ownership and
-configuration are **not yet migrated**. Dense page accounting and the existing
+remaining implementation/builder, routing, native/fused/QSA/restore writers,
+host ownership and configuration are **not yet migrated**. Dense page accounting and the existing
 Triton inline scale views now share a storage descriptor as described below. This is an independently revertible
 first review scope, not an uncalled registry claiming the final architecture.
 
@@ -398,3 +398,33 @@ no-regression screen, not a statistical equivalence bound or a speedup claim.
 The paired source-policy suite has identical 186 passes / 11 failures in each
 arm; all failures require the absent built SM70 FA2 library. They remain pending
 for the final installed vLLM wheel. Pre-commit and 16 source/build guards pass.
+
+## Complete source artifact continuation
+
+The normal parent setup/CMake build now produces a complete SM70 wheel from the
+owned source, including FA2 grouped/scalar/75T kernels, Flash-V100 and FlashQLA.
+The build uses Torch 2.10.0+cu128, CUDA 12.8.93 and the normal `RelWithDebInfo`
+configuration. All eight relocated/changed Python source files match the wheel;
+16 native libraries have no RPATH/RUNPATH or private dependency path. The final
+wheel's FA2 and Flash-V100 complete SASS matches the immutable baseline under
+matching compiler settings, normalizing only namespace source-path hashes.
+A separate environment installs the wheel and standard dependencies; a fresh
+isolated process imports the modules and loads the packaged native libraries
+with no PYTHONPATH, preload or library-path overrides. These are package/load
+checks, not executed CUDA attention or model qualification.
+
+The first packaging command specified `build_ext --build-temp` separately.
+Setuptools reinitialized that subcommand during install, losing the custom
+CMake directory. Passing `--build-temp` to the top-level `build` command gives
+all reinitialized subcommands the same directory and completes normal packaging.
+No setup source change or private extension copy is required. Optional Rust
+frontend compilation is skipped by the existing normal workflow because the
+Rust compiler is absent; this wheel exercises the Python/SM70 path.
+
+The local PCIe/GPU outage remains; the user requested continued source/CPU work
+without waiting for V100. Native writer/model/graph/route/performance and real
+request format-selection gates remain pending. Source and package success do
+not complete the full refactor or admit INT8. The inventory now reports both
+physical backend counts and backend-plus-module counts: 89 environment names,
+134 dtype tokens, 26 dtype predicates and 52 route calls remain. No switch has
+been retired by this code movement.
