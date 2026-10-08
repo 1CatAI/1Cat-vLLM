@@ -5,12 +5,12 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
-from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -19,7 +19,7 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
 def _debug_draft_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
     stage: str,
     attn_metadata: TritonAttentionMetadata,
     common_attn_metadata,
@@ -67,7 +67,7 @@ def _debug_draft_metadata(
 
 
 def _stabilize_draft_graph_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
     attn_metadata: TritonAttentionMetadata,
     common_attn_metadata,
 ) -> None:
@@ -106,13 +106,11 @@ def _stabilize_draft_graph_metadata(
     ]
 
 
-def build_for_drafting(
-    self: _metadata.FlashAttnV100MetadataBuilder, common_attn_metadata, draft_index: int
-):
+def build_for_drafting(self: Any, common_attn_metadata, draft_index: int):
     profile_enabled = _debug._dflash_ddtree_worker_profile_enabled()
     profile_t0 = time.perf_counter() if profile_enabled else 0.0
     profile_stage_t0 = profile_t0
-    attn_metadata = super(_metadata._spec_builder_super_owner, self).build(
+    attn_metadata = self.ops.base_build(
         common_prefix_len=0,
         common_attn_metadata=common_attn_metadata,
         fast_build=True,
@@ -121,7 +119,7 @@ def build_for_drafting(
         (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-    self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
+    self.ops.attach_common(attn_metadata, common_attn_metadata)
     attach_common_ms = (
         (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
@@ -145,12 +143,12 @@ def build_for_drafting(
         (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-    self._attach_decode_shape_hints(attn_metadata, common_attn_metadata)
+    self.ops.attach_shape_hints(attn_metadata, common_attn_metadata)
     shape_hints_ms = (
         (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-    self._update_decode_active_num_partitions(
+    self.ops.update_active_partitions(
         attn_metadata,
         stage=f"draft{draft_index}",
     )
@@ -190,7 +188,7 @@ def build_for_drafting(
 
 
 def _ensure_flash_draft_graph_buffers(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
     required_reqs: int,
     block_table: torch.Tensor,
 ) -> bool:
@@ -206,7 +204,7 @@ def _ensure_flash_draft_graph_buffers(
 
 
 def copy_dflash_graph_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,

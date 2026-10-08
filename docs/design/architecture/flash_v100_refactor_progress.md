@@ -24,8 +24,9 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | GPU gates |
 | 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
 | 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Required | Strict/rebase/GPU gates |
-| 6a: verifier ownership | — | CPU/golden/strict passed | Cycles 13 → 11; model terms 169 → 158 | Required | Strict/rebase/GPU gates |
-| 6b: registered speculative features | — | Not started | — | Required | Step 6a gates |
+| 6a: verifier ownership | #1090 | CPU/golden/strict/rebase passed | Cycles 13 → 11; model terms 169 → 158 | Required | Strict/rebase/GPU gates |
+| 6b: metadata builder ownership | — | CPU/golden/strict passed | Cycles 11 → 4; private 347 → 341 | Required | Strict/rebase/GPU gates |
+| 6c: registered speculative features and remaining mixins | — | Not started | — | Required | Step 6b gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -703,3 +704,44 @@ exclusions**, with all original shim patches consumed. Evidence:
 `a3-spec-verifier-strict-final.log` and `a3-spec-verifier-shim-final.json`.
 Pre-commit including mypy/layering passes (`a3-spec-verifier-precommit-ready.log`).
 No production files changed while this accepted full run was executing.
+
+## Step 6b metadata builder ownership
+
+PR #1090 is `f917a5f35df0c652c90896bf7f053d73d62022ef`. Its actual pinned
+PR #1028 integration is `674785c0e9495fd9f6feacfaa51bdf490eb1ee28`, tree
+`ffe9ec852916153f1ecb0ba228fcffb53ab7b0a0`, matching the clean merge-tree.
+The integration passes 37 CPU tests with 98 GPU skips; four hash-verified GPU
+queues are staged under `a3-step6a` on authorized 54633.
+
+Mechanical extraction `9a842373f` precedes builder ownership. The common
+builder no longer inherits the speculative method mixin. SpecMetadataState
+owns its configuration and MetadataWorkspace, receives immutable inputs and
+five narrow common callbacks, and never receives/imports the common builder.
+The old MetadataHooks object remains only as a compatibility adapter. Attention
+and metadata field mixins still exist; feature registration is subsequent work.
+
+The original builder identity is passed explicitly: grouped metadata prepared
+by the proposer continues to validate against that identity, not the new state
+object's identity. Persistent draft and small-query buffers retain addresses
+across refreshes. Legacy configuration writes replace immutable inputs while
+legacy state reads/writes reach the single owner. Existing ordering/capture
+tests inject owned callbacks and retain their original assertions and test IDs.
+
+All 813 immutable traces and 14 original metadata calculation hashes pass.
+Six independent ownership cases cover replay pointers, prepared metadata
+identity, two capacity failures before publication, compatibility writes and
+base-build failure propagation. The focused suite passes 24 tests; evidence:
+`a3-spec-metadata-owner-golden.log`. The dependency ceiling is now
+402 / 402 / 341 / 4 / 158 / 0 / 29, without new forbidden edges.
+
+Step 1c host-FP8's rebuilt native parent and candidate unit suites each pass
+135 tests. The parent full model has saved its two greedy records; candidate
+execution is underway. Full host parity is not yet claimed. DFlash2 parity
+passes; the original DDTree baseline failure and separate fix #1089 remain
+recorded, with baseline clarification pending.
+
+The fixed-source strict suite passes **280 tests / 1 skip / 28 GPU exclusions**,
+including actual consumed shim patches. Evidence:
+`a3-spec-metadata-owner-strict.log` and `a3-spec-metadata-owner-shim.json`.
+Pre-commit including mypy/layering passes; no production or oracle file changed
+during the accepted full run. Four GPU queues and #1028 replay are next.

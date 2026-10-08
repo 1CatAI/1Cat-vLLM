@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from vllm.config.sm70_dflash2 import (
@@ -13,19 +15,19 @@ from vllm.config.sm70_dflash2 import (
 from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
 from vllm.v1.attention.backends.flash_v100.spec import (
     smallq_metadata as _smallq_metadata,
 )
+from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import metadata_view
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
 def build(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
     common_prefix_len,
     common_attn_metadata,
     fast_build: bool = False,
@@ -35,11 +37,11 @@ def build(
         _smallq_metadata.DFlash2SmallQPreparedMetadata | None
     ) = None,
 ):
-    attn_metadata = super(_metadata._spec_builder_super_owner, self).build(
+    attn_metadata = self.ops.base_build(
         common_prefix_len, common_attn_metadata, fast_build
     )
-    self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
-    self._attach_prefix_anchored_metadata(attn_metadata, common_attn_metadata)
+    self.ops.attach_common(attn_metadata, common_attn_metadata)
+    self.ops.attach_prefix(attn_metadata, common_attn_metadata)
     self._attach_ddtree_metadata(
         attn_metadata,
         ddtree_parent_ids=ddtree_parent_ids,
@@ -87,15 +89,13 @@ def build(
                     int(getattr(common_attn_metadata, "max_seq_len", 0) or 0) or None
                 ),
             )
-    self._attach_decode_shape_hints(attn_metadata, common_attn_metadata)
-    self._update_decode_active_num_partitions(attn_metadata, stage="build")
+    self.ops.attach_shape_hints(attn_metadata, common_attn_metadata)
+    self.ops.update_active_partitions(attn_metadata, stage="build")
     self._debug_draft_metadata("build", attn_metadata, common_attn_metadata)
     return attn_metadata
 
 
-def initialize_builder(
-    self: _metadata.FlashAttnV100MetadataBuilder, spec_config
-) -> None:
+def initialize_builder(self: Any, spec_config) -> None:
     self._is_dflash_draft_model = self._is_speculative_draft_model and (
         getattr(spec_config, "method", None) == "dflash"
     )
@@ -126,9 +126,7 @@ def initialize_builder(
     self.metadata_workspace = _workspace.MetadataWorkspace()
 
 
-def prepare_capture(
-    self: _metadata.FlashAttnV100MetadataBuilder, attn_metadata, common_attn_metadata
-) -> None:
+def prepare_capture(self: Any, attn_metadata, common_attn_metadata) -> None:
     # The Triton builder shortens capture seq_lens to 1 so full graph
     # capture stays cheap. That is valid for single-token decode, but the
     # FA2 small-query MTP verifier replays a tiny causal prefill as paged
@@ -166,7 +164,7 @@ def prepare_capture(
         )
 
 
-def attach_common(self: _metadata.FlashAttnV100MetadataBuilder, attn_metadata) -> None:
-    _metadata._as_flash_v100_metadata(
+def attach_common(self: Any, attn_metadata) -> None:
+    metadata_view(
         attn_metadata
     ).is_dflash_selector_target = self._is_dflash_selector_target

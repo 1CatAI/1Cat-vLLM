@@ -7,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -105,6 +106,17 @@ class _Normalize(ast.NodeTransformer):
     def visit_Attribute(self, node):
         node = self.generic_visit(node)
         path = ast.unparse(node)
+        callbacks = {
+            "self.ops.attach_common": "self._attach_common_flash_metadata",
+            "self.ops.attach_prefix": "self._attach_prefix_anchored_metadata",
+            "self.ops.attach_shape_hints": "self._attach_decode_shape_hints",
+            "self.ops.update_active_partitions": (
+                "self._update_decode_active_num_partitions"
+            ),
+            "self.inputs.builder_id": "id(self)",
+        }
+        if path in callbacks:
+            return ast.parse(callbacks[path], mode="eval").body
         prefix = "self.metadata_workspace."
         if path.startswith(prefix) and path[len(prefix) :] in _BUFFER_FIELDS:
             return ast.Attribute(
@@ -122,6 +134,10 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
+        if ast.unparse(node.func) == "metadata_view":
+            node.func = ast.Name(id="_as_flash_v100_metadata", ctx=ast.Load())
+        if ast.unparse(node.func) == "self.ops.base_build":
+            node.func = ast.parse("super().build", mode="eval").body
         if ast.unparse(node.func) == "_config.raw":
             node.func = ast.Attribute(
                 value=ast.Name(id="os", ctx=ast.Load()), attr="getenv", ctx=ast.Load()
@@ -258,6 +274,7 @@ def test_persistent_draft_buffers_keep_addresses_across_replays():
 
 def test_feature_build_calls_base_once_and_keeps_hook_order(monkeypatch):
     instance = _builder()
+    state = instance.spec_state
     attn = SimpleNamespace(query_start_loc=torch.tensor([0, 2]), max_query_len=2)
     events = []
 
@@ -275,11 +292,24 @@ def test_feature_build_calls_base_once_and_keeps_hook_order(monkeypatch):
         "_update_decode_active_num_partitions",
         "_debug_draft_metadata",
     ):
-        setattr(instance, name, lambda *a, _name=name, **kw: events.append(_name))
-    instance._update_smallq_decode_metadata = MagicMock()
+        owner = (
+            state
+            if name in ("_attach_ddtree_metadata", "_debug_draft_metadata")
+            else instance
+        )
+        setattr(owner, name, lambda *a, _name=name, **kw: events.append(_name))
+    state.ops = replace(
+        state.ops,
+        base_build=base.__get__(instance),
+        attach_common=instance._attach_common_flash_metadata,
+        attach_prefix=instance._attach_prefix_anchored_metadata,
+        attach_shape_hints=instance._attach_decode_shape_hints,
+        update_active_partitions=instance._update_decode_active_num_partitions,
+    )
+    state._update_smallq_decode_metadata = MagicMock()
     common = SimpleNamespace(max_seq_len=17)
     assert instance.build(0, common) is attn
-    instance._update_smallq_decode_metadata.assert_called_once_with(
+    state._update_smallq_decode_metadata.assert_called_once_with(
         attn, common, workspace_seq_capacity_cap=17
     )
     assert events == [
@@ -295,21 +325,22 @@ def test_feature_build_calls_base_once_and_keeps_hook_order(monkeypatch):
 
 def test_capture_hook_preserves_small_query_lengths_and_bucket_hint(monkeypatch):
     instance = _builder()
+    state = instance.spec_state
     attn = SimpleNamespace(max_query_len=3, seq_lens=torch.tensor([1]))
     common = SimpleNamespace(max_seq_len=256)
-    instance._update_smallq_decode_metadata = MagicMock()
-    instance._stabilize_draft_graph_metadata = MagicMock()
+    state._update_smallq_decode_metadata = MagicMock()
+    state._stabilize_draft_graph_metadata = MagicMock()
     monkeypatch.setattr(legacy, "_mtp_context_bucket_partition_size_hint", lambda: 64)
     METADATA_HOOKS.prepare_capture(instance, attn, common)
     assert attn.seq_lens.tolist() == [3]
-    instance._update_smallq_decode_metadata.assert_called_once_with(
+    state._update_smallq_decode_metadata.assert_called_once_with(
         attn,
         common,
         force=True,
         workspace_seq_capacity_cap=256,
         partition_size_hint=64,
     )
-    instance._stabilize_draft_graph_metadata.assert_not_called()
+    state._stabilize_draft_graph_metadata.assert_not_called()
     instance._is_dflash_draft_model = True
     METADATA_HOOKS.prepare_capture(instance, attn, common)
-    instance._stabilize_draft_graph_metadata.assert_called_once_with(attn, common)
+    state._stabilize_draft_graph_metadata.assert_called_once_with(attn, common)

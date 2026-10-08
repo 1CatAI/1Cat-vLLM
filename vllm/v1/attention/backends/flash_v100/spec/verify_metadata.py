@@ -5,16 +5,17 @@
 from __future__ import annotations
 
 import time
+from typing import Any
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
-from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 from vllm.v1.attention.backends.flash_v100.spec import (
     smallq_metadata as _smallq_metadata,
 )
+from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import metadata_view
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -23,20 +24,18 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
 def _configured_smallq_max_query_len(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
 ) -> int:
     return int(_config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
 
 
 def _configured_smallq_max_model_len(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
 ) -> int:
     return int(_config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0"))
 
 
-def _smallq_buffer_token_capacity(
-    self: _metadata.FlashAttnV100MetadataBuilder, required_tokens: int
-) -> int:
+def _smallq_buffer_token_capacity(self: Any, required_tokens: int) -> int:
     compilation_config = self.vllm_config.compilation_config
     graph_tokens = compilation_config.max_cudagraph_capture_size
     if graph_tokens is None and compilation_config.cudagraph_capture_sizes:
@@ -60,10 +59,10 @@ def _smallq_buffer_token_capacity(
 
 
 def _clear_smallq_decode_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
     attn_metadata: TritonAttentionMetadata,
 ) -> None:
-    flash_metadata = _metadata._as_flash_v100_metadata(attn_metadata)
+    flash_metadata = metadata_view(attn_metadata)
     flash_metadata.smallq_decode_block_table = None
     flash_metadata.smallq_decode_seq_lens = None
     flash_metadata.smallq_query_start_loc = None
@@ -73,12 +72,12 @@ def _clear_smallq_decode_metadata(
 
 
 def _attach_prepared_dflash2_smallq_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
     attn_metadata: TritonAttentionMetadata,
     prepared: _smallq_metadata.DFlash2SmallQPreparedMetadata,
 ) -> None:
     """Attach buffers refreshed by the cross-cache-group launch."""
-    if prepared.builder_id != id(self):
+    if prepared.builder_id != self.inputs.builder_id:
         raise ValueError("grouped small-query metadata belongs to another builder")
     if (
         self.metadata_workspace.smallq.block_table is None
@@ -92,7 +91,7 @@ def _attach_prepared_dflash2_smallq_metadata(
         raise RuntimeError("grouped small-query metadata exceeds captured capacity")
 
     self._clear_smallq_decode_metadata(attn_metadata)
-    flash_metadata = _metadata._as_flash_v100_metadata(attn_metadata)
+    flash_metadata = metadata_view(attn_metadata)
     flash_metadata.smallq_decode_block_table = (
         self.metadata_workspace.smallq.block_table[: prepared.num_query_tokens]
     )
@@ -110,7 +109,7 @@ def _attach_prepared_dflash2_smallq_metadata(
 
 
 def _update_smallq_decode_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
     attn_metadata: TritonAttentionMetadata,
     common_attn_metadata,
     *,
@@ -118,7 +117,7 @@ def _update_smallq_decode_metadata(
     workspace_seq_capacity_cap: int | None = None,
     partition_size_hint: int | None = None,
 ) -> None:
-    flash_metadata = _metadata._as_flash_v100_metadata(attn_metadata)
+    flash_metadata = metadata_view(attn_metadata)
     profile_enabled = _debug._dflash_ddtree_worker_profile_enabled()
     profile_t0 = time.perf_counter() if profile_enabled else 0.0
     profile_stage_t0 = profile_t0
@@ -396,7 +395,7 @@ def _update_smallq_decode_metadata(
 
 
 def _ensure_smallq_decode_buffers(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+    self: Any,
     required_tokens: int,
     required_reqs: int,
     block_table: torch.Tensor,

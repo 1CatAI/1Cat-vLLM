@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Speculative metadata operations before moving their receiver ownership."""
+"""Own speculative builder state with explicit inputs and common callbacks."""
 
 from __future__ import annotations
 
@@ -11,9 +11,38 @@ from vllm.v1.attention.backends.flash_v100.spec import (
     tree,
     verify_metadata,
 )
+from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import (
+    MetadataInputs,
+    MetadataOps,
+)
 
 
-class SpecMetadataMethods:
+class SpecMetadataState:
+    def __init__(self, inputs: MetadataInputs, ops: MetadataOps, spec_config):
+        self.inputs = inputs
+        self.ops = ops
+        builder.initialize_builder(self, spec_config)
+
+    @property
+    def vllm_config(self):
+        return self.inputs.vllm_config
+
+    @property
+    def device(self):
+        return self.inputs.device
+
+    @property
+    def block_size(self):
+        return self.inputs.block_size
+
+    @property
+    def _is_speculative_draft_model(self):
+        return self.inputs.is_draft
+
+    attach_common = builder.attach_common
+    prepare_capture = builder.prepare_capture
+    debug_metadata = draft._debug_draft_metadata
+
     _is_dflash_draft_model: bool
     _is_dflash_selector_target: bool
     _use_sm70_dflash2_fused_smallq_metadata: bool

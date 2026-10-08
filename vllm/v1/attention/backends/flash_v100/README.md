@@ -67,25 +67,23 @@ qualification and the explicit super receiver; other calculation nodes must
 match. Mechanical feature hook calls are expanded back into their calculation
 bodies, with argument order checked; the same 47 parent hashes still match.
 
-## Speculative metadata hooks
+## Speculative metadata ownership
 
-The common metadata builder inherits the compatibility method surface from
-`spec.hooks.SpecMetadataMethods` and invokes the frozen `METADATA_HOOKS`
-registration at initialization, common attachment and capture preparation.
-`spec.builder` owns feature selection and the legacy extended build signature;
-`spec.tree` owns tree attachment/restoration; `spec.draft` owns persistent graph
-buffers and drafting refresh; `spec.verify_metadata` owns small-query verifier
-buffers and attachment. `spec.smallq_metadata` owns device/grouped preparation.
-The previous `smallq_metadata` path is a module alias to that owner, preserving
-patch identity. Internal imports use the owner path.
+The common metadata builder owns a `SpecMetadataState` through `spec_state`.
+It injects immutable `MetadataInputs` and five `MetadataOps` callbacks for the
+base builder and common metadata. The state owns persistent draft/small-query
+buffers and speculative configuration. It neither imports nor receives the
+common builder. The old private calls delegate to this owner for compatibility;
+`METADATA_HOOKS` remains an external compatibility adapter, not the production
+registration path. Metadata field and attention mixins still require removal.
 
-The generic `metadata.py` contains no family names. Its prefix-anchored and
-decode shape/partition metadata remain local. Speculative methods preserve
-the old names and arguments, including positional build options. Their super
-calls continue after the feature mixin so the Triton builder executes once.
-Fourteen extracted calculation bodies match frozen parent hashes; CPU tests
-exercise tree restoration, hook ordering, capture length guards and persistent
-buffer addresses across refreshes. Native metadata kernels remain unmeasured.
+`spec.builder` preserves the extended build options; `spec.tree` owns tree
+attachment/restoration; `spec.draft` owns drafting refresh; `spec.verify_metadata`
+owns small-query attachment; `spec.smallq_metadata` owns grouped preparation.
+The previous `smallq_metadata` path aliases the owner and retains patch identity.
+Prepared grouped metadata validates the original common-builder identity from
+immutable inputs. Persistent storage belongs to the same workspace across
+replays. Fourteen calculation hashes remain identical to the frozen parent.
 
 `spec.attention.ATTENTION_HOOKS` registers typed callbacks for scalar-tail
 initialization, verifier ABI/policy, prefill wrapper policy, feature contract

@@ -6,23 +6,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
-
-from vllm.v1.attention.backends.flash_v100.spec import (
-    builder,
-)
-from vllm.v1.attention.backends.flash_v100.spec.metadata_state import (
-    SpecMetadataMethods as SpecMetadataMethods,
-)
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
     from vllm.v1.attention.backend import CommonAttentionMetadata
-    from vllm.v1.attention.backends.flash_v100.metadata import (
-        FlashAttnV100MetadataBuilder,
-    )
     from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 
 
@@ -37,13 +27,11 @@ class SpecMetadataFields:
 
 @dataclass(frozen=True)
 class MetadataHooks:
-    initialize: Callable[[FlashAttnV100MetadataBuilder, SpeculativeConfig | None], None]
-    attach_common: Callable[
-        [FlashAttnV100MetadataBuilder, TritonAttentionMetadata], None
-    ]
+    initialize: Callable[[Any, SpeculativeConfig | None], None]
+    attach_common: Callable[[Any, TritonAttentionMetadata], None]
     prepare_capture: Callable[
         [
-            FlashAttnV100MetadataBuilder,
+            Any,
             TritonAttentionMetadata,
             CommonAttentionMetadata,
         ],
@@ -51,12 +39,24 @@ class MetadataHooks:
     ]
 
 
+def initialize_legacy(instance: Any, spec_config) -> None:
+    instance.initialize_spec_state(spec_config)
+
+
+def attach_common_legacy(instance: Any, attn_metadata) -> None:
+    instance.spec_state.attach_common(attn_metadata)
+
+
+def prepare_capture_legacy(instance: Any, attn_metadata, common_attn_metadata) -> None:
+    instance.spec_state.prepare_capture(attn_metadata, common_attn_metadata)
+
+
 def register_metadata_hooks() -> MetadataHooks:
     """Register the built-in feature providers without a mutable global registry."""
     return MetadataHooks(
-        initialize=builder.initialize_builder,
-        attach_common=builder.attach_common,
-        prepare_capture=builder.prepare_capture,
+        initialize=initialize_legacy,
+        attach_common=attach_common_legacy,
+        prepare_capture=prepare_capture_legacy,
     )
 
 
