@@ -62,6 +62,7 @@ def main():
         "--compare", choices=("routing", "host-prefill"), default="routing"
     )
     parser.add_argument("--decode-check", action="store_true")
+    parser.add_argument("--completion-check", action="store_true")
     parser.add_argument("--profile-once", action="store_true")
     args = parser.parse_args()
     if args.input_tokens <= 0 or args.prefill_chunk <= 0:
@@ -101,6 +102,7 @@ def main():
         comparison=args.compare,
         rows=[],
         decode_checks=[],
+        completions=[],
         complete=False,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -182,17 +184,59 @@ def main():
             for enabled in (False, True):
                 llm.collective_rpc(method, args=(enabled,))
                 for width in (1, 4):
-                    steps, _ = observed_cohort(
+                    steps, outputs = observed_cohort(
                         llm,
                         ids[:8192],
                         SamplingParams(temperature=0, max_tokens=600, ignore_eos=True),
                         width,
                     )
-                    report["decode_checks"].append(
+                    check = dict(
+                        enabled=enabled,
+                        width=width,
+                        input_tokens=8192,
+                        steps=steps,
+                        output_ids=[list(row.outputs[0].token_ids) for row in outputs],
+                    )
+                    report["decode_checks"].append(check)
+                    save()
+                    try:
+                        check["summary"] = summarize(steps, width)
+                    except RuntimeError as error:
+                        # Preserve admission failures without losing the later
+                        # diagnostic trace. A missing interval is not a pass.
+                        check["error"] = str(error)
+                    save()
+            report["decode_checks_valid"] = all(
+                "summary" in row for row in report["decode_checks"]
+            )
+            save()
+        if args.completion_check:
+            prompts = (
+                "只给出计算结果：17×5 等于多少？",
+                "用两句话解释为什么推理测试要分别测 prefill 和 decode。",
+                "写一个 Python 函数，返回整数列表中所有偶数的和，并举一个调用例子。",
+            )
+            for enabled in (False, True):
+                llm.collective_rpc(method, args=(enabled,))
+                for prompt in prompts:
+                    rendered = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": prompt}],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                    output = llm.generate(
+                        rendered,
+                        SamplingParams(temperature=0, max_tokens=512),
+                        use_tqdm=False,
+                    )[0].outputs[0]
+                    report["completions"].append(
                         dict(
                             enabled=enabled,
-                            width=width,
-                            summary=summarize(steps, width),
+                            prompt=prompt,
+                            output_ids=list(output.token_ids),
+                            text=output.text,
+                            finish_reason=output.finish_reason,
                         )
                     )
                     save()
