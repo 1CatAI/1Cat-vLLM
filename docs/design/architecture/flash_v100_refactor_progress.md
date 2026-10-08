@@ -321,3 +321,11 @@ including the immutable 813-case trace, strict shim use, original calculation
 hashes, capacity/pointer contracts and parity-tool controls. Evidence:
 `a3-metadata-workspace-strict.log` and `a3-metadata-workspace-shim.json`.
 GPU route/token/output/performance and complete outcome maps are pending.
+
+Step 3b's pinned #1028 rebase at code head `4259f29bd` passed 37 host-KV/QSA
+CPU tests with 98 GPU skips; its integration tree matches the clean merge-tree.
+The subsequent full Step 1c Flash-Next baseline exposed an older `_C` HC ABI
+while warming the #1028 integration. A source-matching integration `_C` build is
+running under `a3-native-abi` on 54633, without changing the shared runtime.
+Host model parity remains failed/pending, with failed logs retained. See the
+known-issues document; no model gate or merge is claimed from the CPU results.
