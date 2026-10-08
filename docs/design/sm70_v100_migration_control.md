@@ -49158,3 +49158,36 @@ passed. Raw logs and the source-normalization helper are under
 A3b feature metadata hooks and removing family references from the remaining
 initialization/forward orchestration are still pending and must be a separate
 review scope; do not mark the full A3b or the architecture campaign complete.
+
+## 2026-10-08 — architecture A3b-2 speculative metadata hooks
+
+Stack on A3b-1 #1055 (`fb6b12c5b8013ec43b5c34e0135857f3b0fb74e7`) in
+`agent/v100-arch-spec-hooks-20261008-090436`, root-disk worktree
+`/home/ymzx/arch-ws/v100-arch-spec-hooks-20261008-090436`.
+
+Move 14 feature builder methods into spec/builder, draft, tree and
+verify_metadata; move device/group preparation into spec/smallq_metadata with
+a true module alias at the prior path. Register initialization, common attach
+and capture preparation hooks. Keep generic metadata, prefix-anchored windows,
+decode shape hints and partition buffers in metadata.py (1345 to 471 lines).
+The common file has no DFlash/DDTree names. The inherited compatibility mixin
+keeps every method and the extended positional/keyword build signature;
+extracted super calls continue after the mixin and execute the Triton builder
+once. Internal imports use the new device metadata owner.
+
+All 14 normalized calculation bodies match the parent. Six new CPU tests
+plus three retained implementation tests pass. These check legacy
+module alias/patch identity, tree capture restoration and invalid inputs,
+persistent draft buffer addresses/capacity, base builder and feature hook
+order, and small-query capture lengths/partition hints. Existing focused
+suite: 306 passed. Existing policy suite: 233 passed / 9 inherited device
+inference failures / 1 skipped; all 243 JUnit outcomes match A3b-1 exactly.
+Evidence: a3b_cpu_ab.json, a3b_cpu_new.xml, a3b-tests.log and a3b-spec-tests-final.log
+under /home/ymzx/arch-ws/tmp. Initial mypy errors from typed assignments to an
+external self were fixed by retaining field annotations on the owning mixin.
+
+Coupling totals stay model 2325 / platform 3964 / raw env 335. The two
+small-query env reads move to their feature owner; accept-moves records this
+without total growth. GPU validation remains waived by the explicit user
+instruction. Remaining A3b scope: implementation initialization/forward hooks
+and removal of feature names from the backend core. The campaign is ongoing.

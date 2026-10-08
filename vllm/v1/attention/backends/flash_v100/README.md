@@ -3,8 +3,9 @@
 `backend` owns registration, `impl` owns initialization and the forward entry
 point. It binds methods from `decode`, `prefill`, `verify` and `debug_compare`;
 `state` owns their shared one-shot flags. `ops` owns
-native loading, `kv_layout` owns cache views/gathers, and `metadata` plus
-`smallq_metadata` own host/device metadata construction. `dense_prefill` owns
+native loading, `kv_layout` owns cache views/gathers, and `metadata` owns common
+host metadata construction. `spec/` owns speculative feature metadata.
+`dense_prefill` owns
 dense D256 operators and workspaces; `masks` owns reference visibility masks;
 `debug` owns comparisons and tracing. Access mutable helpers/state through the
 owning module. The old `flash_attn_v100` module forwards imports and patches.
@@ -61,5 +62,25 @@ comparison super call uses the original class object, preserving its old
 The method fixture records normalized parent calculation hashes for all 47
 methods. Normalize docstring indentation, typed-self annotations, moved state
 qualification and the explicit super receiver; other calculation nodes must
-match. Feature metadata registration and removal of family names from forward
-orchestration remain the next independent scope.
+match. Removal of family names from forward orchestration remains the next
+independent scope.
+
+## Speculative metadata hooks
+
+The common metadata builder inherits the compatibility method surface from
+`spec.hooks.SpecMetadataMethods` and invokes the frozen `METADATA_HOOKS`
+registration at initialization, common attachment and capture preparation.
+`spec.builder` owns feature selection and the legacy extended build signature;
+`spec.tree` owns tree attachment/restoration; `spec.draft` owns persistent graph
+buffers and drafting refresh; `spec.verify_metadata` owns small-query verifier
+buffers and attachment. `spec.smallq_metadata` owns device/grouped preparation.
+The previous `smallq_metadata` path is a module alias to that owner, preserving
+patch identity. Internal imports use the owner path.
+
+The generic `metadata.py` contains no family names. Its prefix-anchored and
+decode shape/partition metadata remain local. Speculative methods preserve
+the old names and arguments, including positional build options. Their super
+calls continue after the feature mixin so the Triton builder executes once.
+Fourteen extracted calculation bodies match frozen parent hashes; CPU tests
+exercise tree restoration, hook ordering, capture length guards and persistent
+buffer addresses across refreshes. Native metadata kernels remain unmeasured.

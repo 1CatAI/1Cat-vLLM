@@ -391,9 +391,6 @@
  "vllm/v1/attention/backends/flash_v100/impl.py": {
   "env": 23
  },
- "vllm/v1/attention/backends/flash_v100/metadata.py": {
-  "env": 2
- },
  "vllm/v1/attention/backends/flash_v100/ops.py": {
   "env": 1
  },
@@ -402,6 +399,9 @@
  },
  "vllm/v1/attention/backends/flash_v100/routing.py": {
   "env": 15
+ },
+ "vllm/v1/attention/backends/flash_v100/spec/verify_metadata.py": {
+  "env": 2
  },
  "vllm/v1/attention/backends/flash_v100/verify.py": {
   "env": 1
