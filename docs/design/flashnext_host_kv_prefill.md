@@ -371,3 +371,30 @@ modules, weights and dispatch remain unchanged. A normal installed-wheel GPU
 smoke confirms that the schedule exports actual CUDA kernel events; a CPU-only
 schedule smoke checks warmup/record/export ordering. Full-model trace collection
 still requires the next benchmark run.
+
+## First complete 32K model comparison
+
+The matched rerun uses the same normally installed production wheel, four
+V100-SXM2-32GB, CUDA 12.8, Torch 2.10.0+cu128, TP4 and FP16 MTP4. Target and
+draft KV are FP16, recurrent state is FP32, the GPU KV/state budget is 1 GiB,
+HC blocks are 2048 rows, expert blocks are 4096 rows, and the scheduler chunk
+is 16384. Prefix caching is disabled. Both reader policies are warmed before
+the unprofiled ABBA requests. Input is 32768 fixed tokens of repeated technical
+text; output is one greedy token. This is a throughput workload, not a natural
+completion or quality corpus. Observed prefill SM clocks reach 1530 MHz.
+
+| Host reader | Scheduled-to-first-token samples, s | Mean, s | Input tokens/s |
+| --- | --- | ---: | ---: |
+| Existing 32-row reader | 96.9423, 96.5130 | 96.7277 | 338.8 |
+| Staged prefill reader | 13.2925, 13.2781 | 13.2853 | 2466.5 |
+
+The measured ratio is 7.28x. All warmup and timed first-token IDs are 147113.
+Live Torch allocation after each request returns to 28.7483 GiB/rank; peak
+live allocation is 30.3892 GiB/rank. Near-full allocator reservations retain
+unused cached blocks and must be reported separately from live tensor storage.
+These repeated requests do not show growing live allocations.
+
+The 6000 tokens/s goal remains unmet: the candidate still needs about 2.43x
+throughput improvement. C1/C4 checks and post-measurement GPU tracing follow
+this comparison. Those results, natural-output checks and the critical-rank
+latency account are required before promotion.
