@@ -360,6 +360,26 @@ rejections remain unsupported; this does not admit new accelerated INT8 paths.
 The same normal installed wheel passes 197 policy and four GPU metadata tests
 with source-tree imports excluded and native extensions loaded normally.
 
+### Native calibrated cache writer boundary
+
+`csrc/kv_cache_codec.cuh` now owns the existing calibrated scalar writer,
+exposed as `KVWriter<cache_t, scalar_t, kv_dt>`, and the E5M2 unit-scale bit
+encoder/fast writer. The regular reshape/cache and Flash-cache kernels use
+this callable interface in NHD/HND and per-head/per-tensor scale cases.
+Original conversion bodies, fast-path conditions, addresses, vectorization,
+host dispatch and launches remain unchanged. A source guard reconstructs
+the entire immutable cache-kernel file, including all other kernels, rather
+than checking only selected stores.
+
+Reuse vLLM's existing NVIDIA/AMD quant converters behind this boundary; do not
+duplicate their dtype, saturation or platform semantics. The E5M2 bit path
+remains its existing qualified specialization. Standard SM70 CMake rebuild
+succeeds and the **complete** `_C_stable_libtorch` SASS is identical to source8794
+without any normalization. GPU writer and normal final-wheel/model gates are
+separate and still pending. Dynamic-token/group writers, MLA-specific stores,
+QSA auxiliary state, restore and unification with the standalone reader ABI
+remain subsequent steps; this header does not admit INT8 or change defaults.
+
 ### Fused Qwen norm/RoPE writer
 
 The existing Qwen fused writer's E4M3 software byte encoder now lives in the
@@ -400,9 +420,9 @@ change needs its own data/quality decision.
 
 Triton interpreter probing showed FP16 passthrough working, but its E4M3
 conversion disagreed with PyTorch even on integers such as 17 and 31. Do not use
-interpreter FP8 results as numerical admission evidence. Native CUDA, fused
-QK/RoPE, QSA and restore writer migration remain pending; this interface is an
-implemented first writer family, not completion of unified writes.
+interpreter FP8 results as numerical admission evidence. Remaining native/fused,
+QSA and restore writer migration is unfinished; these implemented writer
+families do not complete unified writes.
 
 ### Constraints for the INT8 tile reader
 

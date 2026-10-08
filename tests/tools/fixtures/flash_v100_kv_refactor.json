@@ -140,5 +140,7 @@
   "qwen_rope_encoder_ast": {
     "_e4m3_satfinite": "43f5b4a71fd085b8b159fce2f386bc0ce0fcf6b928526630dcfaa6af7c476c64"
   },
-  "qwen_rope_kernel_ast": "5904f612a59f32b539cfdd97c1423e6d93509a8a555cea7a5f6cfb8edc76ba9f"
+  "qwen_rope_kernel_ast": "5904f612a59f32b539cfdd97c1423e6d93509a8a555cea7a5f6cfb8edc76ba9f",
+  "native_writer_helpers_sha256": "d50bbbe8dd8759ce95d0e5a0d00928dfe3b5a9a8cefc5fdb441ef048fe693b89",
+  "native_cache_kernels_sha256": "d1a79ec1fe1c1247337607fa00171f57f30a5df968137b338ecb7f00ae6c918f"
 }

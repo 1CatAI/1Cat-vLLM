@@ -965,5 +965,14 @@
     "host_and_kernel_math_addressing_guarded": true,
     "rejected_variant": "Scaling and byte encoding combined inside K store expression changes pointer evaluation and ptxas RMSNorm FMA order; retain separate codec scale and byte operations.",
     "scope": "No new INT8/default/unsupported compiler admission or performance claim"
+  },
+  "native_calibrated_writer_extraction": {
+    "status": "source/compiler gate only; final installed GPU/model pending",
+    "source_guard": "entire immutable cache-kernel reconstruction including helpers, type spelling, math, addresses, host dispatch and launches",
+    "interface": "KVWriter<cache_t, scalar_t, kv_dt>",
+    "native_cmake_build_passed": true,
+    "complete_sm70_sass_equal_without_normalization": true,
+    "sass_sha256": "db0199dc0df559bf842dff93cfaa36cb78f9a683ae634c67a4bc708ed7770a75",
+    "scope": "calibrated reshape/Flash-cache writers; dynamic/MLA/QSA auxiliary/restore and reader ABI unification remain pending; no INT8/default changes"
   }
 }

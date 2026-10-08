@@ -49197,3 +49197,19 @@ TP4 and packed PLE handling; never materialize the full PLE table in FP16.
 Normal source8794 wheel is built, native15/16 libraries are byte-identical to
 page448 and the remaining complete FA2 SM70 SASS matches. GPU locks remain
 occupied by another task even when GPUs1/2 are idle; do not bypass global locks.
+
+Both fixed Flash-Next shards are now size/SHA256 verified. Single-connection
+first-shard transfer slowed; eight mature curl ranges validate Content-Range
+and length before merge/full checksum. Only the verified task-owned download
+child was stopped; existing prefix and failed logs were retained. GPU validation
+first reached a lease but stopped before comparisons when the shallow clone
+tried to lazily fetch an immutable baseline blob and GitHub timed out. Transfer
+authentic baseline Git blobs from the owned local object store and preflight
+their availability outside the lease; do not regenerate numerical baselines.
+
+Native calibrated reshape/Flash writers now use the extracted `KVWriter`
+interface. Entire cache-kernel reconstruction matches the immutable baseline
+after restoring the helper/type spelling and include. Normal CMake rebuild
+passes; full `_C_stable_libtorch` SM70 SASS is identical without normalization.
+Final-wheel GPU/operator/model gates remain pending; no format/default or
+dispatch change. The following other TP4 job again fills all four GPUs.

@@ -7,11 +7,7 @@
 #include "quantization/vectorization_utils.cuh"
 #include "concat_mla_q.cuh"
 
-#ifdef USE_ROCM
-  #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"
-#else
-  #include "../quantization/w8a8/fp8/nvidia/quant_utils.cuh"
-#endif
+#include "../kv_cache_codec.cuh"
 
 #include <algorithm>
 #include <cassert>
@@ -232,47 +228,6 @@ __global__ void copy_blocks_mla_kernel(
 
 namespace vllm {
 
-// Used to copy/convert one element
-template <typename OutT, typename InT, Fp8KVCacheDataType kv_dt>
-struct CopyWithScaleOp {
-  float scale;
-
-  __device__ __forceinline__ void operator()(OutT& dst, const InT src) const {
-    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-      dst = static_cast<OutT>(src);
-    } else {
-      dst = fp8::scaled_convert<OutT, InT, kv_dt>(src, scale);
-    }
-  }
-};
-
-__device__ __forceinline__ uint8_t
-fp16_bits_to_e5m2_satfinite_rn(const uint16_t bits) {
-  const uint16_t sign = (bits >> 8) & 0x80u;
-  const uint16_t magnitude = bits & 0x7fffu;
-  const uint16_t exponent = magnitude >> 10;
-  const uint16_t mantissa = magnitude & 0x03ffu;
-
-  if (exponent == 0x1fu) {
-    // Match CUDA's __NV_SATFINITE behavior: infinities clamp to max finite,
-    // while every NaN payload and sign canonicalizes to positive E5M2 NaN.
-    return mantissa == 0 ? static_cast<uint8_t>(sign | 0x7bu) : 0x7fu;
-  }
-
-  uint16_t rounded = magnitude >> 8;
-  const uint16_t remainder = magnitude & 0x00ffu;
-  rounded += remainder > 0x80u || (remainder == 0x80u && (rounded & 1u) != 0u);
-  rounded = rounded > 0x7bu ? 0x7bu : rounded;
-  return static_cast<uint8_t>(sign | rounded);
-}
-
-struct CopyFp16ToE5M2UnitScaleOp {
-  __device__ __forceinline__ void operator()(uint8_t& dst,
-                                             const uint16_t src) const {
-    dst = fp16_bits_to_e5m2_satfinite_rn(src);
-  }
-};
-
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void reshape_and_cache_kernel(
     const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
@@ -319,9 +274,9 @@ __global__ void reshape_and_cache_kernel(
 
   constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
   float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *k_scale;
-  CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+  KVWriter<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
   float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *v_scale;
-  CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+  KVWriter<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
 
   vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, x, 0, 1, k_op);
 
@@ -384,7 +339,7 @@ __global__ void reshape_and_cache_flash_kernel(
                                            threadIdx.x, blockDim.x,
                                            CopyFp16ToE5M2UnitScaleOp{});
       } else {
-        CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+        KVWriter<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
         vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems,
                                            threadIdx.x, blockDim.x, k_op);
       }
@@ -393,13 +348,13 @@ __global__ void reshape_and_cache_flash_kernel(
                                            threadIdx.x, blockDim.x,
                                            CopyFp16ToE5M2UnitScaleOp{});
       } else {
-        CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+        KVWriter<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
         vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
                                            threadIdx.x, blockDim.x, v_op);
       }
     } else {
-      CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
-      CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+      KVWriter<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+      KVWriter<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
 
       vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems, threadIdx.x,
                                          blockDim.x, k_op);
@@ -437,7 +392,7 @@ __global__ void reshape_and_cache_flash_kernel(
           vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,
                                              32, CopyFp16ToE5M2UnitScaleOp{});
         } else {
-          CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+          KVWriter<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
           vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,
                                              32, k_op);
         }
@@ -445,13 +400,13 @@ __global__ void reshape_and_cache_flash_kernel(
           vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane,
                                              32, CopyFp16ToE5M2UnitScaleOp{});
         } else {
-          CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+          KVWriter<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
           vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane,
                                              32, v_op);
         }
       } else {
-        CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
-        CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+        KVWriter<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+        KVWriter<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
 
         // Within each head, let one warp perform the vector copy.
         vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,

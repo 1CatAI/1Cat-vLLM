@@ -137,6 +137,39 @@ def test_packed_converters_have_one_preserved_implementation():
         assert "KVReader<KV_DTYPE>::template half8_from_packed" in attention
 
 
+def test_native_writer_helpers_and_cache_kernel_bodies_are_preserved():
+    header = (ROOT / "csrc/kv_cache_codec.cuh").read_text()
+    start = header.index("// Used to copy/convert one element")
+    end = header.rindex("\n}  // namespace vllm")
+    helpers = header[start:end].replace("KVWriter", "CopyWithScaleOp")
+    compact = lambda text: re.sub(r"\s+", "", text)
+    assert (
+        hashlib.sha256(compact(helpers).encode()).hexdigest()
+        == FIXTURE["native_writer_helpers_sha256"]
+    )
+    source = (ROOT / "csrc/libtorch_stable/cache_kernels.cu").read_text()
+    original_include = (
+        "#ifdef USE_ROCM\n"
+        '  #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"\n'
+        "#else\n"
+        '  #include "../quantization/w8a8/fp8/nvidia/quant_utils.cuh"\n'
+        "#endif"
+    )
+    source = source.replace('#include "../kv_cache_codec.cuh"', original_include)
+    source = source.replace("KVWriter", "CopyWithScaleOp")
+    marker = (
+        "template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>\n"
+        "__global__ void reshape_and_cache_kernel"
+    )
+    assert source.count(marker) == 1
+    restored = source.replace(marker, helpers + "\n" + marker)
+    assert (
+        hashlib.sha256(compact(restored).encode()).hexdigest()
+        == FIXTURE["native_cache_kernels_sha256"]
+    )
+    assert "recursive-include csrc *" in (ROOT / "MANIFEST.in").read_text()
+
+
 class _EraseCodecExpressions(ast.NodeTransformer):
     """Guard address/scale stores and launch ABI while extracting encoding math."""
 
