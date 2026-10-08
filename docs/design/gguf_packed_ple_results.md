@@ -36,14 +36,22 @@ rejected by host capacity. A separate graph-node trace has an early target
 wait of roughly 2.3 ms before copying the 25,600-byte M5 PLE result. This
 profiled wait is not an unprofiled end-to-end speedup estimate.
 
-A CPU-only diagnostic on real IQ4_NL rows observed the following warm,
-rotating-prefix producer costs. These first screens used separate processes,
-exclude IPC and GPU consumption, and are hypotheses for the matched test.
+A same-process ABBA diagnostic on real IQ4_NL rows observed the following warm,
+rotating-prefix producer costs. Both arms use the normally installed wheel
+from `ec0e22c17d`, Torch 2.10.0 and one CPU thread. All 32 prefix batches per
+shape produce identical FP16 result bytes after official GGUF dequantization.
+These measurements exclude IPC and GPU consumption.
 
 | Tokens | Existing producer | Packed producer | Possible CPU reduction |
 | --- | ---: | ---: | ---: |
-| 5 | 0.838 ms | 0.168 ms | 0.670 ms |
-| 20 | 2.749 ms | 0.626 ms | 2.123 ms |
+| 5 | 0.832 ms | 0.242 ms | 0.590 ms |
+| 20 | 2.557 ms | 0.366 ms | 2.192 ms |
+
+The wheel SHA-256 is
+`5ed7c3151b4241ba00f3b6a0cee2abd8af5d4eb5d8fd9d60de13c6ce6f05e371`.
+All 17 native modules are unchanged from the device-history measurement
+artifact. The packed-result decoder is registered Python/Triton source in the
+wheel. No separate extension is loaded.
 
 Flattening the official CPU decoder's small row batches reduced M5 by only
 0.24 ms and is not implemented. Transferring packed rows removes that CPU
