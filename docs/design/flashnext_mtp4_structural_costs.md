@@ -124,10 +124,14 @@ on 0-3 and 1-2. The logical order `[0,1,2,3]` uses direct XOR-1/XOR-2
 peers and forwards diagonal traffic. It is not a full NV2 mesh.
 
 Each M5 HC input reduction transfers 12,800 FP32 values with a 32-bit epoch
-tag per value. Two dependent phases therefore send **204,800 wire bytes per
-card per boundary**, not 25,600 FP16 bytes. Critical ranks 1/3 use NV1 in
-both phases. At 25 GB/s/direction the input wire floor is 8.192 us/boundary,
-or **0.770 ms over 94 boundaries**. LoRA and output forwarding add traffic
+tag per value. Two phases send **204,800 wire bytes per card per boundary**,
+not 25,600 FP16 bytes. Critical ranks 1/3 use NV1 in both phases, but on
+different links. Each CTA forwards its 32-column chunk independently; there
+is no whole-grid barrier between phases. Consequently the phases can pipeline.
+At 25 GB/s/direction the bandwidth floor is the larger phase,
+**4.096 us/boundary, or 0.385 ms over 94 boundaries**, plus unmeasured
+pipeline startup and final-chunk latency. Adding both complete phase transfer
+times would incorrectly give 0.770 ms. LoRA and output forwarding add traffic
 and dependent arrival latency. Every boundary also has two intra-GPU grid
 barriers; polling instruction counts are arrival-dependent.
 
@@ -139,13 +143,42 @@ inside the kernel as GPU idle would understate waiting.
 NCCL's [LL128 eligibility rules](https://github.com/NVIDIA/nccl/blob/v2.27.6-1/src/graph/tuning.cc)
 include homogeneous SM70 with eligible NVLink paths; SM90-only restrictions
 cannot be assumed. However, replacing tagged LL words with a more efficient
-wire protocol alone only removes roughly 0.36 ms from these input reductions
+wire protocol alone only removes roughly 0.18 ms from these input reductions
 at the bandwidth roof. It is insufficient as an independent structural
 proposal with a 0.5 ms minimum projected gain.
 
+### Isolated HC phase measurements
+
+The unchanged packaged kernel was measured on eight real HC weight pairs at
+M5, TP4, on this topology. Non-instrumented whole-chain median is 29.136 us.
+Device-local stage medians are:
+
+| Stage | Rank 0 us | Rank 1 us | Rank 2 us | Rank 3 us |
+| --- | ---: | ---: | ---: | ---: |
+| Input sum and weight prefetch | 5.120 | 6.144 | 5.120 | 6.144 |
+| First grid barrier | 2.048 | 3.072 | 2.048 | 3.072 |
+| Norm and partial prefetch | 3.072 | 3.072 | 3.072 | 3.072 |
+| LoRA arrival, up prefetch and second barrier | 6.144 | 4.096 | 7.168 | 5.120 |
+| Up and gate mix | 3.072 | 2.048 | 2.048 | 2.048 |
+| Output exchange | 1.024 | 2.048 | 1.024 | 2.048 |
+
+Globaltimer samples have 1.024 us granularity. Per-CTA medians are not
+additive, and timestamps cannot establish cross-rank ordering. These numbers
+identify dependencies for a prototype; they are not endpoint improvements.
+The 27.998 us instrumented chain is not a faster implementation: profiling
+and clock variation explain why it must not be compared as a speed gain.
+
 ## Structural directions to evaluate
 
-1. **Distributed-K HC.** Reduce-scatter the block partial into 640-column
+1. **HC-to-input-projection pipeline.** Group four HC CTAs, publish their
+   output-column readiness, and accumulate the next dense projection over
+   each available 128-column K slice. Twenty deterministic split-K partials
+   fit in L2 at M5; the current canonical packed weights can be retained.
+   The hypothesis is to overlap projection with HC completion and remove
+   the full-HC dependency, with at least 0.5 ms chain savings required.
+   This is unimplemented and unmeasured; extra registers, readiness polling,
+   partial traffic and loss of dense parallelism can reject it.
+2. **Distributed-K HC.** Reduce-scatter the block partial into 640-column
    ownership, retain sharded residuals between HC boundaries, apply global
    RMS coefficients before publishing collapsed local down partials, reduce
    FP32 LoRA contributions, then gather the next block input. This can shrink
@@ -153,13 +186,16 @@ proposal with a 0.5 ms minimum projected gain.
    materialization is required before a consumer needing full residuals.
    Extra normalization collectives must overlap down computation; merely
    moving all-reduce later is not a gain. FP32 partial/communication precision
-   must be retained. The initial proposed saving is 1.0-1.5 ms, not measured.
-2. **HC-to-router producer pipeline.** Produce router K-slice partials while
+   must be retained. Pipelined input-wire savings alone are capped at about
+   0.193 ms across 94 boundaries. The earlier 1.0-1.5 ms proposal relied on
+   adding serial phase transfer times and is withdrawn. Additional workspace
+   and dependency savings must be demonstrated before admitting this path.
+3. **HC-to-router producer pipeline.** Produce router K-slice partials while
    HC output columns are resident, then combine deterministic FP32 partials
    with top-k/input quantization. The current projection/top-k/input-quant
    chain has about 1.22 ms service; a 0.5-0.8 ms proposal is plausible only if
    the added HC tail does not consume that saving.
-3. **Read/decode once per repeated expert.** Share decoded IQ words among
+4. **Read/decode once per repeated expert.** Share decoded IQ words among
    tokens of the same expert and preserve the down FP16 boundary and ordered
    weighted reduction. The 28% compulsory/issued gap is an upper opportunity,
    not an expected endpoint gain. Register occupancy and single-token expert
