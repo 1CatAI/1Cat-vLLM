@@ -64,6 +64,11 @@ def main():
     parser.add_argument("--decode-check", action="store_true")
     parser.add_argument("--completion-check", action="store_true")
     parser.add_argument("--profile-once", action="store_true")
+    parser.add_argument(
+        "--candidate-only",
+        action="store_true",
+        help="Measure the candidate after a separately recorded matched comparison",
+    )
     args = parser.parse_args()
     if args.input_tokens <= 0 or args.prefill_chunk <= 0:
         parser.error("input and chunk token counts must be positive")
@@ -100,6 +105,7 @@ def main():
         version=vllm.__version__,
         origin=vllm.__file__,
         comparison=args.compare,
+        candidate_only=args.candidate_only,
         rows=[],
         decode_checks=[],
         completions=[],
@@ -136,7 +142,8 @@ def main():
             else "set_gguf_prefill_routing_policy"
         )
         report["warmups"] = []
-        for enabled in (False, True):
+        policies = (True,) if args.candidate_only else (False, True)
+        for enabled in policies:
             policy = llm.collective_rpc(method, args=(enabled,))
             warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
             report["warmups"].append(
@@ -148,7 +155,10 @@ def main():
                 )
             )
             save()
-        for enabled in (False, True, True, False):
+        measured_policies = (
+            (True, True) if args.candidate_only else (False, True, True, False)
+        )
+        for enabled in measured_policies:
             policy = llm.collective_rpc(method, args=(enabled,))
             before_memory = llm.collective_rpc("read_prefill_memory", args=(True,))
             started = time.perf_counter()
@@ -181,7 +191,7 @@ def main():
             from benchmarks.benchmark_flashnext_acceptance import observed_cohort
             from benchmarks.benchmark_sm70_qwen38_concurrency import summarize
 
-            for enabled in (False, True):
+            for enabled in policies:
                 llm.collective_rpc(method, args=(enabled,))
                 for width in (1, 4):
                     steps, outputs = observed_cohort(
@@ -216,7 +226,7 @@ def main():
                 "用两句话解释为什么推理测试要分别测 prefill 和 decode。",
                 "写一个 Python 函数，返回整数列表中所有偶数的和，并举一个调用例子。",
             )
-            for enabled in (False, True):
+            for enabled in policies:
                 llm.collective_rpc(method, args=(enabled,))
                 for prompt in prompts:
                     rendered = tokenizer.apply_chat_template(
