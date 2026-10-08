@@ -2100,6 +2100,13 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   // reduction order (and therefore numerics) match the single-stream M<=8
   // path exactly. Gated by env so the old route stays one flip away.
   if (m > 8 && m <= 32 && env_enabled("VLLM_SM70_FP8_QPN8_BLOCKSCALED_CHUNKED")) {
+    static std::once_flag block_chunked_log_once;
+    std::call_once(block_chunked_log_once, []() {
+      std::fprintf(stderr,
+                   "INFO SM70 block-FP8 QPN8 M=9..32 chunked decode route "
+                   "engaged (set VLLM_SM70_FP8_QPN8_BLOCKSCALED_CHUNKED=0 to "
+                   "restore the per-step dequant fallback).\n");
+    });
     for (int64_t row = 0; row < m; row += 8) {
       const int64_t rows = std::min<int64_t>(8, m - row);
       auto input_chunk = input.narrow(0, row, rows);
