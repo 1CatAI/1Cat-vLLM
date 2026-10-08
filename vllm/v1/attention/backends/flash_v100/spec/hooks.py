@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
 from vllm.v1.attention.backends.flash_v100.spec import (
     builder,
     draft,
@@ -51,14 +52,14 @@ class SpecMetadataMethods:
 
     _attach_ddtree_metadata = tree._attach_ddtree_metadata
     _debug_draft_metadata = draft._debug_draft_metadata
-    _ensure_flash_draft_graph_buffers = draft._ensure_flash_draft_graph_buffers
+    _ensure_flash_draft_graph_buffers = _workspace._ensure_flash_draft_graph_buffers
     _stabilize_draft_graph_metadata = draft._stabilize_draft_graph_metadata
-    copy_dflash_graph_metadata = draft.copy_dflash_graph_metadata
+    copy_dflash_graph_metadata = _workspace.copy_dflash_graph_metadata
     build_for_drafting = draft.build_for_drafting
     _configured_smallq_max_query_len = verify_metadata._configured_smallq_max_query_len
     _configured_smallq_max_model_len = verify_metadata._configured_smallq_max_model_len
     _smallq_buffer_token_capacity = verify_metadata._smallq_buffer_token_capacity
-    _ensure_smallq_decode_buffers = verify_metadata._ensure_smallq_decode_buffers
+    _ensure_smallq_decode_buffers = _workspace._ensure_smallq_decode_buffers
     _clear_smallq_decode_metadata = verify_metadata._clear_smallq_decode_metadata
     _attach_prepared_dflash2_smallq_metadata = (
         verify_metadata._attach_prepared_dflash2_smallq_metadata

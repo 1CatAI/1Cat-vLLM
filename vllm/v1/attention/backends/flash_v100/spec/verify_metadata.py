@@ -59,58 +59,6 @@ def _smallq_buffer_token_capacity(
     )
 
 
-def _ensure_smallq_decode_buffers(
-    self: _metadata.FlashAttnV100MetadataBuilder,
-    required_tokens: int,
-    required_reqs: int,
-    block_table: torch.Tensor,
-) -> bool:
-    token_capacity = self._smallq_buffer_token_capacity(required_tokens)
-    req_capacity = max(
-        min(
-            int(self.vllm_config.scheduler_config.max_num_seqs),
-            token_capacity,
-        ),
-        int(required_reqs),
-        1,
-    )
-    block_cols = int(block_table.shape[1])
-    shape = (token_capacity, req_capacity, block_cols)
-    if self._smallq_buffer_shape == shape:
-        return True
-
-    if self._smallq_buffer_shape is not None:
-        old_tokens, old_reqs, old_block_cols = self._smallq_buffer_shape
-        return (
-            required_tokens <= old_tokens
-            and required_reqs <= old_reqs
-            and block_cols == old_block_cols
-        )
-
-    self._smallq_decode_block_table = torch.empty(
-        (token_capacity, block_cols),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_decode_seq_lens = torch.empty(
-        (token_capacity,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_query_start_loc = torch.empty(
-        (req_capacity + 1,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_token_indices = torch.arange(
-        token_capacity,
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_buffer_shape = shape
-    return True
-
-
 def _clear_smallq_decode_metadata(
     self: _metadata.FlashAttnV100MetadataBuilder,
     attn_metadata: TritonAttentionMetadata,

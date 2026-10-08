@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import time
 
-import torch
-
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
@@ -66,44 +64,6 @@ def _debug_draft_metadata(
     )
 
 
-def _ensure_flash_draft_graph_buffers(
-    self: _metadata.FlashAttnV100MetadataBuilder,
-    required_reqs: int,
-    block_table: torch.Tensor,
-) -> bool:
-    req_capacity = max(
-        int(self.vllm_config.scheduler_config.max_num_seqs),
-        int(required_reqs),
-        1,
-    )
-    block_cols = int(block_table.shape[1])
-    shape = (req_capacity, block_cols)
-    if self._flash_draft_buffer_shape == shape:
-        return True
-
-    if self._flash_draft_buffer_shape is not None:
-        old_reqs, old_block_cols = self._flash_draft_buffer_shape
-        return required_reqs <= old_reqs and block_cols == old_block_cols
-
-    self._draft_block_table = torch.empty(
-        (req_capacity, block_cols),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._draft_seq_lens = torch.empty(
-        (req_capacity,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._draft_query_start_loc = torch.empty(
-        (req_capacity + 1,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._flash_draft_buffer_shape = shape
-    return True
-
-
 def _stabilize_draft_graph_metadata(
     self: _metadata.FlashAttnV100MetadataBuilder,
     attn_metadata: TritonAttentionMetadata,
@@ -140,28 +100,6 @@ def _stabilize_draft_graph_metadata(
     attn_metadata.block_table = self._draft_block_table[:num_reqs]
     attn_metadata.seq_lens = self._draft_seq_lens[:num_reqs]
     attn_metadata.query_start_loc = self._draft_query_start_loc[: num_reqs + 1]
-
-
-def copy_dflash_graph_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    query_start_loc: torch.Tensor,
-) -> None:
-    """Refresh the three persistent inputs of a non-causal DFlash graph."""
-    num_reqs = seq_lens.numel()
-    assert self._draft_block_table is not None
-    assert self._draft_seq_lens is not None
-    assert self._draft_query_start_loc is not None
-    self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
-    self._draft_seq_lens[:num_reqs].copy_(
-        seq_lens,
-        non_blocking=True,
-    )
-    self._draft_query_start_loc[: num_reqs + 1].copy_(
-        query_start_loc,
-        non_blocking=True,
-    )
 
 
 def build_for_drafting(

@@ -5,11 +5,16 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 
 import torch
 
 from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 
 
 @dataclass
@@ -139,3 +144,258 @@ class V100Workspace:
     """Mutable state owned by one attention layer, separate from its policy."""
 
     decode_cache: DecodeCache = field(default_factory=DecodeCache)
+
+
+_MIXED_ROWS_PLAN_ATTR = "_flash_v100_mixed_decode_rows_plan"
+_MIXED_ROWS_GROUP = 8
+
+
+class _MixedDecodeRowsPlan:
+    """Layout of the small-query rows of one mixed prefill/decode step.
+
+    The host side depends only on ``query_start_loc`` and the sequence-length
+    shadow, so it is built once per step and shared by every attention layer of
+    the group instead of re-deriving it (lists, host-to-device copies, gathers)
+    in each layer. Visible KV lengths are never taken from the host shadow: it
+    can be an upper bound under async speculative decoding, so every row length
+    is derived on the device from the authoritative ``seq_lens``.
+
+    Tokens are ordered by request and then by position inside the request.
+    A request with ``q`` query tokens is split into ``ceil(q / 8)`` groups of
+    eight rows for the request-major grouped operator; the causal boundary of
+    each row is carried by its own length, so slicing a longer span is exact.
+    """
+
+    __slots__ = (
+        "rows",
+        "max_query_len",
+        "max_seq_len_hint",
+        "num_groups",
+        "src_idx",
+        "token_req",
+        "token_delta",
+        "dst_idx",
+        "group_req",
+        "_token_lengths",
+        "_group_lengths",
+        "_group_table",
+    )
+
+    def __init__(
+        self,
+        rows: tuple[int, ...],
+        qsl: list[int],
+        seq_lens_host: list[int],
+        device: torch.device,
+    ) -> None:
+        src: list[int] = []
+        req: list[int] = []
+        delta: list[int] = []
+        dst: list[int] = []
+        group_req: list[int] = []
+        max_query_len = 0
+        max_seq_len = 0
+        for i in rows:
+            q_len = qsl[i + 1] - qsl[i]
+            max_query_len = max(max_query_len, q_len)
+            max_seq_len = max(max_seq_len, int(seq_lens_host[i]))
+            base = len(group_req) * _MIXED_ROWS_GROUP
+            group_req.extend([i] * -(-q_len // _MIXED_ROWS_GROUP))
+            for j in range(q_len):
+                src.append(qsl[i] + j)
+                req.append(i)
+                delta.append(1 + j - q_len)
+                dst.append(base + j)
+        self.rows = rows
+        self.max_query_len = max_query_len
+        self.max_seq_len_hint = max_seq_len
+        self.num_groups = len(group_req)
+        packed = torch.tensor(
+            src + req + delta + dst + group_req,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        ).to(device, non_blocking=True)
+        n = len(src)
+        self.src_idx = packed[:n]
+        self.token_req = packed[n : 2 * n]
+        self.token_delta = packed[2 * n : 3 * n].to(torch.int32)
+        self.dst_idx = packed[3 * n : 4 * n]
+        self.group_req = packed[4 * n :]
+        self._token_lengths: torch.Tensor | None = None
+        self._group_lengths: torch.Tensor | None = None
+        self._group_table: torch.Tensor | None = None
+
+    def token_lengths(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        """Visible KV length of every selected query token (int32, [T])."""
+        if self._token_lengths is None:
+            self._token_lengths = (
+                seq_lens.index_select(0, self.token_req).to(torch.int32)
+                + self.token_delta
+            )
+        return self._token_lengths
+
+    def group_lengths(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        """Row lengths of the padded eight-row groups (zero on padding rows)."""
+        if self._group_lengths is None:
+            lengths = torch.zeros(
+                self.num_groups * _MIXED_ROWS_GROUP,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            lengths.index_copy_(0, self.dst_idx, self.token_lengths(seq_lens))
+            self._group_lengths = lengths
+        return self._group_lengths
+
+    def group_table(self, block_table: torch.Tensor) -> torch.Tensor:
+        """One block-table row per eight-row group ([G, columns])."""
+        if self._group_table is None:
+            self._group_table = block_table.index_select(0, self.group_req)
+        return self._group_table
+
+
+def _mixed_decode_rows_plan(
+    attn_metadata: TritonAttentionMetadata,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_query_len: int,
+    device: torch.device,
+) -> _MixedDecodeRowsPlan | None:
+    """Select the resident decode/verification rows of a mixed batch.
+
+    Returns ``None`` when the batch has no such row, or only such rows (that
+    shape is the uniform small-query batch and has its own route). The result is
+    cached on the step's metadata object, which every layer of the group shares.
+    """
+    cached = getattr(attn_metadata, _MIXED_ROWS_PLAN_ATTR, False)
+    if cached is not False:
+        return cast(_MixedDecodeRowsPlan | None, cached)
+    num_seqs = len(query_start_loc) - 1
+    qsl = query_start_loc[: num_seqs + 1].tolist()
+    seq_lens_host = seq_lens[:num_seqs].tolist()
+    rows = tuple(
+        i
+        for i in range(num_seqs)
+        if 1 <= qsl[i + 1] - qsl[i] <= max_query_len
+        and int(seq_lens_host[i]) > qsl[i + 1] - qsl[i]
+    )
+    plan = (
+        _MixedDecodeRowsPlan(rows, qsl, seq_lens_host, device)
+        if rows and len(rows) != num_seqs
+        else None
+    )
+    with suppress(AttributeError):
+        setattr(attn_metadata, _MIXED_ROWS_PLAN_ATTR, plan)
+    return plan
+
+
+def _ensure_flash_draft_graph_buffers(
+    self: _metadata.FlashAttnV100MetadataBuilder,
+    required_reqs: int,
+    block_table: torch.Tensor,
+) -> bool:
+    req_capacity = max(
+        int(self.vllm_config.scheduler_config.max_num_seqs),
+        int(required_reqs),
+        1,
+    )
+    block_cols = int(block_table.shape[1])
+    shape = (req_capacity, block_cols)
+    if self._flash_draft_buffer_shape == shape:
+        return True
+
+    if self._flash_draft_buffer_shape is not None:
+        old_reqs, old_block_cols = self._flash_draft_buffer_shape
+        return required_reqs <= old_reqs and block_cols == old_block_cols
+
+    self._draft_block_table = torch.empty(
+        (req_capacity, block_cols),
+        dtype=torch.int32,
+        device=self.device,
+    )
+    self._draft_seq_lens = torch.empty(
+        (req_capacity,),
+        dtype=torch.int32,
+        device=self.device,
+    )
+    self._draft_query_start_loc = torch.empty(
+        (req_capacity + 1,),
+        dtype=torch.int32,
+        device=self.device,
+    )
+    self._flash_draft_buffer_shape = shape
+    return True
+
+
+def copy_dflash_graph_metadata(
+    self: _metadata.FlashAttnV100MetadataBuilder,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Refresh the three persistent inputs of a non-causal DFlash graph."""
+    num_reqs = seq_lens.numel()
+    assert self._draft_block_table is not None
+    assert self._draft_seq_lens is not None
+    assert self._draft_query_start_loc is not None
+    self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
+    self._draft_seq_lens[:num_reqs].copy_(
+        seq_lens,
+        non_blocking=True,
+    )
+    self._draft_query_start_loc[: num_reqs + 1].copy_(
+        query_start_loc,
+        non_blocking=True,
+    )
+
+
+def _ensure_smallq_decode_buffers(
+    self: _metadata.FlashAttnV100MetadataBuilder,
+    required_tokens: int,
+    required_reqs: int,
+    block_table: torch.Tensor,
+) -> bool:
+    token_capacity = self._smallq_buffer_token_capacity(required_tokens)
+    req_capacity = max(
+        min(
+            int(self.vllm_config.scheduler_config.max_num_seqs),
+            token_capacity,
+        ),
+        int(required_reqs),
+        1,
+    )
+    block_cols = int(block_table.shape[1])
+    shape = (token_capacity, req_capacity, block_cols)
+    if self._smallq_buffer_shape == shape:
+        return True
+
+    if self._smallq_buffer_shape is not None:
+        old_tokens, old_reqs, old_block_cols = self._smallq_buffer_shape
+        return (
+            required_tokens <= old_tokens
+            and required_reqs <= old_reqs
+            and block_cols == old_block_cols
+        )
+
+    self._smallq_decode_block_table = torch.empty(
+        (token_capacity, block_cols),
+        dtype=torch.int32,
+        device=self.device,
+    )
+    self._smallq_decode_seq_lens = torch.empty(
+        (token_capacity,),
+        dtype=torch.int32,
+        device=self.device,
+    )
+    self._smallq_query_start_loc = torch.empty(
+        (req_capacity + 1,),
+        dtype=torch.int32,
+        device=self.device,
+    )
+    self._smallq_token_indices = torch.arange(
+        token_capacity,
+        dtype=torch.int32,
+        device=self.device,
+    )
+    self._smallq_buffer_shape = shape
+    return True
