@@ -172,10 +172,12 @@ Across 48 target expert layers, canonical gate/up codes occupy 4.785 GiB,
 their metadata 4.614 GiB, and the down banks 4.944 GiB. Another 6.752 GiB
 holds original packed gate/up weights across 47 layers. These original blocks
 serve small-M raw/dp4a kernels while canonical banks serve large prefill.
-This is simultaneous storage for two execution routes, not proof of a leak.
-Removing a bank requires a replacement that covers both routes and a matched
-decode/concurrency comparison. File size alone therefore understates current
-device weight storage.
+This is avoidable simultaneous storage for two execution routes. The original
+expert storage implementation has already measured 11.808 GiB per rank for
+the same target expert projections, including TP boundary blocks. The current
+21.095 GiB therefore adds 9.286 GiB per rank. Keep these representations in
+the weight-storage ledger rather than treating them as required model size.
+Removing the duplication still requires matched decode/concurrency checks.
 
 An isolated CPU diagnostic uses the exact tokenizer and repeated technical-text
 input hash from the 32K baseline. Its two 16K chunks contain 568 and 544 unique
@@ -294,10 +296,12 @@ failed allocating the 80 MiB first embedding all-reduce output. Torch had
 a 388 MiB CUDA context. This run is an admission failure, not throughput
 or correctness evidence for the staged attention reader.
 
-A prior storage audit identified 14.345 GiB/rank of canonical expert banks
-plus 6.752 GiB/rank of original gate/up blocks. Both serve selected runtime
-routes. Removing one without a replacement would alter the established
-small-batch or prefill route; this duplicate storage remains unresolved.
+A prior storage audit identified 14.343 GiB/rank of canonical expert banks
+plus 6.752 GiB/rank of original gate/up blocks. The constrained-memory branch
+already supplies a single original-block storage policy. The prefill branch
+had ported initialization fixes but omitted that policy and the sharded HC
+storage policy. This omission explains the much larger expert residency;
+it is not an intrinsic memory requirement of the GGUF checkpoint.
 
 The memory follow-up ports context-free attention and GDN capability queries,
 CPU/meta GDN norm placement, and TP-only EP communicator admission from the
@@ -661,3 +665,53 @@ runs inside the opaque operator boundary, and static fallback reporting is
 excluded from graph tracing. Two strict fullgraph/export regressions cover both
 HC4 admission and HC3 fallback, including residual and eager output comparison.
 No model memory or speed claim is taken from that failed initialization.
+
+## Original-block memory policy follow-up
+
+The source comparison with the constrained-memory GGUF implementation identifies
+omitted weight-storage policies, rather than an unusually large required expert
+footprint. The initialized target expert ledger is:
+
+| Representation | GiB per rank |
+| --- | ---: |
+| Current canonical expert codes and metadata | 14.343 |
+| Current additional original gate/up blocks | 6.752 |
+| Current total expert weights | 21.095 |
+| Reference single original-block expert banks, including TP margins | 11.808 |
+| Avoidable difference | 9.286 |
+
+The reference target weights total 13.058 GiB per rank; adding the approved
+FP16 MTP weights brings model weights to about 14.281 GiB. These figures exclude
+runtime, CUDA graph, cache and prefill temporaries. They must not be compared
+with the current 28.501 GiB initialized runner census as if both were weights.
+
+This change reuses `expert_storage="original"`, `dense_storage="original"`,
+sharded HC storage and guarded bank allocations from the constrained-memory
+implementation. Defaults retain accelerated canonical execution. Original
+expert fallback is a capacity comparison, not a claim of equal decode or
+prefill speed. HC's existing LL operators read retained local shards; large
+batches gather local projected rows and columns. The current HCX implementation
+requires dense checkpoint matrices and reports rejection when only shards
+remain. A compact HCX representation needs its own admission evidence.
+
+The next model contract uses memory utilization 0.5, FULL graphs, TP4, MTP4,
+32768 input tokens and a 16384-token scheduler chunk. Historical QSA K/V remains
+host-backed; PLE retains the existing disk cascade with bounded resident rows.
+The benchmark now accepts memory utilization directly and leaves the explicit
+KV byte override unset by default. Passing a fixed KV byte override bypasses
+the automatic memory-utilization budget and cannot prove this capacity contract.
+Actual device peak, graph allocations and allocator retries must be recorded.
+
+A separate GPU staging primitive reconstructs the existing canonical IQ3_XXS,
+IQ3_S and IQ2_S packet layouts from original blocks. Its test compares every
+prepared byte against the packaged Converter, including signed zeros, small
+coefficients and replay after replacing the source bank. It is not connected
+to model dispatch until those device checks pass. A shared per-layer working
+area can then replace persistent canonical gate/up copies without changing
+the existing small-M raw/dp4a routes or canonical FP16 prefill arithmetic.
+
+34 CPU storage/initialization checks pass, including all four Q2_0 TP boundaries,
+exact HC shard reconstruction and CPU staging. This is not yet the installed
+32K/FULL memory or throughput result. The existing NVFP4 prefix-prefill report
+records 5409 tokens/s at 32K with TP4/MTP4; its 8K scheduler chunk, cache layout
+and memory budget differ and must be accounted for in a matched comparison.

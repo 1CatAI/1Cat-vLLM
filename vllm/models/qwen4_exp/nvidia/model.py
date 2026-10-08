@@ -1118,6 +1118,9 @@ class Qwen4ExpForCausalLM(
             method = getattr(module, "quant_method", None)
             if method is not None and method is not previous.get(module):
                 method.process_weights_after_loading(module)
+        from .sm70_hc_storage import prepare_sharded_hc_storage
+
+        prepare_sharded_hc_storage(self, self.vllm_config)
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture."""

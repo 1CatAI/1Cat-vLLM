@@ -25,7 +25,8 @@ def main():
     parser.add_argument("--input-tokens", type=int, default=32768)
     parser.add_argument("--prefill-chunk", type=int, default=16384)
     parser.add_argument("--tp", type=int, default=4)
-    parser.add_argument("--kv-cache-memory-bytes", type=int, default=1610612736)
+    parser.add_argument("--kv-cache-memory-bytes", type=int)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
     parser.add_argument("--kernel-config", type=json.loads, default={})
     parser.add_argument(
         "--compare",
@@ -71,7 +72,7 @@ def main():
         max_num_batched_tokens=args.prefill_chunk,
         max_num_seqs=4,
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
-        gpu_memory_utilization=0.95,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         enable_prefix_caching=False,
         disable_log_stats=False,
         language_model_only=True,

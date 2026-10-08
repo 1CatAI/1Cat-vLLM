@@ -513,11 +513,18 @@ class GGUFModelLoader(BaseModelLoader):
             quant_config.canonical_expert_storage = (
                 quant_config.native_expert_storage
                 and vllm_config.kernel_config.sm70_gguf.enabled
+                and getattr(
+                    vllm_config.kernel_config.sm70_gguf,
+                    "expert_storage",
+                    "canonical",
+                )
+                == "canonical"
                 and model_config.dtype == torch.float16
                 and current_platform.get_device_capability() == (7, 0)
                 and hasattr(torch.ops._C, "gguf_affine_grouped_gemm_sm70_out")
             )
             adapter.canonical_expert_storage = quant_config.canonical_expert_storage
+            adapter.preserve_expert_blocks = quant_config.native_expert_storage
             if "output.weight" not in self._native_tensors:
                 model_config.hf_config.tie_word_embeddings = True
         logger.debug("GGUF unquantized modules: %s", unquant_names)

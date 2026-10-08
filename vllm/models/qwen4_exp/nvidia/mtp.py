@@ -622,6 +622,11 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         object.__setattr__(self, "_sm70_decode_graph_model", None)
         self._sm70_draft_head = None
 
+    def prepare_loaded_linear_weights(self) -> None:
+        from .sm70_hc_storage import prepare_sharded_hc_storage
+
+        prepare_sharded_hc_storage(self, self.vllm_config)
+
     def prepare_sm70_draft_head(self) -> None:
         # Called after checkpoint loading and target-head sharing, before KV
         # allocation and warmup consume the startup quantization workspace.

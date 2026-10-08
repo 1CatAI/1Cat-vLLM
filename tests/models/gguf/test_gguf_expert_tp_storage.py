@@ -87,11 +87,16 @@ def test_expert_projection_storage_keeps_types_and_tp_dimensions_independent():
         )
 
 
-def test_reject_unconverted_q2_down_before_allocating_expert_storage():
-    layer, method = layer_and_method(0)
+@pytest.mark.parametrize("rank", range(4))
+def test_original_q2_down_retains_tp_boundary_blocks(rank):
+    layer, method = layer_and_method(rank)
+    packed = q2_weight(256)
     method.load_expert(layer, layer.w2_qweight_type, torch.tensor(42), "w2", 0)
-    with pytest.raises(ValueError, match="local K=160.*block 64"):
-        method.load_expert(
-            layer, layer.w2_qweight, torch.from_numpy(q2_weight(256)), "w2", 0
-        )
-    assert not hasattr(layer, "gguf_w2")
+    method.load_expert(layer, layer.w2_qweight, torch.from_numpy(packed), "w2", 0)
+    left, physical_k = method.input_padding["w2"]
+    assert (left, physical_k) == (32 if rank % 2 else 0, 192)
+    np.testing.assert_array_equal(
+        dequantize(layer.gguf_w2[0].numpy(), 42)[:, left : left + 160],
+        dequantize(packed, 42)[:, rank * 160 : (rank + 1) * 160],
+    )
+    assert layer.gguf_w2.numel() == 2 * 256 * 54

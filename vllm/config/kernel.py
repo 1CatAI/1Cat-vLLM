@@ -364,6 +364,20 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    expert_storage: Literal["canonical", "original"] = "canonical"
+    """Keep accelerated canonical banks or one bank of original GGUF blocks.
+
+    Original storage avoids simultaneous canonical and raw expert weights.
+    It uses the packaged native fallback and zero-pads activations when a TP
+    boundary cuts a source block. It does not change the quantized weights.
+    """
+
+    dense_storage: Literal["canonical", "original"] = "canonical"
+    """Keep accelerated projection banks or only original quantized rows."""
+
+    dequant_workspace_bytes: int = Field(default=32 * 1024**2, ge=1024**2)
+    """Bound dense matrix tiles for the original projection storage policy."""
+
     embedding_storage: Literal["dense", "original"] = "dense"
     """Keep dense token embeddings or decode original GGUF rows on lookup."""
 
@@ -559,6 +573,9 @@ class KernelConfig:
 
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
+
+    hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
+    """Keep replicated HC matrices or only the lossless local TP4 LL packs."""
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
