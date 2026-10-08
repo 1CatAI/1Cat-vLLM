@@ -3,6 +3,7 @@
 """Capture mask/slot provenance checks; synthetic inputs do not select a format."""
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,148 @@ def load_tool(name):
 
 
 capture = load_tool("capture")
+
+
+@pytest.mark.parametrize(
+    "packed,fail_second", [(False, False), (True, False), (True, True)]
+)
+def test_capture_loop_isolates_requests_and_retains_incomplete_marker(
+    monkeypatch, tmp_path, packed, fail_second
+):
+    instances = []
+
+    class Engine:
+        def __init__(self, **config):
+            instances.append(self)
+            self.pending = None
+            self.generated = 0
+            assert config["max_num_batched_tokens"] == (3 if packed else 2)
+
+        def collective_rpc(self, method, args=()):
+            if method is capture.start_capture_on_worker:
+                assert self.pending is None
+                directory, ids, provenance, adapter = args
+                self.pending = (ids, provenance)
+                return []
+            assert method is capture.finish_capture_on_worker
+            assert self.pending is not None
+            ids, provenance = self.pending
+            self.pending = None
+            return [
+                {
+                    "rank": 0,
+                    "route_delta": {"test_only": 1},
+                    "samples": [{**provenance, "tensor_path": "rank0-layer0.pt"}],
+                }
+            ]
+
+        def generate(self, prompts, params, use_tqdm):
+            assert self.pending is not None
+            assert prompts == [{"prompt_token_ids": self.pending[0]}]
+            self.generated += 1
+            if fail_second and self.generated == 2:
+                raise RuntimeError("synthetic request failure")
+            return [SimpleNamespace(outputs=[SimpleNamespace(token_ids=[7])])]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm",
+        SimpleNamespace(
+            __file__="/test/site-packages/vllm/__init__.py",
+            LLM=Engine,
+            SamplingParams=lambda **kwargs: kwargs,
+            envs=SimpleNamespace(VLLM_ALLOW_INSECURE_SERIALIZATION=True),
+        ),
+    )
+    monkeypatch.setattr(capture, "verify_runtime_wheel", lambda *args: {})
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"model": "synthetic_control_flow_only"}))
+    request = tmp_path / "request.json"
+    request.write_text(
+        json.dumps(
+            [
+                {"id": "first", "prompt_token_ids": [1, 2]},
+                {"id": "second", "prompt_token_ids": [3, 4, 5]},
+            ]
+            if packed
+            else {"prompt_token_ids": [1, 2]}
+        )
+    )
+    wheel = tmp_path / "test.whl"
+    wheel.write_bytes(b"synthetic control flow; no installed/GPU evidence")
+    out = tmp_path / "samples"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "capture",
+            "--engine-config",
+            str(config),
+            "--request",
+            str(request),
+            "--wheel",
+            str(wheel),
+            "--source-sha",
+            "test",
+            "--out",
+            str(out),
+        ],
+    )
+    if fail_second:
+        with pytest.raises(RuntimeError, match="synthetic request failure"):
+            capture.main()
+    else:
+        capture.main()
+        assert instances[0].pending is None
+    assert len(instances) == 1
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["performance_evidence"] is False
+    if packed:
+        assert manifest["complete"] is (not fail_second)
+        assert [s["tensor_path"] for s in manifest["samples"]] == (
+            ["first/rank0-layer0.pt"]
+            if fail_second
+            else ["first/rank0-layer0.pt", "second/rank0-layer0.pt"]
+        )
+        assert [s["request_id"] for s in manifest["samples"]] == (
+            ["first"] if fail_second else ["first", "second"]
+        )
+    else:
+        assert "complete" not in manifest and "request_id" not in manifest["samples"][0]
+        assert manifest["output_token_ids"] == [7]
+
+
+def test_request_corpus_preserves_order_and_single_request_compatibility():
+    packed, requests = capture.capture_requests({"prompt_token_ids": [1, 2, 3]})
+    assert not packed and requests == [("request", [1, 2, 3])]
+    packed, requests = capture.capture_requests(
+        [
+            {"id": "zh_story", "prompt_token_ids": [1, 3]},
+            {"id": "python_cache", "prompt_token_ids": [2]},
+        ]
+    )
+    assert packed and requests == [("zh_story", [1, 3]), ("python_cache", [2])]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        None,
+        {"prompt_token_ids": []},
+        {"prompt_token_ids": [True]},
+        {"prompt_token_ids": [-1]},
+        {"prompt_token_ids": "123"},
+        [{"id": "../escape", "prompt_token_ids": [1]}],
+        [
+            {"id": "same", "prompt_token_ids": [1]},
+            {"id": "same", "prompt_token_ids": [2]},
+        ],
+    ],
+)
+def test_invalid_corpus_cannot_overwrite_or_misrepresent_samples(payload):
+    with pytest.raises(ValueError):
+        capture.capture_requests(payload)
 
 
 def test_qsa_layers_cover_rare_compression_ratios_without_losing_depths():

@@ -254,6 +254,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
+    if manifest.get("complete") is False:
+        raise ValueError("Refusing an incomplete request corpus")
     if manifest.get("version") != 1 or not manifest.get("samples"):
         raise ValueError("Expected a version 1 manifest with nonempty samples")
     results = []

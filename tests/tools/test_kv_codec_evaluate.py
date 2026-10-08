@@ -3,6 +3,7 @@
 """Numerical contracts of offline candidates, not format-selection evidence."""
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -15,6 +16,19 @@ assert SPEC is not None and SPEC.loader is not None
 evaluate = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = evaluate
 SPEC.loader.exec_module(evaluate)
+
+
+def test_incomplete_corpus_is_rejected_before_evaluation(monkeypatch, tmp_path):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"version": 1, "complete": False, "samples": []}))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["evaluate", "--manifest", str(manifest), "--out", str(tmp_path / "out.json")],
+    )
+    with pytest.raises(ValueError, match="incomplete request corpus"):
+        evaluate.main()
+    assert not (tmp_path / "out.json").exists()
 
 
 def test_symmetric_int8_uses_the_stored_fp16_scale():

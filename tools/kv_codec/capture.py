@@ -15,8 +15,10 @@ import hashlib
 import json
 import time
 from pathlib import Path
+from typing import Any
 from zipfile import ZipFile
 
+import regex as re
 import torch
 
 
@@ -469,6 +471,36 @@ def finish_capture_on_worker(worker):
     return finish_capture(worker.get_model())
 
 
+def capture_requests(request):
+    """Validate a single request or an ordered corpus with unique directory IDs."""
+    packed = isinstance(request, list)
+    rows = request if packed else [request]
+    if not rows:
+        raise ValueError("Need at least one real request")
+    result = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("Request must be an object with prompt_token_ids")
+        identifier = row.get("id", "request")
+        if (
+            not isinstance(identifier, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", identifier)
+            or identifier in seen
+        ):
+            raise ValueError("Request IDs must be unique directory-safe strings")
+        ids = row.get("prompt_token_ids")
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or any(type(token) is not int or token < 0 for token in ids)
+        ):
+            raise ValueError("Need the real request's nonempty integer token IDs")
+        seen.add(identifier)
+        result.append((identifier, ids))
+    return packed, result
+
+
 def main() -> None:
     import vllm
     from vllm import LLM, SamplingParams, envs
@@ -476,7 +508,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine-config", type=Path, required=True)
     parser.add_argument(
-        "--request", type=Path, required=True, help="JSON prompt_token_ids"
+        "--request",
+        type=Path,
+        required=True,
+        help="JSON prompt_token_ids object or ordered list with unique request IDs",
     )
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--source-sha", required=True)
@@ -495,9 +530,8 @@ def main() -> None:
         raise ValueError("Use a new sample directory; do not mix request/model runs")
     config = json.loads(args.engine_config.read_text())
     request = json.loads(args.request.read_text())
-    ids = request["prompt_token_ids"]
-    if not ids or any(type(token) is not int or token < 0 for token in ids):
-        raise ValueError("Need the real request's nonempty integer token IDs")
+    packed, requests = capture_requests(request)
+    longest = max(len(ids) for _, ids in requests)
     if config.get("speculative_config"):
         raise ValueError("Draft/MTP capture needs explicit role and mask adapters")
     if args.adapter == "qsa" and config.get("decode_context_parallel_size", 1) != 1:
@@ -514,9 +548,9 @@ def main() -> None:
         if name in config and config[name] != expected:
             raise ValueError(f"Capture requires {name}={expected!r}")
         config[name] = expected
-    if config.get("max_num_batched_tokens", len(ids)) < len(ids):
+    if config.get("max_num_batched_tokens", longest) < longest:
         raise ValueError("The whole real request must fit in one prefill")
-    config.setdefault("max_num_batched_tokens", len(ids))
+    config.setdefault("max_num_batched_tokens", longest)
     provenance = {
         "model": config["model"],
         "source_sha": args.source_sha,
@@ -550,39 +584,74 @@ def main() -> None:
     llm = LLM(**config)
     end_stage("engine_initialization", started)
     args.out.mkdir(parents=True)
-    started = begin_stage("install_hooks")
-    llm.collective_rpc(
-        start_capture_on_worker, args=(str(args.out), ids, provenance, args.adapter)
-    )
-    end_stage("install_hooks", started)
-    started = begin_stage("real_request")
-    outputs = llm.generate(
-        [{"prompt_token_ids": ids}],
-        SamplingParams(temperature=0, max_tokens=1),
-        use_tqdm=False,
-    )
-    end_stage("real_request", started)
-    started = begin_stage("finish_capture")
-    captured = llm.collective_rpc(finish_capture_on_worker)
-    end_stage("finish_capture", started)
-    samples = [row for rank in captured for row in rank["samples"]]
-    manifest = {
+    common: dict[str, Any] = {
         "version": 1,
         "adapter": args.adapter,
-        "samples": samples,
         "engine_config": config,
         "torch": torch.__version__,
         "diagnostic_eager_capture": True,
         "performance_evidence": False,
-        "diagnostic_stage_seconds": durations,
-        "output_token_ids": outputs[0].outputs[0].token_ids,
         "sampling": {"temperature": 0, "max_tokens": 1, "ignore_eos": False},
-        "executed_route_deltas": [
-            {"rank": rank["rank"], "routes": rank["route_delta"]} for rank in captured
-        ],
     }
-    (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    print(json.dumps({"samples": len(samples), "directory": str(args.out)}))
+    corpus: dict[str, Any] = {
+        **common,
+        "complete": False,
+        "samples": [],
+        "requests": [],
+    }
+    if packed:
+        (args.out / "manifest.json").write_text(json.dumps(corpus, indent=2) + "\n")
+    engine_seconds = durations["engine_initialization"]
+    for identifier, ids in requests:
+        directory = args.out / identifier if packed else args.out
+        directory.mkdir(exist_ok=not packed)
+        durations = {"engine_initialization": engine_seconds}
+        request_provenance = (
+            {**provenance, "request_id": identifier} if packed else provenance
+        )
+        started = begin_stage("install_hooks")
+        llm.collective_rpc(
+            start_capture_on_worker,
+            args=(str(directory), ids, request_provenance, args.adapter),
+        )
+        end_stage("install_hooks", started)
+        started = begin_stage("real_request")
+        outputs = llm.generate(
+            [{"prompt_token_ids": ids}],
+            SamplingParams(temperature=0, max_tokens=1),
+            use_tqdm=False,
+        )
+        end_stage("real_request", started)
+        started = begin_stage("finish_capture")
+        captured = llm.collective_rpc(finish_capture_on_worker)
+        end_stage("finish_capture", started)
+        samples = [row for rank in captured for row in rank["samples"]]
+        manifest = {
+            **common,
+            "samples": samples,
+            "diagnostic_stage_seconds": durations,
+            "output_token_ids": outputs[0].outputs[0].token_ids,
+            "executed_route_deltas": [
+                {"rank": rank["rank"], "routes": rank["route_delta"]}
+                for rank in captured
+            ],
+        }
+        (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        if packed:
+            corpus["samples"].extend(
+                {**row, "tensor_path": f"{identifier}/{row['tensor_path']}"}
+                for row in samples
+            )
+            corpus["requests"].append(
+                {
+                    "id": identifier,
+                    "manifest": f"{identifier}/manifest.json",
+                    "samples": len(samples),
+                }
+            )
+            corpus["complete"] = len(corpus["requests"]) == len(requests)
+            (args.out / "manifest.json").write_text(json.dumps(corpus, indent=2) + "\n")
+        print(json.dumps({"samples": len(samples), "directory": str(directory)}))
 
 
 if __name__ == "__main__":
