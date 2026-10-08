@@ -9,11 +9,43 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 
 import vllm
 from vllm import LLM, SamplingParams
+
+
+def _start_prefill_trace(worker: Any) -> None:
+    # Tracing starts after the unprofiled measurements. Release unused cached
+    # allocations to admit CUPTI buffers, then warm again before recording.
+    torch.accelerator.empty_cache()
+    worker._gguf_prefill_trace = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    )
+    worker._gguf_prefill_trace.start()
+
+
+def _activate_prefill_trace(worker: Any) -> None:
+    worker._gguf_prefill_trace.step()
+
+
+def _finish_prefill_trace(worker: Any, directory: str) -> dict:
+    profile = worker._gguf_prefill_trace
+    profile.stop()
+    output = Path(directory) / f"rank{worker.rank}.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    profile.export_chrome_trace(str(output))
+    worker._gguf_prefill_trace = None
+    return dict(rank=worker.rank, path=str(output), bytes=output.stat().st_size)
 
 
 def main():
@@ -30,6 +62,7 @@ def main():
         "--compare", choices=("routing", "host-prefill"), default="routing"
     )
     parser.add_argument("--decode-check", action="store_true")
+    parser.add_argument("--profile-once", action="store_true")
     args = parser.parse_args()
     if args.input_tokens <= 0 or args.prefill_chunk <= 0:
         parser.error("input and chunk token counts must be positive")
@@ -169,6 +202,24 @@ def main():
             )
             == 1
         )
+        save()
+        if args.profile_once:
+            llm.collective_rpc(method, args=(True,))
+            llm.collective_rpc(_start_prefill_trace)
+            warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
+            llm.collective_rpc(_activate_prefill_trace)
+            profiled = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[
+                0
+            ]
+            files = llm.collective_rpc(
+                _finish_prefill_trace, args=(str(args.output.parent / "prefill-trace"),)
+            )
+            report["profile"] = dict(
+                scope="profiled candidate; excluded from unprofiled throughput",
+                warmup_output_ids=warmup.outputs[0].token_ids,
+                output_ids=profiled.outputs[0].token_ids,
+                files=files,
+            )
         report["complete"] = True
         save()
     except Exception as error:

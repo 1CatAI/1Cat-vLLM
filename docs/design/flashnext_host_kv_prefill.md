@@ -362,3 +362,12 @@ was saved. Enable statistics explicitly and save wall time/output/memory before
 requiring timestamps so a reporting failure retains useful evidence. Re-run
 the matched benchmark with the same installed production wheel; this runner
 change does not alter production modules or native kernels.
+
+An optional post-measurement CPU/CUDA trace uses the existing worker callable
+RPC. After all unprofiled requests, release unused allocator cache to admit
+CUPTI, warm one staged request, then record the next request on all four ranks.
+Export separate Chrome traces and label their timing as profiled. Production
+modules, weights and dispatch remain unchanged. A normal installed-wheel GPU
+smoke confirms that the schedule exports actual CUDA kernel events; a CPU-only
+schedule smoke checks warmup/record/export ordering. Full-model trace collection
+still requires the next benchmark run.
