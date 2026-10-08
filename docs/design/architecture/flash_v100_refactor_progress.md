@@ -29,7 +29,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Required | Strict/rebase/GPU gates |
 | 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Required | Strict/rebase/GPU gates |
 | 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Required | Strict/rebase/GPU gates |
-| 6f: complete prefill execution ownership | — | CPU/golden passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Required | Strict/rebase/GPU gates |
+| 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Required | Strict/rebase/GPU gates |
+| 6g: owned comparison diagnostics | — | CPU/golden passed | Private 318 → 309; cycles 2 → 1 | Required | Strict/rebase/GPU gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -925,3 +926,36 @@ Step 3a's small Qwen model gate is also complete: FP16/E4M3 crossed with
 eager/graph, three requests each, all token/route records equal. The four
 `a3-step3a/logs/qwen-*-compare.log` files report `equal=True, requests=3`;
 `qwen.done` is dated 2026-10-09 05:16:38 +08:00. Host/spec gates still remain.
+
+## Step 6g comparison diagnostics ownership
+
+PR #1101 is `785d84b7fd62bd7e675dbc517d3b9fa016baf80c`. Actual #1028
+replay is `f0dd2d11a4c1d4ebd061b2dc8256db43bd09c701`, tree
+`b8b9fa02f3963d0b33eae6d54c1f831954bb62ef`, equal to clean merge-tree;
+37 CPU integration tests pass with 98 GPU skips. Four source-verified durable
+queues are staged as `a3-step6f` on 54633.
+
+ComparisonExecutor receives policy, scalar geometry, explicit native/reference
+operators and per-layer ComparisonState. No comparison calculation imports or
+receives Impl. Legacy counter reads/writes reach the owned state; enabled
+partially initialized objects retain their missing-counter error. Common
+assembly binds the original class-cell super().forward as a narrow reference
+callback, preserving export-monkeypatch behavior and per-instance overrides,
+including static helpers. Calculation bodies stay in place; the old super call
+becomes the injected reference callback, already covered by the original AST
+projection. No mechanical code move is included in this slice.
+
+All 813 traces and original calculation hashes pass in 21 focused cases
+(`a3-debug-owner-focused.log`). Six direct tests verify layer-local quotas shared
+across short-lived executors, legacy counter resets, partial initialization,
+capture skipping after quota reservation, reference failure propagation, real
+BHMD JSON output and static helper overrides (`a3-debug-owner-boundary.log`).
+The ceiling tightens to 400 / 400 / 309 / 1 / 151 / 0 / 29 without new forbidden
+edges. The remaining import cycle is KV gather versus dense allocation; complete
+debug event dispatch and the other final A3 gates are still open.
+
+The complete fixed-source strict suite passes **321 tests / 1 skip / 28 GPU
+exclusions**, with real shim consumption (`a3-debug-owner-strict.log`,
+`a3-debug-owner-shim.json`). Pre-commit, mypy and layering pass
+(`a3-debug-owner-precommit.log`). Production and source-oracle files remain
+unchanged throughout the accepted strict run.

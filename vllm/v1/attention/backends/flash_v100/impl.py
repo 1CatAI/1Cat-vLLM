@@ -128,14 +128,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
         return attributes["_spec_attention"]
 
+    @property
+    def comparison_state(self):
+        attributes = vars(self)
+        if "_comparison_state" not in attributes:
+            state = _debug_compare.ComparisonState()
+            for name in _debug_compare.COUNTER_FIELDS:
+                if name in attributes:
+                    setattr(state, name, attributes.pop(name))
+            attributes["_comparison_state"] = state
+        return attributes["_comparison_state"]
+
     def __getattr__(self, name: str) -> Any:
         if name in _feature.POLICY_FIELDS:
             return getattr(self.spec_attention, name)
+        if name in _debug_compare.COUNTER_FIELDS:
+            return getattr(self.comparison_state, name)
         raise AttributeError(name)
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name in _feature.POLICY_FIELDS:
             setattr(self.spec_attention, name, value)
+        elif name in _debug_compare.COUNTER_FIELDS:
+            setattr(self.comparison_state, name, value)
         else:
             super().__setattr__(name, value)
 
@@ -418,29 +433,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         self.config = _config.V100AttnConfig.take_legacy_attributes(vars(self))
 
-    _maybe_compare_bhmd_out = _debug_compare._maybe_compare_bhmd_out
-
-    _reserve_bhmd_compare_call = _debug_compare._reserve_bhmd_compare_call
-
-    _reserve_triton_compare_call = _debug_compare._reserve_triton_compare_call
-
-    _write_bhmd_compare_report = _debug_compare._write_bhmd_compare_report
-
-    _write_triton_compare_report = _debug_compare._write_triton_compare_report
-
-    _maybe_write_triton_tensor_dump = _debug_compare._maybe_write_triton_tensor_dump
-
     _small_tensor_list = staticmethod(_debug_compare._small_tensor_list)
 
     _layer_debug_info = staticmethod(_debug_compare._layer_debug_info)
 
     _tensor_compare_stats = staticmethod(_debug_compare._tensor_compare_stats)
-
-    _prefill_raw_kv_cache_compare_stats = (
-        _debug_compare._prefill_raw_kv_cache_compare_stats
-    )
-
-    _maybe_compare_triton_output = _debug_compare._maybe_compare_triton_output
 
     @property
     def kv_codec(self) -> KVCodec | None:
@@ -568,6 +565,26 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             partition_size_hint=partition_size_hint,
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
+        )
+
+    def _new_comparison_executor(self):
+        return _debug_compare.ComparisonExecutor(
+            self._policy(),
+            getattr(self, "scale", 1.0),
+            getattr(self, "kv_cache_dtype", "auto"),
+            _debug_compare.ComparisonOps(
+                triton_forward=super().forward,
+                paged_bhmd=getattr(self, "flash_attn_prefill_paged_bhmd", None),
+            ),
+            self.comparison_state,
+            {
+                name: vars(self)[name]
+                for name in (
+                    *_debug_compare.LEGACY_METHODS,
+                    *_debug_compare.STATIC_METHODS,
+                )
+                if name in vars(self)
+            },
         )
 
     def _new_prefill_executor(self):
@@ -1164,4 +1181,16 @@ def _prefill_method(method):
 
 for _legacy_name in _prefill.LEGACY_METHODS:
     _compatibility_method = _prefill_method(_legacy_name)
+    setattr(FlashAttnV100Impl, _legacy_name, _compatibility_method)
+
+
+def _comparison_method(method):
+    def call(instance, *args, **kwargs):
+        return getattr(instance._new_comparison_executor(), method)(*args, **kwargs)
+
+    return call
+
+
+for _legacy_name in _debug_compare.LEGACY_METHODS:
+    _compatibility_method = _comparison_method(_legacy_name)
     setattr(FlashAttnV100Impl, _legacy_name, _compatibility_method)

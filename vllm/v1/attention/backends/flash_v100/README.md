@@ -149,3 +149,14 @@ admission callbacks from this owner. Snapshot construction is per legacy call,
 so later operator or policy changes affect subsequent calls without changing an
 already created owner. Speculative callback names and capabilities belong to
 `spec.attention`; no entire attention implementation is passed there.
+
+## Comparison ownership
+
+Comparison calculations receive `ComparisonExecutor`, whose policy, operators
+and `ComparisonState` are separate from Impl. Counters remain local to each
+layer and shared by its comparison calls. Common assembly injects the original
+Triton super callback; legacy counter/method access forwards to the owner.
+Capture keeps the original reservation-before-skip order. Instance overrides,
+including static diagnostic helpers, remain effective. The prefill event
+subscribers remain unchanged; converting remaining direct diagnostic entry
+points to events is still final A3 work.
