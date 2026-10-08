@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm._sm70_ops as sm70_ops
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.deepseek_v4.sm70.sparse_kernels import (
@@ -446,3 +447,161 @@ def test_glm53_sm70_fused_q_kv_rmsnorm_matches_reference():
 
     torch.testing.assert_close(q_actual, q_ref, rtol=2e-3, atol=2e-3)
     torch.testing.assert_close(kv_actual, kv_ref, rtol=2e-3, atol=2e-3)
+
+
+def _glm53_fp8_dequant_reference(cache: torch.Tensor, slots: torch.Tensor):
+    """Dequantize packed GLM-5.3 E4M3 slots exactly as the kernels must."""
+    block_size = cache.shape[1]
+    flat = cache.reshape(cache.shape[0], block_size * 520)
+    block, pos = slots // block_size, slots % block_size
+    columns = torch.arange(512, device=cache.device)
+    data = flat[block[:, None], pos[:, None] * 512 + columns[None, :]]
+    scale_cols = (
+        block_size * 512 + pos[:, None] * 8 + torch.arange(8, device=cache.device)
+    )
+    encoded = flat[block[:, None], scale_cols].float()
+    scale = torch.where(encoded == 0, 0.0, torch.exp2(encoded - 127.0)).half()
+    values = data.view(torch.float8_e4m3fn).half().reshape(-1, 8, 64)
+    return (values * scale[..., None]).reshape(-1, 512)
+
+
+def _glm53_sparse_mla_fp64_reference(q, cache, indices, lengths, scale):
+    num_slots = cache.shape[0] * cache.shape[1]
+    out = torch.zeros(q.shape, dtype=torch.float64, device=q.device)
+    for row in range(q.shape[0]):
+        selected = indices[row, : int(lengths[row])]
+        selected = selected[(selected >= 0) & (selected < num_slots)].long()
+        if selected.numel() == 0:
+            continue
+        kv = _glm53_fp8_dequant_reference(cache, selected).double()
+        probs = torch.softmax(q[row].double() @ kv.T * scale, dim=-1)
+        out[row] = probs @ kv
+    return out
+
+
+def _glm53_sparse_mla_case(num_tokens, num_heads, q_scale, seed):
+    torch.manual_seed(seed)
+    device = torch.device("cuda")
+    num_kv, block_size, index_width = 512, 64, 256
+    kv = torch.randn(num_kv, 512, dtype=torch.float16, device=device) * 0.5
+    kv[:, :8] *= 6.0  # a few heavy channels, like post-norm latents
+    cache = torch.zeros(
+        num_kv // block_size, block_size, 520, dtype=torch.uint8, device=device
+    )
+    sm70_glm5_fp8_kv_insert(
+        kv, cache, torch.arange(num_kv, dtype=torch.int64, device=device)
+    )
+    q = (
+        torch.randn(num_tokens, num_heads, 512, dtype=torch.float16, device=device)
+        * q_scale
+    )
+    indices = torch.stack(
+        [torch.randperm(num_kv, device=device)[:index_width] for _ in range(num_tokens)]
+    ).int()
+    indices[:, 7::13] = -1  # skipped entries
+    lengths = torch.randint(
+        index_width // 2, index_width + 1, (num_tokens,), device=device
+    ).int()
+    lengths[0] = index_width
+    if num_tokens > 1:
+        lengths[-1] = 0  # a row with nothing selected
+    return q, cache, indices, lengths
+
+
+def _glm53_sparse_mla_fp32(q, cache, indices, lengths, scale, num_splits):
+    out = torch.empty_like(q)
+    o_part = torch.empty(
+        (*q.shape[:2], num_splits, 512), dtype=torch.float32, device=q.device
+    )
+    ml = torch.empty(
+        (*q.shape[:2], num_splits, 2), dtype=torch.float32, device=q.device
+    )
+    sm70_ops.sm70_glm53_sparse_mla_fp8_out(
+        out, o_part, ml, q, cache, indices, lengths, scale
+    )
+    return out
+
+
+_requires_glm53_sparse_mla_op = pytest.mark.skipif(
+    not current_platform.is_cuda()
+    or not current_platform.is_device_capability((7, 0))
+    or not hasattr(torch.ops._C, "sm70_glm53_sparse_mla_fp8_out"),
+    reason="requires an exact SM70 CUDA device and the native op",
+)
+
+
+@_requires_glm53_sparse_mla_op
+@pytest.mark.parametrize("num_tokens", [1, 2, 5, 8])
+@pytest.mark.parametrize("num_heads", [16, 32])
+@pytest.mark.parametrize("num_splits", [1, 3, None])
+def test_glm53_sm70_fp32_sparse_mla_matches_fp64_reference(
+    num_tokens, num_heads, num_splits
+):
+    q, cache, indices, lengths = _glm53_sparse_mla_case(
+        num_tokens, num_heads, q_scale=0.5, seed=20261008 + num_tokens
+    )
+    if num_splits is None:
+        num_splits = sparse_module._sparse_mla_fp8_num_splits(
+            indices.shape[1], num_tokens
+        )
+    scale = 256**-0.5
+    out = _glm53_sparse_mla_fp32(q, cache, indices, lengths, scale, num_splits)
+    ref = _glm53_sparse_mla_fp64_reference(q, cache, indices, lengths, scale)
+
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.double(), ref, rtol=1e-2, atol=2e-3)
+
+
+@_requires_glm53_sparse_mla_op
+def test_glm53_sm70_fp32_sparse_mla_handles_scores_beyond_fp16_range():
+    # Raw QK^T scores reach ~1e5. The fp16-score GEMM route stores them
+    # unscaled and returns a wrong (finite) output; the FP32 route matches
+    # the FP64 reference.
+    q, cache, indices, lengths = _glm53_sparse_mla_case(
+        1, 16, q_scale=2000.0, seed=20261009
+    )
+    scale = 256**-0.5
+    ref = _glm53_sparse_mla_fp64_reference(q, cache, indices, lengths, scale)
+    out = _glm53_sparse_mla_fp32(q, cache, indices, lengths, scale, num_splits=8)
+
+    index_width = indices.shape[1]
+    legacy = torch.empty_like(q)
+    sm70_glm5_sparse_attention_paged_fp8_gemm(
+        q,
+        cache,
+        indices,
+        lengths,
+        scale,
+        legacy,
+        torch.empty(index_width, 512, dtype=torch.float16, device=q.device),
+        torch.empty(16, index_width, dtype=torch.float16, device=q.device),
+        torch.empty(16, index_width, dtype=torch.float16, device=q.device),
+    )
+
+    legacy_error = (legacy.double() - ref).norm() / ref.norm()
+    assert legacy_error > 0.5
+    torch.testing.assert_close(out.double(), ref, rtol=1e-2, atol=2e-3)
+
+
+@_requires_glm53_sparse_mla_op
+def test_glm53_sm70_fp32_sparse_mla_cuda_graph_replay_is_exact():
+    q, cache, indices, lengths = _glm53_sparse_mla_case(
+        4, 16, q_scale=0.5, seed=20261010
+    )
+    scale = 256**-0.5
+    num_splits = sparse_module._sparse_mla_fp8_num_splits(indices.shape[1], 4)
+    eager = _glm53_sparse_mla_fp32(q, cache, indices, lengths, scale, num_splits)
+
+    out = torch.empty_like(q)
+    o_part = torch.empty((4, 16, num_splits, 512), dtype=torch.float32, device="cuda")
+    ml = torch.empty((4, 16, num_splits, 2), dtype=torch.float32, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sm70_ops.sm70_glm53_sparse_mla_fp8_out(
+            out, o_part, ml, q, cache, indices, lengths, scale
+        )
+    out.zero_()
+    graph.replay()
+    torch.accelerator.synchronize()
+
+    assert torch.equal(out, eager)

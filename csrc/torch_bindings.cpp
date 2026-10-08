@@ -922,6 +922,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            vllm::sm70::with_policy(&sm70_glm53_fp16_gemv_out));
 
   ops.def(
+      "sm70_glm53_sparse_mla_fp8_out(Tensor(a!) out, Tensor(b!) o_part, "
+      "Tensor(c!) ml, Tensor q, Tensor kv_cache, Tensor indices, "
+      "Tensor lengths, float scale) -> ()");
+  ops.impl("sm70_glm53_sparse_mla_fp8_out", torch::kCUDA,
+           &sm70_glm53_sparse_mla_fp8_out);
+
+  ops.def(
       "sm70_glm53_moe_permute_q8_out("
       "Tensor input, Tensor topk_ids, Tensor(a!) permuted_input, "
       "Tensor(b!) sorted_row_idx, Tensor(c!) inv_permuted_idx, "
