@@ -64,8 +64,8 @@ target wall time.
 
 The router score and GDN state rows omit small activation/metadata traffic.
 The QSA index projection service includes one small boundary GEMM. The
-selected sparse KV union, cache preparation traffic, all temporary buffers,
-and remaining decoder instruction counts are unresolved; this is an initial
+selected sparse KV union and cache counters are measured below. Remaining
+workspace traffic and instruction-port costs are unresolved; this is an initial
 ledger, not a complete lower-bound proof.
 
 | Four draft steps | Operand MB | HBM floor ms | Profiled service ms |
@@ -116,6 +116,57 @@ lanes/SM, it gives about 0.99 ms across the 10/17/20 layers of these formats.
 The independent warp-issue estimate is about 0.69 ms. Use the actual clock
 and instruction-port limits before treating either estimate as a strict
 roof. A bandwidth-only gate/up floor is too optimistic.
+
+### Dense decoder measurements
+
+The selected `gguf_dense_segments_sm70_out` was profiled at M5, K2560,
+with actual TP4 input groups. These are the selected segment banks, rather
+than the independently shipped DMV13 side-projection control.
+
+| Input group | N | Formats | Predicated thread instructions M | Integer-related M | Warp issue floor us |
+| --- | --- | --- | ---: | ---: | ---: |
+| GDN layer 0 | 2560 + 1536 | Q6_K + Q4_K | 55.132 | 28.076 | 4.289 |
+| GDN layer 2 | 2560 + 1536 | Q6_K + IQ4_XS | 55.659 | 28.454 | 4.332 |
+| Attention layer 3 | 3072 + 256 + 256 | IQ4_XS + Q6_K + Q6_K | 44.539 | 20.657 | 3.478 |
+
+The issue floor uses four schedulers per SM at 1290 MHz. It excludes
+multi-cycle port limits and dependencies. NCU's replayed durations are not
+endpoint timings. The larger operand bandwidth floor and the profiled
+instruction/stall evidence must be considered together.
+
+### Actual sparse KV operands
+
+A second untimed C1 capture records causal indices, request IDs and cumulative
+cache counters. Its 256 output IDs match all three device-history controls.
+All four ranks agree on selections. Target statistics use 38 central M5
+calls across twelve QSA layers; the first cache delta includes unrecorded
+prefill and is excluded. Cache hit-plus-miss deltas equal selected entries
+for every retained call.
+
+| Per-card target QSA work | Per round |
+| --- | ---: |
+| Query-list entries | 122,970 tokens |
+| Sum of within-layer, cross-query unions | 43,160 tokens |
+| FP16 reader union | 44.196 MB |
+| FP16 query-list operands | 125.921 MB |
+| Encoded E4M3 union including two FP32 scales/token | 22.443 MB |
+| Encoded miss reads, rank0 | 0.567 MB |
+| Cache hits, rank0 | 121,879 tokens |
+| Cache misses, rank0 | 1,091 tokens |
+
+The target hit rate is about 99.11%. Rank-specific miss counts differ slightly
+because cache installation contends; selections and output IDs remain equal.
+Operand unions are not measured DRAM transfers or a count of physical hot-cache
+allocations. The FP16 union floor at 900 GB/s is 0.049 ms; a direct E4M3 union
+floor is 0.025 ms. Reading a vector once per query issues 2.85 times the union,
+before L2 reuse and per-head implementation effects.
+
+The bounded draft ring retains sixteen complete M5/M1/M1/M1 rounds;
+twelve central rounds are used. Four-step FP16 reader unions total 9.458 MB
+and query-list operands 16.789 MB. Draft M5 averages 3,088 distinct tokens
+and 10,247.5 query-list entries; later M1 calls average 2,049.3 each.
+The measured cache preparation and attention service still need critical-path
+A/B attribution before any byte reduction is called an endpoint gain.
 
 ## HC communication ledger
 
@@ -170,15 +221,27 @@ and clock variation explain why it must not be compared as a speed gain.
 
 ## Structural directions to evaluate
 
-1. **HC-to-input-projection pipeline.** Group four HC CTAs, publish their
+1. **Direct device-history QSA.** Bypass protected hot-cache ownership and
+   miss staging for the already device-resident E4M3 reference. Reconstruct
+   precisely the same FP16 key/value operands, use FP16 QK with FP32 MMA
+   accumulation, and retain FP32 probabilities and PV accumulation. The
+   current target partial/merge plus gather service is about 1.08 ms; a
+   projected 0.5-0.8 ms chain gain must pass an isolated numerical and chain
+   gate. This is a hypothesis, not a measured speedup. Host history remains
+   a separate placement path.
+2. **HC-to-input-projection pipeline.** Group four HC CTAs, publish their
    output-column readiness, and accumulate the next dense projection over
    each available 128-column K slice. Twenty deterministic split-K partials
    fit in L2 at M5; the current canonical packed weights can be retained.
    The hypothesis is to overlap projection with HC completion and remove
    the full-HC dependency, with at least 0.5 ms chain savings required.
-   This is unimplemented and unmeasured; extra registers, readiness polling,
-   partial traffic and loss of dense parallelism can reject it.
-2. **Distributed-K HC.** Reduce-scatter the block partial into 640-column
+   This split-K version was measured on eight actual input groups: selected
+   segment control 46.688 us, copied HC control 45.028 us, candidate 58.660 us.
+   Numerical checks pass, but the chain gate fails. The version is rejected;
+   no model restart or end-to-end claim is made. Extra registers, readiness
+   polling and partial traffic are possible causes, not separately measured
+   attribution. See the companion HC consumer screen.
+3. **Distributed-K HC.** Reduce-scatter the block partial into 640-column
    ownership, retain sharded residuals between HC boundaries, apply global
    RMS coefficients before publishing collapsed local down partials, reduce
    FP32 LoRA contributions, then gather the next block input. This can shrink
@@ -190,12 +253,12 @@ and clock variation explain why it must not be compared as a speed gain.
    0.193 ms across 94 boundaries. The earlier 1.0-1.5 ms proposal relied on
    adding serial phase transfer times and is withdrawn. Additional workspace
    and dependency savings must be demonstrated before admitting this path.
-3. **HC-to-router producer pipeline.** Produce router K-slice partials while
+4. **HC-to-router producer pipeline.** Produce router K-slice partials while
    HC output columns are resident, then combine deterministic FP32 partials
    with top-k/input quantization. The current projection/top-k/input-quant
    chain has about 1.22 ms service; a 0.5-0.8 ms proposal is plausible only if
    the added HC tail does not consume that saving.
-4. **Read/decode once per repeated expert.** Share decoded IQ words among
+5. **Read/decode once per repeated expert.** Share decoded IQ words among
    tokens of the same expert and preserve the down FP16 boundary and ordered
    weighted reduction. The 28% compulsory/issued gap is an upper opportunity,
    not an expected endpoint gain. Register occupancy and single-token expert
