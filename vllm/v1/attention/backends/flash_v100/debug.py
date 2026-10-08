@@ -30,22 +30,6 @@ def _draft_graph_debug_limit() -> int:
     return int(_config.raw("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT", "12"))
 
 
-def _dflash_prefix_dump_enabled() -> bool:
-    return _config.raw("VLLM_FLASH_V100_DFLASH_PREFIX_DUMP", "0") == "1"
-
-
-def _dflash_ddtree_triton_branch_attn_enabled() -> bool:
-    return _config.raw("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN", "1") != "0"
-
-
-def _dflash_ddtree_triton_branch_attn_strict() -> bool:
-    return _config.raw("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT", "0") == "1"
-
-
-def _dflash_ddtree_worker_profile_enabled() -> bool:
-    return _config.raw("VLLM_DFLASH_DDTREE_WORKER_PROFILE", "0") == "1"
-
-
 def _format_tensor_debug(tensor: torch.Tensor | None, name: str) -> str:
     if tensor is None:
         return f"{name}=None"
@@ -100,3 +84,27 @@ def _graph_metadata_debug_log(key: str, message: str, *args: object) -> None:
         count,
         message,
     )
+
+
+def _dflash_prefix_dump_enabled() -> bool:
+    from vllm.v1.attention.backends.flash_v100.spec import policy
+
+    return policy._dflash_prefix_dump_enabled()
+
+
+def _dflash_ddtree_triton_branch_attn_enabled() -> bool:
+    from vllm.v1.attention.backends.flash_v100.spec import policy
+
+    return policy._dflash_ddtree_triton_branch_attn_enabled()
+
+
+def _dflash_ddtree_triton_branch_attn_strict() -> bool:
+    from vllm.v1.attention.backends.flash_v100.spec import policy
+
+    return policy._dflash_ddtree_triton_branch_attn_strict()
+
+
+def _dflash_ddtree_worker_profile_enabled() -> bool:
+    from vllm.v1.attention.backends.flash_v100.spec import policy
+
+    return policy._dflash_ddtree_worker_profile_enabled()

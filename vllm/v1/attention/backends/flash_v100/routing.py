@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import atexit
 import json
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -605,44 +604,6 @@ def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
         )
 
 
-def _mtp_context_bucket_partition_size_hint() -> int | None:
-    raw = _config.raw("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE")
-    if raw is None:
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in _VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
-
-
-def _mtp5_xqa_dual_cta_partition_size_hint() -> int | None:
-    if _config.raw("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "1") != "1":
-        return None
-    raw = _config.raw("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "1024")
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in _VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
-
-
 def _select_default_decode_partition_size(
     max_seq_len_hint: int | None,
 ) -> int:
@@ -799,23 +760,6 @@ def _record_route(route: str) -> None:
     if not _route_summary_registered:
         atexit.register(_log_route_summary)
         _route_summary_registered = True
-
-
-def _ddtree_trace_event(event: str, payload: dict[str, object]) -> None:
-    trace_path = _config.raw("VLLM_DFLASH_DDTREE_TRACE_JSONL")
-    if not trace_path:
-        return
-    record = {"event": event, "pid": os.getpid(), **payload}
-    try:
-        with open(trace_path, "a", encoding="utf-8") as trace_file:
-            json.dump(record, trace_file, ensure_ascii=True, sort_keys=True)
-            trace_file.write("\n")
-    except OSError:
-        logger.exception("Failed to write DDTree trace event to %s", trace_path)
-
-
-def _ddtree_trace_enabled() -> bool:
-    return bool(_config.raw("VLLM_DFLASH_DDTREE_TRACE_JSONL"))
 
 
 def _decode_active_trace_enabled() -> bool:
@@ -1001,3 +945,27 @@ def _log_fp8_kv_cache_route(
         )
         _logged_fp8_kv_decode = True
         return
+
+
+def _mtp_context_bucket_partition_size_hint() -> int | None:
+    from vllm.v1.attention.backends.flash_v100.spec import policy
+
+    return policy._mtp_context_bucket_partition_size_hint()
+
+
+def _mtp5_xqa_dual_cta_partition_size_hint() -> int | None:
+    from vllm.v1.attention.backends.flash_v100.spec import policy
+
+    return policy._mtp5_xqa_dual_cta_partition_size_hint()
+
+
+def _ddtree_trace_event(event: str, payload: dict[str, object]) -> None:
+    from vllm.v1.attention.backends.flash_v100.spec import policy
+
+    return policy._ddtree_trace_event(event, payload)
+
+
+def _ddtree_trace_enabled() -> bool:
+    from vllm.v1.attention.backends.flash_v100.spec import policy
+
+    return policy._ddtree_trace_enabled()
