@@ -259,9 +259,9 @@ def reset_routes():
         raise RuntimeError("No routing recorders were attached before graph capture")
     for recorder in _RECORDERS.values():
         recorder.counter.zero_()
-    for recorder in _SELECTIONS.values():
-        recorder.counter.zero_()
-        state = getattr(recorder.owner, "host_kv", None)
+    for selection in _SELECTIONS.values():
+        selection.counter.zero_()
+        state = getattr(selection.owner, "host_kv", None)
         if state is not None:
             state._stats.zero_()
     torch.accelerator.synchronize()
