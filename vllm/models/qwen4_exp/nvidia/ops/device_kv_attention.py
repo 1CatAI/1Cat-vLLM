@@ -38,14 +38,16 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
         return
     key = (state.history.device, state.width)
     if key not in _WORKSPACES:
-        splits = (state.width + 63) // 64
+        # The protected launch policy uses 16-column tiles and up to 64 splits,
+        # including at short widths. Bound all admitted M values before capture.
+        elements = max(
+            rows * 6 * _attention_profile(rows, state.width)[2] for rows in range(1, 21)
+        )
         _WORKSPACES[key] = (
             torch.empty(
-                20 * 6 * splits * 256, dtype=torch.float32, device=state.history.device
+                elements * 256, dtype=torch.float32, device=state.history.device
             ),
-            torch.empty(
-                20 * 6 * splits * 2, dtype=torch.float32, device=state.history.device
-            ),
+            torch.empty(elements, dtype=torch.float32, device=state.history.device),
         )
     state.device_history_workspace = _WORKSPACES[key]
 
@@ -95,26 +97,34 @@ def device_history_attention(
     return True
 
 
+def _attention_profile(rows, width):
+    from vllm.triton_utils import triton
+
+    from .qsa import (
+        _qsa_sparse_launch_profile,
+        _use_sm70_qsa_two_warp_partial,
+    )
+
+    heads, dim, block_m = 6, 256, 8
+    block_n, target, warps = _qsa_sparse_launch_profile(rows, block_m, True)
+    if _use_sm70_qsa_two_warp_partial(rows, heads, dim):
+        warps = 2
+    tiles = triton.cdiv(width, block_n)
+    splits = min(1 << (tiles.bit_length() - 1), target)
+    return block_m, block_n, splits, warps
+
+
 def _direct_history_triton(
     query, state, indices, table, requests, positions, lengths, out, gate, workspace
 ):
     """Remove placement dependencies while retaining protected QSA arithmetic."""
     from vllm.triton_utils import triton
 
-    from .qsa import (
-        _qsa_merge_splitk_kernel,
-        _qsa_sparse_launch_profile,
-        _qsa_sparse_paged_gqa_splitk_kernel,
-        _use_sm70_qsa_two_warp_partial,
-    )
+    from .qsa import _qsa_merge_splitk_kernel, _qsa_sparse_paged_gqa_splitk_kernel
 
     rows, heads, dim = query.shape
-    block_m = triton.next_power_of_2(heads)
-    block_n, target, warps = _qsa_sparse_launch_profile(rows, block_m, True)
-    if _use_sm70_qsa_two_warp_partial(rows, heads, dim):
-        warps = 2
+    block_m, block_n, splits, warps = _attention_profile(rows, indices.shape[1])
     tiles = triton.cdiv(indices.shape[1], block_n)
-    splits = min(1 << (tiles.bit_length() - 1), target)
     if splits == 1:
         partial = lse = out
     else:
