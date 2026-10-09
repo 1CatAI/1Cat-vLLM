@@ -50,3 +50,13 @@ def test_other_mtp_overrides_unchanged() -> None:
     assert config.model_type == "deepseek_mtp"
     assert config.architectures == ["DeepSeekMTPModel"]
     assert not getattr(config, "is_mtp_draft", False)
+
+
+def test_glm53_mtp_override_is_idempotent() -> None:
+    config = SpeculativeConfig.hf_config_override(
+        _glm53_config("Glm5NextForCausalLM")
+    )
+    assert SpeculativeConfig.hf_config_override(config) is config
+    assert config.model_type == "glm5_next_mtp"
+    assert config.architectures == ["Glm5NextMTPModel"]
+    assert config.hc_mult == 1

@@ -345,6 +345,8 @@ class Glm5NextConfig(PretrainedConfig):
         The draft head reads the collapsed post-norm trunk state, not the
         multi-stream hyper-connection residual, so it runs with ``hc_mult=1``.
         """
+        if getattr(self, "is_mtp_draft", False):
+            return self
         arch = self.architectures[0]
         self.model_type = f"{self.model_type}_mtp"
         self.update(
