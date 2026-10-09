@@ -152,6 +152,94 @@ clean-wheel audit preserves all 16 previous native modules byte-for-byte and
 adds only the resident MoE module. This packaging check does not promote the
 experimental operators to model dispatch or establish an end-to-end gain.
 
+## MonoMoE implementation comparison
+
+This audit compares the experiments above with the
+[MonoMoE paper](https://arxiv.org/html/2609.04244v1) and FlashInfer commit
+`8e39ceb390302b0d1eeb5ccca6787f4b688efc9a`, especially its
+[design](https://github.com/flashinfer-ai/flashinfer/blob/8e39ceb390302b0d1eeb5ccca6787f4b688efc9a/docs/design_docs/monomoe_kernel.md),
+`moe.cuh`, `moe_up_projection.cuh`, and `moe_down_projection.cuh`.
+The pinned implementation is a block-FP8 Hopper specialization with
+E256/N512/K2048, at most eight tokens, and router logits supplied as an
+input. The paper describes a broader generated interface, including overlap
+with router-logit computation. Neither the router projection nor support for
+the Flash-Next IQ formats is provided by this pinned operator interface.
+
+| Mechanism | MonoMoE | Current SM70 experiments |
+| --- | --- | --- |
+| Work ownership | Expert-weight output stripes; a fixed CTA group streams an expert sequence | Weight reuse exists, but producers are distributed by gate-task ordinal; consumers own output stripes and traverse many experts |
+| Weight pipeline | Several future panels stay in flight; the next expert's first panels occupy the current expert's final pipeline slots | `load_group` immediately precedes the current integer dot; there is no separate next-panel producer or pipeline spanning expert boundaries |
+| Epilogue | Previous-expert requantization and accumulation run during the next expert's GEMM | Gate/up reduction, FP16 SiLU/multiply, Q8_1 publication and down reduction run inline before the worker takes another task |
+| Handoff | Consumers wait on their required scale/payload cells; only final stripe writers wait for completion | Chunk/expert readiness already exists, but the first schedule repeatedly inspects readiness for output-wide consumption; the six-worker schedule adds four-producer joins for each Q8_1 chunk |
+| Storage lifetime | Shared-memory views reuse storage across disjoint phases | The resident state retains gate, down, routing and partial-reduction storage together; the first schedule reserves more than half an SM's shared memory |
+| Operator boundary | Routing, quantization, both projections and combine share one launch | First resident schedule has one launch; six-worker schedule has three, equal to its existing-chain control; router remains outside both |
+
+The difference is not simply a missing global barrier removal. These
+experiments already use per-data readiness and retain graph-safe reset and
+progress checks. They do not implement MonoMoE's continuous weight pipeline
+or its overlap of epilogues with the following expert. The first kernel's
+72--80 registers/thread and underused down warps are confirmed resource
+differences. The six-worker kernel reduces block size and repeated input
+quantization, but still has 72-register workers, inline epilogues and no
+weight lookahead. The relative costs of decode instructions, memory waits,
+readiness polling and resource pressure have not been separated by counters;
+they must not be presented as measured causes of the complete-chain loss.
+
+### Bound the contribution of expert reuse
+
+The real-route M5 samples use fifty token/expert pairs. Their compulsory
+weight-byte accounting, rather than measured HBM transactions, is:
+
+| Sample | Unique experts | Route-issued bytes | Unique bytes | Potential traffic reduction |
+| --- | ---: | ---: | ---: | ---: |
+| IQ3_S, layer 17 | 39 | 29.184 MB | 22.764 MB | 22% |
+| IQ3_XXS, layer 0 | 40 | 27.264 MB | 21.811 MB | 20% |
+| IQ2_S, layer 1 | 48 | 20.864 MB | 20.029 MB | 4% |
+
+These three samples do not establish a model-wide routing average. They
+show why eliminating duplicate reads alone cannot justify a several-ms
+claim. The reuse-only AB results above already bound that implementation's
+benefit. Better memory issue efficiency and hiding dependent decode work
+are separate hypotheses that need an isolated pipeline measurement.
+
+### Adaptation to SM70
+
+The production M5 integer route already avoids padding each expert's token
+count to an eight-row GEMM tile. MonoMoE's SwapAB padding savings therefore
+cannot be counted again for that route. Its WGMMA/TMA implementation is not
+a portable SM70 kernel: ordinary loads, shared-memory publication and `dp4a`
+use SM instruction and register resources. Dedicated producers may hide load
+latency, but their decode and copying instructions still have a cost.
+
+The next experiment should isolate continuous gate/up streaming before
+combining both projections. Keep consecutive weight panels and the next
+expert's first panel in flight, distinguish singleton from shared-expert
+token lists, and defer the previous expert's epilogue when a successor is
+available. Compare with the same numerical decoder, recorded routes and
+fixed weight layout, then separately ablate lookahead and deferred epilogues.
+Record complete-chain graph time, active-warp/resource limits, polling time
+and compulsory versus issued bytes before another model admission test.
+
+Preserve the existing numerical and reset contracts:
+
+- A Q8_1 group can legitimately have zero scale. Do not transplant MonoMoE's
+  zero-scale readiness sentinel into the Q8_1 payload without a separate
+  status representation.
+- Keep FP16 gate/up and activation boundaries, Q8_1 group geometry, and
+  routing-weight placement. Applying routing weights before requantization
+  changes rounding even when the unquantized algebra is equivalent.
+- MonoMoE uses FP32 atomic output accumulation. Retain ordered FP32 reduction
+  for the first SM70 pipeline comparison so its effect is not mixed with
+  scheduling changes.
+- Do not transplant its timing-based accumulator-reset margin into the
+  narrower N160 shape. Retain explicit graph-safe reset and poisoned replay
+  tests.
+- M20 remains on its qualified path. The pinned MonoMoE specialization's
+  token cap is eight and does not establish C4 behavior.
+
+The reported H200 speedups are reference results, not a prediction for V100.
+No new operator or end-to-end gain is established by this audit.
+
 ## References
 
 Weight-major ownership and readiness scheduling are informed by
