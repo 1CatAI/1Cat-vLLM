@@ -162,6 +162,14 @@ class PolicyDefaults:
                     "value": getattr(policy, field),
                 }
             )
+        for path in POLICY_OWNERS:
+            bind = getattr(_owner(self.cfg, path), "bind_consumers", None)
+            if bind is not None:
+                bind(
+                    graph,
+                    self.cfg.observability_config.runtime_trace,
+                    self.cfg.cache_config.cache_dtype,
+                )
 
 
 EXTRA_BINDINGS = {
@@ -209,6 +217,7 @@ def finalize_runtime_policy_hashes(cfg):
     contract = model_graph_contract(cfg)
     if spec is not None:
         graph_fields.append("mtp_context_buckets")
+        graph_fields.append("mtp_context_partition_size")
     if graph.dsv4_context_buckets is not None or (
         pre_ampere and contract.compress_ratios
     ):
@@ -299,6 +308,11 @@ def runtime_policy_report(cfg):
                     else None
                 ),
                 "active": _owner(cfg, path).active,
+                "details": (
+                    _owner(cfg, path).explain()
+                    if hasattr(_owner(cfg, path), "explain")
+                    else None
+                ),
             }
             for path in POLICY_OWNERS
         },
@@ -373,6 +387,9 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
     ignored: set[str] = set()
     for path in POLICY_OWNERS:
         policy = _owner(cfg, path)
+        extra_aliases = getattr(policy, "compile_ignored_aliases", None)
+        if extra_aliases is not None:
+            ignored.update(extra_aliases())
         ignored.update(
             alias for field, alias in policy.aliases.items() if field in policy.sources
         )
@@ -388,6 +405,11 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
     trace = _owner(cfg, "observability_config.runtime_trace")
     if trace is not None:
         from vllm.config.diagnostic_dump import DUMP_BINDINGS
+
+        for child in vars(trace).values():
+            extra_aliases = getattr(child, "compile_ignored_aliases", None)
+            if extra_aliases is not None:
+                ignored.update(extra_aliases())
 
         ignored.update(trace.sampling.aliases.values())
         ignored.update(trace.dflash.aliases.values())

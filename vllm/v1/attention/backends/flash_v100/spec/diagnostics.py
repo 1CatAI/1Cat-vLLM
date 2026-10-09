@@ -8,8 +8,15 @@ import os
 
 import torch
 
-from vllm.logger import init_logger, log_once_seen, set_log_once_state
+from vllm.diagnostics import diagnostic_engine_tag, write_payload
+from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
+from vllm.v1.attention.backends.flash_v100.config import (
+    diagnostic_seen as log_once_seen,
+)
+from vllm.v1.attention.backends.flash_v100.config import (
+    mark_diagnostic as set_log_once_state,
+)
 from vllm.v1.attention.backends.flash_v100.plan import events as _events
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
@@ -149,7 +156,9 @@ class PrefixReportObserver:
             dump_path = (
                 f"/tmp/flash_v100_dflash_prefix_dump_pid{os.getpid()}_seq{event.i}.pt"
             )
-            torch.save(
+            dump_path = write_payload(
+                os.path.dirname(dump_path),
+                os.path.basename(dump_path),
                 {
                     "layer_name": event.layer_info(event.layer).get("layer_name"),
                     "causal": event.causal,
@@ -215,7 +224,7 @@ class PrefixReportObserver:
                     "key_cache_stride": tuple(event.key_cache.stride()),
                     "value_cache_stride": tuple(event.value_cache.stride()),
                 },
-                dump_path,
+                diagnostic_engine_tag(),
             )
             logger.warning(
                 "FLASH_ATTN_V100 saved DFlash prefix dump to %s "
@@ -236,7 +245,9 @@ class PrefixReportObserver:
             and (nan_count > 0)
         ):
             dump_path = f"/tmp/flash_v100_prefill_nan_dump_pid{os.getpid()}.pt"
-            torch.save(
+            dump_path = write_payload(
+                os.path.dirname(dump_path),
+                os.path.basename(dump_path),
                 {
                     "query": event.query[event.start : event.end].detach().cpu(),
                     "key_cache": event.key_cache.detach().cpu(),
@@ -254,7 +265,7 @@ class PrefixReportObserver:
                     "out_seq": event.out_seq.detach().cpu(),
                     "ref_out": ref_out.detach().cpu(),
                 },
-                dump_path,
+                diagnostic_engine_tag(),
             )
             logger.warning(
                 "FLASH_ATTN_V100 saved failing prefix prefill dump to %s", dump_path

@@ -34,7 +34,7 @@ def configured_smallq_max_query_len(
 def configured_smallq_max_model_len(
     self: Any,
 ) -> int:
-    return int(_config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0"))
+    return _config.options().value("smallq_decode_max_model_len")
 
 
 def smallq_buffer_token_capacity(self: Any, required_tokens: int) -> int:

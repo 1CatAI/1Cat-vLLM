@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ from typing import Any
 
 import torch
 
+from vllm.diagnostics import diagnostic_engine_tag, write_json_payload, write_payload
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100.spec.diagnostics import (
@@ -120,12 +120,10 @@ def _write_bhmd_compare_report(
     }
     report.update(extra)
 
-    os.makedirs(self.compare_bhmd_out_dir, exist_ok=True)
     file_name = f"bhmd_compare_pid{os.getpid()}_call{call_idx}_{time.time_ns()}.json"
-    path = os.path.join(self.compare_bhmd_out_dir, file_name)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, sort_keys=True)
-        f.write("\n")
+    write_json_payload(
+        self.compare_bhmd_out_dir, file_name, report, diagnostic_engine_tag()
+    )
 
 
 def _write_triton_compare_report(
@@ -154,15 +152,13 @@ def _write_triton_compare_report(
     }
     report.update(extra)
 
-    os.makedirs(self.compare_triton_out_dir, exist_ok=True)
     file_name = (
         f"triton_out_compare_pid{os.getpid()}_call{call_idx}_"
         f"{stage}_{time.time_ns()}.json"
     )
-    path = os.path.join(self.compare_triton_out_dir, file_name)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, sort_keys=True)
-        f.write("\n")
+    write_json_payload(
+        self.compare_triton_out_dir, file_name, report, diagnostic_engine_tag()
+    )
 
 
 def _maybe_write_triton_tensor_dump(
@@ -235,13 +231,13 @@ def _maybe_write_triton_tensor_dump(
         payload["cache_key"] = k_cont.detach().cpu()
         payload["cache_value"] = v_cont.detach().cpu()
 
-    os.makedirs(self.compare_triton_tensor_dump_dir, exist_ok=True)
     file_name = (
         f"triton_tensor_dump_pid{os.getpid()}_call{call_idx}_"
         f"{stage}_{time.time_ns()}.pt"
     )
-    path = os.path.join(self.compare_triton_tensor_dump_dir, file_name)
-    torch.save(payload, path)
+    path = write_payload(
+        self.compare_triton_tensor_dump_dir, file_name, payload, diagnostic_engine_tag()
+    )
     return {"tensor_dump_path": path}
 
 

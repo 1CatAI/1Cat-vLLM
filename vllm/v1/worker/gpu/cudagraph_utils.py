@@ -227,7 +227,7 @@ class CudaGraphManager:
                     self.decode_query_lens,
                 )
         self._sm70_dflash2_tail_graphs = bool(
-            envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
+            vllm_config.attention_config.flash_v100.options.value("tail_cudagraphs")
             and isinstance(self, ModelCudaGraphManager)
             and speculative_config is not None
             and speculative_config.method == "dflash"
@@ -540,7 +540,11 @@ class ModelCudaGraphManager(CudaGraphManager):
                 max_batch_size = 1
             if context_limit is not None:
                 if self._sm70_dflash2_tail_graphs and (
-                    bool(envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST)
+                    bool(
+                        vllm_config.attention_config.flash_v100.options.value(
+                            "scalar_tail_manifest"
+                        )
+                    )
                     or scalar_tail_attention_available()
                 ):
                     query_rows = (1, *query_rows)

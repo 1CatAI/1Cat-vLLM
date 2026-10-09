@@ -13,6 +13,10 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
+from vllm.v1.attention.backends.flash_v100.runtime import (
+    bind_attention_operation,
+    prepare_attention_runtime,
+)
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
@@ -125,16 +129,21 @@ def get_flash_ops():
             _flash_attn_prefill_paged_bhmd = None
             _flash_attn_prefill_paged_bfla = None
             _flash_attn_prefill_paged_splitkv = None
-    return (
-        _flash_attn_func,
-        _flash_attn_bhmd_func,
-        _flash_attn_decode_paged,
-        _flash_attn_decode_paged_xqa,
-        _flash_attn_decode_paged_wmma,
-        _flash_attn_prefill_paged,
-        _flash_attn_prefill_paged_bhmd,
-        _flash_attn_prefill_paged_bfla,
-        _flash_attn_prefill_paged_splitkv,
+    if _flash_attn_func is not None:
+        prepare_attention_runtime()
+    return tuple(
+        bind_attention_operation(operation)
+        for operation in (
+            _flash_attn_func,
+            _flash_attn_bhmd_func,
+            _flash_attn_decode_paged,
+            _flash_attn_decode_paged_xqa,
+            _flash_attn_decode_paged_wmma,
+            _flash_attn_prefill_paged,
+            _flash_attn_prefill_paged_bhmd,
+            _flash_attn_prefill_paged_bfla,
+            _flash_attn_prefill_paged_splitkv,
+        )
     )
 
 
@@ -145,7 +154,7 @@ def get_flash_grouped_verify_op():
     global _flash_attn_grouped_verify_request_major_abi_version
     global _flash_attn_grouped_verify_checked
     if _flash_attn_grouped_verify_checked:
-        return _flash_attn_grouped_verify_paged
+        return bind_attention_operation(_flash_attn_grouped_verify_paged)
 
     _flash_attn_grouped_verify_checked = True
     try:
@@ -174,7 +183,7 @@ def get_flash_grouped_verify_op():
             _flash_attn_grouped_verify_request_major_abi_version = 0
     except ImportError:
         _flash_attn_grouped_verify_paged = None
-    return _flash_attn_grouped_verify_paged
+    return bind_attention_operation(_flash_attn_grouped_verify_paged)
 
 
 def get_sm70_splitd_d256_ops():
@@ -250,57 +259,43 @@ def _sm70_gqa_has_fp32_accumulation() -> bool:
     return False
 
 
+_sm70_gqa_capabilities: dict[str, Callable | None] = {}
+
+
 def get_sm70_d256_gqa_architecture_op():
-    """Load the optional SM70 GQA long-prefill architecture operator."""
-    global _sm70_d256_gqa_architecture_op
+    """Select by engine policy; cache only immutable native capabilities."""
     global _sm70_d256_gqa_architecture_op_checked
-    if _sm70_d256_gqa_architecture_op_checked:
-        return _sm70_d256_gqa_architecture_op
-
-    _sm70_d256_gqa_architecture_op_checked = True
+    if not _sm70_d256_gqa_architecture_op_checked:
+        _sm70_gqa_capabilities.clear()
+        _sm70_d256_gqa_architecture_op_checked = True
+    use_v37 = _config.options().value("prefill_d256_gqa_v37")
+    op_name = "sm70_d256_gqa_v37_fwd" if use_v37 else "sm70_d256_gqa_architecture_fwd"
+    if op_name in _sm70_gqa_capabilities:
+        return _sm70_gqa_capabilities[op_name]
+    operation = None
     try:
-        op_name = (
-            "sm70_d256_gqa_v37_fwd"
-            if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
-            else "sm70_d256_gqa_architecture_fwd"
-        )
-        # The Split-D loader also resolves an explicit source-overlay
-        # sidecar. Calling it here keeps both operator families on one binary.
-        if not hasattr(
-            torch.ops._vllm_fa2_C,
-            op_name,
-        ):
+        if not hasattr(torch.ops._vllm_fa2_C, op_name):
             get_sm70_splitd_d256_ops()
-
-        if (
-            not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
-            and not _sm70_gqa_has_fp32_accumulation()
-        ):
-            _sm70_d256_gqa_architecture_op = None
+        if not use_v37 and not _sm70_gqa_has_fp32_accumulation():
+            _sm70_gqa_capabilities[op_name] = None
             return None
-        _sm70_d256_gqa_architecture_op = getattr(
-            torch.ops._vllm_fa2_C,
-            op_name,
-            None,
-        )
-        if _sm70_d256_gqa_architecture_op is None:
+        operation = getattr(torch.ops._vllm_fa2_C, op_name, None)
+        if operation is None:
             logger.warning_once(
                 "Requested SM70 GQA operator %s is absent; rebuild FA2. "
                 "Using exact dense prefill, not relabelling the old kernel.",
                 op_name,
             )
     except (AttributeError, ImportError, RuntimeError) as exc:
-        _sm70_d256_gqa_architecture_op = None
-        if _config.registered(
-            "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
-        ):
+        if _config.options().value("prefill_d256_gqa_arch_128k_experimental"):
             logger.warning_once(
                 "SM70 D256 GQA architecture operator is unavailable "
                 "(%s: %s); using the exact dense prefill kernel.",
                 type(exc).__name__,
                 exc,
             )
-    return _sm70_d256_gqa_architecture_op
+    _sm70_gqa_capabilities[op_name] = operation
+    return operation
 
 
 def get_sm70_d256_gqa_architecture_q8192_op():
@@ -366,7 +361,7 @@ def get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
             _flash_attn_forward_lse = _flash_attn_forward
         except (ImportError, AttributeError):
             _flash_attn_forward_lse = None
-    return _flash_attn_forward_lse
+    return bind_attention_operation(_flash_attn_forward_lse)
 
 
 def _get_flash_turboquant_decode_op():
@@ -387,7 +382,7 @@ def _get_flash_turboquant_decode_op():
         except ImportError:
             _flash_attn_turboquant_decode_paged = None
         _flash_attn_turboquant_decode_checked = True
-    return _flash_attn_turboquant_decode_paged
+    return bind_attention_operation(_flash_attn_turboquant_decode_paged)
 
 
 def flash_v100_turboquant_decode_available() -> bool:

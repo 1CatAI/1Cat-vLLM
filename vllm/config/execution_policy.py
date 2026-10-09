@@ -3,12 +3,16 @@
 
 """Typed execution policies captured once and serialized with their owners."""
 
+from collections.abc import Callable
+from contextlib import suppress
 from typing import ClassVar
 
 import torch
 from pydantic import Field
 
 from vllm.config.collective import CollectiveNativeConfig
+from vllm.config.execution_policy_base import ExecutionPolicy as BaseExecutionPolicy
+from vllm.config.flash_v100 import FlashV100Policy
 from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.utils import config, hash_factors
 
@@ -66,44 +70,111 @@ def read_execution_legacy(name: str):
 
 
 @config
-class ExecutionPolicy:
-    """Common provenance; computation never consumes legacy names."""
+class ExecutionPolicy(BaseExecutionPolicy):
+    """Existing execution policies retain their initialization parser dialects."""
 
-    aliases: ClassVar[dict[str, str]] = {}
-    sources: dict[str, str] = Field(default_factory=dict, init=False)
-    """Initialization source for each field; excluded from calculation hashes."""
-    active: bool = Field(default=True, init=False)
-    """Whether the owning feature can affect this engine's computation."""
-
-    hash_fields: tuple[str, ...] | None = Field(default=None, init=False)
-    """Effective computation fields; resource and unused feature choices are omitted."""
-
-    def resolve(self) -> None:
-        from vllm.config.sm70_runtime import resolve_legacy_fields
-
-        pending = {
-            field: alias
-            for field, alias in self.aliases.items()
-            if field not in self.sources
-        }
-        resolve_legacy_fields(self, pending, reader=read_execution_legacy)
-
-    def compute_hash(self) -> str:
-        return hash_factors(
-            {
-                field: getattr(self, field)
-                for field in (
-                    self.hash_fields if self.hash_fields is not None else self.aliases
-                )
-            }
-            if self.active
-            else {}
-        )
+    legacy_reader: ClassVar[Callable[[str], object] | None] = staticmethod(
+        read_execution_legacy
+    )
+    """Retain the existing execution family's initialization-only parsing."""
 
 
 @config
 class GraphPolicy(ExecutionPolicy):
     """Execution policy owned by compilation_config.runtime."""
+
+    legacy_inputs: dict[str, str | None] = Field(default_factory=dict, init=False)
+    """Original graph inputs for existing native parser projections."""
+    decode_partition: int | None = Field(default=None, init=False)
+    """Parsed partition override; None retains dynamic context selection."""
+    decode_partition_error: tuple[str, str | None] | None = Field(
+        default=None, init=False
+    )
+    """Captured error for the original attention admission checkpoint."""
+
+    def resolve(self) -> None:
+        import os
+
+        if not self.legacy_inputs:
+            self.legacy_inputs = {
+                field: os.getenv(alias) for field, alias in self.aliases.items()
+            }
+        super().resolve()
+        self.decode_partition = None
+        self.decode_partition_error = None
+        raw_decode = self.decode_partition_size
+        if raw_decode is not None:
+            try:
+                self.decode_partition = int(raw_decode)
+            except ValueError as exc:
+                self.decode_partition_error = (
+                    "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
+                    f"(256, 512, 1024), got {raw_decode!r}",
+                    str(exc),
+                )
+            else:
+                if self.decode_partition not in (256, 512, 1024):
+                    self.decode_partition_error = (
+                        "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
+                        f"(256, 512, 1024), got {self.decode_partition}",
+                        None,
+                    )
+        self.mtp_partition_error = None
+        self.mtp_partition = None
+        raw = self.mtp_context_partition_size
+        if raw is not None:
+            try:
+                self.mtp_partition = int(raw)
+            except ValueError as exc:
+                self.mtp_partition_error = (
+                    "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
+                    f"(256, 512, 1024), got {raw!r}",
+                    str(exc),
+                )
+            else:
+                if self.mtp_partition not in (256, 512, 1024):
+                    self.mtp_partition_error = (
+                        "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
+                        f"(256, 512, 1024), got {self.mtp_partition}",
+                        None,
+                    )
+
+    mtp_context_partition_size: str | int | None = None
+    """Partition override for the existing MTP context buckets."""
+    mtp_partition: int | None = Field(default=None, init=False)
+    """Parsed override; request/context bucket selection remains dynamic."""
+    mtp_partition_error: tuple[str, str | None] | None = Field(default=None, init=False)
+    """Deferred partition error, consumed only at the original admission point."""
+
+    def mtp_partition_hint(self):
+        if self.mtp_partition_error is not None:
+            message, cause = self.mtp_partition_error
+            if cause is not None:
+                raise ValueError(message) from ValueError(cause)
+            raise ValueError(message)
+        return self.mtp_partition
+
+    def decode_partition_hint(self):
+        if self.decode_partition_error is not None:
+            message, cause = self.decode_partition_error
+            if cause is not None:
+                raise ValueError(message) from ValueError(cause)
+            raise ValueError(message)
+        return self.decode_partition
+
+    def compute_hash(self):
+        values = {
+            field: getattr(self, field)
+            for field in (
+                self.hash_fields if self.hash_fields is not None else self.aliases
+            )
+        }
+        for field in ("decode_partition_size", "mtp_context_partition_size"):
+            if values.get(field) is not None:
+                # An invalid input retains its original error spelling.
+                with suppress(ValueError):
+                    values[field] = int(values[field])
+        return hash_factors(values if self.active else {})
 
     mtp_context_buckets: str | tuple[int, ...] | None = None
     """Explicit verification context buckets; empty disables, None uses defaults."""
@@ -160,6 +231,7 @@ class GraphPolicy(ExecutionPolicy):
     """Use the existing graph memory admission estimator."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "mtp_context_partition_size": "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE",
         "aot_compile": "VLLM_USE_AOT_COMPILE",
         "mega_aot": "VLLM_USE_MEGA_AOT_ARTIFACT",
         "breakable": "VLLM_USE_BREAKABLE_CUDAGRAPH",
@@ -458,36 +530,6 @@ class PlePlacementPolicy(ExecutionPolicy):
         "hybrid": "VLLM_SM70_QWEN38_HYBRID_PLE",
         "cpu": "VLLM_PLE_CPU_OFFLOAD",
         "disk": "VLLM_PLE_DISK_OFFLOAD",
-    }
-
-
-@config
-class FlashV100Policy(ExecutionPolicy):
-    """Execution policy owned by attention_config.flash_v100."""
-
-    enabled: bool | None = None
-    """Retain the platform's Flash-V100 backend qualification switch."""
-
-    bfla_keep_ratio: float | None = None
-    """Retained fraction for block-filtered prefill attention."""
-
-    grouped_verify: bool | None = None
-    """Enable the qualified grouped speculative attention operator."""
-
-    grouped_verify_min_model_len: int | None = None
-    """Minimum model context for grouped verification."""
-
-    smallq_max_q: int | None = None
-    """Largest query length admitted by small-query decode."""
-
-    aliases: ClassVar[dict[str, str]] = {
-        "bfla_keep_ratio": "VLLM_FLASH_V100_BFLA_KEEP_RATIO",
-        "grouped_verify": "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY",
-        "grouped_verify_min_model_len": (
-            "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN"
-        ),
-        "smallq_max_q": "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q",
-        "enabled": "VLLM_SM70_FLASH_ATTN_V100",
     }
 
 

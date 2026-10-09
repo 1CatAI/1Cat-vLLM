@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.triton_attn import (
 from vllm.v1.attention.kv_codecs import (
     resolve_kv_codec,
 )
+from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 _warned_prefill_gather_oom = False
@@ -382,6 +383,9 @@ def _get_prefill_gather_dense_workspace(
     required_blocks: int,
     max_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    cache = workspace_cache(
+        "prefill_gather_dense_workspaces", _prefill_gather_dense_workspaces
+    )
     global _warned_prefill_gather_oom
 
     if required_blocks <= 0:
@@ -404,8 +408,9 @@ def _get_prefill_gather_dense_workspace(
         int(key_cache.shape[2]),
         int(key_cache.shape[3]),
     )
-    workspace = _prefill_gather_dense_workspaces.get(cache_key)
+    workspace = cache.get(cache_key)
     if workspace is not None and workspace[0].shape[0] >= required_blocks:
+        retain_for_capture(cache, workspace, key_cache)
         return workspace[0][:required_blocks], workspace[1][:required_blocks]
     if _routing.is_cuda_graph_capturing(key_cache):
         return None
@@ -424,7 +429,7 @@ def _get_prefill_gather_dense_workspace(
         return key_out, torch.empty_like(key_out)
 
     workspace = None
-    _prefill_gather_dense_workspaces.pop(cache_key, None)
+    cache.pop(cache_key, None)
     allocated = _workspace.allocate_growing_workspace(
         _allocate, on_cuda=key_cache.is_cuda
     )
@@ -437,7 +442,7 @@ def _get_prefill_gather_dense_workspace(
             _warned_prefill_gather_oom = True
         return None
     key_out, value_out = allocated
-    _prefill_gather_dense_workspaces[cache_key] = key_out, value_out
+    cache[cache_key] = key_out, value_out
     return key_out[:required_blocks], value_out[:required_blocks]
 
 

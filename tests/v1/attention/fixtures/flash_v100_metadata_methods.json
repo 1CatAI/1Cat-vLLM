@@ -1,8 +1,8 @@
 {
   "base_sha": "fb6b12c5b8013ec43b5c34e0135857f3b0fb74e7",
   "methods": {
-    "_configured_smallq_max_query_len": "03c48326647269f99ef5ebaf48134effe2acb4f3fb96a7620432aeb1c2629bf2",
-    "_configured_smallq_max_model_len": "e1f00fe1cdeca5d0bed5be30e23626b1c089ff7b756d9fb3b38c7991006e1bb8",
+    "_configured_smallq_max_query_len": "6f5ece5518345ec90d321dbde09c5e4fb51eb77f088c4a508025e147dc29af4e",
+    "_configured_smallq_max_model_len": "4c1b52d387a5a06e6f79141068f535e8c70a7551ecc2392075ef2f02dd420333",
     "_smallq_buffer_token_capacity": "5cd843820fa4d846dd0bdd92c4e3ebc940b7bffc0e2617cba3b1b0ad099249ab",
     "_ensure_smallq_decode_buffers": "75c1bc7d1f99aec92c560a75128629a6cf8643b2e456f38f0248197d88479fc5",
     "_clear_smallq_decode_metadata": "5ce3fbb1465067b61705c71b442ebab82381bfe19331b1845697a0cd8de50f50",
@@ -15,5 +15,10 @@
     "copy_dflash_graph_metadata": "47bc40edbd28836c9b30c8ae9d4cd0584fa052dd112bd31bb54db9d5d7678689",
     "build_for_drafting": "60899fcaf446aca846a3c47021429d72e8bb5fff369f7966bb0866640e43cdc7",
     "build": "cf6ed8f1cd8fd8c379f7101e115bdce95c47ae0abd16742400f4f478a61e247d"
+  },
+  "policy_migrations": {
+    "_configured_smallq_max_query_len": "C: attention_config.flash_v100.smallq_max_q; pre-existing typed getter, unchanged in D4",
+    "_configured_smallq_max_model_len": "D4: attention_config.flash_v100.options.smallq_decode_max_model_len",
+    "behavior_test": "tests/config/test_flash_v100_lifecycle.py::test_smallq_metadata_uses_initialized_policy_after_environment_change"
   }
 }

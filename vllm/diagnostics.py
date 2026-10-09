@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Engine-owned diagnostic counters, capture buffers and output management."""
 
+import json
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -299,3 +300,19 @@ def write_payload(
     path = output_path(directory, filename, engine_tag)
     torch.save(payload, path)
     return path
+
+
+def write_json_payload(
+    directory: str, filename: str, payload: dict, engine_tag: str = ""
+) -> str:
+    os.makedirs(directory, exist_ok=True)
+    path = output_path(directory, filename, engine_tag)
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    return path
+
+
+def diagnostic_engine_tag() -> str:
+    owner = diagnostics_for()
+    return "" if owner is None else owner.engine_tag

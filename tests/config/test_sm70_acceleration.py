@@ -78,11 +78,12 @@ def config(monkeypatch):
             inductor_compile_config={},
         ),
     )
-    from vllm.config import AttentionConfig, OffloadConfig
+    from vllm.config import AttentionConfig, ObservabilityConfig, OffloadConfig
     from vllm.config.execution_policy import CommunicationPolicy, GraphPolicy
     from vllm.config.policy_defaults import PolicyDefaults
 
     cfg.attention_config = AttentionConfig()
+    cfg.observability_config = ObservabilityConfig()
     cfg.offload_config = OffloadConfig()
     cfg.compilation_config.runtime = GraphPolicy()
     cfg.parallel_config.communication = CommunicationPolicy()
@@ -129,12 +130,15 @@ def test_bm32_report_explains_fallback(config, monkeypatch, change, reason):
     config.cache_config.block_size = change.get("block_size", 816)
     config.model_config.dtype = change.get("dtype", torch.float16)
     config.model_config.hf_text_config.head_dim = change.get("head_dim", 256)
-    monkeypatch.setenv(
-        "VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM", change.get("low_smem", "1")
+    from vllm.config.flash_v100 import FlashV100Options
+
+    # Explain a new resolved policy; reports do not sample the live environment.
+    options = FlashV100Options(
+        prefill_d256_low_smem=change.get("low_smem", "1") != "0",
+        prefill_d256_bm32_phase=change.get("phase", "1") != "0",
     )
-    monkeypatch.setenv(
-        "VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE", change.get("phase", "1")
-    )
+    options.resolve()
+    config.attention_config.flash_v100.options = options
     row = acc._bm32_paged_prefill_report(
         config, {"bm32_aligned_pages": change.get("native", True)}
     )

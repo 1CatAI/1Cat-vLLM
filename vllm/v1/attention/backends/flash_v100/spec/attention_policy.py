@@ -26,9 +26,9 @@ def initialize_scalar_tail(self: Any, use_e4m3_fp32: bool) -> None:
 
     if (
         use_e4m3_fp32
-        and _config.registered("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS")
+        and _config.options().value("tail_cudagraphs")
         and (
-            _config.registered("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST")
+            _config.options().value("scalar_tail_manifest")
             or scalar_tail_attention_available()
         )
         and not graph_policy().decode_partition_size
@@ -36,7 +36,7 @@ def initialize_scalar_tail(self: Any, use_e4m3_fp32: bool) -> None:
         # An empty name selects the operator compiled into this extension;
         # a manifest name keeps the explicit experimental override.
         self._sm70_scalar_tail_attention = load_scalar_tail_attention(
-            _config.registered("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST") or "",
+            _config.options().value("scalar_tail_manifest") or "",
             torch.device("cuda", torch.accelerator.current_device_index()),
         )
 
@@ -80,7 +80,7 @@ def configure_verifier(self: Any) -> None:
     )
     self.use_dflash2_batched_grouped_verify = (
         self.use_dflash2_grouped_verify
-        and _config.registered("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY")
+        and _config.options().value("dflash2_batched_grouped_verify")
     )
     self.dflash2_grouped_verify_min_model_len = (
         flash_v100_policy().grouped_verify_min_model_len

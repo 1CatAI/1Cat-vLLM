@@ -137,11 +137,18 @@ def _config(**overrides: object) -> SimpleNamespace:
     )
     from types import MethodType
 
-    from vllm.config import AttentionConfig, KernelConfig, OffloadConfig, VllmConfig
+    from vllm.config import (
+        AttentionConfig,
+        KernelConfig,
+        ObservabilityConfig,
+        OffloadConfig,
+        VllmConfig,
+    )
     from vllm.config.execution_policy import CommunicationPolicy, GraphPolicy
 
     cfg.kernel_config = KernelConfig()
     cfg.attention_config = AttentionConfig()
+    cfg.observability_config = ObservabilityConfig()
     cfg.offload_config = OffloadConfig()
     cfg.compilation_config.runtime = GraphPolicy()
     cfg.parallel_config.communication = CommunicationPolicy()

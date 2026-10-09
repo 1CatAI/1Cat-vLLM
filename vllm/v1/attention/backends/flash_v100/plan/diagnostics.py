@@ -14,7 +14,7 @@ from vllm.v1.attention.backends.flash_v100.plan.events import (
 
 
 def sm70_profile_trace(message: str, *args: object) -> None:
-    if _config.registered("VLLM_SM70_PROFILE_TRACE"):
+    if _config.trace().profile_trace:
         if args:
             message = message % args
         diagnostic_messages.emit(
@@ -26,11 +26,11 @@ _draft_graph_debug_counts: dict[str, int] = {}
 
 
 def draft_graph_debug_enabled() -> bool:
-    return _config.raw("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG", "0") == "1"
+    return _config.trace().flash_v100.value("draft_graph_debug")
 
 
 def _draft_graph_debug_limit() -> int:
-    return int(_config.raw("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT", "12"))
+    return _config.trace().flash_v100.value("draft_graph_debug_limit")
 
 
 def format_tensor_debug(tensor: torch.Tensor | None, name: str) -> str:
@@ -58,10 +58,11 @@ def format_tensor_debug(tensor: torch.Tensor | None, name: str) -> str:
 def draft_graph_debug_log(key: str, message: str, *args: object) -> None:
     if not draft_graph_debug_enabled():
         return
-    count = _draft_graph_debug_counts.get(key, 0)
+    counts = _config.observations("draft_graph", _draft_graph_debug_counts)
+    count = counts.get(key, 0)
     if count >= _draft_graph_debug_limit():
         return
-    _draft_graph_debug_counts[key] = count + 1
+    counts[key] = count + 1
     if args:
         message = message % args
     diagnostic_messages.emit(
@@ -74,10 +75,11 @@ def draft_graph_debug_log(key: str, message: str, *args: object) -> None:
 def graph_metadata_debug_log(key: str, message: str, *args: object) -> None:
     if not draft_graph_debug_enabled():
         return
-    count = _draft_graph_debug_counts.get(key, 0)
+    counts = _config.observations("draft_graph", _draft_graph_debug_counts)
+    count = counts.get(key, 0)
     if count >= _draft_graph_debug_limit():
         return
-    _draft_graph_debug_counts[key] = count + 1
+    counts[key] = count + 1
     if args:
         message = message % args
     diagnostic_messages.emit(

@@ -184,7 +184,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         ) = _ops.get_flash_ops()
         self.flash_attn_grouped_verify_paged = _ops.get_flash_grouped_verify_op()
         use_e4m3_fp32 = (
-            _config.registered("VLLM_FLASH_V100_E4M3_GROUPED_FP32")
+            _config.options().value("e4m3_grouped_fp32")
             and self.kv_codec is FP8_E4M3
             and current_platform.is_device_capability(70)
         )
@@ -242,114 +242,97 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
 
     def _initialize_prefill_policy(self):
-        paged_prefill_enable = _config.raw("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
-        paged_prefill_disable = (
-            _config.raw("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1"
-        )
+        paged_prefill_enable = _config.options().value("enable_paged_prefill")
+        paged_prefill_disable = _config.options().value("disable_paged_prefill")
         self.use_flash_v100_prefill_paged = (
             self.flash_attn_prefill_paged is not None
-            and paged_prefill_enable != "0"
+            and paged_prefill_enable
             and not paged_prefill_disable
         )
         self.use_fp8_prefill_bridge = (
             self.fp8_e4m3_paged_kv_to_fp16 is not None
             if self.kv_codec is FP8_E4M3
             else self.fp8_e5m2_paged_kv_to_fp16 is not None
-        ) and _config.raw("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1") != "0"
+        ) and _config.options().value("fp8_prefill_bridge")
         self.use_flash_v100_prefill_splitkv = (
             self.flash_attn_prefill_paged_splitkv is not None
-            and _config.registered("VLLM_FLASH_V100_PREFILL_SPLIT_KV")
+            and _config.options().value("prefill_split_kv")
             and self.use_flash_v100_prefill_paged
         )
         self.use_flash_v100_prefill_bfla = (
             self.flash_attn_prefill_paged_bfla is not None
-            and _config.registered("VLLM_FLASH_V100_BFLA_PREFILL")
+            and _config.options().value("bfla_prefill")
             and self.use_flash_v100_prefill_paged
         )
         self.use_flash_v100_prefill_contig_dense = (
             self.flash_attn_func is not None
             and self.use_flash_v100_prefill_paged
-            and _config.registered("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE")
+            and _config.options().value("prefill_contig_dense")
         )
-        self.prefill_contig_dense_min_q = _config.registered(
-            "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q"
+        self.prefill_contig_dense_min_q = _config.options().value(
+            "prefill_contig_dense_min_q"
         )
-        self.prefill_contig_dense_min_kv = _config.registered(
-            "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV"
+        self.prefill_contig_dense_min_kv = _config.options().value(
+            "prefill_contig_dense_min_kv"
         )
-        self.prefill_contig_dense_allow_copy = _config.registered(
-            "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY"
+        self.prefill_contig_dense_allow_copy = _config.options().value(
+            "prefill_contig_dense_allow_copy"
         )
         self.use_flash_v100_prefill_gather_dense = (
             self.use_flash_v100_prefill_paged
-            and _config.registered("VLLM_FLASH_V100_PREFILL_GATHER_DENSE")
+            and _config.options().value("prefill_gather_dense")
         )
-        self.prefill_gather_dense_min_q = _config.registered(
-            "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q"
+        self.prefill_gather_dense_min_q = _config.options().value(
+            "prefill_gather_dense_min_q"
         )
-        self.prefill_gather_dense_min_kv = _config.registered(
-            "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV"
+        self.prefill_gather_dense_min_kv = _config.options().value(
+            "prefill_gather_dense_min_kv"
         )
-        self.prefill_split_kv_tokens = _config.registered(
-            "VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS"
+        self.prefill_split_kv_tokens = _config.options().value(
+            "prefill_split_kv_tokens"
         )
-        self.prefill_split_kv_min_q = _config.registered(
-            "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q"
+        self.prefill_split_kv_min_q = _config.options().value("prefill_split_kv_min_q")
+        self.prefill_split_kv_max_q = _config.options().value("prefill_split_kv_max_q")
+        self.prefill_split_kv_min_kv = _config.options().value(
+            "prefill_split_kv_min_kv"
         )
-        self.prefill_split_kv_max_q = _config.registered(
-            "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q"
-        )
-        self.prefill_split_kv_min_kv = _config.registered(
-            "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV"
-        )
-        self.prefill_bfla_min_q = _config.registered("VLLM_FLASH_V100_BFLA_MIN_Q")
-        self.prefill_bfla_min_kv = _config.registered("VLLM_FLASH_V100_BFLA_MIN_KV")
-        self.prefill_bfla_mask_block_n = _config.registered(
-            "VLLM_FLASH_V100_BFLA_MASK_BLOCK_N"
-        )
-        self.use_prefill_paged_cache = (
-            _config.raw("VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE", "0") == "1"
+        self.prefill_bfla_min_q = _config.options().value("bfla_min_q")
+        self.prefill_bfla_min_kv = _config.options().value("bfla_min_kv")
+        self.prefill_bfla_mask_block_n = _config.options().value("bfla_mask_block_n")
+        self.use_prefill_paged_cache = _config.options().value(
+            "prefill_use_paged_cache"
         )
         # Explicit diagnostic fallback only. The production migration target is
         # a complete Flash-V100 backend, so selected Flash routes should not
         # hide Flash prefill issues behind Triton by default.
-        self.use_triton_prefill = (
-            _config.raw("VLLM_FLASH_V100_PREFILL_USE_TRITON", "0") != "0"
-        )
-        self.allow_triton_fallback = (
-            _config.raw("VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK", "0") == "1"
-        )
+        self.use_triton_prefill = _config.options().value("prefill_use_triton")
+        self.allow_triton_fallback = _config.options().value("allow_triton_fallback")
         self.smallq_decode_max_query_len = int(
             cast(int, flash_v100_policy().smallq_max_q)
         )
-        self.smallq_decode_max_model_len = int(
-            _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")
+        self.smallq_decode_max_model_len = _config.options().value(
+            "smallq_decode_max_model_len"
         )
 
     def _initialize_decode_policy(self):
-        self.use_decode_dense_reference = (
-            _config.raw("VLLM_FLASH_V100_DECODE_DENSE_REFERENCE", "0") == "1"
+        self.use_decode_dense_reference = _config.options().value(
+            "decode_dense_reference"
         )
-        self.use_decode_dense_cache = (
-            _config.raw("VLLM_FLASH_V100_DECODE_DENSE_CACHE", "0") == "1"
-        )
+        self.use_decode_dense_cache = _config.options().value("decode_dense_cache")
         # Classified quality rule: long q=1 scalar paged decode is a Type-B
         # reduction-order path, not a Type-A layout bug. Keep it as the
         # production Flash decode default so an explicit FLASH_ATTN_V100
         # selection does not silently become Triton during CUDA graph capture.
-        decode_paged_prefill_env = _config.raw(
-            "VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL"
+        decode_paged_prefill_env = _config.options().value("decode_use_paged_prefill")
+        self.use_decode_paged_prefill = decode_paged_prefill_env
+        decode_bhmd_out_env = _config.options().value("decode_use_bhmd_out")
+        self.use_decode_paged_prefill_bhmd_out = decode_bhmd_out_env
+        self.use_decode_wmma_wrapper = _config.options().value(
+            "decode_use_wmma_wrapper"
         )
-        self.use_decode_paged_prefill = decode_paged_prefill_env == "1"
-        decode_bhmd_out_env = _config.raw("VLLM_FLASH_V100_DECODE_USE_BHMD_OUT")
-        self.use_decode_paged_prefill_bhmd_out = decode_bhmd_out_env != "0"
-        self.use_decode_wmma_wrapper = (
-            _config.raw("VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER", "0") == "1"
-        )
-        self.use_decode_xqa = _config.raw("VLLM_FLASH_V100_DECODE_USE_XQA", "1") == "1"
-        self.use_smallq_decode_xqa = (
-            self.use_decode_xqa
-            and _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", "1") == "1"
+        self.use_decode_xqa = _config.options().value("decode_use_xqa")
+        self.use_smallq_decode_xqa = self.use_decode_xqa and _config.options().value(
+            "smallq_decode_use_xqa"
         )
         self.decode_strategy = _routing.resolve_decode_strategy(
             self.kv_codec,
@@ -359,24 +342,26 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and self.num_heads == 6 * self.num_kv_heads,
         )
         self.spec_attention.configure_verifier(self.flash_attn_grouped_verify_paged)
-        decode_scalar_paged_env = _config.raw("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
-        self.use_decode_scalar_paged = decode_scalar_paged_env != "0"
-        self.compare_bhmd_out_dir = _config.raw("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR")
-        self.compare_bhmd_out_max_calls = int(
-            _config.raw("VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS", "0")
+        decode_scalar_paged_env = _config.options().value("decode_use_scalar_paged")
+        self.use_decode_scalar_paged = decode_scalar_paged_env
+        self.compare_bhmd_out_dir = _config.trace().flash_v100.value(
+            "compare_bhmd_out_dir"
+        )
+        self.compare_bhmd_out_max_calls = _config.trace().flash_v100.value(
+            "compare_bhmd_out_max_calls"
         )
         self._compare_bhmd_out_calls = 0
-        self.compare_triton_out_dir = _config.raw(
-            "VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR"
+        self.compare_triton_out_dir = _config.trace().flash_v100.value(
+            "compare_triton_out_dir"
         )
-        self.compare_triton_out_max_calls = int(
-            _config.raw("VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS", "0")
+        self.compare_triton_out_max_calls = _config.trace().flash_v100.value(
+            "compare_triton_out_max_calls"
         )
-        self.compare_triton_tensor_dump_dir = _config.raw(
-            "VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_DIR"
+        self.compare_triton_tensor_dump_dir = _config.trace().flash_v100.value(
+            "compare_triton_tensor_dump_dir"
         )
-        self.compare_triton_tensor_dump_max_tokens = int(
-            _config.raw("VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS", "64")
+        self.compare_triton_tensor_dump_max_tokens = _config.trace().flash_v100.value(
+            "compare_triton_tensor_dump_max_tokens"
         )
         self._compare_triton_out_calls = 0
         self.workspace = _decode.V100Workspace()

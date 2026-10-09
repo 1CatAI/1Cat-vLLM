@@ -211,7 +211,7 @@ class BflaPrefill(SequenceCandidate):
 class Fa2Prefill(SequenceCandidate):
     def admit(self, request: PrefillRequest) -> bool:
         return (
-            _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL")
+            _config.options().value("fa2_d256_prefill")
             and request.key_cache.dtype == torch.float16
             and (request.value_cache.dtype == torch.float16)
             and (request.q_len >= 1024)
@@ -423,7 +423,7 @@ class ContiguousDensePrefill(SequenceCandidate):
         self.executor.ops.log_contiguous_dense(self.executor.config)
         k_dense, v_dense = contig_dense_kv
         fa2_out = None
-        if _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL"):
+        if _config.options().value("fa2_d256_prefill"):
             cu_q, cu_k = self.executor.ops.uniform(
                 request.q_seq,
                 batch_size=1,

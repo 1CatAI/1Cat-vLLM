@@ -2575,7 +2575,10 @@ def test_flash_v100_decode_uses_xqa_by_default_when_shape_supported(monkeypatch)
 
 
 @pytest.mark.parametrize("dflash_target", [False, True])
-def test_flash_v100_decode_e4m3_respects_dflash_fp32_policy(monkeypatch, dflash_target):
+@pytest.mark.parametrize("strategy", ["shared", "legacy"])
+def test_flash_v100_decode_e4m3_respects_dflash_fp32_policy(
+    monkeypatch, dflash_target, strategy
+):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
     monkeypatch.delenv("VLLM_FLASH_V100_DECODE_USE_XQA", raising=False)
@@ -2590,6 +2593,10 @@ def test_flash_v100_decode_e4m3_respects_dflash_fp32_policy(monkeypatch, dflash_
         sliding_window=None,
         kv_cache_dtype="fp8_e4m3",
     )
+    # The real extension can select shared during construction, whereas the
+    # source-only fixture lacks its revision. Exercise each declared strategy
+    # independently of which optional extension is installed on the test host.
+    impl.decode_strategy = strategy
     calls: list[tuple[str, int | None, str | None]] = []
 
     def hit_xqa(*args, **kwargs):
@@ -2635,7 +2642,9 @@ def test_flash_v100_decode_e4m3_respects_dflash_fp32_policy(monkeypatch, dflash_
 
     assert result is output
     assert calls == [
-        ("scalar", None, "fp8_e4m3") if dflash_target else ("xqa", 64, "fp8_e4m3")
+        ("scalar", None, "fp8_e4m3")
+        if dflash_target
+        else ("xqa", 64 if strategy == "legacy" else None, "fp8_e4m3")
     ]
     assert torch.all(output == 1)
 

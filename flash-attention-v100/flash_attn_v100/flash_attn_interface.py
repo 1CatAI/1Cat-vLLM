@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
-import os
 
 import torch
+
+from . import legacy_policy as _legacy
 
 try:
     from . import flash_attn_v100_cuda
@@ -109,12 +110,16 @@ def _round_decode_partition_capacity(required_num_partitions: int) -> int:
     return 1 << (required_num_partitions - 1).bit_length()
 
 
-def _decode_dynamic_partitions_enabled() -> bool:
-    return os.getenv("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
+def _decode_dynamic_partitions_enabled(*, _runtime=None) -> bool:
+    return (
+        _runtime.policy.dynamic_partitions
+        if _runtime is not None
+        else _legacy.dynamic_partitions()
+    )
 
 
-def _xqa_staged_pv_enabled() -> bool:
-    return os.getenv("VLLM_FLASH_V100_XQA_STAGED_PV", "0") == "1"
+def _xqa_staged_pv_enabled(*, _runtime=None) -> bool:
+    return _runtime.policy.staged_pv if _runtime is not None else _legacy.staged_pv()
 
 
 def _cuda_graph_capture_active() -> bool:
@@ -172,6 +177,7 @@ def _get_decode_plan(
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
     valid_partition_sizes: tuple[int, ...] = VALID_DECODE_PARTITION_SIZES,
+    _runtime=None,
 ) -> _DecodePlan:
     batch_capacity = batch_size_hint or block_table.shape[0]
     num_heads = q.shape[1]
@@ -214,9 +220,14 @@ def _get_decode_plan(
             num_kv_heads=k_cache.shape[2],
             max_seq_len_hint=effective_max_seq_len,
             batch_size_hint=batch_capacity,
+            _runtime=_runtime,
         )
         if partition_size not in valid_partition_sizes:
-            if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
+            if (
+                _runtime.policy.partition()
+                if _runtime is not None
+                else _legacy.partition_size()
+            ) is not None:
                 _validate_decode_partition_size(
                     partition_size,
                     "VLLM_FLASH_V100_DECODE_PARTITION_SIZE",
@@ -270,10 +281,14 @@ def _get_decode_plan(
         plan.workspace_num_partitions,
     )
     if _can_cache_workspace(q) and workspace_seq_capacity_hint is None:
-        cached = _decode_plan_cache.get(key)
+        cached = (
+            _runtime.decode_plan_cache if _runtime is not None else _decode_plan_cache
+        ).get(key)
         if cached is not None:
             return cached
-        _decode_plan_cache[key] = plan
+        (_runtime.decode_plan_cache if _runtime is not None else _decode_plan_cache)[
+            key
+        ] = plan
     return plan
 
 
@@ -337,10 +352,15 @@ def _get_decode_workspace_for_plan(
     plan: _DecodePlan,
     active_num_partitions: torch.Tensor | None = None,
     partial_dtype: torch.dtype = torch.float16,
+    _runtime=None,
 ):
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
-    share_rows = os.getenv("VLLM_FLASH_V100_SHARE_DECODE_WORKSPACE", "1") != "0"
+    share_rows = (
+        _runtime.policy.share_workspace
+        if _runtime is not None
+        else _legacy.share_workspace()
+    )
     partition_capacity = _round_decode_partition_capacity(plan.workspace_num_partitions)
     key = (
         device_index,
@@ -353,7 +373,15 @@ def _get_decode_workspace_for_plan(
         partition_capacity if share_rows else None,
     )
 
-    workspace = _decode_workspace_cache.get(key) if _can_cache_workspace(q) else None
+    workspace = (
+        (
+            _runtime.decode_workspace_cache
+            if _runtime is not None
+            else _decode_workspace_cache
+        ).get(key)
+        if _can_cache_workspace(q)
+        else None
+    )
     if (
         workspace is None
         or workspace.tmp_out.size(0) < batch_capacity
@@ -385,7 +413,11 @@ def _get_decode_workspace_for_plan(
         if previous is not None:
             workspace.previous = previous if previous.captured else previous.previous
         if _can_cache_workspace(q):
-            _decode_workspace_cache[key] = workspace
+            (
+                _runtime.decode_workspace_cache
+                if _runtime is not None
+                else _decode_workspace_cache
+            )[key] = workspace
 
     if _cuda_graph_capture_active():
         workspace.captured = True
@@ -406,6 +438,7 @@ def _get_xqa_staged_rescale_workspace(
     batch_capacity: int,
     num_heads: int,
     plan: _DecodePlan,
+    _runtime=None,
 ) -> torch.Tensor:
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = _workspace_stream_id(q.device)
@@ -420,7 +453,11 @@ def _get_xqa_staged_rescale_workspace(
         plan.partition_size,
     )
     workspace = (
-        _xqa_staged_rescale_workspace_cache.get(key)
+        (
+            _runtime.xqa_staged_rescale_workspace_cache
+            if _runtime is not None
+            else _xqa_staged_rescale_workspace_cache
+        ).get(key)
         if _can_cache_workspace(q)
         else None
     )
@@ -436,7 +473,11 @@ def _get_xqa_staged_rescale_workspace(
         if previous is not None:
             workspace.previous = previous if previous.captured else previous.previous
         if _can_cache_workspace(q):
-            _xqa_staged_rescale_workspace_cache[key] = workspace
+            (
+                _runtime.xqa_staged_rescale_workspace_cache
+                if _runtime is not None
+                else _xqa_staged_rescale_workspace_cache
+            )[key] = workspace
     # Warmup allocations can become graph storage when reused during capture.
     if _cuda_graph_capture_active():
         workspace.captured = True
@@ -448,6 +489,8 @@ def _get_turboquant_decode_workspace(
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,
     num_kv_splits: int,
+    *,
+    _runtime=None,
 ):
     batch_capacity = block_table.shape[0]
     num_heads = q_rot.shape[1]
@@ -476,7 +519,11 @@ def _get_turboquant_decode_workspace(
         partition_size,
     )
 
-    workspace = _turboquant_decode_workspace_cache.get(key)
+    workspace = (
+        _runtime.turboquant_decode_workspace_cache
+        if _runtime is not None
+        else _turboquant_decode_workspace_cache
+    ).get(key)
     if workspace is None:
         workspace = (
             torch.empty(
@@ -495,7 +542,11 @@ def _get_turboquant_decode_workspace(
                 device=q_rot.device,
             ),
         )
-        _turboquant_decode_workspace_cache[key] = workspace
+        (
+            _runtime.turboquant_decode_workspace_cache
+            if _runtime is not None
+            else _turboquant_decode_workspace_cache
+        )[key] = workspace
 
     return workspace, partition_size
 
@@ -534,7 +585,7 @@ def _allocate_prefill_splitkv3_workspace(
 
 
 def _get_prefill_splitkv3_workspace(
-    q: torch.Tensor,
+    q: torch.Tensor, *, _runtime=None
 ) -> _PrefillSplitkv3Workspace:
     if not _can_cache_workspace(q):
         return _allocate_prefill_splitkv3_workspace(q)
@@ -551,10 +602,18 @@ def _get_prefill_splitkv3_workspace(
         head_dim,
         q.dtype,
     )
-    workspace = _prefill_splitkv3_workspace_cache.get(key)
+    workspace = (
+        _runtime.prefill_splitkv3_workspace_cache
+        if _runtime is not None
+        else _prefill_splitkv3_workspace_cache
+    ).get(key)
     if workspace is None:
         workspace = _allocate_prefill_splitkv3_workspace(q)
-        _prefill_splitkv3_workspace_cache[key] = workspace
+        (
+            _runtime.prefill_splitkv3_workspace_cache
+            if _runtime is not None
+            else _prefill_splitkv3_workspace_cache
+        )[key] = workspace
     return workspace
 
 
@@ -563,6 +622,7 @@ def _get_grouped_verify_workspace(
     batch_size: int = 1,
     *,
     partial_dtype: torch.dtype = torch.float16,
+    _runtime=None,
 ) -> _GroupedVerifyWorkspace:
     query_len = q.shape[0] // batch_size
     max_query_tokens = 16 if query_len > 8 else 8
@@ -578,7 +638,13 @@ def _get_grouped_verify_workspace(
         partial_dtype,
     )
     workspace = (
-        _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
+        (
+            _runtime.grouped_verify_workspace_cache
+            if _runtime is not None
+            else _grouped_verify_workspace_cache
+        ).get(key)
+        if _can_cache_workspace(q)
+        else None
     )
     if workspace is None:
         partial_out_shape = (
@@ -606,7 +672,11 @@ def _get_grouped_verify_workspace(
             ),
         )
         if _can_cache_workspace(q):
-            _grouped_verify_workspace_cache[key] = workspace
+            (
+                _runtime.grouped_verify_workspace_cache
+                if _runtime is not None
+                else _grouped_verify_workspace_cache
+            )[key] = workspace
     return workspace
 
 
@@ -617,8 +687,14 @@ def _get_decode_partition_size(
     num_kv_heads: int,
     max_seq_len_hint: int | None = None,
     batch_size_hint: int | None = None,
+    *,
+    _runtime=None,
 ) -> int:
-    raw = os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
+    raw = (
+        _runtime.policy.partition()
+        if _runtime is not None
+        else _legacy.partition_size()
+    )
     if raw is None:
         return _select_default_decode_partition_size(max_seq_len_hint)
     try:
@@ -669,12 +745,14 @@ def _flash_attn_forward(
     softcap: float,
     alibi_slopes: torch.Tensor,
     return_softmax: bool,
+    *,
+    _runtime=None,
 ) -> tuple:
     q, k, v = map(maybe_contiguous, (q, k, v))
     out = maybe_contiguous(out)
     if out is None:
         out = torch.zeros_like(q)
-    outputs = flash_attn_v100_cuda.fwd(
+    outputs = (_runtime.native if _runtime is not None else flash_attn_v100_cuda).fwd(
         q,
         k,
         v,
@@ -711,9 +789,11 @@ def _flash_attn_backward(
     alibi_slopes: torch.Tensor,
     deterministic: bool,
     rng_state: torch.Tensor = None,
+    *,
+    _runtime=None,
 ) -> torch.Tensor:
     dout, q, k, v, out = map(maybe_contiguous, (dout, q, k, v, out))
-    grads = flash_attn_v100_cuda.bwd(
+    grads = (_runtime.native if _runtime is not None else flash_attn_v100_cuda).bwd(
         dout,
         q,
         k,
@@ -754,7 +834,9 @@ class FlashAttnFunc(torch.autograd.Function):
         return_softmax: bool,
         is_grad_enabled: bool,
         out: torch.Tensor | None,
+        _runtime=None,
     ):
+        ctx.attention_runtime = _runtime
         q_ = q.permute(0, 2, 1, 3).contiguous()
         k_ = k.permute(0, 2, 1, 3).contiguous()
         v_ = v.permute(0, 2, 1, 3).contiguous()
@@ -801,6 +883,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap,
             alibi_slopes,
             return_softmax,
+            _runtime=_runtime,
         )
 
         out = _copy_bhmd_to_bmhd_out(out_, out)
@@ -819,6 +902,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        _runtime = ctx.attention_runtime
         q_, k_, v_, out_, lse_, rng_state = ctx.saved_tensors
 
         dout_ = dout.permute(0, 2, 1, 3).contiguous()
@@ -846,13 +930,29 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.alibi_slopes,
             ctx.deterministic,
             rng_state,
+            _runtime=_runtime,
         )
 
         dq = dq_.permute(0, 2, 1, 3)
         dk = dk_.permute(0, 2, 1, 3)
         dv = dv_.permute(0, 2, 1, 3)
 
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None
+        return (
+            dq,
+            dk,
+            dv,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def flash_attn_func(
@@ -868,6 +968,8 @@ def flash_attn_func(
     deterministic: bool = False,
     return_attn_probs: bool = False,
     out: torch.Tensor | None = None,
+    *,
+    _runtime=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -887,6 +989,7 @@ def flash_attn_func(
             return_attn_probs,
             torch.is_grad_enabled(),
             out,
+            _runtime,
         )
     except Exception:
         logger.debug(
@@ -922,6 +1025,8 @@ def flash_attn_bhmd_func(
     alibi_slopes: torch.Tensor = None,
     return_attn_probs: bool = False,
     out: torch.Tensor | None = None,
+    *,
+    _runtime=None,
 ):
     """Forward-only Flash-V100 dense attention for [B, H, T, D] tensors."""
     if softmax_scale is None:
@@ -947,6 +1052,7 @@ def flash_attn_bhmd_func(
         softcap,
         alibi_slopes,
         return_attn_probs,
+        _runtime=_runtime,
     )
     return out if not return_attn_probs else (out, lse, None)
 
@@ -956,6 +1062,8 @@ def flash_attn_qk_scores(
     k: torch.Tensor,
     softmax_scale: float | None = None,
     causal: bool = False,
+    *,
+    _runtime=None,
 ):
     """Debug-only Flash-V100 QK score dump before softmax."""
     if softmax_scale is None:
@@ -965,7 +1073,9 @@ def flash_attn_qk_scores(
     k = maybe_contiguous(k)
     q_ = q.permute(0, 2, 1, 3).contiguous()
     k_ = k.permute(0, 2, 1, 3).contiguous()
-    return flash_attn_v100_cuda.qk_scores_fwd(q_, k_, softmax_scale, causal)
+    return (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).qk_scores_fwd(q_, k_, softmax_scale, causal)
 
 
 def flash_attn_lse(
@@ -974,6 +1084,8 @@ def flash_attn_lse(
     v: torch.Tensor,
     softmax_scale: float | None = None,
     causal: bool = False,
+    *,
+    _runtime=None,
 ):
     """Debug-only Flash-V100 softmax LSE dump."""
     if softmax_scale is None:
@@ -996,6 +1108,7 @@ def flash_attn_lse(
         0.0,
         None,
         False,
+        _runtime=_runtime,
     )
     return lse
 
@@ -1018,6 +1131,8 @@ def flash_attn_decode_paged(
     partition_size_hint: int | None = None,
     anchor_lens: torch.Tensor | None = None,
     anchored_window: int = 0,
+    *,
+    _runtime=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1044,7 +1159,7 @@ def flash_attn_decode_paged(
     batch_capacity = q.shape[0]
     num_heads = q.shape[1]
     head_dim = q.shape[2]
-    if not _decode_dynamic_partitions_enabled():
+    if not _decode_dynamic_partitions_enabled(_runtime=_runtime):
         max_seq_len_hint = None
         workspace_seq_capacity_hint = None
         active_num_partitions = None
@@ -1057,6 +1172,7 @@ def flash_attn_decode_paged(
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
         active_num_partitions=active_num_partitions,
         partition_size_hint=partition_size_hint,
+        _runtime=_runtime,
     )
     _assert_decode_launch_covers_seq_lens(
         plan,
@@ -1064,11 +1180,7 @@ def flash_attn_decode_paged(
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
     )
     if (
-        os.getenv(
-            "VLLM_FLASH_V100_E4M3_SCALAR_FAST",
-            os.getenv("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST", "1"),
-        )
-        == "1"
+        (_runtime.policy.scalar_fast if _runtime is not None else _legacy.scalar_fast())
         and e4m3_fp32
         and q.dtype == torch.float16
         and q.shape[2] == 256
@@ -1088,10 +1200,13 @@ def flash_attn_decode_paged(
             plan=plan,
             active_num_partitions=active_num_partitions,
             partial_dtype=torch.float32 if e4m3_fp32 else torch.float16,
+            _runtime=_runtime,
         )
     )
 
-    return flash_attn_v100_cuda.decode_paged_fwd(
+    return (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).decode_paged_fwd(
         q,
         k_cache,
         v_cache,
@@ -1170,6 +1285,7 @@ def flash_attn_grouped_e4m3_fp32_paged(
     softmax_scale: float,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    _runtime=None,
 ) -> torch.Tensor:
     """E4M3 q2..8/B1 or request-major q8/B2..16 GQA6/D256 attention.
 
@@ -1196,9 +1312,11 @@ def flash_attn_grouped_e4m3_fp32_paged(
     if batch_size > 1 and not flash_attn_grouped_e4m3_fp32_available(6):
         raise RuntimeError("Rebuild Flash-V100 for request-major E4M3 revision 6")
     workspace = _get_grouped_verify_workspace(
-        q, batch_size=batch_size, partial_dtype=torch.float32
+        q, batch_size=batch_size, partial_dtype=torch.float32, _runtime=_runtime
     )
-    return flash_attn_v100_cuda.grouped_e4m3_fp32_paged_fwd(
+    return (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).grouped_e4m3_fp32_paged_fwd(
         q,
         k_cache,
         v_cache,
@@ -1225,6 +1343,8 @@ def flash_attn_grouped_verify_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     one_pass: bool = False,
+    *,
+    _runtime=None,
 ) -> torch.Tensor:
     """Exact request-major grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
 
@@ -1240,8 +1360,12 @@ def flash_attn_grouped_verify_paged(
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
-    workspace = _get_grouped_verify_workspace(q, int(block_table.shape[0]))
-    return flash_attn_v100_cuda.grouped_verify_paged_fwd(
+    workspace = _get_grouped_verify_workspace(
+        q, int(block_table.shape[0]), _runtime=_runtime
+    )
+    return (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).grouped_verify_paged_fwd(
         q,
         k_cache,
         v_cache,
@@ -1281,6 +1405,8 @@ def flash_attn_decode_paged_xqa(
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
     batch_context_routing: bool = False,
+    *,
+    _runtime=None,
 ):
     if not flash_attn_decode_paged_xqa_available():
         raise RuntimeError("flash_attn_v100 CUDA extension lacks XQA decode")
@@ -1297,7 +1423,7 @@ def flash_attn_decode_paged_xqa(
     batch_capacity = q.shape[0]
     num_heads = q.shape[1]
     head_dim = q.shape[2]
-    if not _decode_dynamic_partitions_enabled():
+    if not _decode_dynamic_partitions_enabled(_runtime=_runtime):
         max_seq_len_hint = None
         workspace_seq_capacity_hint = None
         active_num_partitions = None
@@ -1316,7 +1442,11 @@ def flash_attn_decode_paged_xqa(
             and q.ndim == 3
             and k_cache.shape[2] > 0
             and q.shape[1:] == (6 * k_cache.shape[2], 256)
-            and os.getenv("VLLM_FLASH_V100_E4M3_BATCH_XQA", "1") == "1"
+            and (
+                _runtime.policy.batch_xqa
+                if _runtime is not None
+                else _legacy.batch_xqa()
+            )
             and q.shape[0] > 1
             and k_cache.dtype == torch.uint8
             and v_cache.dtype == torch.uint8
@@ -1337,6 +1467,7 @@ def flash_attn_decode_paged_xqa(
                 )
             )
         ),
+        _runtime=_runtime,
     )
     _assert_decode_launch_covers_seq_lens(
         plan,
@@ -1356,15 +1487,20 @@ def flash_attn_decode_paged_xqa(
                 if kv_cache_dtype in ("fp8", "fp8_e4m3")
                 else torch.float16
             ),
+            _runtime=_runtime,
         )
     )
 
     q_per_kv = q.shape[1] // k_cache.shape[2]
     use_staged_pv = (
-        _xqa_staged_pv_enabled()
+        _xqa_staged_pv_enabled(_runtime=_runtime)
         and flash_attn_decode_paged_xqa_staged_available()
-        and os.getenv("VLLM_FLASH_V100_XQA_PADDED_SMEM", "1") != "0"
-        and os.getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA", "0") == "1"
+        and (
+            _runtime.policy.padded_smem
+            if _runtime is not None
+            else _legacy.padded_smem()
+        )
+        and (_runtime.policy.dual_cta if _runtime is not None else _legacy.dual_cta())
         and plan.partition_size == 256
         and q.shape[2] == 256
         and q_per_kv == 6
@@ -1377,8 +1513,11 @@ def flash_attn_decode_paged_xqa(
             batch_capacity=batch_capacity,
             num_heads=num_heads,
             plan=plan,
+            _runtime=_runtime,
         )
-        return flash_attn_v100_cuda.decode_paged_xqa_staged_fwd(
+        return (
+            _runtime.native if _runtime is not None else flash_attn_v100_cuda
+        ).decode_paged_xqa_staged_fwd(
             q,
             k_cache,
             v_cache,
@@ -1416,7 +1555,9 @@ def flash_attn_decode_paged_xqa(
         if batch_context_max_seq_len <= 0:
             batch_context_max_seq_len = plan.launch_num_partitions * plan.partition_size
 
-    return flash_attn_v100_cuda.decode_paged_xqa_fwd(
+    return (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).decode_paged_xqa_fwd(
         q,
         k_cache,
         v_cache,
@@ -1456,6 +1597,8 @@ def flash_attn_decode_paged_wmma(
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    *,
+    _runtime=None,
 ):
     """Single-query decode using the paged-prefill WMMA compute order.
 
@@ -1469,7 +1612,9 @@ def flash_attn_decode_paged_wmma(
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
 
-    return flash_attn_v100_cuda.decode_paged_wmma_fwd(
+    return (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).decode_paged_wmma_fwd(
         q,
         k_cache,
         v_cache,
@@ -1491,6 +1636,8 @@ def flash_attn_decode_qk_scores(
     softmax_scale: float | None = None,
     kv_cache_dtype: str = "auto",
     k_scale: float = 1.0,
+    *,
+    _runtime=None,
 ):
     """Debug-only scalar paged decode QK score dump before softmax."""
     if softmax_scale is None:
@@ -1505,8 +1652,11 @@ def flash_attn_decode_qk_scores(
         head_dim=q.shape[2],
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
+        _runtime=_runtime,
     )
-    return flash_attn_v100_cuda.decode_qk_scores_fwd(
+    return (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).decode_qk_scores_fwd(
         q,
         k_cache,
         block_table,
@@ -1534,6 +1684,8 @@ def flash_attn_turboquant_decode_paged(
     value_quant_bits: int = 4,
     norm_correction: bool = True,
     num_kv_splits: int = 32,
+    *,
+    _runtime=None,
 ):
     if not flash_attn_turboquant_decode_paged_available():
         raise RuntimeError("flash_attn_v100 CUDA extension lacks TurboQuant decode")
@@ -1547,10 +1699,12 @@ def flash_attn_turboquant_decode_paged(
     centroids = maybe_contiguous(centroids)
     out = maybe_contiguous(out)
     (tmp_out, max_logits, exp_sums), partition_size = _get_turboquant_decode_workspace(
-        q_rot, kv_cache, block_table, int(num_kv_splits)
+        q_rot, kv_cache, block_table, int(num_kv_splits), _runtime=_runtime
     )
 
-    return flash_attn_v100_cuda.decode_turboquant_paged_fwd(
+    return (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).decode_turboquant_paged_fwd(
         q_rot,
         kv_cache,
         out,
@@ -1584,6 +1738,8 @@ def flash_attn_prefill_paged(
     anchor_lens: torch.Tensor | None = None,
     anchored_window: int = 0,
     dflash2_window_split: bool = True,
+    *,
+    _runtime=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1653,7 +1809,9 @@ def flash_attn_prefill_paged(
             and k_cache.shape[1] in (1024, 2048)
             and hasattr(flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd")
         ):
-            return flash_attn_v100_cuda.dflash2_paged_bmhd_fwd(
+            return (
+                _runtime.native if _runtime is not None else flash_attn_v100_cuda
+            ).dflash2_paged_bmhd_fwd(
                 q.contiguous(),
                 k_cache,
                 v_cache,
@@ -1682,7 +1840,9 @@ def flash_attn_prefill_paged(
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
 
-    out_ = flash_attn_v100_cuda.prefill_paged_fwd(
+    out_ = (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).prefill_paged_fwd(
         q_,
         k_cache,
         v_cache,
@@ -1781,6 +1941,8 @@ def flash_attn_prefill_paged_bfla(
     v_scale: float = 1.0,
     causal: bool = True,
     window_size: tuple = (-1, -1),
+    *,
+    _runtime=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1798,7 +1960,9 @@ def flash_attn_prefill_paged_bfla(
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
 
-    out_ = flash_attn_v100_cuda.prefill_paged_bfla_fwd(
+    out_ = (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).prefill_paged_bfla_fwd(
         q_,
         k_cache,
         v_cache,
@@ -1833,6 +1997,8 @@ def flash_attn_prefill_paged_splitkv(
     window_size: tuple = (-1, -1),
     split_kv_tokens: int = 32768,
     max_seq_len_hint: int = 0,
+    *,
+    _runtime=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1849,7 +2015,9 @@ def flash_attn_prefill_paged_splitkv(
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
 
-    out_ = flash_attn_v100_cuda.prefill_paged_splitkv_fwd(
+    out_ = (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).prefill_paged_splitkv_fwd(
         q_,
         k_cache,
         v_cache,
@@ -1882,6 +2050,8 @@ def flash_attn_prefill_paged_bhmd(
     v_scale: float = 1.0,
     causal: bool = True,
     window_size: tuple = (-1, -1),
+    *,
+    _runtime=None,
 ):
     """Paged prefill entry for tensors already laid out as [B, H, M, D]."""
     if softmax_scale is None:
@@ -1895,7 +2065,9 @@ def flash_attn_prefill_paged_bhmd(
     if window_size_left < -1 or window_size_right < -1:
         raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
 
-    return flash_attn_v100_cuda.prefill_paged_fwd(
+    return (
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).prefill_paged_fwd(
         q,
         k_cache,
         v_cache,
@@ -1923,6 +2095,8 @@ def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch(
     softmax_scale: float | None = None,
     out: torch.Tensor | None = None,
     softmax_lse: torch.Tensor | None = None,
+    *,
+    _runtime=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the fixed causal SM70 D256 BM32 ALL_P pair-scratch entry.
 
@@ -1935,16 +2109,16 @@ def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch(
         softmax_scale = q.shape[-1] ** -0.5
 
     out_result, lse_result = (
-        flash_attn_v100_cuda.prefill_paged_d256_bm32_allp_pair_scratch_fwd(
-            q,
-            k_cache,
-            v_cache,
-            out,
-            softmax_lse,
-            block_table,
-            seq_lens,
-            float(softmax_scale),
-        )
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).prefill_paged_d256_bm32_allp_pair_scratch_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        softmax_lse,
+        block_table,
+        seq_lens,
+        float(softmax_scale),
     )
     return out_result, lse_result
 
@@ -1959,6 +2133,7 @@ def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3(
     softmax_scale: float | None = None,
     out: torch.Tensor | None = None,
     softmax_lse: torch.Tensor | None = None,
+    _runtime=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the fixed causal SM70 D256 BM32 three-way split-KV entry.
 
@@ -1968,26 +2143,26 @@ def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
-    workspace = _get_prefill_splitkv3_workspace(q)
+    workspace = _get_prefill_splitkv3_workspace(q, _runtime=_runtime)
     if out is None:
         out = workspace.out
     if softmax_lse is None:
         softmax_lse = workspace.softmax_lse
 
     out_result, lse_result = (
-        flash_attn_v100_cuda.prefill_paged_d256_bm32_allp_pair_scratch_splitkv3_fwd(
-            q,
-            k_cache,
-            v_cache,
-            out,
-            softmax_lse,
-            workspace.tmp_out,
-            workspace.row_max,
-            workspace.row_sum,
-            block_table,
-            int(actual_n),
-            float(softmax_scale),
-        )
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    ).prefill_paged_d256_bm32_allp_pair_scratch_splitkv3_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        softmax_lse,
+        workspace.tmp_out,
+        workspace.row_max,
+        workspace.row_sum,
+        block_table,
+        int(actual_n),
+        float(softmax_scale),
     )
     return out_result, lse_result
 
