@@ -191,6 +191,10 @@ def test_worker_serialization_and_forward_borrowing(monkeypatch):
         compilation_config=CompilationConfig(runtime=GraphPolicy(dual_compile=True)),
     )
     other = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    parent_resources = runtime_resources_for(cfg)
+    # A worker handle cannot be pickled; the transfer must not even visit it.
+    parent_resources["live_handle"] = lambda: None
+    parent_resources["diagnostics"].histories["attention"] = {"decode": 7}
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
     process = context.Process(target=_worker_roundtrip, args=(sender, cfg))
@@ -206,6 +210,10 @@ def test_worker_serialization_and_forward_borrowing(monkeypatch):
             process.terminate()
             process.join()
     assert process.exitcode == 0
+    worker_resources = runtime_resources_for(transferred)
+    assert "live_handle" not in worker_resources
+    assert "attention" not in worker_resources["diagnostics"].histories
+    assert parent_resources["diagnostics"].histories["attention"] == {"decode": 7}
     assert transferred.compilation_config.runtime.dual_compile
     assert (
         transferred.compilation_config.runtime.sources

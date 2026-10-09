@@ -10,9 +10,16 @@ input. A forward borrows the same owners, never a copy of their mutable state.
 from typing import Any
 
 
+class _RuntimeResources(dict[str, Any]):
+    """Configuration transfers carry policies, never worker-local live owners."""
+
+    def __reduce__(self):
+        return type(self), ()
+
+
 def runtime_resources_for(config) -> dict[str, Any]:
     resources = getattr(config, "_runtime_resources", None)
-    if resources is None:
+    if not resources:
         from vllm.config.execution_policy import POLICY_OWNERS
 
         policies = {}
@@ -21,12 +28,14 @@ def runtime_resources_for(config) -> dict[str, Any]:
             policy = getattr(getattr(config, owner, None), name, None)
             if policy is not None:
                 policies[path] = policy
-        resources = {
-            "execution_policies": policies,
-            "runtime_trace": getattr(
-                getattr(config, "observability_config", None), "runtime_trace", None
-            ),
-        }
+        resources = _RuntimeResources(
+            {
+                "execution_policies": policies,
+                "runtime_trace": getattr(
+                    getattr(config, "observability_config", None), "runtime_trace", None
+                ),
+            }
+        )
         config._runtime_resources = resources
         if resources["runtime_trace"] is not None:
             from vllm.diagnostics import EngineDiagnostics
