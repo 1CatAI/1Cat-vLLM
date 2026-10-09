@@ -693,6 +693,21 @@ class KernelConfig:
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
     """Startup reason when calibrated automatic storage cannot be selected."""
 
+    qsa_host_kv: bool = False
+    """Keep QSA attention history in pinned host storage on SM70."""
+    qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
+    """Authoritative target history format; FP16 isolates placement error."""
+    qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "float16"] = "float16"
+    """Preserve speculative cache precision independently of target storage."""
+    qsa_host_kv_device_reference: bool = False
+    """Keep identical encoded history on device for controlled placement A/B."""
+    qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
+    """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_active: bool = Field(default=False, init=False)
+    """Whether the host QSA cache geometry has been admitted."""
+    qsa_host_kv_reason: str | None = Field(default=None, init=False)
+    """Reason the requested host QSA storage is unavailable."""
+
     ple_disk_cascade: bool = True
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""
     ple_disk_release_pages: bool = False
@@ -745,6 +760,11 @@ class KernelConfig:
             return value.lower().replace("-", "_")
         return value
 
+    def resolve_attention_history(self, cfg) -> bool:
+        from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_host_kv
+
+        return resolve_qsa_host_kv(cfg)
+
     @property
     def capture_all_draft_steps(self) -> bool:
         """Policy consumed by the generic multistep draft graph manager."""
@@ -794,6 +814,7 @@ class KernelConfig:
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
+            "qsa_host_kv_reason",
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")

@@ -11,6 +11,70 @@ from vllm.sm70_graph_observer import GraphParityWorkerExtension
 
 
 class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
+    def read_host_kv_memory(self):
+        """Read storage accounting and cache counters outside timed replay."""
+        runner = self.model_runner
+        config = runner.kv_cache_config
+        owners = []
+        staging = {}
+        resolution = {}
+        for name, module in runner.compilation_config.static_forward_context.items():
+            state = getattr(module, "host_kv", None)
+            if state is None:
+                continue
+            tensors = [
+                state.hot_values,
+                state.tags,
+                state.stamps,
+                state.hands,
+                state.page_slots,
+                state.epoch,
+                state._stats,
+            ]
+            staging[state.staging.untyped_storage().data_ptr()] = (
+                state.staging.untyped_storage().nbytes()
+            )
+            for tensor in (state.initial, state.resolved, state.remapped):
+                storage = tensor.untyped_storage()
+                resolution[storage.data_ptr()] = storage.nbytes()
+            owners.append(
+                {
+                    "layer": name,
+                    "host_dtype": "fp8_e4m3" if state.fp8 else "float16",
+                    "attention_reader": "protected_hot_and_staged_misses",
+                    "history_storage": (
+                        "device_reference" if state.device_reference else "host"
+                    ),
+                    "host_bytes": (
+                        0
+                        if state.device_reference
+                        else state.history.nbytes + state.host_scales.nbytes
+                    ),
+                    "device_history_bytes": (
+                        state.history.nbytes + state.scales.nbytes
+                        if state.device_reference
+                        else 0
+                    ),
+                    "device_hot_bytes": sum(t.nbytes for t in tensors),
+                    "stats": state.stats.cpu().tolist(),
+                }
+            )
+        return {
+            "rank": self.rank,
+            "blocks": config.num_blocks,
+            "host_pool_bytes": sum(
+                t.size for t in config.kv_cache_tensors if t.host_backed
+            ),
+            "device_pool_bytes": sum(
+                t.size for t in config.kv_cache_tensors if not t.host_backed
+            ),
+            "shared_staging_bytes": sum(staging.values()),
+            "shared_resolution_bytes": sum(resolution.values()),
+            "owners": owners,
+            "torch_allocated_bytes": torch.accelerator.memory_allocated(),
+            "torch_reserved_bytes": torch.accelerator.memory_reserved(),
+        }
+
     @torch.inference_mode()
     def inspect_ple_snapshots(self, directory: str):
         """Locate the first TP divergence at the PLE residual boundary."""
@@ -211,6 +275,35 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
                     raise RuntimeError("Teacher logits must cover the full vocabulary")
                 self._teacher_count += 1
                 if self.rank == 0:
+                    kv_samples = {}
+                    mappings = state.slot_mappings_by_layer or {}
+                    for (
+                        name,
+                        module,
+                    ) in runner.compilation_config.static_forward_context.items():
+                        cache = getattr(module, "host_kv", None)
+                        slots = mappings.get(name)
+                        if cache is None or slots is None:
+                            continue
+                        slots = slots[:5]
+                        slots = slots[slots >= 0]
+                        blocks, offsets = (
+                            slots // cache.page_size,
+                            slots % cache.page_size,
+                        )
+                        kinds = torch.arange(2, device=slots.device)
+                        values = cache.history[
+                            blocks[:, None], kinds[None, :], offsets[:, None], 0
+                        ].cpu()
+                        if cache.fp8:
+                            scales = cache.scales[slots].cpu()
+                            values = (
+                                values.view(torch.float8_e4m3fn).float()
+                                * scales[:, :, None]
+                            ).half()
+                        kv_samples[name] = values
+                    if kv_samples:
+                        torch.save(kv_samples, root / f"{key}-kv.pt")
                     torch.save(
                         dict(
                             logits=logits.detach().float().cpu(),

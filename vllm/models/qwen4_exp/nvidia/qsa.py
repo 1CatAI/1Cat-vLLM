@@ -269,7 +269,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError("QSA does not support sliding-window attention")
 
         num_tokens = attn_metadata.num_actual_tokens
-        output.zero_()
+        if num_tokens and getattr(layer, "host_kv_enabled", False):
+            # Direct host QSA writes every active row, including empty
+            # selections. Only graph padding requires explicit initialization.
+            output[num_tokens:].zero_()
+        else:
+            output.zero_()
         if num_tokens == 0:
             return output
 
@@ -278,6 +283,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
+        if getattr(layer, "host_kv_enabled", False):
+            if query_positions is None or sequence_lengths is None:
+                raise RuntimeError(
+                    "Host QSA requires exact positions and sequence lengths"
+                )
+            layer.host_kv_forward(
+                query[:num_tokens],
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                query_positions[:num_tokens],
+                sequence_lengths,
+                output[:num_tokens],
+                output_gate,
+            )
+            return output
         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
         # [num_blocks, 2, block_size, num_kv_heads, head_size].
         key_cache, value_cache = kv_cache.unbind(1)
@@ -601,11 +622,25 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
+        self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
+        self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
+        self.host_kv_device_reference = (
+            vllm_config.kernel_config.qsa_host_kv_device_reference
+        )
+        self.host_kv_dtype = (
+            vllm_config.kernel_config.qsa_host_kv_draft_dtype
+            if getattr(vllm_config, "is_speculative_draft", False)
+            else vllm_config.kernel_config.qsa_host_kv_dtype
+        )
         if self.kv_cache_dtype not in ("fp8", "fp8_e4m3") and (
             self.kv_cache_torch_dtype != model_config.dtype
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
+            )
+        if self.host_kv_enabled:
+            self.kv_cache_torch_dtype = (
+                torch.uint8 if self.host_kv_dtype == "fp8_e4m3" else torch.float16
             )
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
@@ -647,6 +682,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self._sm70_qsa_prep = bool(
             vllm_config.kernel_config.sm70_qsa_prep
+            and not self.host_kv_enabled
             and getattr(self.rotary_emb, "is_neox_style", False)
             and self.head_dim == 256
             and self.num_kv_heads == 1
@@ -756,12 +792,56 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if self.host_kv_enabled:
+            from .ops.host_kv import HostQSAKV
+
+            self.host_kv = HostQSAKV(
+                kv_cache.shape[0],
+                kv_cache.shape[2],
+                self.head_dim,
+                kv_cache.device,
+                hot_tokens=self.host_kv_hot_tokens,
+                history=kv_cache,
+                width=self.indexer.output_width,
+                device_reference=self.host_kv_device_reference,
+            )
+            logger.info_once(
+                "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
+                "attention reads FP16 hot pages; only unresolved misses are staged.",
+                "device_reference" if self.host_kv_device_reference else "host",
+                self.host_kv_dtype,
+                self.host_kv_hot_tokens,
+            )
+
+    def host_kv_forward(
+        self, query, indices, table, requests, positions, lengths, output, gate
+    ) -> None:
+        from .ops.host_kv_attention import host_qsa_attention
+
+        state = self.host_kv
+        for start in range(0, query.shape[0], state.rows):
+            stop = min(start + state.rows, query.shape[0])
+            host_qsa_attention(
+                query[start:stop],
+                state,
+                indices[start:stop],
+                table,
+                requests[start:stop],
+                positions[start:stop],
+                lengths,
+                output[start:stop],
+                gate[start:stop] if gate is not None else None,
+            )
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size, _, dcp_sharded = qsa_dcp_block_geometry(
             vllm_config, self.layer_name
         )
         return FullAttentionSpec(
             block_size=block_size,
+            host_backed=self.host_kv_enabled,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
@@ -884,7 +964,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             selected,
         )
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
-        if query.dim() == 2:
+        if self.host_kv_enabled:
+            self.host_kv.write(key, value, main_metadata.slot_mapping)
+        elif query.dim() == 2:
             # SM70 prep: raw qkv rows -> normalized/rotated query + cache write.
             key_cache, value_cache = self.kv_cache.unbind(1)
             prepared = query.new_empty((num_tokens, self.num_heads, self.head_dim))

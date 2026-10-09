@@ -3,7 +3,7 @@
 The acceptance objective remains C1 <=12 ms/round, correct target output,
 retained acceptance and no C4 regression. The measured host-E4M3 baseline is
 18.320 ms/round; no new endpoint improvement is established by these screens.
-The [contributor round ledger](https://github.com/1CatAI/1Cat-vLLM/blob/81259b8109c99d8823ba5e731d60da2412814d0d/docs/design/flashnext_mtp4_latency_20261008.md) records the
+The [current round ledger](flashnext_mtp4_latency_20261008.md) records the
 workload, graph composition and overlapping service totals.
 
 ## Measurement contract
