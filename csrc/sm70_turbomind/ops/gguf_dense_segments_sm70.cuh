@@ -289,6 +289,8 @@ __device__ __forceinline__ void write_out(const Seg& sg, int t, int v,
   }
 }
 
+#include "gguf_dense_weight_major_sm70.cuh"
+
 template <int W, bool Batch>
 __global__ void __launch_bounds__(32 * W)
     dense_mv(Segs segs, const half* __restrict__ x, int ldx, int M, int K,
@@ -367,6 +369,21 @@ __global__ void __launch_bounds__(32 * W)
 template <int W>
 void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
             int G, int split, float* ws, int* cnt, int tiles, cudaStream_t st) {
+  // Small-M verification needs three token tiles, but each uses the same
+  // weights. Keep the original path for other shapes and split-K schedules.
+  int total_n = 0;
+  for (int i = 0; i < segs.nseg; ++i) total_n += segs.s[i].n;
+  if constexpr (W == 4 || W == 8) {
+    if (M == 20 && split == 1 &&
+        ((K == 2560 && (total_n == 4096 || total_n == 3584)) ||
+         (K == 1536 && total_n == 2560))) {
+      dense_weight_major<W, 3>
+          <<<dim3(tiles, split), 32 * W, 3 * W * 256 * 4, st>>>(
+              segs, x, ldx, M, K, S, G, split, ws, cnt);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      return;
+    }
+  }
   const size_t xs_bytes = static_cast<size_t>(W) * 256 * 16 + 1024;
   const size_t red_bytes = static_cast<size_t>(W) * 256 * 4;
   const size_t smem = xs_bytes > red_bytes ? xs_bytes : red_bytes;
