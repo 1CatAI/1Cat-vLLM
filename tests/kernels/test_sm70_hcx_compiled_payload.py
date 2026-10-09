@@ -12,6 +12,7 @@ import torch.multiprocessing as mp
 def _worker_run(rank, port, results):
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import (
+        graph_capture,
         init_distributed_environment,
         initialize_model_parallel,
         tensor_model_parallel_all_reduce_sum2,
@@ -119,7 +120,12 @@ def _worker_run(rank, port, results):
             materialize(x, hidden, injection)
             torch.accelerator.synchronize()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            # M20 uses custom all-reduce. Its captured peer pointers must be
+            # registered when capture ends, as they are in the model runner.
+            with (
+                graph_capture(device=torch.device("cuda", rank)) as capture,
+                torch.cuda.graph(graph, stream=capture.stream),
+            ):
                 outputs, scratch = compiled(x, hidden, injection)
                 combined, final_outputs, final_scratch = materialize(
                     x, hidden, injection

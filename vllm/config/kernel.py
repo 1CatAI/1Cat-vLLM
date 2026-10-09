@@ -694,6 +694,7 @@ class KernelConfig:
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
             "collective_kernel_selections",
+            "sm70_hcx_local_schedule",  # Native dispatch inside the opaque HC op.
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
