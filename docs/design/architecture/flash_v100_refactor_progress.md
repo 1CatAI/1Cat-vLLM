@@ -13,8 +13,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 1a: immutable CPU trace and owner guard | #1071 | Gates passed; ready | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
 | 1b: patch efficacy + dependency ratchet | #1072 | Gates passed; ready | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
 | 1c: route/token/output parity tools | #1073 | Draft; model records pending | Production unchanged | 12 native cases exact; host baseline unit tests 135 passed | Greedy model records and full outcome map |
-| 2a: dynamic environment boundary | — | Focused CPU gates passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | Pending complete outcome map | Commit/rebase and GPU outcome gates |
-| 2b: frozen construction policy | — | Prototype preserved separately | Target remaining 41 → 0; 41 immutable fields | Not accepted yet | Stack after 2a gates |
+| 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | Pending complete outcome map | Prerequisite model and outcome gates |
+| 2b: frozen construction policy | — | Focused CPU and pre-commit passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | Pending complete outcome map | Commit/rebase and prerequisite gates |
 | 3: owned workspaces | — | Not started | — | Required | Step 2 gates |
 | 4: decode executor and ordered candidates | — | Not started | — | Required | Step 3 gates |
 | 5a: per-sequence prefill candidates | — | Not started | — | Required | Step 4 gates |
@@ -212,3 +212,34 @@ The reduced 2a scope passes the original focused command: 219 passed,
 match; strict patch-use validation passes. Pre-commit including mypy and
 layering passes. Logs are `a3-config-dynamic-{strict,precommit}.log` and
 `a3-config-dynamic-shim.json` in the local task artifact directory.
+
+## Step 2b frozen snapshot
+
+`V100AttnConfig` now owns 41 resolved policy fields. The implementation's
+39 environment reads and metadata builder's two reads use the same boundary,
+at their original execution points. Construction first performs the existing
+validation and short-circuit evaluation, then transfers the scalar fields into
+a frozen snapshot without re-reading environment variables. Native operators,
+geometry inherited from Triton and mutable buffers retain their existing owners
+until their dedicated extraction steps.
+
+`ConfigField` is a temporary compatibility descriptor for existing callers and
+partial test fixtures. A completed implementation stores each policy value only
+in its snapshot. A legacy assignment creates a replacement snapshot; retained
+snapshots remain immutable. It is not an executor, hook, registry or mixin.
+Steps 4/5 will consume the snapshot directly instead of passing an Impl object.
+The test checks real construction, immutability, absence of duplicate scalar
+storage, post-construction environment changes and legacy snapshot replacement.
+
+All 813 immutable traces remain identical. The focused strict command returns
+220 passed / 1 skipped / 28 GPU-only deselections; the extra passing case is the
+snapshot contract. Pre-commit including mypy passes. Direct reads outside config
+are now zero and the repository model/platform/env ceiling is 2325/3964/284.
+Logs: `a3-frozen-config-{strict,precommit}.log`, `a3-frozen-config-shim.json`.
+Constructor environment wiring and frozen-state ownership are separate commits.
+
+For #1075, pinned #1028 was rebased to validation head
+`0ab8ad125a7d339c402a78c5afbf6ebafad93fb4`; tree
+`9ea84629e4c0af8fbd757d62714705ff4713f677` exactly matches the clean merge.
+Its CPU suites return 37 passed / 98 skipped. This check will be repeated for
+2b before readiness. All pending GPU gates remain pending; no merge is claimed.

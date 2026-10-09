@@ -9,9 +9,9 @@ from typing import cast
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionCGSupport
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100.spec.hooks import (
     METADATA_HOOKS,
@@ -229,8 +229,8 @@ class FlashAttnV100MetadataBuilder(SpecMetadataMethods, TritonAttentionMetadataB
             is self.vllm_config.model_config
         )
         self._batch_context_routing_enabled = (
-            envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING
-            and envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE is None
+            _config.registered("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING")
+            and _config.registered("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is None
             and spec_config is None
             and _routing._batch_context_routing_cache_dtype_supported(
                 getattr(cache_config, "cache_dtype", None)
