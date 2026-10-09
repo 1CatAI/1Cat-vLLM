@@ -8,6 +8,7 @@ from packaging.version import parse
 from pydantic import Field, field_validator, model_validator
 
 from vllm import version
+from vllm.config.sm70_runtime import StepProfilerConfig
 from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 
@@ -17,6 +18,9 @@ DetailedTraceModules = Literal["model", "worker", "all"]
 @config
 class ObservabilityConfig:
     """Configuration for observability - metrics and tracing."""
+
+    step_profiler: StepProfilerConfig = Field(default_factory=StepProfilerConfig)
+    """Per-engine speculative timing; excluded from computation graph hashes."""
 
     show_hidden_metrics_for_version: str | None = None
     """Enable deprecated Prometheus metrics that have been hidden since the
