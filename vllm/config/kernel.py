@@ -613,6 +613,8 @@ class KernelConfig:
 
     sm70_qsa_device_history: bool = True
     """Read device E4M3/FP16 QSA history directly at M1..20, H6, D256."""
+    sm70_qsa_shared_key: bool = False
+    """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
     qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
