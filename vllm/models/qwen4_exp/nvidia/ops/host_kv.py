@@ -395,6 +395,7 @@ class HostQSAKV:
         dtype: torch.dtype = torch.uint8,
         device_reference: bool = False,
         direct_device: bool | None = None,
+        is_speculative_draft: bool = False,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -409,6 +410,7 @@ class HostQSAKV:
             raise ValueError("Host history requires E4M3 bytes or FP16 values")
         self.fp8 = dtype == torch.uint8
         self.device_reference = device_reference
+        self.is_speculative_draft = is_speculative_draft
         self.host = None
         if history is None:
             self.host = torch.zeros(

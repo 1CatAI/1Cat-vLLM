@@ -70,6 +70,33 @@ def _bare_qsa_attention(output_width: int) -> Qwen4ExpQSAAttention:
     return attention
 
 
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_cache_binding_retains_owner_history_policy(monkeypatch, is_draft):
+    from vllm.models.qwen4_exp.nvidia.ops import host_kv
+
+    attention = _bare_qsa_attention(output_width=2051)
+    attention.host_kv_enabled = True
+    attention.host_kv_hot_tokens = 64
+    attention.host_kv_device_reference = True
+    attention.host_kv_is_draft = is_draft
+    attention.host_kv_direct_device = True
+    attention.host_kv_dtype = "float16" if is_draft else "fp8_e4m3"
+    attention.head_dim = 256
+    seen = {}
+
+    def state_factory(*args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            device_history_workspace=None,
+            device_history_reason="speculative_draft_unqualified",
+        )
+
+    monkeypatch.setattr(host_kv, "HostQSAKV", state_factory)
+    attention.bind_kv_cache(torch.empty(1, 2, 16, 1, 256))
+    assert seen["is_speculative_draft"] is is_draft
+    assert seen["direct_device"] is True
+
+
 def test_qsa_attention_reuses_shared_topk_indices_buffer() -> None:
     attention = _bare_qsa_attention(output_width=7)
     shared = torch.empty(16, 7, dtype=torch.int32)
