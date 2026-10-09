@@ -58,7 +58,12 @@ def test_input_core_tail_route_keeps_recurrent_operands(monkeypatch, m):
     x = torch.empty(m, 2560, device="cuda", dtype=torch.float16)
     z = torch.empty(m, 12, 128, device="cuda", dtype=torch.float16)
     core = torch.empty_like(z)
+    from vllm.config.gdn import GdnConfig
+
+    policy = GdnConfig()
+    policy.resolve()
     layer = SimpleNamespace(
+        gdn_policy=policy,
         in_proj_qkvz=lambda _: (q, None),
         in_proj_ba=lambda _: (ba, None),
         gqa_interleaved_layout=False,

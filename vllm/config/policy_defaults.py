@@ -302,6 +302,12 @@ def runtime_policy_report(cfg):
             }
             for path in POLICY_OWNERS
         },
+        "gdn_projection": asdict(cfg.kernel_config.gdn.projection),
+        "speculative_sampling": (
+            asdict(cfg.speculative_config.sampling_policy)
+            if getattr(cfg.speculative_config, "sampling_policy", None) is not None
+            else None
+        ),
         "fp16_native": {
             "values": cfg.kernel_config.layer_execution.native.hash_options(),
             "sources": cfg.kernel_config.layer_execution.native.sources,
@@ -368,6 +374,9 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
         for field, alias in trace.layer_aliases.items():
             if field in trace.sources:
                 ignored.add(alias)
+    gdn = _owner(cfg, "kernel_config.gdn")
+    if gdn is not None and gdn.resolved:
+        ignored.update(gdn.projection.aliases.values())
     spec = _owner(cfg, "speculative_config.sm70_dflash2")
     if spec is not None and spec.resolved:
         ignored.update(SM70_DFLASH2_LEGACY_FIELDS)
@@ -377,5 +386,14 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
                 "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE",
                 "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P",
             )
+        )
+    if spec is not None and spec.lookup.sources:
+        ignored.update(spec.lookup.aliases.values())
+    sampling = _owner(cfg, "speculative_config.sampling_policy")
+    if sampling is not None:
+        ignored.update(
+            alias
+            for field, alias in sampling.aliases.items()
+            if field in sampling.sources
         )
     return ignored

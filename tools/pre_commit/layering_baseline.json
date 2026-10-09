@@ -44,6 +44,9 @@
   "env": 1,
   "platform": 15
  },
+ "vllm/config/gdn_projection.py": {
+  "platform": 14
+ },
  "vllm/config/gdn_schedule.py": {
   "platform": 46
  },
@@ -64,8 +67,11 @@
   "platform": 36
  },
  "vllm/config/speculative.py": {
-  "model": 140,
-  "platform": 16
+  "model": 141,
+  "platform": 17
+ },
+ "vllm/config/speculative_sampling.py": {
+  "platform": 19
  },
  "vllm/config/vllm.py": {
   "env": 2,
@@ -231,8 +237,8 @@
  },
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 44,
-  "model": 239,
-  "platform": 536
+  "model": 236,
+  "platform": 513
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -495,7 +501,7 @@
  },
  "vllm/v1/sample/rejection_sampler.py": {
   "env": 6,
-  "platform": 5
+  "platform": 4
  },
  "vllm/v1/sample/sampler.py": {
   "env": 3,
@@ -517,16 +523,16 @@
   "model": 4
  },
  "vllm/v1/spec_decode/llm_base_proposer.py": {
-  "env": 3,
+  "env": 1,
   "model": 43,
-  "platform": 44
+  "platform": 35
  },
  "vllm/v1/spec_decode/profiling.py": {
   "model": 4,
   "platform": 3
  },
  "vllm/v1/spec_decode/static_draft_vocab.py": {
-  "platform": 36
+  "platform": 28
  },
  "vllm/v1/spec_decode/utils.py": {
   "model": 20
@@ -592,7 +598,7 @@
  "vllm/v1/worker/gpu_model_runner.py": {
   "env": 41,
   "model": 669,
-  "platform": 237
+  "platform": 235
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 1,

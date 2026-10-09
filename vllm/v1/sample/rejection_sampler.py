@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 
 from vllm import envs
+from vllm.config.speculative_sampling import resolve_sampling_policy
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
@@ -151,9 +152,13 @@ def _combined_bonus_processor_safe(processor: object) -> bool:
 
 def _token_matching_sampling_enabled(
     sampling_metadata: SamplingMetadata,
+    *,
+    enabled: bool | None = None,
 ) -> bool:
     """Use 0.0.3-style token matching for MTP stochastic sampling when safe."""
-    if os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0") != "1":
+    if enabled is None:
+        enabled = os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0") == "1"
+    if not enabled:
         return False
     if sampling_metadata.max_num_logprobs is not None:
         return False
@@ -179,9 +184,13 @@ def _token_matching_sampling_enabled(
 def _combined_bonus_sampling_enabled(
     sampling_metadata: SamplingMetadata,
     needs_output_logprobs: bool,
+    *,
+    enabled: bool | None = None,
 ) -> bool:
     """Fast path for the common no-logprobs MTP verifier sampling case."""
-    if os.getenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1") == "0":
+    if enabled is None:
+        enabled = os.getenv("VLLM_SM70_REJECTION_COMBINE_BONUS", "1") != "0"
+    if not enabled:
         return False
     if needs_output_logprobs:
         return False
@@ -233,6 +242,7 @@ class RejectionSampler(nn.Module):
     ):
         super().__init__()
         self.sampler = sampler
+        self._sampling_policy = resolve_sampling_policy(spec_config)
         logprobs_mode = self.sampler.logprobs_mode
         self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
         self.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
@@ -257,7 +267,7 @@ class RejectionSampler(nn.Module):
         self,
         target_logits: torch.Tensor,
     ) -> None:
-        if envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE <= 0:
+        if self._sampling_policy.dynamic_tail_size <= 0:
             return
         k = min(20, target_logits.shape[-1])
         topk = torch.topk(target_logits, k=k, dim=-1)
@@ -309,7 +319,9 @@ class RejectionSampler(nn.Module):
         if (
             draft_probs is None
             and not sampling_metadata.all_greedy
-            and _token_matching_sampling_enabled(sampling_metadata)
+            and _token_matching_sampling_enabled(
+                sampling_metadata, enabled=self._sampling_policy.token_matching
+            )
         ):
             return self._sample_by_token_matching(metadata, logits, sampling_metadata)
 
@@ -329,7 +341,9 @@ class RejectionSampler(nn.Module):
             and not self.synthetic_mode
             and bonus_logits_indices.numel() == len(metadata.num_draft_tokens)
             and _combined_bonus_sampling_enabled(
-                sampling_metadata, needs_output_logprobs
+                sampling_metadata,
+                needs_output_logprobs,
+                enabled=self._sampling_policy.combine_bonus,
             )
         ):
             return self._forward_combined_bonus(

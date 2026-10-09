@@ -14,6 +14,7 @@ from vllm.config.sm70_dflash2 import (
     sm70_dflash2_enabled,
 )
 from vllm.config.speculative import SpeculativeConfig
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 
 
 @pytest.fixture(autouse=True)
@@ -106,6 +107,7 @@ def _hash_subject(method, policy):
         method=method,
         use_local_argmax_reduction=False,
         sm70_dflash2=policy,
+        sampling_policy=SpeculativeSamplingPolicy(),
         mtp_expert_quantization=None,
         draft_model_config=None,
         use_dflash_family=lambda: method == "dflash",

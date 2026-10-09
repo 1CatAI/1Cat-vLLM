@@ -1338,6 +1338,11 @@ class GPUModelRunner(
             self.parallel_config.tensor_parallel_size,
             self.model_config.architecture,
             self.model_config.model,
+            policy=(
+                self.speculative_config.sampling_policy
+                if self.speculative_config is not None
+                else None
+            ),
         )
         self.dynamic_draft_vocab_prefill_topk = draft_vocab_config.prefill_topk
         validate_dynamic_draft_vocab_prefill_topk(
@@ -1501,7 +1506,8 @@ class GPUModelRunner(
         self.sync_spec_decode_accept_counts = (
             self.use_async_scheduling
             and self.num_spec_tokens > 0
-            and envs.VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS
+            and self.speculative_config is not None
+            and self.speculative_config.sampling_policy.sync_accept_counts
         )
         self.use_async_spec_decode = (
             self.use_async_scheduling
@@ -10989,7 +10995,7 @@ class GPUModelRunner(
                     and uniform_decode
                     and max_query_len > 1
                     and force_attention
-                    and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+                    and bool(self.vllm_config.kernel_config.gdn.state.spec_core)
                     and current_platform.is_device_capability(70)
                 )
                 # SM70 Qwen GDN split spec-core is part of the compiled FULL
