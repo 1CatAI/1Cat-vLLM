@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.config.execution_policy import communication_policy, graph_policy
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -600,7 +601,7 @@ class MoERunner(MoERunnerInterface):
     ) -> bool:
         if shared_output is None:
             return False
-        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and not use_sm70_decode_graph_semantics():
+        if graph_policy().dual_compile and not use_sm70_decode_graph_semantics():
             return False
         if not current_platform.is_cuda():
             return False
@@ -625,7 +626,7 @@ class MoERunner(MoERunnerInterface):
             and shared_output.dtype == torch.float16
             and tuple(shared_output.shape) == (8, 4096)
         )
-        if not envs.VLLM_SM70_MOE_ADD_ALLREDUCE and not glm53_q8:
+        if not communication_policy().moe_add_allreduce and not glm53_q8:
             return False
         return tp_size in (2, 4, 6, 8)
 

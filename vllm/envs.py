@@ -18525,7 +18525,7 @@ def validate_environ(hard_fail: bool) -> None:
                 logger.warning("Unknown vLLM environment variable detected: %s", env)
 
 
-def compile_factors(kernel_config=None) -> dict[str, object]:
+def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object]:
     """Return env vars used for torch.compile cache keys.
 
     Start with every known vLLM env var; drop entries in `ignored_factors`;
@@ -18603,6 +18603,11 @@ def compile_factors(kernel_config=None) -> dict[str, object]:
         from vllm.config.sm70_native import compile_ignored_aliases
 
         ignored_factors.update(compile_ignored_aliases(kernel_config))
+
+    if vllm_config is not None:
+        from vllm.config.policy_defaults import runtime_compile_ignored_aliases
+
+        ignored_factors.update(runtime_compile_ignored_aliases(vllm_config))
 
     from vllm.config.utils import normalize_value
 

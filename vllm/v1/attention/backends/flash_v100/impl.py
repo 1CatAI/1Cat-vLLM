@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import torch
 
+from vllm.config.execution_policy import flash_v100_policy
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
@@ -319,7 +320,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             _config.raw("VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK", "0") == "1"
         )
         self.smallq_decode_max_query_len = int(
-            _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")
+            cast(int, flash_v100_policy().smallq_max_q)
         )
         self.smallq_decode_max_model_len = int(
             _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")

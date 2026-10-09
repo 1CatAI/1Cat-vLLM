@@ -456,6 +456,13 @@ class Platform:
         pass
 
     @classmethod
+    def apply_runtime_policy_defaults(cls, vllm_config: "VllmConfig"):
+        """Resolve early graph/kernel defaults before the existing late checks."""
+        from vllm.platforms.runtime_defaults import apply_runtime_policy_defaults
+
+        return apply_runtime_policy_defaults(vllm_config)
+
+    @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
         """
         Apply the platform-specific default values to the config.

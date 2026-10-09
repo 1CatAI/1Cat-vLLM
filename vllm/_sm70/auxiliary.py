@@ -78,8 +78,16 @@ def sm70_glm_mhc_pre_norm_out(
     hc_post_mult: float,
     sinkhorn_repeat: int,
     norm_eps: float,
+    *,
+    threads: int | None = None,
 ) -> None:
-    _op("sm70_glm_mhc_pre_norm_out")(
+    name = (
+        "sm70_glm_mhc_pre_norm_out"
+        if threads is None
+        else "sm70_glm_mhc_pre_norm_configured_out"
+    )
+    extra = () if threads is None else (threads,)
+    _op(name)(
         gemm_mul,
         gemm_sqrsum,
         hc_scale,
@@ -95,6 +103,7 @@ def sm70_glm_mhc_pre_norm_out(
         hc_post_mult,
         sinkhorn_repeat,
         norm_eps,
+        *extra,
     )
 
 
@@ -117,6 +126,30 @@ if hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
         hc_post_mult: float,
         sinkhorn_repeat: int,
         norm_eps: float,
+    ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_configured_out"):
+
+    @register_fake("_C::sm70_glm_mhc_pre_norm_configured_out")
+    def _sm70_glm_mhc_pre_norm_configured_out_fake(
+        gemm_mul: torch.Tensor,
+        gemm_sqrsum: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+        residual: torch.Tensor,
+        post_mix: torch.Tensor,
+        comb_mix: torch.Tensor,
+        layer_input: torch.Tensor,
+        norm_weight: torch.Tensor,
+        rms_eps: float,
+        hc_pre_eps: float,
+        hc_sinkhorn_eps: float,
+        hc_post_mult: float,
+        sinkhorn_repeat: int,
+        norm_eps: float,
+        configured_threads: int,
     ) -> None:
         return None
 

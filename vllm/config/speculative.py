@@ -1123,7 +1123,12 @@ class SpeculativeConfig:
 
         pp_size = self.target_parallel_config.pipeline_parallel_size
         num_layers = self.target_model_config.get_total_num_hidden_layers()
-        last_start, last_end = get_pp_indices(num_layers, pp_size - 1, pp_size)
+        last_start, last_end = get_pp_indices(
+            num_layers,
+            pp_size - 1,
+            pp_size,
+            partition=self.target_parallel_config.communication.pp_layer_partition,
+        )
         layer_ids = tuple(
             getattr(
                 self.draft_model_config.hf_config,

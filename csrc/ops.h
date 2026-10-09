@@ -424,6 +424,14 @@ void sm70_glm_mhc_pre_norm_out(
     double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
     double norm_eps);
 
+void sm70_glm_mhc_pre_norm_configured_out(
+    torch::Tensor gemm_mul, torch::Tensor gemm_sqrsum, torch::Tensor hc_scale,
+    torch::Tensor hc_base, torch::Tensor residual, torch::Tensor post_mix,
+    torch::Tensor comb_mix, torch::Tensor layer_input,
+    torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
+    double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
+    double norm_eps, int64_t configured_threads);
+
 void sm70_glm_mhc_post_dot_q8_out(torch::Tensor residual_out,
                                   torch::Tensor gemm_mul,
                                   torch::Tensor gemm_sqrsum,

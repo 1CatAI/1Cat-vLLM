@@ -7,6 +7,7 @@ import os
 from pydantic import Field
 
 from vllm import envs
+from vllm.config.execution_policy import read_execution_legacy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 
@@ -33,6 +34,32 @@ SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "1",
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
 }
+
+SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS = {
+    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "1",
+    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "1",
+    "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": "1",
+    "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": "1",
+    "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "1",
+    "VLLM_SM70_DFLASH2_BF16_EMULATION": "1",
+    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "0.9",
+    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "0.95",
+    # The sparse target sampler is not part of the retained GLM quality route.
+    "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "0",
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY": "1",
+    "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN": "1",
+    "VLLM_SM70_GLM53_TP8_CUBLASLT": "1",
+    "VLLM_SM70_GLM53_TP8_FUSED_FG_B": "1",
+    "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": "1",
+    "VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8": "1",
+    "VLLM_SM70_GLM_MHC_PRE_THREADS": "1024",
+    "VLLM_SM70_GLM53_MOE_QPN_W13_Q8": "0",
+    "VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS": "1",
+    "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR": "1",
+    "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR": "1",
+    "VLLM_USE_AOT_COMPILE": "0",
+}
+
 
 SM70_DFLASH2_LEGACY_FIELDS = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": "fused_gdn_verify",
@@ -121,6 +148,15 @@ class Sm70DFlash2Config:
     sharded_context_fc: bool | None = None
     """Policy for sharded context fc; None retains automatic qualification."""
 
+    bf16_emulation: bool | None = None
+    """Preserve the draft's BF16 emulation contract on FP16-only devices."""
+    proposal_temperature_scale: float | None = None
+    """Multiplier for probabilistic proposal temperature; positive."""
+    proposal_top_p: float | None = None
+    """Nucleus probability for draft proposals, in (0, 1]."""
+    sources: dict[str, str] = Field(default_factory=dict, init=False)
+    """Initialization sources, excluded from graph options."""
+
     qualified: bool = Field(default=False, init=False, repr=False)
     """Whether the retained complete-model validation boundary matches."""
 
@@ -143,7 +179,10 @@ class Sm70DFlash2Config:
         explicit = []
         for name, field in SM70_DFLASH2_LEGACY_FIELDS.items():
             configured = getattr(self, field)
-            if configured is not None or name in os.environ:
+            if (
+                configured is not None
+                and not self.sources.get(field, "").startswith("default:")
+            ) or name in os.environ:
                 explicit.append(field)
             if name in os.environ:
                 logger.warning_once(
@@ -160,6 +199,19 @@ class Sm70DFlash2Config:
                     else envs.environment_variables[name]()
                 )
             setattr(self, field, configured)
+        from vllm.config.sm70_runtime import resolve_legacy_fields
+
+        resolve_legacy_fields(
+            self,
+            {
+                "bf16_emulation": "VLLM_SM70_DFLASH2_BF16_EMULATION",
+                "proposal_temperature_scale": (
+                    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE"
+                ),
+                "proposal_top_p": "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P",
+            },
+            reader=read_execution_legacy,
+        )
         self.explicit_fields = tuple(explicit)
         self.qualified = qualified
         self.resolved = True
@@ -167,7 +219,11 @@ class Sm70DFlash2Config:
     def graph_options(self) -> dict[str, bool | None]:
         return {
             field: getattr(self, field)
-            for field in (*SM70_DFLASH2_LEGACY_FIELDS.values(), "draft_window_split")
+            for field in (
+                *SM70_DFLASH2_LEGACY_FIELDS.values(),
+                "draft_window_split",
+                "bf16_emulation",
+            )
         }
 
 
@@ -189,3 +245,9 @@ def sm70_dflash2_enabled(field: str, policy: Sm70DFlash2Config | None) -> bool:
         name for name, value in SM70_DFLASH2_LEGACY_FIELDS.items() if value == field
     )
     return bool(getattr(envs, name))
+
+
+def dflash2_bf16_emulation(policy: Sm70DFlash2Config | None) -> bool:
+    if policy is not None and policy.resolved:
+        return bool(policy.bf16_emulation)
+    return read_execution_legacy("VLLM_SM70_DFLASH2_BF16_EMULATION")

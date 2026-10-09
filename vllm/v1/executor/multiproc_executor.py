@@ -27,6 +27,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.config.execution_policy import ple_policy
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
 from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
@@ -613,9 +614,9 @@ class WorkerProc:
 
         # Load model
         self.worker.init_device()
-        if ple_offload_enabled(vllm_config) and not envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        if ple_offload_enabled(vllm_config) and not ple_policy(vllm_config).hybrid:
             self.worker.spawn_ple_offload()
-        elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        elif ple_policy(vllm_config).hybrid:
             self.worker.prepare_ple_offload_spawn()
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
@@ -625,7 +626,7 @@ class WorkerProc:
             self.worker.elastic_ep_execute("load_model")
         else:
             self.worker.load_model()
-        if envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+        if ple_policy(vllm_config).hybrid:
             # Hybrid mode retains a large pinned shard in every TP worker.
             # Load those shards before the file-backed PLE worker scans the
             # checkpoint so startup does not create avoidable memory pressure.

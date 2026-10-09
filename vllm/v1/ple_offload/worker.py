@@ -341,11 +341,6 @@ class PleOffloadWorkerHandle:
 
 def _init_offload_distributed() -> None:
     """Initialize the single-rank Gloo world required by TP-aware layers."""
-    # The worker builds its model in the PP1 world configured below, but it
-    # inherits the GPU workers' environment: a VLLM_PP_LAYER_PARTITION written
-    # for the real pipeline makes get_pp_indices() refuse the single stage
-    # ("len(partitions) != pp_size") while the meta model is constructed.
-    os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
     if dist.is_initialized():
         return
 
@@ -508,6 +503,7 @@ class PleOffloadWorker:
 
             # Initialize Gloo before installing the real VllmConfig. This keeps
             # the CPU process in an isolated rank-zero, world-size-one group.
+            vllm_config.parallel_config.communication.pp_layer_partition = None
             _init_offload_distributed()
 
             # Model components read the active VllmConfig while the meta model

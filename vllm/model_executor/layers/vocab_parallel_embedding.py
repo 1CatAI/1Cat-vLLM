@@ -11,6 +11,7 @@ from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
+from vllm.config.execution_policy import graph_policy, layer_policy
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
@@ -56,7 +57,7 @@ def _sm70_env_bool(name: str, default: bool) -> bool:
 
 
 def _sm70_lm_head_top1_default() -> bool:
-    return not _sm70_env_bool("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", False)
+    return not graph_policy().compile_graph
 
 
 def _sm70_dflash2_option(field: str, layer=None) -> bool:
@@ -110,7 +111,7 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
         return False
     if not (
         _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
-        or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default())
+        or bool(layer_policy().lm_head_top1)
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
         or _sm70_dflash2_option("fp32_logits", layer)
         or _sm70_dflash2_qpn8_rerank_requested(layer=layer)
@@ -402,9 +403,7 @@ def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
         # or the number of devices participating in tensor parallelism.
         layer._sm70_dflash2_fp32_logits = True
 
-    raw_top1_requested = _sm70_env_bool(
-        "VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default()
-    )
+    raw_top1_requested = bool(layer_policy().lm_head_top1)
     packed_layout_requested = _sm70_lm_head_packed_layout_requested(
         getattr(layer, "_sm70_dflash2_fp32_logits", False), layer=layer
     )
@@ -478,9 +477,7 @@ def _maybe_sm70_lm_head_top1(
     x: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    lm_head_top1 = _sm70_env_bool(
-        "VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default()
-    )
+    lm_head_top1 = bool(layer_policy().lm_head_top1)
     lm_head_top1_tc = _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
     if not (lm_head_top1 or lm_head_top1_tc):
         return None

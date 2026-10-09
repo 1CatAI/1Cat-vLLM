@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from vllm import envs
+from vllm.config.execution_policy import layer_policy
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     register_layer_workspace,
     workspace_pool,
@@ -97,7 +98,7 @@ def use_batched_gemm_layouts() -> bool:
     do not restrict this shared policy. Small-M kernels retain their existing
     packed layouts; larger batches consume prepared TurboMind weights/scales.
     """
-    return envs.VLLM_SM70_BATCH_GEMM_LAYOUTS and is_exact_sm70_cuda_platform()
+    return bool(layer_policy().batch_gemm_layouts) and is_exact_sm70_cuda_platform()
 
 
 def use_native_qpn_layouts() -> bool:

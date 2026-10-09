@@ -7,12 +7,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.config.runtime_policy_utils import make_policy_defaults
 from tests.utils import set_lazy_env
 from vllm.compilation.sm70_decode_graph import (
     is_sm70_decode_graph_compiling,
     sm70_decode_graph_compilation,
     use_sm70_decode_graph_semantics,
 )
+from vllm.config import DeviceConfig
+from vllm.config.execution_policy import ple_policy
 from vllm.config.parallel import ParallelConfig
 from vllm.config.vllm import (
     VllmConfig,
@@ -141,21 +144,27 @@ def test_qwen38_nomtp_defaults_preserve_overrides(monkeypatch):
     cfg = _nomtp_default_config()
     disabled = "VLLM_SM70_QWEN38_FP16_GEMV"
     os.environ[disabled] = "0"
-    applied = _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
-    assert disabled not in applied and os.environ[disabled] == "0"
+    defaults = make_policy_defaults()
+    applied = _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True, defaults=defaults)
+    assert disabled not in applied and defaults[disabled] == "0"
     assert len(applied) == 4
-    assert os.environ["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
-    assert "VLLM_SM70_RMSNORM_GATED_EXACT" not in os.environ
-    assert _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True) == ()
-    assert "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8" not in os.environ
-    assert "VLLM_SM70_NVFP4_QPN2" not in os.environ
+    assert defaults["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
+    assert "VLLM_SM70_RMSNORM_GATED_EXACT" not in defaults
+    assert (
+        _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True, defaults=defaults) == ()
+    )
+    assert "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8" not in defaults
+    assert "VLLM_SM70_NVFP4_QPN2" not in defaults
 
 
 def test_qwen38_exact_gated_norm_preserves_explicit_override(monkeypatch):
     monkeypatch.setattr(os, "environ", {"VLLM_SM70_RMSNORM_GATED_EXACT": "0"})
-    applied = _apply_sm70_qwen38_decode_defaults(_nomtp_default_config(), is_sm70=True)
+    defaults = make_policy_defaults()
+    applied = _apply_sm70_qwen38_decode_defaults(
+        _nomtp_default_config(), is_sm70=True, defaults=defaults
+    )
     assert "VLLM_SM70_RMSNORM_GATED_EXACT" not in applied
-    assert os.environ["VLLM_SM70_RMSNORM_GATED_EXACT"] == "0"
+    assert defaults["VLLM_SM70_RMSNORM_GATED_EXACT"] == "0"
 
 
 @pytest.mark.parametrize(
@@ -176,7 +185,13 @@ def test_qwen38_nomtp_defaults_reject_unqualified_contract(monkeypatch, mismatch
         cfg.model_config.dtype = torch.bfloat16
     elif mismatch == "multimodal":
         cfg.model_config.multimodal_config.language_model_only = False
-    assert _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=mismatch != "device") == ()
+    defaults = make_policy_defaults()
+    assert (
+        _apply_sm70_qwen38_decode_defaults(
+            cfg, is_sm70=mismatch != "device", defaults=defaults
+        )
+        == ()
+    )
     assert not os.environ
 
 
@@ -212,15 +227,16 @@ def test_projection_defaults_do_not_depend_on_unrelated_model_policy(
     for parent in parents:
         obj = getattr(obj, parent)
     setattr(obj, field, value)
-    _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
+    defaults = make_policy_defaults()
+    _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True, defaults=defaults)
     for name in (
         "VLLM_SM70_QWEN38_FP16_GEMV",
         "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16",
         "VLLM_SM70_QWEN38_FUSED_HC_FP16",
     ):
-        assert os.environ[name] == "1"
+        assert defaults[name] == "1"
     if path in ("parallel_config.enable_expert_parallel", "parallel_config.enable_dbo"):
-        assert "VLLM_SM70_MOE_ADD_ALLREDUCE" not in os.environ
+        assert "VLLM_SM70_MOE_ADD_ALLREDUCE" not in defaults
 
 
 def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
@@ -235,12 +251,13 @@ def test_parallel_config_initializes_ple_ipc_after_late_auto_enable(
     parallel_config = ParallelConfig()
     assert parallel_config._ple_offload_ipc_path == ""
 
-    _apply_sm70_qwen38_disk_ple_defaults(parallel_config)
+    defaults = make_policy_defaults()
+    _apply_sm70_qwen38_disk_ple_defaults(parallel_config, defaults=defaults)
     ipc_path = parallel_config._ple_offload_ipc_path
 
-    assert os.environ["VLLM_SM70_QWEN38_HYBRID_PLE"] == "0"
-    assert os.environ["VLLM_PLE_CPU_OFFLOAD"] == "1"
-    assert os.environ["VLLM_PLE_DISK_OFFLOAD"] == "1"
+    assert defaults["VLLM_SM70_QWEN38_HYBRID_PLE"] == "0"
+    assert defaults["VLLM_PLE_CPU_OFFLOAD"] == "1"
+    assert defaults["VLLM_PLE_DISK_OFFLOAD"] == "1"
     assert ipc_path.startswith("ipc://")
     parallel_config.ensure_ple_offload_ipc_path()
     assert parallel_config._ple_offload_ipc_path == ipc_path
@@ -282,7 +299,8 @@ def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
     set_lazy_env(monkeypatch, "VLLM_SM70_QWEN38_HYBRID_PLE", "1")
     launches: list[tuple[int, int]] = []
     connector = SimpleNamespace(
-        _launch=lambda num_reqs, num_tokens: launches.append((num_reqs, num_tokens))
+        _ple_policy=ple_policy(),
+        _launch=lambda num_reqs, num_tokens: launches.append((num_reqs, num_tokens)),
     )
 
     PleOffloadConnector.prepare_forward(
@@ -306,9 +324,10 @@ def test_qwen4exp_ple_cascade_starts_the_offload_worker(monkeypatch) -> None:
     # without inheriting admission or changing the process environment. On SM70
     # hosts VllmConfig() itself applies the Flash-V100 baseline defaults, so the
     # snapshot is taken after it.
-    cfg = VllmConfig()
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
     before = dict(os.environ)
-    assert not _qwen4exp_ple_cascade_requested(cfg)
+    defaults = make_policy_defaults()
+    assert not _qwen4exp_ple_cascade_requested(cfg, defaults=defaults)
     assert cfg.kernel_config.ple_disk_cascade_reason == "no PLE layers"
     assert dict(os.environ) == before
 
@@ -340,15 +359,14 @@ def test_qwen38_shared_defaults_match_operator_admission(
         method=method, num_speculative_tokens=width
     )
     assert _exact_runtime_contract(cfg) == admitted
-    applied = _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True)
+    defaults = make_policy_defaults()
+    applied = _apply_sm70_qwen38_decode_defaults(cfg, is_sm70=True, defaults=defaults)
     assert bool(applied) == admitted
     if admitted:
         assert len(applied) == (6 if method == "mtp" else 5)
-        assert os.environ["VLLM_SM70_QWEN38_FP16_GEMV"] == "1"
-        assert os.environ["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
-        assert ("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS" in os.environ) == (
-            method == "mtp"
-        )
+        assert defaults["VLLM_SM70_QWEN38_FP16_GEMV"] == "1"
+        assert defaults["VLLM_SM70_QWEN38_FUSED_HC_FP16"] == "1"
+        assert ("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS" in defaults) == (method == "mtp")
 
 
 @pytest.mark.parametrize("tokens", [1, 5])
@@ -357,7 +375,9 @@ def test_hybrid_ple_admits_target_decode_widths(monkeypatch, tokens):
 
     monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
     launches = []
-    connector = SimpleNamespace(_launch=lambda *args: launches.append(args))
+    connector = SimpleNamespace(
+        _ple_policy=ple_policy(), _launch=lambda *args: launches.append(args)
+    )
     PleOffloadConnector.prepare_forward(connector, 1, tokens, False, True)
     assert launches == []
     PleOffloadConnector.prepare_forward(connector, 1, tokens, False, False)

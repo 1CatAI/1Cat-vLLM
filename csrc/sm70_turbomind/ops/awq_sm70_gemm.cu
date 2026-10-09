@@ -2262,7 +2262,7 @@ void sm70_glm_mhc_pre_norm_out(
     torch::Tensor comb_mix, torch::Tensor layer_input,
     torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
     double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
-    double norm_eps) {
+    double norm_eps, int64_t configured_threads) {
   TORCH_CHECK(
       gemm_mul.is_cuda() && gemm_sqrsum.is_cuda() && hc_scale.is_cuda() &&
           hc_base.is_cuda() && residual.is_cuda() && post_mix.is_cuda() &&
@@ -2326,7 +2326,13 @@ void sm70_glm_mhc_pre_norm_out(
           static_cast<float>(hc_sinkhorn_eps),                                 \
           static_cast<float>(hc_post_mult), static_cast<int>(sinkhorn_repeat), \
           static_cast<float>(norm_eps))
-  const int threads = num_tokens == 1 ? 128 : glm_mhc_pre_threads();
+  const int requested_threads = static_cast<int>(configured_threads);
+  const int valid_threads =
+      (requested_threads == 128 || requested_threads == 256 ||
+       requested_threads == 512 || requested_threads == 1024)
+          ? requested_threads
+          : 256;
+  const int threads = num_tokens == 1 ? 128 : valid_threads;
   switch (threads) {
     case 128:
       VLLM_LAUNCH_GLM_MHC_PRE(128);
@@ -7296,7 +7302,21 @@ void sm70_glm_mhc_pre_norm_out(
   vllm::awq_sm70::sm70_glm_mhc_pre_norm_out(
       gemm_mul, gemm_sqrsum, hc_scale, hc_base, residual, post_mix, comb_mix,
       layer_input, norm_weight, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-      hc_post_mult, sinkhorn_repeat, norm_eps);
+      hc_post_mult, sinkhorn_repeat, norm_eps,
+      vllm::awq_sm70::glm_mhc_pre_threads());
+}
+
+void sm70_glm_mhc_pre_norm_configured_out(
+    torch::Tensor gemm_mul, torch::Tensor gemm_sqrsum, torch::Tensor hc_scale,
+    torch::Tensor hc_base, torch::Tensor residual, torch::Tensor post_mix,
+    torch::Tensor comb_mix, torch::Tensor layer_input,
+    torch::Tensor norm_weight, double rms_eps, double hc_pre_eps,
+    double hc_sinkhorn_eps, double hc_post_mult, int64_t sinkhorn_repeat,
+    double norm_eps, int64_t configured_threads) {
+  vllm::awq_sm70::sm70_glm_mhc_pre_norm_out(
+      gemm_mul, gemm_sqrsum, hc_scale, hc_base, residual, post_mix, comb_mix,
+      layer_input, norm_weight, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+      hc_post_mult, sinkhorn_repeat, norm_eps, configured_threads);
 }
 
 void sm70_glm_mhc_post_dot_q8_out(torch::Tensor residual_out,
