@@ -13,6 +13,8 @@ from typing import Any
 import gguf
 from transformers import AutoConfig, PretrainedConfig
 
+from vllm.transformers_utils.gguf_fast_fields import FastFieldsMixin
+
 # GGUF architecture, HF configuration type, vLLM model implementation.
 _ARCHITECTURES = {
     "llama": ("llama", "LlamaForCausalLM"),
@@ -25,7 +27,7 @@ _ARCHITECTURES = {
 }
 
 
-class _MetadataReader(gguf.GGUFReader):
+class _MetadataReader(FastFieldsMixin, gguf.GGUFReader):
     def _build_tensors(self, _offset, _fields):
         # The config/tokenizer stage must work even when a checkpoint contains
         # a newer GGML type unknown to the installed gguf package. Tensor

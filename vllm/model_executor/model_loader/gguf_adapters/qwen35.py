@@ -6,6 +6,8 @@ Name and GDN layout rules are adapted from vllm-gguf-plugin at
 e2b8ad532b8b5ea175100202c30430c1d2b5e6a8 (Apache-2.0).
 """
 
+import os
+
 import gguf
 import numpy as np
 import regex as re
@@ -58,14 +60,36 @@ def _embedding_chunks(tensor, dtype, name, rows_per_chunk=1024):
         yield start, stop, converted
 
 
+def _decode_embedding_rows(tensor, dtype, name, start, stop):
+    data = gguf.quants.dequantize(tensor.data[start:stop], tensor.tensor_type)
+    decoded = torch.from_numpy(data)
+    converted = decoded.to(dtype)
+    if torch.any(torch.isfinite(decoded) & ~torch.isfinite(converted)):
+        raise ValueError(f"GGUF {name}: values overflow {dtype}; use --dtype float32")
+    return converted
+
+
 def _dequantize_embedding(tensor, dtype, name, rows_per_chunk=1024):
-    """Bound temporary decode/range-check memory for dense vocabulary tables."""
+    """Bound temporary decode/range-check memory for dense vocabulary tables.
+
+    Row chunks are independent; NumPy and Torch release the GIL inside each
+    decode, so a few threads shorten startup without changing any value.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     rows, columns = map(int, tensor.shape[::-1])
     weight = torch.empty((rows, columns), dtype=dtype, device="cpu")
-    for start, stop, converted in _embedding_chunks(
-        tensor, dtype, name, rows_per_chunk
-    ):
-        weight[start:stop].copy_(converted)
+
+    def fill(start):
+        stop = min(start + rows_per_chunk, rows)
+        weight[start:stop].copy_(
+            _decode_embedding_rows(tensor, dtype, name, start, stop)
+        )
+
+    workers = max(1, min(6, (os.cpu_count() or 1) // 4))
+    with ThreadPoolExecutor(workers) as pool:
+        # list() re-raises the first failing chunk in row order.
+        list(pool.map(fill, range(0, rows, rows_per_chunk)))
     return weight
 
 

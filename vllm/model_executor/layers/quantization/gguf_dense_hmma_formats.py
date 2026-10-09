@@ -220,3 +220,93 @@ def pack(fmt, q, s, m, gs):
     scale = sc.reshape(T, 32, G, 4).transpose(0, 2, 1, 3)  # (T, G, L, 4)
     f = lambda a: np.ascontiguousarray(a).astype(np.uint32).view(np.uint8).reshape(-1)
     return f(codes), (f(high) if high.size else high), f(scale)
+
+
+def pack_device(fmt, q, s, m, gs, device):
+    """Device twin of ``pack``: identical bytes, returned as device uint8 tensors.
+
+    ``q``/``s``/``m`` are the same NumPy inputs ``pack`` takes; the integer
+    register assembly runs on ``device`` in int64 and is emitted as the same
+    little-endian uint32 words. FP16 conversion uses the same round-to-nearest.
+    """
+    import torch
+
+    q = torch.from_numpy(np.ascontiguousarray(q)).to(device)
+    N, K = q.shape
+    T = (N + 31) // 32
+    S = (K + 31) // 32
+    G = (S + 3) // 4
+    Sp = G * 4
+    rowmap = torch.from_numpy(ROWMAP).to(device)
+    qp = torch.zeros((T * 32, Sp * 32), dtype=torch.uint8, device=device)
+    qp[:N, :K] = q
+    Q = qp.view(T, 32, Sp, 32)[:, rowmap].long()
+    lo = Q & 0xF
+
+    def half_bits(values, cols):
+        padded = torch.zeros((T * 32, cols), dtype=torch.float32, device=device)
+        padded[:N, : values.shape[1]] = torch.from_numpy(
+            np.ascontiguousarray(values, dtype=np.float32)
+        ).to(device)
+        return padded.half().view(torch.int16).long() & 0xFFFF
+
+    S16 = half_bits(s, Sp * 32 // gs).view(T, 32, Sp, 32 // gs)[:, rowmap]
+    if m is not None:
+        M16 = half_bits(m, Sp * 32 // gs).view(T, 32, Sp, 1)[:, rowmap]
+    high = None
+    if fmt in (Q4K, Q5K, Q6K):
+        regs = torch.zeros((T, 32, Sp, 4), dtype=torch.long, device=device)
+        for c in range(4):
+            for j in range(4):
+                regs[..., c] |= lo[..., 8 * c + 2 * j] << (4 * j)
+                regs[..., c] |= lo[..., 8 * c + 2 * j + 1] << (4 * j + 16)
+        codes = regs.permute(0, 2, 1, 3)
+    elif fmt == LUT4:
+        regs = torch.zeros((T, 32, Sp, 4), dtype=torch.long, device=device)
+        for c in range(4):
+            for b in range(4):
+                byte = Q[..., 8 * c + 2 * b] | (Q[..., 8 * c + 2 * b + 1] << 4)
+                regs[..., c] |= byte << (8 * b)
+        codes = regs.permute(0, 2, 1, 3)
+    else:
+        regs = torch.zeros((T, 32, Sp, 8), dtype=torch.long, device=device)
+        for c in range(8):
+            for b in range(4):
+                regs[..., c] |= Q[..., 4 * c + b] << (8 * b)
+        codes = regs.view(T, 32, Sp, 2, 4).permute(0, 2, 3, 1, 4)
+    if fmt == Q5K:
+        hb = (Q >> 4) & 1
+        H = torch.zeros((T, 32, Sp), dtype=torch.long, device=device)
+        for c in range(4):
+            for j in range(4):
+                H |= hb[..., 8 * c + 2 * j] << (4 * c + j)
+                H |= hb[..., 8 * c + 2 * j + 1] << (16 + 4 * c + j)
+        high = H.view(T, 32, G, 4).permute(0, 2, 1, 3)
+    elif fmt == Q6K:
+        hb = (Q >> 4) & 3
+        H = torch.zeros((T, 32, Sp, 2), dtype=torch.long, device=device)
+        for c in range(4):
+            for j in range(4):
+                p = 2 * (4 * (c & 1) + j)
+                H[..., c >> 1] |= hb[..., 8 * c + 2 * j] << p
+                H[..., c >> 1] |= hb[..., 8 * c + 2 * j + 1] << (16 + p)
+        high = H.view(T, 32, G, 2, 4).permute(0, 2, 3, 1, 4)
+    if fmt in (Q4K, Q5K):
+        sc = S16[..., 0] | (M16[..., 0] << 16)
+    elif fmt == Q6K:
+        sc = S16[..., 0] | (S16[..., 1] << 16)
+    else:
+        sc = S16[..., 0] | (S16[..., 0] << 16)
+    scale = sc.reshape(T, 32, G, 4).permute(0, 2, 1, 3)
+
+    def words(a):
+        a = a.contiguous()
+        return (
+            (a - ((a >> 31) & 1) * (1 << 32))
+            .to(torch.int32)
+            .view(torch.uint8)
+            .reshape(-1)
+        )
+
+    empty = torch.zeros(0, dtype=torch.uint8, device=device)
+    return words(codes), (words(high) if high is not None else empty), words(scale)
