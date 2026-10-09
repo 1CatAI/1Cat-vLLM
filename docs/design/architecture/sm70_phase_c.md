@@ -54,12 +54,12 @@ diagnostics and warmup-only selection do not.
 | C1b | Staged input resources and ordinary speculative sampling boundary | Merged as #1131 (`dfaeb1ba19ca98`) |
 | C2a | GDN compute plan, providers and shared stages | Merged as #1133 (`ec535b1e69b6`) |
 | C2b | GDN metadata and state preparation/commit | Merged as #1135 (`ad19d7ad1166`) |
-| C3 | Ordered defaults, model qualification and engine-local effective values | Pending |
+| C3 | Ordered defaults, model qualification and engine-local effective values | Validated in #1137 |
 | C4a | Shared embedding, LM-head, norm and linear providers | Pending |
 | C4b | Graph/communication/fusion boundaries and final explanation report | Pending |
 
-Each batch is reviewed and merged directly into main before creating the next
-branch. Existing experiments remain available; default-off alone does not imply
+Each PR is based on merged main and is reviewed and merged before the next
+PR is published. Existing experiments remain available; default-off alone does not imply
 deprecation. Compatibility modules forward to the single owning implementation.
 Generic executors neither call back into the old format/model module nor accept
 an entire runner as an untyped execution context.
@@ -573,3 +573,44 @@ Standalone fullgraph admission is also covered: configuration construction is
 constant-folded outside tensor tracing only when no engine owner exists. Active
 engines bypass that compatibility path. A fullgraph CPU test alternates two
 engine forward contexts and verifies the selected policy does not leak.
+
+C3 GPU acceptance on 54633 is complete. The normal `_C` CMake target was built
+for SM70 with CUDA 12.8, Torch 2.10.0+cu128 and driver 580.173.02; GPU 0 is a
+V100-SXM2-32GB. Native SHA256 is
+`4df50cb5cc140449a80705b4f7e846dcb4f393b14fb3a9a6b3e82446b0d9ddd1`.
+Its dependencies are standard CUDA/Torch/system libraries. Fresh Python
+processes loaded and exercised it without preload or private library overrides.
+The build's three changed native files match the final source token-for-token;
+only clang-format whitespace differs in the CUDA source.
+
+- Existing mHC subset: **7 baseline + 7 candidate passed**.
+- Configured native threads, updated-input graph replay, Gemma norm and GDN
+  stages: **46 passed**, including bitwise legacy/configured comparisons.
+- Seven alternating paired rounds tested M1/M8 at 256/1024 configured threads
+  (M1 still launches 128). All 56 direct-ABI output digests and all 56 actual
+  provider output digests match their paired baseline. Both use the same
+  source/model-less input contract, with no model weights loaded.
+
+Actual `sm70_mhc_pre_norm_from_staging` provider measurements, in microseconds:
+
+| Rows / threads | GPU baseline → candidate | Host baseline → candidate | Paired host delta |
+|---|---|---|---|
+| 1 / 256 | 16.583 → 16.584 | 17.226 → 18.506 | +1.285 |
+| 1 / 1024 | 16.572 → 16.571 | 16.933 → 18.449 | +1.110 |
+| 8 / 256 | 14.506 → 14.506 | 19.125 → 18.535 | -1.620 |
+| 8 / 1024 | 12.802 → 12.801 | 19.042 → 18.269 | -1.461 |
+
+Entries are medians; paired deltas are medians of matched-round differences.
+Baseline host ranges were respectively 16.164–18.878, 15.959–19.221,
+18.184–21.645 and 18.730–21.300 microseconds. M1 has a small measured host
+increase inside that variation; this is not a speedup claim. GPU changes are
+within the paired baseline variation. Direct ABI medians likewise remain
+16.621/16.610/14.596/12.888 → 16.623/16.614/14.596/12.886 microseconds.
+**No additional temporary GPU allocation** was measured in either harness.
+
+Raw evidence: the task-owned `phase-c3-20261009/artifacts` directory on 54633,
+including `baseline-v3.xml`, `candidate-v3.xml`, `candidate-stages-v3.xml`,
+`bench-v3.jsonl`, `bench-provider-v2.jsonl`, native dependency records and build
+log. Local retained copies and the source-token comparison are in
+`/home/ymzx/arch-ws/tmp/phase-c3`. No model throughput, TTFT or 35B conclusion is
+made by this acceptance.
