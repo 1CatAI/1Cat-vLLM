@@ -175,9 +175,10 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((max_tokens, num_heads, self.kv_lora_rank), torch.float16),
         ]
-        # FP8-KV decode/verify keeps scores and softmax in FP32. The GEMM
-        # routes below store raw scores in fp16, which overflows on large
-        # logits; they remain only for head counts the kernel cannot tile.
+        # FP8-KV attention keeps scores and softmax in FP32 through one
+        # tensor-core kernel for every token count: decode, verify and prefill.
+        # The fp16-score GEMM routes (<= 8 tokens) and the Triton prefill route
+        # remain only for head counts the kernel cannot tile.
         self.use_fp32_sparse_mla = (
             self.use_fp8_cache and num_heads % _SPARSE_MLA_FP8_HEADS_PER_CTA == 0
         )
@@ -190,7 +191,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 )
             max_rows = max(
                 t * _sparse_mla_fp8_num_splits(self.index_width, t)
-                for t in range(1, self.fp8_gemm_max_tokens + 1)
+                for t in range(1, max_tokens + 1)
             )
             workspace_specs.extend(
                 (
@@ -332,7 +333,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 )
                 diagnostic_history("glm_sparse_indices")["seen"] = True
         workspace_manager = current_workspace_manager()
-        if self.use_fp32_sparse_mla and num_tokens <= self.fp8_gemm_max_tokens:
+        if self.use_fp32_sparse_mla:
             splits = _sparse_mla_fp8_num_splits(self.index_width, num_tokens)
             out, o_part, ml = workspace_manager.get_simultaneous(
                 ((num_tokens, self.num_heads, self.kv_lora_rank), torch.float16),

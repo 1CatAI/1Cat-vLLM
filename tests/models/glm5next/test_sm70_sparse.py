@@ -605,3 +605,41 @@ def test_glm53_sm70_fp32_sparse_mla_cuda_graph_replay_is_exact():
     torch.accelerator.synchronize()
 
     assert torch.equal(out, eager)
+
+
+@_requires_glm53_sparse_mla_op
+@pytest.mark.parametrize("num_tokens", [64, 300])
+def test_glm53_sm70_fp32_sparse_mla_prefill_matches_fp64_reference(num_tokens):
+    # Prefill shapes take the same kernel as decode, with the backend's split
+    # heuristic (a single split once the token count fills the GPU).
+    q, cache, indices, lengths = _glm53_sparse_mla_case(
+        num_tokens, 16, q_scale=0.5, seed=20261011 + num_tokens
+    )
+    num_splits = sparse_module._sparse_mla_fp8_num_splits(indices.shape[1], num_tokens)
+    scale = 256**-0.5
+    out = _glm53_sparse_mla_fp32(q, cache, indices, lengths, scale, num_splits)
+    ref = _glm53_sparse_mla_fp64_reference(q, cache, indices, lengths, scale)
+
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out.double(), ref, rtol=1e-2, atol=2e-3)
+
+
+@_requires_glm53_sparse_mla_op
+def test_glm53_sm70_fp32_sparse_mla_prefill_matches_triton_route():
+    # The FP32 kernel replaces the Triton prefill route for FP8 KV; both keep
+    # the softmax state in FP32 and must agree at prefill token counts.
+    q, cache, indices, lengths = _glm53_sparse_mla_case(
+        300, 16, q_scale=0.5, seed=20261012
+    )
+    scale = 256**-0.5
+    out = _glm53_sparse_mla_fp32(
+        q,
+        cache,
+        indices,
+        lengths,
+        scale,
+        sparse_module._sparse_mla_fp8_num_splits(indices.shape[1], 300),
+    )
+    triton_out = torch.empty_like(q)
+    sm70_glm5_sparse_attention_paged_fp8(q, cache, indices, lengths, scale, triton_out)
+    torch.testing.assert_close(out, triton_out, rtol=1e-2, atol=2e-3)
