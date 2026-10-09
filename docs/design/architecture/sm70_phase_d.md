@@ -62,7 +62,7 @@ part of the contract.
 | D2 GDN and speculation | Merged [#1143](https://github.com/1CatAI/1Cat-vLLM/pull/1143); CI passed | CPU isolation/compatibility, 17 GPU operator cases and matched A/B passed. |
 | D3 diagnostics | Merged [#1146](https://github.com/1CatAI/1Cat-vLLM/pull/1146); CI passed | Shared diagnostic owner, 74 initialized parameters, legacy typed MoE bridge, CPU isolation and 7 GPU cases plus matched operator A/B. |
 | D4a attention package | Merged `d4ce51399`, CI passed [#1148](https://github.com/1CatAI/1Cat-vLLM/pull/1148) | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
-| D4b FA2/79T resources | Pending, next main-based delivery | Remaining native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build. D4 is not closed by D4a. |
+| D4b FA2/79T resources | Validated, ready for review | Native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build; evidence below. |
 | D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
 | D6 closure | Pending | Complete evidence audit, remaining-name ownership, report and execution-time read guards. |
 
@@ -399,14 +399,28 @@ reads and no string parsing. The independent legacy adapter and benchmark-only
 `PREFIX_BATCHED_TAIL_QK_ALGO_RUNTIME` / overlap-wave controls remain explicitly
 outside engine execution. The latter occur under `!PREFIX_TORCH_EXTENSION`.
 
-Validation so far: 63 focused CPU cases pass, including config/provenance/hash,
+Validation: 63 focused CPU cases pass, including config/provenance/hash,
 missing capabilities and ownership checks. On 54633, 203 operator/routing and
 synthetic-metadata cases pass without loading a model. Bound Q8000/Q8192 outputs
 match legacy exports bit for bit; two owners with distinct score-block policies
 retain correct outputs across interleaved stream replay, changed inputs, later
 query-family workspace allocation and independent shutdown. The normal FA2
-artifact builds successfully. Independent baseline/candidate performance runs
-are queued on the shared GPU lock; their results will be added before merge.
+artifact builds successfully. Eleven additional native parser projections pass
+without allocating GPU tensors. Changed-file pre-commit and layering checks pass.
+
+Three alternating process A/B rounds use the same GPU 2, TP1, Torch 2.10.0+cu128,
+CUDA 12.8 and driver 580.173.02, with FP16 Q/Hq6/Hkv1/D256 and KV32768. Median
+results (GPU events around five-call graphs; host enqueue measured separately):
+
+| Query | GPU µs baseline → candidate | Host µs baseline → candidate | Temporary bytes |
+| --- | --- | --- | --- |
+| 8000 | 28920.83 → 28980.84 (+0.21%) | 306.65 → 309.05 | 0 → 0 |
+| 8192 | 28972.65 → 28950.12 (-0.08%) | 293.98 → 298.52 | 0 → 0 |
+
+Output digests match across all six processes at both shapes. GPU differences
+are within observed event-sample variation; host samples overlap. No speedup or
+model-performance conclusion is claimed. Raw samples, artifact SHAs and the
+workload contract are in [phase_d4b_operators.json](phase_d4b_operators.json).
 
 Artifacts are under `/home/ymzx/arch-ws/phase-d4b-20261009` on 54633. The first
 baseline extraction retained old timestamps and Ninja reused candidate objects;
