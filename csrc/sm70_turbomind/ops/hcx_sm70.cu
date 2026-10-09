@@ -179,7 +179,7 @@ __device__ __forceinline__ unsigned long long gtime() {
 // pushes to all three peers, no forwarding hop. Sums use the fixed order (v0 +
 // v1) + (v2 + v3) on every rank, the same value the two-hop recursive doubling
 // produces.
-template <bool FULL, int OF>
+template <bool FULL, int OF, bool LOCAL_SCHEDULE = false>
 __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   TS(0);
   const int i = blockIdx.x, t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -310,9 +310,9 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       dhi[s] = ldgv(p + 32 + lane);
     }
   }
-  // Up weights: L2 prefetch now (one 128-byte line per lane: 5 warps x 4 s x 1
-  // KB), registers later.
-  if (warp >= 3) {
+  // Up weights use one 128-byte line per lane (5 warps x 4 KB).
+  // The local schedule delays these requests until down weights are ready.
+  if (!LOCAL_SCHEDULE && warp >= 3) {
     const char* p =
         reinterpret_cast<const char*>(a.wu + (i * 5 + warp - 3) * 4 * 64);
     pf_l2(p + lane * 128);
@@ -360,6 +360,11 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   }
   __syncthreads();
   TS(2);
+  if (LOCAL_SCHEDULE && warp >= 3) {
+    const char* p =
+        reinterpret_cast<const char*>(a.wu + (i * 5 + warp - 3) * 4 * 64);
+    pf_l2(p + lane * 128);
+  }
   // ---- 3. per-stream HC down partials over this CTA's 128 K rows (stream b =
   // k_local / 32)
   if (warp < 6) {
@@ -520,9 +525,12 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     for (int e = 0; e < 8; ++e) red[uw][e][lane] = acc[e];
   }
   __syncthreads();
-  if (warp == 0) {
+  // Independent accumulator slots can be mixed by separate warps. Each slot
+  // keeps the original five-part sum, FP16 rounding and four-stream FMA order.
+  if (LOCAL_SCHEDULE || warp == 0) {
 #pragma unroll
-    for (int e = 0; e < 8; ++e) {
+    for (int e = LOCAL_SCHEDULE ? warp : 0; e < 8;
+         e += LOCAL_SCHEDULE ? 8 : 1) {
       float acc = red[0][e][lane];
 #pragma unroll
       for (int q = 1; q < 5; ++q) acc += red[q][e][lane];
@@ -605,7 +613,7 @@ void sm70_hcx_out(
     std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
     int64_t ofmt, std::optional<torch::Tensor> gz,
     std::optional<torch::Tensor> gw, double geps,
-    std::optional<torch::Tensor> gscr) {
+    std::optional<torch::Tensor> gscr, bool local_schedule) {
   const c10::cuda::CUDAGuard guard(p0.device());
   hcx::Args a{};
   a.p0 = reinterpret_cast<const half*>(p0.data_ptr());
@@ -683,7 +691,11 @@ void sm70_hcx_out(
   else                \
     HCXO_GO(false, O);
   if (!ox) {
-    HCXO_F(-1)
+    if (full && local_schedule) {
+      hcx::hcx_kernel<true, -1, true><<<hcx::NC, 256, 0, st>>>(a);
+    } else {
+      HCXO_F(-1)
+    }
   } else if (ofmt == dmvns::Q4K) {
     HCXO_F(dmvns::Q4K)
   } else if (ofmt == dmvns::Q5K) {

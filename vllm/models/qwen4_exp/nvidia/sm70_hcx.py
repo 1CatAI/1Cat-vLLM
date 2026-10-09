@@ -203,6 +203,7 @@ class Sm70HcxRuntime:
         self.reason: str | None = None
         self.top1_enabled = False
         self.diagnostic = False
+        self.local_schedule = True
         self.snapshots: dict[str, dict[str, torch.Tensor]] = {}
         self.group = group
         self.rank = dist.get_rank(group)
@@ -379,6 +380,7 @@ class Sm70HcxRuntime:
             None,
             1e-6,
             None,
+            self.local_schedule,
         )
         if snapshot is not None:
             for key, value in (

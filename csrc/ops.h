@@ -1064,7 +1064,7 @@ void sm70_hcx_out(
     std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
     int64_t ofmt, std::optional<torch::Tensor> gz,
     std::optional<torch::Tensor> gw, double geps,
-    std::optional<torch::Tensor> gscr);
+    std::optional<torch::Tensor> gscr, bool local_schedule);
 
 void sm70_dmv13_out(torch::Tensor x, std::vector<torch::Tensor> codes,
                     std::vector<torch::Tensor> high,
