@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ast
+import io
 import itertools
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import regex as re
 import torch
 
 from vllm import _sm70_ops
@@ -15,6 +19,28 @@ from vllm.config.sm70_moe import Sm70MoEFormatConfig
 from vllm.config.sm70_native import NATIVE_FIELDS, UNSET, Sm70NativeConfig
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_packaged_native_policy_schemas_parse_before_build():
+    # Torch rejects str[] defaults written as [], even though C++ compiles.
+    # Parse the actual concatenated registration literals before a GPU build.
+    root = Path(__file__).parents[2]
+    names = set()
+    for source in ("csrc/torch_bindings.cpp", "csrc/moe/torch_bindings.cpp"):
+        text = (root / source).read_text()
+        for match in re.finditer(
+            r'\b(?:ops|m)\.def\(\s*((?:"[^"\\]*(?:\\.[^"\\]*)*"\s*)+)', text
+        ):
+            schema = "".join(
+                ast.literal_eval(item)
+                for item in re.findall(r'"[^"\\]*(?:\\.[^"\\]*)*"', match[1])
+            )
+            if "native_policy=" not in schema:
+                continue
+            parsed = torch._C.parse_schema(schema)
+            names.add(parsed.name)
+            assert parsed.arguments[-1].default_value is None
+    assert names == set(binding.CONFIGURED_OPERATORS + binding.ROUTING_OPERATORS)
 
 
 def values(policy):
@@ -196,6 +222,63 @@ def test_explicit_native_option_for_a_different_format_is_not_silently_ignored()
     policy = Sm70NativeConfig(nvfp4_qpn2_m16_native=True)
     with pytest.raises(ValueError, match="does not apply to fp8"):
         policy.resolve("fp8")
+
+
+def test_opaque_native_policy_survives_export_with_dynamic_rows(monkeypatch):
+    # The optional string-list schema must retain all captured values through
+    # fake dispatch and serialization, while M stays dynamic inside the op.
+    from vllm.model_executor.kernels.linear.qpn import nvfp4_dequant
+
+    policy = Sm70NativeConfig(nvfp4_qpn2_m16_native=False)
+    policy.resolve("nvfp4")
+    observed: list[tuple[int, tuple[str, ...] | str]] = []
+
+    def native(operation, native_policy, out, x, *args):
+        observed.append((x.shape[0], tuple(native_policy)))
+        out.zero_()
+
+    def dense(x, codes, scales, global_scale, n, k):
+        observed.append((x.shape[0], "dense"))
+        return x.new_zeros((x.shape[0], n))
+
+    monkeypatch.setattr(binding, "call_native", native)
+    monkeypatch.setattr(nvfp4_dequant, "_nvfp4_qpn2_dense_linear", dense)
+
+    class Projection(torch.nn.Module):
+        def forward(self, x):
+            return torch.ops.vllm.nvfp4_qpn2_dispatch_linear(
+                x, x, x, 1.0, 8, 4, 16, 2, list(policy.values)
+            )
+
+    lib = None
+    if not torch._C._dispatch_has_kernel_for_dispatch_key(
+        "vllm::nvfp4_qpn2_dispatch_linear", "CPU"
+    ):
+        lib = torch.library.Library("vllm", "IMPL", "CPU")
+        lib.impl(
+            "nvfp4_qpn2_dispatch_linear", nvfp4_dequant._nvfp4_qpn2_dispatch_linear
+        )
+    try:
+        exported = torch.export.export(
+            Projection(),
+            (torch.zeros(2, 4),),
+            dynamic_shapes={"x": {0: torch.export.Dim("rows", min=1, max=128)}},
+        )
+        artifact = io.BytesIO()
+        torch.export.save(exported, artifact)
+        artifact.seek(0)
+        reloaded = torch.export.load(artifact).module()
+        for rows in (1, 32, 33, 65):
+            assert reloaded(torch.zeros(rows, 4)).shape == (rows, 8)
+        assert observed == [
+            (1, policy.values),
+            (32, policy.values),
+            (33, "dense"),
+            (65, "dense"),
+        ]
+    finally:
+        if lib is not None:
+            lib._destroy()
 
 
 @pytest.mark.parametrize("explicit_qpn8", [None, False, True])

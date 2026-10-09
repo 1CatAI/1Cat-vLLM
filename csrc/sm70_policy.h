@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -91,9 +92,11 @@ class PolicyScope {
 // kernels; graph replay needs neither TLS nor policy storage addresses.
 template <typename Result, typename... Args>
 auto with_policy(Result (*operation)(Args...)) {
-  return [operation](Args... args,
-                     std::vector<std::string> native_policy) -> Result {
-    const PolicyScope scope(native_policy);
+  return [operation](
+             Args... args,
+             std::optional<std::vector<std::string>> native_policy) -> Result {
+    const std::vector<std::string> empty;
+    const PolicyScope scope(native_policy ? *native_policy : empty);
     return operation(args...);
   };
 }

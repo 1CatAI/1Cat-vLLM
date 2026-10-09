@@ -222,6 +222,7 @@ def main():
             LayerWorkspaceView(layer, "sm70_" + family + "_"),
             raw,
             layer.swiglu_limit,
+            bindings=getattr(new, "native_ops", None),
         )
         print(
             json.dumps(

@@ -101,7 +101,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "int n_local_expert,"
       "int topk, Tensor! permuted_input, Tensor! "
       "expert_first_token_offset, Tensor! inv_permuted_idx, Tensor! "
-      "permuted_idx, str[] native_policy=[])->()");
+      "permuted_idx, str[]? native_policy=None)->()");
 
   m.def(
       "moe_permute_with_scratch(Tensor input, Tensor topk_ids,"
@@ -110,8 +110,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "int topk, Tensor! permuted_input, Tensor! "
       "expert_first_token_offset, Tensor! inv_permuted_idx, Tensor! "
       "permuted_idx, Tensor! sort_workspace, Tensor! permuted_experts_id, "
-      "Tensor! sorted_row_idx, Tensor! topk_ids_for_sort, str[] "
-      "native_policy=[])->()");
+      "Tensor! sorted_row_idx, Tensor! topk_ids_for_sort, str[]? "
+      "native_policy=None)->()");
 
   m.def(
       "moe_permute_metadata_with_scratch(Tensor input, Tensor topk_ids,"
@@ -120,12 +120,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor! inv_permuted_idx, Tensor! permuted_idx, Tensor! "
       "input_row_indices, Tensor! sort_workspace, Tensor! "
       "permuted_experts_id, Tensor! sorted_row_idx, Tensor! "
-      "topk_ids_for_sort, str[] native_policy=[])->()");
+      "topk_ids_for_sort, str[]? native_policy=None)->()");
 
   m.def(
       "moe_unpermute(Tensor permuted_hidden_states, Tensor topk_weights,"
       "Tensor inv_permuted_idx, Tensor? expert_first_token_offset, "
-      "int topk, Tensor! hidden_states, str[] native_policy=[])->()");
+      "int topk, Tensor! hidden_states, str[]? native_policy=None)->()");
 
   m.def("moe_permute_unpermute_supported() -> bool");
   m.def(
