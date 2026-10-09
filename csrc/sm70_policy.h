@@ -129,20 +129,12 @@ inline const char* policy_value(PolicyField field) {
 
 class PolicyScope {
  public:
-  explicit PolicyScope(const std::vector<std::string>& values)
+  explicit PolicyScope(const std::optional<std::string>& token)
       : previous_(active_policy), previous_key_(active_policy_key) {
-    if (values.empty()) return;
-    if (values.size() == 1) {
-      const auto& policy = prepared_policy(values.front());
-      active_policy = &policy.values;
-      active_policy_key = policy.key;
-      return;
-    }
-    if (values.size() != policy_size) {
-      throw std::invalid_argument("SM70 native policy ABI size mismatch");
-    }
-    active_policy = &values;
-    active_policy_key = policy_key(values);
+    if (!token) return;
+    const auto& policy = prepared_policy(*token);
+    active_policy = &policy.values;
+    active_policy_key = policy.key;
   }
   ~PolicyScope() {
     active_policy = previous_;
@@ -160,11 +152,9 @@ class PolicyScope {
 // kernels; graph replay needs neither TLS nor policy storage addresses.
 template <typename Result, typename... Args>
 auto with_policy(Result (*operation)(Args...)) {
-  return [operation](
-             Args... args,
-             std::optional<std::vector<std::string>> native_policy) -> Result {
-    const std::vector<std::string> empty;
-    const PolicyScope scope(native_policy ? *native_policy : empty);
+  return [operation](Args... args,
+                     std::optional<std::string> native_policy) -> Result {
+    const PolicyScope scope(native_policy);
     return operation(args...);
   };
 }

@@ -129,7 +129,13 @@ def call_native(operation, native_policy, *args, **kwargs):
     if qualified_name.startswith("_C_qwen38::"):
         return operation(*args, **kwargs)
     if native_policy:
-        return operation(*args, **kwargs, native_policy=native_policy)
+        return operation(
+            *args,
+            **kwargs,
+            native_policy=native_policy[0]
+            if len(native_policy) == 1
+            else native_policy,
+        )
     return operation(*args, **kwargs)
 
 
@@ -141,12 +147,6 @@ def native_policy_abi_available() -> bool:
         and namespace.sm70_native_policy_abi() == len(NATIVE_FIELDS)
         for namespace in (torch.ops._C, torch.ops._moe_C)
     )
-
-
-def call_public(name, native_policy, *args, **kwargs):
-    from vllm import _sm70_ops
-
-    return getattr(_sm70_ops, name)(*args, **kwargs, native_policy=native_policy)
 
 
 def call_routing(name, native_policy, *args, **kwargs):
@@ -195,17 +195,24 @@ class NativeBindings:
         self.arguments = self.values
         namespaces = (torch.ops._C, torch.ops._moe_C)
         if self.values and all(
-            hasattr(namespace, "sm70_prepare_native_policy") for namespace in namespaces
+            hasattr(namespace, "sm70_prepare_native_policy_token")
+            for namespace in namespaces
         ):
             token = "sm70:1:" + "".join(
                 f"{len(value.encode('utf-8'))}:{value}" for value in self.values
             )
             for namespace in namespaces:
-                namespace.sm70_prepare_native_policy(token)
+                namespace.sm70_prepare_native_policy_token(token)
             self.arguments = (token,)
         if self.values:
+            from vllm import _sm70_ops
+
             for name in CONFIGURED_OPERATORS + ROUTING_OPERATORS:
-                setattr(self, name, partial(call_public, name, self.arguments))
+                operation = getattr(_sm70_ops, name, None)
+                if operation is not None:
+                    setattr(
+                        self, name, partial(operation, native_policy=self.arguments)
+                    )
 
     def __getattr__(self, name):
         from vllm import _sm70_ops

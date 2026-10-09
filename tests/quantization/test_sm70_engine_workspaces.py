@@ -66,13 +66,6 @@ def test_export_reload_uses_execution_engine_workspace_and_policy(monkeypatch):
     configs = [_config(), _config()]
     workspaces = [torch.full((8,), 1.0), torch.full((8,), 2.0)]
     policies = []
-    for i, (cfg, tensor) in enumerate(zip(configs, workspaces)):
-        cfg.kernel_config.sm70_fp8.native.fp8_dense_tune_max_m = 8 * (i + 1)
-        with set_current_vllm_config(cfg):
-            ws.register_layer_workspace(
-                SimpleNamespace(prefix=_PREFIX), tensor, family="fp8"
-            )
-            policies.append(ws._workspace_binding(_PREFIX).native.arguments)
     observed = []
 
     def native(out, address, *args, native_policy):
@@ -82,6 +75,14 @@ def test_export_reload_uses_execution_engine_workspace_and_policy(monkeypatch):
         out.fill_(current.workspace[0].item())
 
     monkeypatch.setattr(_sm70_ops, "fp8_qpn8_dispatch_sm70_out", native)
+
+    for i, (cfg, tensor) in enumerate(zip(configs, workspaces)):
+        cfg.kernel_config.sm70_fp8.native.fp8_dense_tune_max_m = 8 * (i + 1)
+        with set_current_vllm_config(cfg):
+            ws.register_layer_workspace(
+                SimpleNamespace(prefix=_PREFIX), tensor, family="fp8"
+            )
+            policies.append(ws._workspace_binding(_PREFIX).native.arguments)
 
     class Projection(torch.nn.Module):
         def forward(self, x):

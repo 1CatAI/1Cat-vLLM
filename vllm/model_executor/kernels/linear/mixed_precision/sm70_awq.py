@@ -234,11 +234,13 @@ class TurboMindAwqLinearKernel(MPLinearKernel):
         return out_2d.reshape(*x.shape[:-1], out_features)
 
     def apply_weights(self, layer, x, bias=None):
-        reshaped_x = x.reshape(-1, x.shape[-1])
-        out_shape = x.shape[:-1] + (layer._awq_sm70_weight.shape[-1] * 8,)
         prefill_workspace = getattr(
             layer, "_awq_sm70_prefill_exact_dense_workspace", None
         )
+        if prefill_workspace is None:
+            return tm.apply_prepared_linear(layer, x, bias)
+        reshaped_x = x.reshape(-1, x.shape[-1])
+        out_shape = x.shape[:-1] + (layer._awq_sm70_weight.shape[-1] * 8,)
         if (
             prefill_workspace is not None
             and reshaped_x.dtype == torch.float16

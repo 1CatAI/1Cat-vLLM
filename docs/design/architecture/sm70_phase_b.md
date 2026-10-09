@@ -322,11 +322,12 @@ Final source counts and validation evidence are recorded in the migration log.
 
 Prepared owners encode their native policy once as a versioned, length-prefixed
 content token. The packaged native libraries cache its parsed values and
-calculation key; launches pass one string instead of converting all 55 fields.
-The token contains no process address and survives AOT export/reload. The full
-argument form remains compatible. Diagnostic changes can have separate content
-tokens while sharing calculation caches. Neither form reads environment values
-during prepared execution.
+calculation key; the native schema accepts one optional string instead of a
+list of strings. Owners also bind the public callable during initialization.
+The token contains no process address and survives AOT export/reload. Older
+list-policy artifacts are recognized during initialization and retain their
+full argument form. Diagnostic changes can have separate content tokens while
+sharing calculation caches. Prepared execution reads no environment values.
 
 `benchmarks/kernels/sm70_native_artifact_parity.py` runs in separate baseline
 and candidate installations, each with its normally built native extensions.

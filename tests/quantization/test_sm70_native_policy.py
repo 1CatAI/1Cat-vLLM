@@ -40,6 +40,7 @@ def test_packaged_native_policy_schemas_parse_before_build():
             parsed = torch._C.parse_schema(schema)
             names.add(parsed.name)
             assert parsed.arguments[-1].default_value is None
+            assert str(parsed.arguments[-1].type) == "Optional[str]"
     assert names == set(binding.CONFIGURED_OPERATORS + binding.ROUTING_OPERATORS)
 
 
@@ -135,16 +136,16 @@ def test_bindings_forward_captured_values_without_reading_environment(monkeypatc
     first.resolve("fp8")
     second = Sm70NativeConfig(fp8_dense_tune_max_m=16)
     second.resolve("fp8")
-    owners = [
-        binding.NativeBindings(first.values),
-        binding.NativeBindings(second.values),
-    ]
     observed = []
     monkeypatch.setattr(
         _sm70_ops,
         "fp8_gemm_sm70_out",
         lambda *a, **kw: observed.append(kw["native_policy"]),
     )
+    owners = [
+        binding.NativeBindings(first.values),
+        binding.NativeBindings(second.values),
+    ]
     monkeypatch.setattr(
         os, "getenv", lambda *a: pytest.fail("execution read environment")
     )
@@ -160,11 +161,17 @@ def test_prepared_argument_is_registered_once_and_preserves_utf8(monkeypatch):
         monkeypatch.setattr(
             torch.ops,
             namespace,
-            SimpleNamespace(sm70_prepare_native_policy=registered.append),
+            SimpleNamespace(sm70_prepare_native_policy_token=registered.append),
         )
     monkeypatch.setattr(torch.ops, "_C_qwen38", SimpleNamespace())
     policy = Sm70NativeConfig(tm_gemm_trace_filter="路径:1")
     policy.resolve("fp8")
+    observed = []
+    monkeypatch.setattr(
+        _sm70_ops,
+        "fp8_gemm_sm70_out",
+        lambda *a, native_policy: observed.append(native_policy),
+    )
     owner = binding.NativeBindings(policy.values)
     assert owner.values == policy.values
     assert len(owner.arguments) == 1 and registered == [owner.arguments[0]] * 2
@@ -178,12 +185,6 @@ def test_prepared_argument_is_registered_once_and_preserves_utf8(monkeypatch):
         decoded.append(remaining[:length].decode("utf-8"))
         remaining = remaining[length:]
     assert tuple(decoded) == policy.values
-    observed = []
-    monkeypatch.setattr(
-        _sm70_ops,
-        "fp8_gemm_sm70_out",
-        lambda *a, native_policy: observed.append(native_policy),
-    )
     for _ in range(3):
         owner.fp8_gemm_sm70_out(None)
     assert observed == [owner.arguments] * 3
@@ -276,7 +277,7 @@ def test_opaque_native_policy_survives_export_with_dynamic_rows(monkeypatch, com
         for namespace in (torch.ops._C, torch.ops._moe_C):
             monkeypatch.setattr(
                 namespace,
-                "sm70_prepare_native_policy",
+                "sm70_prepare_native_policy_token",
                 lambda token: None,
                 raising=False,
             )
