@@ -98,9 +98,13 @@ IDs in the 48 input cases. Maximum relative L2 projection errors were
 
 ### Packaged scorer and position types
 
-The normal extension passed all 14 GPU cases, including changed graph
+The updated normal extension passed all 16 GPU cases, including changed graph
 inputs, invalid pages, ties, strided dimensions, int32/int64 positions,
-truncated score width, and the unchanged C4 fallback.
+truncated score width, the unchanged C4 fallback, short-context selector
+replay, and negative-position visibility. The last case preserves Triton's
+signed integer division toward zero; mathematical floor division differs
+for negative padded positions. This does not explain the positive-context
+model differences below.
 
 Position dtype must be recorded with the scorer measurements. The prototype
 table above uses int32 positions. The packaged benchmark uses int64, matching
@@ -122,6 +126,14 @@ The benchmark now defaults to the observed 204-key pages and 12 pages per
 request; the earlier micro geometry is reproducible with `--page-size 16
 --pages-per-request 156`. Position type and page geometry are included in
 each result.
+
+A diagnostic keeps the original int64 metadata and FP32 arithmetic but
+narrows only the nonnegative, bounded loop index to int32. All initial and
+changed-input graph outputs are exact. Twelve scorers with actual 204-key
+pages take 0.2331 to 0.2241 ms at M5 and 0.6233 to 0.5997 ms at M20.
+The M5 native scorer takes 0.1154 ms against its paired 0.2325 ms control.
+These are scoring-only measurements. The bounded-index change saves only
+0.0090/0.0236 ms at model geometry and is not pursued as a structural gain.
 
 ### Full-model comparison
 
@@ -189,14 +201,31 @@ reduces projection weight traffic from about 126 MB to 31.5 MB per rank per
 48-layer chain. FP32 partial-sum reassociation is measured separately from
 the exact selection rule.
 
-Two execution structures are prepared: projection followed by a fused
+Two execution structures were tested: projection followed by a fused
 reduction/selection/peer exchange, and one kernel with 64 projection
 producers plus five row consumers connected by readiness tags. The latter
 removes the producer/consumer launch boundary. Communication uses tagged
 double-buffered words on direct NVLink peers, with bounded polling. Both
-are research-only and must pass changing-input graph replay and a complete
-four-rank chain before a model comparison. Weight-byte savings alone are
-not a latency result.
+are research-only. A same-process four-rank graph ABBA measures the slowest
+rank across 48 distinct router layers:
+
+| TP4 router structure | Control ms | Candidate ms |
+| --- | ---: | ---: |
+| Two launches, including local/global selection and LL exchange | 0.5047 | 0.7232 |
+| Producer/consumer kernel, including selection and LL exchange | 0.5051 | 0.8448 |
+
+Both are rejected before model integration. Reducing weight bytes does not
+offset the added selection, communication and readiness work in either
+complete chain. The individual contributions have not been isolated.
+
+Changing-input graph replay preserves expert IDs and source indices on all
+four ranks. Maximum projection relative L2 errors against FP64 matmul are
+2.1731e-4 for the reference and 2.2663e-4 for the candidate. Reassociation
+can move a logit by 0.001953125 and a normalized weight by 7.1239e-5 relative
+to the reference. Reconstructing the global candidate FP16 logits confirms
+exact IDs and a maximum 5.9605e-8 error in selection/normalization itself.
+The first stricter cross-projection weight comparison failed; this separate
+projection/selection accounting explains it without claiming bit identity.
 
 ## Validation and admission
 
