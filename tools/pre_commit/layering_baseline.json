@@ -16,7 +16,7 @@
  },
  "vllm/compilation/passes/fusion/allreduce_rms_fusion.py": {
   "model": 1,
-  "platform": 83
+  "platform": 77
  },
  "vllm/compilation/passes/fusion/sequence_parallelism.py": {
   "platform": 6
@@ -30,12 +30,15 @@
  "vllm/config/cache.py": {
   "platform": 3
  },
+ "vllm/config/collective.py": {
+  "platform": 1
+ },
  "vllm/config/compilation.py": {
   "model": 3
  },
  "vllm/config/execution_policy.py": {
-  "model": 18,
-  "platform": 69
+  "model": 19,
+  "platform": 105
  },
  "vllm/config/gdn.py": {
   "env": 1,
@@ -58,7 +61,7 @@
  },
  "vllm/config/policy_defaults.py": {
   "model": 18,
-  "platform": 35
+  "platform": 36
  },
  "vllm/config/speculative.py": {
   "model": 140,
@@ -72,16 +75,19 @@
  "vllm/distributed/communication_op.py": {
   "platform": 6
  },
+ "vllm/distributed/device_communicators/collective_provider.py": {
+  "platform": 2
+ },
  "vllm/distributed/device_communicators/cpu_communicator.py": {
   "env": 1
  },
  "vllm/distributed/device_communicators/cuda_communicator.py": {
   "model": 2,
-  "platform": 60
+  "platform": 53
  },
  "vllm/distributed/device_communicators/custom_all_reduce.py": {
-  "model": 22,
-  "platform": 80
+  "model": 20,
+  "platform": 71
  },
  "vllm/distributed/parallel_state.py": {
   "platform": 57
@@ -138,9 +144,6 @@
  "vllm/model_executor/layers/attention/mla_attention.py": {
   "model": 3,
   "platform": 2
- },
- "vllm/model_executor/layers/batch_invariant.py": {
-  "env": 1
  },
  "vllm/model_executor/layers/fla/ops/chunk_delta_h.py": {
   "env": 1,
@@ -219,12 +222,12 @@
  },
  "vllm/model_executor/layers/linear.py": {
   "model": 14,
-  "platform": 58
+  "platform": 52
  },
  "vllm/model_executor/layers/logits_processor.py": {
   "env": 2,
   "model": 12,
-  "platform": 24
+  "platform": 23
  },
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 44,
@@ -443,9 +446,6 @@
  "vllm/v1/attention/ops/prefix_prefill.py": {
   "model": 1
  },
- "vllm/v1/attention/ops/sm70_grouped.py": {
-  "env": 1
- },
  "vllm/v1/attention/ops/triton_decode_attention.py": {
   "platform": 9
  },
@@ -467,8 +467,7 @@
   "model": 136
  },
  "vllm/v1/cudagraph_dispatcher.py": {
-  "env": 3,
-  "platform": 74
+  "platform": 47
  },
  "vllm/v1/engine/core.py": {
   "env": 2,

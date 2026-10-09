@@ -135,6 +135,11 @@ class PolicyDefaults:
                 policy.resolve(
                     dflash=_owner(self.cfg, "speculative_config.sm70_dflash2")
                 )
+            elif path == "parallel_config.communication":
+                policy.resolve(
+                    layers=self.cfg.kernel_config.layer_execution,
+                    trace=_owner(self.cfg, "observability_config.runtime_trace"),
+                )
             else:
                 policy.resolve()
         graph = self.cfg.compilation_config.runtime
@@ -190,12 +195,40 @@ def finalize_runtime_policy_hashes(cfg):
     graph_fields = ["aot_compile", "breakable", "mega_aot"]
     if pre_ampere:
         graph_fields.append("compile_graph")
+        graph_fields.extend(("decode_only_capture", "decode_partition_size"))
         if _is_sm70_qwen38_decode_compile_contract(
             cfg.model_config, spec, cfg.parallel_config
         ):
             graph_fields.append("dual_compile")
         if getattr(spec, "method", None) == "mtp":
             graph_fields.append("split_draft_graphs")
+    # Explicit bucket overrides historically apply even on a simulated/non-SM70
+    # platform. Fingerprint only the features that can consume each choice.
+    from vllm.model_executor.models.graph_contract import model_graph_contract
+
+    contract = model_graph_contract(cfg)
+    if spec is not None:
+        graph_fields.append("mtp_context_buckets")
+    if graph.dsv4_context_buckets is not None or (
+        pre_ampere and contract.compress_ratios
+    ):
+        graph_fields.append("dsv4_context_buckets")
+    if spec is None and (
+        graph.fp8_context_buckets is not None
+        or (pre_ampere and contract.cache_dtype == "fp8_e5m2")
+    ):
+        graph_fields.append("fp8_context_buckets")
+    if pre_ampere and contract.cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2"):
+        graph_fields.append("batch_context_routing")
+        if contract.cache_dtype != "fp8_e5m2":
+            graph_fields.extend(
+                (
+                    "e4m3_batch_xqa",
+                    "e4m3_p64_p256_auto",
+                    "e4m3_wave_partitions",
+                    "e4m3_p512_begin",
+                )
+            )
     graph.hash_fields = tuple(graph_fields)
     layers = cfg.kernel_config.layer_execution
     layers.hash_fields = (
@@ -203,6 +236,19 @@ def finalize_runtime_policy_hashes(cfg):
     )
     tp = cfg.parallel_config.tensor_parallel_size
     comm = cfg.parallel_config.communication
+    comm.native.active = tp > 1 and (
+        not cfg.parallel_config.disable_custom_all_reduce
+        or (
+            pre_ampere
+            and (
+                comm.top1_custom_ar
+                or comm.awq_tile_ar
+                or comm.awq_tile_overlap
+                or comm.long_prefill_norm
+            )
+        )
+    )
+    comm.native.finalize_hash(tp, pre_ampere)
     comm.hash_fields = tuple(
         field
         for field in comm.aliases
@@ -214,6 +260,10 @@ def finalize_runtime_policy_hashes(cfg):
             or (pre_ampere and field == "tp4_push" and tp == 4)
             or (pre_ampere and field in ("tp8_hierarchical", "tp8_push") and tp == 8)
             or (pre_ampere and field == "moe_add_allreduce" and tp > 1)
+            or (pre_ampere and field == "long_prefill_norm" and tp == 4)
+            or (pre_ampere and field.startswith("awq_") and tp == 2)
+            or (pre_ampere and field == "top1_custom_ar" and tp > 1)
+            or (field in ("symm_mem", "flashinfer") and tp > 1)
         )
     )
     text = getattr(cfg.model_config, "hf_text_config", None)
@@ -229,7 +279,11 @@ def finalize_runtime_policy_hashes(cfg):
 
 def runtime_policy_report(cfg):
     """Explain typed values and their initialization trace; not a native hit log."""
+    from dataclasses import asdict
+
     trace = _owner(cfg, "observability_config.runtime_trace")
+    resources = getattr(cfg, "_runtime_resources", {})
+    plan = resources.get("graph_execution_plan")
     return {
         "evidence": "resolved_configuration",
         "owners": {
@@ -252,9 +306,25 @@ def runtime_policy_report(cfg):
             "values": cfg.kernel_config.layer_execution.native.hash_options(),
             "sources": cfg.kernel_config.layer_execution.native.sources,
         },
+        "collective_native": {
+            "values": {
+                field: cfg.parallel_config.communication.native.raw(field)
+                for field in cfg.parallel_config.communication.native.aliases
+            },
+            "sources": cfg.parallel_config.communication.native.sources,
+            "hash_fields": cfg.parallel_config.communication.native.hash_fields,
+            "active": cfg.parallel_config.communication.native.active,
+        },
         "layer_diagnostics": {
             field: getattr(trace, field)
             for field in (trace.layer_aliases if trace is not None else {})
+        },
+        "graph_execution_plan": asdict(plan) if plan is not None else None,
+        "execution_observations": {
+            "evidence": "host dispatch returned; graph capture is not replay counting",
+            "collectives": [
+                owner.snapshot() for owner in resources.get("collective_traces", ())
+            ],
         },
         "default_resolution": cfg.runtime_default_sources,
     }
@@ -288,6 +358,10 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
         alias
         for alias, paths in EXTRA_BINDINGS.items()
         if all(_owner(cfg, path) is not None for path in paths)
+    )
+    native = cfg.parallel_config.communication.native
+    ignored.update(
+        alias for field, alias in native.aliases.items() if field in native.sources
     )
     trace = _owner(cfg, "observability_config.runtime_trace")
     if trace is not None:

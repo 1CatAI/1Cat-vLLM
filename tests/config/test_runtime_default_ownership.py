@@ -326,3 +326,19 @@ def test_fullgraph_policy_compatibility_and_engine_isolation(monkeypatch):
     for cfg, expected in ((first, value + 1), (second, value), (first, value + 1)):
         with set_current_vllm_config(cfg), set_forward_context(None, cfg):
             assert torch.equal(compiled(value), expected)
+
+
+def test_fp16_decode_partition_is_computation_and_fp8_wave_is_unused(monkeypatch):
+    first = engine(decode_partition_size=256, e4m3_p512_begin=100)
+    second = engine(decode_partition_size=512, e4m3_p512_begin=200)
+    apply(first, monkeypatch)
+    apply(second, monkeypatch)
+    assert (
+        first.compilation_config.compute_hash()
+        != second.compilation_config.compute_hash()
+    )
+    second.compilation_config.runtime.decode_partition_size = 256
+    assert (
+        first.compilation_config.compute_hash()
+        == second.compilation_config.compute_hash()
+    )

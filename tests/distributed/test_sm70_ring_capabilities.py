@@ -86,7 +86,7 @@ def test_dispatch_prefers_admitted_ring_and_preserves_fallback(monkeypatch, admi
     comm.ring_comm = SimpleNamespace(all_reduce=lambda _: output if admitted else None)
     comm.pynccl_comm = SimpleNamespace(world_size=4)
     visited = []
-    monkeypatch.setattr(cuda, "_trace_all_reduce_path", lambda *args: None)
+    comm._collective_trace = SimpleNamespace(record=lambda *args: None)
 
     def symmetric_guard(*args):
         visited.append("fallback")

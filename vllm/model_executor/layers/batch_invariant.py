@@ -951,8 +951,6 @@ def enable_batch_invariant_mode():
 
 
 def override_envs_for_invariance():
-    os.environ["VLLM_ALLREDUCE_USE_SYMM_MEM"] = "0"
-
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
     # NCCL determinism settings
@@ -972,6 +970,8 @@ def override_envs_for_invariance():
 
     cfg = get_current_vllm_config_or_none()
     if cfg is not None:
+        cfg.parallel_config.communication.symm_mem = False
+        cfg.parallel_config.communication.sources["symm_mem"] = "safety:batch_invariant"
         cfg.compilation_config.runtime.aot_compile = False
         cfg.compilation_config.runtime.sources["aot_compile"] = "safety:batch_invariant"
         if cfg.compilation_config.runtime.sources.get("mega_aot") == "default":

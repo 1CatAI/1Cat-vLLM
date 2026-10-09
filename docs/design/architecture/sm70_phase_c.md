@@ -55,7 +55,7 @@ diagnostics and warmup-only selection do not.
 | C2a | GDN compute plan, providers and shared stages | Merged as #1133 (`ec535b1e69b6`) |
 | C2b | GDN metadata and state preparation/commit | Merged as #1135 (`ad19d7ad1166`) |
 | C3 | Ordered defaults, model qualification and engine-local effective values | Merged as #1137 (`51c0f97201a7`) |
-| C4a | Shared embedding, LM-head, norm and linear providers | Validated in #1139 |
+| C4a | Shared embedding, LM-head, norm and linear providers | Merged as #1139 (`c73eb2d1d100`) |
 | C4b | Graph/communication/fusion boundaries and final explanation report | Pending |
 
 Each PR is based on merged main and is reviewed and merged before the next
@@ -714,3 +714,74 @@ on 54633, including `bench-v2.jsonl`, `bench-fixed-v1.jsonl`, baseline/candidate
 JUnit and `followup-v2.xml`. The unchanged packaged C3 extension has SHA256
 `4df50cb5cc140449a80705b4f7e846dcb4f393b14fb3a9a6b3e82446b0d9ddd1`.
 No model weights, throughput, TTFT or 35B acceptance are claimed.
+
+## C4b graph and communication ownership
+
+This delivery is based on merged C4a, `c73eb2d1d100`. It preserves the
+existing graph dispatcher and collective selection order. The dispatcher binds
+one immutable `GraphExecutionPlan`; live batch sizes, request counts, context
+lengths, partition keys and capture/replay tables stay in their original owners.
+Model geometry is declared by `GraphModelContract`, and the platform policy
+resolves its existing capability gates. Explicit empty buckets still disable
+auto buckets. Explicit partition overrides still suppress automatic variants.
+The backend-priority cache includes the resolved Flash-V100 enable flag, so two
+engines cannot reuse another engine's candidate list.
+
+The existing custom communicator still allocates/exports/imports CUDA IPC,
+registers eager and graph buffers, restores allocator settings and disposes the
+native pointer. `NativeCollectiveBindings` binds its owning extension once for
+initialization, launches and destruction. `CollectiveCapabilities` supplies one
+shared admission implementation for ordinary reductions and the three Gemma
+collective/norm variants. Their differences remain explicit: TP2 accepts FP16 or
+FP32 residual; TP4 requires FP32 residual; long prefill requires divisible rows
+and its separate registered output capacity. The fusion pass consumes these
+capabilities and retains its missing-op and missing-buffer fallbacks.
+
+HC row/width/operator contracts and fused-chain CTA requirements belong to the
+model adapter. The communicator's old HC methods remain forwarding entrypoints.
+The native provider handles optional schema arguments without knowing the model.
+There is one native pointer owner and one registration/destruction path.
+
+### C4b configuration and explanation ledger
+
+| Owner | Migrated controls | Preserved behavior |
+|---|---|---|
+| `CompilationConfig.runtime` | MTP/compressed-index/FP8 buckets, FP8 batch variants, decode partition, E4M3 auto/wave/threshold, decode-only capture | Legacy names are read at initialization. Positive-bucket validation, explicit-empty disable, partition error and eager/piecewise fallback remain. Metadata builders retain their engine policy outside the forward context. |
+| `AttentionConfig.flash_v100.enabled` | Flash-V100 platform/attention qualification | Existing model/device/backend gates stay in place; cache entries include this effective value. |
+| `ParallelConfig.communication` | Top1 provisioning, symmetric memory, FlashInfer, AWQ tile/overlap/grids, long-prefill norm | Typed values precede aliases; batch invariance still forces symmetric memory off, now on this engine's configuration. Existing invalid tile mode returns the ordinary fallback. |
+| `ParallelConfig.communication.native` | Eighteen native selector/launch inputs, including block limits, algorithms, TP4 push controls, TP2/TP4 norm threads and TP8 hierarchy | The shared native configuration adapter encodes raw strings once; native `atoi`, `strtol`, exact-string and unset/empty semantics stay distinct. Parser errors remain at the original operation checkpoint. |
+| `KernelConfig.layer_execution` | Batch fastpath and HC MTP/cooperative/full-unroll stages | Consumers use resolved fields. Explicit shared batch policy is reconciled with the native collective input; contradictory typed owners fail initialization. |
+| `ObservabilityConfig.runtime_trace` | TP all-reduce tracing and native profile tracing | Seen sets belong to each communicator/layer; diagnostic choices do not alter calculation hashes. |
+
+The native configuration lives alongside B's native vector adapters in
+`config/sm70_native.py`; `config/collective.py` forwards the import. The ordinary
+packaged extension adds `init_custom_ar_configured` and keeps the old constructor
+schema. The Python compatibility initializer also supplies the historical two
+push defaults without writing them to `os.environ`. Missing configured native
+ABI disables custom AR before IPC allocation and keeps ordinary communication
+fallback. No sidecar, preload or private extension is required.
+
+The C0 source ledger reads aliases directly from these declarations. The existing
+runtime explanation report includes resolved values, sources, effective hash
+fields, the initialized graph plan and optional collective observations.
+Configuration selection and host dispatch observations are separately labelled;
+observations during graph capture are not described as replay counts or as a
+GPU kernel timing trace. Typed policies serialize with the engine. Runtime plans,
+IPC pointers, buffers and trace sets stay in the worker resource owner.
+
+### C4b verification in progress
+
+The affected local suite passed 191 cases with five hardware skips. Follow-up
+layer/configuration coverage passed 66 cases, and provider/trace/guard/graph
+coverage passed 82 cases (overlapping subsets, not additive unique totals).
+The CUDA backend-priority test requires the native extension and is assigned to
+54633. The native CUDA kernel bodies compare identically for all 19 kernels in
+`custom_all_reduce.cuh` and `custom_all_reduce.cu` after removing whitespace and
+comments. Selection inputs and per-owner diagnostic flags are the changed native
+host code.
+
+The C4b normal CMake `_C` build and TP2/TP4 operator A/B are recorded under
+`/home/ymzx/arch-ws/phase-c4b-20261009` on 54633. The GPU job waits for the shared
+ownership lock; no result is claimed until that job completes. Final paired
+GPU/host/allocation results and extension provenance will replace this pending
+paragraph before merge. TP8 remains a contract-only test on this four-V100 host.

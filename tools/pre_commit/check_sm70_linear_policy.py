@@ -74,6 +74,16 @@ RUNTIME_NAMES = {
     and node.value.startswith("VLLM_")
     and node.value.isidentifier()
 }
+RUNTIME_NAMES.update(
+    node.value
+    for cls in ast.parse((_CONFIG_ROOT / "sm70_native.py").read_text()).body
+    if isinstance(cls, ast.ClassDef) and cls.name == "CollectiveNativeConfig"
+    for node in ast.walk(cls)
+    if isinstance(node, ast.Constant)
+    and isinstance(node.value, str)
+    and node.value.startswith("VLLM_")
+    and node.value.isidentifier()
+)
 for _class in ast.parse((_CONFIG_ROOT / "sm70_runtime.py").read_text()).body:
     if isinstance(_class, ast.ClassDef) and _class.name == "RuntimeTraceConfig":
         for _field in _class.body:

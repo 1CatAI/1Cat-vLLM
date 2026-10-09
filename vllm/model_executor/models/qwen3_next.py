@@ -19,7 +19,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
-from vllm.config.execution_policy import layer_policy
+from vllm.config.execution_policy import communication_policy, layer_policy
 from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import (
     get_ep_group,
@@ -809,7 +809,7 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         use_direct_attention_output = (
             (
-                envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
+                communication_policy().long_prefill_norm
                 or getattr(self, "sm70_dflash2_direct_attention_output", False)
             )
             and torch.compiler.is_compiling()

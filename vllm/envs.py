@@ -18669,17 +18669,3 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         factors[var] = normalize_value(os.getenv(var))
 
     return factors
-
-
-# The SM70 native all-reduce reads these two switches with std::getenv at
-# kernel-launch time instead of through this module, so a default declared here
-# would never reach the kernel and the optimization would stay silently off.
-# Publish the resolved values so the native path follows this module.
-for _sm70_native_allreduce in (
-    "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES",
-    "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY",
-):
-    if _sm70_native_allreduce not in os.environ:
-        os.environ[_sm70_native_allreduce] = (
-            "1" if environment_variables[_sm70_native_allreduce]() else "0"
-        )

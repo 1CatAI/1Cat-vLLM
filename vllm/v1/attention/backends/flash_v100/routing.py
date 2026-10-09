@@ -14,6 +14,7 @@ import regex as re
 import torch
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.execution_policy import graph_policy
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
@@ -432,7 +433,7 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
         # The legacy small-Q guard accepts zero rows, whereas uniform and
         # mixed decode require one row or an explicitly enabled batch.
         if (shape.rows > 1 if smallq else shape.rows != 1) and not (
-            shape.rows > 1 and _config.registered("VLLM_FLASH_V100_E4M3_BATCH_XQA")
+            shape.rows > 1 and bool(graph_policy().e4m3_batch_xqa)
         ):
             return "e4m3_batch"
     if smallq:
@@ -509,12 +510,13 @@ def batch_context_routing_for_graph_variant(
     return graph_variant == CUDAGRAPH_VARIANT_LONG_CONTEXT
 
 
-def batch_context_routing_cache_dtype_supported(cache_dtype: str | None) -> bool:
+def batch_context_routing_cache_dtype_supported(
+    cache_dtype: str | None, *, policy=None
+) -> bool:
     """Admit the exact FP8 XQA formats implemented by Flash-V100."""
     codec = resolve_kv_codec(cache_dtype)
-    return codec is FP8_E5M2 or (
-        codec is FP8_E4M3 and _config.registered("VLLM_FLASH_V100_E4M3_BATCH_XQA")
-    )
+    policy = policy if policy is not None else graph_policy()
+    return codec is FP8_E5M2 or (codec is FP8_E4M3 and bool(policy.e4m3_batch_xqa))
 
 
 _logged_fp8_kv_prefill = False
@@ -542,8 +544,11 @@ def decode_dynamic_partitions_enabled() -> bool:
 
 def decode_partition_size_for_metadata(
     max_seq_len_hint: int | None = None,
+    *,
+    policy=None,
 ) -> int:
-    raw = _config.raw("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
+    policy = policy if policy is not None else graph_policy()
+    raw = policy.decode_partition_size
     if raw is None:
         return _select_default_decode_partition_size(max_seq_len_hint)
     try:
@@ -588,7 +593,7 @@ def g6_aligned_page_partition_size_hint(
     *,
     strategy: Literal["shared", "legacy"] = "legacy",
 ) -> int | None:
-    if _config.raw("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
+    if graph_policy().decode_partition_size is not None:
         return None
     if _config.raw("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
         return None
@@ -754,7 +759,7 @@ def _decode_xqa_allowed_for_q_per_kv(
 def _e4m3_batch_xqa_allowed(query: torch.Tensor) -> bool:
     """Admit GQA6 batches independently of the number of local KV heads."""
     return (
-        _config.registered("VLLM_FLASH_V100_E4M3_BATCH_XQA")
+        bool(graph_policy().e4m3_batch_xqa)
         and query.ndim == 3
         and query.shape[0] > 1
         and query.shape[1] > 0

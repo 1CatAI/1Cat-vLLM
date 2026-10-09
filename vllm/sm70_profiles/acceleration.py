@@ -11,7 +11,7 @@ from dataclasses import asdict, fields, is_dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm import envs
-from vllm.config.execution_policy import graph_policy
+from vllm.config.execution_policy import graph_policy, layer_policy
 from vllm.envs_metadata import EnvVar
 from vllm.logger import init_logger
 
@@ -286,10 +286,19 @@ def _is_sm70(cfg: VllmConfig) -> bool:
 
 def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     """Explain qualified defaults and packed-copy cost, without claiming hits."""
+    from vllm.config.policy_defaults import effective_runtime_values
+
+    effective = effective_runtime_values(cfg)
+    values = {
+        name: effective[name] if name in effective else getattr(envs, name)
+        for name, getter in envs.environment_variables.items()
+        if "Flash-Next qualified batch"
+        in cast(EnvVar, getter).metadata.acceleration_paths
+    }
     controls = {
         name: {
-            "enabled": bool(getattr(envs, name)),
-            "reason": None if getattr(envs, name) else "user_override",
+            "enabled": bool(values[name]),
+            "reason": None if values[name] else "user_override",
             "description": cast(EnvVar, getter).metadata.description,
         }
         for name, getter in envs.environment_variables.items()
@@ -330,11 +339,11 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     )
     copies: dict[str, int] = {}
     if reference_layout:
-        batch = envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+        batch = layer_policy(cfg).batch_fastpath
         gdn_layers = list(getattr(text, "layer_types", ())).count("linear_attention")
         if batch or envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH:
             copies["gdn_input"] = gdn_layers * (4096 + 32) * 2560 * 2
-        if batch or (draft_layers and envs.VLLM_SM70_MTP_HC_BATCH):
+        if batch or (draft_layers and layer_policy(cfg).hc_mtp_batch):
             copies["hc_target"] = layers * 2 * (96 * 10240 + 2560 * 320) * 2
             copies["hc_draft"] = draft_layers * 2 * (96 * 10240 + 2560 * 320) * 2
         if draft_layers and envs.VLLM_SM70_MTP_ROUTER_BATCH:
@@ -818,7 +827,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             "user_override"
             if (
                 not envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
-                or envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE
+                or graph_policy().decode_partition_size
             )
             else (
                 "page_size"
@@ -834,7 +843,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         switches={
             "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS,
             "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": (
-                envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE
+                graph_policy().decode_partition_size
             ),
         },
     )

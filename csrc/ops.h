@@ -816,6 +816,10 @@ using fptr_t = int64_t;
 fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
                       torch::Tensor& rank_data, int64_t rank,
                       bool fully_connected);
+fptr_t init_custom_ar_configured(const std::vector<int64_t>& fake_ipc_ptrs,
+                                 torch::Tensor& rank_data, int64_t rank,
+                                 bool fully_connected,
+                                 const std::vector<std::string>& policy);
 void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
                 fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
 void sm70_tp2_all_reduce_gemma_rms_norm(

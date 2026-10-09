@@ -10,9 +10,9 @@ from typing import Any, cast
 
 import torch
 
+from vllm.config.execution_policy import graph_policy
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionCGSupport
-from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import (
     INPUT_FIELDS,
@@ -108,6 +108,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._graph_policy = graph_policy(self.vllm_config)
         spec_config = getattr(self.vllm_config, "speculative_config", None)
         cache_config = getattr(self.vllm_config, "cache_config", None)
         model_config = self.vllm_config.model_config
@@ -128,11 +129,11 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             is self.vllm_config.model_config
         )
         self._batch_context_routing_enabled = (
-            _config.registered("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING")
-            and _config.registered("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is None
+            self._graph_policy.batch_context_routing
+            and self._graph_policy.decode_partition_size is None
             and spec_config is None
             and _routing.batch_context_routing_cache_dtype_supported(
-                getattr(cache_config, "cache_dtype", None)
+                getattr(cache_config, "cache_dtype", None), policy=self._graph_policy
             )
             and batch_context_shape_supported
         )
@@ -278,7 +279,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         flash_metadata.flash_v100_cudagraph_capture = False
         flash_metadata.flash_v100_batch_context_routing = (
             _routing.batch_context_routing_for_graph_variant(
-                self._batch_context_routing_enabled,
+                bool(self._batch_context_routing_enabled),
                 getattr(common_attn_metadata, "cudagraph_graph_variant", None),
             )
         )
@@ -373,7 +374,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             return
 
         partition_size = _routing.decode_partition_size_for_metadata(
-            int(max_seq_len_hint)
+            int(max_seq_len_hint), policy=self._graph_policy
         )
         active = max(1, (int(max_seq_len_hint) + partition_size - 1) // partition_size)
         active_num_partitions = self._ensure_decode_active_num_partitions()

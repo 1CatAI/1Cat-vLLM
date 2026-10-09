@@ -71,7 +71,7 @@ from vllm.config.cache import (
     PrefixCachingHashAlgo,
 )
 from vllm.config.device import Device
-from vllm.config.execution_policy import graph_policy
+from vllm.config.execution_policy import flash_v100_policy, graph_policy
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
 from vllm.config.lora import MaxLoRARanks
 from vllm.config.mamba import MambaBackendEnum
@@ -147,7 +147,7 @@ def _resolve_sm70_flash_v100_kv_cache_dtype_alias(
     if (
         requested_dtype != "fp8"
         or resolved_dtype != "fp8"
-        or not envs.VLLM_SM70_FLASH_ATTN_V100
+        or not flash_v100_policy().enabled
         or not current_platform.is_cuda()
     ):
         return resolved_dtype

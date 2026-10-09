@@ -400,6 +400,15 @@ def test_flash_next_batch_memory_and_explicit_off(config, monkeypatch):
     assert len(report["controls"]) == 14
     for name in report["controls"]:
         monkeypatch.setenv(name, "0")
+    # Existing engines retain initialized choices despite later env changes.
+    assert acc.build_report(config)["flash_next_batch"]["controls"][
+        "VLLM_SM70_QWEN38_BATCH_FASTPATH"
+    ]["enabled"]
+    from vllm.config.execution_policy import LayerExecutionPolicy
+
+    policy = LayerExecutionPolicy()
+    policy.resolve()
+    config.kernel_config.layer_execution = policy
     report = acc.build_report(config)["flash_next_batch"]
     assert report["packed_weight_memory"]["total_bytes"] == 0
     assert all(row["reason"] == "user_override" for row in report["controls"].values())

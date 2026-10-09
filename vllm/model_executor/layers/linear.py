@@ -9,7 +9,7 @@ import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
-from vllm.config.execution_policy import layer_policy
+from vllm.config.execution_policy import communication_policy, layer_policy
 from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import (
     divide,
@@ -47,7 +47,6 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
-_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TRACE_SEEN: set[str] = set()
 
 
 def _maybe_sm70_dense_forward(layer, x, bias):
@@ -76,7 +75,7 @@ def _maybe_sm70_awq_mlp_down_tile_all_reduce(
     layer: torch.nn.Module,
     output_parallel: torch.Tensor,
 ) -> torch.Tensor | None:
-    if not envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR:
+    if not layer._communication_policy.awq_tile_ar:
         return None
     if getattr(layer, "prefix", "").rsplit(".", 1)[-1] != "down_proj":
         return None
@@ -104,14 +103,14 @@ def _maybe_sm70_awq_mlp_down_tile_gemm_reduce(
 
     def trace_route(reason: str) -> None:
         if not (
-            envs.VLLM_TP_ALLREDUCE_TRACE
-            and envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP
+            layer._layer_trace.tp_allreduce
+            and layer._communication_policy.awq_tile_overlap
             and prefix.rsplit(".", 1)[-1] == "down_proj"
         ):
             return
-        if reason in _SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TRACE_SEEN:
+        if reason in layer._awq_overlap_trace_seen:
             return
-        _SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TRACE_SEEN.add(reason)
+        layer._awq_overlap_trace_seen.add(reason)
         logger.warning(
             "SM70 AWQ MLP down tile-overlap route prefix=%s reason=%s "
             "x_shape=%s x_dtype=%s bias=%s tp_size=%s prepared=%s "
@@ -126,7 +125,7 @@ def _maybe_sm70_awq_mlp_down_tile_gemm_reduce(
             getattr(layer, "output_size", None),
         )
 
-    if not envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP:
+    if not layer._communication_policy.awq_tile_overlap:
         return None
     if bias is not None:
         trace_route("skip_bias")
@@ -153,7 +152,7 @@ def _maybe_sm70_awq_mlp_down_tile_gemm_reduce(
         trace_route(f"skip_out_features_{out_features}")
         return None
 
-    if envs.VLLM_TP_ALLREDUCE_TRACE:
+    if layer._layer_trace.tp_allreduce:
         trace_route("dispatch")
     out_2d = tensor_model_parallel_sm70_awq_mlp_down_tile_gemm_reduce(
         x_2d,
@@ -489,6 +488,8 @@ class LinearBase(PluggableLayer):
 
         self._layer_execution_policy = layer_policy()
         self._layer_trace = capture_runtime_trace()
+        self._communication_policy = communication_policy()
+        self._awq_overlap_trace_seen: set[str] = set()
 
         # Keep input parameters
         self.input_size = input_size

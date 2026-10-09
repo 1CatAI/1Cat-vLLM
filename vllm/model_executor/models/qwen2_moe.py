@@ -38,6 +38,7 @@ import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.execution_policy import layer_policy
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -194,7 +195,7 @@ class Qwen2MoeMLP(nn.Module):
                 "SM70 Qwen3Next exact single-token shared-expert gate enabled."
             )
         self._sm70_batch_shared_expert_gate = False
-        if self._sm70_exact_shared_expert_gate and envs.VLLM_SM70_QWEN38_BATCH_FASTPATH:
+        if self._sm70_exact_shared_expert_gate and layer_policy().batch_fastpath:
             from vllm.models.qwen4_exp.nvidia.sm70_fp16_gemv import (
                 _batch_runtime_contract,
             )

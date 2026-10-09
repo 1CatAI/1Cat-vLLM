@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Initialization adapter for explicit native linear/MoE policy inputs."""
+"""Initialization adapter for explicit native linear/MoE/collective policy inputs."""
 
 import os
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import Field
 
-from vllm.config.utils import config
+from vllm.config.utils import config, hash_factors
 
 # Order is the versioned native vector ABI. Append fields; never reorder.
 NATIVE_FIELDS = (
@@ -465,3 +465,188 @@ def compile_ignored_aliases(kernel) -> set[str]:
     )
     ignored.add("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG")
     return ignored
+
+
+@config
+class CollectiveNativeConfig:
+    """Typed overrides are encoded once for the existing native selectors.
+
+    Raw strings retain historical atoi/strtol/exact-string differences. Native
+    validation remains at the original operation checkpoint, including errors
+    from options that are irrelevant to another topology or operator.
+    """
+
+    sm70_tp4_push_allreduce_small_messages: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES."""
+
+    sm70_tp4_push_allreduce_concurrency: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY."""
+
+    sm70_tp4_push_allreduce_qwen38_batch: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH."""
+
+    sm70_qwen38_batch_fastpath: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_QWEN38_BATCH_FASTPATH."""
+
+    sm70_tp4_push_allreduce_qwen38_batch_blocks: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS."""
+
+    sm70_tp4_push_allreduce_mtp5: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5."""
+
+    sm70_tp2_ar_gemma_rms_threads: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS."""
+
+    sm70_tp4_long_fused_norm_threads: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS."""
+
+    sm70_tp4_long_fused_norm_blocks: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS."""
+
+    sm70_tp8_hierarchical_custom_ar: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR."""
+
+    sm70_tp8_hierarchical_push_blocks: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS."""
+
+    custom_allreduce_block_limit: str | int | bool | None = None
+    """Initialization override for VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT."""
+
+    sm70_tp4_mtp_ar_block_tuning: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING."""
+
+    sm70_tp4_m5_ar_threads: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_M5_AR_THREADS."""
+
+    sm70_tp4_small_ar_pack32: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_SMALL_AR_PACK32."""
+
+    custom_allreduce_algo: str | int | bool | None = None
+    """Initialization override for VLLM_CUSTOM_ALLREDUCE_ALGO."""
+
+    sm70_tp4_push_allreduce_sum2_m1: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1."""
+
+    sm70_profile_trace: str | int | bool | None = None
+    """Initialization override for VLLM_SM70_PROFILE_TRACE."""
+
+    aliases: ClassVar[dict[str, str]] = {
+        "sm70_tp4_push_allreduce_small_messages": (
+            "VLLM_SM70_TP4_PUSH_ALLREDUCE_SMALL_MESSAGES"
+        ),
+        "sm70_tp4_push_allreduce_concurrency": (
+            "VLLM_SM70_TP4_PUSH_ALLREDUCE_CONCURRENCY"
+        ),
+        "sm70_tp4_push_allreduce_qwen38_batch": (
+            "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH"
+        ),
+        "sm70_qwen38_batch_fastpath": "VLLM_SM70_QWEN38_BATCH_FASTPATH",
+        "sm70_tp4_push_allreduce_qwen38_batch_blocks": (
+            "VLLM_SM70_TP4_PUSH_ALLREDUCE_QWEN38_BATCH_BLOCKS"
+        ),
+        "sm70_tp4_push_allreduce_mtp5": "VLLM_SM70_TP4_PUSH_ALLREDUCE_MTP5",
+        "sm70_tp2_ar_gemma_rms_threads": "VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS",
+        "sm70_tp4_long_fused_norm_threads": "VLLM_SM70_TP4_LONG_FUSED_NORM_THREADS",
+        "sm70_tp4_long_fused_norm_blocks": "VLLM_SM70_TP4_LONG_FUSED_NORM_BLOCKS",
+        "sm70_tp8_hierarchical_custom_ar": "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR",
+        "sm70_tp8_hierarchical_push_blocks": "VLLM_SM70_TP8_HIERARCHICAL_PUSH_BLOCKS",
+        "custom_allreduce_block_limit": "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT",
+        "sm70_tp4_mtp_ar_block_tuning": "VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING",
+        "sm70_tp4_m5_ar_threads": "VLLM_SM70_TP4_M5_AR_THREADS",
+        "sm70_tp4_small_ar_pack32": "VLLM_SM70_TP4_SMALL_AR_PACK32",
+        "custom_allreduce_algo": "VLLM_CUSTOM_ALLREDUCE_ALGO",
+        "sm70_tp4_push_allreduce_sum2_m1": "VLLM_SM70_TP4_PUSH_ALLREDUCE_SUM2_M1",
+        "sm70_profile_trace": "VLLM_SM70_PROFILE_TRACE",
+    }
+
+    values: tuple[str, ...] = Field(default=(), init=False)
+    """Versioned immutable input vector; sentinel preserves unset versus empty."""
+    sources: dict[str, str] = Field(default_factory=dict, init=False)
+    """Parameter provenance, excluded from computation hashes."""
+    active: bool = Field(default=True, init=False)
+    """False when native communication cannot affect the engine."""
+
+    hash_fields: tuple[str, ...] | None = Field(default=None, init=False)
+    """Fields admitted by the engine topology; None preserves standalone behavior."""
+
+    def resolve(self, overrides=None):
+        if self.values:
+            return
+        overrides = overrides or {}
+        values = []
+        for field, alias in self.aliases.items():
+            value = getattr(self, field)
+            if value is not None:
+                if field in overrides and str(
+                    int(value) if isinstance(value, bool) else value
+                ) != str(overrides[field]):
+                    raise ValueError(f"Conflicting typed requests for {alias}")
+                self.sources[field] = "typed"
+            elif field in overrides:
+                value = overrides[field]
+                self.sources[field] = "owner"
+            else:
+                # These defaults used to be written into os.environ on import.
+                default = (
+                    "1"
+                    if field
+                    in (
+                        "sm70_tp4_push_allreduce_small_messages",
+                        "sm70_tp4_push_allreduce_concurrency",
+                    )
+                    else "\x1f"
+                )
+                value = os.environ.get(alias, default)
+                self.sources[field] = alias if alias in os.environ else "default"
+            values.append(str(int(value) if isinstance(value, bool) else value))
+        self.values = tuple(values)
+
+    def resolve_for_owners(self, overrides, *, layers=None, trace=None):
+        if trace is not None and trace.sources.get("profile_trace") == "typed":
+            overrides["sm70_profile_trace"] = int(trace.profile_trace)
+        if layers is not None and layers.sources.get("batch_fastpath") == "typed":
+            overrides["sm70_qwen38_batch_fastpath"] = int(layers.batch_fastpath)
+        self.resolve(overrides)
+        if (
+            layers is not None
+            and self.sources.get("sm70_qwen38_batch_fastpath") == "typed"
+        ):
+            layers.batch_fastpath = self.registry_bool(
+                "sm70_qwen38_batch_fastpath", "1"
+            )
+            layers.sources["batch_fastpath"] = "typed:collective_native"
+
+    def finalize_hash(self, tp, pre_ampere):
+        self.hash_fields = tuple(
+            field
+            for field in self.aliases
+            if field.startswith("custom_allreduce_")
+            or (
+                pre_ampere
+                and (
+                    (field.startswith("sm70_tp2_") and tp == 2)
+                    or (field.startswith("sm70_tp4_") and tp == 4)
+                    or (field == "sm70_qwen38_batch_fastpath" and tp == 4)
+                    or (field.startswith("sm70_tp8_") and tp == 8)
+                )
+            )
+        )
+
+    def raw(self, field, default=None):
+        value = self.values[tuple(self.aliases).index(field)]
+        return default if value == "\x1f" else value
+
+    def registry_bool(self, field, default):
+        return bool(int(self.raw(field, default)))
+
+    def compute_hash(self):
+        return hash_factors(
+            {
+                field: value
+                for field, value in zip(self.aliases, self.values)
+                if field != "sm70_profile_trace"
+                and (self.hash_fields is None or field in self.hash_fields)
+            }
+            if self.active
+            else {}
+        )

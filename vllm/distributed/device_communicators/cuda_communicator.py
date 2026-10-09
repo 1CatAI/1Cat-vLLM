@@ -2,10 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from typing import cast
+
 import torch
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
+from vllm.config.execution_policy import communication_policy
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed.device_communicators.all_reduce_utils import (
     NCCL_SYMM_MEM_ALL_REDUCE_CONFIG,
     should_nccl_symm_mem_allreduce,
@@ -19,43 +23,10 @@ from vllm.platforms import current_platform
 
 from ..utils import StatelessProcessGroup
 from .base_device_communicator import DeviceCommunicatorBase
+from .collective_provider import CollectiveTrace
 
 logger = init_logger(__name__)
 _SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
-_SEEN_TP_ALLREDUCE_PATHS: set[tuple[str, str, tuple[int, ...], torch.dtype, int]] = (
-    set()
-)
-
-
-def _trace_all_reduce_path(
-    communicator: "CudaCommunicator",
-    backend: str,
-    input_: torch.Tensor,
-) -> None:
-    if not envs.VLLM_TP_ALLREDUCE_TRACE:
-        return
-    key = (
-        communicator.unique_name,
-        backend,
-        tuple(input_.shape),
-        input_.dtype,
-        input_.element_size() * input_.numel(),
-    )
-    if key in _SEEN_TP_ALLREDUCE_PATHS:
-        return
-    _SEEN_TP_ALLREDUCE_PATHS.add(key)
-    logger.warning(
-        "TP all-reduce trace backend=%s group=%s shape=%s dtype=%s bytes=%d "
-        "custom_enabled=%s torch_symm_mem=%s flashinfer=%s",
-        backend,
-        communicator.unique_name,
-        tuple(input_.shape),
-        input_.dtype,
-        input_.element_size() * input_.numel(),
-        communicator.use_custom_allreduce,
-        communicator.use_torch_symm_mem,
-        communicator.use_flashinfer_allreduce,
-    )
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -77,6 +48,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             global_ranks,
             global_world_size,
         )
+        self._policy = communication_policy()
+        trace_enabled = capture_runtime_trace().tp_allreduce
         if "tp" not in unique_name:
             # custom allreduce or torch symm mem can be used only by tp
             use_custom_allreduce = False
@@ -90,21 +63,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
             use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
-            use_top1_custom_ar = (
-                envs.VLLM_SM70_TOP1_CUSTOM_AR
-                and current_platform.is_device_capability(70)
-            )
-            use_sm70_awq_mlp_down_tile_ar = envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_AR
-            use_sm70_awq_mlp_down_tile_overlap = (
-                envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP
-            )
+            use_top1_custom_ar = bool(
+                self._policy.top1_custom_ar
+            ) and current_platform.is_device_capability(70)
+            use_sm70_awq_mlp_down_tile_ar = bool(self._policy.awq_tile_ar)
+            use_sm70_awq_mlp_down_tile_overlap = bool(self._policy.awq_tile_overlap)
             use_sm70_tp4_long_prefill_fused_norm = (
-                envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
+                bool(self._policy.long_prefill_norm)
                 and self.world_size == 4
                 and current_platform.is_device_capability(70)
             )
-            use_torch_symm_mem = envs.VLLM_ALLREDUCE_USE_SYMM_MEM
-            use_flashinfer_allreduce = envs.VLLM_ALLREDUCE_USE_FLASHINFER
+            use_torch_symm_mem = bool(self._policy.symm_mem)
+            use_flashinfer_allreduce = bool(self._policy.flashinfer)
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_top1_custom_ar = use_top1_custom_ar
@@ -113,6 +83,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_sm70_tp4_long_prefill_fused_norm = use_sm70_tp4_long_prefill_fused_norm
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
+        self._collective_trace = CollectiveTrace(
+            bool(trace_enabled),
+            unique_name,
+            use_custom_allreduce,
+            use_torch_symm_mem,
+            use_flashinfer_allreduce,
+        )
+        if trace_enabled:
+            from vllm.runtime_resources import current_runtime_resources
+
+            resources = current_runtime_resources()
+            if resources is not None:
+                resources.setdefault("collective_traces", []).append(
+                    self._collective_trace
+                )
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -349,7 +334,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_):
         ring_out = self.ring_comm.all_reduce(input_)
         if ring_out is not None:
-            _trace_all_reduce_path(self, "sm70_ring", input_)
+            self._collective_trace.record("sm70_ring", input_)
             return ring_out
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
@@ -358,7 +343,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
-                _trace_all_reduce_path(self, "nccl_symmetric", input_)
+                self._collective_trace.record("nccl_symmetric", input_)
                 return out
         # always try quick reduce first, then flashinfer, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -370,7 +355,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
-            _trace_all_reduce_path(self, "quick_reduce", input_)
+            self._collective_trace.record("quick_reduce", input_)
             return out
         fi_ar_comm = self.fi_ar_comm
         if (
@@ -380,7 +365,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = fi_ar_comm.all_reduce(input_)
             assert out is not None
-            _trace_all_reduce_path(self, "flashinfer", input_)
+            self._collective_trace.record("flashinfer", input_)
             return out
         ca_comm = self.ca_comm
         if (
@@ -391,19 +376,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
-            _trace_all_reduce_path(self, "custom", input_)
+            self._collective_trace.record("custom", input_)
             return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
-            _trace_all_reduce_path(self, "torch_symm_mem", input_)
+            self._collective_trace.record("torch_symm_mem", input_)
             return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
-            _trace_all_reduce_path(self, "torch_distributed", input_)
+            self._collective_trace.record("torch_distributed", input_)
             return out
         assert pynccl_comm is not None
         out = pynccl_comm.all_reduce(input_)
@@ -414,9 +399,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # group, where we always have either custom allreduce or pynccl.
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
-            _trace_all_reduce_path(self, "torch_distributed_fallback", input_)
+            self._collective_trace.record("torch_distributed_fallback", input_)
         else:
-            _trace_all_reduce_path(self, "pynccl", input_)
+            self._collective_trace.record("pynccl", input_)
         return out
 
     def all_reduce_sum2(self, input_a, input_b):
@@ -431,7 +416,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = ca_comm.custom_all_reduce_sum2(input_a, input_b)
             if out is not None:
-                _trace_all_reduce_path(self, "custom_sum2", input_a)
+                self._collective_trace.record("custom_sum2", input_a)
                 return out
         return self.all_reduce(input_a + input_b)
 
@@ -514,7 +499,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 "SM70 TP4 long-prefill fused collective-norm route was "
                 "compiled for an unsupported runtime shape or communicator."
             )
-        _trace_all_reduce_path(self, "sm70_tp4_fused_rs_norm_ag", input_)
+        self._collective_trace.record("sm70_tp4_fused_rs_norm_ag", input_)
         return ca_comm.sm70_tp4_reduce_scatter_gemma_rms_norm_all_gather(
             input_, residual, weight, epsilon
         )
@@ -527,7 +512,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             return None
         out = ca_comm.custom_tile_runtime_all_reduce(input_)
         if out is not None:
-            _trace_all_reduce_path(self, "sm70_awq_mlp_down_tile_ar", input_)
+            self._collective_trace.record("sm70_awq_mlp_down_tile_ar", input_)
         return out
 
     def sm70_awq_mlp_down_tile_gemm_reduce(
@@ -551,15 +536,15 @@ class CudaCommunicator(DeviceCommunicatorBase):
             group_size,
             k_ld,
             q_ld,
-            tile_numel=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL,
-            reducer_blocks=(envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS),
+            tile_numel=cast(int, self._policy.awq_overlap_tile_numel),
+            reducer_blocks=(cast(int, self._policy.awq_overlap_reducer_blocks)),
             kernel_reducer_blocks=(
-                envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS
+                cast(int, self._policy.awq_overlap_kernel_reducer_blocks)
             ),
-            overlap=envs.VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM,
+            overlap=bool(self._policy.awq_overlap_side_stream),
         )
         if out is not None:
-            _trace_all_reduce_path(self, "sm70_awq_mlp_down_tile_overlap", input_)
+            self._collective_trace.record("sm70_awq_mlp_down_tile_overlap", input_)
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
