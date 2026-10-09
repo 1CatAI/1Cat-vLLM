@@ -104,11 +104,19 @@ def typed_declarations(source: str) -> dict[str, list[dict]]:
                     and isinstance(key.value, str)
                     and key.value.isidentifier()
                     and key.value.islower()
-                    and isinstance(value, ast.Constant)
-                    and isinstance(value.value, str)
-                    and value.value.startswith(PREFIXES)
                 ):
-                    result[value.value].append(dict(field=key.value, line=value.lineno))
+                    # An initialization declaration may carry a parser/default
+                    # tuple or multiple historical aliases for the same field.
+                    aliases = value.elts if isinstance(value, ast.Tuple) else [value]
+                    for alias in aliases:
+                        if (
+                            isinstance(alias, ast.Constant)
+                            and isinstance(alias.value, str)
+                            and alias.value.startswith(PREFIXES)
+                        ):
+                            result[alias.value].append(
+                                dict(field=key.value, line=alias.lineno)
+                            )
         elif isinstance(node, ast.Tuple) and len(node.elts) >= 3:
             first, second = node.elts[:2]
             if (

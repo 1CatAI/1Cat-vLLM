@@ -9,47 +9,20 @@ import os
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
-from vllm.v1.attention.backends.flash_v100 import routing
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
 def context_bucket_partition_size_hint() -> int | None:
-    raw = _config.raw("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE")
-    if raw is None:
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
-            f"{routing.VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in routing.VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
-            f"{routing.VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
+    from vllm.config.execution_policy import graph_policy
+
+    return graph_policy().mtp_partition_hint()
 
 
 def dual_cta_partition_size_hint() -> int | None:
-    if _config.raw("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "1") != "1":
+    if not _config.options().value("xqa_mtp5_dual_cta"):
         return None
-    raw = _config.raw("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "1024")
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
-            f"{routing.VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in routing.VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
-            f"{routing.VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
+    return _config.options().value("xqa_mtp5_partition_size")
 
 
 def trace_event(event: str, payload: dict[str, object]) -> None:
@@ -70,7 +43,7 @@ def trace_enabled() -> bool:
 
 
 def prefix_dump_enabled() -> bool:
-    return _config.raw("VLLM_FLASH_V100_DFLASH_PREFIX_DUMP", "0") == "1"
+    return _config.trace().flash_v100.value("dflash_prefix_dump")
 
 
 def branch_attn_enabled() -> bool:

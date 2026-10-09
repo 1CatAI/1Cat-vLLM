@@ -1518,7 +1518,7 @@ class Worker(WorkerBase):
     def shutdown(self) -> None:
         from vllm.v1.worker.gpu.shutdown import log_loaded_attention_route_summaries
 
-        log_loaded_attention_route_summaries()
+        log_loaded_attention_route_summaries(self.vllm_config)
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:
             ensure_kv_transfer_shutdown()
@@ -1538,6 +1538,10 @@ class Worker(WorkerBase):
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
+
+        from vllm.runtime_resources import release_runtime_resources
+
+        release_runtime_resources(self.vllm_config)
 
     def elastic_ep_execute(self, execute_method: str, *args, **kwargs):
         return self.elastic_ep_executor.execute(execute_method, *args, **kwargs)

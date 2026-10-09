@@ -1,3 +1,4 @@
+#include "flash_v100_policy.h"
 #include <torch/extension.h>
 #include <ATen/ATen.h>
 #include <stdexcept>
@@ -81,4 +82,68 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Expand paged FP8 E5M2 K/V into a preallocated FP16 paged workspace");
   m.def("fp8_e4m3_paged_kv_to_fp16", &flash_attention_fp8_e4m3_paged_kv_to_fp16,
         "Expand paged FP8 E4M3 K/V into a preallocated FP16 paged workspace");
+
+  m.attr("policy_abi_version") = 1;
+  m.attr("policy_fields") = flash_v100::policy::size;
+  py::class_<flash_v100::policy::PreparedPolicy>(m, "PreparedPolicy")
+      .def(py::init<const std::vector<std::optional<std::string>>&>())
+      .def_property_readonly(
+          "values",
+          [](const flash_v100::policy::PreparedPolicy& p) { return p.values; })
+      .def_property_readonly("observations",
+                             [](const flash_v100::policy::PreparedPolicy& p) {
+                               std::vector<unsigned long long> result;
+                               for (const auto& value : p.observations)
+                                 result.push_back(value.load());
+                               return result;
+                             });
+  m.def("fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_forward));
+  m.def("qk_scores_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_qk_scores));
+  m.def("bwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_backward));
+  m.def("decode_paged_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_decode_paged));
+  m.def("decode_paged_xqa_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_decode_paged_xqa));
+  m.def("decode_paged_xqa_staged_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_decode_paged_xqa_staged));
+  m.def("grouped_verify_paged_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_grouped_verify_paged));
+  m.def("grouped_e4m3_fp32_paged_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_grouped_e4m3_fp32_paged));
+  m.def("tp2_e4m3_scalar_fast_launch_count_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_tp2_e4m3_scalar_fast_launch_count));
+  m.def("grouped_sparse_page4_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_grouped_sparse_page4));
+  m.def("grouped_sparse_page4_plan_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_grouped_sparse_page4_plan));
+  m.def("decode_paged_wmma_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_decode_paged_wmma));
+  m.def("decode_qk_scores_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_decode_qk_scores));
+  m.def("decode_turboquant_paged_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_turboquant_decode_paged));
+  m.def("dflash2_paged_bmhd_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_dflash2_paged_bmhd));
+  m.def("prefill_paged_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_prefill_paged));
+  m.def("prefill_paged_d256_bm32_allp_pair_scratch_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_prefill_paged_d256_bm32_allp_pair_scratch));
+  m.def(
+      "prefill_paged_d256_bm32_allp_pair_scratch_splitkv3_fwd_configured",
+      flash_v100::policy::with_policy(
+          &flash_attention_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3));
+  m.def("prefill_paged_bfla_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_prefill_paged_bfla));
+  m.def(
+      "prefill_paged_splitkv_fwd_configured",
+      flash_v100::policy::with_policy(&flash_attention_prefill_paged_splitkv));
 }

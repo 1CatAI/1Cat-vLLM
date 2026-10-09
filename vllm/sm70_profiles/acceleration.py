@@ -483,8 +483,8 @@ def _bm32_paged_prefill_report(cfg, native: Mapping[str, bool]) -> dict[str, Any
         else "page_alignment"
         if page < 16 or page % 16
         else "user_override"
-        if not envs.VLLM_FLASH_V100_PREFILL_D256_LOW_SMEM
-        or not envs.VLLM_FLASH_V100_PREFILL_D256_BM32_PHASE
+        if not cfg.attention_config.flash_v100.options.value("prefill_d256_low_smem")
+        or not cfg.attention_config.flash_v100.options.value("prefill_d256_bm32_phase")
         else "operator_missing:aligned_bm32_paged_prefill"
         if not native.get("bm32_aligned_pages", False)
         else None
@@ -731,6 +731,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         switches=decode_values,
     )
 
+    attention_options = cfg.attention_config.flash_v100.options
     page_size = int(cfg.cache_config.block_size or 0)
     try:
         native = _native_capabilities(page_size)
@@ -796,7 +797,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         if dtype != "fp8_e4m3"
         else (
             "user_override"
-            if not envs.VLLM_FLASH_V100_E4M3_GROUPED_FP32
+            if not cfg.attention_config.flash_v100.options.value("e4m3_grouped_fp32")
             else (
                 None
                 if native["grouped_fp32"]
@@ -808,7 +809,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         grouped_reason,
         kv_cache_dtype=dtype,
         switches={
-            "VLLM_FLASH_V100_E4M3_GROUPED_FP32": envs.VLLM_FLASH_V100_E4M3_GROUPED_FP32
+            "VLLM_FLASH_V100_E4M3_GROUPED_FP32": attention_options.value(
+                "e4m3_grouped_fp32"
+            )
         },
     )
     long_reason = grouped_reason or (
@@ -826,7 +829,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         or (
             "user_override"
             if (
-                not envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
+                not cfg.attention_config.flash_v100.options.value("tail_cudagraphs")
                 or graph_policy().decode_partition_size
             )
             else (
@@ -841,7 +844,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         ),
         block_size=page_size,
         switches={
-            "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS,
+            "VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS": attention_options.value(
+                "tail_cudagraphs"
+            ),
             "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": (
                 graph_policy().decode_partition_size
             ),
@@ -853,7 +858,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         if budget < 8000
         else (
             "user_override"
-            if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+            if cfg.attention_config.flash_v100.options.value("prefill_d256_gqa_v37")
             else (
                 None
                 if native["q8000"]
@@ -863,7 +868,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         max_num_batched_tokens=budget,
         switches={
             "VLLM_FLASH_V100_PREFILL_D256_GQA_V37": (
-                envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+                cfg.attention_config.flash_v100.options.value("prefill_d256_gqa_v37")
             )
         },
     )

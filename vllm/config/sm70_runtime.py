@@ -4,7 +4,6 @@
 """Initialization-only compatibility for runner lifecycle policy."""
 
 import os
-from dataclasses import fields
 from typing import ClassVar
 
 import torch
@@ -12,47 +11,23 @@ from pydantic import Field
 
 from vllm.config.diagnostic_dump import TensorDiagnosticsConfig
 from vllm.config.diagnostic_sampling import SamplingDiagnosticsConfig
+from vllm.config.flash_v100 import FlashV100Diagnostics
 from vllm.config.sm70_dflash2 import DFlashDiagnosticsConfig
 from vllm.config.utils import config
 
 
-def resolve_legacy_fields(
-    policy,
-    aliases: dict[str, str],
-    *,
-    inactive_defaults: dict[str, int | float] | None = None,
-    reader=None,
-) -> None:
-    from vllm import envs
-    from vllm.envs_metadata import EnvVar
+def resolve_legacy_fields(policy, aliases, *, inactive_defaults=None, reader=None):
+    from vllm.config.utils import resolve_legacy_fields as resolve
 
-    for field in fields(policy):
-        name = field.name
-        if name not in aliases:
-            continue
-        legacy = aliases[name]
-        variable = envs.environment_variables.get(legacy)
-        if isinstance(variable, EnvVar):
-            variable.warn_if_deprecated()
-        if getattr(policy, name) is not None:
-            policy.sources.setdefault(name, "typed")
-        else:
-            source = legacy if legacy in os.environ else "default"
-            try:
-                value = (
-                    reader(legacy)
-                    if reader is not None
-                    else envs.environment_variables[legacy]()
-                )
-            except ValueError:
-                if inactive_defaults is None or name not in inactive_defaults:
-                    raise
-                value = inactive_defaults[name]
-                source = f"inactive default (ignored {legacy})"
-            setattr(policy, name, value)
-            policy.sources[name] = source
-            if legacy == "VLLM_SM70_MTP_PROFILE" and "VLLM_SM70_DEBUG" in os.environ:
-                policy.sources[name] = "VLLM_SM70_DEBUG"
+    resolve(
+        policy,
+        aliases,
+        inactive_defaults=inactive_defaults,
+        reader=reader,
+        source_overrides={"VLLM_SM70_MTP_PROFILE": "VLLM_SM70_DEBUG"}
+        if "VLLM_SM70_DEBUG" in os.environ
+        else None,
+    )
 
 
 @config
@@ -116,6 +91,9 @@ def capture_runtime_config() -> Sm70RuntimeConfig:
 @config
 class RuntimeTraceConfig:
     """Captured runner diagnostics; never part of compiled computation."""
+
+    flash_v100: FlashV100Diagnostics = Field(default_factory=FlashV100Diagnostics)
+    """Attention comparison, native trace and route observations."""
 
     dflash: DFlashDiagnosticsConfig = Field(default_factory=DFlashDiagnosticsConfig)
     """Family-specific trace inputs; qualification belongs to its adapter."""
@@ -187,6 +165,7 @@ class RuntimeTraceConfig:
     def __post_init__(self) -> None:
         if self.sources:
             return
+        self.flash_v100.resolve()
         from vllm import envs
 
         def read_flag(name):

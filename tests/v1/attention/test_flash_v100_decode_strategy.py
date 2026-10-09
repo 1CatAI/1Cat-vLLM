@@ -86,7 +86,9 @@ def source_interface(monkeypatch):
     import sys
 
     monkeypatch.setitem(sys.modules, "flash_attn_v100_cuda", native)
-    spec = importlib.util.spec_from_file_location("_shared_decode_source", path)
+    spec = importlib.util.spec_from_file_location(
+        "_shared_decode_source", path, submodule_search_locations=[str(path.parent)]
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)

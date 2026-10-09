@@ -469,3 +469,43 @@ def set_from_deprecated_env_if_set(
         elif to_int:
             field_value = int(env_value)
         setattr(config, field_name, field_value)
+
+
+def resolve_legacy_fields(
+    policy,
+    aliases: dict[str, str],
+    *,
+    inactive_defaults: dict[str, int | float] | None = None,
+    reader=None,
+    source_overrides: dict[str, str] | None = None,
+) -> None:
+    from vllm import envs
+    from vllm.envs_metadata import EnvVar
+
+    for config_field in fields(policy):
+        name = config_field.name
+        if name not in aliases:
+            continue
+        legacy = aliases[name]
+        variable = envs.environment_variables.get(legacy)
+        if isinstance(variable, EnvVar):
+            variable.warn_if_deprecated()
+        if getattr(policy, name) is not None:
+            policy.sources.setdefault(name, "typed")
+        else:
+            source = legacy if legacy in os.environ else "default"
+            try:
+                value = (
+                    reader(legacy)
+                    if reader is not None
+                    else envs.environment_variables[legacy]()
+                )
+            except ValueError:
+                if inactive_defaults is None or name not in inactive_defaults:
+                    raise
+                value = inactive_defaults[name]
+                source = f"inactive default (ignored {legacy})"
+            setattr(policy, name, value)
+            policy.sources[name] = source
+            if source_overrides and legacy in source_overrides:
+                policy.sources[name] = source_overrides[legacy]

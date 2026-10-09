@@ -60,8 +60,9 @@ part of the contract.
 | --- | --- | --- |
 | D1 registry and ledger | Merged [#1141](https://github.com/1CatAI/1Cat-vLLM/pull/1141); CI passed | Static inventory, structured deprecation metadata, shared registration scanner and explicit-input warn-once support. This establishes visibility; it does not claim execution consumers migrated. |
 | D2 GDN and speculation | Merged [#1143](https://github.com/1CatAI/1Cat-vLLM/pull/1143); CI passed | CPU isolation/compatibility, 17 GPU operator cases and matched A/B passed. |
-| D3 diagnostics | Validated; merge after self-review | Shared diagnostic owner, 74 initialized parameters, legacy typed MoE bridge, CPU isolation and 7 GPU cases plus matched operator A/B. |
-| D4 attention | Pending | Connect backend, standalone package and versioned native policy; isolate workspaces. |
+| D3 diagnostics | Merged [#1146](https://github.com/1CatAI/1Cat-vLLM/pull/1146); CI passed | Shared diagnostic owner, 74 initialized parameters, legacy typed MoE bridge, CPU isolation and 7 GPU cases plus matched operator A/B. |
+| D4a attention package | Validation and self-review | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
+| D4b FA2/79T resources | Pending, next main-based delivery | Remaining native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build. D4 is not closed by D4a. |
 | D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
 | D6 closure | Pending | Complete evidence audit, remaining-name ownership, report and execution-time read guards. |
 
@@ -261,3 +262,77 @@ change. Full logs, the benchmark script and the initial stale-archive collection
 failure are retained under `/home/ymzx/arch-ws/tmp/phase-d3/`; the corrected GPU
 run required no source-side numerical change. The remote task is
 `/home/ymzx/arch-ws/phase-d3-20261009/` and has released its GPU lock.
+
+### D4a attention configuration and worker ownership
+
+Base: `649dbd63a3d45384a8225252336747318ba210a0` (merged D3).
+The independent attention package and FA2/79T have distinct native builds, so
+D4 is delivered in two consecutive main-based changes. Neither the retained
+79T environment reads nor its native workspace maps are counted as complete
+in this first delivery.
+
+`attention_config.flash_v100.options` captures 105 remaining computation and
+resource controls. `observability_config.runtime_trace.flash_v100` captures 23
+diagnostic controls. Existing graph fields remain the sole owners of shared
+partition/context policy; attention receives their projections after ordered
+model/platform defaults. The existing five parent attention fields remain
+compatible. Declarations also feed the inventory, explanation and read guard.
+
+| Boundary | Implementation / preserved contract |
+| --- | --- |
+| Initialization | Typed values override legacy inputs. Alias precedence, exact-string versus first-character booleans, integer clamps and qualified errors are retained. Serialized provenance and deferred errors travel with workers. |
+| Backend and graph | Consumers use resolved fields. Decode and MTP partition parsing occurs once; token count, request order, context length and prefill/decode choices remain dynamic at the original checkpoints. |
+| Independent package | Thirty public/internal functions pass an optional explicit runtime through their existing calls. Engines bind the runtime once; no-config functions use a separate independent compatibility adapter. |
+| Native package | ABI 1 adds a `PreparedPolicy` and 20 configured bindings; all existing exports remain. Its 66 parsed projections represent 65 legacy names, including one historical scalar alias. Calls borrow immutable parsed values and per-owner observations without parsing strings or reading the environment. An old binary fails clearly during engine initialization. |
+| Hash | Effective backend, package and native choices participate, including cases where old parser dialects disagree. Resource sharing, ordinary diagnostics, inactive formats and disabled feature sub-options are filtered. Migrated aliases no longer additionally salt the environment hash. |
+| Resources | Six package caches and eight backend/grouped-attention caches or warmup records belong to two worker owners. Shutdown closes only that engine. Captured bridge/gather buffers survive subsequent eager growth until graph teardown; existing eager OOM/fallback and capture-growth rejection remain. |
+| Observations | Native counters, backend route/fallback counts, dtype observations and prefix-dump budgets are engine-owned. Comparison arithmetic and per-layer quotas keep their original owners. JSON and tensor writers share the diagnostic output manager; payloads/log labels remain and filenames gain the existing engine suffix. |
+| Compatibility | Public package calls, legacy module aliases, custom-op schemas, fake registrations and native loading checkpoints remain. Standalone caches/counters serve independent no-config callers only. |
+
+The common policy base and field resolver have no reverse dependency on an
+owning attention/runtime module. Existing import paths re-export their public
+classes/functions. Runtime resource objects are created after worker transfer;
+no native handle or workspace address is stored in serialized configuration.
+Native observation counts describe host dispatch/capture, not graph replay hits.
+
+Scoped source census: the changed Python backend/package files contained 118
+literal, registered or wrapped read references; 9 remain: two compatibility
+getter definitions, one dynamic-library loader and six deferred DDTree sites.
+The configured paths for the other 109 sites consume initialization results.
+This count is a source census, not a per-token call count. Native package
+getters now share the policy projection; direct-call fallback still preserves
+their historical parsing. The 98 similarly named helpers copied into the
+grouped/scalar FA2 sources are not reached by their exported operators; they
+remain historical source, with three distinct defaults, rather than being
+misreported as active reads migrated in this change.
+
+The work replaces policy interpretation and shared resource ownership while
+retaining the existing algorithm tree. Dense/paged layouts, FP16/E4M3/E5M2,
+scalar/XQA/grouped and experimental BFLA branches remain for their actual
+layout, numerical or algorithmic differences. Defaults and qualification are
+unchanged; disabled experiments are not deprecated merely for being disabled.
+
+Validation evidence is recorded in [the operator rounds](phase_d4a_operators.json).
+On 54633 GPU 2 (V100 SXM2 32GB, Torch 2.10.0+cu128, CUDA 12.8, driver
+580.173.02), three alternating source-lane rounds give the following medians:
+
+| Operator | GPU µs before → after | Host enqueue µs before → after | Extra allocation, both |
+| --- | --- | --- | --- |
+| FP16 XQA decode, sequence 1537 | 47.4624 → 47.3702 | 91.105 → 81.760 | 0 B |
+| E4M3 scalar decode, sequence 1537, partition 1024 | 146.6675 → 146.4422 | 86.140 → 82.776 | 0 B |
+| Causal dense prefill, Q32/K128/GQA6/D256 | 42.2810 → 42.2400 | 176.035 → 182.337 | 295936 B |
+
+Every output hash matches. GPU changes are below 0.2%. Dense-prefill host
+samples overlap the baseline range; this does not establish a host-prefill
+speedup. These are operator measurements, with no model throughput or TTFT
+conclusion. Both standalone native packages were built through normal setup
+from their source lanes, without private kernel overlays or preloads.
+
+Initial capture/operator validation passed 18 cases; the added runtime release,
+old-binary rejection and backend capture-growth cases subsequently passed too.
+The broader GPU-host policy suite initially stopped because its task directory
+lacked the unchanged normal FA2 library; that test setup failure is retained
+in `gpu-final.log`. CPU source review also exposed older test fixtures patching
+retired getters or omitting the new observability owner; those fixtures now
+exercise resolved policies. Final validation totals and artifact identities are
+recorded with the PR after the remaining focused checks finish.

@@ -123,6 +123,25 @@ for _class in ast.parse(_POLICY.read_text()).body:
             and node.value.isidentifier()
         )
 
+# Component-owned attention declarations include both public aliases and the
+# initialized native binding. Importing the optional CUDA package is unnecessary.
+for _class in ast.parse((_CONFIG_ROOT / "flash_v100.py").read_text()).body:
+    if not isinstance(_class, ast.ClassDef):
+        continue
+    for _field in _class.body:
+        if (
+            isinstance(_field, ast.AnnAssign)
+            and isinstance(_field.target, ast.Name)
+            and _field.target.id in ("aliases", "bindings", "legacy_aliases")
+        ):
+            RUNTIME_NAMES.update(
+                node.value
+                for node in ast.walk(_field.value)
+                if isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and node.value.startswith("VLLM_")
+            )
+
 
 def runtime_policy_reads(path: Path, tree: ast.AST) -> list[str]:
     """Ordered defaults can reference aliases; execution cannot read their envs."""
@@ -142,7 +161,10 @@ def runtime_policy_reads(path: Path, tree: ast.AST) -> list[str]:
             call = ast.unparse(node.func)
             index = 1 if call == "getattr" else 0
             if (
-                call in {"os.getenv", "os.environ.get", "getattr"}
+                (
+                    call in {"os.getenv", "os.environ.get", "getattr"}
+                    or call.rsplit(".", 1)[-1] in ("registered", "raw", "env_is_set")
+                )
                 and len(node.args) > index
                 and isinstance(node.args[index], ast.Constant)
             ):

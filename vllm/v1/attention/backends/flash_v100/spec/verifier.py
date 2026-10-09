@@ -703,7 +703,7 @@ class VerificationExecutor:
         trace_kv_diff = (
             _config.raw("VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF", "0") == "1"
         )
-        profile_enabled = _config.registered("VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE")
+        profile_enabled = _config.trace().flash_v100.value("prefill_chunk_profile")
         profile_start: torch.cuda.Event | None = None
         profile_end: torch.cuda.Event | None = None
         if profile_enabled:

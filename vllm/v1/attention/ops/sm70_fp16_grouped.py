@@ -13,6 +13,7 @@ from vllm.v1.attention.ops.sm70_grouped import MAX_CONTEXT as MAX_CONTEXT
 from vllm.v1.attention.ops.sm70_grouped import (
     grouped_fp16_fp32_reason as grouped_fp16_fp32_reason,
 )
+from vllm.v1.attention.ops.sm70_workspaces import workspace_cache
 
 OPERATOR = "sm70_grouped_fp16_fwd"
 _WORKSPACES: dict[tuple, list[tuple[torch.Tensor, torch.Tensor]]] = {}
@@ -53,9 +54,10 @@ def short_split_capability():
 
 
 def _run(q, k, v, table, row_lengths, *, out, softmax_scale):
+    cache = workspace_cache("grouped_fp16", _WORKSPACES)
     groups = table.shape[0]
     key = (q.device, torch.cuda.current_stream(q.device).cuda_stream)
-    bank = _WORKSPACES.setdefault(key, [])
+    bank = cache.setdefault(key, [])
     for partial, lse in bank:
         if partial.shape[0] >= groups:
             break

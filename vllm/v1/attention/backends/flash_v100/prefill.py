@@ -343,7 +343,7 @@ def _should_use_prefill_gather_dense(
 ) -> bool:
     graph_capture = _routing.is_cuda_graph_capturing(key_cache)
     q8192_family = (
-        not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
+        not _config.options().value("prefill_d256_gqa_v37")
         and _dense_prefill._SM70_79T_CORE_QUERY_LEN
         <= q_len
         <= _dense_prefill._SM70_79T_MAX_QUERY_LEN
@@ -400,7 +400,7 @@ def _prefill_prefix_decode_rows_allowed(
     window_size: tuple[int, int],
 ) -> bool:
     return (
-        _config.registered("VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS")
+        _config.options().value("prefill_prefix_decode_rows")
         and causal
         and anchor_lens is None
         and num_seqs > 1
@@ -687,7 +687,7 @@ def _run_prefill_paged_call(
     block_size: int,
     fn: Callable[[], torch.Tensor],
 ) -> torch.Tensor:
-    if not _config.registered("VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE"):
+    if not _config.trace().flash_v100.value("prefill_chunk_profile"):
         return fn()
 
     start_event = torch.cuda.Event(enable_timing=True)
@@ -743,10 +743,10 @@ def _flash_v100_prefill_with_prefix(
     block_size = key_cache.shape[1]
     num_kv_heads = key_cache.shape[2]
     head_dim = key_cache.shape[3]
-    debug_compare = _config.raw("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0") == "1"
+    debug_compare = _config.trace().flash_v100.value("debug_prefill_compare")
     feature_dump = (
         self.ops.prefix_dump_enabled()
-        and not log_once_seen("flash_v100.prefix_dump")
+        and not _config.diagnostic_seen("flash_v100.prefix_dump")
         and self.ops.is_draft_layer(layer)
     )
 
@@ -850,7 +850,7 @@ def _flash_v100_prefill_with_prefix(
                 continue
             need_dense_debug = (
                 debug_compare
-                and not log_once_seen("flash_v100._logged_prefill_compare")
+                and not _config.diagnostic_seen("flash_v100._logged_prefill_compare")
             ) or feature_dump
             if need_dense_debug:
                 observe_prefill_reference(
@@ -919,9 +919,9 @@ def log_bfla(config):
             config.policy.prefill_bfla_min_q,
             config.policy.prefill_bfla_min_kv,
             config.policy.prefill_bfla_mask_block_n,
-            _config.registered("VLLM_FLASH_V100_BFLA_KEEP_MASS"),
-            _config.registered("VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS"),
-            _config.registered("VLLM_FLASH_V100_BFLA_POOL"),
+            _config.options().value("bfla_keep_mass"),
+            _config.options().value("bfla_local_blocks"),
+            _config.options().value("bfla_pool"),
             scope="process",
             key="flash_v100._logged_prefill_prefix_bfla",
         )

@@ -44,6 +44,18 @@ def test_non_vllm_native_settings_are_included():
     ]
 
 
+def test_parser_and_historical_alias_tuples_retain_one_owner():
+    declarations = typed_declarations("""
+bindings = {"pipeline": ("VLLM_SM70_PIPELINE", "first_ne0", True)}
+legacy_aliases = {"scalar": ("VLLM_SM70_SCALAR", "VLLM_SM70_OLD_SCALAR")}
+""")
+    assert {name: rows[0]["field"] for name, rows in declarations.items()} == {
+        "VLLM_SM70_PIPELINE": "pipeline",
+        "VLLM_SM70_SCALAR": "scalar",
+        "VLLM_SM70_OLD_SCALAR": "scalar",
+    }
+
+
 def test_direct_registered_imports_are_visible():
     assert (
         python_references("from vllm.envs import VLLM_SM70_EXAMPLE as flag")[0]["name"]

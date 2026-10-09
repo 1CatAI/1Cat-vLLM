@@ -444,9 +444,7 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
             int(context.max_seq_len_hint or 0),
             int(context.workspace_seq_capacity_hint or 0) if capture else 0,
         )
-        minimum = int(
-            _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN", "4096")
-        )
+        minimum = _config.options().value("smallq_decode_xqa_min_seq_len")
         if context.codec is FP8_E5M2:
             minimum = max(minimum, _decode_fp8_xqa_min_seq_len())
         if hint < max(1, minimum):
@@ -539,7 +537,7 @@ def normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
 
 
 def decode_dynamic_partitions_enabled() -> bool:
-    return _config.raw("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
+    return _config.options().value("decode_dynamic_partitions")
 
 
 def decode_partition_size_for_metadata(
@@ -548,22 +546,12 @@ def decode_partition_size_for_metadata(
     policy=None,
 ) -> int:
     policy = policy if policy is not None else graph_policy()
-    raw = policy.decode_partition_size
-    if raw is None:
-        return _select_default_decode_partition_size(max_seq_len_hint)
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
-            f"{VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
-            f"{VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
+    value = policy.decode_partition_hint()
+    return (
+        value
+        if value is not None
+        else _select_default_decode_partition_size(max_seq_len_hint)
+    )
 
 
 def resolve_decode_strategy(
@@ -595,7 +583,7 @@ def g6_aligned_page_partition_size_hint(
 ) -> int | None:
     if graph_policy().decode_partition_size is not None:
         return None
-    if _config.raw("VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH", "1") == "0":
+    if not _config.options().value("xqa_g6_p1024_sawtooth"):
         return None
     if not (
         query.ndim == 3
@@ -637,9 +625,8 @@ def g6_aligned_page_partition_size_hint(
 
 
 def log_kv_dtype_contract(kv_cache_dtype: str) -> None:
-    if kv_cache_dtype in _logged_kv_dtype_contracts:
+    if _config.observed("kv_contracts", kv_cache_dtype, _logged_kv_dtype_contracts):
         return
-    _logged_kv_dtype_contracts.add(kv_cache_dtype)
     if kv_cache_dtype == "fp8":
         logger.warning(
             "SM70 Flash-V100 received an unresolved `fp8` KV-cache dtype and "
@@ -675,28 +662,11 @@ def _select_default_decode_partition_size(
 
 
 def _decode_xqa_q4_min_seq_len() -> int:
-    raw = _config.raw("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN")
-    if raw is None:
-        return _DEFAULT_Q4_XQA_MIN_SEQ_LEN
-    try:
-        return max(1, int(raw))
-    except ValueError as exc:
-        raise ValueError(
-            f"VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN must be an integer, got {raw!r}"
-        ) from exc
+    return _config.options().value("decode_xqa_q4_min_seq_len")
 
 
 def _decode_fp8_xqa_min_seq_len() -> int:
-    raw = _config.raw("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN")
-    if raw is None:
-        return _DEFAULT_FP8_XQA_MIN_SEQ_LEN
-    try:
-        return max(1, int(raw))
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN must be an integer, "
-            f"got {raw!r}"
-        ) from exc
+    return _config.options().value("decode_fp8_xqa_min_seq_len")
 
 
 def _decode_fp8_xqa_allowed(
@@ -777,15 +747,10 @@ def is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
 
 
 def _route_summary_enabled() -> bool:
-    if _config.env_is_set("VLLM_SM70_DEBUG"):
-        return "routing" in _config.registered("VLLM_SM70_DEBUG")
-    return (
-        _config.raw("VLLM_FLASH_V100_ROUTE_SUMMARY", "0") == "1"
-        or _config.raw("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY", "0") == "1"
-    )
+    return _config.trace().flash_v100.value("route_summary")
 
 
-def _log_route_summary() -> None:
+def _flush_route_summary(_route_counts, _fallback_counts) -> None:
     if _route_counts:
         logger.info(
             "FLASH_ATTN_V100 route summary: %s",
@@ -800,11 +765,24 @@ def _log_route_summary() -> None:
         _fallback_counts.clear()
 
 
+def _log_route_summary(owner=None) -> None:
+    _flush_route_summary(
+        _route_counts
+        if owner is None
+        else owner.histories.get("flash_v100_routes", {}),
+        _fallback_counts
+        if owner is None
+        else owner.histories.get("flash_v100_fallbacks", {}),
+    )
+
+
 def record_route(route: str) -> None:
     global _route_summary_registered
+    counts = _config.observations("routes", _route_counts)
+    fallbacks = _config.observations("fallbacks", _fallback_counts)
     spec = route_spec(route)
     if spec.fallback:
-        _fallback_counts[route] = _fallback_counts.get(route, 0) + 1
+        fallbacks[route] = fallbacks.get(route, 0) + 1
         logger.warning_once(
             "FLASH_ATTN_V100 explicit fallback selected: %s",
             route,
@@ -814,14 +792,25 @@ def record_route(route: str) -> None:
     if not enabled and not spec.fallback:
         return
     if enabled:
-        _route_counts[route] = _route_counts.get(route, 0) + 1
+        counts[route] = counts.get(route, 0) + 1
+    from vllm.diagnostics import diagnostics_for
+
+    owner = diagnostics_for()
+    if owner is not None:
+        import weakref
+
+        lifetime = owner.histories.setdefault("flash_v100_summary", {})
+        if not lifetime:
+            lifetime["registered"] = True
+            weakref.finalize(owner, _flush_route_summary, counts, fallbacks)
+        return
     if not _route_summary_registered:
         atexit.register(_log_route_summary)
         _route_summary_registered = True
 
 
 def _decode_active_trace_enabled() -> bool:
-    return _config.raw("VLLM_FLASH_V100_TRACE_DECODE_ACTIVE", "0") == "1"
+    return _config.trace().flash_v100.value("trace_decode_active")
 
 
 def _decode_active_value(active_num_partitions: object) -> int | None:
@@ -886,9 +875,8 @@ def trace_decode_active(
         workspace_partitions,
         window_size,
     )
-    if signature in _decode_active_trace_signatures:
+    if _config.observed("decode_active", signature, _decode_active_trace_signatures):
         return
-    _decode_active_trace_signatures.add(signature)
     logger.info(
         "FLASH_ATTN_V100 decode active trace: route=%s q=%d heads_q=%d "
         "heads_kv=%d head_dim=%d page_size=%d seq_len=%d partition=%d "
@@ -943,9 +931,8 @@ def trace_decode_active_metadata(
         partition_size,
         workspace_partitions,
     )
-    if signature in _decode_active_trace_signatures:
+    if _config.observed("decode_active", signature, _decode_active_trace_signatures):
         return
-    _decode_active_trace_signatures.add(signature)
     logger.info(
         "FLASH_ATTN_V100 decode active metadata: stage=%s seq_len_hint=%d "
         "partition=%d active=%d expected_active=%d workspace_partitions=%s "

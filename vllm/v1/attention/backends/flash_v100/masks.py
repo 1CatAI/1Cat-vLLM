@@ -40,7 +40,7 @@ def build_bfla_block_mask_for_seq(
     if mask_block_n <= 0:
         return None
 
-    pool_mode = _config.registered("VLLM_FLASH_V100_BFLA_POOL").lower()
+    pool_mode = _config.options().value("bfla_pool")
     flat_group_tokens = 64
     use_flat64 = pool_mode == "flat64"
     if use_flat64 and mask_block_n % flat_group_tokens != 0:
@@ -123,10 +123,10 @@ def build_bfla_block_mask_for_seq(
     k_block_start = torch.arange(kv_tiles, device=q_seq.device) * mask_block_n
     causal = k_block_start[None, :] <= q_block_end[:, None]
 
-    threshold = float(_config.registered("VLLM_FLASH_V100_BFLA_THRESHOLD"))
-    keep_mass = float(_config.registered("VLLM_FLASH_V100_BFLA_KEEP_MASS"))
+    threshold = float(_config.options().value("bfla_threshold"))
+    keep_mass = float(_config.options().value("bfla_keep_mass"))
     keep_ratio = float(cast(float, flash_v100_policy().bfla_keep_ratio))
-    min_keep_blocks = int(_config.registered("VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS"))
+    min_keep_blocks = int(_config.options().value("bfla_min_keep_blocks"))
     for kv_h in range(num_kv_heads):
         q_h0 = kv_h * num_queries_per_kv
         q_h1 = q_h0 + num_queries_per_kv
@@ -172,14 +172,14 @@ def build_bfla_block_mask_for_seq(
         context_len + torch.arange(q_blocks, device=q_seq.device) * mask_block_n
     ) // mask_block_n
     k_idx = torch.arange(kv_tiles, device=q_seq.device)
-    local_blocks = max(0, int(_config.registered("VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS")))
+    local_blocks = max(0, int(_config.options().value("bfla_local_blocks")))
     local = (k_idx[None, :] <= q_tile_abs[:, None]) & (
         k_idx[None, :] >= q_tile_abs[:, None] - local_blocks
     )
     keep_per_kv |= local[None, :, :]
     keep_per_kv[:, :, 0] = True
 
-    spec_stride = int(_config.registered("VLLM_FLASH_V100_BFLA_SPEC_STRIDE"))
+    spec_stride = int(_config.options().value("bfla_spec_stride"))
     if spec_stride > 0:
         dropped = causal[None, :, :] & ~keep_per_kv
         q_idx = torch.arange(q_blocks, device=q_seq.device, dtype=torch.int64)[:, None]
@@ -190,13 +190,13 @@ def build_bfla_block_mask_for_seq(
             (
                 q_idx * 131
                 + k_idx_i64 * 17
-                + int(_config.registered("VLLM_FLASH_V100_BFLA_SPEC_SEED"))
+                + int(_config.options().value("bfla_spec_seed"))
             )
             % spec_stride
         ) == 0
         keep_per_kv |= dropped & stride_keep[None, :, :]
 
-    spec_prob = float(_config.registered("VLLM_FLASH_V100_BFLA_SPEC_PROB"))
+    spec_prob = float(_config.options().value("bfla_spec_prob"))
     if spec_prob > 0:
         prob = max(0.0, min(spec_prob, 1.0))
         dropped = causal[None, :, :] & ~keep_per_kv
@@ -216,7 +216,7 @@ def build_bfla_block_mask_for_seq(
                 (q_idx + 1) * 1103515245
                 + (k_idx_i64 + 1) * 12345
                 + (h_idx + 1) * 2654435761
-                + int(_config.registered("VLLM_FLASH_V100_BFLA_SPEC_SEED"))
+                + int(_config.options().value("bfla_spec_seed"))
             ) & 0x7FFFFFFF
             random_keep = (hashed % 1000000) < int(prob * 1000000)
             keep_per_kv |= dropped & random_keep

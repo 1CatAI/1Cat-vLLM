@@ -47,3 +47,13 @@ def current_runtime_resources() -> dict[str, Any] | None:
 
     config = get_current_vllm_config_or_none()
     return runtime_resources_for(config) if config is not None else None
+
+
+def release_runtime_resources(config) -> None:
+    """Release initialized owners without loading unused components."""
+    resources = getattr(config, "_runtime_resources", {})
+    for owner in resources.values():
+        close = getattr(owner, "close", None)
+        if close is not None:
+            close()
+    resources.clear()

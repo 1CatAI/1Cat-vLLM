@@ -111,7 +111,9 @@ def test_prefill_candidates_with_independent_operators(monkeypatch, choice):
         return None if choice == "mask_decline" else torch.ones(1)
 
     monkeypatch.setattr(
-        sequence._config, "registered", lambda name: choice.startswith("fa2")
+        sequence._config,
+        "options",
+        lambda: SimpleNamespace(value=lambda name: choice.startswith("fa2")),
     )
     monkeypatch.setattr(sequence._masks, "_build_bfla_block_mask_for_seq", mask)
     monkeypatch.setattr(sequence._kv_layout, "_contiguous_paged_kv_view", view)

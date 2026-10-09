@@ -35,7 +35,7 @@ class FlashAttnV100Backend(TritonAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        if _config.registered("VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16"):
+        if _config.options().value("kernel_block_size16"):
             return [16]
         return TritonAttentionBackend.get_supported_kernel_block_sizes()
 
