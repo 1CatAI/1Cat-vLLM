@@ -10,9 +10,9 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | Step | PR | Status | Metrics | GPU validation | Open items |
 | --- | --- | --- | --- | --- | --- |
 | 0: scope and codec ownership | — | Decision communicated; #1028 rebased locally | Baseline measured | Runtime parity belongs to 1c | Retest each subsequent step |
-| 1a: immutable CPU trace and owner guard | #1071 | Draft; local gates pass, GPU queued | Production unchanged | CPU-only safety-net portion | Coverage, patch efficacy, exact parent result map |
-| 1b: patch efficacy + dependency ratchet | — | Implemented; validating full patch audit | Production unchanged | Same parent/candidate result gate | Must finish before Step 2 |
-| 1c: route/token/output parity tools | — | Not started | — | Required fixtures pending | #1060 baseline, Flash-Next host-FP8 integration |
+| 1a: immutable CPU trace and owner guard | #1071 | Gates passed; ready | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
+| 1b: patch efficacy + dependency ratchet | #1072 | Gates passed; ready | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
+| 1c: route/token/output parity tools | — | CPU tools implemented | Production unchanged | Numerical baselines in preparation | Small Qwen, speculative verification, Flash-Next host-FP8 |
 | 2: frozen config + explicit dynamic reads | — | Not started | — | CPU trace allowed | Step 1 gates |
 | 3: owned workspaces | — | Not started | — | Required | Step 2 gates |
 | 4: decode executor and ordered candidates | — | Not started | — | Required | Step 3 gates |
@@ -136,3 +136,32 @@ Current package ceilings are 14 cycles and 32 forbidden import edges.
 The generated fixture includes all 119 env reads and their current owners;
 39 reads in the implementation constructor and two in the metadata builder
 are captured; the other 78 reads are classified as dynamic by current location.
+
+## Completed Step 1a/1b gates
+
+The complete 60-file run returned 1656 passed / 7 failed at #1060, 1667 / 7
+at #1071, and 1668 / 7 at #1072. Both comparisons have an empty changed-outcome
+map and all new tests pass. The seven failures are documented baseline issues.
+The final strict GPU report consumed 41 names with no unused patches.
+Evidence: local `a3-outcome-parity.json`, `a3-gpu-shim.json`; remote
+`a3-step1/logs/outcome-parity.json`, `candidate-files-verified.log`.
+
+PR #1028 was rebased independently onto each safety-net commit. For #1071 the
+validation head is `ee51e3c447c8ff369a996161094cdaa9556456ee`, for #1072 it is
+`f0b12ea9da153e339cf8cc3e20725af19b9582f0`. Both trees exactly match their
+respective clean merge results; each host-KV/QSA CPU run again reports
+37 passed / 98 skipped. GitHub pre-commit checks are green for both PRs.
+
+## Step 1c tools
+
+`route_parity.py` records fixed prompts, greedy token IDs, startup/request
+route counters, native hashes and actual host-FP8 QSA epochs/statistics.
+`op_parity.py` runs native forward with eager/graph fixtures and requires
+finite outputs with maximum absolute error zero. The separate performance
+gate requires both XQA and the 75T prefill workload and rejects changes
+outside +/-2%; this is not a claim of 75 TFLOP/s throughput.
+Both tools reject mismatched workload/runtime contracts or empty evidence.
+Model/tokenizer files are hash-verified before generation. The small Qwen
+fixture is Qwen3-0.6B at revision `c1899de289a04d12100db370d81485cdf75e47ca`;
+weights live only in task-owned remote artifacts. No GPU parity or final A3
+completion is claimed until the pending records and comparisons finish.
