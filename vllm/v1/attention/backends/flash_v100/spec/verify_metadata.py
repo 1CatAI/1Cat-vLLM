@@ -59,58 +59,6 @@ def _smallq_buffer_token_capacity(
     )
 
 
-def _ensure_smallq_decode_buffers(
-    self: _metadata.FlashAttnV100MetadataBuilder,
-    required_tokens: int,
-    required_reqs: int,
-    block_table: torch.Tensor,
-) -> bool:
-    token_capacity = self._smallq_buffer_token_capacity(required_tokens)
-    req_capacity = max(
-        min(
-            int(self.vllm_config.scheduler_config.max_num_seqs),
-            token_capacity,
-        ),
-        int(required_reqs),
-        1,
-    )
-    block_cols = int(block_table.shape[1])
-    shape = (token_capacity, req_capacity, block_cols)
-    if self._smallq_buffer_shape == shape:
-        return True
-
-    if self._smallq_buffer_shape is not None:
-        old_tokens, old_reqs, old_block_cols = self._smallq_buffer_shape
-        return (
-            required_tokens <= old_tokens
-            and required_reqs <= old_reqs
-            and block_cols == old_block_cols
-        )
-
-    self._smallq_decode_block_table = torch.empty(
-        (token_capacity, block_cols),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_decode_seq_lens = torch.empty(
-        (token_capacity,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_query_start_loc = torch.empty(
-        (req_capacity + 1,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_token_indices = torch.arange(
-        token_capacity,
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._smallq_buffer_shape = shape
-    return True
-
-
 def _clear_smallq_decode_metadata(
     self: _metadata.FlashAttnV100MetadataBuilder,
     attn_metadata: TritonAttentionMetadata,
@@ -133,27 +81,27 @@ def _attach_prepared_dflash2_smallq_metadata(
     if prepared.builder_id != id(self):
         raise ValueError("grouped small-query metadata belongs to another builder")
     if (
-        self._smallq_decode_block_table is None
-        or self._smallq_decode_seq_lens is None
-        or self._smallq_query_start_loc is None
-        or self._smallq_buffer_shape is None
+        self.metadata_workspace.smallq.block_table is None
+        or self.metadata_workspace.smallq.seq_lens is None
+        or self.metadata_workspace.smallq.query_start_loc is None
+        or self.metadata_workspace.smallq.shape is None
     ):
         raise RuntimeError("grouped small-query metadata has no persistent buffers")
-    token_capacity, req_capacity, _ = self._smallq_buffer_shape
+    token_capacity, req_capacity, _ = self.metadata_workspace.smallq.shape
     if prepared.num_query_tokens > token_capacity or prepared.num_reqs > req_capacity:
         raise RuntimeError("grouped small-query metadata exceeds captured capacity")
 
     self._clear_smallq_decode_metadata(attn_metadata)
     flash_metadata = _metadata._as_flash_v100_metadata(attn_metadata)
-    flash_metadata.smallq_decode_block_table = self._smallq_decode_block_table[
+    flash_metadata.smallq_decode_block_table = (
+        self.metadata_workspace.smallq.block_table[: prepared.num_query_tokens]
+    )
+    flash_metadata.smallq_decode_seq_lens = self.metadata_workspace.smallq.seq_lens[
         : prepared.num_query_tokens
     ]
-    flash_metadata.smallq_decode_seq_lens = self._smallq_decode_seq_lens[
-        : prepared.num_query_tokens
-    ]
-    flash_metadata.smallq_query_start_loc = self._smallq_query_start_loc[
-        : prepared.num_reqs + 1
-    ]
+    flash_metadata.smallq_query_start_loc = (
+        self.metadata_workspace.smallq.query_start_loc[: prepared.num_reqs + 1]
+    )
     flash_metadata.smallq_decode_max_seq_len_hint = prepared.max_seq_len_hint
     flash_metadata.smallq_decode_workspace_seq_capacity_hint = (
         prepared.workspace_seq_capacity_hint
@@ -211,7 +159,11 @@ def _update_smallq_decode_metadata(
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
     query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
     has_prefix_context = bool(torch.any(query_lens_cpu != seq_lens_cpu).item())
-    if not force and not has_prefix_context and self._smallq_buffer_shape is None:
+    if (
+        not force
+        and not has_prefix_context
+        and self.metadata_workspace.smallq.shape is None
+    ):
         return
 
     num_query_tokens = int(attn_metadata.num_actual_tokens)
@@ -229,8 +181,8 @@ def _update_smallq_decode_metadata(
         num_reqs,
         block_table,
     ):
-        assert self._smallq_buffer_shape is not None
-        token_capacity, req_capacity, block_cols = self._smallq_buffer_shape
+        assert self.metadata_workspace.smallq.shape is not None
+        token_capacity, req_capacity, block_cols = self.metadata_workspace.smallq.shape
         raise RuntimeError(
             "FLASH_ATTN_V100 small-query CUDA graph metadata shape exceeds "
             "the captured persistent buffer capacity: "
@@ -245,10 +197,10 @@ def _update_smallq_decode_metadata(
     ensure_ms = (
         (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
-    assert self._smallq_decode_block_table is not None
-    assert self._smallq_decode_seq_lens is not None
-    assert self._smallq_query_start_loc is not None
-    assert self._smallq_token_indices is not None
+    assert self.metadata_workspace.smallq.block_table is not None
+    assert self.metadata_workspace.smallq.seq_lens is not None
+    assert self.metadata_workspace.smallq.query_start_loc is not None
+    assert self.metadata_workspace.smallq.token_indices is not None
 
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
     query_start_loc = attn_metadata.query_start_loc[: num_reqs + 1]
@@ -263,9 +215,9 @@ def _update_smallq_decode_metadata(
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
     if self._use_sm70_dflash2_fused_smallq_metadata:
         _smallq_metadata._sm70_prepare_smallq_decode_metadata(
-            self._smallq_decode_block_table,
-            self._smallq_decode_seq_lens,
-            self._smallq_query_start_loc,
+            self.metadata_workspace.smallq.block_table,
+            self.metadata_workspace.smallq.seq_lens,
+            self.metadata_workspace.smallq.query_start_loc,
             block_table,
             seq_lens,
             query_start_loc,
@@ -313,9 +265,9 @@ def _update_smallq_decode_metadata(
             repeat_query_lens,
             output_size=num_query_tokens,
         )
-        token_indices = self._smallq_token_indices[:num_query_tokens].to(
-            dtype=seq_lens.dtype
-        )
+        token_indices = self.metadata_workspace.smallq.token_indices[
+            :num_query_tokens
+        ].to(dtype=seq_lens.dtype)
         offsets = token_indices - start_locs_rep + 1
         decode_seq_lens = (seq_lens_rep - query_lens_rep + offsets).contiguous()
         if padding_tokens > 0:
@@ -337,15 +289,15 @@ def _update_smallq_decode_metadata(
         )
 
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-        self._smallq_decode_block_table[:num_query_tokens].copy_(
+        self.metadata_workspace.smallq.block_table[:num_query_tokens].copy_(
             decode_block_table,
             non_blocking=True,
         )
-        self._smallq_decode_seq_lens[:num_query_tokens].copy_(
+        self.metadata_workspace.smallq.seq_lens[:num_query_tokens].copy_(
             decode_seq_lens,
             non_blocking=True,
         )
-        self._smallq_query_start_loc[: num_reqs + 1].copy_(
+        self.metadata_workspace.smallq.query_start_loc[: num_reqs + 1].copy_(
             query_start_loc,
             non_blocking=True,
         )
@@ -356,13 +308,15 @@ def _update_smallq_decode_metadata(
         )
 
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-    flash_metadata.smallq_decode_block_table = self._smallq_decode_block_table[
+    flash_metadata.smallq_decode_block_table = (
+        self.metadata_workspace.smallq.block_table[:num_query_tokens]
+    )
+    flash_metadata.smallq_decode_seq_lens = self.metadata_workspace.smallq.seq_lens[
         :num_query_tokens
     ]
-    flash_metadata.smallq_decode_seq_lens = self._smallq_decode_seq_lens[
-        :num_query_tokens
-    ]
-    flash_metadata.smallq_query_start_loc = self._smallq_query_start_loc[: num_reqs + 1]
+    flash_metadata.smallq_query_start_loc = (
+        self.metadata_workspace.smallq.query_start_loc[: num_reqs + 1]
+    )
     raw_seq_capacity = int(block_table.shape[1]) * int(self.block_size)
     max_seq_len_hint = int(seq_lens_cpu.max().item())
     if max_seq_len_hint > 0 and raw_seq_capacity > 0:
@@ -439,3 +393,29 @@ def _update_smallq_decode_metadata(
                 "smallq_qsl",
             ),
         )
+
+
+def _ensure_smallq_decode_buffers(
+    self: _metadata.FlashAttnV100MetadataBuilder,
+    required_tokens: int,
+    required_reqs: int,
+    block_table: torch.Tensor,
+) -> bool:
+    token_capacity = self._smallq_buffer_token_capacity(required_tokens)
+    req_capacity = max(
+        min(
+            int(self.vllm_config.scheduler_config.max_num_seqs),
+            token_capacity,
+        ),
+        int(required_reqs),
+        1,
+    )
+    block_cols = int(block_table.shape[1])
+    return self.metadata_workspace.smallq.ensure(
+        token_capacity,
+        req_capacity,
+        block_cols,
+        required_tokens,
+        required_reqs,
+        self.device,
+    )

@@ -3,6 +3,7 @@
 """Speculative metadata preserves calculation bodies and graph buffer identity."""
 
 import ast
+import copy
 import hashlib
 import inspect
 import json
@@ -22,6 +23,71 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadataBuilde
 pytestmark = pytest.mark.cpu_test
 
 
+_BUFFER_FIELDS = {
+    "draft.block_table": "_draft_block_table",
+    "draft.seq_lens": "_draft_seq_lens",
+    "draft.query_start_loc": "_draft_query_start_loc",
+    "draft.shape": "_flash_draft_buffer_shape",
+    "smallq.block_table": "_smallq_decode_block_table",
+    "smallq.seq_lens": "_smallq_decode_seq_lens",
+    "smallq.query_start_loc": "_smallq_query_start_loc",
+    "smallq.token_indices": "_smallq_token_indices",
+    "smallq.shape": "_smallq_buffer_shape",
+}
+
+
+class _InlineWorkspace(ast.NodeTransformer):
+    def __init__(self):
+        source = Path(metadata.__file__).with_name("workspace.py")
+        self.methods = {
+            (cls.name, fn.name): fn
+            for cls in ast.parse(source.read_text()).body
+            if isinstance(cls, ast.ClassDef)
+            for fn in cls.body
+            if isinstance(fn, ast.FunctionDef)
+        }
+
+    def inline(self, call):
+        if not isinstance(call, ast.Call):
+            return None
+        target = ast.unparse(call.func)
+        targets = {
+            "self.metadata_workspace.draft.ensure": ("DraftBuffers", "ensure"),
+            "self.metadata_workspace.smallq.ensure": ("SmallQueryBuffers", "ensure"),
+            "self.metadata_workspace.draft.copy_metadata": (
+                "DraftBuffers",
+                "copy_metadata",
+            ),
+        }
+        if target not in targets:
+            return None
+        method = self.methods[targets[target]]
+        assert not call.keywords
+        assert isinstance(call.func, ast.Attribute)
+        assert len(call.args) == len(method.args.args) - 1
+        substitutions = dict(
+            zip(
+                [a.arg for a in method.args.args],
+                [call.func.value, *call.args],
+            )
+        )
+
+        class Substitute(ast.NodeTransformer):
+            def visit_Name(self, node):
+                return copy.deepcopy(substitutions.get(node.id, node))
+
+        body = copy.deepcopy(method.body)
+        if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+            body = body[1:]
+        return [Substitute().visit(node) for node in body]
+
+    def visit_Return(self, node):
+        return self.inline(node.value) or self.generic_visit(node)
+
+    def visit_Expr(self, node):
+        return self.inline(node.value) or self.generic_visit(node)
+
+
 class _Normalize(ast.NodeTransformer):
     def visit_FunctionDef(self, node):
         node = self.generic_visit(node)
@@ -38,6 +104,14 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Attribute(self, node):
         node = self.generic_visit(node)
+        path = ast.unparse(node)
+        prefix = "self.metadata_workspace."
+        if path.startswith(prefix) and path[len(prefix) :] in _BUFFER_FIELDS:
+            return ast.Attribute(
+                value=ast.Name(id="self", ctx=ast.Load()),
+                attr=_BUFFER_FIELDS[path[len(prefix) :]],
+                ctx=node.ctx,
+            )
         if (
             isinstance(node.value, ast.Name)
             and node.value.id == "_metadata"
@@ -73,7 +147,7 @@ def test_moved_metadata_calculations_match_parent():
             if isinstance(fn, ast.FunctionDef) and fn.name in expected:
                 assert fn.name not in actual
                 actual[fn.name] = hashlib.sha256(
-                    ast.dump(_Normalize().visit(fn)).encode()
+                    ast.dump(_Normalize().visit(_InlineWorkspace().visit(fn))).encode()
                 ).hexdigest()
     assert actual == expected
 

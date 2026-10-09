@@ -228,6 +228,29 @@ class Recorder:
             )
 
 
+def persistent_tensors(builder):
+    """Read current buffer owners; canonical labels match the #1060 trace."""
+    for name, value in vars(builder).items():
+        if isinstance(value, torch.Tensor):
+            yield name, value
+    workspace = getattr(builder, "metadata_workspace", None)
+    if workspace is not None:
+        names = {
+            "_draft_block_table": "draft.block_table",
+            "_draft_seq_lens": "draft.seq_lens",
+            "_draft_query_start_loc": "draft.query_start_loc",
+            "_smallq_decode_block_table": "smallq.block_table",
+            "_smallq_decode_seq_lens": "smallq.seq_lens",
+            "_smallq_query_start_loc": "smallq.query_start_loc",
+            "_smallq_token_indices": "smallq.token_indices",
+        }
+        for name, path in names.items():
+            group, field = path.split(".")
+            value = getattr(getattr(workspace, group), field)
+            if isinstance(value, torch.Tensor):
+                yield name, value
+
+
 def install_ops(monkeypatch, recorder, legacy, case):
     original_read = legacy.FlashAttnV100Impl.__getattribute__
 
@@ -513,8 +536,7 @@ def run_case(case):
                     assert result.data_ptr() == output.data_ptr()
                     buffers = {
                         name: recorder.describe(value)
-                        for name, value in vars(builder).items()
-                        if isinstance(value, torch.Tensor)
+                        for name, value in persistent_tensors(builder)
                     }
                     recorder.events.append(["buffers", buffers])
             except (ValueError, RuntimeError) as error:

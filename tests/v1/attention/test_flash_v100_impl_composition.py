@@ -127,6 +127,15 @@ class _Normalize(ast.NodeTransformer):
         if ast.unparse(node.value) == "self.workspace.decode_cache":
             node.value = ast.Name(id="self", ctx=ast.Load())
             node.attr = _CACHE_METHODS.get(node.attr, node.attr)
+        if ast.unparse(node.value) == "_workspace":
+            names = {
+                "MixedDecodeRowsPlan": "_MixedDecodeRowsPlan",
+                "mixed_decode_rows_plan": "_mixed_decode_rows_plan",
+                "MIXED_ROWS_GROUP": "_MIXED_ROWS_GROUP",
+            }
+            if node.attr in names:
+                node.value = ast.Name(id="_metadata", ctx=ast.Load())
+                node.attr = names[node.attr]
         if isinstance(node.value, ast.Name) and node.value.id == "_state":
             return ast.Name(id=node.attr, ctx=node.ctx)
         return node

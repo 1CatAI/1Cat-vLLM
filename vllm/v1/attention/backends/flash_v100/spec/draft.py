@@ -66,44 +66,6 @@ def _debug_draft_metadata(
     )
 
 
-def _ensure_flash_draft_graph_buffers(
-    self: _metadata.FlashAttnV100MetadataBuilder,
-    required_reqs: int,
-    block_table: torch.Tensor,
-) -> bool:
-    req_capacity = max(
-        int(self.vllm_config.scheduler_config.max_num_seqs),
-        int(required_reqs),
-        1,
-    )
-    block_cols = int(block_table.shape[1])
-    shape = (req_capacity, block_cols)
-    if self._flash_draft_buffer_shape == shape:
-        return True
-
-    if self._flash_draft_buffer_shape is not None:
-        old_reqs, old_block_cols = self._flash_draft_buffer_shape
-        return required_reqs <= old_reqs and block_cols == old_block_cols
-
-    self._draft_block_table = torch.empty(
-        (req_capacity, block_cols),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._draft_seq_lens = torch.empty(
-        (req_capacity,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._draft_query_start_loc = torch.empty(
-        (req_capacity + 1,),
-        dtype=torch.int32,
-        device=self.device,
-    )
-    self._flash_draft_buffer_shape = shape
-    return True
-
-
 def _stabilize_draft_graph_metadata(
     self: _metadata.FlashAttnV100MetadataBuilder,
     attn_metadata: TritonAttentionMetadata,
@@ -115,8 +77,8 @@ def _stabilize_draft_graph_metadata(
 
     block_table = attn_metadata.block_table[:num_reqs]
     if not self._ensure_flash_draft_graph_buffers(num_reqs, block_table):
-        assert self._flash_draft_buffer_shape is not None
-        req_capacity, block_cols = self._flash_draft_buffer_shape
+        assert self.metadata_workspace.draft.shape is not None
+        req_capacity, block_cols = self.metadata_workspace.draft.shape
         raise RuntimeError(
             "FLASH_ATTN_V100 draft CUDA graph metadata shape exceeds "
             "the captured persistent buffer capacity: "
@@ -127,9 +89,9 @@ def _stabilize_draft_graph_metadata(
             "Replay would otherwise read stale draft metadata."
         )
 
-    assert self._draft_block_table is not None
-    assert self._draft_seq_lens is not None
-    assert self._draft_query_start_loc is not None
+    assert self.metadata_workspace.draft.block_table is not None
+    assert self.metadata_workspace.draft.seq_lens is not None
+    assert self.metadata_workspace.draft.query_start_loc is not None
 
     self.copy_dflash_graph_metadata(
         block_table,
@@ -137,31 +99,11 @@ def _stabilize_draft_graph_metadata(
         attn_metadata.query_start_loc[: num_reqs + 1],
     )
 
-    attn_metadata.block_table = self._draft_block_table[:num_reqs]
-    attn_metadata.seq_lens = self._draft_seq_lens[:num_reqs]
-    attn_metadata.query_start_loc = self._draft_query_start_loc[: num_reqs + 1]
-
-
-def copy_dflash_graph_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    query_start_loc: torch.Tensor,
-) -> None:
-    """Refresh the three persistent inputs of a non-causal DFlash graph."""
-    num_reqs = seq_lens.numel()
-    assert self._draft_block_table is not None
-    assert self._draft_seq_lens is not None
-    assert self._draft_query_start_loc is not None
-    self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
-    self._draft_seq_lens[:num_reqs].copy_(
-        seq_lens,
-        non_blocking=True,
-    )
-    self._draft_query_start_loc[: num_reqs + 1].copy_(
-        query_start_loc,
-        non_blocking=True,
-    )
+    attn_metadata.block_table = self.metadata_workspace.draft.block_table[:num_reqs]
+    attn_metadata.seq_lens = self.metadata_workspace.draft.seq_lens[:num_reqs]
+    attn_metadata.query_start_loc = self.metadata_workspace.draft.query_start_loc[
+        : num_reqs + 1
+    ]
 
 
 def build_for_drafting(
@@ -245,3 +187,29 @@ def build_for_drafting(
             getattr(common_attn_metadata, "num_reqs", None),
         )
     return attn_metadata
+
+
+def _ensure_flash_draft_graph_buffers(
+    self: _metadata.FlashAttnV100MetadataBuilder,
+    required_reqs: int,
+    block_table: torch.Tensor,
+) -> bool:
+    req_capacity = max(
+        int(self.vllm_config.scheduler_config.max_num_seqs),
+        int(required_reqs),
+        1,
+    )
+    block_cols = int(block_table.shape[1])
+    return self.metadata_workspace.draft.ensure(
+        req_capacity, block_cols, required_reqs, self.device
+    )
+
+
+def copy_dflash_graph_metadata(
+    self: _metadata.FlashAttnV100MetadataBuilder,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Refresh the three persistent inputs of a non-causal DFlash graph."""
+    self.metadata_workspace.draft.copy_metadata(block_table, seq_lens, query_start_loc)
