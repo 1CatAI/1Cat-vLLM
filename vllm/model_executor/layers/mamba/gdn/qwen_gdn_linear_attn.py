@@ -125,17 +125,16 @@ def _warmup_sm70_qwen_gdn_causal_conv1d(
     the non-speculative causal-conv variant to JIT on the first structured
     request.
     """
-    if (
-        not envs.VLLM_SM70_AUX_KERNEL_WARMUP
-        or not current_platform.is_device_capability(70)
-    ):
-        return False
+    from vllm.config.sm70_runtime import capture_runtime_config
+    from vllm.model_executor.warmup.sm70_runtime import warmup_bound_convolution
 
-    for layer in forward_context.values():
-        warmup = getattr(layer, "_warmup_sm70_causal_conv1d_real_state", None)
-        if warmup is not None and warmup():
-            return True
-    return False
+    return warmup_bound_convolution(
+        forward_context,
+        enabled=bool(
+            capture_runtime_config().auxiliary_warmup
+            and current_platform.is_device_capability(70)
+        ),
+    )
 
 
 @triton.jit
