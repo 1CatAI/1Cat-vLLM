@@ -422,14 +422,14 @@ def main():
                 "写一句简短的睡前晚安祝福。",
             ):
                 tokenizer = llm.get_tokenizer()
-                tokens = tokenizer.apply_chat_template(
+                rendered = tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt}],
-                    tokenize=True,
+                    tokenize=False,
                     add_generation_prompt=True,
                     enable_thinking=False,
                 )
                 result = llm.generate(
-                    {"prompt_token_ids": tokens},
+                    rendered,
                     SamplingParams(temperature=0, max_tokens=512),
                     use_tqdm=False,
                 )[0].outputs[0]
