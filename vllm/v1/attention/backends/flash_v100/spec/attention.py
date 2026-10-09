@@ -4,19 +4,18 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 
-import vllm.envs as envs
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import impl as _impl
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
@@ -42,17 +41,17 @@ def initialize_scalar_tail(self: _impl.FlashAttnV100Impl, use_e4m3_fp32: bool) -
 
     if (
         use_e4m3_fp32
-        and envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
+        and _config.registered("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS")
         and (
-            envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST
+            _config.registered("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST")
             or scalar_tail_attention_available()
         )
-        and not os.environ.get("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
+        and not _config.raw("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
     ):
         # An empty name selects the operator compiled into this extension;
         # a manifest name keeps the explicit experimental override.
         self._sm70_scalar_tail_attention = load_scalar_tail_attention(
-            envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST or "",
+            _config.registered("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST") or "",
             torch.device("cuda", torch.accelerator.current_device_index()),
         )
 
@@ -95,15 +94,15 @@ def configure_prefill(self: _impl.FlashAttnV100Impl) -> None:
 def configure_verifier(self: _impl.FlashAttnV100Impl) -> None:
     self.use_dflash2_grouped_verify = (
         self.flash_attn_grouped_verify_paged is not None
-        and envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY
+        and _config.registered("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY")
         and current_platform.is_device_capability(70)
     )
     self.use_dflash2_batched_grouped_verify = (
         self.use_dflash2_grouped_verify
-        and envs.VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY
+        and _config.registered("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY")
     )
-    self.dflash2_grouped_verify_min_model_len = (
-        envs.VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN
+    self.dflash2_grouped_verify_min_model_len = _config.registered(
+        "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN"
     )
     if self.dflash2_grouped_verify_min_model_len < 1:
         raise ValueError(

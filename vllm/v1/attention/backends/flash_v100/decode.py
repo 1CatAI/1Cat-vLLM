@@ -4,12 +4,11 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import impl as _impl
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
@@ -709,7 +708,7 @@ def _flash_v100_decode(
                 xqa_codec is FP8_E4M3
                 and getattr(self, "decode_strategy", "legacy") == "legacy"
                 and query.shape[0] == 1
-                and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1") != "0"
+                and _config.raw("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1") != "0"
             ):
                 _routing._record_route(
                     f"decode_xqa_e4m3_dynamic_page{key_cache.shape[1]}"

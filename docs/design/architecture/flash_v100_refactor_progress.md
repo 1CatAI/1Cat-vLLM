@@ -12,8 +12,9 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 0: scope and codec ownership | — | Decision communicated; #1028 rebased locally | Baseline measured | Runtime parity belongs to 1c | Retest each subsequent step |
 | 1a: immutable CPU trace and owner guard | #1071 | Gates passed; ready | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
 | 1b: patch efficacy + dependency ratchet | #1072 | Gates passed; ready | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
-| 1c: route/token/output parity tools | — | CPU tools implemented | Production unchanged | Numerical baselines in preparation | Small Qwen, speculative verification, Flash-Next host-FP8 |
-| 2: frozen config + explicit dynamic reads | — | Not started | — | CPU trace allowed | Step 1 gates |
+| 1c: route/token/output parity tools | #1073 | Draft; model records pending | Production unchanged | 12 native cases exact; host baseline unit tests 135 passed | Greedy model records and full outcome map |
+| 2a: dynamic environment boundary | — | Focused CPU gates passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | Pending complete outcome map | Commit/rebase and GPU outcome gates |
+| 2b: frozen construction policy | — | Prototype preserved separately | Target remaining 41 → 0; 41 immutable fields | Not accepted yet | Stack after 2a gates |
 | 3: owned workspaces | — | Not started | — | Required | Step 2 gates |
 | 4: decode executor and ordered candidates | — | Not started | — | Required | Step 3 gates |
 | 5a: per-sequence prefill candidates | — | Not started | — | Required | Step 4 gates |
@@ -165,3 +166,49 @@ Model/tokenizer files are hash-verified before generation. The small Qwen
 fixture is Qwen3-0.6B at revision `c1899de289a04d12100db370d81485cdf75e47ca`;
 weights live only in task-owned remote artifacts. No GPU parity or final A3
 completion is claimed until the pending records and comparisons finish.
+
+## Step 1c initial GPU evidence
+
+On 54633, all 12 attention cases at source `2b4532127c4c90e93630225beafcd0ecd32882d2`
+match exact #1060: finite outputs, zero maximum absolute error, equal route
+counts and stable current-owner buffer pointers, including metadata refresh.
+The two XQA graph cases and eager 8192-token architecture prefill differ by
+0%, +0.0273% and -0.00773% respectively. Other timings are recorded but are
+not substituted for those designated performance gates.
+The #1028 baseline GPU suites also pass all 135 cases. These are operator
+and integration-unit results, not model-token parity or final A3 completion.
+Artifacts: `a3-step1c/logs/op-compare.log`, `host-unit-parent.log` on 54633.
+
+## Step 2 retry split and environment inventory
+
+The initial combined prototype preserved all 813 golden traces and passed
+220 focused CPU tests, including immutable-snapshot checks. The work encountered
+a two-line size-ceiling increase, two old AST-normalization adaptations, a
+test AST type annotation, and six GPU-only fixtures selected in an early CPU
+run. Under the requested retry/split rule it was returned to the exact parent
+and split into dynamic-read centralization (2a) and constructor capture (2b).
+No golden was regenerated and no acceptance ceiling was relaxed.
+
+Step 2a centralizes the 78 previously inventoried non-constructor reads plus
+two environment-membership predicates missed by the original inventory.
+The 39 implementation and two metadata-constructor reads remain untouched
+for 2b. The JSON `environment` table in
+`tests/v1/attention/fixtures/flash_v100_dependency_baseline.json` records every
+call site, expression, owner, capture/dynamic classification and `via_config`.
+The `config.py` implementation row is separate from the 121 policy call sites.
+Dynamic reads preserve short-circuit order, raw-string defaults, registered
+getter parsing and the existing environment cache. No new cache is added.
+The audit recognizes the mediated call sites so centralization cannot erase
+them from the inventory. The package ceiling is reduced to 41 direct reads
+outside config; repository model/platform/env ceilings become 2325/3964/306.
+
+The owned 2a worktree is `v100-a3-config-20261008-153907`, based on #1073
+`ec40c95f506ae5a95e23fe3334ffe4e1a5b2a4ae`. GPU model jobs remained queued under
+the group/per-card leases while this CPU work proceeded. Both 2a and 2b stay
+Draft until their prerequisite and complete outcome-map gates pass.
+
+The reduced 2a scope passes the original focused command: 219 passed,
+1 skipped and 28 GPU-only cases deselected. All 813 immutable golden cases
+match; strict patch-use validation passes. Pre-commit including mypy and
+layering passes. Logs are `a3-config-dynamic-{strict,precommit}.log` and
+`a3-config-dynamic-shim.json` in the local task artifact directory.

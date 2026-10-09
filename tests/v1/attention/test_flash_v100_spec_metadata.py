@@ -48,6 +48,10 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
+        if ast.unparse(node.func) == "_config.raw":
+            node.func = ast.Attribute(
+                value=ast.Name(id="os", ctx=ast.Load()), attr="getenv", ctx=ast.Load()
+            )
         if isinstance(node.func, ast.Name) and node.func.id == "super" and node.args:
             assert [ast.unparse(a) for a in node.args] == [
                 "_metadata._spec_builder_super_owner",

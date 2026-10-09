@@ -8,9 +8,9 @@ from collections.abc import Callable
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
@@ -156,12 +156,14 @@ def _should_use_prefill_dense_splitkv3(
     splitkv3_op: Callable[..., torch.Tensor] | None,
 ) -> bool:
     return (
-        envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3
+        _config.registered("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3")
         and splitkv3_op is not None
         and (
             query.shape == (1, 4096, 6, 256)
             or (
-                envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL
+                _config.registered(
+                    "VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL"
+                )
                 and query.shape == (1, 8000, 6, 256)
             )
         )
@@ -170,7 +172,8 @@ def _should_use_prefill_dense_splitkv3(
         and key.shape[1] == max_seqlen_k
         and key.shape[2:] == (1, 256)
         and max_seqlen_q == query.shape[1]
-        and max_seqlen_k >= envs.VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV
+        and max_seqlen_k
+        >= _config.registered("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV")
         and max_seqlen_k > max_seqlen_q
         and not _routing._is_cuda_graph_capturing(query)
     )
@@ -187,7 +190,7 @@ def _should_use_prefill_d256_gqa_architecture(
     architecture_op: Callable[..., torch.Tensor] | None,
 ) -> bool:
     """Use the v37 family or the Q8000-core long-prefill dispatcher."""
-    if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
+    if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37"):
         shape_allowed = (
             64 <= max_seqlen_q <= 8192
             and max_seqlen_q % 64 == 0
@@ -201,7 +204,7 @@ def _should_use_prefill_d256_gqa_architecture(
             and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
         )
     return (
-        envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
+        _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL")
         and architecture_op is not None
         and shape_allowed
         and query.ndim == 4
@@ -235,9 +238,11 @@ _sm70_prefill_profiled_workspaces: set[tuple[torch.device, int]] = set()
 
 def _profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> None:
     if (
-        not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
-        or not envs.VLLM_FLASH_V100_FA2_D256_PREFILL
-        or envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+        not _config.registered(
+            "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
+        )
+        or not _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL")
+        or _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
         or not query.is_cuda
         or query.dtype != torch.float16
         or query.ndim != 3
@@ -477,7 +482,7 @@ def _try_sm70_fa2_d256_prefill(
     global _warned_prefill_d256_gqa_architecture_oom
 
     int32_max = torch.iinfo(torch.int32).max
-    if not envs.VLLM_FLASH_V100_FA2_D256_PREFILL:
+    if not _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL"):
         return None
     if (
         query.device.type != "cuda"
@@ -504,7 +509,7 @@ def _try_sm70_fa2_d256_prefill(
         return None
     paged_kv = block_table is not None
     if max_seqlen_q < 1024:
-        if paged_kv or not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
+        if paged_kv or not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37"):
             return None
         if not _should_use_prefill_d256_gqa_architecture(
             query,
@@ -552,7 +557,7 @@ def _try_sm70_fa2_d256_prefill(
     splitd_ops = _ops._get_sm70_splitd_d256_ops()
     q8000_core_dispatch_eligible = (
         not paged_kv
-        and not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+        and not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
         and _SM70_79T_CORE_QUERY_LEN <= max_seqlen_q <= _SM70_79T_MAX_QUERY_LEN
     )
     architecture_kv_eligible = (
@@ -602,13 +607,15 @@ def _try_sm70_fa2_d256_prefill(
                 splitd_out = out if out is not None else torch.empty_like(query)
                 architecture_op = (
                     _ops._get_sm70_d256_gqa_architecture_op()
-                    if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL
+                    if _config.registered(
+                        "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
+                    )
                     else None
                 )
                 architecture_q8192_op = (
                     _ops._get_sm70_d256_gqa_architecture_q8192_op()
                     if architecture_op is not None
-                    and not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+                    and not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
                     and max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
                     else None
                 )
@@ -623,7 +630,7 @@ def _try_sm70_fa2_d256_prefill(
                 ):
                     assert architecture_op is not None
                     try:
-                        if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
+                        if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37"):
                             splitd_result = _run_sm70_gqa_groups(
                                 architecture_op,
                                 query,
@@ -669,7 +676,9 @@ def _try_sm70_fa2_d256_prefill(
                                 "FLASH_ATTN_V100 SM70 D256 GQA "
                                 "long-prefill architecture route active (%s).",
                                 "v37 FP32"
-                                if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+                                if _config.registered(
+                                    "VLLM_FLASH_V100_PREFILL_D256_GQA_V37"
+                                )
                                 else "Q8000 core / Q8192 QK+PV FP32 dispatch",
                             )
                             _logged_prefill_d256_gqa_architecture = True
@@ -678,7 +687,7 @@ def _try_sm70_fa2_d256_prefill(
                                 "prefill_dense_d256_gqa_arch_long"
                             ].name
                         )
-                        if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37:
+                        if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37"):
                             _routing._record_route(
                                 _routing.ROUTE_SPECS["prefill_dense_d256_gqa_v37"].name
                             )

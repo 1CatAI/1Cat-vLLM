@@ -4,12 +4,12 @@
 
 from __future__ import annotations
 
-import os
 import time
 
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 from vllm.v1.attention.backends.flash_v100.spec import (
@@ -25,13 +25,13 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 def _configured_smallq_max_query_len(
     self: _metadata.FlashAttnV100MetadataBuilder,
 ) -> int:
-    return int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
+    return int(_config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
 
 
 def _configured_smallq_max_model_len(
     self: _metadata.FlashAttnV100MetadataBuilder,
 ) -> int:
-    return int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0"))
+    return int(_config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0"))
 
 
 def _smallq_buffer_token_capacity(

@@ -79,13 +79,16 @@ def audit():
                 private.append(f"{path.relative_to(PACKAGE)}:{node.lineno}")
             expression = ast.unparse(node) if isinstance(node, ast.Call) else ""
             is_env = expression.startswith(("os.getenv(", "os.environ.get("))
+            via_config = expression.startswith(
+                ("_config.registered(", "_config.raw(", "_config.env_is_set(")
+            )
             is_env |= (
                 isinstance(node, ast.Attribute)
                 and isinstance(node.value, ast.Name)
                 and node.value.id == "envs"
                 and node.attr.isupper()
             )
-            if is_env:
+            if is_env or via_config:
                 owners = [
                     fn
                     for fn in ast.walk(tree)
@@ -102,6 +105,7 @@ def audit():
                         file=str(path.relative_to(PACKAGE)),
                         line=node.lineno,
                         expression=ast.unparse(node),
+                        via_config=via_config,
                         owner=owner.name if owner else "<module>",
                         policy="captured"
                         if owner and owner.name == "__init__"
@@ -137,7 +141,9 @@ def audit():
             cross_module_private=len(private),
             import_cycles=len(cycles),
             model_names_outside_spec=model_hits,
-            env_outside_config=sum(e["file"] != "config.py" for e in env),
+            env_outside_config=sum(
+                e["file"] != "config.py" and not e["via_config"] for e in env
+            ),
             state_flags=flags,
         ),
         "cycles": cycles,
