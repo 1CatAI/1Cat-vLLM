@@ -488,6 +488,12 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             reserve_bhmd_compare=self._reserve_bhmd_compare_call,
             write_bhmd_compare=self._write_bhmd_compare_report,
             compare_bhmd=self._maybe_compare_bhmd_out,
+            compare_triton=self._maybe_compare_triton_output,
+            triton_forward=super().forward,
+            profile_trace=_debug._sm70_profile_trace,
+            draft_debug_enabled=_debug._draft_graph_debug_enabled,
+            draft_debug_log=_debug._draft_graph_debug_log,
+            format_debug=_debug._format_tensor_debug,
             scalar_override=vars(self).get("_call_flash_attn_decode_paged"),
         )
         workspace = getattr(self, "workspace", None)
@@ -936,202 +942,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             )
             return result
 
-        if not self.use_flash_v100_decode:
-            message = (
-                "FLASH_ATTN_V100 decode cannot run because the paged decode op "
-                "is unavailable. Select TRITON_ATTN for a full Triton route, or "
-                "set VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for explicit "
-                "diagnostic fallback."
-            )
-            if not self.allow_triton_fallback:
-                raise RuntimeError(message)
-            if self.use_flash_v100 and not _state._warned_decode_fallback:
-                logger.warning("%s", message)
-                _state._warned_decode_fallback = True
-            _debug._sm70_profile_trace(
-                "forward branch=decode_triton_no_flash_decode layer=%s",
-                layer_name,
-            )
-            _routing._record_route(
-                _routing.ROUTE_SPECS["decode_triton_no_flash_decode"].name
-            )
-            return super().forward(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
-            )
-
-        if (
-            self.use_decode_paged_prefill
-            and self.use_flash_v100_prefill_paged
-            and not is_capturing
-        ):
-            _routing._log_fp8_kv_cache_route(
-                "decode", self.kv_cache_dtype, "decode_as_paged_prefill"
-            )
-            _debug._sm70_profile_trace(
-                "forward branch=decode_paged_prefill layer=%s",
-                layer_name,
-            )
-            result = self._flash_v100_decode_as_paged_prefill(
-                layer,
-                query,
-                kv_cache,
-                attn_metadata,
-                output,
-            )
-            self._maybe_compare_triton_output(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
-                "decode_paged_prefill",
-            )
-            _routing._record_route(_routing.ROUTE_SPECS["decode_paged_prefill"].name)
-            return result
-        if self.use_decode_dense_cache and not is_capturing:
-            _routing._log_fp8_kv_cache_route(
-                "decode", self.kv_cache_dtype, "dense_cache_bridge"
-            )
-            _debug._sm70_profile_trace(
-                "forward branch=decode_dense_cache layer=%s",
-                layer_name,
-            )
-            result = self._flash_v100_decode_dense_cache(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-            )
-            self._maybe_compare_triton_output(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
-                "decode_dense_cache",
-            )
-            _routing._record_route(_routing.ROUTE_SPECS["decode_dense_cache"].name)
-            return result
-        if self.use_decode_dense_reference and not is_capturing:
-            _routing._log_fp8_kv_cache_route(
-                "decode", self.kv_cache_dtype, "dense_reference_bridge"
-            )
-            _debug._sm70_profile_trace(
-                "forward branch=decode_dense_reference layer=%s",
-                layer_name,
-            )
-            result = self._flash_v100_decode_dense_reference(
-                layer,
-                query,
-                kv_cache,
-                attn_metadata,
-                output,
-            )
-            self._maybe_compare_triton_output(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
-                "decode_dense_reference",
-            )
-            _routing._record_route(_routing.ROUTE_SPECS["decode_dense_reference"].name)
-            return result
-        if not self.use_decode_scalar_paged:
-            message = (
-                "FLASH_ATTN_V100 decode has no enabled Flash route: scalar "
-                "paged decode is disabled and the strict paged-prefill bridge "
-                "is unavailable or CUDA graph capture is active. Re-enable "
-                "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED=1, select TRITON_ATTN "
-                "for a full Triton route, or set "
-                "VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for explicit "
-                "diagnostic fallback."
-            )
-            if not self.allow_triton_fallback:
-                raise RuntimeError(message)
-            if not _state._warned_decode_strict_fallback:
-                logger.warning("%s", message)
-                _state._warned_decode_strict_fallback = True
-            _debug._sm70_profile_trace(
-                "forward branch=decode_triton_scalar_disabled layer=%s",
-                layer_name,
-            )
-            _routing._record_route(
-                _routing.ROUTE_SPECS["decode_triton_scalar_disabled"].name
-            )
-            return super().forward(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
-            )
-
-        if not _state._logged_decode_flash:
-            logger.info(
-                "FLASH_ATTN_V100 decode path active (paged KV, "
-                "CUDA-graph safe; selected route is reported separately)."
-            )
-            _state._logged_decode_flash = True
-        if _debug._draft_graph_debug_enabled():
-            _debug._draft_graph_debug_log(
-                "forward:decode",
-                "layer=%s %s %s %s",
-                layer_name,
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "query_start_loc", None),
-                    "attn_qsl",
-                ),
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "seq_lens", None),
-                    "attn_seq",
-                ),
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "block_table", None),
-                    "attn_bt",
-                ),
-            )
-        _debug._sm70_profile_trace(
-            "forward branch=decode_scalar_paged layer=%s",
-            layer_name,
-        )
-        result = self._flash_v100_decode(
-            layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output,
-        )
-        self._maybe_compare_triton_output(
+        return self._forward_decode(
             layer,
             query,
             key,
@@ -1141,9 +952,39 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             output,
             output_scale,
             output_block_scale,
-            "decode_scalar_paged",
+            is_capturing,
+            layer_name,
         )
-        return result
+
+    def _forward_decode(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None,
+        output_block_scale: torch.Tensor | None,
+        is_capturing: bool,
+        layer_name: object,
+    ) -> torch.Tensor:
+        return self._new_decode_executor().forward(
+            _decode.DecodeRequest(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+                is_capturing,
+                layer_name,
+            )
+        )
 
     def _flash_v100_decode_as_paged_prefill(
         self,

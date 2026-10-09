@@ -71,6 +71,12 @@ class DecodeOps:
     reserve_bhmd_compare: Callable[[], int | None]
     write_bhmd_compare: Callable[..., None]
     compare_bhmd: Callable[..., None]
+    compare_triton: Callable[..., None]
+    triton_forward: Callable[..., torch.Tensor]
+    profile_trace: Callable[..., None]
+    draft_debug_enabled: Callable[[], bool]
+    draft_debug_log: Callable[..., None]
+    format_debug: Callable[..., str]
     scalar_override: Callable[..., None] | None = None
 
 
@@ -90,6 +96,21 @@ class NativeDecodeRequest:
     selection: _routing.RouteSpec | None
 
 
+@dataclass(frozen=True)
+class DecodeRequest:
+    layer: torch.nn.Module
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    kv_cache: torch.Tensor
+    attn_metadata: TritonAttentionMetadata
+    output: torch.Tensor
+    output_scale: torch.Tensor | None
+    output_block_scale: torch.Tensor | None
+    is_capturing: bool
+    layer_name: object
+
+
 class DecodeExecutor:
     """Execute decode without importing or receiving the attention Impl."""
 
@@ -97,6 +118,11 @@ class DecodeExecutor:
         self.config = config
         self.ops = ops
         self.workspace = workspace
+
+    def forward(self, request: DecodeRequest) -> torch.Tensor:
+        return _plan.execute(
+            request, (candidate(self) for candidate in DECODE_CANDIDATES)
+        )
 
     def _flash_v100_window_size(self, causal: bool) -> tuple[int, int]:
         window = self.config.sliding_window
@@ -868,3 +894,265 @@ class ScalarDecode:
             request.anchored_window,
             record=record,
         )
+
+
+class DecodeCandidate(_plan.Candidate[DecodeRequest, torch.Tensor]):
+    """A pure admission predicate and an independently executable branch."""
+
+    def __init__(self, executor: DecodeExecutor):
+        self.executor = executor
+
+
+class DecodeUnavailable(DecodeCandidate):
+    def admit(self, request: DecodeRequest) -> bool:
+        return not self.executor.config.policy.use_flash_v100_decode
+
+    def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
+        message = (
+            "FLASH_ATTN_V100 decode cannot run because the paged decode "
+            "op is unavailable. Select TRITON_ATTN for a full Triton "
+            "route, or set VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for "
+            "explicit diagnostic fallback."
+        )
+        if not self.executor.config.policy.allow_triton_fallback:
+            raise RuntimeError(message)
+        if self.executor.config.policy.use_flash_v100 and (
+            not _state._warned_decode_fallback
+        ):
+            logger.warning("%s", message)
+            _state._warned_decode_fallback = True
+        self.executor.ops.profile_trace(
+            "forward branch=decode_triton_no_flash_decode layer=%s", request.layer_name
+        )
+        record(_routing.ROUTE_SPECS["decode_triton_no_flash_decode"].name)
+        return self.executor.ops.triton_forward(
+            request.layer,
+            request.query,
+            request.key,
+            request.value,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+            request.output_scale,
+            request.output_block_scale,
+        )
+
+
+class DecodePagedPrefill(DecodeCandidate):
+    def admit(self, request: DecodeRequest) -> bool:
+        return (
+            self.executor.config.policy.use_decode_paged_prefill
+            and self.executor.config.policy.use_flash_v100_prefill_paged
+            and (not request.is_capturing)
+        )
+
+    def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
+        _routing._log_fp8_kv_cache_route(
+            "decode",
+            self.executor.config.kv_cache_dtype,
+            "decode_as_paged_prefill",
+            record=record,
+        )
+        self.executor.ops.profile_trace(
+            "forward branch=decode_paged_prefill layer=%s", request.layer_name
+        )
+        result = self.executor._flash_v100_decode_as_paged_prefill(
+            request.layer,
+            request.query,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+        )
+        self.executor.ops.compare_triton(
+            request.layer,
+            request.query,
+            request.key,
+            request.value,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+            request.output_scale,
+            request.output_block_scale,
+            "decode_paged_prefill",
+        )
+        record(_routing.ROUTE_SPECS["decode_paged_prefill"].name)
+        return result
+
+
+class DecodeDenseCache(DecodeCandidate):
+    def admit(self, request: DecodeRequest) -> bool:
+        return self.executor.config.policy.use_decode_dense_cache and (
+            not request.is_capturing
+        )
+
+    def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
+        _routing._log_fp8_kv_cache_route(
+            "decode",
+            self.executor.config.kv_cache_dtype,
+            "dense_cache_bridge",
+            record=record,
+        )
+        self.executor.ops.profile_trace(
+            "forward branch=decode_dense_cache layer=%s", request.layer_name
+        )
+        result = self.executor._flash_v100_decode_dense_cache(
+            request.layer,
+            request.query,
+            request.key,
+            request.value,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+        )
+        self.executor.ops.compare_triton(
+            request.layer,
+            request.query,
+            request.key,
+            request.value,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+            request.output_scale,
+            request.output_block_scale,
+            "decode_dense_cache",
+        )
+        record(_routing.ROUTE_SPECS["decode_dense_cache"].name)
+        return result
+
+
+class DecodeDenseReference(DecodeCandidate):
+    def admit(self, request: DecodeRequest) -> bool:
+        return self.executor.config.policy.use_decode_dense_reference and (
+            not request.is_capturing
+        )
+
+    def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
+        _routing._log_fp8_kv_cache_route(
+            "decode",
+            self.executor.config.kv_cache_dtype,
+            "dense_reference_bridge",
+            record=record,
+        )
+        self.executor.ops.profile_trace(
+            "forward branch=decode_dense_reference layer=%s", request.layer_name
+        )
+        result = self.executor._flash_v100_decode_dense_reference(
+            request.layer,
+            request.query,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+        )
+        self.executor.ops.compare_triton(
+            request.layer,
+            request.query,
+            request.key,
+            request.value,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+            request.output_scale,
+            request.output_block_scale,
+            "decode_dense_reference",
+        )
+        record(_routing.ROUTE_SPECS["decode_dense_reference"].name)
+        return result
+
+
+class DecodeScalarDisabled(DecodeCandidate):
+    def admit(self, request: DecodeRequest) -> bool:
+        return not self.executor.config.policy.use_decode_scalar_paged
+
+    def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
+        message = (
+            "FLASH_ATTN_V100 decode has no enabled Flash route: scalar "
+            "paged decode is disabled and the strict paged-prefill bridge"
+            " is unavailable or CUDA graph capture is active. Re-enable "
+            "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED=1, select "
+            "TRITON_ATTN for a full Triton route, or set "
+            "VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for explicit "
+            "diagnostic fallback."
+        )
+        if not self.executor.config.policy.allow_triton_fallback:
+            raise RuntimeError(message)
+        if not _state._warned_decode_strict_fallback:
+            logger.warning("%s", message)
+            _state._warned_decode_strict_fallback = True
+        self.executor.ops.profile_trace(
+            "forward branch=decode_triton_scalar_disabled layer=%s", request.layer_name
+        )
+        record(_routing.ROUTE_SPECS["decode_triton_scalar_disabled"].name)
+        return self.executor.ops.triton_forward(
+            request.layer,
+            request.query,
+            request.key,
+            request.value,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+            request.output_scale,
+            request.output_block_scale,
+        )
+
+
+class DecodePaged(DecodeCandidate):
+    def admit(self, request: DecodeRequest) -> bool:
+        return True
+
+    def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
+        if not _state._logged_decode_flash:
+            logger.info(
+                "FLASH_ATTN_V100 decode path active (paged KV, CUDA-graph "
+                "safe; selected route is reported separately)."
+            )
+            _state._logged_decode_flash = True
+        if self.executor.ops.draft_debug_enabled():
+            self.executor.ops.draft_debug_log(
+                "forward:decode",
+                "layer=%s %s %s %s",
+                request.layer_name,
+                self.executor.ops.format_debug(
+                    getattr(request.attn_metadata, "query_start_loc", None), "attn_qsl"
+                ),
+                self.executor.ops.format_debug(
+                    getattr(request.attn_metadata, "seq_lens", None), "attn_seq"
+                ),
+                self.executor.ops.format_debug(
+                    getattr(request.attn_metadata, "block_table", None), "attn_bt"
+                ),
+            )
+        self.executor.ops.profile_trace(
+            "forward branch=decode_scalar_paged layer=%s", request.layer_name
+        )
+        result = self.executor._flash_v100_decode(
+            request.layer,
+            request.query,
+            request.key,
+            request.value,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+        )
+        self.executor.ops.compare_triton(
+            request.layer,
+            request.query,
+            request.key,
+            request.value,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+            request.output_scale,
+            request.output_block_scale,
+            "decode_scalar_paged",
+        )
+        return result
+
+
+DECODE_CANDIDATES = (
+    DecodeUnavailable,
+    DecodePagedPrefill,
+    DecodeDenseCache,
+    DecodeDenseReference,
+    DecodeScalarDisabled,
+    DecodePaged,
+)
