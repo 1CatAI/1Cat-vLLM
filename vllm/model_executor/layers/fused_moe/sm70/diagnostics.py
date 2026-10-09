@@ -14,6 +14,7 @@ import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm.config.sm70_moe import capture_sm70_moe_config
+from vllm.diagnostics import diagnostics_for, output_path
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.sm70_moe_router import Sm70MoeStageRoute
 
@@ -92,29 +93,13 @@ def _diagnostics(layer):
 
 
 def _dump_awq_moe_buffer_requested(layer: RoutedExperts, label: str) -> bool:
-    policy = _diagnostics(layer)
-    if not policy.dump_buffers:
+    policy = _diagnostics(layer).dump_policy
+    if not policy.enabled or not policy.directory:
         return False
-    if not policy.dump_dir:
-        return False
-
-    raw_layer_ids = policy.dump_layers
-    if raw_layer_ids.strip().lower() not in {"*", "all"}:
-        try:
-            layer_ids = _parse_layer_id_filter(
-                raw_layer_ids, "VLLM_SM70_DUMP_QWEN_LAYER_IDS"
-            )
-        except ValueError:
-            layer_ids = {0, 1}
-        layer_id = _get_layer_id(layer)
-        if layer_id is None:
-            layer_id = getattr(layer, "sm70_awq_moe_layer_id", None)
-        if layer_id is None or layer_id not in (layer_ids or {0, 1}):
-            return False
-
-    raw_labels = policy.dump_labels
-    labels = {item.strip() for item in raw_labels.split(",") if item.strip()}
-    return not labels or label in labels
+    layer_id = _get_layer_id(layer)
+    if layer_id is None:
+        layer_id = getattr(layer, "sm70_awq_moe_layer_id", None)
+    return policy.allows("layers", layer_id) and policy.allows("labels", label)
 
 
 def _dump_awq_moe_buffer(
@@ -133,25 +118,13 @@ def _dump_awq_moe_buffer(
 
 
 def _compare_dense_base_enabled(layer: RoutedExperts) -> bool:
-    policy = _diagnostics(layer)
-    if not policy.compare_dir:
+    policy = _diagnostics(layer).compare_policy
+    if not policy.can_save():
         return False
-    enable_file = policy.compare_enable_file
-    if enable_file and not os.path.exists(enable_file):
-        return False
-    raw_layer_ids = policy.compare_layers
-    if raw_layer_ids is not None and raw_layer_ids.strip().lower() in {"*", "all"}:
-        return True
-    layer_ids = _parse_layer_id_filter(
-        raw_layer_ids,
-        "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS",
-    )
-    if layer_ids is None:
-        return True
     layer_id = _get_layer_id(layer)
     if layer_id is None:
         layer_id = getattr(layer, "sm70_awq_moe_layer_id", None)
-    return layer_id is not None and layer_id in layer_ids
+    return policy.allows("layers", layer_id)
 
 
 def _compare_dense_decode_step(layer: RoutedExperts) -> int | None:
@@ -160,11 +133,7 @@ def _compare_dense_decode_step(layer: RoutedExperts) -> int | None:
         return None
     step = int(getattr(layer, "_awq_moe_compare_dense_decode_step", 0))
     layer._awq_moe_compare_dense_decode_step = step + 1
-    steps = _parse_layer_id_filter(
-        policy.compare_steps,
-        "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_STEPS",
-    )
-    if steps is not None and step not in steps:
+    if not policy.compare_policy.allows("steps", step):
         return None
     reports = int(getattr(layer, "_awq_moe_compare_dense_reports", 0))
     max_reports = policy.compare_max_reports
@@ -204,9 +173,11 @@ def _write_compare_dense_record(record: dict[str, object], policy=None) -> None:
     device = (
         torch.accelerator.current_device_index() if torch.cuda.is_available() else "cpu"
     )
-    path = os.path.join(
+    owner = diagnostics_for()
+    path = output_path(
         out_dir,
         f"awq_moe_dense_compare_pid{os.getpid()}_cuda{device}.jsonl",
+        owner.engine_tag if owner is not None else "",
     )
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, sort_keys=True) + "\n")

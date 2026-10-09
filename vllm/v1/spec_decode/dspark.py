@@ -5,7 +5,6 @@
 import torch
 from typing_extensions import override
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -51,7 +50,7 @@ class DSparkProposer(DFlashProposer):
         # projection. Collect logits only when the calibrated threshold or the
         # explicit alignment diagnostic consumes them.
         self.collect_confidence_logits = (
-            self._confidence_threshold > 0.0 or envs.VLLM_SPEC_DUMP_ALIGNMENT
+            self.speculative_config.diagnostic_confidence_logits
         )
         self._last_confidence_logits: torch.Tensor | None = None
         self._last_verification_lengths: torch.Tensor | None = None

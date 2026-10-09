@@ -26,6 +26,12 @@ from vllm.config.sm70_dflash2 import (
     sm70_dflash2_enabled,
 )
 from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import (
+    diagnostic_channel,
+    diagnostic_history,
+    legacy_channel,
+    legacy_history,
+)
 from vllm.distributed import (
     divide,
 )
@@ -41,6 +47,7 @@ from vllm.model_executor.layers.fla.ops import (
     fused_sigmoid_gating_delta_rule_update_mixed_qkv,
     fused_sigmoid_gating_delta_rule_update_mixed_qkv_out,
 )
+from vllm.model_executor.layers.fla.ops import gdn_diagnostics as _gdn_diagnostics
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd as l2norm_fwd
 from vllm.model_executor.layers.fla.ops.gdn_chunk_kernels import bind_chunk_kernels
 from vllm.model_executor.layers.fla.ops.gdn_prefill import (
@@ -150,15 +157,13 @@ fla_chunk_gated_delta_rule = _fla_chunk_rule  # Legacy import path.
 
 logger = init_logger(__name__)
 
-_SM70_GDN_DUMP_COUNTS: dict[str, int] = {}
-_SM70_GDN_PROJ_DUMP_COUNTS: dict[str, int] = {}
-_SM70_GDN_PACKED_COMPARE_COUNTS: dict[str, int] = {}
-_SM70_GDN_PACKED_COMPARE_REPORTS = 0
-_SM70_GDN_GRAPH_BUFFERS: dict[str, torch.Tensor] = {}
-_SM70_GDN_GRAPH_META: dict[str, dict[str, object]] = {}
-_SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS: dict[str, int] = {}
+_SM70_GDN_DUMP_COUNTS = legacy_channel("gdn_core").counts
+_SM70_GDN_PROJ_DUMP_COUNTS = legacy_channel("gdn_projection").counts
+_SM70_GDN_PACKED_COMPARE_COUNTS = legacy_channel("gdn_compare").counts
+_SM70_GDN_GRAPH_BUFFERS = legacy_channel("gdn_graph").buffers
+_SM70_GDN_GRAPH_META = legacy_channel("gdn_graph").metadata
+_SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS = legacy_history("gdn_route")
 _SM70_GDN_PREFILL_PROFILE_COUNTS: dict[str, int] = {}
-_SM70_GDN_PREFILL_WARMUP_KEYS: set[tuple[object, ...]] = set()
 _DFLASH_DDTREE_PATH_PROBE_REPORTS = 0
 
 
@@ -495,18 +500,19 @@ def _sm70_log_flashqla_decode_route(
     state_indices: torch.Tensor | None,
     num_decode_tokens: int,
 ) -> None:
-    if not envs.VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG:
+    if not capture_runtime_trace().value("gdn_route_debug"):
         return
     if torch.compiler.is_compiling():
         return
     mixed_layout = _sm70_mixed_qkv_decode_layout(mixed_qkv)
     key = f"{os.getpid()}:{stage}:{decision}:{reason}:{mixed_layout}:{layer_name}"
-    count = _SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS.get(key, 0)
+    counts = diagnostic_history("gdn_route")
+    count = counts.get(key, 0)
     if count >= 1:
         return
-    if len(_SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS) >= 96:
+    if len(counts) >= 96:
         return
-    _SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS[key] = count + 1
+    counts[key] = count + 1
     state_desc = "None"
     if state_indices is not None:
         state_desc = (
@@ -538,72 +544,7 @@ def _sm70_log_flashqla_decode_route(
     )
 
 
-def _sm70_dump_gdn_core_tensor(
-    label: str,
-    layer_name: LayerNameType,
-    tensor: torch.Tensor,
-    source: str = "core",
-) -> None:
-    dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_CORE_DIR")
-    graph_dump = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") == "1" and bool(
-        os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
-    )
-    # Keep the production path free of CUDA runtime queries. This hook runs
-    # several times per GDN layer, while core dumps are normally disabled.
-    if not dump_dir and not graph_dump:
-        return
-    if graph_dump:
-        _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, source)
-    if not dump_dir or not tensor.is_cuda:
-        return
-    if torch.cuda.is_current_stream_capturing():
-        return
-    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_GDN_CORE_LAYER_IDS")
-    if raw_layer_ids:
-        layer_idx = _sm70_gdn_layer_idx(layer_name)
-        layer_ids = _sm70_parse_int_set(raw_layer_ids, set())
-        if layer_idx not in layer_ids:
-            return
-    enable_file = os.getenv("VLLM_SM70_DUMP_GDN_CORE_ENABLE_FILE")
-    if enable_file and not os.path.exists(enable_file):
-        return
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
-        return
-
-    try:
-        max_dumps = int(os.getenv("VLLM_SM70_DUMP_GDN_CORE_MAX_DUMPS", "4"))
-    except ValueError:
-        max_dumps = 4
-    if max_dumps <= 0:
-        return
-
-    key = f"{os.getpid()}:{label}"
-    count = _SM70_GDN_DUMP_COUNTS.get(key, 0)
-    if count >= max_dumps:
-        return
-    _SM70_GDN_DUMP_COUNTS[key] = count + 1
-
-    safe_layer = str(layer_name).replace("/", "_").replace(".", "_")
-    path = os.path.join(
-        dump_dir,
-        f"pid{os.getpid()}_{label}_{count:03d}_{safe_layer}.pt",
-    )
-    os.makedirs(dump_dir, exist_ok=True)
-    torch.save(
-        {
-            "label": label,
-            "layer_name": str(layer_name),
-            "shape": tuple(tensor.shape),
-            "stride": tuple(tensor.stride()),
-            "storage_offset": int(tensor.storage_offset()),
-            "data_ptr": int(tensor.data_ptr()),
-            "is_contiguous": bool(tensor.is_contiguous()),
-            "source": source,
-            "dtype": str(tensor.dtype),
-            "tensor": tensor.detach().cpu(),
-        },
-        path,
-    )
+_sm70_dump_gdn_core_tensor = _gdn_diagnostics.dump_core
 
 
 def _sm70_gdn_layer_idx(layer_name: LayerNameType) -> int | None:
@@ -627,23 +568,10 @@ def _sm70_parse_int_set(raw: str | None, default: set[int]) -> set[int]:
 
 
 def _sm70_parse_int_ranges(raw_ranges: str | None) -> set[int] | None:
-    if not raw_ranges:
-        return None
-    values: set[int] = set()
-    for raw_part in raw_ranges.split(","):
-        part = raw_part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start_raw, end_raw = part.split("-", 1)
-            start = int(start_raw.strip())
-            end = int(end_raw.strip())
-            if end < start:
-                start, end = end, start
-            values.update(range(start, end + 1))
-        else:
-            values.add(int(part))
-    return values
+    from vllm.config.diagnostic_dump import parse_int_filter
+
+    selected = parse_int_filter(raw_ranges)
+    return None if selected is None else set(selected)
 
 
 def _sm70_qwen_gdn_has_active_spec_decode(
@@ -1006,78 +934,7 @@ def _qwen_gdn_non_spec_metadata_tensors(
     )
 
 
-def _sm70_gdn_graph_buffer_copy(
-    label: str,
-    layer_name: LayerNameType,
-    tensor: torch.Tensor,
-    source: str,
-) -> None:
-    if torch.compiler.is_compiling():
-        return
-    dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
-    if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") != "1" or not dump_dir:
-        return
-    if not tensor.is_cuda:
-        return
-
-    target_labels = {
-        item.strip()
-        for item in os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LABELS", "").split(",")
-        if item.strip()
-    }
-    if target_labels and label not in target_labels:
-        return
-
-    shape = tuple(tensor.shape)
-    raw_shapes = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_SHAPES")
-    if raw_shapes:
-        allowed_shapes = {
-            item.strip() for item in raw_shapes.split(",") if item.strip()
-        }
-        shape_text = "x".join(str(dim) for dim in shape)
-        if shape_text not in allowed_shapes:
-            return
-
-    layer_idx = _sm70_gdn_layer_idx(layer_name)
-    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LAYER_IDS")
-    if raw_layer_ids:
-        try:
-            layer_ids = _sm70_parse_int_ranges(raw_layer_ids) or set()
-        except ValueError:
-            layer_ids = set()
-        if layer_idx not in layer_ids:
-            return
-
-    key = f"{os.getpid()}:{source}:{layer_name}:{label}:{shape}"
-    buffer = _SM70_GDN_GRAPH_BUFFERS.get(key)
-    tensor_meta = {
-        "input_shape": shape,
-        "input_stride": tuple(tensor.stride()),
-        "input_storage_offset": int(tensor.storage_offset()),
-        "input_data_ptr": int(tensor.data_ptr()),
-        "input_is_contiguous": bool(tensor.is_contiguous()),
-    }
-    if (
-        buffer is None
-        or tuple(buffer.shape) != shape
-        or buffer.dtype != tensor.dtype
-        or buffer.device != tensor.device
-    ):
-        buffer = torch.empty_like(tensor)
-        _SM70_GDN_GRAPH_BUFFERS[key] = buffer
-        _SM70_GDN_GRAPH_META[key] = {
-            "label": label,
-            "layer_name": str(layer_name),
-            "layer_idx": layer_idx,
-            "source": source,
-            "shape": shape,
-            "dtype": str(tensor.dtype),
-            "pid": os.getpid(),
-            **tensor_meta,
-        }
-    else:
-        _SM70_GDN_GRAPH_META[key].update(tensor_meta)
-    buffer.copy_(tensor)
+_sm70_gdn_graph_buffer_copy = _gdn_diagnostics.capture_tensor
 
 
 def _sm70_gdn_graph_buffer_copy_state_slice(
@@ -1089,7 +946,7 @@ def _sm70_gdn_graph_buffer_copy_state_slice(
 ) -> None:
     if state_indices is None or num_tokens <= 0:
         return
-    if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") != "1":
+    if not diagnostic_channel("gdn_graph").policy.capture:
         return
     indices = state_indices[:num_tokens].to(device=state.device, dtype=torch.long)
     indices = indices.clamp(0, state.shape[0] - 1)
@@ -1099,7 +956,7 @@ def _sm70_gdn_graph_buffer_copy_state_slice(
         state.index_select(0, indices),
         "state",
     )
-    if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STATE_INDICES") == "1":
+    if diagnostic_channel("gdn_graph").policy.state_indices:
         _sm70_gdn_graph_buffer_copy(
             f"{label}_indices",
             layer_name,
@@ -1121,7 +978,7 @@ def _sm70_dump_gdn_spec_metadata_graph_buffers(
     num_accepted_tokens: torch.Tensor | None = None,
     spec_state_slot_selectors: torch.Tensor | None = None,
 ) -> None:
-    if os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_METADATA") != "1":
+    if not diagnostic_channel("gdn_graph").policy.metadata:
         return
     for label, tensor in (
         ("meta_non_spec_query_start_loc", non_spec_query_start_loc),
@@ -1140,91 +997,10 @@ def _sm70_dump_gdn_spec_metadata_graph_buffers(
 
 
 def dump_sm70_gdn_graph_buffers(step: int, stage: str) -> None:
-    dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
-    if not dump_dir:
-        return
-    enable_file = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_ENABLE_FILE")
-    if enable_file and not os.path.exists(enable_file):
-        return
-    target_steps = _sm70_parse_int_ranges(os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_STEPS"))
-    if target_steps is not None and step not in target_steps:
-        return
-    if not _SM70_GDN_GRAPH_BUFFERS:
-        return
-
-    os.makedirs(dump_dir, exist_ok=True)
-    for key, buffer in _SM70_GDN_GRAPH_BUFFERS.items():
-        meta = _SM70_GDN_GRAPH_META.get(key, {})
-        label = str(meta.get("label", "unknown")).replace("/", "_").replace(".", "_")
-        source = str(meta.get("source", "unknown")).replace("/", "_").replace(".", "_")
-        layer_idx = meta.get("layer_idx")
-        layer_text = f"{layer_idx:02d}" if isinstance(layer_idx, int) else "none"
-        shape = "x".join(str(dim) for dim in tuple(buffer.shape))
-        path = os.path.join(
-            dump_dir,
-            (
-                f"pid{os.getpid()}_step{step:04d}_layer{layer_text}_"
-                f"{source}_{label}_shape{shape}.pt"
-            ),
-        )
-        torch.save(
-            {
-                **meta,
-                "step": step,
-                "stage": stage,
-                "graph_buffer_key": key,
-                "tensor": buffer.detach().cpu(),
-            },
-            path,
-        )
+    diagnostic_channel("gdn_graph").flush_graph(step, stage, gdn=True)
 
 
-def _sm70_gdn_packed_compare_request(
-    layer_name: LayerNameType,
-) -> tuple[str, int] | None:
-    dump_dir = os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_DIR")
-    if not dump_dir:
-        return None
-    enable_file = os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_ENABLE_FILE")
-    if enable_file and not os.path.exists(enable_file):
-        return None
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
-        return None
-
-    layer_idx = _sm70_gdn_layer_idx(layer_name)
-    if layer_idx is None:
-        return None
-    layer_ids = _sm70_parse_int_set(
-        os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_LAYER_IDS"),
-        {0},
-    )
-    if layer_idx not in layer_ids:
-        return None
-
-    global _SM70_GDN_PACKED_COMPARE_REPORTS
-    max_reports = envs.VLLM_SM70_COMPARE_GDN_PACKED_DECODE_MAX_REPORTS
-    if max_reports <= 0 or max_reports <= _SM70_GDN_PACKED_COMPARE_REPORTS:
-        return None
-
-    key = f"{os.getpid()}:{layer_name}"
-    step = _SM70_GDN_PACKED_COMPARE_COUNTS.get(key, 0) + 1
-    _SM70_GDN_PACKED_COMPARE_COUNTS[key] = step
-
-    target_steps = _sm70_parse_int_set(
-        os.getenv("VLLM_SM70_COMPARE_GDN_PACKED_DECODE_STEPS"),
-        set(),
-    )
-    if target_steps and step not in target_steps:
-        return None
-
-    _SM70_GDN_PACKED_COMPARE_REPORTS += 1
-    os.makedirs(dump_dir, exist_ok=True)
-    safe_layer = str(layer_name).replace("/", "_").replace(".", "_")
-    path = os.path.join(
-        dump_dir,
-        f"pid{os.getpid()}_step{step:04d}_layer{safe_layer}.pt",
-    )
-    return path, step
+_sm70_gdn_packed_compare_request = _gdn_diagnostics.compare_request
 
 
 def _sm70_save_gdn_packed_compare_report(
@@ -1283,79 +1059,10 @@ def _sm70_save_gdn_packed_compare_report(
     )
 
 
-def _sm70_gdn_projection_dump_requested(layer_name: LayerNameType) -> bool:
-    if not os.getenv("VLLM_SM70_DUMP_GDN_PROJ_DIR") and (
-        os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") != "1"
-        or not os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")
-    ):
-        return False
-    layer_idx = _sm70_gdn_layer_idx(layer_name)
-    if layer_idx is None:
-        return False
-    raw_graph_layer_ids = os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_LAYER_IDS")
-    if raw_graph_layer_ids and os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") == "1":
-        try:
-            graph_layer_ids = _sm70_parse_int_ranges(raw_graph_layer_ids) or set()
-        except ValueError:
-            graph_layer_ids = set()
-        return layer_idx in graph_layer_ids
-    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_LAYER_IDS", "0,1")
-    try:
-        layer_ids = {
-            int(item.strip()) for item in raw_layer_ids.split(",") if item.strip()
-        }
-    except ValueError:
-        layer_ids = {0, 1}
-    return layer_idx in layer_ids
+_sm70_gdn_projection_dump_requested = _gdn_diagnostics.projection_requested
 
 
-def _sm70_gdn_projection_dump_impl(
-    tensor: torch.Tensor,
-    label: str,
-    layer_name: LayerNameType,
-) -> torch.Tensor:
-    _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, "proj")
-    if torch.cuda.is_current_stream_capturing():
-        return tensor.clone()
-    dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_DIR")
-    enable_file = os.getenv("VLLM_SM70_DUMP_GDN_PROJ_ENABLE_FILE")
-    if (
-        dump_dir
-        and (not enable_file or os.path.exists(enable_file))
-        and not torch.cuda.is_current_stream_capturing()
-    ):
-        try:
-            max_dumps = int(os.getenv("VLLM_SM70_DUMP_GDN_PROJ_MAX_DUMPS", "4"))
-        except ValueError:
-            max_dumps = 4
-        key = f"{os.getpid()}:{layer_name}:{label}"
-        count = _SM70_GDN_PROJ_DUMP_COUNTS.get(key, 0)
-        if max_dumps > 0 and count < max_dumps:
-            _SM70_GDN_PROJ_DUMP_COUNTS[key] = count + 1
-            safe_layer = str(layer_name).replace("/", "_").replace(".", "_")
-            safe_label = label.replace("/", "_").replace(".", "_")
-            path = os.path.join(
-                dump_dir,
-                f"pid{os.getpid()}_{safe_label}_{count:03d}_{safe_layer}.pt",
-            )
-            os.makedirs(dump_dir, exist_ok=True)
-            torch.save(
-                {
-                    "label": label,
-                    "layer_name": str(layer_name),
-                    "shape": tuple(tensor.shape),
-                    "stride": tuple(tensor.stride()),
-                    "storage_offset": int(tensor.storage_offset()),
-                    "data_ptr": int(tensor.data_ptr()),
-                    "is_contiguous": bool(tensor.is_contiguous()),
-                    "dtype": str(tensor.dtype),
-                    "tensor": tensor.detach().cpu(),
-                },
-                path,
-            )
-    # This custom op has a non-aliasing output schema. Returning the input
-    # lets AOT reuse live projection storage across diagnostic boundaries.
-    return tensor.clone()
+_sm70_gdn_projection_dump_impl = _gdn_diagnostics.dump_projection
 
 
 def _sm70_gdn_projection_dump_fake(
@@ -1656,6 +1363,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.gdn_policy = resolve_gdn_config(vllm_config)
         self.gdn_state_trace = resolve_state_trace(vllm_config)
         self._gdn_profiler = bind_gdn_profiler(vllm_config)
+        from vllm.runtime_resources import runtime_resources_for
+
+        self._prefill_warmup_keys = runtime_resources_for(vllm_config).setdefault(
+            "gdn_prefill_warmup_keys", set()
+        )
         # Runtime forward/capture need not retain the initialization config.
         # Capture LoRA exclusion while the owning configuration is available.
         self.enable_sm70_gdn_ba_verify = vllm_config.lora_config is None
@@ -1864,8 +1576,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
-        self.compare_sm70_fused_sigmoid_mixed_qkv = (
-            envs.VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE
+        self.compare_sm70_fused_sigmoid_mixed_qkv = capture_runtime_trace().value(
+            "gdn_mixed_compare"
         )
         self.enable_flashqla_decode = self.gdn_policy.flashqla_decode
         self.flashqla_decode_admission = FlashQlaDecodeAdmission.bind(
@@ -3927,7 +3639,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_token_counts,
             is_conv_state_dim_first(),
         )
-        if warmup_key in _SM70_GDN_PREFILL_WARMUP_KEYS:
+        if warmup_key in self._prefill_warmup_keys:
             if _sm70_profile_trace_enabled():
                 logger.info(
                     "SM70 profile trace: GDN prefill/decode warmup skip "
@@ -3935,7 +3647,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     self.prefix,
                 )
             return
-        _SM70_GDN_PREFILL_WARMUP_KEYS.add(warmup_key)
+        self._prefill_warmup_keys.add(warmup_key)
 
         # All kernels use BT = chunk_size, so a single pass with T = chunk_size
         # is sufficient to populate every autotuner cache. Also run the

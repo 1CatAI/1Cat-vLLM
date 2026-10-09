@@ -1681,10 +1681,21 @@ class VllmConfig:
         from vllm.config.policy_defaults import finalize_runtime_policy_hashes
 
         finalize_runtime_policy_hashes(self)
+        from vllm.config.sm70_moe import bind_moe_diagnostics
+
+        bind_moe_diagnostics(
+            self.kernel_config, self.observability_config.runtime_trace
+        )
         self.kernel_config.resolve_gdn(self.model_config, self.additional_config)
         if self.speculative_config is not None:
             self.speculative_config.resolve_execution_policy()
 
+            self.speculative_config.bind_diagnostic_output(
+                self.observability_config.runtime_trace.sampling.value("alignment")
+                if self.speculative_config.method == "dspark"
+                and self.speculative_config.dspark_confidence_threshold <= 0.0
+                else False
+            )
         if self.kernel_config.gdn.resolved:
             self.observability_config.gdn_profile.resolve()
             self.observability_config.gdn_state.resolve()

@@ -59,8 +59,8 @@ part of the contract.
 | Delivery | State | Evidence / remaining work |
 | --- | --- | --- |
 | D1 registry and ledger | Merged [#1141](https://github.com/1CatAI/1Cat-vLLM/pull/1141); CI passed | Static inventory, structured deprecation metadata, shared registration scanner and explicit-input warn-once support. This establishes visibility; it does not claim execution consumers migrated. |
-| D2 GDN and speculation | Validated [#1143](https://github.com/1CatAI/1Cat-vLLM/pull/1143) | CPU isolation/compatibility, 17 GPU operator cases and matched A/B passed; merge after final self-review. |
-| D3 diagnostics | Pending | Consolidate filters/budgets/dumps and remove engine state from global dictionaries. |
+| D2 GDN and speculation | Merged [#1143](https://github.com/1CatAI/1Cat-vLLM/pull/1143); CI passed | CPU isolation/compatibility, 17 GPU operator cases and matched A/B passed. |
+| D3 diagnostics | Validated; merge after self-review | Shared diagnostic owner, 74 initialized parameters, legacy typed MoE bridge, CPU isolation and 7 GPU cases plus matched operator A/B. |
 | D4 attention | Pending | Connect backend, standalone package and versioned native policy; isolate workspaces. |
 | D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
 | D6 closure | Pending | Complete evidence audit, remaining-name ownership, report and execution-time read guards. |
@@ -187,3 +187,77 @@ Diagnostics remain D3 scope. Provider warmup controls and the paused
 allocation behavior. Graph/piecewise attention policy belongs to D4. Existing
 DDTree execution and upstream Mamba scheduler controls are not claimed as
 migrated here.
+
+### D3 diagnostic policy and resource lifecycle
+
+Base: `eb5a87b6ae03ad448d687a4dc133b3fc38b17e8a` (merged D2).
+
+`observability_config.runtime_trace` now owns tensor channels under `dumps`,
+ordinary sampler observations under `sampling`, and family-specific observations
+under `dflash`. Its serialized provenance includes the legacy input or typed
+field, parsed filters and deferred parser errors. Channel declarations also
+feed the execution-read guard and compile-cache alias filtering. Reports use
+these captured values; generating a report never evaluates an environment getter.
+
+| Boundary | Shared behavior and retained differences |
+| --- | --- |
+| Initialization | Resolve paths, filter dialects, budgets and flags once. B's `sm70_moe.awq/fp8.diagnostics` fields forward into the same owner; explicit observability fields take priority over those old typed inputs, then legacy environment/defaults. Invalid unused format inputs retain their qualified error checkpoint. |
+| Layer observations | Qwen and MoE use one capture/record implementation. The Qwen custom op still clones its result; the MoE custom op retains its aliasing schema. GDN projection payload preparation stays in the FLA adapter and uses the shared storage/output machinery. |
+| Capture resources | One engine diagnostic owner contains independent channel counters, budgets, buffers and metadata. Replaced buffers stay alive for previously captured graphs. GDN prefill warmup keys are also engine-owned; immutable shared code does not own them. |
+| Graph output | Qwen, MoE and GDN use one graph flush implementation. Existing runner filter precedence, paired Qwen/MoE flush checkpoint and enable-file behavior remain intact. |
+| Sampler/runner output | MTP step, sample tensors, classic logits, compile inputs, ordinary speculative and DFlash selector dumps use the common output manager. Payload fields and log labels remain unchanged; engine outputs append a unique engine suffix to prevent same-directory overwrites. Independent legacy helpers retain their filenames. |
+| Qualification/hash | Ordinary diagnostics are excluded from computation hashes. DSpark alignment requires extra confidence logits, so its effective output contract participates in DSpark's hash. An already-required confidence output does not gain another hash variation. |
+| Legacy helpers | Historical custom-op names, fake implementations, imports and helper names remain. Module dictionaries forward to independent standalone owners only; engine execution never uses those owners to reread environment inputs. DDTree-specific diagnostics remain deferred. |
+
+Original parser distinctions remain explicit: reverse ranges for Qwen/graph
+filters, strict nonnegative sampler steps, comma-only GDN comparisons, empty
+AWQ comparison sets, exact `1` flags versus integer booleans, and per-channel
+zero-budget behavior. Trigger paths are fixed at initialization; file existence
+is still checked dynamically. Disabled GDN diagnostics do not query CUDA or
+allocate a diagnostic tensor. Rejection timing aggregates are per engine;
+existing model/layer-local reference-comparison counters retain their owners.
+
+The scoped structural counts are:
+
+- 74 diagnostic inputs now have an initialization owner. In the changed execution
+  modules their literal/registered source-read sites decrease from 112 to 0.
+  These are source references, not a claim that all 112 ran on each token.
+- Two layer capture/record flows become one; three graph flush loops become one.
+  The runner, rejection sampler and selector share their filter parser with the
+  layer observers, with dialect differences declared at initialization.
+- 27 previously shared mutable diagnostic/warmup state containers or counters
+  no longer serve engines. Each engine has one diagnostic owner plus its GDN
+  warmup-key set. Historical standalone aliases remain explicitly separate;
+  per-layer reference arithmetic and deferred DDTree probes are retained.
+- The existing generic layering census decreases from 241 to 158 raw reads,
+  3422 to 3326 platform references, and 2134 to 2132 model references. No owner
+  exclusions or whitelist entries were added. This census remains narrower
+  than the full Phase D inventory.
+
+Validation: 121 related CPU cases passed; after the final resource/parser and
+static-guard review, 55 focused ownership/default/guard cases passed. GPU tests
+on 54633 passed 7 cases, including alternating engine capture/replay with changed
+inputs, replacement-buffer lifetime, empty/dynamic shapes, non-aliasing custom-op
+schema/fake behavior and AOT values. Small final changes to comparison-filter
+edge cases, standalone parser forwarding and JSON reporting do not alter the
+GPU tensor implementation; their CPU cases are recorded separately.
+
+Three alternating process rounds compare the merged D2 source with the complete
+candidate source on V100 SXM2 32GB GPU 2, TP1, Torch 2.10.0+cu128, CUDA 12.8,
+driver 580.173.02. The normal native extensions are unchanged. The observation
+operator uses FP16 `[8, 128]` tensors; direct file I/O is disabled in the timed
+capture case. Values below are medians of the three per-process medians.
+
+| Observation mode | GPU µs old → new | Host enqueue µs old → new | Admission µs old → new | Peak additional bytes, both |
+| --- | --- | --- | --- | --- |
+| Diagnostic off | 1.0803 → 1.0795 | 38.220 → 32.716 | 0.569 → 0.432 | 2048 |
+| Capture copy on | 2.1488 → 2.1504 | 64.798 → 60.203 | 2.229 → 0.644 | 2048 |
+
+All output hashes match and measured allocations are identical. GPU changes
+are below 0.1%; the main measured reduction is repeated host policy parsing.
+This is an operator result, with no model throughput or TTFT conclusion.
+[Raw rounds and source/native hashes](phase_d3_operators.json) accompany the
+change. Full logs, the benchmark script and the initial stale-archive collection
+failure are retained under `/home/ymzx/arch-ws/tmp/phase-d3/`; the corrected GPU
+run required no source-side numerical change. The remote task is
+`/home/ymzx/arch-ws/phase-d3-20261009/` and has released its GPU lock.

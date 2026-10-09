@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn as nn
 
-from vllm import envs
+from vllm.config.diagnostic_sampling import legacy_rejection_profile
 from vllm.config.speculative_sampling import resolve_sampling_policy
+from vllm.diagnostics import bind_diagnostics, write_payload
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors, SamplerOutput
@@ -33,10 +34,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_SPEC_ALIGNMENT_DUMP_COUNT = 0
-_SPEC_ALIGNMENT_STEP_COUNTER = 0
-_REJECTION_PROFILE_INTERVAL_SUMS: dict[str, float] = {}
-_REJECTION_PROFILE_INTERVAL_CALLS = 0
 
 PLACEHOLDER_TOKEN_ID: tl.constexpr = -1
 GREEDY_TEMPERATURE: tl.constexpr = 0
@@ -45,15 +42,16 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 MAX_SPEC_LEN = 128
 
 
-def _rejection_profile_enabled() -> bool:
-    return os.getenv("VLLM_SM70_REJECTION_PROFILE", "0") == "1"
+def _rejection_profile_enabled(policy=None) -> bool:
+    if policy is not None:
+        return bool(policy.rejection_profile)
+    return legacy_rejection_profile("enabled")
 
 
-def _rejection_profile_interval() -> int:
-    try:
-        return max(1, int(os.getenv("VLLM_SM70_REJECTION_PROFILE_INTERVAL", "20")))
-    except ValueError:
-        return 20
+def _rejection_profile_interval(policy=None) -> int:
+    if policy is not None:
+        return policy.rejection_interval
+    return legacy_rejection_profile("interval")
 
 
 def _rejection_profile_start(
@@ -80,57 +78,42 @@ def _rejection_profile_finish(
 
 def _rejection_profile_report(
     events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
+    owner=None,
 ) -> None:
     if not events:
         return
-    global _REJECTION_PROFILE_INTERVAL_CALLS
+    owner = bind_diagnostics() if owner is None else owner
     for name, start, end in events:
         end.synchronize()
-        _REJECTION_PROFILE_INTERVAL_SUMS[name] = _REJECTION_PROFILE_INTERVAL_SUMS.get(
-            name, 0.0
-        ) + start.elapsed_time(end)
-    _REJECTION_PROFILE_INTERVAL_CALLS += 1
-    interval = _rejection_profile_interval()
-    if interval > _REJECTION_PROFILE_INTERVAL_CALLS:
+        owner.timing_sums[name] = owner.timing_sums.get(name, 0.0) + start.elapsed_time(
+            end
+        )
+    owner.timing_calls += 1
+    interval = _rejection_profile_interval(owner.sampling)
+    if interval > owner.timing_calls:
         return
 
     parts = [
-        f"{name}={total / _REJECTION_PROFILE_INTERVAL_CALLS:.3f}"
-        for name, total in sorted(_REJECTION_PROFILE_INTERVAL_SUMS.items())
+        f"{name}={total / owner.timing_calls:.3f}"
+        for name, total in sorted(owner.timing_sums.items())
     ]
     logger.warning(
         "SM70 rejection sampler profile interval_avg_ms calls=%d %s",
-        _REJECTION_PROFILE_INTERVAL_CALLS,
+        owner.timing_calls,
         ", ".join(parts),
     )
-    _REJECTION_PROFILE_INTERVAL_SUMS.clear()
-    _REJECTION_PROFILE_INTERVAL_CALLS = 0
+    owner.timing_sums.clear()
+    owner.timing_calls = 0
 
 
 def _parse_step_filter(raw_steps: str | None) -> set[int] | None:
-    if not raw_steps:
-        return None
-    steps: set[int] = set()
+    from vllm.config.diagnostic_dump import parse_int_filter
+
     try:
-        for item in raw_steps.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if "-" in item:
-                start_text, end_text = item.split("-", 1)
-                start = int(start_text)
-                end = int(end_text)
-                if start < 0 or end < start:
-                    return set()
-                steps.update(range(start, end + 1))
-                continue
-            step = int(item)
-            if step < 0:
-                return set()
-            steps.add(step)
-        return steps
+        result = parse_int_filter(raw_steps, strict=True)
     except ValueError:
         return set()
+    return None if result is None else set(result)
 
 
 def _token_matching_processor_safe(processor: object) -> bool:
@@ -239,8 +222,12 @@ class RejectionSampler(nn.Module):
         sampler: Sampler,
         spec_config: SpeculativeConfig | None = None,
         device: torch.device | None = None,
+        *,
+        diagnostics=None,
     ):
         super().__init__()
+        self._diagnostics = bind_diagnostics() if diagnostics is None else diagnostics
+        self._trace = self._diagnostics.sampling
         self.sampler = sampler
         self._sampling_policy = resolve_sampling_policy(spec_config)
         logprobs_mode = self.sampler.logprobs_mode
@@ -326,7 +313,7 @@ class RejectionSampler(nn.Module):
             return self._sample_by_token_matching(metadata, logits, sampling_metadata)
 
         profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = (
-            ([]) if _rejection_profile_enabled() else None
+            ([]) if _rejection_profile_enabled(self._trace) else None
         )
         profile_total_start = _rejection_profile_start(profile_events)
         bonus_logits_indices = metadata.bonus_logits_indices
@@ -441,7 +428,7 @@ class RejectionSampler(nn.Module):
             profile_events, "rejection_sample_total", profile_rejection_start
         )
         _rejection_profile_finish(profile_events, "forward_total", profile_total_start)
-        _rejection_profile_report(profile_events)
+        _rejection_profile_report(profile_events, self._diagnostics)
         self._maybe_dump_alignment(
             metadata=metadata,
             draft_probs=draft_probs,
@@ -527,7 +514,7 @@ class RejectionSampler(nn.Module):
             profile_events, "rejection_sample_total", profile_rejection_start
         )
         _rejection_profile_finish(profile_events, "forward_total", profile_total_start)
-        _rejection_profile_report(profile_events)
+        _rejection_profile_report(profile_events, self._diagnostics)
         self._maybe_dump_alignment(
             metadata=metadata,
             draft_probs=draft_probs,
@@ -591,8 +578,8 @@ class RejectionSampler(nn.Module):
             logprobs_tensors=None,
         )
 
-    @staticmethod
     def _maybe_dump_alignment(
+        self,
         *,
         metadata: SpecDecodeMetadata,
         draft_probs: torch.Tensor | None,
@@ -604,17 +591,17 @@ class RejectionSampler(nn.Module):
         sampling_metadata: SamplingMetadata,
         draft_confidence_logits: torch.Tensor | None,
     ) -> None:
-        global _SPEC_ALIGNMENT_DUMP_COUNT, _SPEC_ALIGNMENT_STEP_COUNTER
-        _SPEC_ALIGNMENT_STEP_COUNTER += 1
-        dump_limit = envs.VLLM_SPEC_DUMP_ALIGNMENT_LIMIT
-        target_steps = _parse_step_filter(envs.VLLM_SPEC_DUMP_ALIGNMENT_STEPS)
-        step_matches = (
-            target_steps is None or _SPEC_ALIGNMENT_STEP_COUNTER in target_steps
-        )
+        counts = self._diagnostics.counters
+        step = counts.get("alignment_steps", 0) + 1
+        counts["alignment_steps"] = step
+        saved = counts.get("alignment_dumps", 0)
+        dump_limit = self._trace.value("alignment_limit")
+        target_steps = self._trace.selected_steps
+        step_matches = target_steps is None or step in target_steps
         should_dump_alignment = (
-            envs.VLLM_SPEC_DUMP_ALIGNMENT
+            self._trace.value("alignment")
             and step_matches
-            and dump_limit > _SPEC_ALIGNMENT_DUMP_COUNT
+            and dump_limit > saved
             and sum(metadata.num_draft_tokens) >= min(4, metadata.max_spec_len)
         )
         if not should_dump_alignment:
@@ -654,7 +641,7 @@ class RejectionSampler(nn.Module):
             )
             payload = {
                 "rank": int(os.getenv("RANK", "-1")),
-                "step": _SPEC_ALIGNMENT_STEP_COUNTER,
+                "step": step,
                 "draft_token_ids": metadata.draft_token_ids.detach().cpu(),
                 "num_draft_tokens": list(metadata.num_draft_tokens),
                 "cu_num_draft_tokens": metadata.cu_num_draft_tokens.detach().cpu(),
@@ -721,21 +708,17 @@ class RejectionSampler(nn.Module):
                 payload["draft_confidence_logits"] = (
                     draft_confidence_logits.detach().float().cpu()
                 )
-            _SPEC_ALIGNMENT_DUMP_COUNT += 1
-            dump_dir = os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR", "/tmp")
-            os.makedirs(dump_dir, exist_ok=True)
-            raw_tag = os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_TAG", "")
-            safe_tag = "".join(
-                ch if ch.isalnum() or ch in "._-" else "_" for ch in raw_tag
-            )
+            saved += 1
+            counts["alignment_dumps"] = saved
+            dump_dir = self._trace.alignment_directory
+            safe_tag = self._trace.safe_tag
             tag_part = f"{safe_tag}_" if safe_tag else ""
-            dump_path = os.path.join(
+            dump_path = write_payload(
                 dump_dir,
-                f"spec_alignment_{tag_part}pid{os.getpid()}_"
-                f"step{_SPEC_ALIGNMENT_STEP_COUNTER:06d}_"
-                f"{_SPEC_ALIGNMENT_DUMP_COUNT}.pt",
+                f"spec_alignment_{tag_part}pid{os.getpid()}_step{step:06d}_{saved}.pt",
+                payload,
+                self._diagnostics.engine_tag,
             )
-            torch.save(payload, dump_path)
             logger.warning("Dumped speculative alignment diagnostics to %s", dump_path)
 
     def _get_logprobs_tensors(

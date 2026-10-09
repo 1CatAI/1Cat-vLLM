@@ -325,6 +325,22 @@ def runtime_policy_report(cfg):
             field: getattr(trace, field)
             for field in (trace.layer_aliases if trace is not None else {})
         },
+        "diagnostic_channels": {
+            name: {
+                "policy": channel.report(),
+                "evidence": "host observations, not GPU kernel hits or replay totals",
+                "owner": "engine runtime_resources.diagnostics",
+                "observations": (
+                    dict(resources["diagnostics"].channels[name].counts)
+                    if "diagnostics" in resources
+                    else {}
+                ),
+            }
+            for name, channel in vars(trace.dumps).items()
+            if hasattr(channel, "sources")
+        }
+        if trace is not None
+        else {},
         "graph_execution_plan": asdict(plan) if plan is not None else None,
         "execution_observations": {
             "evidence": "host dispatch returned; graph capture is not replay counting",
@@ -371,6 +387,16 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
     )
     trace = _owner(cfg, "observability_config.runtime_trace")
     if trace is not None:
+        from vllm.config.diagnostic_dump import DUMP_BINDINGS
+
+        ignored.update(trace.sampling.aliases.values())
+        ignored.update(trace.dflash.aliases.values())
+
+        ignored.update(
+            alias
+            for bindings in DUMP_BINDINGS.values()
+            for alias, _, _ in bindings.values()
+        )
         for field, alias in trace.layer_aliases.items():
             if field in trace.sources:
                 ignored.add(alias)

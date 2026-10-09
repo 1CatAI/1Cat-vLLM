@@ -44,6 +44,7 @@ from vllm.config import (
 from vllm.config.cache import CacheConfig
 from vllm.config.execution_policy import graph_policy
 from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import bind_diagnostics, diagnostic_channel, flush_runner_graphs
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -117,7 +118,6 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.sm70_decode_trace import (
-    sm70_decode_event_trace_enabled,
     sm70_trace_event_sync,
 )
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
@@ -279,11 +279,6 @@ from vllm.model_executor.warmup.sm70_runtime import (
 from vllm.v1.spec_decode.profiling import create_step_profiler
 
 logger = init_logger(__name__)
-_SM70_SAMPLE_TENSOR_DUMP_COUNTER = 0
-_SM70_SAMPLE_SYNC_COUNTER = 0
-_SM70_QWEN_LAYER_GRAPH_DUMP_COUNTER = 0
-_SM70_MTP_STEP_DUMP_COUNTER = 0
-_SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED = False
 
 
 def _unwrap_pipeline_intermediate_hidden_states(
@@ -422,27 +417,29 @@ def _dflash_ddtree_target_forward_profiler_step() -> int:
         return 0
 
 
-def _maybe_dump_sm70_mtp_step(phase: str, payload: dict[str, object]) -> None:
-    dump_dir = os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR")
+def _maybe_dump_sm70_mtp_step(
+    phase: str, payload: dict[str, object], *, diagnostics=None
+) -> None:
+    channel = diagnostic_channel("mtp_step", owner=diagnostics)
+    policy = channel.policy
+    dump_dir = policy.directory
     if not dump_dir:
         return
 
-    global _SM70_MTP_STEP_DUMP_COUNTER
-    _SM70_MTP_STEP_DUMP_COUNTER += 1
-    step = _SM70_MTP_STEP_DUMP_COUNTER
-    target_steps = _sm70_parse_step_filter(os.getenv("VLLM_SM70_MTP_DUMP_STEP_STEPS"))
+    step = channel.advance("steps", start=1)
+    target_steps = policy.filters["steps"]
     if target_steps is not None:
         if step not in target_steps:
             return
     else:
-        max_steps = int(os.getenv("VLLM_SM70_MTP_DUMP_STEP_MAX", "512"))
+        max_steps = policy.value("max_dumps")
         if max_steps > 0 and step > max_steps:
             return
 
     def _to_cpu(value: object) -> object:
         if isinstance(value, torch.Tensor):
             tensor = value.detach()
-            max_elems = int(os.getenv("VLLM_SM70_MTP_DUMP_TENSOR_MAX", "512"))
+            max_elems = policy.value("max_elements")
             if max_elems > 0 and tensor.numel() > max_elems:
                 flat = tensor.reshape(-1)
                 return {
@@ -454,7 +451,7 @@ def _maybe_dump_sm70_mtp_step(phase: str, payload: dict[str, object]) -> None:
                 }
             return tensor.cpu()
         if isinstance(value, np.ndarray):
-            max_elems = int(os.getenv("VLLM_SM70_MTP_DUMP_TENSOR_MAX", "512"))
+            max_elems = policy.value("max_elements")
             if max_elems > 0 and value.size > max_elems:
                 flat = value.reshape(-1)
                 return {
@@ -470,63 +467,43 @@ def _maybe_dump_sm70_mtp_step(phase: str, payload: dict[str, object]) -> None:
             return type(value)(_to_cpu(item) for item in value)
         return value
 
-    os.makedirs(dump_dir, exist_ok=True)
     rank = get_tp_group().rank_in_group if torch.distributed.is_initialized() else 0
-    path = os.path.join(
-        dump_dir,
+    channel.write(
         f"mtp_step_pid{os.getpid()}_rank{rank}_{step:06d}_{phase}.pt",
-    )
-    torch.save(
         {
             "phase": phase,
             "step": step,
             **{key: _to_cpu(value) for key, value in payload.items()},
         },
-        path,
     )
 
 
 def _sm70_parse_step_filter(raw_steps: str | None) -> set[int] | None:
-    if not raw_steps:
-        return None
-    steps: set[int] = set()
+    from vllm.config.diagnostic_dump import parse_int_filter
+
     try:
-        for item in raw_steps.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if "-" in item:
-                start_text, end_text = item.split("-", 1)
-                start = int(start_text)
-                end = int(end_text)
-                if start < 0 or end < start:
-                    return set()
-                steps.update(range(start, end + 1))
-                continue
-            step = int(item)
-            if step < 0:
-                return set()
-            steps.add(step)
-        return steps
+        result = parse_int_filter(raw_steps, strict=True)
     except ValueError:
         return set()
+    return None if result is None else set(result)
 
 
-def _maybe_sync_sm70_sample_tensors(sample_hidden_states: torch.Tensor) -> None:
-    target_steps = _sm70_parse_step_filter(
-        os.environ.get("VLLM_SM70_SYNC_SAMPLE_TENSORS_STEPS")
-    )
+def _maybe_sync_sm70_sample_tensors(
+    sample_hidden_states: torch.Tensor, *, diagnostics=None
+) -> None:
+    channel = diagnostic_channel("sample_sync", owner=diagnostics)
+    target_steps = channel.policy.filters["steps"]
     if target_steps is None:
         return
     if _sm70_cuda_graph_capture_active():
         return
 
-    global _SM70_SAMPLE_SYNC_COUNTER
-    _SM70_SAMPLE_SYNC_COUNTER += 1
-    if _SM70_SAMPLE_SYNC_COUNTER not in target_steps:
+    step = channel.advance("steps", start=1)
+    if step not in target_steps:
         return
 
-    mode = os.environ.get("VLLM_SM70_SYNC_SAMPLE_TENSORS_MODE", "stream")
+    mode = channel.policy.mode
+    assert mode is not None
     mode = mode.strip().lower()
     if mode == "d2h":
         _ = sample_hidden_states.detach().cpu()
@@ -541,36 +518,34 @@ def _maybe_dump_sm70_sample_tensors(
     logits: torch.Tensor | None,
     stage: str,
     metadata: dict[str, Any] | None = None,
+    *,
+    diagnostics=None,
 ) -> None:
-    dump_dir = os.environ.get("VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR")
+    channel = diagnostic_channel("sample", owner=diagnostics)
+    policy = channel.policy
+    dump_dir = policy.directory
     if not dump_dir:
         return
-    enable_file = os.environ.get("VLLM_SM70_DUMP_SAMPLE_TENSORS_ENABLE_FILE")
+    enable_file = policy.enable_file
     if enable_file and not os.path.exists(enable_file):
         return
     if _sm70_cuda_graph_capture_active():
         return
 
-    global _SM70_SAMPLE_TENSOR_DUMP_COUNTER
-    _SM70_SAMPLE_TENSOR_DUMP_COUNTER += 1
-    target_steps = _sm70_parse_step_filter(
-        os.environ.get("VLLM_SM70_DUMP_SAMPLE_TENSORS_STEPS")
-    )
-    if (
-        target_steps is not None
-        and _SM70_SAMPLE_TENSOR_DUMP_COUNTER not in target_steps
-    ):
+    step = channel.advance("steps", start=1)
+    target_steps = policy.filters["steps"]
+    if target_steps is not None and step not in target_steps:
         return
 
-    max_steps = int(os.environ.get("VLLM_SM70_DUMP_SAMPLE_TENSORS_MAX_STEPS", "0"))
-    if max_steps > 0 and max_steps < _SM70_SAMPLE_TENSOR_DUMP_COUNTER:
+    max_steps = policy.value("max_dumps")
+    if max_steps > 0 and max_steps < step:
         return
 
-    os.makedirs(dump_dir, exist_ok=True)
-    torch.save(
+    channel.write(
+        f"sample_tensors_pid{os.getpid()}_step{step:04d}.pt",
         {
             "stage": stage,
-            "step": _SM70_SAMPLE_TENSOR_DUMP_COUNTER,
+            "step": step,
             "pid": os.getpid(),
             "sample_hidden_states": sample_hidden_states.detach().cpu(),
             "logits": None if logits is None else logits.detach().cpu(),
@@ -580,53 +555,11 @@ def _maybe_dump_sm70_sample_tensors(
             "logits_dtype": None if logits is None else str(logits.dtype),
             "metadata": metadata or {},
         },
-        os.path.join(
-            dump_dir,
-            (
-                f"sample_tensors_pid{os.getpid()}"
-                f"_step{_SM70_SAMPLE_TENSOR_DUMP_COUNTER:04d}.pt"
-            ),
-        ),
     )
 
 
-def _maybe_dump_sm70_qwen_layer_graph_buffers(stage: str) -> None:
-    qwen_enabled = os.environ.get("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS") == "1"
-    gdn_enabled = os.environ.get("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") == "1"
-    if not qwen_enabled and not gdn_enabled:
-        return
-
-    global _SM70_QWEN_LAYER_GRAPH_DUMP_COUNTER
-    _SM70_QWEN_LAYER_GRAPH_DUMP_COUNTER += 1
-    target_steps = _sm70_parse_step_filter(
-        os.environ.get("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS")
-        or os.environ.get("VLLM_SM70_DUMP_QWEN_LAYER_COUNTS")
-        or os.environ.get("VLLM_SM70_DUMP_GDN_GRAPH_STEPS")
-    )
-    if (
-        target_steps is not None
-        and _SM70_QWEN_LAYER_GRAPH_DUMP_COUNTER not in target_steps
-    ):
-        return
-
-    if qwen_enabled:
-        from vllm.model_executor.models.qwen3_next import (
-            dump_sm70_qwen_layer_graph_buffers,
-        )
-
-        dump_sm70_qwen_layer_graph_buffers(
-            _SM70_QWEN_LAYER_GRAPH_DUMP_COUNTER,
-            stage,
-        )
-    if gdn_enabled:
-        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-            dump_sm70_gdn_graph_buffers,
-        )
-
-        dump_sm70_gdn_graph_buffers(
-            _SM70_QWEN_LAYER_GRAPH_DUMP_COUNTER,
-            stage,
-        )
+def _maybe_dump_sm70_qwen_layer_graph_buffers(stage: str, *, diagnostics=None) -> None:
+    flush_runner_graphs(stage, owner=diagnostics)
 
 
 def _should_record_sm70_sample_hidden_ready_event(
@@ -665,9 +598,12 @@ def _wait_sm70_sample_hidden_ready_event(
 
 def _sync_sm70_before_compile_graph_forward(
     cudagraph_mode: CUDAGraphMode,
+    *,
+    diagnostics=None,
 ) -> None:
+    trace = diagnostics.trace if diagnostics is not None else capture_runtime_trace()
     if (
-        envs.VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD
+        trace.sync_before_compile
         and cudagraph_mode != CUDAGraphMode.NONE
         and bool(graph_policy().compile_graph)
         and current_platform.is_device_capability(70)
@@ -713,42 +649,30 @@ def _maybe_log_sm70_decode_event_trace_config(
     use_async_scheduling: bool,
     greedy_token_fastpath: bool,
     num_spec_tokens: int,
+    diagnostics=None,
 ) -> None:
-    if not sm70_decode_event_trace_enabled():
+    diagnostics = bind_diagnostics() if diagnostics is None else diagnostics
+    if not diagnostics.trace.events:
         return
-    global _SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED
-    if _SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED:
+    if diagnostics.counters.get("event_trace_config_logged"):
         return
-    _SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED = True
+    diagnostics.counters["event_trace_config_logged"] = 1
     logger.warning(
         "SM70 decode event trace enabled: async_scheduling=%s "
         "greedy_token_fastpath=%s num_spec_tokens=%s threshold_ms=%s every=%s",
         use_async_scheduling,
         greedy_token_fastpath,
         num_spec_tokens,
-        envs.VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS,
-        envs.VLLM_SM70_DECODE_EVENT_TRACE_EVERY,
+        diagnostics.trace.event_threshold_ms,
+        diagnostics.trace.event_every,
     )
 
 
-_SM70_COMPILE_GRAPH_INPUT_DUMP_STEP = 0
-
-
 def _sm70_parse_dump_steps(raw: str | None) -> set[int] | None:
-    if not raw:
-        return None
-    steps: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start_s, end_s = part.split("-", 1)
-            start, end = int(start_s), int(end_s)
-            steps.update(range(start, end + 1))
-        else:
-            steps.add(int(part))
-    return steps
+    from vllm.config.diagnostic_dump import parse_int_filter
+
+    result = parse_int_filter(raw, reverse=False)
+    return None if result is None else set(result)
 
 
 def _sm70_to_cpu_for_dump(value: Any) -> Any:
@@ -777,18 +701,19 @@ def _sm70_dump_compile_graph_inputs(
     seq_lens: torch.Tensor,
     num_computed_tokens: torch.Tensor,
     input_batch: InputBatch,
+    diagnostics=None,
 ) -> None:
-    dump_dir = os.getenv("VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_DIR")
+    channel = diagnostic_channel("compile_inputs", owner=diagnostics)
+    policy = channel.policy
+    dump_dir = policy.directory
     if not dump_dir:
         return
 
-    global _SM70_COMPILE_GRAPH_INPUT_DUMP_STEP
-    _SM70_COMPILE_GRAPH_INPUT_DUMP_STEP += 1
-    step = _SM70_COMPILE_GRAPH_INPUT_DUMP_STEP
+    step = channel.advance("steps", start=1)
 
-    target_steps = _sm70_parse_dump_steps(
-        os.getenv("VLLM_SM70_DUMP_COMPILE_GRAPH_INPUT_STEPS")
-    )
+    if "steps" in policy.filter_errors:
+        raise ValueError(policy.filter_errors["steps"])
+    target_steps = policy.filters["steps"]
     if target_steps is not None and step not in target_steps:
         return
 
@@ -837,9 +762,8 @@ def _sm70_dump_compile_graph_inputs(
                 }
                 break
 
-    os.makedirs(dump_dir, exist_ok=True)
-    path = os.path.join(dump_dir, f"pid{os.getpid()}_step{step:04d}.pt")
-    torch.save(
+    channel.write(
+        f"pid{os.getpid()}_step{step:04d}.pt",
         {
             "pid": os.getpid(),
             "step": step,
@@ -870,7 +794,6 @@ def _sm70_dump_compile_graph_inputs(
             "req_id_to_index": dict(input_batch.req_id_to_index),
             "gdn_metadata": gdn_metadata,
         },
-        path,
     )
 
 
@@ -1144,7 +1067,7 @@ class GPUModelRunner(
 
         nvtx_enabled = bool(
             _dflash_ddtree_target_forward_nvtx_enabled()
-            or os.getenv("VLLM_SM70_SPEC_TARGET_FORWARD_NVTX", "0") == "1"
+            or capture_runtime_trace().spec_target_nvtx
         )
         profiler_step = _dflash_ddtree_target_forward_profiler_step()
         if not nvtx_enabled and profiler_step <= 0:
@@ -1189,6 +1112,7 @@ class GPUModelRunner(
         device: torch.device,
     ):
         self.vllm_config = vllm_config
+        self._diagnostics = bind_diagnostics(vllm_config)
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
         self.offload_config = vllm_config.offload_config
@@ -1329,7 +1253,9 @@ class GPUModelRunner(
         self._async_trace_every = self._runtime_trace.async_every
 
         # Sampler
-        self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+        self.sampler = Sampler(
+            logprobs_mode=self.model_config.logprobs_mode, diagnostics=self._diagnostics
+        )
         self.sm70_greedy_token_fastpath = envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH
         self.sm70_greedy_token_fastpath_trace = self._runtime_trace.greedy_token_trace
         self._sm70_greedy_token_fastpath_trace_seen: set[str] = set()
@@ -1364,6 +1290,7 @@ class GPUModelRunner(
             use_async_scheduling=self.use_async_scheduling,
             greedy_token_fastpath=self.sm70_greedy_token_fastpath,
             num_spec_tokens=self.num_spec_tokens,
+            diagnostics=self._diagnostics,
         )
 
         self.eplb_state: EplbState | None = None
@@ -1484,7 +1411,10 @@ class GPUModelRunner(
                     f"{self.speculative_config.method}"
                 )
             self.rejection_sampler = RejectionSampler(
-                self.sampler, self.speculative_config, self.device
+                self.sampler,
+                self.speculative_config,
+                self.device,
+                diagnostics=self._diagnostics,
             )
 
         elif self.speculative_config:
@@ -6772,7 +6702,7 @@ class GPUModelRunner(
         self,
         logits_indices: torch.Tensor | None,
     ) -> dict[str, Any] | None:
-        if not os.environ.get("VLLM_SM70_DUMP_SAMPLE_TENSORS_DIR"):
+        if not self._diagnostics.channels["sample"].policy.directory:
             return None
 
         num_reqs = self.input_batch.num_reqs
@@ -7062,9 +6992,14 @@ class GPUModelRunner(
             logits,
             "pre_sample",
             self._make_sm70_sample_dump_metadata(logits_indices),
+            diagnostics=self._diagnostics,
         )
-        _maybe_dump_sm70_qwen_layer_graph_buffers("pre_sample")
-        _maybe_sync_sm70_sample_tensors(sample_hidden_states)
+        _maybe_dump_sm70_qwen_layer_graph_buffers(
+            "pre_sample", diagnostics=self._diagnostics
+        )
+        _maybe_sync_sm70_sample_tensors(
+            sample_hidden_states, diagnostics=self._diagnostics
+        )
         if spec_decode_metadata is None:
             if logits is None and self._can_use_sm70_compact_topk20_tokens(
                 scheduler_output, spec_decode_metadata
@@ -7551,7 +7486,7 @@ class GPUModelRunner(
                 target_candidate_ids,
                 sampler_output.sampled_token_ids,
             )
-        if os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR"):
+        if self._diagnostics.channels["mtp_step"].policy.directory:
             sampled_token_ids = sampler_output.sampled_token_ids
             valid_sampled_count = _count_contiguous_spec_tokens(sampled_token_ids)
             payload: dict[str, object] = {
@@ -7586,7 +7521,9 @@ class GPUModelRunner(
                 payload["prev_valid_sampled_token_count_gpu"] = (
                     self.valid_sampled_token_count_gpu
                 )
-            _maybe_dump_sm70_mtp_step("sample_output", payload)
+            _maybe_dump_sm70_mtp_step(
+                "sample_output", payload, diagnostics=self._diagnostics
+            )
         return sampler_output
 
     def _can_use_greedy_token_fastpath(
@@ -8617,6 +8554,7 @@ class GPUModelRunner(
                 seq_lens=self.seq_lens,
                 num_computed_tokens=self.num_computed_tokens,
                 input_batch=self.input_batch,
+                diagnostics=self._diagnostics,
             )
 
         if trace_log:
@@ -8642,7 +8580,9 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        _sync_sm70_before_compile_graph_forward(cudagraph_mode)
+        _sync_sm70_before_compile_graph_forward(
+            cudagraph_mode, diagnostics=self._diagnostics
+        )
         mtp_profile_events: (
             list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None
         ) = (
@@ -9815,7 +9755,7 @@ class GPUModelRunner(
         # Alignment has a small but non-zero launch/copy cost. Keep it out of
         # ordinary serving until confidence scheduling is explicitly enabled;
         # alignment dumps are the calibration path used before that gate.
-        if not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+        if not self._diagnostics.sampling.value("alignment"):
             return None
         return get_aligned_draft_scalar_values(
             req_ids=self.input_batch.req_ids,
@@ -10076,7 +10016,10 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
 
-            if os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR") and spec_config.method == "mtp":
+            if (
+                self._diagnostics.channels["mtp_step"].policy.directory
+                and spec_config.method == "mtp"
+            ):
                 payload = {
                     "req_ids": list(
                         self.input_batch.req_ids[: self.input_batch.num_reqs]
@@ -10120,7 +10063,9 @@ class GPUModelRunner(
                     )
                 if "valid_sampled_tokens_count" in locals():
                     payload["valid_sampled_tokens_count"] = valid_sampled_tokens_count
-                _maybe_dump_sm70_mtp_step("draft_input", payload)
+                _maybe_dump_sm70_mtp_step(
+                    "draft_input", payload, diagnostics=self._diagnostics
+                )
 
             if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
                 mm_embed_inputs = self._gather_mm_embeddings(
@@ -10142,7 +10087,10 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
-            if os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR") and spec_config.method == "mtp":
+            if (
+                self._diagnostics.channels["mtp_step"].policy.directory
+                and spec_config.method == "mtp"
+            ):
                 _maybe_dump_sm70_mtp_step(
                     "draft_output",
                     {
@@ -10154,6 +10102,7 @@ class GPUModelRunner(
                         "token_indices_to_sample": token_indices_to_sample,
                         "next_token_ids": next_token_ids,
                     },
+                    diagnostics=self._diagnostics,
                 )
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()

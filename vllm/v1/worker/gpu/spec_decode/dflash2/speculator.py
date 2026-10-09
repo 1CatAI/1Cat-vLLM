@@ -6,7 +6,6 @@ from typing import Any
 import numpy as np
 import torch
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.sm70_dflash2 import (
@@ -14,6 +13,7 @@ from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
 )
+from vllm.diagnostics import bind_diagnostics
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -387,6 +387,8 @@ class DFlash2Speculator(DFlashSpeculator):
             capture_sm70_dflash2_config(vllm_config) or Sm70DFlash2Config()
         )
         self._sm70_dflash2_policy.resolve(qualified=False)
+        self._diagnostics = bind_diagnostics(vllm_config)
+        self._trace = self._diagnostics.sampling
         self._context_kv_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._context_compute_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._context_store_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -484,7 +486,7 @@ class DFlash2Speculator(DFlashSpeculator):
         self._alignment_candidate_ids: torch.Tensor | None = None
         self._alignment_unary_logits: torch.Tensor | None = None
         self._alignment_lattice_scores: torch.Tensor | None = None
-        if envs.VLLM_SPEC_DUMP_ALIGNMENT and sm70_dflash2_enabled(
+        if self._trace.value("alignment") and sm70_dflash2_enabled(
             "sparse_target_rejection", self._sm70_dflash2_policy
         ):
             packed_shape = (
@@ -666,7 +668,7 @@ class DFlash2Speculator(DFlashSpeculator):
         else:
             self._lookup_q16_rounds += 1
         if (
-            envs.VLLM_DFLASH_PROFILE
+            self._diagnostics.trace.dflash.value("profile")
             and verify_tokens != self._lookup_last_verify_tokens
         ):
             logger.info(
@@ -1147,8 +1149,9 @@ class DFlash2Speculator(DFlashSpeculator):
 
         self._ngram_skipped_rounds += int(skip_query)
         if (
-            envs.VLLM_DFLASH_PROFILE
-            and self._ngram_rounds % envs.VLLM_DFLASH_PROFILE_LOG_INTERVAL == 0
+            self._diagnostics.trace.dflash.value("profile")
+            and self._ngram_rounds % self._diagnostics.trace.dflash.value("interval")
+            == 0
         ):
             eligible_count = max(assist.num_eligible, 1)
             logger.info(

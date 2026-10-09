@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING
@@ -10,8 +9,16 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.config.diagnostic_dump import parse_int_filter
 from vllm.config.execution_policy import communication_policy, graph_policy
 from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import (
+    diagnostic_channel,
+    flush_layer_buffers,
+    layer_dump_requested,
+    legacy_channel,
+    record_layer_tensor,
+)
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -51,28 +58,13 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
-_SM70_MOE_RUNNER_DUMP_BUFFERS: dict[str, torch.Tensor] = {}
-_SM70_MOE_RUNNER_DUMP_META: dict[str, dict[str, object]] = {}
+_SM70_MOE_RUNNER_DUMP_BUFFERS = legacy_channel("moe_runner").buffers
+_SM70_MOE_RUNNER_DUMP_META = legacy_channel("moe_runner").metadata
 
 
 def _sm70_parse_int_ranges(raw_ranges: str | None) -> set[int] | None:
-    if not raw_ranges:
-        return None
-    values: set[int] = set()
-    for raw_part in raw_ranges.split(","):
-        part = raw_part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start_raw, end_raw = part.split("-", 1)
-            start = int(start_raw.strip())
-            end = int(end_raw.strip())
-            if end < start:
-                start, end = end, start
-            values.update(range(start, end + 1))
-        else:
-            values.add(int(part))
-    return values
+    selected = parse_int_filter(raw_ranges)
+    return None if selected is None else set(selected)
 
 
 def _sm70_extract_moe_layer_idx(layer_name: str) -> int:
@@ -87,68 +79,17 @@ def _sm70_extract_moe_layer_idx(layer_name: str) -> int:
 
 
 def _sm70_moe_runner_dump_requested(layer_idx: int, label: str) -> bool:
-    if not os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR") or layer_idx < 0:
-        return False
-    raw_layer_ids = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_IDS", "0,1")
-    if raw_layer_ids.strip().lower() not in {"*", "all"}:
-        try:
-            layer_ids = _sm70_parse_int_ranges(raw_layer_ids) or {0, 1}
-        except ValueError:
-            layer_ids = {0, 1}
-        if layer_idx not in layer_ids:
-            return False
-    target_labels = {
-        item.strip()
-        for item in os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_LABELS", "").split(",")
-        if item.strip()
-    }
-    return not target_labels or label in target_labels
+    return layer_dump_requested(layer_idx, label, moe=True)
 
 
 def _sm70_moe_runner_dump_token_count_allowed(tensor: torch.Tensor) -> bool:
-    raw = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_MAX_TOKENS")
-    if not raw or tensor.ndim == 0:
-        return True
-    try:
-        max_tokens = int(raw)
-    except ValueError:
-        return True
-    return max_tokens <= 0 or int(tensor.shape[0]) <= max_tokens
+    return diagnostic_channel("moe_runner").policy.allows_tokens(tensor)
 
 
 def _sm70_moe_runner_dump_impl(
-    tensor: torch.Tensor,
-    label: str,
-    layer_idx: int,
+    tensor: torch.Tensor, label: str, layer_idx: int
 ) -> torch.Tensor:
-    dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
-    if not dump_dir:
-        return tensor
-    if not _sm70_moe_runner_dump_token_count_allowed(tensor):
-        return tensor
-    graph_buffers = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_BUFFERS") == "1"
-    if graph_buffers and tensor.is_cuda:
-        shape = tuple(tensor.shape)
-        key = f"{os.getpid()}:{layer_idx}:{label}:{shape}:{tensor.dtype}"
-        buffer = _SM70_MOE_RUNNER_DUMP_BUFFERS.get(key)
-        if (
-            buffer is None
-            or tuple(buffer.shape) != shape
-            or buffer.dtype != tensor.dtype
-            or buffer.device != tensor.device
-        ):
-            buffer = torch.empty_like(tensor)
-            _SM70_MOE_RUNNER_DUMP_BUFFERS[key] = buffer
-            _SM70_MOE_RUNNER_DUMP_META[key] = {
-                "label": label,
-                "layer_idx": layer_idx,
-                "layer_type": "moe_runner",
-                "shape": shape,
-                "dtype": str(tensor.dtype),
-                "pid": os.getpid(),
-            }
-        buffer.copy_(tensor)
-    return tensor
+    return record_layer_tensor(tensor, label, layer_idx, "moe_runner", moe=True)
 
 
 def _sm70_moe_runner_dump_fake(
@@ -179,40 +120,7 @@ def _sm70_dump_moe_runner_tensor(
 
 
 def dump_sm70_moe_runner_graph_buffers(step: int, stage: str) -> None:
-    dump_dir = os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
-    if not dump_dir or not _SM70_MOE_RUNNER_DUMP_BUFFERS:
-        return
-    target_steps = _sm70_parse_int_ranges(
-        os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_GRAPH_STEPS")
-        or os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_COUNTS")
-    )
-    if target_steps is not None and step not in target_steps:
-        return
-    os.makedirs(dump_dir, exist_ok=True)
-    for key, buffer in _SM70_MOE_RUNNER_DUMP_BUFFERS.items():
-        meta = _SM70_MOE_RUNNER_DUMP_META.get(key, {})
-        label = str(meta.get("label", "unknown")).replace("/", "_").replace(".", "_")
-        layer_type = str(meta.get("layer_type", "moe_runner"))
-        layer_idx_value = meta.get("layer_idx", -1)
-        layer_idx = layer_idx_value if isinstance(layer_idx_value, int) else -1
-        shape = "x".join(str(dim) for dim in tuple(buffer.shape))
-        path = os.path.join(
-            dump_dir,
-            (
-                f"pid{os.getpid()}_step{step:04d}_layer{layer_idx:02d}_"
-                f"{layer_type}_{label}_shape{shape}.pt"
-            ),
-        )
-        torch.save(
-            {
-                **meta,
-                "step": step,
-                "stage": stage,
-                "graph_buffer_key": key,
-                "tensor": buffer.detach().cpu(),
-            },
-            path,
-        )
+    flush_layer_buffers(step, stage, moe=True)
 
 
 def get_layer_from_name(layer_name: str) -> torch.nn.Module:

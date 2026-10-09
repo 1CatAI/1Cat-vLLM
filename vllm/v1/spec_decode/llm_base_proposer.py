@@ -16,10 +16,12 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
+from vllm.config.sm70_dflash2 import proposer_diagnostic_flag, proposer_diagnostic_flags
 from vllm.config.speculative_sampling import (
     SpeculativeSamplingPolicy,
     resolve_sampling_policy,
 )
+from vllm.diagnostics import bind_diagnostics, write_payload
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
@@ -128,23 +130,24 @@ def _is_dflash_method(method: str | None) -> bool:
     return method in ("dflash", "dflash_ddtree", "dspark")
 
 
-def _spec_debug_corruption_enabled(method: str) -> bool:
-    if _is_dflash_method(method) and envs.VLLM_DFLASH_DEBUG_CORRUPTION:
-        return True
-    return envs.VLLM_SPEC_DEBUG_CORRUPTION
+def _spec_debug_corruption_enabled(method: str, policy=None) -> bool:
+    return proposer_diagnostic_flag(method, "corruption", policy)
 
 
-def _spec_dump_draft_logits_enabled(method: str) -> bool:
-    if _is_dflash_method(method) and envs.VLLM_DFLASH_DUMP_DRAFT_LOGITS:
-        return True
-    return envs.VLLM_SPEC_DUMP_DRAFT_LOGITS
+def _spec_dump_draft_logits_enabled(method: str, policy=None) -> bool:
+    return proposer_diagnostic_flag(method, "draft_logits", policy)
 
 
-def _dump_spec_debug(payload: dict[str, Any], method: str, suffix: str) -> str:
+def _dump_spec_debug(
+    payload: dict[str, Any], method: str, suffix: str, *, diagnostics=None
+) -> str:
     prefix = method if _is_dflash_method(method) else f"spec_{method}"
-    dump_path = f"/tmp/{prefix}_{suffix}_pid{os.getpid()}.pt"
-    torch.save(payload, dump_path)
-    return dump_path
+    return write_payload(
+        "/tmp",
+        f"{prefix}_{suffix}_pid{os.getpid()}.pt",
+        payload,
+        diagnostics.engine_tag if diagnostics is not None else "",
+    )
 
 
 def _clone_tensor_or_none(tensor: torch.Tensor | None) -> torch.Tensor | None:
@@ -210,6 +213,7 @@ class SpecDecodeBaseProposer:
         runner=None,
     ):
         self.vllm_config = vllm_config
+        self._diagnostics = bind_diagnostics(vllm_config)
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
         self._sampling_policy = resolve_sampling_policy(
@@ -221,6 +225,9 @@ class SpecDecodeBaseProposer:
         method = self.speculative_config.method
         assert method is not None
         self.method: str = method
+        self._diagnostic_flags = proposer_diagnostic_flags(
+            method, self._diagnostics.trace
+        )
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
 
         self.device = device
@@ -1191,9 +1198,9 @@ class SpecDecodeBaseProposer:
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
         debug_logits = None
         debug_summary: dict[str, Any] | None = None
-        should_collect_draft_logits = _spec_debug_corruption_enabled(
-            self.method
-        ) or _spec_dump_draft_logits_enabled(self.method)
+        should_collect_draft_logits = (
+            self._diagnostic_flags[0] or self._diagnostic_flags[1]
+        )
         if should_collect_draft_logits:
             debug_logits = self._compute_logits_for_step(sample_hidden_states, 0)
             topk = min(5, debug_logits.shape[-1])
@@ -1230,7 +1237,7 @@ class SpecDecodeBaseProposer:
                 "logits_topk_vals": topk_vals.detach().cpu(),
                 "first_pass": getattr(self, "_debug_last_first_pass", None),
             }
-            if _spec_dump_draft_logits_enabled(self.method):
+            if self._diagnostic_flags[1]:
                 debug_summary["sample_hidden_states"] = (
                     sample_hidden_states.detach().to(torch.float16).cpu()
                 )
@@ -1241,7 +1248,10 @@ class SpecDecodeBaseProposer:
                 or int(nonfinite_counts.sum().item()) > 0
             ):
                 dump_path = _dump_spec_debug(
-                    debug_summary, self.method, "draft_corruption"
+                    debug_summary,
+                    self.method,
+                    "draft_corruption",
+                    diagnostics=self._diagnostics,
                 )
                 self._spec_corruption_dumped = True
                 logger.warning(
@@ -1267,7 +1277,7 @@ class SpecDecodeBaseProposer:
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 ).contiguous()
             if (
-                _spec_dump_draft_logits_enabled(self.method)
+                self._diagnostic_flags[1]
                 and not getattr(self, "_spec_logits_dumped", False)
                 and debug_summary is not None
             ):
@@ -1276,7 +1286,12 @@ class SpecDecodeBaseProposer:
                     debug_summary["draft_probs"] = (
                         draft_probs.detach().to(torch.float16).cpu()
                     )
-                dump_path = _dump_spec_debug(debug_summary, self.method, "draft_logits")
+                dump_path = _dump_spec_debug(
+                    debug_summary,
+                    self.method,
+                    "draft_logits",
+                    diagnostics=self._diagnostics,
+                )
                 self._spec_logits_dumped = True
                 logger.warning(
                     "Saved %s draft logits debug to %s", self.method, dump_path
@@ -1314,12 +1329,17 @@ class SpecDecodeBaseProposer:
         self._step_profiler.finish(profile_events, "first_sample", first_sample_start)
         draft_probs_list = None if draft_probs is None else [draft_probs]
         if (
-            _spec_dump_draft_logits_enabled(self.method)
+            self._diagnostic_flags[1]
             and not getattr(self, "_spec_logits_dumped", False)
             and debug_summary is not None
         ):
             debug_summary["draft_token_ids"] = draft_token_ids.detach().cpu()
-            dump_path = _dump_spec_debug(debug_summary, self.method, "draft_logits")
+            dump_path = _dump_spec_debug(
+                debug_summary,
+                self.method,
+                "draft_logits",
+                diagnostics=self._diagnostics,
+            )
             self._spec_logits_dumped = True
             logger.warning("Saved %s draft logits debug to %s", self.method, dump_path)
 

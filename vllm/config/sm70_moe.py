@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
+from vllm.config.diagnostic_dump import TensorDumpConfig
 from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.utils import config, hash_factors
 
@@ -145,32 +146,80 @@ class Sm70MoEDiagnostics:
     strict_compare_fail: bool | None = None
     """Retained FP8 legacy no-op warning; never changes arithmetic."""
 
+    dump_policy: TensorDumpConfig | None = Field(default=None, init=False)
+    """Canonical observer projection; compatibility fields above retain old access."""
+    compare_policy: TensorDumpConfig | None = Field(default=None, init=False)
+    """Canonical comparison policy shared with the engine diagnostic owner."""
+
+    def bind(self, family: MoEFormat, dumps) -> None:
+        bindings = MOE_DIAGNOSTIC_BINDINGS[family]
+        for old, (channel, field) in bindings.items():
+            setattr(self, old, getattr(getattr(dumps, channel), field))
+        self.dump_policy = dumps.awq_buffers if family == "awq" else None
+        self.compare_policy = getattr(dumps, f"{family}_compare")
+
     def resolve(self, family: MoEFormat) -> None:
-        import os
+        if self.compare_policy is None:
+            # Independent no-engine compatibility entry, resolved once per owner.
+            from vllm.config.diagnostic_dump import TensorDiagnosticsConfig
 
-        from vllm import envs
+            dumps = TensorDiagnosticsConfig()
+            _project_moe_diagnostic_inputs(self, family, dumps)
+            dumps.project_shared_fields()
+            self.bind(family, dumps)
+        # Preserve the qualified format initialization error checkpoint.
+        fields = (
+            ("max_dumps",)
+            if family == "awq"
+            else ("enabled", "max_dumps", "strict_fail")
+        )
+        assert self.compare_policy is not None
+        for field in fields:
+            self.compare_policy.value(field)
 
-        if family == "awq":
-            for field, (name, default) in AWQ_DUMP_ALIASES.items():
-                if getattr(self, field) is None:
-                    value = os.getenv(name, default)
-                    setattr(
-                        self, field, value == "1" if field == "dump_buffers" else value
-                    )
-            for field, name in AWQ_COMPARE_ALIASES.items():
-                if getattr(self, field) is None:
-                    setattr(self, field, getattr(envs, name))
-        else:
-            for field, (name, default) in FP8_COMPARE_ALIASES.items():
-                if getattr(self, field) is None:
-                    numeric_value = int(os.getenv(name, default))
-                    setattr(
-                        self,
-                        field,
-                        numeric_value
-                        if field == "compact_compare_reports"
-                        else bool(numeric_value),
-                    )
+
+MOE_DIAGNOSTIC_BINDINGS = {
+    "awq": {
+        "dump_buffers": ("awq_buffers", "enabled"),
+        "dump_dir": ("qwen_layer", "directory"),
+        "dump_layers": ("qwen_layer", "layers"),
+        "dump_labels": ("awq_buffers", "labels"),
+        "compare_dir": ("awq_compare", "directory"),
+        "compare_enable_file": ("awq_compare", "enable_file"),
+        "compare_layers": ("awq_compare", "layers"),
+        "compare_steps": ("awq_compare", "steps"),
+        "compare_max_reports": ("awq_compare", "max_dumps"),
+    },
+    "fp8": {
+        "compact_compare": ("fp8_compare", "enabled"),
+        "compact_compare_reports": ("fp8_compare", "max_dumps"),
+        "strict_compare_fail": ("fp8_compare", "strict_fail"),
+    },
+}
+
+
+def _project_moe_diagnostic_inputs(legacy, family, dumps) -> None:
+    if legacy.compare_policy is not None:
+        return
+    for old, (channel, field) in MOE_DIAGNOSTIC_BINDINGS[family].items():
+        value = getattr(legacy, old)
+        policy = getattr(dumps, channel)
+        if value is not None and policy.sources.get(field) != "typed":
+            setattr(policy, field, value)
+            policy.sources[field] = f"kernel_config.sm70_moe.{family}.diagnostics.{old}"
+            policy.filter_errors.pop(field, None)
+            policy.parse_filters(channel)
+
+
+def bind_moe_diagnostics(kernel, trace) -> None:
+    """Resolve B typed aliases before workers, with observability overrides first."""
+    for family in ("awq", "fp8"):
+        _project_moe_diagnostic_inputs(
+            getattr(kernel.sm70_moe, family).diagnostics, family, trace.dumps
+        )
+    trace.dumps.project_shared_fields()
+    for family in ("awq", "fp8"):
+        getattr(kernel.sm70_moe, family).diagnostics.bind(family, trace.dumps)
 
 
 @config

@@ -342,3 +342,24 @@ def test_fp16_decode_partition_is_computation_and_fp8_wave_is_unused(monkeypatch
         first.compilation_config.compute_hash()
         == second.compilation_config.compute_hash()
     )
+
+
+def test_diagnostic_report_is_json_safe_without_environment_getters(monkeypatch):
+    import json
+
+    from vllm.config.observability import ObservabilityConfig
+
+    cfg = engine()
+    cfg.observability_config = ObservabilityConfig()
+    apply(cfg, monkeypatch)
+
+    def forbidden():
+        raise AssertionError("report must not evaluate environment getters")
+
+    for name in envs.environment_variables:
+        monkeypatch.setitem(envs.environment_variables, name, forbidden)
+    report = runtime_policy_report(cfg)
+    assert report["diagnostic_channels"]["qwen_layer"]["policy"]["filters"][
+        "layers"
+    ] == [0, 1]
+    json.dumps(report)
