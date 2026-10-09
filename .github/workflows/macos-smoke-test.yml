@@ -48,32 +48,40 @@ jobs:
           VLLM_CPU_KVCACHE_SPACE=1 \
           vllm serve Qwen/Qwen3-0.6B \
             --max-model-len=2K \
+            --max-num-seqs 2 \
+            --max-num-batched-tokens 128 \
             --load-format=dummy \
             --hf-overrides '{"num_hidden_layers": 2}' \
             --enforce-eager \
             --port 8000 &
 
           SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
           # Wait for server to start
           for i in {1..30}; do
-            if curl -s http://localhost:8000/health > /dev/null; then
+            if curl -fsS --connect-timeout 2 --max-time 2 \
+                http://localhost:8000/health > /dev/null; then
               echo "Server started successfully"
               break
             fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "Server exited before becoming healthy"
+              wait "$SERVER_PID"
+              exit 1
+            fi
             if [ "$i" -eq 30 ]; then
               echo "Server failed to start"
-              kill "$SERVER_PID"
               exit 1
             fi
             sleep 2
           done
 
           # Test health endpoint
-          curl -f http://localhost:8000/health
+          curl -f --connect-timeout 2 --max-time 30 http://localhost:8000/health
 
           # Test completion
-          curl -f http://localhost:8000/v1/completions \
+          curl -f --connect-timeout 2 --max-time 30 http://localhost:8000/v1/completions \
             -H "Content-Type: application/json" \
             -d '{
               "model": "Qwen/Qwen3-0.6B",
@@ -81,5 +89,4 @@ jobs:
               "max_tokens": 5
             }'
 
-          # Cleanup
-          kill "$SERVER_PID"
+          # The EXIT trap cleans up the server on both success and failure.
