@@ -97,7 +97,7 @@ def _sm70_prepare_smallq_decode_metadata_kernel(
         )
 
 
-def _sm70_prepare_smallq_decode_metadata(
+def sm70_prepare_smallq_decode_metadata(
     out_block_table: torch.Tensor,
     out_seq_lens: torch.Tensor,
     out_query_start_loc: torch.Tensor,
@@ -584,3 +584,9 @@ def prepare_dflash2_smallq_group_metadata(
         for builder_id, workspace_hint in zip(builder_ids, workspace_hints)
     }
     return prepared, descriptor
+
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {
+    "_sm70_prepare_smallq_decode_metadata": "sm70_prepare_smallq_decode_metadata"
+}

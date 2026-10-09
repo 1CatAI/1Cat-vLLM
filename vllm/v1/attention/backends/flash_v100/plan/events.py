@@ -67,3 +67,11 @@ class PrefillDebugEvent:
 
 
 prefill_debug = EventStream[PrefillDebugEvent]()
+
+
+class DiagnosticMessage(NamedTuple):
+    message: str
+    args: tuple[object, ...]
+
+
+diagnostic_messages = EventStream[DiagnosticMessage]()

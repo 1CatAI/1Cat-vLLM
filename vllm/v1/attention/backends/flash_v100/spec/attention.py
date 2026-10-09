@@ -9,10 +9,10 @@ from typing import Any
 
 import torch
 
-from vllm.logger import init_logger
+from vllm.logger import init_logger, log_once_seen, set_log_once_state
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100.spec import contracts, policy, tree_masks
+from vllm.v1.attention.backends.flash_v100.spec import prefill as prefix
 from vllm.v1.attention.backends.flash_v100.spec.attention_policy import (
     POLICY_FIELDS as POLICY_FIELDS,
 )
@@ -48,18 +48,27 @@ def unsupported(
 ) -> None:
     if not (policy.allow_triton_fallback or is_dflash_draft_attn):
         raise RuntimeError(message)
-    if policy.use_flash_v100 and not _state._warned_feature_fallback:
+    if policy.use_flash_v100 and not log_once_seen(
+        "flash_v100._warned_feature_fallback"
+    ):
         if is_dflash_draft_attn:
-            logger.warning(
+            logger.warning_once(
                 "FLASH_ATTN_V100 falling back to Triton for D-Flash "
                 "draft attention layer %s because the SM70 Flash-V100 "
                 "backend does not yet support this layer/config.",
                 layer_info.get("layer_name"),
+                scope="process",
+                key="flash_v100._warned_feature_fallback",
             )
         else:
-            logger.warning("%s", message)
-        _state._warned_feature_fallback = True
-    _routing._record_route(
+            logger.warning_once(
+                "%s",
+                message,
+                scope="process",
+                key="flash_v100._warned_feature_fallback",
+            )
+        set_log_once_state("flash_v100._warned_feature_fallback", True)
+    _routing.record_route(
         "dflash_draft_triton_fallback"
         if is_dflash_draft_attn
         else "unsupported_triton_fallback"
@@ -89,18 +98,18 @@ def record_capture_prefix() -> None:
     # graph. Bind directly to the non-causal paged-prefix
     # kernel; runtime updates its persistent sequence and
     # block-table buffers before every replay.
-    _routing._record_route(
+    _routing.record_route(
         _routing.ROUTE_SPECS["prefill_capture_dflash_noncausal_paged"].name
     )
 
 
 def record_capture_layout(attn_metadata: TritonAttentionMetadata) -> None:
     if getattr(attn_metadata, "ddtree_parent_ids", None) is None:
-        _routing._record_route(
+        _routing.record_route(
             _routing.ROUTE_SPECS["prefill_capture_smallq_no_ddtree_metadata"].name
         )
     else:
-        _routing._record_route(
+        _routing.record_route(
             _routing.ROUTE_SPECS["prefill_capture_smallq_ddtree_metadata"].name
         )
 
@@ -147,6 +156,10 @@ def prefill_dependencies(state):
     return {
         "tree_requires_branch": tree_masks.parent_metadata_requires_branch,
         "prefix_dump_enabled": policy.prefix_dump_enabled,
+        "log_noncausal": prefix.log_noncausal,
+        "is_draft_layer": prefix.is_draft_layer,
+        "noncausal_batch": prefix.noncausal_batch,
+        "reject_tree_anchor": prefix.reject_tree_anchor,
         "supports_bmhd": getattr(
             state, "_flash_prefill_paged_supports_dflash2_bmhd", False
         ),

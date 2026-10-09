@@ -14,15 +14,16 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_v100 import config as _config
-from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import debug_compare as _debug_compare
 from vllm.v1.attention.backends.flash_v100 import decode as _decode
 from vllm.v1.attention.backends.flash_v100 import dense_prefill as _dense_prefill
+from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import prefill as _prefill
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.backends.flash_v100 import verify as _verify
+from vllm.v1.attention.backends.flash_v100.plan import diagnostics as _debug
 from vllm.v1.attention.backends.flash_v100.spec import attention as _feature
+from vllm.v1.attention.backends.flash_v100.spec import verifier as _verify
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionImpl,
     TritonAttentionMetadata,
@@ -122,7 +123,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         attributes = vars(self)
         if "_spec_attention" not in attributes:
             attributes["_spec_attention"] = _feature.SpecAttentionState(
-                _ops._callable_accepts_keyword
+                _ops.callable_accepts_keyword
             )
         return attributes["_spec_attention"]
 
@@ -168,15 +169,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     def _contract_validator(self):
         return getattr(self, _feature.VALIDATION_METHOD)
 
-    def __init__(self, *args, **kwargs):
-        self.prefix_anchored_decode_window = kwargs.pop(
-            "prefix_anchored_decode_window", None
-        )
-        super().__init__(*args, **kwargs)
-        _routing._log_kv_dtype_contract(self.kv_cache_dtype)
-        self.kv_cache_dtype = _routing._normalize_flash_v100_kv_cache_dtype(
-            self.kv_cache_dtype
-        )
+    def _initialize_native_ops(self):
         (
             self.flash_attn_func,
             self.flash_attn_bhmd_func,
@@ -187,8 +180,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.flash_attn_prefill_paged_bhmd,
             self.flash_attn_prefill_paged_bfla,
             self.flash_attn_prefill_paged_splitkv,
-        ) = _ops._get_flash_ops()
-        self.flash_attn_grouped_verify_paged = _ops._get_flash_grouped_verify_op()
+        ) = _ops.get_flash_ops()
+        self.flash_attn_grouped_verify_paged = _ops.get_flash_grouped_verify_op()
         use_e4m3_fp32 = (
             _config.registered("VLLM_FLASH_V100_E4M3_GROUPED_FP32")
             and self.kv_codec is FP8_E4M3
@@ -214,9 +207,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             _ops._flash_attn_grouped_verify_max_query_tokens,
             _ops._flash_attn_grouped_verify_request_major_abi_version,
         )
-        self.fp8_e5m2_paged_kv_to_fp16 = _ops._get_fp8_e5m2_paged_kv_bridge_op()
+        self.fp8_e5m2_paged_kv_to_fp16 = _ops.get_fp8_e5m2_paged_kv_bridge_op()
         self.fp8_e4m3_paged_kv_to_fp16 = (
-            _ops._get_sm70_v37_e4m3_bridge_op() if self.kv_codec is FP8_E4M3 else None
+            _ops.get_sm70_v37_e4m3_bridge_op() if self.kv_codec is FP8_E4M3 else None
         )
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -235,17 +228,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "anchored_window",
             )
             if self.flash_attn_decode_paged is not None
-            and _ops._callable_accepts_keyword(self.flash_attn_decode_paged, name)
+            and _ops.callable_accepts_keyword(self.flash_attn_decode_paged, name)
         }
         self._flash_prefill_paged_supports_anchor = (
             self.flash_attn_prefill_paged is not None
-            and _ops._callable_accepts_keyword(
+            and _ops.callable_accepts_keyword(
                 self.flash_attn_prefill_paged, "anchor_lens"
             )
         )
         self.flash_attn_prefill_paged = self.spec_attention.configure_prefill(
             self.flash_attn_prefill_paged
         )
+
+    def _initialize_prefill_policy(self):
         paged_prefill_enable = _config.raw("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
         paged_prefill_disable = (
             _config.raw("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1"
@@ -329,6 +324,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.smallq_decode_max_model_len = int(
             _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")
         )
+
+    def _initialize_decode_policy(self):
         self.use_decode_dense_reference = (
             _config.raw("VLLM_FLASH_V100_DECODE_DENSE_REFERENCE", "0") == "1"
         )
@@ -383,6 +380,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self._compare_triton_out_calls = 0
         self.workspace = _decode.V100Workspace()
 
+    def __init__(self, *args, **kwargs):
+        self.prefix_anchored_decode_window = kwargs.pop(
+            "prefix_anchored_decode_window", None
+        )
+        super().__init__(*args, **kwargs)
+        _routing.log_kv_dtype_contract(self.kv_cache_dtype)
+        self.kv_cache_dtype = _routing.normalize_flash_v100_kv_cache_dtype(
+            self.kv_cache_dtype
+        )
+        self._initialize_native_ops()
+
+        self._initialize_prefill_policy()
+
+        self._initialize_decode_policy()
+
         if self.prefix_anchored_decode_window is not None:
             if (
                 self.prefix_anchored_decode_window <= 0
@@ -431,11 +443,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         self.config = _config.V100AttnConfig.take_legacy_attributes(vars(self))
 
-    _small_tensor_list = staticmethod(_debug_compare._small_tensor_list)
+    _small_tensor_list = staticmethod(_debug_compare.small_tensor_list)
 
     _layer_debug_info = staticmethod(_debug_compare._layer_debug_info)
 
-    _tensor_compare_stats = staticmethod(_debug_compare._tensor_compare_stats)
+    _tensor_compare_stats = staticmethod(_debug_compare.tensor_compare_stats)
 
     @property
     def kv_codec(self) -> KVCodec | None:
@@ -461,7 +473,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
-        supported_kv_dtype = not _routing._uses_fp8_kv_cache(
+        supported_kv_dtype = not _routing.uses_fp8_kv_cache(
             self.kv_cache_dtype
         ) or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
         return (
@@ -513,10 +525,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             compare_bhmd=self._maybe_compare_bhmd_out,
             compare_triton=self._maybe_compare_triton_output,
             triton_forward=super().forward,
-            profile_trace=_debug._sm70_profile_trace,
-            draft_debug_enabled=_debug._draft_graph_debug_enabled,
-            draft_debug_log=_debug._draft_graph_debug_log,
-            format_debug=_debug._format_tensor_debug,
+            profile_trace=_debug.sm70_profile_trace,
+            draft_debug_enabled=_debug.draft_graph_debug_enabled,
+            draft_debug_log=_debug.draft_graph_debug_log,
+            format_debug=_debug.format_tensor_debug,
             scalar_override=vars(self).get("_call_flash_attn_decode_paged"),
         )
         workspace = getattr(self, "workspace", None)
@@ -657,6 +669,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             **limits,
         )
         ops = _verify.VerificationOps(
+            parent_ids_cpu=_masks.parent_ids_cpu,
+            draft_debug_enabled=_debug.draft_graph_debug_enabled,
+            metadata_debug_log=_debug.graph_metadata_debug_log,
+            format_debug=_debug.format_tensor_debug,
             grouped=getattr(self, "flash_attn_grouped_verify_paged", None),
             fp16_grouped=getattr(self, "flash_attn_grouped_fp16_fp32_paged", None),
             e4m3_grouped=getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None),
@@ -677,6 +693,70 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self, attn_metadata: TritonAttentionMetadata
     ) -> tuple[torch.Tensor | None, int]:
         return self._new_decode_executor()._anchored_swa_params(attn_metadata)
+
+    def _observe_forward(
+        self,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+        is_prefill,
+        is_capturing,
+        layer_name,
+    ):
+        if _debug.draft_graph_debug_enabled():
+            _debug.draft_graph_debug_log(
+                "forward:enter",
+                "layer=%s is_prefill=%s is_capturing=%s max_query_len=%s "
+                "max_seq_len=%s num_actual_tokens=%s %s %s %s %s %s %s",
+                layer_name,
+                is_prefill,
+                is_capturing,
+                int(attn_metadata.max_query_len),
+                int(attn_metadata.max_seq_len),
+                int(attn_metadata.num_actual_tokens),
+                _debug.format_tensor_debug(query, "query"),
+                _debug.format_tensor_debug(output, "output"),
+                _debug.format_tensor_debug(
+                    getattr(attn_metadata, "query_start_loc", None),
+                    "attn_qsl",
+                ),
+                _debug.format_tensor_debug(
+                    getattr(attn_metadata, "seq_lens", None),
+                    "attn_seq",
+                ),
+                _debug.format_tensor_debug(
+                    getattr(attn_metadata, "block_table", None),
+                    "attn_bt",
+                ),
+                _debug.format_tensor_debug(
+                    getattr(attn_metadata, "smallq_decode_seq_lens", None),
+                    "smallq_seq",
+                ),
+            )
+        _debug.sm70_profile_trace(
+            "forward enter layer=%s q_shape=%s k_shape=%s v_shape=%s "
+            "kv_shape=%s is_prefill=%s is_capturing=%s max_query_len=%s "
+            "max_seq_len=%s num_actual_tokens=%s use_decode_scalar=%s "
+            "use_decode_paged_prefill=%s use_prefill_paged=%s "
+            "use_triton_prefill=%s",
+            layer_name,
+            tuple(query.shape),
+            tuple(key.shape),
+            tuple(value.shape),
+            tuple(kv_cache.shape) if hasattr(kv_cache, "shape") else None,
+            is_prefill,
+            is_capturing,
+            int(attn_metadata.max_query_len),
+            int(attn_metadata.max_seq_len),
+            int(attn_metadata.num_actual_tokens),
+            self.use_decode_scalar_paged,
+            self.use_decode_paged_prefill,
+            self.use_flash_v100_prefill_paged,
+            self.use_triton_prefill,
+        )
 
     def forward(
         self,
@@ -709,8 +789,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 and self.sinks is None
                 and abs(self.scale - 0.0625) <= 1.0e-8
             ):
-                _dense_prefill._profile_sm70_prefill_workspace(query, self.num_kv_heads)
-            _routing._record_route(
+                _dense_prefill.profile_sm70_prefill_workspace(query, self.num_kv_heads)
+            _routing.record_route(
                 _routing.ROUTE_SPECS["metadata_none_zero_output"].name
             )
             return output.fill_(0)
@@ -749,58 +829,18 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         assert output is not None
         is_prefill = attn_metadata.max_query_len > 1
-        is_capturing = _routing._is_cuda_graph_capturing(query)
+        is_capturing = _routing.is_cuda_graph_capturing(query)
         layer_name = self._layer_debug_info(layer).get("layer_name")
-        if _debug._draft_graph_debug_enabled():
-            _debug._draft_graph_debug_log(
-                "forward:enter",
-                "layer=%s is_prefill=%s is_capturing=%s max_query_len=%s "
-                "max_seq_len=%s num_actual_tokens=%s %s %s %s %s %s %s",
-                layer_name,
-                is_prefill,
-                is_capturing,
-                int(attn_metadata.max_query_len),
-                int(attn_metadata.max_seq_len),
-                int(attn_metadata.num_actual_tokens),
-                _debug._format_tensor_debug(query, "query"),
-                _debug._format_tensor_debug(output, "output"),
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "query_start_loc", None),
-                    "attn_qsl",
-                ),
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "seq_lens", None),
-                    "attn_seq",
-                ),
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "block_table", None),
-                    "attn_bt",
-                ),
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "smallq_decode_seq_lens", None),
-                    "smallq_seq",
-                ),
-            )
-        _debug._sm70_profile_trace(
-            "forward enter layer=%s q_shape=%s k_shape=%s v_shape=%s "
-            "kv_shape=%s is_prefill=%s is_capturing=%s max_query_len=%s "
-            "max_seq_len=%s num_actual_tokens=%s use_decode_scalar=%s "
-            "use_decode_paged_prefill=%s use_prefill_paged=%s "
-            "use_triton_prefill=%s",
-            layer_name,
-            tuple(query.shape),
-            tuple(key.shape),
-            tuple(value.shape),
-            tuple(kv_cache.shape) if hasattr(kv_cache, "shape") else None,
+        self._observe_forward(
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
             is_prefill,
             is_capturing,
-            int(attn_metadata.max_query_len),
-            int(attn_metadata.max_seq_len),
-            int(attn_metadata.num_actual_tokens),
-            self.use_decode_scalar_paged,
-            self.use_decode_paged_prefill,
-            self.use_flash_v100_prefill_paged,
-            self.use_triton_prefill,
+            layer_name,
         )
 
         if is_prefill:

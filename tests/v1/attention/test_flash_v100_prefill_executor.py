@@ -10,6 +10,7 @@ import torch
 
 from vllm.v1.attention.backends.flash_v100 import prefill_candidates as sequence
 from vllm.v1.attention.backends.flash_v100.config import V100AttnConfig
+from vllm.v1.attention.backends.flash_v100.spec import prefill as spec_prefill
 from vllm.v1.attention.backends.flash_v100.workspace import V100Workspace
 
 pytestmark = pytest.mark.cpu_test
@@ -277,6 +278,9 @@ def test_batch_candidates_with_independent_operators(monkeypatch, choice):
         small_query=complete("small"),
         allow_rows=lambda **kwargs: choice == "rows",
         decode_rows=rows,
+        is_draft_layer=spec_prefill.is_draft_layer,
+        noncausal_batch=spec_prefill.noncausal_batch,
+        reject_tree_anchor=spec_prefill.reject_tree_anchor,
         log_noncausal=lambda *args: None,
         log_small_query=lambda *args: None,
     )

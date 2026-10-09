@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm.logger import init_logger
@@ -27,7 +29,7 @@ _prefill_gather_dense_workspaces: dict[
 ] = {}
 
 
-def _split_paged_kv_cache(
+def split_paged_kv_cache(
     kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if isinstance(kv_cache, (list, tuple)):
@@ -56,7 +58,7 @@ def _split_paged_kv_cache(
     )
 
 
-def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
+def has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
     """Return True if any sequence has KV context before current query tokens."""
     query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
     seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
@@ -68,13 +70,13 @@ def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
     return not torch.equal(query_lens, attn_metadata.seq_lens)
 
 
-def _metadata_expects_more_query_tokens_than_available(
+def metadata_expects_more_query_tokens_than_available(
     attn_metadata: TritonAttentionMetadata,
     available_query_tokens: int,
 ) -> bool:
     """Return True when per-layer Q/K/V tensors are shorter than query metadata.
 
-    Hybrid Qwen3.5/3.6 routes can feed a full-attention layer only the live
+    Hybrid model routes can feed a full-attention layer only the live
     query-token subset while the batch-level metadata still describes the
     wider request span. That shape is not a dense raw-QKV prefill; it must use
     the prefix/live-token compatible path.
@@ -91,7 +93,7 @@ def _metadata_expects_more_query_tokens_than_available(
     return available_query_tokens < expected_query_tokens
 
 
-def _normalize_query_start_loc_for_available_tokens(
+def normalize_query_start_loc_for_available_tokens(
     query_start_loc: torch.Tensor,
     available_query_tokens: int,
 ) -> torch.Tensor:
@@ -141,7 +143,7 @@ def _normalize_query_start_loc_for_available_tokens(
     )
 
 
-def _extract_contiguous_kv_from_paged_cache(
+def extract_contiguous_kv_from_paged_cache(
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -155,9 +157,9 @@ def _extract_contiguous_kv_from_paged_cache(
     Uses the CUDA extension when available and falls back to a Python path.
     """
 
-    paged_kv_utils = _ops._get_paged_kv_utils()
+    paged_kv_utils = _ops.get_paged_kv_utils()
 
-    key_cache, value_cache = _split_paged_kv_cache(kv_cache)
+    key_cache, value_cache = split_paged_kv_cache(kv_cache)
 
     if paged_kv_utils is not None and key_cache.dtype != torch.uint8:
         if hasattr(paged_kv_utils, "paged_kv_to_contiguous"):
@@ -213,14 +215,14 @@ def _extract_contiguous_kv_from_paged_cache(
     return k_cont, v_cont
 
 
-def _dequantize_fp8_contiguous_kv(
+def dequantize_fp8_contiguous_kv(
     key: torch.Tensor,
     value: torch.Tensor,
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if not _routing._uses_fp8_kv_cache(kv_cache_dtype):
+    if not _routing.uses_fp8_kv_cache(kv_cache_dtype):
         return key, value
     codec = resolve_kv_codec(kv_cache_dtype)
     if codec is None or not codec.quantized:
@@ -255,7 +257,7 @@ def _contiguous_paged_start_block(
     contig_cache = getattr(attn_metadata, "flash_v100_contig_dense_cache", None)
     if contig_cache is None:
         contig_cache = {}
-        _metadata._as_flash_v100_metadata(
+        _metadata.as_flash_v100_metadata(
             attn_metadata
         ).flash_v100_contig_dense_cache = contig_cache
 
@@ -285,7 +287,7 @@ def _contiguous_paged_start_block(
     return start_block, num_blocks
 
 
-def _contiguous_paged_kv_view(
+def contiguous_paged_kv_view(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_table_row: torch.Tensor,
@@ -330,7 +332,7 @@ def _contiguous_paged_kv_view(
     )
 
 
-def _contiguous_paged_kv_bhmd(
+def contiguous_paged_kv_bhmd(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_table_row: torch.Tensor,
@@ -405,7 +407,7 @@ def _get_prefill_gather_dense_workspace(
     workspace = _prefill_gather_dense_workspaces.get(cache_key)
     if workspace is not None and workspace[0].shape[0] >= required_blocks:
         return workspace[0][:required_blocks], workspace[1][:required_blocks]
-    if _routing._is_cuda_graph_capturing(key_cache):
+    if _routing.is_cuda_graph_capturing(key_cache):
         return None
 
     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
@@ -439,7 +441,7 @@ def _get_prefill_gather_dense_workspace(
     return key_out[:required_blocks], value_out[:required_blocks]
 
 
-def _gather_paged_kv_to_exact_dense(
+def gather_paged_kv_to_exact_dense(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     block_table_row: torch.Tensor,
@@ -459,7 +461,7 @@ def _gather_paged_kv_to_exact_dense(
         return None
 
     block_size = int(key_cache.shape[1])
-    required_blocks = _masks._cdiv_int(seq_len, block_size)
+    required_blocks = _masks.cdiv_int(seq_len, block_size)
     if required_blocks > int(block_table_row.shape[0]):
         return None
     workspace = _get_prefill_gather_dense_workspace(
@@ -483,3 +485,38 @@ def _gather_paged_kv_to_exact_dense(
         1, seq_len, num_kv_heads, head_dim
     )
     return key_dense, value_dense
+
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {
+    "_gather_paged_kv_to_exact_dense": "gather_paged_kv_to_exact_dense",
+    "_contiguous_paged_kv_bhmd": "contiguous_paged_kv_bhmd",
+    "_dequantize_fp8_contiguous_kv": "dequantize_fp8_contiguous_kv",
+    "_extract_contiguous_kv_from_paged_cache": "extract_contiguous_kv_from_paged_cache",
+    "_metadata_expects_more_query_tokens_than_available": (
+        "metadata_expects_more_query_tokens_than_available"
+    ),
+    "_split_paged_kv_cache": "split_paged_kv_cache",
+    "_normalize_query_start_loc_for_available_tokens": (
+        "normalize_query_start_loc_for_available_tokens"
+    ),
+    "_contiguous_paged_kv_view": "contiguous_paged_kv_view",
+    "_has_prefix_context": "has_prefix_context",
+}
+
+
+if TYPE_CHECKING:
+    # Static compatibility only; runtime writes use live owner aliases.
+    _gather_paged_kv_to_exact_dense = gather_paged_kv_to_exact_dense
+    _contiguous_paged_kv_bhmd = contiguous_paged_kv_bhmd
+    _dequantize_fp8_contiguous_kv = dequantize_fp8_contiguous_kv
+    _extract_contiguous_kv_from_paged_cache = extract_contiguous_kv_from_paged_cache
+    _metadata_expects_more_query_tokens_than_available = (
+        metadata_expects_more_query_tokens_than_available
+    )
+    _split_paged_kv_cache = split_paged_kv_cache
+    _normalize_query_start_loc_for_available_tokens = (
+        normalize_query_start_loc_for_available_tokens
+    )
+    _contiguous_paged_kv_view = contiguous_paged_kv_view
+    _has_prefix_context = has_prefix_context

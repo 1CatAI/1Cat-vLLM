@@ -47,6 +47,13 @@ def test_dependency_and_coupling_ratchet():
         (FIXTURES / "flash_v100_dependency_baseline.json").read_text()
     )
     current = audit()
+    assert current["metrics"]["forward"] <= 150
+    assert current["metrics"]["largest_active_function"] <= 200
+    assert current["metrics"]["cross_module_private"] <= 30
+    assert not current["forbidden_edges"]
+    for name, ceiling in current["deferred_functions"].items():
+        assert current["functions"][name] <= ceiling
+
     for metric, value in current["metrics"].items():
         assert value <= baseline["metrics"][metric], (metric, value)
     assert {tuple(c) for c in current["cycles"]} <= {

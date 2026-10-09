@@ -58,6 +58,7 @@ def policy():
 
 def operators(native):
     return verify.VerificationOps(
+        draft_debug_enabled=lambda: False,
         grouped=native("legacy"),
         fp16_grouped=native("fp16"),
         e4m3_grouped=native("e4m3"),
