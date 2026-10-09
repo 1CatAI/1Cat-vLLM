@@ -21,12 +21,16 @@ def resolve_legacy_fields(
     reader=None,
 ) -> None:
     from vllm import envs
+    from vllm.envs_metadata import EnvVar
 
     for field in fields(policy):
         name = field.name
         if name not in aliases:
             continue
         legacy = aliases[name]
+        variable = envs.environment_variables.get(legacy)
+        if isinstance(variable, EnvVar):
+            variable.warn_if_deprecated()
         if getattr(policy, name) is not None:
             policy.sources.setdefault(name, "typed")
         else:

@@ -9,6 +9,7 @@ from pydantic import Field
 from vllm import envs
 from vllm.config.execution_policy import read_execution_legacy
 from vllm.config.utils import config
+from vllm.envs_metadata import EnvVar
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -199,13 +200,17 @@ class Sm70DFlash2Config:
             ) or name in os.environ:
                 explicit.append(field)
             if name in os.environ:
-                logger.warning_once(
-                    "%s is deprecated; use speculative_config.sm70_dflash2.%s. "
-                    "Explicit configuration takes precedence. The alias remains "
-                    "for one full released compatibility cycle.",
-                    name,
-                    field,
-                )
+                variable = envs.environment_variables[name]
+                if isinstance(variable, EnvVar) and variable.metadata.deprecated:
+                    variable.warn_if_deprecated()
+                else:
+                    logger.warning_once(
+                        "%s is deprecated; use speculative_config.sm70_dflash2.%s. "
+                        "Explicit configuration takes precedence. The alias remains "
+                        "for one full released compatibility cycle.",
+                        name,
+                        field,
+                    )
             if configured is None:
                 configured = (
                     bool(int(SM70_DFLASH2_VERIFIER_DEFAULTS[name]))
