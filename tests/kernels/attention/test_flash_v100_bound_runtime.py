@@ -23,7 +23,20 @@ def runtime():
 
 
 @pytest.mark.parametrize(
-    "raw", [None, "", "0", "1", "01", "true", " 6tail", "-8", "32"]
+    "raw",
+    [
+        None,
+        "",
+        "0",
+        "1",
+        "01",
+        "true",
+        " 6tail",
+        "-8",
+        "32",
+        "\u00a06",
+        "999999999999999999999999",
+    ],
 )
 def test_native_parser_projection_matches_python(raw):
     extension = interface.flash_attn_v100_cuda

@@ -350,8 +350,24 @@ def native_value(rule, raw, default=None):
         return raw is not None and raw != "0"
     if rule == "nonempty_ne0":
         return bool(raw) and raw[:1] != "0"
-    match = re.match(r"\s*([+-]?[0-9]+)", raw or "")
-    value = ctypes.c_int(int(match.group(1))).value if match else 0
+    match = re.match(r"[ \t\n\r\v\f]*([+-]?[0-9]+)", raw or "")
+    # Match the worker libc's atoi: ASCII whitespace, strtol saturation followed
+    # by an int conversion. Python int accepts a broader whitespace/size range.
+    limit = 1 << (8 * ctypes.sizeof(ctypes.c_long) - 1)
+    digits = match.group(1) if match else "0"
+    negative = digits.startswith("-")
+    digits = digits.lstrip("+-").lstrip("0") or "0"
+    parsed = int(digits) if len(digits) <= 19 else limit
+    parsed = min(limit - 1, max(-limit, -parsed if negative else parsed))
+    value = ctypes.c_int(parsed).value
+    if rule == "optional_atoi":
+        return None if raw is None else value
+    if rule == "score_block":
+        if raw is None:
+            return 0  # Use the translation unit's qualified block size.
+        valid = re.fullmatch(r"[ \t\n\r\v\f]*[+-]?[0-9]+", raw)
+        value = parsed if valid else -1
+        return value if 8192 <= value <= 131072 and value % 8192 == 0 else -1
     if rule == "positive_atoi":
         return default if raw is None else max(1, value)
     if rule == "warps":
@@ -489,6 +505,8 @@ class FlashV100Options(CapturedFlashOptions):
         default_factory=dict, init=False
     )
     """Independent package's parsed Python policy, projected from its owners."""
+    prefill_native_effective: tuple[int, ...] = Field(default=(), init=False)
+    """FA2 prefill ABI 1: immutable policy, with diagnostic projection."""
     cache_dtype: str = Field(default="auto", init=False)
     """Qualified storage format, used to exclude unused native format policy."""
 
@@ -499,6 +517,19 @@ class FlashV100Options(CapturedFlashOptions):
         diagnostics.resolve()
         graph.resolve()
         self.cache_dtype = cache_dtype
+        assert self.prefill_score_block_tokens is not None
+        assert self.prefill_serial_tail is not None
+        assert self.prefill_exact_tail is not None
+        assert self.prefill_direct_tail is not None
+        self.prefill_native_effective = (
+            int(self.prefill_qk_algorithm is not None),
+            self.prefill_qk_algorithm or 0,
+            self.prefill_score_block_tokens,
+            int(self.prefill_serial_tail),
+            int(self.prefill_exact_tail),
+            int(diagnostics.prefill_dump_tail),
+            int(self.prefill_direct_tail),
+        )
         inputs = {}
         scalar_alias = self.legacy_aliases["e4m3_scalar_fast"][0]
         inputs[scalar_alias] = self.legacy_inputs[scalar_alias]
@@ -552,6 +583,18 @@ class FlashV100Options(CapturedFlashOptions):
     def hash_values(self):
         fields = {}
         for field in self.bindings:
+            if field in (
+                "prefill_qk_algorithm",
+                "prefill_score_block_tokens",
+                "prefill_serial_tail",
+                "prefill_exact_tail",
+                "prefill_direct_tail",
+            ) and (
+                not self.fa2_d256_prefill
+                or not self.prefill_d256_gqa_arch_128k_experimental
+                or self.prefill_d256_gqa_v37
+            ):
+                continue
             if field == "share_decode_workspace":
                 continue
             if field.startswith("bfla_") and not self.bfla_prefill:
@@ -588,6 +631,17 @@ class FlashV100Options(CapturedFlashOptions):
             field: error for field, error in self.errors.items() if field in fields
         }
         return fields
+
+    prefill_qk_algorithm: int | None = None
+    """Optional 79T cuBLAS algorithm; legacy atoi parsing and enum preserved."""
+    prefill_score_block_tokens: int | None = None
+    """79T workspace block size; 0 uses the build default, -1 defers invalid env."""
+    prefill_serial_tail: bool | None = None
+    """Keep the serial-tail default and the exact legacy string comparison."""
+    prefill_exact_tail: bool | None = None
+    """Return-affecting exact-tail experiment; legacy presence enables it."""
+    prefill_direct_tail: bool | None = None
+    """Return-affecting direct-tail experiment; legacy presence enables it."""
 
     bfla_threshold: float | None = None
     """Retained VLLM_FLASH_V100_BFLA_THRESHOLD input."""
@@ -797,6 +851,23 @@ class FlashV100Options(CapturedFlashOptions):
     """Retained VLLM_FLASH_V100_XQA_STAGED_PV input."""
 
     bindings: ClassVar[dict[str, tuple[str, str, object]]] = {
+        "prefill_qk_algorithm": (
+            "PREFIX_QK_CUBLAS_ALGO_RUNTIME",
+            "native:optional_atoi",
+            None,
+        ),
+        "prefill_score_block_tokens": (
+            "VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS",
+            "native:score_block",
+            None,
+        ),
+        "prefill_serial_tail": (
+            "PREFIX_TORCH_SERIAL_TAIL",
+            "native:exact_ne0_on",
+            None,
+        ),
+        "prefill_exact_tail": ("PREFIX_TORCH_EXACT_TAIL", "native:present", None),
+        "prefill_direct_tail": ("PREFIX_TORCH_DIRECT_TAIL", "native:present", None),
         "tail_cudagraphs": ("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "registered", None),
         "scalar_tail_manifest": (
             "VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST",
@@ -1219,6 +1290,9 @@ class FlashV100Options(CapturedFlashOptions):
 
 @config
 class FlashV100Diagnostics(CapturedFlashOptions):
+    prefill_dump_tail: bool | None = None
+    """Retain the native 79T tail observation points and output format."""
+
     legacy_aliases: ClassVar[dict[str, tuple[str, ...]]] = {
         "route_summary": ("VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY",),
     }
@@ -1287,6 +1361,7 @@ class FlashV100Diagnostics(CapturedFlashOptions):
     """Retained VLLM_FLASH_V100_XQA_ALIGNED_PADDED_SMEM_TRACE input."""
 
     bindings: ClassVar[dict[str, tuple[str, str, object]]] = {
+        "prefill_dump_tail": ("PREFIX_TORCH_DUMP_TAIL", "native:present", None),
         "trace_decode_active": ("VLLM_FLASH_V100_TRACE_DECODE_ACTIVE", "eq1", "0"),
         "route_summary": ("VLLM_FLASH_V100_ROUTE_SUMMARY", "eq1", "0"),
         "compare_bhmd_out_dir": ("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR", "raw", None),
@@ -1406,6 +1481,12 @@ class FlashV100Policy(ExecutionPolicy):
                 )
             ],
             "package_policy": dict(options.python_policy),
+            "prefill_native": {
+                "abi": 1,
+                "values": options.prefill_native_effective,
+                "resources": "worker runtime_resources.sm70_prefill",
+                "shared_resource": "physical-device execution gate for kernel globals",
+            },
             "resources": "worker runtime_resources.flash_v100",
         }
 

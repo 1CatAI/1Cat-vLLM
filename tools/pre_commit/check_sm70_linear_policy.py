@@ -139,7 +139,7 @@ for _class in ast.parse((_CONFIG_ROOT / "flash_v100.py").read_text()).body:
                 for node in ast.walk(_field.value)
                 if isinstance(node, ast.Constant)
                 and isinstance(node.value, str)
-                and node.value.startswith("VLLM_")
+                and node.value.startswith(("VLLM_", "PREFIX_"))
             )
 
 

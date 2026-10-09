@@ -85,3 +85,16 @@ def test_diagnostics_cannot_reparse_initialized_filters(tmp_path):
         assert violations(path)
     path.write_text('value = diagnostics.channels["gdn_graph"].policy.directory\n')
     assert not violations(path)
+
+
+def test_prefill_prefix_alias_is_rejected_in_execution():
+    import ast
+    from pathlib import Path
+
+    from tools.pre_commit.check_sm70_linear_policy import runtime_policy_reads
+
+    errors = runtime_policy_reads(
+        Path("vllm/v1/attention/ops/example.py"),
+        ast.parse('def forward():\n    return os.getenv("PREFIX_TORCH_EXACT_TAIL")'),
+    )
+    assert errors and "PREFIX_TORCH_EXACT_TAIL" in errors[0]

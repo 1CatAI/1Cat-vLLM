@@ -15,7 +15,9 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100.runtime import (
     bind_attention_operation,
+    bind_prefill_operation,
     prepare_attention_runtime,
+    prepare_prefill_runtime,
 )
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
@@ -131,6 +133,14 @@ def get_flash_ops():
             _flash_attn_prefill_paged_splitkv = None
     if _flash_attn_func is not None:
         prepare_attention_runtime()
+        if (
+            _config.options().value("fa2_d256_prefill")
+            and _config.options().value("prefill_d256_gqa_arch_128k_experimental")
+            and not _config.options().value("prefill_d256_gqa_v37")
+        ):
+            get_sm70_splitd_d256_ops()
+            if _sm70_gqa_has_fp32_accumulation():
+                prepare_prefill_runtime(torch.ops._vllm_fa2_C)
     return tuple(
         bind_attention_operation(operation)
         for operation in (
@@ -271,7 +281,8 @@ def get_sm70_d256_gqa_architecture_op():
     use_v37 = _config.options().value("prefill_d256_gqa_v37")
     op_name = "sm70_d256_gqa_v37_fwd" if use_v37 else "sm70_d256_gqa_architecture_fwd"
     if op_name in _sm70_gqa_capabilities:
-        return _sm70_gqa_capabilities[op_name]
+        operation = _sm70_gqa_capabilities[op_name]
+        return operation if use_v37 else bind_prefill_operation(operation, 8000)
     operation = None
     try:
         if not hasattr(torch.ops._vllm_fa2_C, op_name):
@@ -295,7 +306,7 @@ def get_sm70_d256_gqa_architecture_op():
                 exc,
             )
     _sm70_gqa_capabilities[op_name] = operation
-    return operation
+    return operation if use_v37 else bind_prefill_operation(operation, 8000)
 
 
 def get_sm70_d256_gqa_architecture_q8192_op():
@@ -303,7 +314,7 @@ def get_sm70_d256_gqa_architecture_q8192_op():
     global _sm70_d256_gqa_architecture_q8192_op
     global _sm70_d256_gqa_architecture_q8192_op_checked
     if _sm70_d256_gqa_architecture_q8192_op_checked:
-        return _sm70_d256_gqa_architecture_q8192_op
+        return bind_prefill_operation(_sm70_d256_gqa_architecture_q8192_op, 8192)
 
     _sm70_d256_gqa_architecture_q8192_op_checked = True
     op_name = "sm70_d256_gqa_architecture_q8192_fwd"
@@ -320,7 +331,7 @@ def get_sm70_d256_gqa_architecture_q8192_op():
         )
     except (AttributeError, ImportError, RuntimeError):
         _sm70_d256_gqa_architecture_q8192_op = None
-    return _sm70_d256_gqa_architecture_q8192_op
+    return bind_prefill_operation(_sm70_d256_gqa_architecture_q8192_op, 8192)
 
 
 def get_sm70_v37_e4m3_bridge_op():

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "shared_workspace.h"
+#if defined(PREFIX_TORCH_EXTENSION)
+  #include "runtime_owner.h"
+#endif
 #include <cstring>
 
 /***************************************************************************************************
@@ -1967,11 +1970,20 @@ struct CublasQKLauncher {
   #else
     cublasGemmAlgo_t qk_algorithm = CUBLAS_GEMM_ALGO9_TENSOR_OP;
   #endif
+  #if defined(PREFIX_TORCH_EXTENSION)
+    if (onecat_sm70_prefill::policy_value(
+            onecat_sm70_prefill::PolicyField::QkOverride)) {
+      qk_algorithm =
+          static_cast<cublasGemmAlgo_t>(onecat_sm70_prefill::policy_value(
+              onecat_sm70_prefill::PolicyField::QkAlgorithm));
+    }
+  #else
     if (char const* runtime_algorithm =
             std::getenv("PREFIX_QK_CUBLAS_ALGO_RUNTIME")) {
       qk_algorithm =
           static_cast<cublasGemmAlgo_t>(std::atoi(runtime_algorithm));
     }
+  #endif
   #if defined(PREFIX_QK_CUBLAS_FP32_ACCUM)
     #if defined(PREFIX_QK_LOG2_SCORES)
     float alpha = 0.0625f * 1.4426950408889634f;
@@ -5863,21 +5875,19 @@ extern "C" int64_t onecat_sm70_q8000_accumulation_bits() {
 
 struct Sm70GqaScoreWorkspace {
   at::Tensor scores;
-  cudaEvent_t completion = nullptr;
-  bool completion_recorded = false;
-  std::mutex launch_mutex;
+  std::shared_ptr<onecat_sm70_prefill::ExecutionGate> gate;
+  cudaEvent_t& completion;
+  bool& completion_recorded;
+  std::mutex& launch_mutex;
 
   Sm70GqaScoreWorkspace(const at::Tensor& q, int rows, int block_n)
-      : scores(at::empty({rows, block_n}, q.options())) {
-    C10_CUDA_CHECK(
-        cudaEventCreateWithFlags(&completion, cudaEventDisableTiming));
-  }
+      : scores(at::empty({rows, block_n}, q.options())),
+        gate(onecat_sm70_prefill::execution_gate(q.get_device())),
+        completion(gate->completion),
+        completion_recorded(gate->completion_recorded),
+        launch_mutex(gate->mutex) {}
 
-  ~Sm70GqaScoreWorkspace() {
-    if (completion != nullptr) {
-      cudaEventDestroy(completion);
-    }
-  }
+  ~Sm70GqaScoreWorkspace() = default;
 };
 
 using Sm70GqaScoreWorkspacePtr = std::shared_ptr<Sm70GqaScoreWorkspace>;
@@ -5894,6 +5904,14 @@ std::map<int, Sm70GqaScoreWorkspacePtr>& sm70_gqa_score_cache() {
 
 Sm70GqaScoreWorkspacePtr get_sm70_gqa_score_workspace(const at::Tensor& q,
                                                       int rows, int block_n) {
+  if (auto* owner = onecat_sm70_prefill::current_owner()) {
+    constexpr auto slot = PREFIX_TORCH_QUERY_TOKENS == 8000
+                              ? onecat_sm70_prefill::CacheSlot::Q8000Score
+                              : onecat_sm70_prefill::CacheSlot::Q8192Score;
+    return owner->workspace<Sm70GqaScoreWorkspace>(slot, q.get_device(), [&] {
+      return std::make_shared<Sm70GqaScoreWorkspace>(q, rows, block_n);
+    });
+  }
   std::lock_guard<std::mutex> lock(sm70_gqa_score_cache_mutex());
   int device = q.get_device();
   auto& cache = sm70_gqa_score_cache();
@@ -5905,6 +5923,12 @@ Sm70GqaScoreWorkspacePtr get_sm70_gqa_score_workspace(const at::Tensor& q,
 }
 
 Sm70GqaScoreWorkspacePtr find_sm70_gqa_score_workspace(int device) {
+  if (auto* owner = onecat_sm70_prefill::current_owner()) {
+    constexpr auto slot = PREFIX_TORCH_QUERY_TOKENS == 8000
+                              ? onecat_sm70_prefill::CacheSlot::Q8000Score
+                              : onecat_sm70_prefill::CacheSlot::Q8192Score;
+    return owner->find<Sm70GqaScoreWorkspace>(slot, device);
+  }
   std::lock_guard<std::mutex> lock(sm70_gqa_score_cache_mutex());
   auto& cache = sm70_gqa_score_cache();
   auto found = cache.find(device);
@@ -6163,9 +6187,8 @@ struct Sm70GqaHalf2Workspace {
     size_t total_bytes = 0;
     C10_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
     size_t tail_score_bytes = kTailScoreElements * sizeof(ScoreElement);
-    const char* serial_tail = std::getenv("PREFIX_TORCH_SERIAL_TAIL");
-    bool force_serial_tail =
-        serial_tail == nullptr || std::strcmp(serial_tail, "0") != 0;
+    bool force_serial_tail = onecat_sm70_prefill::policy_value(
+        onecat_sm70_prefill::PolicyField::SerialTail);
     concurrent_tail_scores =
         !force_serial_tail &&
         free_bytes >= tail_score_bytes + kTailAllocationHeadroom;
@@ -6214,6 +6237,14 @@ std::map<int, Sm70GqaHalf2WorkspacePtr>& sm70_gqa_half2_cache() {
 }
 
 Sm70GqaHalf2WorkspacePtr get_sm70_gqa_half2_workspace(const at::Tensor& q) {
+  if (auto* owner = onecat_sm70_prefill::current_owner()) {
+    constexpr auto slot = PREFIX_TORCH_QUERY_TOKENS == 8000
+                              ? onecat_sm70_prefill::CacheSlot::Q8000Half2
+                              : onecat_sm70_prefill::CacheSlot::Q8192Half2;
+    return owner->workspace<Sm70GqaHalf2Workspace>(slot, q.get_device(), [&] {
+      return std::make_shared<Sm70GqaHalf2Workspace>(q);
+    });
+  }
   std::lock_guard<std::mutex> lock(sm70_gqa_half2_cache_mutex());
   auto& workspace = sm70_gqa_half2_cache()[q.get_device()];
   if (!workspace) {
@@ -6235,9 +6266,12 @@ at::Tensor sm70_d256_gqa_half2_family_fwd(const at::Tensor& q,
   cudaStream_t caller_stream = at::cuda::getCurrentCUDAStream();
   cudaStream_t prefix_stream = workspace->prefix_stream;
   cudaStream_t tail_stream = workspace->tail_stream;
-  bool exact_tail_debug = std::getenv("PREFIX_TORCH_EXACT_TAIL") != nullptr;
-  bool dump_tail_debug = std::getenv("PREFIX_TORCH_DUMP_TAIL") != nullptr;
-  bool direct_tail_debug = std::getenv("PREFIX_TORCH_DIRECT_TAIL") != nullptr;
+  bool exact_tail_debug = onecat_sm70_prefill::policy_value(
+      onecat_sm70_prefill::PolicyField::ExactTail);
+  bool dump_tail_debug = onecat_sm70_prefill::policy_value(
+      onecat_sm70_prefill::PolicyField::DumpTail);
+  bool direct_tail_debug = onecat_sm70_prefill::policy_value(
+      onecat_sm70_prefill::PolicyField::DirectTail);
   bool concurrent_tail_scores = workspace->concurrent_tail_scores;
 
   auto* query = reinterpret_cast<Element*>(q.data_ptr<at::Half>());

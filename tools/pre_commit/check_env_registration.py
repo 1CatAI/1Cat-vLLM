@@ -42,8 +42,9 @@ def native_reads(content: str) -> list[tuple[str, int]]:
         return re.sub(r"[^\n]", " ", token) if token.startswith(("//", "/*")) else token
 
     source = tokens.sub(mask_comments, content)
-    key_pattern = r"(?:VLLM_|TM_|FLASH_QLA_)[A-Z0-9_]+"
+    key_pattern = r"(?:VLLM_|TM_|FLASH_QLA_|PREFIX_)[A-Z0-9_]+"
     aliases = list(re.finditer(r'\b(\w+)\s*=\s*"(' + key_pattern + r')"', source))
+    arrays = list(re.finditer(r"\b(\w+)\s*\[\s*\]\s*=\s*\{([^}]+)\}", source))
     calls = re.finditer(
         r'\b(\w+)\s*(?:<[^>\n]*>)?\s*\(\s*(?:"(' + key_pattern + r')"|(\w+)\b)',
         source,
@@ -62,8 +63,25 @@ def native_reads(content: str) -> list[tuple[str, int]]:
                 ),
                 None,
             )
+        line = source.count("\n", 0, call.start()) + 1
         if name:
-            reads.append((name, source.count("\n", 0, call.start()) + 1))
+            reads.append((name, line))
+        elif call[3] is not None:
+            array = next(
+                (
+                    item
+                    for item in reversed(arrays)
+                    if item[1] == call[3] and item.start() < call.start()
+                ),
+                None,
+            )
+            if array is not None:
+                reads.extend(
+                    (key, line)
+                    for key in dict.fromkeys(
+                        re.findall(r'"(' + key_pattern + r')"', array[2])
+                    )
+                )
     return reads
 
 
