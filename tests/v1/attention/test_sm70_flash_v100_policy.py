@@ -1000,6 +1000,8 @@ def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch, v37):
     monkeypatch.setattr(flash_v100, "_sm70_d256_gqa_architecture_op", None)
 
     assert flash_v100._get_sm70_d256_gqa_architecture_op() is architecture
+    monkeypatch.setattr(flash_v100, "_sm70_d256_gqa_architecture_op", architecture)
+    assert flash_v100._get_sm70_d256_gqa_architecture_op() is architecture
 
 
 @pytest.mark.parametrize("bits", [None, 16, 32])
@@ -1022,6 +1024,8 @@ def test_sm70_architecture_rejects_stale_accumulation(monkeypatch, bits, q8192):
     monkeypatch.setattr(flash_v100, name, None)
     monkeypatch.setattr(flash_v100, name + "_checked", False)
     loader = getattr(flash_v100, "_get" + name)
+    assert loader() is (architecture if bits == 32 else None)
+    monkeypatch.setattr(flash_v100, name, architecture if bits == 32 else None)
     assert loader() is (architecture if bits == 32 else None)
 
 
@@ -1480,7 +1484,6 @@ def test_flash_v100_prefill_live_token_mismatch_uses_prefix_path(monkeypatch):
     impl._flash_v100_prefill = fail_dense  # type: ignore[method-assign]
     impl._flash_v100_prefill_with_prefix = hit_prefix  # type: ignore[method-assign]
     impl._maybe_compare_triton_output = lambda *args, **kwargs: None  # type: ignore[method-assign]
-    impl._reset_decode_cache = lambda: None  # type: ignore[method-assign]
 
     query = torch.zeros((1, 4, 256), dtype=torch.float16)
     key = torch.zeros((1, 1, 256), dtype=torch.float16)

@@ -10,17 +10,17 @@ from functools import partial
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import dense_prefill as _dense_prefill
 from vllm.v1.attention.backends.flash_v100 import impl as _impl
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
-from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import state as _state
+from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -342,7 +342,7 @@ def _should_use_prefill_gather_dense(
 ) -> bool:
     graph_capture = _routing._is_cuda_graph_capturing(key_cache)
     q8192_family = (
-        not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+        not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
         and _dense_prefill._SM70_79T_CORE_QUERY_LEN
         <= q_len
         <= _dense_prefill._SM70_79T_MAX_QUERY_LEN
@@ -399,7 +399,7 @@ def _prefill_prefix_decode_rows_allowed(
     window_size: tuple[int, int],
 ) -> bool:
     return (
-        envs.VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS
+        _config.registered("VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS")
         and causal
         and anchor_lens is None
         and num_seqs > 1
@@ -421,7 +421,7 @@ def _run_mixed_rows_grouped_e4m3(
     value_cache: torch.Tensor,
     attn_metadata: TritonAttentionMetadata,
     out_view: torch.Tensor,
-    plan: _metadata._MixedDecodeRowsPlan,
+    plan: _workspace.MixedDecodeRowsPlan,
 ) -> bool:
     """Run the resident rows of a mixed batch on the grouped E4M3 operator.
 
@@ -438,7 +438,7 @@ def _run_mixed_rows_grouped_e4m3(
         return False
     table = plan.group_table(attn_metadata.block_table)
     lengths = plan.group_lengths(attn_metadata.seq_lens)
-    total_rows = plan.num_groups * _metadata._MIXED_ROWS_GROUP
+    total_rows = plan.num_groups * _workspace.MIXED_ROWS_GROUP
     q_pad = query.new_zeros((total_rows, query.shape[1], query.shape[2]))
     out_pad = torch.empty_like(q_pad)
     chunks = [
@@ -446,7 +446,7 @@ def _run_mixed_rows_grouped_e4m3(
         for g0 in range(0, plan.num_groups, MAX_GROUPS_PER_CALL)
     ]
     for g0, g1 in chunks:
-        r0, r1 = g0 * _metadata._MIXED_ROWS_GROUP, g1 * _metadata._MIXED_ROWS_GROUP
+        r0, r1 = g0 * _workspace.MIXED_ROWS_GROUP, g1 * _workspace.MIXED_ROWS_GROUP
         if not grouped_e4m3_fp32_groups_allowed(
             self,
             q_pad[r0:r1],
@@ -462,7 +462,7 @@ def _run_mixed_rows_grouped_e4m3(
     k_scale = float(layer._k_scale_float)
     v_scale = float(layer._v_scale_float)
     for g0, g1 in chunks:
-        r0, r1 = g0 * _metadata._MIXED_ROWS_GROUP, g1 * _metadata._MIXED_ROWS_GROUP
+        r0, r1 = g0 * _workspace.MIXED_ROWS_GROUP, g1 * _workspace.MIXED_ROWS_GROUP
         # Row lengths are authoritative: padding rows have length zero and
         # produce zero output, so no row can read an unwritten KV entry.
         grouped_op(
@@ -523,7 +523,7 @@ def _run_prefill_prefix_decode_rows(
     other layouts use XQA or the scalar decoder. Returns the row indices
     consumed here; the caller's per-sequence loop skips them.
     """
-    plan = _metadata._mixed_decode_rows_plan(
+    plan = _workspace.mixed_decode_rows_plan(
         attn_metadata,
         query_start_loc,
         seq_lens,
@@ -680,7 +680,7 @@ def _run_prefill_paged_call(
     block_size: int,
     fn: Callable[[], torch.Tensor],
 ) -> torch.Tensor:
-    if not envs.VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE:
+    if not _config.registered("VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE"):
         return fn()
 
     start_event = torch.cuda.Event(enable_timing=True)
@@ -759,7 +759,7 @@ def _flash_v100_prefill_with_prefix(
     block_size = key_cache.shape[1]
     num_kv_heads = key_cache.shape[2]
     head_dim = key_cache.shape[3]
-    debug_compare = os.getenv("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0") == "1"
+    debug_compare = _config.raw("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0") == "1"
     dflash_dump = (
         _debug._dflash_prefix_dump_enabled()
         and not _state._logged_dflash_prefix_dump
@@ -979,7 +979,7 @@ def _flash_v100_prefill_with_prefix(
             fa2_route = None
             if (
                 bfla_block_mask is None
-                and envs.VLLM_FLASH_V100_FA2_D256_PREFILL
+                and _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL")
                 and key_cache.dtype == torch.float16
                 and value_cache.dtype == torch.float16
                 and q_len >= 1024
@@ -1155,9 +1155,9 @@ def _flash_v100_prefill_with_prefix(
                         self.prefill_bfla_min_q,
                         self.prefill_bfla_min_kv,
                         self.prefill_bfla_mask_block_n,
-                        envs.VLLM_FLASH_V100_BFLA_KEEP_MASS,
-                        envs.VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS,
-                        envs.VLLM_FLASH_V100_BFLA_POOL,
+                        _config.registered("VLLM_FLASH_V100_BFLA_KEEP_MASS"),
+                        _config.registered("VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS"),
+                        _config.registered("VLLM_FLASH_V100_BFLA_POOL"),
                     )
                     _state._logged_prefill_prefix_bfla = True
                 _routing._record_route(_routing.ROUTE_SPECS["prefill_prefix_bfla"].name)
@@ -1244,7 +1244,7 @@ def _flash_v100_prefill_with_prefix(
                     _state._logged_prefill_prefix_contig_dense = True
                 k_dense, v_dense = contig_dense_kv
                 fa2_out = None
-                if envs.VLLM_FLASH_V100_FA2_D256_PREFILL:
+                if _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL"):
                     cu_q, cu_k = _dense_prefill._uniform_cu_seqlens(
                         q_seq,
                         batch_size=1,
