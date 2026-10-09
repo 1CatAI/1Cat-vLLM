@@ -67,6 +67,32 @@ join. Eight chained calls took 0.6337/0.6346 ms for IQ3_S,
 (control/candidate). Outputs were identical. The later contention cancels
 the router's isolated gain, so this scheduling change is not included.
 
+### Router dependency-chain follow-up
+
+The installed M5 projection uses 64 single-warp CTAs. Its fully unrolled
+SM70 binary contains 640 HMMA step instructions, 160 vector global loads,
+32 shuffles and 24 FP32 adds per CTA, with no local spills. Static instruction
+counts are not runtime counters, but they explain why a byte-only estimate
+misses a long per-CTA dependency chain and a narrow grid.
+
+A separate research candidate assigns 32 expert rows and 160 K elements
+to each of 256 producers. The MMA quad dimension handles different expert
+rows rather than duplicating one partition's work. Total MMA work remains
+unchanged. A second kernel merges FP32 partials, rounds logits to FP16 and
+selects the ten experts. There is no global polling or additional launch
+relative to projection followed by selection. The producer compiles to
+44 registers without spills; the reducer/selector uses 32 registers without
+spills. Reassociated FP32 sums require numerical and model checks.
+
+An independent full-K SIMD reference follows the scheduling idea in
+[SGLang's router implementation](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/moe/router.py):
+expand the K dimension in one parallel load/reduction instead of repeatedly
+waiting on a narrow load loop. This increases issued weight traffic across
+query rows, so its latency must be measured with rotating weights and the
+shared-expert branch present. SM70 does not use its optional dependent-launch
+mechanism. Both follow-up candidates are research-only, pending GPU results;
+neither is dispatched by the model.
+
 ## Validation and admission
 
 The packaged scorer must pass causal masks, invalid pages, ties, sliced
