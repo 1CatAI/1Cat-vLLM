@@ -38,7 +38,7 @@ and evidence here instead of silently dropping old paths from the ledger.
 | Communicator → collective selection → native op; HC composition | Current peer topology, TP, shape/dtype and native availability. TP8 hardware evidence is not implied by TP4 tests. | C4b communicator retains IPC registration, buffers and destruction; provider owns capabilities, model adapter owns HC composition. Existing collective fallback retained. Fusion pass consumes capabilities. |
 | Scheduler and DDTree consumers | Existing generic Mamba alignment/retention rules stay in scheduler. Tree scheduling/verification is deferred by explicit scope. | No new scheduler framework. Deferred paths remain reachable and separately listed, not presented as eliminated debt. |
 
-All parameter values are resolved at their owner's initialization. Typed values
+Migrated execution parameters resolve at their owner's initialization. Typed values
 win over compatibility input. Existing legacy-to-legacy precedence remains
 binding: explicit `VLLM_SM70_DEBUG` overrides the old MTP profile flag, including
 an empty channel list. Original integer parsing, errors and interval clamping
@@ -56,7 +56,7 @@ diagnostics and warmup-only selection do not.
 | C2b | GDN metadata and state preparation/commit | Merged as #1135 (`ad19d7ad1166`) |
 | C3 | Ordered defaults, model qualification and engine-local effective values | Merged as #1137 (`51c0f97201a7`) |
 | C4a | Shared embedding, LM-head, norm and linear providers | Merged as #1139 (`c73eb2d1d100`) |
-| C4b | Graph/communication/fusion boundaries and final explanation report | Pending |
+| C4b | Graph/communication/fusion boundaries and final explanation report | Delivered in #1140; acceptance below |
 
 Each PR is based on merged main and is reviewed and merged before the next
 PR is published. Existing experiments remain available; default-off alone does not imply
@@ -769,22 +769,100 @@ observations during graph capture are not described as replay counts or as a
 GPU kernel timing trace. Typed policies serialize with the engine. Runtime plans,
 IPC pointers, buffers and trace sets stay in the worker resource owner.
 
-### C4b verification in progress
+### C4b verification
 
 The affected local suite passed 191 cases with five hardware skips. Follow-up
 layer/configuration coverage passed 66 cases, and provider/trace/guard/graph
 coverage passed 82 cases (overlapping subsets, not additive unique totals).
-The CUDA backend-priority test requires the native extension and is assigned to
-54633. The native CUDA kernel bodies compare identically for all 19 kernels in
+Final hash/report selections passed 63 and 84 cases; the cold-import/native-policy
+selection passed 11, and HC consumer coverage passed 77. These selections also
+overlap. Pre-commit, layering and Python 3.13 typing passed. The native CUDA
+kernel bodies compare identically for all 19 kernels in
 `custom_all_reduce.cuh` and `custom_all_reduce.cu` after removing whitespace and
 comments. Selection inputs and per-owner diagnostic flags are the changed native
 host code.
 
-The C4b normal CMake `_C` build and TP2/TP4 operator A/B are recorded under
-`/home/ymzx/arch-ws/phase-c4b-20261009` on 54633. The GPU job waits for the shared
-ownership lock; no result is claimed until that job completes. Final paired
-GPU/host/allocation results and extension provenance will replace this pending
-paragraph before merge. TP8 remains a contract-only test on this four-V100 host.
+The first GPU candidate exposed a cold-start cycle: platform discovery imported
+configuration before `current_platform` had finished initialization. The policy
+import now occurs when backend priorities are requested. A fresh subprocess
+regression reproduces this ordering on CPU CI without creating a CUDA context.
+The repaired candidate passed **7 tests** on 54633: the same two TP4 correctness
+tests passed on baseline, two native-owner construction orders exercise deferred
+errors and changed-input graph replay, and three backend-priority/cache tests
+cover simulated platform choices. Failed candidate-v1 is retained, not counted
+as passing. The initial build also lacked unrelated CMake dependency sources;
+the complete-source build-v2 succeeded.
+
+Two older A3 fixture failures reproduce on the unchanged C4a baseline (a frozen
+AST helper expectation and a CPU Triton stub without `.run`); they are not C4b
+passes. The Ray-based distributed integration module cannot collect in the local
+environment without Ray. Its dtype fixture is updated for the initialized
+capability owner, while the focused dispatch suite and TP2/TP4 GPU operators
+provide this batch's coverage. No full Ray or model suite is claimed.
+
+The normal CMake `_C` artifact has SHA256
+`46d5abe030c305419894cb6954b82064ab3bf6423b3a99e5c3705feac5951954`.
+All six changed native source files match the candidate byte-for-byte. Fresh
+process loading and `/proc/self/maps` confirm the packaged extension and standard
+Torch/CUDA/system dependencies, without preload or private library overrides.
+The environment is Torch 2.10.0+cu128, CUDA 12.8, driver 580.173.02 and four
+NVLink-connected V100-SXM2-32GB GPUs. TP8 remains contract-only.
+
+Raw evidence is retained under the task-owned `phase-c4b-20261009/artifacts`
+directory on 54633: baseline-v1 and candidate-v2 JUnit, the failed candidate-v1
+log, native dependency/loading records, and per-round/per-rank benchmark records.
+The frozen source lanes, benchmark harness and launch scripts are in its parent
+directory. Source inventory, source parity, CPU tests and review logs are also
+retained locally in `/home/ymzx/arch-ws/tmp/phase-c4b`.
+
+Three paired process rounds use identical seeds, inputs, TP membership and graph
+state. Each replay contains 20 calls. CUDA events time 500 captured calls; eager
+host calls and host replay enqueue time are measured separately. Each table
+entry is the median of the slowest rank in each round. Replay host time is per
+20-call graph, not per operator or end-to-end latency. Reduction/norm inputs are
+FP16; residuals are FP32. Top-one uses FP32 score/token pairs with equal scores.
+Long-norm and sum2 are explicitly admitted experiments, not changed defaults.
+
+| TP | Operator / M / width | GPU old → new µs | Eager host old → new µs | Replay host old → new µs |
+|---|---|---:|---:|---:|
+| 2 | norm / 1 / 5120 | 15.856 → 15.968 | 53.593 → 43.806 | 7.343 → 7.515 |
+| 2 | norm / 8 / 5120 | 18.956 → 18.942 | 53.533 → 43.528 | 7.812 → 7.411 |
+| 2 | reduce / 1 / 5120 | 8.661 → 8.626 | 40.652 → 28.792 | 8.074 → 8.430 |
+| 2 | reduce / 1 / 262136 | 22.315 → 22.319 | 41.040 → 29.425 | 8.198 → 7.928 |
+| 2 | reduce / 1 / 262144 | 22.340 → 22.319 | 45.498 → 35.558 | 7.827 → 7.549 |
+| 2 | reduce / 1 / 327680 | 25.426 → 25.457 | 40.386 → 29.693 | 7.580 → 7.118 |
+| 2 | reduce / 5 / 5120 | 11.096 → 11.151 | 40.820 → 28.552 | 8.007 → 7.774 |
+| 2 | reduce / 8 / 5120 | 11.696 → 11.657 | 38.754 → 28.096 | 8.546 → 8.274 |
+| 2 | top1 / 8 / 2 | 7.676 → 7.623 | 49.181 → 39.338 | 7.967 → 7.804 |
+| 4 | long_norm / 32 / 5120 | 17.494 → 17.433 | 60.613 → 46.198 | 7.754 → 7.992 |
+| 4 | norm / 1 / 5120 | 16.605 → 16.753 | 56.132 → 43.759 | 7.917 → 7.852 |
+| 4 | norm / 8 / 5120 | 6.638 → 6.664 | 46.218 → 34.719 | 7.560 → 8.106 |
+| 4 | reduce / 1 / 5120 | 3.287 → 3.277 | 44.649 → 38.005 | 9.161 → 11.642 |
+| 4 | reduce / 1 / 262136 | 21.457 → 21.332 | 42.745 → 30.161 | 8.238 → 8.231 |
+| 4 | reduce / 1 / 262144 | 20.746 → 20.703 | 51.631 → 38.658 | 7.838 → 7.954 |
+| 4 | reduce / 1 / 327680 | 22.307 → 22.272 | 43.193 → 30.697 | 7.690 → 7.535 |
+| 4 | reduce / 5 / 5120 | 4.522 → 4.514 | 41.582 → 30.172 | 8.098 → 8.944 |
+| 4 | reduce / 8 / 5120 | 5.757 → 5.677 | 42.889 → 30.142 | 8.283 → 8.735 |
+| 4 | sum2 / 1 / 2560 | 3.226 → 3.207 | 1.827 → 1.938 | 7.773 → 7.637 |
+| 4 | top1 / 8 / 2 | 8.092 → 8.139 | 53.512 → 42.257 | 7.788 → 7.784 |
+
+All **186 paired rank/output observations** are bitwise identical, including
+changed-input replay and minimum-token tie handling. Eager and graph replay
+allocation peaks are unchanged for all 20 cases. Eager sum2 intentionally
+returns the ordinary fallback; its 1.827 → 1.938 µs measures admission overhead,
+not the captured sum2 kernel. This small increase accompanies the shared
+capability call and is not hidden inside the GPU figures. Host graph enqueue
+measures the unchanged Torch replay API; its process-to-process variation is
+reported without presenting it as execution-policy work.
+
+Three focused pairs reverse the first/last lane order and repeat only the two
+GPU cases outside the initial narrow baseline range. TP2 M5/width5120 measures
+**11.076 → 11.041 µs**; M1/width327680 measures **25.491 → 25.496 µs**.
+All 12 additional paired rank/output observations remain bitwise identical and
+allocation peaks are unchanged. The original increases of 0.055/0.031 µs do not
+reproduce as a consistent regression; no kernel or selection tuning was changed
+to obtain the follow-up. Raw records are under `artifacts/focused-v1`.
+No model throughput or TTFT conclusion follows from these operator measurements.
 
 ## Phase C structural accounting and retained boundaries
 
