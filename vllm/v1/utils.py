@@ -30,6 +30,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils.network_utils import get_open_zmq_ipc_path, get_tcp_uri
+from vllm.utils.staged_copy import StagedCopyOwner
 from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
 from vllm.v1.core.sched.output import SchedulerOutput
 
@@ -134,16 +135,17 @@ class CpuGpuBuffer:
                     "numpy array, so call CpuGpuBuffer with with_numpy=False"
                 )
             self.np = self.cpu.numpy()
-        self._staged_gpu_copies: list[tuple[torch.cuda.Event, torch.Tensor]] = []
+        self._staged_copy_owner = StagedCopyOwner()
+
+    @property
+    def _staged_gpu_copies(
+        self,
+    ) -> list[tuple[torch.cuda.Event | torch.cuda.Stream | None, torch.Tensor]]:
+        """Compatibility view of the sole source-lifetime owner."""
+        return self._staged_copy_owner.pending
 
     def _prune_staged_gpu_copies(self) -> None:
-        if not self._staged_gpu_copies:
-            return
-        self._staged_gpu_copies = [
-            (event, tensor)
-            for event, tensor in self._staged_gpu_copies
-            if not event.query()
-        ]
+        self._staged_copy_owner.prune()
 
     def copy_to_gpu(self, n: int | None = None) -> torch.Tensor:
         if n is None:
@@ -153,29 +155,12 @@ class CpuGpuBuffer:
     def copy_view_to_gpu_staged(
         self, src: torch.Tensor, dst: torch.Tensor
     ) -> torch.Tensor:
-        if self.gpu.device.type != "cuda":
-            return dst.copy_(src, non_blocking=True)
-
-        self._prune_staged_gpu_copies()
-        if len(self._staged_gpu_copies) >= 64:
-            event, _ = self._staged_gpu_copies.pop(0)
-            event.synchronize()
-
-        staging = torch.empty(
-            src.shape, dtype=src.dtype, device="cpu", pin_memory=src.is_pinned()
-        )
-        staging.copy_(src)
-        result = dst.copy_(staging, non_blocking=True)
-
-        event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(self.gpu.device))
-        self._staged_gpu_copies.append((event, staging))
-        return result
+        return self._staged_copy_owner.copy(src, dst)
 
     def copy_to_gpu_staged(self, n: int | None = None) -> torch.Tensor:
         src = self.cpu if n is None else self.cpu[:n]
         dst = self.gpu if n is None else self.gpu[:n]
-        return self.copy_view_to_gpu_staged(src, dst)
+        return self._staged_copy_owner.copy(src, dst)
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization

@@ -50,8 +50,8 @@ diagnostics and warmup-only selection do not.
 
 | Batch | Implementation boundary | Status |
 |---|---|---|
-| C1a | C0 ledger; three profilers share collection/aggregation; ordered warmup; typed runtime and diagnostic configuration | Validated in #1130; merge checks in progress |
-| C1b | Staged input resources and ordinary speculative sampling boundary | Pending |
+| C1a | C0 ledger; three profilers share collection/aggregation; ordered warmup; typed runtime and diagnostic configuration | Merged as #1130 (`c31d98d333d90`) |
+| C1b | Staged input resources and ordinary speculative sampling boundary | Implemented; operator and synthetic validation recorded below |
 | C2a | GDN compute plan, providers and shared stages | Pending |
 | C2b | GDN metadata and state preparation/commit | Pending |
 | C3 | Ordered defaults, model qualification and engine-local effective values | Pending |
@@ -138,3 +138,106 @@ Validation commands use the affected runner/MTP safety, GDN metadata, Mamba stat
 and new `test_step_profiler.py` suites under `tests/v1/`, followed by the normal
 pre-commit checks (including mypy and layering). The C0 ledger and per-batch
 status remain the handoff for C1b–C4b; none of those batches are claimed complete.
+
+## C1b implementation and acceptance
+
+The V1 runner binds `InputTransferSession` once through the platform hook. The
+session owns preparation mode, event and trace counters; each `CpuGpuBuffer`
+owns exactly one `StagedCopyOwner`. This preserves the original per-buffer
+64-source bound, pinned-source lifetime and copy-stream ordering. It does not
+expand the opt-in, single-request/token, non-speculative CUDA70 gate. The old
+prepare-event property and staged-copy methods forward to these sole owners.
+Synchronization or event-record failures now restore preparation mode; if a
+copy may already be in flight when recording fails, the owner retains its
+source until the stream confirms completion. No buffer/event owner is global.
+
+`BaseSpeculator` now exposes target preparation, optional sampling and target
+trace hooks. The V2 runner consumes three explicit outcomes: `SamplerOutput`,
+`ComputedTargetLogits`, or `None`. Completed logits can themselves be `None` on
+non-gather ranks: this still means projection has already run. The DFlash2
+implementation owns sparse verification; its old fallback import aliases the
+same outcome type. Grammar application, rejection sampling and accepted/rejected
+counts retain their order. Ordinary DFlash/Eagle use the default fallback;
+runner-generation selection is unchanged. Deferred tree tracing stays at its
+existing V1 boundary.
+
+`KernelConfig.sm70_runtime.staged_input`, `ObservabilityConfig.runtime_trace`
+and `ObservabilityConfig.spec_decode_trace` capture legacy compatibility input
+once, with explicit typed values taking precedence. Unified `VLLM_SM70_DEBUG`
+retains priority over the event-trace alias. The target trace preserves the
+legacy exact-string `1` parser and ignores malformed thresholds when disabled.
+These host-transfer/diagnostic settings do not alter model graph hashes. Event
+trace counters are per engine; existing unmigrated standalone trace functions
+retain their compatibility entry points.
+
+Local affected CPU coverage: **85 passed, 2 CUDA skips**. On 54633, the unchanged
+C1a baseline passed **29 tests**; the candidate passed **77 tests**, including
+source mutation immediately after staged enqueue, changed-input graph replay,
+exact synthetic state, both initialization orders with cached legacy getters,
+event/copy failure ownership, three sampling outcomes, and cached-logit reuse.
+The existing sparse/logit tests retain their original arithmetic tolerances;
+new transfer/replay tests require exact tensor equality. No weights were loaded.
+
+C1b uses the same Python/Torch/CUDA/driver/native artifacts as C1a. GPU 0 was
+reserved and checked idle before running the pair. Neither source nor tests
+modify other tasks' runtimes or caches. Full local pre-commit, including mypy,
+passes. The previous #1130 final CI run also completed successfully.
+
+Runner input-preparation lifecycle branches now share one context manager;
+source leases remain independently owned per buffer. The V2 runner's two
+DFlash2-specific preparation/sampling dispatch sites become feature hooks,
+while the verifier remains one implementation. On the expanded C inventory
+(which includes the pre-existing buffer, event-trace and speculator files on
+both sides), parameter read sites decrease **376 → 370**. Alias declarations
+remain visible in the generated explanation. Repository coupling decreases
+from platform **3756 → 3727**, model **2322 → 2315**, raw environment **271 → 269**;
+no ownership whitelist changes are used. Sparse-verifier alignment dumps and
+DDTree tracing remain with their feature owners and are not claimed migrated.
+
+### Integration with concurrent main changes
+
+Before C1b merged, main advanced through #1007 and #1028 to `465da8a45`.
+C1b was rebased on that main: its host-backed KV allocations and newly added
+greedy verifier remain intact. The sampler protocol fixture now supplies the
+real kernel configuration/device used by that call site. The new greedy
+provider still exposes a whole-runner adapter in main; C4a will narrow that
+pre-existing boundary together with packed LM-head selection. It is not counted
+as a C1b decoupling result. Updated main-to-C1b coupling is platform
+**3747 → 3718**, model **2322 → 2315**, environment **271 → 269**. The rebased
+CPU integration suite passed **76 tests**, with seven CUDA-only skips.
+
+### C1b final performance and source follow-up
+
+The rebased GPU integration suite passed **83 tests**. A final source-owner
+follow-up covers restored enqueue ordering and recovery when a stream handle
+cannot be obtained (retain an unfenced source until device synchronization).
+
+The larger staged copy initially added about 4 µs of host time. Moving the
+current-stream lookup back after copy enqueue restores the original overlap;
+the normal buffer method also calls the owner directly. Both failure protections
+remain. The final same-process A/B uses the real baseline class/method bodies,
+15 alternating-order rounds, 10,000 context entries or 100 copies per round,
+with the legacy getter cache enabled:
+
+| Operation | Baseline median µs | Shared owner median µs |
+|---|---:|---:|
+| Ordinary input-preparation context | 4.916 | 2.604 |
+| Staged input-preparation context | 3.092 | 2.460 |
+| 1 KiB staged copy, host | 54.852 | 55.157 |
+| 128 KiB staged copy, host | 69.635 | 69.833 |
+
+Paired copy deltas are 0.479/0.069 µs, inside the observed baseline ranges
+(54.347–56.378 and 68.995–73.641 µs). The earlier unexplained copy regression is
+not carried into the final change. Separate stable-address H2D graph controls
+measured 2.270/2.403 µs for 1 KiB and 22.668/23.111 µs for 128 KiB; these are DMA
+controls, not model kernels. Peak GPU allocation was identical (2,048 and
+132,096 bytes including the control buffers). Separately instrumented host
+allocation peaks were 451/419 and 451/662 bytes; tracing was disabled during
+timing. No new per-copy device workspace or model-performance claim is made.
+
+The final trace-config/lease CPU suite passed **59 tests** (two CUDA skips).
+Disabled legacy diagnostics retain their old behavior for malformed, unused
+numeric options; enabling the diagnostic or retained tree worker override still
+raises the original parser error. Source explanations mark the inactive default
+instead of presenting the malformed input as its effective value. This does
+not change typed validation or computation hashes.

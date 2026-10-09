@@ -153,6 +153,21 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
         self._debug_tensor_dump_count = 0
 
+    def trace_target_output(
+        self, input_batch, output, num_sampled, num_rejected, hidden_states, logger
+    ) -> None:
+        if getattr(self, "_debug_proposal_stages", False):
+            logger.info(
+                "DFlash target verification diagnostic: draft_input=%s "
+                "sampled=%s num_sampled=%s num_rejected=%s "
+                "finite_hidden=%s",
+                input_batch.input_ids[input_batch.logits_indices].tolist(),
+                output.sampled_token_ids.tolist(),
+                num_sampled.tolist(),
+                num_rejected.tolist(),
+                bool(torch.isfinite(hidden_states).all().item()),
+            )
+
     def _debug_proposal_stage(self, stage: str) -> None:
         if getattr(self, "_debug_proposal_stages", False):
             logger.info("DFlash proposal stage: %s", stage)

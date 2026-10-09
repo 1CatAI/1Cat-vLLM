@@ -19,7 +19,6 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
-import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -118,16 +117,12 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
-from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
-    DFlash2LogitsFallback,
-    try_dflash2_sparse_target_rejection,
-)
-from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
+from vllm.v1.worker.gpu.spec_decode.target_sampling import ComputedTargetLogits
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -1223,16 +1218,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if input_batch.num_draft_tokens > 0:
             assert self.rejection_sampler is not None
             assert self.speculator is not None
-            sparse_result = try_dflash2_sparse_target_rejection(
+            sparse_result = self.speculator.try_sample_target(
                 self.model,
-                self.speculator,
                 self.rejection_sampler,
                 sample_hidden_states,
                 input_batch,
                 grammar_output,
                 allow_graph=self.lora_config is None,
             )
-            if isinstance(sparse_result, DFlash2LogitsFallback):
+            if isinstance(sparse_result, ComputedTargetLogits):
                 cached_logits = sparse_result
             else:
                 sampler_output = sparse_result
@@ -1250,25 +1244,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if cached_logits is not None
                 else self.model.compute_logits(sample_hidden_states)
             )
-            if (
-                input_batch.num_draft_tokens > 0
-                and os.getenv("VLLM_DFLASH_DEBUG_TARGET_LOGITS", "0") == "1"
-                and logits is not None
-            ):
-                debug_positions = input_batch.positions[input_batch.logits_indices]
-                min_position = int(
-                    os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8")
-                )
-                if int(debug_positions[0].item()) >= min_position:
-                    top_values, top_ids = torch.topk(logits.float(), 2, dim=-1)
-                    logger.warning(
-                        "DFLASH_TARGET_LOGITS_TRACE inputs=%s positions=%s "
-                        "top1=%s top1_margin=%s",
-                        input_batch.input_ids[input_batch.logits_indices].tolist(),
-                        debug_positions.tolist(),
-                        top_ids[:, 0].tolist(),
-                        (top_values[:, 0] - top_values[:, 1]).tolist(),
-                    )
+            if input_batch.num_draft_tokens > 0:
+                assert self.speculator is not None
+                self.speculator.trace_target_logits(logits, input_batch, logger)
             if grammar_output is not None:
                 # Apply grammar bitmask to the logits in-place.
                 assert self.structured_outputs_worker is not None
@@ -1303,18 +1281,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.idx_mapping,
             self.req_states.prefill_len.gpu,
         )
-        if input_batch.num_draft_tokens > 0 and getattr(
-            self.speculator, "_debug_proposal_stages", False
-        ):
-            logger.info(
-                "DFlash target verification diagnostic: draft_input=%s "
-                "sampled=%s num_sampled=%s num_rejected=%s "
-                "finite_hidden=%s",
-                input_batch.input_ids[input_batch.logits_indices].tolist(),
-                sampler_output.sampled_token_ids.tolist(),
-                num_sampled.tolist(),
-                num_rejected.tolist(),
-                bool(torch.isfinite(sample_hidden_states).all().item()),
+        if input_batch.num_draft_tokens > 0:
+            assert self.speculator is not None
+            self.speculator.trace_target_output(
+                input_batch,
+                sampler_output,
+                num_sampled,
+                num_rejected,
+                sample_hidden_states,
+                logger,
             )
         return sampler_output, num_sampled, num_rejected
 
@@ -1697,7 +1672,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        if isinstance(self.speculator, DFlash2Speculator):
+        if self.speculator is not None:
             self.speculator.prepare_target_context(
                 input_batch, hidden_states, aux_hidden_states
             )
