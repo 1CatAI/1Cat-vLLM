@@ -12,12 +12,14 @@ import functools
 import importlib.util
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace as NS
 
 import torch
 
 from vllm import _sm70_ops, envs
+from vllm._sm70.policy import CONFIGURED_OPERATORS, NativeBindings
 from vllm.config.sm70_moe import (
     MXFP4_ALIASES,
     NVFP4_ALIASES,
@@ -57,6 +59,7 @@ def main():
     aliases = NVFP4_ALIASES if family == "nvfp4" else MXFP4_ALIASES
     config_cls = Sm70NvFp4MoEConfig if family == "nvfp4" else Sm70MxFp4MoEConfig
     native_calls = []
+    reference_policy = ()
     for name in dir(_sm70_ops):
         native = getattr(_sm70_ops, name)
         if callable(native) and name.startswith(
@@ -73,6 +76,8 @@ def main():
             def instrument(fn, name):
                 @functools.wraps(fn)
                 def call(*a, **kw):
+                    if reference_policy and name in CONFIGURED_OPERATORS:
+                        kw.setdefault("native_policy", reference_policy)
                     result = fn(*a, **kw)
                     native_calls.append(name)
                     return result
@@ -122,7 +127,11 @@ def main():
             )
         if args.grouped_only:
             preparation.update(grouped_mtp5=True, qpn_mtp5=True, grouped_decode=True)
-        flags(preparation)
+        preparation_policy = flags(preparation)
+        prepared_binding = NativeBindings(preparation_policy.native.values)
+        reference_policy = getattr(
+            prepared_binding, "arguments", prepared_binding.values
+        )
         h, i, e, k, group = (
             (2560, 160, 512, 10, 16) if family == "nvfp4" else (4096, 512, 256, 6, 32)
         )
@@ -185,6 +194,7 @@ def main():
         new.moe = cfg
         new.sm70_moe_policy = config_cls()
         new.sm70_moe_policy.resolve()
+        new.native_ops = NativeBindings(new.sm70_moe_policy.native.values)
         new.process_weights_after_loading(candidate_layer)
         expected = dict(layer.named_parameters())
         actual = dict(candidate_layer.named_parameters())
@@ -222,6 +232,7 @@ def main():
             LayerWorkspaceView(layer, "sm70_" + family + "_"),
             raw,
             layer.swiglu_limit,
+            bindings=getattr(new, "native_ops", None),
         )
         print(
             json.dumps(
@@ -318,6 +329,17 @@ def main():
             )
             policy = flags(values)
             layer.sm70_moe_policy = new.sm70_moe_policy = policy
+            # Each row emulates a distinct initialized engine. Old Python reads
+            # these flags per call; the new native ABI freezes them per owner.
+            # Bind both algorithms to this row's policy instead of comparing
+            # an old process's first-use flags with a different prepared owner.
+            new.native_ops = NativeBindings(policy.native.values)
+            reference_policy = getattr(
+                new.native_ops, "arguments", new.native_ops.values
+            )
+            layer.sm70_fp4_codec = replace(
+                layer.sm70_fp4_codec, bindings=new.native_ops
+            )
             # These are the post-load effective availability fields, unchanged
             # between A/B. Each combination is admitted by the real selector.
             if family == "nvfp4":

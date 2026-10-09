@@ -121,7 +121,7 @@ The operator A/B harness records actual public native calls, bit-exact outputs,
 prepared banks, eager/graph replay and alternating graph-event timings.
 The final validation record is maintained in the migration control document.
 
-## Remaining delivery boundaries
+## Delivery boundaries
 
 Delivery 2 implements the FP4 Python stage migration and GGUF/skinny reusable
 reduction. Delivery 3 owns linear dispatch/QPN/native module ownership, the
@@ -148,8 +148,8 @@ prefill, GLM's exact reduction tree and ordered Triton/native reductions.
 
 `NvFp4MoEWorkspace` and `MxFp4MoEWorkspace` own allocation/view/overflow rules.
 Their original layer attributes remain the storage owners; the codec borrows
-views, so rebinding remains visible. Raw-scale storage still uses the original
-per-device shared expansion workspace and rejects microbatching before allocation.
+views, so rebinding remains visible. Raw-scale storage retains its shared expansion contract and rejects
+microbatching before allocation; delivery 3 gives each engine its own pool.
 MXFP4 retains its separate immutable direct-order offsets after M2..8 compaction.
 No new persistent weight copy or global pointer registry is introduced.
 
@@ -211,3 +211,157 @@ in addition to the linear/provider/native module work.
 
 Operator testing is the owner's accepted gate. No new model geometry, TP/EP
 qualification, attention configuration, 35B throughput or TTFT claim is made.
+
+## Delivery 3: prepared linear providers and native policy ownership
+
+Integration base: `fc2f145aebee0d2e7cbfc2b520c383cb64644e57` (delivery 2,
+PR #1126, merged; remote CI passed). The common kernel selector still owns
+candidate order and capability rejection. Preparation now binds a
+`PreparedLinearProvider` to the packed weight state. Shared input flattening,
+optional contiguity, output allocation/cropping, interleaved layout restoration,
+bias and reshape serve the original uint4, FP8, MXFP4, NVFP4, compact-scale,
+QPN4 and dense-QPN2 implementations. AWQ's exact-dense prefill and fused entry
+retain their separate numerical/layout contracts. Dynamic M dispatch remains
+inside the original opaque QPN operators; it is not frozen at tracing time.
+
+QPN implementations, including serialized FP8 and NVFP4 providers, live in
+`kernels/linear/qpn/`. Old module paths alias the same module objects, retaining
+private workspace-tool imports and monkeypatch behavior. `_sm70_ops.py` remains
+a compatibility facade; `_sm70/{loader,common,linear,moe,auxiliary,policy}.py`
+own loading order, fake registrations, bindings and prepared native arguments.
+No production executor calls back into an old quantization method module.
+
+### Configuration crossing the native boundary
+
+The generated [binding ledger](sm70_phase_b_bindings.md) now includes linear
+aliases and 55 native compatibility inputs, with exact consumer links. Native
+options reside under the existing per-format linear policy's `native` field,
+or `sm70_moe.<format>.native`; MXFP4 linear uses `sm70_mxfp4` directly. Explicit
+parent/native requests for the same parameter must agree. Unsupported native
+fields for a loaded format fail clearly. Null legacy values retain each C++
+consumer's original default, including differences from Python getter defaults.
+
+The packaged `_C` and `_moe_C` operators accept an optional policy token.
+Prepared bindings capture its values once; numerical execution performs no environment
+reads. The native launch scope selects the existing kernels, without changing
+CUDA arithmetic. Direct legacy native callers capture their environment on
+first use. Existing research-library imports retain their original opt-in and
+ABI; they cannot silently implement conflicting typed requests. Their old-ABI
+compatibility guard remains, while the source-built native ABI supports typed
+precedence. This delivery does not depend on research libraries or preload.
+
+Calculation policy partitions the native GEMM holders, tuned-shape sets and
+imported tuning tables. Export keeps the legacy raw table and a policy-indexed
+companion; distributed warmup transmits the indexed container. Untagged old
+LUTs may seed legacy configurations, but never silently seed a conflicting typed
+calculation policy. Trace/filter/warning fields share calculation caches.
+
+Effective prepared policies participate in both KernelConfig and AOT hashes;
+format-specific diagnostic/provenance and unused-format options do not salt
+other graphs. Shared legacy backend/library-admission switches and generic MoE
+permutation aliases remain in the environment hash because an engine can also
+contain an unconverted consumer. Generic FP16/auxiliary tuning remains outside
+this Phase B migration. These are conservative compatibility boundaries, not
+claims that all repository configuration has been migrated.
+
+Channel-FP8 preserves its qualified DFlash default when the generic QPN8 option
+is automatic. An explicit typed linear option wins; legacy DFlash/generic
+precedence remains unchanged. The batch-prescaled experiment uses the existing
+literal `"1"` interpretation. No initialization adapter modifies `os.environ`.
+
+### Resources and diagnostics
+
+Opaque linear calls resolve scratch addresses and native policy through the
+executing engine's existing forward registry. Two engines can use the same
+layer prefix without sharing scratch. Capacity-keyed pools keep earlier live
+allocations valid. Qwen NVFP4 raw-scale expansion is shared within an engine,
+with the existing microbatch/DBO rejection; a second engine owns another pool.
+AOT reload resolves the new engine's addresses instead of embedded old pointers.
+
+The two FP8 reference-comparison stage sequences now call the same routed
+executor as production. Their zeroing, rounding boundaries, report limits and
+historical messages remain intact; reference calls suppress production route
+logging. AWQ observers use the prepared native owner. Monolithic legacy kernels,
+GGUF's mixed and separate gate/up formats, and skinny's modular/per-expert
+reference semantics remain independent for the reasons recorded above.
+
+`--category moe` on the route snapshot retains its legacy comparison rows and
+adds parameter provenance, selected plans, fusion coverage, layouts and predicted
+operators. `tools/sm70/explain.py` also accepts an already selected linear
+provider and the existing selector's admission report. Neither tool chooses
+another path. FP4 execution and explanation normalize layout variants through
+the same declaration function.
+
+`NativeDispatchTrace` observes native dispatch during eager execution or graph
+capture. Its report labels fake/meta dispatch separately, never treats capture
+as replay, and records no tensor data or process-local addresses. Use it outside
+timing loops; synchronized outputs and changed-input graph replay establish
+execution correctness. `--observed-trace <json>` attaches that evidence separately
+to a static snapshot.
+
+### Structural accounting
+
+| Maintenance unit | Before Phase B | After consolidation |
+|---|---|---|
+| AWQ/FP8 ordinary single/routed stage sequences | Four | Two shared executors |
+| NVFP4/MXFP4 production stage sequences | Seven | One FP4 executor |
+| FP8 decomposed experiment | Separate stage sequence | Existing routed executor |
+| FP8 reference compare pipelines | Two duplicated stage sequences | Existing routed executor with diagnostic layouts |
+| Prepared linear `op_kind` dispatch | Two execution-time branch chains | Preparation-time binding and shared I/O |
+| Native configuration consumers | Environment reads and first-call static switches | Captured arguments and policy-partitioned caches |
+
+The expanded Python audit (including warmup, new owners and configuration)
+records 74 direct reads/215 direct native call sites at the delivery-3 base,
+versus 57/179 after the channel-FP8 alias migration. This is a broader
+scope than delivery 2's 48/179 report. Declared aliases and indirect native
+bindings remain in the ledger; moving a getter does not remove a supported
+path. The common numerical stage executors and codecs have zero policy reads.
+Final source counts and validation evidence are recorded in the migration log.
+
+### Native artifact comparison
+
+Prepared owners encode their native policy once as a versioned, length-prefixed
+content token. The packaged native libraries cache its parsed values and
+calculation key; the native schema accepts one optional string instead of a
+list of strings. Owners also bind the public callable during initialization.
+The token contains no process address and survives AOT export/reload. Older
+list-policy artifacts are recognized during initialization and retain their
+full argument form. Diagnostic changes can have separate content tokens while
+sharing calculation caches. Prepared execution reads no environment values.
+
+`benchmarks/kernels/sm70_native_artifact_parity.py` runs in separate baseline
+and candidate installations, each with its normally built native extensions.
+Use `--output base.pt` first, then `--output head.pt --reference base.pt`, with
+identical GPU, environment and input contracts. It checks native call order,
+eager outputs, changed-input graph replay and the retained FP8 reference stages.
+It records graph device time separately from eager host wall time.
+Pin both runs to the same CPU affinity for host-time comparison; the report
+records that affinity alongside the GPU and software contract.
+
+For GGUF, pass the same `--gguf-cache <path>` to both runs. Its existing cold
+descriptor autotuning is independent of the AWQ tuning switch and can select
+different split-K plans in fresh processes. The baseline exports its measured
+choices; the candidate warms the descriptors, then imports those choices before
+comparison. This freezes the numerical oracle without changing production
+selection defaults. Failed comparisons retain their outputs for inspection.
+
+`benchmarks/kernels/sm70_native_policy_isolation.py --output policy.json` uses
+two conflicting explicit routing policies in one process. Native kernel traces
+distinguish the actual fast and generic launches; changed-input/route replay
+and alternating owners check isolation. These are operator checks, not model
+decode or TTFT measurements.
+
+The common linear I/O helpers keep already two-dimensional tensor views,
+including noncontiguous and cropped layouts. Additional batch dimensions still
+use the original reshape. Persistent MoE buffer reads resolve directly on the
+layer without another attribute-proxy hop; no view/address cache or new tensor
+lifetime is introduced. Stage messages use the existing keyed log-once facility
+to skip repeated distributed-rank queries after their first accepted event.
+Message text, argument distinctions and rank scope remain intact; execution
+traces and route counters are independent of these informational messages.
+
+Argument-preserving MoE wrappers declare their direct native binding. Prepared
+owners resolve these once and pass the captured token directly, while public
+compatibility entry points and instrumented wrappers keep their old behavior.
+AWQ skips disabled dump callbacks; enabled dumps retain their stage positions.
+Output trimming creates a view only when the physical width differs.

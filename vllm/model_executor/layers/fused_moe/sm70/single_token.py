@@ -7,7 +7,6 @@ from typing import Any
 
 import torch
 
-from vllm import _sm70_ops as ops
 from vllm.model_executor.layers.fused_moe.sm70.weight_codec import Sm70MoEWeightCodec
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
     Sm70MoeRoutePlan,
@@ -126,11 +125,11 @@ def execute_single_token(
     if observe is not None:
         buffers["sorted_output"] = observe(layer, buffers["sorted_output"], "st_w2_out")
     sorted_output = buffers["sorted_output"]
-    if trim_output:
+    if trim_output and sorted_output.shape[1] != layer.sm70_hidden_logical_size:
         sorted_output = sorted_output[:, : layer.sm70_hidden_logical_size]
     if plan.weighted_reduce:
         codec.log("MoE single-token weighted-reduce path enabled (top_k=%d).", top_k)
-        ops.awq_moe_single_token_weighted_reduce_out(
+        codec.operators.awq_moe_single_token_weighted_reduce_out(
             sorted_output,
             topk_weights,
             buffers["inv_permuted_idx"],
@@ -139,7 +138,7 @@ def execute_single_token(
             layer.sm70_hidden_logical_size,
         )
     else:
-        torch.ops._moe_C.moe_unpermute(
+        codec.operators.moe_unpermute(
             sorted_output,
             topk_weights,
             buffers["inv_permuted_idx"],

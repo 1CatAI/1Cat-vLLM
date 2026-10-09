@@ -16,10 +16,13 @@ from unittest.mock import patch
 
 import torch
 
+from tools.sm70.explain import explain_moe_plan
 from vllm import envs
+from vllm.config.sm70_moe import Sm70MoEFormatConfig
 from vllm.model_executor.layers.fused_moe.sm70.declarations import native_binding
 from vllm.model_executor.layers.quantization import awq_sm70_moe, fp8_sm70_moe
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
+    select_single_token_plan,
     select_sm70_quantized_moe_route,
 )
 
@@ -42,6 +45,7 @@ def load_baseline(ref, directory):
 def snapshot(modules=None):
     modules = modules or {"awq": awq_sm70_moe, "fp8": fp8_sm70_moe}
     rows = []
+    explanations = []
     for family, tokens, batched, indexed, strict, native in itertools.product(
         ("awq", "fp8"),
         (0, 1, 2, 32, 33, 64, 65),
@@ -78,10 +82,18 @@ def snapshot(modules=None):
             single = tokens == 1 and (
                 not batched or (family == "awq" and (strict or (i13 and i2)))
             )
+            plan = None
             if not tokens:
                 stages = {}
                 operators = []
             elif single:
+                plan = select_single_token_plan(
+                    compact_w13=False,
+                    indexed_w13=i13,
+                    indexed_w2=i2,
+                    weighted_reduce=False,
+                    strict=strict,
+                )
                 stages = {
                     "w13": "indexed" if i13 and not strict else "active_dense",
                     "w2": "indexed" if i2 and not strict else "active_dense",
@@ -116,6 +128,25 @@ def snapshot(modules=None):
                     else None,
                 }
             )
+            policy = Sm70MoEFormatConfig()
+            policy.resolve(family)
+            explanations.append(
+                {
+                    "config": rows[-1]["config"],
+                    **explain_moe_plan(
+                        family,
+                        plan,
+                        policy,
+                        admission=(
+                            {"contract": "prepared SM70 FP16 E4/top-k2 layer"},
+                            {
+                                "reason": rows[-1]["fallback"],
+                                "indexed_native_available": native,
+                            },
+                        ),
+                    ),
+                }
+            )
     envs.disable_envs_cache()
     from tools.sm70.path_inventory import binding_catalog
 
@@ -124,5 +155,6 @@ def snapshot(modules=None):
         "evidence": "static selector prediction; native execution unobserved",
         "contract": "prepared SM70 FP16 layer; E4/top-k2; no model-specific route",
         "cases": rows,
+        "explanations": explanations,
         "edge_cases": [],
     }

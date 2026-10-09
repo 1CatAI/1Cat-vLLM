@@ -49444,3 +49444,106 @@ syntax exit 0. No CUDA driver repair or GPU execution was attempted.
   Raw GPU evidence: `/home/ymzx/arch-ws/phase-b2-20261009/artifacts/` on 54633.
   Local CPU/GPU/log evidence: `/home/ymzx/arch-ws/tmp/phase-b2/`.
   No model service, port, sidecar, preload or background benchmark remains.
+
+## Phase B delivery 3: linear/native consolidation, operator acceptance, 2026-10-09
+
+- Base `fc2f145aebee0d2e7cbfc2b520c383cb64644e57`; PR #1128, owned branch
+  `agent/v100-phase-b-linear-native-20261009-035407`, worktree
+  `/home/ymzx/arch-ws/v100-phase-b-linear-native-20261009-035407`.
+  Deliveries 1 (#1124) and 2 (#1126) are merged with remote CI passing.
+- Prepared linear providers share input/output handling; QPN implementations
+  share one directory and historical module identities remain compatible.
+  Native loading/linear/MoE/auxiliary bindings are split behind `_sm70_ops.py`;
+  all 134 baseline public function/class definitions remain exported.
+  Weight layouts, CUDA arithmetic, defaults and qualification are unchanged.
+- Explicit native policies cross the packaged `_C`/`_moe_C` ABI as one optional
+  string token. Preparation caches parsed values and the calculation key, and
+  binds argument-preserving MoE calls directly. Instrumented public wrappers
+  remain observable. GEMM holders, tuning and imported tables are partitioned
+  by calculation policy; diagnostic differences share calculation caches.
+- Engine-owned scratch registries preserve capacity growth and AOT address
+  reload, including linear pools and NVFP4 raw-scale expansion. Already-matrix
+  linear inputs/outputs avoid redundant views. MoE reads layer buffers directly;
+  there is no tensor-view cache, stale-address shortcut or new buffer lifetime.
+  Disabled AWQ diagnostics skip callbacks; enabled diagnostics keep their stage
+  positions. Stage log-once skips repeated rank queries after an accepted event.
+- CPU evidence: combined regression 583 passed / 7 skipped; lifecycle/buffer/
+  MXFP4/FP8-prefill supplement 79 passed / 5 skipped; owner/explanation recheck
+  36 passed. String transport/prebinding checks: 128 passed locally and 128
+  against the newly built artifact. Host-view changes: 117 passed; provider
+  checks 52 passed / 96 GPU skips. Final binding/flow/owner check: 370 passed /
+  one local old-ABI skip; AWQ stage recheck 59 passed. On the actual artifact,
+  direct native export/reload and instrumentation checks pass all three cases.
+  Counts overlap and must not be added as unique test coverage.
+- Export/reload covers dynamic M=1/32/33/65, full and token policies, and another
+  engine's workspace/policy. The direct native export test uses a CPU dispatcher
+  implementation solely to validate transport/serialization, not CUDA math.
+  Standalone C++ checks cover UTF-8, empty/unset fields, malformed tokens,
+  nested scopes and thread isolation. All source checks pass; remote CI for
+  `9a1aa8b29` is run `37901353942`. The final PR carries the follow-up CI result.
+- Static route comparison: 168 cases, zero differences from the delivery base.
+  Python/C++ declaration order and calculation/diagnostic fields agree. Expanded
+  source audit: 58 files, 135 parameters, 1042 functions; direct reads 74 to 57,
+  direct native call sites 215 to 179. These counts do not mean paths were
+  deleted. Common numerical executors/codecs have no policy reads. Layering
+  totals remain model 2325, platform 3880, environment 271.
+- Normal source-complete CUDA 12.8/SM70 build on 54633 uses Torch 2.10.0+cu128.
+  Fresh import, ABI=55, four-format fake dispatch and `readelf`/`ldd` checks pass
+  without preload or private kernel libraries. Native hashes (unchanged by the
+  final Python-only host changes):
+  `_C` `70cfdcc88eb7b8f2c86db0b78b93c59852f55c7911a8c8371d89bdcb0c624881`,
+  `_moe_C` `4c671824b05e69741be29c39d70c0285062facc4ed9b90d0efba2536a23c7fe3`.
+- Fresh baseline/candidate artifact A/B: 323 outputs bit-exact, matching native
+  order/error contracts (75 eager outputs, 216 changed-input replays, 32 FP8
+  reference intermediates). Final affected-family follow-up: 143 exact outputs
+  for QPN8, AWQ MoE and FP8 MoE. QPN8 traces observe actual native calls on both
+  sides of M=8. Typed routing policies produce distinct generic/fast CUDA hits;
+  six changed-input/ID replays and four alternating-owner calls remain exact.
+  Rechecking FP4 stages on the new ABI gives NVFP4 84 eager / 180 replays and
+  MXFP4 20 / 51, all exact with matching stage order.
+- Performance contract: GPU0 V100-SXM2-32GB, fixed CPU affinity 6, one CPU thread,
+  same environment and frozen GGUF tuning table. N=K=256 linear projections;
+  ordinary MoE E4/top-k2; M=1/2/8/9/32/33/64/65/128. Five timing samples per
+  case; each sample has 100 graph replays and 30 eager calls. Graph device time
+  is separate from synchronized eager host wall time. Final family medians:
+
+  | Family | Graph change | Eager change | Eager delta |
+  |---|---:|---:|---:|
+  | AWQ linear | -0.519% | -12.05% | -8.47 us |
+  | FP8 linear | -0.659% | -9.96% | -8.18 us |
+  | NVFP4 linear | -0.370% | -12.00% | -7.77 us |
+  | MXFP4 linear | -0.472% | -12.82% | -8.66 us |
+  | GGUF affine | -0.311% | -4.78% | -3.27 us |
+  | QPN8 | -0.058% | +3.11% | +4.03 us |
+  | AWQ MoE | +0.098% | -4.17% | -20.52 us |
+  | FP8 MoE | -0.012% | +2.24% | +10.05 us |
+
+  First five rows use the full artifact run; last three use the final affected
+  follow-up. All final graph cases are within +0.63% on the slower side. Eager
+  QPN8/FP8 MoE retain small host overhead (maximum case +6.35%/+4.14%); this is
+  accepted for structural consolidation and engine-policy isolation, not hidden
+  as a speedup or a claim that every eager case is faster. No model performance
+  conclusion is drawn from these synthetic operators.
+- Retained negative evidence: initial `str[]=[]` schema compiled but failed
+  Torch registration. The optional list ABI fixed import but 55 strings added
+  11–23% eager time; compact-list transport still added overhead. The final
+  optional-string token, direct bindings and common host handling replace those
+  variants. Do not repeat their builds. Cold GGUF M9 selected a different tuning
+  descriptor (max difference 0.0001220703125); importing the baseline table fixes
+  the oracle without relaxing equality or changing production defaults.
+  FP4 fixture policy capture also needed both frozen/current Python stages bound
+  to the same per-case native policy; the corrected checks remain bit-exact.
+  Raw baseline AWQ M0 cannot launch; CPU dispatch coverage is retained and raw
+  TM M0 is excluded from GPU timings. GGUF M0 matches its pre-launch error.
+- Raw evidence on 54633: `/home/ymzx/arch-ws/phase-b3-20261009/artifacts/`.
+  `base-operators.*` / `head-operators.*` are the full artifact run;
+  `final-base.*` / `final-head.*` are the affected-family follow-up;
+  `nvfp4-stage.log`, `mxfp4-stage.log`, `typed-policy-isolation.json`,
+  `native-verification.json` and `direct-stage-export.log` cover other gates.
+  Earlier `vector-policy/`, `compact-list-policy/`, `string-policy/`,
+  `direct-*` and untuned GGUF records retain the rejected/intermediate evidence.
+  Local logs/summaries: `/home/ymzx/arch-ws/tmp/phase-b3/`.
+- This closes the three Phase B delivery scopes under the owner's explicit
+  operator-only acceptance. Model throughput, pure 35B decode and TTFT were not
+  run or claimed. DDTree and broad C/D remain subsequent work. GPU leases and
+  task benchmark processes are released; no model service or port was created.

@@ -12,7 +12,10 @@ from typing import Any, Literal
 import torch
 
 from vllm import _sm70_ops as ops
-from vllm.model_executor.layers.fused_moe.sm70.declarations import fp4_native_binding
+from vllm.model_executor.layers.fused_moe.sm70.declarations import (
+    fp4_binding_mode,
+    fp4_native_binding,
+)
 from vllm.model_executor.layers.quantization.sm70_moe_router import Sm70MoeRoutePlan
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     LayerWorkspaceView,
@@ -26,6 +29,11 @@ class Fp4MoECodec:
     dimensions: LayerWorkspaceView
     raw_scale: bool = False
     swiglu_limit: float | None = None
+    bindings: Any = None
+
+    @property
+    def operators(self):
+        return self.bindings if self.bindings is not None else ops
 
     @staticmethod
     def prepare_weights(
@@ -38,8 +46,11 @@ class Fp4MoECodec:
             )
         return prepare(packed, scales, group_size)
 
-    def _op(self, stage: str, mode: str):
-        return getattr(ops, fp4_native_binding(self.family, stage, mode))
+    def _op(self, stage: str, mode: str, *, qpn_mtp=False):
+        mode = fp4_binding_mode(
+            self.family, mode, raw_scale=self.raw_scale, qpn_mtp=qpn_mtp
+        )
+        return getattr(self.operators, fp4_native_binding(self.family, stage, mode))
 
     def _bank(self, stage: str) -> tuple[torch.Tensor, ...]:
         w = self.weights
@@ -73,7 +84,7 @@ class Fp4MoECodec:
     def _expand(self, stage: str, interleaved: bool) -> None:
         if self.raw_scale:
             _, codes, global_scales = self._bank(stage)
-            ops.nvfp4_expand_raw_scales_sm70_out(
+            self.operators.nvfp4_expand_raw_scales_sm70_out(
                 getattr(self.weights, stage + "_tm_scales"),
                 codes,
                 global_scales,
@@ -87,11 +98,9 @@ class Fp4MoECodec:
         if self.family == "mxfp4":
             self._op(stage, "qpn")(*args)
         elif self.raw_scale:
-            self._op(stage, "qpn_raw")(
-                *args, plan.interleaved if w13 else False, split_k
-            )
+            self._op(stage, "qpn")(*args, plan.interleaved if w13 else False, split_k)
         else:
-            op = self._op(stage, "qpn_mtp" if plan.qpn_mtp else "qpn")
+            op = self._op(stage, "qpn", qpn_mtp=plan.qpn_mtp)
             op(*args, split_k)
 
     def gemm_w13(
@@ -124,11 +133,7 @@ class Fp4MoECodec:
                 buffers["intermediate"], x, *self._bank("w13"), ids
             )
         elif mode == "fused_batch_qpn":
-            op = (
-                self._op("w13", "fused_batch_qpn_raw")
-                if self.raw_scale
-                else self._op("w13", "fused_batch_qpn")
-            )
+            op = self._op("w13", mode)
             op(buffers["intermediate"], x, *self._bank("w13"), ids, plan.interleaved)
         elif mode == "prepare_w13":
             self._op("w13", "prepare_w13")(
@@ -154,7 +159,7 @@ class Fp4MoECodec:
                     (buffers["intermediate"][:, :128], "w13_head", 256),
                     (buffers["intermediate"][:, 128:], "w13_tail", 64),
                 ):
-                    self._op("w13", "indexed_fused")(
+                    self._op("w13", mode)(
                         middle,
                         x,
                         buffers["input_row_indices"],
@@ -212,11 +217,7 @@ class Fp4MoECodec:
                 buffers["output"], x, *self._bank("w2"), ids, topk_weights
             )
         elif mode == "batch_reduce":
-            op = (
-                self._op("w2", "batch_reduce_raw")
-                if self.raw_scale
-                else self._op("w2", "batch_reduce")
-            )
+            op = self._op("w2", mode)
             op(buffers["output"], x, *self._bank("w2"), ids, topk_weights)
         else:
             self._expand("w2", False)

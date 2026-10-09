@@ -10,8 +10,12 @@ register their workspace here under their prefix, which is the same in every
 process, and apply() calls the opaque ops below with the prefix.
 """
 
+from collections.abc import MutableMapping
+from dataclasses import dataclass
+
 import torch
 
+from vllm._sm70.policy import NativeBindings
 from vllm.utils.torch_utils import direct_register_custom_op
 
 # Layer prefix -> the workspace its kernels write through.
@@ -42,19 +46,76 @@ class LayerWorkspaceView:
         setattr(self._layer, self._prefix + name, value)
 
 
-def register_layer_workspace(layer: torch.nn.Module, workspace: torch.Tensor) -> None:
-    """Make `workspace` the scratch the opaque SM70 ops use for `layer`."""
+@dataclass
+class _WorkspaceBinding:
+    workspace: torch.Tensor
+    native: NativeBindings
+
+
+_WORKSPACE_PREFIX = "sm70_workspace:"
+_legacy_native: dict[str, NativeBindings] = {}
+
+
+def _engine_workspace_registry():
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if is_forward_context_available():
+        return get_forward_context().no_compile_layers
+    config = get_current_vllm_config_or_none()
+    return config.compilation_config.static_forward_context if config else None
+
+
+def workspace_pool(name: str, legacy: MutableMapping) -> MutableMapping:
+    """Share bounded scratch within an engine, never between live engines."""
+    registry = _engine_workspace_registry()
+    if registry is None:
+        return legacy
+    return registry.setdefault(_WORKSPACE_PREFIX + "pool:" + name, {})
+
+
+def register_layer_workspace(
+    layer: torch.nn.Module, workspace: torch.Tensor, *, family: str | None = None
+) -> None:
+    """Bind addresses and native policy to this engine's existing context."""
+    from vllm.config.sm70_native import capture_linear_native_config
+
     prefix = getattr(layer, "prefix", "")
     if not prefix:
         raise RuntimeError("SM70 workspaces are bound by layer prefix")
-    bound = _layer_workspaces.get(prefix)
-    if bound is not None and bound is not workspace:
+    values = capture_linear_native_config(family).values if family else ()
+    binding = _WorkspaceBinding(workspace, NativeBindings(values))
+    registry = _engine_workspace_registry()
+    if registry is None:
+        bound = _layer_workspaces.get(prefix)
+        if bound is not None and bound is not workspace:
+            raise RuntimeError(f"{prefix} is already bound to another SM70 workspace")
+        _layer_workspaces[prefix] = workspace
+        _legacy_native[prefix] = binding.native
+        return
+    key = _WORKSPACE_PREFIX + prefix
+    bound = registry.get(key)
+    if bound is not None and bound.workspace is not workspace:
         raise RuntimeError(f"{prefix} is already bound to another SM70 workspace")
-    _layer_workspaces[prefix] = workspace
+    registry[key] = binding
+
+
+def _workspace_binding(prefix: str) -> _WorkspaceBinding:
+    registry = _engine_workspace_registry()
+    if registry is not None:
+        return registry[_WORKSPACE_PREFIX + prefix]
+    return _WorkspaceBinding(_layer_workspaces[prefix], _legacy_native[prefix])
 
 
 def clear_layer_workspaces() -> None:
-    _layer_workspaces.clear()
+    registry = _engine_workspace_registry()
+    if registry is not None:
+        for key in tuple(registry):
+            if key.startswith(_WORKSPACE_PREFIX):
+                del registry[key]
+    else:
+        _layer_workspaces.clear()
+        _legacy_native.clear()
 
 
 def _sm70_fp8_qpn8_dispatch(
@@ -68,11 +129,11 @@ def _sm70_fp8_qpn8_dispatch(
     prefetch_codes: bool,
     gated_silu: bool,
 ) -> None:
-    from vllm import _sm70_ops as sm70_ops
+    binding = _workspace_binding(layer_name)
 
-    sm70_ops.fp8_qpn8_dispatch_sm70_out(
+    binding.native.fp8_qpn8_dispatch_sm70_out(
         out,
-        _layer_workspaces[layer_name].data_ptr(),
+        binding.workspace.data_ptr(),
         x,
         codes,
         scales,
@@ -118,16 +179,16 @@ def _sm70_fp8_qpn8_dispatch_ba_split(
     scales: torch.Tensor,
     ba_weight: torch.Tensor,
 ) -> None:
-    from vllm import _sm70_ops as sm70_ops
+    binding = _workspace_binding(layer_name)
 
-    sm70_ops.fp8_qpn8_dispatch_ba_split_sm70_out(
+    binding.native.fp8_qpn8_dispatch_ba_split_sm70_out(
         qkv_out,
         z_out,
         b_out,
         a_out,
         qkvz_staging,
         ba_staging,
-        _layer_workspaces[layer_name].data_ptr(),
+        binding.workspace.data_ptr(),
         x,
         codes,
         scales,
@@ -171,11 +232,11 @@ def _sm70_fp8_prefill_dispatch(
     gated_silu: bool,
     min_prefill_m: int,
 ) -> None:
-    from vllm import _sm70_ops as sm70_ops
+    binding = _workspace_binding(layer_name)
 
-    sm70_ops.fp8_gemm_sm70_prefill_dispatch_out(
+    binding.native.fp8_gemm_sm70_prefill_dispatch_out(
         out,
-        _layer_workspaces[layer_name].data_ptr(),
+        binding.workspace.data_ptr(),
         x,
         weight,
         scales,
@@ -220,11 +281,11 @@ def _sm70_nvfp4_qpn4_dispatch(
     use_scale_code: bool,
     gated_silu: bool,
 ) -> None:
-    from vllm import _sm70_ops as sm70_ops
+    binding = _workspace_binding(layer_name)
 
-    sm70_ops.nvfp4_qpn4_dispatch_sm70_out(
+    binding.native.nvfp4_qpn4_dispatch_sm70_out(
         out,
-        _layer_workspaces[layer_name].data_ptr(),
+        binding.workspace.data_ptr(),
         x,
         codes,
         scales,

@@ -236,8 +236,10 @@ class AwqStageObserver:
         active_grouped,
         compare_step,
         weighted_reduce,
+        operators=sm70_ops,
     ):
         self.layer = layer
+        self.operators = operators
         self.x = x
         self.topk_weights = topk_weights
         self.topk_ids_i32 = ids
@@ -267,7 +269,7 @@ class AwqStageObserver:
         elif self.use_active_exact_small_batched_moe:
             if self.compare_dense_step is not None:
                 self.dense_gate_up = torch.empty_like(buffers["gate_up"])
-                sm70_ops.awq_moe_dense_stage_sm70_out(
+                self.operators.awq_moe_dense_stage_sm70_out(
                     self.dense_gate_up,
                     buffers["permuted_input"],
                     buffers["expert_offsets"],
@@ -288,7 +290,7 @@ class AwqStageObserver:
             )
             if self.compare_dense_step is not None:
                 self.dense_gate_up = torch.empty_like(buffers["gate_up"])
-                sm70_ops.awq_moe_dense_stage_sm70_out(
+                self.operators.awq_moe_dense_stage_sm70_out(
                     self.dense_gate_up,
                     buffers["permuted_input"],
                     buffers["expert_offsets"],
@@ -318,7 +320,7 @@ class AwqStageObserver:
         if self.use_active_exact_small_batched_moe or self.use_batched_active_exact_w2:
             if self.compare_dense_step is not None:
                 dense_sorted_output = torch.empty_like(buffers["sorted_output"])
-                sm70_ops.awq_moe_dense_stage_sm70_out(
+                self.operators.awq_moe_dense_stage_sm70_out(
                     dense_sorted_output,
                     buffers["intermediate"],
                     buffers["expert_offsets"],
@@ -344,7 +346,7 @@ class AwqStageObserver:
                     _silu_and_mul_w13(
                         self.layer, dense_intermediate, self.dense_gate_up
                     )
-                    sm70_ops.awq_moe_dense_stage_sm70_out(
+                    self.operators.awq_moe_dense_stage_sm70_out(
                         dense_full_sorted_output,
                         dense_intermediate,
                         buffers["expert_offsets"],
@@ -362,7 +364,7 @@ class AwqStageObserver:
                 dense_full_sorted_output_logical = dense_full_sorted_output[
                     :, : self.layer.sm70_hidden_logical_size
                 ]
-                torch.ops._moe_C.moe_unpermute(
+                self.operators.moe_unpermute(
                     dense_full_sorted_output_logical,
                     self.topk_weights,
                     buffers["inv_permuted_idx"],
@@ -391,7 +393,7 @@ class AwqStageObserver:
             )
             if self.compare_dense_step is not None:
                 dense_sorted_output = torch.empty_like(buffers["sorted_output"])
-                sm70_ops.awq_moe_dense_stage_sm70_out(
+                self.operators.awq_moe_dense_stage_sm70_out(
                     dense_sorted_output,
                     buffers["intermediate"],
                     buffers["expert_offsets"],
@@ -411,7 +413,7 @@ class AwqStageObserver:
                 self.compare_dense_full_output = torch.empty_like(output)
                 self.compare_dense_full_output.zero_()
                 _silu_and_mul_w13(self.layer, dense_intermediate, self.dense_gate_up)
-                sm70_ops.awq_moe_dense_stage_sm70_out(
+                self.operators.awq_moe_dense_stage_sm70_out(
                     dense_full_sorted_output,
                     dense_intermediate,
                     buffers["expert_offsets"],
@@ -429,7 +431,7 @@ class AwqStageObserver:
                 dense_full_sorted_output_logical = dense_full_sorted_output[
                     :, : self.layer.sm70_hidden_logical_size
                 ]
-                torch.ops._moe_C.moe_unpermute(
+                self.operators.moe_unpermute(
                     dense_full_sorted_output_logical,
                     self.topk_weights,
                     buffers["inv_permuted_idx"],
@@ -454,7 +456,7 @@ class AwqStageObserver:
                     )
                     self.compare_strict_output = torch.empty_like(output)
                     self.compare_strict_output.zero_()
-                    sm70_ops.awq_moe_single_token_dense_w13_sm70_out(
+                    self.operators.awq_moe_single_token_dense_w13_sm70_out(
                         strict_gate_up,
                         strict_compact_input,
                         self.x,
@@ -471,7 +473,7 @@ class AwqStageObserver:
                         self.layer.sm70_hidden_logical_size,
                     )
                     _silu_and_mul_w13(self.layer, strict_intermediate, strict_gate_up)
-                    sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
+                    self.operators.awq_moe_single_token_dense_stage_sm70_out(
                         strict_sorted_output,
                         strict_intermediate,
                         strict_expert_offsets,
@@ -487,7 +489,7 @@ class AwqStageObserver:
                         :, : self.layer.sm70_hidden_logical_size
                     ]
                     if self.weighted_reduce:
-                        sm70_ops.awq_moe_single_token_weighted_reduce_out(
+                        self.operators.awq_moe_single_token_weighted_reduce_out(
                             strict_sorted_output_logical,
                             self.topk_weights,
                             strict_inv_permuted_idx,
@@ -496,7 +498,7 @@ class AwqStageObserver:
                             self.layer.sm70_hidden_logical_size,
                         )
                     else:
-                        torch.ops._moe_C.moe_unpermute(
+                        self.operators.moe_unpermute(
                             strict_sorted_output_logical,
                             self.topk_weights,
                             strict_inv_permuted_idx,
@@ -567,3 +569,134 @@ class AwqStageObserver:
                 )
             _write_compare_dense_record(record, _diagnostics(self.layer))
         return _dump_awq_moe_buffer(self.layer, output, "output")
+
+
+def fp8_stage_reference(codec, layer, x, weights, ids, buffers, group_size, *, compact):
+    """Historical FP8 reference layouts, using the production stage executor."""
+    from dataclasses import replace
+
+    from vllm.model_executor.layers.fused_moe.sm70.stages import execute_routed
+    from vllm.model_executor.layers.quantization.sm70_moe_router import (
+        select_sm70_quantized_moe_route,
+    )
+
+    names = (
+        "permuted_input",
+        "gate_up",
+        "intermediate",
+        "sorted_output",
+        "output",
+        "expert_offsets",
+        "expert_offsets64",
+        "inv_permuted_idx",
+    )
+    ref = {name: torch.empty_like(buffers[name]) for name in names}
+    ref["output"].zero_()
+    top_k = weights.shape[1]
+    if compact:
+        codec.operators.awq_moe_single_token_exact_layout_prepare(
+            ids,
+            x,
+            ref["permuted_input"],
+            ref["expert_offsets"],
+            ref["expert_offsets64"],
+            ref["inv_permuted_idx"],
+            layer.sm70_num_experts,
+        )
+        plan = select_sm70_quantized_moe_route(
+            batched_enabled=True, num_tokens=1, total_slots=top_k
+        )
+    else:
+        permuted_idx = torch.empty_like(buffers["permuted_idx"])
+        args = (
+            x,
+            ids,
+            buffers["token_expert_indices"],
+            layer.expert_map,
+            layer.global_num_experts,
+            layer.local_num_experts,
+            top_k,
+            ref["permuted_input"],
+            ref["expert_offsets64"],
+            ref["inv_permuted_idx"],
+            permuted_idx,
+        )
+        if layer.sm70_fp8_moe_permute_with_scratch:
+            permuted_idx.fill_(x.shape[0] * top_k)
+            codec.operators.moe_permute_with_scratch(
+                *args,
+                *(
+                    torch.empty_like(buffers[name])
+                    for name in (
+                        "sort_workspace",
+                        "permuted_experts_id",
+                        "sorted_row_idx",
+                        "topk_ids_for_sort",
+                    )
+                ),
+            )
+        else:
+            codec.operators.moe_permute(*args)
+        ref["expert_offsets"].copy_(ref["expert_offsets64"], non_blocking=True)
+        plan = select_sm70_quantized_moe_route(
+            batched_enabled=layer.sm70_fp8_moe_batched_gemm,
+            num_tokens=x.shape[0],
+            total_slots=x.shape[0] * top_k,
+            w13_per_expert_dispatch=layer.sm70_fp8_moe_batched_w13_per_expert_dispatch,
+            w2_per_expert_dispatch=layer.sm70_fp8_moe_batched_w2_per_expert_dispatch,
+        )
+    execute_routed(
+        replace(codec, diagnostic=True),
+        plan,
+        layer,
+        ref,
+        x,
+        weights,
+        group_size,
+        layer._fp8_buf_dense_expert_ids,
+    )
+    return ref
+
+
+def report_stage_compare(
+    logger,
+    layer_name,
+    prefix,
+    report_index,
+    reference_tensors,
+    actual_tensors,
+    topk_ids_i32,
+):
+    """Common comparison observer, preserving the historical FP8 fields."""
+
+    def _max_diff(name: str) -> float:
+        actual = actual_tensors[name]
+        expected = reference_tensors[name]
+        return float((actual - expected).abs().max().item())
+
+    logger.warning(
+        "SM70 FP8 %s compare: layer=%s report=%d "
+        "perm=%g off_eq=%s off64_eq=%s inv_eq=%s "
+        "w13=%g silu=%g w2=%g out=%g topk_ids=%s",
+        prefix,
+        layer_name,
+        report_index,
+        _max_diff("permuted_input"),
+        torch.equal(
+            actual_tensors["expert_offsets"],
+            reference_tensors["expert_offsets"],
+        ),
+        torch.equal(
+            actual_tensors["expert_offsets64"],
+            reference_tensors["expert_offsets64"],
+        ),
+        torch.equal(
+            actual_tensors["inv_permuted_idx"],
+            reference_tensors["inv_permuted_idx"],
+        ),
+        _max_diff("gate_up"),
+        _max_diff("intermediate"),
+        _max_diff("sorted_output"),
+        _max_diff("output"),
+        topk_ids_i32.detach().cpu().view(-1).tolist(),
+    )

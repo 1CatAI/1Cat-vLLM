@@ -133,42 +133,75 @@ class Fp8MoEWorkspace:
         *,
         buffer_prefix: str,
     ) -> dict[str, torch.Tensor]:
-        buffers = LayerWorkspaceView(layer, buffer_prefix)
-        if total_slots <= buffers.max_slots and num_tokens <= buffers.max_tokens:
+        if total_slots <= getattr(
+            layer, buffer_prefix + "max_slots"
+        ) and num_tokens <= getattr(layer, buffer_prefix + "max_tokens"):
             return {
-                "output": buffers.output[:num_tokens],
-                "permuted_input": buffers.permuted_input[:total_slots],
-                "intermediate": buffers.intermediate[:total_slots],
-                "gate_up": buffers.gate_up[:total_slots],
-                "sorted_output": buffers.sorted_output[:total_slots],
-                "expert_offsets": buffers.expert_offsets,
-                "expert_offsets64": buffers.expert_offsets64,
-                "inv_permuted_idx": buffers.inv_permuted_idx[:num_tokens],
-                "topk_ids": buffers.topk_ids[:num_tokens],
-                "token_expert_indices": buffers.token_expert_indices[:num_tokens],
-                "permuted_idx": buffers.permuted_idx[:total_slots],
-                "sorted_expert_ids": buffers.sorted_expert_ids[:total_slots],
-                "sort_workspace": buffers.sort_workspace,
-                "permuted_experts_id": buffers.permuted_experts_id[:total_slots],
-                "sorted_row_idx": buffers.sorted_row_idx[:total_slots],
-                "topk_ids_for_sort": buffers.topk_ids_for_sort[:total_slots],
+                "output": getattr(layer, buffer_prefix + "output")[:num_tokens],
+                "permuted_input": getattr(layer, buffer_prefix + "permuted_input")[
+                    :total_slots
+                ],
+                "intermediate": getattr(layer, buffer_prefix + "intermediate")[
+                    :total_slots
+                ],
+                "gate_up": getattr(layer, buffer_prefix + "gate_up")[:total_slots],
+                "sorted_output": getattr(layer, buffer_prefix + "sorted_output")[
+                    :total_slots
+                ],
+                "expert_offsets": getattr(layer, buffer_prefix + "expert_offsets"),
+                "expert_offsets64": getattr(layer, buffer_prefix + "expert_offsets64"),
+                "inv_permuted_idx": getattr(layer, buffer_prefix + "inv_permuted_idx")[
+                    :num_tokens
+                ],
+                "topk_ids": getattr(layer, buffer_prefix + "topk_ids")[:num_tokens],
+                "token_expert_indices": getattr(
+                    layer, buffer_prefix + "token_expert_indices"
+                )[:num_tokens],
+                "permuted_idx": getattr(layer, buffer_prefix + "permuted_idx")[
+                    :total_slots
+                ],
+                "sorted_expert_ids": getattr(
+                    layer, buffer_prefix + "sorted_expert_ids"
+                )[:total_slots],
+                "sort_workspace": getattr(layer, buffer_prefix + "sort_workspace"),
+                "permuted_experts_id": getattr(
+                    layer, buffer_prefix + "permuted_experts_id"
+                )[:total_slots],
+                "sorted_row_idx": getattr(layer, buffer_prefix + "sorted_row_idx")[
+                    :total_slots
+                ],
+                "topk_ids_for_sort": getattr(
+                    layer, buffer_prefix + "topk_ids_for_sort"
+                )[:total_slots],
                 "active_expert_offsets": (
-                    buffers.active_expert_offsets[: total_slots + 1]
+                    getattr(layer, buffer_prefix + "active_expert_offsets")[
+                        : total_slots + 1
+                    ]
                 ),
-                "sorted_weights": buffers.sorted_weights,
-                "broadcast_input_indices": buffers.broadcast_input_indices,
-                "compact_w13_ptrs_w": buffers.compact_w13_ptrs_w,
-                "compact_w13_ptrs_s": buffers.compact_w13_ptrs_s,
-                "legacy_w13_ptrs_w": buffers.legacy_w13_ptrs_w,
-                "legacy_w13_ptrs_s": buffers.legacy_w13_ptrs_s,
-                "legacy_w2_ptrs_w": buffers.legacy_w2_ptrs_w,
-                "legacy_w2_ptrs_s": buffers.legacy_w2_ptrs_s,
-                "empty_weight": buffers.empty_weight,
-                "empty_scale": buffers.empty_scale,
+                "sorted_weights": getattr(layer, buffer_prefix + "sorted_weights"),
+                "broadcast_input_indices": getattr(
+                    layer, buffer_prefix + "broadcast_input_indices"
+                ),
+                "compact_w13_ptrs_w": getattr(
+                    layer, buffer_prefix + "compact_w13_ptrs_w"
+                ),
+                "compact_w13_ptrs_s": getattr(
+                    layer, buffer_prefix + "compact_w13_ptrs_s"
+                ),
+                "legacy_w13_ptrs_w": getattr(
+                    layer, buffer_prefix + "legacy_w13_ptrs_w"
+                ),
+                "legacy_w13_ptrs_s": getattr(
+                    layer, buffer_prefix + "legacy_w13_ptrs_s"
+                ),
+                "legacy_w2_ptrs_w": getattr(layer, buffer_prefix + "legacy_w2_ptrs_w"),
+                "legacy_w2_ptrs_s": getattr(layer, buffer_prefix + "legacy_w2_ptrs_s"),
+                "empty_weight": getattr(layer, buffer_prefix + "empty_weight"),
+                "empty_scale": getattr(layer, buffer_prefix + "empty_scale"),
             }
 
-        device = buffers.output.device
-        top_k = buffers.top_k
+        device = getattr(layer, buffer_prefix + "output").device
+        top_k = getattr(layer, buffer_prefix + "top_k")
         hidden_size = layer.sm70_hidden_logical_size
         if self.use_permute_with_scratch:
             sort_workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
@@ -181,8 +214,10 @@ class Fp8MoEWorkspace:
                 total_slots + 1, dtype=torch.int32, device=device
             )
         else:
-            sort_workspace = buffers.sort_workspace
-            active_expert_offsets = buffers.active_expert_offsets[: total_slots + 1]
+            sort_workspace = getattr(layer, buffer_prefix + "sort_workspace")
+            active_expert_offsets = getattr(
+                layer, buffer_prefix + "active_expert_offsets"
+            )[: total_slots + 1]
         return {
             "output": torch.empty(
                 num_tokens, hidden_size, dtype=torch.float16, device=device
@@ -235,14 +270,16 @@ class Fp8MoEWorkspace:
                 total_slots, dtype=torch.int32, device=device
             ),
             "active_expert_offsets": active_expert_offsets,
-            "sorted_weights": buffers.sorted_weights,
-            "broadcast_input_indices": buffers.broadcast_input_indices,
-            "compact_w13_ptrs_w": buffers.compact_w13_ptrs_w,
-            "compact_w13_ptrs_s": buffers.compact_w13_ptrs_s,
-            "legacy_w13_ptrs_w": buffers.legacy_w13_ptrs_w,
-            "legacy_w13_ptrs_s": buffers.legacy_w13_ptrs_s,
-            "legacy_w2_ptrs_w": buffers.legacy_w2_ptrs_w,
-            "legacy_w2_ptrs_s": buffers.legacy_w2_ptrs_s,
-            "empty_weight": buffers.empty_weight,
-            "empty_scale": buffers.empty_scale,
+            "sorted_weights": getattr(layer, buffer_prefix + "sorted_weights"),
+            "broadcast_input_indices": getattr(
+                layer, buffer_prefix + "broadcast_input_indices"
+            ),
+            "compact_w13_ptrs_w": getattr(layer, buffer_prefix + "compact_w13_ptrs_w"),
+            "compact_w13_ptrs_s": getattr(layer, buffer_prefix + "compact_w13_ptrs_s"),
+            "legacy_w13_ptrs_w": getattr(layer, buffer_prefix + "legacy_w13_ptrs_w"),
+            "legacy_w13_ptrs_s": getattr(layer, buffer_prefix + "legacy_w13_ptrs_s"),
+            "legacy_w2_ptrs_w": getattr(layer, buffer_prefix + "legacy_w2_ptrs_w"),
+            "legacy_w2_ptrs_s": getattr(layer, buffer_prefix + "legacy_w2_ptrs_s"),
+            "empty_weight": getattr(layer, buffer_prefix + "empty_weight"),
+            "empty_scale": getattr(layer, buffer_prefix + "empty_scale"),
         }

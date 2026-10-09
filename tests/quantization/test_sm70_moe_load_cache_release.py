@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm import _sm70_ops as native
 from vllm.config.sm70_moe import NVFP4_ALIASES, Sm70MoEFormatConfig, Sm70NvFp4MoEConfig
 from vllm.model_executor.layers.fused_moe.sm70.weight_codec import Sm70MoEWeightCodec
 from vllm.model_executor.layers.quantization import awq_sm70_moe as awq
@@ -49,8 +50,9 @@ def _awq_case(monkeypatch):
     def prepare(weight, scales, zeros, group_size, interleaved):
         return weight.clone(), scales.clone(), torch.tensor([64, 64])
 
-    monkeypatch.setattr(awq.sm70_ops, "awq_sm70_prepare", prepare)
+    monkeypatch.setattr(native, "awq_sm70_prepare", prepare)
     method = SimpleNamespace(
+        native_ops=native,
         group_size=32,
         pack_factor=8,
         weight_codec=Sm70MoEWeightCodec("AWQ", awq.logger),
@@ -109,8 +111,9 @@ def _nvfp4_case(monkeypatch):
     def prepare(weight, scales, group_size, **kwargs):
         return weight.clone(), scales.clone(), torch.tensor([64, 64])
 
-    monkeypatch.setattr(nvfp4.sm70_ops, "nvfp4_sm70_prepare", prepare)
+    monkeypatch.setattr(native, "nvfp4_sm70_prepare", prepare)
     method = SimpleNamespace(
+        native_ops=native,
         sm70_moe_policy=Sm70NvFp4MoEConfig(**dict.fromkeys(NVFP4_ALIASES, False)),
         moe=SimpleNamespace(has_bias=False),
         _allocate_graph_safe_decode_buffers=lambda layer: setattr(
@@ -130,7 +133,7 @@ def _nvfp4_case(monkeypatch):
 def test_release_once_after_source_removal_preserves_prepared_tensors(
     monkeypatch, make_case
 ):
-    monkeypatch.setattr(awq.sm70_ops, "awq_moe_build_strided_ptrs", _ptrs)
+    monkeypatch.setattr(native, "awq_moe_build_strided_ptrs", _ptrs)
     load, method, reference, _ = make_case(monkeypatch)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
     load(method, reference)
@@ -161,8 +164,8 @@ def test_release_once_after_source_removal_preserves_prepared_tensors(
 def test_failed_conversion_does_not_run_success_cleanup(monkeypatch, make_case):
     load, method, layer, source_names = make_case(monkeypatch)
     failing_prepare = Mock(side_effect=RuntimeError("conversion failed"))
-    monkeypatch.setattr(awq.sm70_ops, "awq_sm70_prepare", failing_prepare)
-    monkeypatch.setattr(nvfp4.sm70_ops, "nvfp4_sm70_prepare", failing_prepare)
+    monkeypatch.setattr(native, "awq_sm70_prepare", failing_prepare)
+    monkeypatch.setattr(native, "nvfp4_sm70_prepare", failing_prepare)
     release = Mock()
     monkeypatch.setattr(torch.accelerator, "empty_cache", release)
     with pytest.raises(RuntimeError, match="conversion failed"):

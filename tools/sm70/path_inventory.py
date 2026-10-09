@@ -15,6 +15,8 @@ import subprocess
 from contextlib import suppress
 from pathlib import Path
 
+import regex as re
+
 ROOT = Path(__file__).resolve().parents[2]
 QUANT = "vllm/model_executor/layers/quantization/"
 LINEAR = "vllm/model_executor/kernels/linear/"
@@ -170,7 +172,17 @@ class Inventory(ast.NodeVisitor):
                         "expression": ast.unparse(node),
                     }
                 )
-        if name.startswith(("sm70_ops.", "torch.ops.")):
+        if name.startswith(
+            (
+                "sm70_ops.",
+                "torch.ops.",
+                "self.native_ops.",
+                "codec.operators.",
+                "self.operators.",
+                "state.native_ops.",
+                "binding.native.",
+            )
+        ):
             self.calls.append(
                 {
                     **self.location(node),
@@ -194,9 +206,25 @@ def source_paths(ref: str | None) -> list[str]:
     common = {
         path
         for path in available
-        if path.startswith("vllm/model_executor/layers/fused_moe/sm70/")
+        if path.startswith(
+            (
+                "vllm/model_executor/layers/fused_moe/sm70/",
+                "vllm/model_executor/kernels/linear/qpn/",
+                "vllm/_sm70/",
+            )
+        )
     }
-    common.add("vllm/config/sm70_moe.py")
+    common.update(
+        {
+            "vllm/config/sm70_moe.py",
+            "vllm/config/sm70_native.py",
+            LINEAR + "sm70_provider.py",
+            QUANT + "compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py",
+            QUANT + "awq_marlin.py",
+            "vllm/model_executor/warmup/sm70_native_cache.py",
+            "vllm/model_executor/warmup/awq_sm70_warmup.py",
+        }
+    )
     return sorted((set(SOURCES) | common) & available)
 
 
@@ -211,6 +239,10 @@ def inventory(ref: str | None = None) -> dict:
         calls.extend(visitor.calls)
         functions.extend(visitor.functions)
     names = sorted({row["name"] for row in parameters})
+    declared = binding_catalog() if ref is None else {}
+    for row in declared.get("aliases", []) + declared.get("native_parameters", []):
+        if row["legacy"] not in names:
+            names.append(row["legacy"])
     return {
         "source": ref or "working-tree",
         "evidence": "static call sites; not runtime route hits",
@@ -222,6 +254,7 @@ def inventory(ref: str | None = None) -> dict:
             "functions": len(functions),
         },
         "parameters": {name: registry.get(name) for name in names},
+        "initialized_declarations": declared,
         "source_files": paths,
         "reads": parameters,
         "native_calls": calls,
@@ -310,16 +343,58 @@ def binding_catalog() -> dict:
     aliases = dict(
         policy["ALIASES"], nvfp4=policy["NVFP4_ALIASES"], mxfp4=policy["MXFP4_ALIASES"]
     )
+    linear = assignments("vllm/config/kernel.py")
+    for family in ("awq", "fp8", "nvfp4"):
+        aliases["linear_" + family] = linear[
+            "SM70_" + family.upper() + "_LINEAR_ALIASES"
+        ]
     registry = registrations(read_source("vllm/envs.py", None))
     bindings = assignments("vllm/model_executor/layers/fused_moe/sm70/declarations.py")[
         "FP4_STAGE_BINDINGS"
     ]
+    native = assignments("vllm/config/sm70_native.py")["NATIVE_FIELDS"]
+    cpp_paths = (
+        "csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu",
+        "csrc/sm70_turbomind/ops/awq_sm70_gemm.cu",
+        "csrc/sm70_turbomind/ops/nvfp4_qpn2_sm70.cu",
+        "csrc/sm70_turbomind/ops/qwen38_prefill_cutlass.cu",
+        "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/gemm.cu",
+        "csrc/sm70_turbomind/lmdeploy/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu",
+    )
+    consumers = {field: [] for field, *_ in native}
+    for path in cpp_paths:
+        for line, source in enumerate(read_source(path, None).splitlines(), 1):
+            for field in consumers:
+                if re.search(r"PolicyField::" + re.escape(field) + r"\b", source):
+                    consumers[field].append({"file": path, "line": line})
     return {
         "evidence": "configuration and binding declarations; no native execution claim",
+        "native_parameters": [
+            dict(
+                legacy=alias,
+                field=field,
+                families=families,
+                diagnostic=diagnostic,
+                getter=registry.get(alias, {}).get("getter", "native unset default"),
+                consumers=consumers[field],
+                timing="owner initialization; frozen native argument at execution",
+                precedence=(
+                    "typed parent/native (conflict rejected) > "
+                    "captured legacy > original native default"
+                ),
+            )
+            for field, alias, families, diagnostic in native
+        ],
         "aliases": [
             {
                 "legacy": name,
-                "typed": "sm70_moe." + family + "." + field,
+                "typed": (
+                    ("sm70_" + family.removeprefix("linear_"))
+                    if family.startswith("linear_")
+                    else "sm70_moe." + family
+                )
+                + "."
+                + field,
                 "getter": registry[name]["getter"],
                 "timing": "engine initialization",
                 "precedence": "explicit typed value > legacy getter/default",
@@ -376,6 +451,32 @@ def binding_markdown(catalog: dict) -> str:
             f"`{row['operator']}` | {row['covers']} | {row['layout']} | "
             f"{row['arithmetic']} |"
         )
+    lines += [
+        "",
+        "## Native policy arguments",
+        "",
+        "Native policy is captured once. An unset value remains a null sentinel, "
+        "preserving each native consumer's own default (which can differ from "
+        "the Python compatibility getter). Consumer links are authoritative. "
+        "Explicit parent and native requests for the same alias must agree. "
+        "FP16 auxiliary aliases retain their independent legacy owner outside Phase B.",
+        "",
+        "| Legacy alias / field | Families | Compatibility getter | "
+        "Native consumers | Hash role |",
+        "|---|---|---|---|---|",
+    ]
+    for row in catalog["native_parameters"]:
+        links = "<br>".join(
+            f"[source](../../../{site['file']}#L{site['line']})"
+            for site in row["consumers"]
+        )
+        getter = row["getter"].replace("|", "\\|")
+        lines.append(
+            f"| `{row['legacy']}` / `{row['field']}` | "
+            f"{', '.join(row['families'])} | `{getter}` | {links} | "
+            + ("diagnostic" if row["diagnostic"] else "calculation")
+            + " |"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -389,7 +490,7 @@ def main() -> None:
     if args.bindings:
         catalog = binding_catalog()
         print(
-            binding_markdown(catalog)
+            binding_markdown(catalog).rstrip()
             if args.markdown
             else json.dumps(catalog, indent=2)
         )

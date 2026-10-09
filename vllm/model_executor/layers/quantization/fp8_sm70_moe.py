@@ -7,7 +7,6 @@ from dataclasses import replace
 import torch
 from torch.nn import Parameter
 
-from vllm import _sm70_ops as sm70_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config.sm70_moe import Sm70MoEFormatConfig, capture_sm70_moe_config
 from vllm.logger import init_logger
@@ -16,12 +15,15 @@ from vllm.model_executor.layers.fused_moe import (
     RoutedExperts,
     SharedExperts,
 )
+from vllm.model_executor.layers.fused_moe.sm70.diagnostics import (
+    fp8_stage_reference,
+    report_stage_compare,
+)
 from vllm.model_executor.layers.fused_moe.sm70.method import Sm70MoEMethodBase
 from vllm.model_executor.layers.fused_moe.sm70.single_token import execute_single_token
 from vllm.model_executor.layers.fused_moe.sm70.stages import execute_routed
 from vllm.model_executor.layers.fused_moe.sm70.workspace import Fp8MoEWorkspace
 from vllm.model_executor.layers.quantization.sm70_moe_router import (
-    Sm70MoeStageRoute,
     select_sm70_quantized_moe_route,
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
@@ -249,14 +251,14 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
 
         w13_k_ld, w13_q_ld = int(w13_meta[0][0].item()), int(w13_meta[0][1].item())
         w2_k_ld, w2_q_ld = int(w2_meta[0][0].item()), int(w2_meta[0][1].item())
-        w13_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w13_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
             layer.w13_tm_scales,
             w13_k_ld,
             w13_q_ld,
             num_experts,
         )
-        w2_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w2_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w2_tm_weight,
             layer.w2_tm_scales,
             w2_k_ld,
@@ -323,7 +325,7 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
             end = offsets[expert_id + 1]
             if start == end:
                 continue
-            sm70_ops.fp8_gemm_sm70_out_meta(
+            self.native_ops.fp8_gemm_sm70_out_meta(
                 out[start:end],
                 sorted_input[start:end],
                 tm_weight[expert_id],
@@ -344,282 +346,46 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
         )
 
     def _apply_batched_reference_for_compare(
-        self,
-        layer: RoutedExperts,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids_i32: torch.Tensor,
-        buffers: dict[str, torch.Tensor],
-        top_k: int,
-    ) -> dict[str, torch.Tensor]:
-        num_tokens = x.shape[0]
-        total_slots = num_tokens * top_k
-        ref_permuted_input = torch.empty_like(buffers["permuted_input"])
-        ref_gate_up = torch.empty_like(buffers["gate_up"])
-        ref_intermediate = torch.empty_like(buffers["intermediate"])
-        ref_sorted_output = torch.empty_like(buffers["sorted_output"])
-        ref_output = torch.empty_like(buffers["output"])
-        ref_output.zero_()
-        ref_expert_offsets = torch.empty_like(buffers["expert_offsets"])
-        ref_expert_offsets64 = torch.empty_like(buffers["expert_offsets64"])
-        ref_inv_permuted_idx = torch.empty_like(buffers["inv_permuted_idx"])
-        ref_permuted_idx = torch.empty_like(buffers["permuted_idx"])
-
-        if layer.sm70_fp8_moe_permute_with_scratch:
-            ref_permuted_idx.fill_(total_slots)
-            torch.ops._moe_C.moe_permute_with_scratch(
-                x,
-                topk_ids_i32,
-                buffers["token_expert_indices"],
-                layer.expert_map,
-                layer.global_num_experts,
-                layer.local_num_experts,
-                top_k,
-                ref_permuted_input,
-                ref_expert_offsets64,
-                ref_inv_permuted_idx,
-                ref_permuted_idx,
-                torch.empty_like(buffers["sort_workspace"]),
-                torch.empty_like(buffers["permuted_experts_id"]),
-                torch.empty_like(buffers["sorted_row_idx"]),
-                torch.empty_like(buffers["topk_ids_for_sort"]),
-            )
-        else:
-            torch.ops._moe_C.moe_permute(
-                x,
-                topk_ids_i32,
-                buffers["token_expert_indices"],
-                layer.expert_map,
-                layer.global_num_experts,
-                layer.local_num_experts,
-                top_k,
-                ref_permuted_input,
-                ref_expert_offsets64,
-                ref_inv_permuted_idx,
-                ref_permuted_idx,
-            )
-        ref_expert_offsets.copy_(ref_expert_offsets64, non_blocking=True)
-
-        route_plan = select_sm70_quantized_moe_route(
-            batched_enabled=layer.sm70_fp8_moe_batched_gemm,
-            num_tokens=num_tokens,
-            total_slots=total_slots,
-            w13_per_expert_dispatch=(
-                layer.sm70_fp8_moe_batched_w13_per_expert_dispatch
-            ),
-            w2_per_expert_dispatch=(layer.sm70_fp8_moe_batched_w2_per_expert_dispatch),
-        )
-        if route_plan.w13 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
-            sm70_ops.fp8_moe_gemm_sm70_per_expert_dispatch_out(
-                ref_gate_up,
-                ref_permuted_input,
-                ref_expert_offsets,
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                layer.sm70_num_experts,
-                layer.sm70_w13_k_dim,
-                layer.sm70_w13_n_dim,
-                self.group_size,
-                False,
-            )
-        elif route_plan.w13 == Sm70MoeStageRoute.BATCHED:
-            sm70_ops.fp8_moe_gemm_sm70_out(
-                ref_gate_up,
-                ref_permuted_input,
-                ref_expert_offsets,
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                layer.sm70_num_experts,
-                layer.sm70_w13_k_dim,
-                layer.sm70_w13_n_dim,
-                self.group_size,
-                False,
-            )
-        else:
-            sm70_ops.fp8_moe_dense_stage_sm70_out(
-                ref_gate_up,
-                ref_permuted_input,
-                ref_expert_offsets,
-                layer._fp8_buf_dense_expert_ids,
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                layer.sm70_num_experts,
-                layer.sm70_w13_k_dim,
-                layer.sm70_w13_n_dim,
-                self.group_size,
-            )
-        torch.ops._C.silu_and_mul(ref_intermediate, ref_gate_up)
-        if route_plan.w2 == Sm70MoeStageRoute.PER_EXPERT_DISPATCH:
-            sm70_ops.fp8_moe_gemm_sm70_per_expert_dispatch_out(
-                ref_sorted_output,
-                ref_intermediate,
-                ref_expert_offsets,
-                layer.w2_strided_ptrs_w,
-                layer.w2_strided_ptrs_s,
-                layer.sm70_num_experts,
-                layer.sm70_w2_k_dim,
-                layer.sm70_w2_n_dim,
-                self.group_size,
-                False,
-            )
-        elif route_plan.w2 == Sm70MoeStageRoute.BATCHED:
-            sm70_ops.fp8_moe_gemm_sm70_out(
-                ref_sorted_output,
-                ref_intermediate,
-                ref_expert_offsets,
-                layer.w2_strided_ptrs_w,
-                layer.w2_strided_ptrs_s,
-                layer.sm70_num_experts,
-                layer.sm70_w2_k_dim,
-                layer.sm70_w2_n_dim,
-                self.group_size,
-                False,
-            )
-        else:
-            sm70_ops.fp8_moe_dense_stage_sm70_out(
-                ref_sorted_output,
-                ref_intermediate,
-                ref_expert_offsets,
-                layer._fp8_buf_dense_expert_ids,
-                layer.w2_strided_ptrs_w,
-                layer.w2_strided_ptrs_s,
-                layer.sm70_num_experts,
-                layer.sm70_w2_k_dim,
-                layer.sm70_w2_n_dim,
-                self.group_size,
-            )
-        torch.ops._moe_C.moe_unpermute(
-            ref_sorted_output,
+        self, layer, x, topk_weights, topk_ids_i32, buffers, top_k
+    ):
+        return fp8_stage_reference(
+            self.weight_codec,
+            layer,
+            x,
             topk_weights,
-            ref_inv_permuted_idx,
-            ref_expert_offsets64,
-            top_k,
-            ref_output,
+            topk_ids_i32,
+            buffers,
+            self.group_size,
+            compact=False,
         )
-        return {
-            "permuted_input": ref_permuted_input,
-            "expert_offsets": ref_expert_offsets,
-            "expert_offsets64": ref_expert_offsets64,
-            "inv_permuted_idx": ref_inv_permuted_idx,
-            "gate_up": ref_gate_up,
-            "intermediate": ref_intermediate,
-            "sorted_output": ref_sorted_output,
-            "output": ref_output,
-        }
 
     def _apply_compact_reference_for_compare(
-        self,
-        layer: RoutedExperts,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids_i32: torch.Tensor,
-        buffers: dict[str, torch.Tensor],
-        top_k: int,
-    ) -> dict[str, torch.Tensor]:
-        ref_permuted_input = torch.empty_like(buffers["permuted_input"])
-        ref_gate_up = torch.empty_like(buffers["gate_up"])
-        ref_intermediate = torch.empty_like(buffers["intermediate"])
-        ref_sorted_output = torch.empty_like(buffers["sorted_output"])
-        ref_output = torch.empty_like(buffers["output"])
-        ref_output.zero_()
-        ref_expert_offsets = torch.empty_like(buffers["expert_offsets"])
-        ref_expert_offsets64 = torch.empty_like(buffers["expert_offsets64"])
-        ref_inv_permuted_idx = torch.empty_like(buffers["inv_permuted_idx"])
-
-        sm70_ops.awq_moe_single_token_exact_layout_prepare(
-            topk_ids_i32,
+        self, layer, x, topk_weights, topk_ids_i32, buffers, top_k
+    ):
+        return fp8_stage_reference(
+            self.weight_codec,
+            layer,
             x,
-            ref_permuted_input,
-            ref_expert_offsets,
-            ref_expert_offsets64,
-            ref_inv_permuted_idx,
-            layer.sm70_num_experts,
-        )
-        sm70_ops.fp8_moe_gemm_sm70_out(
-            ref_gate_up,
-            ref_permuted_input,
-            ref_expert_offsets,
-            layer.w13_strided_ptrs_w,
-            layer.w13_strided_ptrs_s,
-            layer.sm70_num_experts,
-            layer.sm70_w13_k_dim,
-            layer.sm70_w13_n_dim,
-            self.group_size,
-            False,
-        )
-        torch.ops._C.silu_and_mul(ref_intermediate, ref_gate_up)
-        sm70_ops.fp8_moe_gemm_sm70_out(
-            ref_sorted_output,
-            ref_intermediate,
-            ref_expert_offsets,
-            layer.w2_strided_ptrs_w,
-            layer.w2_strided_ptrs_s,
-            layer.sm70_num_experts,
-            layer.sm70_w2_k_dim,
-            layer.sm70_w2_n_dim,
-            self.group_size,
-            False,
-        )
-        torch.ops._moe_C.moe_unpermute(
-            ref_sorted_output,
             topk_weights,
-            ref_inv_permuted_idx,
-            ref_expert_offsets64,
-            top_k,
-            ref_output,
+            topk_ids_i32,
+            buffers,
+            self.group_size,
+            compact=True,
         )
-        return {
-            "permuted_input": ref_permuted_input,
-            "expert_offsets": ref_expert_offsets,
-            "expert_offsets64": ref_expert_offsets64,
-            "inv_permuted_idx": ref_inv_permuted_idx,
-            "gate_up": ref_gate_up,
-            "intermediate": ref_intermediate,
-            "sorted_output": ref_sorted_output,
-            "output": ref_output,
-        }
 
     def _maybe_report_compare(
-        self,
-        layer: RoutedExperts,
-        prefix: str,
-        reference_tensors: dict[str, torch.Tensor],
-        actual_tensors: dict[str, torch.Tensor],
-        topk_ids_i32: torch.Tensor,
-    ) -> None:
+        self, layer, prefix, reference_tensors, actual_tensors, topk_ids_i32
+    ):
         if self._compact_compare_reports >= self.compact_compare_max_reports:
             return
-
-        def _max_diff(name: str) -> float:
-            actual = actual_tensors[name]
-            expected = reference_tensors[name]
-            return float((actual - expected).abs().max().item())
-
-        logger.warning(
-            "SM70 FP8 %s compare: layer=%s report=%d "
-            "perm=%g off_eq=%s off64_eq=%s inv_eq=%s "
-            "w13=%g silu=%g w2=%g out=%g topk_ids=%s",
-            prefix,
+        report_stage_compare(
+            logger,
             getattr(layer, "layer_name", "<unknown>"),
+            prefix,
             self._compact_compare_reports,
-            _max_diff("permuted_input"),
-            torch.equal(
-                actual_tensors["expert_offsets"],
-                reference_tensors["expert_offsets"],
-            ),
-            torch.equal(
-                actual_tensors["expert_offsets64"],
-                reference_tensors["expert_offsets64"],
-            ),
-            torch.equal(
-                actual_tensors["inv_permuted_idx"],
-                reference_tensors["inv_permuted_idx"],
-            ),
-            _max_diff("gate_up"),
-            _max_diff("intermediate"),
-            _max_diff("sorted_output"),
-            _max_diff("output"),
-            topk_ids_i32.detach().cpu().view(-1).tolist(),
+            reference_tensors,
+            actual_tensors,
+            topk_ids_i32,
         )
         self._compact_compare_reports += 1
 
@@ -660,7 +426,7 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
                 top_k,
                 layer.sm70_num_experts,
             )
-            sm70_ops.awq_moe_single_token_exact_layout_prepare(
+            self.native_ops.awq_moe_single_token_exact_layout_prepare(
                 topk_ids_i32,
                 x,
                 buffers["permuted_input"],
@@ -679,7 +445,7 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
                 self.group_size,
                 layer._fp8_buf_dense_expert_ids,
             )
-        sm70_ops.fp8_moe_single_token_sm70_out(
+        self.native_ops.fp8_moe_single_token_sm70_out(
             output,
             x,
             topk_weights,
@@ -720,7 +486,7 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
         )
         if self.compact_native_unpermute:
             output.zero_()
-            torch.ops._moe_C.moe_unpermute(
+            self.native_ops.moe_unpermute(
                 buffers["sorted_output"],
                 topk_weights,
                 buffers["inv_permuted_idx"],
@@ -800,7 +566,7 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
             )
         if layer.sm70_fp8_moe_permute_with_scratch:
             buffers["permuted_idx"].fill_(total_slots)
-            torch.ops._moe_C.moe_permute_with_scratch(
+            self.native_ops.moe_permute_with_scratch(
                 x,
                 topk_ids_i32,
                 buffers["token_expert_indices"],
@@ -818,7 +584,7 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
                 buffers["topk_ids_for_sort"],
             )
         else:
-            torch.ops._moe_C.moe_permute(
+            self.native_ops.moe_permute(
                 x,
                 topk_ids_i32,
                 buffers["token_expert_indices"],

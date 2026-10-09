@@ -14,7 +14,7 @@ from typing import Final
 import torch
 from torch.nn import Parameter
 
-from vllm import _sm70_ops as sm70_ops
+from vllm._sm70.policy import NativeBindings
 from vllm.config.sm70_moe import Sm70MxFp4MoEConfig, capture_mxfp4_moe_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -415,6 +415,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
     def __init__(self, moe: FusedMoEConfig):
         FusedMoEMethodBase.__init__(self, moe)
         self.sm70_moe_policy = capture_mxfp4_moe_config()
+        self.native_ops = NativeBindings(self.sm70_moe_policy.native.values)
         self.weight_dtype = "mxfp4"
         if moe.moe_parallel_config.use_all2all_kernels:
             raise NotImplementedError(
@@ -545,14 +546,14 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         w2_k_ld = int(w2_meta[0][0].item())
         w2_q_ld = int(w2_meta[0][1].item())
 
-        w13_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w13_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
             layer.w13_tm_scales,
             w13_k_ld,
             w13_q_ld,
             num_experts,
         )
-        w2_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w2_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w2_tm_weight,
             layer.w2_tm_scales,
             w2_k_ld,
@@ -579,6 +580,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
             LayerWorkspaceView(layer, "sm70_mxfp4_"),
             raw_scale=False,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
+            bindings=self.native_ops,
         )
         self._allocate_graph_safe_decode_buffers(layer)
 
@@ -698,7 +700,7 @@ class Mxfp4SM70MoEMethod(Mxfp4MoEMethod):
         topk_ids_i32 = buffers["topk_ids"]
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
         buffers["permuted_idx"].fill_(total_slots)
-        torch.ops._moe_C.moe_permute_with_scratch(
+        self.native_ops.moe_permute_with_scratch(
             x,
             topk_ids_i32,
             buffers["token_expert_indices"],

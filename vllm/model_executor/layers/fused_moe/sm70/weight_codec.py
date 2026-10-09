@@ -8,7 +8,7 @@ from typing import Any, Literal
 import torch
 
 from vllm import _sm70_ops as ops
-from vllm.logger import _VllmLogger
+from vllm.logger import _VllmLogger, log_once_seen
 from vllm.model_executor.layers.fused_moe.sm70.declarations import native_binding
 
 
@@ -22,6 +22,12 @@ class Sm70MoEWeightCodec:
 
     name: Literal["AWQ", "FP8"]
     logger: _VllmLogger
+    diagnostic: bool = False
+    bindings: Any = None
+
+    @property
+    def operators(self):
+        return self.bindings if self.bindings is not None else ops
 
     def prepare_weights(
         self,
@@ -38,7 +44,7 @@ class Sm70MoEWeightCodec:
         resolves the execution policy, and never owns layer scratch tensors.
         """
         suffix = "_compact" if compact_metadata else ""
-        prepare = getattr(ops, self.name.lower() + "_sm70_prepare" + suffix)
+        prepare = getattr(self.operators, self.name.lower() + "_sm70_prepare" + suffix)
         result13: list[list[torch.Tensor]] = [[], [], []]
         result2: list[list[torch.Tensor]] = [[], [], []]
         for expert in range(w13[0].shape[0]):
@@ -55,11 +61,15 @@ class Sm70MoEWeightCodec:
         return result13, result2
 
     def gemm_w13(self, mode: str, *args: Any) -> None:
-        getattr(ops, native_binding(self.name, "w13", mode))(*args)
+        getattr(self.operators, native_binding(self.name, "w13", mode))(*args)
 
     def gemm_w2(self, mode: str, *args: Any) -> None:
-        getattr(ops, native_binding(self.name, "w2", mode))(*args)
+        getattr(self.operators, native_binding(self.name, "w2", mode))(*args)
 
     def log(self, message: str, *args: Any) -> None:
-        if not torch.compiler.is_compiling():
-            self.logger.info_once("SM70 " + self.name + " " + message, *args)
+        if not self.diagnostic and not torch.compiler.is_compiling():
+            key = ("sm70_moe_stage", self.logger.name, self.name, message, args)
+            if not log_once_seen(key):
+                self.logger.info_once(
+                    "SM70 " + self.name + " " + message, *args, key=key
+                )

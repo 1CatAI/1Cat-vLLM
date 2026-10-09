@@ -670,7 +670,7 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     factors = []
     # 0. factors come from the env, for example, The values of
     # VLLM_PP_LAYER_PARTITION will affect the computation graph.
-    env_hash = hash_factors(envs.compile_factors())
+    env_hash = hash_factors(envs.compile_factors(vllm_config.kernel_config))
     factors.append(env_hash)
 
     # 1. factors come from the vllm_config (it mainly summarizes how the

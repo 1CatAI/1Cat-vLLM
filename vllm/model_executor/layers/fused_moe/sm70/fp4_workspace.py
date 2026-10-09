@@ -12,6 +12,9 @@ import torch
 
 from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    workspace_pool,
+)
 
 
 class NvFp4MoEWorkspace:
@@ -401,8 +404,8 @@ _qwen38_raw_scale_workspaces: dict[int, torch.Tensor] = {}
 
 
 def clear_sm70_nvfp4_moe_workspaces() -> None:
-    """Release process-global Qwen3.8 raw-scale expansion workspaces."""
-    _qwen38_raw_scale_workspaces.clear()
+    """Release this engine's Qwen raw-scale expansion workspace ownership."""
+    workspace_pool("nvfp4_moe_raw_scale", _qwen38_raw_scale_workspaces).clear()
 
 
 def _get_qwen38_raw_scale_workspace(device: torch.device) -> torch.Tensor:
@@ -419,12 +422,13 @@ def _get_qwen38_raw_scale_workspace(device: torch.device) -> torch.Tensor:
     device_index = device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    workspace = _qwen38_raw_scale_workspaces.get(device_index)
+    pool = workspace_pool("nvfp4_moe_raw_scale", _qwen38_raw_scale_workspaces)
+    workspace = pool.get(device_index)
     if workspace is None:
         workspace = torch.empty(
             _QWEN38_RAW_SCALE_WORKSPACE_ELEMENTS,
             dtype=torch.float16,
             device=device,
         )
-        _qwen38_raw_scale_workspaces[device_index] = workspace
+        pool[device_index] = workspace
     return workspace

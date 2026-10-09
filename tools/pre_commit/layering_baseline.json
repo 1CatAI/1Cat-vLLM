@@ -2,7 +2,7 @@
  "vllm/_custom_ops.py": {
   "env": 1
  },
- "vllm/_sm70_ops.py": {
+ "vllm/_sm70/loader.py": {
   "env": 11
  },
  "vllm/benchmarks/startup.py": {
@@ -87,16 +87,10 @@
   "platform": 9
  },
  "vllm/model_executor/kernels/linear/__init__.py": {
-  "platform": 32
+  "platform": 30
  },
  "vllm/model_executor/kernels/linear/fp16_gemv_silu.py": {
   "platform": 4
- },
- "vllm/model_executor/kernels/linear/pre_ampere_qpn.py": {
-  "platform": 13
- },
- "vllm/model_executor/kernels/linear/scaled_mm/qpn8_blk.py": {
-  "platform": 46
  },
  "vllm/model_executor/kernels/mhc/tilelang.py": {
   "model": 1,
@@ -217,10 +211,10 @@
   "platform": 10
  },
  "vllm/model_executor/layers/quantization/awq.py": {
-  "platform": 39
+  "platform": 44
  },
  "vllm/model_executor/layers/quantization/awq_marlin.py": {
-  "platform": 50
+  "platform": 44
  },
  "vllm/model_executor/layers/quantization/base_config.py": {
   "platform": 1
@@ -238,21 +232,20 @@
   "platform": 13
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py": {
-  "platform": 23
+  "platform": 21
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py": {
-  "env": 3,
   "model": 4,
-  "platform": 158
+  "platform": 151
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_wNa16.py": {
   "platform": 13
  },
  "vllm/model_executor/layers/quantization/fp8.py": {
-  "platform": 63
+  "platform": 66
  },
  "vllm/model_executor/layers/quantization/modelopt.py": {
-  "platform": 95
+  "platform": 89
  },
  "vllm/model_executor/layers/quantization/mxfp4.py": {
   "platform": 25
@@ -268,9 +261,6 @@
  },
  "vllm/model_executor/layers/quantization/utils/nvfp4_emulation_utils.py": {
   "platform": 1
- },
- "vllm/model_executor/layers/quantization/utils/nvfp4_qpn2_dequant.py": {
-  "platform": 10
  },
  "vllm/model_executor/layers/sm70_attention.py": {
   "env": 1

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Thin adapter to the existing FusedMoEMethodBase lifecycle."""
 
+from vllm._sm70.policy import NativeBindings
 from vllm.config.sm70_moe import capture_sm70_moe_config
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
 from vllm.model_executor.layers.fused_moe.sm70.weight_codec import Sm70MoEWeightCodec
@@ -13,7 +14,10 @@ from vllm.model_executor.layers.quantization.sm70_moe_router import (
 class Sm70MoEMethodBase(FusedMoEMethodBase):
     def _initialize_sm70_policy(self, family, layer, logger):
         self.sm70_moe_policy = capture_sm70_moe_config(family)
-        self.weight_codec = Sm70MoEWeightCodec(family.upper(), logger)
+        self.native_ops = NativeBindings(self.sm70_moe_policy.native.values)
+        self.weight_codec = Sm70MoEWeightCodec(
+            family.upper(), logger, bindings=self.native_ops
+        )
         policy = self.sm70_moe_policy
         self.use_batched_gemm = bool(policy.batched)
         layer.sm70_moe_diagnostics = policy.diagnostics

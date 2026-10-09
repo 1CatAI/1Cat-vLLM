@@ -10,7 +10,6 @@ from typing import Any
 
 import torch
 
-from vllm import _sm70_ops as ops
 from vllm.model_executor.layers.fused_moe.sm70.single_token import Activation
 from vllm.model_executor.layers.fused_moe.sm70.weight_codec import Sm70MoEWeightCodec
 from vllm.model_executor.layers.quantization.sm70_moe_router import Sm70MoeRoutePlan
@@ -136,7 +135,7 @@ def execute_routed(
     if observer is not None:
         observer.after_activation(buffers)
     if plan.w2 == "chunked":
-        ops.awq_moe_chunked_w2_sm70_out(
+        codec.operators.awq_moe_chunked_w2_sm70_out(
             buffers["output"],
             buffers["sorted_output"],
             buffers["intermediate"],
@@ -178,11 +177,11 @@ def execute_routed(
     if observer is not None:
         observer.after_w2(buffers)
     sorted_output = buffers["sorted_output"]
-    if trim_output:
+    if trim_output and sorted_output.shape[1] != layer.sm70_hidden_logical_size:
         sorted_output = sorted_output[:, : layer.sm70_hidden_logical_size]
     if plan.zero_output_before_reduce:
         buffers["output"].zero_()
-    torch.ops._moe_C.moe_unpermute(
+    codec.operators.moe_unpermute(
         sorted_output,
         topk_weights,
         buffers["inv_permuted_idx"],
