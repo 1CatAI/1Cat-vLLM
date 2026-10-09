@@ -14,6 +14,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tests.v1.attention.flash_v100_extraction_oracle import (
+    InlineFinalHelpers,
+    LegacyNames,
+)
 from tests.v1.attention.flash_v100_sequence_oracle import (
     batch_calculations,
     prefill_debug_calculations,
@@ -103,7 +107,11 @@ class _InlineFeatureHooks(ast.NodeTransformer):
             isinstance(n, ast.Assign) and ast.unparse(n) == "forward = forward"
             for n in executor.body
         )
-        block = ast.Module(body=copy.deepcopy(forward.body), type_ignores=[])
+        block = InlineFinalHelpers().visit(
+            LegacyNames().visit(
+                ast.Module(body=copy.deepcopy(forward.body), type_ignores=[])
+            )
+        )
         return self.visit(block).body
 
     def _decode_branches(self, helper):
@@ -250,6 +258,16 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Call(self, node):
+        if ast.unparse(node.func) == "self.ops.is_draft_layer":
+            from vllm.v1.attention.backends.flash_v100.spec import prefill as feature
+
+            predicate = ast.parse(inspect.getsource(feature.is_draft_layer)).body[0]
+            assert isinstance(predicate, ast.FunctionDef)
+            assert [ast.unparse(a) for a in node.args] == ["layer"]
+            assert len(predicate.body) == 1 and isinstance(
+                predicate.body[0], ast.Return
+            )
+            return copy.deepcopy(predicate.body[0].value)
         hook = self._hook(node)
         if hook is not None:
             assert len(hook.body) == 1 and isinstance(hook.body[0], ast.Return)
@@ -300,6 +318,24 @@ class _Normalize(ast.NodeTransformer):
         assert node.value in names
         return names[node.value]
 
+    def _log_target(self, key, ctx):
+        name = self._log_flag(key)
+        if name == "_logged_prefill_fa2_d256":
+            return ast.Attribute(ast.Name("_dense_prefill", ast.Load()), name, ctx)
+        return ast.Name(name, ctx)
+
+    def visit_Constant(self, node):
+        docs = {
+            "strict single-concurrency bridge for single-token experiments": (
+                "strict single-concurrency bridge for no-MTP experiments"
+            ),
+            "Without it a speculative target in": "Without it a DFlash2 target in",
+        }
+        if isinstance(node.value, str):
+            for new, old in docs.items():
+                node.value = node.value.replace(new, old)
+        return node
+
     def visit_Expr(self, node):
         call = node.value
         if (
@@ -309,7 +345,7 @@ class _Normalize(ast.NodeTransformer):
             assert not call.keywords and len(call.args) == 2
             assert ast.unparse(call.args[1]) == "True"
             return ast.Assign(
-                targets=[ast.Name(self._log_flag(call.args[0]), ast.Store())],
+                targets=[self._log_target(call.args[0], ast.Store())],
                 value=ast.Constant(True),
             )
         return self.generic_visit(node)
@@ -371,6 +407,8 @@ class _Normalize(ast.NodeTransformer):
     def visit_Attribute(self, node):
         expression = ast.unparse(node)
         verification = {
+            "self.ops.parent_ids_cpu": "_masks._ddtree_parent_ids_cpu",
+            "self.ops.metadata_debug_log": "_debug._graph_metadata_debug_log",
             "self.ops.partition_hint": (
                 "_routing._mtp5_xqa_dual_cta_partition_size_hint"
             ),
@@ -490,8 +528,12 @@ class _Normalize(ast.NodeTransformer):
         node = self.generic_visit(node)
         if ast.unparse(node.func) == "log_once_seen":
             assert not node.keywords and len(node.args) == 1
-            return ast.Name(self._log_flag(node.args[0]), ast.Load())
-        if ast.unparse(node.func) in ("logger.info_once", "logger.warning_once"):
+            return self._log_target(node.args[0], ast.Load())
+        if ast.unparse(node.func) in (
+            "logger.info_once",
+            "logger.warning_once",
+            "logger.exception_once",
+        ):
             explicit = [k for k in node.keywords if k.arg == "key"]
             if explicit:
                 assert len(explicit) == 1
@@ -567,6 +609,8 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
     for path in (
         *Path(impl.__file__).parent.glob("*.py"),
         Path(impl.__file__).parent / "spec/contracts.py",
+        Path(impl.__file__).parent / "spec/verifier.py",
+        Path(impl.__file__).parent / "spec/diagnostics.py",
     ):
         for node in ast.parse(path.read_text()).body:
             candidates = (
@@ -595,7 +639,7 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                 ):
                     continue
                 if (
-                    path.name == "verify.py"
+                    path.name in ("verify.py", "verifier.py")
                     and fn.name
                     in ("validate_contract", "_validate_dflash_attention_contract")
                     and fn.args.args[0].arg == "self"
@@ -615,7 +659,7 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                         else "self._flash_v100_window_size",
                     ]
                     continue
-                if path.name == "verify.py" and fn.name == "__init__":
+                if path.name in ("verify.py", "verifier.py") and fn.name == "__init__":
                     continue
                 if any(
                     isinstance(n, ast.Call)
@@ -667,12 +711,20 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                 name = _VERIFY_METHODS.get(
                     fn.name, _CACHE_METHODS.get(fn.name, fn.name)
                 )
+                if name in ("small_tensor_list", "tensor_compare_stats"):
+                    name = "_" + name
                 if name not in fixture:
                     continue
                 assert name not in actual
                 actual[name] = hashlib.sha256(
                     ast.dump(
-                        _Normalize().visit(_InlineFeatureHooks().visit(fn))
+                        _Normalize().visit(
+                            LegacyNames().visit(
+                                _InlineFeatureHooks().visit(
+                                    LegacyNames().visit(InlineFinalHelpers().visit(fn))
+                                )
+                            )
+                        )
                     ).encode()
                 ).hexdigest()
     # A4b deliberately changes policy capture and the two hint consumers.

@@ -58,7 +58,7 @@ def attach_metadata(
         seq_lens = getattr(attn_metadata, "seq_lens", None)
         seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
         if seq_lens is not None and seq_lens_cpu is not None:
-            if _routing._is_cuda_graph_capturing(seq_lens):
+            if _routing.is_cuda_graph_capturing(seq_lens):
                 seq_lens[:num_reqs].copy_(
                     seq_lens_cpu[:num_reqs].to(
                         device=seq_lens.device,
@@ -71,7 +71,7 @@ def attach_metadata(
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
         if query_start_loc is not None and query_start_loc_cpu is not None:
             num_boundaries = num_reqs + 1
-            if _routing._is_cuda_graph_capturing(query_start_loc):
+            if _routing.is_cuda_graph_capturing(query_start_loc):
                 query_start_loc[:num_boundaries].copy_(
                     query_start_loc_cpu[:num_boundaries].to(
                         device=query_start_loc.device,

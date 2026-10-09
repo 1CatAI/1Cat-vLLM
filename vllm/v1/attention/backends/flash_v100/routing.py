@@ -8,7 +8,7 @@ import atexit
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import regex as re
 import torch
@@ -107,7 +107,6 @@ class RouteSpec:
 # All 44 literal counters, plus concrete names from the old dynamic sites.
 # Format-bearing counter names are retained until a separate compatibility
 # change; implementation admission is expressed by codecs instead.
-ROUTE_SPECS: dict[str, RouteSpec] = {}
 
 
 def _declare(names: str, stage: RouteStage, **kwargs) -> None:
@@ -117,185 +116,239 @@ def _declare(names: str, stage: RouteStage, **kwargs) -> None:
         ROUTE_SPECS[name] = RouteSpec(name, stage, **kwargs)
 
 
-_declare("decode_xqa_paged", "decode", head_dims=(256,), gqa_ratios=(4, 6, 8), xqa=True)
-_declare(
-    "prefill_prefix_decode_rows_xqa",
-    "mixed_decode",
-    head_dims=(256,),
-    gqa_ratios=(4, 6, 8),
-    xqa=True,
-)
-_declare(
-    "prefill_smallq_decode_xqa", "verify", head_dims=(256,), gqa_ratios=(6, 8), xqa=True
-)
-_declare("decode_scalar_paged", "decode", fallback=True)
-_declare("prefill_smallq_decode_scalar", "verify", fallback=True)
-_declare("prefill_prefix_decode_rows_scalar", "mixed_decode", fallback=True)
-_declare("decode_dense_cache decode_paged_prefill", "decode")
-_declare("decode_dense_reference", "decode", codecs=_ALL_CODECS)
-_declare(
-    "decode_e4m3_compact_scalar_tail",
-    "decode",
-    codecs=frozenset((FP8_E4M3,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    page_alignment=16,
-)
-_declare(
-    "decode_triton_no_flash_decode decode_triton_scalar_disabled",
-    "decode",
-    codecs=_ALL_CODECS,
-    fallback=True,
-)
-_declare(
-    "unsupported_triton_fallback dflash_draft_triton_fallback",
-    "any",
-    codecs=_ALL_CODECS,
-    fallback=True,
-)
-_declare("prefill_triton_safe", "prefill", codecs=_ALL_CODECS, fallback=True)
-_declare("prefill_ddtree_triton", "verify", codecs=_ALL_CODECS)
-_declare(
-    "metadata_none_zero_output prefill_capture_dflash_noncausal_paged "
-    "prefill_capture_smallq prefill_capture_smallq_ddtree_metadata "
-    "prefill_capture_smallq_no_ddtree_metadata",
-    "metadata",
-    codecs=_ALL_CODECS,
-    observer=True,
-)
-_declare(
-    "prefill_smallq_fp16_grouped_fp32",
-    "verify",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    page_alignment=16,
-)
-_declare(
-    "prefill_smallq_e4m3_grouped_fp32",
-    "verify",
-    codecs=frozenset((FP8_E4M3,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    page_alignment=16,
-)
-_declare(
-    "prefill_prefix_decode_rows_e4m3_grouped_fp32",
-    "mixed_decode",
-    codecs=frozenset((FP8_E4M3,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    page_alignment=16,
-)
-_declare("prefill_smallq_dflash2_grouped_verify prefill_ddtree_dense", "verify")
-_declare(
-    "prefill_dense_splitd_d256 prefill_prefix_splitd_d256 "
-    "prefill_prefix_paged_splitd_d256 prefill_prefix_gather_splitd_d256 "
-    "prefill_prefix_contig_splitd_d256",
-    "prefill",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-)
-_declare(
-    "prefill_dense_splitd_d256_splitkv3_kernel",
-    "prefill",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    chunk_sizes=(4096, 8000),
-)
-_declare(
-    "prefill_dense_d256_gqa_arch_long",
-    "prefill",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    min_chunk=64,
-    max_chunk=8192,
-)
-_declare(
-    "prefill_dense_d256_gqa_v37",
-    "prefill",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    chunk_alignment=64,
-    min_chunk=64,
-    max_chunk=8192,
-)
-_declare(
-    "prefill_dense_d256_gqa_79t_fp32",
-    "prefill",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    min_chunk=8000,
-    max_chunk=8192,
-)
-_declare(
-    "prefill_dense_d256_gqa_79t_fp32_fringe_fallback",
-    "prefill",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    min_chunk=8001,
-    max_chunk=8192,
-)
-_declare(
-    "prefill_dense_d256_gqa_79t_fp32_q8192",
-    "prefill",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    min_chunk=8001,
-    max_chunk=8192,
-)
-_declare(
-    "prefill_dense_d256_gqa_79t_fp32_q8192_pad",
-    "prefill",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-    gqa_ratios=(6,),
-    min_chunk=8001,
-    max_chunk=8191,
-)
-_declare(
-    "prefill_prefix_fp8_bridge_exact_d256 "
-    "prefill_prefix_fp8_bridge_exact_d256_tailpad "
-    "prefill_prefix_fp8_bridge_exact_dense_d256 "
-    "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad",
-    "prefill",
-    codecs=frozenset((FP8_E4M3, FP8_E5M2)),
-    head_dims=(256,),
-)
-_declare("prefill_prefix_fp8_e4m3_bridge", "prefill", codecs=frozenset((FP8_E4M3,)))
-_declare(
-    "decode_strategy_legacy_revision",
-    "decode",
-    codecs=frozenset((FP8_E4M3,)),
-    fallback=True,
-    observer=True,
-)
-_declare("prefill_prefix_fp8_e5m2_bridge", "prefill", codecs=frozenset((FP8_E5M2,)))
-_declare(
-    "prefill_no_prefix_dense_flash prefill_no_prefix_paged_cache_flash "
-    "prefill_prefix_bfla prefill_prefix_contig_dense "
-    "prefill_prefix_contig_dense_bhmd prefill_prefix_contig_dense_fa2_d256 "
-    "prefill_prefix_dflash_noncausal_batch prefill_prefix_flash "
-    "prefill_prefix_paged_anchored prefill_prefix_splitkv",
-    "prefill",
+def _build_specs(declarations):
+    result = {}
+    for names, stage, options in declarations:
+        for name in names.split():
+            if name in result:
+                raise ValueError(f"Duplicate Flash-V100 route: {name}")
+            result[name] = RouteSpec(name, stage, **options)
+    return result
+
+
+ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
+    [
+        (
+            "decode_xqa_paged",
+            "decode",
+            {"head_dims": (256,), "gqa_ratios": (4, 6, 8), "xqa": True},
+        ),
+        (
+            "prefill_prefix_decode_rows_xqa",
+            "mixed_decode",
+            {"head_dims": (256,), "gqa_ratios": (4, 6, 8), "xqa": True},
+        ),
+        (
+            "prefill_smallq_decode_xqa",
+            "verify",
+            {"head_dims": (256,), "gqa_ratios": (6, 8), "xqa": True},
+        ),
+        ("decode_scalar_paged", "decode", {"fallback": True}),
+        ("prefill_smallq_decode_scalar", "verify", {"fallback": True}),
+        ("prefill_prefix_decode_rows_scalar", "mixed_decode", {"fallback": True}),
+        ("decode_dense_cache decode_paged_prefill", "decode", {}),
+        ("decode_dense_reference", "decode", {"codecs": _ALL_CODECS}),
+        (
+            "decode_e4m3_compact_scalar_tail",
+            "decode",
+            {
+                "codecs": frozenset((FP8_E4M3,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "page_alignment": 16,
+            },
+        ),
+        (
+            "decode_triton_no_flash_decode decode_triton_scalar_disabled",
+            "decode",
+            {"codecs": _ALL_CODECS, "fallback": True},
+        ),
+        (
+            "unsupported_triton_fallback dflash_draft_triton_fallback",
+            "any",
+            {"codecs": _ALL_CODECS, "fallback": True},
+        ),
+        ("prefill_triton_safe", "prefill", {"codecs": _ALL_CODECS, "fallback": True}),
+        ("prefill_ddtree_triton", "verify", {"codecs": _ALL_CODECS}),
+        (
+            (
+                "metadata_none_zero_output prefill_capture_dflash_noncausal_paged "
+                "prefill_capture_smallq prefill_capture_smallq_ddtree_metadata "
+                "prefill_capture_smallq_no_ddtree_metadata"
+            ),
+            "metadata",
+            {"codecs": _ALL_CODECS, "observer": True},
+        ),
+        (
+            "prefill_smallq_fp16_grouped_fp32",
+            "verify",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "page_alignment": 16,
+            },
+        ),
+        (
+            "prefill_smallq_e4m3_grouped_fp32",
+            "verify",
+            {
+                "codecs": frozenset((FP8_E4M3,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "page_alignment": 16,
+            },
+        ),
+        (
+            "prefill_prefix_decode_rows_e4m3_grouped_fp32",
+            "mixed_decode",
+            {
+                "codecs": frozenset((FP8_E4M3,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "page_alignment": 16,
+            },
+        ),
+        ("prefill_smallq_dflash2_grouped_verify prefill_ddtree_dense", "verify", {}),
+        (
+            (
+                "prefill_dense_splitd_d256 prefill_prefix_splitd_d256 "
+                "prefill_prefix_paged_splitd_d256 "
+                "prefill_prefix_gather_splitd_d256 "
+                "prefill_prefix_contig_splitd_d256"
+            ),
+            "prefill",
+            {"codecs": frozenset((FP16,)), "head_dims": (256,)},
+        ),
+        (
+            "prefill_dense_splitd_d256_splitkv3_kernel",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "chunk_sizes": (4096, 8000),
+            },
+        ),
+        (
+            "prefill_dense_d256_gqa_arch_long",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "min_chunk": 64,
+                "max_chunk": 8192,
+            },
+        ),
+        (
+            "prefill_dense_d256_gqa_v37",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "chunk_alignment": 64,
+                "min_chunk": 64,
+                "max_chunk": 8192,
+            },
+        ),
+        (
+            "prefill_dense_d256_gqa_79t_fp32",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "min_chunk": 8000,
+                "max_chunk": 8192,
+            },
+        ),
+        (
+            "prefill_dense_d256_gqa_79t_fp32_fringe_fallback",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "min_chunk": 8001,
+                "max_chunk": 8192,
+            },
+        ),
+        (
+            "prefill_dense_d256_gqa_79t_fp32_q8192",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "min_chunk": 8001,
+                "max_chunk": 8192,
+            },
+        ),
+        (
+            "prefill_dense_d256_gqa_79t_fp32_q8192_pad",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "min_chunk": 8001,
+                "max_chunk": 8191,
+            },
+        ),
+        (
+            (
+                "prefill_prefix_fp8_bridge_exact_d256 "
+                "prefill_prefix_fp8_bridge_exact_d256_tailpad "
+                "prefill_prefix_fp8_bridge_exact_dense_d256 "
+                "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad"
+            ),
+            "prefill",
+            {"codecs": frozenset((FP8_E4M3, FP8_E5M2)), "head_dims": (256,)},
+        ),
+        (
+            "prefill_prefix_fp8_e4m3_bridge",
+            "prefill",
+            {"codecs": frozenset((FP8_E4M3,))},
+        ),
+        (
+            "decode_strategy_legacy_revision",
+            "decode",
+            {"codecs": frozenset((FP8_E4M3,)), "fallback": True, "observer": True},
+        ),
+        (
+            "prefill_prefix_fp8_e5m2_bridge",
+            "prefill",
+            {"codecs": frozenset((FP8_E5M2,))},
+        ),
+        (
+            (
+                "prefill_no_prefix_dense_flash prefill_no_prefix_paged_cache_flash "
+                "prefill_prefix_bfla prefill_prefix_contig_dense "
+                "prefill_prefix_contig_dense_bhmd "
+                "prefill_prefix_contig_dense_fa2_d256 "
+                "prefill_prefix_dflash_noncausal_batch prefill_prefix_flash "
+                "prefill_prefix_paged_anchored prefill_prefix_splitkv"
+            ),
+            "prefill",
+            {},
+        ),
+        (
+            "flashinfer_sm70_fixed_entry flashinfer_sm70_splitkv3_fast_visible",
+            "prefill",
+            {
+                "codecs": frozenset((FP16,)),
+                "head_dims": (256,),
+                "page_alignment": 16,
+                "page_sizes": (784,),
+                "observer": True,
+            },
+        ),
+    ]
 )
 
 # The sibling FlashInfer backend uses this shared accounting owner too.
-_declare(
-    "flashinfer_sm70_fixed_entry flashinfer_sm70_splitkv3_fast_visible",
-    "prefill",
-    codecs=frozenset((FP16,)),
-    head_dims=(256,),
-    page_alignment=16,
-    page_sizes=(784,),
-    observer=True,
-)
 
 # Diagnostic families are observers, not additional dispatch implementations.
 _ROUTE_FAMILIES = (
@@ -385,7 +438,7 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
     if smallq:
         assert context.query is not None
         capture = bool(getattr(context.metadata, "flash_v100_cudagraph_capture", False))
-        capture = capture or _is_cuda_graph_capturing(context.query)
+        capture = capture or is_cuda_graph_capturing(context.query)
         hint = max(
             int(context.max_seq_len_hint or 0),
             int(context.workspace_seq_capacity_hint or 0) if capture else 0,
@@ -444,7 +497,7 @@ def select_route(
     return spec
 
 
-def _batch_context_routing_for_graph_variant(
+def batch_context_routing_for_graph_variant(
     routing_enabled: bool,
     graph_variant: int | None,
 ) -> bool:
@@ -456,7 +509,7 @@ def _batch_context_routing_for_graph_variant(
     return graph_variant == CUDAGRAPH_VARIANT_LONG_CONTEXT
 
 
-def _batch_context_routing_cache_dtype_supported(cache_dtype: str | None) -> bool:
+def batch_context_routing_cache_dtype_supported(cache_dtype: str | None) -> bool:
     """Admit the exact FP8 XQA formats implemented by Flash-V100."""
     codec = resolve_kv_codec(cache_dtype)
     return codec is FP8_E5M2 or (
@@ -477,17 +530,17 @@ _DEFAULT_Q4_XQA_MIN_SEQ_LEN = 32768
 _DEFAULT_FP8_XQA_MIN_SEQ_LEN = 16384
 
 
-def _normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
+def normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:
     # One spelling per codec: "float16" is the extension's "auto" layout and
     # the `fp8` shorthand is E4M3, so every route sees the same format name.
     return canonical_kv_cache_dtype(kv_cache_dtype)
 
 
-def _decode_dynamic_partitions_enabled() -> bool:
+def decode_dynamic_partitions_enabled() -> bool:
     return _config.raw("VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS", "1") != "0"
 
 
-def _decode_partition_size_for_metadata(
+def decode_partition_size_for_metadata(
     max_seq_len_hint: int | None = None,
 ) -> int:
     raw = _config.raw("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
@@ -523,11 +576,11 @@ def resolve_decode_strategy(
     revision = getattr(operator, "shared_decode_strategy_revision", 0)
     if isinstance(revision, int) and revision >= 1:
         return "shared"
-    _record_route(ROUTE_SPECS["decode_strategy_legacy_revision"].name)
+    record_route(ROUTE_SPECS["decode_strategy_legacy_revision"].name)
     return "legacy"
 
 
-def _g6_aligned_page_partition_size_hint(
+def g6_aligned_page_partition_size_hint(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -578,7 +631,7 @@ def _g6_aligned_page_partition_size_hint(
     return None
 
 
-def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
+def log_kv_dtype_contract(kv_cache_dtype: str) -> None:
     if kv_cache_dtype in _logged_kv_dtype_contracts:
         return
     _logged_kv_dtype_contracts.add(kv_cache_dtype)
@@ -647,7 +700,7 @@ def _decode_fp8_xqa_allowed(
 ) -> bool:
     graph_capture = bool(
         getattr(attn_metadata, "flash_v100_cudagraph_capture", False)
-    ) or _is_cuda_graph_capturing(query)
+    ) or is_cuda_graph_capturing(query)
     if graph_capture:
         hint_names = (
             "flash_v100_static_decode_seq_hint",
@@ -710,11 +763,11 @@ def _e4m3_batch_xqa_allowed(query: torch.Tensor) -> bool:
     )
 
 
-def _same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
+def same_storage(left: torch.Tensor, right: torch.Tensor) -> bool:
     return left.untyped_storage().data_ptr() == right.untyped_storage().data_ptr()
 
 
-def _is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
+def is_cuda_graph_capturing(tensor: torch.Tensor) -> bool:
     return bool(tensor.is_cuda and torch.cuda.is_current_stream_capturing())
 
 
@@ -742,7 +795,7 @@ def _log_route_summary() -> None:
         _fallback_counts.clear()
 
 
-def _record_route(route: str) -> None:
+def record_route(route: str) -> None:
     global _route_summary_registered
     spec = route_spec(route)
     if spec.fallback:
@@ -774,7 +827,7 @@ def _decode_active_value(active_num_partitions: object) -> int | None:
     return int(active_num_partitions.detach().reshape(-1)[0].item())
 
 
-def _trace_decode_active(
+def trace_decode_active(
     *,
     route: str,
     query: torch.Tensor,
@@ -792,7 +845,7 @@ def _trace_decode_active(
         getattr(attn_metadata, "flash_v100_decode_active_num_partitions", None)
     )
     seq_len = int(seq_lens[: query.shape[0]].max().item())
-    partition_size = _decode_partition_size_for_metadata(seq_len)
+    partition_size = decode_partition_size_for_metadata(seq_len)
     expected_active = max(1, (seq_len + partition_size - 1) // partition_size)
     max_seq_hint = getattr(
         attn_metadata,
@@ -854,7 +907,7 @@ def _trace_decode_active(
     )
 
 
-def _trace_decode_active_metadata(
+def trace_decode_active_metadata(
     *,
     stage: str,
     max_seq_len_hint: int,
@@ -903,11 +956,11 @@ def _trace_decode_active_metadata(
     )
 
 
-def _uses_fp8_kv_cache(kv_cache_dtype: str) -> bool:
+def uses_fp8_kv_cache(kv_cache_dtype: str) -> bool:
     return isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8")
 
 
-def _log_fp8_kv_cache_route(
+def log_fp8_kv_cache_route(
     stage: str,
     kv_cache_dtype: str,
     route: str,
@@ -916,11 +969,11 @@ def _log_fp8_kv_cache_route(
 ) -> None:
     global _logged_fp8_kv_decode, _logged_fp8_kv_prefill
 
-    if not _uses_fp8_kv_cache(kv_cache_dtype):
+    if not uses_fp8_kv_cache(kv_cache_dtype):
         return
     if stage not in ("prefill", "decode"):
         raise ValueError(f"Unsupported FP8 KV cache route stage: {stage}")
-    emit = _record_route if record is None else record
+    emit = record_route if record is None else record
     emit(f"fp8_kv_{stage}")
     emit(f"fp8_kv_{stage}_{route}")
     if stage == "prefill":
@@ -945,3 +998,46 @@ def _log_fp8_kv_cache_route(
         )
         _logged_fp8_kv_decode = True
         return
+
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {
+    "_g6_aligned_page_partition_size_hint": "g6_aligned_page_partition_size_hint",
+    "_uses_fp8_kv_cache": "uses_fp8_kv_cache",
+    "_log_kv_dtype_contract": "log_kv_dtype_contract",
+    "_normalize_flash_v100_kv_cache_dtype": "normalize_flash_v100_kv_cache_dtype",
+    "_trace_decode_active": "trace_decode_active",
+    "_record_route": "record_route",
+    "_decode_partition_size_for_metadata": "decode_partition_size_for_metadata",
+    "_is_cuda_graph_capturing": "is_cuda_graph_capturing",
+    "_batch_context_routing_for_graph_variant": (
+        "batch_context_routing_for_graph_variant"
+    ),
+    "_batch_context_routing_cache_dtype_supported": (
+        "batch_context_routing_cache_dtype_supported"
+    ),
+    "_decode_dynamic_partitions_enabled": "decode_dynamic_partitions_enabled",
+    "_trace_decode_active_metadata": "trace_decode_active_metadata",
+    "_log_fp8_kv_cache_route": "log_fp8_kv_cache_route",
+    "_same_storage": "same_storage",
+}
+
+
+if TYPE_CHECKING:
+    # Static compatibility only; runtime writes use live owner aliases.
+    _g6_aligned_page_partition_size_hint = g6_aligned_page_partition_size_hint
+    _uses_fp8_kv_cache = uses_fp8_kv_cache
+    _log_kv_dtype_contract = log_kv_dtype_contract
+    _normalize_flash_v100_kv_cache_dtype = normalize_flash_v100_kv_cache_dtype
+    _trace_decode_active = trace_decode_active
+    _record_route = record_route
+    _decode_partition_size_for_metadata = decode_partition_size_for_metadata
+    _is_cuda_graph_capturing = is_cuda_graph_capturing
+    _batch_context_routing_for_graph_variant = batch_context_routing_for_graph_variant
+    _batch_context_routing_cache_dtype_supported = (
+        batch_context_routing_cache_dtype_supported
+    )
+    _decode_dynamic_partitions_enabled = decode_dynamic_partitions_enabled
+    _trace_decode_active_metadata = trace_decode_active_metadata
+    _log_fp8_kv_cache_route = log_fp8_kv_cache_route
+    _same_storage = same_storage

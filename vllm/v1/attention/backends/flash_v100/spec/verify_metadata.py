@@ -11,7 +11,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
-from vllm.v1.attention.backends.flash_v100 import debug as _debug
+from vllm.v1.attention.backends.flash_v100.plan import diagnostics as _debug
 from vllm.v1.attention.backends.flash_v100.spec import policy
 from vllm.v1.attention.backends.flash_v100.spec import (
     smallq_metadata as _smallq_metadata,
@@ -24,19 +24,19 @@ from vllm.v1.attention.backends.triton_attn import (
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-def _configured_smallq_max_query_len(
+def configured_smallq_max_query_len(
     self: Any,
 ) -> int:
     return int(_config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
 
 
-def _configured_smallq_max_model_len(
+def configured_smallq_max_model_len(
     self: Any,
 ) -> int:
     return int(_config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0"))
 
 
-def _smallq_buffer_token_capacity(self: Any, required_tokens: int) -> int:
+def smallq_buffer_token_capacity(self: Any, required_tokens: int) -> int:
     compilation_config = self.vllm_config.compilation_config
     graph_tokens = compilation_config.max_cudagraph_capture_size
     if graph_tokens is None and compilation_config.cudagraph_capture_sizes:
@@ -59,7 +59,7 @@ def _smallq_buffer_token_capacity(self: Any, required_tokens: int) -> int:
     )
 
 
-def _clear_smallq_decode_metadata(
+def clear_smallq_decode_metadata(
     self: Any,
     attn_metadata: TritonAttentionMetadata,
 ) -> None:
@@ -212,9 +212,142 @@ def update_decode_metadata(
     prep_ms = (
         (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
     )
+    expand_ms, copy_ms = _expand_decode_rows(
+        self,
+        block_table,
+        seq_lens,
+        query_start_loc,
+        num_reqs,
+        num_query_tokens,
+        real_num_query_tokens,
+        padding_tokens,
+        profile_enabled,
+    )
+
+    profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
+    flash_metadata.smallq_decode_block_table = (
+        self.metadata_workspace.smallq.block_table[:num_query_tokens]
+    )
+    flash_metadata.smallq_decode_seq_lens = self.metadata_workspace.smallq.seq_lens[
+        :num_query_tokens
+    ]
+    flash_metadata.smallq_query_start_loc = (
+        self.metadata_workspace.smallq.query_start_loc[: num_reqs + 1]
+    )
+    raw_seq_capacity = int(block_table.shape[1]) * int(self.block_size)
+    max_seq_len_hint = int(seq_lens_cpu.max().item())
+    if max_seq_len_hint > 0 and raw_seq_capacity > 0:
+        # MTP verification reaches this backend as q>1 prefix prefill, but
+        # the Flash-V100 long-context optimization still applies because
+        # the actual compute is paged decode over each tiny query row.
+        # Keep graph replay capacity fixed while letting kernels skip
+        # inactive partitions for the current runtime sequence length.
+        flash_metadata.smallq_decode_max_seq_len_hint = max_seq_len_hint
+        if workspace_seq_capacity_cap is not None:
+            # A distinct CUDA graph key guarantees replay only below this
+            # bound. The block table remains full-width so runtime KV
+            # addresses stay stable, while the captured workspace/grid is
+            # reduced to the bounded context envelope.
+            raw_seq_capacity = min(
+                raw_seq_capacity,
+                max(max_seq_len_hint, int(workspace_seq_capacity_cap)),
+            )
+        flash_metadata.smallq_decode_workspace_seq_capacity_hint = raw_seq_capacity
+        flash_metadata.smallq_decode_partition_size_hint = partition_size_hint
+    hint_ms = (
+        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
+    )
+    if profile_enabled:
+        logger.info(
+            "FLASH_ATTN_V100 DDTREE_WORKER_PROFILE smallq_metadata "
+            "total_ms=%.3f clear_ms=%.3f guard_ms=%.3f ensure_ms=%.3f "
+            "prep_ms=%.3f expand_ms=%.3f copy_ms=%.3f hint_ms=%.3f "
+            "num_reqs=%d num_query_tokens=%d real_query_tokens=%d "
+            "padding_tokens=%d block_cols=%d fused=%s",
+            (time.perf_counter() - profile_t0) * 1000.0,
+            clear_ms,
+            guard_ms,
+            ensure_ms,
+            prep_ms,
+            expand_ms,
+            copy_ms,
+            hint_ms,
+            num_reqs,
+            num_query_tokens,
+            real_num_query_tokens,
+            padding_tokens,
+            int(block_table.shape[1]),
+            self._use_sm70_dflash2_fused_smallq_metadata,
+        )
+    _observe_smallq_update(
+        self,
+        force,
+        num_reqs,
+        num_query_tokens,
+        real_num_query_tokens,
+        padding_tokens,
+        max_query_len,
+        query_start_loc_cpu,
+        seq_lens_cpu,
+        attn_metadata,
+        flash_metadata,
+    )
+
+
+def ensure_smallq_decode_buffers(
+    self: Any,
+    required_tokens: int,
+    required_reqs: int,
+    block_table: torch.Tensor,
+) -> bool:
+    token_capacity = self._smallq_buffer_token_capacity(required_tokens)
+    req_capacity = max(
+        min(
+            int(self.vllm_config.scheduler_config.max_num_seqs),
+            token_capacity,
+        ),
+        int(required_reqs),
+        1,
+    )
+    block_cols = int(block_table.shape[1])
+    return self.metadata_workspace.smallq.ensure(
+        token_capacity,
+        req_capacity,
+        block_cols,
+        required_tokens,
+        required_reqs,
+        self.device,
+    )
+
+
+# External compatibility; state owners bind the public calculations.
+_attach_prepared_dflash2_smallq_metadata = attach_prepared_metadata
+_update_smallq_decode_metadata = update_decode_metadata
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {
+    "_smallq_buffer_token_capacity": "smallq_buffer_token_capacity",
+    "_ensure_smallq_decode_buffers": "ensure_smallq_decode_buffers",
+    "_configured_smallq_max_query_len": "configured_smallq_max_query_len",
+    "_clear_smallq_decode_metadata": "clear_smallq_decode_metadata",
+    "_configured_smallq_max_model_len": "configured_smallq_max_model_len",
+}
+
+
+def _expand_decode_rows(
+    self,
+    block_table,
+    seq_lens,
+    query_start_loc,
+    num_reqs,
+    num_query_tokens,
+    real_num_query_tokens,
+    padding_tokens,
+    profile_enabled,
+):
     profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
     if self._use_sm70_dflash2_fused_smallq_metadata:
-        _smallq_metadata._sm70_prepare_smallq_decode_metadata(
+        _smallq_metadata.sm70_prepare_smallq_decode_metadata(
             self.metadata_workspace.smallq.block_table,
             self.metadata_workspace.smallq.seq_lens,
             self.metadata_workspace.smallq.query_start_loc,
@@ -306,64 +439,24 @@ def update_decode_metadata(
             if profile_enabled
             else 0.0
         )
+    return expand_ms, copy_ms
 
-    profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-    flash_metadata.smallq_decode_block_table = (
-        self.metadata_workspace.smallq.block_table[:num_query_tokens]
-    )
-    flash_metadata.smallq_decode_seq_lens = self.metadata_workspace.smallq.seq_lens[
-        :num_query_tokens
-    ]
-    flash_metadata.smallq_query_start_loc = (
-        self.metadata_workspace.smallq.query_start_loc[: num_reqs + 1]
-    )
-    raw_seq_capacity = int(block_table.shape[1]) * int(self.block_size)
-    max_seq_len_hint = int(seq_lens_cpu.max().item())
-    if max_seq_len_hint > 0 and raw_seq_capacity > 0:
-        # MTP verification reaches this backend as q>1 prefix prefill, but
-        # the Flash-V100 long-context optimization still applies because
-        # the actual compute is paged decode over each tiny query row.
-        # Keep graph replay capacity fixed while letting kernels skip
-        # inactive partitions for the current runtime sequence length.
-        flash_metadata.smallq_decode_max_seq_len_hint = max_seq_len_hint
-        if workspace_seq_capacity_cap is not None:
-            # A distinct CUDA graph key guarantees replay only below this
-            # bound. The block table remains full-width so runtime KV
-            # addresses stay stable, while the captured workspace/grid is
-            # reduced to the bounded context envelope.
-            raw_seq_capacity = min(
-                raw_seq_capacity,
-                max(max_seq_len_hint, int(workspace_seq_capacity_cap)),
-            )
-        flash_metadata.smallq_decode_workspace_seq_capacity_hint = raw_seq_capacity
-        flash_metadata.smallq_decode_partition_size_hint = partition_size_hint
-    hint_ms = (
-        (time.perf_counter() - profile_stage_t0) * 1000.0 if profile_enabled else 0.0
-    )
-    if profile_enabled:
-        logger.info(
-            "FLASH_ATTN_V100 DDTREE_WORKER_PROFILE smallq_metadata "
-            "total_ms=%.3f clear_ms=%.3f guard_ms=%.3f ensure_ms=%.3f "
-            "prep_ms=%.3f expand_ms=%.3f copy_ms=%.3f hint_ms=%.3f "
-            "num_reqs=%d num_query_tokens=%d real_query_tokens=%d "
-            "padding_tokens=%d block_cols=%d fused=%s",
-            (time.perf_counter() - profile_t0) * 1000.0,
-            clear_ms,
-            guard_ms,
-            ensure_ms,
-            prep_ms,
-            expand_ms,
-            copy_ms,
-            hint_ms,
-            num_reqs,
-            num_query_tokens,
-            real_num_query_tokens,
-            padding_tokens,
-            int(block_table.shape[1]),
-            self._use_sm70_dflash2_fused_smallq_metadata,
-        )
-    if _debug._draft_graph_debug_enabled():
-        _debug._graph_metadata_debug_log(
+
+def _observe_smallq_update(
+    self,
+    force,
+    num_reqs,
+    num_query_tokens,
+    real_num_query_tokens,
+    padding_tokens,
+    max_query_len,
+    query_start_loc_cpu,
+    seq_lens_cpu,
+    attn_metadata,
+    flash_metadata,
+):
+    if _debug.draft_graph_debug_enabled():
+        _debug.graph_metadata_debug_log(
             "smallq_update",
             "draft=%s force=%s num_reqs=%s num_query_tokens=%s "
             "real_num_query_tokens=%s padding_tokens=%s max_query_len=%s "
@@ -377,50 +470,19 @@ def update_decode_metadata(
             max_query_len,
             query_start_loc_cpu,
             seq_lens_cpu,
-            _debug._format_tensor_debug(attn_metadata.query_start_loc, "attn_qsl"),
-            _debug._format_tensor_debug(attn_metadata.seq_lens, "attn_seq"),
-            _debug._format_tensor_debug(attn_metadata.block_table, "attn_bt"),
-            _debug._format_tensor_debug(
+            _debug.format_tensor_debug(attn_metadata.query_start_loc, "attn_qsl"),
+            _debug.format_tensor_debug(attn_metadata.seq_lens, "attn_seq"),
+            _debug.format_tensor_debug(attn_metadata.block_table, "attn_bt"),
+            _debug.format_tensor_debug(
                 flash_metadata.smallq_decode_block_table,
                 "smallq_bt",
             ),
-            _debug._format_tensor_debug(
+            _debug.format_tensor_debug(
                 flash_metadata.smallq_decode_seq_lens,
                 "smallq_seq",
             ),
-            _debug._format_tensor_debug(
+            _debug.format_tensor_debug(
                 flash_metadata.smallq_query_start_loc,
                 "smallq_qsl",
             ),
         )
-
-
-def _ensure_smallq_decode_buffers(
-    self: Any,
-    required_tokens: int,
-    required_reqs: int,
-    block_table: torch.Tensor,
-) -> bool:
-    token_capacity = self._smallq_buffer_token_capacity(required_tokens)
-    req_capacity = max(
-        min(
-            int(self.vllm_config.scheduler_config.max_num_seqs),
-            token_capacity,
-        ),
-        int(required_reqs),
-        1,
-    )
-    block_cols = int(block_table.shape[1])
-    return self.metadata_workspace.smallq.ensure(
-        token_capacity,
-        req_capacity,
-        block_cols,
-        required_tokens,
-        required_reqs,
-        self.device,
-    )
-
-
-# External compatibility; state owners bind the public calculations.
-_attach_prepared_dflash2_smallq_metadata = attach_prepared_metadata
-_update_smallq_decode_metadata = update_decode_metadata

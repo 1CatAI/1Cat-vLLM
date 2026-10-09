@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.flash_v100 import debug as _debug
+from vllm.v1.attention.backends.flash_v100.plan import diagnostics as _debug
 from vllm.v1.attention.backends.flash_v100.spec import policy
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
@@ -19,15 +19,15 @@ from vllm.v1.attention.backends.triton_attn import (
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-def _debug_draft_metadata(
+def debug_draft_metadata(
     self: Any,
     stage: str,
     attn_metadata: TritonAttentionMetadata,
     common_attn_metadata,
 ) -> None:
-    if not self._is_speculative_draft_model or not _debug._draft_graph_debug_enabled():
+    if not self._is_speculative_draft_model or not _debug.draft_graph_debug_enabled():
         return
-    _debug._draft_graph_debug_log(
+    _debug.draft_graph_debug_log(
         f"builder:{stage}",
         "num_reqs=%s num_actual_tokens=%s max_query_len=%s max_seq_len=%s "
         "common_qsl_cpu=%s common_seq_cpu=%s %s %s %s %s %s %s %s",
@@ -37,37 +37,37 @@ def _debug_draft_metadata(
         getattr(common_attn_metadata, "max_seq_len", None),
         getattr(common_attn_metadata, "query_start_loc_cpu", None),
         getattr(common_attn_metadata, "seq_lens_cpu", None),
-        _debug._format_tensor_debug(
+        _debug.format_tensor_debug(
             getattr(common_attn_metadata, "query_start_loc", None),
             "common_qsl",
         ),
-        _debug._format_tensor_debug(
+        _debug.format_tensor_debug(
             getattr(common_attn_metadata, "seq_lens", None),
             "common_seq",
         ),
-        _debug._format_tensor_debug(
+        _debug.format_tensor_debug(
             getattr(common_attn_metadata, "block_table_tensor", None),
             "common_bt",
         ),
-        _debug._format_tensor_debug(
+        _debug.format_tensor_debug(
             getattr(attn_metadata, "query_start_loc", None),
             "attn_qsl",
         ),
-        _debug._format_tensor_debug(
+        _debug.format_tensor_debug(
             getattr(attn_metadata, "seq_lens", None), "attn_seq"
         ),
-        _debug._format_tensor_debug(
+        _debug.format_tensor_debug(
             getattr(attn_metadata, "block_table", None),
             "attn_bt",
         ),
-        _debug._format_tensor_debug(
+        _debug.format_tensor_debug(
             getattr(attn_metadata, "smallq_decode_seq_lens", None),
             "smallq_seq",
         ),
     )
 
 
-def _stabilize_draft_graph_metadata(
+def stabilize_draft_graph_metadata(
     self: Any,
     attn_metadata: TritonAttentionMetadata,
     common_attn_metadata,
@@ -188,7 +188,7 @@ def build_for_drafting(self: Any, common_attn_metadata, draft_index: int):
     return attn_metadata
 
 
-def _ensure_flash_draft_graph_buffers(
+def ensure_flash_draft_graph_buffers(
     self: Any,
     required_reqs: int,
     block_table: torch.Tensor,
@@ -212,3 +212,11 @@ def copy_dflash_graph_metadata(
 ) -> None:
     """Refresh the three persistent inputs of a non-causal DFlash graph."""
     self.metadata_workspace.draft.copy_metadata(block_table, seq_lens, query_start_loc)
+
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {
+    "_stabilize_draft_graph_metadata": "stabilize_draft_graph_metadata",
+    "_debug_draft_metadata": "debug_draft_metadata",
+    "_ensure_flash_draft_graph_buffers": "ensure_flash_draft_graph_buffers",
+}

@@ -10,8 +10,16 @@ working. New code should import from the package.
 
 import sys
 import types
+import warnings
 
 from vllm.v1.attention.backends import flash_v100 as _package
+
+warnings.warn(
+    "flash_attn_v100 is deprecated; import owners from "
+    "vllm.v1.attention.backends.flash_v100 instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 __all__ = sorted(
     {

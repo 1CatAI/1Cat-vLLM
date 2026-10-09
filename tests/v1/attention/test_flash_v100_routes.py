@@ -5,6 +5,7 @@
 import ast
 import itertools
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +38,7 @@ def legacy():
     )
     namespace = {
         "_routing": r,
-        "os": r.os,
+        "os": os,
         "torch": r.torch,
         "TritonAttentionMetadata": r.TritonAttentionMetadata,
         "FP8_E4M3": FP8_E4M3,
@@ -219,9 +220,9 @@ def test_every_literal_accounting_site_uses_a_declared_spec():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            direct = (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_record_route"
+            direct = isinstance(node.func, ast.Attribute) and node.func.attr in (
+                "_record_route",
+                "record_route",
             )
             injected = isinstance(node.func, ast.Name) and node.func.id == "record"
             if not (direct or injected):

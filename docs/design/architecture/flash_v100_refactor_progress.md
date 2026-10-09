@@ -10,12 +10,34 @@ GPU validation uses the authorized `dx.1catai.com:54633` and task-owned locks,
 artifacts and dependencies. Fifty idle host/spec retry queues were stopped under
 this updated policy; their deferred records replace no test completion markers.
 
-Current merge decision: accept the completed stack through #1110 after the
-FlashInfer-SM70 compatibility fix described below. Keep the still-open A3
-structural targets as follow-up work, rather than accumulating more draft PRs.
-The final 153-line forward, 315-line maximum function, 269 cross-module private
-references, 83 outside-Spec model terms and 20 state flags are **not** full A3
-completion. Import cycles and environment reads outside config are already zero.
+A3 is accepted within the user-adjusted scope and delivered by [#1119](https://github.com/1CatAI/1Cat-vLLM/pull/1119).
+DDTree algorithm work and its GPU gate remain explicitly deferred.
+
+Final cleanup is on the owned `agent/v100-a3-finish-20261009-005942` branch,
+based on main `84b57580d9ba24d02866166a60ade0505919013d`. The earlier stack is
+already integrated through #1113; no dependency on its closed draft PRs remains.
+Step 7 below records the final acceptance evidence. DDTree remains
+an explicit user-deferred exception, not a passed GPU claim.
+
+| Metric | #1060 | Main before final cleanup | Final cleanup |
+| --- | ---: | ---: | ---: |
+| Forward lines | 597 | 153 | 113 |
+| Largest active function | 977 | 303 | 200 |
+| Whole-package maximum (includes deferred DDTree) | 977 | 315 | 321 |
+| Cross-module private references | 390 | 269 | 11 |
+| Import cycles | 14 | 0 | 0 |
+| Model terms outside Spec / route declarations | 169 | 83 | 0 |
+| Environment reads outside config | 119 | 0 | 0 |
+| State module boolean flags | 29 | 20 | 0 |
+
+The six-line increase in the deferred DDTree function is explicit keyed logging;
+its calculation hash remains frozen. The non-deferred 200-line ceiling has its
+own ratchet, so the exception cannot conceal another oversized function.
+Composition imports are a named, exact allowlist for constructor wiring and the
+legacy verifier facade; every other execution/Spec dependency remains checked.
+
+The following rows retain per-slice evidence. The final combined Step 7 gate
+supersedes the retired per-slice queues.
 
 | Step | PR | Status | Metrics | GPU validation | Open items |
 | --- | --- | --- | --- | --- | --- |
@@ -31,23 +53,23 @@ completion. Import cycles and environment reads outside config are already zero.
 | 4b: native decode candidates | #1081 | Merged to main | Private references 374 → 370 | 1691 passes / same 7 failures; 12 outputs exact; named timings and 4 Qwen contracts pass | Deferred; not a merge gate |
 | 4c: outer decode dispatch candidates | #1083 | Merged to main | Forward 597 → 402; private 370 → 358 | 1691 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts pass | Deferred; not a merge gate |
 | 1c follow-up: immutable requested workload | #1084 | Merged to main | Production unchanged | 1692 passes / same 7 failures; no changed old outcomes | Deferred; not a merge gate |
-| 5a: per-sequence prefill candidates | #1085 | Merged to main | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | Follow-up GPU evidence |
-| 5b: batch prefill candidates | #1086 | Merged to main | Largest function 529 → 414; private 348 → 347 | Follow-up | Follow-up GPU evidence |
-| 5c: debug observer | #1088 | Merged to main | Largest function 414 → 402 | Queued | Follow-up GPU evidence |
-| 6a: verifier ownership | #1090 | Merged to main | Cycles 13 → 11; model terms 169 → 158 | Queued | Follow-up GPU evidence |
-| 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Queued | Follow-up GPU evidence |
-| 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Queued | Follow-up GPU evidence |
-| 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Queued | Follow-up GPU evidence |
-| 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Queued | Follow-up GPU evidence |
-| 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Queued | Follow-up GPU evidence |
-| 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Queued | Follow-up GPU evidence |
-| 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Queued | Follow-up GPU evidence |
-| 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Queued | Follow-up GPU evidence |
-| 6j: tree visibility feature ownership | #1107 | CPU/golden/strict/rebase passed | Private 308 → 303; model terms 151 → 137 | Queued | Follow-up GPU evidence |
-| 6k: feature contract ownership | #1108 | CPU/golden/strict/rebase passed | Private 303 → 301; model terms 137 → 126 | Four queues staged | Follow-up GPU evidence |
-| 6l: dynamic feature policies | #1109 | CPU/golden/strict/rebase passed | Private 301 → 287; model terms 126 → 83 | Four queues staged | Follow-up GPU evidence |
-| 6m: decode one-shot logging | #1110 | Full CPU/golden/strict and logger tests passed | State flags 29 → 20; private 287 → 269 | Follow-up | Follow-up GPU evidence |
-| 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
+| 5a: per-sequence prefill candidates | #1085 | Merged to main | Largest function 977 → 529; private 358 → 348 | Superseded by Step 7 | Superseded by Step 7 |
+| 5b: batch prefill candidates | #1086 | Merged to main | Largest function 529 → 414; private 348 → 347 | Follow-up | Superseded by Step 7 |
+| 5c: debug observer | #1088 | Merged to main | Largest function 414 → 402 | Superseded by Step 7 | Superseded by Step 7 |
+| 6a: verifier ownership | #1090 | Merged to main | Cycles 13 → 11; model terms 169 → 158 | Superseded by Step 7 | Superseded by Step 7 |
+| 6b: metadata builder ownership | #1093 | Integrated to main through #1113 | Cycles 11 → 4; private 347 → 341 | Superseded by Step 7 | Superseded by Step 7 |
+| 6c: attention policy ownership | #1095 | Integrated to main through #1113 | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Superseded by Step 7 | Superseded by Step 7 |
+| 6d: owned per-request metadata packet | #1096 | Integrated to main through #1113 | Private 333 → 332; final metadata mixin removed | Superseded by Step 7 | Superseded by Step 7 |
+| 6e: registered speculative features | #1097 | Integrated to main through #1113 | Private 332 → 330 | Superseded by Step 7 | Superseded by Step 7 |
+| 6f: complete prefill execution ownership | #1101 | Integrated to main through #1113 | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Superseded by Step 7 | Superseded by Step 7 |
+| 6g: owned comparison diagnostics | #1103 | Integrated to main through #1113 | Private 318 → 309; cycles 2 → 1 | Superseded by Step 7 | Superseded by Step 7 |
+| 6h: shared allocation ownership | #1104 | Integrated to main through #1113 | Private 309 → 308; final cycle 1 → 0 | Superseded by Step 7 | Superseded by Step 7 |
+| 6i: outer prefill dispatch | #1105 | Integrated to main through #1113 | Forward 400 → 153; largest function 400 → 318 | Superseded by Step 7 | Superseded by Step 7 |
+| 6j: tree visibility feature ownership | #1107 | Integrated to main through #1113 | Private 308 → 303; model terms 151 → 137 | Superseded by Step 7 | Superseded by Step 7 |
+| 6k: feature contract ownership | #1108 | Integrated to main through #1113 | Private 303 → 301; model terms 137 → 126 | Superseded by Step 7 | Superseded by Step 7 |
+| 6l: dynamic feature policies | #1109 | Integrated to main through #1113 | Private 301 → 287; model terms 126 → 83 | Superseded by Step 7 | Superseded by Step 7 |
+| 6m: decode one-shot logging | #1110 | Integrated to main through #1113 | State flags 29 → 20; private 287 → 269 | Follow-up | Superseded by Step 7 |
+| 7: final boundaries, flags, docs, ratchet | [#1119](https://github.com/1CatAI/1Cat-vLLM/pull/1119) | Complete within agreed scope | 113 / 200 active / 11 private / 0 cycles-model-env-flags | 10 native cases + 4 greedy contracts passed on 54633 | DDTree deferred |
 
 ## Step 0 decisions
 
@@ -1338,3 +1360,80 @@ with **37 passes / 98 GPU skips** and unchanged native sources. Local evidence:
 `a3-main-integration-1028-cpu.log`. An additional 37 idle per-slice GPU retry
 queues were retired; an already-active regression job was left to finish.
 No deferred queue was given a passing completion marker.
+
+## Step 7: final ownership and completion
+
+Final implementation:
+
+- Mechanical commit `b205f25c0` moves verifier and feature diagnostics into Spec;
+  the following rewrite commit promotes actual owner operations with live legacy
+  aliases, moves feature admission/logging out of common prefill, removes all
+  remaining process flag storage and separates long functions by responsibility.
+- Diagnostic preparation publishes synchronous events to logging subscribers.
+  Completion keys preserve the old guard and final-mark locations. The legacy
+  import warns about deprecation; patch writes still reach executed owners.
+- `check_layering` now measures model names inside this backend rather than
+  exempting the entire V100 package. The dependency baseline locks final counts,
+  the 200-line active ceiling and the one explicit deferred function.
+- The immutable trace, route names, native interfaces, QSA/RoPE code and original
+  calculation fixtures are not changed. New test normalization only expands
+  actual extracted code, checks parameter binding, and resolves live aliases.
+
+Final source: `f228be11c1b96966bf6dfec73b8d11eea9ca2d9e` (includes main
+`9dcf6c4724c1efd8a238973f876488a2b932e706`). The final follow-up adds documentation and TYPE_CHECKING-only aliases for
+legacy imports. Excluding those static declarations/imports, all three affected
+module runtime ASTs are identical to this GPU-tested source. Results:
+
+| Check | Command / artifact | Result |
+| --- | --- | --- |
+| Immutable CPU behavior and calculation oracles | `pytest test_flash_v100_trace_golden.py test_flash_v100_impl_composition.py::test_all_method_bodies_and_static_descriptors_match_parent test_flash_v100_spec_metadata.py::test_moved_metadata_calculations_match_parent` | 14 passed; 813 trace cases; fixtures unchanged |
+| Full strict owner/patch regression | `bash /home/ymzx/arch-ws/tmp/a3-finish-strict.sh` | 360 passed, 1 skipped, 28 deselected; two obsolete warning-mock assertions corrected in the next row |
+| Corrected cases, exception logging, diagnostic boundary and FlashInfer | `pytest -p tools.sm70.flash_v100_shim_audit --require-shim-use` with `test_flash_v100_attention_hooks.py`, `test_flash_v100_decode_once.py`, `test_flash_v100_final_boundaries.py`, `test_sm70_flashinfer_backend.py` | 36 passed; full audit has 45 consumed shim names, zero unconsumed |
+| Logger and route declaration/predicate regression | `pytest tests/test_logger.py tests/v1/attention/test_flash_v100_routes.py` | 286 passed |
+| Constructor extraction | `a3-finish-constructor.py`, exact normalized comparison to b205f25c0 | Native loading, construction calculations and env read order unchanged; SHA256 `ea188e863bed01f94d3274eed62b5a80358458e155cd1878a9a8181dcc3f7aab` |
+| Lint and type checking | Full commit pre-commit; manual `mypy-3.12` on 32 changed production files; local mypy 3.10 also checks tests; `check_layering.py` | Passed |
+| Native attention GPU | `tools.sm70.op_parity record/compare`, ten non-DDTree cases, 100 iterations × 9 repeats | All output/replay tensors exact, `max_abs=0`; route counts equal and persistent pointers stable |
+| Native timing roles | Same op artifacts, no rerun | FP16 XQA graph 0.000%; E4M3 XQA graph +0.045%; 8K prefill +0.678% versus #1060, within ±2% |
+| Final Qwen greedy gate (FP16/E4M3 eager/graph) | Four FP16/E4M3 × eager/graph contracts, three fixed prompts each | 4/4 contracts passed; 12/12 prompt results and worker route counts exactly match #1060 |
+| Pinned #1028 replay | Three host-KV/QSA-cache/KV-cache suites | 37 passed / 98 skipped; integration c06a820d438e7678b3e93c9a07e70f2ff8e7263b |
+
+CPU artifacts: `/home/ymzx/arch-ws/tmp/a3-finish-*`. GPU artifacts and full
+commands: `~/arch-ws/architecture-gpu-54633-20261008/a3-step7finish/` on 54633,
+with runner `a3-run-step7finish-gpu-wait.sh`. The source manifest verifies every
+tracked Python/native-source input before launch. Runtime uses Torch 2.10.0+cu128,
+CUDA 12.8 and one Tesla V100-SXM2-32GB, GPU 0; native libraries are the recorded,
+unchanged baseline artifacts, not a newly built wheel. Qwen3-0.6B uses the
+original model/tokenizer revision, TP1, max length 16384, chunk 8192, one sequence,
+0.65 memory utilization, greedy 64-token output and original prompts (23/32/9029
+input tokens). Eager and FULL_DECODE_ONLY graph [1] are separate contracts.
+The native matrix also exercises DFlash2 FP16/E4M3 grouped verification and MTP
+small-query capture. DDTree's two native GPU cases are explicitly omitted from
+both compared case sets; the original stored baseline remains intact.
+
+The first GPU attempt yielded to another maintainer's TP4 lock (exit 75).
+The second found a missing nested FA2-library symlink in this new task-owned
+verification directory. The third uses the same library bytes as the baseline;
+no shared runtime or other process was modified. Failed-attempt logs are kept.
+
+The #1028 merge-tree comparison is exact for every file except the conflict in
+`flashnext_mtp4_round12_screens_20261008.md`, resolved to latest main, which already
+contains the older evidence and updated status. Attention native sources remain
+unchanged. The unrelated PLE range-error correction from main is retained in
+`csrc/ple_disk_rows.cpp`; it is not an A3 kernel change. #1028 and #1048 heads were
+rechecked as `17fa23e5` and `847bb3d8` respectively, and neither branch is modified.
+The initial GitHub CI run caught six missing static legacy-export declarations
+in four unchanged consumers (RoPE, FlashInfer and acceleration configuration).
+Those declarations now live under TYPE_CHECKING, preserving dynamic runtime
+forwarding. The eight-file consumer check passed; the 14 final golden/oracle
+checks also passed again.
+
+Historical host-model A/A nondeterminism in the known-issues record remains an
+explicit limitation; it is not represented as a passed final host-model gate.
+
+After A3, resume frozen work independently from the resulting main commit:
+PRs #1061/#1048 adapt native codec traits/readers/storage accounting to the single
+`kv_codecs.py` API; #1063 adapts its bridge to current prefill operations;
+PR #1064 rebases documentation against the completed owners; #1065/#1066 rebase
+MoE work independently and retain A3 safety tests. Do not restore the old stacked
+PR bases. #1028 remains separately owned; use the pinned compatibility replay,
+without publishing changes to its branch.

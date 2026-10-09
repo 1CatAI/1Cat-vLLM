@@ -10,16 +10,15 @@ from typing import Any
 
 import torch
 
-from vllm.logger import init_logger
+from vllm.logger import init_logger, log_once_seen, set_log_once_state
 from vllm.v1.attention.backends.flash_v100 import config as _config
-from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import dense_prefill as _dense_prefill
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import prefill_candidates as _sequence
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
+from vllm.v1.attention.backends.flash_v100.plan import diagnostics as _debug
 from vllm.v1.attention.backends.flash_v100.plan import events as _events
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
@@ -124,17 +123,17 @@ def _run_fp8_prefill_bridge(
     input_block_size = int(key_cache.shape[1])
     active_input_blocks = min(
         int(block_table.shape[1]),
-        _masks._cdiv_int(seq_len, input_block_size),
+        _masks.cdiv_int(seq_len, input_block_size),
     )
     if active_input_blocks <= 0:
         return None
     active_block_table = block_table[:, :active_input_blocks]
     input_capacity = active_input_blocks * input_block_size
-    required_blocks = _masks._cdiv_int(
+    required_blocks = _masks.cdiv_int(
         input_capacity,
         _dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE,
     )
-    workspace = _dense_prefill._get_fp8_prefill_bridge_workspace(
+    workspace = _dense_prefill.get_fp8_prefill_bridge_workspace(
         key_cache,
         required_blocks,
     )
@@ -163,9 +162,9 @@ def _run_fp8_prefill_bridge(
     exact_out = out
     tail_prefix = 0
     if q_len % 64 != 0 and seq_len % 32 == 0:
-        padded_q_len = _masks._cdiv_int(q_len, 64) * 64
+        padded_q_len = _masks.cdiv_int(q_len, 64) * 64
         if padded_q_len <= seq_len:
-            tail_workspace = _dense_prefill._get_fp8_prefill_bridge_tail_workspace(
+            tail_workspace = _dense_prefill.get_fp8_prefill_bridge_tail_workspace(
                 query,
                 padded_q_len,
             )
@@ -174,7 +173,7 @@ def _run_fp8_prefill_bridge(
                 tail_prefix = padded_q_len - q_len
                 exact_query[:, :tail_prefix].zero_()
                 exact_query[:, tail_prefix:].copy_(query)
-    cu_q, cu_k = _dense_prefill._uniform_cu_seqlens(
+    cu_q, cu_k = _dense_prefill.uniform_cu_seqlens(
         exact_query,
         batch_size=1,
         query_len=int(exact_query.shape[1]),
@@ -182,7 +181,7 @@ def _run_fp8_prefill_bridge(
     )
     key_dense = key_out.flatten(0, 1)[:seq_len].unsqueeze(0)
     value_dense = value_out.flatten(0, 1)[:seq_len].unsqueeze(0)
-    exact_result = _dense_prefill._try_sm70_fa2_d256_prefill(
+    exact_result = _dense_prefill.try_sm70_fa2_d256_prefill(
         exact_query,
         key_dense,
         value_dense,
@@ -198,17 +197,17 @@ def _run_fp8_prefill_bridge(
     if exact_result is not None:
         if tail_prefix:
             out.copy_(exact_result[:, tail_prefix:])
-            _routing._record_route(
+            _routing.record_route(
                 _routing.ROUTE_SPECS[
                     "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad"
                 ].name
             )
             return out, True
-        _routing._record_route(
+        _routing.record_route(
             _routing.ROUTE_SPECS["prefill_prefix_fp8_bridge_exact_dense_d256"].name
         )
         return exact_result, True
-    exact_result = _dense_prefill._try_sm70_fa2_d256_prefill(
+    exact_result = _dense_prefill.try_sm70_fa2_d256_prefill(
         exact_query,
         key_out,
         value_out,
@@ -226,13 +225,13 @@ def _run_fp8_prefill_bridge(
     if exact_result is not None:
         if tail_prefix:
             out.copy_(exact_result[:, tail_prefix:])
-            _routing._record_route(
+            _routing.record_route(
                 _routing.ROUTE_SPECS[
                     "prefill_prefix_fp8_bridge_exact_d256_tailpad"
                 ].name
             )
             return out, True
-        _routing._record_route(
+        _routing.record_route(
             _routing.ROUTE_SPECS["prefill_prefix_fp8_bridge_exact_d256"].name
         )
         return exact_result, True
@@ -342,7 +341,7 @@ def _should_use_prefill_gather_dense(
     window_size: tuple[int, int],
     num_seqs: int,
 ) -> bool:
-    graph_capture = _routing._is_cuda_graph_capturing(key_cache)
+    graph_capture = _routing.is_cuda_graph_capturing(key_cache)
     q8192_family = (
         not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
         and _dense_prefill._SM70_79T_CORE_QUERY_LEN
@@ -369,7 +368,7 @@ def _should_use_prefill_gather_dense(
         and key_cache.shape == value_cache.shape
         and not graph_capture
     )
-    _debug._sm70_profile_trace(
+    _debug.sm70_profile_trace(
         "prefill gather-dense policy: eligible=%s gate=%s q=%d min_q=%d "
         "kv=%d min_kv=%d num_seqs=%d head_dim=%d causal=%s window=%s "
         "key_dtype=%s value_dtype=%s same_shape=%s graph_capture=%s",
@@ -411,7 +410,7 @@ def _prefill_prefix_decode_rows_allowed(
         and not self.use_decode_dense_cache
         and not self.use_decode_dense_reference
         and window_size == (-1, -1)
-        and not _routing._is_cuda_graph_capturing(query)
+        and not _routing.is_cuda_graph_capturing(query)
     )
 
 
@@ -429,7 +428,7 @@ def _run_mixed_rows_grouped_e4m3(
 
     This is the route a uniform verification batch already takes: eight
     query rows share one pass over the request's KV, accumulate in FP32 and
-    keep the explicit per-row causal length. Without it a DFlash2 target in
+    keep the explicit per-row causal length. Without it a speculative target in
     a mixed batch reads the whole KV once per query token through the
     scalar decoder, and the cost grows with the context. Returns ``False``
     when the operator or the layout is not admitted; nothing has been
@@ -479,8 +478,8 @@ def _run_mixed_rows_grouped_e4m3(
             v_scale=v_scale,
         )
     out_view.index_copy_(0, plan.src_idx, out_pad.index_select(0, plan.dst_idx))
-    if not _state._logged_prefill_prefix_decode_rows_grouped:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_prefill_prefix_decode_rows_grouped"):
+        logger.info_once(
             "FLASH_ATTN_V100 mixed-batch small-query rows take the grouped "
             "E4M3 FP32 route (requests=%d, groups=%d, max_q=%d, "
             "max_seq_len=%d).",
@@ -488,10 +487,14 @@ def _run_mixed_rows_grouped_e4m3(
             plan.num_groups,
             plan.max_query_len,
             plan.max_seq_len_hint,
+            scope="process",
+            key="flash_v100._logged_prefill_prefix_decode_rows_grouped",
         )
-        _state._logged_prefill_prefix_decode_rows_grouped = True
-    _routing._log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "grouped_fp32")
-    _routing._record_route(
+        set_log_once_state(
+            "flash_v100._logged_prefill_prefix_decode_rows_grouped", True
+        )
+    _routing.log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "grouped_fp32")
+    _routing.record_route(
         _routing.ROUTE_SPECS["prefill_prefix_decode_rows_e4m3_grouped_fp32"].name
     )
     return True
@@ -516,11 +519,11 @@ def _run_prefill_prefix_decode_rows(
     the whole context (kernel/fused_mha_api.cpp launches ``grid(ceil(q/BM),
     1, B*H)``). A resident decoder at 240K pays ~58 ms per layer that way
     versus ~1.8 ms on the partitioned decode kernel (1CatAI/1Cat-vLLM#490),
-    and an MTP/DFlash verify row (q = K+1) has the same grid. The rows are
+    and a speculative verify row (q = K+1) has the same grid. The rows are
     therefore pulled out of the prefill batch and run on a decode operator.
     Every query token of a selected row becomes one decode row whose visible
     KV length grows by one, the expansion _flash_v100_small_query_prefill_as_decode
-    uses for the verifier, so the causal mask is preserved. A DFlash2 E4M3
+    uses for the verifier, so the causal mask is preserved. A speculative E4M3
     target takes the grouped FP32 operator like its uniform verifier does;
     other layouts use XQA or the scalar decoder. Returns the row indices
     consumed here; the caller's per-sequence loop skips them.
@@ -583,7 +586,7 @@ def _run_prefill_prefix_decode_rows(
     block_table = attn_metadata.block_table.index_select(0, plan.token_req)
     seq_lens_rows = plan.token_lengths(attn_metadata.seq_lens)
     partition_size_hint = (
-        _routing._g6_aligned_page_partition_size_hint(
+        _routing.g6_aligned_page_partition_size_hint(
             q_rows,
             key_cache,
             value_cache,
@@ -639,8 +642,8 @@ def _run_prefill_prefix_decode_rows(
             )
             return out_rows
 
-    if not _state._logged_prefill_prefix_decode_rows:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_prefill_prefix_decode_rows"):
+        logger.info_once(
             "FLASH_ATTN_V100 mixed-batch small-query rows take the paged "
             "decode route (%s, rows=%d of %d, max_q=%d, max_seq_len=%d).",
             route,
@@ -648,8 +651,10 @@ def _run_prefill_prefix_decode_rows(
             len(query_start_loc) - 1,
             max_query_len_rows,
             max_seq_len_hint,
+            scope="process",
+            key="flash_v100._logged_prefill_prefix_decode_rows",
         )
-        _state._logged_prefill_prefix_decode_rows = True
+        set_log_once_state("flash_v100._logged_prefill_prefix_decode_rows", True)
     self._run_prefill_paged_call(
         route=route,
         q_len=max_query_len_rows,
@@ -660,12 +665,12 @@ def _run_prefill_prefix_decode_rows(
         block_size=int(key_cache.shape[1]),
         fn=run,
     )
-    _routing._log_fp8_kv_cache_route(
+    _routing.log_fp8_kv_cache_route(
         "decode",
         self.kv_cache_dtype,
         "xqa_paged" if use_xqa else "scalar_paged",
     )
-    _routing._record_route(route)
+    _routing.record_route(route)
     out_view.index_copy_(0, plan.src_idx, out_rows)
     return set(plan.rows)
 
@@ -724,48 +729,25 @@ def _flash_v100_prefill_with_prefix(
         anchor_lens, anchored_window = None, 0
     else:
         anchor_lens, anchored_window = self._anchored_swa_params(attn_metadata)
-    if anchor_lens is not None:
-        # Fail closed: with the anchored decode-window mask active the
-        # KV cache manager evicts gap blocks, so running any unmasked
-        # prefill route would silently produce wrong output.
-        if not self.use_flash_v100_prefill_paged:
-            raise RuntimeError(
-                "FLASH_ATTN_V100 anchored decode-window mask requires "
-                "the paged prefill kernel; it is disabled or unavailable."
-            )
-        if not self._flash_prefill_paged_supports_anchor:
-            raise RuntimeError(
-                "FLASH_ATTN_V100 prefill op does not support the "
-                "anchored decode-window mask with this extension build; "
-                "rebuild flash_attn_v100."
-            )
+    _validate_prefix_mask(self, anchor_lens)
+
     num_actual_tokens = attn_metadata.num_actual_tokens
     query = query[:num_actual_tokens]
     out_view = output[:num_actual_tokens]
 
-    query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
-    query_start_loc = (
-        query_start_loc_cpu
-        if query_start_loc_cpu is not None
-        else attn_metadata.query_start_loc
-    )
-    query_start_loc = _kv_layout._normalize_query_start_loc_for_available_tokens(
-        query_start_loc,
-        int(query.shape[0]),
-    )
-    seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
-    seq_lens = seq_lens_cpu if seq_lens_cpu is not None else attn_metadata.seq_lens
+    query_start_loc, seq_lens = _prefix_host_metadata(attn_metadata, query)
+
     num_seqs = len(query_start_loc) - 1
 
-    key_cache, value_cache = _kv_layout._split_paged_kv_cache(kv_cache)
+    key_cache, value_cache = _kv_layout.split_paged_kv_cache(kv_cache)
     block_size = key_cache.shape[1]
     num_kv_heads = key_cache.shape[2]
     head_dim = key_cache.shape[3]
     debug_compare = _config.raw("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0") == "1"
-    dflash_dump = (
+    feature_dump = (
         self.ops.prefix_dump_enabled()
-        and not _state._logged_dflash_prefix_dump
-        and bool(getattr(layer, "is_dflash_draft_attn", False))
+        and not log_once_seen("flash_v100.prefix_dump")
+        and self.ops.is_draft_layer(layer)
     )
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
@@ -793,7 +775,7 @@ def _flash_v100_prefill_with_prefix(
         window_size,
         anchor_lens,
         debug_compare,
-        dflash_dump,
+        feature_dump,
     )
     if batch_complete:
         return batch_output
@@ -814,7 +796,7 @@ def _flash_v100_prefill_with_prefix(
             if anchor_lens is not None:
                 # Anchored decode-window mask: single masked paged
                 # prefill route; every unmasked fast path is bypassed.
-                _routing._record_route(
+                _routing.record_route(
                     _routing.ROUTE_SPECS["prefill_prefix_paged_anchored"].name
                 )
                 out_seq = self._run_prefill_paged_call(
@@ -867,8 +849,9 @@ def _flash_v100_prefill_with_prefix(
             if skip_debug:
                 continue
             need_dense_debug = (
-                debug_compare and not _state._logged_prefill_compare
-            ) or dflash_dump
+                debug_compare
+                and not log_once_seen("flash_v100._logged_prefill_compare")
+            ) or feature_dump
             if need_dense_debug:
                 observe_prefill_reference(
                     self,
@@ -893,11 +876,11 @@ def _flash_v100_prefill_with_prefix(
                     query_start_loc,
                     seq_lens,
                     debug_compare,
-                    dflash_dump,
+                    feature_dump,
                 )
         else:
             seq_len = int(seq_lens[i].item())
-            k_cont, v_cont = _kv_layout._extract_contiguous_kv_from_paged_cache(
+            k_cont, v_cont = _kv_layout.extract_contiguous_kv_from_paged_cache(
                 kv_cache=kv_cache,
                 block_table=attn_metadata.block_table[i : i + 1],
                 seq_lens=attn_metadata.seq_lens[i : i + 1],
@@ -906,7 +889,7 @@ def _flash_v100_prefill_with_prefix(
                 block_size=block_size,
                 total_tokens=seq_len,
             )
-            k_cont, v_cont = _kv_layout._dequantize_fp8_contiguous_kv(
+            k_cont, v_cont = _kv_layout.dequantize_fp8_contiguous_kv(
                 k_cont,
                 v_cont,
                 self.kv_cache_dtype,
@@ -929,8 +912,8 @@ def _flash_v100_prefill_with_prefix(
 
 
 def log_bfla(config):
-    if not _state._logged_prefill_prefix_bfla:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_prefill_prefix_bfla"):
+        logger.info_once(
             "FLASH_ATTN_V100 prefix prefill BFLA sparse path active (min_q=%d "
             "min_kv=%d mask_block_n=%d keep_mass=%.4f local_blocks=%d pool=%s).",
             config.policy.prefill_bfla_min_q,
@@ -939,74 +922,88 @@ def log_bfla(config):
             _config.registered("VLLM_FLASH_V100_BFLA_KEEP_MASS"),
             _config.registered("VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS"),
             _config.registered("VLLM_FLASH_V100_BFLA_POOL"),
+            scope="process",
+            key="flash_v100._logged_prefill_prefix_bfla",
         )
-        _state._logged_prefill_prefix_bfla = True
+        set_log_once_state("flash_v100._logged_prefill_prefix_bfla", True)
 
 
 def log_fa2(config, fa2_route):
-    if not _dense_prefill._logged_prefill_fa2_d256:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_prefill_fa2_d256"):
+        logger.info_once(
             "FLASH_ATTN_V100 SM70 Split-D D256 software-pipelined prefill path "
             "active (route=%s).",
             fa2_route,
+            scope="process",
+            key="flash_v100._logged_prefill_fa2_d256",
         )
-        _dense_prefill._logged_prefill_fa2_d256 = True
+        set_log_once_state("flash_v100._logged_prefill_fa2_d256", True)
 
 
 def log_contiguous_bhmd(config):
-    if not _state._logged_prefill_prefix_contig_dense:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_prefill_prefix_contig_dense"):
+        logger.info_once(
             "FLASH_ATTN_V100 prefix prefill contiguous dense BHMD path active "
             "(min_q=%d min_kv=%d allow_copy=%s).",
             config.policy.prefill_contig_dense_min_q,
             config.policy.prefill_contig_dense_min_kv,
             str(config.policy.prefill_contig_dense_allow_copy),
+            scope="process",
+            key="flash_v100._logged_prefill_prefix_contig_dense",
         )
-        _state._logged_prefill_prefix_contig_dense = True
+        set_log_once_state("flash_v100._logged_prefill_prefix_contig_dense", True)
 
 
 def log_contiguous_dense(config):
-    if not _state._logged_prefill_prefix_contig_dense:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_prefill_prefix_contig_dense"):
+        logger.info_once(
             "FLASH_ATTN_V100 prefix prefill contiguous dense path active "
             "(min_q=%d min_kv=%d).",
             config.policy.prefill_contig_dense_min_q,
             config.policy.prefill_contig_dense_min_kv,
+            scope="process",
+            key="flash_v100._logged_prefill_prefix_contig_dense",
         )
-        _state._logged_prefill_prefix_contig_dense = True
+        set_log_once_state("flash_v100._logged_prefill_prefix_contig_dense", True)
 
 
 def log_dense_fa2(config):
-    if not _dense_prefill._logged_prefill_fa2_d256:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_prefill_fa2_d256"):
+        logger.info_once(
             "FLASH_ATTN_V100 SM70 FA2 D256 software-pipelined dense prefill path "
-            "active."
+            "active.",
+            scope="process",
+            key="flash_v100._logged_prefill_fa2_d256",
         )
-        _dense_prefill._logged_prefill_fa2_d256 = True
+        set_log_once_state("flash_v100._logged_prefill_fa2_d256", True)
 
 
 def log_fp8_bridge(config):
-    if not _state._logged_fp8_prefill_bridge:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_fp8_prefill_bridge"):
+        logger.info_once(
             "FLASH_ATTN_V100 %s prefill bridge active (one-pass dequant, shared "
             "FP16 page-%d workspace).",
             config.kv_cache_dtype,
             _dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE,
+            scope="process",
+            key="flash_v100._logged_fp8_prefill_bridge",
         )
-        _state._logged_fp8_prefill_bridge = True
+        set_log_once_state("flash_v100._logged_fp8_prefill_bridge", True)
 
 
 def log_splitkv(config):
-    if not _state._logged_prefill_prefix_splitkv:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_prefill_prefix_splitkv"):
+        logger.info_once(
             "FLASH_ATTN_V100 prefix prefill split-KV path active "
             "(split_kv_tokens=%d min_q=%d max_q=%d min_kv=%d).",
             config.policy.prefill_split_kv_tokens,
             config.policy.prefill_split_kv_min_q,
             config.policy.prefill_split_kv_max_q,
             config.policy.prefill_split_kv_min_kv,
+            scope="process",
+            key="flash_v100._logged_prefill_prefix_splitkv",
         )
-        _state._logged_prefill_prefix_splitkv = True
+        set_log_once_state("flash_v100._logged_prefill_prefix_splitkv", True)
 
 
 def execute_prefill_sequence(
@@ -1071,8 +1068,8 @@ def create_prefill_executor(self):
         paged=getattr(self, "flash_attn_prefill_paged", None),
         bfla=getattr(self, "flash_attn_prefill_paged_bfla", None),
         splitkv=getattr(self, "flash_attn_prefill_paged_splitkv", None),
-        uniform=_dense_prefill._uniform_cu_seqlens,
-        try_fa2=_dense_prefill._try_sm70_fa2_d256_prefill,
+        uniform=_dense_prefill.uniform_cu_seqlens,
+        try_fa2=_dense_prefill.try_sm70_fa2_d256_prefill,
         log_bfla=log_bfla,
         log_fa2=log_fa2,
         log_contiguous_bhmd=log_contiguous_bhmd,
@@ -1087,7 +1084,10 @@ def create_prefill_executor(self):
         small_query=self.ops.small_query,
         allow_rows=getattr(self, "_prefill_prefix_decode_rows_allowed", None),
         decode_rows=getattr(self, "_run_prefill_prefix_decode_rows", None),
-        log_noncausal=log_noncausal,
+        log_noncausal=self.ops.log_noncausal,
+        is_draft_layer=self.ops.is_draft_layer,
+        noncausal_batch=self.ops.noncausal_batch,
+        reject_tree_anchor=self.ops.reject_tree_anchor,
         log_small_query=log_small_query,
     )
     return _sequence.PrefillExecutor(
@@ -1095,24 +1095,16 @@ def create_prefill_executor(self):
     )
 
 
-def log_noncausal(config, num_seqs, max_query_len, block_size):
-    logger.info_once(
-        "FLASH_ATTN_V100 DFlash uniform noncausal paged batch route "
-        "active (batch=%d, q=%d, page=%d).",
-        num_seqs,
-        max_query_len,
-        block_size,
-    )
-
-
 def log_small_query(config):
-    if not _state._logged_prefill_smallq_decode:
-        logger.info(
+    if not log_once_seen("flash_v100._logged_prefill_smallq_decode"):
+        logger.info_once(
             "FLASH_ATTN_V100 prefix prefill small-query path active "
             "(paged decode verifier, max_query_len<=%d).",
             config.policy.smallq_decode_max_query_len,
+            scope="process",
+            key="flash_v100._logged_prefill_smallq_decode",
         )
-        _state._logged_prefill_smallq_decode = True
+        set_log_once_state("flash_v100._logged_prefill_smallq_decode", True)
 
 
 def execute_prefill_batch(
@@ -1221,7 +1213,7 @@ def observe_prefill_reference(
             self.kv_cache_dtype,
             self.scale,
             self.flash_attn_func,
-            _masks._torch_attention_reference,
+            _masks.torch_attention_reference,
             self._layer_debug_info,
         )
     )
@@ -1248,25 +1240,27 @@ def forward(
         int(output.shape[0]),
     )
     metadata_live_token_mismatch = (
-        _kv_layout._metadata_expects_more_query_tokens_than_available(
+        _kv_layout.metadata_expects_more_query_tokens_than_available(
             attn_metadata,
             available_query_tokens,
         )
     )
     if self.use_triton_prefill:
-        if not _state._logged_prefill_triton_safe:
-            logger.info(
+        if not log_once_seen("flash_v100._logged_prefill_triton_safe"):
+            logger.info_once(
                 "FLASH_ATTN_V100 prefill uses explicit Triton diagnostic "
                 "fallback because VLLM_FLASH_V100_PREFILL_USE_TRITON=1; "
-                "this mixed route is not a final performance path."
+                "this mixed route is not a final performance path.",
+                scope="process",
+                key="flash_v100._logged_prefill_triton_safe",
             )
-            _state._logged_prefill_triton_safe = True
-        _debug._sm70_profile_trace(
+            set_log_once_state("flash_v100._logged_prefill_triton_safe", True)
+        _debug.sm70_profile_trace(
             "forward branch=prefill_triton_safe layer=%s",
             layer_name,
         )
         self.workspace.decode_cache.invalidate()
-        _routing._record_route(_routing.ROUTE_SPECS["prefill_triton_safe"].name)
+        _routing.record_route(_routing.ROUTE_SPECS["prefill_triton_safe"].name)
         return self.ops.triton_forward(
             layer,
             query,
@@ -1297,41 +1291,9 @@ def forward(
             )
         smallq_decode = self.ops.small_query_enabled(attn_metadata)
         if smallq_decode:
-            if _debug._draft_graph_debug_enabled():
-                _debug._draft_graph_debug_log(
-                    "forward:prefill_capture_smallq",
-                    "layer=%s %s %s %s",
-                    layer_name,
-                    _debug._format_tensor_debug(
-                        getattr(
-                            attn_metadata,
-                            "smallq_decode_block_table",
-                            None,
-                        ),
-                        "smallq_bt",
-                    ),
-                    _debug._format_tensor_debug(
-                        getattr(
-                            attn_metadata,
-                            "smallq_decode_seq_lens",
-                            None,
-                        ),
-                        "smallq_seq",
-                    ),
-                    _debug._format_tensor_debug(
-                        getattr(
-                            attn_metadata,
-                            "smallq_query_start_loc",
-                            None,
-                        ),
-                        "smallq_qsl",
-                    ),
-                )
-            _debug._sm70_profile_trace(
-                "forward branch=prefill_capture_smallq layer=%s",
-                layer_name,
-            )
-            _routing._record_route(_routing.ROUTE_SPECS["prefill_capture_smallq"].name)
+            _observe_capture_smallq(attn_metadata, layer_name)
+
+            _routing.record_route(_routing.ROUTE_SPECS["prefill_capture_smallq"].name)
             self.ops.record_capture_layout(attn_metadata)
             return self._flash_v100_prefill_with_prefix(
                 layer,
@@ -1342,76 +1304,17 @@ def forward(
                 attn_metadata,
                 output,
             )
-        _debug._sm70_profile_trace(
+        _debug.sm70_profile_trace(
             "forward branch=prefill_capture_full_flash layer=%s",
             layer_name,
         )
-    has_prefix_context = metadata_live_token_mismatch or _kv_layout._has_prefix_context(
+    has_prefix_context = metadata_live_token_mismatch or _kv_layout.has_prefix_context(
         attn_metadata
     )
     smallq_decode = has_prefix_context and self.ops.small_query_enabled(attn_metadata)
     if has_prefix_context:
-        if _debug._draft_graph_debug_enabled():
-            _debug._draft_graph_debug_log(
-                "forward:prefill_prefix",
-                "layer=%s smallq=%s metadata_live_token_mismatch=%s %s %s %s",
-                layer_name,
-                smallq_decode,
-                metadata_live_token_mismatch,
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "smallq_decode_block_table", None),
-                    "smallq_bt",
-                ),
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "smallq_decode_seq_lens", None),
-                    "smallq_seq",
-                ),
-                _debug._format_tensor_debug(
-                    getattr(attn_metadata, "smallq_query_start_loc", None),
-                    "smallq_qsl",
-                ),
-            )
-        _debug._sm70_profile_trace(
-            "forward branch=prefill_prefix layer=%s smallq=%s",
-            layer_name,
-            smallq_decode,
-        )
-        if not _state._logged_prefill_prefix_flash:
-            if smallq_decode:
-                logger.info(
-                    "FLASH_ATTN_V100 prefill path active "
-                    "(prefix/chunked via small-query paged decode)."
-                )
-            elif self.use_flash_v100_prefill_paged:
-                logger.info(
-                    "FLASH_ATTN_V100 prefill path active "
-                    "(prefix/chunked via direct paged prefill kernel)."
-                )
-            else:
-                logger.info(
-                    "FLASH_ATTN_V100 prefill path active "
-                    "(prefix/chunked via paged-KV gather)."
-                )
-            _state._logged_prefill_prefix_flash = True
-        if metadata_live_token_mismatch:
-            logger.info(
-                "FLASH_ATTN_V100 prefill switched to prefix/live-token "
-                "path because layer QKV tokens (%d) are shorter than "
-                "query metadata span.",
-                available_query_tokens,
-            )
-        _routing._log_fp8_kv_cache_route("prefill", self.kv_cache_dtype, "prefix")
-        self.workspace.decode_cache.invalidate()
-        result = self._flash_v100_prefill_with_prefix(
-            layer,
-            query,
-            key,
-            value,
-            kv_cache,
-            attn_metadata,
-            output,
-        )
-        self.ops.compare_triton(
+        return _forward_with_prefix(
+            self,
             layer,
             query,
             key,
@@ -1421,27 +1324,34 @@ def forward(
             output,
             output_scale,
             output_block_scale,
-            "prefill_prefix",
+            layer_name,
+            smallq_decode,
+            metadata_live_token_mismatch,
+            available_query_tokens,
         )
-        _routing._record_route(_routing.ROUTE_SPECS["prefill_prefix_flash"].name)
-        return result
-    if not _state._logged_prefill_flash:
-        logger.info("FLASH_ATTN_V100 prefill path active (no prefix/chunked context).")
-        _state._logged_prefill_flash = True
+    if not log_once_seen("flash_v100._logged_prefill_flash"):
+        logger.info_once(
+            "FLASH_ATTN_V100 prefill path active (no prefix/chunked context).",
+            scope="process",
+            key="flash_v100._logged_prefill_flash",
+        )
+        set_log_once_state("flash_v100._logged_prefill_flash", True)
     self.workspace.decode_cache.invalidate()
     if self.use_prefill_paged_cache and self.use_flash_v100_prefill_paged:
-        _debug._sm70_profile_trace(
+        _debug.sm70_profile_trace(
             "forward branch=prefill_no_prefix_paged_cache layer=%s",
             layer_name,
         )
-        if not _state._logged_prefill_paged_cache:
-            logger.warning(
+        if not log_once_seen("flash_v100._logged_prefill_paged_cache"):
+            logger.warning_once(
                 "FLASH_ATTN_V100 no-prefix prefill is reading paged "
                 "KV cache for strict input-source diagnostics. This "
-                "may be slower than dense raw-KV prefill."
+                "may be slower than dense raw-KV prefill.",
+                scope="process",
+                key="flash_v100._logged_prefill_paged_cache",
             )
-            _state._logged_prefill_paged_cache = True
-        _routing._log_fp8_kv_cache_route(
+            set_log_once_state("flash_v100._logged_prefill_paged_cache", True)
+        _routing.log_fp8_kv_cache_route(
             "prefill", self.kv_cache_dtype, "no_prefix_paged_cache"
         )
         result = self._flash_v100_prefill_with_prefix(
@@ -1465,11 +1375,11 @@ def forward(
             output_block_scale,
             "prefill_no_prefix_paged_cache",
         )
-        _routing._record_route(
+        _routing.record_route(
             _routing.ROUTE_SPECS["prefill_no_prefix_paged_cache_flash"].name
         )
         return result
-    _debug._sm70_profile_trace(
+    _debug.sm70_profile_trace(
         "forward branch=prefill_no_prefix_dense layer=%s",
         layer_name,
     )
@@ -1486,7 +1396,7 @@ def forward(
         output_block_scale,
         "prefill_no_prefix",
     )
-    _routing._record_route(_routing.ROUTE_SPECS["prefill_no_prefix_dense_flash"].name)
+    _routing.record_route(_routing.ROUTE_SPECS["prefill_no_prefix_dense_flash"].name)
     return result
 
 
@@ -1519,6 +1429,10 @@ class PrefillDriverOps:
     supports_bmhd: bool = False
     split_pages: tuple[int, ...] = ()
     prefix_dump_enabled: Any = None
+    log_noncausal: Any = None
+    is_draft_layer: Any = None
+    noncausal_batch: Any = None
+    reject_tree_anchor: Any = None
 
 
 # Calculation bodies keep their old local spelling. Each binding below resolves
@@ -1603,3 +1517,172 @@ LEGACY_METHODS = (
     "_run_prefill_paged_call",
     "_flash_v100_prefill_with_prefix",
 )
+
+
+def _validate_prefix_mask(self, anchor_lens):
+    if anchor_lens is not None:
+        # Fail closed: with the anchored decode-window mask active the
+        # KV cache manager evicts gap blocks, so running any unmasked
+        # prefill route would silently produce wrong output.
+        if not self.use_flash_v100_prefill_paged:
+            raise RuntimeError(
+                "FLASH_ATTN_V100 anchored decode-window mask requires "
+                "the paged prefill kernel; it is disabled or unavailable."
+            )
+        if not self._flash_prefill_paged_supports_anchor:
+            raise RuntimeError(
+                "FLASH_ATTN_V100 prefill op does not support the "
+                "anchored decode-window mask with this extension build; "
+                "rebuild flash_attn_v100."
+            )
+
+
+def _forward_with_prefix(
+    self,
+    layer,
+    query,
+    key,
+    value,
+    kv_cache,
+    attn_metadata,
+    output,
+    output_scale,
+    output_block_scale,
+    layer_name,
+    smallq_decode,
+    metadata_live_token_mismatch,
+    available_query_tokens,
+):
+    if _debug.draft_graph_debug_enabled():
+        _debug.draft_graph_debug_log(
+            "forward:prefill_prefix",
+            "layer=%s smallq=%s metadata_live_token_mismatch=%s %s %s %s",
+            layer_name,
+            smallq_decode,
+            metadata_live_token_mismatch,
+            _debug.format_tensor_debug(
+                getattr(attn_metadata, "smallq_decode_block_table", None),
+                "smallq_bt",
+            ),
+            _debug.format_tensor_debug(
+                getattr(attn_metadata, "smallq_decode_seq_lens", None),
+                "smallq_seq",
+            ),
+            _debug.format_tensor_debug(
+                getattr(attn_metadata, "smallq_query_start_loc", None),
+                "smallq_qsl",
+            ),
+        )
+    _debug.sm70_profile_trace(
+        "forward branch=prefill_prefix layer=%s smallq=%s",
+        layer_name,
+        smallq_decode,
+    )
+    if not log_once_seen("flash_v100._logged_prefill_prefix_flash"):
+        if smallq_decode:
+            logger.info_once(
+                "FLASH_ATTN_V100 prefill path active "
+                "(prefix/chunked via small-query paged decode).",
+                scope="process",
+                key="flash_v100._logged_prefill_prefix_flash",
+            )
+        elif self.use_flash_v100_prefill_paged:
+            logger.info_once(
+                "FLASH_ATTN_V100 prefill path active "
+                "(prefix/chunked via direct paged prefill kernel).",
+                scope="process",
+                key="flash_v100._logged_prefill_prefix_flash",
+            )
+        else:
+            logger.info_once(
+                "FLASH_ATTN_V100 prefill path active "
+                "(prefix/chunked via paged-KV gather).",
+                scope="process",
+                key="flash_v100._logged_prefill_prefix_flash",
+            )
+        set_log_once_state("flash_v100._logged_prefill_prefix_flash", True)
+    if metadata_live_token_mismatch:
+        logger.info(
+            "FLASH_ATTN_V100 prefill switched to prefix/live-token "
+            "path because layer QKV tokens (%d) are shorter than "
+            "query metadata span.",
+            available_query_tokens,
+        )
+    _routing.log_fp8_kv_cache_route("prefill", self.kv_cache_dtype, "prefix")
+    self.workspace.decode_cache.invalidate()
+    result = self._flash_v100_prefill_with_prefix(
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+    )
+    self.ops.compare_triton(
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+        output_scale,
+        output_block_scale,
+        "prefill_prefix",
+    )
+    _routing.record_route(_routing.ROUTE_SPECS["prefill_prefix_flash"].name)
+    return result
+
+
+def _prefix_host_metadata(attn_metadata, query):
+    query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+    query_start_loc = (
+        query_start_loc_cpu
+        if query_start_loc_cpu is not None
+        else attn_metadata.query_start_loc
+    )
+    query_start_loc = _kv_layout.normalize_query_start_loc_for_available_tokens(
+        query_start_loc,
+        int(query.shape[0]),
+    )
+    seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+    seq_lens = seq_lens_cpu if seq_lens_cpu is not None else attn_metadata.seq_lens
+    return query_start_loc, seq_lens
+
+
+def _observe_capture_smallq(attn_metadata, layer_name):
+    if _debug.draft_graph_debug_enabled():
+        _debug.draft_graph_debug_log(
+            "forward:prefill_capture_smallq",
+            "layer=%s %s %s %s",
+            layer_name,
+            _debug.format_tensor_debug(
+                getattr(
+                    attn_metadata,
+                    "smallq_decode_block_table",
+                    None,
+                ),
+                "smallq_bt",
+            ),
+            _debug.format_tensor_debug(
+                getattr(
+                    attn_metadata,
+                    "smallq_decode_seq_lens",
+                    None,
+                ),
+                "smallq_seq",
+            ),
+            _debug.format_tensor_debug(
+                getattr(
+                    attn_metadata,
+                    "smallq_query_start_loc",
+                    None,
+                ),
+                "smallq_qsl",
+            ),
+        )
+    _debug.sm70_profile_trace(
+        "forward branch=prefill_capture_smallq layer=%s",
+        layer_name,
+    )

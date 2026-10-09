@@ -27,7 +27,7 @@ class Candidate(Protocol[C_contra, R_co]):
 def try_execute(context: C, candidates: Iterable[Candidate[C, R]]) -> R | None:
     def record(name: str) -> None:
         # Keep dynamic observations at their original pre/post-op positions.
-        accounting._record_route(name)
+        accounting.record_route(name)
 
     for candidate in candidates:
         if candidate.admit(context):

@@ -66,6 +66,9 @@ class PrefillOps:
     decode_rows: Any = None
     log_noncausal: Any = None
     log_small_query: Any = None
+    is_draft_layer: Any = None
+    noncausal_batch: Any = None
+    reject_tree_anchor: Any = None
 
 
 @dataclass
@@ -163,7 +166,7 @@ class BflaPrefill(SequenceCandidate):
         self, request: PrefillRequest, record: _plan.RecordRoute
     ) -> PrefillResult | None:
         out_is_destination = False
-        bfla_block_mask = _masks._build_bfla_block_mask_for_seq(
+        bfla_block_mask = _masks.build_bfla_block_mask_for_seq(
             request.q_seq,
             request.key_cache,
             request.attn_metadata.block_table[request.i],
@@ -225,7 +228,7 @@ class Fa2Prefill(SequenceCandidate):
             request.q_seq, batch_size=1, query_len=request.q_len, kv_len=request.seq_len
         )
         fa2_out_dest = request.out_view[request.start : request.end].unsqueeze(0)
-        fa2_dense_kv = _kv_layout._contiguous_paged_kv_view(
+        fa2_dense_kv = _kv_layout.contiguous_paged_kv_view(
             request.key_cache,
             request.value_cache,
             request.attn_metadata.block_table[request.i],
@@ -248,9 +251,9 @@ class Fa2Prefill(SequenceCandidate):
                 window_size=request.window_size,
                 num_seqs=request.num_seqs,
             )
-            and (_ops._get_sm70_splitd_d256_ops() is not None)
+            and (_ops.get_sm70_splitd_d256_ops() is not None)
         ):
-            fa2_dense_kv = _kv_layout._gather_paged_kv_to_exact_dense(
+            fa2_dense_kv = _kv_layout.gather_paged_kv_to_exact_dense(
                 request.key_cache,
                 request.value_cache,
                 request.attn_metadata.block_table[request.i],
@@ -355,7 +358,7 @@ class ContiguousBhmdPrefill(SequenceCandidate):
             and self.executor.config.policy.prefill_contig_dense_allow_copy
             and self.executor.ops.bhmd is not None
         ):
-            contig_dense_kv_bhmd = _kv_layout._contiguous_paged_kv_bhmd(
+            contig_dense_kv_bhmd = _kv_layout.contiguous_paged_kv_bhmd(
                 request.key_cache,
                 request.value_cache,
                 request.attn_metadata.block_table[request.i],
@@ -404,7 +407,7 @@ class ContiguousDensePrefill(SequenceCandidate):
         self, request: PrefillRequest, record: _plan.RecordRoute
     ) -> PrefillResult | None:
         out_is_destination = False
-        contig_dense_kv = _kv_layout._contiguous_paged_kv_view(
+        contig_dense_kv = _kv_layout.contiguous_paged_kv_view(
             request.key_cache,
             request.value_cache,
             request.attn_metadata.block_table[request.i],
@@ -656,7 +659,7 @@ class NoncausalBatch(BatchCandidate):
         return (
             self.executor.config.policy.use_flash_v100_prefill_paged
             and (not request.causal)
-            and bool(getattr(request.layer, "is_dflash_draft_attn", False))
+            and self.executor.ops.is_draft_layer(request.layer)
             and (request.anchor_lens is None)
             and (
                 request.num_seqs > 1
@@ -689,41 +692,8 @@ class NoncausalBatch(BatchCandidate):
     def run(
         self, request: PrefillBatchRequest, record: _plan.RecordRoute
     ) -> PrefillBatchResult:
-        shape = (
-            request.num_seqs,
-            request.max_query_len,
-            request.query.shape[1],
-            request.head_dim,
-        )
-        self.executor.ops.log_noncausal(
-            self.executor.config,
-            request.num_seqs,
-            request.max_query_len,
-            request.block_size,
-        )
-        record(_routing.ROUTE_SPECS["prefill_prefix_dflash_noncausal_batch"].name)
-        self.executor.ops.run_paged(
-            route="prefill_prefix_dflash_noncausal_batch",
-            q_len=request.max_query_len,
-            seq_len=int(request.seq_lens.max().item()),
-            heads_q=request.query.shape[1],
-            heads_kv=request.num_kv_heads,
-            head_dim=request.head_dim,
-            block_size=request.block_size,
-            fn=lambda: self.executor.ops.paged(
-                request.query.reshape(shape),
-                request.key_cache,
-                request.value_cache,
-                request.attn_metadata.block_table[: request.num_seqs],
-                request.attn_metadata.seq_lens[: request.num_seqs],
-                out=request.out_view.view(shape),
-                softmax_scale=self.executor.config.scale,
-                kv_cache_dtype=self.executor.config.kv_cache_dtype,
-                k_scale=float(request.layer._k_scale_float),
-                v_scale=float(request.layer._v_scale_float),
-                causal=False,
-                window_size=request.window_size,
-            ),
+        self.executor.ops.noncausal_batch(
+            self.executor.config, self.executor.ops, request, record
         )
         return PrefillBatchResult(True, request.output, set())
 
@@ -738,10 +708,7 @@ class TreeBatch(BatchCandidate):
         self, request: PrefillBatchRequest, record: _plan.RecordRoute
     ) -> PrefillBatchResult:
         if request.anchor_lens is not None:
-            raise RuntimeError(
-                "FLASH_ATTN_V100 anchored decode-window mask does not "
-                "support ddtree drafting metadata."
-            )
+            self.executor.ops.reject_tree_anchor()
         return PrefillBatchResult(
             True,
             self.executor.ops.tree_prefill(

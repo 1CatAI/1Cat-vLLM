@@ -86,7 +86,7 @@ class FlashAttnV100Metadata(TritonAttentionMetadata):
         return result
 
 
-def _as_flash_v100_metadata(
+def as_flash_v100_metadata(
     attn_metadata: TritonAttentionMetadata,
 ) -> FlashAttnV100Metadata:
     # The inherited builder creates this exact class. Adopt its object in place
@@ -128,7 +128,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             _config.registered("VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING")
             and _config.registered("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is None
             and spec_config is None
-            and _routing._batch_context_routing_cache_dtype_supported(
+            and _routing.batch_context_routing_cache_dtype_supported(
                 getattr(cache_config, "cache_dtype", None)
             )
             and batch_context_shape_supported
@@ -241,7 +241,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         persistent_anchor_lens = self.persistent_prefix_anchor_lens[:anchor_reqs]
         persistent_anchor_lens.copy_(prefix_anchor_lens[:anchor_reqs])
-        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata = as_flash_v100_metadata(attn_metadata)
         flash_metadata.prefix_anchor_lens = persistent_anchor_lens
         flash_metadata.decode_sliding_window = window
 
@@ -250,7 +250,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata: TritonAttentionMetadata,
         common_attn_metadata,
     ) -> None:
-        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata = as_flash_v100_metadata(attn_metadata)
         flash_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
         if seq_lens_cpu is None:
@@ -274,7 +274,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         flash_metadata.max_model_len = self.vllm_config.model_config.max_model_len
         flash_metadata.flash_v100_cudagraph_capture = False
         flash_metadata.flash_v100_batch_context_routing = (
-            _routing._batch_context_routing_for_graph_variant(
+            _routing.batch_context_routing_for_graph_variant(
                 self._batch_context_routing_enabled,
                 getattr(common_attn_metadata, "cudagraph_graph_variant", None),
             )
@@ -287,7 +287,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         *,
         static_decode: bool = False,
     ) -> None:
-        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata = as_flash_v100_metadata(attn_metadata)
         flash_metadata.flash_v100_decode_max_seq_len_hint = None
         flash_metadata.flash_v100_decode_workspace_seq_capacity_hint = None
         flash_metadata.flash_v100_static_decode_seq_hint = None
@@ -345,9 +345,9 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         *,
         stage: str,
     ) -> None:
-        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata = as_flash_v100_metadata(attn_metadata)
         flash_metadata.flash_v100_decode_active_num_partitions = None
-        if not _routing._decode_dynamic_partitions_enabled():
+        if not _routing.decode_dynamic_partitions_enabled():
             return
 
         max_seq_len_hint = getattr(
@@ -369,14 +369,14 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         ):
             return
 
-        partition_size = _routing._decode_partition_size_for_metadata(
+        partition_size = _routing.decode_partition_size_for_metadata(
             int(max_seq_len_hint)
         )
         active = max(1, (int(max_seq_len_hint) + partition_size - 1) // partition_size)
         active_num_partitions = self._ensure_decode_active_num_partitions()
         active_num_partitions.fill_(active)
         flash_metadata.flash_v100_decode_active_num_partitions = active_num_partitions
-        _routing._trace_decode_active_metadata(
+        _routing.trace_decode_active_metadata(
             stage=stage,
             max_seq_len_hint=int(max_seq_len_hint),
             workspace_seq_capacity_hint=getattr(
@@ -402,7 +402,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         attn_metadata = super().build_for_cudagraph_capture(common_attn_metadata)
         self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
-        flash_metadata = _as_flash_v100_metadata(attn_metadata)
+        flash_metadata = as_flash_v100_metadata(attn_metadata)
         self._attach_prefix_anchored_metadata(attn_metadata, common_attn_metadata)
         flash_metadata.seq_lens_cpu = capture_seq_lens_cpu
 
@@ -421,3 +421,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._update_decode_active_num_partitions(attn_metadata, stage="capture")
 
         return attn_metadata
+
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {"_as_flash_v100_metadata": "as_flash_v100_metadata"}
