@@ -41,6 +41,8 @@ bool sm70_marlin_available() {
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("sm70_native_policy_abi() -> int",
           []() -> int64_t { return vllm::sm70::policy_size; });
+  ops.def("sm70_prepare_native_policy(str token) -> ()",
+          &vllm::sm70::prepare_native_policy);
   // vLLM custom ops
   //
 

@@ -20,11 +20,17 @@ import torch
 from torch.nn import Parameter
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from vllm import _sm70_ops as ops
 from vllm.model_executor.layers.quantization import sm70_turbomind as tm
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--output", type=Path, required=True)
 parser.add_argument("--reference", type=Path)
+parser.add_argument(
+    "--gguf-cache",
+    type=Path,
+    help="Export baseline GGUF tuning choices and reuse them after candidate warmup",
+)
 args = parser.parse_args()
 assert not os.getenv("LD_PRELOAD")
 assert torch.cuda.get_device_capability() == (7, 0)
@@ -168,7 +174,25 @@ def fixture(family):
             torch.full((n, k // 32), 0.00125, device="cuda", dtype=torch.float16)
         )
         kernel.process_weights_after_loading(layer)
-        return k, lambda x: kernel.apply_weights(layer, x, bias)
+
+        def apply_gguf(x):
+            return kernel.apply_weights(layer, x, bias)
+
+        if args.gguf_cache:
+            owner = getattr(kernel, "native_ops", ops)
+            hint = torch.empty(0, device="cuda")
+            if args.reference:
+                # GGUF deliberately measures each cold descriptor, regardless
+                # of AWQ tuning flags. Populate its warmup set first, then
+                # import the same measured choices for deterministic A/B.
+                for rows in (1, 2, 8, 9, 32):
+                    apply_gguf(torch.zeros(rows, k, device="cuda", dtype=torch.float16))
+                torch.accelerator.synchronize()
+                assert owner.sm70_gemm_import_cache(hint, str(args.gguf_cache)) > 0
+            apply_gguf.export_cache = lambda: owner.sm70_gemm_export_cache(
+                hint, str(args.gguf_cache)
+            )
+        return k, apply_gguf
     fmt = family.removeprefix("moe_")
     from vllm.model_executor.layers.quantization import awq_sm70_moe, fp8_sm70_moe
 
@@ -316,6 +340,30 @@ for family in ("awq", "fp8", "nvfp4", "mxfp4", "qpn8", "gguf", "moe_awq", "moe_f
         assert torch.isfinite(y).all(), name
         outputs[name + ":eager"] = y.cpu().clone()
         row = {"case": name, "native_calls": trace.names, "eager_shape": list(y.shape)}
+        if family == "qpn8" and m in (1, 33):
+            # TorchDispatchMode stops at this provider's opaque custom op.
+            # Observe its nested native launch on both sides of the M boundary.
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ]
+            ) as profiler:
+                apply(x)
+                torch.accelerator.synchronize()
+            row["observed_native_operators"] = [
+                event.name
+                for event in profiler.events()
+                if event.name.startswith(("_C::", "_moe_C::"))
+            ]
+            row["cuda_kernels"] = sorted(
+                {
+                    event.name
+                    for event in profiler.events()
+                    if event.device_type == torch.autograd.DeviceType.CUDA
+                }
+            )
+            assert row["observed_native_operators"] and row["cuda_kernels"]
         if m:
             for _ in range(4):
                 apply(x)
@@ -353,6 +401,8 @@ for family in ("awq", "fp8", "nvfp4", "mxfp4", "qpn8", "gguf", "moe_awq", "moe_f
             )
         rows.append(row)
         print(name, flush=True)
+    if family == "gguf" and args.gguf_cache and not args.reference:
+        assert apply.export_cache() > 0
     if family == "moe_fp8":
         for mode, tensors, calls in apply.references():
             name = "fp8_reference:" + mode
@@ -376,14 +426,21 @@ record = {
     },
     "rows": rows,
 }
+if args.gguf_cache:
+    record["contract"]["gguf_cache_sha256"] = hashlib.sha256(
+        args.gguf_cache.read_bytes()
+    ).hexdigest()
+torch.save(outputs, args.output)
+args.output.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
 if args.reference:
     old = torch.load(args.reference, weights_only=True)
     assert outputs.keys() == old.keys()
-    for name, value in outputs.items():
-        assert torch.equal(value, old[name]), (
-            name,
-            (value - old[name]).abs().max().item(),
-        )
+    mismatches = {
+        name: (value - old[name]).abs().max().item()
+        for name, value in outputs.items()
+        if not torch.equal(value, old[name])
+    }
+    record["mismatches"] = mismatches
     reference = json.loads(args.reference.with_suffix(".json").read_text())
     assert reference["contract"] == record["contract"]
     for old, new in zip(reference["rows"], rows, strict=True):
@@ -391,9 +448,12 @@ if args.reference:
             old["case"] == new["case"]
             and old["native_calls"] == new["native_calls"]
             and old.get("error") == new.get("error")
+            and old.get("observed_native_operators")
+            == new.get("observed_native_operators")
         ), (old, new)
         if "graph_us" in new:
             new["graph_change_pct"] = 100 * (new["graph_us"] / old["graph_us"] - 1)
-    record["exact_outputs"] = len(outputs)
-torch.save(outputs, args.output)
+    record["exact_outputs"] = len(outputs) - len(mismatches)
 args.output.with_suffix(".json").write_text(json.dumps(record, indent=2) + "\n")
+if args.reference:
+    assert not mismatches, mismatches

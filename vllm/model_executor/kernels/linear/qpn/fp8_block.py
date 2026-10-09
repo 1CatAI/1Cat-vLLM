@@ -297,7 +297,7 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
             getattr(layer, "_sm70_block_fp8_turbomind_packed_scales", None),
             getattr(layer, "_qpn8_fallback_k_ld", 0),
             getattr(layer, "_qpn8_fallback_q_ld", 0),
-            self.native_ops.values,
+            self.native_ops.arguments,
         )
         if bias is not None:
             y = y + bias

@@ -633,7 +633,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         bool(layer.sm70_fp8_qpn8_prefetch),
                         False,
                         bool(layer.sm70_fp8_batch_tm_prescaled),
-                        self.native_ops.values,
+                        self.native_ops.arguments,
                     )
                 else:
                     torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
@@ -645,7 +645,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                         int(layer.sm70_fp8_qpn8_nacc),
                         bool(layer.sm70_fp8_qpn8_prefetch),
                         False,
-                        self.native_ops.values,
+                        self.native_ops.arguments,
                     )
             else:
                 self.native_ops.fp8_gemm_sm70_out(
@@ -701,7 +701,7 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 bool(layer.sm70_fp8_qpn8_gated_prefetch),
                 True,
                 bool(layer.sm70_fp8_batch_tm_prescaled),
-                self.native_ops.values,
+                self.native_ops.arguments,
             )
         else:
             torch.ops.vllm.sm70_ct_fp8_qpn8_dispatch(
@@ -713,6 +713,6 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 int(layer.sm70_fp8_qpn8_gated_nacc),
                 bool(layer.sm70_fp8_qpn8_gated_prefetch),
                 True,
-                self.native_ops.values,
+                self.native_ops.arguments,
             )
         return out_2d.reshape(*x.shape[:-1], out_features)

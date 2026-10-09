@@ -72,7 +72,7 @@ def test_export_reload_uses_execution_engine_workspace_and_policy(monkeypatch):
             ws.register_layer_workspace(
                 SimpleNamespace(prefix=_PREFIX), tensor, family="fp8"
             )
-            policies.append(cfg.kernel_config.sm70_fp8.native.values)
+            policies.append(ws._workspace_binding(_PREFIX).native.arguments)
     observed = []
 
     def native(out, address, *args, native_policy):

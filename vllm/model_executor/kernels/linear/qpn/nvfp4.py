@@ -391,7 +391,7 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
                 split_k,
                 nacc,
                 gated_silu,
-                state.native_ops.values,
+                state.native_ops.arguments,
             )
         elif getattr(layer, "sm70_nvfp4_qpn2_shared_weight", False):
             min_prefill_m = (

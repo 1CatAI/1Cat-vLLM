@@ -146,7 +146,7 @@ def native_policy_abi_available() -> bool:
 def call_public(name, native_policy, *args, **kwargs):
     from vllm import _sm70_ops
 
-    return call_native(getattr(_sm70_ops, name), native_policy, *args, **kwargs)
+    return getattr(_sm70_ops, name)(*args, **kwargs, native_policy=native_policy)
 
 
 def call_routing(name, native_policy, *args, **kwargs):
@@ -192,9 +192,20 @@ class NativeBindings:
                     + ", ".join(conflicts)
                 )
         self.values = values if available else ()
+        self.arguments = self.values
+        namespaces = (torch.ops._C, torch.ops._moe_C)
+        if self.values and all(
+            hasattr(namespace, "sm70_prepare_native_policy") for namespace in namespaces
+        ):
+            token = "sm70:1:" + "".join(
+                f"{len(value.encode('utf-8'))}:{value}" for value in self.values
+            )
+            for namespace in namespaces:
+                namespace.sm70_prepare_native_policy(token)
+            self.arguments = (token,)
         if self.values:
             for name in CONFIGURED_OPERATORS + ROUTING_OPERATORS:
-                setattr(self, name, partial(call_public, name, self.values))
+                setattr(self, name, partial(call_public, name, self.arguments))
 
     def __getattr__(self, name):
         from vllm import _sm70_ops

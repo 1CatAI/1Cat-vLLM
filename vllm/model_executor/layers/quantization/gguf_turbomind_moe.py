@@ -569,7 +569,7 @@ class GGUFExpertBank(torch.nn.Module):
                 self.experts,
                 self.group,
                 self.down_vector_batches,
-                self.native_ops.values,
+                self.native_ops.arguments,
             )
             return output
         capability = (
@@ -586,7 +586,7 @@ class GGUFExpertBank(torch.nn.Module):
         )
         call_gguf_native(
             getattr(torch.ops._C, capability.operator),
-            self.native_ops.values,
+            self.native_ops.arguments,
             output,
             x,
             offsets,
@@ -825,7 +825,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 down.down_vector_batches,
                 self.dp4a_batches,
                 self.q8_intermediate_batches,
-                self.native_ops.values,
+                self.native_ops.arguments,
             )
         ids = topk_ids
         mask = None
@@ -867,7 +867,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 top_k,
                 self.raw_batches,
                 self.vector_bands,
-                self.native_ops.values,
+                self.native_ops.arguments,
             )
         else:
             gate = bank["w1"](routed, offsets, sorted_ids)

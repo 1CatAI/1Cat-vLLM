@@ -317,3 +317,33 @@ scope than delivery 2's 48/179 report. Declared aliases and indirect native
 bindings remain in the ledger; moving a getter does not remove a supported
 path. The common numerical stage executors and codecs have zero policy reads.
 Final source counts and validation evidence are recorded in the migration log.
+
+### Native artifact comparison
+
+Prepared owners encode their native policy once as a versioned, length-prefixed
+content token. The packaged native libraries cache its parsed values and
+calculation key; launches pass one string instead of converting all 55 fields.
+The token contains no process address and survives AOT export/reload. The full
+argument form remains compatible. Diagnostic changes can have separate content
+tokens while sharing calculation caches. Neither form reads environment values
+during prepared execution.
+
+`benchmarks/kernels/sm70_native_artifact_parity.py` runs in separate baseline
+and candidate installations, each with its normally built native extensions.
+Use `--output base.pt` first, then `--output head.pt --reference base.pt`, with
+identical GPU, environment and input contracts. It checks native call order,
+eager outputs, changed-input graph replay and the retained FP8 reference stages.
+It records graph device time separately from eager host wall time.
+
+For GGUF, pass the same `--gguf-cache <path>` to both runs. Its existing cold
+descriptor autotuning is independent of the AWQ tuning switch and can select
+different split-K plans in fresh processes. The baseline exports its measured
+choices; the candidate warms the descriptors, then imports those choices before
+comparison. This freezes the numerical oracle without changing production
+selection defaults. Failed comparisons retain their outputs for inspection.
+
+`benchmarks/kernels/sm70_native_policy_isolation.py --output policy.json` uses
+two conflicting explicit routing policies in one process. Native kernel traces
+distinguish the actual fast and generic launches; changed-input/route replay
+and alternating owners check isolation. These are operator checks, not model
+decode or TTFT measurements.

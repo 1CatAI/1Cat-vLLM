@@ -232,7 +232,7 @@
   "platform": 13
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py": {
-  "platform": 23
+  "platform": 21
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py": {
   "model": 4,

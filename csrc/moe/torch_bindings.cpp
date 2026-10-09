@@ -5,6 +5,8 @@
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def("sm70_native_policy_abi() -> int",
         []() -> int64_t { return vllm::sm70::policy_size; });
+  m.def("sm70_prepare_native_policy(str token) -> ()",
+        &vllm::sm70::prepare_native_policy);
   // Apply topk softmax to the gating outputs.
   m.def(
       "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor! "

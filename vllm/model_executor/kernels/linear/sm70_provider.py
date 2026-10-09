@@ -64,7 +64,7 @@ def _qpn2_dense(state, x, out, prefix, *, gated=False):
         x.shape[1],
         state.split_k,
         state.accumulator_chains,
-        state.native_ops.values,
+        state.native_ops.arguments,
     )
 
 

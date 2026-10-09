@@ -150,7 +150,44 @@ def test_bindings_forward_captured_values_without_reading_environment(monkeypatc
     )
     for owner in (*owners, owners[0]):
         owner.fp8_gemm_sm70_out(None)
-    assert observed == [first.values, second.values, first.values]
+    assert observed == [owner.arguments for owner in (*owners, owners[0])]
+
+
+def test_prepared_argument_is_registered_once_and_preserves_utf8(monkeypatch):
+    monkeypatch.setattr(binding, "native_policy_abi_available", lambda: True)
+    registered: list[str] = []
+    for namespace in ("_C", "_moe_C"):
+        monkeypatch.setattr(
+            torch.ops,
+            namespace,
+            SimpleNamespace(sm70_prepare_native_policy=registered.append),
+        )
+    monkeypatch.setattr(torch.ops, "_C_qwen38", SimpleNamespace())
+    policy = Sm70NativeConfig(tm_gemm_trace_filter="路径:1")
+    policy.resolve("fp8")
+    owner = binding.NativeBindings(policy.values)
+    assert owner.values == policy.values
+    assert len(owner.arguments) == 1 and registered == [owner.arguments[0]] * 2
+    encoded = owner.arguments[0].encode("utf-8")
+    assert encoded.startswith(b"sm70:1:")
+    remaining = encoded[7:]
+    decoded = []
+    while remaining:
+        size, remaining = remaining.split(b":", 1)
+        length = int(size)
+        decoded.append(remaining[:length].decode("utf-8"))
+        remaining = remaining[length:]
+    assert tuple(decoded) == policy.values
+    observed = []
+    monkeypatch.setattr(
+        _sm70_ops,
+        "fp8_gemm_sm70_out",
+        lambda *a, native_policy: observed.append(native_policy),
+    )
+    for _ in range(3):
+        owner.fp8_gemm_sm70_out(None)
+    assert observed == [owner.arguments] * 3
+    assert len(registered) == 2
 
 
 def test_old_native_abi_accepts_legacy_but_rejects_silent_typed_override(monkeypatch):
@@ -224,13 +261,27 @@ def test_explicit_native_option_for_a_different_format_is_not_silently_ignored()
         policy.resolve("fp8")
 
 
-def test_opaque_native_policy_survives_export_with_dynamic_rows(monkeypatch):
+@pytest.mark.parametrize("compact", [False, True])
+def test_opaque_native_policy_survives_export_with_dynamic_rows(monkeypatch, compact):
     # The optional string-list schema must retain all captured values through
     # fake dispatch and serialization, while M stays dynamic inside the op.
     from vllm.model_executor.kernels.linear.qpn import nvfp4_dequant
 
     policy = Sm70NativeConfig(nvfp4_qpn2_m16_native=False)
     policy.resolve("nvfp4")
+    arguments = policy.values
+    if compact:
+        monkeypatch.setattr(binding, "native_policy_abi_available", lambda: True)
+        monkeypatch.setattr(torch.ops, "_C_qwen38", SimpleNamespace())
+        for namespace in (torch.ops._C, torch.ops._moe_C):
+            monkeypatch.setattr(
+                namespace,
+                "sm70_prepare_native_policy",
+                lambda token: None,
+                raising=False,
+            )
+        arguments = binding.NativeBindings(policy.values).arguments
+        assert len(arguments) == 1
     observed: list[tuple[int, tuple[str, ...] | str]] = []
 
     def native(operation, native_policy, out, x, *args):
@@ -247,7 +298,7 @@ def test_opaque_native_policy_survives_export_with_dynamic_rows(monkeypatch):
     class Projection(torch.nn.Module):
         def forward(self, x):
             return torch.ops.vllm.nvfp4_qpn2_dispatch_linear(
-                x, x, x, 1.0, 8, 4, 16, 2, list(policy.values)
+                x, x, x, 1.0, 8, 4, 16, 2, list(arguments)
             )
 
     lib = None
@@ -271,8 +322,8 @@ def test_opaque_native_policy_survives_export_with_dynamic_rows(monkeypatch):
         for rows in (1, 32, 33, 65):
             assert reloaded(torch.zeros(rows, 4)).shape == (rows, 8)
         assert observed == [
-            (1, policy.values),
-            (32, policy.values),
+            (1, arguments),
+            (32, arguments),
             (33, "dense"),
             (65, "dense"),
         ]

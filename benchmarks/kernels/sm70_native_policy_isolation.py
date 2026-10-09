@@ -13,6 +13,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from tools.sm70.native_trace import NativeDispatchTrace
+from vllm import _sm70_ops  # noqa: F401 - load the packaged native registrations
 from vllm._sm70.policy import NativeBindings, native_policy_abi_available
 from vllm.config.sm70_native import Sm70NativeConfig
 
