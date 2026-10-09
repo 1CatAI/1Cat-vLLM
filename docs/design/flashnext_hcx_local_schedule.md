@@ -7,8 +7,8 @@ all eight slots serially. Each output retains the original five-part FP32
 sum, FP16 casts, sigmoid and four-stream FMA order.
 
 The normal `_C` implementation offers this experimental schedule for TP4
-full-mesh HCX, M1–8, with a separate output projection. Fused output projections and the
-two-hop exchange retain their existing schedule. Large batches still use the
+full-mesh HCX, M1–8, with a separate output projection. Fused output projections
+and the two-hop exchange retain their existing schedule. Large batches still use the
 existing model fallback. The kernel policy `sm70_hcx_local_schedule=true`
 opts in before graph capture. The default is false at both the Python policy
 and native operator schema because model qualification has not passed.
@@ -109,6 +109,26 @@ all-reduce peer addresses. Both wheels failed at the first M20 graph replay,
 before HCX was selected. The test now uses the same distributed
 `graph_capture` context as the model runner. Both reruns pass and report
 identical errors against their independent reference implementation.
+
+The final default-off policy is built from
+`84e41a1d1489e5f358c78658a7ab337611a17d8b` into
+`1cat_vllm-1.5.2.dev1197+g84e41a1d14.cu128-cp312-cp312-linux_x86_64.whl`.
+Its SHA256 is
+`bd5a10fb8355a5bc88bb8ac9759bdb9f2bc98ff25a40dab34fc978adf4623970`;
+the rebuilt core SHA256 is
+`26b02babd7a3680ddb3e85f1b035688ad595873ce4c80b30ebf9c3ff4debf6e6`.
+A fresh installed audit confirms the false default in the Python configuration
+and native schema, with equal compile keys for explicit true/false settings.
+All 25 CPU cases and focused pre-commit checks pass again. The entire GPU
+device-code section is byte-identical to the measured wheel, with SHA256
+`8b6e60a06b8139f22819adb17ba4af44fe897da59365a909ad9ae21deac1c1d4`.
+The core hash changes because of the C++ schema default; the GPU kernels did
+not change. A follow-up with four timing samples (eight observations per arm)
+against the installed default-off wheel passes the same 67 bitwise checks per
+rank at M1, M5 and M8. Its paired
+medians are 18.827/16.352, 23.733/21.146 and 30.540/27.877 µs respectively.
+This confirms the packaged routes; the longer initial run remains the quoted
+performance dataset. This check does not replace model quality qualification.
 
 ## Model measurement contract
 
