@@ -32,7 +32,13 @@ FP8_NAMES = {
     "VLLM_SM70_FP8_PREFILL_VISIBLE_DENSE_MM",
     "VLLM_SM70_FP8_DENSE_GATED_SILU",
 }
-ALLOWED = {"vllm/envs.py", "vllm/config/kernel.py", "vllm/config/sm70_dflash2.py"}
+ALLOWED = {
+    "vllm/envs.py",
+    "vllm/config/kernel.py",
+    "vllm/config/sm70_dflash2.py",
+    "vllm/config/sm70_moe.py",
+    "vllm/config/sm70_native.py",
+}
 _POLICY = Path(__file__).resolve().parents[2] / "vllm/config/sm70_dflash2.py"
 _POLICY_TREE = ast.parse(_POLICY.read_text())
 DFLASH_NAMES = set(
@@ -48,13 +54,64 @@ DFLASH_NAMES = set(
 ) - {"VLLM_SM70_FP8_QPN8"}
 
 
+_MOE_POLICY = Path(__file__).resolve().parents[2] / "vllm/config/sm70_moe.py"
+MOE_NAMES = {
+    node.value
+    for node in ast.walk(ast.parse(_MOE_POLICY.read_text()))
+    if isinstance(node, ast.Constant)
+    and isinstance(node.value, str)
+    and node.value.startswith("VLLM_")
+    and node.value.isidentifier()
+}
+
+
+def moe_policy_reads(path: Path, tree: ast.AST) -> list[str]:
+    if not (
+        "/fused_moe/sm70/" in path.as_posix()
+        or path.name
+        in {
+            "awq_sm70_moe.py",
+            "fp8_sm70_moe.py",
+            "nvfp4_sm70_moe.py",
+            "mxfp4_sm70_moe.py",
+            "awq_qpn_sm70.py",
+        }
+    ):
+        return []
+    errors = []
+    for node in ast.walk(tree):
+        name = None
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "envs"
+        ):
+            name = node.attr
+        elif isinstance(node, ast.Call) and ast.unparse(node.func) in {
+            "os.getenv",
+            "os.environ.get",
+            "getattr",
+        }:
+            index = 1 if ast.unparse(node.func) == "getattr" else 0
+            if len(node.args) > index and isinstance(node.args[index], ast.Constant):
+                name = node.args[index].value
+        if name in MOE_NAMES:
+            errors.append(
+                f"{path}:{node.lineno}: {name} belongs to "
+                "KernelConfig.sm70_moe initialization"
+            )
+    return errors
+
+
 def violations(path: Path) -> list[str]:
     if path.as_posix() in ALLOWED or "vllm" not in path.parts:
         return []
     tree = ast.parse(path.read_text())
-    errors = []
+    errors = moe_policy_reads(path, tree)
     fp8_nodes = set()
-    if path.name == "sm70_fp8.py":
+    if path.name == "sm70_fp8.py" or path.as_posix().endswith(
+        "kernels/linear/qpn/fp8.py"
+    ):
         fp8_nodes.update(ast.walk(tree))
     elif path.name == "fp8.py":
         for candidate in tree.body:

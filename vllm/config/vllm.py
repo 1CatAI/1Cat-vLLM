@@ -1619,9 +1619,7 @@ class VllmConfig:
         # unset falls back to the stock ones.
         self.parallel_config.set_dcp_defaults()
 
-        from vllm.models.qwen4_exp.common.kv_policy import resolve_qsa_host_kv
-
-        if resolve_qsa_host_kv(self):
+        if self.kernel_config.resolve_attention_history(self):
             logger.info_once(
                 "QSA host KV enabled: per-vector E4M3 history, bounded device "
                 "hot pages and FP16 staging; active recurrent states stay on GPU."
@@ -1641,7 +1639,7 @@ class VllmConfig:
             )
         )
         self.kernel_config.sm70_nvfp4.resolve(
-            qualified=sm70_dflash2_nvfp4_qualified(self)
+            qualified=sm70_dflash2_nvfp4_qualified(self), active=False
         )
         if self.model_config is not None and self.model_config.quantization == "awq":
             self.kernel_config.sm70_awq.resolve()

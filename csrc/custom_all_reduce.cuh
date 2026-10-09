@@ -159,10 +159,13 @@ constexpr int kSm70PushNormRows = 8;
 constexpr int kSm70PushNormParts = 5;
 struct alignas(8) Sm70PushNormMeta {
   uint32_t generation[kSm70PushNormRows];
-  // Sum-of-squares partials double as readiness payloads. -1 is empty.
   float partial[kSm70Tp4PushAllreduceEpochs][kSm70PushNormRows]
                [kSm70PushNormParts];
   uint64_t inverse_packet[kSm70PushNormRows];
+};
+struct alignas(8) Sm70PushNormPacketMeta {
+  uint32_t generation[kSm70PushNormRows];
+  uint64_t partial[kSm70PushNormRows][kSm70PushNormParts];
 };
 struct Sm70PushNormReferenceMeta {
   uint32_t generation[kSm70PushNormRows];
@@ -171,15 +174,19 @@ struct Sm70PushNormReferenceMeta {
   float partial[kSm70PushNormRows][kSm70PushNormParts];
   float inverse[kSm70PushNormRows];
 };
-constexpr size_t kSm70PushNormMetaBytes =
-    ((sizeof(Sm70PushNormMeta) + 127) / 128) * 128;
-static_assert(kSm70PushNormMetaBytes == 512);
+// Preserve IPC payload offsets and buffer capacity for both norm routes.
+constexpr size_t kSm70PushNormMetaBytes = 512;
+static_assert(sizeof(Sm70PushNormMeta) <= kSm70PushNormMetaBytes);
+static_assert(sizeof(Sm70PushNormReferenceMeta) <= kSm70PushNormMetaBytes);
+static_assert(sizeof(Sm70PushNormPacketMeta) <= kSm70PushNormMetaBytes);
 constexpr size_t kSm70PushNormOffset =
     ((kSm70Tp4PushAllreduceLegacyBufferBytes + 127) / 128) * 128;
-constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+constexpr size_t kSm70PushNormPacketOffset =
     kSm70PushNormOffset + kSm70PushNormMetaBytes +
     kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
         kSm70Tp4PushAllreduceM8Bytes;
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70PushNormPacketOffset + kSm70PushNormMetaBytes;
 
 static_assert(kSm70Qwen38HcGateEpochIndexBase + kSm70Qwen38HcGatePushBlocks <=
               kSm70Qwen38HcPushSignalBytes / sizeof(uint32_t));
@@ -1723,7 +1730,7 @@ template <typename WeightT, bool Reference = false>
 __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
     vllm::RankData buffers, const half* input, const float* residual,
     const WeightT* weight, half* output, float* residual_out, int rank,
-    float epsilon) {
+    const void* local_buffer, float epsilon) {
   constexpr int Threads = 128, Parts = kSm70PushNormParts;
   constexpr int Width = kSm70GemmaRmsNormHiddenSize;
   constexpr int Elements = kSm70PushNormRows * Width;
@@ -1734,12 +1741,13 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
   static_assert(PacksPerPart <= Threads);
   const int row = blockIdx.x / Parts, part = blockIdx.x % Parts;
   const int tid = threadIdx.x;
-  char* local =
-      const_cast<char*>(reinterpret_cast<const char*>(buffers.ptrs[rank])) +
-      kSm70PushNormOffset;
+  char* local = const_cast<char*>(reinterpret_cast<const char*>(local_buffer)) +
+                kSm70PushNormOffset;
   using Meta = std::conditional_t<Reference, Sm70PushNormReferenceMeta,
-                                  Sm70PushNormMeta>;
-  auto* meta = reinterpret_cast<volatile Meta*>(local);
+                                  Sm70PushNormPacketMeta>;
+  auto* meta = reinterpret_cast<volatile Meta*>(
+      Reference ? local
+                : local + kSm70PushNormPacketOffset - kSm70PushNormOffset);
   const uint32_t generation = meta->generation[row] + 1;
   const int epoch_offset = (generation & 1) * 4 * (Elements / P::size);
   const int pack = row * (Width / P::size) + part * PacksPerPart + tid;
@@ -1837,46 +1845,37 @@ __global__ __launch_bounds__(128, 1) void sm70_push_allreduce_gemma_rms_norm(
       inverse = meta->inverse[row];
     }
   } else {
-    // A nonnegative sum of squares is its own readiness payload. There is
-    // no separate flag that needs a fence after storing the value.
-    const int phase = generation & 1;
-    if (tid == 0) meta->partial[phase][row][part] = variance;
+    if (tid == 0) {
+      const uint64_t packet =
+          (uint64_t(generation) << 32) | __float_as_uint(variance);
+      asm volatile(
+          "st.volatile.global.u64 [%0], %1;" ::"l"(&meta->partial[row][part]),
+          "l"(packet)
+          : "memory");
+    }
     __syncwarp();
-    if (part == 0 && tid < 32) {
+    if (tid < 32) {
       float own_partial = 0;
       if (tid < Parts) {
-        while (true) {
-          own_partial = meta->partial[phase][row][tid];
-          if (__float_as_uint(own_partial) != __float_as_uint(-1.0f)) break;
-        }
+        uint64_t packet;
+        do {
+          asm volatile("ld.volatile.global.u64 %0, [%1];"
+                       : "=l"(packet)
+                       : "l"(&meta->partial[row][tid])
+                       : "memory");
+        } while (uint32_t(packet >> 32) != generation);
+        own_partial = __uint_as_float(uint32_t(packet));
       }
       __syncwarp();
       float total = 0;
 #pragma unroll
       for (int p = 0; p < Parts; ++p)
         total += __shfl_sync(0xffffffff, own_partial, p);
-      if (tid < Parts) meta->partial[phase][row][tid] = -1.0f;
       if (tid == 0) {
         inverse = rsqrtf(total / Width + epsilon);
-        const uint64_t packet =
-            (uint64_t(generation) << 32) | __float_as_uint(inverse);
-        // The generation and inverse are one naturally aligned 64-bit store.
-        // Partial resets are only reused after the complete kernel finishes.
-        asm volatile("st.volatile.global.u64 [%0], %1;" ::"l"(
-                         &meta->inverse_packet[row]),
-                     "l"(packet)
-                     : "memory");
-        meta->generation[row] = generation;
+        // All producers read generation before their packets are observed.
+        if (part == 0) meta->generation[row] = generation;
       }
-    } else if (part != 0 && tid == 0) {
-      uint64_t packet;
-      do {
-        asm volatile("ld.volatile.global.u64 %0, [%1];"
-                     : "=l"(packet)
-                     : "l"(&meta->inverse_packet[row])
-                     : "memory");
-      } while (uint32_t(packet >> 32) != generation);
-      inverse = __uint_as_float(uint32_t(packet));
     }
   }
   __syncthreads();
@@ -2073,8 +2072,8 @@ class CustomAllreduce {
                          cudaMemcpyHostToDevice));
     CUDACHECK(cudaMemset(norm_meta + kSm70PushNormMetaBytes,
                          kSm70Tp4PushAllreduceSentinelByte,
-                         kSm70Tp4PushAllreduceBufferBytes -
-                             kSm70PushNormOffset - kSm70PushNormMetaBytes));
+                         kSm70PushNormPacketOffset - kSm70PushNormOffset -
+                             kSm70PushNormMetaBytes));
     sm70_tp4_push_buffers_registered_ = true;
   }
 
@@ -2373,13 +2372,14 @@ class CustomAllreduce {
           sm70_tp4_push_buffers_registered_) {
         if (benchmark_reference) {
           sm70_push_allreduce_gemma_rms_norm<WeightT, true>
-              <<<40, 128, 0, stream>>>(sm70_tp4_push_buffers_, input, residual,
-                                       weight, normalized_out, residual_out,
-                                       rank_, epsilon);
+              <<<40, 128, 0, stream>>>(
+                  sm70_tp4_push_buffers_, input, residual, weight,
+                  normalized_out, residual_out, rank_,
+                  sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
         } else {
           sm70_push_allreduce_gemma_rms_norm<WeightT><<<40, 128, 0, stream>>>(
               sm70_tp4_push_buffers_, input, residual, weight, normalized_out,
-              residual_out, rank_, epsilon);
+              residual_out, rank_, sm70_tp4_push_buffers_.ptrs[rank_], epsilon);
         }
         return;
       }

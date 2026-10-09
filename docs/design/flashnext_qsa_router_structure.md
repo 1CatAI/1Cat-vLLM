@@ -77,7 +77,8 @@ reports both its runtime use and fallback reasons. Admission requires SM70,
 FP16 Q and indexer cache, H4/D128, M2..8, and one request. Multiple requests,
 M20, prefill, and other layouts keep the existing implementation. Dimension
 strides are supported; aligned contiguous dimensions use vector loads.
-The switch remains disabled until the full-model gates pass.
+The capability is enabled by default for admitted shapes; explicit rollback
+uses the same KernelConfig field.
 
 ## Experiments
 
@@ -212,7 +213,8 @@ The 37 central event-observed rounds also show no target improvement:
 | Round | 19.5606 | 19.5842 |
 
 These are same-rank event envelopes, not kernel-service sums or aligned
-cross-GPU clocks. The native scorer is not enabled by default.
+cross-GPU clocks. Subsequent interleaved and production-dispatch checks are
+recorded below.
 
 The fixed C1 probe and all four C4 output streams were identical. The eight
 600-token natural continuations differed, with first differences between
@@ -406,3 +408,31 @@ ready work at tile granularity and uses named worker barriers. Its overlap
 depends on the actual model dependencies and worker resource contract. The
 joint-router screens above evaluate those constraints on SM70 while keeping
 the existing arithmetic; reducing launch count alone was insufficient.
+
+## Interleaved graph attribution and integration
+
+A separate request-internal diagnostic compares eight-round ABBA/BAAB blocks
+using one loaded model and each rank's own GPU event clock. Each complete
+32-round block contributes sixteen rounds per arm. C1 uses I8192/O600 and
+C4 uses I128/O600. All four ranks observe the same scheduling labels.
+
+| Target capability | C1 target GPU savings, ABBA / BAAB ms | C4 target GPU savings, ABBA / BAAB ms |
+| --- | ---: | ---: |
+| Shared-key scorer | 0.4143 / 0.3587 | 0.0886 / 0.1573 |
+| Native device-history reader | 0.4309 / 0.6561 | 1.3345 / 0.1347 |
+| Both | 0.7938 / 1.2263 | 0.4263 / 0.3551 |
+
+These rank-0 figures are instrumented GPU envelopes, not unobserved acceptance
+ms/round. Other ranks agree, and changes outside target are small. M20 scorer
+fallback has no distinct kernel optimization; its approximately 0.1-ms
+variation is an estimate of schedule noise. All C1 sequences and the scorer's
+C4 sequences match control. The native reader retains FP32 probabilities, so
+its C4 and natural continuations may differ; numerical and acceptance results
+are recorded above. The historical 17.401789-ms baseline is unchanged.
+
+Production dispatch now calls the packaged native reader and preallocates
+both per-split maxima and denominators before capture. Draft attention is
+excluded from the new path. The production benchmark changes only capability
+state before capturing each target graph; it does not replace attention
+functions or load private extensions. It also checks three short natural
+completions in addition to the eight-prompt acceptance and teacher forcing.

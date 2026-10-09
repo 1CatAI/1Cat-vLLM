@@ -600,6 +600,19 @@ class AWQMarlinLinearMethod(LinearMethodBase):
             layer._awq_sm70_k_ld = int(meta[0])
             layer._awq_sm70_q_ld = int(meta[1])
             layer._awq_sm70_group_size = self.quant_config.group_size
+            setattr(
+                layer,
+                sm70_tm.STATE_ATTR,
+                sm70_tm.SM70TurboMindLinearState(
+                    tm_weight,
+                    tm_scales,
+                    self.quant_config.group_size,
+                    int(meta[0]),
+                    int(meta[1]),
+                    tm_weight.shape[-1] * self.quant_config.pack_factor,
+                    "uint4",
+                ),
+            )
             layer._awq_sm70_prepared = True
 
             layer.qweight = torch.nn.Parameter(
@@ -633,29 +646,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if getattr(layer, "_awq_sm70_prepared", False):
-            reshaped_x = x.reshape(-1, x.shape[-1])
-            out_shape = x.shape[:-1] + (
-                layer._awq_sm70_weight.shape[-1] * self.quant_config.pack_factor,
-            )
-            out = torch.empty(
-                (reshaped_x.shape[0], out_shape[-1]),
-                dtype=x.dtype,
-                device=x.device,
-            )
-            from vllm import _sm70_ops as sm70_ops
-
-            sm70_ops.awq_gemm_sm70_out(
-                out,
-                reshaped_x,
-                layer._awq_sm70_weight,
-                layer._awq_sm70_scales,
-                layer._awq_sm70_group_size,
-                layer._awq_sm70_k_ld,
-                layer._awq_sm70_q_ld,
-            )
-            if bias is not None:
-                out.add_(bias)
-            return out.reshape(out_shape)
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
         return self.kernel.apply_weights(layer, x, bias)
 
 

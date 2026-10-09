@@ -6,21 +6,52 @@ hot-page resolution and miss staging before attention. Direct device reads
 remove that ownership, resolution and staging dependency when the authoritative
 history is already on the GPU. Host history keeps the protected reader.
 
-The direct reader groups six query heads per local KV head and decodes
+The native reader groups six query heads per local KV head and decodes
 per-vector E4M3 scales into the same FP16 K/V operands as the protected
-reader. It retains the protected reader's tile/split assignment, FP32
-accumulation and softmax, FP16 probability operands for PV, FP32 merging and
-FP16 attention output before the FP32 sigmoid gate. Only placement and
-ownership dependencies are removed. This arithmetic-preserving revision
-requires its own isolated and model qualification.
+reader. QK uses Volta mma884 with FP32 accumulation; softmax, PV and the
+split merge retain FP32. Attention is rounded to FP16 before the FP32
+sigmoid gate. Retaining FP32 probabilities changes the protected reader's
+FP16 PV rounding boundary; model error is measured below.
 
-The two attention kernels cover M1..20, H6, D256 and selection widths up to 4096. A
-single per-device, per-width workspace is shared by serial target and draft
-QSA owners and allocated before graph capture. Other shapes keep the existing
-reader. `sm70_qsa_device_history` controls the capability; startup reports
-explain disabled, host-resident, unsupported hardware and missing-extension
-cases. Runtime guards explain incompatible geometry or metadata. The module
-is built and installed through normal CMake and wheel registration.
+The two attention kernels cover target M1..20, H6, D256 and selection widths
+up to 4096. A per-device, per-width workspace is allocated before graph
+capture. Native split states contain both maxima and denominators; M20 at
+width 2051 needs 7920 floats. Unsupported shapes and host history retain
+the protected reader. Speculative draft attention retains its existing path.
+`sm70_qsa_device_history` controls the capability, enabled by default for
+admitted target history. Startup and runtime reports explain fallbacks.
+The extension is built and installed by normal CMake/wheel registration.
+The arithmetic-preserving Triton variant remains a numerical reference.
+
+## Same-loaded-model qualification
+
+All arms use one set of loaded Flash-Next IQ3_S weights, FP16 MTP4, TP4,
+full CUDA graphs, target device E4M3 history, FP16 draft history and disk
+PLE. Hardware is a full-NV2 V100-SXM2-32GB mesh at 1530 MHz, CUDA 12.8,
+Torch 2.10.0+cu128. The draft graphs are unchanged. A recaptured control
+reproduces all 64 aligned teacher logits and eight natural continuations
+bit-exactly, ruling out recapture as the numerical difference.
+
+The native target path matches 63/64 teacher top-1 decisions. Mean/max KL
+is 0.000522681/0.009480884. Eight 600-token prompt clusters have a paired
+acceptance difference of -0.0251 percentage points, with prompt-bootstrap
+95% CI [-1.7922, +2.0874]. No clear decrease is detected; the interval does
+not establish exact equivalence. The continuations diverge numerically.
+The deterministic I8192/O256 C1 probe retains every token and 4.885714
+emitted tokens/round. C4 emits 2.326271 tokens/request/round versus 2.324786.
+
+Unobserved same-process ABBA means are C1 19.352215 to 18.760776 ms/round
+and C4 38.960747 to 38.410213. Control endpoints drift by 0.724 ms in C1,
+so these are provisional endpoint estimates. A separate request-internal
+ABBA/BAAB diagnostic measures target GPU savings of 0.431/0.656 ms at C1
+and 1.335/0.135 ms at C4 on rank 0. Within each complete 32-round block,
+16 control and 16 candidate rounds are compared on the same GPU clock;
+other ranks agree. Draft and exposed gaps change only slightly. GPU-event
+envelopes are not substituted for ordinary acceptance ms/round.
+
+These results supersede the earlier separate-process quality comparison
+below; they do not change the historical 17.401789-ms baseline or establish
+the 12-ms objective. Final production-dispatch checks are recorded separately.
 
 ## Initial FP32-probability experiment
 

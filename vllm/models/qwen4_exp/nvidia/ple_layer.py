@@ -1182,10 +1182,15 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._disk_mapped_paths: set[str] = set()
         self._disk_row_kernel: MappedRowGatherKernel | None = None
         runtime = get_current_vllm_config_or_none()
+        # Read the disk-tier policy now: load_weights may run outside the config
+        # context (direct loads, tests), and the admission record goes to the
+        # engine's kernel config when there is one.
+        self._kernel_config = getattr(runtime, "kernel_config", None)
         self._release_disk_pages = bool(
-            getattr(
-                getattr(runtime, "kernel_config", None), "ple_disk_release_pages", False
-            )
+            getattr(self._kernel_config, "ple_disk_release_pages", False)
+        )
+        self._disk_row_gather = bool(
+            getattr(self._kernel_config, "ple_disk_row_gather", True)
         )
         self._disk_executor: ThreadPoolExecutor | None = None
         from .gguf_embedding import (
@@ -1998,16 +2003,18 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             self._disk_shard_pointers = [
                 array.ctypes.data for array in self._disk_shard_arrays
             ]
-            runtime = get_current_vllm_config()
             self._disk_row_kernel, row_admission = prepare_mapped_row_gather(
                 pointers=self._disk_shard_pointers,
                 shard_size=self._disk_shard_size,
                 num_rows=self.ngram_embedding.org_vocab_size,
                 row_bytes=self.head_dim,
                 file_backed=bool(self._disk_mapped_paths),
-                enabled=runtime.kernel_config.ple_disk_row_gather,
+                enabled=self._disk_row_gather,
             )
-            runtime.kernel_config.ple_disk_row_readers[self.layer_name] = row_admission
+            if self._kernel_config is not None:
+                self._kernel_config.ple_disk_row_readers[self.layer_name] = (
+                    row_admission
+                )
             logger.info("PLE mapped row-reader admission: %s", row_admission)
             mapped_gib = (
                 sum(

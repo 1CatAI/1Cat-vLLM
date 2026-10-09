@@ -270,6 +270,13 @@ repos:
     entry: python tools/pre_commit/validate_config.py
     language: python
     additional_dependencies: [regex]
+  - id: check-layering
+    name: Keep generic modules free of new model/platform/env coupling
+    entry: python tools/pre_commit/check_layering.py
+    language: python
+    pass_filenames: false
+    files: ^(vllm/.*\.py|tools/pre_commit/(check_layering\.py|layering_baseline\.json))$
+    additional_dependencies: [regex]
   - id: check-sm70-linear-policy
     name: Keep migrated SM70 policy in configuration
     entry: python tools/pre_commit/check_sm70_linear_policy.py

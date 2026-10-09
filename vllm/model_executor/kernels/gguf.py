@@ -98,10 +98,10 @@ def three_format_qkv_capabilities(
         reason = "three_format_qkv_requires_sm70"
     elif dtype != torch.float16:
         reason = "three_format_qkv_requires_fp16_activations"
-    elif names not in DMV_THREE_FORMAT_QKV or (k, widths) != (
-        5120,
-        (3072, 256, 256),
-    ):
+    elif names not in DMV_THREE_FORMAT_QKV or (k, widths) not in {
+        (5120, (3072, 256, 256)),
+        (5120, (6144, 512, 512)),
+    }:
         reason = "three_format_qkv_shape_or_sources_unmeasured"
     elif not hasattr(torch.ops._C, "gguf_dmv_three_formats_sm70_supported"):
         reason = "operator_missing:gguf_dmv_three_formats_sm70_supported"
