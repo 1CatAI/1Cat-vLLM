@@ -8,14 +8,81 @@ order. Persistent barrier counters remove the completion-counter/reset phase;
 acquire/release atomics publish the two remaining grid barriers.
 
 The normal `_C` implementation offers this experimental schedule for TP4
-full-mesh HCX, M1–8, with a separate output projection. Fused output projections
-and the two-hop exchange retain their existing schedule. Large batches still use the
+full-mesh HCX, M1–8, with a separate output projection or a fused Q4_K/Q6_K
+projection whose input normalization is already complete. Other projection
+formats, the optional fused gated-normalization prefix and the two-hop
+exchange retain their existing schedule. Large batches still use the
 existing model fallback. The kernel policy `sm70_hcx_local_schedule=true`
 opts in before graph capture. The default is false at both the Python policy
 and native operator schema pending repeatable fresh-process model qualification.
 HCX itself remains controlled by `sm70_hcx`.
 
-## Current installed result: second optimization round
+## Installed projection-plus-HC route, 2026-10-10
+
+Source `b0d7af22b584a272dfea362b0fefffaf97760054` adds the local schedule to
+the normal fused Q4_K/Q6_K producer dispatch. It instantiates the existing
+device template; it does not change its arithmetic. The gated-normalization
+prefix retains its legacy barrier protocol. Eligible model projections also
+require `sm70_hcx_output_projection`, whose existing default is true.
+
+The source-complete CMake `_C` build is installed in a fresh runtime as
+`1cat_vllm-1.5.2.dev1419+gb0d7af22b5.cu128-cp312-cp312-linux_x86_64.whl`.
+Wheel SHA256 is
+`71f9eb9f88bd32472a313ee57ba6b515f8f217266b5359f8d51ddc0a338486d8`;
+core SHA256 is
+`b2b4ff426e06e234f747c67d39ae096d7bf6f0c05be9818bf04bd89ffb844679`.
+The route needs no research library or private native overlay. Startup loader
+overrides are unset and `_C` has no RPATH/RUNPATH. The audit separately records
+OpenCV's normal post-import library-path addition and the resolved standard
+Torch/CUDA dependencies. Q4_K uses 126 registers and Q6_K 181; both use
+13,888 static plus 32,768 dynamic shared-memory bytes and no stack/spills.
+
+`benchmarks/kernels/benchmark_sm70_hcxo_schedule.py` compares complete chains
+using eight real matching projection/HC weight pairs, normalized synthetic
+inputs, K=1536 per rank and N=2560. Production dense-segments projection uses
+eight warps and split=1. Each formal graph has 512 boundaries and each arm
+has 24 observations with rotating/reversed order and critical-rank timing.
+
+| Rows | Separate production projection + local HCX, µs | Existing fused schedule, µs | Fused local schedule, µs | Saving vs separate |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 23.031 | 24.485 | 20.712 | 10.1% |
+| 5 | 28.505 | 30.205 | 26.395 | 7.4% |
+| 8 | 35.447 | 36.776 | 32.628 | 8.0% |
+
+The M5 gain is 2.110 µs over the complete production chain. Producer-only
+time is 8.930 µs; subtracting it from fused time does not measure an independent
+HC kernel. A 48-boundary multiplication of the saving gives 0.101 ms under
+this microbenchmark contract, not a measured model saving. The real paired
+weight file SHA256 is
+`86071aa93080816cbf50c77375b2e355830a5e3a3763ef5f37aa48f441e25176`.
+
+Every M1–8 shape passes 35 eager/changed-input-graph comparisons for each
+fused schedule per rank, plus 12 counter-wrap/interleaving and four fallback
+comparisons. All three outputs are checked as raw FP16 bits. Separate-path
+partial output is poisoned with NaNs before the fused eager/graph checks,
+so stale producer output cannot satisfy the oracle. Cases include zeros,
+shared/per-branch norms and both quantization formats. The fallback cases
+cover gated normalization and the two-hop algorithm on full-mesh hardware;
+they do not qualify an actual two-hop topology. M2/3/4/6/7 use fewer timing
+samples as a correctness follow-up. A separate CUDA trace observes both
+reference and selected fused kernel specializations on every rank: six
+Q6_K and two Q4_K calls per schedule. Profiling is outside reported timings.
+
+The unfused regression is 23.766 to 18.993 µs at M5, with 73 raw-bit cases
+per rank. Both unfused specializations' extracted SASS match V6 exactly.
+The 25 focused dispatch/cache-policy tests and applicable pre-commit checks
+pass. The first runner accidentally selected the standalone benchmark with
+FFN weights; those passing M1–8 results are retained under
+`standalone-ffn-*` and are not fused-chain evidence. Corrected results are
+`round3-results/native-v7/native.json`, `other-rows.json` and `route.json`.
+
+These results validate installed native operators. They do not exercise the
+model's Python projection-layout adapter or qualify model logits, acceptance
+or latency. Full-model work remains deferred and the local-schedule default
+remains false. Halving the current approximately 19-µs HC boundary is still
+unachieved.
+
+## Unfused boundary: second optimization round
 
 Source `71fce5ca51a923c9bf52cd4016d0a63df63d32e4` is built by the normal
 CMake `_C` target and installed in
@@ -195,15 +262,52 @@ libraries; no new implementation is selected for the normal model route.
 | Replace first grid join with per-producer release/acquire readiness | 18.672 | 23.952 | Reject; overlapped-norm control is 19.645 |
 | FP16 payload and 16-bit epoch in one 32-bit LoRA word | 18.747 | 19.790 | Reject this all-row-refresh implementation |
 | Count only LoRA receiver CTAs at the second join, retaining mix locally | 18.680 | 19.598 | Reject; retained-mix control is 19.052 |
+| Full-K down column per CTA using Tensor Cores, prefetched / streamed weights | 19.080 | 24.756 / 29.448 | Reject |
+| Compact LoRA packets with separate buffers and epochs for each M | 18.818 | 20.289 | Reject; copied control is 18.853 |
+| Stage LoRA into shared memory four / eight FP16 values per thread | 18.609 | 22.615 / 20.827 | Reject; copied control is 18.617 |
+| Four full-K Tensor Core columns per down CTA, prefetched / streamed | 19.016 | 21.258 / 27.039 | Reject; one-column control is 24.726 |
+| Two / eight full-K columns per down CTA, prefetched | 19.094 | 21.437 / 22.243 | Reject; four-column control is 21.252 |
 
-All these candidates pass raw-FP16-bit comparisons against installed V6:
+The norm, readiness, compact-packet and selective-arrival candidates pass
+raw-FP16-bit comparisons against installed V6:
 24 eager cases and three changed-input graph cases per candidate per rank,
 plus two counter-wrap/interleaving cases. The compact packet additionally
 passes 18 row-count/short-epoch cases and a graph stress exceeding 65,536
 calls. It refreshes all eight packet rows even when M is smaller, preventing
 old inactive slots from matching a wrapped epoch. That extra work is part of
-its measured cost. A subsequent screen separates buffers and counters by M
-to test the format without per-call padding refresh.
+its measured cost. The follow-up separates buffers and counters by M, so every
+active packet is refreshed without padding work. It still regresses, passes
+54 raw-bit comparisons and four counter cases per rank, and additionally
+passes 36 interleaved row-count/short-epoch cases plus a graph stress exceeding
+65,536 calls. The result does not support padding refresh as the sole reason
+the compact protocol loses.
+
+The full-K Tensor Core variant assigns one down output column to each of 80
+CTAs and uses otherwise unused MMA columns for the four injection outputs.
+Every K reduction stays in shared memory; the global down-partial table is
+eliminated. Prefetching all weights uses 254 registers; streaming them uses
+82, with no spills in either case. A resident-grid occupancy check precedes
+launch. Both variants pass 27 changed-input numerical cases and repeat-run
+determinism per rank; the maximum relative L2 error against V6 is 6.19e-5.
+They preserve full residual/block/injection delivery but change the K sum
+tree, so this is only a numerical screen. Removing the partial table this
+way does not offset the new full-K work and data access schedule.
+
+Grouping four down columns shares one input scan among them. Twenty CTAs
+perform down, while all 80 still combine inputs and produce up outputs. It
+reduces repeated input reads fourfold and improves the one-column prototype
+by 3.468 µs, but remains slower than V6. Its numerical and determinism checks
+pass with maximum relative L2 error 6.19e-5. Prefetched weights still require
+254 registers with zero spills. The separate vector-staging screen preserves
+the arithmetic and passes 81 raw-bit plus six counter cases per rank, but
+its wider packet reads, packing and shared stores regress at both widths.
+
+The follow-up tests two and eight columns with 40 and 10 down-owner CTAs;
+the eight-column path assigns injection to one additional CTA on rank three.
+The complete grid remains 80 CTAs. Neither improves on the paired four-column
+control, and all three lose to native V6. All use 254 registers without spills
+and pass the same numerical/determinism screen, with maximum relative L2
+error 6.19e-5. More input reuse alone does not produce the desired latency.
 
 The readiness rewrite publishes complete down partials with device-scoped
 release stores and acquires each producer's flag before loading its payload.
@@ -241,10 +345,38 @@ layout transitions are not exercised by this chain.
 
 Sources, build hashes, logs and per-rank results are retained in
 `residual-carry`, `norm-overlap`, `norm-handoff`, `compact-lora`,
-`selective-lora`, `round3-build-manifest.json` and `round3-results` under the
+`selective-lora`, `tensor-column`, `compact-lora-shaped`, `lora-vectorstage`,
+`tensor-column-group4`, `tensor-column-widths`, `current-ablation`,
+`round3-build-manifest.json` and `round3-results` under the
 existing artifact root. Each measured variant has zero stack/spills. These
 results leave the admitted native V6 latency and its opt-in/default status
 unchanged; neither halving current latency nor sub-1-ms HC is demonstrated.
+
+### Current-schedule diagnostic ablations
+
+These are deliberately incorrect-output controls, not usable HCX variants.
+Each arm owns separate IPC buffers, scratch and counters. Peer-wait removal
+loads each packet once; grid joins are bypassed only together with peer
+waits. Weight removal also removes prefetch, but every build retains 128
+static HMMA instructions. Communication writes, intermediate staging,
+arithmetic and kernel boundaries remain. Register allocation changes between
+65 and 96 registers without spills, so the differences are neither additive
+causal costs nor a rigorous latency lower bound.
+
+| M5 diagnostic arm | Median, µs |
+| --- | ---: |
+| Installed V6 | 18.632 |
+| Copied complete control | 19.037 |
+| Weight reads/prefetch removed | 17.733 |
+| Peer waits bypassed | 17.901 |
+| Both grid joins and peer waits bypassed | 14.893 |
+| Weight reads/prefetch, grid joins and peer waits bypassed | 13.206 |
+
+Only the copied valid control has a numerical gate: 27 raw-bit and two
+counter cases per rank. The 13.206-µs combined ablation still exceeds the
+9.5-µs target while doing less required work. It motivates reducing the
+remaining arithmetic/data-staging path or changing the surrounding operator
+contract; it does not prove that a correct 9.5-µs implementation is impossible.
 
 ### Output projection plus HC
 
@@ -276,8 +408,8 @@ The three original/fused arms pass 81 raw-FP16-bit comparisons per rank
 against separate DMV13 + V6, including changed-input graph replays. The
 production dense-segments chain also matches all three outputs bit-for-bit
 for the 24 eager cases per rank. This source supports Q4_K/Q6_K and already
-normalized producer inputs only. It has no model quality gate, clean normal
-package, or production dispatch change and remains a research result.
+normalized producer inputs only. This first screen has no model quality gate
+or clean normal package; installed-route validation is recorded separately.
 
 The follow-up `producer-register` variant moves down-weight loads into
 registers before the output projection, instead of relying on L2 prefetch.
@@ -285,12 +417,12 @@ It passes the same raw-bit comparisons but regresses: 28.001 µs versus
 26.498 µs for the fused control in that run. Q6_K register use rises from
 181 to 243 with no spills. The paired complete-chain result rejects this
 placement; early weight fetch cannot be assumed to disappear from the
-producer's critical path. The selected fused design remains research-only.
+producer's critical path. The register-prefetch variant remains research-only.
 
 The owned branch subsequently merges integration commit `4825b6831f`.
 The sole conflict is the equivalent peer-buffer registration fix in the
-compiled-payload test; the integration spelling is retained. The HCX CUDA
-source remains byte-identical to measured V6 source `71fce5ca51`. This merge
+compiled-payload test; the integration spelling is retained. At that merge,
+the HCX CUDA source is byte-identical to measured V6 source `71fce5ca51`. This merge
 does not make the older V6 wheel a new integration-wide runtime qualification.
 The 25 focused HCX dispatch and compile-cache policy tests pass again on the
 merged source, and the merge's pre-commit checks pass.
@@ -335,8 +467,9 @@ are not an additive partition of the unprofiled 17.3988-ms endpoint.
 Those historical workers report missing direct links for rank pairs 0/3 and
 1/2 and execute the two-hop HCX kernel. The current scheduling experiments
 use a different machine with a full NV2 mesh. The local schedule is admitted
-only by the full-mesh, separate-output-projection branch; its benefits have
-not been measured or implemented for the historical two-hop branch.
+only by full-mesh branches; the latest extension also supports eligible
+fused output projections. Its benefits have not been measured or implemented
+for the historical two-hop branch.
 
 Multiplying 94 target boundaries by an isolated approximately 19-us graph
 measurement gives an approximately 1.8-ms microbenchmark service estimate.

@@ -54,6 +54,22 @@ research DSO, supports Q4_K/Q6_K with already normalized input, and is not
 part of the installed result or a model speedup. Do not omit producer work
 from the comparison or budget the previous assumed 3.8 µs per fusion.
 
+Source `b0d7af22b5` subsequently adds the local schedule to normal fused
+Q4_K/Q6_K dispatch for already-normalized inputs; gated normalization and
+two-hop paths retain their legacy schedules. Its source-complete `_C` is
+installed in a fresh V7 runtime. The matched M5 production-projection-plus-HC
+chain is 28.505 µs separate, 30.205 µs with the legacy fused schedule, and
+26.395 µs with fused local scheduling: a 2.110-µs (7.4%) complete-chain gain.
+M1 is 23.031 to 20.712 µs; M8 is 35.447 to 32.628 µs. All M1–8 shapes pass
+35 raw-bit eager/graph cases per fused mode per rank, plus 12 counter and
+four fallback comparisons. Poisoned partial outputs rule out stale separate
+producer results. A separate CUDA trace observes both Q4_K/Q6_K selected
+kernel specializations on all four ranks. The unfused M5 regression remains
+18.993 µs, and both unfused SASS variants match V6. This validates native
+operators, not the model layout adapter, quality or latency. Keep the local
+schedule default false and model tests deferred. Identities and raw evidence
+are in [the local schedule report](flashnext_hcx_local_schedule.md).
+
 The 2026-10-10 follow-up targets half the **current** approximately 19-µs
 boundary, or at most approximately 9.5 µs. Five new research screens do not
 reach it. A 94-boundary synthetic recurrent chain, including full block
@@ -66,7 +82,22 @@ per-producer first-join readiness, compact all-row-refresh LoRA packets and
 receiver-only second-join arrivals all regress against their paired V6
 controls. Their raw-bit checks pass. Keep these failures recorded in
 [the local schedule report](flashnext_hcx_local_schedule.md) before reusing
-their layouts. No candidate is promoted and full-model work remains deferred.
+their layouts. No structural partition candidate is promoted and full-model
+work remains deferred.
+
+Further screens reject full-K Tensor Core column ownership (24.756 / 29.448 µs
+prefetched / streamed versus 19.080 installed), per-M compact LoRA buffers
+(20.289 versus 18.818), and vectorized LoRA staging (22.615 / 20.827 versus
+18.609). Sharing input across four down columns improves the column prototype
+to 21.258 µs from 24.726, but still loses to its 19.016-µs native control.
+Two/eight-column follow-ups take 21.437/22.243 µs against four-column 21.252
+and native 19.094 µs; stop treating wider input reuse as a presumed win.
+The numerical gates pass; changed-tree candidates are not model-qualified.
+An intentionally incorrect-output V6 ablation bypassing weight reads,
+both grid joins and peer waits still measures 13.206 µs against a 19.037-µs
+copied control. It retains arithmetic, intermediate staging and communication
+writes. It is not a usable implementation, an additive cost ledger or a
+rigorous lower bound. The half-current target remains unmet.
 
 The historical approximately 3-ms HC number is 2.9623 ms of profiled target
 HCX service on the earlier two-hop machine, alongside a separate unprofiled

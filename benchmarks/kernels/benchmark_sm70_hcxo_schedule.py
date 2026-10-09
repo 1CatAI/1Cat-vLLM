@@ -118,6 +118,9 @@ def benchmark_rows(args, runtime, weights, rows, rank):
             norm = weight["norm"][:2560].contiguous() if seed == 20261012 else None
             run(weight, "separate", norm)
             reference = tuple(value.clone() for value in outputs)
+            # A fused producer must compute its own partial instead of reading
+            # the result left by the separate reference call.
+            partial.fill_(float("nan"))
             for mode in ("fused_reference", "fused_selected"):
                 run(weight, mode, norm)
                 assert_bits(outputs, reference)
@@ -158,6 +161,7 @@ def benchmark_rows(args, runtime, weights, rows, rank):
         change_input(seed)
         graphs["separate"].replay()
         reference = tuple(value.clone() for value in outputs)
+        partial.fill_(float("nan"))
         for mode in ("fused_reference", "fused_selected"):
             graphs[mode].replay()
             assert_bits(outputs, reference)
@@ -262,6 +266,7 @@ def main():
             ),
             torch=torch.__version__,
             cuda=torch.version.cuda,
+            benchmark_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
             weights_sha256=hashlib.sha256(args.weights.read_bytes()).hexdigest(),
             core_sha256=hashlib.sha256(Path(core.__file__).read_bytes()).hexdigest(),
             results=results,
