@@ -13,10 +13,6 @@ jobs:
   macos-m1-smoke-test:
     runs-on: macos-latest
     timeout-minutes: 30
-    env:
-      GLOO_SOCKET_IFNAME: lo0
-      VLLM_HOST_IP: "::1"
-
     steps:
       - uses: actions/checkout@v6.0.1
 
@@ -43,12 +39,25 @@ jobs:
         run: |
           .venv/bin/python - <<'PY'
           from datetime import timedelta
+          import socket
           import torch
           import torch.distributed as dist
 
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+              listener.settimeout(5)
+              listener.bind(("127.0.0.1", 0))
+              listener.listen(1)
+              with socket.create_connection(listener.getsockname(), timeout=5) as client:
+                  client.sendall(b"smoke")
+                  connection, _ = listener.accept()
+                  with connection:
+                      connection.settimeout(5)
+                      assert connection.recv(5) == b"smoke"
+          print("Python loopback communication passed", flush=True)
+
           timeout = timedelta(seconds=30)
           store = dist.TCPStore(
-              "::1", 0, 1, True, timeout
+              "127.0.0.1", 0, 1, True, timeout
           )
           dist.init_process_group(
               "gloo", store=store, rank=0, world_size=1, timeout=timeout
