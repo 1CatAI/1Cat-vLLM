@@ -68,5 +68,7 @@ def test_skips_without_structured_requests_or_placeholders():
     core.model_executor.take_draft_token_ids.assert_not_called()
 
     core = _core({"0": _request(True, placeholders=4)}, None)
-    core._fill_structured_output_drafts(_scheduler_output({"0": [-1, -1]}, structured=False))
+    core._fill_structured_output_drafts(
+        _scheduler_output({"0": [-1, -1]}, structured=False)
+    )
     core.model_executor.take_draft_token_ids.assert_not_called()

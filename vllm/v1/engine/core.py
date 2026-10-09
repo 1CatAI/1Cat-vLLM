@@ -756,9 +756,7 @@ class EngineCore:
 
         return engine_core_outputs, model_executed
 
-    def _fill_structured_output_drafts(
-        self, scheduler_output: SchedulerOutput
-    ) -> None:
+    def _fill_structured_output_drafts(self, scheduler_output: SchedulerOutput) -> None:
         """Replace draft placeholders with the worker's drafts before the
         grammar bitmask is built.
 
