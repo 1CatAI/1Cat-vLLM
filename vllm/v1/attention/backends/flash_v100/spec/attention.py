@@ -237,3 +237,22 @@ def register_attention_hooks() -> AttentionHooks:
 
 
 ATTENTION_HOOKS = register_attention_hooks()
+
+
+# Compatibility names stay at the feature boundary, not in common assembly.
+VERIFICATION_CONFIG_FIELDS = {
+    "grouped_max_query": ("dflash2_grouped_verify_max_query_tokens", 0),
+    "grouped_request_major_abi": (
+        "dflash2_grouped_verify_request_major_abi_version",
+        0,
+    ),
+    "grouped_min_model_len": ("dflash2_grouped_verify_min_model_len", 0),
+    "grouped_enabled": ("use_dflash2_grouped_verify", False),
+    "grouped_batch_enabled": ("use_dflash2_batched_grouped_verify", False),
+}
+VERIFICATION_OVERRIDES = {
+    "admit_grouped_override": "_dflash2_grouped_verify_allowed",
+    "run_grouped_override": "_call_dflash2_grouped_verify",
+    "admit_xqa_override": "_smallq_decode_xqa_allowed",
+    "run_smallq_override": "_call_flash_attn_smallq_decode_paged",
+}

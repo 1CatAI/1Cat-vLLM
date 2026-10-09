@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import torch
 
@@ -26,6 +26,8 @@ from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100 import verify as _verify
 from vllm.v1.attention.backends.flash_v100.spec.attention import (
     ATTENTION_HOOKS,
+    VERIFICATION_CONFIG_FIELDS,
+    VERIFICATION_OVERRIDES,
     SpecAttentionMethods,
 )
 from vllm.v1.attention.backends.triton_attn import (
@@ -541,6 +543,45 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
         )
+
+    def _new_verification_executor(self) -> _verify.VerificationExecutor:
+        policy = getattr(self, "config", None)
+        if policy is None:
+            attributes = vars(self)
+            policy = SimpleNamespace(
+                **{
+                    field.name: attributes[field.name]
+                    for field in fields(_config.V100AttnConfig)
+                    if field.name in attributes
+                }
+            )
+        limits: dict[str, Any] = {
+            name: getattr(self, legacy_name, default)
+            for name, (legacy_name, default) in VERIFICATION_CONFIG_FIELDS.items()
+        }
+        config = _verify.VerificationConfig(
+            policy=cast(_config.V100AttnConfig, policy),
+            scale=getattr(self, "scale", 1.0),
+            kv_cache_dtype=getattr(self, "kv_cache_dtype", "auto"),
+            alibi_slopes=getattr(self, "alibi_slopes", None),
+            logits_soft_cap=getattr(self, "logits_soft_cap", 0.0),
+            **limits,
+        )
+        ops = _verify.VerificationOps(
+            grouped=getattr(self, "flash_attn_grouped_verify_paged", None),
+            fp16_grouped=getattr(self, "flash_attn_grouped_fp16_fp32_paged", None),
+            e4m3_grouped=getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None),
+            xqa=getattr(self, "flash_attn_decode_paged_xqa", None),
+            window_size=getattr(self, "_flash_v100_window_size", None),
+            layer_info=getattr(self, "_layer_debug_info", None),
+            xqa_codec=getattr(self, "_xqa_kv_codec", None),
+            decode=getattr(self, "_call_flash_attn_decode_paged", None),
+            **{
+                name: vars(self).get(legacy_name)
+                for name, legacy_name in VERIFICATION_OVERRIDES.items()
+            },
+        )
+        return _verify.VerificationExecutor(config, ops)
 
     _smallq_decode_xqa_allowed = _verify._smallq_decode_xqa_allowed
 

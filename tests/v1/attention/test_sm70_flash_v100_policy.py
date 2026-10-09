@@ -3576,7 +3576,11 @@ def test_flash_v100_fp8_kv_route_summary_counts_repeated_hits(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["selected", "off", "batch2"])
 def test_e4m3_fp32_smallq_forwards_live_lengths_or_falls_back(monkeypatch, mode):
+    from typing import cast
+
     from vllm.v1.attention.backends import flash_attn_v100 as mod
+    from vllm.v1.attention.backends.flash_v100 import verify
+    from vllm.v1.attention.backends.flash_v100.config import V100AttnConfig
 
     monkeypatch.delenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE", raising=False)
     calls = []
@@ -3590,14 +3594,30 @@ def test_e4m3_fp32_smallq_forwards_live_lengths_or_falls_back(monkeypatch, mode)
         calls.append((args, kwargs))
         kwargs["out"].fill_(2)
 
-    instance = SimpleNamespace(
-        flash_attn_grouped_e4m3_fp32_paged=None if mode == "off" else grouped,
-        kv_cache_dtype="fp8_e4m3",
-        use_smallq_decode_xqa=True,
-        scale=0.0625,
-        _flash_v100_window_size=lambda causal: (-1, -1),
-        _smallq_decode_xqa_allowed=lambda *args, **kwargs: False,
-        _call_flash_attn_decode_paged=scalar,
+    executor = verify.VerificationExecutor(
+        verify.VerificationConfig(
+            policy=cast(V100AttnConfig, SimpleNamespace(use_smallq_decode_xqa=True)),
+            kv_cache_dtype="fp8_e4m3",
+            scale=0.0625,
+            alibi_slopes=None,
+            logits_soft_cap=0.0,
+            grouped_enabled=False,
+            grouped_batch_enabled=False,
+            grouped_max_query=0,
+            grouped_request_major_abi=0,
+            grouped_min_model_len=0,
+        ),
+        verify.VerificationOps(
+            grouped=None,
+            fp16_grouped=None,
+            e4m3_grouped=None if mode == "off" else grouped,
+            xqa=None,
+            window_size=lambda causal: (-1, -1),
+            layer_info=None,
+            xqa_codec=None,
+            decode=scalar,
+            admit_xqa_override=lambda *args, **kwargs: False,
+        ),
     )
     q = torch.empty((5, 6, 256), dtype=torch.float16)
     k = torch.empty((1, 848, 1, 256), dtype=torch.uint8)
@@ -3610,8 +3630,7 @@ def test_e4m3_fp32_smallq_forwards_live_lengths_or_falls_back(monkeypatch, mode)
     layer = SimpleNamespace(_k_scale_float=0.5, _v_scale_float=1.25)
     out = torch.empty_like(q)
     monkeypatch.setattr(mod, "_record_route", routes.append)
-    mod.FlashAttnV100Impl._call_flash_attn_smallq_decode_paged(
-        instance,
+    executor.call_smallq_decode_paged(
         layer,
         q,
         k,

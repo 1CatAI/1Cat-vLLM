@@ -23,8 +23,9 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
 | 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | GPU gates |
 | 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
-| 5c: debug observer | — | CPU/golden/strict passed | Largest function 414 → 402 | Required | Strict/rebase/GPU gates |
-| 6: registered speculative features | — | Not started | — | Required | Step 5c gates |
+| 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Required | Strict/rebase/GPU gates |
+| 6a: verifier ownership | — | CPU/golden/strict passed | Cycles 13 → 11; model terms 169 → 158 | Required | Strict/rebase/GPU gates |
+| 6b: registered speculative features | — | Not started | — | Required | Step 6a gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -647,3 +648,58 @@ The fixed-source strict run passes **266 tests / 1 skip / 28 GPU exclusions**,
 including all consumed shim patches. Evidence: `a3-prefill-debug-strict.log`
 and `a3-prefill-debug-shim.json`. All code/type/layering hooks pass; the first
 pre-commit invocation only reformatted an extra Markdown blank line.
+
+## Step 6a verifier ownership
+
+PR #1088 is `27ecbdccfe4d1e4b11a65b1f2cd39619e97df745`. Its actual pinned
+PR #1028 integration is `30d27b609bcd983d45aa5bfe8e4439c377959423`, tree
+`1e6b737b5a178fc25f71cde2d7edb4c5be9f58ec`, equal to the clean merge-tree.
+The integration passes 37 CPU tests with 98 GPU skips. Four dependent GPU
+queues and hash-verified sources are staged under `a3-step5c` on 54633.
+
+Mechanical grouping `c06fb8c15` precedes explicit ownership. VerificationExecutor
+receives frozen VerificationConfig and explicit VerificationOps; its calculation
+module no longer imports Impl. Grouped-kernel admission receives only its five
+required fields/callables. Tree correction receives the three scalar policy
+fields it consumes through the frozen configuration. Internal legacy test
+injections remain explicit optional operators; a falsey callable is retained.
+Temporary typed adapter functions preserve existing callers and method signatures.
+They do not claim completion of speculative feature registration or removal of
+all legacy adapters, which belongs to the following Step 6/7 work.
+
+All 813 immutable traces and original calculation hashes pass (15 focused
+checks). The source oracle validates every adapter argument and projects actual
+executor dependencies back to the original calculation. Eight independent
+executor cases and seven existing attention-hook tests pass: grouped FP16,
+E4M3, XQA and scalar order, native input contract, persistent metadata pointers,
+falsey injected operators and declared causality. Evidence:
+`a3-spec-verifier-focused.log` and `a3-spec-verifier-injection.log`.
+The ceiling is 402 / 402 / 347 / 11 / 158 / 0 / 29; cycles and model-name
+ceilings are tightened and no new forbidden edge appears. Moving the old static
+calculation aliases exposed mypy descriptor inference; typed function aliases
+fixed the intermediate mechanical commit before the ownership change.
+
+The first complete strict run exposed three historical policy cases calling an
+unbound Impl method on SimpleNamespace. Those same cases now inject the actual
+VerificationExecutor, preserving their test IDs, inputs, native/route assertions
+and strict shim patch consumption. Ordinary non-speculative contract validation
+also bypasses executor construction, retaining the lightweight per-token guard.
+The final focused executor/calculation/three-policy-case run passes 14 tests.
+Evidence: `a3-spec-verifier-focused-final.log`. The earlier strict failure is
+retained in `a3-spec-verifier-strict.log` and is not a passing final gate.
+
+Step 1c DFlash2 parity now passes: both fixed greedy requests match exactly,
+including all four workers' route records. The shared versioned recorder returns
+`equal: true, requests: 2`. Evidence: `a3-step1c/logs/dflash-compare.log` and
+`dflash.done` on 54633, with both JSON artifacts copied locally. DDTree remains
+separately blocked on its original baseline interface bug; the isolated fix is
+Draft PR #1089, `6f22879a12a2a51e26656797ef1fa9b6c3ba2fa1`. It is not part of
+A3. Applying it symmetrically to DDTree's model comparison requires the pending
+baseline clarification. Host-FP8's rebuilt-binary parent unit suite passes all
+135 cases; its full model is currently loading under the declared contract.
+
+The final fixed-source strict run passes **274 tests / 1 skip / 28 GPU
+exclusions**, with all original shim patches consumed. Evidence:
+`a3-spec-verifier-strict-final.log` and `a3-spec-verifier-shim-final.json`.
+Pre-commit including mypy/layering passes (`a3-spec-verifier-precommit-ready.log`).
+No production files changed while this accepted full run was executing.
