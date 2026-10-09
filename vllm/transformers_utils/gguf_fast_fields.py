@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fast, structure-identical parsing of GGUF metadata arrays.
 
 gguf-py builds every array element through recursive ``_get`` calls on the
