@@ -193,3 +193,15 @@ remain visible in the generated explanation. Repository coupling decreases
 from platform **3756 → 3727**, model **2322 → 2315**, raw environment **271 → 269**;
 no ownership whitelist changes are used. Sparse-verifier alignment dumps and
 DDTree tracing remain with their feature owners and are not claimed migrated.
+
+### Integration with concurrent main changes
+
+Before C1b merged, main advanced through #1007 and #1028 to `465da8a45`.
+C1b was rebased on that main: its host-backed KV allocations and newly added
+greedy verifier remain intact. The sampler protocol fixture now supplies the
+real kernel configuration/device used by that call site. The new greedy
+provider still exposes a whole-runner adapter in main; C4a will narrow that
+pre-existing boundary together with packed LM-head selection. It is not counted
+as a C1b decoupling result. Updated main-to-C1b coupling is platform
+**3747 → 3718**, model **2322 → 2315**, environment **271 → 269**. The rebased
+CPU integration suite passed **76 tests**, with seven CUDA-only skips.

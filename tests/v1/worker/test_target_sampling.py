@@ -7,6 +7,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.config.kernel import KernelConfig
 from vllm.config.observability import ObservabilityConfig
 from vllm.config.sm70_runtime import SpecDecodeTraceConfig
 from vllm.v1.worker.gpu import model_runner
@@ -35,6 +36,8 @@ def test_runner_target_protocol_reuses_completed_projection(
         "ordinary": None,
     }[outcome]
     runner = model_runner.GPUModelRunner.__new__(model_runner.GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(kernel_config=KernelConfig())
+    runner.device = torch.device("cpu")
     runner.lora_config = object()  # Graph admission is passed to the feature owner.
 
     def project(hidden):
