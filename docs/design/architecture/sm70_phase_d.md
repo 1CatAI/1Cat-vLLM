@@ -61,7 +61,7 @@ part of the contract.
 | D1 registry and ledger | Merged [#1141](https://github.com/1CatAI/1Cat-vLLM/pull/1141); CI passed | Static inventory, structured deprecation metadata, shared registration scanner and explicit-input warn-once support. This establishes visibility; it does not claim execution consumers migrated. |
 | D2 GDN and speculation | Merged [#1143](https://github.com/1CatAI/1Cat-vLLM/pull/1143); CI passed | CPU isolation/compatibility, 17 GPU operator cases and matched A/B passed. |
 | D3 diagnostics | Merged [#1146](https://github.com/1CatAI/1Cat-vLLM/pull/1146); CI passed | Shared diagnostic owner, 74 initialized parameters, legacy typed MoE bridge, CPU isolation and 7 GPU cases plus matched operator A/B. |
-| D4a attention package | Validated [#1148](https://github.com/1CatAI/1Cat-vLLM/pull/1148) | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
+| D4a attention package | Merged `d4ce51399`, CI passed [#1148](https://github.com/1CatAI/1Cat-vLLM/pull/1148) | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
 | D4b FA2/79T resources | Pending, next main-based delivery | Remaining native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build. D4 is not closed by D4a. |
 | D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
 | D6 closure | Pending | Complete evidence audit, remaining-name ownership, report and execution-time read guards. |
@@ -350,3 +350,67 @@ normal FA2 dependency; its log/XML and source archives remain in the task
 artifact directory. A legacy atexit route-summary logger writes to pytest’s
 already closed captured stream after the successful suite; this did not affect
 assertions or process exit status.
+
+### D4b FA2/79T policy and native resource ownership
+
+The normal `_vllm_fa2_C` target now ships prefill policy ABI 1 and the
+`Sm70PrefillRuntime` owner. Existing Q8000/Q8192 schemas and registrations remain
+available for independent legacy callers. A qualified engine binds the explicit
+owner during attention initialization. A binary that supplies the qualified
+legacy operator but lacks the binding fails initialization; missing operators
+or FP32 accumulation qualification retain the existing dense fallback.
+
+| Compatibility input | Canonical field | Retained parser / default |
+| --- | --- | --- |
+| `PREFIX_QK_CUBLAS_ALGO_RUNTIME` | `flash_v100.options.prefill_qk_algorithm` | Optional native `atoi`; unset retains the build's cuBLAS algorithm. |
+| `VLLM_FLASH_V100_PREFILL_SCORE_BLOCK_TOKENS` | `flash_v100.options.prefill_score_block_tokens` | Whole-string `strtol`, multiples of 8192 in [8192, 131072]; unset uses the build default. Invalid legacy input raises at the original workspace checkpoint. |
+| `PREFIX_TORCH_SERIAL_TAIL` | `flash_v100.options.prefill_serial_tail` | Unset or any string other than `0` enables serial execution. Memory-headroom qualification remains dynamic at allocation. |
+| `PREFIX_TORCH_EXACT_TAIL` | `flash_v100.options.prefill_exact_tail` | Presence, including empty string; return-affecting experiment remains in the calculation hash. |
+| `PREFIX_TORCH_DIRECT_TAIL` | `flash_v100.options.prefill_direct_tail` | Presence; return-affecting experiment remains in the calculation hash. |
+| `PREFIX_TORCH_DUMP_TAIL` | `runtime_trace.flash_v100.prefill_dump_tail` | Presence; original observation points and stderr format, excluded from the calculation hash. |
+
+Explicit typed values take precedence without rewriting the environment.
+The seven-field native projection distinguishes an absent algorithm override
+from algorithm zero. Native scalar parsing now also preserves ASCII whitespace
+and libc overflow behavior; the config/report path never invokes an environment
+getter after initialization. Inactive 79T parameters do not perturb other
+attention paths. `PREFIX_*` declarations and native constant-array readers are
+included in the existing inventory and policy checker.
+
+Three active process caches (the shared score tensor and the two query-family
+workspaces) become one worker owner containing the same three cache slots per
+device. The owner also accommodates the two historical generic-score slots,
+which are inactive in the normal recipe. Buffers, cuBLAS handles, streams,
+immutable host metadata and dispatch observations belong to this owner. Its
+lifetime is retained through capture/replay and ends after graph destruction.
+Closing it drains device work, including a dispatch that failed before recording
+its final event; this synchronization is confined to shutdown.
+
+One physical-device execution gate deliberately remains shared. The unchanged
+kernels bind device-global pointers, so independent workspace tensors alone
+would introduce races between engines. The original event wait/record points,
+including external capture events, remain in place. The shared gate coordinates
+both query families and all block sizes; it owns no calculation policy or score
+tensor. The two algorithms and their rounding sequences remain unchanged.
+
+Scope counts: six active alias consumers previously interpreted compatibility
+inputs in the native path; configured execution now performs zero environment
+reads and no string parsing. The independent legacy adapter and benchmark-only
+`PREFIX_BATCHED_TAIL_QK_ALGO_RUNTIME` / overlap-wave controls remain explicitly
+outside engine execution. The latter occur under `!PREFIX_TORCH_EXTENSION`.
+
+Validation so far: 63 focused CPU cases pass, including config/provenance/hash,
+missing capabilities and ownership checks. On 54633, 203 operator/routing and
+synthetic-metadata cases pass without loading a model. Bound Q8000/Q8192 outputs
+match legacy exports bit for bit; two owners with distinct score-block policies
+retain correct outputs across interleaved stream replay, changed inputs, later
+query-family workspace allocation and independent shutdown. The normal FA2
+artifact builds successfully. Independent baseline/candidate performance runs
+are queued on the shared GPU lock; their results will be added before merge.
+
+Artifacts are under `/home/ymzx/arch-ws/phase-d4b-20261009` on 54633. The first
+baseline extraction retained old timestamps and Ninja reused candidate objects;
+that run was rejected before benchmarking. The corrected build explicitly
+refreshes source timestamps and produces a different baseline artifact. The
+local policy/metadata suite also needs a GPU-capable platform for nine existing
+fixtures; those fixtures pass in the 203-case remote run.

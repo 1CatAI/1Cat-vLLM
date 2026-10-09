@@ -22,7 +22,7 @@ from tools.pre_commit.check_env_registration import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-PREFIXES = ("VLLM_", "TM_", "FLASH_QLA_")
+PREFIXES = ("VLLM_", "TM_", "FLASH_QLA_", "PREFIX_")
 
 
 def python_references(source: str) -> list[dict]:
@@ -142,7 +142,9 @@ def destination(name: str, metadata: dict) -> str:
         word in name for word in ("DUMP", "TRACE", "PROFILE", "COMPARE", "DEBUG")
     ):
         return "observability_config.runtime_trace"
-    if any(word in name for word in ("FLASH_V100", "TURBOQUANT")):
+    if name.startswith("PREFIX_") or any(
+        word in name for word in ("FLASH_V100", "TURBOQUANT")
+    ):
         return "attention_config.flash_v100 / compilation_config.runtime"
     if "GDN" in name or "FLASH_QLA" in name:
         return "kernel_config.gdn"
@@ -218,9 +220,10 @@ def collect(root: Path = ROOT) -> dict:
             entry = dict(path=filename, **item)
             if name is None:
                 unresolved.append(entry)
-            elif name in names or name.startswith(("TM_", "FLASH_QLA_")):
+            elif name in names or name.startswith(("TM_", "FLASH_QLA_", "PREFIX_")):
                 names.add(name)
                 consumers[name].append(entry)
+    names.update(declarations)
     parameters = {}
     for name in sorted(names):
         data = metadata.get(name, {})

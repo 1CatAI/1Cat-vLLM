@@ -61,3 +61,14 @@ def test_direct_registered_imports_are_visible():
         python_references("from vllm.envs import VLLM_SM70_EXAMPLE as flag")[0]["name"]
         == "VLLM_SM70_EXAMPLE"
     )
+
+
+def test_native_constant_array_records_each_compatible_consumer():
+    source = (
+        'const char* names[] = {"PREFIX_TORCH_EXACT_TAIL", "TM_TEST"};\n'
+        "std::getenv(names[index]);"
+    )
+    assert native_reads(source) == [("PREFIX_TORCH_EXACT_TAIL", 2), ("TM_TEST", 2)]
+    assert "PREFIX_TORCH_EXACT_TAIL" in typed_declarations(
+        'bindings = {"exact": ("PREFIX_TORCH_EXACT_TAIL", "present", None)}'
+    )
