@@ -537,7 +537,7 @@ def test_ple_offload_wait_only_waits_for_done(
             stream.cuda_stream,
             flag_tensor.data_ptr(),
             ple_offload_layer.CpuGpuSemaphore.DONE_VALUE,
-            ple_offload_layer.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+            ple_offload_layer.cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
         )
     ]
 
