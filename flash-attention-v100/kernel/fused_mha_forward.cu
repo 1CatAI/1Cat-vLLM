@@ -56,6 +56,20 @@ using namespace nvcuda::wmma;
 #define BLOCK_N_256_LOW_SMEM 32
 #define WARPS_256_LOW_SMEM 16
 
+// head_dim 512 (gemma global layers): small blocks so 512-wide tiles fit smem.
+#define BLOCK_M_512 16
+#define BLOCK_N_512 32
+#define WARPS_512 16
+
+inline bool env_flag_enabled(const char* name) {
+  const char* raw = std::getenv(name);
+  return raw != nullptr && std::strcmp(raw, "0") != 0;
+}
+
+inline bool env_flag_enabled_default_on(const char* name) {
+  const char* raw = std::getenv(name);
+  return raw == nullptr || std::strcmp(raw, "0") != 0;
+}
 template <int D, bool LOW_SMEM = false>
 struct KernelConfig {
   static constexpr int BLOCK_M =
@@ -63,18 +77,21 @@ struct KernelConfig {
       : (D == 32)  ? BLOCK_M_32
       : (D == 64)  ? BLOCK_M_64
       : (D == 128) ? BLOCK_M_128
+      : (D == 512) ? BLOCK_M_512
                    : (LOW_SMEM ? BLOCK_M_256_LOW_SMEM : BLOCK_M_256);
   static constexpr int BLOCK_N =
       (D == 16)    ? BLOCK_N_16
       : (D == 32)  ? BLOCK_N_32
       : (D == 64)  ? BLOCK_N_64
       : (D == 128) ? BLOCK_N_128
+      : (D == 512) ? BLOCK_N_512
                    : (LOW_SMEM ? BLOCK_N_256_LOW_SMEM : BLOCK_N_256);
   static constexpr int WARPS_PER_BLOCK =
       (D == 16)    ? WARPS_16
       : (D == 32)  ? WARPS_32
       : (D == 64)  ? WARPS_64
       : (D == 128) ? WARPS_128
+      : (D == 512) ? WARPS_512
                    : (LOW_SMEM ? WARPS_256_LOW_SMEM : WARPS_256);
 
   static constexpr int THREADS_PER_BLOCK =
@@ -986,8 +1003,8 @@ at::Tensor flash_attention_qk_scores(const at::Tensor& q, const at::Tensor& k,
 
   TORCH_CHECK(k.size(0) == B, "K batch size must match Q");
   TORCH_CHECK(k.size(3) == D, "K head_dim must match Q");
-  TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0,
-              "D must be even, <=256, multiple of 8");
+  TORCH_CHECK((D <= 256 || D == 512) && D % 8 == 0 && D % 2 == 0,
+              "D must be even, multiple of 8, and <=256 or ==512");
   TORCH_CHECK(H_KV > 0, "num_kv_heads must be positive");
   TORCH_CHECK(H % H_KV == 0,
               "num_attention_heads must be divisible by num_kv_heads");
@@ -997,7 +1014,7 @@ at::Tensor flash_attention_qk_scores(const at::Tensor& q, const at::Tensor& k,
   TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
   auto scores = torch::full({B, H, M, N}, -1e30f,
-                            torch::dtype(torch::kFloat32).device(q.device()));
+                             torch::dtype(torch::kFloat32).device(q.device()));
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   switch (D) {
@@ -1019,6 +1036,10 @@ at::Tensor flash_attention_qk_scores(const at::Tensor& q, const at::Tensor& k,
       break;
     case 256:
       launcher_flash_attention_qk_scores<256>(q, k, scores, softmax_scale,
+                                              is_causal, stream);
+      break;
+    case 512:
+      launcher_flash_attention_qk_scores<512>(q, k, scores, softmax_scale,
                                               is_causal, stream);
       break;
     default:
@@ -1054,8 +1075,8 @@ std::vector<at::Tensor> flash_attention_forward(
   const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
   const int H_KV = k.size(1);
   const int N = k.size(2);
-  TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0,
-              "D must be even, <=256, multiple of 8");
+  TORCH_CHECK((D <= 256 || D == 512) && D % 8 == 0 && D % 2 == 0,
+              "D must be even, multiple of 8, and <=256 or ==512");
   TORCH_CHECK(H_KV > 0, "num_kv_heads must be positive");
   TORCH_CHECK(H % H_KV == 0,
               "num_attention_heads must be divisible by num_kv_heads");
@@ -1101,6 +1122,11 @@ std::vector<at::Tensor> flash_attention_forward(
       break;
     case 256:
       launcher_flash_attention_forward<256>(
+          q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, scalar_pv,
+          window_size_left, window_size_right, stream);
+      break;
+    case 512:
+      launcher_flash_attention_forward<512>(
           q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, scalar_pv,
           window_size_left, window_size_right, stream);
       break;
