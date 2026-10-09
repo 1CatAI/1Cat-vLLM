@@ -13,6 +13,8 @@ jobs:
   macos-m1-smoke-test:
     runs-on: macos-latest
     timeout-minutes: 30
+    env:
+      GLOO_SOCKET_IFNAME: lo0
 
     steps:
       - uses: actions/checkout@v6.0.1
@@ -41,6 +43,28 @@ jobs:
       - name: Verify installation
         run: |
           python -c "import vllm; print(f'vLLM version: {vllm.__version__}')"
+
+      - name: Verify single-process Gloo
+        timeout-minutes: 2
+        run: |
+          .venv/bin/python - <<'PY'
+          from datetime import timedelta
+          import torch
+          import torch.distributed as dist
+
+          timeout = timedelta(seconds=30)
+          store = dist.TCPStore("127.0.0.1", 0, 1, True, timeout)
+          dist.init_process_group(
+              "gloo", store=store, rank=0, world_size=1, timeout=timeout
+          )
+          try:
+              value = torch.ones(1)
+              dist.all_reduce(value)
+              assert value.item() == 1
+              print("Single-process Gloo communication passed")
+          finally:
+              dist.destroy_process_group()
+          PY
 
       - name: Smoke test vllm serve
         run: |
