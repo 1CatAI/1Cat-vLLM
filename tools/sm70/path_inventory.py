@@ -72,6 +72,7 @@ C_SOURCES = {
 }
 C_OWNERS = (
     "vllm/v1/worker/runtime/",
+    "vllm/platforms/sm70/",
     "vllm/model_executor/warmup/",
     "vllm/model_executor/layers/fla/ops/sm70/",
 )
@@ -237,7 +238,16 @@ def source_paths(ref: str | None, phase: str = "b") -> list[str]:
         sources = {path for group in C_SOURCES.values() for path in group}
         sources.update(path for path in available if path.startswith(C_OWNERS))
         sources.update(
-            {"vllm/config/sm70_runtime.py", "vllm/v1/spec_decode/profiling.py"}
+            {
+                "vllm/config/sm70_runtime.py",
+                "vllm/v1/spec_decode/profiling.py",
+                "vllm/v1/spec_decode/diagnostics.py",
+                "vllm/utils/staged_copy.py",
+                "vllm/v1/utils.py",
+                "vllm/sm70_decode_trace.py",
+                "vllm/v1/worker/gpu/spec_decode/speculator.py",
+                "vllm/v1/worker/gpu/spec_decode/target_sampling.py",
+            }
         )
         return sorted(sources & available)
     common = {
@@ -273,19 +283,23 @@ def runtime_catalog() -> dict:
         if not isinstance(cls, ast.ClassDef):
             continue
         for node in ast.walk(cls):
-            if (
-                isinstance(node, ast.Call)
-                and ast.unparse(node.func) == "resolve_legacy_fields"
-            ):
-                fields = ast.literal_eval(node.args[1])
-                aliases.extend(
-                    dict(
-                        legacy=legacy,
-                        typed=f"{cls.name}.{field}",
-                        timing="initialization only",
-                    )
-                    for field, legacy in fields.items()
+            if not isinstance(node, ast.Dict):
+                continue
+            try:
+                fields = ast.literal_eval(node)
+            except (ValueError, TypeError):
+                continue
+            aliases.extend(
+                dict(
+                    legacy=legacy,
+                    typed=f"{cls.name}.{field}",
+                    timing="initialization only",
                 )
+                for field, legacy in fields.items()
+                if isinstance(field, str)
+                and isinstance(legacy, str)
+                and legacy.startswith("VLLM_")
+            )
     return {
         "evidence": "configuration declarations; not runtime launches",
         "aliases": aliases,

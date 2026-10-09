@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -26,6 +25,11 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
     rejection_sample,
 )
 
+# Preserve the public compatibility name while the outcome belongs to the protocol.
+from vllm.v1.worker.gpu.spec_decode.target_sampling import (
+    ComputedTargetLogits as DFlash2LogitsFallback,
+)
+
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -37,13 +41,6 @@ _TARGET_TOP_K = 20
 _TARGET_PROBE_K = 64
 _SELECTOR_ALIGNMENT_DUMP_COUNT = 0
 _SELECTOR_ALIGNMENT_STEP = 0
-
-
-@dataclass(frozen=True)
-class DFlash2LogitsFallback:
-    """A completed dense projection; non-gather ranks may have no logits."""
-
-    logits: torch.Tensor | None
 
 
 @triton.jit

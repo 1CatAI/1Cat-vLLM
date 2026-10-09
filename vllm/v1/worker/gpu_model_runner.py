@@ -110,6 +110,7 @@ from vllm.multimodal.inputs import (
 )
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.platforms import current_platform
+from vllm.platforms.sm70.runner_hooks import create_input_transfer
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
@@ -417,12 +418,6 @@ def _dflash_ddtree_target_forward_profiler_step() -> int:
         return max(0, int(raw))
     except ValueError:
         return 0
-
-
-def _sm70_worker_trace_enabled(use_async_scheduling: bool) -> bool:
-    return (
-        envs.VLLM_SM70_ASYNC_CPU_TRACE and use_async_scheduling
-    ) or _dflash_ddtree_worker_profile_enabled()
 
 
 def _maybe_dump_sm70_mtp_step(phase: str, payload: dict[str, object]) -> None:
@@ -1326,9 +1321,10 @@ class GPUModelRunner(
             )
         self._sm70_async_worker_execute_trace_step = 0
         self._sm70_async_worker_sample_trace_step = 0
-        self._sm70_async_worker_input_prep_trace_step = 0
-        self._sm70_async_staged_input_prep_active = False
-        self._sm70_async_staged_input_prep_logged = False
+        self._input_transfer = create_input_transfer(vllm_config, device, logger=logger)
+        self._runtime_trace = vllm_config.observability_config.runtime_trace
+        assert self._runtime_trace.async_every is not None
+        self._async_trace_every = self._runtime_trace.async_every
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -1573,7 +1569,7 @@ class GPUModelRunner(
         self.async_output_copy_stream: torch.cuda.Stream | None = None
         # cuda event to synchronize use of output tensors between steps
         # when async scheduling is enabled.
-        self.prepare_inputs_event: torch.Event | None = None
+        self.prepare_inputs_event = None
         if self.use_async_scheduling:
             self.async_output_copy_stream = torch.cuda.Stream()
             self.prepare_inputs_event = torch.Event()
@@ -1934,55 +1930,40 @@ class GPUModelRunner(
             with_numpy=numpy,
         )
 
+    @property
+    def prepare_inputs_event(self) -> torch.Event | None:
+        return self._input_transfer.event
+
+    @prepare_inputs_event.setter
+    def prepare_inputs_event(self, event: torch.Event | None) -> None:
+        self._input_transfer.event = event
+
     def _can_use_sm70_staged_input_prep(
-        self,
-        scheduler_output: "SchedulerOutput",
+        self, scheduler_output: "SchedulerOutput"
     ) -> bool:
-        if not (
-            envs.VLLM_SM70_ASYNC_STAGED_INPUT_PREP
-            and self.use_async_scheduling
-            and self.device.type == "cuda"
-            and current_platform.is_device_capability(70)
-        ):
+        if not self._input_transfer.eligible:
             return False
-        if self.speculative_config is not None or self.num_spec_tokens:
-            return False
-        if (
-            self.model_config.is_encoder_decoder
-            or scheduler_output.scheduled_encoder_inputs
-        ):
-            return False
-        if scheduler_output.scheduled_spec_decode_tokens:
-            return False
-        if scheduler_output.total_num_scheduled_tokens != 1:
-            return False
-        if self.input_batch.num_reqs != 1:
-            return False
-        if self.input_batch.prev_sampled_token_ids is None:
-            return False
-        return self.num_accepted_tokens_event is None
+        return self._input_transfer.can_stage(
+            num_tokens=scheduler_output.total_num_scheduled_tokens,
+            num_reqs=self.input_batch.num_reqs,
+            has_previous_sample=self.input_batch.prev_sampled_token_ids is not None,
+            has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+            has_draft_tokens=bool(scheduler_output.scheduled_spec_decode_tokens),
+            has_accepted_event=self.num_accepted_tokens_event is not None,
+        )
 
     def _copy_buffer_to_gpu(
         self, buffer: CpuGpuBuffer, n: int | None = None
     ) -> torch.Tensor:
-        if self._sm70_async_staged_input_prep_active:
-            return buffer.copy_to_gpu_staged(n)
-        return buffer.copy_to_gpu(n)
+        return self._input_transfer.copy_buffer(buffer, n)
 
     def _copy_position_buffer_to_gpu(
         self, buffer: CpuGpuBuffer, n: int
     ) -> torch.Tensor:
-        src = buffer.cpu[:, :n]
-        dst = buffer.gpu[:, :n]
-        if self._sm70_async_staged_input_prep_active:
-            return buffer.copy_view_to_gpu_staged(src, dst)
-        return dst.copy_(src, non_blocking=True)
+        return self._input_transfer.copy_positions(buffer, n)
 
     def _commit_block_table_to_gpu(self, num_reqs: int) -> None:
-        if self._sm70_async_staged_input_prep_active:
-            self.input_batch.block_table.commit_block_table_staged(num_reqs)
-        else:
-            self.input_batch.block_table.commit_block_table(num_reqs)
+        self._input_transfer.commit_block_table(self.input_batch.block_table, num_reqs)
 
     def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
         # Only reachable on the ``mamba_cache_mode == "align"`` path.
@@ -7922,66 +7903,12 @@ class GPUModelRunner(
             invalid_req_indices,
         )
 
-    @contextmanager
     def synchronize_input_prep(self, skip_sync: bool = False):
-        trace_enabled = _sm70_worker_trace_enabled(self.use_async_scheduling)
-        trace_step = self._sm70_async_worker_input_prep_trace_step
-        trace_log = trace_enabled and (
-            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
+        return self._input_transfer.prepare(
+            skip_sync=skip_sync,
+            # Retain the deferred tree diagnostic override at its existing boundary.
+            trace_override=_dflash_ddtree_worker_profile_enabled(),
         )
-        if trace_enabled:
-            self._sm70_async_worker_input_prep_trace_step += 1
-        trace_sync_ms = 0.0
-        trace_body_t0 = 0.0
-        previous_staged_input_prep = self._sm70_async_staged_input_prep_active
-        self._sm70_async_staged_input_prep_active = skip_sync
-        if self.prepare_inputs_event is None:
-            trace_body_t0 = time.perf_counter() if trace_log else 0.0
-            try:
-                yield
-            finally:
-                self._sm70_async_staged_input_prep_active = previous_staged_input_prep
-                if trace_log:
-                    logger.info(
-                        "SM70 async worker trace kind=input_prep step=%d "
-                        "mode=no_event sync_ms=0.000 body_ms=%.3f",
-                        trace_step,
-                        (time.perf_counter() - trace_body_t0) * 1000.0,
-                    )
-            return
-
-        # Async input prep normally waits for the previous step's H2D copies
-        # because they use reusable pinned CPU buffers. The staged SM70 decode
-        # path gives each H2D copy its own source buffer, so it can preserve
-        # stream ordering without blocking the CPU here.
-        if skip_sync:
-            if not self._sm70_async_staged_input_prep_logged:
-                logger.info("SM70 async staged input prep enabled for no-MTP decode.")
-                self._sm70_async_staged_input_prep_logged = True
-            trace_body_t0 = time.perf_counter() if trace_log else 0.0
-        else:
-            trace_sync_t0 = time.perf_counter() if trace_log else 0.0
-            sm70_trace_event_sync(
-                self.prepare_inputs_event,
-                "GPUModelRunner.prepare_inputs_event.synchronize",
-            )
-            if trace_log:
-                trace_sync_ms = (time.perf_counter() - trace_sync_t0) * 1000.0
-                trace_body_t0 = time.perf_counter()
-        try:
-            yield
-        finally:
-            self.prepare_inputs_event.record()
-            self._sm70_async_staged_input_prep_active = previous_staged_input_prep
-            if trace_log:
-                logger.info(
-                    "SM70 async worker trace kind=input_prep step=%d "
-                    "mode=%s sync_ms=%.3f body_ms=%.3f",
-                    trace_step,
-                    "staged_event" if skip_sync else "event",
-                    trace_sync_ms,
-                    (time.perf_counter() - trace_body_t0) * 1000.0,
-                )
 
     def _model_forward(
         self,
@@ -8379,11 +8306,12 @@ class GPUModelRunner(
         if self.device.type == "cuda":
             self.mixed_prefill_timer.begin(scheduler_output)
 
-        trace_enabled = _sm70_worker_trace_enabled(self.use_async_scheduling)
-        trace_step = self._sm70_async_worker_execute_trace_step
-        trace_log = trace_enabled and (
-            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
+        trace_enabled = (
+            bool(self._runtime_trace.async_cpu and self.use_async_scheduling)
+            or _dflash_ddtree_worker_profile_enabled()
         )
+        trace_step = self._sm70_async_worker_execute_trace_step
+        trace_log = trace_enabled and (trace_step % self._async_trace_every == 0)
         if trace_enabled:
             self._sm70_async_worker_execute_trace_step += 1
         trace_t0 = time.perf_counter() if trace_log else 0.0
@@ -8927,11 +8855,12 @@ class GPUModelRunner(
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        trace_enabled = _sm70_worker_trace_enabled(self.use_async_scheduling)
-        trace_step = getattr(self, "_sm70_async_worker_sample_trace_step", 0)
-        trace_log = trace_enabled and (
-            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
+        trace_enabled = (
+            bool(self._runtime_trace.async_cpu and self.use_async_scheduling)
+            or _dflash_ddtree_worker_profile_enabled()
         )
+        trace_step = getattr(self, "_sm70_async_worker_sample_trace_step", 0)
+        trace_log = trace_enabled and (trace_step % self._async_trace_every == 0)
         if trace_enabled:
             self._sm70_async_worker_sample_trace_step = trace_step + 1
         trace_t0 = time.perf_counter() if trace_log else 0.0
@@ -11053,12 +10982,7 @@ class GPUModelRunner(
                 # remove_request() are visible to the attention metadata
                 # builder. Without this, stale block IDs from finished
                 # requests can corrupt Mamba state.
-                if self._sm70_async_staged_input_prep_active:
-                    self.input_batch.block_table.commit_block_table_staged(
-                        num_reqs_padded
-                    )
-                else:
-                    self.input_batch.block_table.commit_block_table(num_reqs_padded)
+                self._commit_block_table_to_gpu(num_reqs_padded)
 
                 force_spec_graph_metadata = (
                     self.speculative_config is not None

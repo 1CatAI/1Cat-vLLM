@@ -32,22 +32,31 @@ def _rank() -> int:
     return -1
 
 
-def _should_log(label: str, elapsed_ms: float) -> bool:
-    threshold_ms = envs.VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS
+def _should_log_values(label, elapsed_ms, threshold_ms, every, counts) -> bool:
     if elapsed_ms < threshold_ms:
         return False
-    _TRACE_COUNTS[label] += 1
-    every = max(1, envs.VLLM_SM70_DECODE_EVENT_TRACE_EVERY)
-    count = _TRACE_COUNTS[label]
-    return count <= 4 or count % every == 0
+    counts[label] += 1
+    count = counts[label]
+    return count <= 4 or count % max(1, every) == 0
+
+
+def _should_log(label: str, elapsed_ms: float) -> bool:
+    threshold = envs.VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS
+    if elapsed_ms < threshold:
+        return False
+    return _should_log_values(
+        label,
+        elapsed_ms,
+        threshold,
+        envs.VLLM_SM70_DECODE_EVENT_TRACE_EVERY,
+        _TRACE_COUNTS,
+    )
 
 
 @contextmanager
-def sm70_decode_trace_range(label: str) -> Iterator[None]:
-    if not sm70_decode_event_trace_enabled():
-        yield
-        return
-
+def _trace_range(
+    label: str, should_log: Callable[[str, float], bool]
+) -> Iterator[None]:
     pushed = False
     if torch.cuda.is_available():
         try:
@@ -55,7 +64,6 @@ def sm70_decode_trace_range(label: str) -> Iterator[None]:
             pushed = True
         except RuntimeError:
             pushed = False
-
     start = time.perf_counter()
     try:
         yield
@@ -63,7 +71,7 @@ def sm70_decode_trace_range(label: str) -> Iterator[None]:
         elapsed_ms = (time.perf_counter() - start) * 1000.0
         if pushed:
             torch.cuda.nvtx.range_pop()
-        if _should_log(label, elapsed_ms):
+        if should_log(label, elapsed_ms):
             logger.warning(
                 "SM70 decode event trace: label=%s elapsed_ms=%.3f pid=%s rank=%s",
                 label,
@@ -71,6 +79,39 @@ def sm70_decode_trace_range(label: str) -> Iterator[None]:
                 os.getpid(),
                 _rank(),
             )
+
+
+@contextmanager
+def sm70_decode_trace_range(label: str) -> Iterator[None]:
+    if not sm70_decode_event_trace_enabled():
+        yield
+        return
+    with _trace_range(label, _should_log):
+        yield
+
+
+class DecodeEventTracer:
+    """Engine-local trace counts and policy for migrated runtime consumers."""
+
+    def __init__(self, policy):
+        self.policy = policy
+        self.counts: defaultdict[str, int] = defaultdict(int)
+
+    def _should_log(self, label: str, elapsed_ms: float) -> bool:
+        return _should_log_values(
+            label,
+            elapsed_ms,
+            self.policy.event_threshold_ms,
+            self.policy.event_every,
+            self.counts,
+        )
+
+    def synchronize(self, event: torch.Event, label: str) -> None:
+        if not self.policy.events:
+            event.synchronize()
+            return
+        with _trace_range(label, self._should_log):
+            event.synchronize()
 
 
 def sm70_trace_call(label: str, fn: Callable[[], T]) -> T:

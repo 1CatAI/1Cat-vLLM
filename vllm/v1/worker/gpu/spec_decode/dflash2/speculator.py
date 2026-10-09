@@ -357,6 +357,29 @@ def _advance_lookup_controller(
 class DFlash2Speculator(DFlashSpeculator):
     _speculator_name = "DFlash2"
 
+    def try_sample_target(
+        self,
+        model,
+        rejection_sampler,
+        hidden_states,
+        input_batch,
+        grammar_output,
+        *,
+        allow_graph=True,
+    ):
+        # Lazy feature import avoids a speculator/provider initialization cycle.
+        from .sparse_rejection import try_dflash2_sparse_target_rejection
+
+        return try_dflash2_sparse_target_rejection(
+            model,
+            self,
+            rejection_sampler,
+            hidden_states,
+            input_batch,
+            grammar_output,
+            allow_graph=allow_graph,
+        )
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)

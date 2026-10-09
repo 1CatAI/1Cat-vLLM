@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -23,12 +23,48 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.spec_decode.target_sampling import ComputedTargetLogits
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.core.sched.output import GrammarOutput
+    from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
 
 logger = init_logger(__name__)
 
 
 class BaseSpeculator(ABC):
+    def prepare_target_context(
+        self,
+        input_batch: InputBatch,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        """Optional feature-owned preparation before target verification."""
+        return None
+
+    def try_sample_target(
+        self,
+        model: nn.Module,
+        rejection_sampler: "RejectionSampler",
+        hidden_states: torch.Tensor,
+        input_batch: InputBatch,
+        grammar_output: "GrammarOutput | None",
+        *,
+        allow_graph: bool = True,
+    ) -> SamplerOutput | ComputedTargetLogits | None:
+        """None requests normal logits and sampling; computed logits are distinct."""
+        return None
+
+    def trace_target_logits(self, logits, input_batch, logger) -> None:
+        return None
+
+    def trace_target_output(
+        self, input_batch, output, num_sampled, num_rejected, hidden_states, logger
+    ) -> None:
+        return None
+
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
@@ -79,6 +115,9 @@ class DraftModelSpeculator(BaseSpeculator):
 
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
+        self._target_trace_policy = (
+            vllm_config.observability_config.spec_decode_trace.resolve()
+        )
         self.method = self.speculative_config.method
         self.num_speculative_steps = self.speculative_config.num_speculative_tokens
         self.draft_model_config = self.speculative_config.draft_model_config
@@ -144,6 +183,11 @@ class DraftModelSpeculator(BaseSpeculator):
             self._draft_logits_init = self.draft_logits_spec(vllm_config)
 
         self.supports_mm_inputs = False
+
+    def trace_target_logits(self, logits, input_batch, logger) -> None:
+        from vllm.v1.spec_decode.diagnostics import trace_target_logits
+
+        trace_target_logits(self._target_trace_policy, logits, input_batch, logger)
 
     @abstractmethod
     def load_draft_model(

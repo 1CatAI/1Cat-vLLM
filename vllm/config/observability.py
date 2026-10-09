@@ -8,7 +8,11 @@ from packaging.version import parse
 from pydantic import Field, field_validator, model_validator
 
 from vllm import version
-from vllm.config.sm70_runtime import StepProfilerConfig
+from vllm.config.sm70_runtime import (
+    RuntimeTraceConfig,
+    SpecDecodeTraceConfig,
+    StepProfilerConfig,
+)
 from vllm.config.utils import config
 from vllm.utils.hashing import safe_hash
 
@@ -18,6 +22,14 @@ DetailedTraceModules = Literal["model", "worker", "all"]
 @config
 class ObservabilityConfig:
     """Configuration for observability - metrics and tracing."""
+
+    spec_decode_trace: SpecDecodeTraceConfig = Field(
+        default_factory=SpecDecodeTraceConfig
+    )
+    """Captured target-logit diagnostics, excluded from computation graph hashes."""
+
+    runtime_trace: RuntimeTraceConfig = Field(default_factory=RuntimeTraceConfig)
+    """Per-engine runner trace controls, excluded from computation graph hashes."""
 
     step_profiler: StepProfilerConfig = Field(default_factory=StepProfilerConfig)
     """Per-engine speculative timing; excluded from computation graph hashes."""

@@ -50,8 +50,8 @@ diagnostics and warmup-only selection do not.
 
 | Batch | Implementation boundary | Status |
 |---|---|---|
-| C1a | C0 ledger; three profilers share collection/aggregation; ordered warmup; typed runtime and diagnostic configuration | Validated in #1130; merge checks in progress |
-| C1b | Staged input resources and ordinary speculative sampling boundary | Pending |
+| C1a | C0 ledger; three profilers share collection/aggregation; ordered warmup; typed runtime and diagnostic configuration | Merged as #1130 (`c31d98d333d90`) |
+| C1b | Staged input resources and ordinary speculative sampling boundary | Implemented; operator and synthetic validation recorded below |
 | C2a | GDN compute plan, providers and shared stages | Pending |
 | C2b | GDN metadata and state preparation/commit | Pending |
 | C3 | Ordered defaults, model qualification and engine-local effective values | Pending |
@@ -138,3 +138,58 @@ Validation commands use the affected runner/MTP safety, GDN metadata, Mamba stat
 and new `test_step_profiler.py` suites under `tests/v1/`, followed by the normal
 pre-commit checks (including mypy and layering). The C0 ledger and per-batch
 status remain the handoff for C1b–C4b; none of those batches are claimed complete.
+
+## C1b implementation and acceptance
+
+The V1 runner binds `InputTransferSession` once through the platform hook. The
+session owns preparation mode, event and trace counters; each `CpuGpuBuffer`
+owns exactly one `StagedCopyOwner`. This preserves the original per-buffer
+64-source bound, pinned-source lifetime and copy-stream ordering. It does not
+expand the opt-in, single-request/token, non-speculative CUDA70 gate. The old
+prepare-event property and staged-copy methods forward to these sole owners.
+Synchronization or event-record failures now restore preparation mode; if a
+copy may already be in flight when recording fails, the owner retains its
+source until the stream confirms completion. No buffer/event owner is global.
+
+`BaseSpeculator` now exposes target preparation, optional sampling and target
+trace hooks. The V2 runner consumes three explicit outcomes: `SamplerOutput`,
+`ComputedTargetLogits`, or `None`. Completed logits can themselves be `None` on
+non-gather ranks: this still means projection has already run. The DFlash2
+implementation owns sparse verification; its old fallback import aliases the
+same outcome type. Grammar application, rejection sampling and accepted/rejected
+counts retain their order. Ordinary DFlash/Eagle use the default fallback;
+runner-generation selection is unchanged. Deferred tree tracing stays at its
+existing V1 boundary.
+
+`KernelConfig.sm70_runtime.staged_input`, `ObservabilityConfig.runtime_trace`
+and `ObservabilityConfig.spec_decode_trace` capture legacy compatibility input
+once, with explicit typed values taking precedence. Unified `VLLM_SM70_DEBUG`
+retains priority over the event-trace alias. The target trace preserves the
+legacy exact-string `1` parser and ignores malformed thresholds when disabled.
+These host-transfer/diagnostic settings do not alter model graph hashes. Event
+trace counters are per engine; existing unmigrated standalone trace functions
+retain their compatibility entry points.
+
+Local affected CPU coverage: **85 passed, 2 CUDA skips**. On 54633, the unchanged
+C1a baseline passed **29 tests**; the candidate passed **77 tests**, including
+source mutation immediately after staged enqueue, changed-input graph replay,
+exact synthetic state, both initialization orders with cached legacy getters,
+event/copy failure ownership, three sampling outcomes, and cached-logit reuse.
+The existing sparse/logit tests retain their original arithmetic tolerances;
+new transfer/replay tests require exact tensor equality. No weights were loaded.
+
+C1b uses the same Python/Torch/CUDA/driver/native artifacts as C1a. GPU 0 was
+reserved and checked idle before running the pair. Neither source nor tests
+modify other tasks' runtimes or caches. Full local pre-commit, including mypy,
+passes. The previous #1130 final CI run also completed successfully.
+
+Runner input-preparation lifecycle branches now share one context manager;
+source leases remain independently owned per buffer. The V2 runner's two
+DFlash2-specific preparation/sampling dispatch sites become feature hooks,
+while the verifier remains one implementation. On the expanded C inventory
+(which includes the pre-existing buffer, event-trace and speculator files on
+both sides), parameter read sites decrease **376 → 370**. Alias declarations
+remain visible in the generated explanation. Repository coupling decreases
+from platform **3756 → 3727**, model **2322 → 2315**, raw environment **271 → 269**;
+no ownership whitelist changes are used. Sparse-verifier alignment dumps and
+DDTree tracing remain with their feature owners and are not claimed migrated.

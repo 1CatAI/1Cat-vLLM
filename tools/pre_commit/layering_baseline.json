@@ -480,6 +480,9 @@
  "vllm/v1/spec_decode/dflash.py": {
   "env": 2
  },
+ "vllm/v1/spec_decode/diagnostics.py": {
+  "model": 1
+ },
  "vllm/v1/spec_decode/dspark.py": {
   "model": 4
  },
@@ -509,8 +512,7 @@
   "model": 2
  },
  "vllm/v1/worker/gpu/model_runner.py": {
-  "env": 2,
-  "model": 15,
+  "model": 3,
   "platform": 8
  },
  "vllm/v1/worker/gpu/model_states/mamba_hybrid.py": {
@@ -559,8 +561,8 @@
  },
  "vllm/v1/worker/gpu_model_runner.py": {
   "env": 41,
-  "model": 665,
-  "platform": 277
+  "model": 669,
+  "platform": 248
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 3,
