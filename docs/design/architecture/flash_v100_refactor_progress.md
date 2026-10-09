@@ -19,8 +19,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native/Qwen passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 4b: native decode candidates | #1081 | CPU/golden/strict/native/Qwen passed | Private references 374 → 370 | 1691 passes / same 7 failures; 12 outputs exact; named timings and 4 Qwen contracts pass | Host/spec model gates |
-| 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase/native passed | Forward 597 → 402; private 370 → 358 | 1691 passes / same 7 failures; 12 outputs exact; named timings pass | Model gates |
-| 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
+| 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase/native/Qwen passed | Forward 597 → 402; private 370 → 358 | 1691 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts pass | Host/spec model gates |
+| 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase/GPU regression passed | Production unchanged | 1692 passes / same 7 failures; no changed old outcomes | Host/spec token records |
 | 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | GPU gates |
 | 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
 | 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Queued | GPU gates |
@@ -35,7 +35,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Queued | GPU gates |
 | 6j: tree visibility feature ownership | #1107 | CPU/golden/strict/rebase passed | Private 308 → 303; model terms 151 → 137 | Queued | GPU gates |
 | 6k: feature contract ownership | #1108 | CPU/golden/strict/rebase passed | Private 303 → 301; model terms 137 → 126 | Four queues staged | GPU gates |
-| 6l: dynamic feature policies | — | CPU/golden/strict passed | Private 301 → 287; model terms 126 → 83 | Required | Rebase/GPU gates |
+| 6l: dynamic feature policies | #1109 | CPU/golden/strict/rebase passed | Private 301 → 287; model terms 126 → 83 | Four queues staged | GPU gates |
+| 6m: decode one-shot logging | — | Full CPU/golden/strict and logger tests passed | State flags 29 → 20; private 287 → 269 | Required | Rebase/GPU gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -1218,3 +1219,51 @@ three requests each (`a3-step4b-v2/logs/qwen-*-compare.log`, `qwen.done`).
 Host/spec baseline failures remain unresolved; no complete model gate claimed.
 The current upstream heads for #1028 and #1048 were rechecked and still match
 the pinned replay/reference SHAs. No frozen follow-up PR was modified.
+
+## Step 6m process-wide decode log events
+
+PR #1109 is `78df907297dfc8d396ad5e458952d6f56cd8042a`. Its actual
+integration with #1028 is `7f4d3e6a61ae9d5351e5d8214a32f6298f833cf8`, tree
+`a252bcd391af331dd9d507c9e1d51e603fe0b5c9`, equal to clean merge-tree.
+Integration tests pass 37 cases / 98 GPU skips. Four verified queues are
+staged as `a3-step6l` on 54633. No complete model gate or main merge claimed.
+
+Nine decode log flags now use explicit process-wide logger keys. Existing
+info_once/warning_once behavior remains unchanged when no key is supplied;
+explicit namespaced keys deduplicate across changing messages, arguments and
+logger instances without LRU expiry. The original outer guards remain, so
+already-observed events do not reevaluate guarded log arguments. Observation
+is recorded only after a successful logging call, at the original assignment
+site even for an injected logger. Log levels, messages and process scope stay
+unchanged. This is a rewrite without a mechanical body move.
+
+Legacy flag names are live module views of the actual logger keys. The strict
+patch auditor retains custom module setters and credits only a production
+read of the matching logger key; patch setup/property reads are not evidence.
+The focused 15-case strict run passes all immutable golden and calculation
+hashes (`a3-decode-once-focused.log`, `a3-decode-once-focused-shim.json`). Its
+flag consumption points are the real dense-cache/reference methods. Five
+boundary cases pass, covering process granularity, changed payload/logger,
+non-expiring event keys, scope decline, emission errors, unchanged unkeyed
+behavior, and reset controls across two real attention instances
+(`a3-decode-once-boundary.log`). All 22 existing logger tests pass
+(`a3-decode-once-logger.log`). Metrics reduce to
+153 / 315 / 269 / 0 / 83 / 0 / 20; full strict and GPU gates remain required.
+
+The complete fixed-source strict suite passes **362 tests / 1 skip / 28 GPU
+exclusions** (`a3-decode-once-strict.log`, `a3-decode-once-shim.json`). All
+813 golden traces, original calculation/metadata hashes and actual patch
+consumption pass. The sixth boundary launches an isolated strict auditor
+and proves that a flag patched/read only by the test is still rejected as
+unconsumed (`a3-decode-once-auditor-negative.log`). Pre-commit/mypy/layering
+pass (`a3-decode-once-precommit-final.log`); the method-binding map needed an
+explicit Callable type after optional keyed signatures diverged. No production
+or source-oracle file changes during the accepted strict run.
+
+Step 4c Qwen validation completes at 2026-10-09 08:10:48 +08:00: all four
+FP16/E4M3 × eager/graph contracts agree on route/token records for three
+requests each (`a3-step4c-v2/logs/qwen-*-compare.log`, `qwen.done`). The
+recorder follow-up completes GPU regression at 08:07:39 +08:00 with 1692
+passes / the same seven failures, one new pass and no changed old outcomes
+(`a3-snapshot-v2/logs/regression-parity.json`, `regression.done`). Both PR
+bodies reflect these results; host/spec baseline failures remain unresolved.

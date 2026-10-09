@@ -2,11 +2,11 @@
   "metrics": {
     "forward": 153,
     "largest_function": 315,
-    "cross_module_private": 287,
+    "cross_module_private": 269,
     "import_cycles": 0,
     "model_names_outside_spec": 83,
     "env_outside_config": 0,
-    "state_flags": 29
+    "state_flags": 20
   },
   "cycles": [],
   "edges": [
@@ -157,10 +157,6 @@
     [
       "vllm.v1.attention.backends.flash_v100.decode",
       "vllm.v1.attention.backends.flash_v100.routing"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.decode",
-      "vllm.v1.attention.backends.flash_v100.state"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.decode",
@@ -529,10 +525,6 @@
       "vllm.v1.attention.backends.flash_v100.debug_compare"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.decode",
-      "vllm.v1.attention.backends.flash_v100.state"
-    ],
-    [
       "vllm.v1.attention.backends.flash_v100.impl",
       "vllm.v1.attention.backends.flash_v100.debug"
     ],
@@ -632,7 +624,7 @@
     },
     {
       "file": "decode.py",
-      "line": 743,
+      "line": 765,
       "expression": "_config.raw('VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO', '1')",
       "via_config": true,
       "owner": "xqa",
@@ -1612,14 +1604,14 @@
     "decode.py:_xqa_kv_codec": 9,
     "decode.py:_call_flash_attn_decode_paged": 82,
     "decode.py:_anchored_swa_params": 27,
-    "decode.py:_flash_v100_decode_as_paged_prefill": 209,
-    "decode.py:_flash_v100_decode_dense_cache": 96,
-    "decode.py:_flash_v100_decode_dense_reference": 75,
+    "decode.py:_flash_v100_decode_as_paged_prefill": 228,
+    "decode.py:_flash_v100_decode_dense_cache": 98,
+    "decode.py:_flash_v100_decode_dense_reference": 77,
     "decode.py:_flash_v100_decode": 64,
     "decode.py:xqa": 80,
     "decode.py:scalar": 61,
     "decode.py:admit": 2,
-    "decode.py:run": 47,
+    "decode.py:run": 49,
     "dense_prefill.py:clear_flash_attn_v100_workspaces": 9,
     "dense_prefill.py:_uniform_cu_seqlens": 31,
     "dense_prefill.py:_get_prefill_dense_splitkv3_workspace": 49,
@@ -1862,6 +1854,8 @@
     "spec/verify_metadata.py:attach_prepared_metadata": 35,
     "spec/verify_metadata.py:update_decode_metadata": 284,
     "spec/verify_metadata.py:_ensure_smallq_decode_buffers": 24,
+    "state.py:__getattr__": 4,
+    "state.py:__setattr__": 5,
     "verify.py:kv_codec": 2,
     "verify.py:__init__": 30,
     "verify.py:validate_contract": 2,

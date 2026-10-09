@@ -53,6 +53,10 @@ def audit_legacy_patches(request):
         yield
         return
     with strict_shim() as legacy:
+        from vllm.logger import log_once_seen
+        from vllm.v1.attention.backends.flash_v100 import state
+
+        log_names = {key: name for name, key in state.LOG_KEYS.items()}
         original_class = type(legacy)
         targets = {}
         c_targets = []
@@ -90,6 +94,20 @@ def audit_legacy_patches(request):
                         c_targets.append((name, value))
 
         def observe(frame, event, arg):
+            if event == "return" and frame.f_code is log_once_seen.__code__:
+                name = log_names.get(frame.f_locals.get("key"))
+                caller = frame.f_back
+                if (
+                    name in globals_targets
+                    and arg is globals_targets[name]
+                    and production(caller)
+                ):
+                    # A virtual legacy flag counts only when production reads
+                    # its actual logger key. Shim reads during patch setup do
+                    # not count (their __getattr__ caller is excluded).
+                    report[name]["read_from"].append(
+                        caller.f_globals["__name__"] + ":" + caller.f_code.co_name
+                    )
             if event == "call":
                 names = targets.get(frame.f_code, set())
                 name = next(iter(names)) if len(names) == 1 else None
@@ -166,8 +184,12 @@ def audit_legacy_patches(request):
                 return value
 
         owners = [(module, type(module)) for module in legacy._package.SUBMODULES]
-        for module, _ in owners:
-            module.__class__ = ObservedOwner
+        for module, cls in owners:
+            module.__class__ = (
+                ObservedOwner
+                if cls is types.ModuleType
+                else type("ObservedCustomOwner", (ObservedOwner, cls), {})
+            )
 
         legacy.__class__ = ObservedModule
         previous = sys.getprofile()

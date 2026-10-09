@@ -11,12 +11,11 @@ from typing import Any
 
 import torch
 
-from vllm.logger import init_logger
+from vllm.logger import init_logger, log_once_seen, set_log_once_state
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100.plan import routing as _plan
 from vllm.v1.attention.backends.flash_v100.workspace import (
     V100Workspace as V100Workspace,
@@ -269,12 +268,14 @@ class DecodeExecutor:
         order as dense/paged prefill. It is a strictness bridge while the
         scalar paged decode kernel is brought to bitwise parity.
         """
-        if not _state._logged_decode_paged_prefill:
-            logger.warning(
+        if not log_once_seen("flash_v100._logged_decode_paged_prefill"):
+            logger.warning_once(
                 "FLASH_ATTN_V100 decode-as-paged-prefill path active. This is "
-                "for strict debugging and may be slower than paged decode."
+                "for strict debugging and may be slower than paged decode.",
+                scope="process",
+                key="flash_v100._logged_decode_paged_prefill",
             )
-            _state._logged_decode_paged_prefill = True
+            set_log_once_state("flash_v100._logged_decode_paged_prefill", True)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
@@ -326,12 +327,16 @@ class DecodeExecutor:
                     and self.config.policy.use_decode_wmma_wrapper
                     and self.ops.wmma is not None
                 ):
-                    if not _state._logged_decode_wmma_wrapper:
-                        logger.info(
+                    if not log_once_seen("flash_v100._logged_decode_wmma_wrapper"):
+                        logger.info_once(
                             "FLASH_ATTN_V100 decode WMMA wrapper path active "
-                            "(experimental exactness bridge)."
+                            "(experimental exactness bridge).",
+                            scope="process",
+                            key="flash_v100._logged_decode_wmma_wrapper",
                         )
-                        _state._logged_decode_wmma_wrapper = True
+                        set_log_once_state(
+                            "flash_v100._logged_decode_wmma_wrapper", True
+                        )
                     q_wmma = q_batch[:, 0].contiguous()
                     out_wmma = out_batch_view[:, 0]
                     self.ops.wmma(
@@ -354,12 +359,18 @@ class DecodeExecutor:
                     and q_bhmd.is_contiguous()
                     and out_bhmd.is_contiguous()
                 ):
-                    if not _state._logged_decode_paged_prefill_bhmd:
-                        logger.info(
+                    if not log_once_seen(
+                        "flash_v100._logged_decode_paged_prefill_bhmd"
+                    ):
+                        logger.info_once(
                             "FLASH_ATTN_V100 decode-as-paged-prefill "
-                            "BHMD out path active."
+                            "BHMD out path active.",
+                            scope="process",
+                            key="flash_v100._logged_decode_paged_prefill_bhmd",
                         )
-                        _state._logged_decode_paged_prefill_bhmd = True
+                        set_log_once_state(
+                            "flash_v100._logged_decode_paged_prefill_bhmd", True
+                        )
                     compare_call_idx = self.ops.reserve_bhmd_compare()
                     safe_bmhd = None
                     if compare_call_idx is not None:
@@ -378,12 +389,19 @@ class DecodeExecutor:
                     raw_q_bhmd = q_bhmd
                     q_out_same_storage = _routing._same_storage(raw_q_bhmd, out_bhmd)
                     if q_out_same_storage:
-                        if not _state._logged_decode_paged_prefill_bhmd_q_clone:
-                            logger.info(
+                        if not log_once_seen(
+                            "flash_v100._logged_decode_paged_prefill_bhmd_q_clone"
+                        ):
+                            logger.info_once(
                                 "FLASH_ATTN_V100 BHMD out path cloned Q to "
-                                "avoid input/output storage aliasing."
+                                "avoid input/output storage aliasing.",
+                                scope="process",
+                                key="flash_v100._logged_decode_paged_prefill_bhmd_q_clone",
                             )
-                            _state._logged_decode_paged_prefill_bhmd_q_clone = True
+                            set_log_once_state(
+                                "flash_v100._logged_decode_paged_prefill_bhmd_q_clone",
+                                True,
+                            )
                         raw_q_bhmd = q_bhmd.clone()
                     self.ops.prefill_bhmd(
                         raw_q_bhmd,
@@ -497,12 +515,14 @@ class DecodeExecutor:
                 attn_metadata,
                 output,
             )
-        if not _state._logged_decode_dense_cache:
-            logger.warning(
+        if not log_once_seen("flash_v100._logged_decode_dense_cache"):
+            logger.warning_once(
                 "FLASH_ATTN_V100 decode dense-cache path active. This is "
-                "single-sequence strict debugging and may be slower than paged decode."
+                "single-sequence strict debugging and may be slower than paged decode.",
+                scope="process",
+                key="flash_v100._logged_decode_dense_cache",
             )
-            _state._logged_decode_dense_cache = True
+            set_log_once_state("flash_v100._logged_decode_dense_cache", True)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
@@ -576,12 +596,14 @@ class DecodeExecutor:
         dense Flash-V100 oracle while the paged decode kernel is brought to
         bitwise parity.
         """
-        if not _state._logged_decode_dense_reference:
-            logger.warning(
+        if not log_once_seen("flash_v100._logged_decode_dense_reference"):
+            logger.warning_once(
                 "FLASH_ATTN_V100 decode dense-reference path active. This is "
-                "for strict debugging and is expected to be slower than paged decode."
+                "for strict debugging and is expected to be slower than paged decode.",
+                scope="process",
+                key="flash_v100._logged_decode_dense_reference",
             )
-            _state._logged_decode_dense_reference = True
+            set_log_once_state("flash_v100._logged_decode_dense_reference", True)
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
@@ -917,10 +939,15 @@ class DecodeUnavailable(DecodeCandidate):
         if not self.executor.config.policy.allow_triton_fallback:
             raise RuntimeError(message)
         if self.executor.config.policy.use_flash_v100 and (
-            not _state._warned_decode_fallback
+            not log_once_seen("flash_v100._warned_decode_fallback")
         ):
-            logger.warning("%s", message)
-            _state._warned_decode_fallback = True
+            logger.warning_once(
+                "%s",
+                message,
+                scope="process",
+                key="flash_v100._warned_decode_fallback",
+            )
+            set_log_once_state("flash_v100._warned_decode_fallback", True)
         self.executor.ops.profile_trace(
             "forward branch=decode_triton_no_flash_decode layer=%s", request.layer_name
         )
@@ -1075,9 +1102,14 @@ class DecodeScalarDisabled(DecodeCandidate):
         )
         if not self.executor.config.policy.allow_triton_fallback:
             raise RuntimeError(message)
-        if not _state._warned_decode_strict_fallback:
-            logger.warning("%s", message)
-            _state._warned_decode_strict_fallback = True
+        if not log_once_seen("flash_v100._warned_decode_strict_fallback"):
+            logger.warning_once(
+                "%s",
+                message,
+                scope="process",
+                key="flash_v100._warned_decode_strict_fallback",
+            )
+            set_log_once_state("flash_v100._warned_decode_strict_fallback", True)
         self.executor.ops.profile_trace(
             "forward branch=decode_triton_scalar_disabled layer=%s", request.layer_name
         )
@@ -1100,12 +1132,14 @@ class DecodePaged(DecodeCandidate):
         return True
 
     def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
-        if not _state._logged_decode_flash:
-            logger.info(
+        if not log_once_seen("flash_v100._logged_decode_flash"):
+            logger.info_once(
                 "FLASH_ATTN_V100 decode path active (paged KV, CUDA-graph "
-                "safe; selected route is reported separately)."
+                "safe; selected route is reported separately).",
+                scope="process",
+                key="flash_v100._logged_decode_flash",
             )
-            _state._logged_decode_flash = True
+            set_log_once_state("flash_v100._logged_decode_flash", True)
         if self.executor.ops.draft_debug_enabled():
             self.executor.ops.draft_debug_log(
                 "forward:decode",

@@ -119,6 +119,7 @@ SUBMODULES = (
 # Renamed compatibility bindings resolve to their actual owner. Do not copy
 # function values: old-name writes must also affect the public execution path.
 COMPATIBILITY_ALIASES = {
+    **{name: (state, name) for name in state.LOG_KEYS},
     "_allocate_growing_workspace": (workspace, "allocate_growing_workspace"),
     "_VALID_DECODE_PARTITION_SIZES": (routing, "VALID_DECODE_PARTITION_SIZES"),
     **{

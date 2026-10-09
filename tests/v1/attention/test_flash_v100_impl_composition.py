@@ -294,6 +294,26 @@ _VERIFY_METHODS = {
 class _Normalize(ast.NodeTransformer):
     in_cache = False
 
+    def _log_flag(self, node):
+        assert isinstance(node, ast.Constant)
+        names = {key: name for name, key in state.LOG_KEYS.items()}
+        assert node.value in names
+        return names[node.value]
+
+    def visit_Expr(self, node):
+        call = node.value
+        if (
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func) == "set_log_once_state"
+        ):
+            assert not call.keywords and len(call.args) == 2
+            assert ast.unparse(call.args[1]) == "True"
+            return ast.Assign(
+                targets=[ast.Name(self._log_flag(call.args[0]), ast.Store())],
+                value=ast.Constant(True),
+            )
+        return self.generic_visit(node)
+
     def visit_Name(self, node):
         if node.id == "seen_contracts":
             return ast.Name(id="_logged_dflash_attention_contracts", ctx=node.ctx)
@@ -468,6 +488,19 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
+        if ast.unparse(node.func) == "log_once_seen":
+            assert not node.keywords and len(node.args) == 1
+            return ast.Name(self._log_flag(node.args[0]), ast.Load())
+        if ast.unparse(node.func) in ("logger.info_once", "logger.warning_once"):
+            explicit = [k for k in node.keywords if k.arg == "key"]
+            if explicit:
+                assert len(explicit) == 1
+                self._log_flag(explicit[0].value)
+                assert len(node.keywords) == 2
+                assert ast.unparse(node.keywords[0].value) == "'process'"
+                assert isinstance(node.func, ast.Attribute)
+                node.func.attr = node.func.attr.removesuffix("_once")
+                node.keywords = []
         if ast.unparse(node.func) == "ddtree_branch_attention_correction":
             argument = next(k for k in node.keywords if k.arg == "impl")
             assert ast.unparse(argument.value) == "self.config"
@@ -668,7 +701,7 @@ def test_legacy_state_rebinding_reaches_moved_decode_method(monkeypatch):
         )
         is query
     )
-    logger.warning.assert_not_called()
+    logger.warning_once.assert_not_called()
     for _ in range(2):
         assert (
             instance._flash_v100_decode_dense_reference(
@@ -678,7 +711,7 @@ def test_legacy_state_rebinding_reaches_moved_decode_method(monkeypatch):
         )
     assert state._logged_decode_dense_reference
     assert legacy._logged_decode_dense_reference
-    logger.warning.assert_called_once()
+    logger.warning_once.assert_called_once()
 
 
 def test_extracted_compare_super_uses_original_class_cell(monkeypatch):
