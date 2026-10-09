@@ -1116,8 +1116,12 @@ class Qwen4ExpForCausalLM(
                 method.process_weights_after_loading(module)
 
     def prepare_sm70_decode_graph_model(self) -> bool:
-        """Create the shared-weight decode compiler just before graph capture."""
-        if not graph_policy().dual_compile:
+        """Create the shared-weight decode compiler just before graph capture.
+
+        Capture runs outside a forward context and without a current config,
+        so read this engine's resolved policy instead of a standalone one.
+        """
+        if not graph_policy(self.vllm_config).dual_compile:
             return False
         if self._sm70_decode_graph_model is None:
             decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
