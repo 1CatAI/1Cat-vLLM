@@ -117,6 +117,20 @@ def measure(runtime, packed, rank, m, args):
         graphs[True].replay()
         assert_bitwise(outputs, reference)
         checks += 1
+    counter_wrap_checks = 0
+    if runtime.bar.numel() >= 4:
+        # Cross both the signed boundary and uint32 rollover inside a replay,
+        # then alternate policies using the same exchange buffers and epoch.
+        for base in (2**31 - 96, -96):
+            runtime.bar[2:].fill_(base)
+            change_input(20261100 + counter_wrap_checks)
+            graphs[False].replay()
+            reference = tuple(x.clone() for x in outputs)
+            for schedule in (True, False, True):
+                graphs[schedule].replay()
+                assert_bitwise(outputs, reference)
+                checks += 1
+                counter_wrap_checks += 1
     torch.cuda.synchronize()
     for _ in range(4):
         for graph in graphs.values():
@@ -138,7 +152,12 @@ def measure(runtime, packed, rank, m, args):
             end.synchronize()
             us = start.elapsed_time(end) * 1000 / args.repeats / len(packed)
             times["candidate" if schedule else "reference"].append(us)
-    local = dict(rank=rank, bitwise_checks=checks, samples_us=times)
+    local = dict(
+        rank=rank,
+        bitwise_checks=checks,
+        counter_wrap_checks=counter_wrap_checks,
+        samples_us=times,
+    )
     records = [None] * 4
     dist.all_gather_object(records, local)
     critical = {
@@ -154,6 +173,7 @@ def measure(runtime, packed, rank, m, args):
     return dict(
         M=m,
         bitwise_checks_per_rank=checks,
+        counter_wrap_checks_per_rank=counter_wrap_checks,
         critical_median_us=medians,
         critical_samples_us=critical,
         rank_records=records,

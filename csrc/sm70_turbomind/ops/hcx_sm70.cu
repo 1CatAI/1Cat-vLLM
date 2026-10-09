@@ -167,6 +167,21 @@ __device__ __forceinline__ void grid_bar(unsigned* bar, unsigned target) {
   __syncthreads();
 }
 
+// A persistent counter avoids the end-of-kernel arrival/reset phase. Signed
+// differences handle uint32 wrap while fewer than 2^31 arrivals are in flight.
+__device__ __forceinline__ void grid_bar_epoch(unsigned* bar, unsigned target) {
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    atomicAdd(bar, 1u);
+    const auto start = clock64();
+    while (static_cast<int>(ldv(bar) - target) < 0)
+      if (clock64() - start > 4000000000LL) __trap();
+    __threadfence();
+  }
+  __syncthreads();
+}
+
 __device__ __forceinline__ unsigned long long gtime() {
   unsigned long long v;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(v));
@@ -185,6 +200,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   const int i = blockIdx.x, t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int M = a.M, rk = a.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
   const unsigned ep = ldv(a.seq), tag = ep + 1;
+  const unsigned base = LOCAL_SCHEDULE ? ldv(a.bar + 3) : 0;
   const int r8 = (lane & 3) + ((lane & 16) ? 4 : 0), quad = (lane >> 2) & 3;
   // ---- 1. all-reduce of the block output for columns [32i, 32i + 32). The
   // partial is loaded and pushed before the weight prefetch is issued, so the
@@ -434,7 +450,10 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   }
   TS(3);
   const unsigned gb = (OF >= 0 && a.gz) ? NC : 0;
-  grid_bar(a.bar, gb + NC);
+  if constexpr (LOCAL_SCHEDULE)
+    grid_bar_epoch(a.bar + 2, base + NC);
+  else
+    grid_bar(a.bar, gb + NC);
   TS(4);
   // The split-K partials of this warp's first output do not depend on rrms:
   // load them now so the two L2 round trips (sq for rrms, dpart for the
@@ -552,7 +571,10 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     if (!FULL && ((c >= 80 * p1 && c < 80 * p1 + 80) || (p1 == 3 && c >= 320)))
       st2(a.lora[p2] + pos, w, tag);
   }
-  grid_bar(a.bar, gb + 2 * NC);
+  if constexpr (LOCAL_SCHEDULE)
+    grid_bar_epoch(a.bar + 2, base + 2 * NC);
+  else
+    grid_bar(a.bar, gb + 2 * NC);
   for (int idx = t; idx < M * 320; idx += 256) {
     const int rw = idx / 320, c = idx % 320;
     ls[rw][c] = __ushort_as_half(
@@ -683,9 +705,18 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
     }
   }
-  __syncthreads();
+  if constexpr (!LOCAL_SCHEDULE) __syncthreads();
   TS(8);
-  if (t == 0) {
+  if constexpr (LOCAL_SCHEDULE) {
+    // All CTAs read ep/base before the first grid barrier completes. The next
+    // same-stream kernel starts after every CTA finishes, so one writer can
+    // publish the next epoch without an arrival counter or final CTA join.
+    // Separate counter words keep interleaved legacy/local calls valid.
+    if (i == 0 && t == 0) {
+      a.bar[3] = base + 2 * NC;
+      a.seq[0] = tag;
+    }
+  } else if (t == 0) {
     __threadfence();
     if (atomicAdd(a.bar + 1, 1u) == NC - 1) {
       a.bar[0] = 0;
@@ -788,6 +819,8 @@ void sm70_hcx_out(
     HCXO_GO(false, O);
   if (!ox) {
     if (full && local_schedule) {
+      TORCH_CHECK(bar.numel() >= 4,
+                  "HCX local schedule needs four counter words");
       hcx::hcx_kernel<true, -1, true><<<hcx::NC, 256, 0, st>>>(a);
     } else {
       HCXO_F(-1)

@@ -282,7 +282,9 @@ class Sm70HcxRuntime:
             self.dpart = torch.zeros(
                 80 * 8 * 96 * 4, device=device, dtype=torch.float32
             )
-            self.bar = torch.zeros(2, device=device, dtype=torch.int32)
+            # Legacy arrival/reset counters and separate local-schedule
+            # cumulative counter/base permit alternating graph policies.
+            self.bar = torch.zeros(4, device=device, dtype=torch.int32)
             self.seq = torch.zeros(1, device=device, dtype=torch.int32)
             torch.accelerator.synchronize()
         dist.barrier(group=group)
