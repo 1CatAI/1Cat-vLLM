@@ -51,6 +51,11 @@ MMA instructions; its M5 improvement is negligible and it is not selected.
 Lower register counts and fewer lookup instructions alone are not latency
 evidence.
 
+A three-group weight-prefetch pipeline is also rejected: M5 rises from
+1.2451 to 1.3420 ms, despite 384 bit-identical output checks. Registers rise
+to 174; GDN/attention inputs regress while output projections improve only
+slightly. Deeper prefetch is not selected for these mixed-format shapes.
+
 An initial CUDA 12.0 screen is retained separately. Its control was faster
 than the installed CUDA 12.8 kernel, so those cross-compiler differences are
 not counted as optimization gains. All results in the table use CUDA 12.8.
@@ -117,6 +122,13 @@ The shared-expert translation unit is rebuilt with the normal CMake flags
 and linked into the full core. Other source/native components retain the
 frozen `86e9675964` control; the measured dense translation unit is unchanged
 between that control and the PR base before this patch. No wheel is rebuilt.
+
+The final admitted-dimension GPU suite passes all 19 cases. A fresh process
+running the native-only reproduction command passes 192 real-shard official
+reference checks, with maximum relative L2 error 0.0008691. Its standalone
+M5/M20 totals are 1.2246/2.2044 ms; these are reproducibility observations,
+not a replacement denominator for the paired comparison above. No research
+extension is imported by this command.
 
 The additional GPU suite covers all six dense source types, real admitted
 dimensions, mixed segments, strided output, shared-gate rounding, poisoned
