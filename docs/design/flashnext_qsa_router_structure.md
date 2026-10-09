@@ -227,6 +227,84 @@ exact IDs and a maximum 5.9605e-8 error in selection/normalization itself.
 The first stricter cross-projection weight comparison failed; this separate
 projection/selection accounting explains it without claiming bit identity.
 
+### Joint router and shared-expert scheduling
+
+Two further research kernels combine the existing router projection, exact
+expert selection, input Q8 quantization and shared gate/up. Shared down and
+routed expert projections remain the installed implementations. The first
+schedule assigns different CTAs to the independent work and connects router
+producers to selectors with readiness tags. The second lets one router warp
+and the original eight shared-expert warps execute concurrently inside a CTA,
+with a named barrier excluding the router warp. Both retain each projection's
+FP32 summation order.
+
+Eight complete MoE calls on real IQ3_S layer-17 weights take 0.6520 to
+0.7009 ms for separate CTA roles and 0.6471 to 0.7394 ms for concurrent
+in-CTA roles. Activations are synthetic and the last input hits 47 experts;
+these measurements are rejection screens, not a model-wide routing sample.
+Both schedules are rejected. Fusing independent branches also joins their
+completion before the next routed-expert launch, and the fused binary
+requires 166/168 registers per thread. The first 99-CTA schedule exceeds
+one resident 80-SM wave; the second reduces the grid to 69 CTAs but remains
+slower. Resource declarations and the added dependency are known facts;
+their individual timing contributions have not been isolated.
+
+For the initial input and four changed-input graph replays, router logits,
+expert/source IDs, Q8 activations/intermediates, and shared outputs are exact.
+Routing normalization differs by at most 1.4901e-8; the maximum routed-output
+relative L2 difference is 1.1673e-5. Neither candidate reaches model testing.
+
+### Sparse attention concurrency
+
+The existing grouped page4 entry uses `grid(1, 1, num_groups)`, and its
+partial kernel fixes `active_splits=1` for sparse attention. Padding M5 to
+its eight-query contract therefore gives one active attention CTA. The
+[earlier grouped/XQA screen](https://github.com/1CatAI/1Cat-vLLM/pull/398)
+rejected this entry at the verifier shape. Its result does not evaluate
+shared-query KV reuse with parallel context stripes.
+
+A new research screen retains those sparse masks and the existing grouped
+MMA computation, divides the selected KV union across context stripes and
+merges FP32 partitions. The first timing excludes union planning and the
+protected hot/cold KV reader. This optimistic bound must show enough benefit
+to pay those costs before adapting the full chain.
+
+With M5/H6/D256, 816-token pages, 2,051 selected columns and about 82% shared
+selected pages, twelve distinct layer caches take 0.5969 to 0.4355 ms,
+including the FP32 partition merge. The 0.1613 ms difference excludes CPU
+union planning and protected-reader adaptation; it is not a full-chain gain.
+Initial and two changed-input graph replays pass a direct FP64 attention
+oracle. Maximum relative L2 errors are 2.918e-4 for the control and 2.953e-4
+for the candidate; maximum candidate/control absolute difference is 3.052e-5.
+
+A second implementation maps the 30 live query/head rows into four MMA884
+warps, replacing the eight-query template. It is slower than the original
+striped implementation: the twelve-layer chain takes 0.5712 ms with an
+explicit V transpose and 0.5053 ms with row-major PV operands. Both pass the
+same numerical checks. The row-major version eliminates the transpose using
+the documented [PTX MMA884 operand mapping](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-884-f16);
+it does not change operand precision. Neither compact implementation is
+selected, and no additional tile-parameter sweep is justified by these gains.
+
+### Same-process model localization
+
+Fresh-process QSA comparisons cannot uniquely attribute the recorded teacher
+differences to native scoring: all their short teacher contexts select every
+compressed key, independent of scores. A related HCX experiment also reports
+a same-wheel reference/reference cross-start difference while its same-process
+reference recapture is exact. This is new evidence for a more controlled
+comparison, not evidence that either QSA candidate preserves model quality.
+
+A diagnostic therefore retains one loaded target and its original draft
+graphs, recaptures M5/M20 target graphs and compares original, recaptured
+control, scorer-only, direct FP32-probability attention, both changes and
+the original graphs again. The direct-attention operator is already shipped
+in the installed extension; the diagnostic selects it explicitly instead of
+loading a research library. It separately records teacher distributions,
+eight natural continuations, acceptance and symmetric C1/C4 graph ablations.
+Timing is skipped if either same-process control comparison fails. Results
+are pending; neither path is admitted by this diagnostic design alone.
+
 ## Validation and admission
 
 The packaged scorer must pass causal masks, invalid pages, ties, sliced
@@ -246,3 +324,9 @@ provides a useful stable-tie contract for small expert selection.
 provides alternative radix selection and synchronization strategies. Their
 algorithmic ideas require measurements at this workload's 512 experts and
 five query rows; reducing comparison count alone did not improve M5 here.
+
+[Cohere's decode megakernel](https://cohere.com/blog/megakernels) also separates
+ready work at tile granularity and uses named worker barriers. Its overlap
+depends on the actual model dependencies and worker resource contract. The
+joint-router screens above evaluate those constraints on SM70 while keeping
+the existing arithmetic; reducing launch count alone was insufficient.
