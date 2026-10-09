@@ -34,8 +34,8 @@
   "model": 3
  },
  "vllm/config/execution_policy.py": {
-  "model": 14,
-  "platform": 49
+  "model": 18,
+  "platform": 69
  },
  "vllm/config/gdn.py": {
   "env": 1,
@@ -57,8 +57,8 @@
   "platform": 1
  },
  "vllm/config/policy_defaults.py": {
-  "model": 16,
-  "platform": 34
+  "model": 18,
+  "platform": 35
  },
  "vllm/config/speculative.py": {
   "model": 140,
@@ -115,6 +115,9 @@
  },
  "vllm/model_executor/kernels/linear/fp16_gemv_silu.py": {
   "platform": 4
+ },
+ "vllm/model_executor/kernels/lm_head/fp32.py": {
+  "platform": 1
  },
  "vllm/model_executor/kernels/mhc/tilelang.py": {
   "platform": 69
@@ -197,7 +200,7 @@
   "platform": 8
  },
  "vllm/model_executor/layers/fused_moe/router/gate_linear.py": {
-  "platform": 7
+  "platform": 5
  },
  "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": {
   "env": 9,
@@ -211,12 +214,12 @@
   "platform": 2
  },
  "vllm/model_executor/layers/layernorm.py": {
-  "model": 33,
-  "platform": 90
+  "model": 6,
+  "platform": 32
  },
  "vllm/model_executor/layers/linear.py": {
-  "model": 20,
-  "platform": 88
+  "model": 14,
+  "platform": 58
  },
  "vllm/model_executor/layers/logits_processor.py": {
   "env": 2,
@@ -310,11 +313,11 @@
   "platform": 17
  },
  "vllm/model_executor/layers/utils.py": {
-  "platform": 6
+  "platform": 5
  },
  "vllm/model_executor/layers/vocab_parallel_embedding.py": {
-  "model": 124,
-  "platform": 219
+  "model": 18,
+  "platform": 53
  },
  "vllm/model_executor/models/qwen2_moe.py": {
   "env": 1
@@ -541,7 +544,7 @@
  },
  "vllm/v1/worker/gpu/model_runner.py": {
   "model": 3,
-  "platform": 8
+  "platform": 12
  },
  "vllm/v1/worker/gpu/model_states/mamba_hybrid.py": {
   "model": 75,
@@ -590,7 +593,7 @@
  "vllm/v1/worker/gpu_model_runner.py": {
   "env": 41,
   "model": 669,
-  "platform": 238
+  "platform": 237
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 1,

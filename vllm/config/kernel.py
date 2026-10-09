@@ -812,13 +812,6 @@ class KernelConfig:
                 native_verify=self.sm70_gdn_verify,
             )
 
-    def sample_greedy(self, *args):
-        from vllm.v1.worker.gpu.spec_decode.sm70_greedy_verify import (
-            maybe_sample_greedy,
-        )
-
-        return maybe_sample_greedy(*args)
-
     def compute_hash(self) -> str:
         """
         Produces a hash unique to the pass configuration.

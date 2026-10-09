@@ -13,6 +13,7 @@ import torch
 import vllm.model_executor.layers.logits_processor as logits_processor_module
 import vllm.model_executor.models.qwen3_dflash as dflash_model
 import vllm.model_executor.models.qwen3_dflash2 as dflash2_model
+import vllm.model_executor.models.shared_weights as shared_weights
 import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
@@ -799,7 +800,7 @@ def test_dflash_loader_preserves_draft_rope_layout(monkeypatch, draft_style):
 
     monkeypatch.setattr(dflash_utils, "replace", fake_replace)
     monkeypatch.setattr(dflash_utils, "get_model", lambda **_kwargs: draft_model)
-    monkeypatch.setattr(dflash_utils, "get_target_lm_head", lambda *_args: None)
+    monkeypatch.setattr(shared_weights, "get_target_lm_head", lambda *_args: None)
     monkeypatch.setattr(
         dflash_utils, "_validate_dflash_shared_weights", lambda *_args: None
     )
@@ -1107,7 +1108,7 @@ def test_selector_default_path_does_not_allocate_sparse_score_cache(monkeypatch)
 def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
     allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
-    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "1")
     speculator = DFlash2Speculator(None, torch.device("cpu"))
     sparse_logits = speculator.get_sparse_draft_logits()
     assert sparse_logits is not None
@@ -1120,7 +1121,7 @@ def test_selector_opt_in_allocates_sparse_score_cache(monkeypatch):
 def test_selector_alignment_shadow_is_explicit_and_keeps_full_lattice(monkeypatch):
     allocated = torch.full((2, 7, 31), -float("inf"), dtype=torch.float32)
     _stub_base(monkeypatch, allocated)
-    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "1")
     monkeypatch.setattr(envs, "VLLM_SPEC_DUMP_ALIGNMENT", True)
 
     speculator = DFlash2Speculator(None, torch.device("cpu"))
@@ -1411,7 +1412,7 @@ def test_probabilistic_cache_keeps_ids_and_scores_in_request_slot_order(monkeypa
     device = torch.device("cuda")
     dense_cache = torch.zeros((2, 7, 31), dtype=torch.float32, device=device)
     _stub_base(monkeypatch, dense_cache)
-    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True)
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", "1")
     speculator = DFlash2Speculator(None, device)
     speculator.sample_idx_mapping = torch.tensor(
         [1] * 7 + [0] * 7,

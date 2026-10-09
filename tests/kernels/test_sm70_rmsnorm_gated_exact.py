@@ -50,6 +50,7 @@ def test_changed_graph_inputs_and_canaries(
 ):
     require_native()
     monkeypatch.setenv("VLLM_SM70_RMSNORM_GATED_EXACT", "1")
+    default_vllm_config.kernel_config.sm70_rmsnorm_gated_exact = True
     envs.disable_envs_cache()
     torch.manual_seed(20260927)
     x = torch.randn(rows, 128, device="cuda", dtype=torch.float16)
@@ -118,6 +119,7 @@ def test_compiled_norm_keeps_native_bits_across_batch_and_fusion_context(
 ):
     require_native()
     monkeypatch.setenv("VLLM_SM70_RMSNORM_GATED_EXACT", "1")
+    default_vllm_config.kernel_config.sm70_rmsnorm_gated_exact = True
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     envs.disable_envs_cache()
     torch.manual_seed(20260928)

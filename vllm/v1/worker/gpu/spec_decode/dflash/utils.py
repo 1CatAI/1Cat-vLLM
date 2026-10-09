@@ -7,12 +7,16 @@ from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models.interfaces import EagleModelMixin
-from vllm.model_executor.models.utils import PPMissingLayer
-from vllm.platforms import current_platform
-from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
-    _should_share,
-    get_target_lm_head,
+from vllm.model_executor.models.shared_weights import (
+    DFLASH_DRAFT_WEIGHTS,
+    share_embeddings,
+    share_lm_head,
+    validate_dflash_shared_weights,
 )
+from vllm.model_executor.models.shared_weights import (
+    get_target_lm_head as get_target_lm_head,
+)
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -22,45 +26,13 @@ def _validate_dflash_shared_weights(
     shared_embed: bool,
     shared_lm_head: bool,
 ) -> None:
-    if not get_pp_group().is_last_rank:
-        return
-
-    requires_shared_embed = not getattr(dflash_model, "has_own_embed_tokens", False)
-    requires_shared_lm_head = not getattr(dflash_model, "has_own_lm_head", False)
-    logger.info_once(
-        "DFlash shared-weight contract on the final PP stage: "
-        "embedding=%s lm_head=%s draft_has_own_embedding=%s "
-        "draft_has_own_lm_head=%s",
+    validate_dflash_shared_weights(
+        dflash_model,
         shared_embed,
         shared_lm_head,
-        not requires_shared_embed,
-        not requires_shared_lm_head,
+        is_last_rank=get_pp_group().is_last_rank,
+        log=logger,
     )
-    if requires_shared_embed and not shared_embed:
-        raise RuntimeError(
-            "The DFlash checkpoint has no embedding, but the final pipeline "
-            "stage could not share the target embedding. DFlash proposals "
-            "would be invalid."
-        )
-    shared_embed_module = getattr(
-        getattr(dflash_model, "model", None), "embed_tokens", None
-    )
-    if (
-        requires_shared_embed
-        and shared_embed
-        and getattr(shared_embed_module, "_dflash_pp_replica_expected", False)
-        and not getattr(shared_embed_module, "_dflash_pp_replica_loaded", False)
-    ):
-        raise RuntimeError(
-            "The DFlash checkpoint has no embedding, but the shared target "
-            "embedding replica on the final pipeline stage was not loaded."
-        )
-    if requires_shared_lm_head and not shared_lm_head:
-        raise RuntimeError(
-            "The DFlash checkpoint has no lm_head, but the final pipeline "
-            "stage could not share the target lm_head. DFlash proposals "
-            "would be invalid."
-        )
 
 
 def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -111,39 +83,19 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if hasattr(target_model, "get_language_model")
         else target_model
     )
-    # MuseGlimmerForCausalLM marks its inner MuseGlimmerModel as the language
-    # model, so get_language_model() already returns the inner module and has
-    # no .model of its own.
-    target_inner = getattr(target_language_model, "model", target_language_model)
-    draft_inner = dflash_model.model
-
-    target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
-        target_inner, "embedding", None
+    shared_embed = share_embeddings(
+        dflash_model,
+        target_language_model,
+        DFLASH_DRAFT_WEIGHTS,
+        log=logger,
     )
-    draft_embed = getattr(draft_inner, "embed_tokens", None)
-    shared_embed = False
-    if (
-        target_embed is not None
-        and not isinstance(target_embed, PPMissingLayer)
-        and _should_share(
-            dflash_model, "has_own_embed_tokens", draft_embed, target_embed
-        )
-    ):
-        if draft_embed is not None:
-            del draft_inner.embed_tokens
-        draft_inner.embed_tokens = target_embed
-        shared_embed = True
-
-    target_lm_head = get_target_lm_head(target_model, target_language_model)
-    draft_lm_head = getattr(dflash_model, "lm_head", None)
-    shared_lm_head = False
-    if target_lm_head is not None and _should_share(
-        dflash_model, "has_own_lm_head", draft_lm_head, target_lm_head
-    ):
-        if draft_lm_head is not None:
-            del dflash_model.lm_head
-        dflash_model.lm_head = target_lm_head
-        shared_lm_head = True
+    shared_lm_head = share_lm_head(
+        dflash_model,
+        target_model,
+        target_language_model,
+        DFLASH_DRAFT_WEIGHTS,
+        log=logger,
+    )
 
     _validate_dflash_shared_weights(dflash_model, shared_embed, shared_lm_head)
 

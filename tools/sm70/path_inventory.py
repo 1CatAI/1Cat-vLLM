@@ -76,6 +76,8 @@ C_OWNERS = (
     "vllm/model_executor/warmup/",
     "vllm/model_executor/layers/fla/ops/sm70/",
     "vllm/model_executor/layers/fla/ops/gdn_",
+    "vllm/model_executor/kernels/norm/",
+    "vllm/model_executor/kernels/lm_head/",
 )
 
 
@@ -241,6 +243,10 @@ def source_paths(ref: str | None, phase: str = "b") -> list[str]:
         sources.update(
             {
                 "vllm/config/sm70_runtime.py",
+                "vllm/model_executor/kernels/linear/sm70_dense.py",
+                "vllm/model_executor/kernels/linear_io.py",
+                "vllm/model_executor/models/shared_weights.py",
+                "vllm/models/deepseek_v4/sm70/gemv.py",
                 "vllm/config/gdn.py",
                 "vllm/config/gdn_schedule.py",
                 "vllm/config/gdn_state.py",

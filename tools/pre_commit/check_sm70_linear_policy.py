@@ -74,6 +74,16 @@ RUNTIME_NAMES = {
     and node.value.startswith("VLLM_")
     and node.value.isidentifier()
 }
+for _class in ast.parse((_CONFIG_ROOT / "sm70_runtime.py").read_text()).body:
+    if isinstance(_class, ast.ClassDef) and _class.name == "RuntimeTraceConfig":
+        for _field in _class.body:
+            if (
+                isinstance(_field, ast.AnnAssign)
+                and isinstance(_field.target, ast.Name)
+                and _field.target.id == "layer_aliases"
+            ):
+                RUNTIME_NAMES.update(ast.literal_eval(_field.value).values())
+
 for _node in ast.parse((_CONFIG_ROOT / "policy_defaults.py").read_text()).body:
     if isinstance(_node, ast.Assign) and any(
         isinstance(target, ast.Name) and target.id == "EXTRA_BINDINGS"

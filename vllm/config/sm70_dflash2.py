@@ -70,6 +70,7 @@ SM70_DFLASH2_LEGACY_FIELDS = {
     "VLLM_SM70_DFLASH2_FP32_LOGITS": "fp32_logits",
     "VLLM_SM70_FP8_QPN8": "target_fp8_qpn8",
     "VLLM_SM70_DFLASH2_QPN8_RERANK": "qpn8_rerank",
+    "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW": "qpn8_rerank_shadow",
     "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": "verify_fastpath",
     "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": "fused_gdn_metadata",
     "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": "fused_gdn_norm",
@@ -117,6 +118,9 @@ class Sm70DFlash2Config:
 
     qpn8_rerank: bool | None = None
     """Policy for qpn8 rerank; None retains automatic qualification."""
+
+    qpn8_rerank_shadow: bool | None = None
+    """Eager coverage audit returning dense logits; changes execution semantics."""
 
     verify_fastpath: bool | None = None
     """Policy for verify fastpath; None retains automatic qualification."""
@@ -179,6 +183,16 @@ class Sm70DFlash2Config:
         explicit = []
         for name, field in SM70_DFLASH2_LEGACY_FIELDS.items():
             configured = getattr(self, field)
+            self.sources.setdefault(
+                field,
+                "typed"
+                if configured is not None
+                else name
+                if name in os.environ
+                else "qualified_model"
+                if qualified and name in SM70_DFLASH2_VERIFIER_DEFAULTS
+                else "default",
+            )
             if (
                 configured is not None
                 and not self.sources.get(field, "").startswith("default:")
@@ -195,7 +209,9 @@ class Sm70DFlash2Config:
             if configured is None:
                 configured = (
                     bool(int(SM70_DFLASH2_VERIFIER_DEFAULTS[name]))
-                    if qualified and name not in os.environ
+                    if qualified
+                    and name in SM70_DFLASH2_VERIFIER_DEFAULTS
+                    and name not in os.environ
                     else envs.environment_variables[name]()
                 )
             setattr(self, field, configured)
@@ -215,6 +231,21 @@ class Sm70DFlash2Config:
         self.explicit_fields = tuple(explicit)
         self.qualified = qualified
         self.resolved = True
+
+    def native_overrides(self) -> dict[str, bool | None]:
+        """Bridge explicit/model defaults to B's FP16 native policy ABI.
+
+        Unchanged legacy native inputs retain their own historical parser.
+        """
+        return {
+            alias: getattr(self, field)
+            for field, alias in (
+                ("qpn8_rerank", "VLLM_SM70_DFLASH2_QPN8_RERANK"),
+                ("qpn8_rerank_shadow", "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW"),
+            )
+            if self.sources.get(field) in ("typed", "qualified_model")
+            or self.sources.get(field, "").startswith("default:")
+        }
 
     def graph_options(self) -> dict[str, bool | None]:
         return {
@@ -251,3 +282,12 @@ def dflash2_bf16_emulation(policy: Sm70DFlash2Config | None) -> bool:
     if policy is not None and policy.resolved:
         return bool(policy.bf16_emulation)
     return read_execution_legacy("VLLM_SM70_DFLASH2_BF16_EMULATION")
+
+
+def resolved_sm70_dflash2_config():
+    """Bind a standalone policy once when a layer has no speculative owner."""
+    policy = capture_sm70_dflash2_config()
+    if policy is None:
+        policy = Sm70DFlash2Config()
+        policy.resolve(qualified=False)
+    return policy

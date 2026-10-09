@@ -25,6 +25,7 @@ from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
 )
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import (
     divide,
 )
@@ -433,7 +434,7 @@ def _sm70_gdn_prefill_profile_enabled():
 
 
 def _sm70_profile_trace_enabled() -> bool:
-    return envs.VLLM_SM70_PROFILE_TRACE and not torch.compiler.is_compiling()
+    return capture_runtime_trace().profile_trace and not torch.compiler.is_compiling()
 
 
 def _sm70_flashqla_original_prefill_enabled() -> bool:

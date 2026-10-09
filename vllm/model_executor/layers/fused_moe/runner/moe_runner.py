@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config.execution_policy import communication_policy, graph_policy
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
@@ -639,7 +640,7 @@ class MoERunner(MoERunnerInterface):
         if not self._can_use_sm70_moe_sum2_allreduce(shared_output, fused_output):
             return None
         assert shared_output is not None
-        if envs.VLLM_SM70_PROFILE_TRACE and not torch.compiler.is_compiling():
+        if capture_runtime_trace().profile_trace and not torch.compiler.is_compiling():
             logger.info_once(
                 "SM70 MoE shared+routed all_reduce_sum2 candidate selected; "
                 "actual custom op route is reported by C++ trace during CUDA "
