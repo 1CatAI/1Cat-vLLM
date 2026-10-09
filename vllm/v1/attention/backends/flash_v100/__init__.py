@@ -47,6 +47,7 @@ from vllm.v1.attention.backends.flash_v100.spec import (
     builder as spec_builder,
 )
 from vllm.v1.attention.backends.flash_v100.spec import contracts as spec_contracts
+from vllm.v1.attention.backends.flash_v100.spec import diagnostics as spec_diagnostics
 from vllm.v1.attention.backends.flash_v100.spec import (
     draft as spec_draft,
 )
@@ -114,6 +115,7 @@ SUBMODULES = (
     spec_contracts,
     spec_policy,
     spec_attention_policy,
+    spec_diagnostics,
 )
 
 # Renamed compatibility bindings resolve to their actual owner. Do not copy

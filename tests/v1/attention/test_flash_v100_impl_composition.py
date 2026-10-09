@@ -567,6 +567,8 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
     for path in (
         *Path(impl.__file__).parent.glob("*.py"),
         Path(impl.__file__).parent / "spec/contracts.py",
+        Path(impl.__file__).parent / "spec/verifier.py",
+        Path(impl.__file__).parent / "spec/diagnostics.py",
     ):
         for node in ast.parse(path.read_text()).body:
             candidates = (
@@ -595,7 +597,7 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                 ):
                     continue
                 if (
-                    path.name == "verify.py"
+                    path.name in ("verify.py", "verifier.py")
                     and fn.name
                     in ("validate_contract", "_validate_dflash_attention_contract")
                     and fn.args.args[0].arg == "self"
@@ -615,7 +617,7 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                         else "self._flash_v100_window_size",
                     ]
                     continue
-                if path.name == "verify.py" and fn.name == "__init__":
+                if path.name in ("verify.py", "verifier.py") and fn.name == "__init__":
                     continue
                 if any(
                     isinstance(n, ast.Call)

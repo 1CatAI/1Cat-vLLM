@@ -354,7 +354,11 @@ def prefill_debug_calculations(call):
         "_masks._torch_attention_reference",
         "self._layer_debug_info",
     ]
-    tree = ast.parse(Path(debug_compare.__file__).read_text())
+    tree = ast.parse(
+        Path(
+            debug_compare.PrefixReportObserver.__call__.__code__.co_filename
+        ).read_text()
+    )
     classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
     subscribers = []
     for statement in tree.body:
