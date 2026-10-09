@@ -22,6 +22,29 @@ by a 7.616 us selector. Isolating that projection gives about 7.2 us; moving
 its overlap to another part of the MoE chain does not automatically save
 the difference.
 
+The category label does not cover the entire QSA dependency chain. In the
+retained device-KV diagnostic (source `17fa23e57`, Torch 2.10.0+cu128), the
+37 central rank-0 target graphs contain twelve serial intervals between
+QKV projection completion and output projection start. Their median summed
+envelope is 2.5638 ms, including 0.1737 ms between kernels. Each interval has
+14 kernels on one stream; no overlap is subtracted twice in this accounting.
+
+| Work inside those intervals | Median service ms/round |
+| --- | ---: |
+| Query/key preparation outside the QSA custom operation | 0.1059 |
+| Indexer projection and split-K reduction | 0.2165 |
+| Pre-index cache update | 0.1060 |
+| Scoring, top-k and expansion | 0.7368 |
+| Main KV write | 0.0957 |
+| Protected KV resolution and gather | 0.3331 |
+| Sparse attention and partition merge | 0.7942 |
+
+Individual medians need not sum exactly to the median envelope. This is a
+profiled device-KV chain, not a replacement for the historical unprofiled
+17.4018 ms/round baseline. Direct reads can remove the 0.3331 ms placement
+dependency for device history; host history still requires its reader. The
+paired model comparison must determine the actual round-time reduction.
+
 ## Shared-key indexer
 
 A single request's two to eight queries occupy the MMA output dimension
