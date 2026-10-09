@@ -391,3 +391,15 @@ def sparse_execution_family(model_config):
     if getattr(text, "index_head_dim", None):
         return "indexer"
     return None
+
+
+def uses_mtp_weight_policy(model, spec):
+    """Target and independent draft configs share the same weight contract."""
+    draft = getattr(spec, "draft_model_config", None)
+    for candidate in (model, draft):
+        if getattr(candidate, "architecture", None) in ("Qwen3_5MTP", "Qwen3_5MoeMTP"):
+            return True
+    text = getattr(model, "hf_text_config", None)
+    return getattr(spec, "method", None) == "mtp" and getattr(
+        text, "model_type", None
+    ) in ("qwen3_5_text", "qwen3_5_moe_text")

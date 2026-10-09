@@ -478,3 +478,27 @@ that all remaining readers execute per token. D6 must compare the full campaign
 with one unchanged counter and classify its remaining consumers. The new native owner is still under
 validation. Other provider/loading boundaries and the full D6 inventory are
 unfinished; this section does not claim completion of D5 or D.
+
+The next Python-only candidate captures eight Triton fallback-attention schedule
+inputs and four quantized-warmup controls. The schedule is validated once with
+its original deferred error gate; shape-dependent prefill/decode tiles remain
+dynamic. Effective warp choices replace redundant alias inputs in the hash.
+TurboQuant provider choices and comparison policy now share the engine lifecycle:
+comparison/dump budgets use the common diagnostic channels, continuation reserve
+records and Hadamard tensors use engine attention caches, and each layer retains
+its initialized upstream workspace manager. The upstream manager installation
+API remains a separate compatibility boundary.
+
+The same candidate migrates both runners' greedy admission, the retained
+piecewise/profile graph controls, MTP projection allowlists/weight-sharing rules, shared-expert gates and QSA
+calibration inputs. Calibration destinations are fixed; the existing `COLLECTING`
+marker still changes corpus shards dynamically. The six quantized loader families
+and their remaining provider-selection aliases are still under review.
+
+The focused CPU suite passes 166 tests with three CUDA-only skips and one
+CPU-Triton fixture deselection (`attention-cpu-v6.log`). An additional FP16 Triton
+operator test covers independent schedules and changed-input capture/replay; its
+GPU result is pending. No tensor algorithm or numerical acceptance was broadened.
+The unchanged D5 counter records 129 -> 119 raw environment references,
+3186 -> 3130 platform references and 2111 -> 2111 model references for this
+candidate. Ledger updates accept only total reductions, not additional exclusions.

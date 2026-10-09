@@ -1256,7 +1256,9 @@ class GPUModelRunner(
         self.sampler = Sampler(
             logprobs_mode=self.model_config.logprobs_mode, diagnostics=self._diagnostics
         )
-        self.sm70_greedy_token_fastpath = envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH
+        self.sm70_greedy_token_fastpath = bool(
+            vllm_config.kernel_config.layer_execution.greedy_token_fastpath
+        )
         self.sm70_greedy_token_fastpath_trace = self._runtime_trace.greedy_token_trace
         self._sm70_greedy_token_fastpath_trace_seen: set[str] = set()
         draft_vocab_config = resolve_mtp_draft_vocab_config(
@@ -7585,7 +7587,7 @@ class GPUModelRunner(
     ) -> bool:
         if not self.vllm_config.kernel_config.layer_execution.value("compact_topk20"):
             return False
-        if not envs.VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER:
+        if not self.vllm_config.kernel_config.layer_execution.value("tp_local_topk20"):
             return False
         if spec_decode_metadata is not None:
             return self._reject_sm70_compact_topk20_tokens("spec_decode")
@@ -8000,7 +8002,7 @@ class GPUModelRunner(
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         disable_full_for_sm70_gdn_spec_decode = (
-            envs.VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE
+            self.vllm_config.compilation_config.runtime.gdn_spec_piecewise
             and self.speculative_config is not None
             and self.uniform_decode_query_len > 1
             and uniform_decode
@@ -10745,7 +10747,7 @@ class GPUModelRunner(
         skip_compiled_profile = (
             is_profile
             and bool(graph_policy().compile_graph)
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN
+            and bool(self.vllm_config.compilation_config.runtime.eager_profile_run)
             and current_platform.is_device_capability(70)
         )
 

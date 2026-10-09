@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import ClassVar, cast
 
 import torch
@@ -946,7 +945,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
-        if os.getenv("VLLM_QSA_KV_CALIBRATION_DIR"):
+        from vllm.diagnostics import diagnostic_channel
+
+        if diagnostic_channel("qsa_calibration").policy.directory:
             from .ops.qsa_kv_calibration import observe_qsa_kv
 
             observe_qsa_kv(

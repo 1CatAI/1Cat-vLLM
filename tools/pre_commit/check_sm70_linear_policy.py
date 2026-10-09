@@ -85,12 +85,15 @@ RUNTIME_NAMES.update(
     and node.value.isidentifier()
 )
 for _class in ast.parse((_CONFIG_ROOT / "sm70_runtime.py").read_text()).body:
-    if isinstance(_class, ast.ClassDef) and _class.name == "RuntimeTraceConfig":
+    if isinstance(_class, ast.ClassDef) and _class.name in (
+        "RuntimeTraceConfig",
+        "Sm70RuntimeConfig",
+    ):
         for _field in _class.body:
             if (
                 isinstance(_field, ast.AnnAssign)
                 and isinstance(_field.target, ast.Name)
-                and _field.target.id == "layer_aliases"
+                and _field.target.id in ("layer_aliases", "warmup_aliases")
             ):
                 RUNTIME_NAMES.update(ast.literal_eval(_field.value).values())
 
@@ -103,7 +106,12 @@ for _node in ast.parse((_CONFIG_ROOT / "policy_defaults.py").read_text()).body:
 
 
 # Newly migrated provider declarations share the same runtime rule.
-for _name in ("sm70_sparse.py", "gdn_projection.py"):
+for _name in (
+    "sm70_sparse.py",
+    "gdn_projection.py",
+    "sm70_triton_attention.py",
+    "turboquant_runtime.py",
+):
     RUNTIME_NAMES.update(
         node.value
         for node in ast.walk(ast.parse((_CONFIG_ROOT / _name).read_text()))

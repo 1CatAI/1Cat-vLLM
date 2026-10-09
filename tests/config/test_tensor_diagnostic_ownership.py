@@ -343,3 +343,40 @@ def test_shared_dflash_dump_directory_and_separate_budgets(tmp_path):
     owner = diagnostics_for(engine)
     owner.channels["dflash_tensor"].reports = 1
     assert owner.channels["dflash_pp_aux"].reports == 0
+
+
+def test_qsa_calibration_uses_frozen_destination_and_dynamic_marker(
+    monkeypatch, tmp_path
+):
+    import json
+
+    from tests.config.runtime_policy_utils import make_policy_defaults
+    from vllm.config import set_current_vllm_config
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_kv_calibration import observe_qsa_kv
+
+    cfg = make_policy_defaults().cfg
+    policy = cfg.observability_config.runtime_trace.dumps.qsa_calibration
+    policy.directory = str(tmp_path)
+    policy.mode = "fallback-shard"
+    monkeypatch.setenv("VLLM_QSA_KV_CALIBRATION_DIR", "/unused-after-init")
+    monkeypatch.setenv("VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD", "changed-after-init")
+    data = torch.ones(1, 1, 8)
+    with set_current_vllm_config(cfg):
+        observe_qsa_kv(0, data, data)
+        assert not list(tmp_path.glob("*.jsonl"))
+        marker = tmp_path / "COLLECTING"
+        marker.write_text("")
+        observe_qsa_kv(0, data, data)
+        marker.write_text("second-shard")
+        observe_qsa_kv(0, data, data)
+        marker.unlink()
+        observe_qsa_kv(0, data, data)
+    records = [
+        json.loads(line)
+        for path in tmp_path.glob("*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert [record["corpus_shard"] for record in records] == [
+        "fallback-shard",
+        "second-shard",
+    ]

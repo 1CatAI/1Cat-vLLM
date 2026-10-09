@@ -42,7 +42,9 @@ def read_execution_legacy(name: str):
             "yes",
             "on",
         )
-    if name == "VLLM_SM70_GLM53_EXACT_KDA_GEMV":
+    if name == "VLLM_QWEN35_MTP_KEEP_QUANT":
+        return os.getenv(name, "0") == "1"
+    if name in ("VLLM_SM70_GLM53_EXACT_KDA_GEMV", "VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS"):
         return os.getenv(name, "1") != "0"
     if name in ("VLLM_SM70_GLM53_TP8_CUBLASLT", "VLLM_SM70_GLM53_TP8_FUSED_FG_B"):
         return os.getenv(name, "0") != "0"
@@ -179,6 +181,11 @@ class GraphPolicy(ExecutionPolicy):
                     values[field] = int(values[field])
         return hash_factors(values if self.active else {})
 
+    gdn_spec_piecewise: bool | None = None
+    """Retain the SM70 aligned-cache speculative decode capture restriction."""
+    eager_profile_run: bool | None = None
+    """Skip compiled execution during the existing SM70 profiling step."""
+
     mtp_context_buckets: str | tuple[int, ...] | None = None
     """Explicit verification context buckets; empty disables, None uses defaults."""
     dsv4_context_buckets: str | tuple[int, ...] | None = None
@@ -234,6 +241,8 @@ class GraphPolicy(ExecutionPolicy):
     """Use the existing graph memory admission estimator."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "gdn_spec_piecewise": "VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE",
+        "eager_profile_run": "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN",
         "mtp_context_partition_size": "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE",
         "aot_compile": "VLLM_USE_AOT_COMPILE",
         "mega_aot": "VLLM_USE_MEGA_AOT_ARTIFACT",
@@ -288,6 +297,9 @@ class LayerExecutionPolicy(ExecutionPolicy):
 
     deferred_fields: ClassVar[tuple[str, ...]] = (
         "online_qpn8",
+        "tp_local_topk20",
+        "mtp_dense_fastpath",
+        "shared_gate_fusion",
         "compact_topk20",
         "chunked_topk20_chunks",
         "glm_exact_kda_gemv",
@@ -359,6 +371,25 @@ class LayerExecutionPolicy(ExecutionPolicy):
 
     glm_pp_mhc_materialize: bool | None = None
     """Materialize completed mHC states at the existing PP boundary."""
+
+    greedy_token_fastpath: bool | None = None
+    """Admit the retained runner greedy-token path at its dynamic eligibility gate."""
+    tp_local_topk20: bool | None = None
+    """Use local TP top-k20 only after the compact-sampler gate passes."""
+
+    moe_dense_allowlist: str | None = None
+    """Optional model-qualified projection suffixes for dense expert preparation."""
+    shared_gate_fusion: bool | None = None
+    """Fuse only the shared-expert projection shapes accepted by their adapter."""
+
+    mtp_dense_fastpath: bool | None = None
+    """Permit the model adapter's MTP FP16 projection allowlist."""
+    mtp_dense_allowlist: str | None = None
+    """Optional suffix list; the model adapter retains the historical defaults."""
+    mtp_share_io_weights: bool | None = None
+    """Share target embeddings and output weights on the qualified MTP model."""
+    mtp_keep_quant: bool | None = None
+    """Retain draft quantization despite a checkpoint exclusion rule."""
 
     online_qpn8: bool | None = None
     """Prepare the qualified checkpoint-FP16 weights in online QPN8 layout."""
@@ -436,6 +467,14 @@ class LayerExecutionPolicy(ExecutionPolicy):
         "topk_topp_b8_b16_warps8": "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS",
         "topk_topp_warps8": "VLLM_SM70_TOPK_TOPP_8_WARPS",
         "glm_pp_mhc_materialize": "VLLM_GLM53_PP_MHC_MATERIALIZE",
+        "greedy_token_fastpath": "VLLM_SM70_GREEDY_TOKEN_FASTPATH",
+        "tp_local_topk20": "VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER",
+        "moe_dense_allowlist": "VLLM_SM70_MOE_DENSE_ALLOWLIST",
+        "shared_gate_fusion": "VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION",
+        "mtp_dense_fastpath": "VLLM_SM70_MTP_DENSE_F16_FASTPATH",
+        "mtp_dense_allowlist": "VLLM_SM70_MTP_DENSE_F16_ALLOWLIST",
+        "mtp_share_io_weights": "VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS",
+        "mtp_keep_quant": "VLLM_QWEN35_MTP_KEEP_QUANT",
         "online_qpn8": "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8",
         "compact_topk20": "VLLM_SM70_COMPACT_TOPK20_SAMPLER",
         "chunked_topk20_chunks": "VLLM_SM70_CHUNKED_TOPK20_CHUNKS",
@@ -607,6 +646,8 @@ POLICY_OWNERS = {
     "parallel_config.communication": "CommunicationPolicy",
     "offload_config.ple": "PlePlacementPolicy",
     "attention_config.flash_v100": "FlashV100Policy",
+    "attention_config.sm70_triton": "Sm70TritonAttentionPolicy",
+    "attention_config.flash_v100.turboquant": "TurboQuantRuntimePolicy",
 }
 
 

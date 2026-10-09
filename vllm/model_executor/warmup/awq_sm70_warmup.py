@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
-import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings
 from vllm.config.sm70_moe import (
@@ -20,6 +19,7 @@ from vllm.config.sm70_moe import (
     capture_sm70_moe_config,
 )
 from vllm.config.sm70_native import NATIVE_FIELDS, UNSET, capture_linear_native_config
+from vllm.config.sm70_runtime import capture_runtime_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.qpn.fp8_block import _QPN8_MAX_M
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
@@ -77,7 +77,7 @@ def _group_size_from_tm_scales(k_dim: int, tm_scales: torch.Tensor) -> int:
 
 
 def _resolve_lut_path(device: torch.device) -> str | None:
-    template = envs.VLLM_SM70_GEMM_LUT_PATH
+    template = capture_runtime_config().value("gemm_lut_path")
     if not template:
         return None
     device_idx = 0 if device.index is None else int(device.index)
@@ -259,10 +259,9 @@ def _warmup_fp8_dense_layers_coordinated(
 ) -> int:
     if not layers:
         return 0
-    if (
-        not _native_number("fp8", "fp8_tune_small_shapes", 1)
-        or not envs.VLLM_SM70_FP8_COORDINATED_TUNING
-    ):
+    if not _native_number(
+        "fp8", "fp8_tune_small_shapes", 1
+    ) or not capture_runtime_config().value("fp8_coordinated_tuning"):
         return _warmup_fp8_dense_layers(layers, m_values)
 
     return _run_coordinated_dense_warmup(
@@ -290,7 +289,7 @@ def _warmup_dense_quantized_layers_coordinated(
 
     if not (awq_layers or fp8_layers or fp4_layers):
         return 0, 0, 0
-    if not envs.VLLM_SM70_FP8_COORDINATED_TUNING:
+    if not capture_runtime_config().value("fp8_coordinated_tuning"):
         return warmup()
     return _run_coordinated_dense_warmup(warmup, device, "AWQ/FP8/FP4")
 
@@ -337,7 +336,11 @@ def _get_decode_m_values(worker: Worker) -> list[int]:
 def _get_moe_token_counts(worker: Worker) -> list[int]:
     max_tokens = max(
         1,
-        int(envs.VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS),
+        int(
+            worker.vllm_config.kernel_config.sm70_runtime.value(
+                "awq_warmup_max_moe_tokens"
+            )
+        ),
         _spec_decode_query_len(worker),
     )
     return [m for m in _get_decode_m_values(worker) if m <= max_tokens]
@@ -1224,7 +1227,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
 
 
 def sm70_awq_warmup(worker: Worker) -> None:
-    if not envs.VLLM_SM70_AWQ_WARMUP:
+    if not worker.vllm_config.kernel_config.sm70_runtime.value("awq_warmup"):
         return
     if not hasattr(torch.ops._C, "awq_gemm_sm70_out"):
         return

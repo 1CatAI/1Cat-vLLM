@@ -273,6 +273,10 @@ class TensorDumpConfig:
 # Names are explicit so the static parameter inventory can resolve each reader.
 # Format: field -> (legacy name, original raw default, original parser).
 DUMP_BINDINGS: dict[str, dict[str, tuple[str, str | None, str]]] = {
+    "qsa_calibration": {
+        "directory": ("VLLM_QSA_KV_CALIBRATION_DIR", None, "text"),
+        "mode": ("VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD", "unspecified", "text"),
+    },
     "top_token_margin": {
         "directory": ("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR", None, "text"),
         "enable_file": ("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE", None, "text"),
@@ -400,6 +404,9 @@ DUMP_BINDINGS: dict[str, dict[str, tuple[str, str | None, str]]] = {
 
 @config
 class TensorDiagnosticsConfig:
+    qsa_calibration: TensorDumpConfig = Field(default_factory=TensorDumpConfig)
+    """Offline sparse-cache observations; the COLLECTING marker remains dynamic."""
+
     top_token_margin: TensorDumpConfig = Field(default_factory=TensorDumpConfig)
     """LM-head top-token margin, probe and report budget."""
     top1_sync: TensorDumpConfig = Field(default_factory=TensorDumpConfig)

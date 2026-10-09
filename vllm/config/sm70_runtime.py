@@ -17,6 +17,7 @@ from vllm.config.diagnostic_dump import (
 from vllm.config.diagnostic_sampling import SamplingDiagnosticsConfig
 from vllm.config.flash_v100 import FlashV100Diagnostics
 from vllm.config.sm70_dflash2 import DFlashDiagnosticsConfig
+from vllm.config.turboquant_runtime import TurboQuantDiagnostics
 from vllm.config.utils import config
 
 
@@ -41,6 +42,24 @@ def resolve_legacy_fields(
 class Sm70RuntimeConfig:
     """Warmup policy; does not alter the compiled model computation."""
 
+    awq_warmup: bool | None = None
+    """Run the existing quantized-kernel warmup at the original checkpoint."""
+    awq_warmup_max_moe_tokens: int | None = None
+    """Largest MoE warmup shape, clamped by the consumer's decode sizes."""
+    fp8_coordinated_tuning: bool | None = None
+    """Share the existing authoritative tensor-parallel tuning plan."""
+    gemm_lut_path: str | None = None
+    """Optional tuning-cache template; device/rank expansion remains worker-local."""
+    errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Deferred errors for options skipped by the original warmup gates."""
+
+    warmup_aliases: ClassVar[dict[str, str]] = {
+        "awq_warmup": "VLLM_SM70_AWQ_WARMUP",
+        "awq_warmup_max_moe_tokens": "VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS",
+        "fp8_coordinated_tuning": "VLLM_SM70_FP8_COORDINATED_TUNING",
+        "gemm_lut_path": "VLLM_SM70_GEMM_LUT_PATH",
+    }
+
     awq_warmup_max_m: int | None = None
     """Largest dense AWQ warmup shape; platform default applies at engine init."""
 
@@ -54,7 +73,21 @@ class Sm70RuntimeConfig:
     sources: dict[str, str] = Field(default_factory=dict, init=False)
     """Initialization provenance, excluded from compiled computation."""
 
+    def value(self, field):
+        if field in self.errors:
+            raise ValueError(self.errors[field])
+        return getattr(self, field)
+
     def __post_init__(self) -> None:
+        resolve_legacy_fields(
+            self,
+            {
+                field: alias
+                for field, alias in self.warmup_aliases.items()
+                if field not in self.sources
+            },
+            deferred_errors=self.errors,
+        )
         resolve_legacy_fields(
             self,
             {
@@ -99,6 +132,9 @@ def capture_runtime_config() -> Sm70RuntimeConfig:
 class RuntimeTraceConfig:
     """Captured runner diagnostics; never part of compiled computation."""
 
+    turboquant: TurboQuantDiagnostics = Field(default_factory=TurboQuantDiagnostics)
+    """Packed-cache compare policy; counters and outputs share engine diagnostics."""
+
     flash_v100: FlashV100Diagnostics = Field(default_factory=FlashV100Diagnostics)
     """Attention comparison, native trace and route observations."""
 
@@ -124,6 +160,9 @@ class RuntimeTraceConfig:
         "qwen_next_trace": "VLLM_QWEN3_NEXT_SM70_TRACE",
         "unquant_debug": "VLLM_SM70_UNQUANT_DEBUG",
         "profile_trace": "VLLM_SM70_PROFILE_TRACE",
+        "qwen_mlp_internals": "VLLM_SM70_DUMP_QWEN_MLP_INTERNALS",
+        "mtp_load": "VLLM_DEBUG_MTP_LOAD",
+        "mtp_load_verbose": "VLLM_DEBUG_MTP_LOAD_VERBOSE",
         "greedy_token_trace": "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE",
     }
 
@@ -150,6 +189,12 @@ class RuntimeTraceConfig:
     """Explain unquantized fallback projections."""
     profile_trace: bool | None = None
     """Trace retained model/layer route events without changing computation."""
+    qwen_mlp_internals: bool | None = None
+    """Admit the retained intermediate MLP tensor observation points."""
+    mtp_load: bool | None = None
+    """Report draft weight preparation at the original loading checkpoints."""
+    mtp_load_verbose: bool | None = None
+    """Include detailed draft parameter names only when loading trace is enabled."""
     greedy_token_trace: bool | None = None
     """Explain local greedy-token fastpath admission."""
     async_cpu: bool | None = None
@@ -172,6 +217,7 @@ class RuntimeTraceConfig:
         return {
             **{name: getattr(self.dumps, name) for name in DUMP_BINDINGS},
             **self.dflash.dump_channels(),
+            **self.turboquant.dump_channels(),
         }
 
     @staticmethod
@@ -191,16 +237,24 @@ class RuntimeTraceConfig:
         if self.sources:
             return
         self.flash_v100.resolve()
+        self.turboquant.resolve()
         from vllm import envs
 
         def read_flag(name):
+            if name == "VLLM_SM70_DUMP_QWEN_MLP_INTERNALS":
+                return os.getenv(name) == "1"
             try:
                 value = envs.environment_variables[name]()
             except ValueError as exc:
                 field = next(
                     (
                         field
-                        for field in ("gdn_route_debug", "gdn_mixed_compare")
+                        for field in (
+                            "gdn_route_debug",
+                            "gdn_mixed_compare",
+                            "mtp_load",
+                            "mtp_load_verbose",
+                        )
                         if self.layer_aliases[field] == name
                     ),
                     None,

@@ -67,8 +67,19 @@ class DiagnosticChannel:
         os.makedirs(self.policy.directory, exist_ok=True)
         return output_path(self.policy.directory, filename, self.engine_tag)
 
-    def append_json(self, filename: str, payload: dict) -> None:
+    def append_json(self, filename: str, payload: dict, *, compact=False) -> None:
         with open(self.output_path(filename), "a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(payload, separators=(",", ":")) + "\n"
+                if compact
+                else json.dumps(payload, sort_keys=True) + "\n"
+            )
+
+    def append_json_path(self, path: str, payload: dict) -> None:
+        # Explicit JSONL paths retain their parent-creation/error behavior.
+        parent, filename = os.path.split(path)
+        path = output_path(parent, filename, self.engine_tag)
+        with open(path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(payload, sort_keys=True) + "\n")
 
     def flush_graph(self, step: int, stage: str, *, gdn=False, trigger=True) -> None:

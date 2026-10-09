@@ -34,11 +34,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen2MoeConfig
 
-import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.execution_policy import layer_policy
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -88,9 +88,7 @@ def _sm70_dump_qwen_mlp_tensor(
         return tensor
     # This diagnostic piggybacks on qwen3_next's graph-buffer dump path. It is
     # intentionally env-gated so normal model execution is unchanged.
-    import os
-
-    if os.getenv("VLLM_SM70_DUMP_QWEN_MLP_INTERNALS") != "1":
+    if not capture_runtime_trace().qwen_mlp_internals:
         return tensor
     from vllm.model_executor.models.qwen3_next import _sm70_dump_qwen_layer_tensor
 
@@ -180,7 +178,7 @@ class Qwen2MoeMLP(nn.Module):
         )
         self.expert_gate = expert_gate
         self._sm70_exact_shared_expert_gate = (
-            envs.VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION
+            layer_policy().value("shared_gate_fusion")
             and expert_gate is not None
             and prefix.endswith(".mlp.shared_expert")
             and _sm70_fused_shared_expert_gate_module_supported(

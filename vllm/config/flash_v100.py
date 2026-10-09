@@ -12,6 +12,7 @@ from typing import ClassVar
 from pydantic import Field
 
 from vllm.config.execution_policy_base import ExecutionPolicy
+from vllm.config.turboquant_runtime import TurboQuantRuntimePolicy
 from vllm.config.utils import config, hash_factors
 
 NATIVE_FIELDS = (
@@ -1472,6 +1473,7 @@ class FlashV100Policy(ExecutionPolicy):
 
     def bind_consumers(self, graph, trace, cache_dtype):
         self.options.finalize(graph, trace.flash_v100, cache_dtype)
+        self.turboquant.active = cache_dtype.startswith("turboquant")
 
     def compile_ignored_aliases(self):
         return self.options.compile_ignored_aliases()
@@ -1500,19 +1502,26 @@ class FlashV100Policy(ExecutionPolicy):
             "resources": "worker runtime_resources.flash_v100",
         }
 
+    turboquant: TurboQuantRuntimePolicy = Field(default_factory=TurboQuantRuntimePolicy)
+    """Packed-cache provider choices, qualified independently of dense attention."""
+
     options: FlashV100Options = Field(default_factory=FlashV100Options)
     """Backend, package and native choices bound to this attention owner."""
 
     def resolve(self) -> None:
         super().resolve()
         self.options.resolve()
+        self.turboquant.resolve()
 
     def compute_hash(self) -> str:
-        return hash_factors(
+        factors = (
             {"base": super().compute_hash(), "options": self.options.hash_values()}
             if self.active
             else {}
         )
+        if self.turboquant.active:
+            factors["turboquant"] = self.turboquant.compute_hash()
+        return hash_factors(factors)
 
     enabled: bool | None = None
     """Retain the platform's Flash-V100 backend qualification switch."""

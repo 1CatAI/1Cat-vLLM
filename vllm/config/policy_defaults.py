@@ -207,6 +207,7 @@ def finalize_runtime_policy_hashes(cfg):
     """Fingerprint computation, excluding diagnostics and unused feature knobs."""
     from vllm.model_executor.models.runtime_defaults import (
         _is_sm70_qwen38_decode_compile_contract,
+        uses_mtp_weight_policy,
     )
     from vllm.platforms.runtime_defaults import _any_participating_device_is_pre_ampere
 
@@ -216,6 +217,8 @@ def finalize_runtime_policy_hashes(cfg):
     graph_fields = ["aot_compile", "breakable", "mega_aot"]
     if pre_ampere:
         graph_fields.append("compile_graph")
+        if spec is not None:
+            graph_fields.append("gdn_spec_piecewise")
         graph_fields.extend(("decode_only_capture", "decode_partition_size"))
         if _is_sm70_qwen38_decode_compile_contract(
             cfg.model_config, spec, cfg.parallel_config
@@ -256,6 +259,12 @@ def finalize_runtime_policy_hashes(cfg):
     layers.hash_fields = (
         tuple(layers.aliases) if pre_ampere else ("shared_moe_overlap",)
     )
+    if not uses_mtp_weight_policy(cfg.model_config, spec):
+        layers.hash_fields = tuple(
+            field for field in layers.hash_fields if not field.startswith("mtp_")
+        )
+    elif not pre_ampere:
+        layers.hash_fields += ("mtp_share_io_weights", "mtp_keep_quant")
     tp = cfg.parallel_config.tensor_parallel_size
     comm = cfg.parallel_config.communication
     comm.native.active = tp > 1 and (
@@ -292,6 +301,7 @@ def finalize_runtime_policy_hashes(cfg):
     cfg.offload_config.ple.active = bool(getattr(text, "ple_layer_ids", None))
     attention = cfg.attention_config
     backend_name = getattr(attention.backend, "name", attention.backend)
+    attention.sm70_triton.active = pre_ampere and backend_name in (None, "TRITON_ATTN")
     attention.flash_v100.active = pre_ampere and backend_name in (
         None,
         "FLASH_ATTN_V100",
@@ -440,6 +450,13 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
         for field, alias in trace.layer_aliases.items():
             if field in trace.sources:
                 ignored.add(alias)
+    runtime = _owner(cfg, "kernel_config.sm70_runtime")
+    if runtime is not None:
+        ignored.update(
+            alias
+            for field, alias in runtime.warmup_aliases.items()
+            if field in runtime.sources
+        )
     routing = _owner(cfg, "kernel_config.sm70_moe.routing")
     if routing is not None and routing.sources:
         ignored.update(routing.aliases.values())

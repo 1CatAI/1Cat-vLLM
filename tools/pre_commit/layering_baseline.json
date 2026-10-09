@@ -25,7 +25,7 @@
   "platform": 18
  },
  "vllm/config/attention.py": {
-  "platform": 8
+  "platform": 17
  },
  "vllm/config/cache.py": {
   "platform": 3
@@ -45,7 +45,7 @@
  },
  "vllm/config/execution_policy.py": {
   "model": 9,
-  "platform": 47
+  "platform": 52
  },
  "vllm/config/gdn.py": {
   "env": 1,
@@ -71,7 +71,7 @@
  },
  "vllm/config/policy_defaults.py": {
   "model": 14,
-  "platform": 24
+  "platform": 26
  },
  "vllm/config/speculative.py": {
   "model": 142,
@@ -80,6 +80,9 @@
  "vllm/config/speculative_sampling.py": {
   "model": 1,
   "platform": 3
+ },
+ "vllm/config/turboquant_runtime.py": {
+  "platform": 7
  },
  "vllm/config/vllm.py": {
   "env": 2,
@@ -335,19 +338,10 @@
   "model": 18,
   "platform": 53
  },
- "vllm/model_executor/models/qwen2_moe.py": {
-  "env": 1
- },
- "vllm/model_executor/models/qwen3_5_mtp.py": {
-  "env": 2
- },
  "vllm/model_executor/warmup/kernel_warmup.py": {
   "platform": 3
  },
  "vllm/models/qwen4_exp/nvidia/ops/qsa.py": {
-  "env": 1
- },
- "vllm/models/qwen4_exp/nvidia/qsa.py": {
   "env": 1
  },
  "vllm/platforms/cpu.py": {
@@ -435,8 +429,7 @@
   "platform": 7
  },
  "vllm/v1/attention/backends/turboquant_attn.py": {
-  "env": 6,
-  "platform": 79
+  "platform": 38
  },
  "vllm/v1/attention/ops/gdn_state.py": {
   "model": 1
@@ -451,7 +444,7 @@
   "platform": 1
  },
  "vllm/v1/attention/ops/triton_unified_attention.py": {
-  "platform": 78
+  "platform": 46
  },
  "vllm/v1/core/kv_cache_utils.py": {
   "model": 31,
@@ -550,7 +543,7 @@
   "model": 1
  },
  "vllm/v1/worker/gpu/sample/sampler.py": {
-  "platform": 2
+  "platform": 1
  },
  "vllm/v1/worker/gpu/shutdown.py": {
   "platform": 11
@@ -583,7 +576,7 @@
  "vllm/v1/worker/gpu_model_runner.py": {
   "env": 18,
   "model": 669,
-  "platform": 168
+  "platform": 163
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 1,
