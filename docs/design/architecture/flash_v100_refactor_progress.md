@@ -20,21 +20,21 @@ completion. Import cycles and environment reads outside config are already zero.
 | Step | PR | Status | Metrics | GPU validation | Open items |
 | --- | --- | --- | --- | --- | --- |
 | 0: scope and codec ownership | — | Decision communicated; #1028 rebased locally | Baseline measured | Runtime parity belongs to 1c | Retest each subsequent step |
-| 1a: immutable CPU trace and owner guard | #1071 | Accepted for merge | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
-| 1b: patch efficacy + dependency ratchet | #1072 | Accepted for merge | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
-| 1c: route/token/output parity tools | #1073 | Accepted; host/spec model records pending | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Deferred; not a merge gate |
-| 2a: dynamic environment boundary | #1075 | Accepted; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Deferred; not a merge gate |
-| 2b: frozen construction policy | #1076 | Accepted; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Deferred; not a merge gate |
-| 3a: per-layer decode cache | #1077 | Accepted; CPU/golden/rebase/native/Qwen passed | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
-| 3b: step plan and persistent metadata buffers | #1079 | Accepted; CPU/golden/rebase/native/Qwen passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
-| 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native/Qwen passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
-| 4b: native decode candidates | #1081 | CPU/golden/strict/native/Qwen passed | Private references 374 → 370 | 1691 passes / same 7 failures; 12 outputs exact; named timings and 4 Qwen contracts pass | Deferred; not a merge gate |
-| 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase/native/Qwen passed | Forward 597 → 402; private 370 → 358 | 1691 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts pass | Deferred; not a merge gate |
-| 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase/GPU regression passed | Production unchanged | 1692 passes / same 7 failures; no changed old outcomes | Deferred; not a merge gate |
-| 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | Follow-up GPU evidence |
-| 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Follow-up | Follow-up GPU evidence |
-| 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Queued | Follow-up GPU evidence |
-| 6a: verifier ownership | #1090 | CPU/golden/strict/rebase passed | Cycles 13 → 11; model terms 169 → 158 | Queued | Follow-up GPU evidence |
+| 1a: immutable CPU trace and owner guard | #1071 | Merged to main | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
+| 1b: patch efficacy + dependency ratchet | #1072 | Merged to main | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
+| 1c: route/token/output parity tools | #1073 | Merged to main | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Deferred; not a merge gate |
+| 2a: dynamic environment boundary | #1075 | Merged to main | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Deferred; not a merge gate |
+| 2b: frozen construction policy | #1076 | Merged to main | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Deferred; not a merge gate |
+| 3a: per-layer decode cache | #1077 | Merged to main | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
+| 3b: step plan and persistent metadata buffers | #1079 | Merged to main | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
+| 4a: explicit decode executor dependencies | #1080 | Merged to main | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
+| 4b: native decode candidates | #1081 | Merged to main | Private references 374 → 370 | 1691 passes / same 7 failures; 12 outputs exact; named timings and 4 Qwen contracts pass | Deferred; not a merge gate |
+| 4c: outer decode dispatch candidates | #1083 | Merged to main | Forward 597 → 402; private 370 → 358 | 1691 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts pass | Deferred; not a merge gate |
+| 1c follow-up: immutable requested workload | #1084 | Merged to main | Production unchanged | 1692 passes / same 7 failures; no changed old outcomes | Deferred; not a merge gate |
+| 5a: per-sequence prefill candidates | #1085 | Merged to main | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | Follow-up GPU evidence |
+| 5b: batch prefill candidates | #1086 | Merged to main | Largest function 529 → 414; private 348 → 347 | Follow-up | Follow-up GPU evidence |
+| 5c: debug observer | #1088 | Merged to main | Largest function 414 → 402 | Queued | Follow-up GPU evidence |
+| 6a: verifier ownership | #1090 | Merged to main | Cycles 13 → 11; model terms 169 → 158 | Queued | Follow-up GPU evidence |
 | 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Queued | Follow-up GPU evidence |
 | 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Queued | Follow-up GPU evidence |
 | 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Queued | Follow-up GPU evidence |
@@ -1318,3 +1318,23 @@ FlashInfer and owned-prefill suites pass all 28 cases with strict shim consumpti
 No golden or stored calculation hash was changed. CI-style mypy (all 61 changed
 source files) and pre-commit pass. Final package metrics remain
 153 / 315 / 269 / 0 / 83 / 0 / 20.
+
+Main delivery: 24 campaign PRs through #1090 have been merged individually and
+verified against their clean integration trees. The remaining 12 reviewed PRs
+are delivered together with the compatibility correction in
+[#1113](https://github.com/1CatAI/1Cat-vLLM/pull/1113), preserving their commits.
+The integrated source at `93226ec38381f9811644c02b826498aa5d7f139a` passed
+**70 focused CPU tests** with strict shim consumption. This includes the real
+FlashInfer adapters and the concurrent main changes in #956/#1005/#1111/#1112.
+Those changes were retained, not authored or independently promoted by A3.
+In particular, #1112 superseded the separate #1089 proposal; DDTree remains
+outside this campaign's current acceptance and development scope.
+
+The final pinned #1028 replay is
+`17089eef4539a53f2e9231775f769a79bb581413`, tree
+`f3f5a36e8dd4d1823ed587c0f81ce50f3ec6541b`, equal to the clean merge result,
+with **37 passes / 98 GPU skips** and unchanged native sources. Local evidence:
+`a3-main-integration-tests.log`, `a3-main-integration-1028.json` and
+`a3-main-integration-1028-cpu.log`. An additional 37 idle per-slice GPU retry
+queues were retired; an already-active regression job was left to finish.
+No deferred queue was given a passing completion marker.
