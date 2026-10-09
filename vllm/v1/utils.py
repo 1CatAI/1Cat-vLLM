@@ -140,7 +140,7 @@ class CpuGpuBuffer:
     @property
     def _staged_gpu_copies(
         self,
-    ) -> list[tuple[torch.cuda.Event | torch.cuda.Stream, torch.Tensor]]:
+    ) -> list[tuple[torch.cuda.Event | torch.cuda.Stream | None, torch.Tensor]]:
         """Compatibility view of the sole source-lifetime owner."""
         return self._staged_copy_owner.pending
 
@@ -160,7 +160,7 @@ class CpuGpuBuffer:
     def copy_to_gpu_staged(self, n: int | None = None) -> torch.Tensor:
         src = self.cpu if n is None else self.cpu[:n]
         dst = self.gpu if n is None else self.gpu[:n]
-        return self.copy_view_to_gpu_staged(src, dst)
+        return self._staged_copy_owner.copy(src, dst)
 
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization

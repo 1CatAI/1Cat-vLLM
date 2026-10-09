@@ -233,3 +233,36 @@ def test_runtime_policy_legacy_priority_and_isolation(monkeypatch, order):
         assert first.counts["copy"] == 5 and not second.counts
     finally:
         envs.disable_envs_cache()
+
+
+def test_failed_stream_lookup_retains_unfenced_source(monkeypatch):
+    source, staging, destination = Mock(), Mock(), Mock(device=torch.device("cuda"))
+    source.shape, source.dtype = (1,), torch.float32
+    source.is_pinned.return_value = True
+    monkeypatch.setattr(torch, "empty", lambda *args, **kwargs: staging)
+    monkeypatch.setattr(torch.cuda, "Event", Mock())
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", Mock(side_effect=RuntimeError("stream failed"))
+    )
+    owner = StagedCopyOwner()
+    with pytest.raises(RuntimeError, match="stream failed"):
+        owner.copy(source, destination)
+    assert owner.pending == [(None, staging)]
+    owner.prune()
+    assert owner.pending == [(None, staging)]
+
+
+def test_unfenced_capacity_sync_preserves_device_and_source(monkeypatch):
+    from contextlib import nullcontext
+
+    owner = StagedCopyOwner()
+    owner.pending = [(None, torch.ones(1))] * 64
+    device_scope = Mock(return_value=nullcontext())
+    synchronize = Mock(side_effect=RuntimeError("device failed"))
+    monkeypatch.setattr(torch.accelerator, "device_index", device_scope)
+    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    with pytest.raises(RuntimeError, match="device failed"):
+        owner.copy(torch.ones(1), SimpleNamespace(device=torch.device("cuda:2")))
+    device_scope.assert_called_once_with(2)
+    synchronize.assert_called_once_with()
+    assert len(owner.pending) == 64

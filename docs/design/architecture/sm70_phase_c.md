@@ -205,3 +205,32 @@ pre-existing boundary together with packed LM-head selection. It is not counted
 as a C1b decoupling result. Updated main-to-C1b coupling is platform
 **3747 → 3718**, model **2322 → 2315**, environment **271 → 269**. The rebased
 CPU integration suite passed **76 tests**, with seven CUDA-only skips.
+
+### C1b final performance and source follow-up
+
+The rebased GPU integration suite passed **83 tests**. A final source-owner
+follow-up covers restored enqueue ordering and recovery when a stream handle
+cannot be obtained (retain an unfenced source until device synchronization).
+
+The larger staged copy initially added about 4 µs of host time. Moving the
+current-stream lookup back after copy enqueue restores the original overlap;
+the normal buffer method also calls the owner directly. Both failure protections
+remain. The final same-process A/B uses the real baseline class/method bodies,
+15 alternating-order rounds, 10,000 context entries or 100 copies per round,
+with the legacy getter cache enabled:
+
+| Operation | Baseline median µs | Shared owner median µs |
+|---|---:|---:|
+| Ordinary input-preparation context | 4.916 | 2.604 |
+| Staged input-preparation context | 3.092 | 2.460 |
+| 1 KiB staged copy, host | 54.852 | 55.157 |
+| 128 KiB staged copy, host | 69.635 | 69.833 |
+
+Paired copy deltas are 0.479/0.069 µs, inside the observed baseline ranges
+(54.347–56.378 and 68.995–73.641 µs). The earlier unexplained copy regression is
+not carried into the final change. Separate stable-address H2D graph controls
+measured 2.270/2.403 µs for 1 KiB and 22.668/23.111 µs for 128 KiB; these are DMA
+controls, not model kernels. Peak GPU allocation was identical (2,048 and
+132,096 bytes including the control buffers). Separately instrumented host
+allocation peaks were 451/419 and 451/662 bytes; tracing was disabled during
+timing. No new per-copy device workspace or model-performance claim is made.
