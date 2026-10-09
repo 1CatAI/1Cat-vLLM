@@ -1198,6 +1198,7 @@ def qsa_mqa_paged(
     compress_ratio: int,
     num_columns: int | None = None,
     score_scale: float | None = None,
+    shared_key_scoring: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
 
@@ -1228,6 +1229,22 @@ def qsa_mqa_paged(
     columns = capacity if num_columns is None else num_columns
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
+    if shared_key_scoring and 0 < columns <= capacity and q.shape[0]:
+        from .qsa_shared_key import maybe_shared_key_scores
+
+        result = maybe_shared_key_scores(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            columns,
+            score_divisor,
+        )
+        if result is not None:
+            return result
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
@@ -1596,6 +1613,7 @@ def qsa_select_paged_tokens(
     compress_ratio: int,
     out: torch.Tensor | None = None,
     query_start_loc_cpu: torch.Tensor | None = None,
+    shared_key_scoring: bool = False,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -1686,6 +1704,7 @@ def qsa_select_paged_tokens(
                 query_positions[row_slice],
                 sequence_lengths,
                 compress_ratio,
+                shared_key_scoring=shared_key_scoring,
             )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (

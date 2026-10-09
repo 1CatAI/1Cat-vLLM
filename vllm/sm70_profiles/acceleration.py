@@ -576,6 +576,21 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "arithmetic": "FP16 QK operands; FP32 accumulation, softmax, PV and merge",
         "fallback": "protected hot-page reader",
     }
+    shared_key_reason = None
+    if not cfg.kernel_config.sm70_qsa_shared_key:
+        shared_key_reason = "user_override"
+    elif not sm70:
+        shared_key_reason = "requires_SM70"
+    elif importlib.util.find_spec("vllm._sm70_qsa_indexer_C") is None:
+        shared_key_reason = "native_extension_unavailable"
+    report["qsa_shared_key_indexer"] = {
+        "enabled": shared_key_reason is None,
+        "reason": shared_key_reason,
+        "scope": "configured_native_capability",
+        "runtime_guards": "one request; M2..8, H4, D128; FP16 Q and indexer K",
+        "arithmetic": "FP16 MMA inputs; FP32 accumulation and scores",
+        "fallback": "paged Triton indexer; multiple requests and other shapes",
+    }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {
         "scope": "indexed_sparse_attention",
