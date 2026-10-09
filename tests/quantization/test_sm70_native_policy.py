@@ -333,6 +333,50 @@ def test_opaque_native_policy_survives_export_with_dynamic_rows(monkeypatch, com
             lib._destroy()
 
 
+def test_native_token_survives_direct_operator_export_reload():
+    if not hasattr(torch.ops._C, "sm70_prepare_native_policy_token"):
+        pytest.skip("requires the packaged native token ABI")
+    policy = Sm70NativeConfig(tm_gemm_trace_filter="路径:1")
+    policy.resolve("awq")
+    owner = binding.NativeBindings(policy.values)
+    assert len(owner.arguments) == 1
+    token = owner.arguments[0]
+    observed: list[tuple[int, str]] = []
+
+    def native(out, x, weight, scales, group, k, n, gated, native_policy=None):
+        # This CPU implementation checks transport and mutation semantics;
+        # numerical CUDA parity is covered by the artifact comparison.
+        assert isinstance(native_policy, str)
+        assert native_policy == token
+        observed.append((x.shape[0], native_policy))
+        out.copy_(x)
+
+    class Projection(torch.nn.Module):
+        def forward(self, x):
+            out = torch.empty_like(x)
+            owner.awq_gemm_sm70_out(out, x, x, x, 16, 4, 4, False)
+            return out
+
+    lib = torch.library.Library("_C", "IMPL", "CPU")
+    lib.impl("awq_gemm_sm70_out", native)
+    try:
+        exported = torch.export.export(
+            Projection(),
+            (torch.zeros(2, 4),),
+            dynamic_shapes={"x": {0: torch.export.Dim("rows", min=1, max=128)}},
+        )
+        artifact = io.BytesIO()
+        torch.export.save(exported, artifact)
+        artifact.seek(0)
+        reloaded = torch.export.load(artifact).module()
+        for rows in (1, 33, 65):
+            x = torch.full((rows, 4), float(rows))
+            assert torch.equal(reloaded(x), x)
+        assert observed == [(rows, token) for rows in (1, 33, 65)]
+    finally:
+        lib._destroy()
+
+
 @pytest.mark.parametrize("explicit_qpn8", [None, False, True])
 def test_channel_fp8_keeps_qualified_default_but_typed_linear_request_wins(
     monkeypatch, explicit_qpn8

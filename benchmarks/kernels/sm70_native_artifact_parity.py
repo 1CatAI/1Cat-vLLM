@@ -417,6 +417,7 @@ record = {
         "torch": str(torch.__version__),
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
+        "cpu_affinity": sorted(os.sched_getaffinity(0)),
         "env": {
             k: v for k, v in os.environ.items() if k.startswith(("VLLM_SM70_", "TM_"))
         },

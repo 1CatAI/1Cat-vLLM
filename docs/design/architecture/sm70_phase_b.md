@@ -335,6 +335,8 @@ Use `--output base.pt` first, then `--output head.pt --reference base.pt`, with
 identical GPU, environment and input contracts. It checks native call order,
 eager outputs, changed-input graph replay and the retained FP8 reference stages.
 It records graph device time separately from eager host wall time.
+Pin both runs to the same CPU affinity for host-time comparison; the report
+records that affinity alongside the GPU and software contract.
 
 For GGUF, pass the same `--gguf-cache <path>` to both runs. Its existing cold
 descriptor autotuning is independent of the AWQ tuning switch and can select
