@@ -21,7 +21,12 @@ def runtime_resources_for(config) -> dict[str, Any]:
             policy = getattr(getattr(config, owner, None), name, None)
             if policy is not None:
                 policies[path] = policy
-        resources = {"execution_policies": policies}
+        resources = {
+            "execution_policies": policies,
+            "runtime_trace": getattr(
+                getattr(config, "observability_config", None), "runtime_trace", None
+            ),
+        }
         config._runtime_resources = resources
     return resources
 

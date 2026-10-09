@@ -7,6 +7,7 @@ import os
 from dataclasses import fields
 from typing import ClassVar
 
+import torch
 from pydantic import Field
 
 from vllm.config.utils import config
@@ -109,6 +110,24 @@ def capture_runtime_config() -> Sm70RuntimeConfig:
 class RuntimeTraceConfig:
     """Captured runner diagnostics; never part of compiled computation."""
 
+    layer_aliases: ClassVar[dict[str, str]] = {
+        "dense_debug": "VLLM_SM70_F16_DENSE_DEBUG",
+        "qwen_next_trace": "VLLM_QWEN3_NEXT_SM70_TRACE",
+        "unquant_debug": "VLLM_SM70_UNQUANT_DEBUG",
+        "profile_trace": "VLLM_SM70_PROFILE_TRACE",
+        "greedy_token_trace": "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE",
+    }
+
+    dense_debug: bool | None = None
+    """Explain prepared dense FP16 projections."""
+    qwen_next_trace: bool | None = None
+    """Retain Qwen3Next projection route diagnostics."""
+    unquant_debug: bool | None = None
+    """Explain unquantized fallback projections."""
+    profile_trace: bool | None = None
+    """Trace retained model/layer route events without changing computation."""
+    greedy_token_trace: bool | None = None
+    """Explain local greedy-token fastpath admission."""
     async_cpu: bool | None = None
     """Trace asynchronous runner preparation/execute/sample CPU stages."""
     async_every: int | None = Field(default=None, ge=1)
@@ -129,6 +148,7 @@ class RuntimeTraceConfig:
             self,
             {
                 "async_cpu": "VLLM_SM70_ASYNC_CPU_TRACE",
+                **self.layer_aliases,
                 "events": "VLLM_SM70_DECODE_EVENT_TRACE",
             },
         )
@@ -203,3 +223,18 @@ class SpecDecodeTraceConfig:
                 else "8"
             )
         return self
+
+
+def capture_runtime_trace():
+    """Borrow the engine diagnostic owner during initialization or a forward."""
+    from vllm.runtime_resources import current_runtime_resources
+
+    resources = current_runtime_resources()
+    if resources is not None and resources.get("runtime_trace") is not None:
+        return resources["runtime_trace"]
+    return _standalone_runtime_trace()
+
+
+@torch.compiler.assume_constant_result
+def _standalone_runtime_trace():
+    return RuntimeTraceConfig()

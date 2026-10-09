@@ -43,6 +43,7 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheConfig
 from vllm.config.execution_policy import graph_policy
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -701,7 +702,7 @@ def _select_dummy_sample_hidden_states(
 
 
 def _sm70_profile_trace(message: str, *args: object) -> None:
-    if envs.VLLM_SM70_PROFILE_TRACE:
+    if capture_runtime_trace().profile_trace:
         if args:
             message = message % args
         logger.info("SM70 profile trace: %s", message)
@@ -1330,9 +1331,7 @@ class GPUModelRunner(
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
         self.sm70_greedy_token_fastpath = envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH
-        self.sm70_greedy_token_fastpath_trace = (
-            envs.VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE
-        )
+        self.sm70_greedy_token_fastpath_trace = self._runtime_trace.greedy_token_trace
         self._sm70_greedy_token_fastpath_trace_seen: set[str] = set()
         draft_vocab_config = resolve_mtp_draft_vocab_config(
             (self.speculative_config.method or "") if self.speculative_config else "",

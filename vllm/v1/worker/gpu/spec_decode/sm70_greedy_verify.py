@@ -65,8 +65,20 @@ def greedy_verify(
     return sampled, num_sampled
 
 
+def greedy_capability(device, has_lora: bool) -> bool:
+    return bool(
+        device.type == "cuda"
+        and current_platform.is_device_capability(70)
+        and not has_lora
+    )
+
+
 def maybe_sample_greedy(
-    runner,
+    model,
+    sampler,
+    rejection_sampler,
+    capability_enabled: bool,
+    verify_enabled: bool,
     sample_hidden_states,
     input_batch,
     grammar_output,
@@ -80,37 +92,31 @@ def maybe_sample_greedy(
         and input_batch.num_tokens == 1
         and not input_batch.is_prefilling_np[0]
         and grammar_output is None
-        and runner.device.type == "cuda"
-        and current_platform.is_device_capability(70)
-        and getattr(runner, "lora_config", None) is None
-        and hasattr(runner.model, "get_top_tokens")
-        and runner.sampler is not None
-        and runner.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
+        and capability_enabled
+        and hasattr(model, "get_top_tokens")
+        and sampler is not None
+        and sampler.can_use_sm70_greedy_token_fastpath(input_batch)
     )
     sm70_greedy_verify = (
         sampler_output is None
         and cached_logits is None
         and input_batch.num_draft_tokens > 0
         and grammar_output is None
-        and runner.device.type == "cuda"
-        and current_platform.is_device_capability(70)
-        and getattr(runner, "lora_config", None) is None
-        and hasattr(runner.model, "get_top_tokens")
-        and runner.rejection_sampler is not None
-        and runner.rejection_sampler.synthetic_conditional_rates is None
-        and runner.vllm_config.kernel_config.sm70_greedy_verify
-        and runner.rejection_sampler.sampler.can_use_sm70_greedy_token_fastpath(
-            input_batch
-        )
+        and capability_enabled
+        and hasattr(model, "get_top_tokens")
+        and rejection_sampler is not None
+        and rejection_sampler.synthetic_conditional_rates is None
+        and verify_enabled
+        and rejection_sampler.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
     )
     if sm70_greedy_verify:
-        assert runner.rejection_sampler is not None
-        target_ids = runner.model.get_top_tokens(sample_hidden_states).view(-1)
+        assert rejection_sampler is not None
+        target_ids = model.get_top_tokens(sample_hidden_states).view(-1)
         sampled, num_sampled = greedy_verify(
             target_ids,
             input_batch.input_ids[input_batch.logits_indices],
             input_batch.cu_num_logits,
-            runner.rejection_sampler.num_speculative_steps,
+            rejection_sampler.num_speculative_steps,
         )
         sampler_output = SamplerOutput(
             sampled_token_ids=sampled,
@@ -120,7 +126,7 @@ def maybe_sample_greedy(
         )
         logger.info_once("SM70 greedy MTP verification from TP-local argmax.")
     if sm70_greedy_decode:
-        sampled = runner.model.get_top_tokens(sample_hidden_states)
+        sampled = model.get_top_tokens(sample_hidden_states)
         sampler_output = SamplerOutput(
             sampled_token_ids=sampled.view(-1, 1),
             logprobs_tensors=None,

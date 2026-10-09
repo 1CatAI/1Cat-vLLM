@@ -9,7 +9,8 @@ import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 import vllm.envs as envs
-from vllm import _sm70_ops as sm70_ops
+from vllm.config.execution_policy import layer_policy
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -49,90 +50,26 @@ logger = init_logger(__name__)
 _SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TRACE_SEEN: set[str] = set()
 
 
-def _interleave_output_rows_for_gated_silu(weight: torch.Tensor) -> torch.Tensor:
-    half = weight.shape[0] // 2
-    return torch.stack((weight[:half], weight[half:]), dim=1).reshape(weight.shape)
+def _maybe_sm70_dense_forward(layer, x, bias):
+    state = getattr(layer, "_sm70_dense_state", None)
+    if state is None or state.weight is not layer.weight:
+        return None
+    return state.apply(x, bias)
 
 
-def _maybe_sm70_glm53_tp8_cublaslt(
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-    bias: torch.Tensor | None,
-) -> torch.Tensor | None:
-    if not getattr(layer, "_sm70_glm53_tp8_cublaslt", False):
+def _maybe_sm70_glm53_tp8_cublaslt(layer, x, bias):
+    state = getattr(layer, "_sm70_dense_state", None)
+    if state is None or state.weight is not layer.weight:
         return None
-    if bias is not None or x.dtype != torch.float16 or x.shape[-1] not in (1024, 4096):
-        return None
-    x_2d = x.reshape(-1, x.shape[-1])
-    if x_2d.shape[0] != 8 or not x_2d.is_contiguous():
-        return None
-    weight = layer.weight
-    if weight.dtype != torch.float16 or not weight.is_contiguous():
-        return None
-    shape = (tuple(weight.shape), tuple(x_2d.shape))
-    if shape not in (
-        ((3336, 4096), (8, 4096)),
-        ((4096, 1024), (8, 1024)),
-    ):
-        return None
-    if not hasattr(torch.ops._C, "sm70_glm53_tp8_cublaslt_out"):
-        raise RuntimeError(
-            "The SM70 GLM-5.3 TP8 cuBLASLt projection requires its native "
-            "op. Rebuild vLLM from source with CUDA 12.8 and arch 7.0."
-        )
-    out = torch.empty((x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
-    sm70_ops.sm70_glm53_tp8_cublaslt_out(out, x_2d, weight)
-    logger.info_once("SM70 GLM-5.3 TP8 cuBLASLt M8 projection path enabled.")
-    return out.reshape(*x.shape[:-1], out.shape[-1])
+    return state.apply_glm(x, bias)
 
 
-def _maybe_sm70_dense_forward(
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-    bias: torch.Tensor | None,
-) -> torch.Tensor | None:
-    glm53_output = _maybe_sm70_glm53_tp8_cublaslt(layer, x, bias)
-    if glm53_output is not None:
-        return glm53_output
-    if getattr(layer, "_sm70_f16_forbidden", False):
-        return None
-    if not getattr(layer, "_sm70_f16_prepared", False):
-        return None
-    if not hasattr(torch.ops._C, "sm70_f16_gemm"):
-        return None
-    max_m = getattr(layer, "_sm70_f16_max_m", None)
-    if max_m is not None and x.numel() // x.shape[-1] > max_m:
-        return None
+def _interleave_output_rows_for_gated_silu(weight):
+    from vllm.model_executor.kernels.linear.sm70_dense import (
+        _interleave_output_rows_for_gated_silu as interleave,
+    )
 
-    if envs.VLLM_SM70_F16_DENSE_DEBUG or envs.VLLM_QWEN3_NEXT_SM70_TRACE:
-        rows = x.numel() // x.shape[-1]
-        logger.info(
-            "SM70 dense apply active for %s m=%d n=%d k=%d",
-            getattr(layer, "prefix", "<unknown>"),
-            rows,
-            layer.weight.shape[0],
-            x.shape[-1],
-        )
-
-    x_2d = x.reshape(-1, x.shape[-1])
-    if not x_2d.is_contiguous():
-        x_2d = x_2d.contiguous()
-
-    tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
-    k_ld = getattr(layer, "_sm70_f16_k_ld", None)
-    if not torch.compiler.is_compiling() and tm_weight is not None and k_ld is not None:
-        out = torch.empty(
-            (x_2d.size(0), tm_weight.shape[0]),
-            dtype=x_2d.dtype,
-            device=x_2d.device,
-        )
-        sm70_ops.sm70_f16_gemm_out(out, x_2d, tm_weight, k_ld, False)
-    else:
-        out = sm70_ops.sm70_f16_gemm(x_2d, layer.weight)
-
-    if bias is not None:
-        out = out + bias
-    return out.reshape(*x.shape[:-1], out.shape[-1])
+    return interleave(weight)
 
 
 def _maybe_sm70_awq_mlp_down_tile_all_reduce(
@@ -422,7 +359,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if maybe_prepare_online_qpn8(layer):
             return
 
-        if envs.VLLM_SM70_DSV4_FP13_GEMV and getattr(
+        if layer_policy().dsv4_fp13_gemv and getattr(
             layer, "_sm70_dsv4_fp13_gemv", False
         ):
             from vllm.models.deepseek_v4.sm70.gemv import (
@@ -431,55 +368,27 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
             prepare_sm70_dsv4_fp13_gemv(layer)
 
-        force_enable = getattr(layer, "_sm70_f16_force_enable", False)
-        if not envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH and not force_enable:
-            return
-        if getattr(layer, "_sm70_f16_forbidden", False):
-            return
-        if not force_enable and not is_layer_sm70_f16_dense(
-            getattr(layer, "prefix", "")
-        ):
-            return
-        if hasattr(layer, "input_is_parallel") and not layer.input_is_parallel:
-            return
-        if not hasattr(torch.ops._C, "sm70_f16_prepare"):
-            return
-        if layer.weight.dtype != torch.float16 or not layer.weight.is_cuda:
-            return
-        if torch.cuda.get_device_capability(layer.weight.device) != (7, 0):
-            return
-        if (
-            layer.weight.ndim != 2
-            or (layer.weight.shape[1] % 16) != 0
-            or (layer.weight.shape[0] % 32) != 0
-        ):
-            return
+        from vllm.model_executor.kernels.linear import sm70_dense as dense_provider
 
-        prepared = sm70_ops.sm70_f16_prepare(layer.weight)
-        layer._sm70_f16_tm_weight = prepared[0]
-        layer._sm70_f16_k_ld = int(prepared[1][0].item())
-        prefix = getattr(layer, "prefix", "")
-        if (
-            prefix.rsplit(".", 1)[-1] == "gate_up_proj"
-            and layer.weight.shape[0] % 2 == 0
-        ):
-            gated_weight = _interleave_output_rows_for_gated_silu(
-                layer.weight
-            ).contiguous()
-            gated_prepared = sm70_ops.sm70_f16_prepare(gated_weight)
-            layer._sm70_f16_gated_weight = gated_weight
-            layer._sm70_f16_gated_tm_weight = gated_prepared[0]
-            layer._sm70_f16_gated_k_ld = int(gated_prepared[1][0].item())
-        layer._sm70_f16_prepared = True
-        logger.info_once(
-            "SM70 dense fp16 fast path enabled for small decode projections."
+        state = dense_provider.DenseLinearState(
+            layer.weight,
+            prefix=getattr(layer, "prefix", ""),
+            policy=layer._layer_execution_policy,
+            trace=layer._layer_trace,
+            forbidden=getattr(layer, "_sm70_f16_forbidden", False),
+            max_m=getattr(layer, "_sm70_f16_max_m", None),
+            glm_cublaslt=getattr(layer, "_sm70_glm53_tp8_cublaslt", False),
         )
-        if envs.VLLM_SM70_F16_DENSE_DEBUG or envs.VLLM_QWEN3_NEXT_SM70_TRACE:
-            logger.info(
-                "SM70 dense prepared for %s weight_shape=%s",
-                getattr(layer, "prefix", "<unknown>"),
-                tuple(layer.weight.shape),
-            )
+        layer._sm70_dense_state = state
+        dense_provider.prepare_dense(
+            state,
+            force_enable=getattr(layer, "_sm70_f16_force_enable", False),
+            input_parallel=getattr(layer, "input_is_parallel", True),
+            suffix_allowed=is_layer_sm70_f16_dense(
+                getattr(layer, "prefix", ""),
+                policy=layer._layer_execution_policy,
+            ),
+        )
 
     def apply(
         self,
@@ -513,11 +422,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return sm70_out
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
-        if envs.VLLM_SM70_UNQUANT_DEBUG and x.dim() >= 2:
+        if layer._layer_trace.unquant_debug and x.dim() >= 2:
             x_2d = x.reshape(-1, x.shape[-1])
             log_fn = (
                 logger.info
-                if x_2d.size(0) <= envs.VLLM_SM70_F16_DENSE_MAX_M
+                if x_2d.size(0) <= layer._layer_execution_policy.dense_max_m
                 else logger.info_once
             )
             log_fn(
@@ -546,6 +455,23 @@ class LinearBase(PluggableLayer):
         disable_tp: If true, tensor parallelism will be disabled for this layer.
     """
 
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            if name.startswith("_sm70_f16_"):
+                state = self._modules.get("_sm70_dense_state")
+                if state is not None:
+                    return getattr(state, name)
+            raise
+
+    def __setattr__(self, name, value):
+        if name == "weight":
+            state = self.__dict__.get("_modules", {}).get("_sm70_dense_state")
+            if state is not None and state.weight is not value:
+                del self._sm70_dense_state
+        super().__setattr__(name, value)
+
     def __init__(
         self,
         input_size: int,
@@ -560,6 +486,9 @@ class LinearBase(PluggableLayer):
         disable_tp: bool = False,
     ):
         super().__init__()
+
+        self._layer_execution_policy = layer_policy()
+        self._layer_trace = capture_runtime_trace()
 
         # Keep input parameters
         self.input_size = input_size

@@ -54,8 +54,8 @@ diagnostics and warmup-only selection do not.
 | C1b | Staged input resources and ordinary speculative sampling boundary | Merged as #1131 (`dfaeb1ba19ca98`) |
 | C2a | GDN compute plan, providers and shared stages | Merged as #1133 (`ec535b1e69b6`) |
 | C2b | GDN metadata and state preparation/commit | Merged as #1135 (`ad19d7ad1166`) |
-| C3 | Ordered defaults, model qualification and engine-local effective values | Validated in #1137 |
-| C4a | Shared embedding, LM-head, norm and linear providers | Pending |
+| C3 | Ordered defaults, model qualification and engine-local effective values | Merged as #1137 (`51c0f97201a7`) |
+| C4a | Shared embedding, LM-head, norm and linear providers | CPU validated; GPU operator validation pending |
 | C4b | Graph/communication/fusion boundaries and final explanation report | Pending |
 
 Each PR is based on merged main and is reviewed and merged before the next
@@ -614,3 +614,61 @@ including `baseline-v3.xml`, `candidate-v3.xml`, `candidate-stages-v3.xml`,
 log. Local retained copies and the source-token comparison are in
 `/home/ymzx/arch-ws/tmp/phase-c3`. No model throughput, TTFT or 35B conclusion is
 made by this acceptance.
+
+## C4a implementation and acceptance
+
+Three draft-weight binding flows now share `models.shared_weights`: legacy
+EAGLE/MTP, Runner V2 EAGLE/MTP, and ordinary DFlash. The model contract retains
+PP=1 qualification for the first two, final-stage embedding replication for
+DFlash, the existing memory-dependent weight comparison, and MTP shared-head
+and top-k buffer identity. The runner owns execution order and local-argmax
+validation; it no longer implements the binding lifecycle.
+
+Gemma native/CUDA entries use one ordered provider dispatcher for fixed-width
+normalization, fused FP32 residual, and long-prefill normalization. Their
+arithmetic implementations remain independent because reduction and casting
+order differ. Custom-op names, schemas, fake functions and registration order
+are unchanged. The three moved Triton kernel ASTs are unchanged.
+
+Prepared LM-head state owns packed FP16/QPN8 weights and scratch, while the
+embedding owns its original parameter and sharding. Dense FP16 projections use
+the same ownership boundary. Compatibility attributes borrow that state; weight
+replacement drops it. Packs are nonpersistent buffers and are not duplicated in
+state dictionaries. Packed top-one, raw GEMV, FP32 logits and QPN8 candidate
+rerank keep their layout, accumulation and dense-vocabulary tie contracts.
+Shadow comparison returns a typed request to the layer adapter, which computes
+ordinary logits once; the provider has no quant-method or runner callback.
+
+B's input flattening/output restoration is shared by quantized, FP16 and LM-head
+providers. These views now live outside the kernel selector package initializer,
+so importing the generic linear layer cannot trigger a registration cycle.
+Preparation binds the native policy only after device/layout admission; a CPU
+or unsupported-device fallback does not require a CUDA ABI. The compiler still
+uses the original-weight operator while eager execution uses prepared weights.
+Dynamic M admission remains inside the existing execution boundary.
+
+| Parameter family | Initialization owner and compatibility |
+|---|---|
+| Dense enable, suffix allowlist, max M, LM-head dense/top-one, Gemma eager/long-prefill | `KernelConfig.layer_execution`; typed values precede legacy aliases. LM-head truth-word admission and deferred integer-parser logging errors remain distinct. |
+| Native FP16 max M and tuning | B's `Sm70NativeConfig` nested under the layer policy; two conflicting typed max-M requests raise rather than silently disagree. |
+| DFlash FP32 logits, QPN8 rerank and shadow | `SpeculativeConfig.sm70_dflash2`; explicit/model-resolved choices reach native FP16 policy. Shadow remains explicit and affects computation hashes because it returns dense results. |
+| DeepSeek FP13 / exact FP16 fallback | Layer execution policy consumed by the existing model provider; tensor-value qualification and FP13-to-FP16 fallback are unchanged. |
+| Dense/unquantized/profile/greedy-token/Qwen trace | `ObservabilityConfig.runtime_trace`; borrowed by engine resources and excluded from calculation hashes. |
+
+The expanded same-scope source inventory measures **277 → 251** legacy read
+sites (62 → 70 source files, including the destination providers). These are
+source counts, not kernel-launch counts. Draft binding lifecycles decrease
+**3 → 1**, and Gemma stage dispatchers **2 → 1**. The retained independent
+arithmetic/layout branches are listed above; no layering whitelist was enlarged.
+Layering counts are env 248, platform 3447, model 2137.
+
+Local operator/configuration/state coverage passed **174 tests**, with **14
+CUDA-only skips**. A separate fresh-import/consumer selection passed **87 tests**
+(overlapping coverage; not additive). Tests include explicit/legacy conflicts,
+engine initialization order, stable configuration after environment changes,
+weight/pack release, missing native ABI rejection, cached greedy-verification
+results, and row bounds on eager/compiled dispatch. A fresh-process import test
+caught and eliminated the registration cycle before promotion.
+
+GPU correctness and matched A/B evidence will be recorded before merging this
+batch. No model weights, throughput, TTFT or 35B acceptance are claimed.

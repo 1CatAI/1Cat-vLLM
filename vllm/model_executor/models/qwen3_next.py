@@ -20,6 +20,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.execution_policy import layer_policy
+from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -94,7 +95,7 @@ _SM70_QWEN_LAYER_GRAPH_META: dict[str, dict[str, object]] = {}
 
 
 def _sm70_profile_trace_enabled() -> bool:
-    return envs.VLLM_SM70_PROFILE_TRACE and not torch.compiler.is_compiling()
+    return capture_runtime_trace().profile_trace and not torch.compiler.is_compiling()
 
 
 def _sm70_profile_trace(message: str, *args: object) -> None:

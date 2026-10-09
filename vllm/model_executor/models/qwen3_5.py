@@ -1129,7 +1129,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
                 module_prefix = getattr(module, "prefix", "")
                 if module_prefix and module_prefix.rsplit(".", 1)[-1] in allowlist:
                     module._sm70_f16_forbidden = False
-        if envs.VLLM_SM70_ENABLE_DENSE_F16_FASTPATH or allowlist is not None:
+        if vllm_config.kernel_config.layer_execution.dense_f16 or allowlist is not None:
             logger.info_once(
                 "SM70 dense fp16 fast path is disabled for Qwen3.5 MoE "
                 "modules except VLLM_SM70_MOE_DENSE_ALLOWLIST=%s.",

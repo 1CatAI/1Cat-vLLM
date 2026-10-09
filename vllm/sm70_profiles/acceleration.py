@@ -680,7 +680,15 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         else:
             values = _switches(defaults, cfg)
         paths[name] = _row(
-            reason or (None if _switches_match(values, defaults) else "user_override"),
+            reason
+            or (
+                None
+                if _switches_match(
+                    {key: value for key, value in values.items() if key in defaults},
+                    defaults,
+                )
+                else "user_override"
+            ),
             switches=values,
         )
 

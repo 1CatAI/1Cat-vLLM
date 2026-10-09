@@ -7,15 +7,42 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-import vllm.model_executor.layers.vocab_parallel_embedding as vocab_embedding
-from vllm import envs
+import vllm.model_executor.kernels.lm_head.sm70 as vocab_embedding
+from vllm.config.execution_policy import layer_policy
+from vllm.config.sm70_dflash2 import resolved_sm70_dflash2_config
+from vllm.config.sm70_runtime import capture_runtime_trace
 
 pytestmark = pytest.mark.skip_global_cleanup
+
+
+@pytest.fixture(autouse=True)
+def fake_native_bindings(monkeypatch):
+    # This suite substitutes operator implementations; GPU tests use the real ABI.
+    monkeypatch.setattr(
+        vocab_embedding, "NativeBindings", lambda values: vocab_embedding.sm70_ops
+    )
+
+
+def _make_state(**values):
+    weight = values.pop("weight") if "weight" in values else torch.empty((32, 16))
+    shard = values.pop("shard_indices", vocab_embedding.VocabShard())
+    state = vocab_embedding.Sm70LMHeadState(
+        weight,
+        shard,
+        is_lm_head=True,
+        policy=layer_policy(),
+        dflash=resolved_sm70_dflash2_config(),
+        trace=capture_runtime_trace(),
+    )
+    for name, value in values.items():
+        setattr(state, name, value)
+    return state
 
 
 class _FakeCudaTensor:
     def __init__(self, shape, dtype=torch.float16):
         self.shape = tuple(shape)
+        self.ndim = len(shape)
         self.dtype = dtype
         self.device = torch.device("cuda:0")
         self.is_cuda = True
@@ -47,8 +74,8 @@ def _set_lm_head_routes(
     monkeypatch.setenv("VLLM_SM70_LM_HEAD_TOP1", str(int(raw_top1)))
     monkeypatch.setenv("VLLM_SM70_LM_HEAD_TOP1_TC", str(int(tc_top1)))
     monkeypatch.setenv("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", str(int(dense)))
-    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_QPN8_RERANK", qpn8)
-    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW", False)
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_QPN8_RERANK", str(int(qpn8)))
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW", "0")
 
 
 def test_raw_top1_does_not_prepare_packed_lm_head(monkeypatch) -> None:
@@ -60,7 +87,7 @@ def test_raw_top1_does_not_prepare_packed_lm_head(monkeypatch) -> None:
     )
     prepare = Mock(side_effect=AssertionError("raw top1 must not pack the LM head"))
     monkeypatch.setattr(vocab_embedding.sm70_ops, "sm70_f16_prepare", prepare)
-    layer = SimpleNamespace(weight=object())
+    layer = _make_state(weight=object())
 
     assert vocab_embedding.maybe_prepare_sm70_lm_head_top1(layer)
     assert layer._sm70_f16_raw_top1_ready
@@ -90,7 +117,7 @@ def test_raw_top1_dispatch_uses_original_weight(monkeypatch) -> None:
         lambda shape, dtype, device: _FakeCudaTensor(shape, dtype),
     )
     weight = _FakeCudaTensor((64, 16))
-    layer = SimpleNamespace(
+    layer = _make_state(
         weight=weight,
         _sm70_f16_raw_top1_ready=True,
         shard_indices=SimpleNamespace(
@@ -135,7 +162,7 @@ def test_packed_lm_head_routes_still_prepare_layout(
         "_is_sm70_lm_head_fastpath_eligible",
         lambda _layer: True,
     )
-    packed_weight = object()
+    packed_weight = torch.empty(1)
     prepare = Mock(return_value=(packed_weight, torch.tensor([32])))
     monkeypatch.setattr(torch.ops._C, "sm70_f16_prepare", Mock(), raising=False)
     monkeypatch.setattr(vocab_embedding.sm70_ops, "sm70_f16_prepare", prepare)
@@ -145,7 +172,7 @@ def test_packed_lm_head_routes_still_prepare_layout(
         "_prepare_sm70_dflash2_qpn8_rerank",
         prepare_qpn8,
     )
-    layer = SimpleNamespace(weight=object())
+    layer = _make_state(weight=object())
 
     assert vocab_embedding.maybe_prepare_sm70_lm_head_top1(layer), route
     assert layer._sm70_f16_prepared
@@ -159,12 +186,12 @@ def test_packed_lm_head_routes_still_prepare_layout(
 @pytest.mark.parametrize("tc_top1", [False, True])
 def test_fp32_qpn8_only_packs_for_explicit_tc_top1(monkeypatch, dense, tc_top1) -> None:
     _set_lm_head_routes(monkeypatch, qpn8=True, dense=dense, tc_top1=tc_top1)
-    monkeypatch.setattr(envs, "VLLM_SM70_DFLASH2_FP32_LOGITS", True)
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_FP32_LOGITS", "1")
     monkeypatch.setattr(
         vocab_embedding, "_is_sm70_lm_head_fastpath_eligible", lambda _layer: True
     )
-    layer = SimpleNamespace(weight=_FakeCudaTensor((62080, 5120)), tp_size=4)
-    prepare = Mock(return_value=(object(), torch.tensor([5120])))
+    layer = _make_state(weight=_FakeCudaTensor((62080, 5120)), tp_size=4)
+    prepare = Mock(return_value=(torch.empty(1), torch.tensor([5120])))
     monkeypatch.setattr(torch.ops._C, "sm70_f16_prepare", Mock(), raising=False)
     monkeypatch.setattr(vocab_embedding.sm70_ops, "sm70_f16_prepare", prepare)
     prepare_qpn8 = Mock(return_value=True)
@@ -184,7 +211,7 @@ def test_fp32_qpn8_only_packs_for_explicit_tc_top1(monkeypatch, dense, tc_top1) 
 
 def test_raw_top1_readiness_does_not_enable_dense_fastpath(monkeypatch) -> None:
     _set_lm_head_routes(monkeypatch, raw_top1=True, dense=True)
-    layer = SimpleNamespace(_sm70_f16_raw_top1_ready=True)
+    layer = _make_state(_sm70_f16_raw_top1_ready=True)
 
     assert (
         vocab_embedding._maybe_sm70_lm_head_forward(
@@ -197,7 +224,7 @@ def test_raw_top1_readiness_does_not_enable_dense_fastpath(monkeypatch) -> None:
 
 def test_disabled_lm_head_routes_prepare_nothing(monkeypatch) -> None:
     _set_lm_head_routes(monkeypatch)
-    layer = SimpleNamespace(weight=object())
+    layer = _make_state(weight=object())
 
     assert not vocab_embedding.maybe_prepare_sm70_lm_head_top1(layer)
     assert not hasattr(layer, "_sm70_f16_raw_top1_ready")

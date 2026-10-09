@@ -131,7 +131,12 @@ class PolicyDefaults:
             self.setdefault("VLLM_SM70_LM_HEAD_TOP1", "0")
         for path in POLICY_OWNERS:
             policy = _owner(self.cfg, path)
-            policy.resolve()
+            if path == "kernel_config.layer_execution":
+                policy.resolve(
+                    dflash=_owner(self.cfg, "speculative_config.sm70_dflash2")
+                )
+            else:
+                policy.resolve()
         graph = self.cfg.compilation_config.runtime
         if graph.sources.get("mega_aot") == "default":
             from vllm.utils.torch_utils import is_torch_equal_or_newer
@@ -224,6 +229,7 @@ def finalize_runtime_policy_hashes(cfg):
 
 def runtime_policy_report(cfg):
     """Explain typed values and their initialization trace; not a native hit log."""
+    trace = _owner(cfg, "observability_config.runtime_trace")
     return {
         "evidence": "resolved_configuration",
         "owners": {
@@ -241,6 +247,14 @@ def runtime_policy_report(cfg):
                 "active": _owner(cfg, path).active,
             }
             for path in POLICY_OWNERS
+        },
+        "fp16_native": {
+            "values": cfg.kernel_config.layer_execution.native.hash_options(),
+            "sources": cfg.kernel_config.layer_execution.native.sources,
+        },
+        "layer_diagnostics": {
+            field: getattr(trace, field)
+            for field in (trace.layer_aliases if trace is not None else {})
         },
         "default_resolution": cfg.runtime_default_sources,
     }
@@ -275,6 +289,11 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
         for alias, paths in EXTRA_BINDINGS.items()
         if all(_owner(cfg, path) is not None for path in paths)
     )
+    trace = _owner(cfg, "observability_config.runtime_trace")
+    if trace is not None:
+        for field, alias in trace.layer_aliases.items():
+            if field in trace.sources:
+                ignored.add(alias)
     spec = _owner(cfg, "speculative_config.sm70_dflash2")
     if spec is not None and spec.resolved:
         ignored.update(SM70_DFLASH2_LEGACY_FIELDS)

@@ -2137,153 +2137,32 @@ class SpecDecodeBaseProposer:
                 self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
-        """
-        Some draft models may not have their own embedding layers, and some may
-        have a duplicate copy of the target model's embedding layers. In these cases,
-        we share the target model's embedding layers with the draft model to save
-        memory.
-        """
-        if get_pp_group().world_size == 1:
-            inner_model = getattr(target_language_model, "model", None)
-            if inner_model is None:
-                raise AttributeError("Target model does not have 'model' attribute")
-            if hasattr(inner_model, "embed_tokens"):
-                target_embed_tokens = inner_model.embed_tokens
-            elif hasattr(inner_model, "embedding"):
-                target_embed_tokens = inner_model.embedding
-            else:
-                raise AttributeError(
-                    "Target model does not have 'embed_tokens' or 'embedding' attribute"
-                )
+        from vllm.model_executor.models.shared_weights import (
+            LEGACY_DRAFT_WEIGHTS,
+            share_embeddings,
+        )
 
-            share_embeddings = False
-            if hasattr(self.model, "has_own_embed_tokens"):
-                # EAGLE model
-                if not self.model.has_own_embed_tokens:
-                    share_embeddings = True
-                    logger.info(
-                        "Detected EAGLE model without its own embed_tokens in the"
-                        " checkpoint. Sharing target model embedding weights with the"
-                        " draft model."
-                    )
-                elif (
-                    isinstance(target_embed_tokens.weight, torch.Tensor)
-                    and isinstance(self.model.model.embed_tokens.weight, torch.Tensor)
-                    # TODO: Offload to CPU for comparison to avoid extra GPU memory
-                    # usage in CI testing environments with limited GPU memory
-                    and torch.equal(
-                        target_embed_tokens.weight.cpu(),
-                        self.model.model.embed_tokens.weight.cpu(),
-                    )
-                ):
-                    share_embeddings = True
-                    logger.info(
-                        "Detected EAGLE model with embed_tokens identical to the target"
-                        " model. Sharing target model embedding weights with the draft"
-                        " model."
-                    )
-                else:
-                    logger.info(
-                        "Detected EAGLE model with distinct embed_tokens weights. "
-                        "Keeping separate embedding weights from the target model."
-                    )
-            else:
-                # MTP model
-                share_embeddings = True
-                logger.info(
-                    "Detected MTP model. "
-                    "Sharing target model embedding weights with the draft model."
-                )
-
-            if share_embeddings:
-                if hasattr(self.model.model, "embed_tokens"):
-                    del self.model.model.embed_tokens
-                self.model.model.embed_tokens = target_embed_tokens
-        else:
-            logger.info(
-                "The draft model's vocab embedding will be loaded separately"
-                " from the target model."
-            )
+        share_embeddings(
+            self.model,
+            target_language_model,
+            LEGACY_DRAFT_WEIGHTS,
+            pp_size=get_pp_group().world_size,
+            log=logger,
+        )
 
     def _maybe_share_lm_head(self, target_language_model: nn.Module) -> None:
-        """
-        Some draft models may not have their own LM head, and some may have a
-        duplicate copy of the target model's LM head. In these cases, we share
-        the target model's LM head with the draft model to save memory.
-        """
-        share_lm_head = False
-        if hasattr(self.model, "has_own_lm_head"):
-            # EAGLE model
-            if not self.model.has_own_lm_head:
-                share_lm_head = True
-                logger.info(
-                    "Detected EAGLE model without its own lm_head in the checkpoint. "
-                    "Sharing target model lm_head weights with the draft model."
-                )
-            elif (
-                hasattr(target_language_model, "lm_head")
-                and hasattr(target_language_model.lm_head, "weight")
-                and hasattr(self.model.lm_head, "weight")
-                and isinstance(target_language_model.lm_head.weight, torch.Tensor)
-                and isinstance(self.model.lm_head.weight, torch.Tensor)
-                # TODO: Offload to CPU for comparison to avoid extra GPU memory
-                # usage in CI testing environments with limited GPU memory
-                and torch.equal(
-                    target_language_model.lm_head.weight.cpu(),
-                    self.model.lm_head.weight.cpu(),
-                )
-            ):
-                share_lm_head = True
-                logger.info(
-                    "Detected EAGLE model with lm_head identical to the target model. "
-                    "Sharing target model lm_head weights with the draft model."
-                )
-            else:
-                logger.info(
-                    "Detected EAGLE model with distinct lm_head weights. "
-                    "Keeping separate lm_head weights from the target model."
-                )
-        else:
-            # MTP model
-            share_lm_head = True
-            logger.info(
-                "Detected MTP model. "
-                "Sharing target model lm_head weights with the draft model."
-            )
+        from vllm.model_executor.models.shared_weights import (
+            LEGACY_DRAFT_WEIGHTS,
+            share_lm_head,
+        )
 
-        if share_lm_head and hasattr(target_language_model, "lm_head"):
-            if hasattr(self.model, "lm_head"):
-                del self.model.lm_head
-            self.model.lm_head = target_language_model.lm_head
-
-            # MTP models call compute_logits via shared_head.head (a
-            # ParallelLMHead inside each MTP layer), not self.model.lm_head.
-            # If the checkpoint omits a copy of the lm_head weights at the
-            # MTP layer path, shared_head.head stays uninitialised and
-            # produces NaN logits. Always share it explicitly.
-            inner = getattr(self.model, "model", None)
-            layers = getattr(inner, "layers", None) if inner else None
-            if layers is not None:
-                items = layers.values() if isinstance(layers, nn.ModuleDict) else layers
-                for layer in items:
-                    sh = getattr(layer, "shared_head", None)
-                    if sh is not None and hasattr(sh, "head"):
-                        del sh.head
-                        sh.head = target_language_model.lm_head
-                        logger.info(
-                            "Shared target model lm_head with MTP shared_head.head."
-                        )
-
-        if hasattr(target_language_model.model, "topk_indices_buffer"):
-            if hasattr(self.model.model, "topk_indices_buffer"):
-                del self.model.model.topk_indices_buffer
-            self.model.model.topk_indices_buffer = (
-                target_language_model.model.topk_indices_buffer
-            )
-            logger.info(
-                "Detected MTP model with topk_indices_buffer. "
-                "Sharing target model topk_indices_buffer with the draft model."
-            )
+        share_lm_head(
+            self.model,
+            target_language_model,
+            target_language_model,
+            LEGACY_DRAFT_WEIGHTS,
+            log=logger,
+        )
 
         if self.use_local_argmax_reduction:
             if not hasattr(self.model, "get_top_tokens"):

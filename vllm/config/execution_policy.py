@@ -8,6 +8,7 @@ from typing import ClassVar
 import torch
 from pydantic import Field
 
+from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.utils import config, hash_factors
 
 
@@ -16,7 +17,13 @@ def read_execution_legacy(name: str):
 
     from vllm import envs
 
-    if name == "VLLM_SM70_DFLASH2_BF16_EMULATION":
+    if name in (
+        "VLLM_SM70_DFLASH2_BF16_EMULATION",
+        "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH",
+        "VLLM_SM70_LM_HEAD_TOP1_TC",
+    ):
+        if name != "VLLM_SM70_DFLASH2_BF16_EMULATION":
+            return os.getenv(name, "0").strip().lower() in ("1", "true", "yes", "on")
         raw = envs.environment_variables[name]()
         return ("1" if raw is None else raw).strip().lower() in (
             "1",
@@ -30,12 +37,20 @@ def read_execution_legacy(name: str):
         "VLLM_SM70_GLM_MHC_PRE_THREADS",
         "VLLM_SM70_FP8_DENSE_TUNE_MAX_M",
         "VLLM_SM70_NVFP4_DENSE_TUNE_MAX_M",
+        "VLLM_SM70_F16_DENSE_MAX_M",
     ):
         import regex as re
 
         # The native compatibility entry uses atoi, then accepts four sizes.
         is_threads = name == "VLLM_SM70_GLM_MHC_PRE_THREADS"
-        raw = os.getenv(name, "256" if is_threads else "16")
+        raw = os.getenv(
+            name,
+            "256"
+            if is_threads
+            else "64"
+            if name == "VLLM_SM70_F16_DENSE_MAX_M"
+            else "16",
+        )
         match = re.match(r"\s*([+-]?[0-9]+)", raw)
         value = int(match.group(1)) if match else 0
         if is_threads:
@@ -136,6 +151,46 @@ class GraphPolicy(ExecutionPolicy):
 class LayerExecutionPolicy(ExecutionPolicy):
     """Execution policy owned by kernel_config.layer_execution."""
 
+    native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """B's native ABI owner for FP16 projection selectors and tuning."""
+
+    dense_log_enabled: bool = Field(default=False, init=False)
+    """Legacy logger integer boolean, separate from truth-word admission."""
+    dense_log_error: str | None = Field(default=None, init=False)
+    """Legacy logger parse error, raised only at its original checkpoint."""
+
+    def resolve(self, *, dflash=None) -> None:
+        super().resolve()
+        from vllm import envs
+
+        if "dense_log_enabled" not in self.sources:
+            if self.sources.get("lm_head_dense") == "typed":
+                self.dense_log_enabled = bool(self.lm_head_dense)
+            else:
+                try:
+                    self.dense_log_enabled = envs.environment_variables[
+                        "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH"
+                    ]()
+                except ValueError as error:
+                    self.dense_log_error = str(error)
+            self.sources["dense_log_enabled"] = self.sources["lm_head_dense"]
+        if (
+            self.native.f16_dense_max_m is not None
+            and self.sources.get("dense_max_m") != "typed"
+        ):
+            self.dense_max_m = self.native.f16_dense_max_m
+            self.sources["dense_max_m"] = "typed:native"
+        overrides = {"VLLM_SM70_F16_DENSE_MAX_M": self.dense_max_m}
+        if dflash is not None:
+            overrides.update(dflash.native_overrides())
+        self.native.resolve("f16", overrides)
+
+    def compute_hash(self) -> str:
+        factors: dict[str, object] = {"policy": super().compute_hash()}
+        if self.hash_fields is None or "dense_f16" in self.hash_fields:
+            factors["native"] = self.native.hash_options()
+        return hash_factors(factors)
+
     batch_gemm_layouts: bool | None = None
     """Prepare compatible larger-batch dense weight layouts."""
 
@@ -153,6 +208,30 @@ class LayerExecutionPolicy(ExecutionPolicy):
 
     lm_head_top1: bool | None = None
     """Enable the existing local logits top-one projection shortcut."""
+
+    dsv4_fp13_gemv: bool | None = None
+    """Preserve the qualified DeepSeek packed FP13 projection route."""
+    dsv4_fp16_gemv: bool | None = None
+    """Preserve the exact DeepSeek FP16 projection fallback."""
+
+    dense_f16: bool | None = None
+    """Prepare the retained small FP16 projection layout."""
+    dense_allowlist: str | None = None
+    """Comma-separated projection suffixes; None retains model defaults."""
+    dense_max_m: int | None = None
+    """Legacy dense row threshold used by diagnostics and native dispatch."""
+
+    lm_head_dense: bool | None = None
+    """Enable the retained packed FP16 dense logits provider."""
+
+    lm_head_top1_tc: bool | None = None
+    """Enable the retained packed Tensor Core top-one provider."""
+
+    gemma_long_prefill_fused: bool | None = None
+    """Enable exact mixed-dtype Gemma normalization at the existing row bound."""
+
+    gemma_eager: bool | None = None
+    """Use the eager Gemma normalization custom-op boundary."""
 
     shared_moe_overlap: bool | None = None
     """Overlap the shared expert with routed expert execution."""
@@ -179,6 +258,15 @@ class LayerExecutionPolicy(ExecutionPolicy):
         "fused_hc": "VLLM_SM70_QWEN38_FUSED_HC_FP16",
         "gemma_compile_native": "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE",
         "lm_head_top1": "VLLM_SM70_LM_HEAD_TOP1",
+        "dense_f16": "VLLM_SM70_ENABLE_DENSE_F16_FASTPATH",
+        "dsv4_fp13_gemv": "VLLM_SM70_DSV4_FP13_GEMV",
+        "dsv4_fp16_gemv": "VLLM_SM70_DSV4_FP16_GEMV",
+        "dense_allowlist": "VLLM_SM70_F16_DENSE_ALLOWLIST",
+        "dense_max_m": "VLLM_SM70_F16_DENSE_MAX_M",
+        "lm_head_dense": "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH",
+        "lm_head_top1_tc": "VLLM_SM70_LM_HEAD_TOP1_TC",
+        "gemma_long_prefill_fused": "VLLM_SM70_GEMMA_LONG_PREFILL_FUSED",
+        "gemma_eager": "VLLM_SM70_GEMMA_RMS_NORM_EAGER",
         "shared_moe_overlap": "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP",
         "glm_cublaslt": "VLLM_SM70_GLM53_TP8_CUBLASLT",
         "glm_fused_fg_b": "VLLM_SM70_GLM53_TP8_FUSED_FG_B",

@@ -121,6 +121,10 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+from vllm.v1.worker.gpu.spec_decode.sm70_greedy_verify import (
+    greedy_capability,
+    maybe_sample_greedy,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.gpu.spec_decode.target_sampling import ComputedTargetLogits
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
@@ -158,6 +162,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         set_default_max_concurrency(vllm_config.max_concurrent_batches)
 
         self.device = device
+        self._sm70_greedy_capability = greedy_capability(
+            device, self.lora_config is not None
+        )
         self._auxiliary_warmup_enabled = auxiliary_warmup_enabled(vllm_config)
         from vllm.v1.worker.mixed_prefill import MixedPrefillTimer
 
@@ -1230,8 +1237,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cached_logits = sparse_result
             else:
                 sampler_output = sparse_result
-        sampler_output = self.vllm_config.kernel_config.sample_greedy(
-            self,
+        sampler_output = maybe_sample_greedy(
+            self.model,
+            self.sampler,
+            self.rejection_sampler,
+            self._sm70_greedy_capability,
+            self.vllm_config.kernel_config.sm70_greedy_verify,
             sample_hidden_states,
             input_batch,
             grammar_output,

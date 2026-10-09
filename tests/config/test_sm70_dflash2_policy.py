@@ -68,9 +68,12 @@ def test_legacy_parser_and_configuration_precedence(monkeypatch, raw, expected):
 
 
 def test_norm_retains_its_policy_after_initialization_context_ends(monkeypatch):
+    from vllm.model_executor.kernels.norm import sm70 as norm_provider
     from vllm.model_executor.layers import layernorm
 
-    monkeypatch.setattr(layernorm, "_sm70_gemma_long_prefill_available", lambda: True)
+    monkeypatch.setattr(
+        norm_provider, "_sm70_gemma_long_prefill_available", lambda: True
+    )
     monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
     cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
     policy = Sm70DFlash2Config()
