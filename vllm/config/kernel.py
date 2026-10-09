@@ -908,9 +908,14 @@ class KernelConfig:
                 for key in ("num_experts", "num_local_experts", "n_routed_experts")
             )
         )
-        self.sm70_sparse.active = bool(getattr(text, "index_head_dim", None))
+        self.sm70_moe.routing.resolve()
+        self.sm70_moe.routing.active = self.sm70_moe.unquantized.active
+        from vllm.model_executor.models.runtime_defaults import sparse_execution_family
+
+        sparse_family = sparse_execution_family(model)
+        self.sm70_sparse.active = sparse_family is not None
+        self.sm70_sparse.qualify(sparse_family)
         self.sm70_sparse.resolve()
-        self.sm70_sparse.validate_active()
         self.sm70_sparse.reason = (
             "no indexed sparse-attention metadata"
             if not self.sm70_sparse.active
@@ -921,6 +926,9 @@ class KernelConfig:
                 else ("requires FP16 queries" if model.dtype != torch.float16 else None)
             )
         )
+
+        self.sm70_sparse.active = self.sm70_sparse.reason is None
+        self.sm70_sparse.validate_active()
 
         platform_op_priority = current_platform.get_default_ir_op_priority(vllm_config)
         logger.debug(

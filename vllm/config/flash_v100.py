@@ -423,6 +423,9 @@ class CapturedFlashOptions:
                     value = value == "1"
                 elif parser == "ne0":
                     value = value != "0"
+                elif parser == "not_false":
+                    assert isinstance(value, str)
+                    value = value.strip().lower() not in ("0", "false", "no", "off")
                 elif parser.startswith("native:"):
                     if parser == "native:scalar_alias" and raw is None:
                         raw = self.legacy_inputs[self.legacy_aliases[field][0]]
@@ -486,6 +489,11 @@ class FlashV100Options(CapturedFlashOptions):
     legacy_aliases: ClassVar[dict[str, tuple[str, ...]]] = {
         "e4m3_scalar_fast": ("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST",),
     }
+
+    e4m3_long_enabled: bool | None = None
+    """Retain long-context attention unless the legacy explicit-off rule matches."""
+    e4m3_long_manifest: str | None = None
+    """Experimental long-context provider manifest, captured before execution."""
 
     tail_cudagraphs: bool | None = None
     """Scalar-tail attention also serves ordinary E4M3 decode, beyond DFlash."""
@@ -851,6 +859,8 @@ class FlashV100Options(CapturedFlashOptions):
     """Retained VLLM_FLASH_V100_XQA_STAGED_PV input."""
 
     bindings: ClassVar[dict[str, tuple[str, str, object]]] = {
+        "e4m3_long_enabled": ("VLLM_SM70_E4M3_LONG_ATTENTION", "not_false", ""),
+        "e4m3_long_manifest": ("VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", "raw", ""),
         "prefill_qk_algorithm": (
             "PREFIX_QK_CUBLAS_ALGO_RUNTIME",
             "native:optional_atoi",

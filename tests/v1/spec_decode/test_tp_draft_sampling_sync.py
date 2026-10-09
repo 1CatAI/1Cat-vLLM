@@ -109,6 +109,8 @@ def test_compute_probs_uses_top_k_only_proposal_when_top_k_present(monkeypatch):
         logits: torch.Tensor,
         k: torch.Tensor | None,
         p: torch.Tensor | None,
+        *,
+        runtime=None,
     ) -> torch.Tensor:
         calls.append(
             (k.clone() if k is not None else None, p.clone() if p is not None else None)

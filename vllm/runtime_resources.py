@@ -7,6 +7,7 @@ fields stay serializable and hashable; this private runtime map is not a policy
 input. A forward borrows the same owners, never a copy of their mutable state.
 """
 
+from contextlib import ExitStack, contextmanager
 from typing import Any
 
 
@@ -32,6 +33,11 @@ def runtime_resources_for(config) -> dict[str, Any]:
         resources = _RuntimeResources(
             {
                 "execution_policies": policies,
+                "spec_decode_trace": getattr(
+                    getattr(config, "observability_config", None),
+                    "spec_decode_trace",
+                    None,
+                ),
                 "runtime_trace": getattr(
                     getattr(config, "observability_config", None), "runtime_trace", None
                 ),
@@ -67,3 +73,12 @@ def release_runtime_resources(config) -> None:
         if close is not None:
             close()
     resources.clear()
+
+
+@contextmanager
+def activate_runtime_resources(resources):
+    """Borrow provider execution contexts registered during initialization."""
+    with ExitStack() as stack:
+        for owner in resources.get("execution_context_owners", ()):
+            stack.enter_context(owner.activate())
+        yield

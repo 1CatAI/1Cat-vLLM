@@ -3,13 +3,14 @@
 
 """GLM-5.3-Flash sparse MLA backend for exact SM70 CUDA devices."""
 
-import os
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
+from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
+from vllm.diagnostics import diagnostic_history
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_gathered,
@@ -37,10 +38,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_DEBUG_DFLASH_SPARSE_INDICES = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_COORD_TRACE", "0"))
-)
-_DFLASH_SPARSE_INDICES_SEEN = False
 _FP8_GEMM_MAX_TOKENS = 8
 
 
@@ -233,7 +230,6 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         del layer
-        global _DFLASH_SPARSE_INDICES_SEEN
         if isinstance(q, tuple):
             q_nope, q_pe = q
             if q_pe.shape[-1] != 0:
@@ -256,17 +252,15 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             return_valid_counts=True,
         )
         if (
-            _DEBUG_DFLASH_SPARSE_INDICES
-            and not _DFLASH_SPARSE_INDICES_SEEN
+            capture_runtime_trace().dflash.value("coord_integer")
+            and not diagnostic_history("glm_sparse_indices").get("seen", False)
             and 1 < num_tokens <= 8
         ):
             first_slot = int(attn_metadata.slot_mapping[0].item())
             first_logical_position = (
                 first_slot % attn_metadata.block_size if first_slot >= 0 else -1
             )
-            min_position = int(
-                os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8")
-            )
+            min_position = target_trace_min_position()
             if first_logical_position >= min_position:
                 valid = topk_indices.ge(0)
                 logical_min = torch.where(
@@ -291,7 +285,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     attn_metadata.block_table[:1, :4].detach().cpu().tolist(),
                     global_indices[:num_tokens, :24].detach().cpu().tolist(),
                 )
-                _DFLASH_SPARSE_INDICES_SEEN = True
+                diagnostic_history("glm_sparse_indices")["seen"] = True
         workspace_manager = current_workspace_manager()
         if self.use_fp8_cache:
             if num_tokens == 1:

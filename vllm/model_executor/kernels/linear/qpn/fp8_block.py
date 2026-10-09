@@ -290,7 +290,8 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
     ) -> torch.Tensor:
         codes = layer._sm70_block_fp8_qpn8_packed_codes
         split_k, accumulator_chains, prefetch_codes = layer._qpn8_cfg
-        y = torch.ops.sm70_fp8.qpn8_native_linear(
+        y = self.native_ops.invoke(
+            torch.ops.sm70_fp8.qpn8_native_linear,
             flatten_linear_input(x, codes.shape[0]).contiguous(),
             codes,
             layer._sm70_block_fp8_qpn8_packed_scales,

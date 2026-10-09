@@ -33,7 +33,7 @@ def config(monkeypatch):
     monkeypatch.setattr(
         acc,
         "_native_capabilities",
-        lambda page: dict.fromkeys(
+        lambda page, policy: dict.fromkeys(
             (
                 "grouped_fp32",
                 "fp16_grouped",
@@ -88,8 +88,11 @@ def config(monkeypatch):
     cfg.compilation_config.runtime = GraphPolicy()
     cfg.parallel_config.communication = CommunicationPolicy()
     cfg.runtime_default_sources = {}
+    from vllm.config.sm70_dflash2 import Sm70DFlash2Config
     from vllm.config.speculative_sampling import resolve_sampling_policy
 
+    cfg.speculative_config.sm70_dflash2 = Sm70DFlash2Config()
+    cfg.speculative_config.sm70_dflash2.resolve(qualified=False)
     cfg.speculative_config.sampling_policy = resolve_sampling_policy()
     cfg.kernel_config.gdn.projection.resolve()
     PolicyDefaults(cfg).finish()
@@ -173,7 +176,7 @@ def test_missing_operator_reason(config, monkeypatch):
     monkeypatch.setattr(
         acc,
         "_native_capabilities",
-        lambda page: dict.fromkeys(
+        lambda page, policy: dict.fromkeys(
             (
                 "grouped_fp32",
                 "long_operator",
@@ -191,24 +194,27 @@ def test_missing_operator_reason(config, monkeypatch):
 
 
 def test_user_override_and_strict_failure(config, monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0")
+    config.speculative_config.sm70_dflash2.verify_fastpath = False
     assert (
         acc.build_report(config)["paths"]["dflash2_verifier"]["reason"]
         == "user_override"
     )
-    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+    config.observability_config.runtime_trace.require_profile_acceleration = True
     with pytest.raises(ValueError, match="dflash2_verifier: user_override"):
         acc.log_and_validate(config)
 
 
 def test_strict_target_requirements_do_not_apply_to_internal_draft(config, monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+    config.observability_config.runtime_trace.require_profile_acceleration = True
     config.cache_config.cache_dtype = "auto"
     native_capabilities = acc._native_capabilities
     monkeypatch.setattr(
         acc,
         "_native_capabilities",
-        lambda page: {**native_capabilities(page), "fp16_grouped": False},
+        lambda page, policy: {
+            **native_capabilities(page, policy),
+            "fp16_grouped": False,
+        },
     )
     with pytest.raises(ValueError, match="fp16_grouped_fp32: operator_missing"):
         acc.log_and_validate(config)
@@ -228,7 +234,7 @@ def test_flashnext_report_uses_its_own_required_paths_and_ignores_kv_dtype(
     config.kernel_config.layer_execution.fp16_gemv = True
     config.kernel_config.layer_execution.fused_gdn_input = True
     config.kernel_config.layer_execution.fused_hc = True
-    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+    config.observability_config.runtime_trace.require_profile_acceleration = True
     # MoE stream policy is independent; target FP16 projections do not read KV.
     config.kernel_config.layer_execution.shared_moe_overlap = False
     config.parallel_config.communication.moe_add_allreduce = False
@@ -246,7 +252,7 @@ def test_flashnext_report_uses_its_own_required_paths_and_ignores_kv_dtype(
 
 def test_model_less_component_config_does_not_validate_a_target(config, monkeypatch):
     config.model_config = None
-    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+    config.observability_config.runtime_trace.require_profile_acceleration = True
 
     def unexpected_probe(_page):
         raise AssertionError("component configs must not probe target operators")
@@ -264,7 +270,7 @@ def test_non_sm70_is_not_applicable(config, monkeypatch):
     report = acc.log_and_validate(config)
     assert not report["expected_failures"]
     assert all(row["reason"] == "not_applicable" for row in report["paths"].values())
-    monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
+    config.observability_config.runtime_trace.require_profile_acceleration = True
     with pytest.raises(ValueError, match="not_applicable"):
         acc.log_and_validate(config)
 
@@ -331,7 +337,9 @@ def test_malformed_draft_contract_has_reason(config):
 
 
 def test_release_status_counts_only_expected_paths(config, monkeypatch):
-    monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "1")
+    config.runtime_default_sources["VLLM_DISABLE_COMPILE_CACHE"] = [
+        {"source": "process_startup", "raw": "1"}
+    ]
     report = acc.build_report(config)
     assert report["paths"]["qwen38_decode"]["reason"] == "not_applicable"
     assert report["paths"]["compile_cache"]["reason"] == "compile_cache_disabled"
@@ -454,3 +462,18 @@ def test_quantized_models_report_their_policy_without_claiming_nvfp4_profile(
     assert report["profile"] is None
     assert report["expected_acceleration"] == []
     assert report["linear_kernel_policies"][format_name]["configuration"]["resolved"]
+
+
+def test_report_never_evaluates_legacy_getters(config, monkeypatch):
+    from unittest.mock import Mock
+
+    expected = acc.build_report(config)
+    from vllm.envs_metadata import EnvVar
+
+    monkeypatch.setattr(
+        EnvVar, "__call__", Mock(side_effect=AssertionError("report getter"))
+    )
+    monkeypatch.setattr(
+        envs, "__getattr__", Mock(side_effect=AssertionError("report env attribute"))
+    )
+    assert acc.build_report(config) == expected

@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
-import vllm.envs as envs
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import (
@@ -245,14 +244,14 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         swa_lens = swa_metadata.decode_swa_lens
         assert swa_indices is not None and swa_lens is not None
         use_splitk = (
-            (swa_only and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_SWA)
-            or (layer.compress_ratio == 4 and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C4)
+            (swa_only and layer.sm70_sparse.value("mla_splitk_swa"))
+            or (layer.compress_ratio == 4 and layer.sm70_sparse.value("mla_splitk_c4"))
             or (
                 layer.compress_ratio == 128
-                and envs.VLLM_SM70_DSV4_SPARSE_MLA_SPLITK_C128
+                and layer.sm70_sparse.value("mla_splitk_c128")
             )
         )
-        use_qk_dsplit = envs.VLLM_SM70_DSV4_SPARSE_MLA_QK_DSPLIT
+        use_qk_dsplit = layer.sm70_sparse.value("mla_qk_dsplit")
         main_width = swa_indices.reshape(num_decode_tokens, -1).shape[1]
         extra_width = (
             0

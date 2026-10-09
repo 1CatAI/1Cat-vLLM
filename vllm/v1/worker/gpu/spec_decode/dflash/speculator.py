@@ -11,6 +11,7 @@ import torch.nn as nn
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import get_dflash_model_draft_tokens
+from vllm.diagnostics import diagnostic_channel, diagnostics_for
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -147,13 +148,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
         self._debug_real_proposal = False
         self._debug_input_dump_count = 0
-        self._debug_tensor_dump_dir = os.getenv(
-            "VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR", ""
-        ).strip()
-        self._debug_tensor_dump_limit = max(
-            0, int(os.getenv("VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT", "2"))
+        self._tensor_dump = diagnostic_channel(
+            "dflash_tensor", owner=diagnostics_for(vllm_config)
         )
-        self._debug_tensor_dump_count = 0
+        self._debug_tensor_dump_limit = max(
+            0, self._tensor_dump.policy.value("max_dumps")
+        )
 
     def trace_target_output(
         self, input_batch, output, num_sampled, num_rejected, hidden_states, logger
@@ -189,9 +189,9 @@ class DFlashSpeculator(DraftModelSpeculator):
     ) -> None:
         """Save one complete real-request DFlash boundary for offline A/B."""
         if (
-            not self._debug_tensor_dump_dir
+            not self._tensor_dump.policy.directory
             or not self._debug_real_proposal
-            or self._debug_tensor_dump_count >= self._debug_tensor_dump_limit
+            or self._tensor_dump.reports >= self._debug_tensor_dump_limit
             or get_tensor_model_parallel_rank() != 0
         ):
             return
@@ -258,15 +258,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             for name in debug_tensor_names
             if (tensor := getattr(self, name, None)) is not None
         }
-        os.makedirs(self._debug_tensor_dump_dir, exist_ok=True)
-        dump_index = self._debug_tensor_dump_count
-        dump_path = os.path.join(
-            self._debug_tensor_dump_dir,
+        dump_index = self._tensor_dump.reports
+        dump_path = self._tensor_dump.write(
             f"proposal_{dump_index:02d}_pp{get_pp_group().rank_in_group}_"
             f"tp{get_tensor_model_parallel_rank()}_pid{os.getpid()}.pt",
+            payload,
         )
-        torch.save(payload, dump_path)
-        self._debug_tensor_dump_count += 1
+        self._tensor_dump.reports += 1
         logger.warning("Saved DFlash real-request tensor boundary to %s", dump_path)
 
     @property

@@ -35,6 +35,44 @@ def parse_int_filter(raw: str | None, *, ranges=True, strict=False, reverse=True
     return frozenset(values)
 
 
+def parse_margin_steps(raw: str | None) -> set[int] | None:
+    if raw is None:
+        return None
+    steps: set[int] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if start < 0 or end < start:
+                raise ValueError(f"invalid top-token margin step range: {item}")
+            steps.update(range(start, end + 1))
+            continue
+        step = int(item)
+        if step < 0:
+            raise ValueError(f"invalid top-token margin step: {item}")
+        steps.add(step)
+    return steps
+
+
+def parse_token_probe(raw: str | None) -> list[int]:
+    if raw is None:
+        return []
+    token_ids: list[int] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        token_id = int(item)
+        if token_id < 0:
+            raise ValueError(f"invalid top-token margin probe token: {item}")
+        token_ids.append(token_id)
+    return token_ids
+
+
 @config
 class TensorDumpConfig:
     enabled: bool | None = None
@@ -55,6 +93,8 @@ class TensorDumpConfig:
     """Direct observation-count filter."""
     steps: str | None = None
     """Graph replay/output step filter."""
+    probes: str | None = None
+    """Ordered token probe ids; duplicates retain their diagnostic meaning."""
     max_dumps: int | None = None
     """Existing channel budget; callers preserve zero/unlimited semantics."""
     max_elements: int | None = None
@@ -78,10 +118,11 @@ class TensorDumpConfig:
     filter_errors: dict[str, str] = Field(default_factory=dict, init=False)
     """Malformed strict filters fail only when their old checkpoint consumes them."""
 
-    def resolve(self, channel: str) -> None:
+    def resolve(self, channel: str, *, bindings=None) -> None:
         if self.sources:
             return
-        for field, (alias, default, parser) in DUMP_BINDINGS[channel].items():
+        bindings = DUMP_BINDINGS[channel] if bindings is None else bindings
+        for field, (alias, default, parser) in bindings.items():
             if getattr(self, field) is not None:
                 self.sources[field] = "typed"
                 continue
@@ -101,6 +142,9 @@ class TensorDumpConfig:
                     if parser in ("strict_integer", "strict_flag"):
                         self.filter_errors[field] = str(exc)
                     value = int(default) if default is not None else None
+            elif parser == "strip":
+                assert isinstance(raw, str)
+                value = raw.strip()
             else:
                 value = raw
             setattr(self, field, value)
@@ -153,12 +197,20 @@ class TensorDumpConfig:
         if channel == "awq_compare" and raw == "":
             layers = frozenset()
         self.filters["layers"] = layers
+        if channel == "top_token_margin":
+            try:
+                self.filters["probes"] = tuple(parse_token_probe(self.probes))
+            except ValueError as exc:
+                self.filter_errors["probes"] = str(exc)
         for field in ("steps", "counts"):
             self.filter_errors.pop(field, None)
             raw = getattr(self, field)
             if field == "steps" and channel == "qwen_layer":
                 raw = raw or self.counts
             try:
+                if field == "steps" and channel in ("top_token_margin", "top1_sync"):
+                    self.filters[field] = parse_margin_steps(raw)
+                    continue
                 self.filters[field] = parse_int_filter(
                     raw,
                     ranges=channel != "gdn_compare",
@@ -181,7 +233,9 @@ class TensorDumpConfig:
     def report(self) -> dict:
         result = asdict(self)
         result["filters"] = {
-            name: sorted(value) if value is not None else None
+            name: (list(value) if name == "probes" else sorted(value))
+            if value is not None
+            else None
             for name, value in self.filters.items()
         }
         return result
@@ -190,6 +244,11 @@ class TensorDumpConfig:
         if field in self.filter_errors:
             raise ValueError(self.filter_errors[field])
         return getattr(self, field)
+
+    def parsed(self, field: str):
+        if field in self.filter_errors:
+            raise ValueError(self.filter_errors[field])
+        return self.filters.get(field)
 
     def allows(self, field: str, value) -> bool:
         if field in self.filter_errors:
@@ -214,6 +273,21 @@ class TensorDumpConfig:
 # Names are explicit so the static parameter inventory can resolve each reader.
 # Format: field -> (legacy name, original raw default, original parser).
 DUMP_BINDINGS: dict[str, dict[str, tuple[str, str | None, str]]] = {
+    "top_token_margin": {
+        "directory": ("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR", None, "text"),
+        "enable_file": ("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE", None, "text"),
+        "steps": ("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS", None, "text"),
+        "probes": ("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS", None, "text"),
+        "max_dumps": (
+            "VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS",
+            "128",
+            "strict_integer",
+        ),
+    },
+    "top1_sync": {
+        "steps": ("VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS", None, "text"),
+        "mode": ("VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE", "stream", "text"),
+    },
     "qwen_layer": {
         "directory": ("VLLM_SM70_DUMP_QWEN_LAYER_DIR", None, "text"),
         "enable_file": ("VLLM_SM70_DUMP_QWEN_LAYER_ENABLE_FILE", None, "text"),
@@ -326,6 +400,10 @@ DUMP_BINDINGS: dict[str, dict[str, tuple[str, str | None, str]]] = {
 
 @config
 class TensorDiagnosticsConfig:
+    top_token_margin: TensorDumpConfig = Field(default_factory=TensorDumpConfig)
+    """LM-head top-token margin, probe and report budget."""
+    top1_sync: TensorDumpConfig = Field(default_factory=TensorDumpConfig)
+    """Top1 exchange diagnostic synchronization; does not change selected tokens."""
     awq_buffers: TensorDumpConfig = Field(default_factory=TensorDumpConfig)
     """AWQ observation labels; directory and layer input project from qwen_layer."""
     awq_compare: TensorDumpConfig = Field(default_factory=TensorDumpConfig)

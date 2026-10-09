@@ -9,7 +9,11 @@ from typing import ClassVar
 import torch
 from pydantic import Field
 
-from vllm.config.diagnostic_dump import TensorDiagnosticsConfig
+from vllm.config.diagnostic_dump import (
+    DUMP_BINDINGS,
+    TensorDiagnosticsConfig,
+    TensorDumpConfig,
+)
 from vllm.config.diagnostic_sampling import SamplingDiagnosticsConfig
 from vllm.config.flash_v100 import FlashV100Diagnostics
 from vllm.config.sm70_dflash2 import DFlashDiagnosticsConfig
@@ -110,6 +114,7 @@ class RuntimeTraceConfig:
     """Shared tensor-diagnostic policy; mutable observations are engine-owned."""
 
     layer_aliases: ClassVar[dict[str, str]] = {
+        "require_profile_acceleration": "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
         "gdn_route_debug": "VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG",
         "gdn_mixed_compare": "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE",
         "sync_before_compile": "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD",
@@ -121,6 +126,9 @@ class RuntimeTraceConfig:
         "profile_trace": "VLLM_SM70_PROFILE_TRACE",
         "greedy_token_trace": "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE",
     }
+
+    require_profile_acceleration: bool | None = None
+    """Fail initialization when required profile capabilities are unavailable."""
 
     gdn_route_debug: bool | None = None
     """Bounded GDN decode-admission reports."""
@@ -159,6 +167,20 @@ class RuntimeTraceConfig:
 
     errors: dict[str, str] = Field(default_factory=dict, init=False)
     """Deferred parse errors from model-qualified diagnostic inputs."""
+
+    def dump_channels(self):
+        return {
+            **{name: getattr(self.dumps, name) for name in DUMP_BINDINGS},
+            **self.dflash.dump_channels(),
+        }
+
+    @staticmethod
+    def legacy_dump_channel(name):
+        if name in DUMP_BINDINGS:
+            policy = TensorDumpConfig()
+            policy.resolve(name)
+            return policy
+        return DFlashDiagnosticsConfig.legacy_dump_channel(name)
 
     def value(self, field: str):
         if field in self.errors:
@@ -238,6 +260,8 @@ class SpecDecodeTraceConfig:
     """Legacy target-logit trace, enabled only by the exact string '1'."""
     target_min_position: int | None = None
     """First traced target position, default 8; not a computation policy."""
+    min_position_error: str | None = Field(default=None, init=False)
+    """Deferred malformed threshold, parsed once with its compatibility input."""
     legacy_min_position: str | None = Field(default=None, init=False, repr=False)
     """Captured raw threshold; parse only when a speculative consumer initializes."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)
@@ -255,21 +279,22 @@ class SpecDecodeTraceConfig:
         alias = self.legacy_fields["target_min_position"]
         if self.target_min_position is None:
             # The legacy threshold was not parsed when tracing was disabled.
-            raw = envs.environment_variables[alias]() if self.target_logits else None
+            raw = envs.environment_variables[alias]()
             self.legacy_min_position = raw
+            try:
+                self.target_min_position = int(raw if raw is not None else "8")
+            except ValueError as exc:
+                self.target_min_position = 8
+                self.min_position_error = str(exc)
             self.sources["target_min_position"] = (
                 alias if alias in os.environ and raw is not None else "default"
             )
         else:
             self.sources["target_min_position"] = "typed"
 
-    def resolve(self) -> "SpecDecodeTraceConfig":
-        if self.target_min_position is None:
-            self.target_min_position = int(
-                self.legacy_min_position
-                if self.legacy_min_position is not None
-                else "8"
-            )
+    def resolve(self, *, required=False) -> "SpecDecodeTraceConfig":
+        if self.min_position_error is not None and (self.target_logits or required):
+            raise ValueError(self.min_position_error)
         return self
 
 
@@ -286,3 +311,16 @@ def capture_runtime_trace():
 @torch.compiler.assume_constant_result
 def _standalone_runtime_trace():
     return RuntimeTraceConfig()
+
+
+def capture_spec_decode_trace():
+    from vllm.runtime_resources import current_runtime_resources
+
+    resources = current_runtime_resources()
+    if resources is not None and resources.get("spec_decode_trace") is not None:
+        return resources["spec_decode_trace"]
+    return SpecDecodeTraceConfig()
+
+
+def target_trace_min_position() -> int:
+    return capture_spec_decode_trace().resolve(required=True).target_min_position

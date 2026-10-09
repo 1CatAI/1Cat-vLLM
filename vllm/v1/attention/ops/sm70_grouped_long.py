@@ -5,12 +5,12 @@
 import hashlib
 import importlib.util
 import json
-import os
 from functools import lru_cache
 from pathlib import Path
 
 import torch
 
+from vllm.config.execution_policy import flash_v100_options
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 
@@ -71,10 +71,11 @@ def builtin_long_attention():
 DISABLE_VALUES = {"0", "false", "no", "off"}
 
 
-def long_attention_enabled() -> bool:
-    if os.environ.get(DISABLE_ENV, "").strip().lower() in DISABLE_VALUES:
+def long_attention_enabled(policy=None) -> bool:
+    policy = flash_v100_options() if policy is None else policy
+    if not policy.value("e4m3_long_enabled"):
         return False
-    return bool(os.environ.get(MANIFEST_ENV)) or builtin_long_attention() is not None
+    return bool(policy.e4m3_long_manifest) or builtin_long_attention() is not None
 
 
 @lru_cache(maxsize=4)
@@ -157,11 +158,12 @@ def long_attention_contract(manifest, capacity: int | None = None):
     )
 
 
-def resolve_long_attention():
+def resolve_long_attention(policy=None):
     """The route in effect: an explicit manifest candidate, else the shipped one."""
-    if not long_attention_enabled():
+    policy = flash_v100_options() if policy is None else policy
+    if not long_attention_enabled(policy):
         return None, None
-    manifest_name = os.environ.get(MANIFEST_ENV)
+    manifest_name = policy.e4m3_long_manifest
     if manifest_name:
         return load_long_attention(manifest_name)
     operator = builtin_long_attention()
@@ -178,18 +180,18 @@ def resolve_long_attention():
     return operator, BUILTIN_MANIFEST
 
 
-def long_attention_graph_contract(capacity: int | None = None):
+def long_attention_graph_contract(capacity: int | None = None, *, policy=None):
     """The captured bound for ``capacity``, or ``(None, ())`` when route is off."""
-    _, manifest = resolve_long_attention()
+    _, manifest = resolve_long_attention(policy)
     if manifest is None:
         return None, ()
     return long_attention_contract(manifest, capacity)
 
 
-def long_attention_max_batch_size(manifest=None) -> int:
+def long_attention_max_batch_size(manifest=None, *, policy=None) -> int:
     """Batch capacity of the loaded operator; old libraries remain B1-only."""
     if manifest is None:
-        _, manifest = resolve_long_attention()
+        _, manifest = resolve_long_attention(policy)
     if manifest is None:
         return 1
     if manifest["module_name"] == "_vllm_fa2_C":

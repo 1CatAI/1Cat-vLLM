@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config import AttentionConfig
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
+from vllm.config.execution_policy import GraphPolicy
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.ops.sm70_e4m3_long import BUILTIN_MAX_CONTEXT
 from vllm.v1.worker.gpu import cudagraph_utils as cg
@@ -23,6 +25,7 @@ def graph_pair():
     manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, 8, 1, 8)
     bounded = replace(ordinary, attention_context_bucket=BUILTIN_MAX_CONTEXT)
+    manager._qsa_short_graphs = {}
     manager._long_attention_graphs = {ordinary: bounded}
     manager.graphs = {ordinary: object(), bounded: object()}
     return manager, ordinary, bounded
@@ -47,6 +50,7 @@ def test_request_major_q8_context_boundary(num_reqs):
     manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, num_reqs * 8, num_reqs, 8)
     bounded = replace(ordinary, attention_context_bucket=BUILTIN_MAX_CONTEXT)
+    manager._qsa_short_graphs = {}
     manager._long_attention_graphs = {ordinary: bounded}
     manager.graphs = {ordinary: object(), bounded: object()}
 
@@ -84,6 +88,7 @@ def test_scalar_graph_retains_short_and_oversized_fallback():
     manager = ModelCudaGraphManager.__new__(ModelCudaGraphManager)
     ordinary = BatchExecutionDescriptor(CUDAGraphMode.FULL, 1, 1, 1)
     bounded = replace(ordinary, attention_context_bucket=262144)
+    manager._qsa_short_graphs = {}
     manager._long_attention_graphs = {ordinary: bounded}
     manager.graphs = {ordinary: object(), bounded: object()}
     for upper in (1, 1024, 131071, 262145):
@@ -161,7 +166,9 @@ def test_tail_capture_and_dispatch_from_real_initialization(
         cudagraph_capture_sizes=[8, 16, 24, 32], max_cudagraph_capture_size=32
     )
     compilation.pass_config.enable_sp = sequence_parallel
+    compilation.runtime.resolve()
     config = SimpleNamespace(
+        attention_config=AttentionConfig(),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         model_config=SimpleNamespace(max_model_len=BUILTIN_MAX_CONTEXT),
         compilation_config=compilation,
@@ -172,6 +179,7 @@ def test_tail_capture_and_dispatch_from_real_initialization(
             method=method, num_speculative_tokens=7, ngram_assist=False
         ),
     )
+    config.attention_config.flash_v100.options.resolve()
     cls = ModelCudaGraphManager if target else cg.CudaGraphManager
     manager = cls(config, torch.device("cpu"), CUDAGraphMode.FULL_DECODE_ONLY, 8)
     manager._graphs_captured = True
@@ -209,13 +217,15 @@ def test_batch_long_graph_capture_requires_native_capability(
 
     monkeypatch.setenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "0")
     monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0")
-    monkeypatch.setattr(long, "long_attention_enabled", lambda: True)
+    monkeypatch.setattr(long, "long_attention_enabled", lambda policy=None: True)
     monkeypatch.setattr(
         long,
         "long_attention_graph_contract",
-        lambda capacity: (capacity, tuple(range(2, 9))),
+        lambda capacity, *, policy=None: (capacity, tuple(range(2, 9))),
     )
-    monkeypatch.setattr(long, "long_attention_max_batch_size", lambda: native_capacity)
+    monkeypatch.setattr(
+        long, "long_attention_max_batch_size", lambda *, policy=None: native_capacity
+    )
     monkeypatch.setattr(cg.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(cg.current_platform, "is_device_capability", lambda cap: True)
     monkeypatch.setattr(cg.current_platform, "get_global_graph_pool", lambda: None)
@@ -225,6 +235,7 @@ def test_batch_long_graph_capture_requires_native_capability(
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
     config = SimpleNamespace(
+        attention_config=AttentionConfig(),
         scheduler_config=SimpleNamespace(max_num_seqs=32),
         model_config=SimpleNamespace(
             max_model_len=131072,
@@ -235,6 +246,7 @@ def test_batch_long_graph_capture_requires_native_capability(
         ),
         cache_config=SimpleNamespace(cache_dtype=kv_dtype),
         compilation_config=CompilationConfig(
+            runtime=GraphPolicy(split_draft_graphs=False),
             cudagraph_capture_sizes=[8, 16, 32, 64, 128, 256],
             max_cudagraph_capture_size=256,
         ),
@@ -245,6 +257,7 @@ def test_batch_long_graph_capture_requires_native_capability(
             method="dflash", num_speculative_tokens=7, ngram_assist=False
         ),
     )
+    config.attention_config.flash_v100.options.resolve()
     manager = ModelCudaGraphManager(
         config, torch.device("cpu"), CUDAGraphMode.FULL_DECODE_ONLY, 8
     )

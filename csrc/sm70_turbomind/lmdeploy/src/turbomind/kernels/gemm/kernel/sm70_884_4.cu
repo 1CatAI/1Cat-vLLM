@@ -38,11 +38,12 @@ class ExactMnkKernelImpl final : public KernelImpl<Gemm> {
 
 // Narrow GGUF expert projections otherwise spend much of an N128/N256
 // tile on padding. Keep these candidates out of wide projection descriptors.
-template<class Gemm>
+template <class Gemm>
 class GgufLatticeNarrowKernelImpl final : public KernelImpl<Gemm> {
  public:
   bool is_feasible(const GemmDesc& desc) const noexcept override {
-    return desc.n <= 256 && (desc.m <= 64 || desc.m >= 512) && KernelImpl<Gemm>::is_feasible(desc);
+    return desc.n <= 256 && (desc.m <= 64 || desc.m >= 512) &&
+           KernelImpl<Gemm>::is_feasible(desc);
   }
 };
 
@@ -55,11 +56,11 @@ template <class Gemm>
 class Qwen38Nvfp4W2CacheBKernelImpl final : public KernelImpl<Gemm> {
  public:
   bool is_feasible(const GemmDesc& desc) const noexcept override {
-    const char* enabled =
-        vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill);
-    return (!enabled || std::atoi(enabled) != 0) && desc.m >= 1280 &&
-           desc.num == 512 && desc.n == 2560 && desc.k == 160 &&
-           KernelImpl<Gemm>::is_feasible(desc);
+    return (vllm::sm70::policy_atoi(
+                vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill, 1) !=
+            0) &&
+           desc.m >= 1280 && desc.num == 512 && desc.n == 2560 &&
+           desc.k == 160 && KernelImpl<Gemm>::is_feasible(desc);
   }
 };
 
@@ -70,11 +71,11 @@ template <class Gemm>
 class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
  public:
   bool is_feasible(const GemmDesc& desc) const noexcept override {
-    const char* enabled =
-        vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill);
-    return (!enabled || std::atoi(enabled) != 0) && desc.m >= 1280 &&
-           desc.num == 512 && desc.n == 64 && desc.k == 2560 &&
-           KernelImpl<Gemm>::is_feasible(desc);
+    return (vllm::sm70::policy_atoi(
+                vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill, 1) !=
+            0) &&
+           desc.m >= 1280 && desc.num == 512 && desc.n == 64 &&
+           desc.k == 2560 && KernelImpl<Gemm>::is_feasible(desc);
   }
 };
 
@@ -83,49 +84,76 @@ class Qwen38Nvfp4W13TailN64KernelImpl final : public KernelImpl<Gemm> {
 void Registry::sm70_884_4() {
   {
     auto add_lattice = [this]<int Type, int Group>() {
-      using C = Config_GgufLattice<Type,Group,kColMajor>;
-      using G = Config_GgufLattice<Type,Group,kColMajor,0>;
+      using C = Config_GgufLattice<Type, Group, kColMajor>;
+      using G = Config_GgufLattice<Type, Group, kColMajor, 0>;
       if constexpr (Type == 17) {
-        using Grouped64 = typename G::template Type<128,64,Group,2,1,1,D,D,2,true,1,Group,64,64>;
-        using Grouped128 = typename G::template Type<128,128,Group,2,2,1,D,D,2,true,1,Group,64,128>;
-        Add(std::make_unique<GgufLatticeNarrowKernelImpl<typename Grouped64::Kernel>>());
-        Add(std::make_unique<GgufLatticeNarrowKernelImpl<typename Grouped128::Kernel>>());
-        using Grouped16 = typename G::template Type<16,128,32,1,4,1,D,S,2,true,1,Group>;
-        Add(std::make_unique<GgufLatticeNarrowKernelImpl<typename Grouped16::Kernel>>());
+        using Grouped64 =
+            typename G::template Type<128, 64, Group, 2, 1, 1, D, D, 2, true, 1,
+                                      Group, 64, 64>;
+        using Grouped128 =
+            typename G::template Type<128, 128, Group, 2, 2, 1, D, D, 2, true,
+                                      1, Group, 64, 128>;
+        Add(std::make_unique<
+            GgufLatticeNarrowKernelImpl<typename Grouped64::Kernel>>());
+        Add(std::make_unique<
+            GgufLatticeNarrowKernelImpl<typename Grouped128::Kernel>>());
+        using Grouped16 = typename G::template Type<16, 128, 32, 1, 4, 1, D, S,
+                                                    2, true, 1, Group>;
+        Add(std::make_unique<
+            GgufLatticeNarrowKernelImpl<typename Grouped16::Kernel>>());
       }
 
-      Add<typename C::template Type<128,256,Group,2,4,1,D,D,2,true,1,Group,128,128>>();
-      Add<typename C::template Type<64,128,32,1,4,1,D,S,2,true,1,Group>>();
-      Add<typename C::template Type<32,128,32,1,4,1,D,S,2,true,1,Group>>();
-      Add<typename C::template Type<16,128,32,1,4,1,D,S,2,true,1,Group>>();
-      Add<typename C::template Type<8,128,32,1,4,1,D,S,2,true,1,Group>>();
-      Add<typename G::template Type<128,128,32,2,2,1,D,S,2,true,1,Group>>();
-      Add<typename G::template Type<64,128,32,1,4,1,D,S,2,true,1,Group>>();
-      Add<typename G::template Type<32,128,32,1,4,1,D,S,2,true,1,Group>>();
-      Add<typename G::template Type<8,128,32,1,4,1,D,S,2,true,1,Group>>();
+      Add<typename C::template Type<128, 256, Group, 2, 4, 1, D, D, 2, true, 1,
+                                    Group, 128, 128>>();
+      Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    Group>>();
+      Add<typename C::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    Group>>();
+      Add<typename C::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    Group>>();
+      Add<typename C::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    Group>>();
+      Add<typename G::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
+                                    Group>>();
+      Add<typename G::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    Group>>();
+      Add<typename G::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    Group>>();
+      Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    Group>>();
     };
-    add_lattice.template operator()<16,32>();
-    add_lattice.template operator()<17,16>();
-    add_lattice.template operator()<18,32>();
-    add_lattice.template operator()<19,32>();
-    add_lattice.template operator()<21,32>();
-    add_lattice.template operator()<22,16>();
-    add_lattice.template operator()<29,16>();
+    add_lattice.template operator()<16, 32>();
+    add_lattice.template operator()<17, 16>();
+    add_lattice.template operator()<18, 32>();
+    add_lattice.template operator()<19, 32>();
+    add_lattice.template operator()<21, 32>();
+    add_lattice.template operator()<22, 16>();
+    add_lattice.template operator()<29, 16>();
     auto add_lut = [this]<class C, class G, int GroupSize>() {
-      Add<typename C::template Type<128, 256, 16, 2, 4, 1, D, D, 2, true,
-                                    1, GroupSize, 128, 128>>();
-      Add<typename G::template Type<128, 128, 16, 2, 2, 1, D, D, 2, true,
-                                    1, GroupSize, 64, 128>>();
-      Add<typename C::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename C::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename C::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename C::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename C::template Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1,
+                                    GroupSize, 128, 128>>();
+      Add<typename G::template Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1,
+                                    GroupSize, 64, 128>>();
+      Add<typename C::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename C::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename C::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename C::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
     };
     add_lut.template operator()<Config_GgufLut4_IQ<kColMajor>,
                                 Config_GgufLut4_IQ<kColMajor, 0>, 32>();
@@ -141,23 +169,36 @@ void Registry::sm70_884_4() {
       constexpr int PrefillK = GroupSize == 16 ? 16 : 32;
       Add<typename C::template Type<128, 256, PrefillK, 2, 4, 1, D, D, 2, true,
                                     1, GroupSize, 128, 128>>();
-      Add<typename C::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename C::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename C::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename C::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
-      Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1, GroupSize>>();
+      Add<typename C::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename C::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename C::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename C::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<128, 128, 32, 2, 2, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<16, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
+      Add<typename G::template Type<8, 128, 32, 1, 4, 1, D, S, 2, true, 1,
+                                    GroupSize>>();
     };
-    add_planes.template operator()<Config_GgufCenteredBitPlane3<kColMajor>,
-                                   Config_GgufCenteredBitPlane3<kColMajor, 0>, 16>();
-    add_planes.template operator()<Config_GgufBitPlane<4, 1, 32, kColMajor>,
-                                   Config_GgufBitPlane<4, 1, 32, kColMajor, 0>, 32>();
-    add_planes.template operator()<Config_GgufBitPlane<4, 2, 16, kColMajor>,
-                                   Config_GgufBitPlane<4, 2, 16, kColMajor, 0>, 16>();
+    add_planes
+        .template operator()<Config_GgufCenteredBitPlane3<kColMajor>,
+                             Config_GgufCenteredBitPlane3<kColMajor, 0>, 16>();
+    add_planes
+        .template operator()<Config_GgufBitPlane<4, 1, 32, kColMajor>,
+                             Config_GgufBitPlane<4, 1, 32, kColMajor, 0>, 32>();
+    add_planes
+        .template operator()<Config_GgufBitPlane<4, 2, 16, kColMajor>,
+                             Config_GgufBitPlane<4, 2, 16, kColMajor, 0>, 16>();
   }
   {
     // Two-bit affine weights share the FP16 MMA pipeline and coefficient
@@ -224,17 +265,22 @@ void Registry::sm70_884_4() {
         B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>;
     using Full48K64 =
         B::Type<48, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>;
-    using Tail48K32 =
-        B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true, true>;
-    using Tail64 =
-        B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true, true>;
-    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Rows32::Kernel>>());
-    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full64::Kernel, true>>());
-    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full48K32::Kernel, true>>());
-    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Full48K64::Kernel, true>>());
-    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Tail48K32::Kernel, true, true>>());
-    Add(std::make_unique<DenseBatchSupplyKernelImpl<typename Tail64::Kernel, true, true>>());
-
+    using Tail48K32 = B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48,
+                              128, 1, true, true>;
+    using Tail64 = B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128,
+                           1, true, true>;
+    Add(std::make_unique<
+        DenseBatchSupplyKernelImpl<typename Rows32::Kernel>>());
+    Add(std::make_unique<
+        DenseBatchSupplyKernelImpl<typename Full64::Kernel, true>>());
+    Add(std::make_unique<
+        DenseBatchSupplyKernelImpl<typename Full48K32::Kernel, true>>());
+    Add(std::make_unique<
+        DenseBatchSupplyKernelImpl<typename Full48K64::Kernel, true>>());
+    Add(std::make_unique<
+        DenseBatchSupplyKernelImpl<typename Tail48K32::Kernel, true, true>>());
+    Add(std::make_unique<
+        DenseBatchSupplyKernelImpl<typename Tail64::Kernel, true, true>>());
   }
 
   if constexpr (1) {
@@ -350,7 +396,7 @@ Kernel* MatchPrescaled(const Kernel& control, bool batch = false,
   static thread_local KernelImpl<typename Ordinary::Kernel> ordinary;
   const std::string name =
       ordinary.name() + (mask_m ? "_sm70_batch_supply_mtail"
-                               : (batch ? "_sm70_batch_supply" : ""));
+                                : (batch ? "_sm70_batch_supply" : ""));
   if (control.name() != name) {
     return nullptr;
   }
@@ -368,17 +414,37 @@ Kernel* Sm70Nvfp4PrescaledCounterpart(const Kernel& control) {
   using BP = Config_QuantizedBatch<fp4_e2m1_t, kColMajor,
                                    Transform_HMMA_SIMT_B_PrescaledE2M1>;
   // Match the ordinary tile and split partition before changing its transform.
-  if (auto* k = MatchPrescaled<B::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>, BP::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>>(control, true))
+  if (auto* k = MatchPrescaled<
+          B::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>,
+          BP::Type<32, 128, 32, 1, 4, 1, D, S, 2, true, 1, 16, 32, 128>>(
+          control, true))
     return k;
-  if (auto* k = MatchPrescaled<B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true>, BP::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true>>(control, true))
+  if (auto* k = MatchPrescaled<
+          B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true>,
+          BP::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1,
+                   true>>(control, true))
     return k;
-  if (auto* k = MatchPrescaled<B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>, BP::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>>(control, true))
+  if (auto* k = MatchPrescaled<
+          B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>,
+          BP::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1,
+                   true>>(control, true))
     return k;
-  if (auto* k = MatchPrescaled<B::Type<48, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>, BP::Type<48, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>>(control, true))
+  if (auto* k = MatchPrescaled<
+          B::Type<48, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true>,
+          BP::Type<48, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1,
+                   true>>(control, true))
     return k;
-  if (auto* k = MatchPrescaled<B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true, true>, BP::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48, 128, 1, true, true>>(control, true, true))
+  if (auto* k =
+          MatchPrescaled<B::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16, 48,
+                                 128, 1, true, true>,
+                         BP::Type<48, 128, 32, 2, 4, 1, D, S, 2, true, 1, 16,
+                                  48, 128, 1, true, true>>(control, true, true))
     return k;
-  if (auto* k = MatchPrescaled<B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true, true>, BP::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64, 128, 1, true, true>>(control, true, true))
+  if (auto* k =
+          MatchPrescaled<B::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16, 64,
+                                 128, 1, true, true>,
+                         BP::Type<64, 128, 64, 2, 4, 1, D, S, 2, true, 1, 16,
+                                  64, 128, 1, true, true>>(control, true, true))
     return k;
   if (auto* k = MatchPrescaled<
           C::Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1, 16, 64, 128>,

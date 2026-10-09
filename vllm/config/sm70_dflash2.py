@@ -8,6 +8,7 @@ from typing import ClassVar
 from pydantic import Field
 
 from vllm import envs
+from vllm.config.diagnostic_dump import TensorDumpConfig
 from vllm.config.execution_policy import ExecutionPolicy, read_execution_legacy
 from vllm.config.utils import config
 from vllm.envs_metadata import EnvVar
@@ -307,6 +308,7 @@ class Sm70DFlash2Config:
         return {
             alias: getattr(self, field)
             for field, alias in (
+                ("sharded_context_fc", "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC"),
                 ("qpn8_rerank", "VLLM_SM70_DFLASH2_QPN8_RERANK"),
                 ("qpn8_rerank_shadow", "VLLM_SM70_DFLASH2_QPN8_RERANK_SHADOW"),
             )
@@ -368,6 +370,48 @@ def resolved_sm70_dflash2_config():
 
 @config
 class DFlashDiagnosticsConfig(ExecutionPolicy):
+    tensors: TensorDumpConfig = Field(default_factory=TensorDumpConfig)
+    """Real-request proposal tensor boundary and shared diagnostic directory."""
+    pp_aux: TensorDumpConfig = Field(default_factory=TensorDumpConfig)
+    """PP auxiliary dump budget; directory projects from tensors."""
+    dump_bindings: ClassVar[dict] = {
+        "dflash_tensor": {
+            "directory": ("VLLM_DFLASH_DEBUG_TENSOR_DUMP_DIR", "", "strip"),
+            "max_dumps": ("VLLM_DFLASH_DEBUG_TENSOR_DUMP_LIMIT", "2", "strict_integer"),
+        },
+        "dflash_pp_aux": {
+            "max_dumps": ("VLLM_DFLASH_DEBUG_PP_AUX_DUMP_LIMIT", "2", "strict_integer"),
+        },
+    }
+
+    def compile_ignored_aliases(self):
+        return set(self.aliases.values()) | {
+            alias
+            for bindings in self.dump_bindings.values()
+            for alias, _, _ in bindings.values()
+        }
+
+    def dump_channels(self):
+        return {"dflash_tensor": self.tensors, "dflash_pp_aux": self.pp_aux}
+
+    @classmethod
+    def legacy_dump_channel(cls, name):
+        policy = TensorDumpConfig()
+        policy.resolve(name, bindings=cls.dump_bindings[name])
+        if name == "dflash_pp_aux":
+            shared = cls.legacy_dump_channel("dflash_tensor")
+            policy.directory = shared.directory
+            policy.sources["directory"] = shared.sources["directory"]
+        return policy
+
+    context_kv: bool | None = None
+    """Existing context K/V observations."""
+    coord_trace: str | bool | None = None
+    """One captured input projected into the two retained consumer dialects."""
+    coord_integer: bool = Field(default=False, init=False)
+    """GLM integer-boolean projection."""
+    coord_exact_one: bool = Field(default=False, init=False)
+    """Indexer exact-one projection."""
     proposal_stages: bool | None = None
     """Retain GLM proposal/target nonfinite stage observations."""
     target_layer_trace: bool | None = None
@@ -386,6 +430,8 @@ class DFlashDiagnosticsConfig(ExecutionPolicy):
     """Captured parse failures; unused family controls retain short-circuiting."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "context_kv": "VLLM_DFLASH_DEBUG_CONTEXT_KV",
+        "coord_trace": "VLLM_DFLASH_DEBUG_COORD_TRACE",
         "proposal_stages": "VLLM_DFLASH_DEBUG_PROPOSAL_STAGES",
         "target_layer_trace": "VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE",
         "corruption": "VLLM_DFLASH_DEBUG_CORRUPTION",
@@ -396,6 +442,11 @@ class DFlashDiagnosticsConfig(ExecutionPolicy):
 
     def __post_init__(self) -> None:
         from vllm.config.sm70_runtime import resolve_legacy_fields
+
+        for name, policy in self.dump_channels().items():
+            policy.resolve(name, bindings=self.dump_bindings[name])
+        self.pp_aux.directory = self.tensors.directory
+        self.pp_aux.sources["directory"] = self.tensors.sources["directory"]
 
         pending = {
             field: alias
@@ -414,6 +465,12 @@ class DFlashDiagnosticsConfig(ExecutionPolicy):
                 return 32 if field == "interval" else False
 
         resolve_legacy_fields(self, pending, reader=read)
+        raw = "0" if self.coord_trace is None else self.coord_trace
+        self.coord_exact_one = raw if isinstance(raw, bool) else raw == "1"
+        try:
+            self.coord_integer = bool(int(raw))
+        except ValueError as exc:
+            self.errors["coord_integer"] = str(exc)
 
     def value(self, field: str):
         if field in self.errors:

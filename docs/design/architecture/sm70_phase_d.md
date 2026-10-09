@@ -457,6 +457,24 @@ precision mode, shape bound or native schema changes in this part.
 Focused CPU evidence is under `/home/ymzx/arch-ws/tmp/phase-d5`. The remote
 baseline is main `b14c2ab0a`; normal `_C` and `_moe_C` builds are owned by
 `/home/ymzx/arch-ws/phase-d5-20261010`. GPU validation and A/B results are pending.
-This section does not claim completion of D5 or D: DeepSeek/indexer, remaining
-provider/diagnostic consumers and native resource/policy binding still require
-migration and the D6 inventory must account for every boundary.
+The next candidate also binds DeepSeek/indexer controls, ordinary sampling
+scratch, long-attention opt-out/manifest selection, top-token/GLM/DFlash diagnostics
+and the remaining QPN8 native selectors. Prepared native policies parse scalar
+and target-list inputs once. Native runtime ABI 1 owns TurboMind scratch, packing,
+tuning and trace state per engine. Existing custom-op schemas remain unchanged;
+new host-only runtime classes and an explicit capability query are built into
+both normal extensions. Stable configuration-owner slots rebind AOT policy inputs
+without embedding engine addresses or diagnostic values in compiled graphs.
+
+CPU validation, native-header compilation, normal CUDA rebuild, and operator
+A/B evidence are recorded separately. The candidate policy/provider/diagnostic
+regression suite passes 294 tests (3 GPU-dependent skips); native owner isolation
+and retained diagnostic checkpoints pass 55 focused tests. Both the standalone
+C++ policy header and Torch class registration template compile successfully.
+The same layering counter records 147 -> 129 raw environment references,
+3191 -> 3186 platform references and 2114 -> 2111 model references relative to
+the first D5 candidate's ledger. These counts are source references, not a claim
+that all remaining readers execute per token. D6 must compare the full campaign
+with one unchanged counter and classify its remaining consumers. The new native owner is still under
+validation. Other provider/loading boundaries and the full D6 inventory are
+unfinished; this section does not claim completion of D5 or D.

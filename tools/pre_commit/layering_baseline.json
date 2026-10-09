@@ -37,15 +37,15 @@
   "model": 3
  },
  "vllm/config/diagnostic_dump.py": {
-  "platform": 57
+  "platform": 64
  },
  "vllm/config/diagnostic_sampling.py": {
   "env": 2,
   "platform": 5
  },
  "vllm/config/execution_policy.py": {
-  "model": 8,
-  "platform": 41
+  "model": 9,
+  "platform": 47
  },
  "vllm/config/gdn.py": {
   "env": 1,
@@ -71,13 +71,14 @@
  },
  "vllm/config/policy_defaults.py": {
   "model": 14,
-  "platform": 21
+  "platform": 24
  },
  "vllm/config/speculative.py": {
-  "model": 141,
+  "model": 142,
   "platform": 17
  },
  "vllm/config/speculative_sampling.py": {
+  "model": 1,
   "platform": 3
  },
  "vllm/config/vllm.py": {
@@ -86,7 +87,7 @@
   "platform": 71
  },
  "vllm/diagnostics.py": {
-  "platform": 1
+  "platform": 2
  },
  "vllm/distributed/communication_op.py": {
   "platform": 6
@@ -215,8 +216,8 @@
   "platform": 15
  },
  "vllm/model_executor/layers/fused_moe/router/fused_topk_router.py": {
-  "model": 7,
-  "platform": 8
+  "model": 6,
+  "platform": 7
  },
  "vllm/model_executor/layers/fused_moe/router/gate_linear.py": {
   "platform": 5
@@ -240,14 +241,14 @@
   "platform": 52
  },
  "vllm/model_executor/layers/logits_processor.py": {
-  "env": 2,
+  "env": 1,
   "model": 12,
-  "platform": 23
+  "platform": 9
  },
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 14,
   "model": 236,
-  "platform": 445
+  "platform": 439
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -323,9 +324,9 @@
   "platform": 18
  },
  "vllm/model_executor/layers/sparse_attn_indexer_kpool.py": {
-  "env": 4,
-  "model": 8,
-  "platform": 17
+  "env": 2,
+  "model": 3,
+  "platform": 18
  },
  "vllm/model_executor/layers/utils.py": {
   "platform": 5
@@ -342,15 +343,6 @@
  },
  "vllm/model_executor/warmup/kernel_warmup.py": {
   "platform": 3
- },
- "vllm/models/deepseek_v4/sm70/indexer.py": {
-  "env": 6
- },
- "vllm/models/glm5next/nvidia/model.py": {
-  "env": 5
- },
- "vllm/models/glm5next/sm70/sparse.py": {
-  "env": 2
  },
  "vllm/models/qwen4_exp/nvidia/ops/qsa.py": {
   "env": 1
@@ -478,7 +470,7 @@
  "vllm/v1/engine/core.py": {
   "env": 2,
   "model": 33,
-  "platform": 9
+  "platform": 7
  },
  "vllm/v1/executor/multiproc_executor.py": {
   "platform": 1
@@ -497,7 +489,7 @@
   "model": 8
  },
  "vllm/v1/sample/ops/topk_topp_triton.py": {
-  "platform": 7
+  "platform": 4
  },
  "vllm/v1/sample/rejection_sampler.py": {
   "env": 2,
@@ -541,7 +533,7 @@
  },
  "vllm/v1/worker/gpu/cudagraph_utils.py": {
   "model": 11,
-  "platform": 30
+  "platform": 33
  },
  "vllm/v1/worker/gpu/mamba_align.py": {
   "model": 2
@@ -565,9 +557,6 @@
  },
  "vllm/v1/worker/gpu/spec_decode/__init__.py": {
   "model": 16
- },
- "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py": {
-  "env": 2
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py": {
   "model": 6

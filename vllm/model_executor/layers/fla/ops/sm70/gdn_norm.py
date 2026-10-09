@@ -96,7 +96,7 @@ def _sm70_qwen_gdn_rmsnorm_gated_impl(
     activation: str,
 ) -> torch.Tensor:
     """Old standalone schema; engine calls use the configured entry."""
-    from vllm import envs
+    from vllm.config.gdn_projection import legacy_projection_value
 
     return _sm70_qwen_gdn_rmsnorm_gated_configured_impl(
         x,
@@ -106,7 +106,7 @@ def _sm70_qwen_gdn_rmsnorm_gated_impl(
         group_size,
         norm_before_gate,
         activation,
-        envs.VLLM_SM70_GDN_RMSNORM_ONEPASS,
+        legacy_projection_value("rmsnorm_onepass"),
     )
 
 

@@ -62,7 +62,8 @@ def _qpn4(state, x, out, prefix, *, gated=False):
 def _qpn2_dense(state, x, out, prefix, *, gated=False):
     from vllm.model_executor.kernels.linear.qpn import nvfp4_dequant
 
-    return nvfp4_dequant.nvfp4_qpn2_dispatch_linear(
+    return state.native_ops.invoke(
+        nvfp4_dequant.nvfp4_qpn2_dispatch_linear,
         x,
         state.weight,
         state.scales,

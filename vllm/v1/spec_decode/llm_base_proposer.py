@@ -45,6 +45,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import (
     MAX_SPEC_LEN,
@@ -214,6 +215,7 @@ class SpecDecodeBaseProposer:
         runner=None,
     ):
         self.vllm_config = vllm_config
+        self._topk_runtime = bind_topk_topp_runtime(vllm_config)
         self._diagnostics = bind_diagnostics(vllm_config)
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
@@ -699,7 +701,10 @@ class SpecDecodeBaseProposer:
                 token_ids = self._static_draft_vocab.token_id_map[token_ids]
             return token_ids, None
         token_ids, probs = compute_probs_and_sample_next_token(
-            logits, sampling_metadata, policy=self._sampling_policy
+            logits,
+            sampling_metadata,
+            policy=self._sampling_policy,
+            runtime=self._topk_runtime,
         )
         if self._static_draft_vocab is None:
             return token_ids, probs
@@ -912,7 +917,9 @@ class SpecDecodeBaseProposer:
                 dtype=torch.int32,
                 device=self.device,
             )
-            apply_top_k_top_p(draft_logits, draft_top_k, None)
+            apply_top_k_top_p(
+                draft_logits, draft_top_k, None, runtime=self._topk_runtime
+            )
 
     def warmup_sm70_mtp_hotpath_kernels(self) -> tuple[str, ...]:
         """Warm MTP helper kernels that otherwise JIT on the first request."""
@@ -2584,6 +2591,7 @@ def compute_probs_and_sample_next_token(
     sampling_metadata: SamplingMetadata,
     *,
     policy: SpeculativeSamplingPolicy | None = None,
+    runtime=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if sampling_metadata.all_greedy:
         # For greedy requests, draft_probs is not used in rejection sampling.
@@ -2676,7 +2684,7 @@ def compute_probs_and_sample_next_token(
             int(sampling_metadata.top_k_cpu[0]),
         )
 
-    logits = apply_top_k_top_p(logits, top_k, top_p)
+    logits = apply_top_k_top_p(logits, top_k, top_p, runtime=runtime)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
     q = torch.empty_like(probs)

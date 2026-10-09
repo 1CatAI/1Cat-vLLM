@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Literal
 from pydantic import Field
 
 from vllm.config.diagnostic_dump import TensorDumpConfig
-from vllm.config.execution_policy_base import ExecutionPolicy
+from vllm.config.execution_policy_base import DeferredExecutionPolicy
 from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.utils import config, hash_factors
 
@@ -577,7 +577,7 @@ class Sm70MxFp4MoEConfig(Sm70MoELegacyConfig):
 
 
 @config
-class Sm70UnquantizedMoEConfig(ExecutionPolicy):
+class Sm70UnquantizedMoEConfig(DeferredExecutionPolicy):
     """One initialized policy for warmup and unquantized execution."""
 
     legacy_tiles: bool | None = None
@@ -599,31 +599,28 @@ class Sm70UnquantizedMoEConfig(ExecutionPolicy):
         "mtp_fp16_exact": "VLLM_SM70_MTP_MOE_FP16_EXACT",
     }
 
-    errors: dict[str, str] = Field(default_factory=dict, init=False)
-    """Captured parser failures; dynamic admission retains the original ordering."""
 
-    def resolve(self):
-        from vllm.config.utils import resolve_legacy_fields
+@config
+class Sm70MoERoutingPolicy(DeferredExecutionPolicy):
+    """Common router schedule, independent of expert weight quantization."""
 
-        resolve_legacy_fields(
-            self,
-            {
-                field: alias
-                for field, alias in self.aliases.items()
-                if field not in self.sources
-            },
-            deferred_errors=self.errors,
-        )
+    exact_topk: bool | None = None
+    """Enable the retained E512/K10 exact router at dynamic M1..16."""
+    mtp_top16: bool | None = None
+    """Use partial selection at the existing FP16 M5/M10 gates."""
 
-    def value(self, field):
-        if field in self.errors:
-            raise ValueError(self.errors[field])
-        return getattr(self, field)
+    aliases: ClassVar[dict[str, str]] = {
+        "exact_topk": "VLLM_SM70_QWEN38_ROUTER_TOPK",
+        "mtp_top16": "VLLM_SM70_MTP_ROUTER_TOP16",
+    }
 
 
 @config
 class Sm70MoEConfig:
     """Resolve only loaded families; unused options do not salt graph caches."""
+
+    routing: Sm70MoERoutingPolicy = Field(default_factory=Sm70MoERoutingPolicy)
+    """Shared router policy for every expert weight format."""
 
     unquantized: Sm70UnquantizedMoEConfig = Field(
         default_factory=Sm70UnquantizedMoEConfig
@@ -642,7 +639,7 @@ class Sm70MoEConfig:
 
     @property
     def resolved(self) -> bool:
-        return bool(self.unquantized.sources) or any(
+        return bool(self.unquantized.sources or self.routing.sources) or any(
             getattr(self, family).resolved
             for family in ("awq", "fp8", "nvfp4", "mxfp4")
         )
@@ -655,6 +652,11 @@ class Sm70MoEConfig:
                     for family in ("awq", "fp8", "nvfp4", "mxfp4")
                     if getattr(self, family).resolved
                 },
+                **(
+                    {"routing": self.routing.compute_hash()}
+                    if self.routing.active and self.routing.sources
+                    else {}
+                ),
                 **(
                     {"unquantized": self.unquantized.compute_hash()}
                     if self.unquantized.active and self.unquantized.sources
@@ -698,4 +700,12 @@ def unquantized_moe_policy(cfg=None) -> Sm70UnquantizedMoEConfig:
 
     return capture_execution_policy(
         "kernel_config.sm70_moe.unquantized", Sm70UnquantizedMoEConfig, cfg
+    )
+
+
+def moe_routing_policy(cfg=None) -> Sm70MoERoutingPolicy:
+    from vllm.config.execution_policy import capture_execution_policy
+
+    return capture_execution_policy(
+        "kernel_config.sm70_moe.routing", Sm70MoERoutingPolicy, cfg
     )

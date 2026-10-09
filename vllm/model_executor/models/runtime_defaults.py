@@ -381,3 +381,13 @@ def ple_storage_rejection(cfg) -> str | None:
                 "PLE storage"
             )
     return reason
+
+
+def sparse_execution_family(model_config):
+    """Declare which existing sparse provider the model can consume."""
+    text = getattr(model_config, "hf_text_config", None)
+    if getattr(text, "indexer_n_heads", None) is not None:
+        return "qsa"
+    if getattr(text, "index_head_dim", None):
+        return "indexer"
+    return None

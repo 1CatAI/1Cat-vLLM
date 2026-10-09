@@ -234,3 +234,75 @@ def test_online_native_policy_hashes_without_enabling_serialized_fp8():
         cfg.sm70_fp8.native.resolve("fp8")
         assert not cfg.sm70_fp8.resolved
     assert first.compute_hash() != second.compute_hash()
+
+
+@pytest.mark.parametrize(
+    "family,unused,used",
+    [
+        ("qsa", "indexer_relu", "qsa_indexer_cublas"),
+        ("indexer", "qsa_indexer_cublas", "indexer_relu"),
+    ],
+)
+def test_sparse_hash_and_errors_only_include_consumed_family(
+    monkeypatch, family, unused, used
+):
+    policy = Sm70SparseConfig()
+    policy.resolve()
+    policy.active = True
+    policy.qualify(family)
+    baseline = policy.compute_hash()
+    setattr(policy, unused, not getattr(policy, unused))
+    policy.errors[unused] = "dormant malformed value"
+    policy.validate_active()
+    assert policy.compute_hash() == baseline
+    setattr(policy, used, not getattr(policy, used))
+    assert policy.compute_hash() != baseline
+    policy.errors[used] = "active malformed value"
+    with pytest.raises(ValueError, match="active malformed"):
+        policy.validate_active()
+
+
+@pytest.mark.parametrize(
+    "raw,expected", [(None, True), ("", False), ("2", False), ("1", True)]
+)
+def test_indexer_exact_one_dialect(monkeypatch, raw, expected):
+    alias = "VLLM_SM70_INDEXER_RELU"
+    if raw is None:
+        monkeypatch.delenv(alias, raising=False)
+    else:
+        monkeypatch.setenv(alias, raw)
+    policy = Sm70SparseConfig()
+    policy.resolve()
+    assert policy.value("indexer_relu") is expected
+    typed = Sm70SparseConfig(indexer_relu=not expected)
+    typed.resolve()
+    assert typed.value("indexer_relu") is not expected
+
+
+def test_sampling_after_forward_keeps_bound_policy_and_scratch(monkeypatch):
+    from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
+    from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+
+    engines = [_engine(True), _engine(False)]
+    samplers = []
+    for cfg, enabled in zip(engines, (True, False)):
+        cfg.kernel_config.layer_execution.topk_topp_warps8 = enabled
+        with set_current_vllm_config(cfg):
+            sampler = TopKTopPSampler()
+            assert sampler.runtime is bind_topk_topp_runtime()
+            sampler.runtime.buffers["test"] = torch.ones(3)
+            samplers.append(sampler)
+    monkeypatch.setitem(
+        envs.environment_variables,
+        "VLLM_SM70_TOPK_TOPP_8_WARPS",
+        Mock(side_effect=AssertionError("runtime environment")),
+    )
+    for sampler, enabled in zip(samplers * 2, (True, False) * 2):
+        assert sampler.runtime.policy.value("topk_topp_warps8") is enabled
+    assert (
+        samplers[0].runtime.buffers["test"].data_ptr()
+        != samplers[1].runtime.buffers["test"].data_ptr()
+    )
+    release_runtime_resources(engines[0])
+    assert not samplers[0].runtime.buffers
+    assert "test" in samplers[1].runtime.buffers

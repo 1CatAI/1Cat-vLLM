@@ -38,6 +38,8 @@ def test_runner_target_protocol_reuses_completed_projection(
     runner = model_runner.GPUModelRunner.__new__(model_runner.GPUModelRunner)
     runner.vllm_config = SimpleNamespace(kernel_config=KernelConfig())
     runner.device = torch.device("cpu")
+    runner.sampler = object()
+    runner._sm70_greedy_capability = False
     runner.lora_config = object()  # Graph admission is passed to the feature owner.
 
     def project(hidden):

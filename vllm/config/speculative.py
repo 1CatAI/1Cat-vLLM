@@ -425,6 +425,7 @@ class SpeculativeConfig:
                     self.sampling_policy.compute_hash(
                         draft=self.draft_sample_method == "probabilistic",
                         vocab=self.method == "mtp",
+                        aux_hidden=self.use_dflash_family(),
                     ),
                 )
             )

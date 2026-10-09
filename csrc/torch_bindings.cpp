@@ -1,4 +1,4 @@
-#include "sm70_policy.h"
+#include "sm70_runtime.h"
 // Provides torch::Tensor for ops.h (previously included transitively via
 // cache.h, which is no longer included here after cache ops moved to
 // _C_stable_libtorch).
@@ -39,6 +39,7 @@ bool sm70_marlin_available() {
 // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+  vllm::sm70::register_native_runtime<0>(ops);
   ops.def("sm70_native_policy_abi() -> int",
           []() -> int64_t { return vllm::sm70::policy_size; });
   ops.def("sm70_prepare_native_policy_token(str token) -> ()",

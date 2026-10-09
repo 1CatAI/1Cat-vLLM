@@ -119,3 +119,10 @@ def projection_policy(cfg=None) -> GdnProjectionConfig:
     return capture_execution_policy(
         "kernel_config.gdn.projection", GdnProjectionConfig, cfg
     )
+
+
+def legacy_projection_value(field: str):
+    """Independent old no-config helpers; engine callers pass a bound policy."""
+    from vllm import envs
+
+    return envs.environment_variables[GdnProjectionConfig.aliases[field]]()

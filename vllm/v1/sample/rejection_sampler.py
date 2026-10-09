@@ -24,6 +24,7 @@ from vllm.v1.sample.logits_processor.builtin import (
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
+from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p, random_sample
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -229,6 +230,7 @@ class RejectionSampler(nn.Module):
         self._diagnostics = bind_diagnostics() if diagnostics is None else diagnostics
         self._trace = self._diagnostics.sampling
         self.sampler = sampler
+        self._topk_runtime = bind_topk_topp_runtime()
         self._sampling_policy = resolve_sampling_policy(spec_config)
         logprobs_mode = self.sampler.logprobs_mode
         self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
@@ -405,6 +407,7 @@ class RejectionSampler(nn.Module):
             target_logits,
             metadata.cu_num_draft_tokens,
             sampling_metadata,
+            runtime=self._topk_runtime,
         )
         self._capture_dynamic_draft_candidates(target_logits)
         _rejection_profile_finish(
@@ -476,6 +479,7 @@ class RejectionSampler(nn.Module):
             sampled_logits,
             metadata.cu_num_sampled_tokens,
             sampling_metadata,
+            runtime=self._topk_runtime,
         )
         target_logits = sampled_logits[target_logits_indices]
         self._capture_dynamic_draft_candidates(target_logits)
@@ -1082,6 +1086,8 @@ def apply_sampling_constraints(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     cu_num_draft_tokens: torch.Tensor,  # [batch_size]
     sampling_metadata: SamplingMetadata,
+    *,
+    runtime=None,
 ) -> torch.Tensor:
     """Process logits based on sampling metadata.
 
@@ -1134,7 +1140,7 @@ def apply_sampling_constraints(
 
     # NOTE(woosuk): `apply_top_k_top_p` uses sorting to calculate the mask,
     # which is slow for large vocab sizes. This may cause performance issues.
-    return apply_top_k_top_p(logits, top_k, top_p)
+    return apply_top_k_top_p(logits, top_k, top_p, runtime=runtime)
 
 
 def apply_min_p(

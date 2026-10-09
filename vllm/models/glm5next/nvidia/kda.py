@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 import vllm._sm70_ops as sm70_ops
+from vllm._sm70.policy import NativeBindings
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.execution_policy import layer_policy
@@ -363,6 +364,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             and self.hidden_size == 4096
             and _sm70_exact_kda_gemv_enabled()
         )
+        self._exact_gemv_ops = (
+            NativeBindings(layer_policy().native.values)
+            if self._use_sm70_exact_kda_gemv
+            else None
+        )
         self._use_sm70_fp32_recurrent_output = (
             current_platform.is_cuda()
             and current_platform.get_device_capability() == (7, 0)
@@ -526,7 +532,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            sm70_ops.sm70_glm53_fp16_gemv_out(projected, hidden_states, weight)
+            assert self._exact_gemv_ops is not None
+            self._exact_gemv_ops.sm70_glm53_fp16_gemv_out(
+                projected, hidden_states, weight
+            )
             logger.info_once("SM70 GLM KDA exact FP16 B1-B8 projection path enabled.")
         else:
             projected = self.in_proj_qkvbfg_a(hidden_states)[0]

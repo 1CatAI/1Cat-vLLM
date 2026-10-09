@@ -32,6 +32,15 @@ class PolicyDefaults:
         self.cfg = cfg
         self.phase = "platform.runtime"
         self.raw = dict(os.environ)
+        cfg.runtime_default_sources.setdefault(
+            "VLLM_DISABLE_COMPILE_CACHE",
+            [
+                {
+                    "source": "process_startup",
+                    "raw": self.raw.get("VLLM_DISABLE_COMPILE_CACHE", "0"),
+                }
+            ],
+        )
         self.bindings: dict[str, list[tuple[Any, str]]] = {}
         for path in POLICY_OWNERS:
             policy = _owner(cfg, path)
@@ -393,6 +402,8 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
     ignored: set[str] = set()
     for path in POLICY_OWNERS:
         policy = _owner(cfg, path)
+        if policy is None:
+            continue
         extra_aliases = getattr(policy, "compile_ignored_aliases", None)
         if extra_aliases is not None:
             ignored.update(extra_aliases())
@@ -404,10 +415,11 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
         for alias, paths in EXTRA_BINDINGS.items()
         if all(_owner(cfg, path) is not None for path in paths)
     )
-    native = cfg.parallel_config.communication.native
-    ignored.update(
-        alias for field, alias in native.aliases.items() if field in native.sources
-    )
+    native = _owner(cfg, "parallel_config.communication.native")
+    if native is not None:
+        ignored.update(
+            alias for field, alias in native.aliases.items() if field in native.sources
+        )
     trace = _owner(cfg, "observability_config.runtime_trace")
     if trace is not None:
         from vllm.config.diagnostic_dump import DUMP_BINDINGS
@@ -428,6 +440,9 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
         for field, alias in trace.layer_aliases.items():
             if field in trace.sources:
                 ignored.add(alias)
+    routing = _owner(cfg, "kernel_config.sm70_moe.routing")
+    if routing is not None and routing.sources:
+        ignored.update(routing.aliases.values())
     unquantized = _owner(cfg, "kernel_config.sm70_moe.unquantized")
     if unquantized is not None and unquantized.sources:
         ignored.update(unquantized.aliases.values())
@@ -453,4 +468,7 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
             for field, alias in sampling.aliases.items()
             if field in sampling.sources
         )
+    if getattr(cfg, "speculative_config", None) is None:
+        # These projection paths cannot run without a speculative engine.
+        ignored.update(("VLLM_SM70_MTP_SHARED_BATCH", "VLLM_SM70_MTP_ROUTER_BATCH"))
     return ignored

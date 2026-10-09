@@ -31,6 +31,7 @@ def read_execution_legacy(name: str):
         "VLLM_SM70_DFLASH2_BF16_EMULATION",
         "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH",
         "VLLM_SM70_LM_HEAD_TOP1_TC",
+        "VLLM_GLM53_PP_MHC_MATERIALIZE",
     ):
         if name != "VLLM_SM70_DFLASH2_BF16_EMULATION":
             return os.getenv(name, "0").strip().lower() in ("1", "true", "yes", "on")
@@ -290,6 +291,8 @@ class LayerExecutionPolicy(ExecutionPolicy):
         "compact_topk20",
         "chunked_topk20_chunks",
         "glm_exact_kda_gemv",
+        "topk_topp_b8_b16_warps8",
+        "topk_topp_warps8",
     )
 
     def value(self, field):
@@ -348,6 +351,14 @@ class LayerExecutionPolicy(ExecutionPolicy):
         if self.hash_fields is None or "dense_f16" in self.hash_fields:
             factors["native"] = self.native.hash_options()
         return hash_factors(factors)
+
+    topk_topp_b8_b16_warps8: bool | None = None
+    """Use eight warps at the retained ordinary-sampling vocabulary/row gates."""
+    topk_topp_warps8: bool | None = None
+    """Enable the retained eight-warp schedule for verifier sampling rows."""
+
+    glm_pp_mhc_materialize: bool | None = None
+    """Materialize completed mHC states at the existing PP boundary."""
 
     online_qpn8: bool | None = None
     """Prepare the qualified checkpoint-FP16 weights in online QPN8 layout."""
@@ -422,6 +433,9 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Threads for native multi-token hyperconnection normalization."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "topk_topp_b8_b16_warps8": "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS",
+        "topk_topp_warps8": "VLLM_SM70_TOPK_TOPP_8_WARPS",
+        "glm_pp_mhc_materialize": "VLLM_GLM53_PP_MHC_MATERIALIZE",
         "online_qpn8": "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8",
         "compact_topk20": "VLLM_SM70_COMPACT_TOPK20_SAMPLER",
         "chunked_topk20_chunks": "VLLM_SM70_CHUNKED_TOPK20_CHUNKS",
@@ -602,6 +616,7 @@ BOUND_POLICY_OWNERS = (
     *POLICY_OWNERS,
     "kernel_config.gdn.projection",
     "kernel_config.sm70_moe.unquantized",
+    "kernel_config.sm70_moe.routing",
     "speculative_config.sampling_policy",
 )
 
@@ -632,6 +647,9 @@ def capture_execution_policy(owner: str, cls, cfg=None):
             )
             if owner in policies:
                 return policies[owner]
+            parent, _, field = owner.rpartition(".")
+            if parent in policies:
+                return getattr(policies[parent], field)
         from vllm.config import get_current_vllm_config_or_none
 
         cfg = get_current_vllm_config_or_none()
@@ -664,3 +682,11 @@ def ple_policy(cfg=None) -> PlePlacementPolicy:
 
 def flash_v100_policy(cfg=None) -> FlashV100Policy:
     return capture_execution_policy("attention_config.flash_v100", FlashV100Policy, cfg)
+
+
+def flash_v100_options(cfg=None):
+    from vllm.config.flash_v100 import FlashV100Options
+
+    return capture_execution_policy(
+        "attention_config.flash_v100.options", FlashV100Options, cfg
+    )

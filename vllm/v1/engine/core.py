@@ -585,11 +585,11 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
-        trace_enabled = envs.VLLM_SM70_ASYNC_CPU_TRACE
+        trace_enabled = self.vllm_config.observability_config.runtime_trace.async_cpu
         trace_step = self._sm70_async_cpu_trace_step
-        trace_log = trace_enabled and (
-            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
-        )
+        trace_every = self.vllm_config.observability_config.runtime_trace.async_every
+        assert trace_every is not None
+        trace_log = trace_enabled and trace_step % trace_every == 0
         if trace_enabled:
             self._sm70_async_cpu_trace_step += 1
         trace_t0 = time.perf_counter() if trace_log else 0.0

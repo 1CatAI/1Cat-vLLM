@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <mutex>
 
+#include "sm70_policy.h"
 #include "activation_pack_sm70.cuh"
 #include "qpn_pair_sm70.cuh"
 
@@ -2020,15 +2021,13 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   // M=16. The old path reconstructed the complete channel-FP8 weight before
   // every GEMM. Enable the measured two-row-tile and two-phase kernels for
   // compatible projection geometry, independent of checkpoint identity.
-  const auto env_enabled = [](const char* name) {
-    const char* value = std::getenv(name);
-    return value == nullptr || (value[0] == '1' && value[1] == '\0');
-  };
-  const bool qpn8_m16_enabled = env_enabled("VLLM_SM70_FP8_QPN8_M16");
-  const bool qpn8_m32_chunked_enabled =
-      env_enabled("VLLM_SM70_FP8_QPN8_M32_CHUNKED");
-  const bool qpn8_m32_native_enabled =
-      env_enabled("VLLM_SM70_FP8_QPN8_M32_NATIVE");
+  using vllm::sm70::PolicyField;
+  const bool qpn8_m16_enabled =
+      vllm::sm70::policy_exact_one(PolicyField::fp8_qpn8_m16, true, true);
+  const bool qpn8_m32_chunked_enabled = vllm::sm70::policy_exact_one(
+      PolicyField::fp8_qpn8_m32_chunked, true, true);
+  const bool qpn8_m32_native_enabled = vllm::sm70::policy_exact_one(
+      PolicyField::fp8_qpn8_m32_native, true, true);
   const int64_t m = input.size(0);
   const int64_t k = input.size(1);
   const int64_t packed_n = codes.size(1);

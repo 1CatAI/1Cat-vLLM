@@ -540,7 +540,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         mixed_qkv = _sm70_dump_gdn_projection_tensor(
             "split_mixed_qkv", layer_name, mixed_qkv
         )
-        if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+        if self.gdn_policy.projection.mixed_qkv_contiguous:
             mixed_qkv = mixed_qkv.contiguous()
         z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
         z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)

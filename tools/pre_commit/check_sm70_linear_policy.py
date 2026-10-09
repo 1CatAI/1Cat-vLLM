@@ -102,6 +102,31 @@ for _node in ast.parse((_CONFIG_ROOT / "policy_defaults.py").read_text()).body:
         RUNTIME_NAMES.update(ast.literal_eval(_node.value))
 
 
+# Newly migrated provider declarations share the same runtime rule.
+for _name in ("sm70_sparse.py", "gdn_projection.py"):
+    RUNTIME_NAMES.update(
+        node.value
+        for node in ast.walk(ast.parse((_CONFIG_ROOT / _name).read_text()))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.startswith("VLLM_")
+        and node.value.isidentifier()
+    )
+# MoE route and unquantized policies now cover generic modular consumers too.
+for _cls in ast.parse(_MOE_POLICY.read_text()).body:
+    if isinstance(_cls, ast.ClassDef) and _cls.name in (
+        "Sm70MoERoutingPolicy",
+        "Sm70UnquantizedMoEConfig",
+    ):
+        RUNTIME_NAMES.update(
+            node.value
+            for node in ast.walk(_cls)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("VLLM_")
+            and node.value.isidentifier()
+        )
+
 # Read the canonical diagnostic declarations statically, never invoke getters.
 for _name in ("diagnostic_dump.py", "diagnostic_sampling.py"):
     RUNTIME_NAMES.update(

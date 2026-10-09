@@ -382,7 +382,8 @@ class Qpn2NvFp4LinearKernel(TurboMindNvFp4LinearKernel):
         if gated_silu:
             split_k, nacc = _qpn2_config(x_2d.shape[1], kernel_output_size * 2, True)
         if getattr(layer, "sm70_nvfp4_qpn2_native", False):
-            torch.ops.vllm.sm70_nvfp4_native_dispatch(
+            state.native_ops.invoke(
+                torch.ops.vllm.sm70_nvfp4_native_dispatch,
                 out_2d,
                 x_2d,
                 state.weight,

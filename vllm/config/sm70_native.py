@@ -201,6 +201,27 @@ NATIVE_FIELDS = (
         ("awq", "fp8", "mxfp4", "nvfp4", "gguf"),
         True,
     ),
+    ("fp8_qpn8_m16", "VLLM_SM70_FP8_QPN8_M16", ("fp8",), False),
+    ("fp8_qpn8_m32_chunked", "VLLM_SM70_FP8_QPN8_M32_CHUNKED", ("fp8",), False),
+    ("fp8_qpn8_m32_native", "VLLM_SM70_FP8_QPN8_M32_NATIVE", ("fp8",), False),
+    (
+        "glm_exact_kda_half2_rows",
+        "VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS",
+        ("f16",),
+        False,
+    ),
+    (
+        "dflash_sharded_context_fc",
+        "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
+        ("f16",),
+        False,
+    ),
+    (
+        "tm_gemm_cache_summary",
+        "TM_GEMM_CACHE_SUMMARY",
+        ("awq", "fp8", "mxfp4", "nvfp4", "gguf", "f16"),
+        True,
+    ),
 )
 
 UNSET = "\x1f"
@@ -324,6 +345,18 @@ class Sm70NativeConfig:
     """Native compatibility input VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES."""
     profile_trace: bool | None = None
     """Native compatibility input VLLM_SM70_PROFILE_TRACE."""
+    fp8_qpn8_m16: bool | None = None
+    """Native initialization input VLLM_SM70_FP8_QPN8_M16."""
+    fp8_qpn8_m32_chunked: bool | None = None
+    """Native initialization input VLLM_SM70_FP8_QPN8_M32_CHUNKED."""
+    fp8_qpn8_m32_native: bool | None = None
+    """Native initialization input VLLM_SM70_FP8_QPN8_M32_NATIVE."""
+    glm_exact_kda_half2_rows: int | None = None
+    """Native initialization input VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS."""
+    dflash_sharded_context_fc: bool | None = None
+    """Native initialization input VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC."""
+    tm_gemm_cache_summary: bool | None = None
+    """Native initialization input TM_GEMM_CACHE_SUMMARY."""
     values: tuple[str, ...] = Field(default=(), init=False)
     """Frozen native ABI values, prepared once for this format."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)

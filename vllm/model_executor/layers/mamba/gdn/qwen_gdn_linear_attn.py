@@ -20,6 +20,7 @@ from vllm.config import (
 )
 from vllm.config.execution_policy import graph_policy
 from vllm.config.gdn import GdnProfileConfig, resolve_gdn_config
+from vllm.config.gdn_projection import legacy_projection_value
 from vllm.config.gdn_state import resolve_state_trace
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
@@ -638,12 +639,12 @@ def _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
         _sm70_qwen_gdn_num_speculative_tokens(vllm_config) >= 3
         and _sm70_qwen_gdn_spec_method(vllm_config) == "mtp"
         and (
-            envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
+            legacy_projection_value("spec_core_003")
             if policy is None
             else policy.spec_core_003
         )
         and not (
-            envs.VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP
+            legacy_projection_value("spec_allow_deep_mtp")
             if policy is None
             else policy.spec_allow_deep_mtp
         )
@@ -704,9 +705,9 @@ def _sm70_qwen_gdn_full_forward_enabled(
 def _sm70_qwen_gdn_input_core_boundary_enabled(policy=None) -> bool:
     if policy is not None:
         return bool(policy.input_core and not policy.disable_input_core)
-    if envs.VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP:
+    if legacy_projection_value("disable_input_core"):
         return False
-    return envs.VLLM_SM70_QWEN_GDN_INPUT_CORE_OP
+    return legacy_projection_value("input_core")
 
 
 def _sm70_qwen_gdn_spec_core_enabled(
@@ -1129,7 +1130,7 @@ def _sm70_compile_graph_slice_dim(
 def _sm70_gdn_rmsnorm_onepass_enabled(policy=None) -> bool:
     if policy is not None:
         return bool(policy.rmsnorm_onepass)
-    return envs.VLLM_SM70_GDN_RMSNORM_ONEPASS
+    return legacy_projection_value("rmsnorm_onepass")
 
 
 _SM70_GDN_QPN8_BA_REQUIRED_OPS = (
@@ -1148,7 +1149,9 @@ def _missing_sm70_gdn_qpn8_ba_ops() -> list[str]:
 
 def _sm70_gdn_qpn8_ba_split_enabled(policy=None) -> bool:
     requested = (
-        envs.VLLM_SM70_GDN_QPN8_BA_SPLIT if policy is None else policy.qpn8_ba_split
+        legacy_projection_value("qpn8_ba_split")
+        if policy is None
+        else policy.qpn8_ba_split
     )
     if requested and not _sm70_gdn_rmsnorm_onepass_enabled(policy):
         raise RuntimeError(

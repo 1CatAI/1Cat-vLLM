@@ -14,6 +14,8 @@ from vllm.config.utils import config, hash_factors
 
 @config
 class SpeculativeSamplingPolicy(ExecutionPolicy):
+    compact_aux_hidden: bool | None = None
+    """Ordinary DFlash concatenation into its unchanged projection dtype."""
     sync_accept_counts: bool | None = None
     """Synchronize acceptance counts at the retained async scheduling boundary."""
 
@@ -72,6 +74,7 @@ class SpeculativeSamplingPolicy(ExecutionPolicy):
     """Admit the retained MTP router batch projection."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "compact_aux_hidden": "VLLM_DFLASH_COMPACT_AUX_HIDDEN",
         "shared_batch": "VLLM_SM70_MTP_SHARED_BATCH",
         "router_batch": "VLLM_SM70_MTP_ROUTER_BATCH",
         "sync_accept_counts": "VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS",
@@ -140,6 +143,7 @@ class SpeculativeSamplingPolicy(ExecutionPolicy):
         self, *, draft: bool = True, vocab: bool = True, vocab_default: bool = True
     ) -> None:
         names = {
+            "compact_aux_hidden",
             "shared_batch",
             "router_batch",
             "sync_accept_counts",
@@ -174,8 +178,12 @@ class SpeculativeSamplingPolicy(ExecutionPolicy):
             raise ValueError(self.fused_apply_top_p_error)
         return self.fused_apply_top_p
 
-    def compute_hash(self, *, draft: bool = True, vocab: bool = True) -> str:
+    def compute_hash(
+        self, *, draft: bool = True, vocab: bool = True, aux_hidden: bool = False
+    ) -> str:
         inactive: set[str] = set()
+        if not aux_hidden:
+            inactive.add("compact_aux_hidden")
         if not draft:
             inactive.update(
                 field for field in self.aliases if field.startswith("draft_")
