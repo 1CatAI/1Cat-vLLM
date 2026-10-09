@@ -49323,3 +49323,52 @@ inference failures / 1 skipped, identical across all 243 parent/new outcomes
 (a4b_cpu_ab.json). This validates retained old-ABI decisions, not new-ABI GPU
 output or speed. The clean strategy suite has 21 passes and host binding
 syntax exit 0. No CUDA driver repair or GPU execution was attempted.
+
+## 2026-10-09 Phase B delivery 1: common AWQ/FP8 stages
+
+- Integration base: `fc9a518654d8e2dc5dce32507aaece474930ea17`;
+  owned branch `agent/v100-phase-b-mainflow-20261009-021900`;
+  worktree `/home/ymzx/arch-ws/v100-phase-b-mainflow-20261009-021900`.
+- B0 inventory and disposition: `docs/design/architecture/sm70_phase_b.md`
+  and generated `sm70_phase_b_parameters.md`. Four ordinary decomposed flows
+  (AWQ/FP8 × single/routed) now share two stage executors, the existing route
+  plan, a tensor-only weight codec, and a thin lifecycle base. Monolithic
+  experiments and diagnostic reference arithmetic remain explicitly separate.
+- Legacy policy reads move to per-engine `KernelConfig.sm70_moe` initialization.
+  Native single-token capability and plans are initialized once. Explicit typed
+  config wins; legacy OR/compact/indexed/strict precedence is preserved. Only
+  loaded formats affect graph hashes; diagnostics and provenance do not.
+- Reused #1065's layer-owned workspace view and FP8 buffer extraction, including
+  behavioral allocation, rebinding and fullgraph tracing tests. Source banks,
+  resident addresses, overflow allocation and AOT pointer resolution are kept.
+- CPU: 144 passed, four pre-existing failures unchanged from the baseline
+  (NVFP4 test stub lacks GROUPED_MTP5; two obsolete linear workspace test imports;
+  old AWQ hash golden). The new stage/config/workspace checks pass, including
+  48 frozen single-token call/argument/view sequences. The existing route
+  snapshot command reports 168 configurations and zero baseline differences.
+- GPU host `dx.1catai.com:54633`, GPU1 V100-SXM2-32GB, Torch `2.10.0+cu128`,
+  CUDA `12.8`. H=I=256, E4, top-k2; AWQ g32 and FP8 g128; matching source weights,
+  native bytes and flags. Final ordinary/legacy A/B: 105 eager cases bit-exact,
+  60 capture cases each with three changed-input/route replays bit-exact, and
+  identical observed public native-call order. M=0/1/2/3/32/33/65 covers empty,
+  resident/overflow and 128-slot active-W2 boundaries. Four AWQ diagnostic cases
+  additionally preserve output and reference native-call order.
+- Alternating CUDA-event graph timing medians: median relative change +0.102%;
+  largest increase +5.17% (70.354 to 73.989 microseconds, AWQ indexed request M32).
+  A first dense M1 case measures 83.164 to 39.265 microseconds despite identical
+  public call order; retain this unexplained timing outlier, do not claim a 2x
+  speedup. These are small operator timings, not model decode throughput.
+- Native `_C` SHA256:
+  `2f73362d50ec8c92c7c4ebc1323ee7b1fe56b9775513573b5d1a4ec6737ccbe8`;
+  `_moe_C`: `915e5bd5ad46eeb6ad770cf363ce132259abd18241309d8173c70c9cb80e9a14`.
+  Python-only changes; both runs use the same installed extensions, no preload.
+- Reproducer: `benchmarks/kernels/sm70_moe_stage_parity.py --root <ab-directory>`
+  with baseline source under `base/`, candidate package on PYTHONPATH, and
+  `--diagnostics` for reference-observer cases. Raw evidence on 54633:
+  `/home/ymzx/arch-ws/phase-b-20261009/artifacts/`; local CPU/snapshots/artifacts:
+  `/home/ymzx/arch-ws/tmp/phase-b/`. GPU ownership uses
+  `/tmp/1cat-vllm-v100-gpu1.lock`; no service/port is left running.
+- Owner explicitly authorized operator-only acceptance on 2026-10-09. No 35B
+  AWQ/FP8 model speed, TTFT/prefill, MTP or new-model qualification is claimed.
+  Deliveries 2 (remaining MoE) and 3 (linear/native ownership) follow on main;
+  DDTree and repository-wide C/D remain separate.

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator
 
+from vllm.config.sm70_moe import Sm70MoEConfig
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
 
@@ -430,6 +431,9 @@ class Sm70SparseConfig:
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
+    sm70_moe: Sm70MoEConfig = Field(default_factory=Sm70MoEConfig)
+    """Per-engine MoE stage policy; legacy switches resolve at construction."""
+
     ir_op_priority: IrOpPriorityConfig = Field(default_factory=IrOpPriorityConfig)
     """
     vLLM IR op priority for dispatching/lowering during the forward pass.
@@ -658,9 +662,13 @@ class KernelConfig:
             ignored_factors.add("sm70_awq")
         if not self.sm70_fp8.resolved:
             ignored_factors.add("sm70_fp8")
+        if not self.sm70_moe.resolved:
+            ignored_factors.add("sm70_moe")
         if not self.sm70_sparse.active:
             ignored_factors.add("sm70_sparse")
         factors = get_hash_factors(self, ignored_factors)
+        if self.sm70_moe.resolved:
+            factors["sm70_moe"] = self.sm70_moe.compute_hash()
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
 

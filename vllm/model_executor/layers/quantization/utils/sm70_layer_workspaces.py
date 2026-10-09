@@ -18,6 +18,30 @@ from vllm.utils.torch_utils import direct_register_custom_op
 _layer_workspaces: dict[str, torch.Tensor] = {}
 
 
+class LayerWorkspaceView:
+    """Name a family's layer-owned buffers without copying their bindings.
+
+    The layer remains the sole owner: legacy attribute rebinding and persistent
+    tensor addresses stay visible to every caller. This view creates no tensor
+    allocation or global registration and does not change the single-workspace
+    registry used by opaque linear operators.
+    """
+
+    __slots__ = ("_layer", "_prefix")
+    _layer: torch.nn.Module
+    _prefix: str
+
+    def __init__(self, layer: torch.nn.Module, prefix: str):
+        object.__setattr__(self, "_layer", layer)
+        object.__setattr__(self, "_prefix", prefix)
+
+    def __getattr__(self, name: str):
+        return getattr(self._layer, self._prefix + name)
+
+    def __setattr__(self, name: str, value) -> None:
+        setattr(self._layer, self._prefix + name, value)
+
+
 def register_layer_workspace(layer: torch.nn.Module, workspace: torch.Tensor) -> None:
     """Make `workspace` the scratch the opaque SM70 ops use for `layer`."""
     prefix = getattr(layer, "prefix", "")

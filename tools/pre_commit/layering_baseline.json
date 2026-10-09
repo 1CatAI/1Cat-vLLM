@@ -222,9 +222,6 @@
  "vllm/model_executor/layers/quantization/awq_marlin.py": {
   "platform": 50
  },
- "vllm/model_executor/layers/quantization/awq_sm70_moe.py": {
-  "env": 4
- },
  "vllm/model_executor/layers/quantization/base_config.py": {
   "platform": 1
  },
@@ -253,9 +250,6 @@
  },
  "vllm/model_executor/layers/quantization/fp8.py": {
   "platform": 63
- },
- "vllm/model_executor/layers/quantization/fp8_sm70_moe.py": {
-  "env": 5
  },
  "vllm/model_executor/layers/quantization/modelopt.py": {
   "platform": 95

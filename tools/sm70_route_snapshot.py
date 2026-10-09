@@ -327,7 +327,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--category",
-        choices=("nvfp4", "awq", "fp8-policy", "fp8", "dflash2"),
+        choices=("nvfp4", "awq", "fp8-policy", "fp8", "dflash2", "moe"),
         default="nvfp4",
     )
     parser.add_argument("--output", type=Path)
@@ -343,7 +343,10 @@ def main():
     )
     args = parser.parse_args()
     snapshot_fn, load_fn = snapshot, load_baseline
-    if args.category == "awq":
+    if args.category == "moe":
+        from tools.sm70_moe_route_snapshot import load_baseline as load_fn
+        from tools.sm70_moe_route_snapshot import snapshot as snapshot_fn
+    elif args.category == "awq":
         from tools.sm70_awq_route_snapshot import load_baseline as load_fn
         from tools.sm70_awq_route_snapshot import snapshot as snapshot_fn
     elif args.category == "fp8":
