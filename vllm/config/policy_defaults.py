@@ -162,6 +162,7 @@ class PolicyDefaults:
             graph.mega_aot = bool(
                 graph.aot_compile and is_torch_equal_or_newer("2.12.0.dev")
             )
+        self.cfg.kernel_config.capture_provider_inputs()
         for name in EXTRA_BINDINGS:
             for policy, field in self.bindings[name]:
                 resolve_legacy_fields(

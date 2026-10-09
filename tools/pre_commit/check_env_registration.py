@@ -26,7 +26,9 @@ BASELINE: frozenset[str] = frozenset()
 NATIVE_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"}
 
 
-def native_reads(content: str) -> list[tuple[str, int]]:
+def native_reads(
+    content: str, *, include_unresolved: bool = False
+) -> list[tuple[str | None, int]]:
     """Find literal keys and constant aliases passed to native env readers.
 
     Preserve quoted strings and line numbers while removing C/C++ comments.
@@ -82,6 +84,14 @@ def native_reads(content: str) -> list[tuple[str, int]]:
                         re.findall(r'"(' + key_pattern + r')"', array[2])
                     )
                 )
+            elif include_unresolved and call[1] in (
+                "getenv",
+                "secure_getenv",
+                "getenv_s",
+            ):
+                # A computed key must remain visible even when no declaration
+                # lets the lexical scanner associate it with a known alias.
+                reads.append((None, line))
     return reads
 
 
@@ -90,7 +100,7 @@ def scan_native_file(path: str, known: set[str]) -> int:
     missing = {
         (name, line)
         for name, line in native_reads(content)
-        if name.startswith("VLLM_") and name not in known
+        if name is not None and name.startswith("VLLM_") and name not in known
     }
     for name, line in sorted(missing):
         print(

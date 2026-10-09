@@ -170,13 +170,14 @@ def test_compact_rejection_uses_request_mapping_and_variable_row_counts(
     monkeypatch, temperatures, top_ps
 ):
     class Speculator:
+        _sm70_dflash2_policy = SimpleNamespace(
+            resolved=True, sparse_target_rejection=True
+        )
+
         def get_sparse_draft_logits(self):
             return None, None
 
     monkeypatch.setattr(sparse_rejection, "DFlash2Speculator", Speculator)
-    monkeypatch.setattr(
-        sparse_rejection.envs, "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION", True
-    )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (7, 0))
     monkeypatch.setattr(
         sparse_rejection, "_supports_sparse_sampling_contract", lambda *args: True
@@ -202,6 +203,7 @@ def test_compact_rejection_uses_request_mapping_and_variable_row_counts(
         SimpleNamespace(device=SimpleNamespace(type="cuda")),
         batch,
         None,
+        allow_graph=False,
     )
     assert result is None
 

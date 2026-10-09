@@ -362,9 +362,20 @@ class Sm70NativeConfig:
     sources: dict[str, str] = Field(default_factory=dict, init=False)
     """Provenance of the captured values; excluded from graph fingerprints."""
 
+    legacy_inputs: dict[str, str] | None = Field(default=None, init=False)
+    """Raw native dialect captured by the parent engine before worker transfer."""
+
+    def capture_inputs(self) -> None:
+        if self.legacy_inputs is None:
+            self.legacy_inputs = {
+                alias: os.getenv(alias, UNSET) for _, alias, _, _ in NATIVE_FIELDS
+            }
+
     def resolve(self, family: str, overrides: dict[str, Any] | None = None) -> None:
         if self.values:
             return
+        self.capture_inputs()
+        assert self.legacy_inputs is not None
         overrides = overrides or {}
         values = []
         for field, alias, families, diagnostic in NATIVE_FIELDS:
@@ -383,7 +394,7 @@ class Sm70NativeConfig:
                 value = overrides[alias]
                 source = "configuration"
             if value is None:
-                value = os.getenv(alias, UNSET)
+                value = self.legacy_inputs[alias]
                 source = alias if value != UNSET else "default"
             elif isinstance(value, bool):
                 value = "1" if value else "0"

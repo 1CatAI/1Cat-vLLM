@@ -5,7 +5,6 @@ from collections.abc import Callable
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -93,9 +92,7 @@ class CompressedTensorsW4A16Fp4(CompressedTensorsScheme):
             1.0 / layer.weight_global_scale.max().to(torch.float32), requires_grad=False
         )
 
-        if sm70_tm.should_prepare_turbomind(
-            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-        ):
+        if sm70_tm.is_exact_sm70_cuda(layer.weight, sm70_tm.format_enabled("nvfp4")):
             logger.info_once(
                 "SM70 compressed-tensors NVFP4 TurboMind W4A16 dense path enabled."
             )

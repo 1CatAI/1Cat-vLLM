@@ -85,7 +85,9 @@ def _use_sm70_awq_moe_route(
         and not current_platform.has_device_capability(75)
     ):
         return False
-    if not envs.VLLM_SM70_AWQ_TURBOMIND or envs.VLLM_SM70_AWQ_MOE_DISABLE:
+    if not sm70_tm.format_option("awq", "enabled") or sm70_tm.format_option(
+        "awq", "moe_disable"
+    ):
         return False
     if quant_config.weight_bits != 4:
         return False
@@ -103,7 +105,7 @@ def _should_prepare_sm70_awq_dense_route(
 ) -> bool:
     if not sm70_tm.is_exact_sm70_cuda(
         layer.qweight,
-        envs.VLLM_SM70_AWQ_TURBOMIND,
+        sm70_tm.format_option("awq", "enabled"),
     ):
         return False
     if input_dtype is not None:
@@ -295,7 +297,7 @@ class AWQMarlinConfig(QuantizationConfig):
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
-        sm70_quant_backend = envs.get_sm70_quant_backend()
+        sm70_quant_backend = sm70_tm.quant_backend()
         if (
             current_platform.is_cuda()
             and current_platform.has_device_capability(70)
@@ -305,7 +307,7 @@ class AWQMarlinConfig(QuantizationConfig):
                 or (
                     sm70_quant_backend == "auto"
                     and user_quant not in ("marlin", "awq_marlin")
-                    and sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
+                    and sm70_tm.format_enabled("awq")
                 )
             )
         ):

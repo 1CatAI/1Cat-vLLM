@@ -502,3 +502,40 @@ GPU result is pending. No tensor algorithm or numerical acceptance was broadened
 The unchanged D5 counter records 129 -> 119 raw environment references,
 3186 -> 3130 platform references and 2111 -> 2111 model references for this
 candidate. Ledger updates accept only total reductions, not additional exclusions.
+
+The next loader candidate freezes deferred AWQ/FP8/NVFP4, all four quantized
+MoE owners and native compatibility inputs before worker transfer. Capturing
+inputs does not activate a format; legacy parser errors remain deferred to their
+original consumer. Existing format fields remain authoritative; shared backend
+selection and integer GPTQ/compressed-tensors/MXFP4 admission belong to
+`layer_execution`. The two AWQMarlin gates that historically used the raw format
+flag retain that behavior. Explicit typed format/backend requests override their
+legacy inputs without changing the environment. Loader snapshots and provenance
+are excluded from the calculation hash.
+
+`loader-cpu-v2.log` records 115 passing lifecycle/policy tests and three CUDA-only
+skips, including worker serialization, alternating engines and forbidden legacy
+getters after initialization. Existing CPU preparation simulations now mock their
+native capture dependency explicitly; they do not pretend to validate the native
+ABI. The original AWQ route snapshot is unchanged. The inventory additionally
+lists native enum-bound consumers separately from native environment reads and
+retains unresolved computed native names.
+
+The normal `_C`/`_moe_C` candidate build completed and passed a fresh-process check
+of policy ABI 61 and runtime ABI 1. Initial GPU suites recorded 170 and 197 passes,
+respectively, before stopping on failures; these are incomplete runs. The first
+suite lacked the unchanged `_C_stable_libtorch` package component containing QSA
+selection and activation registration, and one test still expected the old
+MTP-MoE default despite the C baseline enabling it. The second suite exposed stale
+DFlash test fixtures and a compiled-layer test without an outer engine runtime
+scope. The missing standard component is being built from the same source;
+fixtures now use the production lifecycle. Their targeted reruns and same-criterion
+A/B are pending. No GPU completion or performance claim is made here.
+
+Follow-up CPU verification passes 45 default/hash/native-owner tests
+(`loader-defaults-v1.log`) and 33 FP8 preparation/inventory tests
+(`loader-cpu-v7.log`). The existing AWQ golden selector/call-order snapshot passes
+without changing its expected routes. The common ledger records 119 -> 119 raw
+references, 3130 -> 3121 platform references and 2111 -> 2111 model references;
+the worker-isolation tests, rather than these aggregate counts, establish the
+loader lifecycle change.

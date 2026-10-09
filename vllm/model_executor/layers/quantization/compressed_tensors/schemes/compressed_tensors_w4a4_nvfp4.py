@@ -45,16 +45,13 @@ def _explicit_nvfp4_emulation_requested() -> bool:
 class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
     def __init__(self):
         self.kernel = None
-        if not sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND):
+        if not sm70_tm.format_enabled("nvfp4"):
             self.kernel = init_nvfp4_linear_kernel()
         self.group_size = 16
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if (
-            sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND)
-            or sm70_tm.forces_marlin()
-        ):
+        if sm70_tm.format_enabled("nvfp4") or sm70_tm.forces_marlin():
             return 70
         if _explicit_nvfp4_emulation_requested():
             return 70
@@ -149,9 +146,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             layer.input_global_scale * layer.weight_global_scale, requires_grad=False
         )
 
-        if sm70_tm.should_prepare_turbomind(
-            layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
-        ):
+        if sm70_tm.is_exact_sm70_cuda(layer.weight, sm70_tm.format_enabled("nvfp4")):
             from vllm.model_executor.kernels.linear.qpn.nvfp4 import (
                 Sm70NvFp4LinearLayerConfig,
             )
@@ -166,7 +161,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
             policy = cfg.kernel_config.sm70_nvfp4
             dense_gated = bool(
                 sm70_nvfp4_gate_up_qualified(layer)
-                and envs.VLLM_SM70_NVFP4_DENSE_GATED_SILU
+                and sm70_tm.format_option("nvfp4", "gated_silu")
             )
             qpn4_role = sm70_nvfp4_down_qualified(layer) or dense_gated
             config = Sm70NvFp4LinearLayerConfig(

@@ -23,10 +23,10 @@ CONFIG = dict(
 )
 
 
-def test_default_off(monkeypatch):
+def test_default_enabled(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_MTP_MOE_FP16_EXACT", raising=False)
     envs.disable_envs_cache()
-    assert not envs.VLLM_SM70_MTP_MOE_FP16_EXACT
+    assert envs.VLLM_SM70_MTP_MOE_FP16_EXACT
 
 
 @pytest.mark.parametrize("m", [1, 2, 5, 10])

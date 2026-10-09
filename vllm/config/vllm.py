@@ -1161,6 +1161,7 @@ class VllmConfig:
                 and sm70_flash_next_batch_qualified(self)
             )
         )
+        self.kernel_config.capture_provider_inputs()
         self.kernel_config.sm70_nvfp4.resolve(
             qualified=sm70_dflash2_nvfp4_qualified(self), active=False
         )

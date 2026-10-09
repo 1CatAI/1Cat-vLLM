@@ -269,10 +269,10 @@
   "platform": 10
  },
  "vllm/model_executor/layers/quantization/awq.py": {
-  "platform": 44
+  "platform": 42
  },
  "vllm/model_executor/layers/quantization/awq_marlin.py": {
-  "platform": 44
+  "platform": 43
  },
  "vllm/model_executor/layers/quantization/base_config.py": {
   "platform": 1
@@ -284,13 +284,13 @@
   "platform": 3
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_nvfp4.py": {
-  "platform": 8
+  "platform": 9
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxfp4.py": {
   "platform": 13
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py": {
-  "platform": 21
+  "platform": 20
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py": {
   "model": 4,
@@ -300,10 +300,10 @@
   "platform": 13
  },
  "vllm/model_executor/layers/quantization/fp8.py": {
-  "platform": 66
+  "platform": 62
  },
  "vllm/model_executor/layers/quantization/modelopt.py": {
-  "platform": 89
+  "platform": 87
  },
  "vllm/model_executor/layers/quantization/mxfp4.py": {
   "platform": 25

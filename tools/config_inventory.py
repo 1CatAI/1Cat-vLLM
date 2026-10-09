@@ -14,6 +14,8 @@ import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import regex as re
+
 from tools.pre_commit.check_env_metadata import read_metadata, registrations
 from tools.pre_commit.check_env_registration import (
     NATIVE_SUFFIXES,
@@ -185,6 +187,65 @@ def destination(name: str, metadata: dict) -> str:
     return "review_required"
 
 
+def native_policy_fields(root: Path) -> dict[str, str]:
+    """Use the shipped ABI declarations, without loading either native library."""
+    result = {}
+    manifest = root / "csrc/sm70_policy_fields.inc"
+    if manifest.is_file():
+        result.update(
+            ("PolicyField::" + field, alias)
+            for field, alias in re.findall(
+                r'SM70_POLICY_FIELD\(\s*(\w+)\s*,\s*"([^"]+)"', manifest.read_text()
+            )
+        )
+    header = root / "flash-attention-v100/include/flash_v100_policy.h"
+    if header.is_file():
+        source = header.read_text()
+        enum = re.search(r"enum class Field\s*\{([^}]+)\}", source)
+        names = re.search(r"\bnames\[\]\s*=\s*\{([^}]+)\}", source)
+        if enum and names:
+            fields = [
+                field.strip()
+                for field in enum[1].split(",")
+                if field.strip() != "count"
+            ]
+            aliases = re.findall(r'"([^"]+)"', names[1])
+            if len(fields) != len(aliases):
+                raise ValueError("Flash-V100 native policy manifest lengths differ")
+            result.update(
+                ("flash_v100::policy::Field::" + field, alias)
+                for field, alias in zip(fields, aliases)
+            )
+    return result
+
+
+def native_policy_references(source: str, fields: dict[str, str]) -> list[dict]:
+    """Static bound-field references are distinct from compatibility env reads."""
+    # Strings and comments cannot establish an executed policy consumer.
+    masked = re.sub(
+        r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/',
+        lambda match: re.sub(r"[^\n]", " ", match[0]),
+        source,
+    )
+    rows = []
+    for match in re.finditer(
+        r"(?:\bPolicyField::|\bflash_v100::policy::Field::)(\w+)", masked
+    ):
+        key = match[0]
+        if key not in fields:
+            continue
+        rows.append(
+            dict(
+                name=fields[key],
+                line=source.count("\n", 0, match.start()) + 1,
+                kind="native_bound",
+                scope="",
+                binding=key,
+            )
+        )
+    return rows
+
+
 def collect(root: Path = ROOT) -> dict:
     source = (root / "vllm/envs.py").read_text()
     metadata, errors = read_metadata(source)
@@ -200,6 +261,7 @@ def collect(root: Path = ROOT) -> dict:
     paths = subprocess.check_output(
         ["git", "ls-files", "vllm", "csrc", "flash-attention-v100"], cwd=root, text=True
     ).splitlines()
+    native_fields = native_policy_fields(root)
     consumers = defaultdict(list)
     declarations = defaultdict(list)
     unresolved = []
@@ -220,8 +282,9 @@ def collect(root: Path = ROOT) -> dict:
         else:
             references = [
                 dict(name=name, line=line, kind="native", scope="")
-                for name, line in native_reads(text)
+                for name, line in native_reads(text, include_unresolved=True)
             ]
+            references.extend(native_policy_references(text, native_fields))
         for item in references:
             name = item.pop("name")
             entry = dict(path=filename, **item)

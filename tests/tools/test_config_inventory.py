@@ -72,3 +72,48 @@ def test_native_constant_array_records_each_compatible_consumer():
     assert "PREFIX_TORCH_EXACT_TAIL" in typed_declarations(
         'bindings = {"exact": ("PREFIX_TORCH_EXACT_TAIL", "present", None)}'
     )
+
+
+def test_dynamic_native_reads_do_not_disappear():
+    source = "std::getenv(policy_name(field));\nstd::getenv(dynamic_name.c_str());"
+    assert native_reads(source, include_unresolved=True) == [(None, 1), (None, 2)]
+    assert native_reads(source) == []
+
+
+def test_bound_native_policy_references_are_separate_from_raw_reads():
+    from tools.config_inventory import native_policy_references
+
+    source = """// PolicyField::enabled
+const char* message = "PolicyField::enabled";
+return policy_atoi(vllm::sm70::PolicyField::enabled, 1);
+"""
+    assert native_reads(source, include_unresolved=True) == []
+    rows = native_policy_references(source, {"PolicyField::enabled": "VLLM_EXAMPLE"})
+    assert rows == [
+        dict(
+            name="VLLM_EXAMPLE",
+            line=3,
+            kind="native_bound",
+            scope="",
+            binding="PolicyField::enabled",
+        )
+    ]
+
+
+def test_native_policy_inventory_uses_shipped_declarations(tmp_path):
+    from tools.config_inventory import native_policy_fields
+
+    csrc = tmp_path / "csrc"
+    csrc.mkdir()
+    (csrc / "sm70_policy_fields.inc").write_text(
+        'SM70_POLICY_FIELD(example, "VLLM_EXAMPLE", true)\n'
+    )
+    include = tmp_path / "flash-attention-v100" / "include"
+    include.mkdir(parents=True)
+    (include / "flash_v100_policy.h").write_text(
+        'enum class Field { test, count };\nconst char* names[] = {"PREFIX_TEST"};\n'
+    )
+    assert native_policy_fields(tmp_path) == {
+        "PolicyField::example": "VLLM_EXAMPLE",
+        "flash_v100::policy::Field::test": "PREFIX_TEST",
+    }

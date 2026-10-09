@@ -48,9 +48,25 @@ from vllm.model_executor.layers.quantization.utils import (
 
 
 @pytest.fixture(autouse=True)
-def _sm70_fp8_workspace_ops_on_cpu():
+def _sm70_fp8_workspace_ops_on_cpu(monkeypatch):
     """The tests dispatch on CPU tensors; the opaque workspace ops register CUDA
     kernels only. Every test starts with empty workspace caches."""
+    # Mocked CPU kernels check preparation/dispatch, not the native policy ABI.
+    monkeypatch.setattr(
+        ct_fp8_module,
+        "capture_linear_native_config",
+        lambda family: SimpleNamespace(values=()),
+    )
+    monkeypatch.setattr(
+        "vllm.config.sm70_native.capture_linear_native_config",
+        lambda family: SimpleNamespace(values=()),
+    )
+    from vllm._sm70 import policy as native_policy
+
+    native_bindings = native_policy.NativeBindings
+    monkeypatch.setattr(
+        native_policy, "NativeBindings", lambda values=(): native_bindings()
+    )
     libraries = []
     for op_name, impl in (
         ("sm70_fp8_qpn8_dispatch", ws_module._sm70_fp8_qpn8_dispatch),

@@ -5,7 +5,7 @@
 
 from collections.abc import Callable
 from contextlib import suppress
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import torch
 from pydantic import Field
@@ -272,6 +272,15 @@ class GraphPolicy(ExecutionPolicy):
 class LayerExecutionPolicy(ExecutionPolicy):
     """Execution policy owned by kernel_config.layer_execution."""
 
+    quant_backend: Literal["auto", "marlin", "turbomind"] | None = None
+    """Shared pre-Ampere quantization backend; format flags retain their gates."""
+    gptq_turbomind: bool | None = None
+    """Retained opt-in GPTQ weight-only provider."""
+    compressed_tensors_turbomind: bool | None = None
+    """Retained opt-in integer compressed-tensors provider."""
+    mxfp4_turbomind: bool | None = None
+    """MXFP4 loader admission; native tuning stays with its existing owner."""
+
     batch_fastpath: bool | None = None
     """Retain the existing batch fastpath model strategy."""
 
@@ -296,6 +305,10 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Keep unused provider parse failures behind their original admission gates."""
 
     deferred_fields: ClassVar[tuple[str, ...]] = (
+        "quant_backend",
+        "gptq_turbomind",
+        "compressed_tensors_turbomind",
+        "mxfp4_turbomind",
         "online_qpn8",
         "tp_local_topk20",
         "mtp_dense_fastpath",
@@ -464,6 +477,10 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Threads for native multi-token hyperconnection normalization."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "quant_backend": "VLLM_SM70_QUANT_BACKEND",
+        "gptq_turbomind": "VLLM_SM70_GPTQ_TURBOMIND",
+        "compressed_tensors_turbomind": "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND",
+        "mxfp4_turbomind": "VLLM_SM70_MXFP4_TURBOMIND",
         "topk_topp_b8_b16_warps8": "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS",
         "topk_topp_warps8": "VLLM_SM70_TOPK_TOPP_8_WARPS",
         "glm_pp_mhc_materialize": "VLLM_GLM53_PP_MHC_MATERIALIZE",
