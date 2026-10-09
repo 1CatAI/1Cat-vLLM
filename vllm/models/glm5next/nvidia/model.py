@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import ClassVar, Literal
 
 import torch
@@ -797,9 +797,12 @@ def _dflash_aux_hidden_state_key(layer_boundary: int) -> str:
 
 
 def exl3_checkpoint_weights(
-    weights: Iterable[tuple], quant_config: QuantizationConfig | None
+    weights: Iterable[tuple],
+    quant_config: QuantizationConfig | None,
+    skip: Callable[[str], bool] | None = None,
 ) -> Iterable[tuple]:
-    """exllamav3 checkpoints: dequantize the dense EXL3 linears and split the
+    """exllamav3 checkpoints: dequantize the dense EXL3 linears (except the
+    tensors ``skip`` selects, which the caller does not load) and split the
     fused KDA tensors exllamav3 writes (self_attn.qkv_proj / self_attn.conv1d,
     q | k | v along dim 0) back into the HF names."""
     if not isinstance(quant_config, Exl3Config):
@@ -809,7 +812,7 @@ def exl3_checkpoint_weights(
         ".self_attn.qkv_proj.weight": ("q_proj", "k_proj", "v_proj"),
         ".self_attn.conv1d.weight": ("q_conv1d", "k_conv1d", "v_conv1d"),
     }
-    for item in quant_config.dequantize_dense(weights):
+    for item in quant_config.dequantize_dense(weights, skip):
         name = item[0]
         suffix = next((s for s in fused if name.endswith(s)), None)
         if suffix is None:
@@ -1176,7 +1179,14 @@ class Glm5NextModel(nn.Module, EagleModelMixin):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        weights = exl3_checkpoint_weights(weights, self.quant_config)
+        # The MTP layer is loaded by Glm5NextMTP; leave its tensors alone here.
+        weights = exl3_checkpoint_weights(
+            weights,
+            self.quant_config,
+            skip=lambda name: (
+                get_spec_layer_idx_from_weight_name(self.config, name) is not None
+            ),
+        )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".gate_up_proj", ".gate_proj", 0),
