@@ -11,6 +11,7 @@ not each replay. Host-KV epochs/statistics prove actual cache activity.
 import argparse
 import os
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 from tools.sm70.parity_common import (
@@ -109,7 +110,9 @@ def record(args):
         temperature=0.0, seed=1701, max_tokens=args.max_tokens, ignore_eos=False
     )
     contract = dict(
-        engine=options,
+        # Engine initialization enriches nested speculative/graph options.
+        # Keep the requested JSON contract independent of those runtime objects.
+        engine=deepcopy(options),
         prompts=prompts,
         sampling=sampling,
         runtime=runtime(),

@@ -19,7 +19,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase passed | Private references 387 → 380 | Pending | Separate outcome and GPU gates |
 | 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict passed | Private references 380 → 374; cycles 14 → 13 | Queued after Step 3 | Required GPU gates |
 | 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
-| 4c: outer decode dispatch candidates | — | CPU/golden/strict passed | Forward 597 → 402; private 370 → 358 | Required | Parent and GPU gates |
+| 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
+| 1c follow-up: immutable requested workload | — | CPU/golden/strict passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
 | 5a: per-sequence prefill candidates | — | Not started | — | Required | Step 4 gates |
 | 5b: batch prefill candidates | — | Not started | — | Required | Step 5a gates |
 | 5c: debug observer | — | Not started | — | Required | Step 5b gates |
@@ -462,3 +463,42 @@ comparisons have max-abs zero. The run ended with exit 0 and is recorded in
 `a3-step2/logs/outcome-parity.json` on 54633, copied locally as
 `a3-config-gpu-outcome-parity.json`. PRs #1075/#1076 have updated evidence and
 remain Draft while Step 1c model prerequisites are pending.
+
+## Parity recorder configuration snapshot
+
+PR #1083 is `15d8de1229c8df35f2df0c81e0213b66278a1cf5`. Its actual pinned
+PR #1028 rebase is `256bb7e0e63d72fc5ff7f75e419845536787600b`, tree
+`e4091b3a41d4e6146c73fc5853c4bd5b29319985`, identical to the clean merge-tree;
+37 CPU tests pass and 98 GPU cases are skipped in that local check.
+
+The DFlash2 baseline completed graph warmup and generation but failed while
+saving its parity JSON: engine initialization enriched the nested speculative
+options with a non-JSON `ModelConfig`. The recorder had retained a reference
+to that mutable dictionary. No successful token artifact was produced, so
+this run is not parity evidence. Fix the tool by copying the requested JSON
+options before constructing the engine. The engine still receives exactly the
+same options; no serializer fallback, removed field or production change is
+used. The new CPU regression mutates both speculative and graph subcontainers
+and checks the actual saved contract, tokens and native provenance.
+
+The focused tool suite passes 17 tests. Deploy this small repair as versioned
+`a3-parity-tools-v2` on 54633, separately from immutable backend snapshots.
+Each result records the actual harness hashes and backend source SHA. Both
+host/spec comparison arms use the same repaired tool. Preserve failed logs
+and rerun generation; tokens from an exited worker cannot be reconstructed.
+
+Step 3a's full GPU outcome map now reports 1686 passes / the same seven
+inherited failures, with only its new cache test added. All old outcomes match.
+Its 12 native cases and designated XQA/prefill timing gates pass; see
+`a3-step3a/logs/{regression-parity.json,op-compare.log}`. Full model gates remain
+pending and PR #1077 remains Draft.
+
+The recorder repair passes the complete strict suite: **243 passed / 1 skipped /
+28 GPU exclusions**, including all 813 unchanged golden traces. Pre-commit,
+mypy and layering checks pass. Logs are `a3-parity-snapshot-{strict,precommit}.log`
+and `a3-parity-snapshot-shim.json` in the local task evidence directory.
+The versioned remote harness passes SHA256 and import-location verification;
+host/spec runners are updated atomically and the failed DFlash baseline is
+queued again. Step 4c's immutable source and host-integration snapshots and four
+dependent GPU queues are staged under `a3-step4c`; no earlier source snapshot
+is overwritten by the tool repair.
