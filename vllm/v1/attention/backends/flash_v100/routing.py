@@ -7,7 +7,10 @@ from __future__ import annotations
 import atexit
 import json
 import os
+from dataclasses import dataclass
+from typing import Literal
 
+import regex as re
 import torch
 
 import vllm.envs as envs
@@ -17,14 +20,420 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
 from vllm.v1.attention.kv_codecs import (
+    BF16,
     FP8_E4M3,
     FP8_E5M2,
     FP16,
+    KVCodec,
     canonical_kv_cache_dtype,
     resolve_kv_codec,
 )
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
+
+RouteStage = Literal["decode", "verify", "mixed_decode", "prefill", "metadata", "any"]
+_NATIVE_CODECS = frozenset((FP16, FP8_E4M3, FP8_E5M2))
+_ALL_CODECS = _NATIVE_CODECS | {BF16}
+
+
+@dataclass(frozen=True)
+class RouteShape:
+    """Host-visible dimensions only; never read device sequence lengths."""
+
+    rows: int
+    heads_q: int
+    heads_kv: int
+    head_dim: int
+    page_size: int = 0
+    chunk_size: int = 0
+
+    @property
+    def gqa(self) -> int:
+        if self.heads_kv <= 0 or self.heads_q % self.heads_kv:
+            return 0
+        return self.heads_q // self.heads_kv
+
+
+@dataclass(frozen=True)
+class RouteSpec:
+    """Structural admission and the unchanged compatibility counter name.
+
+    Operator availability, metadata/stride/ABI guards and legacy policy still
+    have to admit a candidate. A declaration alone never claims a native op
+    exists. Bridge declarations describe their input storage codec; dense
+    declarations describe the already-converted tensors consumed by the op.
+    """
+
+    name: str
+    stage: RouteStage
+    codecs: frozenset[KVCodec] = _NATIVE_CODECS
+    head_dims: tuple[int, ...] = ()
+    gqa_ratios: tuple[int, ...] = ()
+    page_alignment: int = 1
+    page_sizes: tuple[int, ...] = ()
+    chunk_alignment: int = 1
+    min_chunk: int = 0
+    max_chunk: int | None = None
+    chunk_sizes: tuple[int, ...] = ()
+    fallback: bool = False
+    observer: bool = False
+    xqa: bool = False
+
+    def shape_reason(self, codec: KVCodec | None, shape: RouteShape) -> str | None:
+        if codec not in self.codecs:
+            return "codec"
+        if self.head_dims and shape.head_dim not in self.head_dims:
+            return "head_dim"
+        if self.gqa_ratios and shape.gqa not in self.gqa_ratios:
+            return "gqa"
+        if self.page_alignment > 1 and (
+            shape.page_size <= 0 or shape.page_size % self.page_alignment
+        ):
+            return "page_alignment"
+        if self.page_sizes and shape.page_size not in self.page_sizes:
+            return "page_size"
+        if shape.chunk_size < self.min_chunk:
+            return "min_chunk"
+        if self.max_chunk is not None and shape.chunk_size > self.max_chunk:
+            return "max_chunk"
+        if shape.chunk_size % self.chunk_alignment:
+            return "chunk_alignment"
+        if self.chunk_sizes and shape.chunk_size not in self.chunk_sizes:
+            return "chunk_size"
+        return None
+
+
+# All 44 literal counters, plus concrete names from the old dynamic sites.
+# Format-bearing counter names are retained until a separate compatibility
+# change; implementation admission is expressed by codecs instead.
+ROUTE_SPECS: dict[str, RouteSpec] = {}
+
+
+def _declare(names: str, stage: RouteStage, **kwargs) -> None:
+    for name in names.split():
+        if name in ROUTE_SPECS:
+            raise ValueError(f"Duplicate Flash-V100 route: {name}")
+        ROUTE_SPECS[name] = RouteSpec(name, stage, **kwargs)
+
+
+_declare("decode_xqa_paged", "decode", head_dims=(256,), gqa_ratios=(4, 6, 8), xqa=True)
+_declare(
+    "prefill_prefix_decode_rows_xqa",
+    "mixed_decode",
+    head_dims=(256,),
+    gqa_ratios=(4, 6, 8),
+    xqa=True,
+)
+_declare(
+    "prefill_smallq_decode_xqa", "verify", head_dims=(256,), gqa_ratios=(6, 8), xqa=True
+)
+_declare("decode_scalar_paged", "decode", fallback=True)
+_declare("prefill_smallq_decode_scalar", "verify", fallback=True)
+_declare("prefill_prefix_decode_rows_scalar", "mixed_decode", fallback=True)
+_declare("decode_dense_cache decode_paged_prefill", "decode")
+_declare("decode_dense_reference", "decode", codecs=_ALL_CODECS)
+_declare(
+    "decode_e4m3_compact_scalar_tail",
+    "decode",
+    codecs=frozenset((FP8_E4M3,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    page_alignment=16,
+)
+_declare(
+    "decode_triton_no_flash_decode decode_triton_scalar_disabled",
+    "decode",
+    codecs=_ALL_CODECS,
+    fallback=True,
+)
+_declare(
+    "unsupported_triton_fallback dflash_draft_triton_fallback",
+    "any",
+    codecs=_ALL_CODECS,
+    fallback=True,
+)
+_declare("prefill_triton_safe", "prefill", codecs=_ALL_CODECS, fallback=True)
+_declare("prefill_ddtree_triton", "verify", codecs=_ALL_CODECS)
+_declare(
+    "metadata_none_zero_output prefill_capture_dflash_noncausal_paged "
+    "prefill_capture_smallq prefill_capture_smallq_ddtree_metadata "
+    "prefill_capture_smallq_no_ddtree_metadata",
+    "metadata",
+    codecs=_ALL_CODECS,
+    observer=True,
+)
+_declare(
+    "prefill_smallq_fp16_grouped_fp32",
+    "verify",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    page_alignment=16,
+)
+_declare(
+    "prefill_smallq_e4m3_grouped_fp32",
+    "verify",
+    codecs=frozenset((FP8_E4M3,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    page_alignment=16,
+)
+_declare(
+    "prefill_prefix_decode_rows_e4m3_grouped_fp32",
+    "mixed_decode",
+    codecs=frozenset((FP8_E4M3,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    page_alignment=16,
+)
+_declare("prefill_smallq_dflash2_grouped_verify prefill_ddtree_dense", "verify")
+_declare(
+    "prefill_dense_splitd_d256 prefill_prefix_splitd_d256 "
+    "prefill_prefix_paged_splitd_d256 prefill_prefix_gather_splitd_d256 "
+    "prefill_prefix_contig_splitd_d256",
+    "prefill",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+)
+_declare(
+    "prefill_dense_splitd_d256_splitkv3_kernel",
+    "prefill",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    chunk_sizes=(4096, 8000),
+)
+_declare(
+    "prefill_dense_d256_gqa_arch_long",
+    "prefill",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    min_chunk=64,
+    max_chunk=8192,
+)
+_declare(
+    "prefill_dense_d256_gqa_v37",
+    "prefill",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    chunk_alignment=64,
+    min_chunk=64,
+    max_chunk=8192,
+)
+_declare(
+    "prefill_dense_d256_gqa_79t_fp32",
+    "prefill",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    min_chunk=8000,
+    max_chunk=8192,
+)
+_declare(
+    "prefill_dense_d256_gqa_79t_fp32_fringe_fallback",
+    "prefill",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    min_chunk=8001,
+    max_chunk=8192,
+)
+_declare(
+    "prefill_dense_d256_gqa_79t_fp32_q8192",
+    "prefill",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    min_chunk=8001,
+    max_chunk=8192,
+)
+_declare(
+    "prefill_dense_d256_gqa_79t_fp32_q8192_pad",
+    "prefill",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+    gqa_ratios=(6,),
+    min_chunk=8001,
+    max_chunk=8191,
+)
+_declare(
+    "prefill_prefix_fp8_bridge_exact_d256 "
+    "prefill_prefix_fp8_bridge_exact_d256_tailpad "
+    "prefill_prefix_fp8_bridge_exact_dense_d256 "
+    "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad",
+    "prefill",
+    codecs=frozenset((FP8_E4M3, FP8_E5M2)),
+    head_dims=(256,),
+)
+_declare("prefill_prefix_fp8_e4m3_bridge", "prefill", codecs=frozenset((FP8_E4M3,)))
+_declare("prefill_prefix_fp8_e5m2_bridge", "prefill", codecs=frozenset((FP8_E5M2,)))
+_declare(
+    "prefill_no_prefix_dense_flash prefill_no_prefix_paged_cache_flash "
+    "prefill_prefix_bfla prefill_prefix_contig_dense "
+    "prefill_prefix_contig_dense_bhmd prefill_prefix_contig_dense_fa2_d256 "
+    "prefill_prefix_dflash_noncausal_batch prefill_prefix_flash "
+    "prefill_prefix_paged_anchored prefill_prefix_splitkv",
+    "prefill",
+)
+
+# The sibling FlashInfer backend uses this shared accounting owner too.
+_declare(
+    "flashinfer_sm70_fixed_entry flashinfer_sm70_splitkv3_fast_visible",
+    "prefill",
+    codecs=frozenset((FP16,)),
+    head_dims=(256,),
+    page_alignment=16,
+    page_sizes=(784,),
+    observer=True,
+)
+
+# Diagnostic families are observers, not additional dispatch implementations.
+_ROUTE_FAMILIES = (
+    (
+        re.compile(r"decode_xqa_e4m3_dynamic_page[0-9]+"),
+        RouteSpec(
+            "decode_xqa_e4m3_dynamic_page{page}",
+            "decode",
+            frozenset((FP8_E4M3,)),
+            observer=True,
+        ),
+    ),
+    (
+        re.compile(r"decode_xqa_p[0-9]+_page[0-9]+"),
+        RouteSpec("decode_xqa_p{partition}_page{page}", "decode", observer=True),
+    ),
+    (
+        re.compile(r"fp8_kv_decode(?:_.+)?"),
+        RouteSpec(
+            "fp8_kv_decode", "decode", frozenset((FP8_E4M3, FP8_E5M2)), observer=True
+        ),
+    ),
+    (
+        re.compile(r"fp8_kv_prefill(?:_.+)?"),
+        RouteSpec(
+            "fp8_kv_prefill", "prefill", frozenset((FP8_E4M3, FP8_E5M2)), observer=True
+        ),
+    ),
+)
+
+
+def route_spec(name: str) -> RouteSpec:
+    """Resolve literal and dynamic compatibility counters; reject typos."""
+    spec = ROUTE_SPECS.get(name)
+    if spec is not None:
+        return spec
+    for pattern, spec in _ROUTE_FAMILIES:
+        if pattern.fullmatch(name):
+            return spec
+    raise ValueError(f"Undeclared Flash-V100 route: {name}")
+
+
+@dataclass(frozen=True)
+class RouteContext:
+    stage: RouteStage
+    codec: KVCodec | None
+    shape: RouteShape
+    enabled: bool = True
+    available: bool = True
+    query: torch.Tensor | None = None
+    metadata: TritonAttentionMetadata | None = None
+    seq_rows: int | None = None
+    max_seq_len_hint: int | None = None
+    workspace_seq_capacity_hint: int | None = None
+    partition_size_hint: int | None = None
+    window_size: tuple[int, int] = (-1, -1)
+
+
+def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
+    """One codec/shape decision for uniform, mixed and small-query decode."""
+    shape = context.shape
+    smallq = context.stage == "verify"
+    if smallq and (
+        context.partition_size_hint is not None or context.window_size != (-1, -1)
+    ):
+        return "partition_or_window"
+    if context.seq_rows is not None and shape.rows != context.seq_rows:
+        return "sequence_rows"
+    if smallq and shape.gqa not in (6, 8):
+        return "gqa"
+    if not smallq and shape.gqa == 4:
+        if context.stage == "decode":
+            assert context.metadata is not None
+            if not _decode_xqa_allowed_for_q_per_kv(shape.gqa, context.metadata):
+                return "short_gqa4"
+        elif int(context.max_seq_len_hint or 0) < _decode_xqa_q4_min_seq_len():
+            return "short_gqa4"
+    if context.codec is FP8_E4M3:
+        if shape.gqa != 6:
+            return "e4m3_gqa"
+        # The legacy small-Q guard accepts zero rows, whereas uniform and
+        # mixed decode require one row or an explicitly enabled batch.
+        if (shape.rows > 1 if smallq else shape.rows != 1) and not (
+            shape.rows > 1 and envs.VLLM_FLASH_V100_E4M3_BATCH_XQA
+        ):
+            return "e4m3_batch"
+    if smallq:
+        assert context.query is not None
+        capture = bool(getattr(context.metadata, "flash_v100_cudagraph_capture", False))
+        capture = capture or _is_cuda_graph_capturing(context.query)
+        hint = max(
+            int(context.max_seq_len_hint or 0),
+            int(context.workspace_seq_capacity_hint or 0) if capture else 0,
+        )
+        minimum = int(
+            os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN", "4096")
+        )
+        if context.codec is FP8_E5M2:
+            minimum = max(minimum, _decode_fp8_xqa_min_seq_len())
+        if hint < max(1, minimum):
+            return "short_verify"
+    elif context.codec is FP8_E5M2:
+        if shape.gqa == 4:
+            return "e5m2_gqa4"
+        if context.stage == "decode":
+            assert context.metadata is not None and context.query is not None
+            if not _decode_fp8_xqa_allowed(context.metadata, context.query):
+                return "short_e5m2"
+        elif int(context.max_seq_len_hint or 0) < _decode_fp8_xqa_min_seq_len():
+            return "short_e5m2"
+    if context.stage == "decode" and context.window_size != (-1, -1):
+        return "window"
+    return None
+
+
+def route_reason(spec: RouteSpec, context: RouteContext) -> str | None:
+    if spec.stage not in (context.stage, "any"):
+        return "stage"
+    if not context.enabled:
+        return "disabled"
+    if not context.available:
+        return "unavailable"
+    reason = spec.shape_reason(context.codec, context.shape)
+    if reason is not None:
+        return reason
+    return _xqa_reason(spec, context) if spec.xqa else None
+
+
+def select_route(
+    context: RouteContext, candidates: tuple[str, ...], *, fallback: str | None = None
+) -> RouteSpec | None:
+    """Select in declared priority order; caller supplies operator availability.
+
+    A missing optional route can return None so another native implementation
+    can be tried. Final dispatch supplies an explicit fallback counter.
+    """
+    for name in candidates:
+        spec = route_spec(name)
+        if route_reason(spec, context) is None:
+            return spec
+    if fallback is None:
+        return None
+    spec = route_spec(fallback)
+    if not spec.fallback:
+        raise ValueError(f"Route is not a declared fallback: {fallback}")
+    return spec
 
 
 def _batch_context_routing_for_graph_variant(
@@ -52,6 +461,7 @@ _logged_fp8_kv_decode = False
 _logged_kv_dtype_contracts: set[str] = set()
 _route_summary_registered = False
 _route_counts: dict[str, int] = {}
+_fallback_counts: dict[str, int] = {}
 _decode_active_trace_signatures: set[tuple[object, ...]] = set()
 _DEFAULT_DECODE_PARTITION_SIZE = 256
 _VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
@@ -330,13 +740,29 @@ def _log_route_summary() -> None:
             json.dumps(_route_counts, sort_keys=True),
         )
         _route_counts.clear()
+    if _fallback_counts:
+        logger.warning(
+            "FLASH_ATTN_V100 fallback summary: %s",
+            json.dumps(_fallback_counts, sort_keys=True),
+        )
+        _fallback_counts.clear()
 
 
 def _record_route(route: str) -> None:
     global _route_summary_registered
-    if not _route_summary_enabled():
+    spec = route_spec(route)
+    if spec.fallback:
+        _fallback_counts[route] = _fallback_counts.get(route, 0) + 1
+        logger.warning_once(
+            "FLASH_ATTN_V100 explicit fallback selected: %s",
+            route,
+            scope="process",
+        )
+    enabled = _route_summary_enabled()
+    if not enabled and not spec.fallback:
         return
-    _route_counts[route] = _route_counts.get(route, 0) + 1
+    if enabled:
+        _route_counts[route] = _route_counts.get(route, 0) + 1
     if not _route_summary_registered:
         atexit.register(_log_route_summary)
         _route_summary_registered = True

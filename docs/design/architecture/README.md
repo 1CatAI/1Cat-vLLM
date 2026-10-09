@@ -118,7 +118,8 @@ performance regression), lands as its own PR and can be reverted alone.
    then INT8 on the same interface), then weight formats and the SM70 MoE
    family; split the Flash-V100 backend into routing / metadata / decode /
    verify / prefill / KV-codec modules. *(KV codecs and the module split done;
-   next: declarative route table, one grouped/XQA operator family per codec,
+   declarative route table and shared XQA admission introduced;
+   next: one grouped/XQA operator family per codec,
    decode/prefill/verify split of `impl`.)*
 5. **Kernels and build** — consolidate extension modules, mark retired variant files deprecated,
    split multi-thousand-line kernels by responsibility.

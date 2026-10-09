@@ -49080,3 +49080,47 @@ unrun GPU failure-set, route, numerical or timing checks as passed. A0 has
 11 passing CPU regressions, 194 matching normalized extracted symbols and
 passing pre-commit/mypy/layering checks. This override supersedes the GPU
 publication gate above; hardware qualification remains unmeasured.
+
+## 2026-10-08 — architecture A2 declarative counters and shared XQA admission
+
+Stack on A0 #1052 (`d8aa0bef64b7bb410380e79849c478ec7f915142`) in
+`agent/v100-arch-route-table-20261008-081749`, worktree
+`/home/ymzx/arch-ws/v100-arch-route-table-20261008-081749` on the root disk.
+The user's no-V100 validation override applies; no GPU precision or speed
+claim is made.
+
+`routing.RouteSpec` declares stage, codec set, head/GQA, page and chunk
+constraints. All 44 literal counter names resolve through the table. Dynamic
+page/partition and FP8 observer families retain their original strings;
+concrete split-D aliases and the sibling FlashInfer shared counters are covered.
+Do not classify the native Triton tree correction as diagnostic fallback.
+Uniform, mixed-row and small-query XQA now use one admission implementation
+with the original stage-specific hint priority, window and batch rules.
+Operator metadata/ABI/stride guards remain necessary. Fallback accounting and
+logs are separate from the original route summary, including when debug route
+counting is disabled. Unknown route names fail explicitly.
+
+Focused CPU suite: 306 passed, covering the generated structural matrix,
+frozen A0 predicate equivalence at 4096/16384/32768 boundaries, graph/workspace
+hints, disabled E4M3 batch, policy/availability/window/partition cases, mixed
+row metadata/scatter, compatibility/cleanup and FlashInfer. No CUDA operator
+was executed. Original/new CPU policy suite A/B is recorded separately under
+`/home/ymzx/arch-ws/tmp/a2_cpu_*`; do not confuse these CPU mocks with GPU tests.
+
+Coupling totals remain model 2325 / platform 3964 / env 335. One existing
+small-query raw env read moved from impl (27 to 26) to routing (14 to 15);
+`--accept-moves` records this without growing any total. The new component
+README explains structural coverage versus installed operator qualification.
+Retain the frozen legacy JSON as a migration oracle; the initial fixture
+annotation namespace omission was fixed, then a clean independent test run
+passed. Next scope: split impl and move feature metadata behind hooks (A3b).
+
+A2 final CPU policy A/B: 243 cases in both arms, identical complete JUnit
+outcomes (233 passed / 9 failed / 1 skipped). All nine inherited failures are
+`DeviceConfig` device inference in metadata-builder setup without hardware;
+they are not new routing failures. Evidence: `a2_cpu_ab.json`, paired JUnit
+XML and logs. The clean focused matrix/compatibility/backend suite has 306
+passes. Pre-commit and mypy pass on all nine owned paths. The table contains
+56 concrete declarations plus four observer families; 1,560 differential
+legacy decisions cover boundaries, availability/window/partition/graph hints
+and disabled E4M3 batch. GPU measurements remain unrun per the user override.
