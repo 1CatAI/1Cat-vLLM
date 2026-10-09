@@ -117,7 +117,10 @@ def snapshot(modules=None):
                 }
             )
     envs.disable_envs_cache()
+    from tools.sm70.path_inventory import binding_catalog
+
     return {
+        "stage_declarations": binding_catalog(),
         "evidence": "static selector prediction; native execution unobserved",
         "contract": "prepared SM70 FP16 layer; E4/top-k2; no model-specific route",
         "cases": rows,

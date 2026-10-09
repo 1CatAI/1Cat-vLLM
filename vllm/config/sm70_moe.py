@@ -33,6 +33,7 @@ COMMON_ALIASES = {
 ALIASES = {
     "awq": {
         "batched": "VLLM_SM70_AWQ_MOE_BATCHED_GEMM",
+        "qpn_m1": "VLLM_SM70_AWQ_QWEN38_QPN_M1",
         "strict_w13": "VLLM_SM70_AWQ_MOE_BATCHED_SINGLE_TOKEN_DENSE_W13",
         "exact_w2": "VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2",
         "active_exact_w2": "VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2",
@@ -54,6 +55,37 @@ ALIASES = {
         "permute_scratch": "VLLM_SM70_FP8_MOE_PERMUTE_WITH_SCRATCH",
     },
 }
+
+
+# These aliases are also consumed below the current native ABI. An explicit
+# conflicting Python request must not silently execute a different native
+# algorithm. Delivery 3 replaces this compatibility guard with native policy
+# arguments; keep it until that ABI is available, without process-env mutation.
+NATIVE_LEGACY_ALIASES = frozenset(
+    {
+        "VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2",
+        "VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE",
+        "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH",
+        "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH",
+        "VLLM_SM70_MXFP4_MOE_GROUPED_M8",
+        "VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS",
+        "VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER",
+        "VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS",
+        "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL",
+        "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL",
+    }
+)
+
+
+def _validate_native_legacy_request(policy, field: str, name: str) -> None:
+    from vllm import envs
+
+    if name in NATIVE_LEGACY_ALIASES and getattr(policy, field) != getattr(envs, name):
+        raise ValueError(
+            f"sm70_moe.{field} conflicts with {name}: the current native ABI "
+            "also consumes this legacy switch. Use matching values until the "
+            "native policy-argument ABI is installed."
+        )
 
 
 @config
@@ -150,6 +182,8 @@ class Sm70MoEFormatConfig:
     that is absent therefore retains the old dense fallback, not a new error.
     """
 
+    qpn_m1: bool | None = None
+    """AWQ native-g32 Qwen QPN M1 request; original strict admission applies."""
     batched: bool | None = None
     """Request the existing grouped TurboMind route."""
     single_token_w13: tuple[W13Mode, ...] | None = None
@@ -237,6 +271,7 @@ class Sm70MoEFormatConfig:
         explicit = []
         for field, name in ALIASES[family].items():
             if getattr(self, field) is not None:
+                _validate_native_legacy_request(self, field, name)
                 self.sources[field] = "configuration"
                 explicit.append(field)
             else:
@@ -320,6 +355,156 @@ class Sm70MoEFormatConfig:
         }
 
 
+NVFP4_ALIASES = {
+    "qpn_m1": "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE",
+    "qpn_batch": "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE",
+    "qpn_dynamic": "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE",
+    "qpn_mtp5": "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE",
+    "fused_batch_w13": "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13",
+    "fused_batch_w2": "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2",
+    "w2_direct_reduce": "VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE",
+    "indexed_prefill": "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL",
+    "fused_swiglu_prefill": "VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL",
+    "fast_prefill": "VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL",
+    "raw_scale": "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE",
+    "grouped_prefill": "VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL",
+    "grouped_decode": "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE",
+    "grouped_mtp5": "VLLM_SM70_NVFP4_MOE_GROUPED_MTP5",
+    "grouped_expert_rows": "VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS",
+    "glm53_fused_permute": "VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8",
+    "glm53_qpn_w13": "VLLM_SM70_GLM53_MOE_QPN_W13_Q8",
+}
+
+MXFP4_ALIASES = {
+    "qpn_m1": "VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE",
+    "direct_top6": "VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE",
+    "direct_order": "VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE",
+    "active_experts": "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1",
+    "active_expert_max_tokens": "VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS",
+    "grouped_m8": "VLLM_SM70_MXFP4_MOE_GROUPED_M8",
+    "grouped_verifier": "VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER",
+    "grouped_expert_rows": "VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS",
+    "single_token_fastpath": "VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH",
+    "single_token_permute": "VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH",
+}
+
+
+@config
+class Sm70MoELegacyConfig:
+    """Initialization-only alias adapter shared by the native FP4 formats."""
+
+    resolved: bool = Field(default=False, init=False)
+    """Whether this engine has captured compatibility inputs."""
+    sources: dict[str, str] = Field(default_factory=dict, init=False)
+    """Origin of each value, excluded from graph hashes."""
+    explicit_fields: tuple[str, ...] = Field(default=(), init=False)
+    """Explicit requests preserve the old missing-operator error behavior."""
+
+    def _resolve(self, aliases: dict[str, str]) -> None:
+        from vllm import envs
+
+        if self.resolved:
+            return
+        explicit = []
+        for field, name in aliases.items():
+            if getattr(self, field) is not None:
+                _validate_native_legacy_request(self, field, name)
+                self.sources[field] = "configuration"
+                explicit.append(field)
+            else:
+                setattr(self, field, getattr(envs, name))
+                self.sources[field] = name if envs.is_set(name) else "default"
+                if envs.is_set(name):
+                    explicit.append(field)
+        self.explicit_fields = tuple(explicit)
+        self.resolved = True
+
+    def hash_options(self) -> dict[str, Any]:
+        return {
+            name: value
+            for name, value in vars(self).items()
+            if name not in {"resolved", "sources", "explicit_fields", "route_debug"}
+        }
+
+
+@config
+class Sm70NvFp4MoEConfig(Sm70MoELegacyConfig):
+    """Native NVFP4 requests; selectors retain existing shape/capability gates."""
+
+    qpn_m1: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE."""
+    qpn_batch: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE."""
+    qpn_dynamic: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_QPN_DYNAMIC_DECODE."""
+    qpn_mtp5: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE."""
+    fused_batch_w13: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W13."""
+    fused_batch_w2: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_FUSED_W2."""
+    w2_direct_reduce: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE."""
+    indexed_prefill: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL."""
+    fused_swiglu_prefill: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL."""
+    fast_prefill: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_FAST_PREFILL."""
+    raw_scale: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE."""
+    grouped_prefill: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL."""
+    grouped_decode: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_MOE_GROUPED_DECODE."""
+    grouped_mtp5: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_MOE_GROUPED_MTP5."""
+    grouped_expert_rows: bool | None = None
+    """Initialization override for VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS."""
+    glm53_fused_permute: bool | None = None
+    """Initialization override for VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8."""
+    glm53_qpn_w13: bool | None = None
+    """Initialization override for VLLM_SM70_GLM53_MOE_QPN_W13_Q8."""
+    route_debug: bool | None = None
+    """Historical Qwen route diagnostic, excluded from the calculation hash."""
+
+    def resolve(self) -> None:
+        if self.route_debug is None:
+            import os
+
+            self.route_debug = os.getenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG") == "1"
+        self._resolve(NVFP4_ALIASES)
+
+
+@config
+class Sm70MxFp4MoEConfig(Sm70MoELegacyConfig):
+    """Native MXFP4 requests; selectors retain existing shape/capability gates."""
+
+    qpn_m1: bool | None = None
+    """Initialization override for VLLM_SM70_MXFP4_MOE_QPN_M1_DECODE."""
+    direct_top6: bool | None = None
+    """Initialization override for VLLM_SM70_MXFP4_MOE_DIRECT_TOP6_DECODE."""
+    direct_order: bool | None = None
+    """Initialization override for VLLM_SM70_MXFP4_MOE_DIRECT_ORDER_DECODE."""
+    active_experts: bool | None = None
+    """Initialization override for VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_B1."""
+    active_expert_max_tokens: int | None = None
+    """Initialization override for VLLM_SM70_MXFP4_MOE_ACTIVE_EXPERT_MAX_TOKENS."""
+    grouped_m8: bool | None = None
+    """Initialization override for VLLM_SM70_MXFP4_MOE_GROUPED_M8."""
+    grouped_verifier: bool | None = None
+    """Initialization override for VLLM_SM70_MXFP4_MOE_GROUPED_VERIFIER."""
+    grouped_expert_rows: bool | None = None
+    """Initialization override for VLLM_SM70_MXFP4_MOE_GROUPED_M8_EXPERT_ROWS."""
+    single_token_fastpath: bool | None = None
+    """Initialization override for VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH."""
+    single_token_permute: bool | None = None
+    """Initialization override for VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH."""
+
+    def resolve(self) -> None:
+        self._resolve(MXFP4_ALIASES)
+
+
 @config
 class Sm70MoEConfig:
     """Resolve only loaded families; unused options do not salt graph caches."""
@@ -329,15 +514,23 @@ class Sm70MoEConfig:
     fp8: Sm70MoEFormatConfig = Field(default_factory=Sm70MoEFormatConfig)
     """FP8 options, captured only if an FP8 MoE layer is initialized."""
 
+    nvfp4: Sm70NvFp4MoEConfig = Field(default_factory=Sm70NvFp4MoEConfig)
+    """NVFP4 options captured only when a native NVFP4 layer initializes."""
+    mxfp4: Sm70MxFp4MoEConfig = Field(default_factory=Sm70MxFp4MoEConfig)
+    """MXFP4 options captured only when a native MXFP4 layer initializes."""
+
     @property
     def resolved(self) -> bool:
-        return self.awq.resolved or self.fp8.resolved
+        return any(
+            getattr(self, family).resolved
+            for family in ("awq", "fp8", "nvfp4", "mxfp4")
+        )
 
     def compute_hash(self) -> str:
         return hash_factors(
             {
                 family: getattr(self, family).hash_options()
-                for family in ("awq", "fp8")
+                for family in ("awq", "fp8", "nvfp4", "mxfp4")
                 if getattr(self, family).resolved
             }
         )
@@ -351,4 +544,22 @@ def capture_sm70_moe_config(family: MoEFormat) -> Sm70MoEFormatConfig:
         getattr(cfg.kernel_config.sm70_moe, family) if cfg else Sm70MoEFormatConfig()
     )
     policy.resolve(family)
+    return policy
+
+
+def capture_nvfp4_moe_config() -> Sm70NvFp4MoEConfig:
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    policy = cfg.kernel_config.sm70_moe.nvfp4 if cfg else Sm70NvFp4MoEConfig()
+    policy.resolve()
+    return policy
+
+
+def capture_mxfp4_moe_config() -> Sm70MxFp4MoEConfig:
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    policy = cfg.kernel_config.sm70_moe.mxfp4 if cfg else Sm70MxFp4MoEConfig()
+    policy.resolve()
     return policy

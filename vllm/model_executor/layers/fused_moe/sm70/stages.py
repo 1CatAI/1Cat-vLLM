@@ -180,6 +180,8 @@ def execute_routed(
     sorted_output = buffers["sorted_output"]
     if trim_output:
         sorted_output = sorted_output[:, : layer.sm70_hidden_logical_size]
+    if plan.zero_output_before_reduce:
+        buffers["output"].zero_()
     torch.ops._moe_C.moe_unpermute(
         sorted_output,
         topk_weights,

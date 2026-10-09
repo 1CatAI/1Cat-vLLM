@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from vllm.config.sm70_moe import Sm70MoEFormatConfig
+from vllm.config.sm70_moe import NVFP4_ALIASES, Sm70MoEFormatConfig, Sm70NvFp4MoEConfig
 from vllm.model_executor.layers.fused_moe.sm70.weight_codec import Sm70MoEWeightCodec
 from vllm.model_executor.layers.quantization import awq_sm70_moe as awq
 from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as nvfp4
@@ -94,19 +94,6 @@ def _nvfp4_case(monkeypatch):
         shape = (2, 2) if prefix == "w13" else (2,)
         _parameter(layer, f"{prefix}_weight_scale_2", shape, torch.float32)
         _parameter(layer, f"{prefix}_input_scale", (2,), torch.float32)
-    flags = (
-        "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE",
-        "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_BATCH_DECODE",
-        "VLLM_SM70_NVFP4_QWEN38_MOE_QPN_MTP5_DECODE",
-        "VLLM_SM70_NVFP4_QWEN38_MOE_W2_DIRECT_REDUCE",
-        "VLLM_SM70_NVFP4_QWEN38_MOE_INDEXED_PREFILL",
-        "VLLM_SM70_NVFP4_QWEN38_MOE_FUSED_SWIGLU_PREFILL",
-        "VLLM_SM70_NVFP4_QWEN38_MOE_RAW_SCALE",
-        "VLLM_SM70_GLM53_MOE_FUSED_PERMUTE_Q8",
-        "VLLM_SM70_GLM53_MOE_QPN_W13_Q8",
-        "VLLM_SM70_NVFP4_MOE_GROUPED_DECODE",
-    )
-    monkeypatch.setattr(nvfp4, "envs", SimpleNamespace(**dict.fromkeys(flags, False)))
     for name in (
         "nvfp4_sm70_prepare",
         "nvfp4_moe_dense_stage_sm70_out",
@@ -124,6 +111,7 @@ def _nvfp4_case(monkeypatch):
 
     monkeypatch.setattr(nvfp4.sm70_ops, "nvfp4_sm70_prepare", prepare)
     method = SimpleNamespace(
+        sm70_moe_policy=Sm70NvFp4MoEConfig(**dict.fromkeys(NVFP4_ALIASES, False)),
         moe=SimpleNamespace(has_bias=False),
         _allocate_graph_safe_decode_buffers=lambda layer: setattr(
             layer, "test_buffer", torch.ones(4)

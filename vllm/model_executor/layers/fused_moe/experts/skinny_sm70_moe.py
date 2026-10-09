@@ -24,6 +24,7 @@ from vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe import (
     Nvfp4QuantizationEmulationTritonExperts,
 )
 from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
+from vllm.model_executor.layers.fused_moe.sm70.reduction import weighted_reduce_rows
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kMxfp4Static,
@@ -664,10 +665,13 @@ class Nvfp4SkinnySm70Experts(Nvfp4QuantizationEmulationTritonExperts):
             1,
             self._scale_mode,
         )
-        weighted = y2.view(num_tokens, top_k, -1).float() * topk_weights.to(
-            torch.float32
-        ).unsqueeze(-1)
-        output.copy_(weighted.sum(1).to(output.dtype))
+        output.copy_(
+            weighted_reduce_rows(
+                y2.view(num_tokens, top_k, -1),
+                topk_weights,
+                output.dtype,
+            )
+        )
 
 
 class Mxfp4SkinnySm70Experts(Nvfp4SkinnySm70Experts):
