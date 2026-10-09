@@ -634,6 +634,20 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                         (a.arg, a.arg) for a in fn.args.kwonlyargs
                     ]
                     continue
+                if path.name == "impl.py" and fn.name == "_run_prefill_paged_call":
+                    # The typed assembly adapter is not a second calculation body.
+                    # Check its complete delegation, then hash the original owner.
+                    assert [a.arg for a in fn.args.args] == ["self"]
+                    assert [a.arg for a in fn.args.kwonlyargs] == ["route"]
+                    assert fn.args.kwarg is not None
+                    assert fn.args.kwarg.arg == "kwargs"
+                    assert len(fn.body) == 1 and isinstance(fn.body[0], ast.Return)
+                    assert fn.body[0].value is not None
+                    assert ast.unparse(fn.body[0].value) == (
+                        "_prefill.PrefillExecutor.run_paged_call("
+                        "self._new_prefill_executor(), route=route, **kwargs)"
+                    )
+                    continue
                 if fn.name in ("_forward_decode", "_forward_prefill"):
                     # Expanded and validated with the forward body above.
                     continue

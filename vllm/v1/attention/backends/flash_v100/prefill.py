@@ -1581,6 +1581,10 @@ class PrefillExecutor:
     _prefill_prefix_decode_rows_allowed = _prefill_prefix_decode_rows_allowed
     _run_mixed_rows_grouped_e4m3 = _run_mixed_rows_grouped_e4m3
     _run_prefill_prefix_decode_rows = _run_prefill_prefix_decode_rows
+
+    def run_paged_call(self, **kwargs):
+        return type(self)._run_prefill_paged_call(self, **kwargs)
+
     _run_prefill_paged_call = _run_prefill_paged_call
     _flash_v100_prefill_with_prefix = _flash_v100_prefill_with_prefix
 

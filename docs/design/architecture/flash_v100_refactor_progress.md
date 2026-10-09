@@ -1,42 +1,52 @@
 # Flash-V100 Phase A3 execution record
 
 Baseline: #1060, `8c96e32e56c09d4a3e3112cb5d1a367571f69476`.
-Updated scope (2026-10-08): complete A3 autonomously. The user subsequently
-authorized the executor to merge after self-review and every required gate.
-No merge is authorized by a passing smoke alone. GPU validation uses the
-explicitly authorized `dx.1catai.com:54633`, with the whole-group and per-GPU
-locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
+Updated scope (2026-10-09): the user explicitly authorized self-review and
+merging the completed work to main with proportionate acceptance gates. DDTree
+is deferred for this campaign; #1089 is excluded. The earlier requirement to
+wait for every slice's host/spec/GPU matrix no longer blocks merging. Historical
+failed and pending evidence below is retained as history, not relabeled as a pass.
+GPU validation uses the authorized `dx.1catai.com:54633` and task-owned locks,
+artifacts and dependencies. Fifty idle host/spec retry queues were stopped under
+this updated policy; their deferred records replace no test completion markers.
+
+Current merge decision: accept the completed stack through #1110 after the
+FlashInfer-SM70 compatibility fix described below. Keep the still-open A3
+structural targets as follow-up work, rather than accumulating more draft PRs.
+The final 153-line forward, 315-line maximum function, 269 cross-module private
+references, 83 outside-Spec model terms and 20 state flags are **not** full A3
+completion. Import cycles and environment reads outside config are already zero.
 
 | Step | PR | Status | Metrics | GPU validation | Open items |
 | --- | --- | --- | --- | --- | --- |
 | 0: scope and codec ownership | — | Decision communicated; #1028 rebased locally | Baseline measured | Runtime parity belongs to 1c | Retest each subsequent step |
-| 1a: immutable CPU trace and owner guard | #1071 | Gates passed; ready | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
-| 1b: patch efficacy + dependency ratchet | #1072 | Gates passed; ready | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
-| 1c: route/token/output parity tools | #1073 | Draft; host/spec model records pending | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Host/spec model gates |
-| 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Prerequisite model gates |
-| 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Prerequisite model gates |
-| 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Host/spec model gates |
-| 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
-| 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native/Qwen passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
-| 4b: native decode candidates | #1081 | CPU/golden/strict/native/Qwen passed | Private references 374 → 370 | 1691 passes / same 7 failures; 12 outputs exact; named timings and 4 Qwen contracts pass | Host/spec model gates |
-| 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase/native/Qwen passed | Forward 597 → 402; private 370 → 358 | 1691 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts pass | Host/spec model gates |
-| 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase/GPU regression passed | Production unchanged | 1692 passes / same 7 failures; no changed old outcomes | Host/spec token records |
-| 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | GPU gates |
-| 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
-| 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Queued | GPU gates |
-| 6a: verifier ownership | #1090 | CPU/golden/strict/rebase passed | Cycles 13 → 11; model terms 169 → 158 | Queued | GPU gates |
-| 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Queued | GPU gates |
-| 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Queued | GPU gates |
-| 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Queued | GPU gates |
-| 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Queued | GPU gates |
-| 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Queued | GPU gates |
-| 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Queued | GPU gates |
-| 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Queued | GPU gates |
-| 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Queued | GPU gates |
-| 6j: tree visibility feature ownership | #1107 | CPU/golden/strict/rebase passed | Private 308 → 303; model terms 151 → 137 | Queued | GPU gates |
-| 6k: feature contract ownership | #1108 | CPU/golden/strict/rebase passed | Private 303 → 301; model terms 137 → 126 | Four queues staged | GPU gates |
-| 6l: dynamic feature policies | #1109 | CPU/golden/strict/rebase passed | Private 301 → 287; model terms 126 → 83 | Four queues staged | GPU gates |
-| 6m: decode one-shot logging | — | Full CPU/golden/strict and logger tests passed | State flags 29 → 20; private 287 → 269 | Required | Rebase/GPU gates |
+| 1a: immutable CPU trace and owner guard | #1071 | Accepted for merge | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
+| 1b: patch efficacy + dependency ratchet | #1072 | Accepted for merge | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
+| 1c: route/token/output parity tools | #1073 | Accepted; host/spec model records pending | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Deferred; not a merge gate |
+| 2a: dynamic environment boundary | #1075 | Accepted; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Deferred; not a merge gate |
+| 2b: frozen construction policy | #1076 | Accepted; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Deferred; not a merge gate |
+| 3a: per-layer decode cache | #1077 | Accepted; CPU/golden/rebase/native/Qwen passed | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
+| 3b: step plan and persistent metadata buffers | #1079 | Accepted; CPU/golden/rebase/native/Qwen passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
+| 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native/Qwen passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
+| 4b: native decode candidates | #1081 | CPU/golden/strict/native/Qwen passed | Private references 374 → 370 | 1691 passes / same 7 failures; 12 outputs exact; named timings and 4 Qwen contracts pass | Deferred; not a merge gate |
+| 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase/native/Qwen passed | Forward 597 → 402; private 370 → 358 | 1691 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts pass | Deferred; not a merge gate |
+| 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase/GPU regression passed | Production unchanged | 1692 passes / same 7 failures; no changed old outcomes | Deferred; not a merge gate |
+| 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | Follow-up GPU evidence |
+| 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Follow-up | Follow-up GPU evidence |
+| 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Queued | Follow-up GPU evidence |
+| 6a: verifier ownership | #1090 | CPU/golden/strict/rebase passed | Cycles 13 → 11; model terms 169 → 158 | Queued | Follow-up GPU evidence |
+| 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Queued | Follow-up GPU evidence |
+| 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Queued | Follow-up GPU evidence |
+| 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Queued | Follow-up GPU evidence |
+| 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Queued | Follow-up GPU evidence |
+| 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Queued | Follow-up GPU evidence |
+| 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Queued | Follow-up GPU evidence |
+| 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Queued | Follow-up GPU evidence |
+| 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Queued | Follow-up GPU evidence |
+| 6j: tree visibility feature ownership | #1107 | CPU/golden/strict/rebase passed | Private 308 → 303; model terms 151 → 137 | Queued | Follow-up GPU evidence |
+| 6k: feature contract ownership | #1108 | CPU/golden/strict/rebase passed | Private 303 → 301; model terms 137 → 126 | Four queues staged | Follow-up GPU evidence |
+| 6l: dynamic feature policies | #1109 | CPU/golden/strict/rebase passed | Private 301 → 287; model terms 126 → 83 | Four queues staged | Follow-up GPU evidence |
+| 6m: decode one-shot logging | #1110 | Full CPU/golden/strict and logger tests passed | State flags 29 → 20; private 287 → 269 | Follow-up | Follow-up GPU evidence |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -1267,3 +1277,44 @@ recorder follow-up completes GPU regression at 08:07:39 +08:00 with 1692
 passes / the same seven failures, one new pass and no changed old outcomes
 (`a3-snapshot-v2/logs/regression-parity.json`, `regression.done`). Both PR
 bodies reflect these results; host/spec baseline failures remain unresolved.
+
+## Merge acceptance and FlashInfer-SM70 compatibility (2026-10-09)
+
+The merge review found CI errors hidden by changed-file local mypy checks:
+FlashInfer-SM70 still passed feature metadata positionally to the newly owned
+builder, while its paged-route observer relied on a dynamically attached parent
+method. Restore positional forwarding through the assembly boundary, declare the
+parent paged-call adapter explicitly, and inject the subclass observer into the
+prefill executor. The adapter invokes the owner's default operation so a subclass
+`super()` call cannot recurse into its own injected override. No native kernels,
+route names, candidate ordering or speculative algorithms change.
+
+Three new tests reach the real parent adapter for positional/keyword metadata
+and the real owned prefill candidate callback. The earlier FlashInfer test
+stubbed the parent build/forward, which concealed this regression. The targeted
+suite passed 25 cases. CI-style mypy for Python 3.12 checks all 61 source files
+changed since the original main and passes. The strict trace suite and final
+integration result are recorded below after completion.
+
+Previously recorded evidence includes 813 unchanged golden traces, strict shim
+consumption, 362 focused CPU passes, pinned #1028 replay (37 passes / 98 GPU
+skips), exact native outputs and four exact Qwen FP16/E4M3 eager/graph contracts
+through Step 5a. Step 5a's GPU regression has 1702 passes and the same seven known
+failures. Later per-slice GPU matrices are follow-up evidence; no unrun result is
+claimed. Host-FP8's original same-source A/A greedy mismatch remains a known
+issue, not a refactor pass or an established regression. DDTree and its separate
+fix #1089 remain deferred. Frozen #1061/#1063/#1064/#1065/#1066 stay excluded.
+
+Merging to main preserves the source commits and their review history. Another
+maintainer merged #956 during this delivery; its two Mamba cache-manager files
+are preserved in the clean integration result, without modifying that work.
+
+Compatibility validation: the full strict run on the repaired production source
+returned 361 passes, one skip and one source-inventory failure: the new typed
+adapter was counted twice as the original calculation. The oracle now verifies
+the adapter's complete delegation separately and still hashes the unchanged
+executor calculation against the immutable fixture. The corrected source-oracle,
+FlashInfer and owned-prefill suites pass all 28 cases with strict shim consumption.
+No golden or stored calculation hash was changed. CI-style mypy (all 61 changed
+source files) and pre-commit pass. Final package metrics remain
+153 / 315 / 269 / 0 / 83 / 0 / 20.

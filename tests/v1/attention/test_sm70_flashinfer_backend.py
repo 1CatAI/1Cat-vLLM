@@ -675,3 +675,67 @@ def test_impl_records_parent_dispatch_and_observable_paged_route(
     assert "executed_kernel" not in impl.last_route_proof
     assert impl.last_route_proof["kernel_promoted"] is False
     assert metadata.flashinfer_sm70_runtime_route_proof == impl.last_route_proof
+
+
+@pytest.mark.parametrize("positional", [False, True])
+def test_builder_delegates_real_parent_feature_inputs(positional):
+    builder = object.__new__(FlashInferSM70MetadataBuilder)
+    metadata = SimpleNamespace()
+    common = object()
+    parents, counts, prepared = object(), object(), object()
+    received = []
+
+    def build(prefix, actual_common, fast, *args, **kwargs):
+        received.append((prefix, actual_common, fast, args, kwargs))
+        return metadata
+
+    builder.spec_state = SimpleNamespace(build=build)
+    builder._attach_planner_decision = lambda result, actual_common, stage: result
+    if positional:
+        result = builder.build(0, common, False, parents, counts, prepared)
+    else:
+        result = builder.build(
+            0,
+            common,
+            ddtree_parent_ids=parents,
+            ddtree_num_tree_tokens_cpu=counts,
+            prepared_dflash2_smallq_metadata=prepared,
+        )
+    assert result is metadata
+    assert received == [(0, common, False, (parents, counts, prepared), {})]
+
+
+def test_owned_prefill_observes_subclass_paged_route(monkeypatch):
+    from vllm.v1.attention.backends.flash_v100 import prefill, workspace
+
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE", "0")
+    instance = object.__new__(FlashInferSM70Impl)
+    instance.workspace = workspace.V100Workspace()
+    instance.scale = 0.125
+    instance.kv_cache_dtype = "auto"
+    metadata = SimpleNamespace(flashinfer_sm70_prefill_paged_routes_observed=())
+    instance._flashinfer_sm70_active_metadata = metadata
+    owner = instance._new_prefill_executor()
+    candidates = prefill.create_prefill_executor(owner)
+    expected = object()
+    native_calls = []
+
+    def native():
+        native_calls.append("native")
+        return expected
+
+    result = candidates.ops.run_paged(
+        route="prefill_prefix_paged",
+        q_len=8,
+        seq_len=31,
+        heads_q=6,
+        heads_kv=1,
+        head_dim=256,
+        block_size=832,
+        fn=native,
+    )
+    assert result is expected
+    assert native_calls == ["native"]
+    assert metadata.flashinfer_sm70_prefill_paged_routes_observed == (
+        "prefill_prefix_paged",
+    )

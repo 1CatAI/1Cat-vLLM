@@ -585,6 +585,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             },
         )
 
+    def _run_prefill_paged_call(self, *, route: str, **kwargs):
+        return _prefill.PrefillExecutor.run_paged_call(
+            self._new_prefill_executor(), route=route, **kwargs
+        )
+
     def _new_prefill_executor(self):
         policy = self._policy()
         settings = _prefill.PrefillConfig(
@@ -615,15 +620,23 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             record_capture_prefix=_feature.record_capture_prefix,
             record_capture_layout=_feature.record_capture_layout,
         )
+        overrides = {
+            name: vars(self)[name]
+            for name in _prefill.LEGACY_METHODS
+            if name in vars(self)
+        }
+        if (
+            type(self)._run_prefill_paged_call
+            is not FlashAttnV100Impl._run_prefill_paged_call
+        ):
+            overrides.setdefault(
+                "_run_prefill_paged_call", self._run_prefill_paged_call
+            )
         return _prefill.PrefillExecutor(
             settings,
             ops,
             getattr(self, "workspace", None) or _decode.V100Workspace(),
-            {
-                name: vars(self)[name]
-                for name in _prefill.LEGACY_METHODS
-                if name in vars(self)
-            },
+            overrides,
         )
 
     def _new_verification_executor(self) -> _verify.VerificationExecutor:
@@ -966,6 +979,8 @@ def _prefill_method(method):
 
 
 for _legacy_name in _prefill.LEGACY_METHODS:
+    if _legacy_name in FlashAttnV100Impl.__dict__:
+        continue
     _compatibility_method = _prefill_method(_legacy_name)
     setattr(FlashAttnV100Impl, _legacy_name, _compatibility_method)
 

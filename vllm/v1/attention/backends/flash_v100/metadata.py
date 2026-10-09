@@ -192,10 +192,15 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         common_prefix_len,
         common_attn_metadata,
         fast_build=False,
+        *feature_args,
         **feature_inputs,
     ):
         return self.spec_state.build(
-            common_prefix_len, common_attn_metadata, fast_build, **feature_inputs
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build,
+            *feature_args,
+            **feature_inputs,
         )
 
     def build_for_drafting(self, common_attn_metadata, draft_index):
