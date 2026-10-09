@@ -108,9 +108,9 @@ def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool
         return False
     reduced = torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
     admitted = (
-        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and not reduced and 2 <= x.shape[0] <= 16
+        layer_policy().batch_fastpath and not reduced and 2 <= x.shape[0] <= 16
         if concurrent_batch
-        else envs.VLLM_SM70_MTP_HC_BATCH and reduced and x.shape[0] in (5, 10)
+        else layer_policy().hc_mtp_batch and reduced and x.shape[0] in (5, 10)
     )
 
     return bool(
@@ -139,7 +139,7 @@ def _batch_runtime_ok(x, packed_down, packed_up, concurrent_batch=False) -> bool
 def _replicated_runtime_ok(x, down, up, concurrent_batch):
     return bool(
         concurrent_batch
-        and envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+        and layer_policy().batch_fastpath
         and not envs.VLLM_BATCH_INVARIANT
         and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
@@ -486,8 +486,8 @@ def _qwen38_sm70_fp16_fused_hc(
                 block,
                 injection,
                 round_down_partials=not concurrent_batch,
-                cooperative=not concurrent_batch and envs.VLLM_SM70_MTP_HC_COOPERATIVE,
-                full_unroll=not concurrent_batch and envs.VLLM_SM70_MTP_HC_FULL_UNROLL,
+                cooperative=not concurrent_batch and layer_policy().hc_cooperative,
+                full_unroll=not concurrent_batch and layer_policy().hc_full_unroll,
                 fused_chain=concurrent_batch,
             )
             logger.info_once(
@@ -762,7 +762,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
             not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
         )
         concurrent_batch = bool(
-            envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+            layer_policy().batch_fastpath
             and _batch_runtime_contract(vllm_config)
             and tp4
             # The default worker disables FP16 partial reductions. Reuse the
@@ -771,7 +771,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
             # legacy FP16-partial policy retains its own qualified schedule.
             and (
                 not _mtp_batch_runtime_contract(vllm_config)
-                or (envs.VLLM_SM70_MTP_HC_BATCH and fp32_partials)
+                or (layer_policy().hc_mtp_batch and fp32_partials)
             )
         )
         # Only HC's packed collective owns exactly four TP shards. Local router
@@ -779,7 +779,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
         if tp4 and (
             concurrent_batch
             or (
-                envs.VLLM_SM70_MTP_HC_BATCH and _mtp_batch_runtime_contract(vllm_config)
+                layer_policy().hc_mtp_batch and _mtp_batch_runtime_contract(vllm_config)
             )
         ):
             for role, layer in (

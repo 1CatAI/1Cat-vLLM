@@ -26,3 +26,19 @@ def test_ampere_priorities_are_untouched():
     )
     assert AttentionBackendEnum.FLASH_ATTN in priorities
     assert AttentionBackendEnum.FLASHINFER in priorities
+
+
+def test_backend_priority_cache_isolated_between_engines(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.config import execution_policy
+    from vllm.platforms import cuda
+
+    for enabled in (True, False, True, False):
+        monkeypatch.setattr(
+            execution_policy,
+            "flash_v100_policy",
+            lambda enabled=enabled: SimpleNamespace(enabled=enabled),
+        )
+        choices = cuda._get_backend_priorities(False, DeviceCapability(7, 0))
+        assert (AttentionBackendEnum.FLASH_ATTN_V100 in choices) == enabled

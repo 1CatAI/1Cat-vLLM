@@ -111,12 +111,16 @@ class RuntimeTraceConfig:
     """Captured runner diagnostics; never part of compiled computation."""
 
     layer_aliases: ClassVar[dict[str, str]] = {
+        "tp_allreduce": "VLLM_TP_ALLREDUCE_TRACE",
         "dense_debug": "VLLM_SM70_F16_DENSE_DEBUG",
         "qwen_next_trace": "VLLM_QWEN3_NEXT_SM70_TRACE",
         "unquant_debug": "VLLM_SM70_UNQUANT_DEBUG",
         "profile_trace": "VLLM_SM70_PROFILE_TRACE",
         "greedy_token_trace": "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE",
     }
+
+    tp_allreduce: bool | None = None
+    """Explain each collective route once per owning communicator or layer."""
 
     dense_debug: bool | None = None
     """Explain prepared dense FP16 projections."""

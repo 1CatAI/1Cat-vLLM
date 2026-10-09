@@ -748,6 +748,10 @@ def apply_runtime_policy_defaults(self):
 
     defaults.finish()
     if defaults.value("VLLM_BATCH_INVARIANT"):
+        self.parallel_config.communication.symm_mem = False
+        self.parallel_config.communication.sources["symm_mem"] = (
+            "safety:batch_invariant"
+        )
         self.compilation_config.runtime.aot_compile = False
         self.compilation_config.runtime.sources["aot_compile"] = (
             "safety:batch_invariant"

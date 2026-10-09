@@ -1515,6 +1515,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "int rank, bool fully_connected) -> int");
   custom_ar.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
   custom_ar.def(
+      "init_custom_ar_configured(int[] ipc_tensors, Tensor rank_data, "
+      "int rank, bool fully_connected, str[] policy) -> int");
+  custom_ar.impl("init_custom_ar_configured", torch::kCUDA,
+                 &init_custom_ar_configured);
+
+  custom_ar.def(
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   custom_ar.impl("all_reduce", torch::kCUDA, &all_reduce);

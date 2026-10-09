@@ -469,7 +469,7 @@ def _dense_batch_limit(role: str, shape: tuple[int, ...]) -> int:
 
 def _can_use_dense_batch(x: torch.Tensor, weight: torch.Tensor, role: str) -> bool:
     return bool(
-        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH
+        layer_policy().batch_fastpath
         and not envs.VLLM_BATCH_INVARIANT
         and not torch.backends.cuda.matmul.allow_fp16_accumulation
         # With reduced-precision reductions allowed, cuBLAS uses FP16 partials
@@ -506,7 +506,7 @@ def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
 
 def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
     return bool(
-        (envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH or envs.VLLM_SM70_QWEN38_BATCH_FASTPATH)
+        (envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH or layer_policy().batch_fastpath)
         and not envs.VLLM_BATCH_INVARIANT
         # The packed MMA preserves the original FP32 accumulation contract.
         # Let cuBLAS honor an explicit request for FP16 accumulation.
@@ -788,7 +788,7 @@ def enable_qwen38_sm70_fp16_gemv(
 
     replaced = 0
     batch_allowed = bool(
-        envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and _batch_runtime_contract(vllm_config)
+        layer_policy().batch_fastpath and _batch_runtime_contract(vllm_config)
     )
     for child in module.modules():
         if not (
@@ -863,7 +863,7 @@ def enable_qwen38_sm70_fp16_gemv(
             if (
                 envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH
                 and (batch_qualified or explicit_gdn_batch)
-            ) or (envs.VLLM_SM70_QWEN38_BATCH_FASTPATH and batch_qualified):
+            ) or (layer_policy().batch_fastpath and batch_qualified):
                 assert qkvz is not None and ba is not None
                 qkvz._sm70_qwen38_prepare_gdn_batch = True
                 ba._sm70_qwen38_prepare_gdn_batch = True

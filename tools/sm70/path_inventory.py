@@ -251,6 +251,15 @@ def source_paths(ref: str | None, phase: str = "b") -> list[str]:
                 "vllm/config/gdn_schedule.py",
                 "vllm/config/gdn_state.py",
                 "vllm/config/execution_policy.py",
+                "vllm/config/collective.py",
+                "vllm/config/sm70_native.py",
+                "vllm/distributed/device_communicators/cuda_communicator.py",
+                "vllm/distributed/device_communicators/collective_provider.py",
+                "vllm/model_executor/models/collective_contracts.py",
+                "vllm/model_executor/models/graph_contract.py",
+                "vllm/model_executor/layers/logits_processor.py",
+                "vllm/models/qwen4_exp/nvidia/sm70_fp16_hc.py",
+                "vllm/models/qwen4_exp/nvidia/sm70_fp16_gemv.py",
                 "vllm/config/policy_defaults.py",
                 "vllm/config/sm70_dflash2.py",
                 "vllm/platforms/runtime_defaults.py",
@@ -357,6 +366,27 @@ def runtime_catalog() -> dict:
                         declaration=path,
                     )
                 )
+    # The explanation ledger reads the same per-owner aliases used to initialize
+    # execution; it does not maintain a second list of supported controls.
+    for path in ("vllm/config/execution_policy.py", "vllm/config/sm70_native.py"):
+        for cls in ast.parse(read_source(path, None)).body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for field in cls.body:
+                if (
+                    isinstance(field, ast.AnnAssign)
+                    and isinstance(field.target, ast.Name)
+                    and field.target.id == "aliases"
+                ):
+                    for name, legacy in ast.literal_eval(field.value).items():
+                        aliases.append(
+                            dict(
+                                legacy=legacy,
+                                typed=f"{cls.name}.{name}",
+                                timing="initialization only",
+                                declaration=path,
+                            )
+                        )
     stages = {}
     tree = ast.parse(
         read_source("vllm/model_executor/layers/fla/ops/gdn_selector.py", None)

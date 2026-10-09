@@ -11,6 +11,7 @@ from tests.utils import create_new_process_for_each_test
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
+    AttentionConfig,
     CompilationConfig,
     CompilationMode,
     CUDAGraphMode,
@@ -49,6 +50,9 @@ def _create_vllm_config(
 ) -> MagicMock:
     mock_config = MagicMock(spec=VllmConfig)
     mock_config.compilation_config = compilation_config
+    compilation_config.runtime.resolve()
+    mock_config.attention_config = AttentionConfig()
+    mock_config.attention_config.flash_v100.resolve()
     mock_config.scheduler_config = SchedulerConfig.default_factory(
         max_num_seqs=max_num_seqs,
     )
@@ -423,7 +427,7 @@ class TestCudagraphDispatcher:
         )
         assert bounded in dispatcher.cudagraph_keys[CUDAGraphMode.FULL]
 
-        monkeypatch.setenv("VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS", "")
+        config.compilation_config.runtime.dsv4_context_buckets = ()
         disabled = CudagraphDispatcher(config)
         assert not disabled.sm70_dsv4_decode_context_buckets
 
@@ -479,7 +483,7 @@ class TestCudagraphDispatcher:
         assert mode == CUDAGraphMode.FULL
         assert desc == bounded
 
-        monkeypatch.setenv("VLLM_SM70_MTP_CONTEXT_BUCKETS", "")
+        config.compilation_config.runtime.mtp_context_buckets = ()
         explicitly_disabled = CudagraphDispatcher(config)
         explicitly_disabled.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
@@ -562,11 +566,10 @@ class TestCudagraphDispatcher:
         with (
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
-            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
         ):
-            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
-            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = False
-            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
+            config.attention_config.flash_v100.enabled = True
+            config.compilation_config.runtime.batch_context_routing = False
+            config.compilation_config.runtime.decode_partition_size = None
             dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
@@ -639,11 +642,10 @@ class TestCudagraphDispatcher:
         with (
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
-            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
         ):
-            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
-            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = True
-            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
+            config.attention_config.flash_v100.enabled = True
+            config.compilation_config.runtime.batch_context_routing = True
+            config.compilation_config.runtime.decode_partition_size = None
             dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
@@ -692,11 +694,10 @@ class TestCudagraphDispatcher:
         with (
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
-            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
         ):
-            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
-            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = True
-            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
+            config.attention_config.flash_v100.enabled = True
+            config.compilation_config.runtime.batch_context_routing = True
+            config.compilation_config.runtime.decode_partition_size = None
             dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
@@ -737,12 +738,11 @@ class TestCudagraphDispatcher:
         with (
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
-            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
         ):
-            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
-            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = True
-            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
-            mock_envs.VLLM_FLASH_V100_E4M3_BATCH_XQA = e4m3_enabled
+            config.attention_config.flash_v100.enabled = True
+            config.compilation_config.runtime.batch_context_routing = True
+            config.compilation_config.runtime.decode_partition_size = None
+            config.compilation_config.runtime.e4m3_batch_xqa = e4m3_enabled
             dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
@@ -810,12 +810,11 @@ class TestCudagraphDispatcher:
         with (
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
-            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
         ):
-            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
-            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = True
-            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
-            mock_envs.VLLM_FLASH_V100_E4M3_BATCH_XQA = True
+            config.attention_config.flash_v100.enabled = True
+            config.compilation_config.runtime.batch_context_routing = True
+            config.compilation_config.runtime.decode_partition_size = None
+            config.compilation_config.runtime.e4m3_batch_xqa = True
             dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
@@ -858,12 +857,11 @@ class TestCudagraphDispatcher:
         with (
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
-            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
         ):
-            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
-            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = True
-            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
-            mock_envs.VLLM_FLASH_V100_E4M3_BATCH_XQA = True
+            config.attention_config.flash_v100.enabled = True
+            config.compilation_config.runtime.batch_context_routing = True
+            config.compilation_config.runtime.decode_partition_size = None
+            config.compilation_config.runtime.e4m3_batch_xqa = True
             dispatcher = CudagraphDispatcher(config)
 
         assert not dispatcher.sm70_fp8_kv_batch_context_routing
@@ -884,11 +882,10 @@ class TestCudagraphDispatcher:
         with (
             patch.object(current_platform, "is_cuda", return_value=True),
             patch.object(current_platform, "is_device_capability", return_value=True),
-            patch("vllm.v1.cudagraph_dispatcher.envs") as mock_envs,
         ):
-            mock_envs.VLLM_SM70_FLASH_ATTN_V100 = True
-            mock_envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING = False
-            mock_envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE = None
+            config.attention_config.flash_v100.enabled = True
+            config.compilation_config.runtime.batch_context_routing = False
+            config.compilation_config.runtime.decode_partition_size = None
             dispatcher = CudagraphDispatcher(config)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,

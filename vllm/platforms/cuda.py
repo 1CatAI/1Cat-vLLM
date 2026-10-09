@@ -11,7 +11,7 @@ import os
 from collections.abc import Callable
 from datetime import timedelta
 from functools import cache, lru_cache, wraps
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 import torch
 from torch.distributed import PrefixStore, ProcessGroup
@@ -80,13 +80,32 @@ def _cuda_device_count_stateless(cuda_visible_devices: str | None = None) -> int
     return r
 
 
-@cache
 def _get_backend_priorities(
     use_mla: bool,
     device_capability: DeviceCapability,
     num_heads: int | None = None,
     kv_cache_dtype: CacheDType | None = None,
 ) -> list[AttentionBackendEnum]:
+    # Platform discovery precedes config import in a fresh distributed worker.
+    from vllm.config.execution_policy import flash_v100_policy
+
+    return _get_backend_priorities_cached(
+        use_mla,
+        device_capability,
+        num_heads,
+        kv_cache_dtype,
+        bool(flash_v100_policy().enabled),
+    )
+
+
+@cache
+def _get_backend_priorities_cached(
+    use_mla,
+    device_capability,
+    num_heads,
+    kv_cache_dtype,
+    flash_enabled,
+):
     """Get backend priorities with lazy import to avoid circular dependency."""
     if use_mla:
         if device_capability.major == 10:
@@ -147,7 +166,7 @@ def _get_backend_priorities(
             ]
         else:
             if (
-                envs.VLLM_SM70_FLASH_ATTN_V100
+                flash_enabled
                 and device_capability.major == 7
                 and device_capability.minor in (0, 2)
             ):
@@ -186,6 +205,11 @@ def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
             pynvml.nvmlShutdown()
 
     return wrapper
+
+
+cast(
+    Any, _get_backend_priorities
+).cache_clear = _get_backend_priorities_cached.cache_clear
 
 
 class CudaPlatformBase(Platform):

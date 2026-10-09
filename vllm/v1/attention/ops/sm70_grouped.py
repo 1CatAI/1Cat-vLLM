@@ -5,13 +5,12 @@
 from __future__ import annotations
 
 import importlib
-import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
 
-from vllm import envs
+from vllm.config.execution_policy import graph_policy
 from vllm.v1.attention.kv_codecs import FP8_E4M3, FP16, KVCodec, resolve_kv_codec
 
 GROUP_ROWS = 8
@@ -188,11 +187,7 @@ def grouped_fp32_reason(
     if (
         not instance.use_smallq_decode_xqa
         or partition_size_hint is not None
-        or (
-            os.environ.get("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
-            if contract.raw_partition_policy
-            else envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE
-        )
+        or graph_policy().decode_partition_size
     ):
         return "decode_policy"
     if not (causal if explicit else getattr(metadata, "causal", True)) or (

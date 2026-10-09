@@ -11,7 +11,6 @@ import torch.fx as fx
 from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
-import vllm.envs as envs
 import vllm.ir.ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.passes.fusion.rms_quant_fusion import (
@@ -1086,31 +1085,28 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.group = get_tp_group().device_group
         rank = get_tensor_model_parallel_rank()
         self.rank = rank
-        sm70_common = (
-            self.hidden_dim == 5120
-            and self.model_dtype == torch.float16
-            and current_platform.is_device_capability(70)
+        from vllm.distributed.device_communicators.collective_provider import (
+            gemma_fusion_modes,
         )
-        # The pass configuration controls both TP sizes. Native tensor and
-        # communicator guards retain the unfused path when unsupported.
-        self.sm70_tp2_mode = self.tp_size == 2 and sm70_common
-        self.sm70_tp4_long_mode = (
-            envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
-            and self.tp_size == 4
-            and sm70_common
-            and config.parallel_config.pipeline_parallel_size == 1
-            and config.speculative_config is None
-        )
+
         device_comm = get_tp_group().device_communicator
         ca_comm = None if device_comm is None else getattr(device_comm, "ca_comm", None)
-        self.sm70_tp4_push_mode = (
-            self.tp_size == 4
-            and sm70_common
-            and isinstance(ca_comm, CustomAllreduce)
-            and not ca_comm.disabled
-            and ca_comm.fully_connected
-            and ca_comm.sm70_tp4_push_buffer_ptrs is not None
-            and not self.sm70_tp4_long_mode
+        capabilities = (
+            ca_comm.capabilities
+            if isinstance(ca_comm, CustomAllreduce) and not ca_comm.disabled
+            else None
+        )
+        self.sm70_tp2_mode, self.sm70_tp4_long_mode, self.sm70_tp4_push_mode = (
+            gemma_fusion_modes(
+                capabilities=capabilities,
+                tp_size=self.tp_size,
+                hidden_size=self.hidden_dim,
+                dtype=self.model_dtype,
+                sm70=current_platform.is_device_capability(70),
+                long_requested=config.parallel_config.communication.long_prefill_norm,
+                pp_size=config.parallel_config.pipeline_parallel_size,
+                speculative=config.speculative_config is not None,
+            )
         )
         self.sm70_tp4_model_expected_patterns = (
             2 * config.model_config.get_num_layers(config.parallel_config) - 1

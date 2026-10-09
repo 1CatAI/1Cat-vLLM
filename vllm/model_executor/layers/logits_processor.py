@@ -11,6 +11,7 @@ import torch
 
 from vllm import envs
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.execution_policy import communication_policy
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -204,6 +205,7 @@ class LogitsProcessor(PluggableLayer):
             scale: A scaling factor to apply to the logits.
         """
         super().__init__()
+        self._communication_policy = communication_policy()
         self.scale = scale
         self.vocab_size = vocab_size
         # Whether the input is logits (default is hidden states).
@@ -848,7 +850,7 @@ class LogitsProcessor(PluggableLayer):
         local_pair: torch.Tensor,
     ) -> torch.Tensor | None:
         if (
-            not envs.VLLM_SM70_TOP1_CUSTOM_AR
+            not self._communication_policy.top1_custom_ar
             or not current_platform.is_device_capability(70)
         ):
             return None

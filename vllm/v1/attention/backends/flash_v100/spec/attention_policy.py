@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from vllm.config.execution_policy import flash_v100_policy
+from vllm.config.execution_policy import flash_v100_policy, graph_policy
 from vllm.config.sm70_dflash2 import capture_sm70_dflash2_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -31,7 +31,7 @@ def initialize_scalar_tail(self: Any, use_e4m3_fp32: bool) -> None:
             _config.registered("VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST")
             or scalar_tail_attention_available()
         )
-        and not _config.raw("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
+        and not graph_policy().decode_partition_size
     ):
         # An empty name selects the operator compiled into this extension;
         # a manifest name keeps the explicit experimental override.

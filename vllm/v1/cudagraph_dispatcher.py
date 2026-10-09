@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from collections.abc import Set as AbstractSet
 from dataclasses import replace
 from itertools import product
 
-from vllm import envs
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config.execution_policy import flash_v100_policy, graph_policy
 from vllm.forward_context import (
     CUDAGRAPH_VARIANT_DEFAULT,
     CUDAGRAPH_VARIANT_LONG_CONTEXT,
@@ -14,7 +13,13 @@ from vllm.forward_context import (
 )
 from vllm.logger import init_logger
 from vllm.lora.utils import get_captured_lora_counts
+from vllm.model_executor.models.graph_contract import model_graph_contract
 from vllm.platforms import current_platform
+from vllm.platforms.sm70.graph_policy import (
+    fp8_decode_shape,
+    parse_context_buckets,
+    resolve_graph_plan,
+)
 
 logger = init_logger(__name__)
 
@@ -24,170 +29,38 @@ _SM70_E4M3_B1_WAVE_LONG_CONTEXT_MIN_SEQ_LEN = 49152
 
 
 def _get_sm70_context_buckets(env_name: str) -> tuple[int, ...]:
-    """Parse optional one-request attention graph context buckets."""
-    raw = os.getenv(env_name, "").strip()
-    if not raw:
-        return ()
-
-    try:
-        buckets = tuple(sorted({int(value.strip()) for value in raw.split(",")}))
-    except ValueError as exc:
-        raise ValueError(
-            f"{env_name} must be a comma-separated list of positive integers, "
-            f"got {raw!r}"
-        ) from exc
-    if not buckets or buckets[0] <= 0:
-        raise ValueError(f"{env_name} must contain only positive integers, got {raw!r}")
-    return buckets
+    policy = graph_policy()
+    field = next(field for field, alias in policy.aliases.items() if alias == env_name)
+    return parse_context_buckets(getattr(policy, field), env_name)
 
 
-def _get_sm70_dsv4_decode_context_buckets(
-    vllm_config: VllmConfig,
-) -> tuple[int, ...]:
-    env_name = "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS"
-    if env_name in os.environ:
-        return _get_sm70_context_buckets(env_name)
-    model_config = vllm_config.model_config
-    if not (
-        current_platform.is_cuda() and current_platform.is_device_capability_family(70)
-    ):
-        return ()
+def _get_sm70_dsv4_decode_context_buckets(vllm_config):
+    return resolve_graph_plan(vllm_config).compressed_buckets
 
-    hf_config = model_config.hf_config
-    topk_tokens = getattr(hf_config, "index_topk", None)
-    compress_ratios = getattr(hf_config, "compress_ratios", None)
-    if not isinstance(topk_tokens, int) or not isinstance(
-        compress_ratios, (list, tuple)
-    ):
-        return ()
-    positive_ratios = [
-        ratio for ratio in compress_ratios if isinstance(ratio, int) and ratio > 0
-    ]
-    if not positive_ratios:
-        return ()
 
-    short_bucket = topk_tokens * min(positive_ratios)
-    if short_bucket <= 0 or model_config.max_model_len <= short_bucket:
-        return ()
-    # Keep the graph width close enough to the live context that the C4
-    # indexer does not score the model's entire maximum length immediately
-    # after crossing the short-context bypass. The sparse progression limits
-    # startup graph count while covering the first long-indexer bucket and the
-    # 16K/64K/128K service points used by the long-context quality gates.
-    bucket_multipliers = (1, 2, 8, 32, 64)
-    buckets = tuple(
-        short_bucket * multiplier
-        for multiplier in bucket_multipliers
-        if short_bucket * multiplier < model_config.max_model_len
-    )
-    logger.info_once(
-        "Auto-enabling SM70 compressed-index decode CUDA graph context buckets "
-        "%s. Set %s explicitly to override or to an empty value to disable.",
-        buckets,
-        env_name,
-    )
-    return buckets
+def _get_sm70_fp8_kv_decode_context_buckets(vllm_config):
+    return resolve_graph_plan(vllm_config).fp8_buckets
+
+
+def _sm70_fp8_kv_batch_context_routing_enabled(vllm_config):
+    return resolve_graph_plan(vllm_config).batch_context_routing
 
 
 def _is_sm70_fp8_kv_decode_shape(
-    vllm_config: VllmConfig,
+    vllm_config,
     *,
-    q_per_kv_values: tuple[int, ...],
-    cache_dtypes: tuple[str, ...] = ("fp8_e5m2",),
-    backend_names: tuple[str, ...] = (
-        "FLASH_ATTN_V100",
-        "FLASHINFER_SM70",
-    ),
-) -> bool:
-    if vllm_config.speculative_config is not None:
-        return False
-    if not (
-        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
-    ):
-        return False
-    if not envs.VLLM_SM70_FLASH_ATTN_V100:
-        return False
-
-    cache_config = getattr(vllm_config, "cache_config", None)
-    if getattr(cache_config, "cache_dtype", None) not in cache_dtypes:
-        return False
-
-    attention_config = getattr(vllm_config, "attention_config", None)
-    attention_backend = getattr(attention_config, "backend", None)
-    attention_backend_name = getattr(attention_backend, "name", attention_backend)
-    if attention_backend is not None and attention_backend_name not in backend_names:
-        return False
-
-    model_config = vllm_config.model_config
-    hf_text_config = getattr(model_config, "hf_text_config", None)
-    num_attention_heads = getattr(hf_text_config, "num_attention_heads", None)
-    num_key_value_heads = getattr(hf_text_config, "num_key_value_heads", None)
-    head_dim = getattr(hf_text_config, "head_dim", None)
-    return bool(
-        isinstance(num_attention_heads, int)
-        and isinstance(num_key_value_heads, int)
-        and num_key_value_heads > 0
-        and num_attention_heads % num_key_value_heads == 0
-        and num_attention_heads // num_key_value_heads in q_per_kv_values
-        and head_dim == 256
-    )
-
-
-def _get_sm70_fp8_kv_decode_context_buckets(
-    vllm_config: VllmConfig,
-) -> tuple[int, ...]:
-    """Select a scalar-only B1 graph for the SM70 E5M2 D256 route."""
-    env_name = "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS"
-    if env_name in os.environ:
-        return _get_sm70_context_buckets(env_name)
-    if not _is_sm70_fp8_kv_decode_shape(
-        vllm_config,
-        q_per_kv_values=(6, 8),
-    ):
-        return ()
-
-    bucket = 8192
-    model_config = vllm_config.model_config
-    max_model_len = getattr(model_config, "max_model_len", None)
-    if not isinstance(max_model_len, int) or max_model_len <= bucket:
-        return ()
-    logger.info_once(
-        "Auto-enabling the SM70 E5M2 KV short-context decode CUDA graph "
-        "at %d tokens. This keeps the short D256 GQA graph scalar-only while "
-        "the unbounded graph retains the long-context XQA routes. Set %s "
-        "explicitly to override or to an empty value to disable.",
-        bucket,
-        env_name,
-    )
-    return (bucket,)
-
-
-def _sm70_fp8_kv_batch_context_routing_enabled(
-    vllm_config: VllmConfig,
-) -> bool:
-    if (
-        not envs.VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING
-        or envs.VLLM_FLASH_V100_DECODE_PARTITION_SIZE is not None
-    ):
-        return False
-    cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", None)
-    cache_dtypes: tuple[str, ...]
-    backend_names: tuple[str, ...]
-    if cache_dtype in ("fp8", "fp8_e4m3"):
-        if not envs.VLLM_FLASH_V100_E4M3_BATCH_XQA:
-            return False
-        cache_dtypes = ("fp8", "fp8_e4m3")
-        # E4M3 batch-context variants exist to select Flash-V100 XQA launch
-        # routes. An explicit FlashInfer backend cannot consume that metadata.
-        backend_names = ("FLASH_ATTN_V100",)
-    else:
-        cache_dtypes = ("fp8_e5m2",)
-        backend_names = ("FLASH_ATTN_V100", "FLASHINFER_SM70")
-    return _is_sm70_fp8_kv_decode_shape(
-        vllm_config,
-        q_per_kv_values=(6,),
+    q_per_kv_values,
+    cache_dtypes=("fp8_e5m2",),
+    backend_names=("FLASH_ATTN_V100", "FLASHINFER_SM70"),
+):
+    return fp8_decode_shape(
+        model_graph_contract(vllm_config),
+        sm70=current_platform.is_cuda()
+        and current_platform.is_device_capability((7, 0)),
+        enabled=flash_v100_policy(vllm_config).enabled,
+        ratios=q_per_kv_values,
         cache_dtypes=cache_dtypes,
-        backend_names=backend_names,
+        backends=backend_names,
     )
 
 
@@ -218,34 +91,16 @@ class CudagraphDispatcher:
             if not self.vllm_config.speculative_config
             else 1 + self.vllm_config.speculative_config.num_speculative_tokens
         )
-        self.sm70_mtp_context_buckets = _get_sm70_context_buckets(
-            "VLLM_SM70_MTP_CONTEXT_BUCKETS"
-        )
-        self.sm70_dsv4_decode_context_buckets = _get_sm70_dsv4_decode_context_buckets(
-            vllm_config
-        )
-        self.sm70_fp8_kv_decode_context_buckets = (
-            _get_sm70_fp8_kv_decode_context_buckets(vllm_config)
-        )
-        self.sm70_fp8_kv_batch_context_routing = (
-            _sm70_fp8_kv_batch_context_routing_enabled(vllm_config)
-        )
-        cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", None)
-        self.sm70_e4m3_b1_wave_context_routing = bool(
-            self.sm70_fp8_kv_batch_context_routing
-            and cache_dtype in ("fp8", "fp8_e4m3")
-            and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1") != "0"
-            and os.getenv("VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS", "1") != "0"
-        )
-        self.sm70_e4m3_b1_wave_context_min_seq_len = max(
-            1,
-            int(
-                os.getenv(
-                    "VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN",
-                    str(_SM70_E4M3_B1_WAVE_LONG_CONTEXT_MIN_SEQ_LEN),
-                )
-            ),
-        )
+        self._graph_plan = resolve_graph_plan(vllm_config)
+        from vllm.runtime_resources import runtime_resources_for
+
+        runtime_resources_for(vllm_config)["graph_execution_plan"] = self._graph_plan
+        self.sm70_mtp_context_buckets = self._graph_plan.mtp_buckets
+        self.sm70_dsv4_decode_context_buckets = self._graph_plan.compressed_buckets
+        self.sm70_fp8_kv_decode_context_buckets = self._graph_plan.fp8_buckets
+        self.sm70_fp8_kv_batch_context_routing = self._graph_plan.batch_context_routing
+        self.sm70_e4m3_b1_wave_context_routing = self._graph_plan.wave_context_routing
+        self.sm70_e4m3_b1_wave_context_min_seq_len = self._graph_plan.wave_min_seq_len
         self._logged_sm70_context_bucket = False
         self._logged_sm70_batch_context_variant = False
 
@@ -382,7 +237,7 @@ class CudagraphDispatcher:
 
     def _active_context_buckets(self) -> tuple[int, ...]:
         if self.uniform_decode_query_len > 1:
-            if "VLLM_SM70_MTP_CONTEXT_BUCKETS" in os.environ:
+            if self._graph_plan.mtp_explicit:
                 return self.sm70_mtp_context_buckets
             return self.sm70_dsv4_decode_context_buckets
         return tuple(
@@ -424,7 +279,12 @@ class CudagraphDispatcher:
     ) -> tuple[int, ...]:
         from vllm.sm70_profiles.cudagraph_policy import context_buckets_for_descriptor
 
-        return context_buckets_for_descriptor(self, batch_descriptor)
+        return context_buckets_for_descriptor(
+            self._graph_plan,
+            self.uniform_decode_query_len,
+            self.cudagraph_mode,
+            batch_descriptor,
+        )
 
     @property
     def has_attention_context_buckets(self) -> bool:
@@ -509,7 +369,7 @@ class CudagraphDispatcher:
         # capturing in future PR, some keys may never be triggered.
         skip_sm70_mixed_capture = (
             self.vllm_config.compilation_config.runtime.compile_graph
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE
+            and self._graph_plan.decode_only_capture
             and cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
         )
         if skip_sm70_mixed_capture:

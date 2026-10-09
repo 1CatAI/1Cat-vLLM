@@ -8,6 +8,7 @@ from typing import ClassVar
 import torch
 from pydantic import Field
 
+from vllm.config.collective import CollectiveNativeConfig
 from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.utils import config, hash_factors
 
@@ -17,6 +18,11 @@ def read_execution_legacy(name: str):
 
     from vllm import envs
 
+    if name in (
+        "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO",
+        "VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS",
+    ):
+        return os.getenv(name, "1") != "0"
     if name in (
         "VLLM_SM70_DFLASH2_BF16_EMULATION",
         "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH",
@@ -99,6 +105,27 @@ class ExecutionPolicy:
 class GraphPolicy(ExecutionPolicy):
     """Execution policy owned by compilation_config.runtime."""
 
+    mtp_context_buckets: str | tuple[int, ...] | None = None
+    """Explicit verification context buckets; empty disables, None uses defaults."""
+    dsv4_context_buckets: str | tuple[int, ...] | None = None
+    """Compressed-index decode buckets; parsed at graph initialization."""
+    fp8_context_buckets: str | tuple[int, ...] | None = None
+    """FP8 decode buckets; parsed at graph initialization."""
+    batch_context_routing: bool | None = None
+    """Select existing FP8 batch-context graph variants."""
+    decode_partition_size: str | int | None = None
+    """Raw legacy partition override; native admission retains its validation."""
+    e4m3_batch_xqa: bool | None = None
+    """Enable existing E4M3 batched XQA selection."""
+    e4m3_p64_p256_auto: bool | None = None
+    """Use the existing E4M3 context-dependent partition selection."""
+    e4m3_wave_partitions: bool | None = None
+    """Allow existing long-context wave graph variants."""
+    e4m3_p512_begin: str | int | None = None
+    """Legacy wave threshold, clamped at the graph initialization checkpoint."""
+    decode_only_capture: bool | None = None
+    """Retain the opt-in mixed/piecewise capture suppression."""
+
     aot_compile: bool | None = None
     """Save and reload ahead-of-time compiled artifacts."""
 
@@ -144,12 +171,34 @@ class GraphPolicy(ExecutionPolicy):
         "dual_compile": "VLLM_SM70_QWEN38_DUAL_COMPILE",
         "split_draft_graphs": "VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS",
         "estimate_graph_memory": "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
+        "mtp_context_buckets": "VLLM_SM70_MTP_CONTEXT_BUCKETS",
+        "dsv4_context_buckets": "VLLM_SM70_DSV4_DECODE_CONTEXT_BUCKETS",
+        "fp8_context_buckets": "VLLM_SM70_FP8_KV_DECODE_CONTEXT_BUCKETS",
+        "batch_context_routing": "VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING",
+        "decode_partition_size": "VLLM_FLASH_V100_DECODE_PARTITION_SIZE",
+        "e4m3_batch_xqa": "VLLM_FLASH_V100_E4M3_BATCH_XQA",
+        "e4m3_p64_p256_auto": "VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO",
+        "e4m3_wave_partitions": "VLLM_FLASH_V100_XQA_E4M3_G6_WAVE_PARTITIONS",
+        "e4m3_p512_begin": "VLLM_FLASH_V100_XQA_E4M3_G6_P512_BEGIN",
+        "decode_only_capture": "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE",
     }
 
 
 @config
 class LayerExecutionPolicy(ExecutionPolicy):
     """Execution policy owned by kernel_config.layer_execution."""
+
+    batch_fastpath: bool | None = None
+    """Retain the existing batch fastpath model strategy."""
+
+    hc_mtp_batch: bool | None = None
+    """Retain the existing hc mtp batch model strategy."""
+
+    hc_cooperative: bool | None = None
+    """Retain the existing hc cooperative model strategy."""
+
+    hc_full_unroll: bool | None = None
+    """Retain the existing hc full unroll model strategy."""
 
     native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
     """B's native ABI owner for FP16 projection selectors and tuning."""
@@ -252,6 +301,10 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Threads for native multi-token hyperconnection normalization."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "batch_fastpath": "VLLM_SM70_QWEN38_BATCH_FASTPATH",
+        "hc_mtp_batch": "VLLM_SM70_MTP_HC_BATCH",
+        "hc_cooperative": "VLLM_SM70_MTP_HC_COOPERATIVE",
+        "hc_full_unroll": "VLLM_SM70_MTP_HC_FULL_UNROLL",
         "batch_gemm_layouts": "VLLM_SM70_BATCH_GEMM_LAYOUTS",
         "fp16_gemv": "VLLM_SM70_QWEN38_FP16_GEMV",
         "fused_gdn_input": "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16",
@@ -280,6 +333,67 @@ class LayerExecutionPolicy(ExecutionPolicy):
 class CommunicationPolicy(ExecutionPolicy):
     """Execution policy owned by parallel_config.communication."""
 
+    native: CollectiveNativeConfig = Field(default_factory=CollectiveNativeConfig)
+    """Immutable per-communicator native selection and launch parameters."""
+
+    def resolve(self, native_overrides=None, *, layers=None, trace=None):
+        super().resolve()
+        overrides = dict(native_overrides or {})
+        source = self.sources.get("tp8_hierarchical", "")
+        if source == "typed" or source.startswith("default:"):
+            overrides["sm70_tp8_hierarchical_custom_ar"] = int(
+                bool(self.tp8_hierarchical)
+            )
+        self.native.resolve_for_owners(overrides, layers=layers, trace=trace)
+        if self.native.sources.get("sm70_tp8_hierarchical_custom_ar") == "typed":
+            self.tp8_hierarchical = self.native.registry_bool(
+                "sm70_tp8_hierarchical_custom_ar", "0"
+            )
+            self.sources["tp8_hierarchical"] = "typed:native"
+
+    def compute_hash(self):
+        return hash_factors(
+            {"policy": super().compute_hash(), "native": self.native.compute_hash()}
+        )
+
+    top1_custom_ar: bool | None = None
+    """Provision the existing compact greedy-token collective."""
+
+    symm_mem: bool | None = None
+    """Select symmetric-memory collectives when eligible."""
+
+    flashinfer: bool | None = None
+    """Select the existing FlashInfer collective provider."""
+
+    awq_overlap_side_stream: bool | None = None
+    """Use the existing side stream for AWQ producer/reducer overlap."""
+
+    awq_overlap_tile_numel: int | None = None
+    """Elements per overlapping AWQ reduction tile."""
+
+    awq_overlap_reducer_blocks: int | None = None
+    """Reducer blocks for overlapping AWQ communication."""
+
+    awq_overlap_kernel_reducer_blocks: int | None = None
+    """Reducer grid override inside the overlapping AWQ kernel."""
+
+    long_prefill_norm: bool | None = None
+    """Retain the opt-in TP4 reduce-scatter, Gemma norm and all-gather route."""
+    awq_tile_ar: bool | None = None
+    """Enable the existing AWQ down-projection tile collective."""
+    awq_tile_overlap: bool | None = None
+    """Enable the existing producer/reducer overlap route."""
+    awq_tile_numel: int | None = None
+    """Tile capacity consumed by the existing communication workspace."""
+    awq_tile_mode: str | None = None
+    """Existing tile runtime mode, retaining invalid-mode ordinary fallback."""
+    awq_engine_blocks: int | None = None
+    """Existing single-engine collective grid."""
+    awq_producer_blocks: int | None = None
+    """Existing overlapped GEMM producer grid."""
+    awq_reducer_blocks: int | None = None
+    """Existing overlapped collective reducer grid."""
+
     tp4_push: bool | None = None
     """Allow the existing four-rank push collective."""
 
@@ -299,12 +413,31 @@ class CommunicationPolicy(ExecutionPolicy):
     """Explicit comma-separated pipeline layer counts, or automatic."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "top1_custom_ar": "VLLM_SM70_TOP1_CUSTOM_AR",
+        "symm_mem": "VLLM_ALLREDUCE_USE_SYMM_MEM",
+        "flashinfer": "VLLM_ALLREDUCE_USE_FLASHINFER",
+        "awq_overlap_side_stream": "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_SIDE_STREAM",
+        "awq_overlap_tile_numel": "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_TILE_NUMEL",
+        "awq_overlap_reducer_blocks": (
+            "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS"
+        ),
+        "awq_overlap_kernel_reducer_blocks": (
+            "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS"
+        ),
         "tp4_push": "VLLM_SM70_TP4_PUSH_ALLREDUCE",
         "tp8_hierarchical": "VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR",
         "tp8_push": "VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR",
         "moe_add_allreduce": "VLLM_SM70_MOE_ADD_ALLREDUCE",
         "mq_max_chunks": "VLLM_MQ_BROADCASTER_MAX_CHUNKS",
         "pp_layer_partition": "VLLM_PP_LAYER_PARTITION",
+        "long_prefill_norm": "VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM",
+        "awq_tile_ar": "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR",
+        "awq_tile_overlap": "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP",
+        "awq_tile_numel": "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_TILE_NUMEL",
+        "awq_tile_mode": "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_MODE",
+        "awq_engine_blocks": "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_ENGINE_BLOCKS",
+        "awq_producer_blocks": "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_PRODUCER_BLOCKS",
+        "awq_reducer_blocks": "VLLM_SM70_AWQ_MLP_DOWN_TILE_AR_REDUCER_BLOCKS",
     }
 
 
@@ -332,6 +465,9 @@ class PlePlacementPolicy(ExecutionPolicy):
 class FlashV100Policy(ExecutionPolicy):
     """Execution policy owned by attention_config.flash_v100."""
 
+    enabled: bool | None = None
+    """Retain the platform's Flash-V100 backend qualification switch."""
+
     bfla_keep_ratio: float | None = None
     """Retained fraction for block-filtered prefill attention."""
 
@@ -351,6 +487,7 @@ class FlashV100Policy(ExecutionPolicy):
             "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN"
         ),
         "smallq_max_q": "VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q",
+        "enabled": "VLLM_SM70_FLASH_ATTN_V100",
     }
 
 

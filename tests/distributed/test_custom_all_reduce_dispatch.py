@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -8,6 +9,11 @@ import pytest
 import torch
 
 import vllm._custom_ops as ops
+from vllm.config.collective import CollectiveNativeConfig
+from vllm.distributed.device_communicators.collective_provider import (
+    CollectiveCapabilities,
+    NativeCollectiveBindings,
+)
 from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
 
 
@@ -15,10 +21,16 @@ def _mock_communicator() -> CustomAllreduce:
     communicator = object.__new__(CustomAllreduce)
     communicator.disabled = False
     communicator._ptr = 0
+    policy = CollectiveNativeConfig()
+    policy.resolve()
+    communicator._native = NativeCollectiveBindings(policy)
     communicator.world_size = 4
     communicator.fully_connected = True
     communicator.tp8_hierarchical = False
     communicator.dispatch_max_size = 1024 * 1024
+    communicator.capabilities = CollectiveCapabilities(
+        4, True, False, 1024 * 1024, 1024 * 1024, False, False
+    )
     return communicator
 
 
@@ -158,6 +170,7 @@ def test_hc_shard_admission_requires_owner_operators(
 
     communicator = _mock_communicator()
     communicator.sm70_tp4_push_buffer_ptrs = [0] * 4
+    communicator.capabilities = replace(communicator.capabilities, push_registered=True)
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
     branches = torch.empty((1, 10240), dtype=torch.float16)
     assert communicator.can_sm70_qwen38_hc_shard(branches) == (missing is None)

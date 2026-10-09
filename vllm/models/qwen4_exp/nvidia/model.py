@@ -14,7 +14,7 @@ from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.config.execution_policy import graph_policy
+from vllm.config.execution_policy import communication_policy, graph_policy
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -471,7 +471,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         if self.layer_type == "linear_attention":
             use_direct_attention_output = (
-                envs.VLLM_SM70_TP4_LONG_PREFILL_FUSED_NORM
+                communication_policy().long_prefill_norm
                 and torch.compiler.is_compiling()
             )
             attn_buffer = (

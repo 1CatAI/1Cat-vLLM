@@ -11,6 +11,7 @@ from typing import Any
 
 import torch
 
+from vllm.config.execution_policy import graph_policy
 from vllm.logger import init_logger, log_once_seen, set_log_once_state
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_v100 import config as _config
@@ -784,7 +785,7 @@ class DecodeExecutor:
                 xqa_codec is FP8_E4M3
                 and getattr(self.config.policy, "decode_strategy", "legacy") == "legacy"
                 and query.shape[0] == 1
-                and _config.raw("VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO", "1") != "0"
+                and graph_policy().e4m3_p64_p256_auto
             ):
                 record(f"decode_xqa_e4m3_dynamic_page{key_cache.shape[1]}")
             else:
