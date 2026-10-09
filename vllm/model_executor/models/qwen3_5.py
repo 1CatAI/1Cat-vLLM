@@ -584,7 +584,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         self.sm70_dflash2_direct_attention_output = bool(
             current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
-            and vllm_config.parallel_config.tensor_parallel_size == 4
+            and vllm_config.parallel_config.tensor_parallel_size in (2, 4)
             and model_config.dtype == torch.float16
             and model_config.quantization in ("compressed-tensors", "gguf")
             and config.hidden_size == 5120
@@ -687,9 +687,18 @@ class Qwen3_5Model(Qwen3NextModel):
 
         self.vocab_size = config.vocab_size
 
+        quant_config = vllm_config.quant_config
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            quant_config=(
+                quant_config
+                if quant_config is not None
+                and quant_config.get_name() == "gguf"
+                and not config.tie_word_embeddings
+                else None
+            ),
+            prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
         def get_layer(prefix: str):

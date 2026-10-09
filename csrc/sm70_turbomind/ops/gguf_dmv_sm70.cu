@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <utility>
 #ifndef DMV_IQ4_PRMT
   #define DMV_IQ4_PRMT 1
 #endif
@@ -382,6 +383,9 @@ __device__ __forceinline__ void body6(
   }
   uint4* slot = xs + kslot * 256;
   uint4 X[PARTS];
+  // Three value heads per key head: TP4 has four groups, TP2 has eight.
+  const int head_shift = G == 24 ? 3 : 2;
+  const int head_mask = (1 << head_shift) - 1;
   auto xload = [&](int gg) {
 #pragma unroll
     for (int jj = 0; jj < PARTS; ++jj) {
@@ -389,7 +393,8 @@ __device__ __forceinline__ void body6(
       X[jj] = make_uint4(0, 0, 0, 0);
       if (row < M)
         X[jj] = __ldg(reinterpret_cast<const uint4*>(
-            x + row * ldx + (gdn_heads ? (gg % 4) * 3 + gg / 4 : gg) * 128 +
+            x + row * ldx +
+            (gdn_heads ? (gg & head_mask) * 3 + (gg >> head_shift) : gg) * 128 +
             c * 8));
     }
   };
@@ -507,11 +512,43 @@ __device__ __forceinline__ void ab_row(const Segs& segs,
   }
 }
 
-template <int KW, int TN, int FA, int FB>
+// A separate diagnostic specialization records one timestamp pair per warp.
+// The ordinary specialization contains no timer instructions or stores.
+template <bool Enabled>
+struct WarpTimer {
+  __device__ __forceinline__ WarpTimer(uint64_t*, int) {}
+};
+
+template <>
+struct WarpTimer<true> {
+  uint64_t* slot;
+  __device__ __forceinline__ WarpTimer(uint64_t* timestamps, int warps)
+      : slot(nullptr) {
+    if (threadIdx.x % 32 == 0) {
+      const size_t block =
+          static_cast<size_t>(blockIdx.y) * gridDim.x + blockIdx.x;
+      slot = timestamps + (block * warps + threadIdx.x / 32) * 2;
+      uint64_t now;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now)::"memory");
+      slot[0] = now;
+    }
+  }
+  __device__ __forceinline__ ~WarpTimer() {
+    if (slot != nullptr) {
+      uint64_t now;
+      asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now)::"memory");
+      slot[1] = now;
+    }
+  }
+};
+
+template <int KW, int TN, int FA, int FB, int FC = -1, bool Clocked = false>
 __global__ void __launch_bounds__(32 * KW * TN)
     dense_mv(Segs segs, const half* __restrict__ x, int ldx, int M, int K,
-             int S, int G, int split, float* ws, int* cnt) {
+             int S, int G, int split, float* ws, int* cnt,
+             uint64_t* timestamps) {
   constexpr int W = KW * TN;
+  WarpTimer<Clocked> timer(timestamps, W);
   extern __shared__ uint4 smem[];
   __shared__ int last;
   if (segs.ab_n > 0 && blockIdx.x >= segs.main_tiles) {
@@ -541,10 +578,15 @@ __global__ void __launch_bounds__(32 * KW * TN)
     body6<FA, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx,
                                   M, xs, lut, acc, segs.tab, segs.gdn_heads,
                                   pair);
-  else
+  else if (FC < 0 || sg.fmt == FB)
     body6<FB, KW, TN, legacy_iq2>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx,
                                   M, xs, lut, acc, segs.tab, segs.gdn_heads,
                                   pair);
+  else {
+    if constexpr (FC >= 0)
+      body6<FC, KW, TN, false>(sg, t, on, kslot, tin, g0, g1, S, G, x, ldx, M,
+                               xs, lut, acc, segs.tab, segs.gdn_heads, pair);
+  }
   __syncthreads();
   float* red = reinterpret_cast<float*>(smem);
 #pragma unroll
@@ -644,9 +686,10 @@ __global__ void __launch_bounds__(32 * KW * TN)
   if (threadIdx.x == 0) cnt[tg] = 0;
 }
 
-template <int KW, int TN, int FA, int FB>
+template <int KW, int TN, int FA, int FB, int FC = -1, bool Clocked = false>
 void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
-            int G, int split, float* ws, int* cnt, int tiles, cudaStream_t st) {
+            int G, int split, float* ws, int* cnt, int tiles, cudaStream_t st,
+            uint64_t* timestamps) {
   constexpr int W = KW * TN;
   const size_t xs_bytes = static_cast<size_t>(KW) * 256 * 16 + TAB_VECS * 16;
   const size_t red_bytes = static_cast<size_t>(W) * 256 * 4;
@@ -654,12 +697,13 @@ void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
   static bool init = false;
   if (!init) {
     C10_CUDA_CHECK(cudaFuncSetAttribute(
-        dense_mv<KW, TN, FA, FB>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        90 * 1024));
+        dense_mv<KW, TN, FA, FB, FC, Clocked>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, 90 * 1024));
     init = true;
   }
-  dense_mv<KW, TN, FA, FB><<<dim3(tiles, split), 32 * W, smem, st>>>(
-      segs, x, ldx, M, K, S, G, split, ws, cnt);
+  dense_mv<KW, TN, FA, FB, FC, Clocked>
+      <<<dim3(tiles, split), 32 * W, smem, st>>>(segs, x, ldx, M, K, S, G,
+                                                 split, ws, cnt, timestamps);
   const cudaError_t e = cudaGetLastError();
   TORCH_CHECK(e == cudaSuccess, "dense_mv launch: ", cudaGetErrorString(e));
 }
@@ -667,7 +711,8 @@ void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
 }  // namespace
 
 // codes/high/scale: per segment planes; out: per segment [M, n] views.
-void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
+template <bool Clocked>
+void gguf_dmv_dispatch(torch::Tensor x, std::vector<torch::Tensor> codes,
                        std::vector<torch::Tensor> high,
                        std::vector<torch::Tensor> scale,
                        std::vector<torch::Tensor> out, std::vector<int64_t> fmt,
@@ -679,7 +724,8 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
                        std::optional<torch::Tensor> ab_w = std::nullopt,
                        std::optional<torch::Tensor> ab_out = std::nullopt,
                        std::optional<torch::Tensor> pair_out = std::nullopt,
-                       bool gdn_heads = false) {
+                       bool gdn_heads = false,
+                       torch::Tensor clock_data = torch::Tensor{}) {
   TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
                   x.stride(1) == 1 && x.size(0) == 8 && x.size(1) == K,
               "DMV requires eight FP16 rows with contiguous K");
@@ -759,7 +805,8 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
                     ab_out->stride(1) == 1,
                 "invalid DMV floating operands");
   }
-  TORCH_CHECK(!gdn_heads || K == 1536, "GDN head tiling requires K1536");
+  TORCH_CHECK(!gdn_heads || K == 1536 || K == 3072,
+              "GDN head tiling requires K1536 or K3072");
   Segs segs{};
   segs.gdn_heads = gdn_heads;
   if (pair_out && pair_out->numel()) {
@@ -819,16 +866,40 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
   }
   segs.main_tiles = tiles;
   if (segs.ab_n > 0) tiles += (segs.ab_n + warps * tp - 1) / (warps * tp);
+  uint64_t* timestamps = nullptr;
+  if constexpr (Clocked) {
+    storage(clock_data, at::kLong);
+    TORCH_CHECK(clock_data.dim() == 3 && clock_data.size(0) >= tiles * split &&
+                    clock_data.size(1) == warps * tp && clock_data.size(2) == 2,
+                "DMV timer storage requires [blocks, warps, 2] int64 values");
+    timestamps = reinterpret_cast<uint64_t*>(clock_data.data_ptr<int64_t>());
+  }
+  // Only three measured-reader families are needed by the remaining
+  // three-format attention inputs. Keep the existing pair specializations.
+  int family_mask = 0;
+  for (int i = 0; i < segs.nseg; ++i) family_mask |= 1 << segs.s[i].fmt;
+  if (__builtin_popcount(static_cast<unsigned int>(family_mask)) == 3) {
+    TORCH_CHECK(!segs.pair && warps == 4 && tp == 2,
+                "three-format DMV requires single outputs with KW4/TN2");
+    constexpr int kBase = (1 << Q4K) | (1 << LUT4);
+    if (family_mask == (kBase | (1 << IQ3S)))
+      return launch<4, 2, Q4K, LUT4, IQ3S, Clocked>(
+          segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, timestamps);
+    if (family_mask == (kBase | (1 << IQ3X)))
+      return launch<4, 2, Q4K, LUT4, IQ3X, Clocked>(
+          segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, timestamps);
+    TORCH_CHECK(false, "unqualified three-format DMV family set");
+  }
   int fa = segs.s[0].fmt, fb = fa;
   for (int i = 1; i < segs.nseg; ++i)
     if (segs.s[i].fmt != fa) fb = segs.s[i].fmt;
   for (int i = 0; i < segs.nseg; ++i)
     TORCH_CHECK(segs.s[i].fmt == fa || segs.s[i].fmt == fb,
                 "at most two formats per launch");
-#define CFG(A, B, X, Y)                                                  \
-  if (warps == A && tp == B && fa == X && fb == Y)                       \
-    return launch<A, B, X, Y>(segs, xp, ldx, M, K, S, G, split, wsp, cp, \
-                              tiles, st);
+#define CFG(A, B, X, Y)                                                      \
+  if (warps == A && tp == B && fa == X && fb == Y)                           \
+    return launch<A, B, X, Y, -1, Clocked>(segs, xp, ldx, M, K, S, G, split, \
+                                           wsp, cp, tiles, st, timestamps);
 #define FMTS(A, B)       \
   CFG(A, B, Q4K, Q4K);   \
   CFG(A, B, LUT4, LUT4); \
@@ -868,6 +939,41 @@ void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
 #undef FMTS
 #undef CFG
   TORCH_CHECK(false, "unsupported warps/tp");
+}
+
+void gguf_dmv_sm70_out(torch::Tensor x, std::vector<torch::Tensor> codes,
+                       std::vector<torch::Tensor> high,
+                       std::vector<torch::Tensor> scale,
+                       std::vector<torch::Tensor> out, std::vector<int64_t> fmt,
+                       std::vector<int64_t> n, int64_t K, int64_t split,
+                       int64_t warps, torch::Tensor ws, torch::Tensor cnt,
+                       int64_t tp, std::optional<torch::Tensor> sgate,
+                       std::optional<torch::Tensor> tab,
+                       std::optional<torch::Tensor> ab_w,
+                       std::optional<torch::Tensor> ab_out,
+                       std::optional<torch::Tensor> pair_out, bool gdn_heads) {
+  gguf_dmv_dispatch<false>(
+      std::move(x), std::move(codes), std::move(high), std::move(scale),
+      std::move(out), std::move(fmt), std::move(n), K, split, warps,
+      std::move(ws), std::move(cnt), tp, std::move(sgate), std::move(tab),
+      std::move(ab_w), std::move(ab_out), std::move(pair_out), gdn_heads);
+}
+
+void gguf_dmv_sm70_clocked_out(
+    torch::Tensor clock_data, torch::Tensor x, std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> high, std::vector<torch::Tensor> scale,
+    std::vector<torch::Tensor> out, std::vector<int64_t> fmt,
+    std::vector<int64_t> n, int64_t K, int64_t split, int64_t warps,
+    torch::Tensor ws, torch::Tensor cnt, int64_t tp,
+    std::optional<torch::Tensor> sgate, std::optional<torch::Tensor> tab,
+    std::optional<torch::Tensor> ab_w, std::optional<torch::Tensor> ab_out,
+    std::optional<torch::Tensor> pair_out, bool gdn_heads) {
+  gguf_dmv_dispatch<true>(
+      std::move(x), std::move(codes), std::move(high), std::move(scale),
+      std::move(out), std::move(fmt), std::move(n), K, split, warps,
+      std::move(ws), std::move(cnt), tp, std::move(sgate), std::move(tab),
+      std::move(ab_w), std::move(ab_out), std::move(pair_out), gdn_heads,
+      std::move(clock_data));
 }
 
 namespace {

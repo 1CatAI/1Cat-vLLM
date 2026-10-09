@@ -51,7 +51,9 @@ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
 #endif
   for (int64_t row = 0; row < ids.numel(); ++row) {
     const auto index = indices[row];
-    TORCH_CHECK(index >= 0 && index < num_rows, "PLE disk row ID out of range");
+    TORCH_CHECK_INDEX(index >= 0 && index < num_rows,
+                      "PLE disk row id out of range: ", index, " not in [0, ",
+                      num_rows, ")");
     const auto shard = index / shard_size;
     const auto local = index % shard_size;
     TORCH_CHECK(bases[shard] > 0, "PLE disk shard pointer is invalid");

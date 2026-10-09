@@ -384,19 +384,24 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
     )
 
     # isort: split
-    from vllm.v1.attention.backends.flash_attn_v100 import (
+    from vllm.v1.attention.backends.flash_v100.ops import (
         _get_sm70_d256_gqa_architecture_q8192_op,
     )
-    from vllm.v1.attention.ops.sm70_e4m3_long import (
+    from vllm.v1.attention.ops.sm70_grouped_long import (
         BUILTIN_MANIFEST,
         builtin_long_attention,
         long_attention_enabled,
         long_attention_page_supported,
     )
-    from vllm.v1.attention.ops.sm70_e4m3_scalar import scalar_tail_attention_available
+    from vllm.v1.attention.ops.sm70_grouped_scalar import (
+        scalar_tail_attention_available,
+    )
 
     return {
         "fp16_grouped": hasattr(torch.ops._vllm_fa2_C, "sm70_grouped_fp16_fwd"),
+        "fp16_short_splits": hasattr(
+            torch.ops._vllm_fa2_C, "sm70_grouped_fp16_short_split_revision"
+        ),
         "grouped_fp32": bool(flash_attn_grouped_e4m3_fp32_available()),
         "long_operator": builtin_long_attention() is not None,
         "long_enabled": long_attention_enabled(),
@@ -683,6 +688,17 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         runtime_guards="FP16 operands; local Q/KV heads=6/1, D=256; page=832; "
         "causal full context; B1 q2..8 or B2..4 q8; capacity<=266240",
         arithmetic="FP32 probability/PV/numerator/max/sum",
+        short_context_splits=_row(
+            fp16_reason
+            or (
+                "disabled_by_policy"
+                if not cfg.kernel_config.sm70_fp16_grouped_short_splits
+                else "operator_missing:sm70_grouped_fp16_short_split_revision"
+                if not native.get("fp16_short_splits", False)
+                else None
+            ),
+            runtime_guards="FP16 q8/B1 at device context 129..2048; K64 elsewhere",
+        ),
     )
     if release_profile and dtype in ("auto", "float16", "bfloat16") and fp16_shape:
         report["expected_acceleration"] = [

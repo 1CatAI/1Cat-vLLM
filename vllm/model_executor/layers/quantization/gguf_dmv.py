@@ -7,7 +7,12 @@ import torch
 from torch.nn import Parameter
 
 from vllm.config import get_current_vllm_config_or_none
-from vllm.model_executor.kernels.gguf import GGUFOperatorCapability, decoder_family
+from vllm.model_executor.kernels.gguf import (
+    DMV_THREE_FORMAT_QKV,
+    GGUFOperatorCapability,
+    decoder_family,
+    three_format_qkv_capabilities,
+)
 from vllm.model_executor.layers.quantization import gguf_dmv_formats as iq
 from vllm.model_executor.layers.quantization.gguf_dense_hmma import workspace
 from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import decode, pack
@@ -33,7 +38,7 @@ def reverse_table(kind, device):
 
 
 def eligible_sources(sources, prefix):
-    """Restrict storage replacement to complete, measured TP4 projection shapes."""
+    """Restrict storage replacement to complete, measured TP2/TP4 shapes."""
     cfg = get_current_vllm_config_or_none()
     if cfg is None or not cfg.kernel_config.sm70_gguf.projection_planes:
         return False
@@ -43,13 +48,17 @@ def eligible_sources(sources, prefix):
     if scope == "iq3_xxs" and not any(t == 18 for _, t in sources):
         return False
     quantized = [(w, t) for w, t in sources if t not in (1, 30)]
-    if not quantized or len({t for _, t in quantized}) > 2:
+    if not quantized or len({t for _, t in quantized}) > 3:
         return False
     if any(t in iq.IQ2_FORMATS for _, t in quantized):
         if not cfg.kernel_config.sm70_gguf.iq2_signed_nibbles:
             return False
-        # Only the measured gate/up and down shapes admit the new decoder.
-        if not prefix.endswith((".gate_up_proj", ".down_proj")):
+        # TP2 qkvz also admits measured IQ2/IQ3 combinations. TP4 keeps
+        # its existing precision-preserving projection fallback.
+        iq2_qkvz = prefix.endswith(".in_proj_qkvz") and all(
+            w.shape[0] in (1024, 3072) for w, _ in quantized
+        )
+        if not prefix.endswith((".gate_up_proj", ".down_proj")) and not iq2_qkvz:
             return False
         if any(t in (12, 23) for _, t in quantized):
             return False
@@ -68,7 +77,30 @@ def eligible_sources(sources, prefix):
             (5120, 1536),
             (5120, 3072),
             (5120, 256),
+            (5120, 8704),
+            (8704, 5120),
+            (3072, 5120),
+            (5120, 1024),
+            (5120, 6144),
         }:
+            return False
+        if k == 3072 and prefix.endswith(".out_proj"):
+            # Older wheels assume four GDN key-head groups. Keep their
+            # canonical layout path instead of passing an unsupported map.
+            supports = getattr(torch.ops._C, "gguf_dmv_gdn_heads_sm70_supported", None)
+            if supports is None or not supports(k):
+                return False
+    if len({t for _, t in quantized}) == 3:
+        if not prefix.endswith(".qkv_proj") or len(sources) != 3:
+            return False
+        capabilities = three_format_qkv_capabilities(
+            tuple(t for _, t in quantized),
+            k,
+            tuple(w.shape[0] for w, _ in quantized),
+            torch.float16,
+            enabled=cfg.kernel_config.sm70_gguf.qkv_three_format_planes,
+        )
+        if any(c.reason is not None for c in capabilities):
             return False
     return all(
         t not in (1, 30) or (w.dtype == torch.float16 and w.ndim == 2)
@@ -155,9 +187,19 @@ def prepare_bank(projection, raw_weight, canonical):
         max_m=8,
     )
     scratch = workspace(raw_weight.device)
-    # The largest coalesced TP4 gate/up bank is N8704,K5120. Grow only
-    # during loading, before any layer captures the shared scratch in a graph.
-    for name, size in (("weight", 24 * 1024 * 1024), ("stats", 12 * 1024 * 1024)):
+    # A TP2 coalesced gate/up has twice as many rows as TP4. Size the
+    # restoration buffers during loading, before graph capture; only one
+    # resident plane bank is retained for both M8 and canonical fallback.
+    group = 16 if kind in (17, 22) else 32
+    stats_element_size = (
+        2 if fmt == 3 else 4 if fmt == 0 or kind in iq.IQ2_FORMATS else 8
+    )
+    weight_size = k * n // (2 if fmt in (0, 3) else 4)
+    stats_size = k // group * n * stats_element_size
+    for name, size in (
+        ("weight", max(24 * 1024 * 1024, weight_size)),
+        ("stats", max(12 * 1024 * 1024, stats_size)),
+    ):
         if scratch[name].numel() < size:
             scratch[name] = torch.empty(
                 size, dtype=torch.uint8, device=raw_weight.device
@@ -274,6 +316,25 @@ def prepare_layer(layer, projections):
     # only for an independently launched narrow matrix.
     if not pair and sum(ns) <= 1536:
         split = 2
+    if len(source_types) == 3:
+        cfg = get_current_vllm_config_or_none()
+        kinds = tuple(p.source_type for p in quantized)
+        k = quantized[0].kernel.config.partition_weight_shape[0]
+        capabilities = three_format_qkv_capabilities(
+            kinds,
+            k,
+            tuple(ns),
+            torch.float16,
+            enabled=bool(cfg and cfg.kernel_config.sm70_gguf.qkv_three_format_planes),
+        )
+        if not layer.prefix.endswith(".qkv_proj"):
+            return {"reason": "three_format_qkv_requires_attention_input_projection"}
+        if any(c.reason is not None for c in capabilities):
+            return {"reason": next(c.reason for c in capabilities if c.reason)}
+        names = tuple(quant_type_name(kind) for kind in kinds)
+        kw, tn, split = DMV_THREE_FORMAT_QKV[names]
+        if tuple(ns) == (6144, 512, 512):
+            split = 1
     tiles = (
         ns[0] // 32 // (tn // 2)
         if pair
@@ -362,10 +423,11 @@ def _project(
     )
     if rows.shape[0] != 8:
         if gdn_heads:
+            k = rows.shape[1]
             rows = (
-                rows.reshape(-1, 4, 3, 128)
+                rows.reshape(-1, k // (3 * 128), 3, 128)
                 .transpose(1, 2)
-                .reshape(-1, 1536)
+                .reshape(-1, k)
                 .contiguous()
             )
         result = _prepared_gguf_mixed_projection(

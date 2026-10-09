@@ -138,7 +138,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100MetadataBuilder
+from vllm.v1.attention.backends.flash_v100 import FlashAttnV100MetadataBuilder
 from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadataBuilder
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder

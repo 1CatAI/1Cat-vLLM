@@ -5,11 +5,9 @@
 The changed FP32 reduction order is not a bitwise-equivalence guarantee.
 """
 
-import os
-
 import torch
 
-from vllm import envs
+from vllm.config.sm70_moe import capture_sm70_moe_config
 
 
 def _has_native_op() -> bool:
@@ -17,9 +15,12 @@ def _has_native_op() -> bool:
 
 
 def initialize_qpn_m1(layer, shape_contract: bool) -> bool:
-    if not envs.VLLM_SM70_AWQ_QWEN38_QPN_M1:
+    policy = getattr(layer, "sm70_moe_policy", None)
+    if policy is None:
+        policy = capture_sm70_moe_config("awq")
+    if not policy.qpn_m1:
         return False
-    explicit = "VLLM_SM70_AWQ_QWEN38_QPN_M1" in os.environ
+    explicit = "qpn_m1" in policy.explicit_fields
     if not (
         shape_contract
         and layer.sm70_awq_moe_batched_gemm

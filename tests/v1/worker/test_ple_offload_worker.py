@@ -504,26 +504,18 @@ def test_ple_offload_wait_only_waits_for_done(
         "current_stream",
         lambda: stream,
     )
-    monkeypatch.setattr(
-        ple_offload_layer.cuda_driver,
-        "CUstream",
-        lambda value: value,
+    driver = SimpleNamespace(
+        CUstream=lambda value: value,
+        CUdeviceptr=lambda value: value,
+        cuStreamWaitValue32=fake_wait,
+        cuStreamWriteValue32=lambda *args: pytest.fail(
+            f"wait unexpectedly wrote the flag: {args}"
+        ),
+        CUstreamWaitValue_flags=SimpleNamespace(
+            CU_STREAM_WAIT_VALUE_EQ=SimpleNamespace(value=1)
+        ),
     )
-    monkeypatch.setattr(
-        ple_offload_layer.cuda_driver,
-        "CUdeviceptr",
-        lambda value: value,
-    )
-    monkeypatch.setattr(
-        ple_offload_layer.cuda_driver,
-        "cuStreamWaitValue32",
-        fake_wait,
-    )
-    monkeypatch.setattr(
-        ple_offload_layer.cuda_driver,
-        "cuStreamWriteValue32",
-        lambda *args: pytest.fail(f"wait unexpectedly wrote the flag: {args}"),
-    )
+    monkeypatch.setattr(ple_offload_layer, "cuda_driver", driver)
 
     result = ple_offload_layer._ple_offload_wait_impl(
         flag_tensor,
@@ -537,7 +529,7 @@ def test_ple_offload_wait_only_waits_for_done(
             stream.cuda_stream,
             flag_tensor.data_ptr(),
             ple_offload_layer.CpuGpuSemaphore.DONE_VALUE,
-            ple_offload_layer.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+            ple_offload_layer.cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
         )
     ]
 

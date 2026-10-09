@@ -23,16 +23,20 @@ never maps the complete embedding table.
 import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
-from cuda.bindings import driver as cuda_driver
-from cuda.bindings.driver import CUstreamWaitValue_flags
 from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.utils.import_utils import LazyLoader
 from vllm.utils.torch_utils import direct_register_custom_op
+
+if TYPE_CHECKING:
+    from cuda.bindings import driver as cuda_driver
+else:
+    cuda_driver = LazyLoader("cuda_driver", globals(), "cuda.bindings.driver")
 
 # Module-level flag set to True inside the offload subprocess.
 # Because the offload process and GPU worker processes are separate OS
@@ -149,7 +153,7 @@ class CpuGpuSemaphore:
                 cuda_driver.CUstream(stream.cuda_stream),
                 cuda_driver.CUdeviceptr(self._flag_tensor.data_ptr()),
                 self.RESET_VALUE,
-                CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+                cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
             ),
             "CpuGpuSemaphore.wait_reset",
         )
@@ -181,7 +185,7 @@ def _ple_offload_wait_impl(
             cuda_stream,
             dev_ptr,
             CpuGpuSemaphore.DONE_VALUE,
-            CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
+            cuda_driver.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_EQ.value,
         ),
         "cuStreamWaitValue32(done)",
     )

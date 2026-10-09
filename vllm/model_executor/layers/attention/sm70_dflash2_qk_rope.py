@@ -149,7 +149,9 @@ def sm70_dflash2_qk_norm_rope_cache(
 ) -> None:
     from vllm.model_executor.layers.attention.attention import get_attention_context
     from vllm.utils.torch_utils import _resolve_layer_name
-    from vllm.v1.attention.backends.flash_attn_v100 import _split_paged_kv_cache
+    from vllm.v1.attention.backends.flash_v100.kv_layout import (
+        _split_paged_kv_cache,
+    )
 
     _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
     cache_args = {}
