@@ -5,14 +5,13 @@
 from __future__ import annotations
 
 import inspect
-import os
 from collections.abc import Callable
 from contextlib import suppress
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.flash_v100 import config as _config
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
@@ -209,7 +208,7 @@ def _get_sm70_splitd_d256_ops():
             # deployments can also intentionally keep the extension outside
             # the checkout. In both cases, load only an explicitly selected
             # sidecar and then validate the actual operator capability below.
-            library_path = os.getenv("VLLM_SM70_FA2_D256_LIBRARY")
+            library_path = _config.raw("VLLM_SM70_FA2_D256_LIBRARY")
             if library_path is not None:
                 torch.ops.load_library(library_path)
                 logger.info(
@@ -261,7 +260,7 @@ def _get_sm70_d256_gqa_architecture_op():
     try:
         op_name = (
             "sm70_d256_gqa_v37_fwd"
-            if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+            if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
             else "sm70_d256_gqa_architecture_fwd"
         )
         # The Split-D loader also resolves an explicit source-overlay
@@ -273,7 +272,7 @@ def _get_sm70_d256_gqa_architecture_op():
             _get_sm70_splitd_d256_ops()
 
         if (
-            not envs.VLLM_FLASH_V100_PREFILL_D256_GQA_V37
+            not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
             and not _sm70_gqa_has_fp32_accumulation()
         ):
             _sm70_d256_gqa_architecture_op = None
@@ -291,7 +290,9 @@ def _get_sm70_d256_gqa_architecture_op():
             )
     except (AttributeError, ImportError, RuntimeError) as exc:
         _sm70_d256_gqa_architecture_op = None
-        if envs.VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL:
+        if _config.registered(
+            "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
+        ):
             logger.warning_once(
                 "SM70 D256 GQA architecture operator is unavailable "
                 "(%s: %s); using the exact dense prefill kernel.",

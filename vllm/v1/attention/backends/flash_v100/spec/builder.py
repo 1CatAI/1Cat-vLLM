@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
+from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
 from vllm.v1.attention.backends.flash_v100.spec import (
     smallq_metadata as _smallq_metadata,
 )
@@ -51,7 +52,7 @@ def build(
         and getattr(attn_metadata, "max_query_len", 1) > 1
         and bool(torch.any(ddtree_num_tree_tokens_cpu[:num_reqs] > 0).item())
     )
-    if self._flash_draft_buffer_shape is not None and (
+    if self.metadata_workspace.draft.shape is not None and (
         getattr(attn_metadata, "max_query_len", 1) == 1 or self._is_dflash_draft_model
     ):
         # FULL graph capture binds q=1 decode to these persistent buffers.
@@ -122,15 +123,7 @@ def initialize_builder(
     )
     if self._use_sm70_dflash2_fused_smallq_metadata:
         logger.info_once("SM70 DFlash2 fused Flash-V100 small-query metadata active.")
-    self._draft_block_table = None
-    self._draft_seq_lens = None
-    self._draft_query_start_loc = None
-    self._flash_draft_buffer_shape = None
-    self._smallq_decode_block_table = None
-    self._smallq_decode_seq_lens = None
-    self._smallq_query_start_loc = None
-    self._smallq_token_indices = None
-    self._smallq_buffer_shape = None
+    self.metadata_workspace = _workspace.MetadataWorkspace()
 
 
 def prepare_capture(

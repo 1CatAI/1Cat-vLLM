@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from vllm.v1.attention.backends.flash_v100 import (  # noqa: F401
     backend,
+    config,
     debug,
     debug_compare,
     decode,
@@ -36,6 +37,7 @@ from vllm.v1.attention.backends.flash_v100 import (  # noqa: F401
     routing,
     state,
     verify,
+    workspace,
 )
 from vllm.v1.attention.backends.flash_v100.spec import attention as spec_attention
 from vllm.v1.attention.backends.flash_v100.spec import (
@@ -80,6 +82,7 @@ if TYPE_CHECKING:
 
 # Modules searched by the flash_attn_v100 compatibility module.
 SUBMODULES = (
+    config,
     ops,
     routing,
     debug,
@@ -94,6 +97,7 @@ SUBMODULES = (
     decode,
     prefill,
     verify,
+    workspace,
     debug_compare,
     spec_builder,
     spec_draft,
