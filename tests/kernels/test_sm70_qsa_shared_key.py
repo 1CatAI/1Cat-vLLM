@@ -132,3 +132,18 @@ def test_short_context_selector_graph_is_exact():
         for graph in graphs:
             graph.replay()
         assert torch.equal(*outputs), f"Different selected history at length {length}"
+
+
+def test_negative_positions_match_triton_integer_division():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 required")
+    query = torch.zeros(5, 4, 128, device="cuda", dtype=torch.float16)
+    cache = torch.zeros(1, 204, 1, 128, device="cuda", dtype=torch.float16)
+    table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+    requests = torch.zeros(5, device="cuda", dtype=torch.int32)
+    positions = torch.tensor([-2, -3, -4, -5, -6], device="cuda", dtype=torch.int64)
+    lengths = torch.tensor([10], device="cuda", dtype=torch.int32)
+    args = (query, cache, table, requests, positions, lengths, 4)
+    _, expected = qsa_mqa_paged(*args)
+    _, actual = qsa_mqa_paged(*args, shared_key_scoring=True)
+    assert torch.equal(actual, expected)

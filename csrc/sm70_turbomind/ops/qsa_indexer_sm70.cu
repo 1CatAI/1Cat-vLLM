@@ -38,8 +38,9 @@ __global__ void mqa_multiquery(const half* q, const half* cache,
     const long long prefix = positions[row] + 1;
     const long long length = requests[row] == 0 ? lengths[0] : 0;
     const long long causal = prefix < length ? prefix : length;
-    const int n = causal >= 0 ? causal / compress
-                              : -((-causal + compress - 1) / compress);
+    // Triton's signed integer division truncates toward zero, including
+    // negative padded positions. Keep its visible-length metadata unchanged.
+    const int n = causal / compress;
     end = max(end, min(n, columns));
     if (blockIdx.x == 0 && threadIdx.x == row) visible[row] = n;
   }
