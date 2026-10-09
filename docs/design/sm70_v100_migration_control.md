@@ -14,8 +14,14 @@ not model round latency. Installed-artifact and model results are tracked in
 Both the first fresh-process pair and the subsequent shared-cache comparison
 fail the teacher-distribution gate. The new schedule is explicitly opt-in;
 the Python and native defaults retain the reference schedule. Model promotion
-is pending same-process quality localization. Boundary speed and model
-acceptance are separate results.
+remains pending repeatable fresh-process validation. The completed same-process
+original/recaptured-reference/candidate/original-again comparisons all pass:
+64/64 logits, eight natural continuations and their acceptance counters are
+identical, with KL zero. A same-artifact fresh-process A/A comparison itself
+has top-1 agreement 63/64 and different natural outputs, so the earlier A/B
+differences do not isolate a native scheduling effect. The underlying startup
+variation remains unresolved. Two symmetric C1 timing blocks give -0.024 and
+-0.771 ms; keep these exploratory and quote the reproducible boundary gain.
 
 Do not repeat the K-shard implementations as presumed wins: a centralized
 receiver takes 77–82 µs; distributed receivers take 44–48 µs versus a 23.7-µs

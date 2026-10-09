@@ -11,7 +11,7 @@ full-mesh HCX, M1–8, with a separate output projection. Fused output projectio
 and the two-hop exchange retain their existing schedule. Large batches still use the
 existing model fallback. The kernel policy `sm70_hcx_local_schedule=true`
 opts in before graph capture. The default is false at both the Python policy
-and native operator schema because model qualification has not passed.
+and native operator schema pending repeatable fresh-process model qualification.
 HCX itself remains controlled by `sm70_hcx`.
 
 ## Related work and interpretation
@@ -220,6 +220,72 @@ reference phase is usable for this comparison; its enclosing four-phase
 diagnostic remains incomplete. These results do not qualify a default change
 or a model latency claim.
 
+### Completed same-process controls
+
+The final diagnostic completes all four phases against the cache-policy wheel:
+original graphs, recaptured reference, recaptured candidate, and original
+graphs again. The loaded weights and compiled operators remain fixed. Both
+new captures record 188 native HCX calls per rank across two M5 descriptors,
+with identical counts across schedules and ranks. The 95 prepared modules
+include a final mix-only boundary; each descriptor executes 94 full HCX calls.
+
+| Same-process comparison | Exact teacher logits | Exact natural outputs | Exact acceptance counters | Mean/p99/max KL |
+| --- | ---: | ---: | ---: | ---: |
+| Original / recaptured reference | 64/64 | 8/8 | 8/8 | 0 / 0 / 0 |
+| Recaptured reference / candidate | 64/64 | 8/8 | 8/8 | 0 / 0 / 0 |
+| Original / original again | 64/64 | 8/8 | 8/8 | 0 / 0 / 0 |
+
+These controls pass the model distribution gate and preserve the full-vocabulary
+logits bitwise at the tested positions. Mean draft acceptance is 45.4753% in
+every phase. The conditional per-operator snapshot diagnostic is not invoked
+because all three controls pass.
+
+There is now also a same-artifact fresh-process A/A comparison: the completed
+original phase from the earlier diagnostic versus this final original phase.
+Both use the reference schedule, the same wheel/core, shared compilation
+cache, configuration, actual routes, prompts, seed and warmup. The earlier
+enclosing harness later fails, but its original eight natural rows and 64
+teacher positions are complete. A/A mean/p99/max KL is
+0.000838/0.007006/0.007195, top-1 agreement is 63/64, only 7/64 logits are
+exact, and none of the eight natural outputs is identical. A/A itself fails
+the top-1 gate. This establishes variation between starts without changing
+the HCX schedule; it does not identify its underlying cause.
+
+Using this later reference phase with the earlier fresh candidate instead
+gives mean/p99/max KL 0.000835/0.005859/0.007425 and top-1 agreement 64/64,
+which passes the distribution limits, but only one natural sequence matches.
+This additional comparison does not replace the failed original pair. The
+results together show why one fresh-process A/B pair cannot isolate the native
+schedule's effect. The schedule remains opt-in until startup repeatability
+and the associated promotion gate are resolved.
+
+### Exploratory same-process model timing
+
+After the four quality phases, the same loaded model runs two warmups and
+eight C1 I8192/O256 cohorts, ordered ABBA then BAAB. GPU observation is off.
+All eight output sequences match. Each cohort contributes 35 steady-decode
+intervals and 171 emitted tokens after the benchmark's edge trimming;
+initialization, compilation and prefill are excluded.
+
+| C1 pure-decode round statistic | Reference, ms | Candidate, ms |
+| --- | ---: | ---: |
+| Mean of four cohort means | 19.6543 | 19.2568 |
+| Median of four cohort means | 19.8190 | 19.3727 |
+| Cohort mean range | 19.0438–19.9355 | 18.7460–19.5358 |
+
+The two symmetric blocks give candidate-minus-reference differences of
+-0.0242 and -0.7708 ms. Their large difference prevents admitting the overall
+-0.3975-ms observation as a stable model speedup. The reproducible performance
+claim remains the installed HCX boundary result, with same-process model
+numerical equivalence. A longer controlled timing window and resolution of
+fresh-process A/A variation are required before default promotion.
+
+The retained final artifacts are `model-inprocess-qualified/result.json`,
+`qualified-comparison.json`, `loaded-to-shared-comparison.json`, and
+`qualified-timing.json` in the task's model evidence directory. The diagnostic
+and comparison scripts are retained with the raw captures and source hashes.
+All task-owned model workers exit and release the GPU ownership locks.
+
 ## Rejected or superseded screens
 
 Every row is a same-process comparison within its recorded run. Do not add
@@ -285,3 +351,22 @@ with the same benchmark and a smaller sample count, and run
 ownership and the M20 fallback. Boundary savings do not establish a model
 round saving: compare `sm70_hcx_local_schedule` true/false in the same wheel
 with the rest of the model contract fixed.
+
+The completed same-process procedure is available as
+`benchmarks/diagnose_sm70_hcx_schedule.py`. First produce a completed reference
+with `benchmark_flashnext_acceptance.py` using the same installed wheel,
+HCX enabled, local scheduling disabled, separate output projection, TP4 and
+MTP4. Retain the model contract above and acquire all GPU ownership locks.
+Then run the trusted offline callbacks with:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_DEVICE_ORDER=PCI_BUS_ID \
+  VLLM_ALLOW_INSECURE_SERIALIZATION=1 \
+  .venv/bin/python benchmarks/diagnose_sm70_hcx_schedule.py \
+  --reference "$HCX_REFERENCE_JSON" --output "$HCX_QUALITY_JSON"
+```
+
+The checked-in worker callbacks and comparison logic match the executed
+diagnostic. Its entry point additionally rejects incompatible TP/MTP/policy
+contracts before loading and imports the installed package before adding
+repository benchmark helpers to the module search path.
