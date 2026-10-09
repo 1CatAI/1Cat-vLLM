@@ -20,6 +20,7 @@ def forbidden(source, target):
         return {
             "decode": "exec",
             "prefill": "exec",
+            "prefill_candidates": "exec",
             "verify": "exec",
             "routing": "plan",
             "debug_compare": "debug",

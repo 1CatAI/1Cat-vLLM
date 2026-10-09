@@ -20,8 +20,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict passed | Private references 380 → 374; cycles 14 → 13 | Queued after Step 3 | Required GPU gates |
 | 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
 | 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
-| 1c follow-up: immutable requested workload | — | CPU/golden/strict passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
-| 5a: per-sequence prefill candidates | — | Not started | — | Required | Step 4 gates |
+| 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
+| 5a: per-sequence prefill candidates | — | CPU/golden/strict passed | Largest function 977 → 529; private 358 → 348 | Required after prerequisites | Rebase and GPU gates |
 | 5b: batch prefill candidates | — | Not started | — | Required | Step 5a gates |
 | 5c: debug observer | — | Not started | — | Required | Step 5b gates |
 | 6: registered speculative features | — | Not started | — | Required | Step 5c gates |
@@ -502,3 +502,59 @@ host/spec runners are updated atomically and the failed DFlash baseline is
 queued again. Step 4c's immutable source and host-integration snapshots and four
 dependent GPU queues are staged under `a3-step4c`; no earlier source snapshot
 is overwritten by the tool repair.
+
+## Step 5a sequence candidates
+
+The preceding tool repair is PR #1084 at
+`ec47ee44cdbd590f1856cc4a170c6c7afac09b3b`. Its actual pinned PR #1028 rebase
+is `57ccb8c40eeb5ae4bcb373b56e357601891fd498`, tree
+`5eac54b5afd52124bcbd11e040bb070db7dec37b`, with 37 passes / 98 GPU skips.
+The full outcome-map runner is queued under `a3-snapshot` on 54633.
+
+Mechanical extraction `45c0fda62` separates the original 471-line sequence
+block before ownership changes. Seven real candidates now execute through the
+shared admission/attempt/decline loop: BFLA, FA2, contiguous BHMD, contiguous
+dense, FP8 bridge, split-KV and paged. `PrefillExecutor(config, ops, workspace)`
+neither imports nor receives Impl. Native functions and temporary policy/debug
+callbacks are explicit dependencies; remaining batch/debug ownership belongs
+to Steps 5b/5c. Actual mask/view/gather/native preparation occurs in candidate
+run methods and retains side effects when a candidate declines.
+
+The first four candidates preserve the unconditional split-KV then FP8-bridge
+policy reads after successful preparation but before final native execution.
+The fallback generator performs those reads at the same position when all four
+decline. Contiguous policy is evaluated once. BHMD retains its destination copy
+and early debug skip. A declining FP8 bridge directly executes the original
+paged fallback, bypassing split-KV even if that predicate was true.
+
+All 813 immutable traces pass. The original full calculation hashes also pass:
+the test projects the actual candidate order, admission/decline checks,
+preparation calls and logging callbacks back into the existing AST comparison.
+No saved branch body or changed golden is substituted. Ten new independent
+operator-injection cases cover every winner plus mask, FA2 and bridge declines,
+policy timing and destination identity. Source evidence is
+`a3-prefill-{trace-2,composition-1,injection}.log` locally. The first trace check
+reported the newly introduced private helper as an extra call; that helper now
+has a public orchestration name, while all original observed decisions remain.
+
+Current ceilings are 402 / 529 / 348 / 13 / 169 / 0 / 29 for forward, largest
+function, private references, cycles, outside-spec model terms, outside-config
+environment reads and state flags. No new forbidden dependency edge appears.
+Both largest-function and private-reference ceilings are tightened. The first
+mypy run found generator-variable inference and AST type-narrowing issues;
+these are corrected without changing calculations or the trace contract.
+GPU locks are currently occupied by another task; all owned queues keep waiting
+and all unverified PRs stay Draft. No other task's processes are stopped.
+
+The final unchanged-source strict run passes **253 tests / 1 skip / 28 GPU
+exclusions**, with consumed shim patches and unchanged golden/calculation
+oracles. Pre-commit including mypy/layering passes. Evidence:
+`a3-prefill-candidates-strict-final.log`,
+`a3-prefill-candidates-shim-final.json`, and
+`a3-prefill-candidates-precommit-2.log`. A preceding strict run read source while
+the type-only corrections were being applied and is retained as an invalid
+mixed-revision check; its lone calculation-source assertion failure is not
+accepted as final evidence. The final focused 25-test suite also passes.
+The four existing Qwen baseline JSON contracts were checked against their
+requested engine JSON and match exactly, so the recorder snapshot repair does
+not invalidate those completed baselines.
