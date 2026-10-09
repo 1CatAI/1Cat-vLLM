@@ -4,11 +4,34 @@
 import pytest
 import torch
 
-from vllm.models.qwen4_exp.nvidia.ops.device_kv_attention import _direct_history_triton
+from vllm.models.qwen4_exp.nvidia.ops.device_kv_attention import (
+    _direct_history_triton,
+    initialize_device_history_attention,
+)
 from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
 from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def test_draft_owner_never_admits_native_history():
+    state = HostQSAKV(
+        1,
+        256,
+        256,
+        torch.device("cuda:0"),
+        width=64,
+        hot_tokens=64,
+        device_reference=True,
+        direct_device=True,
+        is_speculative_draft=True,
+    )
+    assert state.device_history_workspace is None
+    assert state.device_history_reason == "speculative_draft_unqualified"
+    # Reconfiguration outside a draft config must retain the owner's policy.
+    initialize_device_history_attention(state, True)
+    assert state.device_history_workspace is None
+    assert state.device_history_reason == "speculative_draft_unqualified"
 
 
 def decoded_history(state):

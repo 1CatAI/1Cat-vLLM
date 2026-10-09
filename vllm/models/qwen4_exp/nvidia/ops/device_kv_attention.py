@@ -24,7 +24,9 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
     reason = None
     if not enabled:
         reason = "user_override"
-    elif cfg and getattr(cfg, "is_speculative_draft", False):
+    elif getattr(state, "is_speculative_draft", False) or (
+        cfg and cfg.is_speculative_draft
+    ):
         reason = "speculative_draft_unqualified"
     elif not state.device_reference:
         reason = "history_on_host"
