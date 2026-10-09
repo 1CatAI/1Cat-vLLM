@@ -266,3 +266,25 @@ def test_unfenced_capacity_sync_preserves_device_and_source(monkeypatch):
     device_scope.assert_called_once_with(2)
     synchronize.assert_called_once_with()
     assert len(owner.pending) == 64
+
+
+def test_disabled_legacy_trace_does_not_parse_unused_bad_numbers(monkeypatch):
+    monkeypatch.setenv("VLLM_SM70_DEBUG", "")
+    monkeypatch.setenv("VLLM_SM70_ASYNC_CPU_TRACE", "0")
+    monkeypatch.setenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE", "0")
+    for name in (
+        "VLLM_SM70_ASYNC_CPU_TRACE_EVERY",
+        "VLLM_SM70_DECODE_EVENT_TRACE_EVERY",
+        "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS",
+    ):
+        monkeypatch.setenv(name, "invalid")
+    policy = RuntimeTraceConfig()
+    assert policy.async_every == policy.event_every == 16
+    assert policy.event_threshold_ms == 1.0
+    with pytest.raises(ValueError):
+        RuntimeTraceConfig(async_cpu=True)
+    with pytest.raises(ValueError):
+        RuntimeTraceConfig(events=True)
+    monkeypatch.setenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE", "1")
+    with pytest.raises(ValueError):
+        RuntimeTraceConfig()

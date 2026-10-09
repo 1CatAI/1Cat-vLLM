@@ -234,3 +234,10 @@ controls, not model kernels. Peak GPU allocation was identical (2,048 and
 132,096 bytes including the control buffers). Separately instrumented host
 allocation peaks were 451/419 and 451/662 bytes; tracing was disabled during
 timing. No new per-copy device workspace or model-performance claim is made.
+
+The final trace-config/lease CPU suite passed **59 tests** (two CUDA skips).
+Disabled legacy diagnostics retain their old behavior for malformed, unused
+numeric options; enabling the diagnostic or retained tree worker override still
+raises the original parser error. Source explanations mark the inactive default
+instead of presenting the malformed input as its effective value. This does
+not change typed validation or computation hashes.

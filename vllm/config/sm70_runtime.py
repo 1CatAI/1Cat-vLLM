@@ -12,7 +12,12 @@ from pydantic import Field
 from vllm.config.utils import config
 
 
-def resolve_legacy_fields(policy, aliases: dict[str, str]) -> None:
+def resolve_legacy_fields(
+    policy,
+    aliases: dict[str, str],
+    *,
+    inactive_defaults: dict[str, int | float] | None = None,
+) -> None:
     from vllm import envs
 
     for field in fields(policy):
@@ -23,8 +28,16 @@ def resolve_legacy_fields(policy, aliases: dict[str, str]) -> None:
         if getattr(policy, name) is not None:
             policy.sources[name] = "typed"
         else:
-            setattr(policy, name, envs.environment_variables[legacy]())
-            policy.sources[name] = legacy if legacy in os.environ else "default"
+            source = legacy if legacy in os.environ else "default"
+            try:
+                value = envs.environment_variables[legacy]()
+            except ValueError:
+                if inactive_defaults is None or name not in inactive_defaults:
+                    raise
+                value = inactive_defaults[name]
+                source = f"inactive default (ignored {legacy})"
+            setattr(policy, name, value)
+            policy.sources[name] = source
             if legacy == "VLLM_SM70_MTP_PROFILE" and "VLLM_SM70_DEBUG" in os.environ:
                 policy.sources[name] = "VLLM_SM70_DEBUG"
 
@@ -101,15 +114,35 @@ class RuntimeTraceConfig:
     """Source of each initialized diagnostic option."""
 
     def __post_init__(self) -> None:
+        from vllm import envs
+
         resolve_legacy_fields(
             self,
             {
                 "async_cpu": "VLLM_SM70_ASYNC_CPU_TRACE",
-                "async_every": "VLLM_SM70_ASYNC_CPU_TRACE_EVERY",
                 "events": "VLLM_SM70_DECODE_EVENT_TRACE",
+            },
+        )
+        # Disabled legacy diagnostics never parsed their numeric options.
+        # Retain valid captured values, but do not reject an unused malformed
+        # interval/threshold. The deferred worker override still enables its
+        # original interval parser during initialization.
+        inactive: dict[str, int | float] = {}
+        worker_profile = (
+            envs.environment_variables["VLLM_DFLASH_DDTREE_WORKER_PROFILE"]() == "1"
+        )
+        if not self.async_cpu and not worker_profile:
+            inactive["async_every"] = 16
+        if not self.events:
+            inactive.update(event_every=16, event_threshold_ms=1.0)
+        resolve_legacy_fields(
+            self,
+            {
+                "async_every": "VLLM_SM70_ASYNC_CPU_TRACE_EVERY",
                 "event_every": "VLLM_SM70_DECODE_EVENT_TRACE_EVERY",
                 "event_threshold_ms": "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS",
             },
+            inactive_defaults=inactive,
         )
         if "VLLM_SM70_DEBUG" in os.environ and self.sources["events"] != "typed":
             self.sources["events"] = "VLLM_SM70_DEBUG"
