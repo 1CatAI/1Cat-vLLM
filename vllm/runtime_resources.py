@@ -13,7 +13,15 @@ from typing import Any
 def runtime_resources_for(config) -> dict[str, Any]:
     resources = getattr(config, "_runtime_resources", None)
     if resources is None:
-        resources = {}
+        from vllm.config.execution_policy import POLICY_OWNERS
+
+        policies = {}
+        for path in POLICY_OWNERS:
+            owner, name = path.split(".")
+            policy = getattr(getattr(config, owner, None), name, None)
+            if policy is not None:
+                policies[path] = policy
+        resources = {"execution_policies": policies}
         config._runtime_resources = resources
     return resources
 

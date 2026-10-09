@@ -1219,6 +1219,7 @@ def test_offload_world_drops_the_pipeline_layer_partition(
     """The worker builds its model as a single pipeline stage; a partition
     inherited from the GPU workers' pipeline would make get_pp_indices refuse
     that stage."""
+    from vllm.config import DeviceConfig, set_current_vllm_config
     from vllm.distributed.utils import get_pp_indices
 
     set_lazy_env(monkeypatch, "VLLM_PP_LAYER_PARTITION", "24,24")
@@ -1227,9 +1228,14 @@ def test_offload_world_drops_the_pipeline_layer_partition(
     # An initialized world leaves only the environment handling to run.
     monkeypatch.setattr(ple_offload_worker.dist, "is_initialized", lambda: True)
 
+    child_config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    child_config.parallel_config.communication.pp_layer_partition = None
     ple_offload_worker._init_offload_distributed()
-
-    assert get_pp_indices(48, 0, 1) == (0, 48)
+    with set_current_vllm_config(child_config):
+        assert get_pp_indices(48, 0, 1) == (0, 48)
+    # The GPU parent's legacy partition is never removed from the process.
+    with pytest.raises(ValueError, match="does not match pp_size"):
+        get_pp_indices(48, 0, 1)
 
 
 def _registration_with_cpu_inputs(

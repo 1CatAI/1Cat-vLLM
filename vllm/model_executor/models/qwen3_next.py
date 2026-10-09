@@ -19,6 +19,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
+from vllm.config.execution_policy import layer_policy
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -394,10 +395,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
             if (
                 envs.VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP
-                or not envs.VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP
+                or not layer_policy().shared_moe_overlap
             ):
                 self.shared_expert._vllm_disable_shared_experts_stream = True
-            if envs.VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP:
+            if layer_policy().shared_moe_overlap:
                 logger.info_once(
                     "Enabling Qwen3Next FusedMoE shared_experts stream "
                     "overlap by explicit request.",

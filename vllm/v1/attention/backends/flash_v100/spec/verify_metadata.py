@@ -5,10 +5,11 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, cast
 
 import torch
 
+from vllm.config.execution_policy import flash_v100_policy
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100.plan import diagnostics as _debug
@@ -27,7 +28,7 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 def configured_smallq_max_query_len(
     self: Any,
 ) -> int:
-    return int(_config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
+    return int(cast(int, flash_v100_policy().smallq_max_q))
 
 
 def configured_smallq_max_model_len(

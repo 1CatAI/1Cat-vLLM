@@ -10,6 +10,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
+from vllm.config.execution_policy import layer_policy
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -727,7 +728,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
 ) -> None:
     """Mark exact base-model HC modules for the fused M=1 route."""
     if (
-        not envs.VLLM_SM70_QWEN38_FUSED_HC_FP16
+        not layer_policy().fused_hc
         or envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
         or dtype != torch.float16
         or not current_platform.is_device_capability((7, 0))

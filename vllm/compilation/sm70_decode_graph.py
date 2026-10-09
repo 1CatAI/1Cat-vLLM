@@ -13,7 +13,7 @@ from contextvars import ContextVar
 
 import torch
 
-import vllm.envs as envs
+from vllm.config.execution_policy import graph_policy
 
 _sm70_decode_graph_compilation = ContextVar(
     "sm70_decode_graph_compilation", default=False
@@ -35,9 +35,10 @@ def is_sm70_decode_graph_compiling() -> bool:
     return _sm70_decode_graph_compilation.get()
 
 
-def use_sm70_decode_graph_semantics() -> bool:
+def use_sm70_decode_graph_semantics(policy=None) -> bool:
     """Preserve legacy behavior unless the dual-compile lane is active."""
-    return not envs.VLLM_SM70_QWEN38_DUAL_COMPILE or is_sm70_decode_graph_compiling()
+    policy = policy if policy is not None else graph_policy()
+    return not policy.dual_compile or is_sm70_decode_graph_compiling()
 
 
 __all__ = [

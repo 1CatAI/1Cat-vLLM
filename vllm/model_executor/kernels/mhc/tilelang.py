@@ -4,6 +4,7 @@ import torch
 
 import vllm._sm70_ops as sm70_ops
 from vllm import envs
+from vllm.config.execution_policy import layer_policy
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -797,7 +798,7 @@ def mhc_fused_post_pre_tilelang(
     )
     use_sm70_fused_post_dot_q8 = (
         use_sm70_fp32_stage
-        and envs.VLLM_SM70_GLM53_MHC_FUSED_POST_DOT_Q8
+        and layer_policy().mhc_fused_post_dot
         and num_tokens == 8
         and tile_n == 12
         and n_splits == 4

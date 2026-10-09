@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 
+from vllm.config.execution_policy import flash_v100_policy
 from vllm.config.sm70_dflash2 import capture_sm70_dflash2_config
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -74,15 +75,15 @@ def configure_prefill(self: Any) -> None:
 def configure_verifier(self: Any) -> None:
     self.use_dflash2_grouped_verify = (
         self.flash_attn_grouped_verify_paged is not None
-        and _config.registered("VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY")
+        and flash_v100_policy().grouped_verify
         and current_platform.is_device_capability(70)
     )
     self.use_dflash2_batched_grouped_verify = (
         self.use_dflash2_grouped_verify
         and _config.registered("VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY")
     )
-    self.dflash2_grouped_verify_min_model_len = _config.registered(
-        "VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN"
+    self.dflash2_grouped_verify_min_model_len = (
+        flash_v100_policy().grouped_verify_min_model_len
     )
     if self.dflash2_grouped_verify_min_model_len < 1:
         raise ValueError(

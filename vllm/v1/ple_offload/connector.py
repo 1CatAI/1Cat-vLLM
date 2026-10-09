@@ -15,8 +15,8 @@ import torch.nn as nn
 import zmq
 from cuda.bindings import driver as cuda_driver
 
-from vllm import envs
 from vllm.config import VllmConfig
+from vllm.config.execution_policy import ple_policy
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.ple.host_result import HostResultRegion
@@ -90,6 +90,7 @@ class PleOffloadConnector:
         self.device = device
         self.dp_rank = get_dp_group().rank_in_group
         self.tp_rank = get_tp_group().rank_in_group
+        self._ple_policy = ple_policy(vllm_config)
         self._layers = self._setup_layers(vllm_config, model)
         self._all_pinned_decode = bool(self._layers) and all(
             getattr(layer, "_pinned_decode", False) for layer in self._layers.values()
@@ -205,7 +206,7 @@ class PleOffloadConnector:
                         and vllm_config.speculative_config.method != "mtp"
                     ):
                         reason = "speculative_transport_not_qualified"
-                    elif envs.VLLM_SM70_QWEN38_HYBRID_PLE:
+                    elif ple_policy(vllm_config).hybrid:
                         reason = "hybrid_local_decode"
                     else:
                         try:
@@ -507,9 +508,7 @@ class PleOffloadConnector:
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
-        if use_local_model and (
-            envs.VLLM_SM70_QWEN38_HYBRID_PLE or self._all_pinned_decode
-        ):
+        if use_local_model and (self._ple_policy.hybrid or self._all_pinned_decode):
             return
         self._launch(num_reqs, num_tokens)
 

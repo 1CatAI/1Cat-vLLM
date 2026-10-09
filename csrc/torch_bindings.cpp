@@ -891,6 +891,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &sm70_glm_mhc_pre_norm_out);
 
   ops.def(
+      "sm70_glm_mhc_pre_norm_configured_out("
+      "Tensor gemm_mul, Tensor gemm_sqrsum, Tensor hc_scale, Tensor hc_base, "
+      "Tensor residual, Tensor(a!) post_mix, Tensor(b!) comb_mix, "
+      "Tensor(c!) layer_input, Tensor norm_weight, float rms_eps, "
+      "float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult, "
+      "int sinkhorn_repeat, float norm_eps, int configured_threads) -> ()");
+  ops.impl("sm70_glm_mhc_pre_norm_configured_out", torch::kCUDA,
+           &sm70_glm_mhc_pre_norm_configured_out);
+
+  ops.def(
       "sm70_glm_mhc_post_dot_q8_out("
       "Tensor(a!) residual_out, Tensor(b!) gemm_mul, "
       "Tensor(c!) gemm_sqrsum, Tensor comb_mix, Tensor residual, "

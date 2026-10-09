@@ -29,6 +29,7 @@ from vllm.compilation.codegen import (
 )
 from vllm.config import CompilationConfig, CUDAGraphMode, VllmConfig
 from vllm.config.compilation import DynamicShapesType
+from vllm.config.execution_policy import graph_policy
 from vllm.config.utils import Range, hash_factors
 from vllm.logger import init_logger
 from vllm.logging_utils import lazy
@@ -112,7 +113,7 @@ def make_copy_and_call(
 
 
 def make_compiler(compilation_config: CompilationConfig) -> CompilerInterface:
-    assert not envs.VLLM_USE_MEGA_AOT_ARTIFACT or envs.VLLM_USE_STANDALONE_COMPILE, (
+    assert not bool(graph_policy().mega_aot) or envs.VLLM_USE_STANDALONE_COMPILE, (
         "VLLM_USE_MEGA_AOT_ARTIFACT=1 requires VLLM_USE_STANDALONE_COMPILE=1"
     )
 
@@ -898,7 +899,7 @@ class VllmBackend:
                   returns_tuple
         """
 
-        if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+        if not bool(graph_policy().mega_aot):
             return None, None, None
 
         from .caching import StandaloneCompiledArtifacts
@@ -1041,7 +1042,9 @@ class VllmBackend:
 
         # Minimal hashing here with existing utilities, reused below.
 
-        env_factors = envs.compile_factors(vllm_config.kernel_config)
+        env_factors = envs.compile_factors(
+            vllm_config.kernel_config, vllm_config=vllm_config
+        )
         env_hash = hash_factors(env_factors)
         # Compute config/compiler/code hashes once and reuse
         config_hash = vllm_config.compute_hash()
@@ -1178,7 +1181,7 @@ class VllmBackend:
         # keep a split_gm copy from BEFORE the interpreter replaces
         # submodules with PiecewiseBackend -- used for serialization
         original_split_gm = None
-        if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+        if bool(graph_policy().mega_aot):
             original_split_gm = deepcopy(self.split_gm)
 
         from torch._dynamo.utils import lazy_format_graph_code
@@ -1270,7 +1273,7 @@ class VllmBackend:
 
         self._called = True
         graph_to_serialize = (
-            original_split_gm if envs.VLLM_USE_MEGA_AOT_ARTIFACT else self.graph
+            original_split_gm if bool(graph_policy().mega_aot) else self.graph
         )
 
         execution_code, submod_names, consts = generate_execution_code(self.split_gm)

@@ -46,7 +46,7 @@ def config(monkeypatch):
             True,
         ),
     )
-    return NS(
+    cfg = NS(
         kernel_config=KernelConfig(),
         model_config=NS(
             architectures=["Qwen3_5ForConditionalGeneration"],
@@ -78,6 +78,17 @@ def config(monkeypatch):
             inductor_compile_config={},
         ),
     )
+    from vllm.config import AttentionConfig, OffloadConfig
+    from vllm.config.execution_policy import CommunicationPolicy, GraphPolicy
+    from vllm.config.policy_defaults import PolicyDefaults
+
+    cfg.attention_config = AttentionConfig()
+    cfg.offload_config = OffloadConfig()
+    cfg.compilation_config.runtime = GraphPolicy()
+    cfg.parallel_config.communication = CommunicationPolicy()
+    cfg.runtime_default_sources = {}
+    PolicyDefaults(cfg).finish()
+    return cfg
 
 
 def test_e5m2_reason(config):
@@ -206,16 +217,13 @@ def test_flashnext_report_uses_its_own_required_paths_and_ignores_kv_dtype(
 ):
     config.model_config.architectures = ["Qwen4ExpForCausalLM"]
     config.speculative_config = NS(method="mtp", num_speculative_tokens=3)
-    for name in (
-        "VLLM_SM70_QWEN38_FP16_GEMV",
-        "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16",
-        "VLLM_SM70_QWEN38_FUSED_HC_FP16",
-    ):
-        monkeypatch.setenv(name, "1")
+    config.kernel_config.layer_execution.fp16_gemv = True
+    config.kernel_config.layer_execution.fused_gdn_input = True
+    config.kernel_config.layer_execution.fused_hc = True
     monkeypatch.setenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "1")
     # MoE stream policy is independent; target FP16 projections do not read KV.
-    monkeypatch.setenv("VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP", "0")
-    monkeypatch.setenv("VLLM_SM70_MOE_ADD_ALLREDUCE", "0")
+    config.kernel_config.layer_execution.shared_moe_overlap = False
+    config.parallel_config.communication.moe_add_allreduce = False
     for dtype in ("auto", "fp8_e4m3"):
         config.cache_config.cache_dtype = dtype
         report = acc.log_and_validate(config)

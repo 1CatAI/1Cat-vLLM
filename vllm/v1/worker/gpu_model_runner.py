@@ -42,6 +42,7 @@ from vllm.config import (
     update_config,
 )
 from vllm.config.cache import CacheConfig
+from vllm.config.execution_policy import graph_policy
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -634,7 +635,7 @@ def _should_record_sm70_sample_hidden_ready_event(
     return (
         sample_hidden_states.is_cuda
         and cudagraph_mode == CUDAGraphMode.FULL
-        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and bool(graph_policy().compile_graph)
         and current_platform.is_device_capability(70)
     )
 
@@ -667,7 +668,7 @@ def _sync_sm70_before_compile_graph_forward(
     if (
         envs.VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD
         and cudagraph_mode != CUDAGraphMode.NONE
-        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and bool(graph_policy().compile_graph)
         and current_platform.is_device_capability(70)
     ):
         torch.accelerator.synchronize()
@@ -678,7 +679,7 @@ def _sync_sm70_before_compile_graph_capture(
 ) -> None:
     if (
         cudagraph_mode != CUDAGraphMode.NONE
-        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and bool(graph_policy().compile_graph)
         and current_platform.is_device_capability(70)
     ):
         logger.info_once(
@@ -10789,7 +10790,7 @@ class GPUModelRunner(
         )
         skip_compiled_profile = (
             is_profile
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and bool(graph_policy().compile_graph)
             and envs.VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN
             and current_platform.is_device_capability(70)
         )
@@ -11898,7 +11899,7 @@ class GPUModelRunner(
                 batch_descriptor_override=batch_descriptor_override,
             )
         if (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            bool(graph_policy().compile_graph)
             and cudagraph_runtime_mode == CUDAGraphMode.FULL
             and current_platform.is_device_capability(70)
         ):

@@ -35,6 +35,7 @@ import torch
 import vllm.envs as envs
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config.execution_policy import graph_policy
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import (
     BatchDescriptor,
@@ -51,7 +52,7 @@ logger = init_logger(__name__)
 
 
 def is_breakable_cudagraph_enabled() -> bool:
-    return bool(envs.VLLM_USE_BREAKABLE_CUDAGRAPH)
+    return bool(graph_policy().breakable)
 
 
 F = TypeVar("F", bound=Callable[..., Any])

@@ -16,7 +16,7 @@ import uuid
 from collections import deque
 from collections.abc import Iterable, Sequence
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch.distributed import ProcessGroup, Store, TCPStore
@@ -28,7 +28,6 @@ from torch.distributed.distributed_c10d import (
 )
 from torch.distributed.rendezvous import rendezvous
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.utils.network_utils import get_tcp_uri
 from vllm.utils.system_utils import suppress_stdout
@@ -93,7 +92,11 @@ def split_tensor_along_last_dim(
 
 
 def get_pp_indices(
-    num_hidden_layers: int, pp_rank: int, pp_size: int
+    num_hidden_layers: int,
+    pp_rank: int,
+    pp_size: int,
+    *,
+    partition: str | None | Literal[False] = False,
 ) -> tuple[int, int]:
     """Try to evenly distribute layers across partitions.
 
@@ -107,8 +110,17 @@ def get_pp_indices(
     across the middle partitions. The first and last partitions are excluded
     because they contain the input and output embeddings respectively and we
     are attempting to reduce maximum memory consumption across partitions.
+
+    ``partition=None`` explicitly requests automatic partitioning. Omitting
+    it retains the current engine/standalone legacy configuration.
     """
-    partition_list_str = envs.VLLM_PP_LAYER_PARTITION
+    from vllm.config.execution_policy import communication_policy
+
+    partition_list_str = (
+        partition
+        if partition is not False
+        else communication_policy().pp_layer_partition
+    )
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]

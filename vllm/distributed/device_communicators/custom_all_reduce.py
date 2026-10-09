@@ -12,6 +12,7 @@ from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.config.execution_policy import communication_policy
 from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
     gpu_p2p_access_check,
@@ -218,7 +219,7 @@ class CustomAllreduce:
         hierarchical_peer_ranks: tuple[int, ...] | None = None
         if world_size > 2 and not fully_connected:
             sm70_tp8_candidate = (
-                envs.VLLM_SM70_TP8_HIERARCHICAL_CUSTOM_AR
+                communication_policy().tp8_hierarchical
                 and world_size == 8
                 and device_capability is not None
                 and device_capability.major == 7
@@ -330,7 +331,7 @@ class CustomAllreduce:
             )
             ops.register_buffer(self._ptr, self.long_prefill_output_ptrs)
         if (
-            envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
+            communication_policy().tp4_push
             and world_size == 4
             and fully_connected
             and current_platform.is_cuda()
@@ -366,7 +367,7 @@ class CustomAllreduce:
                 sum2_m1_status,
                 mtp5_status,
             )
-        if tp8_hierarchical and envs.VLLM_SM70_TP8_HIERARCHICAL_PUSH_AR:
+        if tp8_hierarchical and communication_policy().tp8_push:
             assert hierarchical_peer_ranks is not None
             push_buffer_size = ops.sm70_tp8_hierarchical_push_allreduce_buffer_size()
             self.sm70_tp8_hierarchical_push_buffer_ptrs = self.create_shared_buffer(

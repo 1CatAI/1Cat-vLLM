@@ -53,13 +53,13 @@ diagnostics and warmup-only selection do not.
 | C1a | C0 ledger; three profilers share collection/aggregation; ordered warmup; typed runtime and diagnostic configuration | Merged as #1130 (`c31d98d333d90`) |
 | C1b | Staged input resources and ordinary speculative sampling boundary | Merged as #1131 (`dfaeb1ba19ca98`) |
 | C2a | GDN compute plan, providers and shared stages | Merged as #1133 (`ec535b1e69b6`) |
-| C2b | GDN metadata and state preparation/commit | Implemented; operator acceptance complete |
-| C3 | Ordered defaults, model qualification and engine-local effective values | Pending |
+| C2b | GDN metadata and state preparation/commit | Merged as #1135 (`ad19d7ad1166`) |
+| C3 | Ordered defaults, model qualification and engine-local effective values | Validated in #1137 |
 | C4a | Shared embedding, LM-head, norm and linear providers | Pending |
 | C4b | Graph/communication/fusion boundaries and final explanation report | Pending |
 
-Each batch is reviewed and merged directly into main before creating the next
-branch. Existing experiments remain available; default-off alone does not imply
+Each PR is based on merged main and is reviewed and merged before the next
+PR is published. Existing experiments remain available; default-off alone does not imply
 deprecation. Compatibility modules forward to the single owning implementation.
 Generic executors neither call back into the old format/model module nor accept
 an entire runner as an untyped execution context.
@@ -462,3 +462,155 @@ DDTree-specific fast-build/trace algorithms remain deferred.
 
 Task-owned `phase-c2b-20261009` artifacts retain source/base patches, baseline and
 candidate JUnit records, follow-up results, `bench-state.json` and JIT parity.
+
+## C3: ordered defaults and engine-owned policy
+
+The comparison is merged C2b (`ad19d7ad1166`), with B's operator selectors
+unchanged. Model qualification/defaults now belong to
+`model_executor/models/runtime_defaults.py`, reached through the existing
+`MODELS_CONFIG_MAP` adapter. Device participation, compilation policy and
+resource defaults belong to `platforms/runtime_defaults.py`, invoked through a
+platform hook at the original early checkpoint. The existing late platform
+validation checkpoint remains in place. Legacy imports forward to these owners;
+model exports are lazy to avoid config/distributed/model import cycles.
+
+This batch replaces the process environment as the carrier of automatic
+settings. It does not merge distinct algorithms or change the model eligibility
+contracts. Model-specific PLE checkpoint layout and BFLA shape qualification
+are separate from device/storage/worker capability checks.
+
+### Configuration and consumer ledger
+
+`config/execution_policy.py` declares 36 legacy aliases with typed fields.
+`config/policy_defaults.py` binds ordered default writes to those fields plus
+existing B native policies, runtime warmup and DFlash fields. The declarations
+and `runtime_policy_report` are the parameter-to-owner source of truth.
+
+| Owner | Fields / retained consumer | Lifecycle and fallback |
+|---|---|---|
+| `CompilationConfig.runtime` | AOT/mega-AOT, breakable graph, compile/no-compile decode, capture size, no-op elimination, dual compile, split MTP graphs, memory estimator | Resolved before compilation; decorators, wrappers, cache keys, runners and graph utilities borrow the owner. Existing graph modes and eager fallbacks remain. Dynamic token dispatch is unchanged. |
+| `KernelConfig.layer_execution` | Batch layouts, FP16 GEMV, fused GDN input/HC, Gemma compile semantics, LM-head top1, shared expert overlap, GLM projection and mHC choices | Layers/providers capture the policy; local dtype/shape/device/native admission remains. No weight/buffer copies are added. |
+| `ParallelConfig.communication` | TP4 push, TP8 hierarchy/push, MoE add/reduce, message-queue capacity, PP partition | PP partition is captured early enough for model/speculative validation. Collective selection consumes the prepared value. C4b still owns provider extraction and remaining native controls. |
+| `OffloadConfig.ple` | Hybrid, CPU and disk placement | Executors and connector receive engine-local placement. PLE child resets only its own PP partition; it no longer removes a process variable. Existing IPC ownership remains. |
+| `AttentionConfig.flash_v100` | BFLA keep ratio, grouped verify enable/minimum context, small-query bound | Bound by the existing backend/spec policy. Attention arithmetic, masks and A3 admission remain unchanged. |
+| `SpeculativeConfig.sm70_dflash2` | BF16 emulation and proposal temperature/top-p, alongside existing verifier fields | Draft initialization resolves values once; original validation/errors retained. BF16 affects the model graph; sampling parameters do not salt the model-computation hash. |
+| Existing B native policies / `sm70_runtime` | Dense tune limits, grouped expert rows, GLM W13 choice, AWQ warmup limit | Platform defaults update existing owners, with typed overrides retained independently for linear and MoE. Native workspace/address ownership remains B's. |
+
+Resolution order is explicit typed value, explicit legacy input, ordered
+model/platform defaults, then the original unset default. The original early
+collective, breakable, prefill/projection and graph-cache checkpoints remain in
+order. Batch invariance retains the mandatory AOT disable. Model checkpoint
+provenance is scoped so later platform decisions are not mislabeled as model
+defaults. Reported values and source history are diagnostic, not execution hits.
+
+Consumers' actual parsers are preserved where they differed from registration
+metadata: BF16 emulation defaults on and accepts stripped truth words; two GLM
+projection flags use `raw != "0"`; native thread/tuning integers retain `atoi`
+prefix parsing and their fallback/clamping. mHC accepts 128/256/512/1024 threads,
+otherwise 256, while M1 always uses 128 threads.
+
+The original `sm70_glm_mhc_pre_norm_out` schema remains as the compatibility
+entry. `sm70_glm_mhc_pre_norm_configured_out` supplies the captured thread value
+to the same launcher/kernel. Engine execution uses the configured entry, which
+requires the rebuilt normal `_C` extension; it never silently reverts to a
+process environment launch. Fake registration and old import/schema remain.
+No CUDA arithmetic changed.
+
+Prepared policies serialize with their config into workers. Active execution
+borrows the engine's policy map from its existing forward-context resources;
+standalone component initialization retains legacy compatibility. Explicit
+`get_pp_indices(..., partition=None)` means automatic partitioning and cannot
+inherit another engine's partition. Omitting that keyword retains the legacy
+standalone/current-engine API.
+
+Effective computation is hashed by the typed owners. Migrated aliases are
+removed from compilation's additional environment factors once resolved, so
+explicit typed and equivalent legacy input share cache identity. Resource-only
+settings, source provenance and inapplicable graph/communication/PLE controls
+are excluded. Changing the process environment after initialization does not
+change a prepared engine's policy or its migrated cache factors.
+
+### Structural evidence and retained scope
+
+On the same expanded C inventory, C2b to C3 source parameter reads decrease
+**341 → 269**, across **57 → 61** inventoried files. This includes the new
+configuration/model/platform owners, so moving a consumer does not erase it
+from the ledger. The 36 newly captured aliases have **zero direct Python env
+reads outside initialization/configuration**. This is a static source audit,
+not a native-hit or latency claim. C3 adds no new independent calculation
+pipeline; its change is ordered policy ownership and per-engine isolation.
+
+C2b's Python 3.13 metadata-builder annotations are corrected here. Remaining
+LM-head/norm provider boundaries, graph context/bucket ownership, communicator
+native controls and fusion capabilities are explicitly C4a/C4b work. DDTree,
+external NCCL/CUBLAS process-global determinism setup and D/E are not described
+as removed by this batch.
+
+### C3 validation record
+
+CPU checks cover ordered/default/conflicting settings, worker spawn transfer,
+two-engine initialization order, PP auto/explicit isolation, legacy parser
+edges, unused-policy hashing, typed/legacy cache equivalence and report/API
+serialization. No model weights are loaded.
+
+- Configuration/graph/DFlash/PLE suite: **203 passed**.
+- Report/platform/unused-policy/ownership suite: **96 passed** (overlaps the
+  ownership cases above; not an additional unique-case total).
+- Pipeline and policy-focused regression: **113 passed**.
+- New native launch CPU/ownership subset: **18 passed, 12 CUDA skips** before
+  GPU execution. Runtime compatibility guard: **6 passed**.
+- Full pre-commit and Python 3.13 typing pass. The compatibility guard now
+  derives migrated aliases from declarations and rejects execution-time reads;
+  no layering whitelist is expanded.
+
+An initial report integration had a premature return, and an old test slice
+omitted the now-lazy qualification imports. Both were corrected before
+acceptance. Native CPU/GPU build configuration initially lacked three unrelated
+CMake source files; the matching source files were supplied, then the normal
+`_C` target was rebuilt. These failures are not passing validation evidence.
+
+Standalone fullgraph admission is also covered: configuration construction is
+constant-folded outside tensor tracing only when no engine owner exists. Active
+engines bypass that compatibility path. A fullgraph CPU test alternates two
+engine forward contexts and verifies the selected policy does not leak.
+
+C3 GPU acceptance on 54633 is complete. The normal `_C` CMake target was built
+for SM70 with CUDA 12.8, Torch 2.10.0+cu128 and driver 580.173.02; GPU 0 is a
+V100-SXM2-32GB. Native SHA256 is
+`4df50cb5cc140449a80705b4f7e846dcb4f393b14fb3a9a6b3e82446b0d9ddd1`.
+Its dependencies are standard CUDA/Torch/system libraries. Fresh Python
+processes loaded and exercised it without preload or private library overrides.
+The build's three changed native files match the final source token-for-token;
+only clang-format whitespace differs in the CUDA source.
+
+- Existing mHC subset: **7 baseline + 7 candidate passed**.
+- Configured native threads, updated-input graph replay, Gemma norm and GDN
+  stages: **46 passed**, including bitwise legacy/configured comparisons.
+- Seven alternating paired rounds tested M1/M8 at 256/1024 configured threads
+  (M1 still launches 128). All 56 direct-ABI output digests and all 56 actual
+  provider output digests match their paired baseline. Both use the same
+  source/model-less input contract, with no model weights loaded.
+
+Actual `sm70_mhc_pre_norm_from_staging` provider measurements, in microseconds:
+
+| Rows / threads | GPU baseline → candidate | Host baseline → candidate | Paired host delta |
+|---|---|---|---|
+| 1 / 256 | 16.583 → 16.584 | 17.226 → 18.506 | +1.285 |
+| 1 / 1024 | 16.572 → 16.571 | 16.933 → 18.449 | +1.110 |
+| 8 / 256 | 14.506 → 14.506 | 19.125 → 18.535 | -1.620 |
+| 8 / 1024 | 12.802 → 12.801 | 19.042 → 18.269 | -1.461 |
+
+Entries are medians; paired deltas are medians of matched-round differences.
+Baseline host ranges were respectively 16.164–18.878, 15.959–19.221,
+18.184–21.645 and 18.730–21.300 microseconds. M1 has a small measured host
+increase inside that variation; this is not a speedup claim. GPU changes are
+within the paired baseline variation. Direct ABI medians likewise remain
+16.621/16.610/14.596/12.888 → 16.623/16.614/14.596/12.886 microseconds.
+**No additional temporary GPU allocation** was measured in either harness.
+
+Raw evidence: the task-owned `phase-c3-20261009/artifacts` directory on 54633,
+including `baseline-v3.xml`, `candidate-v3.xml`, `candidate-stages-v3.xml`,
+`bench-v3.jsonl`, `bench-provider-v2.jsonl`, native dependency records and build
+log. Local retained copies and the source-token comparison are in
+`/home/ymzx/arch-ws/tmp/phase-c3`. No model throughput, TTFT or 35B conclusion is
+made by this acceptance.

@@ -71,6 +71,7 @@ from vllm.config.cache import (
     PrefixCachingHashAlgo,
 )
 from vllm.config.device import Device
+from vllm.config.execution_policy import graph_policy
 from vllm.config.kernel import IrOpPriorityConfig, LinearBackend, MoEBackend
 from vllm.config.lora import MaxLoRARanks
 from vllm.config.mamba import MambaBackendEnum
@@ -1910,7 +1911,7 @@ class EngineArgs:
                 # graph sizing to that stage instead of turning a graph policy
                 # into a service-capacity limit.
                 profile_updates.append("mtp_cudagraph_shapes=deferred_to_scheduler")
-            elif envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS and spec_method == "mtp":
+            elif graph_policy().split_draft_graphs and spec_method == "mtp":
                 cudagraph_capture_sizes = _sm70_mtp_cudagraph_capture_sizes(
                     self.max_num_seqs,
                     decode_query_len,

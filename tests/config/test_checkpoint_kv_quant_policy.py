@@ -13,9 +13,9 @@ import pytest
 import torch
 
 from vllm import platforms
-from vllm.config import CacheConfig, VllmConfig
-from vllm.config import vllm as vllm_config_module
+from vllm.config import CacheConfig, DeviceConfig, VllmConfig
 from vllm.config.vllm import checkpoint_kv_quant_allowed
+from vllm.platforms import runtime_defaults as vllm_config_module
 
 SM70 = (7, 0)
 SM75 = (7, 5)
@@ -81,7 +81,10 @@ def test_checkpoint_directive_dropped_on_pre_ampere(monkeypatch):
     monkeypatch.setattr(
         vllm_config_module, "_any_participating_device_is_pre_ampere", lambda cfg: True
     )
-    config = VllmConfig(cache_config=_checkpoint_resolved_cache_config())
+    config = VllmConfig(
+        cache_config=_checkpoint_resolved_cache_config(),
+        device_config=DeviceConfig(device="cpu"),
+    )
     assert config.cache_config.cache_dtype == "auto"
     assert config.cache_config.cache_dtype_from_checkpoint is False
 
@@ -90,7 +93,10 @@ def test_checkpoint_directive_kept_on_ampere(monkeypatch):
     monkeypatch.setattr(
         vllm_config_module, "_any_participating_device_is_pre_ampere", lambda cfg: False
     )
-    config = VllmConfig(cache_config=_checkpoint_resolved_cache_config())
+    config = VllmConfig(
+        cache_config=_checkpoint_resolved_cache_config(),
+        device_config=DeviceConfig(device="cpu"),
+    )
     assert config.cache_config.cache_dtype == "fp8_e4m3"
     assert config.cache_config.cache_dtype_from_checkpoint is True
 
@@ -99,5 +105,8 @@ def test_explicit_request_is_never_touched(monkeypatch):
     monkeypatch.setattr(
         vllm_config_module, "_any_participating_device_is_pre_ampere", lambda cfg: True
     )
-    config = VllmConfig(cache_config=CacheConfig(cache_dtype="fp8_e4m3"))
+    config = VllmConfig(
+        cache_config=CacheConfig(cache_dtype="fp8_e4m3"),
+        device_config=DeviceConfig(device="cpu"),
+    )
     assert config.cache_config.cache_dtype == "fp8_e4m3"

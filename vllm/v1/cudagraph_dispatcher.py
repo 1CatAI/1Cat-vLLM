@@ -508,7 +508,7 @@ class CudagraphDispatcher:
         # guarantee all keys would be used. For example, if we allow lazy
         # capturing in future PR, some keys may never be triggered.
         skip_sm70_mixed_capture = (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            self.vllm_config.compilation_config.runtime.compile_graph
             and envs.VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE
             and cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
         )

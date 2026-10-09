@@ -18,6 +18,7 @@ from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
 )
+from vllm.config.execution_policy import graph_policy
 from vllm.config.gdn import GdnProfileConfig, resolve_gdn_config
 from vllm.config.gdn_state import resolve_state_trace
 from vllm.config.sm70_dflash2 import (
@@ -1395,7 +1396,7 @@ def _sm70_compile_graph_slice_dim(
         dim += tensor.ndim
     if (
         start == 0
-        or not envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        or not graph_policy().compile_graph
         or not use_sm70_decode_graph_semantics()
     ):
         slices = [slice(None)] * tensor.ndim
@@ -1716,6 +1717,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         gqa_interleaved_layout=False,
     ) -> None:
         super().__init__(config, vllm_config, prefix)
+        self._execution_graph_policy = graph_policy(vllm_config)
         self.gdn_policy = resolve_gdn_config(vllm_config)
         self.gdn_state_trace = resolve_state_trace(vllm_config)
         self._gdn_profiler = bind_gdn_profiler(vllm_config)
@@ -1961,18 +1963,18 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             envs.VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD and not block_003_deep_mtp
         )
         self.auto_sm70_qwen_gdn_full_forward = (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            bool(self._execution_graph_policy.compile_graph)
             and vllm_config.speculative_config is not None
             and not self.gdn_policy.state.spec_core
             and (not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP or block_003_deep_mtp)
         )
         self.auto_sm70_qwen_gdn_spec_core = (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            bool(self._execution_graph_policy.compile_graph)
             and vllm_config.speculative_config is not None
             and self.gdn_policy.state.spec_core
         )
         self.auto_sm70_qwen_gdn_003_spec_core = (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            bool(self._execution_graph_policy.compile_graph)
             and vllm_config.speculative_config is not None
             and envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
             and not block_003_deep_mtp
@@ -2182,10 +2184,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         group_width_qkvz = q_size + k_size + v_size + z_size
         group_width_ba = 2 * ba_size
 
-        if (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and use_sm70_decode_graph_semantics()
-        ):
+        if bool(
+            self._execution_graph_policy.compile_graph
+        ) and use_sm70_decode_graph_semantics(self._execution_graph_policy):
             q_idx = _sm70_compile_graph_interleaved_indices(
                 ng, group_width_qkvz, 0, q_size, mixed_qkvz.device
             )
@@ -2299,10 +2300,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z_start = value_start + v_size
         a_start = ba_size
 
-        if (
-            envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and use_sm70_decode_graph_semantics()
-        ):
+        if bool(
+            self._execution_graph_policy.compile_graph
+        ) and use_sm70_decode_graph_semantics(self._execution_graph_policy):
             q_idx = _sm70_compile_graph_interleaved_indices(
                 ng, group_width_qkvz, 0, q_size, mixed_qkvz.device
             )
@@ -3558,7 +3558,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # linears; other layers still benefit from their base GEMV method.
             and isinstance(self.in_proj_qkvz, LinearBase)
             and isinstance(self.in_proj_ba, LinearBase)
-            and use_sm70_decode_graph_semantics()
+            and use_sm70_decode_graph_semantics(self._execution_graph_policy)
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )
         from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (

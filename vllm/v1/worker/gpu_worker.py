@@ -19,6 +19,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode
+from vllm.config.execution_policy import graph_policy, ple_policy
 from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -165,16 +166,18 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         self._ple_offload_worker_handle: Any | None = None
         self._ple_offload_spawn_config: VllmConfig | None = None
-        if envs.VLLM_SM70_QWEN38_HYBRID_PLE and not (
-            envs.VLLM_SM70_QWEN38_DUAL_COMPILE
+        if ple_policy(self.vllm_config).hybrid and not (
+            graph_policy(self.vllm_config).dual_compile
             and ple_offload_enabled(self.vllm_config)
-            and envs.VLLM_PLE_DISK_OFFLOAD
+            and ple_policy(self.vllm_config).disk
         ):
             raise ValueError(
                 "VLLM_SM70_QWEN38_HYBRID_PLE requires dual compilation plus "
                 "PLE CPU and disk offload"
             )
-        if envs.VLLM_PLE_DISK_OFFLOAD and not ple_offload_enabled(self.vllm_config):
+        if ple_policy(self.vllm_config).disk and not ple_offload_enabled(
+            self.vllm_config
+        ):
             raise ValueError("VLLM_PLE_DISK_OFFLOAD requires VLLM_PLE_CPU_OFFLOAD=1")
         self._ple_offload_enabled = self._has_ple_layers()
         if ple_offload_enabled(self.vllm_config):
@@ -598,7 +601,7 @@ class Worker(WorkerBase):
             # profiling but still perform the real capture in warmup.
             cudagraph_memory_estimate = 0
             if (
-                envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+                graph_policy(self.vllm_config).estimate_graph_memory
                 and current_platform.is_cuda()
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
@@ -641,7 +644,7 @@ class Worker(WorkerBase):
         # On CUDA, respect the opt-in flag as originally designed.
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
+            if graph_policy(self.vllm_config).estimate_graph_memory
             else 0
         )
 
@@ -690,7 +693,7 @@ class Worker(WorkerBase):
             total_mem = self.init_snapshot.total_memory
             current_util = self.cache_config.gpu_memory_utilization
             cg_util_delta = cudagraph_memory_estimate / total_mem
-            if envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:
+            if graph_policy(self.vllm_config).estimate_graph_memory:
                 equiv_util = round(current_util - cg_util_delta, 4)
                 suggested_util = min(
                     round(current_util + cg_util_delta, 4),

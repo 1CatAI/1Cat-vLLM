@@ -10,6 +10,7 @@ from torch import nn
 import vllm._sm70_ops as sm70_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.execution_policy import layer_policy
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -187,14 +188,11 @@ def _sm70_exact_kda_gemv_enabled() -> bool:
 
 
 def _sm70_glm53_tp8_cublaslt_enabled() -> bool:
-    return (
-        os.getenv("VLLM_SM70_GLM53_TP8_CUBLASLT", "0") != "0"
-        and torch.version.cuda == "12.8"
-    )
+    return bool(layer_policy().glm_cublaslt) and torch.version.cuda == "12.8"
 
 
 def _sm70_glm53_tp8_fused_fg_b_enabled() -> bool:
-    return os.getenv("VLLM_SM70_GLM53_TP8_FUSED_FG_B", "0") != "0"
+    return bool(layer_policy().glm_fused_fg_b)
 
 
 class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):

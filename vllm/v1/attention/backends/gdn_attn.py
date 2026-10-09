@@ -12,8 +12,12 @@ import torch
 
 from vllm import envs
 from vllm.config import VllmConfig
-from vllm.config.gdn import resolve_gdn_config
-from vllm.config.gdn_state import resolve_state_trace
+from vllm.config.gdn import GdnConfig, resolve_gdn_config
+from vllm.config.gdn_state import (
+    GdnStateConfig,
+    GdnStateTraceConfig,
+    resolve_state_trace,
+)
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
@@ -35,6 +39,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.gdn_state import (
     GDN_SPEC_METADATA_TENSORS,
     CommonGDNSpecMetadata,
+    GdnStateResources,
     build_state_contract,
     gdn_spec_metadata_tensors,
     legacy_state_resources,
@@ -537,11 +542,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     ):
         assert isinstance(kv_cache_spec, MambaSpec)
         self.vllm_config = vllm_config
-        self.gdn_policy = resolve_gdn_config(vllm_config)
-        self.gdn_state = self.gdn_policy.state
-        self.gdn_trace = resolve_state_trace(vllm_config)
-        self.state_resources = state_resources_for(vllm_config)
-        self.fused_dflash_metadata = sm70_dflash2_enabled(
+        self.gdn_policy: GdnConfig = resolve_gdn_config(vllm_config)
+        self.gdn_state: GdnStateConfig = self.gdn_policy.state
+        self.gdn_trace: GdnStateTraceConfig = resolve_state_trace(vllm_config)
+        self.state_resources: GdnStateResources = state_resources_for(vllm_config)
+        self.fused_dflash_metadata: bool = sm70_dflash2_enabled(
             "fused_gdn_metadata", capture_sm70_dflash2_config(vllm_config)
         )
         self.compilation_config = vllm_config.compilation_config

@@ -28,8 +28,8 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
+from vllm.config.execution_policy import ple_policy
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -47,7 +47,7 @@ _offload_worker_flag = False
 
 def ple_offload_enabled(config=None) -> bool:
     """Use the engine's resolved cascade, retaining legacy explicit offload."""
-    if envs.VLLM_PLE_CPU_OFFLOAD:
+    if ple_policy(config).cpu:
         return True
     if config is None:
         from vllm.config import get_current_vllm_config_or_none
@@ -255,7 +255,7 @@ class PleOffloadLayer(nn.Module, ABC):
         ) -> None:
             if (
                 ple_offload_enabled()
-                and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+                and not ple_policy().hybrid
                 and not self.offload_keeps_local_tables()
                 and not is_offload_process()
             ):
@@ -279,9 +279,7 @@ class PleOffloadLayer(nn.Module, ABC):
     @classmethod
     def get_target_device(cls) -> torch.device:
         """Return CPU for the offload process and the active GPU otherwise."""
-        keeps_gpu_tables = (
-            envs.VLLM_SM70_QWEN38_HYBRID_PLE or cls.offload_keeps_local_tables()
-        )
+        keeps_gpu_tables = ple_policy().hybrid or cls.offload_keeps_local_tables()
         if ple_offload_enabled() and not (
             keeps_gpu_tables and not is_offload_process()
         ):
@@ -357,9 +355,7 @@ class PleOffloadLayer(nn.Module, ABC):
         """Wait for an offloaded result or delegate to ``forward_impl``."""
         if self._is_cpu_offloaded:
             pinned = getattr(self, "_pinned_decode", False)
-            if (
-                envs.VLLM_SM70_QWEN38_HYBRID_PLE or pinned
-            ) and use_sm70_decode_graph_semantics():
+            if (ple_policy().hybrid or pinned) and use_sm70_decode_graph_semantics():
                 return self.forward_impl(hidden_states, input_ids, *args, **kwargs)
             if pinned:
                 return self.wait_offloaded_output(hidden_states, input_ids.shape[0])

@@ -135,7 +135,7 @@ class TorchCompileWithNoGuardsWrapper:
         _apply_constrain_to_fx_strides_patch()
 
         aot_context = nullcontext()
-        if envs.VLLM_USE_AOT_COMPILE:
+        if self.vllm_config.compilation_config.runtime.aot_compile:
             if hasattr(torch._dynamo.config, "enable_aot_compile"):
                 aot_context = torch._dynamo.config.patch(enable_aot_compile=True)
             else:

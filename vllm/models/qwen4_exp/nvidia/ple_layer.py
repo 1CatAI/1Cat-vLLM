@@ -24,6 +24,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
 )
+from vllm.config.execution_policy import ple_policy
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -795,7 +796,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         cascade = ple_cascade_configured()
         from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
 
-        hybrid = envs.VLLM_SM70_QWEN38_HYBRID_PLE or pinned_decode_active()
+        hybrid = ple_policy().hybrid or pinned_decode_active()
         spill = None
         if cascade or (explicit_host is None and not hybrid):
             spill = self._device_spill_bytes(device, table_bytes)
@@ -1169,7 +1170,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         self._remote_placements: list[PLERemotePlacement] = []
         self._disk_segments: list[PLEDiskSegment] = []
-        self._disk_offload = bool(envs.VLLM_PLE_DISK_OFFLOAD and is_offload_process())
+        self._disk_offload = bool(ple_policy().disk and is_offload_process())
         # The cascade worker keeps the checkpoint shards file-backed like the
         # disk lane: it serves only the rows the ranks do not hold and copies
         # none of the table into anonymous host memory.
@@ -1877,7 +1878,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         # in that process.
         if (
             ple_offload_enabled()
-            and not envs.VLLM_SM70_QWEN38_HYBRID_PLE
+            and not ple_policy().hybrid
             and not self.offload_keeps_local_tables()
             and not is_offload_process()
         ):

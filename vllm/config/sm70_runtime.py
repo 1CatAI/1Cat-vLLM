@@ -17,6 +17,7 @@ def resolve_legacy_fields(
     aliases: dict[str, str],
     *,
     inactive_defaults: dict[str, int | float] | None = None,
+    reader=None,
 ) -> None:
     from vllm import envs
 
@@ -26,11 +27,15 @@ def resolve_legacy_fields(
             continue
         legacy = aliases[name]
         if getattr(policy, name) is not None:
-            policy.sources[name] = "typed"
+            policy.sources.setdefault(name, "typed")
         else:
             source = legacy if legacy in os.environ else "default"
             try:
-                value = envs.environment_variables[legacy]()
+                value = (
+                    reader(legacy)
+                    if reader is not None
+                    else envs.environment_variables[legacy]()
+                )
             except ValueError:
                 if inactive_defaults is None or name not in inactive_defaults:
                     raise
@@ -46,6 +51,9 @@ def resolve_legacy_fields(
 class Sm70RuntimeConfig:
     """Warmup policy; does not alter the compiled model computation."""
 
+    awq_warmup_max_m: int | None = None
+    """Largest dense AWQ warmup shape; platform default applies at engine init."""
+
     staged_input: bool | None = None
     """Opt into the existing single-request asynchronous input staging gate."""
 
@@ -60,6 +68,7 @@ class Sm70RuntimeConfig:
         resolve_legacy_fields(
             self,
             {
+                "awq_warmup_max_m": "VLLM_SM70_AWQ_WARMUP_MAX_M",
                 "staged_input": "VLLM_SM70_ASYNC_STAGED_INPUT_PREP",
                 "auxiliary_warmup": "VLLM_SM70_AUX_KERNEL_WARMUP",
                 "mtp_concurrency_warmup": "VLLM_SM70_MTP_CONCURRENCY_WARMUP",
