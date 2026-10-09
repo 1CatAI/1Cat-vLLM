@@ -13,7 +13,8 @@ jobs:
   macos-m1-smoke-test:
     runs-on: macos-latest
     timeout-minutes: 30
-
+    env:
+      GLOO_SOCKET_IFNAME: lo0
     steps:
       - uses: actions/checkout@v6.0.1
 
@@ -30,11 +31,48 @@ jobs:
           uv venv
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependencies and build vLLM
+      - name: Install dependencies
         run: |
           uv pip install -r requirements/build/cpu.txt --index-strategy unsafe-best-match
           uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-          uv pip install -e . --no-build-isolation
+
+      - name: Verify single-process Gloo
+        timeout-minutes: 2
+        run: |
+          .venv/bin/python - <<'PY'
+          from datetime import timedelta
+          import socket
+          import torch
+          import torch.distributed as dist
+
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+              listener.settimeout(5)
+              listener.bind(("127.0.0.1", 0))
+              listener.listen(1)
+              with socket.create_connection(listener.getsockname(), timeout=5) as client:
+                  client.sendall(b"smoke")
+                  connection, _ = listener.accept()
+                  with connection:
+                      connection.settimeout(5)
+                      assert connection.recv(5) == b"smoke"
+          print("Python loopback communication passed", flush=True)
+
+          timeout = timedelta(seconds=30)
+          dist.init_process_group(
+              "gloo", store=dist.HashStore(), rank=0, world_size=1, timeout=timeout
+          )
+          try:
+              value = torch.ones(1)
+              dist.all_reduce(value)
+              assert value.item() == 1
+              print("In-memory single-rank Gloo passed", flush=True)
+          finally:
+              dist.destroy_process_group()
+
+          PY
+
+      - name: Build vLLM
+        run: uv pip install -e . --no-build-isolation
         env:
           CMAKE_BUILD_PARALLEL_LEVEL: 4
 
