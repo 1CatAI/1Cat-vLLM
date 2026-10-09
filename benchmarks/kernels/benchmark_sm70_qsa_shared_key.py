@@ -47,7 +47,9 @@ def compare_time(a, b, count):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--position-dtype", choices=("int32", "int64"), default="int64")
     args = parser.parse_args()
+    position_dtype = getattr(torch, args.position_dtype)
     torch.manual_seed(902)
     results = []
     for m in (5, 20):
@@ -63,7 +65,7 @@ def main():
             ).view(requests, -1)
             q = torch.randn(m, 4, 128, device="cuda", dtype=torch.float16)
             req = torch.arange(m, device="cuda", dtype=torch.int32) // 5
-            pos = 8192 + torch.arange(m, device="cuda", dtype=torch.int64) % 5
+            pos = 8192 + torch.arange(m, device="cuda", dtype=position_dtype) % 5
             lengths = torch.full((requests,), 8197, device="cuda", dtype=torch.int32)
             layers.append((q, cache, table, req, pos, lengths))
         for full_selection in (False, True):
@@ -82,7 +84,15 @@ def main():
             if full_selection:
                 assert all(torch.equal(a, b) for a, b in zip(ref, cand))
             timing = compare_time(lambda: run(False), lambda: run(True), 1)
-            row = dict(m=m, full_selection=full_selection, layers=12, timing=timing)
+            row = dict(
+                m=m,
+                full_selection=full_selection,
+                layers=12,
+                position_dtype=args.position_dtype,
+                page_size=16,
+                columns=2496,
+                timing=timing,
+            )
             results.append(row)
             print(row, flush=True)
     args.out.write_text(json.dumps(results, indent=2) + "\n")

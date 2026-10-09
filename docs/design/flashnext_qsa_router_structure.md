@@ -90,8 +90,29 @@ expand the K dimension in one parallel load/reduction instead of repeatedly
 waiting on a narrow load loop. This increases issued weight traffic across
 query rows, so its latency must be measured with rotating weights and the
 shared-expert branch present. SM70 does not use its optional dependent-launch
-mechanism. Both follow-up candidates are research-only, pending GPU results;
-neither is dispatched by the model.
+mechanism. Both follow-up candidates were slower in a 48-layer, M5
+projection-plus-selection chain. N32/K160 took 0.5437 ms against 0.5005 ms;
+full-K SIMD took 0.5538 ms against 0.5139 ms. Neither changed selected expert
+IDs in the 48 input cases. Maximum relative L2 projection errors were
+3.84e-5 and 3.98e-5, respectively. Both are rejected before model integration.
+
+### Packaged scorer and position types
+
+The normal extension passed all 14 GPU cases, including changed graph
+inputs, invalid pages, ties, strided dimensions, int32/int64 positions,
+truncated score width, and the unchanged C4 fallback.
+
+Position dtype must be recorded with the scorer measurements. The prototype
+table above uses int32 positions. The packaged benchmark uses int64, matching
+the QSA metadata builder. The unchanged Triton reference compiled to a
+4,184-byte stack per thread for the contiguous int64 case, compared with no
+stack for int32. Thus the packaged M5 result (1.9302 to 0.1158 ms for 12
+scorers) cannot be compared directly with the earlier 0.2210 ms control.
+The int64 score/selection/expansion chain measured 2.0876 to 0.2741 ms;
+M20, which uses the same fallback in both arms, measured 6.6087 to
+6.6065 ms. These are isolated measurements, not model latency savings.
+The full-model A/B must establish both the actual dispatch and the benefit
+under production page geometry and concurrent work.
 
 ## Validation and admission
 
