@@ -43,6 +43,7 @@ from vllm.model_executor.layers.quantization.gguf_native import pad_weight_tail
 from vllm.model_executor.layers.quantization.gguf_raw import RawGGUFProjection
 from vllm.model_executor.layers.quantization.gguf_transcode import (
     AffineGGUFProjection,
+    tp_slice_packed,
     transcode_affine,
 )
 from vllm.platforms import current_platform
@@ -520,14 +521,17 @@ class GGUFExpertBank(torch.nn.Module):
             self.pending[index] = local.to(self.device).contiguous()
             return
         source = weight.detach().cpu().numpy()
+        local_source = tp_slice_packed(source, self.source_type, rank, size, axis=axis)
+        transcode_source = source if local_source is None else local_source
         canonical: LatticeGGUFProjection | Lut4GGUFProjection | AffineGGUFProjection
         if self.source_type in LATTICE_TYPES:
-            canonical = transcode_lattice(source, self.source_type)
+            canonical = transcode_lattice(transcode_source, self.source_type)
         elif self.source_type in LUT4_TYPES:
-            canonical = transcode_lut4(source, self.source_type)
+            canonical = transcode_lut4(transcode_source, self.source_type)
         else:
-            canonical = transcode_affine(source, self.source_type)
-        canonical = canonical.tp_slice(rank, size, axis=axis)
+            canonical = transcode_affine(transcode_source, self.source_type)
+        if local_source is None:
+            canonical = canonical.tp_slice(rank, size, axis=axis)
         self.group = canonical.group_size
         self.n, self.k = (
             canonical.shape
