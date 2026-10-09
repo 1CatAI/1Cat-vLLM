@@ -25,6 +25,9 @@ parser.add_argument(
 parser.add_argument(
     "--diagnostics", action="store_true", help="AWQ eager reference-observer parity"
 )
+parser.add_argument(
+    "--decomposed", action="store_true", help="FP8 legacy decomposed route only"
+)
 args = parser.parse_args()
 root = args.root
 (root / "artifacts").mkdir(parents=True, exist_ok=True)
@@ -62,6 +65,8 @@ for name in dir(_sm70_ops):
 E, H, INTERMEDIATE, K = 4, 256, 256, 2
 cases = []
 for fmt in ("awq", "fp8"):
+    if args.decomposed and fmt != "fp8":
+        continue
     if args.diagnostics and fmt != "awq":
         continue
     current = awq_sm70_moe if fmt == "awq" else fp8_sm70_moe
@@ -87,6 +92,8 @@ for fmt in ("awq", "fp8"):
             dict(name="compare_batched", batched=True),
             dict(name="compare_active_w2", batched=True, active=True),
         ]
+    if args.decomposed:
+        routes = [dict(name="legacy_decomposed", batched=True, legacy=True)]
     for route in routes:
         for name in list(os.environ):
             if name.startswith("VLLM_SM70_"):
@@ -126,6 +133,8 @@ for fmt in ("awq", "fp8"):
                 root / "artifacts/dense-compare"
             )
             os.environ["VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS"] = "*"
+        if args.decomposed:
+            os.environ["VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED"] = "1"
         envs.disable_envs_cache()
         torch.manual_seed(54633)
         layers = []
@@ -141,7 +150,7 @@ for fmt in ("awq", "fp8"):
             method.compact_compare_reference = False
             method.compact_exact_layout = True
             method.compact_native_unpermute = False
-            method.compact_decomposed = False
+            method.compact_decomposed = args.decomposed
             method.use_batched_gemm = route["batched"]
             method.use_batched_w13_per_expert_dispatch = route.get("dispatch", False)
             method.use_batched_w2_per_expert_dispatch = route.get("dispatch", False)
@@ -154,7 +163,7 @@ for fmt in ("awq", "fp8"):
             layer.expert_map = None
             layer.apply_router_weight_on_input = False
             layer.layer_name = "model.layers.0.mlp.experts"
-            if index:
+            if hasattr(method, "_initialize_sm70_policy"):
                 method._initialize_sm70_policy(fmt, layer, current.logger)
             if index == 0:
                 values = {}

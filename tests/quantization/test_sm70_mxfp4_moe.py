@@ -198,8 +198,12 @@ def test_mxfp4_sm70_b1_dispatch_selects_six_runtime_experts(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda: True)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 1)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda policy=None: True
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 1
+    )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -309,8 +313,12 @@ def test_mxfp4_sm70_b1_dispatch_rejects_expert_parallel_metadata(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda: True)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 1)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_b1_enabled", lambda policy=None: True
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 1
+    )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -333,7 +341,9 @@ def test_mxfp4_sm70_dispatch_retains_dense_fallback(monkeypatch, num_tokens):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 0)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 0
+    )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -356,8 +366,12 @@ def test_mxfp4_sm70_m8_dispatch_selects_fixed_active_slots(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: False)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 8
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda policy=None: False
+    )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
         buffers,
@@ -380,10 +394,14 @@ def test_mxfp4_sm70_m8_grouped_dispatch_keeps_one_row_slots(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: True)
     monkeypatch.setattr(
-        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda: False
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 8
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda policy=None: True
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda policy=None: False
     )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
@@ -407,10 +425,14 @@ def test_mxfp4_sm70_m8_expert_grouped_dispatch_keeps_real_segments(monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: True)
     monkeypatch.setattr(
-        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda: True
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 8
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda policy=None: True
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_expert_rows_enabled", lambda policy=None: True
     )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(
@@ -435,13 +457,19 @@ def test_mxfp4_sm70_m5_grouped_dispatch(expert_rows, monkeypatch):
         "expert_offsets": torch.arange(257, dtype=torch.int32),
         "dense_expert_ids": torch.arange(256, dtype=torch.int32),
     }
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda: 8)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda: False)
-    monkeypatch.setattr(mxfp4_moe, "_mxfp4_grouped_verifier_enabled", lambda: True)
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_active_expert_max_tokens", lambda policy=None: 8
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_m8_enabled", lambda policy=None: False
+    )
+    monkeypatch.setattr(
+        mxfp4_moe, "_mxfp4_grouped_verifier_enabled", lambda policy=None: True
+    )
     monkeypatch.setattr(
         mxfp4_moe,
         "_mxfp4_grouped_m8_expert_rows_enabled",
-        lambda: expert_rows,
+        lambda policy=None: expert_rows,
     )
 
     offsets, expert_ids, count = _select_mxfp4_stage_dispatch(

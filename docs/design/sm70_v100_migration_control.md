@@ -49372,3 +49372,75 @@ syntax exit 0. No CUDA driver repair or GPU execution was attempted.
   AWQ/FP8 model speed, TTFT/prefill, MTP or new-model qualification is claimed.
   Deliveries 2 (remaining MoE) and 3 (linear/native ownership) follow on main;
   DDTree and repository-wide C/D remain separate.
+
+## 2026-10-09 Phase B delivery 2: shared FP4 stages
+
+- Base `fe63db651e3cc4055bf4349411d372ad801714aa`; owned branch
+  `agent/v100-phase-b-moe-formats-20261009-025824`, worktree
+  `/home/ymzx/arch-ws/v100-phase-b-moe-formats-20261009-025824`.
+  Delivery 1 (#1124) is merged, remote CI passed; superseded #1065/#1066 closed.
+- Seven NVFP4/MXFP4 production sequences now use one FP4 stage executor and a
+  weight codec. Includes direct M1/batch/MTP, raw/prepared scales, fused W13,
+  fused W2/reduce, grouped/MTP and indexed/split-prefill/GLM stages. Existing
+  shape/model/TP gates, arithmetic, split choices and native names are preserved.
+  FP8's legacy decomposed path also reuses its common routed executor. GGUF and
+  skinny share FP32 slot-major reduction while retaining their other numerical
+  and modular/mixed-format contracts.
+- New per-engine NVFP4/MXFP4 policy captures 27 aliases; AWQ QPN M1 joins its
+  existing policy. Workspace owners retain layer-owned addresses, overflow and
+  raw-scale shared workspace/microbatch rejection. The codec uses non-owning
+  layer views and sees tensor rebinding. No native binary or CUDA kernel edit.
+- Focused FP4 safety net: 223 passed (213 frozen-main full-apply native argument,
+  order and view traces plus configuration/workspace/reduction checks). AWQ/FP8,
+  QPN and lifecycle combination: 313 passed before the final native-conflict
+  guard; NVFP4 integration/GLM gates: 82 passed. Broader baseline/head run:
+  348 passed, 35 skipped, two unchanged baseline failures (ModelOpt min-capability
+  test and a GGUF PLE test stub missing `ple_pinned_decode`). The original NVFP4
+  lifecycle stub was updated to own its resolved config and now passes.
+  Final combined suite after all edits: 359 passed, 5 skipped; all applicable
+  pre-commit hooks passed, including typing, policy and layering checks.
+- Existing MoE snapshots: 168 configurations, zero differences from base. New
+  generated bindings/alias table and stage coverage use the codec declarations.
+  Static Python inventory: 95 to 48 legacy read sites, 217 to 179 direct native
+  call sites. Indirect bindings and migrated aliases are not deleted paths.
+  Layering totals: model 2325, platform 3964, raw environment 275 to 274.
+- GPU contract: authorized host `dx.1catai.com:54633`, V100-SXM2-32GB, Torch
+  2.10.0+cu128 / CUDA 12.8, same native `_C` / `_moe_C` digests as delivery 1.
+  Synthetic packed checkpoints, FP16 inputs, FP32 router weights; separate
+  baseline/candidate preparations compare banks, pointer offsets and strides.
+  Qwen NVFP4 E512/H2560/I160/top-k10/g16 (TP4 geometry), MXFP4
+  E256/H4096/I512/top-k6/g32/clamp7 (TP4 geometry), GLM NVFP4
+  E288/H4096/I256/top-k8/g16 (TP8 geometry). These are local operators, not
+  distributed model runs. GPUs 1/2/3 used for the respective FP4 checks; GPU0
+  used for FP8 E4/H256/I256/top-k2/g128. Each uses its GPU lock and task caches.
+- Final numerical evidence: Qwen NVFP4 84 eager + 180 changed-input/route replays;
+  MXFP4 20 + 51; GLM 5 + 12; grouped NVFP4/MTP 6 + 12; FP8 decomposed 7 + 12.
+  All outputs are bit-exact and observed public native stage order agrees.
+  Total: 122 eager cases, 89 captured cases with three changed-data replays each.
+  GLM and grouped cases assert actual requested operator hits, not flag presence.
+- CUDA-event graph time medians (head relative to base): Qwen NVFP4 -0.158%,
+  MXFP4 -0.033%; largest increases +1.55% and +0.625%. The first GLM dense M1
+  retains a large faster-head outlier despite matching public calls (also seen
+  in delivery 1); no speedup claim is based on it. Prefill, TTFT and 35B model
+  throughput remain unmeasured under the owner's operator-only acceptance.
+- Corrected validation failures before promotion: an extracted workspace method
+  accidentally retained both staticmethod/classmethod decorators; pointer-bank
+  checks initially compared allocation-specific addresses/StridedPtr padding;
+  the GLM fixture initially omitted the grouped-expert prerequisite and the
+  recorder missed the GLM symbol prefix; the older FP8 harness needed to
+  initialize codecs for both now-refactored revisions. Final checks exercise
+  the real supported combinations and compare only defined pointer fields.
+- A native audit found unresolved dual Python/C++ policy consumers in AWQ
+  active/grouped W2, MXFP4 grouped/verifier, NVFP4 grouped/prefill, and common
+  permutation paths. Conflicting typed boolean overrides fail clearly until
+  explicit native policy arguments land; no environment mutation is used.
+  Do not claim full typed-native precedence or whole-AOT hash isolation yet.
+  Delivery 3 must finish these native consumers/cache factors and FP8 diagnostic
+  ownership alongside linear/QPN/binding consolidation. Defaults and existing
+  legacy configurations retain their observed behavior in this delivery.
+- Reproducers: `benchmarks/kernels/sm70_fp4_stage_parity.py --root <ab> --family
+  nvfp4|mxfp4`, with `--model glm53` or `--grouped-only` for dedicated cases;
+  `benchmarks/kernels/sm70_moe_stage_parity.py --root <ab> --decomposed` for FP8.
+  Raw GPU evidence: `/home/ymzx/arch-ws/phase-b2-20261009/artifacts/` on 54633.
+  Local CPU/GPU/log evidence: `/home/ymzx/arch-ws/tmp/phase-b2/`.
+  No model service, port, sidecar, preload or background benchmark remains.

@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM70 FP8 MoE method backed by TurboMind batched GEMM kernels."""
 
+from dataclasses import replace
+
 import torch
 from torch.nn import Parameter
 
@@ -31,6 +33,10 @@ from vllm.model_executor.utils import set_weight_attrs
 logger = init_logger(__name__)
 
 _DEFAULT_PERSISTENT_MAX_TOKENS = 32
+_COMPACT_DECOMPOSED_PLAN = replace(
+    select_sm70_quantized_moe_route(batched_enabled=True, num_tokens=1, total_slots=1),
+    zero_output_before_reduce=True,
+)
 
 
 def _log_runtime_route_once(message: str, *args) -> None:
@@ -663,41 +669,16 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
                 buffers["inv_permuted_idx"],
                 layer.sm70_num_experts,
             )
-            sm70_ops.fp8_moe_gemm_sm70_out(
-                buffers["gate_up"],
-                buffers["permuted_input"],
-                buffers["expert_offsets"],
-                layer.w13_strided_ptrs_w,
-                layer.w13_strided_ptrs_s,
-                layer.sm70_num_experts,
-                layer.sm70_w13_k_dim,
-                layer.sm70_w13_n_dim,
-                self.group_size,
-                False,
-            )
-            torch.ops._C.silu_and_mul(buffers["intermediate"], buffers["gate_up"])
-            sm70_ops.fp8_moe_gemm_sm70_out(
-                buffers["sorted_output"],
-                buffers["intermediate"],
-                buffers["expert_offsets"],
-                layer.w2_strided_ptrs_w,
-                layer.w2_strided_ptrs_s,
-                layer.sm70_num_experts,
-                layer.sm70_w2_k_dim,
-                layer.sm70_w2_n_dim,
-                self.group_size,
-                False,
-            )
-            output.zero_()
-            torch.ops._moe_C.moe_unpermute(
-                buffers["sorted_output"],
+            return execute_routed(
+                self.weight_codec,
+                _COMPACT_DECOMPOSED_PLAN,
+                layer,
+                buffers,
+                x,
                 topk_weights,
-                buffers["inv_permuted_idx"],
-                buffers["expert_offsets64"],
-                top_k,
-                output,
+                self.group_size,
+                layer._fp8_buf_dense_expert_ids,
             )
-            return output
         sm70_ops.fp8_moe_single_token_sm70_out(
             output,
             x,

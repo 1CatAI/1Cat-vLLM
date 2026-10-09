@@ -65,10 +65,16 @@ MOE_NAMES = {
 
 
 def moe_policy_reads(path: Path, tree: ast.AST) -> list[str]:
-    # Extend this boundary when the remaining format adapters are migrated.
     if not (
         "/fused_moe/sm70/" in path.as_posix()
-        or path.name in {"awq_sm70_moe.py", "fp8_sm70_moe.py"}
+        or path.name
+        in {
+            "awq_sm70_moe.py",
+            "fp8_sm70_moe.py",
+            "nvfp4_sm70_moe.py",
+            "mxfp4_sm70_moe.py",
+            "awq_qpn_sm70.py",
+        }
     ):
         return []
     errors = []

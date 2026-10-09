@@ -22,6 +22,7 @@ from vllm.model_executor.kernels.gguf import (
     select_lattice_grouped_capability,
     small_grouped_vector_capabilities,
 )
+from vllm.model_executor.layers.fused_moe.sm70.reduction import weighted_reduce_rows
 from vllm.model_executor.layers.fused_moe.sm70_small_routing import (
     SM70_SMALL_ROUTING,
 )
@@ -835,4 +836,4 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
         restored = down[order.argsort()].view(tokens, top_k, self.hidden_size)
         if mask is not None:
             restored = torch.where(mask[..., None], restored, 0)
-        return (restored.float() * topk_weights[..., None].float()).sum(1).to(x.dtype)
+        return weighted_reduce_rows(restored, topk_weights, x.dtype)

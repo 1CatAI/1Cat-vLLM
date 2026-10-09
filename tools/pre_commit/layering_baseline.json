@@ -258,7 +258,7 @@
   "platform": 25
  },
  "vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py": {
-  "env": 2
+  "env": 1
  },
  "vllm/model_executor/layers/quantization/utils/marlin_utils.py": {
   "platform": 4
