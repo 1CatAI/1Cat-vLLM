@@ -1143,9 +1143,17 @@ class VllmConfig:
         self.parallel_config.set_dcp_defaults()
 
         if self.kernel_config.resolve_attention_history(self):
+            policy = self.kernel_config
             logger.info_once(
-                "QSA host KV enabled: per-vector E4M3 history, bounded device "
-                "hot pages and FP16 staging; active recurrent states stay on GPU."
+                "QSA history KV enabled: target %s / draft %s history in %s, "
+                "%d device hot tokens per layer and FP16 staging; active "
+                "recurrent states stay on GPU.",
+                policy.qsa_host_kv_dtype,
+                policy.qsa_host_kv_draft_dtype,
+                "device memory"
+                if policy.qsa_host_kv_device_reference
+                else "pinned host memory",
+                policy.qsa_host_kv_hot_tokens,
             )
 
         from vllm.model_executor.models.config import (
