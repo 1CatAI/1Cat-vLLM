@@ -10,10 +10,10 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm.config.sm70_dflash2 import (
     sm70_dflash2_enabled,
 )
+from vllm.diagnostics import write_payload
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.sample.ops.topk_topp_triton import sort_topk_with_vocab_ties
@@ -39,8 +39,6 @@ logger = init_logger(__name__)
 
 _TARGET_TOP_K = 20
 _TARGET_PROBE_K = 64
-_SELECTOR_ALIGNMENT_DUMP_COUNT = 0
-_SELECTOR_ALIGNMENT_STEP = 0
 
 
 @triton.jit
@@ -247,29 +245,13 @@ def _sample_reference_requests(
 
 
 def _parse_alignment_steps(raw_steps: str | None) -> set[int] | None:
-    if not raw_steps:
-        return None
-    steps: set[int] = set()
+    from vllm.config.diagnostic_dump import parse_int_filter
+
     try:
-        for item in raw_steps.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            if "-" in item:
-                start_text, end_text = item.split("-", 1)
-                start = int(start_text)
-                end = int(end_text)
-                if start < 0 or end < start:
-                    return set()
-                steps.update(range(start, end + 1))
-            else:
-                step = int(item)
-                if step < 0:
-                    return set()
-                steps.add(step)
+        result = parse_int_filter(raw_steps, strict=True)
     except ValueError:
         return set()
-    return steps
+    return None if result is None else set(result)
 
 
 def _safe_dump_tag(raw_tag: str) -> str:
@@ -299,17 +281,19 @@ def _maybe_dump_selector_alignment(
     num_sampled: torch.Tensor,
 ) -> None:
     """Dump one exact B1 selector/target alignment record when requested."""
-    if not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+    if not speculator._trace.value("alignment"):
         return
     if _diagnostic_rank() != 0:
         return
 
-    global _SELECTOR_ALIGNMENT_DUMP_COUNT, _SELECTOR_ALIGNMENT_STEP
-    _SELECTOR_ALIGNMENT_STEP += 1
-    if _SELECTOR_ALIGNMENT_DUMP_COUNT >= envs.VLLM_SPEC_DUMP_ALIGNMENT_LIMIT:
+    counts = speculator._diagnostics.counters
+    step = counts.get("selector_alignment_steps", 0) + 1
+    counts["selector_alignment_steps"] = step
+    saved = counts.get("selector_alignment_dumps", 0)
+    if saved >= speculator._trace.value("alignment_limit"):
         return
-    selected_steps = _parse_alignment_steps(envs.VLLM_SPEC_DUMP_ALIGNMENT_STEPS)
-    if selected_steps is not None and _SELECTOR_ALIGNMENT_STEP not in selected_steps:
+    selected_steps = speculator._trace.selected_steps
+    if selected_steps is not None and step not in selected_steps:
         return
 
     shadow = speculator.get_selector_alignment_shadow()
@@ -327,7 +311,7 @@ def _maybe_dump_selector_alignment(
         payload = {
             "format": "dflash2_selector_alignment_v1",
             "rank": _diagnostic_rank(),
-            "step": _SELECTOR_ALIGNMENT_STEP,
+            "step": step,
             "request_state": req_state,
             "selector_top_k": speculator.selector_top_k,
             "num_speculative_steps": speculator.num_speculative_steps,
@@ -352,18 +336,19 @@ def _maybe_dump_selector_alignment(
             "sampled_token_ids": sampled.detach().cpu(),
             "num_sampled": num_sampled.detach().cpu(),
         }
-        _SELECTOR_ALIGNMENT_DUMP_COUNT += 1
-        dump_dir = os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_DIR", "/tmp")
-        os.makedirs(dump_dir, exist_ok=True)
-        tag = _safe_dump_tag(os.getenv("VLLM_SPEC_DUMP_ALIGNMENT_TAG", ""))
+        saved += 1
+        counts["selector_alignment_dumps"] = saved
+        dump_dir = speculator._trace.alignment_directory
+        tag = speculator._trace.safe_tag
         tag_part = f"{tag}_" if tag else ""
-        dump_path = os.path.join(
+        dump_path = write_payload(
             dump_dir,
             f"spec_alignment_dflash2_selector_{tag_part}pid{os.getpid()}_"
-            f"step{_SELECTOR_ALIGNMENT_STEP:06d}_"
-            f"{_SELECTOR_ALIGNMENT_DUMP_COUNT}.pt",
+            f"step{step:06d}_"
+            f"{saved}.pt",
+            payload,
+            speculator._diagnostics.engine_tag,
         )
-        torch.save(payload, dump_path)
         logger.warning("Dumped DFlash2 selector alignment diagnostics to %s", dump_path)
 
 
@@ -438,7 +423,7 @@ def try_dflash2_sparse_target_rejection(
     sparse_draft_logits = speculator.get_sparse_draft_logits()
     if sparse_draft_logits is None:
         return None
-    if allow_graph and not envs.VLLM_SPEC_DUMP_ALIGNMENT:
+    if allow_graph and not speculator._trace.value("alignment"):
         from .sampler_graph import try_graph_rejection
 
         result = try_graph_rejection(
@@ -551,7 +536,7 @@ def try_dflash2_sparse_target_rejection(
         )
         sampled.index_copy_(0, reqs, dense_sampled)
         num_sampled.index_copy_(0, reqs, dense_num_sampled)
-    if envs.VLLM_SPEC_DUMP_ALIGNMENT:
+    if speculator._trace.value("alignment"):
         _maybe_dump_selector_alignment(
             speculator=speculator,
             rejection_sampler=rejection_sampler,

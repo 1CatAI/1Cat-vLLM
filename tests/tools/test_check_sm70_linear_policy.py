@@ -70,3 +70,18 @@ def test_runtime_consumers_cannot_bypass_resolved_engine_policy(tmp_path):
         assert len(violations(path)) == 1
     path.write_text('label = "VLLM_USE_AOT_COMPILE"\nchoice = policy.aot_compile\n')
     assert not violations(path)
+
+
+def test_diagnostics_cannot_reparse_initialized_filters(tmp_path):
+    path = tmp_path / "vllm" / "new_diagnostics.py"
+    path.parent.mkdir()
+    for expression in (
+        'os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_DIR")',
+        "envs.VLLM_SPEC_DUMP_ALIGNMENT",
+        "envs.VLLM_DFLASH_PROFILE",
+        'os.environ["VLLM_SM70_DUMP_AWQ_MOE_LABELS"]',
+    ):
+        path.write_text(f"value = {expression}\n")
+        assert violations(path)
+    path.write_text('value = diagnostics.channels["gdn_graph"].policy.directory\n')
+    assert not violations(path)

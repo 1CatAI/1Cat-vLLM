@@ -36,6 +36,13 @@
  "vllm/config/compilation.py": {
   "model": 3
  },
+ "vllm/config/diagnostic_dump.py": {
+  "platform": 57
+ },
+ "vllm/config/diagnostic_sampling.py": {
+  "env": 2,
+  "platform": 7
+ },
  "vllm/config/execution_policy.py": {
   "model": 19,
   "platform": 105
@@ -63,7 +70,7 @@
   "platform": 1
  },
  "vllm/config/policy_defaults.py": {
-  "model": 18,
+  "model": 19,
   "platform": 36
  },
  "vllm/config/speculative.py": {
@@ -76,7 +83,10 @@
  "vllm/config/vllm.py": {
   "env": 2,
   "model": 80,
-  "platform": 70
+  "platform": 71
+ },
+ "vllm/diagnostics.py": {
+  "platform": 1
  },
  "vllm/distributed/communication_op.py": {
   "platform": 6
@@ -212,9 +222,8 @@
   "platform": 5
  },
  "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": {
-  "env": 9,
   "model": 3,
-  "platform": 59
+  "platform": 41
  },
  "vllm/model_executor/layers/fused_moe/runner/shared_experts.py": {
   "platform": 1
@@ -236,9 +245,9 @@
   "platform": 23
  },
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
-  "env": 44,
+  "env": 14,
   "model": 236,
-  "platform": 513
+  "platform": 445
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -333,9 +342,6 @@
  },
  "vllm/model_executor/models/qwen3_5_mtp.py": {
   "env": 2
- },
- "vllm/model_executor/models/qwen3_next.py": {
-  "env": 14
  },
  "vllm/model_executor/warmup/kernel_warmup.py": {
   "platform": 3
@@ -500,12 +506,11 @@
   "platform": 7
  },
  "vllm/v1/sample/rejection_sampler.py": {
-  "env": 6,
-  "platform": 4
+  "env": 2,
+  "platform": 2
  },
  "vllm/v1/sample/sampler.py": {
-  "env": 3,
-  "platform": 48
+  "platform": 39
  },
  "vllm/v1/spec_decode/ddtree_payload.py": {
   "env": 2
@@ -524,8 +529,8 @@
  },
  "vllm/v1/spec_decode/llm_base_proposer.py": {
   "env": 1,
-  "model": 43,
-  "platform": 35
+  "model": 40,
+  "platform": 36
  },
  "vllm/v1/spec_decode/profiling.py": {
   "model": 4,
@@ -570,9 +575,6 @@
  "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py": {
   "env": 3
  },
- "vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py": {
-  "env": 2
- },
  "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py": {
   "model": 6
  },
@@ -596,9 +598,9 @@
   "platform": 1
  },
  "vllm/v1/worker/gpu_model_runner.py": {
-  "env": 41,
+  "env": 18,
   "model": 669,
-  "platform": 235
+  "platform": 169
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 1,

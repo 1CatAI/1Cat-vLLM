@@ -102,6 +102,28 @@ for _node in ast.parse((_CONFIG_ROOT / "policy_defaults.py").read_text()).body:
         RUNTIME_NAMES.update(ast.literal_eval(_node.value))
 
 
+# Read the canonical diagnostic declarations statically, never invoke getters.
+for _name in ("diagnostic_dump.py", "diagnostic_sampling.py"):
+    RUNTIME_NAMES.update(
+        node.value
+        for node in ast.walk(ast.parse((_CONFIG_ROOT / _name).read_text()))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.startswith("VLLM_")
+        and node.value.isidentifier()
+    )
+for _class in ast.parse(_POLICY.read_text()).body:
+    if isinstance(_class, ast.ClassDef) and _class.name == "DFlashDiagnosticsConfig":
+        RUNTIME_NAMES.update(
+            node.value
+            for node in ast.walk(_class)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("VLLM_")
+            and node.value.isidentifier()
+        )
+
+
 def runtime_policy_reads(path: Path, tree: ast.AST) -> list[str]:
     """Ordered defaults can reference aliases; execution cannot read their envs."""
     if path.as_posix().startswith("vllm/config/"):

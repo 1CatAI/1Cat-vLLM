@@ -10,6 +10,9 @@ from typing import ClassVar
 import torch
 from pydantic import Field
 
+from vllm.config.diagnostic_dump import TensorDiagnosticsConfig
+from vllm.config.diagnostic_sampling import SamplingDiagnosticsConfig
+from vllm.config.sm70_dflash2 import DFlashDiagnosticsConfig
 from vllm.config.utils import config
 
 
@@ -114,7 +117,22 @@ def capture_runtime_config() -> Sm70RuntimeConfig:
 class RuntimeTraceConfig:
     """Captured runner diagnostics; never part of compiled computation."""
 
+    dflash: DFlashDiagnosticsConfig = Field(default_factory=DFlashDiagnosticsConfig)
+    """Family-specific trace inputs; qualification belongs to its adapter."""
+
+    sampling: SamplingDiagnosticsConfig = Field(
+        default_factory=SamplingDiagnosticsConfig
+    )
+    """Sampler and proposer diagnostic policy, independent of RNG policy."""
+
+    dumps: TensorDiagnosticsConfig = Field(default_factory=TensorDiagnosticsConfig)
+    """Shared tensor-diagnostic policy; mutable observations are engine-owned."""
+
     layer_aliases: ClassVar[dict[str, str]] = {
+        "gdn_route_debug": "VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG",
+        "gdn_mixed_compare": "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE",
+        "sync_before_compile": "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD",
+        "spec_target_nvtx": "VLLM_SM70_SPEC_TARGET_FORWARD_NVTX",
         "tp_allreduce": "VLLM_TP_ALLREDUCE_TRACE",
         "dense_debug": "VLLM_SM70_F16_DENSE_DEBUG",
         "qwen_next_trace": "VLLM_QWEN3_NEXT_SM70_TRACE",
@@ -122,6 +140,15 @@ class RuntimeTraceConfig:
         "profile_trace": "VLLM_SM70_PROFILE_TRACE",
         "greedy_token_trace": "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE",
     }
+
+    gdn_route_debug: bool | None = None
+    """Bounded GDN decode-admission reports."""
+    gdn_mixed_compare: bool | None = None
+    """Retain fused mixed-QKV comparison observations."""
+    sync_before_compile: bool | None = None
+    """Existing opt-in synchronization before graph forwarding."""
+    spec_target_nvtx: bool | None = None
+    """Existing speculative target-forward NVTX diagnostic."""
 
     tp_allreduce: bool | None = None
     """Explain each collective route once per owning communicator or layer."""
@@ -149,8 +176,38 @@ class RuntimeTraceConfig:
     sources: dict[str, str] = Field(default_factory=dict, init=False)
     """Source of each initialized diagnostic option."""
 
+    errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Deferred parse errors from model-qualified diagnostic inputs."""
+
+    def value(self, field: str):
+        if field in self.errors:
+            raise ValueError(self.errors[field])
+        return getattr(self, field)
+
     def __post_init__(self) -> None:
+        if self.sources:
+            return
         from vllm import envs
+
+        def read_flag(name):
+            try:
+                value = envs.environment_variables[name]()
+            except ValueError as exc:
+                field = next(
+                    (
+                        field
+                        for field in ("gdn_route_debug", "gdn_mixed_compare")
+                        if self.layer_aliases[field] == name
+                    ),
+                    None,
+                )
+                if field is None:
+                    raise
+                self.errors[field] = str(exc)
+                return False
+            return (
+                value == "1" if name == "VLLM_SM70_SPEC_TARGET_FORWARD_NVTX" else value
+            )
 
         resolve_legacy_fields(
             self,
@@ -159,6 +216,7 @@ class RuntimeTraceConfig:
                 **self.layer_aliases,
                 "events": "VLLM_SM70_DECODE_EVENT_TRACE",
             },
+            reader=read_flag,
         )
         # Disabled legacy diagnostics never parsed their numeric options.
         # Retain valid captured values, but do not reject an unused malformed

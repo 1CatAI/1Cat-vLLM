@@ -387,6 +387,14 @@ class SpeculativeConfig:
         )
         self.sm70_dflash2.resolve_lookup(self)
 
+    diagnostic_confidence_logits: bool = Field(default=False, init=False)
+    """Bound extra confidence output contract; only affects DSpark compilation."""
+
+    def bind_diagnostic_output(self, alignment: bool | None) -> None:
+        self.diagnostic_confidence_logits = self.method == "dspark" and bool(
+            self.dspark_confidence_threshold > 0.0 or alignment
+        )
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -402,6 +410,10 @@ class SpeculativeConfig:
         factors: list[Any] = [
             ("use_local_argmax_reduction", self.use_local_argmax_reduction)
         ]
+        if self.method == "dspark":
+            factors.append(
+                ("diagnostic_confidence_logits", self.diagnostic_confidence_logits)
+            )
         if self.sm70_dflash2.resolved and (
             self.use_dflash_family() or self.sm70_dflash2.explicit_fields
         ):

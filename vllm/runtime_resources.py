@@ -28,6 +28,10 @@ def runtime_resources_for(config) -> dict[str, Any]:
             ),
         }
         config._runtime_resources = resources
+        if resources["runtime_trace"] is not None:
+            from vllm.diagnostics import EngineDiagnostics
+
+            resources["diagnostics"] = EngineDiagnostics(resources["runtime_trace"])
     return resources
 
 

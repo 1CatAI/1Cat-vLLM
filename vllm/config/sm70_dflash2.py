@@ -364,3 +364,73 @@ def resolved_sm70_dflash2_config():
         policy = Sm70DFlash2Config()
         policy.resolve(qualified=False)
     return policy
+
+
+@config
+class DFlashDiagnosticsConfig(ExecutionPolicy):
+    corruption: bool | None = None
+    """Existing family-specific corruption diagnostic admission."""
+    draft_logits: bool | None = None
+    """Existing family-specific draft-logit dumps."""
+    profile: bool | None = None
+    """Existing lookup timing observation points."""
+    interval: int | None = None
+    """Existing lookup timing log interval."""
+
+    errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Captured parse failures; unused family controls retain short-circuiting."""
+
+    aliases: ClassVar[dict[str, str]] = {
+        "corruption": "VLLM_DFLASH_DEBUG_CORRUPTION",
+        "draft_logits": "VLLM_DFLASH_DUMP_DRAFT_LOGITS",
+        "profile": "VLLM_DFLASH_PROFILE",
+        "interval": "VLLM_DFLASH_PROFILE_LOG_INTERVAL",
+    }
+
+    def __post_init__(self) -> None:
+        from vllm.config.sm70_runtime import resolve_legacy_fields
+
+        pending = {
+            field: alias
+            for field, alias in self.aliases.items()
+            if field not in self.sources
+        }
+
+        def read(name):
+            try:
+                return envs.environment_variables[name]()
+            except ValueError as exc:
+                field = next(
+                    field for field, alias in self.aliases.items() if alias == name
+                )
+                self.errors[field] = str(exc)
+                return 32 if field == "interval" else False
+
+        resolve_legacy_fields(self, pending, reader=read)
+
+    def value(self, field: str):
+        if field in self.errors:
+            raise ValueError(self.errors[field])
+        return getattr(self, field)
+
+
+def proposer_diagnostic_flag(method: str, field: str, trace=None) -> bool:
+    """Retain family-before-generic precedence and its short-circuit parser."""
+    family = method in ("dflash", "dflash_ddtree", "dspark")
+    if trace is None:
+        from vllm.config.diagnostic_sampling import SamplingDiagnosticsConfig
+
+        return bool(
+            family
+            and envs.environment_variables[DFlashDiagnosticsConfig.aliases[field]]()
+            or envs.environment_variables[SamplingDiagnosticsConfig.aliases[field]]()
+        )
+    return bool(family and trace.dflash.value(field) or trace.sampling.value(field))
+
+
+def proposer_diagnostic_flags(method: str, trace) -> tuple[bool, bool]:
+    """Bind the historical family qualification once at proposer initialization."""
+    return (
+        proposer_diagnostic_flag(method, "corruption", trace),
+        proposer_diagnostic_flag(method, "draft_logits", trace),
+    )
