@@ -489,6 +489,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
 
   ops.def(
+      "fp8_gemm_sm70_fp32_head_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, int k_ld, int q_ld) -> ()");
+  ops.impl("fp8_gemm_sm70_fp32_head_out", torch::kCUDA,
+           &fp8_gemm_sm70_fp32_head_out);
+
+  ops.def(
       "sm70_dflash2_fp16_m8_out(Tensor(a!) output, Tensor input, Tensor "
       "packed, int tile, int warps) -> ()");
   ops.impl("sm70_dflash2_fp16_m8_out", torch::kCUDA, &sm70_dflash2_fp16_m8_out);

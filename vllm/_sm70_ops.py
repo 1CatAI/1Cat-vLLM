@@ -811,6 +811,20 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_out"):
         return None
 
 
+if hasattr(torch.ops._C, "fp8_gemm_sm70_fp32_head_out"):
+
+    @register_fake("_C::fp8_gemm_sm70_fp32_head_out")
+    def _fp8_gemm_sm70_fp32_head_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        scales: torch.Tensor,
+        k_ld: int,
+        q_ld: int,
+    ) -> None:
+        return None
+
+
 def fp8_gemm_sm70_prefill_prescaled_out(
     out: torch.Tensor,
     input: torch.Tensor,

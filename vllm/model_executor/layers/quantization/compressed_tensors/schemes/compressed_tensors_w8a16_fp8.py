@@ -9,9 +9,10 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationStrate
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
+    sm70_dflash2_enabled,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -513,6 +514,16 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             layer.input_scale = None
             layer.sm70_fp8_turbomind = True
             layer.sm70_fp8_channel_scale = True
+            head_config = get_current_vllm_config_or_none()
+            layer.sm70_fp8_fp32_head = (
+                getattr(layer, "prefix", "").rsplit(".", 1)[-1] == "lm_head"
+                and tuple(layer.weight.shape) == (5120, 62080)
+                and (head_config is None or head_config.lora_config is None)
+                and hasattr(torch.ops._C, "fp8_gemm_sm70_fp32_head_out")
+                and sm70_dflash2_enabled("fp32_logits", capture_sm70_dflash2_config())
+            )
+            if layer.sm70_fp8_fp32_head:
+                logger.info_once("SM70 channel-FP8 LM head uses FP32 logits at M1..32.")
             layer.register_buffer("sm70_fp8_meta", meta, persistent=False)
             layer.sm70_fp8_k_ld = int(meta[0].item())
             layer.sm70_fp8_q_ld = int(meta[1].item())
@@ -565,10 +576,16 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
             x_2d = x.reshape(-1, x.shape[-1])
             if x_2d.stride(-1) != 1:
                 x_2d = x_2d.contiguous()
+            fp32_head = (
+                getattr(layer, "sm70_fp8_fp32_head", False)
+                and bias is None
+                and (output is None or output.dtype == torch.float32)
+                and 1 <= x_2d.shape[0] <= 32
+            )
             if output is not None:
                 if (
                     output.shape != out_shape
-                    or output.dtype != x.dtype
+                    or output.dtype != (torch.float32 if fp32_head else x.dtype)
                     or output.device != x.device
                     or not output.is_contiguous()
                 ):
@@ -578,11 +595,20 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 out_2d = torch.empty(
                     (x_2d.shape[0], layer.output_size_per_partition),
                     device=x.device,
-                    dtype=x.dtype,
+                    dtype=torch.float32 if fp32_head else x.dtype,
                 )
             if x_2d.shape[0] == 0:
                 return out_2d.reshape(out_shape)
-            if getattr(layer, "sm70_fp8_qpn8", False):
+            if fp32_head:
+                torch.ops._C.fp8_gemm_sm70_fp32_head_out(
+                    out_2d,
+                    x_2d,
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    layer.sm70_fp8_k_ld,
+                    layer.sm70_fp8_q_ld,
+                )
+            elif getattr(layer, "sm70_fp8_qpn8", False):
                 if getattr(layer, "sm70_fp8_batch_tm", False):
                     torch.ops.vllm.sm70_ct_fp8_qpn8_batch_dispatch(
                         out_2d,
