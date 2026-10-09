@@ -2,6 +2,26 @@
 
 Date: 2026-05-30
 
+## Full-mesh HCX local schedule, 2026-10-09
+
+The Flash-Next TP4 HCX screen retains two changes: defer up-weight prefetch
+until combine completes and distribute the eight gate-mix accumulator slots
+across warps. The arithmetic order is unchanged. The M5 installed-wheel comparison
+is 23.710 to 21.131 µs per complete boundary; M1 is 18.723 to 16.332 µs.
+These are boundary measurements with actual weights and synthetic activations,
+not model round latency. Installed-artifact and model results are tracked in
+[the local schedule report](flashnext_hcx_local_schedule.md).
+The first fresh-process model comparison fails the teacher-distribution gate;
+model promotion is pending the same-process quality localization. Boundary
+speed and model acceptance are separate results.
+
+Do not repeat the K-shard implementations as presumed wins: a centralized
+receiver takes 77–82 µs; distributed receivers take 44–48 µs versus a 23.7-µs
+control, including delivery of the complete residual state. Last-arrival norm
+reduction, grouped partial layouts and a smaller barrier arrival set also
+failed to produce an additional gain. The CTA-local norm cache helps slightly
+alone but loses when combined with the retained schedule, so it is omitted.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:
