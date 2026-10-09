@@ -203,7 +203,8 @@ def test_frozen_single_token_calls(
         strict=strict,
     )
     codec = weight_codec.Sm70MoEWeightCodec(
-        family.upper(), SimpleNamespace(info_once=lambda *args: None)
+        family.upper(),
+        SimpleNamespace(name="sm70-test", info_once=lambda *args, **kwargs: None),
     )
     actual = single_token.execute_single_token(
         codec,
@@ -269,3 +270,25 @@ def test_diagnostics_and_engine_isolation(monkeypatch):
     assert first.sm70_moe.awq.batched and not second.sm70_moe.awq.batched
     assert first.compute_hash() != second.compute_hash()
     assert dict(os.environ) == environment
+
+
+def test_stage_logs_keep_scope_and_arguments_without_repeated_rank_lookup(monkeypatch):
+    from vllm import logger as logging
+
+    messages = []
+    scope = False
+    logger = logging.init_logger("test.sm70.stage.once")
+    monkeypatch.setattr(logging, "_should_log_with_scope", lambda value: scope)
+    monkeypatch.setattr(logger, "info", lambda *args, **kwargs: messages.append(args))
+    monkeypatch.setattr(logging, "_log_once_keys", set())
+    codec = weight_codec.Sm70MoEWeightCodec("FP8", logger)
+    codec.log("route %d", 1)
+    assert not messages
+    scope = True
+    codec.log("route %d", 1)
+    codec.log("route %d", 1)
+    codec.log("route %d", 2)
+    assert messages == [("SM70 FP8 route %d", 1), ("SM70 FP8 route %d", 2)]
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    codec.log("route %d", 3)
+    assert len(messages) == 2

@@ -134,6 +134,24 @@ def bind_prepared_provider(state: Any) -> PreparedLinearProvider:
     )
 
 
+def flatten_linear_input(x: torch.Tensor, features: int | None = None) -> torch.Tensor:
+    """Keep existing matrix views; flatten only additional batch dimensions."""
+    features = x.shape[-1] if features is None else features
+    # Keep reshape's existing error for an ambiguous zero-width input.
+    if x.ndim == 2 and features != 0 and x.shape[-1] == features:
+        return x
+    return x.reshape(-1, features)
+
+
+def restore_linear_output(
+    output: torch.Tensor, x: torch.Tensor, features: int | None = None
+) -> torch.Tensor:
+    features = output.shape[-1] if features is None else features
+    if x.ndim == 2 and output.shape == (x.shape[0], features):
+        return output
+    return output.reshape(*x.shape[:-1], features)
+
+
 def apply_prepared(state, x, bias, prefix, *, gated=False):
     """Shared flatten, dispatch, crop, layout restoration, bias and reshape."""
     provider = state.provider
@@ -147,7 +165,7 @@ def apply_prepared(state, x, bias, prefix, *, gated=False):
             )
     elif provider.activation_error and x.dtype != torch.float16:
         raise RuntimeError(provider.activation_error.format(dtype=x.dtype))
-    x_2d = x.reshape(-1, x.shape[-1])
+    x_2d = flatten_linear_input(x)
     if (gated or provider.contiguous_input) and x_2d.stride(-1) != 1:
         x_2d = x_2d.contiguous()
     logical_n = state.output_size // 2 if gated else state.output_size
@@ -155,7 +173,7 @@ def apply_prepared(state, x, bias, prefix, *, gated=False):
     physical_n = logical_n if gated else (state.padded_output_size or logical_n)
     out = torch.empty((x_2d.shape[0], physical_n), dtype=x.dtype, device=x.device)
     if gated and x_2d.shape[0] == 0:
-        return out.reshape(*x.shape[:-1], logical_n)
+        return restore_linear_output(out, x, logical_n)
     run = provider.fused if gated else provider.run
     out = run(state, x_2d, out, prefix, gated=gated)
     if physical_n != logical_n:
@@ -168,4 +186,4 @@ def apply_prepared(state, x, bias, prefix, *, gated=False):
         )
     if bias is not None:
         out.add_(bias)
-    return out.reshape(*x.shape[:-1], logical_n)
+    return restore_linear_output(out, x, logical_n)

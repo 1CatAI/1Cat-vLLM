@@ -121,7 +121,7 @@ The operator A/B harness records actual public native calls, bit-exact outputs,
 prepared banks, eager/graph replay and alternating graph-event timings.
 The final validation record is maintained in the migration control document.
 
-## Remaining delivery boundaries
+## Delivery boundaries
 
 Delivery 2 implements the FP4 Python stage migration and GGUF/skinny reusable
 reduction. Delivery 3 owns linear dispatch/QPN/native module ownership, the
@@ -148,8 +148,8 @@ prefill, GLM's exact reduction tree and ordered Triton/native reductions.
 
 `NvFp4MoEWorkspace` and `MxFp4MoEWorkspace` own allocation/view/overflow rules.
 Their original layer attributes remain the storage owners; the codec borrows
-views, so rebinding remains visible. Raw-scale storage still uses the original
-per-device shared expansion workspace and rejects microbatching before allocation.
+views, so rebinding remains visible. Raw-scale storage retains its shared expansion contract and rejects
+microbatching before allocation; delivery 3 gives each engine its own pool.
 MXFP4 retains its separate immutable direct-order offsets after M2..8 compaction.
 No new persistent weight copy or global pointer registry is introduced.
 
@@ -241,8 +241,8 @@ parent/native requests for the same parameter must agree. Unsupported native
 fields for a loaded format fail clearly. Null legacy values retain each C++
 consumer's original default, including differences from Python getter defaults.
 
-The packaged `_C` and `_moe_C` operators accept an optional policy vector.
-Prepared bindings capture it once; numerical execution performs no environment
+The packaged `_C` and `_moe_C` operators accept an optional policy token.
+Prepared bindings capture its values once; numerical execution performs no environment
 reads. The native launch scope selects the existing kernels, without changing
 CUDA arithmetic. Direct legacy native callers capture their environment on
 first use. Existing research-library imports retain their original opt-in and
@@ -350,3 +350,12 @@ two conflicting explicit routing policies in one process. Native kernel traces
 distinguish the actual fast and generic launches; changed-input/route replay
 and alternating owners check isolation. These are operator checks, not model
 decode or TTFT measurements.
+
+The common linear I/O helpers keep already two-dimensional tensor views,
+including noncontiguous and cropped layouts. Additional batch dimensions still
+use the original reshape. Persistent MoE buffer reads resolve directly on the
+layer without another attribute-proxy hop; no view/address cache or new tensor
+lifetime is introduced. Stage messages use the existing keyed log-once facility
+to skip repeated distributed-rank queries after their first accepted event.
+Message text, argument distinctions and rank scope remain intact; execution
+traces and route counters are independent of these informational messages.

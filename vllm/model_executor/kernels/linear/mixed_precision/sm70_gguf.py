@@ -10,6 +10,10 @@ import torch
 from vllm._sm70.policy import NativeBindings
 from vllm.config.sm70_native import capture_linear_native_config
 from vllm.model_executor.kernels.gguf import GGUFDecoderFamily, GGUFOperatorCapability
+from vllm.model_executor.kernels.linear.sm70_provider import (
+    flatten_linear_input,
+    restore_linear_output,
+)
 from vllm.model_executor.layers.quantization.gguf_transcode import (
     AFFINE_BITPLANE_TYPES,
     AFFINE_GROUP32_TYPES,
@@ -172,7 +176,7 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
         if not self.capability.supports_m(x.numel() // x.shape[-1]):
             raise ValueError("M outside the GGUF affine operator capability")
         n = self.config.partition_weight_shape[1]
-        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        rows = flatten_linear_input(x).contiguous()
         output = torch.empty((rows.shape[0], n), dtype=x.dtype, device=x.device)
         if (
             self.prefill_capability.reason is None
@@ -200,4 +204,4 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
             )
         if bias is not None:
             output.add_(bias)
-        return output.reshape(*x.shape[:-1], n)
+        return restore_linear_output(output, x, n)

@@ -8,7 +8,7 @@ from typing import Any, Literal
 import torch
 
 from vllm import _sm70_ops as ops
-from vllm.logger import _VllmLogger
+from vllm.logger import _VllmLogger, log_once_seen
 from vllm.model_executor.layers.fused_moe.sm70.declarations import native_binding
 
 
@@ -68,4 +68,8 @@ class Sm70MoEWeightCodec:
 
     def log(self, message: str, *args: Any) -> None:
         if not self.diagnostic and not torch.compiler.is_compiling():
-            self.logger.info_once("SM70 " + self.name + " " + message, *args)
+            key = ("sm70_moe_stage", self.logger.name, self.name, message, args)
+            if not log_once_seen(key):
+                self.logger.info_once(
+                    "SM70 " + self.name + " " + message, *args, key=key
+                )

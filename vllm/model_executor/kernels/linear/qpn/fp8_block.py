@@ -33,6 +33,10 @@ from vllm.model_executor.kernels.linear.qpn.fp8 import (
 from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.sm70_provider import (
+    flatten_linear_input,
+    restore_linear_output,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
 )
@@ -287,7 +291,7 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         codes = layer._sm70_block_fp8_qpn8_packed_codes
         split_k, accumulator_chains, prefetch_codes = layer._qpn8_cfg
         y = torch.ops.sm70_fp8.qpn8_native_linear(
-            x.reshape(-1, codes.shape[0]).contiguous(),
+            flatten_linear_input(x, codes.shape[0]).contiguous(),
             codes,
             layer._sm70_block_fp8_qpn8_packed_scales,
             split_k,
@@ -301,4 +305,4 @@ class QPN8Fp8BlockScaledMMLinearKernel(TurboMindFp8LinearKernel):
         )
         if bias is not None:
             y = y + bias
-        return y.reshape(x.shape[:-1] + (layer._qpn8_out_features,))
+        return restore_linear_output(y, x, layer._qpn8_out_features)

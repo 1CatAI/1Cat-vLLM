@@ -125,3 +125,36 @@ def test_fused_empty_input_does_not_launch_and_dtype_error_is_retained():
         apply_prepared(
             state, torch.ones(1, 4, dtype=torch.float32), None, "layer", gated=True
         )
+
+
+@pytest.mark.parametrize("shape", [(8,), (0, 8), (3, 8), (2, 3, 8)])
+def test_shared_linear_views_preserve_strides_and_output_shape(shape):
+    from vllm.model_executor.kernels.linear.sm70_provider import (
+        flatten_linear_input,
+        restore_linear_output,
+    )
+
+    x = torch.empty((*shape[:-1], shape[-1] * 2))[..., ::2]
+    rows = flatten_linear_input(x)
+    original = x.reshape(-1, x.shape[-1])
+    assert rows.shape == original.shape
+    assert rows.stride() == original.stride()
+    assert rows.untyped_storage()._cdata == original.untyped_storage()._cdata
+    output = torch.arange(rows.shape[0] * 10).reshape(rows.shape[0], 10)[:, :6]
+    restored = restore_linear_output(output, x)
+    assert torch.equal(restored, output.reshape(*x.shape[:-1], 6))
+    assert restored.stride() == output.reshape(*x.shape[:-1], 6).stride()
+
+
+def test_shared_linear_views_preserve_explicit_width_and_zero_width_error():
+    from vllm.model_executor.kernels.linear.sm70_provider import (
+        flatten_linear_input,
+        restore_linear_output,
+    )
+
+    x = torch.arange(16).reshape(2, 8)
+    assert torch.equal(flatten_linear_input(x, 4), x.reshape(-1, 4))
+    with pytest.raises(RuntimeError, match="shape"):
+        restore_linear_output(x, x, 4)
+    with pytest.raises(RuntimeError, match="ambiguous"):
+        flatten_linear_input(torch.empty(2, 0))

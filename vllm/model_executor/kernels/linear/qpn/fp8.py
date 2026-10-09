@@ -17,6 +17,10 @@ from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
     FP8ScaledMMLinearLayerConfig,
     ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.sm70_provider import (
+    flatten_linear_input,
+    restore_linear_output,
+)
 from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_weight_block_strategy,
@@ -962,8 +966,7 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                     out.add_(bias.view(group_count, output_size))
                 return out
 
-            out_shape = (*x.shape[:-1], layer.output_size_per_partition)
-            x_2d = x.reshape(-1, x.shape[-1])
+            x_2d = flatten_linear_input(x)
             if x_2d.stride(-1) != 1:
                 x_2d = x_2d.contiguous()
             out_2d = torch.empty(
@@ -972,7 +975,7 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 dtype=x.dtype,
             )
             if x_2d.shape[0] == 0:
-                return out_2d.reshape(out_shape)
+                return restore_linear_output(out_2d, x, layer.output_size_per_partition)
             torch.ops.vllm.sm70_fp8_qpn8_dispatch(
                 out_2d,
                 layer.prefix,
@@ -984,7 +987,7 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 bool(layer.sm70_fp8_qpn8_prefetch),
                 False,
             )
-            out = out_2d.reshape(out_shape)
+            out = restore_linear_output(out_2d, x, layer.output_size_per_partition)
             if bias is not None:
                 out.add_(bias)
             return out
@@ -1039,8 +1042,7 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 out.add_(bias.view(group_count, output_size))
             return out
 
-        out_shape = (*x.shape[:-1], layer.output_size_per_partition)
-        x_2d = x.reshape(-1, x.shape[-1])
+        x_2d = flatten_linear_input(x)
         if x_2d.stride(-1) != 1:
             x_2d = x_2d.contiguous()
         out_2d = torch.empty(
@@ -1133,7 +1135,7 @@ class TurboMindFp8LinearKernel(FP8ScaledMMLinearKernel):
                 .transpose(1, 2)
                 .reshape(x_2d.shape[0], layer.output_size_per_partition)
             )
-        out = out_2d.reshape(out_shape)
+        out = restore_linear_output(out_2d, x, layer.output_size_per_partition)
         if bias is not None:
             out.add_(bias)
         return out
