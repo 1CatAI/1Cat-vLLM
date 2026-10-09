@@ -463,9 +463,14 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   TORCH_CHECK(num_tokens > 0 && topk > 0 && topk <= 65535,
               "positive token count and supported routing width are required");
   TORCH_CHECK(num_tokens <= 65535 / topk, "routing slots exceed CUDA grid-y");
-  TORCH_CHECK(splitk == 8 || splitk == 10 || splitk == 16,
+  // 4, 6, 9, 12 and 18 serve K/16 = 36 and 18 (DeepSeek-V4.1 W2 at TP4,
+  // K = 576, and TP8, K = 288), which 8, 10 and 16 cannot divide. They are
+  // instantiated with one accumulator only.
+  TORCH_CHECK(splitk == 4 || splitk == 6 || splitk == 8 || splitk == 9 ||
+                  splitk == 10 || splitk == 12 || splitk == 16 ||
+                  splitk == 18,
               "unsupported split-K specialization");
-  TORCH_CHECK(nacc == 1 || (nacc == 2 && splitk != 10),
+  TORCH_CHECK(nacc == 1 || (nacc == 2 && (splitk == 8 || splitk == 16)),
               "unsupported accumulator specialization");
   TORCH_CHECK(gscales.dim() == 1 && gscales.numel() > 0,
               "expert scales must be nonempty");
@@ -499,7 +504,10 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
   TORCH_CHECK(perm.size(0) == S && y_slots.size(0) == S);
   TORCH_CHECK(S <= 65535, "grouped qpn MoE: tokens * topk = ", S,
               " exceeds the CUDA grid y limit");
-  TORCH_CHECK(K % 64 == 0 && (K / 16) % splitk == 0,
+  // The grouped kernel walks K in 16-code groups and reads MXFP4 scales per
+  // pair of groups, so K % 32 is its real requirement (the dense QPN kernel
+  // above keeps K % 64 for its fixed four-warp split).
+  TORCH_CHECK(K % 32 == 0 && (K / 16) % splitk == 0,
               "K/16 must split into splitk equal slices");
   TORCH_CHECK(N % 32 == 0, "N % 32");
   const dim3 grid((unsigned)(N / 32), (unsigned)S);
@@ -559,10 +567,25 @@ void skinny_moe_qpn_sm70(torch::Tensor x, torch::Tensor qcodes,
       break;
     // SPLITK 32 would need more than the 48 KiB of static shared memory for
     // the per-warp activation stage plus the split-K reduction.
+    case 41:
+      LAUNCH_MOE_QPN(4, 1);
+      break;
+    case 61:
+      LAUNCH_MOE_QPN(6, 1);
+      break;
+    case 91:
+      LAUNCH_MOE_QPN(9, 1);
+      break;
+    case 121:
+      LAUNCH_MOE_QPN(12, 1);
+      break;
+    case 181:
+      LAUNCH_MOE_QPN(18, 1);
+      break;
     default:
-      TORCH_CHECK(
-          false,
-          "moe_qpn (splitk, nacc) in {(8,1), (8,2), (10,1), (16,1), (16,2)}");
+      TORCH_CHECK(false,
+                  "moe_qpn (splitk, nacc) in {(4,1), (6,1), (8,1), (8,2), "
+                  "(9,1), (10,1), (12,1), (16,1), (16,2), (18,1)}");
   }
 #undef LAUNCH_MOE_QPN
 #undef LAUNCH_MOE_QPN_S
