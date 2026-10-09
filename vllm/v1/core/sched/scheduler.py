@@ -126,6 +126,7 @@ class Scheduler(SchedulerInterface):
         self.mixed_prefill_budget = MixedPrefillBudget(
             self.max_num_scheduled_tokens,
             self.scheduler_config.mixed_prefill_step_latency_ms,
+            self.scheduler_config.mixed_prefill_min_tokens,
         )
         self.mixed_prefill_enabled = current_platform.device_type == "cuda"
         self.enable_kv_cache_events = (
@@ -313,6 +314,10 @@ class Scheduler(SchedulerInterface):
         self.mamba_state_block_size = (
             next(iter(mamba_state_block_sizes)) if mamba_state_block_sizes else None
         )
+        if self.need_mamba_block_aligned_split:
+            # A mixed chunk that ends off the state-block grid splits the next
+            # block across steps; keep the latency budget on whole blocks.
+            self.mixed_prefill_budget.block_size = self.mamba_state_block_size
         # Sparse admission only retains replay/shared-prefix and periodic
         # boundaries. Materializing discarded states must not split the whole
         # model's prefill into one-state-block forwards. Mixed alignments still
@@ -598,7 +603,7 @@ class Scheduler(SchedulerInterface):
                 0,
                 min(
                     tokens,
-                    self.mixed_prefill_budget.tokens - used,
+                    self.mixed_prefill_budget.budget - used,
                     token_budget - reserve,
                 ),
             )
@@ -1301,7 +1306,7 @@ class Scheduler(SchedulerInterface):
                 else 0
             ),
             mixed_prefill_budget=(
-                self.mixed_prefill_budget.tokens if control_mixed_prefill else 0
+                self.mixed_prefill_budget.budget if control_mixed_prefill else 0
             ),
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
             scheduled_ddtree_payloads=scheduled_ddtree_payloads or None,

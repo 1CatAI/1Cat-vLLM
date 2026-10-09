@@ -557,6 +557,7 @@ class EngineArgs:
     max_long_partial_prefills: int = SchedulerConfig.max_long_partial_prefills
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     mixed_prefill_step_latency_ms: float = SchedulerConfig.mixed_prefill_step_latency_ms
+    mixed_prefill_min_tokens: int = SchedulerConfig.mixed_prefill_min_tokens
     long_prefill_token_threshold_adaptive: bool = (
         SchedulerConfig.long_prefill_token_threshold_adaptive
     )
@@ -1440,6 +1441,10 @@ class EngineArgs:
             "--mixed-prefill-step-latency-ms",
             **scheduler_kwargs["mixed_prefill_step_latency_ms"],
         )
+        scheduler_group.add_argument(
+            "--mixed-prefill-min-tokens",
+            **scheduler_kwargs["mixed_prefill_min_tokens"],
+        )
         # are no longer supported.
         scheduler_group.add_argument(
             "--scheduling-policy", **scheduler_kwargs["policy"]
@@ -2298,6 +2303,7 @@ class EngineArgs:
             max_long_partial_prefills=self.max_long_partial_prefills,
             long_prefill_token_threshold=self.long_prefill_token_threshold,
             mixed_prefill_step_latency_ms=self.mixed_prefill_step_latency_ms,
+            mixed_prefill_min_tokens=self.mixed_prefill_min_tokens,
             long_prefill_token_threshold_adaptive=(
                 self.long_prefill_token_threshold_adaptive
             ),

@@ -15,11 +15,33 @@ class MixedPrefillBudget:
     not a hard deadline: even a decode-only step can exceed the target.
     """
 
-    def __init__(self, max_tokens: int, target_ms: float) -> None:
+    def __init__(
+        self,
+        max_tokens: int,
+        target_ms: float,
+        min_tokens: int = 0,
+        block_size: int | None = None,
+    ) -> None:
         self.max_tokens = max_tokens
         self.target_ms = target_ms
-        self.tokens = min(512, max_tokens)
+        self.min_tokens = min(min_tokens, max_tokens)
+        # Recurrent-state block size in Mamba align mode, set by the scheduler.
+        self.block_size = block_size
+        self.tokens = max(min(512, max_tokens), self.min_tokens)
         self.ms_per_token: float | None = None
+
+    @property
+    def budget(self) -> int:
+        """Prefill tokens a mixed step may schedule.
+
+        The learned budget, rounded down to whole state blocks once it covers
+        one, and never below ``min_tokens``. The controller keeps the unrounded
+        value so that rounding does not stop it from growing.
+        """
+        tokens = self.tokens
+        if self.block_size and tokens >= self.block_size:
+            tokens = tokens // self.block_size * self.block_size
+        return max(tokens, self.min_tokens)
 
     def update(self, sample: MixedPrefillTiming | None) -> None:
         if (
@@ -45,5 +67,6 @@ class MixedPrefillBudget:
         quantum = min(16, self.max_tokens)
         self.tokens = max(
             quantum,
+            self.min_tokens,
             min(self.max_tokens, int(desired) // quantum * quantum),
         )
