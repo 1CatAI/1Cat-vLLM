@@ -616,7 +616,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def prepare_sm70_decode_graph_model(self) -> bool:
         # Retain the fallback for callers that do not use the Eagle loader.
         self.prepare_sm70_draft_head()
-        if not graph_policy().dual_compile:
+        if not graph_policy(self.vllm_config).dual_compile:
             return False
         if self._sm70_decode_graph_model is None:
             decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
