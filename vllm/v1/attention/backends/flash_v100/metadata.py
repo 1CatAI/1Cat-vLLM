@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
-from typing import cast
+from copy import copy
+from dataclasses import replace
+from typing import Any, cast
 
 import torch
 
@@ -12,11 +14,15 @@ from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.backends.flash_v100.spec.hooks import (
-    METADATA_HOOKS,
-    SpecMetadataFields,
-    SpecMetadataMethods,
+from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import (
+    INPUT_FIELDS,
+    METADATA_FIELDS,
+    STATE_FIELDS,
+    MetadataInputs,
+    MetadataOps,
+    SpecMetadataPacket,
 )
+from vllm.v1.attention.backends.flash_v100.spec.metadata_state import SpecMetadataState
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
@@ -26,8 +32,8 @@ from vllm.v1.kv_cache_interface import PrefixAnchoredSWASpec
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-class FlashAttnV100Metadata(SpecMetadataFields, TritonAttentionMetadata):
-    """Static view of Flash-V100 fields attached to Triton metadata."""
+class FlashAttnV100Metadata(TritonAttentionMetadata):
+    """Common metadata and a single owned speculative packet."""
 
     query_start_loc_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
@@ -42,23 +48,57 @@ class FlashAttnV100Metadata(SpecMetadataFields, TritonAttentionMetadata):
     flash_v100_decode_workspace_seq_capacity_hint: int | None
     flash_v100_static_decode_seq_hint: int | None
     flash_v100_decode_active_num_partitions: torch.Tensor | None
-    smallq_decode_block_table: torch.Tensor | None
-    smallq_decode_seq_lens: torch.Tensor | None
-    smallq_query_start_loc: torch.Tensor | None
-    smallq_decode_max_seq_len_hint: int | None
-    smallq_decode_workspace_seq_capacity_hint: int | None
-    smallq_decode_partition_size_hint: int | None
+
+    @property
+    def spec_state(self) -> SpecMetadataPacket:
+        attributes = vars(self)
+        if "_spec_state" not in attributes:
+            packet = SpecMetadataPacket()
+            # Adoption keeps tensor identities and accepts existing legacy fields.
+            for name in METADATA_FIELDS:
+                if name in attributes:
+                    setattr(packet, name, attributes.pop(name))
+            attributes["_spec_state"] = packet
+        return attributes["_spec_state"]
+
+    def __getattr__(self, name: str) -> Any:
+        if name in METADATA_FIELDS:
+            return getattr(self.spec_state, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in METADATA_FIELDS:
+            setattr(self.spec_state, name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        if name in METADATA_FIELDS:
+            delattr(self.spec_state, name)
+        else:
+            super().__delattr__(name)
+
+    def __copy__(self):
+        result = object.__new__(type(self))
+        vars(result).update(vars(self))
+        if "_spec_state" in vars(self):
+            vars(result)["_spec_state"] = copy(self.spec_state)
+        return result
 
 
 def _as_flash_v100_metadata(
     attn_metadata: TritonAttentionMetadata,
 ) -> FlashAttnV100Metadata:
-    # The inherited Triton builder creates the object; this backend attaches
-    # the fields above before any Flash-V100 path consumes them.
+    # The inherited builder creates this exact class. Adopt its object in place
+    # so all existing tensor references and metadata identities remain valid.
+    if type(attn_metadata) is TritonAttentionMetadata:
+        attn_metadata.__class__ = FlashAttnV100Metadata
+    if isinstance(attn_metadata, FlashAttnV100Metadata):
+        _ = attn_metadata.spec_state
     return cast(FlashAttnV100Metadata, attn_metadata)
 
 
-class FlashAttnV100MetadataBuilder(SpecMetadataMethods, TritonAttentionMetadataBuilder):
+class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     """Attach CPU metadata for the dense prefill path."""
 
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
@@ -93,7 +133,7 @@ class FlashAttnV100MetadataBuilder(SpecMetadataMethods, TritonAttentionMetadataB
             )
             and batch_context_shape_supported
         )
-        METADATA_HOOKS.initialize(self, spec_config)
+        self.initialize_spec_state(spec_config)
         # Prefix-anchored SWA: persistent per-request prompt-length buffer so
         # the device address stays stable across steps.
         kv_cache_spec = self.kv_cache_spec
@@ -110,6 +150,66 @@ class FlashAttnV100MetadataBuilder(SpecMetadataMethods, TritonAttentionMetadataB
                 device=self.device,
             )
         self._decode_active_num_partitions: torch.Tensor | None = None
+
+    def initialize_spec_state(self, spec_config) -> None:
+        self.spec_state = SpecMetadataState(
+            MetadataInputs(
+                id(self),
+                self.vllm_config,
+                self.device,
+                getattr(self, "block_size", 0),
+                self._is_speculative_draft_model,
+            ),
+            MetadataOps(
+                base_build=super().build,
+                attach_common=self._attach_common_flash_metadata,
+                attach_prefix=self._attach_prefix_anchored_metadata,
+                attach_shape_hints=self._attach_decode_shape_hints,
+                update_active_partitions=self._update_decode_active_num_partitions,
+            ),
+            spec_config,
+        )
+
+    def __getattr__(self, name):
+        # Legacy private callers continue to reach the single state owner.
+        state = vars(self).get("spec_state")
+        if state is not None:
+            return getattr(state, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        state = vars(self).get("spec_state")
+        if state is not None:
+            if name in STATE_FIELDS:
+                setattr(state, name, value)
+                return
+            if name in INPUT_FIELDS:
+                state.inputs = replace(state.inputs, **{INPUT_FIELDS[name]: value})
+        super().__setattr__(name, value)
+
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build=False,
+        *feature_args,
+        **feature_inputs,
+    ):
+        return self.spec_state.build(
+            common_prefix_len,
+            common_attn_metadata,
+            fast_build,
+            *feature_args,
+            **feature_inputs,
+        )
+
+    def build_for_drafting(self, common_attn_metadata, draft_index):
+        return self.spec_state.build_for_drafting(common_attn_metadata, draft_index)
+
+    def _stabilize_draft_graph_metadata(self, attn_metadata, common_attn_metadata):
+        self.spec_state._stabilize_draft_graph_metadata(
+            attn_metadata, common_attn_metadata
+        )
 
     def _attach_prefix_anchored_metadata(
         self,
@@ -170,7 +270,7 @@ class FlashAttnV100MetadataBuilder(SpecMetadataMethods, TritonAttentionMetadataB
             else common_attn_metadata.seq_lens_cpu
         )
         flash_metadata.causal = common_attn_metadata.causal
-        METADATA_HOOKS.attach_common(self, attn_metadata)
+        self.spec_state.attach_common(attn_metadata)
         flash_metadata.max_model_len = self.vllm_config.model_config.max_model_len
         flash_metadata.flash_v100_cudagraph_capture = False
         flash_metadata.flash_v100_batch_context_routing = (
@@ -306,8 +406,8 @@ class FlashAttnV100MetadataBuilder(SpecMetadataMethods, TritonAttentionMetadataB
         self._attach_prefix_anchored_metadata(attn_metadata, common_attn_metadata)
         flash_metadata.seq_lens_cpu = capture_seq_lens_cpu
 
-        METADATA_HOOKS.prepare_capture(self, attn_metadata, common_attn_metadata)
-        self._debug_draft_metadata(
+        self.spec_state.prepare_capture(attn_metadata, common_attn_metadata)
+        self.spec_state.debug_metadata(
             "capture",
             attn_metadata,
             common_attn_metadata,
@@ -321,7 +421,3 @@ class FlashAttnV100MetadataBuilder(SpecMetadataMethods, TritonAttentionMetadataB
         self._update_decode_active_num_partitions(attn_metadata, stage="capture")
 
         return attn_metadata
-
-
-# Super calls extracted into the feature mixin continue after that mixin.
-_spec_builder_super_owner = SpecMetadataMethods

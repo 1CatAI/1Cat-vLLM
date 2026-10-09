@@ -196,6 +196,11 @@ class Recorder:
         if not frame.f_globals.get("__name__", "").startswith(PACKAGE):
             return
         name = frame.f_code.co_name
+        if name == "small_query_enabled" and frame.f_globals["__name__"] == (
+            PACKAGE + ".verify"
+        ):
+            # The executed predicate now belongs to the injected verifier.
+            name = "_small_query_decode_enabled"
         if event == "call" and name == "_record_route":
             self.events.append(
                 ["route", frame.f_locals.get("name", frame.f_locals.get("route"))]
@@ -252,7 +257,7 @@ def persistent_tensors(builder):
 
 
 def install_ops(monkeypatch, recorder, legacy, case):
-    from vllm.v1.attention.backends.flash_v100 import config, decode
+    from vllm.v1.attention.backends.flash_v100 import config, decode, prefill
 
     original_policy_read = config.V100AttnConfig.__getattribute__
 
@@ -267,6 +272,15 @@ def install_ops(monkeypatch, recorder, legacy, case):
     monkeypatch.setattr(
         config.V100AttnConfig, "__getattribute__", read_candidate_policy
     )
+    original_prefill_read = prefill.PrefillExecutor.__getattr__
+
+    def read_prefill_predicate(instance, name):
+        value = original_prefill_read(instance, name)
+        if name.startswith("use_") and sys._getframe(1).f_code.co_name == "forward":
+            recorder.events.append(["predicate", name, value])
+        return value
+
+    monkeypatch.setattr(prefill.PrefillExecutor, "__getattr__", read_prefill_predicate)
     original_read = legacy.FlashAttnV100Impl.__getattribute__
 
     def read_predicate(instance, name):

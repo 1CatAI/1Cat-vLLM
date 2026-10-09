@@ -15,6 +15,7 @@ from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
+from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
 from vllm.v1.attention.ops.sm70_grouped import (
     clear_grouped_fp16_workspaces,
 )
@@ -767,31 +768,6 @@ def _try_sm70_fa2_d256_prefill(
     return None
 
 
-def _allocate_growing_workspace(
-    allocate: Callable[[], tuple[torch.Tensor, ...]],
-    *,
-    on_cuda: bool,
-) -> tuple[torch.Tensor, ...] | None:
-    """Allocate a grown workspace, retrying once after releasing cached blocks.
-
-    The caller must drop its reference to the previous workspace *before*
-    calling this, otherwise the old and the new buffer are resident at the same
-    time and the growth can fail on memory its own predecessor is holding.
-    Freed segments are smaller than the grown request, so a retry after
-    ``empty_cache`` is what actually recovers the fragmented headroom.
-    """
-    try:
-        return allocate()
-    except torch.OutOfMemoryError:
-        pass
-    if on_cuda:
-        torch.accelerator.empty_cache()
-    try:
-        return allocate()
-    except torch.OutOfMemoryError:
-        return None
-
-
 def _get_fp8_prefill_bridge_workspace(
     key_cache: torch.Tensor,
     required_blocks: int,
@@ -848,7 +824,7 @@ def _get_fp8_prefill_bridge_workspace(
     # inheriting a doubled capacity that already failed once.
     workspace = None
     _fp8_prefill_bridge_workspaces.pop(cache_key, None)
-    allocated = _allocate_growing_workspace(
+    allocated = _workspace.allocate_growing_workspace(
         _allocate,
         on_cuda=key_cache.is_cuda,
     )
@@ -906,7 +882,7 @@ def _get_fp8_prefill_bridge_tail_workspace(
 
     workspace = None
     _fp8_prefill_bridge_tail_workspaces.pop(cache_key, None)
-    allocated = _allocate_growing_workspace(_allocate, on_cuda=query.is_cuda)
+    allocated = _workspace.allocate_growing_workspace(_allocate, on_cuda=query.is_cuda)
     if allocated is None:
         return None
     padded_query, padded_output = allocated

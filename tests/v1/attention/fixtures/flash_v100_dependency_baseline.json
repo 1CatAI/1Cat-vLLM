@@ -1,67 +1,14 @@
 {
   "metrics": {
-    "forward": 402,
-    "largest_function": 402,
-    "cross_module_private": 347,
-    "import_cycles": 11,
-    "model_names_outside_spec": 158,
+    "forward": 153,
+    "largest_function": 315,
+    "cross_module_private": 269,
+    "import_cycles": 0,
+    "model_names_outside_spec": 83,
     "env_outside_config": 0,
-    "state_flags": 29
+    "state_flags": 20
   },
-  "cycles": [
-    [
-      "vllm.v1.attention.backends.flash_v100.debug_compare",
-      "vllm.v1.attention.backends.flash_v100.impl"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.dense_prefill",
-      "vllm.v1.attention.backends.flash_v100.kv_layout"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.impl",
-      "vllm.v1.attention.backends.flash_v100.prefill"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.impl",
-      "vllm.v1.attention.backends.flash_v100.spec.attention"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.builder",
-      "vllm.v1.attention.backends.flash_v100.spec.hooks"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.builder",
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
-      "vllm.v1.attention.backends.flash_v100.spec.smallq_metadata"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.draft",
-      "vllm.v1.attention.backends.flash_v100.spec.hooks"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.hooks"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
-      "vllm.v1.attention.backends.flash_v100.spec.smallq_metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.verify_metadata"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
-      "vllm.v1.attention.backends.flash_v100.spec.tree"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
-      "vllm.v1.attention.backends.flash_v100.spec.verify_metadata"
-    ]
-  ],
+  "cycles": [],
   "edges": [
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
@@ -121,11 +68,23 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
+      "vllm.v1.attention.backends.flash_v100.spec.attention_policy"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.__init__",
       "vllm.v1.attention.backends.flash_v100.spec.builder"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
+      "vllm.v1.attention.backends.flash_v100.spec.contracts"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.__init__",
       "vllm.v1.attention.backends.flash_v100.spec.draft"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.__init__",
+      "vllm.v1.attention.backends.flash_v100.spec.policy"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
@@ -134,6 +93,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
       "vllm.v1.attention.backends.flash_v100.spec.tree"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.__init__",
+      "vllm.v1.attention.backends.flash_v100.spec.tree_masks"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.__init__",
@@ -169,11 +132,15 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.debug_compare",
-      "vllm.v1.attention.backends.flash_v100.impl"
+      "vllm.v1.attention.backends.flash_v100.kv_layout"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.debug_compare",
-      "vllm.v1.attention.backends.flash_v100.kv_layout"
+      "vllm.v1.attention.backends.flash_v100.plan.events"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.debug_compare",
+      "vllm.v1.attention.backends.flash_v100.state"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.decode",
@@ -190,10 +157,6 @@
     [
       "vllm.v1.attention.backends.flash_v100.decode",
       "vllm.v1.attention.backends.flash_v100.routing"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.decode",
-      "vllm.v1.attention.backends.flash_v100.state"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.decode",
@@ -218,6 +181,10 @@
     [
       "vllm.v1.attention.backends.flash_v100.dense_prefill",
       "vllm.v1.attention.backends.flash_v100.routing"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.dense_prefill",
+      "vllm.v1.attention.backends.flash_v100.workspace"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.impl",
@@ -241,10 +208,6 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.impl",
-      "vllm.v1.attention.backends.flash_v100.kv_layout"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.impl",
       "vllm.v1.attention.backends.flash_v100.ops"
     ],
     [
@@ -261,15 +224,7 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.impl",
-      "vllm.v1.attention.backends.flash_v100.state"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.impl",
       "vllm.v1.attention.backends.flash_v100.verify"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.kv_layout",
-      "vllm.v1.attention.backends.flash_v100.dense_prefill"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.kv_layout",
@@ -288,6 +243,10 @@
       "vllm.v1.attention.backends.flash_v100.routing"
     ],
     [
+      "vllm.v1.attention.backends.flash_v100.kv_layout",
+      "vllm.v1.attention.backends.flash_v100.workspace"
+    ],
+    [
       "vllm.v1.attention.backends.flash_v100.masks",
       "vllm.v1.attention.backends.flash_v100.config"
     ],
@@ -296,10 +255,6 @@
       "vllm.v1.attention.backends.flash_v100.metadata"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.masks",
-      "vllm.v1.attention.backends.flash_v100.routing"
-    ],
-    [
       "vllm.v1.attention.backends.flash_v100.metadata",
       "vllm.v1.attention.backends.flash_v100.config"
     ],
@@ -309,7 +264,11 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.metadata",
-      "vllm.v1.attention.backends.flash_v100.spec.hooks"
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.metadata",
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_state"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.ops",
@@ -333,10 +292,6 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.prefill",
-      "vllm.v1.attention.backends.flash_v100.impl"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.prefill",
       "vllm.v1.attention.backends.flash_v100.kv_layout"
     ],
     [
@@ -345,7 +300,11 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.prefill",
-      "vllm.v1.attention.backends.flash_v100.ops"
+      "vllm.v1.attention.backends.flash_v100.plan.events"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.prefill",
+      "vllm.v1.attention.backends.flash_v100.prefill_candidates"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.prefill",
@@ -357,6 +316,34 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.prefill",
+      "vllm.v1.attention.backends.flash_v100.workspace"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.prefill_candidates",
+      "vllm.v1.attention.backends.flash_v100.config"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.prefill_candidates",
+      "vllm.v1.attention.backends.flash_v100.kv_layout"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.prefill_candidates",
+      "vllm.v1.attention.backends.flash_v100.masks"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.prefill_candidates",
+      "vllm.v1.attention.backends.flash_v100.ops"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.prefill_candidates",
+      "vllm.v1.attention.backends.flash_v100.plan.routing"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.prefill_candidates",
+      "vllm.v1.attention.backends.flash_v100.routing"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.prefill_candidates",
       "vllm.v1.attention.backends.flash_v100.workspace"
     ],
     [
@@ -369,35 +356,43 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.attention",
-      "vllm.v1.attention.backends.flash_v100.config"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.attention",
-      "vllm.v1.attention.backends.flash_v100.impl"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.attention",
-      "vllm.v1.attention.backends.flash_v100.ops"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.attention",
       "vllm.v1.attention.backends.flash_v100.routing"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.attention",
+      "vllm.v1.attention.backends.flash_v100.spec.attention_policy"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.attention",
+      "vllm.v1.attention.backends.flash_v100.spec.contracts"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.attention",
+      "vllm.v1.attention.backends.flash_v100.spec.policy"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.attention",
+      "vllm.v1.attention.backends.flash_v100.spec.tree_masks"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.attention",
       "vllm.v1.attention.backends.flash_v100.state"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.spec.attention",
-      "vllm.v1.attention.backends.flash_v100.verify"
+      "vllm.v1.attention.backends.flash_v100.spec.attention_policy",
+      "vllm.v1.attention.backends.flash_v100.config"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.builder",
-      "vllm.v1.attention.backends.flash_v100.metadata"
+      "vllm.v1.attention.backends.flash_v100.spec.features"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.builder",
-      "vllm.v1.attention.backends.flash_v100.routing"
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.builder",
+      "vllm.v1.attention.backends.flash_v100.spec.policy"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.builder",
@@ -413,42 +408,66 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.draft",
-      "vllm.v1.attention.backends.flash_v100.metadata"
+      "vllm.v1.attention.backends.flash_v100.spec.policy"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.hooks",
-      "vllm.v1.attention.backends.flash_v100.metadata"
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts",
+      "vllm.v1.attention.backends.flash_v100.workspace"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
       "vllm.v1.attention.backends.flash_v100.spec.builder"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
       "vllm.v1.attention.backends.flash_v100.spec.draft"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
+      "vllm.v1.attention.backends.flash_v100.spec.features"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
       "vllm.v1.attention.backends.flash_v100.spec.tree"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
       "vllm.v1.attention.backends.flash_v100.spec.verify_metadata"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_state",
       "vllm.v1.attention.backends.flash_v100.workspace"
     ],
     [
+      "vllm.v1.attention.backends.flash_v100.spec.policy",
+      "vllm.v1.attention.backends.flash_v100.config"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.policy",
+      "vllm.v1.attention.backends.flash_v100.routing"
+    ],
+    [
       "vllm.v1.attention.backends.flash_v100.spec.smallq_metadata",
-      "vllm.v1.attention.backends.flash_v100.metadata"
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.tree",
-      "vllm.v1.attention.backends.flash_v100.metadata"
+      "vllm.v1.attention.backends.flash_v100.routing"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.tree",
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.tree_masks",
       "vllm.v1.attention.backends.flash_v100.routing"
     ],
     [
@@ -461,7 +480,11 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.verify_metadata",
-      "vllm.v1.attention.backends.flash_v100.metadata"
+      "vllm.v1.attention.backends.flash_v100.spec.metadata_contracts"
+    ],
+    [
+      "vllm.v1.attention.backends.flash_v100.spec.verify_metadata",
+      "vllm.v1.attention.backends.flash_v100.spec.policy"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.verify_metadata",
@@ -474,10 +497,6 @@
     [
       "vllm.v1.attention.backends.flash_v100.verify",
       "vllm.v1.attention.backends.flash_v100.debug"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.verify",
-      "vllm.v1.attention.backends.flash_v100.impl"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.verify",
@@ -506,10 +525,6 @@
       "vllm.v1.attention.backends.flash_v100.debug_compare"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.decode",
-      "vllm.v1.attention.backends.flash_v100.state"
-    ],
-    [
       "vllm.v1.attention.backends.flash_v100.impl",
       "vllm.v1.attention.backends.flash_v100.debug"
     ],
@@ -520,10 +535,6 @@
     [
       "vllm.v1.attention.backends.flash_v100.impl",
       "vllm.v1.attention.backends.flash_v100.dense_prefill"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.impl",
-      "vllm.v1.attention.backends.flash_v100.kv_layout"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.impl",
@@ -538,10 +549,6 @@
       "vllm.v1.attention.backends.flash_v100.spec.attention"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.impl",
-      "vllm.v1.attention.backends.flash_v100.state"
-    ],
-    [
       "vllm.v1.attention.backends.flash_v100.prefill",
       "vllm.v1.attention.backends.flash_v100.debug"
     ],
@@ -551,59 +558,19 @@
     ],
     [
       "vllm.v1.attention.backends.flash_v100.prefill",
-      "vllm.v1.attention.backends.flash_v100.impl"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.prefill",
       "vllm.v1.attention.backends.flash_v100.state"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.attention",
-      "vllm.v1.attention.backends.flash_v100.impl"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.attention",
-      "vllm.v1.attention.backends.flash_v100.ops"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.spec.attention",
       "vllm.v1.attention.backends.flash_v100.state"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.spec.attention",
-      "vllm.v1.attention.backends.flash_v100.verify"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.builder",
-      "vllm.v1.attention.backends.flash_v100.metadata"
-    ],
-    [
       "vllm.v1.attention.backends.flash_v100.spec.draft",
       "vllm.v1.attention.backends.flash_v100.debug"
     ],
     [
-      "vllm.v1.attention.backends.flash_v100.spec.draft",
-      "vllm.v1.attention.backends.flash_v100.metadata"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.hooks",
-      "vllm.v1.attention.backends.flash_v100.metadata"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.smallq_metadata",
-      "vllm.v1.attention.backends.flash_v100.metadata"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.tree",
-      "vllm.v1.attention.backends.flash_v100.metadata"
-    ],
-    [
       "vllm.v1.attention.backends.flash_v100.spec.verify_metadata",
       "vllm.v1.attention.backends.flash_v100.debug"
-    ],
-    [
-      "vllm.v1.attention.backends.flash_v100.spec.verify_metadata",
-      "vllm.v1.attention.backends.flash_v100.metadata"
     ],
     [
       "vllm.v1.attention.backends.flash_v100.verify",
@@ -656,40 +623,8 @@
       "policy": "dynamic"
     },
     {
-      "file": "debug.py",
-      "line": 34,
-      "expression": "_config.raw('VLLM_FLASH_V100_DFLASH_PREFIX_DUMP', '0')",
-      "via_config": true,
-      "owner": "_dflash_prefix_dump_enabled",
-      "policy": "dynamic"
-    },
-    {
-      "file": "debug.py",
-      "line": 38,
-      "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN', '1')",
-      "via_config": true,
-      "owner": "_dflash_ddtree_triton_branch_attn_enabled",
-      "policy": "dynamic"
-    },
-    {
-      "file": "debug.py",
-      "line": 42,
-      "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT', '0')",
-      "via_config": true,
-      "owner": "_dflash_ddtree_triton_branch_attn_strict",
-      "policy": "dynamic"
-    },
-    {
-      "file": "debug.py",
-      "line": 46,
-      "expression": "_config.raw('VLLM_DFLASH_DDTREE_WORKER_PROFILE', '0')",
-      "via_config": true,
-      "owner": "_dflash_ddtree_worker_profile_enabled",
-      "policy": "dynamic"
-    },
-    {
       "file": "decode.py",
-      "line": 743,
+      "line": 765,
       "expression": "_config.raw('VLLM_FLASH_V100_XQA_E4M3_G6_P64_P256_AUTO', '1')",
       "via_config": true,
       "owner": "xqa",
@@ -697,7 +632,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 193,
+      "line": 194,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_should_use_prefill_d256_gqa_architecture",
@@ -705,7 +640,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 159,
+      "line": 160,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3')",
       "via_config": true,
       "owner": "_should_use_prefill_dense_splitkv3",
@@ -713,7 +648,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 207,
+      "line": 208,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL')",
       "via_config": true,
       "owner": "_should_use_prefill_d256_gqa_architecture",
@@ -721,7 +656,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 245,
+      "line": 246,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_profile_sm70_prefill_workspace",
@@ -729,7 +664,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 485,
+      "line": 486,
       "expression": "_config.registered('VLLM_FLASH_V100_FA2_D256_PREFILL')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -737,7 +672,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 176,
+      "line": 177,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV')",
       "via_config": true,
       "owner": "_should_use_prefill_dense_splitkv3",
@@ -745,7 +680,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 241,
+      "line": 242,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL')",
       "via_config": true,
       "owner": "_profile_sm70_prefill_workspace",
@@ -753,7 +688,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 244,
+      "line": 245,
       "expression": "_config.registered('VLLM_FLASH_V100_FA2_D256_PREFILL')",
       "via_config": true,
       "owner": "_profile_sm70_prefill_workspace",
@@ -761,7 +696,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 560,
+      "line": 561,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -769,7 +704,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 164,
+      "line": 165,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_Q8000_EXPERIMENTAL')",
       "via_config": true,
       "owner": "_should_use_prefill_dense_splitkv3",
@@ -777,7 +712,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 512,
+      "line": 513,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -785,7 +720,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 610,
+      "line": 611,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -793,7 +728,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 633,
+      "line": 634,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -801,7 +736,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 690,
+      "line": 691,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -809,7 +744,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 618,
+      "line": 619,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -817,7 +752,7 @@
     },
     {
       "file": "dense_prefill.py",
-      "line": 679,
+      "line": 680,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_try_sm70_fa2_d256_prefill",
@@ -825,7 +760,7 @@
     },
     {
       "file": "impl.py",
-      "line": 198,
+      "line": 249,
       "expression": "_config.raw('VLLM_FLASH_V100_ENABLE_PAGED_PREFILL')",
       "via_config": true,
       "owner": "__init__",
@@ -833,7 +768,7 @@
     },
     {
       "file": "impl.py",
-      "line": 227,
+      "line": 278,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q')",
       "via_config": true,
       "owner": "__init__",
@@ -841,7 +776,7 @@
     },
     {
       "file": "impl.py",
-      "line": 230,
+      "line": 281,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV')",
       "via_config": true,
       "owner": "__init__",
@@ -849,7 +784,7 @@
     },
     {
       "file": "impl.py",
-      "line": 233,
+      "line": 284,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY')",
       "via_config": true,
       "owner": "__init__",
@@ -857,7 +792,7 @@
     },
     {
       "file": "impl.py",
-      "line": 240,
+      "line": 291,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q')",
       "via_config": true,
       "owner": "__init__",
@@ -865,7 +800,7 @@
     },
     {
       "file": "impl.py",
-      "line": 243,
+      "line": 294,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV')",
       "via_config": true,
       "owner": "__init__",
@@ -873,7 +808,7 @@
     },
     {
       "file": "impl.py",
-      "line": 246,
+      "line": 297,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS')",
       "via_config": true,
       "owner": "__init__",
@@ -881,7 +816,7 @@
     },
     {
       "file": "impl.py",
-      "line": 249,
+      "line": 300,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q')",
       "via_config": true,
       "owner": "__init__",
@@ -889,7 +824,7 @@
     },
     {
       "file": "impl.py",
-      "line": 252,
+      "line": 303,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q')",
       "via_config": true,
       "owner": "__init__",
@@ -897,7 +832,7 @@
     },
     {
       "file": "impl.py",
-      "line": 255,
+      "line": 306,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV')",
       "via_config": true,
       "owner": "__init__",
@@ -905,7 +840,7 @@
     },
     {
       "file": "impl.py",
-      "line": 258,
+      "line": 309,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_MIN_Q')",
       "via_config": true,
       "owner": "__init__",
@@ -913,7 +848,7 @@
     },
     {
       "file": "impl.py",
-      "line": 259,
+      "line": 310,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_MIN_KV')",
       "via_config": true,
       "owner": "__init__",
@@ -921,7 +856,7 @@
     },
     {
       "file": "impl.py",
-      "line": 260,
+      "line": 311,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_MASK_BLOCK_N')",
       "via_config": true,
       "owner": "__init__",
@@ -929,7 +864,7 @@
     },
     {
       "file": "impl.py",
-      "line": 291,
+      "line": 342,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL')",
       "via_config": true,
       "owner": "__init__",
@@ -937,7 +872,7 @@
     },
     {
       "file": "impl.py",
-      "line": 295,
+      "line": 346,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_USE_BHMD_OUT')",
       "via_config": true,
       "owner": "__init__",
@@ -945,7 +880,7 @@
     },
     {
       "file": "impl.py",
-      "line": 313,
+      "line": 364,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED')",
       "via_config": true,
       "owner": "__init__",
@@ -953,7 +888,7 @@
     },
     {
       "file": "impl.py",
-      "line": 315,
+      "line": 366,
       "expression": "_config.raw('VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR')",
       "via_config": true,
       "owner": "__init__",
@@ -961,7 +896,7 @@
     },
     {
       "file": "impl.py",
-      "line": 320,
+      "line": 371,
       "expression": "_config.raw('VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR')",
       "via_config": true,
       "owner": "__init__",
@@ -969,7 +904,7 @@
     },
     {
       "file": "impl.py",
-      "line": 326,
+      "line": 377,
       "expression": "_config.raw('VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_DIR')",
       "via_config": true,
       "owner": "__init__",
@@ -977,7 +912,7 @@
     },
     {
       "file": "impl.py",
-      "line": 147,
+      "line": 193,
       "expression": "_config.registered('VLLM_FLASH_V100_E4M3_GROUPED_FP32')",
       "via_config": true,
       "owner": "__init__",
@@ -985,7 +920,7 @@
     },
     {
       "file": "impl.py",
-      "line": 200,
+      "line": 251,
       "expression": "_config.raw('VLLM_FLASH_V100_DISABLE_PAGED_PREFILL', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -993,7 +928,7 @@
     },
     {
       "file": "impl.py",
-      "line": 214,
+      "line": 265,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_SPLIT_KV')",
       "via_config": true,
       "owner": "__init__",
@@ -1001,7 +936,7 @@
     },
     {
       "file": "impl.py",
-      "line": 219,
+      "line": 270,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_PREFILL')",
       "via_config": true,
       "owner": "__init__",
@@ -1009,7 +944,7 @@
     },
     {
       "file": "impl.py",
-      "line": 225,
+      "line": 276,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_CONTIG_DENSE')",
       "via_config": true,
       "owner": "__init__",
@@ -1017,7 +952,7 @@
     },
     {
       "file": "impl.py",
-      "line": 238,
+      "line": 289,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_GATHER_DENSE')",
       "via_config": true,
       "owner": "__init__",
@@ -1025,7 +960,7 @@
     },
     {
       "file": "impl.py",
-      "line": 264,
+      "line": 315,
       "expression": "_config.raw('VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -1033,7 +968,7 @@
     },
     {
       "file": "impl.py",
-      "line": 270,
+      "line": 321,
       "expression": "_config.raw('VLLM_FLASH_V100_PREFILL_USE_TRITON', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -1041,7 +976,7 @@
     },
     {
       "file": "impl.py",
-      "line": 273,
+      "line": 324,
       "expression": "_config.raw('VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -1049,7 +984,7 @@
     },
     {
       "file": "impl.py",
-      "line": 276,
+      "line": 327,
       "expression": "_config.raw('VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q', '16')",
       "via_config": true,
       "owner": "__init__",
@@ -1057,7 +992,7 @@
     },
     {
       "file": "impl.py",
-      "line": 279,
+      "line": 330,
       "expression": "_config.raw('VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -1065,7 +1000,7 @@
     },
     {
       "file": "impl.py",
-      "line": 282,
+      "line": 333,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_DENSE_REFERENCE', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -1073,7 +1008,7 @@
     },
     {
       "file": "impl.py",
-      "line": 285,
+      "line": 336,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_DENSE_CACHE', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -1081,7 +1016,7 @@
     },
     {
       "file": "impl.py",
-      "line": 298,
+      "line": 349,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -1089,7 +1024,7 @@
     },
     {
       "file": "impl.py",
-      "line": 300,
+      "line": 351,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_USE_XQA', '1')",
       "via_config": true,
       "owner": "__init__",
@@ -1097,7 +1032,7 @@
     },
     {
       "file": "impl.py",
-      "line": 317,
+      "line": 368,
       "expression": "_config.raw('VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -1105,7 +1040,7 @@
     },
     {
       "file": "impl.py",
-      "line": 324,
+      "line": 375,
       "expression": "_config.raw('VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS', '0')",
       "via_config": true,
       "owner": "__init__",
@@ -1113,7 +1048,7 @@
     },
     {
       "file": "impl.py",
-      "line": 330,
+      "line": 381,
       "expression": "_config.raw('VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS', '64')",
       "via_config": true,
       "owner": "__init__",
@@ -1121,7 +1056,7 @@
     },
     {
       "file": "impl.py",
-      "line": 211,
+      "line": 262,
       "expression": "_config.raw('VLLM_FLASH_V100_FP8_PREFILL_BRIDGE', '1')",
       "via_config": true,
       "owner": "__init__",
@@ -1129,7 +1064,7 @@
     },
     {
       "file": "impl.py",
-      "line": 303,
+      "line": 354,
       "expression": "_config.raw('VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA', '1')",
       "via_config": true,
       "owner": "__init__",
@@ -1137,7 +1072,7 @@
     },
     {
       "file": "masks.py",
-      "line": 42,
+      "line": 41,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_POOL').lower()",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1145,7 +1080,7 @@
     },
     {
       "file": "masks.py",
-      "line": 125,
+      "line": 124,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_THRESHOLD')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1153,7 +1088,7 @@
     },
     {
       "file": "masks.py",
-      "line": 126,
+      "line": 125,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_KEEP_MASS')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1161,7 +1096,7 @@
     },
     {
       "file": "masks.py",
-      "line": 127,
+      "line": 126,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_KEEP_RATIO')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1169,7 +1104,7 @@
     },
     {
       "file": "masks.py",
-      "line": 128,
+      "line": 127,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1177,7 +1112,7 @@
     },
     {
       "file": "masks.py",
-      "line": 181,
+      "line": 180,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_SPEC_STRIDE')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1185,7 +1120,7 @@
     },
     {
       "file": "masks.py",
-      "line": 198,
+      "line": 197,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_SPEC_PROB')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1193,7 +1128,7 @@
     },
     {
       "file": "masks.py",
-      "line": 42,
+      "line": 41,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_POOL')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1201,7 +1136,7 @@
     },
     {
       "file": "masks.py",
-      "line": 174,
+      "line": 173,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1209,7 +1144,7 @@
     },
     {
       "file": "masks.py",
-      "line": 192,
+      "line": 191,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_SPEC_SEED')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1217,7 +1152,7 @@
     },
     {
       "file": "masks.py",
-      "line": 218,
+      "line": 217,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_SPEC_SEED')",
       "via_config": true,
       "owner": "_build_bfla_block_mask_for_seq",
@@ -1225,7 +1160,7 @@
     },
     {
       "file": "metadata.py",
-      "line": 88,
+      "line": 128,
       "expression": "_config.registered('VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING')",
       "via_config": true,
       "owner": "__init__",
@@ -1233,7 +1168,7 @@
     },
     {
       "file": "metadata.py",
-      "line": 89,
+      "line": 129,
       "expression": "_config.registered('VLLM_FLASH_V100_DECODE_PARTITION_SIZE')",
       "via_config": true,
       "owner": "__init__",
@@ -1273,7 +1208,7 @@
     },
     {
       "file": "prefill.py",
-      "line": 402,
+      "line": 404,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS')",
       "via_config": true,
       "owner": "_prefill_prefix_decode_rows_allowed",
@@ -1281,7 +1216,7 @@
     },
     {
       "file": "prefill.py",
-      "line": 683,
+      "line": 685,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE')",
       "via_config": true,
       "owner": "_run_prefill_paged_call",
@@ -1289,7 +1224,7 @@
     },
     {
       "file": "prefill.py",
-      "line": 762,
+      "line": 764,
       "expression": "_config.raw('VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE', '0')",
       "via_config": true,
       "owner": "_flash_v100_prefill_with_prefix",
@@ -1297,7 +1232,7 @@
     },
     {
       "file": "prefill.py",
-      "line": 345,
+      "line": 347,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_D256_GQA_V37')",
       "via_config": true,
       "owner": "_should_use_prefill_gather_dense",
@@ -1305,47 +1240,47 @@
     },
     {
       "file": "prefill.py",
-      "line": 982,
-      "expression": "_config.registered('VLLM_FLASH_V100_FA2_D256_PREFILL')",
-      "via_config": true,
-      "owner": "_flash_v100_prefill_with_prefix",
-      "policy": "dynamic"
-    },
-    {
-      "file": "prefill.py",
-      "line": 1158,
+      "line": 939,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_KEEP_MASS')",
       "via_config": true,
-      "owner": "_flash_v100_prefill_with_prefix",
+      "owner": "log_bfla",
       "policy": "dynamic"
     },
     {
       "file": "prefill.py",
-      "line": 1159,
+      "line": 940,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_LOCAL_BLOCKS')",
       "via_config": true,
-      "owner": "_flash_v100_prefill_with_prefix",
+      "owner": "log_bfla",
       "policy": "dynamic"
     },
     {
       "file": "prefill.py",
-      "line": 1160,
+      "line": 941,
       "expression": "_config.registered('VLLM_FLASH_V100_BFLA_POOL')",
       "via_config": true,
-      "owner": "_flash_v100_prefill_with_prefix",
+      "owner": "log_bfla",
       "policy": "dynamic"
     },
     {
-      "file": "prefill.py",
-      "line": 1247,
+      "file": "prefill_candidates.py",
+      "line": 423,
       "expression": "_config.registered('VLLM_FLASH_V100_FA2_D256_PREFILL')",
       "via_config": true,
-      "owner": "_flash_v100_prefill_with_prefix",
+      "owner": "run",
+      "policy": "dynamic"
+    },
+    {
+      "file": "prefill_candidates.py",
+      "line": 211,
+      "expression": "_config.registered('VLLM_FLASH_V100_FA2_D256_PREFILL')",
+      "via_config": true,
+      "owner": "admit",
       "policy": "dynamic"
     },
     {
       "file": "routing.py",
-      "line": 494,
+      "line": 493,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_PARTITION_SIZE')",
       "via_config": true,
       "owner": "_decode_partition_size_for_metadata",
@@ -1353,23 +1288,7 @@
     },
     {
       "file": "routing.py",
-      "line": 609,
-      "expression": "_config.raw('VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE')",
-      "via_config": true,
-      "owner": "_mtp_context_bucket_partition_size_hint",
-      "policy": "dynamic"
-    },
-    {
-      "file": "routing.py",
-      "line": 630,
-      "expression": "_config.raw('VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE', '1024')",
-      "via_config": true,
-      "owner": "_mtp5_xqa_dual_cta_partition_size_hint",
-      "policy": "dynamic"
-    },
-    {
-      "file": "routing.py",
-      "line": 659,
+      "line": 620,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN')",
       "via_config": true,
       "owner": "_decode_xqa_q4_min_seq_len",
@@ -1377,7 +1296,7 @@
     },
     {
       "file": "routing.py",
-      "line": 671,
+      "line": 632,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN')",
       "via_config": true,
       "owner": "_decode_fp8_xqa_min_seq_len",
@@ -1385,7 +1304,7 @@
     },
     {
       "file": "routing.py",
-      "line": 761,
+      "line": 722,
       "expression": "_config.env_is_set('VLLM_SM70_DEBUG')",
       "via_config": true,
       "owner": "_route_summary_enabled",
@@ -1393,15 +1312,7 @@
     },
     {
       "file": "routing.py",
-      "line": 805,
-      "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRACE_JSONL')",
-      "via_config": true,
-      "owner": "_ddtree_trace_event",
-      "policy": "dynamic"
-    },
-    {
-      "file": "routing.py",
-      "line": 488,
+      "line": 487,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS', '1')",
       "via_config": true,
       "owner": "_decode_dynamic_partitions_enabled",
@@ -1409,7 +1320,7 @@
     },
     {
       "file": "routing.py",
-      "line": 539,
+      "line": 538,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_PARTITION_SIZE')",
       "via_config": true,
       "owner": "_g6_aligned_page_partition_size_hint",
@@ -1417,7 +1328,7 @@
     },
     {
       "file": "routing.py",
-      "line": 541,
+      "line": 540,
       "expression": "_config.raw('VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH', '1')",
       "via_config": true,
       "owner": "_g6_aligned_page_partition_size_hint",
@@ -1425,15 +1336,7 @@
     },
     {
       "file": "routing.py",
-      "line": 628,
-      "expression": "_config.raw('VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA', '1')",
-      "via_config": true,
-      "owner": "_mtp5_xqa_dual_cta_partition_size_hint",
-      "policy": "dynamic"
-    },
-    {
-      "file": "routing.py",
-      "line": 743,
+      "line": 704,
       "expression": "_config.registered('VLLM_FLASH_V100_E4M3_BATCH_XQA')",
       "via_config": true,
       "owner": "_e4m3_batch_xqa_allowed",
@@ -1441,15 +1344,7 @@
     },
     {
       "file": "routing.py",
-      "line": 818,
-      "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRACE_JSONL')",
-      "via_config": true,
-      "owner": "_ddtree_trace_enabled",
-      "policy": "dynamic"
-    },
-    {
-      "file": "routing.py",
-      "line": 822,
+      "line": 766,
       "expression": "_config.raw('VLLM_FLASH_V100_TRACE_DECODE_ACTIVE', '0')",
       "via_config": true,
       "owner": "_decode_active_trace_enabled",
@@ -1457,7 +1352,7 @@
     },
     {
       "file": "routing.py",
-      "line": 395,
+      "line": 394,
       "expression": "_config.raw('VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN', '4096')",
       "via_config": true,
       "owner": "_xqa_reason",
@@ -1465,7 +1360,7 @@
     },
     {
       "file": "routing.py",
-      "line": 464,
+      "line": 463,
       "expression": "_config.registered('VLLM_FLASH_V100_E4M3_BATCH_XQA')",
       "via_config": true,
       "owner": "_batch_context_routing_cache_dtype_supported",
@@ -1473,7 +1368,7 @@
     },
     {
       "file": "routing.py",
-      "line": 762,
+      "line": 723,
       "expression": "_config.registered('VLLM_SM70_DEBUG')",
       "via_config": true,
       "owner": "_route_summary_enabled",
@@ -1481,7 +1376,7 @@
     },
     {
       "file": "routing.py",
-      "line": 764,
+      "line": 725,
       "expression": "_config.raw('VLLM_FLASH_V100_ROUTE_SUMMARY', '0')",
       "via_config": true,
       "owner": "_route_summary_enabled",
@@ -1489,7 +1384,7 @@
     },
     {
       "file": "routing.py",
-      "line": 765,
+      "line": 726,
       "expression": "_config.raw('VLLM_FLASH_V100_DEBUG_ROUTE_SUMMARY', '0')",
       "via_config": true,
       "owner": "_route_summary_enabled",
@@ -1497,71 +1392,143 @@
     },
     {
       "file": "routing.py",
-      "line": 383,
+      "line": 382,
       "expression": "_config.registered('VLLM_FLASH_V100_E4M3_BATCH_XQA')",
       "via_config": true,
       "owner": "_xqa_reason",
       "policy": "dynamic"
     },
     {
-      "file": "spec/attention.py",
-      "line": 104,
+      "file": "spec/attention_policy.py",
+      "line": 84,
       "expression": "_config.registered('VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN')",
       "via_config": true,
       "owner": "configure_verifier",
       "policy": "dynamic"
     },
     {
-      "file": "spec/attention.py",
-      "line": 44,
+      "file": "spec/attention_policy.py",
+      "line": 28,
       "expression": "_config.registered('VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS')",
       "via_config": true,
       "owner": "initialize_scalar_tail",
       "policy": "dynamic"
     },
     {
-      "file": "spec/attention.py",
-      "line": 97,
+      "file": "spec/attention_policy.py",
+      "line": 77,
       "expression": "_config.registered('VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY')",
       "via_config": true,
       "owner": "configure_verifier",
       "policy": "dynamic"
     },
     {
-      "file": "spec/attention.py",
-      "line": 102,
+      "file": "spec/attention_policy.py",
+      "line": 82,
       "expression": "_config.registered('VLLM_FLASH_V100_DFLASH2_BATCHED_GROUPED_VERIFY')",
       "via_config": true,
       "owner": "configure_verifier",
       "policy": "dynamic"
     },
     {
-      "file": "spec/attention.py",
-      "line": 46,
+      "file": "spec/attention_policy.py",
+      "line": 30,
       "expression": "_config.registered('VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST')",
       "via_config": true,
       "owner": "initialize_scalar_tail",
       "policy": "dynamic"
     },
     {
-      "file": "spec/attention.py",
-      "line": 49,
+      "file": "spec/attention_policy.py",
+      "line": 33,
       "expression": "_config.raw('VLLM_FLASH_V100_DECODE_PARTITION_SIZE')",
       "via_config": true,
       "owner": "initialize_scalar_tail",
       "policy": "dynamic"
     },
     {
-      "file": "spec/attention.py",
-      "line": 54,
+      "file": "spec/attention_policy.py",
+      "line": 38,
       "expression": "_config.registered('VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST')",
       "via_config": true,
       "owner": "initialize_scalar_tail",
       "policy": "dynamic"
     },
     {
+      "file": "spec/policy.py",
+      "line": 18,
+      "expression": "_config.raw('VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE')",
+      "via_config": true,
+      "owner": "context_bucket_partition_size_hint",
+      "policy": "dynamic"
+    },
+    {
+      "file": "spec/policy.py",
+      "line": 39,
+      "expression": "_config.raw('VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE', '1024')",
+      "via_config": true,
+      "owner": "dual_cta_partition_size_hint",
+      "policy": "dynamic"
+    },
+    {
+      "file": "spec/policy.py",
+      "line": 56,
+      "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRACE_JSONL')",
+      "via_config": true,
+      "owner": "trace_event",
+      "policy": "dynamic"
+    },
+    {
+      "file": "spec/policy.py",
+      "line": 37,
+      "expression": "_config.raw('VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA', '1')",
+      "via_config": true,
+      "owner": "dual_cta_partition_size_hint",
+      "policy": "dynamic"
+    },
+    {
+      "file": "spec/policy.py",
+      "line": 69,
+      "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRACE_JSONL')",
+      "via_config": true,
+      "owner": "trace_enabled",
+      "policy": "dynamic"
+    },
+    {
+      "file": "spec/policy.py",
+      "line": 73,
+      "expression": "_config.raw('VLLM_FLASH_V100_DFLASH_PREFIX_DUMP', '0')",
+      "via_config": true,
+      "owner": "prefix_dump_enabled",
+      "policy": "dynamic"
+    },
+    {
+      "file": "spec/policy.py",
+      "line": 77,
+      "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN', '1')",
+      "via_config": true,
+      "owner": "branch_attn_enabled",
+      "policy": "dynamic"
+    },
+    {
+      "file": "spec/policy.py",
+      "line": 81,
+      "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT', '0')",
+      "via_config": true,
+      "owner": "branch_attn_strict",
+      "policy": "dynamic"
+    },
+    {
+      "file": "spec/policy.py",
+      "line": 85,
+      "expression": "_config.raw('VLLM_DFLASH_DDTREE_WORKER_PROFILE', '0')",
+      "via_config": true,
+      "owner": "worker_profile_enabled",
+      "policy": "dynamic"
+    },
+    {
       "file": "spec/verify_metadata.py",
-      "line": 28,
+      "line": 30,
       "expression": "_config.raw('VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q', '16')",
       "via_config": true,
       "owner": "_configured_smallq_max_query_len",
@@ -1569,7 +1536,7 @@
     },
     {
       "file": "spec/verify_metadata.py",
-      "line": 34,
+      "line": 36,
       "expression": "_config.raw('VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN', '0')",
       "via_config": true,
       "owner": "_configured_smallq_max_model_len",
@@ -1577,22 +1544,23 @@
     },
     {
       "file": "verify.py",
-      "line": 639,
+      "line": 691,
       "expression": "_config.registered('VLLM_FLASH_V100_PREFILL_CHUNK_PROFILE')",
       "via_config": true,
-      "owner": "_flash_v100_ddtree_small_query_prefill_dense",
+      "owner": "tree_prefill",
       "policy": "dynamic"
     },
     {
       "file": "verify.py",
-      "line": 638,
+      "line": 689,
       "expression": "_config.raw('VLLM_DFLASH_DDTREE_TRACE_KV_CACHE_DIFF', '0')",
       "via_config": true,
-      "owner": "_flash_v100_ddtree_small_query_prefill_dense",
+      "owner": "tree_prefill",
       "policy": "dynamic"
     }
   ],
   "functions": {
+    "__init__.py:_compatibility_bindings": 4,
     "__init__.py:__getattr__": 6,
     "backend.py:get_impl_cls": 2,
     "backend.py:get_builder_cls": 2,
@@ -1610,10 +1578,6 @@
     "debug.py:_sm70_profile_trace": 5,
     "debug.py:_draft_graph_debug_enabled": 2,
     "debug.py:_draft_graph_debug_limit": 2,
-    "debug.py:_dflash_prefix_dump_enabled": 2,
-    "debug.py:_dflash_ddtree_triton_branch_attn_enabled": 2,
-    "debug.py:_dflash_ddtree_triton_branch_attn_strict": 2,
-    "debug.py:_dflash_ddtree_worker_profile_enabled": 2,
     "debug.py:_format_tensor_debug": 20,
     "debug.py:_draft_graph_debug_log": 15,
     "debug.py:_graph_metadata_debug_log": 15,
@@ -1628,6 +1592,11 @@
     "debug_compare.py:_tensor_compare_stats": 35,
     "debug_compare.py:_prefill_raw_kv_cache_compare_stats": 53,
     "debug_compare.py:_maybe_compare_triton_output": 76,
+    "debug_compare.py:__call__": 164,
+    "debug_compare.py:__init__": 8,
+    "debug_compare.py:flash_attn_prefill_paged_bhmd": 2,
+    "debug_compare.py:__getattr__": 4,
+    "debug_compare.py:__setattr__": 5,
     "decode.py:kv_codec": 2,
     "decode.py:__init__": 2,
     "decode.py:forward": 4,
@@ -1635,14 +1604,14 @@
     "decode.py:_xqa_kv_codec": 9,
     "decode.py:_call_flash_attn_decode_paged": 82,
     "decode.py:_anchored_swa_params": 27,
-    "decode.py:_flash_v100_decode_as_paged_prefill": 209,
-    "decode.py:_flash_v100_decode_dense_cache": 96,
-    "decode.py:_flash_v100_decode_dense_reference": 75,
+    "decode.py:_flash_v100_decode_as_paged_prefill": 228,
+    "decode.py:_flash_v100_decode_dense_cache": 98,
+    "decode.py:_flash_v100_decode_dense_reference": 77,
     "decode.py:_flash_v100_decode": 64,
     "decode.py:xqa": 80,
     "decode.py:scalar": 61,
     "decode.py:admit": 2,
-    "decode.py:run": 47,
+    "decode.py:run": 49,
     "dense_prefill.py:clear_flash_attn_v100_workspaces": 9,
     "dense_prefill.py:_uniform_cu_seqlens": 31,
     "dense_prefill.py:_get_prefill_dense_splitkv3_workspace": 49,
@@ -1654,7 +1623,6 @@
     "dense_prefill.py:_get_sm70_79t_q8192_padding_workspace": 30,
     "dense_prefill.py:_run_sm70_d256_gqa_79t_q8192_dispatch": 48,
     "dense_prefill.py:_try_sm70_fa2_d256_prefill": 303,
-    "dense_prefill.py:_allocate_growing_workspace": 23,
     "dense_prefill.py:_get_fp8_prefill_bridge_workspace": 73,
     "dense_prefill.py:_get_fp8_prefill_bridge_tail_workspace": 51,
     "dense_prefill.py:flash_v100_dense_prefill_available": 3,
@@ -1662,21 +1630,36 @@
     "dense_prefill.py:flash_v100_dense_prefill_lse_available": 2,
     "dense_prefill.py:flash_v100_dense_prefill_lse": 156,
     "dense_prefill.py:_allocate": 3,
-    "impl.py:__init__": 257,
+    "impl.py:_verification_method": 14,
+    "impl.py:_prefill_method": 5,
+    "impl.py:_comparison_method": 5,
+    "impl.py:spec_attention": 7,
+    "impl.py:comparison_state": 9,
+    "impl.py:__getattr__": 6,
+    "impl.py:__setattr__": 7,
+    "impl.py:_policy": 12,
+    "impl.py:_contract_validator": 2,
+    "impl.py:__init__": 262,
     "impl.py:kv_codec": 3,
     "impl.py:_xqa_kv_codec": 16,
     "impl.py:_supports_flash_v100_path": 13,
     "impl.py:_flash_v100_has_sliding_window": 5,
     "impl.py:_flash_v100_window_size": 9,
-    "impl.py:_new_decode_executor": 44,
+    "impl.py:_new_decode_executor": 34,
     "impl.py:_call_flash_attn_decode_paged": 40,
+    "impl.py:_new_comparison_executor": 19,
+    "impl.py:_new_prefill_executor": 40,
+    "impl.py:_new_verification_executor": 33,
     "impl.py:_anchored_swa_params": 4,
-    "impl.py:forward": 402,
+    "impl.py:forward": 153,
+    "impl.py:_forward_prefill": 27,
     "impl.py:_forward_decode": 29,
     "impl.py:_flash_v100_decode_as_paged_prefill": 11,
     "impl.py:_flash_v100_decode_dense_cache": 13,
     "impl.py:_flash_v100_decode_dense_reference": 11,
     "impl.py:_flash_v100_decode": 13,
+    "impl.py:call": 2,
+    "impl.py:validate": 4,
     "kv_layout.py:_split_paged_kv_cache": 27,
     "kv_layout.py:_has_prefix_context": 10,
     "kv_layout.py:_metadata_expects_more_query_tokens_than_available": 21,
@@ -1693,14 +1676,18 @@
     "masks.py:_build_bfla_block_mask_for_seq": 200,
     "masks.py:_torch_attention_reference": 44,
     "masks.py:_ddtree_parent_ids_cpu": 13,
-    "masks.py:_ddtree_parent_metadata_requires_branch": 17,
-    "masks.py:_ddtree_triton_seq_lens_match": 22,
-    "masks.py:_ddtree_triton_query_start_loc_match": 30,
-    "masks.py:_ddtree_triton_parent_ids_for_query": 49,
-    "masks.py:_build_ddtree_visibility_mask": 53,
     "masks.py:pool_blocks": 25,
-    "metadata.py:_as_flash_v100_metadata": 6,
+    "metadata.py:_as_flash_v100_metadata": 10,
+    "metadata.py:spec_state": 10,
+    "metadata.py:__getattr__": 6,
+    "metadata.py:__setattr__": 9,
+    "metadata.py:__delattr__": 5,
+    "metadata.py:__copy__": 6,
     "metadata.py:__init__": 47,
+    "metadata.py:initialize_spec_state": 18,
+    "metadata.py:build": 10,
+    "metadata.py:build_for_drafting": 2,
+    "metadata.py:_stabilize_draft_graph_metadata": 4,
     "metadata.py:_attach_prefix_anchored_metadata": 33,
     "metadata.py:_attach_common_flash_metadata": 34,
     "metadata.py:_attach_decode_shape_hints": 49,
@@ -1721,7 +1708,11 @@
     "ops.py:flash_v100_turboquant_decode_available": 2,
     "ops.py:flash_v100_turboquant_decode": 30,
     "ops.py:_get_paged_kv_utils": 16,
-    "plan/routing.py:execute": 11,
+    "plan/events.py:__init__": 2,
+    "plan/events.py:subscribe": 2,
+    "plan/events.py:emit": 4,
+    "plan/routing.py:try_execute": 11,
+    "plan/routing.py:execute": 5,
     "plan/routing.py:record_legacy": 3,
     "plan/routing.py:admit": 2,
     "plan/routing.py:run": 3,
@@ -1737,8 +1728,35 @@
     "prefill.py:_run_mixed_rows_grouped_e4m3": 80,
     "prefill.py:_run_prefill_prefix_decode_rows": 171,
     "prefill.py:_run_prefill_paged_call": 35,
-    "prefill.py:_flash_v100_prefill_with_prefix": 977,
+    "prefill.py:_flash_v100_prefill_with_prefix": 219,
+    "prefill.py:log_bfla": 13,
+    "prefill.py:log_fa2": 8,
+    "prefill.py:log_contiguous_bhmd": 10,
+    "prefill.py:log_contiguous_dense": 9,
+    "prefill.py:log_dense_fa2": 7,
+    "prefill.py:log_fp8_bridge": 9,
+    "prefill.py:log_splitkv": 11,
+    "prefill.py:execute_prefill_sequence": 45,
+    "prefill.py:create_prefill_executor": 37,
+    "prefill.py:log_noncausal": 8,
+    "prefill.py:log_small_query": 8,
+    "prefill.py:execute_prefill_batch": 52,
+    "prefill.py:observe_prefill_reference": 56,
+    "prefill.py:forward": 261,
+    "prefill.py:__init__": 9,
+    "prefill.py:scale": 2,
+    "prefill.py:kv_cache_dtype": 2,
+    "prefill.py:kv_codec": 2,
+    "prefill.py:__getattr__": 4,
     "prefill.py:run": 16,
+    "prefill_candidates.py:kv_codec": 2,
+    "prefill_candidates.py:__init__": 2,
+    "prefill_candidates.py:batch": 5,
+    "prefill_candidates.py:sequence": 2,
+    "prefill_candidates.py:candidates": 6,
+    "prefill_candidates.py:prepare_fallback": 17,
+    "prefill_candidates.py:admit": 8,
+    "prefill_candidates.py:run": 15,
     "routing.py:_declare": 5,
     "routing.py:route_spec": 9,
     "routing.py:_xqa_reason": 55,
@@ -1752,8 +1770,6 @@
     "routing.py:resolve_decode_strategy": 17,
     "routing.py:_g6_aligned_page_partition_size_hint": 49,
     "routing.py:_log_kv_dtype_contract": 24,
-    "routing.py:_mtp_context_bucket_partition_size_hint": 17,
-    "routing.py:_mtp5_xqa_dual_cta_partition_size_hint": 17,
     "routing.py:_select_default_decode_partition_size": 10,
     "routing.py:_decode_xqa_q4_min_seq_len": 10,
     "routing.py:_decode_fp8_xqa_min_seq_len": 11,
@@ -1765,8 +1781,6 @@
     "routing.py:_route_summary_enabled": 7,
     "routing.py:_log_route_summary": 13,
     "routing.py:_record_route": 18,
-    "routing.py:_ddtree_trace_event": 11,
-    "routing.py:_ddtree_trace_enabled": 2,
     "routing.py:_decode_active_trace_enabled": 2,
     "routing.py:_decode_active_value": 6,
     "routing.py:_trace_decode_active": 78,
@@ -1775,10 +1789,6 @@
     "routing.py:_log_fp8_kv_cache_route": 38,
     "routing.py:gqa": 4,
     "routing.py:shape_reason": 22,
-    "spec/attention.py:initialize_scalar_tail": 22,
-    "spec/attention.py:initialize_verify_abi": 7,
-    "spec/attention.py:configure_prefill": 24,
-    "spec/attention.py:configure_verifier": 17,
     "spec/attention.py:reject_xqa": 4,
     "spec/attention.py:fallback_kind": 2,
     "spec/attention.py:unsupported": 24,
@@ -1786,17 +1796,44 @@
     "spec/attention.py:capture_prefix_kind": 6,
     "spec/attention.py:record_capture_prefix": 10,
     "spec/attention.py:record_capture_layout": 9,
-    "spec/attention.py:register_attention_hooks": 14,
-    "spec/builder.py:build": 67,
-    "spec/builder.py:initialize_builder": 31,
-    "spec/builder.py:prepare_capture": 38,
+    "spec/attention.py:prefill_dependencies": 9,
+    "spec/attention.py:verification_dependencies": 13,
+    "spec/attention.py:validate_layer_contract": 2,
+    "spec/attention_policy.py:initialize_scalar_tail": 22,
+    "spec/attention_policy.py:initialize_verify_abi": 3,
+    "spec/attention_policy.py:configure_prefill": 4,
+    "spec/attention_policy.py:configure_verifier": 3,
+    "spec/attention_policy.py:__init__": 2,
+    "spec/builder.py:build": 50,
+    "spec/builder.py:initialize_builder": 29,
+    "spec/builder.py:prepare_capture": 36,
     "spec/builder.py:attach_common": 4,
+    "spec/contracts.py:validate_contract": 54,
     "spec/draft.py:_debug_draft_metadata": 46,
     "spec/draft.py:_stabilize_draft_graph_metadata": 38,
-    "spec/draft.py:build_for_drafting": 81,
+    "spec/draft.py:build_for_drafting": 79,
     "spec/draft.py:_ensure_flash_draft_graph_buffers": 14,
     "spec/draft.py:copy_dflash_graph_metadata": 8,
+    "spec/features.py:prepare_verification": 14,
+    "spec/features.py:prepare": 13,
+    "spec/hooks.py:initialize_legacy": 2,
+    "spec/hooks.py:attach_common_legacy": 2,
+    "spec/hooks.py:prepare_capture_legacy": 2,
     "spec/hooks.py:register_metadata_hooks": 7,
+    "spec/metadata_contracts.py:metadata_view": 4,
+    "spec/metadata_state.py:__init__": 7,
+    "spec/metadata_state.py:vllm_config": 2,
+    "spec/metadata_state.py:device": 2,
+    "spec/metadata_state.py:block_size": 2,
+    "spec/metadata_state.py:_is_speculative_draft_model": 2,
+    "spec/policy.py:context_bucket_partition_size_hint": 17,
+    "spec/policy.py:dual_cta_partition_size_hint": 17,
+    "spec/policy.py:trace_event": 11,
+    "spec/policy.py:trace_enabled": 2,
+    "spec/policy.py:prefix_dump_enabled": 2,
+    "spec/policy.py:branch_attn_enabled": 2,
+    "spec/policy.py:branch_attn_strict": 2,
+    "spec/policy.py:worker_profile_enabled": 2,
     "spec/smallq_metadata.py:_sm70_prepare_smallq_decode_metadata_kernel": 72,
     "spec/smallq_metadata.py:_sm70_prepare_smallq_decode_metadata": 42,
     "spec/smallq_metadata.py:_load_sm70_smallq_i32_ptr": 3,
@@ -1804,23 +1841,33 @@
     "spec/smallq_metadata.py:_sm70_prepare_grouped_smallq_decode_metadata": 152,
     "spec/smallq_metadata.py:prepare_dflash2_smallq_group_metadata": 178,
     "spec/smallq_metadata.py:fallback": 5,
-    "spec/tree.py:_attach_ddtree_metadata": 62,
+    "spec/tree.py:attach_metadata": 62,
+    "spec/tree_masks.py:parent_metadata_requires_branch": 17,
+    "spec/tree_masks.py:triton_seq_lens_match": 22,
+    "spec/tree_masks.py:triton_query_start_loc_match": 30,
+    "spec/tree_masks.py:triton_parent_ids_for_query": 49,
+    "spec/tree_masks.py:build_visibility_mask": 53,
     "spec/verify_metadata.py:_configured_smallq_max_query_len": 4,
     "spec/verify_metadata.py:_configured_smallq_max_model_len": 4,
-    "spec/verify_metadata.py:_smallq_buffer_token_capacity": 23,
+    "spec/verify_metadata.py:_smallq_buffer_token_capacity": 21,
     "spec/verify_metadata.py:_clear_smallq_decode_metadata": 11,
-    "spec/verify_metadata.py:_attach_prepared_dflash2_smallq_metadata": 35,
-    "spec/verify_metadata.py:_update_smallq_decode_metadata": 284,
+    "spec/verify_metadata.py:attach_prepared_metadata": 35,
+    "spec/verify_metadata.py:update_decode_metadata": 284,
     "spec/verify_metadata.py:_ensure_smallq_decode_buffers": 24,
-    "verify.py:_validate_dflash_attention_contract": 54,
-    "verify.py:_dflash2_grouped_verify_allowed": 117,
-    "verify.py:_call_dflash2_grouped_verify": 39,
-    "verify.py:_smallq_decode_xqa_allowed": 39,
-    "verify.py:_call_flash_attn_smallq_decode_paged": 167,
-    "verify.py:_small_query_decode_enabled": 27,
-    "verify.py:_flash_v100_ddtree_small_query_prefill_dense": 305,
-    "verify.py:_flash_v100_small_query_prefill_as_decode": 235,
+    "state.py:__getattr__": 4,
+    "state.py:__setattr__": 5,
+    "verify.py:kv_codec": 2,
+    "verify.py:__init__": 30,
+    "verify.py:validate_contract": 2,
+    "verify.py:grouped_verify_allowed": 117,
+    "verify.py:call_grouped_verify": 39,
+    "verify.py:smallq_xqa_allowed": 39,
+    "verify.py:call_smallq_decode_paged": 175,
+    "verify.py:small_query_enabled": 30,
+    "verify.py:tree_prefill": 315,
+    "verify.py:small_query_prefill": 239,
     "workspace.py:mixed_decode_rows_plan": 33,
+    "workspace.py:allocate_growing_workspace": 23,
     "workspace.py:invalidate": 5,
     "workspace.py:ensure_capacity": 38,
     "workspace.py:get_kv_single_seq": 66,

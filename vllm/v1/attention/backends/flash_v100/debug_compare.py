@@ -1,17 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Flash-V100 debug compare methods, bound by impl."""
+"""Comparison calculations with owned counters and explicit operator inputs."""
 
 from __future__ import annotations
 
 import json
 import os
 import time
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.flash_v100 import impl as _impl
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100.plan import events as _events
@@ -23,7 +24,7 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
 def _maybe_compare_bhmd_out(
-    self: _impl.FlashAttnV100Impl,
+    self: ComparisonExecutor,
     layer: torch.nn.Module,
     q_bhmd: torch.Tensor,
     key_cache: torch.Tensor,
@@ -64,7 +65,7 @@ def _maybe_compare_bhmd_out(
     )
 
 
-def _reserve_bhmd_compare_call(self: _impl.FlashAttnV100Impl) -> int | None:
+def _reserve_bhmd_compare_call(self: ComparisonExecutor) -> int | None:
     if (
         not self.compare_bhmd_out_dir
         or self.compare_bhmd_out_max_calls <= 0
@@ -77,7 +78,7 @@ def _reserve_bhmd_compare_call(self: _impl.FlashAttnV100Impl) -> int | None:
     return call_idx
 
 
-def _reserve_triton_compare_call(self: _impl.FlashAttnV100Impl) -> int | None:
+def _reserve_triton_compare_call(self: ComparisonExecutor) -> int | None:
     if (
         not self.compare_triton_out_dir
         or self.compare_triton_out_max_calls <= 0
@@ -91,7 +92,7 @@ def _reserve_triton_compare_call(self: _impl.FlashAttnV100Impl) -> int | None:
 
 
 def _write_bhmd_compare_report(
-    self: _impl.FlashAttnV100Impl,
+    self: ComparisonExecutor,
     candidate_bmhd: torch.Tensor,
     reference_bmhd: torch.Tensor,
     call_idx: int,
@@ -121,7 +122,7 @@ def _write_bhmd_compare_report(
 
 
 def _write_triton_compare_report(
-    self: _impl.FlashAttnV100Impl,
+    self: ComparisonExecutor,
     candidate: torch.Tensor,
     reference: torch.Tensor,
     call_idx: int,
@@ -158,7 +159,7 @@ def _write_triton_compare_report(
 
 
 def _maybe_write_triton_tensor_dump(
-    self: _impl.FlashAttnV100Impl,
+    self: ComparisonExecutor,
     layer: torch.nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -298,7 +299,7 @@ def _tensor_compare_stats(
 
 
 def _prefill_raw_kv_cache_compare_stats(
-    self: _impl.FlashAttnV100Impl,
+    self: ComparisonExecutor,
     layer: torch.nn.Module,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -353,7 +354,7 @@ def _prefill_raw_kv_cache_compare_stats(
 
 
 def _maybe_compare_triton_output(
-    self: _impl.FlashAttnV100Impl,
+    self: ComparisonExecutor,
     layer: torch.nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -372,7 +373,7 @@ def _maybe_compare_triton_output(
         return
 
     reference = torch.empty_like(output)
-    super(_impl._super_owner, self).forward(
+    self.ops.triton_forward(
         layer,
         query,
         key,
@@ -665,3 +666,71 @@ class PrefixReportObserver:
 
 _events.prefill_debug.subscribe(PrefixReferenceObserver())
 _events.prefill_debug.subscribe(PrefixReportObserver())
+
+
+COUNTER_FIELDS = frozenset({"_compare_bhmd_out_calls", "_compare_triton_out_calls"})
+
+
+class ComparisonState:
+    # No defaults: partial legacy objects retain missing-field errors if a
+    # diagnostic is enabled before the original constructor initializes it.
+    _compare_bhmd_out_calls: int
+    _compare_triton_out_calls: int
+
+
+@dataclass(frozen=True)
+class ComparisonOps:
+    triton_forward: Any
+    paged_bhmd: Any
+
+
+class ComparisonExecutor:
+    def __init__(self, policy, scale, kv_cache_dtype, ops, state, overrides=None):
+        self.policy = policy
+        self.scale = scale
+        self.kv_cache_dtype = kv_cache_dtype
+        self.ops = ops
+        self.state = state
+        if overrides:
+            vars(self).update(overrides)
+
+    @property
+    def flash_attn_prefill_paged_bhmd(self):
+        return self.ops.paged_bhmd
+
+    def __getattr__(self, name):
+        if name in COUNTER_FIELDS:
+            return getattr(self.state, name)
+        return getattr(self.policy, name)
+
+    def __setattr__(self, name, value):
+        if name in COUNTER_FIELDS:
+            setattr(self.state, name, value)
+        else:
+            super().__setattr__(name, value)
+
+    _maybe_compare_bhmd_out = _maybe_compare_bhmd_out
+    _reserve_bhmd_compare_call = _reserve_bhmd_compare_call
+    _reserve_triton_compare_call = _reserve_triton_compare_call
+    _write_bhmd_compare_report = _write_bhmd_compare_report
+    _write_triton_compare_report = _write_triton_compare_report
+    _maybe_write_triton_tensor_dump = _maybe_write_triton_tensor_dump
+    _prefill_raw_kv_cache_compare_stats = _prefill_raw_kv_cache_compare_stats
+    _maybe_compare_triton_output = _maybe_compare_triton_output
+    _small_tensor_list = staticmethod(_small_tensor_list)
+    _layer_debug_info = staticmethod(_layer_debug_info)
+    _tensor_compare_stats = staticmethod(_tensor_compare_stats)
+
+
+LEGACY_METHODS = (
+    "_maybe_compare_bhmd_out",
+    "_reserve_bhmd_compare_call",
+    "_reserve_triton_compare_call",
+    "_write_bhmd_compare_report",
+    "_write_triton_compare_report",
+    "_maybe_write_triton_tensor_dump",
+    "_prefill_raw_kv_cache_compare_stats",
+    "_maybe_compare_triton_output",
+)
+
+STATIC_METHODS = ("_small_tensor_list", "_layer_debug_info", "_tensor_compare_stats")

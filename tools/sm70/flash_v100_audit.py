@@ -50,6 +50,7 @@ def audit():
     graph = nx.DiGraph()
     env = []
     functions = {}
+    function_sizes = []
     private = []
     model_hits = 0
     flags = 0
@@ -71,6 +72,7 @@ def audit():
                 functions[f"{path.relative_to(PACKAGE)}:{node.name}"] = (
                     node.end_lineno - node.lineno + 1
                 )
+                function_sizes.append(node.end_lineno - node.lineno + 1)
             if (
                 isinstance(node, ast.Attribute)
                 and node.attr.startswith("_")
@@ -138,7 +140,7 @@ def audit():
     return {
         "metrics": dict(
             forward=functions["impl.py:forward"],
-            largest_function=max(functions.values()),
+            largest_function=max(function_sizes),
             cross_module_private=len(private),
             import_cycles=len(cycles),
             model_names_outside_spec=model_hits,

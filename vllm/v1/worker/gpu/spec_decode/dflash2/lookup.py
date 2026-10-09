@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import torch
 
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
-_SCORE_STRIDE = tl.constexpr(1 << 32)
+_SCORE_STRIDE = tl.constexpr(1 << 32) if HAS_TRITON else 1 << 32
 
 
 @triton.jit

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
@@ -14,7 +15,9 @@ from vllm.config.sm70_dflash2 import (
 )
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
+from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import (
+    SmallQueryBuilder,
+)
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
@@ -405,7 +408,7 @@ def _sm70_prepare_grouped_smallq_decode_metadata(
 
 def prepare_dflash2_smallq_group_metadata(
     *,
-    builders_by_group: list[tuple[int, _metadata.FlashAttnV100MetadataBuilder]],
+    builders_by_group: Sequence[tuple[int, SmallQueryBuilder]],
     block_tables: tuple[torch.Tensor, ...],
     seq_lens: torch.Tensor,
     query_start_loc: torch.Tensor,

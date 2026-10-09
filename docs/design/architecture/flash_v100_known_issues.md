@@ -69,3 +69,21 @@ Baseline: #1060 `8c96e32e56c09d4a3e3112cb5d1a367571f69476`.
   this pre-existing proposer/model interface bug, and no successful full-model
   DDTree gate is claimed. The independent native DDTree FP16 operator cases
   remain required and do not substitute for the failed model gate.
+
+- The first complete host-FP8 MTP4 pair produces different greedy token IDs
+  despite identical #1060 + #1028 production code on both arms. The France
+  request matches; the Chinese 64-token answer diverges at zero-based token 21
+  (96378 versus 99505). Both arms share all 2,705 production source hashes,
+  native-library hashes, recorder, workload and GPU state. Their isolated
+  cache/IPC paths differ. Preserve `host-parent.json`, `host-candidate.json`,
+  `host-compare.log` and `host-production-source-parity.json` under `a3-step1c`
+  on 54633. This is an unresolved baseline reproducibility investigation,
+  not a passing host gate or evidence that an A3 production edit caused it.
+  An unchanged-parent repeat writes separate `host-parent-repeat` artifacts;
+  it must not overwrite the original records or produce `host.done`.
+
+  The unchanged-parent repeat also diverged at token 21 under the same contract
+  (96378 versus 99505). France remained identical. This confirms failure to
+  reproduce the frozen parent's original output, without establishing the
+  numerical cause. Evidence: `host-parent-repeat-report.json` and
+  `host-parent-repeat.log`; no acceptance result or original record was changed.
