@@ -19,6 +19,17 @@ from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import (
 
 
 class SpecMetadataState:
+    @staticmethod
+    def model_state_kwargs(metadata, builder_key):
+        """Borrow this builder's prepared verification metadata."""
+        return {
+            "prepared_dflash2_smallq_metadata": (
+                None
+                if metadata.prepared_dflash2_smallq_metadata is None
+                else metadata.prepared_dflash2_smallq_metadata.get(builder_key)
+            )
+        }
+
     def __init__(self, inputs: MetadataInputs, ops: MetadataOps, spec_config):
         self.inputs = inputs
         self.ops = ops

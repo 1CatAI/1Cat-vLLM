@@ -2713,6 +2713,7 @@ class VllmConfig:
         self.kernel_config.resolve_gdn(self.model_config, self.additional_config)
         if self.kernel_config.gdn.resolved:
             self.observability_config.gdn_profile.resolve()
+            self.observability_config.gdn_state.resolve()
 
         if self.use_v2_model_runner:
             self._validate_v2_model_runner()

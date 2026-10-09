@@ -40,6 +40,11 @@
  "vllm/config/gdn_schedule.py": {
   "platform": 46
  },
+ "vllm/config/gdn_state.py": {
+  "env": 5,
+  "model": 6,
+  "platform": 14
+ },
  "vllm/config/observability.py": {
   "platform": 1
  },
@@ -214,7 +219,7 @@
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 44,
   "model": 239,
-  "platform": 550
+  "platform": 548
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -392,9 +397,9 @@
   "model": 25
  },
  "vllm/v1/attention/backends/gdn_attn.py": {
-  "env": 17,
-  "model": 181,
-  "platform": 41
+  "env": 11,
+  "model": 179,
+  "platform": 20
  },
  "vllm/v1/attention/backends/mla/flashmla_sparse.py": {
   "platform": 1
@@ -421,6 +426,9 @@
  "vllm/v1/attention/backends/turboquant_attn.py": {
   "env": 6,
   "platform": 79
+ },
+ "vllm/v1/attention/ops/gdn_state.py": {
+  "model": 1
  },
  "vllm/v1/attention/ops/prefix_prefill.py": {
   "model": 1
@@ -535,8 +543,8 @@
   "platform": 8
  },
  "vllm/v1/worker/gpu/model_states/mamba_hybrid.py": {
-  "model": 82,
-  "platform": 28
+  "model": 75,
+  "platform": 23
  },
  "vllm/v1/worker/gpu/pp_utils.py": {
   "model": 1

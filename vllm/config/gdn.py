@@ -9,6 +9,7 @@ from dataclasses import fields
 from pydantic import Field
 
 from vllm.config.gdn_schedule import GdnScheduleConfig
+from vllm.config.gdn_state import GdnStateConfig
 from vllm.config.utils import config, hash_factors
 
 GDN_LEGACY_FIELDS = {
@@ -33,6 +34,9 @@ class GdnConfig:
     GDN layers. A configuration without GDN does not read its legacy controls or
     contribute these options to graph hashes.
     """
+
+    state: GdnStateConfig = Field(default_factory=GdnStateConfig)
+    """State indices, metadata preparation and speculative boundary policy."""
 
     schedule: GdnScheduleConfig = Field(default_factory=GdnScheduleConfig)
     """Per-engine FLA tuning, shared by all recurrence and prefill stages."""
@@ -128,6 +132,7 @@ class GdnConfig:
             )
         else:
             self.sources["native_verify"] = "typed"
+        self.state.resolve()
         self.schedule.resolve()
         self.resolved = True
 
@@ -141,6 +146,8 @@ class GdnConfig:
             field.name: (
                 self.schedule.graph_options()
                 if field.name == "schedule"
+                else self.state.graph_options()
+                if field.name == "state"
                 else getattr(self, field.name)
             )
             for field in fields(self)

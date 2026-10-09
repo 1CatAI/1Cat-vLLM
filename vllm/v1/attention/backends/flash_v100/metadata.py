@@ -101,6 +101,9 @@ def as_flash_v100_metadata(
 class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
     """Attach CPU metadata for the dense prefill path."""
 
+    def get_model_state_kwargs(self, metadata, num_reqs):
+        return SpecMetadataState.model_state_kwargs(metadata, id(self))
+
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, *args, **kwargs):

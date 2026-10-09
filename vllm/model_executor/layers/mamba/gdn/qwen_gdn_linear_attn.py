@@ -19,6 +19,7 @@ from vllm.config import (
     get_current_vllm_config,
 )
 from vllm.config.gdn import GdnProfileConfig, resolve_gdn_config
+from vllm.config.gdn_state import resolve_state_trace
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
@@ -126,6 +127,7 @@ from vllm.v1.attention.backends.gdn_attn import (
     get_registered_gdn_spec_metadata_tensors,
 )
 from vllm.v1.attention.backends.utils import compute_causal_conv1d_metadata
+from vllm.v1.attention.ops.gdn_state import GdnMetadataOverride
 from vllm.v1.worker.gpu.spec_decode import uses_dflash_selector_engine
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
@@ -674,10 +676,17 @@ def _sm70_qwen_gdn_metadata_has_active_spec(
 def _sm70_assert_standard_core_not_active_spec(
     layer_name: LayerNameType,
     attn_metadata: GDNAttentionMetadata | None,
+    *,
+    enabled: bool | None = None,
+    spec_core: bool | None = None,
 ) -> None:
-    if os.getenv("VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD") != "1":
+    if enabled is None:
+        enabled = os.getenv("VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD") == "1"
+    if not enabled:
         return
-    if not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+    if spec_core is None:
+        spec_core = envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+    if not spec_core:
         return
     if not _sm70_qwen_gdn_metadata_has_active_spec(attn_metadata):
         return
@@ -1708,6 +1717,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> None:
         super().__init__(config, vllm_config, prefix)
         self.gdn_policy = resolve_gdn_config(vllm_config)
+        self.gdn_state_trace = resolve_state_trace(vllm_config)
         self._gdn_profiler = bind_gdn_profiler(vllm_config)
         # Runtime forward/capture need not retain the initialization config.
         # Capture LoRA exclusion while the owning configuration is available.
@@ -1953,13 +1963,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.auto_sm70_qwen_gdn_full_forward = (
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
             and vllm_config.speculative_config is not None
-            and not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+            and not self.gdn_policy.state.spec_core
             and (not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP or block_003_deep_mtp)
         )
         self.auto_sm70_qwen_gdn_spec_core = (
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
             and vllm_config.speculative_config is not None
-            and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+            and self.gdn_policy.state.spec_core
         )
         self.auto_sm70_qwen_gdn_003_spec_core = (
             envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
@@ -6014,7 +6024,12 @@ def qwen_gdn_attention_core(
         candidate = attn_metadata_raw.get(layer_name)
         if isinstance(candidate, GDNAttentionMetadata):
             attn_metadata = candidate
-    _sm70_assert_standard_core_not_active_spec(layer_name, attn_metadata)
+    _sm70_assert_standard_core_not_active_spec(
+        layer_name,
+        attn_metadata,
+        enabled=self.gdn_state_trace.assert_standard_boundary,
+        spec_core=self.gdn_policy.state.spec_core,
+    )
     if conv_state_cache.numel() == 0 and ssm_state_cache.numel() == 0:
         kv_cache = getattr(self, "kv_cache", None)
         if kv_cache is not None and kv_cache[0].numel() > 0:
@@ -6143,25 +6158,18 @@ def qwen_gdn_attention_core_standard_spec(
         )
         return
 
-    restore_fields: dict[str, object] = {}
-
-    def _patch_metadata(name: str, tensor: torch.Tensor) -> None:
-        if attn_metadata is not None and tensor.numel() > 0:
-            restore_fields[name] = getattr(attn_metadata, name)
-            setattr(attn_metadata, name, tensor)
-
-    _patch_metadata("non_spec_query_start_loc", non_spec_query_start_loc)
-    _patch_metadata("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
-    _patch_metadata("spec_query_start_loc", spec_query_start_loc)
-    _patch_metadata("spec_state_indices_tensor", spec_state_indices_tensor)
-    _patch_metadata("spec_token_indx", spec_token_indx)
-    _patch_metadata("non_spec_token_indx", non_spec_token_indx)
-    _patch_metadata("spec_sequence_masks", spec_sequence_masks)
-    _patch_metadata("num_accepted_tokens", num_accepted_tokens)
-    if spec_state_slot_selectors.numel() == 0:
-        spec_state_slot_selectors = num_accepted_tokens
-    _patch_metadata("spec_state_slot_selectors", spec_state_slot_selectors)
-    try:
+    with GdnMetadataOverride(attn_metadata, skip_empty=True) as view:
+        view.set("non_spec_query_start_loc", non_spec_query_start_loc)
+        view.set("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
+        view.set("spec_query_start_loc", spec_query_start_loc)
+        view.set("spec_state_indices_tensor", spec_state_indices_tensor)
+        view.set("spec_token_indx", spec_token_indx)
+        view.set("non_spec_token_indx", non_spec_token_indx)
+        view.set("spec_sequence_masks", spec_sequence_masks)
+        view.set("num_accepted_tokens", num_accepted_tokens)
+        if spec_state_slot_selectors.numel() == 0:
+            spec_state_slot_selectors = num_accepted_tokens
+        view.set("spec_state_slot_selectors", spec_state_slot_selectors)
         self._forward_core(
             mixed_qkv=mixed_qkv,
             b=b,
@@ -6169,10 +6177,6 @@ def qwen_gdn_attention_core_standard_spec(
             core_attn_out=core_attn_out,
             kv_cache=(conv_state_cache, ssm_state_cache),
         )
-    finally:
-        if attn_metadata is not None:
-            for name, value in restore_fields.items():
-                setattr(attn_metadata, name, value)
     _sm70_dump_gdn_core_tensor(
         "core_out", layer_name, core_attn_out, "core_standard_spec"
     )
@@ -6218,26 +6222,18 @@ def qwen_gdn_attention_core_spec_commit(
         or attn_metadata.spec_sequence_masks is None
     )
     if fallback_to_standard:
-        fallback_restore_fields: dict[str, object] = {}
-
-        def _patch_fallback_metadata(name: str, value: object) -> None:
-            if attn_metadata is None:
-                return
-            fallback_restore_fields[name] = getattr(attn_metadata, name)
-            setattr(attn_metadata, name, value)
-
-        if (
-            attn_metadata is not None
-            and attn_metadata.num_spec_decodes <= 0
-            and attn_metadata.spec_sequence_masks is not None
-        ):
-            _patch_fallback_metadata("spec_sequence_masks", None)
-            _patch_fallback_metadata("spec_token_indx", None)
-            _patch_fallback_metadata("non_spec_token_indx", None)
-            _patch_fallback_metadata("spec_query_start_loc", None)
-            _patch_fallback_metadata("spec_state_indices_tensor", None)
-            _patch_fallback_metadata("num_accepted_tokens", None)
-        try:
+        with GdnMetadataOverride(attn_metadata) as view:
+            if (
+                attn_metadata is not None
+                and attn_metadata.num_spec_decodes <= 0
+                and attn_metadata.spec_sequence_masks is not None
+            ):
+                view.set("spec_sequence_masks", None)
+                view.set("spec_token_indx", None)
+                view.set("non_spec_token_indx", None)
+                view.set("spec_query_start_loc", None)
+                view.set("spec_state_indices_tensor", None)
+                view.set("num_accepted_tokens", None)
             qwen_gdn_attention_core_standard(
                 mixed_qkv,
                 b,
@@ -6249,10 +6245,6 @@ def qwen_gdn_attention_core_spec_commit(
                 non_spec_state_indices_tensor,
                 layer_name,
             )
-        finally:
-            if attn_metadata is not None:
-                for name, value in fallback_restore_fields.items():
-                    setattr(attn_metadata, name, value)
         return core_attn_out
     assert attn_metadata is not None
     pure_spec_decode = (
@@ -6424,13 +6416,13 @@ def qwen_gdn_attention_core_spec_commit(
             precomputed_gating = (g, beta)
             _log_runtime_route_once("SM70 DFlash2 conv/gating/zero route hit.")
         else:
-            mixed_qkv_spec = causal_conv1d_update(
+            mixed_qkv_spec = convolve_decode(
                 mixed_qkv,
                 conv_state,
                 conv_weights,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=spec_state_indices_tensor[:, 0],
+                state_indices=spec_state_indices_tensor[:, 0],
                 num_accepted_tokens=spec_state_slot_selectors,
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
@@ -6493,35 +6485,25 @@ def qwen_gdn_attention_core_spec_commit(
         )
         return core_attn_out
 
-    restore_fields: dict[str, object] = {}
-
-    def _patch_metadata(name: str, value: torch.Tensor) -> None:
-        restore_fields[name] = getattr(attn_metadata, name)
-        setattr(attn_metadata, name, value)
-
-    def _patch_metadata_scalar(name: str, value: int) -> None:
-        restore_fields[name] = getattr(attn_metadata, name)
-        setattr(attn_metadata, name, value)
-
-    _patch_metadata("non_spec_query_start_loc", non_spec_query_start_loc)
-    _patch_metadata("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
-    _patch_metadata("spec_query_start_loc", spec_query_start_loc)
-    _patch_metadata("spec_state_indices_tensor", spec_state_indices_tensor)
-    _patch_metadata("spec_token_indx", spec_token_indx)
-    _patch_metadata("non_spec_token_indx", non_spec_token_indx)
-    _patch_metadata("spec_sequence_masks", spec_sequence_masks)
-    _patch_metadata("num_accepted_tokens", num_accepted_tokens)
-    _patch_metadata("spec_state_slot_selectors", spec_state_slot_selectors)
-    if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
-        # The tensor rows are the graph-visible contract for FULL graph replay.
-        # They include PAD_SLOT_ID rows with zero-length query ranges, so the
-        # conv/recurrent kernels can skip padded rows without relying on the
-        # capture-time Python num_spec_decodes scalar.
-        _patch_metadata_scalar(
-            "num_spec_decodes",
-            int(spec_state_indices_tensor.shape[0]),
-        )
-    try:
+    with GdnMetadataOverride(attn_metadata) as view:
+        view.set("non_spec_query_start_loc", non_spec_query_start_loc)
+        view.set("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
+        view.set("spec_query_start_loc", spec_query_start_loc)
+        view.set("spec_state_indices_tensor", spec_state_indices_tensor)
+        view.set("spec_token_indx", spec_token_indx)
+        view.set("non_spec_token_indx", non_spec_token_indx)
+        view.set("spec_sequence_masks", spec_sequence_masks)
+        view.set("num_accepted_tokens", num_accepted_tokens)
+        view.set("spec_state_slot_selectors", spec_state_slot_selectors)
+        if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
+            # The tensor rows are the graph-visible contract for FULL graph replay.
+            # They include PAD_SLOT_ID rows with zero-length query ranges, so the
+            # conv/recurrent kernels can skip padded rows without relying on the
+            # capture-time Python num_spec_decodes scalar.
+            view.set(
+                "num_spec_decodes",
+                int(spec_state_indices_tensor.shape[0]),
+            )
         self._forward_core(
             mixed_qkv=mixed_qkv,
             b=b,
@@ -6529,9 +6511,6 @@ def qwen_gdn_attention_core_spec_commit(
             core_attn_out=core_attn_out,
             kv_cache=(conv_state_cache, ssm_state_cache),
         )
-    finally:
-        for name, value in restore_fields.items():
-            setattr(attn_metadata, name, value)
     _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out, metadata_source)
     return core_attn_out
 
@@ -6597,21 +6576,9 @@ def qwen_gdn_attention_core_standard(
         )
         return
 
-    restore_query_start_loc = False
-    restore_state_indices = False
-    if attn_metadata is not None and non_spec_query_start_loc.numel() > 0:
-        old_non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
-        attn_metadata.non_spec_query_start_loc = non_spec_query_start_loc
-        restore_query_start_loc = True
-    else:
-        old_non_spec_query_start_loc = None
-    if attn_metadata is not None and non_spec_state_indices_tensor.numel() > 0:
-        old_non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
-        attn_metadata.non_spec_state_indices_tensor = non_spec_state_indices_tensor
-        restore_state_indices = True
-    else:
-        old_non_spec_state_indices_tensor = None
-    try:
+    with GdnMetadataOverride(attn_metadata, skip_empty=True) as view:
+        view.set("non_spec_query_start_loc", non_spec_query_start_loc)
+        view.set("non_spec_state_indices_tensor", non_spec_state_indices_tensor)
         self._forward_core(
             mixed_qkv=mixed_qkv,
             b=b,
@@ -6619,13 +6586,6 @@ def qwen_gdn_attention_core_standard(
             core_attn_out=core_attn_out,
             kv_cache=(conv_state_cache, ssm_state_cache),
         )
-    finally:
-        if restore_query_start_loc and attn_metadata is not None:
-            attn_metadata.non_spec_query_start_loc = old_non_spec_query_start_loc
-        if restore_state_indices and attn_metadata is not None:
-            attn_metadata.non_spec_state_indices_tensor = (
-                old_non_spec_state_indices_tensor
-            )
     _sm70_dump_gdn_core_tensor("core_out", layer_name, core_attn_out, "core_standard")
 
 
