@@ -68,6 +68,55 @@ selected sparse KV union and cache counters are measured below. Remaining
 workspace traffic and instruction-port costs are unresolved; this is an initial
 ledger, not a complete lower-bound proof.
 
+### Historical C1 comparison and operand-only floors
+
+The historical reporting reference is the resident-FP16-KV run at
+`4348f5810`: C1 17.401789 ms/round and C4 43.932119 ms/round, with pinned
+PLE. Its same-test event-clock partition averages 13.473587 ms target,
+3.316986 ms draft, 0.523361 ms target-to-draft and 0.116882 ms
+draft-to-next-target, closing to 17.430817 ms over 32 central steps.
+
+The static weight/state shapes are unchanged. Expert and sparse-KV unions
+below use the later same-host, same-shape M5 route capture described above;
+they are estimates for this workload, not recorded routes of the original
+resident-FP16-KV run. The service column is the rounded historical operator
+trace, not a sum partition of the unprofiled 17.4-ms result.
+
+| Target family | Historical service ms | Known operand/link floor ms | Basis |
+| --- | ---: | ---: | --- |
+| Routed gate/up plus down | 2.7 | 1.00 | 901.19 MB of unique-expert weights at 900 GB/s |
+| Complete HC boundary | 3.0 | 0.51 | Existing tagged LL format on the busiest NV1 direction; see full link account below |
+| Dense projections | 2.3 | 0.62 | 560.33 MB of selected weight storage |
+| Router | 1.1 | 0.14 | 125.83 MB of FP16 projection weights; selection remains separate |
+| GDN | 0.8 | 0.19 | 169.87 MB of FP32 state read and five snapshots |
+| QSA/indexer | 1.6 | Approximately 0.10 | FP16 sparse union, index weights, compressed index keys and score write/read |
+
+Every number is per card per target round, after TP4 weight partitioning.
+Do not divide these operand counts by four again. These are ideal transfer
+components. Complete operator bounds additionally need decoder/instruction
+throughput, dependent reductions, synchronization and remaining traffic.
+Overlapped resource costs cannot simply be added to obtain either a floor
+or an end-to-end saving.
+
+For routed experts, gate/up contributes 526.90 MB or 0.585 ms; down contributes
+374.29 MB or 0.416 ms. Current route-issued loads total 1,249.41 MB, giving
+1.388 ms when cache reuse is ignored. Repeated routes can hit L2, so this is
+not measured HBM traffic or a strict lower bound for the current program.
+At 500/600/750 GB/s, the unique-weight component alone is 1.802/1.502/1.202 ms.
+The measured gate/up instruction model below also matters; its peak costs
+are not additional standalone durations to add to the HBM estimate.
+
+QSA uses the historical FP16 operand width. The GGUF metadata confirms four
+index query heads, dimension 128, budget 2048 and compression ratio four.
+At an 8192-token prefix, twelve compressed-key tables add 6.291 MB, and
+FP32 score write/read adds 0.983 MB. Alongside 44.196 MB of sparse KV unions
+and 39.322 MB of index projection weights, the accounted component is
+90.792 MB or 0.100880 ms. Keeping the main KV query-list reads instead of
+the union gives 172.517 MB or 0.191686 ms, before cache reuse. Prefix growth,
+other scratch/operand traffic, QK/PV, softmax, top-k and dependency costs
+remain outside this component. The earlier 0.025-ms E4M3 KV-only floor is
+not the historical FP16 QSA/indexer bound.
+
 | Four draft steps | Operand MB | HBM floor ms | Profiled service ms |
 | --- | ---: | ---: | ---: |
 | Routed FP16 experts | 162.78 | 0.181 | 0.288 |
@@ -190,6 +239,37 @@ Packed HC down/up storage is 1,966,080 plus 1,638,400 bytes/boundary. Weight
 prefetch overlaps communication, so adding its 0.376 ms byte floor to the
 wire floor would overstate the combined bound. Conversely, treating polling
 inside the kernel as GPU idle would understate waiting.
+
+### Complete tagged-link byte floor
+
+The 0.385-ms figure above covers only the input reduction. Counting the
+existing low-rank and hidden-output forwarding gives a stronger byte bound
+for the unchanged two-hop LL format. On rank 3's XOR-2 NV1 direction, each
+M5 boundary sends:
+
+| Stage | Bytes on this direction |
+| --- | ---: |
+| Input reduction phase | 102,400 |
+| Own 84 low-rank/injection values per token | 3,360 |
+| Forwarded peer's 80 low-rank values per token | 3,200 |
+| Own 640 hidden values per token | 12,800 |
+| Forwarded peer's 640 hidden values per token | 12,800 |
+| Total | 134,560 |
+
+`st2` sends one value/tag pair in 8 bytes. Each low-rank FP16 value occupies
+one such pair; `st4` packs four hidden FP16 values into two pairs, or 16
+bytes. At 25 GB/s/direction, this is 5.3824 us/boundary and **0.505946 ms
+over 94 boundaries**. Summing traffic on the same link is necessary even
+when different phase computations overlap. This does not add the complete
+durations of phases using different links.
+
+The unchanged-format operand bound is therefore at least
+`max(0.376468 ms HBM weights, 0.505946 ms tagged-link bytes)`. It excludes
+wire transaction overhead, polling, hop startup, arithmetic and grid
+barriers. Changing the wire format changes this bound: the corresponding
+untagged payload is 65,640 bytes on this direction, or 0.246806 ms/round,
+before readiness metadata and synchronization. That is a payload-only
+scenario, not an implemented communication path or a measured saving.
 
 NCCL's [LL128 eligibility rules](https://github.com/NVIDIA/nccl/blob/v2.27.6-1/src/graph/tuning.cc)
 include homogeneous SM70 with eligible NVLink paths; SM90-only restrictions
