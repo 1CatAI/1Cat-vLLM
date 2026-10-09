@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from vllm.models.qwen4_exp.nvidia.ops.device_kv_attention import _direct_history_triton
 from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
 from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
 
@@ -55,14 +56,26 @@ def test_direct_history_matches_protected_arithmetic_and_replay(rows, dtype, str
     else:
         q = torch.randn(rows, 6, 256, dtype=torch.float16, device="cuda")
         gate = torch.randn_like(q)
-    direct, protected = torch.empty_like(q), torch.empty_like(q)
+    direct, protected, native = (torch.empty_like(q) for _ in range(3))
     workspace = state.device_history_workspace
     assert workspace is not None, state.device_history_reason
 
     def captured():
         state.write(key[:7], value[:7], slots[:7])
+        _direct_history_triton(
+            q,
+            state,
+            indices,
+            table,
+            requests,
+            positions,
+            lengths,
+            direct,
+            gate,
+            workspace,
+        )
         host_qsa_attention(
-            q, state, indices, table, requests, positions, lengths, direct, gate
+            q, state, indices, table, requests, positions, lengths, native, gate
         )
         state.device_history_workspace = None
         try:
@@ -72,8 +85,24 @@ def test_direct_history_matches_protected_arithmetic_and_replay(rows, dtype, str
         finally:
             state.device_history_workspace = workspace
 
+    def check():
+        torch.testing.assert_close(direct, protected, rtol=0, atol=0)
+        decoded = decoded_history(state).double()
+        expected = torch.zeros_like(q)
+        for row in range(rows):
+            tokens = indices[row]
+            tokens = tokens[(tokens >= 0) & (tokens <= positions[row])]
+            page = table[requests[row], tokens // state.page_size].long()
+            offset = tokens % state.page_size
+            k = decoded[page, 0, offset]
+            v = decoded[page, 1, offset]
+            probabilities = (q[row].double() @ k.T / 16).softmax(-1)
+            attention = (probabilities @ v).half()
+            expected[row] = (attention.float() * gate[row].float().sigmoid()).half()
+        torch.testing.assert_close(native, expected, rtol=0.003, atol=0.0002)
+
     captured()
-    torch.testing.assert_close(direct, protected, rtol=0, atol=0)
+    check()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     graph = torch.cuda.CUDAGraph()
@@ -93,7 +122,7 @@ def test_direct_history_matches_protected_arithmetic_and_replay(rows, dtype, str
         value[:7].mul_(-0.75)
         graph.replay()
         torch.accelerator.synchronize()
-        torch.testing.assert_close(direct, protected, rtol=0, atol=0)
+        check()
 
 
 @pytest.mark.parametrize("scale", [1.0, 0.001, 256.0])

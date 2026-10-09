@@ -554,6 +554,8 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     device_history_reason = None
     if not cfg.kernel_config.sm70_qsa_device_history:
         device_history_reason = "user_override"
+    elif getattr(cfg, "is_speculative_draft", False):
+        device_history_reason = "speculative_draft_unqualified"
     elif not cfg.kernel_config.qsa_host_kv_active:
         device_history_reason = "qsa_history_inactive"
     elif not cfg.kernel_config.qsa_host_kv_device_reference:
@@ -569,7 +571,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "runtime_guards": (
             "device E4M3/FP16 history; FP16 query; M1..20, H6, D256; width<=4096"
         ),
-        "arithmetic": "FP32 accumulation/softmax/merge; protected FP16 PV operands",
+        "arithmetic": "FP16 QK operands; FP32 accumulation, softmax, PV and merge",
         "fallback": "protected hot-page reader",
     }
     sparse_policy = cfg.kernel_config.sm70_sparse

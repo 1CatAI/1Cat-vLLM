@@ -7,10 +7,13 @@ import importlib
 import torch
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
+logger = init_logger(__name__)
+
 # QSA owners execute serially on the model stream, like the existing shared
-# host staging buffer. Allocate before capture; reuse across target and draft.
+# host staging buffer. Allocate before capture and reuse across target layers.
 _WORKSPACES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
@@ -21,6 +24,8 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
     reason = None
     if not enabled:
         reason = "user_override"
+    elif cfg and getattr(cfg, "is_speculative_draft", False):
+        reason = "speculative_draft_unqualified"
     elif not state.device_reference:
         reason = "history_on_host"
     elif not current_platform.is_device_capability(70):
@@ -40,14 +45,23 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
     if key not in _WORKSPACES:
         # The protected launch policy uses 16-column tiles and up to 64 splits,
         # including at short widths. Bound all admitted M values before capture.
-        elements = max(
+        reference_elements = max(
             rows * 6 * _attention_profile(rows, state.width)[2] for rows in range(1, 21)
         )
+        native_elements = 20 * 6 * ((state.width + 63) // 64)
+        # Native split states contain both a maximum and a denominator. Keep
+        # enough room for the arithmetic-preserving diagnostic reference too.
         _WORKSPACES[key] = (
             torch.empty(
-                elements * 256, dtype=torch.float32, device=state.history.device
+                max(reference_elements, native_elements) * 256,
+                dtype=torch.float32,
+                device=state.history.device,
             ),
-            torch.empty(elements, dtype=torch.float32, device=state.history.device),
+            torch.empty(
+                max(reference_elements, 2 * native_elements),
+                dtype=torch.float32,
+                device=state.history.device,
+            ),
         )
     state.device_history_workspace = _WORKSPACES[key]
 
@@ -58,7 +72,11 @@ def device_history_attention(
     workspace = state.device_history_workspace
     if workspace is None:
         return False
-    if not (0 < query.shape[0] <= 20 and query.shape[1:] == (6, 256)):
+    if not (
+        query.dtype == torch.float16
+        and 0 < query.shape[0] <= 20
+        and query.shape[1:] == (6, 256)
+    ):
         state.device_history_reason = "requires_M1_20_H6_D256"
         return False
     if (
@@ -77,13 +95,18 @@ def device_history_attention(
         and requests.dtype == torch.int32
         and positions.dtype == torch.int64
         and lengths.dtype == torch.int32
+        and requests.is_contiguous()
+        and positions.is_contiguous()
+        and lengths.is_contiguous()
+        and 0 < indices.shape[1] <= state.width
     ):
         state.device_history_reason = "metadata_layout"
         return False
     gate = gate.view_as(query) if gate is not None else None
-    _direct_history_triton(
+    torch.ops.vllm_sm70_qsa_device.run(
         query,
-        state,
+        state.history,
+        state.scales,
         indices,
         table,
         requests,
@@ -91,9 +114,10 @@ def device_history_attention(
         lengths,
         out,
         gate,
-        workspace,
+        *workspace,
     )
     state.device_history_reason = None
+    logger.info_once("Using SM70 native QSA device-history attention (FP32 PV)")
     return True
 
 
