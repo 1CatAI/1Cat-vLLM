@@ -11,9 +11,11 @@ is 23.710 to 21.131 µs per complete boundary; M1 is 18.723 to 16.332 µs.
 These are boundary measurements with actual weights and synthetic activations,
 not model round latency. Installed-artifact and model results are tracked in
 [the local schedule report](flashnext_hcx_local_schedule.md).
-The first fresh-process model comparison fails the teacher-distribution gate;
-model promotion is pending the same-process quality localization. Boundary
-speed and model acceptance are separate results.
+Both the first fresh-process pair and the subsequent shared-cache comparison
+fail the teacher-distribution gate. The new schedule is explicitly opt-in;
+the Python and native defaults retain the reference schedule. Model promotion
+is pending same-process quality localization. Boundary speed and model
+acceptance are separate results.
 
 Do not repeat the K-shard implementations as presumed wins: a centralized
 receiver takes 77–82 µs; distributed receivers take 44–48 µs versus a 23.7-µs

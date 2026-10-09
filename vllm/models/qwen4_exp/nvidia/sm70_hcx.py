@@ -203,7 +203,7 @@ class Sm70HcxRuntime:
         self.reason: str | None = None
         self.top1_enabled = False
         self.diagnostic = False
-        self.local_schedule = True
+        self.local_schedule = False
         self.snapshots: dict[str, dict[str, torch.Tensor]] = {}
         self.group = group
         self.rank = dist.get_rank(group)

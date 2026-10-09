@@ -6,12 +6,13 @@ up-weight prefetch overlapped the initial down-weight loads, and warp 0 mixed
 all eight slots serially. Each output retains the original five-part FP32
 sum, FP16 casts, sigmoid and four-stream FMA order.
 
-The normal `_C` implementation selects this schedule for TP4 full-mesh HCX,
-M1–8, with a separate output projection. Fused output projections and the
+The normal `_C` implementation offers this experimental schedule for TP4
+full-mesh HCX, M1–8, with a separate output projection. Fused output projections and the
 two-hop exchange retain their existing schedule. Large batches still use the
-existing model fallback. The kernel policy `sm70_hcx_local_schedule=false`
-selects the reference schedule in the same wheel; it must be set before graph
-capture. HCX itself remains controlled by `sm70_hcx`.
+existing model fallback. The kernel policy `sm70_hcx_local_schedule=true`
+opts in before graph capture. The default is false at both the Python policy
+and native operator schema because model qualification has not passed.
+HCX itself remains controlled by `sm70_hcx`.
 
 ## Related work and interpretation
 
@@ -51,6 +52,8 @@ pairs rotate through a 512-boundary CUDA graph. Activations are synthetic.
 Each arm runs twice per sample with rotating/reversed order. The statistic
 is the median of the per-sample maximum across all four ranks. The full
 all-reduce/combine/norm/down/up/output exchange is timed.
+The eight-pair weight file has SHA256
+`8ef327c7e24f110147ee2e6fde9c631fb8576018236bed6ac434569d14266aac`.
 
 The research control core SHA256 is
 `784d1447f4f5f5593fa77db525e6b40e841366d654202aab5a56beec67398a0c`.
@@ -162,7 +165,40 @@ Installation into a separate task runtime confirms the native schema and
 equal cache keys for the two schedules. The first diagnostic stopped before
 any output comparison because its trusted local callable RPC lacked the
 serialization opt-in. The corrected offline harness checks this before model
-loading and runs against the cache-policy wheel.
+loading. A second attempt stopped before comparing outputs because engine
+initialization mutated a nested configuration object in the report. The
+report now retains an independent configuration copy. Neither harness failure
+produced a model quality result; both logs are retained. The corrected run
+uses the cache-policy wheel and the original benchmark's matmul precision,
+sampling seed and warmup.
+
+The corrected diagnostic completes its original-schedule phase: eight natural
+continuations and all 64 teacher positions. Recapture then stops on an overly
+strict invocation-count assertion (188 captured calls versus a threshold of
+190); no new-schedule or roundtrip phase completes. These are not successful
+same-process controls. The completed original phase is retained separately
+as the reference for a fresh candidate process using the same cache-policy
+wheel and the same compilation cache.
+
+Both the initial reference and this completed phase select the reference
+native schedule, yet their mean/p99/max KL is 0.000740/0.006074/0.008173, top-1
+agreement is 63/64 and none of the eight natural continuations is identical.
+The Python cache-key policy and compilation artifacts differ between those
+versions; this is not a same-artifact A/A experiment. It shows why the initial
+cross-version observations cannot uniquely identify a native schedule effect.
+
+The subsequent fresh candidate process reuses the same cache-policy wheel
+and compilation cache as that completed reference phase. All actual routes,
+prompt tokenization and conditioning positions match apart from the schedule.
+Mean/p99/max KL is 0.001018/0.006454/0.006540, top-1 agreement is 63/64 and
+none of the eight natural continuations is identical. Candidate repetitions
+remain exactly equal at all 64 positions. This still fails the mean-KL and
+top-1 gates, so separate compilation caches are not a sufficient explanation.
+Mean acceptance changes from 46.6689% to 46.1004%; the paired 95% interval
+for the -0.568-percentage-point change is [-1.769, +0.966]. The completed
+reference phase is usable for this comparison; its enclosing four-phase
+diagnostic remains incomplete. These results do not qualify a default change
+or a model latency claim.
 
 ## Rejected or superseded screens
 
@@ -180,11 +216,22 @@ individual improvements or compare raw timings across unrelated runs.
 | Parallel gate-mix, delayed prefetch, local tile | 23.710 | 21.354 | Retain warp parallelism |
 | Earlier delayed prefetch, global norm tile | 23.750 | 21.052 | Selected compact implementation |
 | Direct per-CTA LoRA polling, local norm tile | 23.735 | 45.797 | Reject even on full mesh |
+| Statically single-slot mix loop, against selected schedule | 21.025 | 21.113 | Reject; installed selected schedule in this run is 21.082 |
+
+The single-slot rewrite reduces the research kernel's static instruction
+count by about 13%, with the same register/shared-memory usage, but does not
+improve measured latency. All 54 changed-input checks per rank pass. This
+screen compares against the already selected schedule, not the original
+23.7-µs schedule; its instruction-count reduction is not a speedup claim.
 
 The K-shard rewrite gives each rank 640 hidden columns and each CTA H columns
 of all four residual streams. It retains its norm/mix input in shared memory,
 reduces squared norms and down partials across ranks, and includes delivery
 of the complete residual state in the measured output exchange.
+That delivery preserves the current model interface. Keeping the residual
+state sharded across multiple model boundaries would require a broader
+layout change and is not measured by these prototypes; the results below
+do not establish a lower bound for that architecture.
 
 | K-shard receiver | Control, µs | H8, µs | H16, µs | H32, µs |
 | --- | ---: | ---: | ---: | ---: |

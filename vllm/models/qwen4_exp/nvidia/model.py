@@ -512,7 +512,7 @@ def enable_sm70_hcx(
     *,
     fuse_output_projection: bool = True,
     diagnostic: bool = False,
-    local_schedule: bool = True,
+    local_schedule: bool = False,
 ) -> bool:
     """Leave supported small-M outputs partial; retain larger-batch reductions."""
     from .sm70_hcx import (

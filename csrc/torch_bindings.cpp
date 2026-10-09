@@ -92,7 +92,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       ", Tensor(g!) bar, Tensor(h!) seq, int[] ar, int[] lora, int[] hb, int "
       "rank, Tensor? dbg, int full, Tensor? ox, Tensor? ocodes, Tensor? ohigh"
       ", Tensor? oscale, int ofmt, Tensor? gz, Tensor? gw, float geps, Tensor"
-      "(i!)? gscr, bool local_schedule=True) -> ()");
+      "(i!)? gscr, bool local_schedule=False) -> ()");
   ops.impl("sm70_hcx_out", torch::kCUDA, &sm70_hcx_out);
   ops.def(
       "sm70_dmv13_out(Tensor x, Tensor[] codes, Tensor[] high, Tensor[] scale, "
