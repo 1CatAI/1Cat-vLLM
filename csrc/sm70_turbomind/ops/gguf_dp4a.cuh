@@ -5,29 +5,11 @@
 #pragma once
 #include <cuda_fp16.h>
 #include <cstdint>
+#include "gguf_q8_1.cuh"
 #include "src/turbomind/kernels/gemm/lattice_codebooks.h"
 #include "src/turbomind/kernels/gemm/transform.h"
 
 namespace vllm::sm70_gguf {
-struct Q8_1 {
-  half2 ds;
-  int8_t qs[32];
-};
-static_assert(sizeof(Q8_1) == 36);
-
-__device__ __forceinline__ void quantize_q8_1_warp(Q8_1* out, float value) {
-  const int lane = threadIdx.x % 32;
-  float maximum = fabsf(value), sum = value;
-#pragma unroll
-  for (int offset = 16; offset; offset >>= 1) {
-    maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
-    sum += __shfl_xor_sync(0xffffffff, sum, offset);
-  }
-  const float d = maximum / 127.f;
-  out->qs[lane] = maximum == 0.f ? 0 : int8_t(roundf(value / d));
-  if (!lane) out->ds = __floats2half2_rn(d, sum);
-}
-
 __device__ __forceinline__ uint32_t load_u32_2(const uint8_t* p) {
   return uint32_t(*reinterpret_cast<const uint16_t*>(p)) |
          (uint32_t(*reinterpret_cast<const uint16_t*>(p + 2)) << 16);

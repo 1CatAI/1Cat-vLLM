@@ -1346,6 +1346,9 @@ if _is_cuda():
             CMakeExtension(name="vllm._sm70_qsa_indexer_C", py_limited_api=False)
         )
         ext_modules.append(
+            CMakeExtension(name="vllm._sm70_router_C", py_limited_api=False)
+        )
+        ext_modules.append(
             CMakeExtension(name="vllm._sm70_exact_reduce_C", py_limited_api=False)
         )
         ext_modules.append(
