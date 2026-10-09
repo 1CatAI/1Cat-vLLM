@@ -4,7 +4,6 @@
 
 import torch
 
-from vllm import _sm70_ops as ops
 from vllm.model_executor.layers.fused_moe.sm70.declarations import FP4_STAGE_BINDINGS
 from vllm.model_executor.layers.fused_moe.sm70.fp4_codec import Fp4MoECodec
 from vllm.model_executor.layers.fused_moe.sm70.reduction import (
@@ -83,7 +82,7 @@ def execute_fp4(
     elif plan.reduction == "triton_batch":
         _mtp_weighted_reduce(buffers["sorted_output"], topk_weights, output)
     elif plan.reduction == "native_weighted":
-        ops.awq_moe_single_token_weighted_reduce_out(
+        codec.operators.awq_moe_single_token_weighted_reduce_out(
             buffers["sorted_output"],
             topk_weights,
             buffers["token_expert_indices"],
@@ -92,7 +91,7 @@ def execute_fp4(
             codec.dimensions.hidden_size,
         )
     else:
-        torch.ops._moe_C.moe_unpermute(
+        codec.operators.moe_unpermute(
             buffers["sorted_output"],
             topk_weights,
             buffers["inv_permuted_idx"],

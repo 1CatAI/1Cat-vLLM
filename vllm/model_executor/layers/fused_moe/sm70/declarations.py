@@ -233,3 +233,12 @@ FP4_STAGE_BINDINGS = {
 
 def fp4_native_binding(family: str, stage: str, mode: str) -> str:
     return FP4_STAGE_BINDINGS[family, stage, mode][0]
+
+
+def fp4_binding_mode(family: str, mode: str, *, raw_scale=False, qpn_mtp=False):
+    """Normalize a codec layout variant without selecting a different route."""
+    if family == "nvfp4" and mode == "qpn":
+        return "qpn_raw" if raw_scale else "qpn_mtp" if qpn_mtp else "qpn"
+    if raw_scale and mode in ("fused_batch_qpn", "batch_reduce"):
+        return mode + "_raw"
+    return mode

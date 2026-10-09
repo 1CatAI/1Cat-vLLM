@@ -8,7 +8,6 @@ from typing import Final
 import torch
 from torch.nn import Parameter
 
-from vllm import _sm70_ops as sm70_ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.sm70_moe import Sm70MoEFormatConfig, capture_sm70_moe_config
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -634,14 +633,14 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
 
         w13_k_ld, w13_q_ld = int(w13_meta[0][0].item()), int(w13_meta[0][1].item())
         w2_k_ld, w2_q_ld = int(w2_meta[0][0].item()), int(w2_meta[0][1].item())
-        w13_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w13_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
             layer.w13_tm_scales,
             w13_k_ld,
             w13_q_ld,
             num_experts,
         )
-        w2_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
+        w2_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w2_tm_weight,
             layer.w2_tm_scales,
             w2_k_ld,
@@ -1142,7 +1141,7 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
                 "SM70 AWQ Qwen3.8 QPN M1 W13/W2 enabled "
                 "(existing prepared banks, direct route order)."
             )
-            sm70_ops.awq_moe_qpn_m1_sm70_out(
+            self.native_ops.awq_moe_qpn_m1_sm70_out(
                 output,
                 buffers["intermediate"],
                 x,
@@ -1160,7 +1159,7 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
             top_k,
             layer.sm70_num_experts,
         )
-        sm70_ops.awq_moe_single_token_sm70_out(
+        self.native_ops.awq_moe_single_token_sm70_out(
             output,
             x,
             topk_weights,
@@ -1264,7 +1263,7 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
                 trim_output=True,
             )
         if indexed_w13:
-            torch.ops._moe_C.moe_permute_metadata_with_scratch(
+            self.native_ops.moe_permute_metadata_with_scratch(
                 x,
                 topk_ids_i32,
                 buffers["token_expert_indices"],
@@ -1282,7 +1281,7 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
                 buffers["topk_ids_for_sort"],
             )
         else:
-            torch.ops._moe_C.moe_permute_with_scratch(
+            self.native_ops.moe_permute_with_scratch(
                 x,
                 topk_ids_i32,
                 buffers["token_expert_indices"],
@@ -1368,6 +1367,7 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
         observer = None
         if compare_step is not None or self.sm70_moe_policy.diagnostics.dump_buffers:
             observer = AwqStageObserver(
+                operators=self.native_ops,
                 layer=layer,
                 x=x,
                 topk_weights=topk_weights,

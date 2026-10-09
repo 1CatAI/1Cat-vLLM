@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
+from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.utils import config, hash_factors
 
 MoEFormat = Literal["awq", "fp8"]
@@ -79,13 +80,40 @@ NATIVE_LEGACY_ALIASES = frozenset(
 
 def _validate_native_legacy_request(policy, field: str, name: str) -> None:
     from vllm import envs
+    from vllm._sm70.policy import native_policy_abi_available
 
+    if native_policy_abi_available():
+        return
     if name in NATIVE_LEGACY_ALIASES and getattr(policy, field) != getattr(envs, name):
         raise ValueError(
             f"sm70_moe.{field} conflicts with {name}: the current native ABI "
             "also consumes this legacy switch. Use matching values until the "
             "native policy-argument ABI is installed."
         )
+
+
+# Diagnostics share one compatibility declaration with compile-cache filtering.
+AWQ_DUMP_ALIASES = {
+    "dump_buffers": ("VLLM_SM70_DUMP_AWQ_MOE_BUFFERS", None),
+    "dump_dir": ("VLLM_SM70_DUMP_QWEN_LAYER_DIR", None),
+    "dump_layers": ("VLLM_SM70_DUMP_QWEN_LAYER_IDS", "0,1"),
+    "dump_labels": ("VLLM_SM70_DUMP_AWQ_MOE_LABELS", ""),
+}
+AWQ_COMPARE_ALIASES = {
+    "compare_dir": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR",
+    "compare_enable_file": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_ENABLE_FILE",
+    "compare_layers": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_LAYER_IDS",
+    "compare_steps": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_STEPS",
+    "compare_max_reports": "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_MAX_REPORTS",
+}
+FP8_COMPARE_ALIASES = {
+    "compact_compare": ("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE", "0"),
+    "compact_compare_reports": (
+        "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE_REPORTS",
+        "16",
+    ),
+    "strict_compare_fail": ("VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL", "0"),
+}
 
 
 @config
@@ -123,55 +151,26 @@ class Sm70MoEDiagnostics:
         from vllm import envs
 
         if family == "awq":
-            raw = {
-                "dump_buffers": ("VLLM_SM70_DUMP_AWQ_MOE_BUFFERS", None),
-                "dump_dir": ("VLLM_SM70_DUMP_QWEN_LAYER_DIR", None),
-                "dump_layers": ("VLLM_SM70_DUMP_QWEN_LAYER_IDS", "0,1"),
-                "dump_labels": ("VLLM_SM70_DUMP_AWQ_MOE_LABELS", ""),
-            }
-            for field, (name, default) in raw.items():
+            for field, (name, default) in AWQ_DUMP_ALIASES.items():
                 if getattr(self, field) is None:
                     value = os.getenv(name, default)
                     setattr(
                         self, field, value == "1" if field == "dump_buffers" else value
                     )
-            registered = {
-                "compare_dir": "DIR",
-                "compare_enable_file": "ENABLE_FILE",
-                "compare_layers": "LAYER_IDS",
-                "compare_steps": "STEPS",
-                "compare_max_reports": "MAX_REPORTS",
-            }
-            for field, suffix in registered.items():
+            for field, name in AWQ_COMPARE_ALIASES.items():
                 if getattr(self, field) is None:
-                    setattr(
-                        self,
-                        field,
-                        getattr(envs, "VLLM_SM70_AWQ_MOE_COMPARE_DENSE_" + suffix),
-                    )
+                    setattr(self, field, getattr(envs, name))
         else:
-            for field, suffix, default in (
-                ("compact_compare", "COMPARE", "0"),
-                ("compact_compare_reports", "COMPARE_REPORTS", "16"),
-            ):
+            for field, (name, default) in FP8_COMPARE_ALIASES.items():
                 if getattr(self, field) is None:
-                    numeric_value = int(
-                        os.getenv(
-                            "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_" + suffix,
-                            default,
-                        )
-                    )
+                    numeric_value = int(os.getenv(name, default))
                     setattr(
                         self,
                         field,
-                        bool(numeric_value)
-                        if field == "compact_compare"
-                        else numeric_value,
+                        numeric_value
+                        if field == "compact_compare_reports"
+                        else bool(numeric_value),
                     )
-            if self.strict_compare_fail is None:
-                self.strict_compare_fail = (
-                    envs.VLLM_SM70_FP8_MOE_COMPACT_STRICT_COMPARE_FAIL
-                )
 
 
 @config
@@ -182,6 +181,8 @@ class Sm70MoEFormatConfig:
     that is absent therefore retains the old dense fallback, not a new error.
     """
 
+    native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """Captured native selector and tuning policy, shared with kernel bindings."""
     qpn_m1: bool | None = None
     """AWQ native-g32 Qwen QPN M1 request; original strict admission applies."""
     batched: bool | None = None
@@ -249,7 +250,7 @@ class Sm70MoEFormatConfig:
                 "compact_native_unpermute",
                 "compact_decomposed",
             }
-        metadata = {"resolved", "sources", "explicit_fields", "diagnostics"}
+        metadata = {"resolved", "sources", "explicit_fields", "diagnostics", "native"}
         for field, supplied_value in vars(self).items():
             if field not in supported | metadata and supplied_value is not None:
                 raise ValueError(f"sm70_moe.{family}.{field} is not supported")
@@ -345,11 +346,21 @@ class Sm70MoEFormatConfig:
                 mode for mode in priority if mode in self.single_token_w13
             )
         self.explicit_fields = tuple(explicit)
+        overrides = {
+            alias: getattr(self, field)
+            for field, alias in ALIASES[family].items()
+            if self.sources.get(field) == "configuration"
+        }
+        if self.sources.get("single_token_reduce") == "configuration":
+            overrides["VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH"] = (
+                self.single_token_reduce == "weighted"
+            )
+        self.native.resolve(family, overrides)
         self.resolved = True
 
     def hash_options(self) -> dict[str, Any]:
         return {
-            name: value
+            name: (self.native.hash_options() if name == "native" else value)
             for name, value in vars(self).items()
             if name not in {"resolved", "sources", "explicit_fields", "diagnostics"}
         }
@@ -393,6 +404,8 @@ MXFP4_ALIASES = {
 class Sm70MoELegacyConfig:
     """Initialization-only alias adapter shared by the native FP4 formats."""
 
+    native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """Captured native selector and tuning policy, shared with kernel bindings."""
     resolved: bool = Field(default=False, init=False)
     """Whether this engine has captured compatibility inputs."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)
@@ -400,7 +413,7 @@ class Sm70MoELegacyConfig:
     explicit_fields: tuple[str, ...] = Field(default=(), init=False)
     """Explicit requests preserve the old missing-operator error behavior."""
 
-    def _resolve(self, aliases: dict[str, str]) -> None:
+    def _resolve(self, aliases: dict[str, str], family: str) -> None:
         from vllm import envs
 
         if self.resolved:
@@ -417,11 +430,19 @@ class Sm70MoELegacyConfig:
                 if envs.is_set(name):
                     explicit.append(field)
         self.explicit_fields = tuple(explicit)
+        self.native.resolve(
+            family,
+            {
+                alias: getattr(self, field)
+                for field, alias in aliases.items()
+                if self.sources.get(field) == "configuration"
+            },
+        )
         self.resolved = True
 
     def hash_options(self) -> dict[str, Any]:
         return {
-            name: value
+            name: (self.native.hash_options() if name == "native" else value)
             for name, value in vars(self).items()
             if name not in {"resolved", "sources", "explicit_fields", "route_debug"}
         }
@@ -473,7 +494,7 @@ class Sm70NvFp4MoEConfig(Sm70MoELegacyConfig):
             import os
 
             self.route_debug = os.getenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG") == "1"
-        self._resolve(NVFP4_ALIASES)
+        self._resolve(NVFP4_ALIASES, "nvfp4")
 
 
 @config
@@ -502,7 +523,7 @@ class Sm70MxFp4MoEConfig(Sm70MoELegacyConfig):
     """Initialization override for VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH."""
 
     def resolve(self) -> None:
-        self._resolve(MXFP4_ALIASES)
+        self._resolve(MXFP4_ALIASES, "mxfp4")
 
 
 @config

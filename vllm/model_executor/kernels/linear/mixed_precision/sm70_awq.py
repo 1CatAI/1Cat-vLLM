@@ -10,6 +10,10 @@ import torch
 from vllm import _sm70_ops as sm70_ops
 from vllm.config.kernel import Sm70AwqConfig
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization import sm70_turbomind as tm
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    workspace_pool,
+)
 from vllm.model_executor.models.config import sm70_awq_prefill_projection_qualified
 from vllm.scalar_type import scalar_types
 
@@ -64,7 +68,9 @@ def _get_sm70_awq_prefill_exact_dense_workspace(
         device_index = torch.accelerator.current_device_index()
     elements = max(_SM70_AWQ_PREFILL_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 8)
     cache_key = (device_index, torch.float16, elements)
-    workspace = _sm70_awq_prefill_dense_workspaces.get(cache_key)
+    workspace = workspace_pool("awq_prefill", _sm70_awq_prefill_dense_workspaces).get(
+        cache_key
+    )
     if workspace is not None:
         return workspace
     try:
@@ -79,7 +85,9 @@ def _get_sm70_awq_prefill_exact_dense_workspace(
             "falling back to TurboMind AWQ."
         )
         return None
-    _sm70_awq_prefill_dense_workspaces[cache_key] = workspace
+    workspace_pool("awq_prefill", _sm70_awq_prefill_dense_workspaces)[cache_key] = (
+        workspace
+    )
     return workspace
 
 
@@ -142,6 +150,18 @@ class TurboMindAwqLinearKernel(MPLinearKernel):
         layer._awq_sm70_k_ld = int(meta[0])
         layer._awq_sm70_q_ld = int(meta[1])
         layer._awq_sm70_group_size = group_size
+        state = tm.SM70TurboMindLinearState(
+            tm_weight,
+            tm_scales,
+            group_size,
+            int(meta[0]),
+            int(meta[1]),
+            tm_weight.shape[-1] * 8,
+            "uint4",
+            gated_silu=use_gated_silu,
+        )
+        setattr(layer, tm.STATE_ATTR, state)
+        self.native_ops = state.native_ops
         layer._awq_sm70_prepared = True
         if use_gated_silu:
             layer._awq_sm70_gated_silu = True
@@ -201,7 +221,7 @@ class TurboMindAwqLinearKernel(MPLinearKernel):
             dtype=x.dtype,
             device=x.device,
         )
-        sm70_ops.awq_gemm_sm70_out(
+        self.native_ops.awq_gemm_sm70_out(
             out_2d,
             x_2d,
             layer._awq_sm70_weight,
@@ -231,7 +251,7 @@ class TurboMindAwqLinearKernel(MPLinearKernel):
             k = reshaped_x.shape[1]
             n = out_shape[-1]
             prefill_weight = prefill_workspace[: k * n].view(k, n)
-            sm70_ops.awq_sm70_dequantize_out(
+            self.native_ops.awq_sm70_dequantize_out(
                 prefill_weight,
                 layer._awq_sm70_weight,
                 layer._awq_sm70_scales,
@@ -241,27 +261,4 @@ class TurboMindAwqLinearKernel(MPLinearKernel):
             if bias is not None:
                 out.add_(bias)
             return out.reshape(out_shape)
-        out = torch.empty(
-            (reshaped_x.shape[0], out_shape[-1]),
-            dtype=x.dtype,
-            device=x.device,
-        )
-        sm70_ops.awq_gemm_sm70_out(
-            out,
-            reshaped_x,
-            layer._awq_sm70_weight,
-            layer._awq_sm70_scales,
-            layer._awq_sm70_group_size,
-            layer._awq_sm70_k_ld,
-            layer._awq_sm70_q_ld,
-        )
-        if getattr(layer, "_awq_sm70_gated_silu_primary", False):
-            out_features = out_shape[-1] // 2
-            out = (
-                out.reshape(reshaped_x.shape[0], out_features, 2)
-                .transpose(1, 2)
-                .reshape(reshaped_x.shape[0], out_shape[-1])
-            )
-        if bias is not None:
-            out.add_(bias)
-        return out.reshape(out_shape)
+        return tm.apply_prepared_linear(layer, x, bias)

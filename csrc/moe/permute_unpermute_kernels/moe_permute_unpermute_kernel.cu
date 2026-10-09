@@ -1,3 +1,4 @@
+#include "sm70_policy.h"
 
 #include "moe_permute_unpermute_kernel.h"
 #include <cstdlib>
@@ -67,27 +68,31 @@ namespace {
 
 constexpr int kSingleTokenFastPathMaxTopK = 32;
 
-bool envFlagEnabled(const char* name) {
-  const char* raw = std::getenv(name);
+bool policyFlagEnabled(vllm::sm70::PolicyField field) {
+  const char* raw = vllm::sm70::policy_value(field);
   return raw != nullptr && std::atoi(raw) != 0;
 }
 
 bool singleTokenPermuteFastPathEnabled() {
-  static const bool enabled = []() {
-    if (envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_PERMUTE_FASTPATH")) {
+  const bool enabled = []() {
+    if (policyFlagEnabled(
+            vllm::sm70::PolicyField::moe_single_token_permute_fastpath)) {
       return true;
     }
-    return envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH");
+    return policyFlagEnabled(
+        vllm::sm70::PolicyField::moe_single_token_fastpath);
   }();
   return enabled;
 }
 
 bool singleTokenUnpermuteFastPathEnabled() {
-  static const bool enabled = []() {
-    if (envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_UNPERMUTE_FASTPATH")) {
+  const bool enabled = []() {
+    if (policyFlagEnabled(
+            vllm::sm70::PolicyField::moe_single_token_unpermute_fastpath)) {
       return true;
     }
-    return envFlagEnabled("VLLM_SM70_MOE_SINGLE_TOKEN_FASTPATH");
+    return policyFlagEnabled(
+        vllm::sm70::PolicyField::moe_single_token_fastpath);
   }();
   return enabled;
 }

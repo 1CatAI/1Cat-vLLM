@@ -112,6 +112,9 @@ class GGUFConfig(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
+        config = get_current_vllm_config_or_none()
+        if config is not None:
+            config.kernel_config.sm70_gguf.active = True
         if isinstance(layer, LinearBase):
             if is_layer_skipped_gguf(
                 prefix, self.unquantized_modules, self.packed_modules_mapping
@@ -540,6 +543,8 @@ class GGUFLinearMethod(LinearMethodBase):
         self.fallback_reason: str | None = None
         config = get_current_vllm_config_or_none()
         policy = config.kernel_config.sm70_gguf if config is not None else None
+        if policy is not None:
+            policy.active = True
         self.native_enabled = policy.enabled if policy is not None else True
         self.prefill_min_m = policy.prefill_min_m if policy is not None else 8
         self.native_prepared = False

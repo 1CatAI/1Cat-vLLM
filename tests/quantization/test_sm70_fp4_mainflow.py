@@ -166,10 +166,9 @@ def test_frozen_apply_call_order(monkeypatch, family, route, m):
             return record(name)
 
     native = Native()
-    monkeypatch.setattr(module, "sm70_ops", native)
+    monkeypatch.setattr(module, "sm70_ops", native, raising=False)
     monkeypatch.setattr(module, "is_exact_sm70_cuda", lambda *a, **kw: True)
     monkeypatch.setattr(fp4_codec, "ops", native)
-    monkeypatch.setattr(fp4_stages, "ops", native)
     monkeypatch.setattr(
         torch.ops._moe_C,
         "moe_permute_sort_workspace_size",
@@ -268,6 +267,7 @@ def test_frozen_apply_call_order(monkeypatch, family, route, m):
         layer.swiglu_limit,
     )
     method = object.__new__(cls)
+    method.native_ops = native
     method.sm70_moe_policy = policy
     method._allocate_graph_safe_decode_buffers(layer)
     buffers = (

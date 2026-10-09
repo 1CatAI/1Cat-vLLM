@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm._sm70.policy import NativeBindings
+from vllm.config.sm70_native import capture_linear_native_config
 from vllm.model_executor.kernels.gguf import GGUFDecoderFamily, GGUFOperatorCapability
 from vllm.model_executor.layers.quantization.gguf_transcode import (
     AFFINE_BITPLANE_TYPES,
@@ -14,6 +16,9 @@ from vllm.model_executor.layers.quantization.gguf_transcode import (
     AFFINE_U2_TYPES,
 )
 from vllm.model_executor.layers.quantization.utils import replace_parameter
+from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
+    workspace_pool,
+)
 from vllm.scalar_type import scalar_types
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 
@@ -42,7 +47,8 @@ _affine_blas_workspaces: weakref.WeakValueDictionary = weakref.WeakValueDictiona
 
 def _get_affine_blas_workspace(weight: torch.Tensor) -> torch.Tensor | None:
     key = (weight.device, torch.float16)
-    workspace = _affine_blas_workspaces.get(key)
+    pool = workspace_pool("gguf_affine_blas", _affine_blas_workspaces)
+    workspace = pool.get(key)
     if workspace is None:
         try:
             workspace = torch.empty(
@@ -52,7 +58,7 @@ def _get_affine_blas_workspace(weight: torch.Tensor) -> torch.Tensor | None:
             )
         except torch.OutOfMemoryError:
             return None
-        _affine_blas_workspaces[key] = workspace
+        pool[key] = workspace
     return workspace
 
 
@@ -117,6 +123,7 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self.native_ops = NativeBindings(capture_linear_native_config("gguf").values)
         if getattr(layer, "_gguf_tm_affine_prepared", False):
             return
         codes, scales, mins, _ = self._get_weight_params(layer)
@@ -181,7 +188,7 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
                 self.config.group_size,
             )
         else:
-            torch.ops._C.gguf_affine_gemm_sm70_out(
+            self.native_ops.gguf_affine_gemm_sm70_out(
                 output,
                 rows,
                 getattr(layer, self.w_q_name),

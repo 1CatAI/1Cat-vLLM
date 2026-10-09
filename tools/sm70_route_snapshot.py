@@ -332,6 +332,11 @@ def main():
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
+        "--observed-trace",
+        type=Path,
+        help="Attach a NativeDispatchTrace JSON as separate observed evidence",
+    )
+    parser.add_argument(
         "--expected-changes",
         type=Path,
         help="JSON list of exact permitted row IDs for a measured broadening PR",
@@ -402,6 +407,8 @@ def main():
                 f"{len(result['cases'])} configurations: "
                 f"expected changes={len(changes)}"
             )
+        if args.observed_trace:
+            result["observed_execution"] = json.loads(args.observed_trace.read_text())
         if args.output:
             args.output.write_text(json.dumps(result, indent=2) + "\n")
     envs.disable_envs_cache()

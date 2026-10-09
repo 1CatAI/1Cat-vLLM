@@ -51,7 +51,7 @@ PATTERNS: dict[str, re.Pattern[str]] = {
 OWNER_PATH = re.compile(
     r"^vllm/(?:models|model_executor/models|sm70_profiles)/"
     r"|sm_?70|v100|volta|turbomind|dflash|ddtree|qwen4_exp|flash_?next|gguf"
-    r"|_custom_ops\.py$|_sm70_ops\.py$",
+    r"|model_executor/kernels/linear/qpn/|_custom_ops\.py$|_sm70_ops\.py$",
     re.IGNORECASE,
 )
 # Configuration registries own every kind of knob by design.

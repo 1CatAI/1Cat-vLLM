@@ -49444,3 +49444,41 @@ syntax exit 0. No CUDA driver repair or GPU execution was attempted.
   Raw GPU evidence: `/home/ymzx/arch-ws/phase-b2-20261009/artifacts/` on 54633.
   Local CPU/GPU/log evidence: `/home/ymzx/arch-ws/tmp/phase-b2/`.
   No model service, port, sidecar, preload or background benchmark remains.
+
+## Phase B delivery 3: linear/native consolidation (validation in progress), 2026-10-09
+
+- Base `fc2f145aebee0d2e7cbfc2b520c383cb64644e57`; owned branch
+  `agent/v100-phase-b-linear-native-20261009-035407`, worktree
+  `/home/ymzx/arch-ws/v100-phase-b-linear-native-20261009-035407`.
+  Deliveries 1 (#1124) and 2 (#1126) are merged with remote CI passing.
+- Prepared linear providers share input/output handling; QPN implementation
+  ownership is unified and historical module identities remain compatible.
+  Native loading/linear/MoE/auxiliary bindings are split behind `_sm70_ops.py`;
+  all 134 baseline public function/class definitions remain exported.
+- Explicit native policies cross the packaged `_C`/`_moe_C` host ABI. Native
+  GEMM/tuning/imported-cache state is partitioned by calculation policy.
+  Diagnostic values and attribution do not partition calculation state.
+  Engine-owned scratch registries preserve capacity growth and AOT address
+  reload, including linear pools and NVFP4 raw-scale expansion. No CUDA
+  numerical algorithm or default route is intentionally changed.
+- CPU combined regression: 583 passed, 7 skipped. Additional lifecycle/buffer/
+  MXFP4/FP8-prefill checks: 79 passed, 5 skipped plus four legacy test fixtures
+  updated to use the prepared native owner. Focused lifecycle/owner/explanation
+  recheck: 36 passed. All applicable pre-commit hooks passed before the final
+  lifecycle fixture and affine-GGUF workspace edits; final hooks will rerun.
+- Static route comparison: 168 cases, zero differences from this delivery's
+  base. Native Python/C++ policy declaration order and computation/diagnostic
+  classification are checked together. Source inventory: 74 to 57 direct
+  reads and 215 to 179 direct native calls in the expanded delivery-3 scope.
+  These are source counts, not removed paths or executed kernels. Layering
+  totals after moves: model 2325, platform 3882, environment 271.
+- GPU status: task-owned source-complete `_C`/`_moe_C` build on 54633 is still
+  running. A queued incremental build installs the final native source after
+  the initial build finishes. The attempted baseline operator run exited at
+  the GPU ownership lock and produced no numerical evidence; another task is
+  loading a TP4 workload, and has not been stopped or modified. Do not claim
+  this delivery's native parity, timing or completion until those gates run.
+- Local evidence `/home/ymzx/arch-ws/tmp/phase-b3/`; remote source/build/logs
+  `/home/ymzx/arch-ws/phase-b3-20261009/`. No model speed/TTFT gate is required
+  in this round, per the owner's explicit operator-only authorization. DDTree
+  and broad C/D remain outside this delivery.

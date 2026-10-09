@@ -37,6 +37,7 @@ ALLOWED = {
     "vllm/config/kernel.py",
     "vllm/config/sm70_dflash2.py",
     "vllm/config/sm70_moe.py",
+    "vllm/config/sm70_native.py",
 }
 _POLICY = Path(__file__).resolve().parents[2] / "vllm/config/sm70_dflash2.py"
 _POLICY_TREE = ast.parse(_POLICY.read_text())
@@ -108,7 +109,9 @@ def violations(path: Path) -> list[str]:
     tree = ast.parse(path.read_text())
     errors = moe_policy_reads(path, tree)
     fp8_nodes = set()
-    if path.name == "sm70_fp8.py":
+    if path.name == "sm70_fp8.py" or path.as_posix().endswith(
+        "kernels/linear/qpn/fp8.py"
+    ):
         fp8_nodes.update(ast.walk(tree))
     elif path.name == "fp8.py":
         for candidate in tree.body:

@@ -109,12 +109,14 @@ def test_frozen_single_token_calls(
         return call
 
     class Native:
+        def __init__(self):
+            self.moe_unpermute = record("reduce")
+
         def __getattr__(self, name):
             return record(name)
 
     native = Native()
     monkeypatch.setattr(weight_codec, "ops", native)
-    monkeypatch.setattr(single_token, "ops", native)
     monkeypatch.setattr(torch.ops._C, "silu_and_mul", record("silu"), raising=False)
     monkeypatch.setattr(
         torch.ops._moe_C, "moe_unpermute", record("reduce"), raising=False
