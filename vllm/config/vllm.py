@@ -1155,6 +1155,22 @@ class VllmConfig:
                 else "pinned host memory",
                 policy.qsa_host_kv_hot_tokens,
             )
+            max_len = self.model_config.max_model_len if self.model_config else 0
+            if (
+                not policy.qsa_host_kv_device_reference
+                and policy.qsa_host_kv_hot_tokens < max_len
+            ):
+                # Measured on 4x V100 (Flash-Next TP4): with 8192 hot tokens a
+                # 30K-token prefill took 101 s; with 32768 it took 17 s.
+                logger.warning_once(
+                    "qsa_host_kv_hot_tokens=%d is below max_model_len=%d: "
+                    "prompts longer than the hot cache re-stage host history "
+                    "per query tile and prefill becomes superlinear. Set "
+                    "kernel_config.qsa_host_kv_hot_tokens to at least the "
+                    "longest expected context (1 KiB/token/layer of GPU memory).",
+                    policy.qsa_host_kv_hot_tokens,
+                    max_len,
+                )
 
         from vllm.model_executor.models.config import (
             sm70_dflash2_nvfp4_qualified,
