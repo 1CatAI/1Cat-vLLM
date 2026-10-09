@@ -170,14 +170,24 @@ __device__ __forceinline__ void grid_bar(unsigned* bar, unsigned target) {
 // A persistent counter avoids the end-of-kernel arrival/reset phase. Signed
 // differences handle uint32 wrap while fewer than 2^31 arrivals are in flight.
 __device__ __forceinline__ void grid_bar_epoch(unsigned* bar, unsigned target) {
-  __threadfence();
+  // CTA synchronization publishes each producer's writes to its leader.
+  // The acquire/release RMW chain and acquire load carry those writes to
+  // every consumer leader; the final CTA barrier distributes visibility.
   __syncthreads();
   if (threadIdx.x == 0) {
-    atomicAdd(bar, 1u);
+    unsigned value;
+    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"
+                 : "=r"(value)
+                 : "l"(bar)
+                 : "memory");
     const auto start = clock64();
-    while (static_cast<int>(ldv(bar) - target) < 0)
+    do {
+      asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+                   : "=r"(value)
+                   : "l"(bar)
+                   : "memory");
       if (clock64() - start > 4000000000LL) __trap();
-    __threadfence();
+    } while (static_cast<int>(value - target) < 0);
   }
   __syncthreads();
 }
