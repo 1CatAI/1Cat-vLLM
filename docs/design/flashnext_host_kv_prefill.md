@@ -709,7 +709,13 @@ coefficients and replay after replacing the source bank. All six device cases
 pass in the installed `5d33064de9` wheel on V100-SXM2-32GB. Staged model dispatch
 now retains original IQ banks and borrows one canonical gate/up working area
 for prefill. Small-M raw/dp4a routes and canonical FP16 prefill arithmetic are
-unchanged. The compiled FFN and model checks remain pending.
+unchanged. The installed `81e76e7384` wheel passes all nine staging checks:
+the six primitive cases plus three compiled FFN cases at E512/N160/K2560.
+Two successive IQ formats reuse the pool, M5/M20 graph replay responds to
+changed activations/routes, and M512 matches resident canonical execution
+bitwise. Extra peak allocation stays below 48 MiB, rejecting large compiler
+clones; the M5/M20 dp4a route leaves poisoned staging storage untouched.
+The full-model memory and throughput comparison remains pending.
 
 The reusable gate/up pool has two disjoint slots. At 512 experts, local width
 160 and K2560, code storage is 100 MiB and group metadata is 100 MiB. IQ3 uses
@@ -726,6 +732,32 @@ the prepared pointer tables. The intended workspace is private to the operator,
 retained by the model, and shared only between serialized forward calls. Device
 tests must cover compilation, changed-input replay, and two successive layers
 with different IQ formats before model admission.
+
+The current model comparison retains GPU memory utilization 0.5, FULL graphs,
+32768 input tokens and the 16384-token scheduler chunk, with FP16 host history
+for both target and draft and the existing PLE disk cascade. It explicitly
+disables additional MTP, GGUF expert and HC activation row blocking:
+`VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING=0`,
+`sm70_gguf.prefill_expert_chunk_size=0`, and `prefill_hc_chunk_size=0`.
+No fixed KV-byte override is supplied. Weight-storage repairs are measured
+before selecting any capacity-driven blocking; actual device peak and the
+automatic cache budget must explain any remaining admission failure.
+
+The existing FP16 MTP MoE activation chunker was tested separately on the actual
+TP4 rank-0 expert weights. M5, M20 and M16384 outputs agree bitwise with
+unchunked execution. Changed-input graph replay also passes for M5 and M20.
+At M16384 the measured workspace falls from 880 MiB to 292.5 MiB with an
+internal 4096-row chunk. Event medians, including restoration of the inplace
+input, are 132.720 ms and 209.030 ms respectively. The 76.31 ms slowdown
+rejects this mode as a prefill speed optimization; the model baseline leaves
+it disabled.
+
+Two failed fixtures are retained. The first reused inputs overwritten by the
+production inplace output. The second restored graph-test inputs by multiplying
+FP16 values by 0.5 and then by 2, which changes subnormal values: 22 M20 input
+elements differ by at most 5.96e-8, producing a 9.54e-7 output difference.
+Restoring from an untouched input copy resolves both failures without relaxing
+the bitwise comparison or altering the production operator.
 
 39 CPU storage/initialization checks pass, including all four Q2_0 TP boundaries,
 exact HC shard reconstruction, shared staging storage and converter-free original
