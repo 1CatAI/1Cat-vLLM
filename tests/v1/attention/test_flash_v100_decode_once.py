@@ -123,3 +123,32 @@ def test_auditor_rejects_virtual_flag_read_only_by_test(tmp_path):
     observation = json.loads(report.read_text())["_logged_decode_flash"]
     assert observation["patched_in"]
     assert observation["read_from"] == observation["called_from"] == []
+
+
+def test_exception_once_preserves_traceback_and_process_key(monkeypatch):
+    import logging
+
+    key = object()
+    first = logging_api.init_logger("vllm.test.once.exception.first")
+    second = logging_api.init_logger("vllm.test.once.exception.second")
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    monkeypatch.setattr(handler, "emit", records.append)
+    for logger in (first, second):
+        monkeypatch.setattr(logger, "handlers", [handler])
+        monkeypatch.setattr(logger, "propagate", False)
+        monkeypatch.setattr(logger, "level", logging.ERROR)
+    error = RuntimeError("retained traceback")
+    try:
+        try:
+            raise error
+        except RuntimeError:
+            first.exception_once("failed %s", 1, scope="process", key=key)
+            second.exception_once("failed %s", 2, scope="process", key=key)
+        assert len(records) == 1
+        assert records[0].getMessage() == "failed 1"
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is error
+        assert records[0].exc_info[2] is not None
+    finally:
+        logging_api.set_log_once_state(key, False)

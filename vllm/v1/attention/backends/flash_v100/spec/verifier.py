@@ -9,13 +9,10 @@ from typing import Any
 
 import torch
 
-from vllm.logger import init_logger
+from vllm.logger import init_logger, log_once_seen, set_log_once_state
 from vllm.v1.attention.backends.flash_v100 import config as _config
-from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
-from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -74,6 +71,10 @@ class VerificationOps:
     branch_strict: Any = None
     tree_trace_enabled: Any = None
     tree_trace_event: Any = None
+    parent_ids_cpu: Any = None
+    draft_debug_enabled: Any = None
+    metadata_debug_log: Any = None
+    format_debug: Any = None
 
 
 @dataclass(frozen=True)
@@ -206,9 +207,11 @@ class VerificationExecutor:
         if (
             self.config.grouped_enabled
             and not allowed
-            and not _state._logged_prefill_smallq_grouped_verify_gate
+            and not log_once_seen(
+                "flash_v100._logged_prefill_smallq_grouped_verify_gate"
+            )
         ):
-            logger.info(
+            logger.info_once(
                 "FLASH_ATTN_V100 DFlash2 grouped verifier gate rejected: "
                 "op=%s marker=%s max_model_len=%s min_model_len=%s "
                 "causal=%s window=%s reqs=%d max_q=%d actual=%d "
@@ -236,8 +239,12 @@ class VerificationExecutor:
                 None if block_table is None else block_table.dtype,
                 None if seq_lens is None else tuple(seq_lens.shape),
                 None if seq_lens is None else seq_lens.dtype,
+                scope="process",
+                key="flash_v100._logged_prefill_smallq_grouped_verify_gate",
             )
-            _state._logged_prefill_smallq_grouped_verify_gate = True
+            set_log_once_state(
+                "flash_v100._logged_prefill_smallq_grouped_verify_gate", True
+            )
         return allowed
 
     def call_grouped_verify(
@@ -251,15 +258,17 @@ class VerificationExecutor:
         out: torch.Tensor,
     ) -> None:
         num_reqs = int(attn_metadata.block_table.shape[0])
-        if not _state._logged_prefill_smallq_grouped_verify:
-            logger.info(
+        if not log_once_seen("flash_v100._logged_prefill_smallq_grouped_verify"):
+            logger.info_once(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
                 "(request-major B%d/q%d/H6/Hkv1/D256, %s KV, one-pass).",
                 num_reqs,
                 query.shape[0] // num_reqs,
                 self.config.kv_cache_dtype,
+                scope="process",
+                key="flash_v100._logged_prefill_smallq_grouped_verify",
             )
-            _state._logged_prefill_smallq_grouped_verify = True
+            set_log_once_state("flash_v100._logged_prefill_smallq_grouped_verify", True)
         self.ops.grouped(
             query,
             key_cache,
@@ -273,10 +282,10 @@ class VerificationExecutor:
             v_scale=float(layer._v_scale_float),
             one_pass=True,
         )
-        _routing._log_fp8_kv_cache_route(
+        _routing.log_fp8_kv_cache_route(
             "decode", self.config.kv_cache_dtype, "dflash2_grouped_verify"
         )
-        _routing._record_route(
+        _routing.record_route(
             _routing.ROUTE_SPECS["prefill_smallq_dflash2_grouped_verify"].name
         )
 
@@ -366,7 +375,7 @@ class VerificationExecutor:
                 key_cache.shape[1],
                 scope="process",
             )
-            _routing._record_route(
+            _routing.record_route(
                 _routing.ROUTE_SPECS["prefill_smallq_fp16_grouped_fp32"].name
             )
             return
@@ -402,10 +411,10 @@ class VerificationExecutor:
                 key_cache.shape[1],
                 scope="process",
             )
-            _routing._log_fp8_kv_cache_route(
+            _routing.log_fp8_kv_cache_route(
                 "decode", self.config.kv_cache_dtype, "grouped_fp32"
             )
-            _routing._record_route(
+            _routing.record_route(
                 _routing.ROUTE_SPECS["prefill_smallq_e4m3_grouped_fp32"].name
             )
             return
@@ -434,8 +443,8 @@ class VerificationExecutor:
                 )
                 else None
             )
-            if not _state._logged_prefill_smallq_decode_xqa:
-                logger.info(
+            if not log_once_seen("flash_v100._logged_prefill_smallq_decode_xqa"):
+                logger.info_once(
                     "FLASH_ATTN_V100 MTP verifier XQA path active "
                     "(rows=%d, q_per_kv=%d, partition_hint=%s, "
                     "mtp5_dual_cta=%s).",
@@ -443,9 +452,11 @@ class VerificationExecutor:
                     int(query.shape[1] // key_cache.shape[2]),
                     verifier_partition_size_hint,
                     verifier_partition_size_hint is not None,
+                    scope="process",
+                    key="flash_v100._logged_prefill_smallq_decode_xqa",
                 )
-                _state._logged_prefill_smallq_decode_xqa = True
-            _routing._log_fp8_kv_cache_route(
+                set_log_once_state("flash_v100._logged_prefill_smallq_decode_xqa", True)
+            _routing.log_fp8_kv_cache_route(
                 "decode", self.config.kv_cache_dtype, "xqa_paged"
             )
             self.ops.xqa(
@@ -471,7 +482,7 @@ class VerificationExecutor:
                     )
                 ),
             )
-            _routing._record_route(
+            _routing.record_route(
                 _routing.ROUTE_SPECS["prefill_smallq_decode_xqa"].name
             )
             return
@@ -492,9 +503,7 @@ class VerificationExecutor:
             workspace_seq_capacity_hint=workspace_seq_capacity_hint,
             partition_size_hint=partition_size_hint,
         )
-        _routing._record_route(
-            _routing.ROUTE_SPECS["prefill_smallq_decode_scalar"].name
-        )
+        _routing.record_route(_routing.ROUTE_SPECS["prefill_smallq_decode_scalar"].name)
 
     def small_query_enabled(
         self,
@@ -542,7 +551,7 @@ class VerificationExecutor:
     ) -> torch.Tensor:
         """Correctness bridge for branched DDTree verifier attention."""
 
-        is_capturing = _routing._is_cuda_graph_capturing(query)
+        is_capturing = _routing.is_cuda_graph_capturing(query)
         parent_ids = getattr(attn_metadata, "ddtree_parent_ids", None)
         num_tree_tokens_cpu = getattr(attn_metadata, "ddtree_num_tree_tokens_cpu", None)
         num_reqs = min(
@@ -612,20 +621,24 @@ class VerificationExecutor:
                                 ),
                             },
                         )
-                    if not _state._logged_prefill_ddtree_triton_fallback:
-                        logger.exception(
+                    if not log_once_seen("flash_v100.tree_fallback"):
+                        logger.exception_once(
                             "FLASH_ATTN_V100 DDTree Triton verifier failed; "
-                            "falling back to dense masked verifier."
+                            "falling back to dense masked verifier.",
+                            scope="process",
+                            key="flash_v100.tree_fallback",
                         )
-                        _state._logged_prefill_ddtree_triton_fallback = True
+                        set_log_once_state("flash_v100.tree_fallback", True)
                 else:
-                    if not _state._logged_prefill_ddtree_triton:
-                        logger.info(
+                    if not log_once_seen("flash_v100.tree_paged"):
+                        logger.info_once(
                             "FLASH_ATTN_V100 DDTree branched verifier path active "
-                            "(Triton paged-KV ancestor mask)."
+                            "(Triton paged-KV ancestor mask).",
+                            scope="process",
+                            key="flash_v100.tree_paged",
                         )
-                    _state._logged_prefill_ddtree_triton = True
-                    _routing._record_route(
+                    set_log_once_state("flash_v100.tree_paged", True)
+                    _routing.record_route(
                         _routing.ROUTE_SPECS["prefill_ddtree_triton"].name
                     )
                     if self.ops.tree_trace_enabled():
@@ -657,20 +670,22 @@ class VerificationExecutor:
                 "or unavailable."
             )
 
-        parent_ids_cpu = _masks._ddtree_parent_ids_cpu(attn_metadata)
+        parent_ids_cpu = self.ops.parent_ids_cpu(attn_metadata)
         if parent_ids_cpu is None or num_tree_tokens_cpu is None:
             raise RuntimeError(
                 "DDTree dense verifier fallback requires parent metadata"
             )
 
-        if not _state._logged_prefill_ddtree_dense:
-            logger.info(
+        if not log_once_seen("flash_v100.tree_dense"):
+            logger.info_once(
                 "FLASH_ATTN_V100 DDTree branched verifier path active "
-                "(dense masked small-query fallback)."
+                "(dense masked small-query fallback).",
+                scope="process",
+                key="flash_v100.tree_dense",
             )
-            _state._logged_prefill_ddtree_dense = True
+            set_log_once_state("flash_v100.tree_dense", True)
 
-        _routing._record_route(_routing.ROUTE_SPECS["prefill_ddtree_dense"].name)
+        _routing.record_route(_routing.ROUTE_SPECS["prefill_ddtree_dense"].name)
         if self.ops.tree_trace_enabled():
             self.ops.tree_trace_event(
                 "flash_ddtree_attention_route",
@@ -745,7 +760,7 @@ class VerificationExecutor:
                         cache_k_by_slot = key_cache[slot_blocks, slot_offsets]
                         cache_v_by_slot = value_cache[slot_blocks, slot_offsets]
                         cache_k_by_slot, cache_v_by_slot = (
-                            _kv_layout._dequantize_fp8_contiguous_kv(
+                            _kv_layout.dequantize_fp8_contiguous_kv(
                                 cache_k_by_slot,
                                 cache_v_by_slot,
                                 self.config.kv_cache_dtype,
@@ -774,7 +789,7 @@ class VerificationExecutor:
                             },
                         )
 
-            k_cont, v_cont = _kv_layout._extract_contiguous_kv_from_paged_cache(
+            k_cont, v_cont = _kv_layout.extract_contiguous_kv_from_paged_cache(
                 (key_cache, value_cache),
                 attn_metadata.block_table[req_idx : req_idx + 1],
                 attn_metadata.seq_lens[req_idx : req_idx + 1],
@@ -783,7 +798,7 @@ class VerificationExecutor:
                 key_cache.shape[1],
                 total_tokens=seq_len,
             )
-            k_cont, v_cont = _kv_layout._dequantize_fp8_contiguous_kv(
+            k_cont, v_cont = _kv_layout.dequantize_fp8_contiguous_kv(
                 k_cont,
                 v_cont,
                 self.config.kv_cache_dtype,
@@ -911,32 +926,30 @@ class VerificationExecutor:
             and persistent_query_start_loc is not None
             and int(persistent_decode_seq_lens.shape[0]) >= num_query_tokens
             and int(persistent_decode_block_table.shape[0]) >= num_query_tokens
-            and not _kv_layout._metadata_expects_more_query_tokens_than_available(
+            and not _kv_layout.metadata_expects_more_query_tokens_than_available(
                 attn_metadata,
                 num_query_tokens,
             )
         ):
             query = query[:num_query_tokens]
             out_view = output[:num_query_tokens]
-            if _debug._draft_graph_debug_enabled():
-                _debug._graph_metadata_debug_log(
+            if self.ops.draft_debug_enabled():
+                self.ops.metadata_debug_log(
                     "smallq_call",
                     "layer=%s num_query_tokens=%s %s %s %s %s %s",
                     self.ops.layer_info(layer).get("layer_name"),
                     num_query_tokens,
-                    _debug._format_tensor_debug(query, "query"),
-                    _debug._format_tensor_debug(out_view, "out"),
-                    _debug._format_tensor_debug(
+                    self.ops.format_debug(query, "query"),
+                    self.ops.format_debug(out_view, "out"),
+                    self.ops.format_debug(
                         persistent_decode_block_table[:num_query_tokens],
                         "smallq_bt",
                     ),
-                    _debug._format_tensor_debug(
+                    self.ops.format_debug(
                         persistent_decode_seq_lens[:num_query_tokens],
                         "smallq_seq",
                     ),
-                    _debug._format_tensor_debug(
-                        persistent_query_start_loc, "smallq_qsl"
-                    ),
+                    self.ops.format_debug(persistent_query_start_loc, "smallq_qsl"),
                 )
             self.run_smallq(
                 layer,
@@ -965,7 +978,7 @@ class VerificationExecutor:
             )
             return output
 
-        if _routing._is_cuda_graph_capturing(query):
+        if _routing.is_cuda_graph_capturing(query):
             raise RuntimeError(
                 "FLASH_ATTN_V100 small-query prefix prefill entered CUDA graph "
                 "capture without persistent smallq decode metadata. The "
@@ -974,8 +987,36 @@ class VerificationExecutor:
                 "derived tensors."
             )
 
+        return self._eager_small_query_prefill(
+            layer,
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            output,
+            query_start_loc,
+            _seq_lens,
+            num_query_tokens,
+            device,
+            dtype,
+        )
+
+    def _eager_small_query_prefill(
+        self,
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        output,
+        query_start_loc,
+        _seq_lens,
+        num_query_tokens,
+        device,
+        dtype,
+    ):
         query_start_loc_norm = (
-            _kv_layout._normalize_query_start_loc_for_available_tokens(
+            _kv_layout.normalize_query_start_loc_for_available_tokens(
                 query_start_loc,
                 num_query_tokens,
             )

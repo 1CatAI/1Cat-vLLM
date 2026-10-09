@@ -1,86 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Debug and profiling switches for the Flash-V100 backend."""
-
-from __future__ import annotations
-
-import torch
+"""Logging subscriber and compatibility access to diagnostic preparation."""
 
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.flash_v100 import config as _config
+from vllm.v1.attention.backends.flash_v100.plan import diagnostics
+from vllm.v1.attention.backends.flash_v100.plan.events import (
+    DiagnosticMessage,
+    diagnostic_messages,
+)
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-def _sm70_profile_trace(message: str, *args: object) -> None:
-    if _config.registered("VLLM_SM70_PROFILE_TRACE"):
-        if args:
-            message = message % args
-        logger.info("SM70 Flash-V100 trace: %s", message)
+def log_diagnostic(event: DiagnosticMessage) -> None:
+    logger.info(event.message, *event.args)
 
 
-_draft_graph_debug_counts: dict[str, int] = {}
+diagnostic_messages.subscribe(log_diagnostic)
 
 
-def _draft_graph_debug_enabled() -> bool:
-    return _config.raw("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG", "0") == "1"
-
-
-def _draft_graph_debug_limit() -> int:
-    return int(_config.raw("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT", "12"))
-
-
-def _format_tensor_debug(tensor: torch.Tensor | None, name: str) -> str:
-    if tensor is None:
-        return f"{name}=None"
-
-    values = ""
-    if tensor.numel() > 0 and not (
-        tensor.is_cuda and torch.cuda.is_current_stream_capturing()
-    ):
-        try:
-            flat = tensor.detach().reshape(-1)[: min(8, tensor.numel())]
-            values = f" vals={flat.cpu().tolist()}"
-        except Exception as exc:  # pragma: no cover - diagnostic only.
-            values = f" vals=<unavailable:{type(exc).__name__}>"
-
-    return (
-        f"{name}=shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-        f"ptr=0x{tensor.data_ptr():x} storage=0x"
-        f"{tensor.untyped_storage().data_ptr():x} "
-        f"offset={tensor.storage_offset()}{values}"
-    )
-
-
-def _draft_graph_debug_log(key: str, message: str, *args: object) -> None:
-    if not _draft_graph_debug_enabled():
-        return
-    count = _draft_graph_debug_counts.get(key, 0)
-    if count >= _draft_graph_debug_limit():
-        return
-    _draft_graph_debug_counts[key] = count + 1
-    if args:
-        message = message % args
-    logger.info(
-        "FLASH_ATTN_V100 draft graph debug[%s#%d]: %s",
-        key,
-        count,
-        message,
-    )
-
-
-def _graph_metadata_debug_log(key: str, message: str, *args: object) -> None:
-    if not _draft_graph_debug_enabled():
-        return
-    count = _draft_graph_debug_counts.get(key, 0)
-    if count >= _draft_graph_debug_limit():
-        return
-    _draft_graph_debug_counts[key] = count + 1
-    if args:
-        message = message % args
-    logger.info(
-        "FLASH_ATTN_V100 graph metadata debug[%s#%d]: %s",
-        key,
-        count,
-        message,
-    )
+def __getattr__(name: str):
+    return getattr(diagnostics, name)

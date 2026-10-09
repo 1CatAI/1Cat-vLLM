@@ -10,12 +10,31 @@ GPU validation uses the authorized `dx.1catai.com:54633` and task-owned locks,
 artifacts and dependencies. Fifty idle host/spec retry queues were stopped under
 this updated policy; their deferred records replace no test completion markers.
 
-Current merge decision: accept the completed stack through #1110 after the
-FlashInfer-SM70 compatibility fix described below. Keep the still-open A3
-structural targets as follow-up work, rather than accumulating more draft PRs.
-The final 153-line forward, 315-line maximum function, 269 cross-module private
-references, 83 outside-Spec model terms and 20 state flags are **not** full A3
-completion. Import cycles and environment reads outside config are already zero.
+Final cleanup is on the owned `agent/v100-a3-finish-20261009-005942` branch,
+based on main `84b57580d9ba24d02866166a60ade0505919013d`. The earlier stack is
+already integrated through #1113; no dependency on its closed draft PRs remains.
+Step 7 below records the final acceptance evidence before merge. DDTree remains
+an explicit user-deferred exception, not a passed GPU claim.
+
+| Metric | #1060 | Main before final cleanup | Final cleanup |
+| --- | ---: | ---: | ---: |
+| Forward lines | 597 | 153 | 113 |
+| Largest active function | 977 | 303 | 200 |
+| Whole-package maximum (includes deferred DDTree) | 977 | 315 | 321 |
+| Cross-module private references | 390 | 269 | 11 |
+| Import cycles | 14 | 0 | 0 |
+| Model terms outside Spec / route declarations | 169 | 83 | 0 |
+| Environment reads outside config | 119 | 0 | 0 |
+| State module boolean flags | 29 | 20 | 0 |
+
+The six-line increase in the deferred DDTree function is explicit keyed logging;
+its calculation hash remains frozen. The non-deferred 200-line ceiling has its
+own ratchet, so the exception cannot conceal another oversized function.
+Composition imports are a named, exact allowlist for constructor wiring and the
+legacy verifier facade; every other execution/Spec dependency remains checked.
+
+The following rows retain per-slice history. Historical queues were retired;
+current completion evidence is in Step 7, not those queue labels.
 
 | Step | PR | Status | Metrics | GPU validation | Open items |
 | --- | --- | --- | --- | --- | --- |
@@ -35,19 +54,19 @@ completion. Import cycles and environment reads outside config are already zero.
 | 5b: batch prefill candidates | #1086 | Merged to main | Largest function 529 → 414; private 348 → 347 | Follow-up | Follow-up GPU evidence |
 | 5c: debug observer | #1088 | Merged to main | Largest function 414 → 402 | Queued | Follow-up GPU evidence |
 | 6a: verifier ownership | #1090 | Merged to main | Cycles 13 → 11; model terms 169 → 158 | Queued | Follow-up GPU evidence |
-| 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Queued | Follow-up GPU evidence |
-| 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Queued | Follow-up GPU evidence |
-| 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Queued | Follow-up GPU evidence |
-| 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Queued | Follow-up GPU evidence |
-| 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Queued | Follow-up GPU evidence |
-| 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Queued | Follow-up GPU evidence |
-| 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Queued | Follow-up GPU evidence |
-| 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Queued | Follow-up GPU evidence |
-| 6j: tree visibility feature ownership | #1107 | CPU/golden/strict/rebase passed | Private 308 → 303; model terms 151 → 137 | Queued | Follow-up GPU evidence |
-| 6k: feature contract ownership | #1108 | CPU/golden/strict/rebase passed | Private 303 → 301; model terms 137 → 126 | Four queues staged | Follow-up GPU evidence |
-| 6l: dynamic feature policies | #1109 | CPU/golden/strict/rebase passed | Private 301 → 287; model terms 126 → 83 | Four queues staged | Follow-up GPU evidence |
-| 6m: decode one-shot logging | #1110 | Full CPU/golden/strict and logger tests passed | State flags 29 → 20; private 287 → 269 | Follow-up | Follow-up GPU evidence |
-| 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
+| 6b: metadata builder ownership | #1093 | Integrated to main through #1113 | Cycles 11 → 4; private 347 → 341 | Queued | Follow-up GPU evidence |
+| 6c: attention policy ownership | #1095 | Integrated to main through #1113 | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Queued | Follow-up GPU evidence |
+| 6d: owned per-request metadata packet | #1096 | Integrated to main through #1113 | Private 333 → 332; final metadata mixin removed | Queued | Follow-up GPU evidence |
+| 6e: registered speculative features | #1097 | Integrated to main through #1113 | Private 332 → 330 | Queued | Follow-up GPU evidence |
+| 6f: complete prefill execution ownership | #1101 | Integrated to main through #1113 | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Queued | Follow-up GPU evidence |
+| 6g: owned comparison diagnostics | #1103 | Integrated to main through #1113 | Private 318 → 309; cycles 2 → 1 | Queued | Follow-up GPU evidence |
+| 6h: shared allocation ownership | #1104 | Integrated to main through #1113 | Private 309 → 308; final cycle 1 → 0 | Queued | Follow-up GPU evidence |
+| 6i: outer prefill dispatch | #1105 | Integrated to main through #1113 | Forward 400 → 153; largest function 400 → 318 | Queued | Follow-up GPU evidence |
+| 6j: tree visibility feature ownership | #1107 | Integrated to main through #1113 | Private 308 → 303; model terms 151 → 137 | Queued | Follow-up GPU evidence |
+| 6k: feature contract ownership | #1108 | Integrated to main through #1113 | Private 303 → 301; model terms 137 → 126 | Four queues staged | Follow-up GPU evidence |
+| 6l: dynamic feature policies | #1109 | Integrated to main through #1113 | Private 301 → 287; model terms 126 → 83 | Four queues staged | Follow-up GPU evidence |
+| 6m: decode one-shot logging | #1110 | Integrated to main through #1113 | State flags 29 → 20; private 287 → 269 | Follow-up | Follow-up GPU evidence |
+| 7: final boundaries, flags, docs, ratchet | Final PR | Final validation in progress | 113 / 200 active / 11 private / 0 cycles-model-env-flags | Final combined check on 54633 | DDTree deferred |
 
 ## Step 0 decisions
 
@@ -1338,3 +1357,31 @@ with **37 passes / 98 GPU skips** and unchanged native sources. Local evidence:
 `a3-main-integration-1028-cpu.log`. An additional 37 idle per-slice GPU retry
 queues were retired; an already-active regression job was left to finish.
 No deferred queue was given a passing completion marker.
+
+## Step 7: final ownership and completion
+
+Final implementation:
+
+- Mechanical commit `b205f25c0` moves verifier and feature diagnostics into Spec;
+  the following rewrite commit promotes actual owner operations with live legacy
+  aliases, moves feature admission/logging out of common prefill, removes all
+  remaining process flag storage and separates long functions by responsibility.
+- Diagnostic preparation publishes synchronous events to logging subscribers.
+  Completion keys preserve the old guard and final-mark locations. The legacy
+  import warns about deprecation; patch writes still reach executed owners.
+- `check_layering` now measures model names inside this backend rather than
+  exempting the entire V100 package. The dependency baseline locks final counts,
+  the 200-line active ceiling and the one explicit deferred function.
+- The immutable trace, route names, native interfaces, QSA/RoPE code and original
+  calculation fixtures are not changed. New test normalization only expands
+  actual extracted code, checks parameter binding, and resolves live aliases.
+
+Validation and merge result will be filled from final run artifacts below.
+
+After A3, resume frozen work independently from the resulting main commit:
+PRs #1061/#1048 adapt native codec traits/readers/storage accounting to the single
+`kv_codecs.py` API; #1063 adapts its bridge to current prefill operations;
+PR #1064 rebases documentation against the completed owners; #1065/#1066 rebase
+MoE work independently and retain A3 safety tests. Do not restore the old stacked
+PR bases. #1028 remains separately owned; use the pinned compatibility replay,
+without publishing changes to its branch.

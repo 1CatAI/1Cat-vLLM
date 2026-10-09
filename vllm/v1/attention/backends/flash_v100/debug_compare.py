@@ -205,7 +205,7 @@ def _maybe_write_triton_tensor_dump(
     }
 
     if stage in ("prefill_no_prefix", "prefill_no_prefix_paged_cache"):
-        key_cache, _ = _kv_layout._split_paged_kv_cache(kv_cache)
+        key_cache, _ = _kv_layout.split_paged_kv_cache(kv_cache)
         block_size = key_cache.shape[1]
         num_kv_heads = key_cache.shape[2]
         head_dim = key_cache.shape[3]
@@ -216,7 +216,7 @@ def _maybe_write_triton_tensor_dump(
             else attn_metadata.query_start_loc
         )
         num_seqs = len(query_start_loc) - 1
-        k_cont, v_cont = _kv_layout._extract_contiguous_kv_from_paged_cache(
+        k_cont, v_cont = _kv_layout.extract_contiguous_kv_from_paged_cache(
             kv_cache=kv_cache,
             block_table=attn_metadata.block_table[:num_seqs],
             seq_lens=attn_metadata.seq_lens[:num_seqs],
@@ -225,7 +225,7 @@ def _maybe_write_triton_tensor_dump(
             block_size=block_size,
             total_tokens=num_actual_tokens,
         )
-        k_cont, v_cont = _kv_layout._dequantize_fp8_contiguous_kv(
+        k_cont, v_cont = _kv_layout.dequantize_fp8_contiguous_kv(
             k_cont,
             v_cont,
             self.kv_cache_dtype,
@@ -245,7 +245,7 @@ def _maybe_write_triton_tensor_dump(
     return {"tensor_dump_path": path}
 
 
-def _small_tensor_list(
+def small_tensor_list(
     tensor: torch.Tensor | None,
     limit: int = 32,
 ) -> list[int] | None:
@@ -255,7 +255,7 @@ def _small_tensor_list(
     return [int(x) for x in flat[:limit].tolist()]
 
 
-def _tensor_compare_stats(
+def tensor_compare_stats(
     candidate: torch.Tensor,
     reference: torch.Tensor,
 ) -> dict[str, object]:
@@ -301,7 +301,7 @@ def _prefill_raw_kv_cache_compare_stats(
     attn_metadata: TritonAttentionMetadata,
     num_actual_tokens: int,
 ) -> dict[str, object]:
-    key_cache, _ = _kv_layout._split_paged_kv_cache(kv_cache)
+    key_cache, _ = _kv_layout.split_paged_kv_cache(kv_cache)
 
     block_size = key_cache.shape[1]
     num_kv_heads = key_cache.shape[2]
@@ -313,7 +313,7 @@ def _prefill_raw_kv_cache_compare_stats(
         else attn_metadata.query_start_loc
     )
     num_seqs = len(query_start_loc) - 1
-    k_cont, v_cont = _kv_layout._extract_contiguous_kv_from_paged_cache(
+    k_cont, v_cont = _kv_layout.extract_contiguous_kv_from_paged_cache(
         kv_cache=kv_cache,
         block_table=attn_metadata.block_table[:num_seqs],
         seq_lens=attn_metadata.seq_lens[:num_seqs],
@@ -322,7 +322,7 @@ def _prefill_raw_kv_cache_compare_stats(
         block_size=block_size,
         total_tokens=num_actual_tokens,
     )
-    k_cont, v_cont = _kv_layout._dequantize_fp8_contiguous_kv(
+    k_cont, v_cont = _kv_layout.dequantize_fp8_contiguous_kv(
         k_cont,
         v_cont,
         self.kv_cache_dtype,
@@ -474,9 +474,9 @@ class ComparisonExecutor:
     _maybe_write_triton_tensor_dump = _maybe_write_triton_tensor_dump
     _prefill_raw_kv_cache_compare_stats = _prefill_raw_kv_cache_compare_stats
     _maybe_compare_triton_output = _maybe_compare_triton_output
-    _small_tensor_list = staticmethod(_small_tensor_list)
+    _small_tensor_list = staticmethod(small_tensor_list)
     _layer_debug_info = staticmethod(_layer_debug_info)
-    _tensor_compare_stats = staticmethod(_tensor_compare_stats)
+    _tensor_compare_stats = staticmethod(tensor_compare_stats)
 
 
 LEGACY_METHODS = (
@@ -491,3 +491,9 @@ LEGACY_METHODS = (
 )
 
 STATIC_METHODS = ("_small_tensor_list", "_layer_debug_info", "_tensor_compare_stats")
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {
+    "_tensor_compare_stats": "tensor_compare_stats",
+    "_small_tensor_list": "small_tensor_list",
+}

@@ -196,8 +196,12 @@ class Recorder:
         if not frame.f_globals.get("__name__", "").startswith(PACKAGE):
             return
         name = frame.f_code.co_name
+        aliases = frame.f_globals.get("LEGACY_ALIASES", {})
+        name = {public: old for old, public in aliases.items()}.get(name, name)
+        if name in ("_run_bhmd_decode", "_try_dense_architecture"):
+            return
         if name == "small_query_enabled" and frame.f_globals["__name__"] == (
-            PACKAGE + ".verify"
+            PACKAGE + ".spec.verifier"
         ):
             # The executed predicate now belongs to the injected verifier.
             name = "_small_query_decode_enabled"
@@ -220,9 +224,16 @@ class Recorder:
                 if "self._reset_decode_cache()" in text
                 or "self.workspace.decode_cache.invalidate()" in text
             ]
-            self.events.append(
-                ["reset", caller.f_code.co_name, sites.index(caller.f_lineno)]
-            )
+            site = sites.index(caller.f_lineno)
+            caller_name = caller.f_code.co_name
+            if caller_name == "_forward_with_prefix":
+                caller_name, site = "forward", 1
+            elif (
+                caller_name == "forward"
+                and caller.f_globals["__name__"] == PACKAGE + ".prefill"
+            ):
+                site = (0, 2)[site]
+            self.events.append(["reset", caller_name, site])
         if (
             name.startswith(("_should_", "_try_", "_supports_", "_run_"))
             or name
@@ -276,7 +287,10 @@ def install_ops(monkeypatch, recorder, legacy, case):
 
     def read_prefill_predicate(instance, name):
         value = original_prefill_read(instance, name)
-        if name.startswith("use_") and sys._getframe(1).f_code.co_name == "forward":
+        if name.startswith("use_") and sys._getframe(1).f_code.co_name in (
+            "forward",
+            "_forward_with_prefix",
+        ):
             recorder.events.append(["predicate", name, value])
         return value
 
@@ -288,6 +302,7 @@ def install_ops(monkeypatch, recorder, legacy, case):
         if name.startswith("use_") and sys._getframe(1).f_code.co_name in (
             "forward",
             "_forward_decode",
+            "_observe_forward",
         ):
             recorder.events.append(["predicate", name, value])
         return value
@@ -448,9 +463,8 @@ def run_case(case):
             from vllm.v1.attention.backends.flash_v100 import dense_prefill, state
 
             dense_prefill.clear_flash_attn_v100_workspaces()
-            for name, value in vars(state).items():
-                if isinstance(value, bool):
-                    mp.setattr(state, name, False)
+            for name in state.LOG_KEYS:
+                mp.setattr(state, name, False)
             config = dict(
                 num_heads=case["gqa"],
                 num_kv_heads=1,

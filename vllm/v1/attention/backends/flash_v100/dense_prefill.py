@@ -5,10 +5,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import ModuleType
 
 import torch
 
-from vllm.logger import init_logger
+from vllm.logger import init_logger, log_once_seen, set_log_once_state
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
@@ -21,14 +22,12 @@ from vllm.v1.attention.ops.sm70_grouped import (
 )
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
+LEGACY_OBSERVATIONS: dict[str, tuple[ModuleType, str]]
 _sm70_fa2_cu_seqlens_cache: dict[
     tuple[int, int, int, int], tuple[torch.Tensor, torch.Tensor]
 ] = {}
-_warned_prefill_dense_splitkv3_oom = False
-_warned_prefill_d256_gqa_architecture_oom = False
-_logged_prefill_fa2_d256 = False
-_logged_prefill_dense_splitkv3 = False
-_logged_prefill_d256_gqa_architecture = False
+
+
 _FP8_PREFILL_BRIDGE_PAGE_SIZE = 784
 _SM70_79T_CORE_QUERY_LEN = 8000
 _SM70_79T_MAX_QUERY_LEN = 8192
@@ -64,7 +63,7 @@ def clear_flash_attn_v100_workspaces() -> None:
     _sm70_79t_q8192_padding_workspaces.clear()
 
 
-def _uniform_cu_seqlens(
+def uniform_cu_seqlens(
     tensor: torch.Tensor,
     *,
     batch_size: int,
@@ -100,9 +99,7 @@ def _uniform_cu_seqlens(
 def _get_prefill_dense_splitkv3_workspace(
     query: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    global _warned_prefill_dense_splitkv3_oom
-
-    if _routing._is_cuda_graph_capturing(query):
+    if _routing.is_cuda_graph_capturing(query):
         return None
     device_index = query.device.index
     if device_index is None:
@@ -136,12 +133,14 @@ def _get_prefill_dense_splitkv3_workspace(
         )
         partial_sum = torch.empty_like(partial_max)
     except torch.OutOfMemoryError:
-        if not _warned_prefill_dense_splitkv3_oom:
-            logger.warning(
+        if not log_once_seen("flash_v100._warned_prefill_dense_splitkv3_oom"):
+            logger.warning_once(
                 "Insufficient memory for the long-prefill split-KV3 FP32 "
-                "workspace; falling back to the exact dense kernel."
+                "workspace; falling back to the exact dense kernel.",
+                scope="process",
+                key="flash_v100._warned_prefill_dense_splitkv3_oom",
             )
-            _warned_prefill_dense_splitkv3_oom = True
+            set_log_once_state("flash_v100._warned_prefill_dense_splitkv3_oom", True)
         return None
     workspace = (partial_out, partial_max, partial_sum)
     _prefill_dense_splitkv3_workspaces[cache_key] = workspace
@@ -176,7 +175,7 @@ def _should_use_prefill_dense_splitkv3(
         and max_seqlen_k
         >= _config.registered("VLLM_FLASH_V100_PREFILL_DENSE_SPLITKV3_MIN_KV")
         and max_seqlen_k > max_seqlen_q
-        and not _routing._is_cuda_graph_capturing(query)
+        and not _routing.is_cuda_graph_capturing(query)
     )
 
 
@@ -228,7 +227,7 @@ def _should_use_prefill_d256_gqa_architecture(
         and key.is_contiguous()
         and value.is_contiguous()
         and abs(softmax_scale - 0.0625) <= 1.0e-8
-        and not _routing._is_cuda_graph_capturing(query)
+        and not _routing.is_cuda_graph_capturing(query)
     )
 
 
@@ -237,7 +236,7 @@ def _should_use_prefill_d256_gqa_architecture(
 _sm70_prefill_profiled_workspaces: set[tuple[torch.device, int]] = set()
 
 
-def _profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> None:
+def profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> None:
     if (
         not _config.registered(
             "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
@@ -263,9 +262,9 @@ def _profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> N
     if cache_key in _sm70_prefill_profiled_workspaces:
         return
     op = (
-        _ops._get_sm70_d256_gqa_architecture_op()
+        _ops.get_sm70_d256_gqa_architecture_op()
         if q_len == _SM70_79T_CORE_QUERY_LEN
-        else _ops._get_sm70_d256_gqa_architecture_q8192_op()
+        else _ops.get_sm70_d256_gqa_architecture_q8192_op()
     )
     if op is None:
         return
@@ -351,7 +350,7 @@ def _run_sm70_d256_gqa_79t_dispatch(
 
     fringe_kv_len = int(key.shape[1]) - _SM70_79T_CORE_QUERY_LEN
     padded_fringe_len = (
-        _masks._cdiv_int(fringe_len, _SM70_79T_EXACT_QUERY_ALIGNMENT)
+        _masks.cdiv_int(fringe_len, _SM70_79T_EXACT_QUERY_ALIGNMENT)
         * _SM70_79T_EXACT_QUERY_ALIGNMENT
     )
     if padded_fringe_len == fringe_len:
@@ -463,7 +462,7 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
     return out
 
 
-def _try_sm70_fa2_d256_prefill(
+def try_sm70_fa2_d256_prefill(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -479,9 +478,6 @@ def _try_sm70_fa2_d256_prefill(
     seqused_k: torch.Tensor | None = None,
     block_table: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
-    global _logged_prefill_d256_gqa_architecture
-    global _warned_prefill_d256_gqa_architecture_oom
-
     int32_max = torch.iinfo(torch.int32).max
     if not _config.registered("VLLM_FLASH_V100_FA2_D256_PREFILL"):
         return None
@@ -519,7 +515,7 @@ def _try_sm70_fa2_d256_prefill(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale,
-            architecture_op=_ops._get_sm70_d256_gqa_architecture_op(),
+            architecture_op=_ops.get_sm70_d256_gqa_architecture_op(),
         ):
             return None
     if block_table is not None:
@@ -555,25 +551,10 @@ def _try_sm70_fa2_d256_prefill(
     ) != (7, 0):
         return None
 
-    splitd_ops = _ops._get_sm70_splitd_d256_ops()
-    q8000_core_dispatch_eligible = (
-        not paged_kv
-        and not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
-        and _SM70_79T_CORE_QUERY_LEN <= max_seqlen_q <= _SM70_79T_MAX_QUERY_LEN
+    splitd_ops, splitd_eligible = _splitd_admission(
+        query, paged_kv, max_seqlen_q, max_seqlen_k
     )
-    architecture_kv_eligible = (
-        q8000_core_dispatch_eligible and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
-    )
-    exact_splitd_shape_eligible = (
-        max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
-        and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
-    )
-    splitd_eligible = (
-        splitd_ops is not None
-        and query.ndim == 4
-        and query.shape[1] == max_seqlen_q
-        and (architecture_kv_eligible or exact_splitd_shape_eligible)
-    )
+
     if splitd_eligible:
         dense_op, paged_op, splitkv3_op = splitd_ops
         splitd_result = None
@@ -606,117 +587,17 @@ def _try_sm70_fa2_d256_prefill(
             )
             if splitd_eligible:
                 splitd_out = out if out is not None else torch.empty_like(query)
-                architecture_op = (
-                    _ops._get_sm70_d256_gqa_architecture_op()
-                    if _config.registered(
-                        "VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL"
-                    )
-                    else None
-                )
-                architecture_q8192_op = (
-                    _ops._get_sm70_d256_gqa_architecture_q8192_op()
-                    if architecture_op is not None
-                    and not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
-                    and max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
-                    else None
-                )
-                if _should_use_prefill_d256_gqa_architecture(
+                splitd_result = _try_dense_architecture(
                     query,
                     key,
                     value,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=softmax_scale,
-                    architecture_op=architecture_op,
-                ):
-                    assert architecture_op is not None
-                    try:
-                        if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37"):
-                            splitd_result = _run_sm70_gqa_groups(
-                                architecture_op,
-                                query,
-                                key,
-                                value,
-                                splitd_out,
-                                softmax_scale,
-                                True,
-                            )
-                        elif architecture_q8192_op is not None:
-                            splitd_result = _run_sm70_d256_gqa_79t_q8192_dispatch(
-                                query,
-                                key,
-                                value,
-                                splitd_out,
-                                softmax_scale=softmax_scale,
-                                architecture_q8192_op=architecture_q8192_op,
-                            )
-                        elif (
-                            max_seqlen_q == _SM70_79T_CORE_QUERY_LEN
-                            or max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
-                        ):
-                            splitd_result = _run_sm70_d256_gqa_79t_dispatch(
-                                query,
-                                key,
-                                value,
-                                splitd_out,
-                                softmax_scale=softmax_scale,
-                                architecture_op=architecture_op,
-                                dense_op=dense_op,
-                            )
-                    except torch.OutOfMemoryError:
-                        if not _warned_prefill_d256_gqa_architecture_oom:
-                            logger.warning(
-                                "Insufficient memory for the default-on "
-                                "SM70 D256 GQA long-prefill architecture; "
-                                "falling back to the exact dense kernel."
-                            )
-                            _warned_prefill_d256_gqa_architecture_oom = True
-                    if splitd_result is not None:
-                        if not _logged_prefill_d256_gqa_architecture:
-                            logger.info(
-                                "FLASH_ATTN_V100 SM70 D256 GQA "
-                                "long-prefill architecture route active (%s).",
-                                "v37 FP32"
-                                if _config.registered(
-                                    "VLLM_FLASH_V100_PREFILL_D256_GQA_V37"
-                                )
-                                else "Q8000 core / Q8192 QK+PV FP32 dispatch",
-                            )
-                            _logged_prefill_d256_gqa_architecture = True
-                        _routing._record_route(
-                            _routing.ROUTE_SPECS[
-                                "prefill_dense_d256_gqa_arch_long"
-                            ].name
-                        )
-                        if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37"):
-                            _routing._record_route(
-                                _routing.ROUTE_SPECS["prefill_dense_d256_gqa_v37"].name
-                            )
-                        else:
-                            _routing._record_route(
-                                _routing.ROUTE_SPECS[
-                                    "prefill_dense_d256_gqa_79t_fp32"
-                                ].name
-                            )
-                            if max_seqlen_q > _SM70_79T_CORE_QUERY_LEN:
-                                if architecture_q8192_op is not None:
-                                    _routing._record_route(
-                                        _routing.ROUTE_SPECS[
-                                            "prefill_dense_d256_gqa_79t_fp32_q8192"
-                                        ].name
-                                    )
-                                    if max_seqlen_q < _SM70_79T_MAX_QUERY_LEN:
-                                        _routing._record_route(
-                                            _routing.ROUTE_SPECS[
-                                                "prefill_dense_d256_gqa_79t_fp32_q8192_pad"
-                                            ].name
-                                        )
-                                else:
-                                    _routing._record_route(
-                                        _routing.ROUTE_SPECS[
-                                            "prefill_dense_d256_gqa_79t_fp32_fringe_fallback"
-                                        ].name
-                                    )
+                    splitd_out,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    softmax_scale,
+                    dense_op,
+                )
+
                 if splitd_result is None and _should_use_prefill_dense_splitkv3(
                     query,
                     key,
@@ -738,16 +619,22 @@ def _try_sm70_fa2_d256_prefill(
                             softmax_scale,
                             True,
                         )
-                        global _logged_prefill_dense_splitkv3
-                        if not _logged_prefill_dense_splitkv3:
-                            logger.info(
+
+                        if not log_once_seen(
+                            "flash_v100._logged_prefill_dense_splitkv3"
+                        ):
+                            logger.info_once(
                                 "FLASH_ATTN_V100 SM70 exact dense split-KV3 "
                                 "long-prefill route active (q=%d kv=%d).",
                                 max_seqlen_q,
                                 max_seqlen_k,
+                                scope="process",
+                                key="flash_v100._logged_prefill_dense_splitkv3",
                             )
-                            _logged_prefill_dense_splitkv3 = True
-                        _routing._record_route(
+                            set_log_once_state(
+                                "flash_v100._logged_prefill_dense_splitkv3", True
+                            )
+                        _routing.record_route(
                             _routing.ROUTE_SPECS[
                                 "prefill_dense_splitd_d256_splitkv3_kernel"
                             ].name
@@ -768,7 +655,7 @@ def _try_sm70_fa2_d256_prefill(
     return None
 
 
-def _get_fp8_prefill_bridge_workspace(
+def get_fp8_prefill_bridge_workspace(
     key_cache: torch.Tensor,
     required_blocks: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
@@ -796,7 +683,7 @@ def _get_fp8_prefill_bridge_workspace(
             workspace[2][:, :required_blocks],
         )
 
-    if _routing._is_cuda_graph_capturing(key_cache):
+    if _routing.is_cuda_graph_capturing(key_cache):
         return None
 
     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
@@ -843,7 +730,7 @@ def _get_fp8_prefill_bridge_workspace(
     )
 
 
-def _get_fp8_prefill_bridge_tail_workspace(
+def get_fp8_prefill_bridge_tail_workspace(
     query: torch.Tensor,
     padded_query_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -869,7 +756,7 @@ def _get_fp8_prefill_bridge_tail_workspace(
             workspace[1][:, :padded_query_len],
         )
 
-    if _routing._is_cuda_graph_capturing(query):
+    if _routing.is_cuda_graph_capturing(query):
         return None
 
     previous_capacity = workspace[0].shape[1] if workspace is not None else 0
@@ -897,7 +784,7 @@ def _get_fp8_prefill_bridge_tail_workspace(
 
 
 def flash_v100_dense_prefill_available() -> bool:
-    flash_attn_func, _, _, _, _, _, _, _, _ = _ops._get_flash_ops()
+    flash_attn_func, _, _, _, _, _, _, _, _ = _ops.get_flash_ops()
     return flash_attn_func is not None
 
 
@@ -914,7 +801,7 @@ def flash_v100_dense_prefill(
     query_start_loc_device: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run Flash-V100 dense raw-QKV prefill without backend metadata coupling."""
-    flash_attn_func, _, _, _, _, _, _, _, _ = _ops._get_flash_ops()
+    flash_attn_func, _, _, _, _, _, _, _, _ = _ops.get_flash_ops()
     if flash_attn_func is None:
         raise RuntimeError("flash_attn_v100 dense prefill op is unavailable")
 
@@ -945,7 +832,7 @@ def flash_v100_dense_prefill(
             splitd_value = value.view(num_seqs, max_seq_len, *value.shape[1:])
             splitd_out = out_view.view(num_seqs, max_seq_len, *out_view.shape[1:])
 
-        fa2_out = _try_sm70_fa2_d256_prefill(
+        fa2_out = try_sm70_fa2_d256_prefill(
             splitd_query,
             splitd_key,
             splitd_value,
@@ -959,14 +846,15 @@ def flash_v100_dense_prefill(
             out=splitd_out,
         )
         if fa2_out is not None:
-            global _logged_prefill_fa2_d256
-            if not _logged_prefill_fa2_d256:
-                logger.info(
+            if not log_once_seen("flash_v100._logged_prefill_fa2_d256"):
+                logger.info_once(
                     "FLASH_ATTN_V100 SM70 exact Split-D D256 "
-                    "software-pipelined dense prefill path active."
+                    "software-pipelined dense prefill path active.",
+                    scope="process",
+                    key="flash_v100._logged_prefill_fa2_d256",
                 )
-                _logged_prefill_fa2_d256 = True
-            _routing._record_route(
+                set_log_once_state("flash_v100._logged_prefill_fa2_d256", True)
+            _routing.record_route(
                 _routing.ROUTE_SPECS["prefill_dense_splitd_d256"].name
             )
             return output
@@ -1013,7 +901,7 @@ def flash_v100_dense_prefill(
 
 
 def flash_v100_dense_prefill_lse_available() -> bool:
-    return _ops._get_flash_dense_forward() is not None
+    return _ops.get_flash_dense_forward() is not None
 
 
 def flash_v100_dense_prefill_lse(
@@ -1036,7 +924,7 @@ def flash_v100_dense_prefill_lse(
     produce zero output and ``-inf`` LSE, making them neutral when attention
     states are merged. Causal calls require equal Q/K lengths for every sequence.
     """
-    fwd = _ops._get_flash_dense_forward()
+    fwd = _ops.get_flash_dense_forward()
     if fwd is None:
         raise RuntimeError("flash_attn_v100 dense LSE prefill op is unavailable")
     if query.ndim != 3 or key.ndim != 3 or value.ndim != 3:
@@ -1172,3 +1060,157 @@ def flash_v100_dense_prefill_lse(
         run_start = run_end
 
     return output, softmax_lse
+
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {
+    "_get_fp8_prefill_bridge_tail_workspace": "get_fp8_prefill_bridge_tail_workspace",
+    "_try_sm70_fa2_d256_prefill": "try_sm70_fa2_d256_prefill",
+    "_uniform_cu_seqlens": "uniform_cu_seqlens",
+    "_get_fp8_prefill_bridge_workspace": "get_fp8_prefill_bridge_workspace",
+    "_profile_sm70_prefill_workspace": "profile_sm70_prefill_workspace",
+}
+
+
+def _try_dense_architecture(
+    query, key, value, splitd_out, max_seqlen_q, max_seqlen_k, softmax_scale, dense_op
+):
+    splitd_result = None
+    architecture_op = (
+        _ops.get_sm70_d256_gqa_architecture_op()
+        if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL")
+        else None
+    )
+    architecture_q8192_op = (
+        _ops.get_sm70_d256_gqa_architecture_q8192_op()
+        if architecture_op is not None
+        and not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
+        and max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
+        else None
+    )
+    if _should_use_prefill_d256_gqa_architecture(
+        query,
+        key,
+        value,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=softmax_scale,
+        architecture_op=architecture_op,
+    ):
+        assert architecture_op is not None
+        try:
+            if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37"):
+                splitd_result = _run_sm70_gqa_groups(
+                    architecture_op,
+                    query,
+                    key,
+                    value,
+                    splitd_out,
+                    softmax_scale,
+                    True,
+                )
+            elif architecture_q8192_op is not None:
+                splitd_result = _run_sm70_d256_gqa_79t_q8192_dispatch(
+                    query,
+                    key,
+                    value,
+                    splitd_out,
+                    softmax_scale=softmax_scale,
+                    architecture_q8192_op=architecture_q8192_op,
+                )
+            elif (
+                max_seqlen_q == _SM70_79T_CORE_QUERY_LEN
+                or max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+            ):
+                splitd_result = _run_sm70_d256_gqa_79t_dispatch(
+                    query,
+                    key,
+                    value,
+                    splitd_out,
+                    softmax_scale=softmax_scale,
+                    architecture_op=architecture_op,
+                    dense_op=dense_op,
+                )
+        except torch.OutOfMemoryError:
+            if not log_once_seen(
+                "flash_v100._warned_prefill_d256_gqa_architecture_oom"
+            ):
+                logger.warning_once(
+                    "Insufficient memory for the default-on "
+                    "SM70 D256 GQA long-prefill architecture; "
+                    "falling back to the exact dense kernel.",
+                    scope="process",
+                    key="flash_v100._warned_prefill_d256_gqa_architecture_oom",
+                )
+                set_log_once_state(
+                    "flash_v100._warned_prefill_d256_gqa_architecture_oom",
+                    True,
+                )
+        if splitd_result is not None:
+            if not log_once_seen("flash_v100._logged_prefill_d256_gqa_architecture"):
+                logger.info_once(
+                    "FLASH_ATTN_V100 SM70 D256 GQA "
+                    "long-prefill architecture route active (%s).",
+                    "v37 FP32"
+                    if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
+                    else "Q8000 core / Q8192 QK+PV FP32 dispatch",
+                    scope="process",
+                    key="flash_v100._logged_prefill_d256_gqa_architecture",
+                )
+                set_log_once_state(
+                    "flash_v100._logged_prefill_d256_gqa_architecture", True
+                )
+            _routing.record_route(
+                _routing.ROUTE_SPECS["prefill_dense_d256_gqa_arch_long"].name
+            )
+            if _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37"):
+                _routing.record_route(
+                    _routing.ROUTE_SPECS["prefill_dense_d256_gqa_v37"].name
+                )
+            else:
+                _routing.record_route(
+                    _routing.ROUTE_SPECS["prefill_dense_d256_gqa_79t_fp32"].name
+                )
+                if max_seqlen_q > _SM70_79T_CORE_QUERY_LEN:
+                    if architecture_q8192_op is not None:
+                        _routing.record_route(
+                            _routing.ROUTE_SPECS[
+                                "prefill_dense_d256_gqa_79t_fp32_q8192"
+                            ].name
+                        )
+                        if max_seqlen_q < _SM70_79T_MAX_QUERY_LEN:
+                            _routing.record_route(
+                                _routing.ROUTE_SPECS[
+                                    "prefill_dense_d256_gqa_79t_fp32_q8192_pad"
+                                ].name
+                            )
+                    else:
+                        _routing.record_route(
+                            _routing.ROUTE_SPECS[
+                                "prefill_dense_d256_gqa_79t_fp32_fringe_fallback"
+                            ].name
+                        )
+    return splitd_result
+
+
+def _splitd_admission(query, paged_kv, max_seqlen_q, max_seqlen_k):
+    splitd_ops = _ops.get_sm70_splitd_d256_ops()
+    q8000_core_dispatch_eligible = (
+        not paged_kv
+        and not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
+        and _SM70_79T_CORE_QUERY_LEN <= max_seqlen_q <= _SM70_79T_MAX_QUERY_LEN
+    )
+    architecture_kv_eligible = (
+        q8000_core_dispatch_eligible and max_seqlen_k % _SM70_79T_KV_ALIGNMENT == 0
+    )
+    exact_splitd_shape_eligible = (
+        max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
+        and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+    )
+    splitd_eligible = (
+        splitd_ops is not None
+        and query.ndim == 4
+        and query.shape[1] == max_seqlen_q
+        and (architecture_kv_eligible or exact_splitd_shape_eligible)
+    )
+    return splitd_ops, splitd_eligible

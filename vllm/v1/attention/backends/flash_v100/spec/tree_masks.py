@@ -41,7 +41,7 @@ def triton_seq_lens_match(
         return True
     if metadata_seq_lens[:num_reqs].data_ptr() == seq_lens[:num_reqs].data_ptr():
         return True
-    if _routing._is_cuda_graph_capturing(metadata_seq_lens):
+    if _routing.is_cuda_graph_capturing(metadata_seq_lens):
         return bool(
             getattr(attn_metadata, "ddtree_seq_lens_restored_for_triton", False)
         )
@@ -69,7 +69,7 @@ def triton_query_start_loc_match(
         == query_start_loc[:num_boundaries].data_ptr()
     ):
         return True
-    if _routing._is_cuda_graph_capturing(metadata_query_start_loc):
+    if _routing.is_cuda_graph_capturing(metadata_query_start_loc):
         return bool(
             getattr(
                 attn_metadata,
@@ -199,3 +199,17 @@ COMPATIBILITY_ALIASES = {
     "_ddtree_triton_parent_ids_for_query": "triton_parent_ids_for_query",
     "_build_ddtree_visibility_mask": "build_visibility_mask",
 }
+
+
+def parent_ids_cpu(
+    attn_metadata: TritonAttentionMetadata,
+    adopt,
+) -> torch.Tensor | None:
+    parent_ids = getattr(attn_metadata, "ddtree_parent_ids", None)
+    if parent_ids is None:
+        return None
+    parent_ids_cpu = getattr(attn_metadata, "ddtree_parent_ids_cpu", None)
+    if parent_ids_cpu is None:
+        parent_ids_cpu = parent_ids.detach().cpu()
+        adopt(attn_metadata).ddtree_parent_ids_cpu = parent_ids_cpu
+    return parent_ids_cpu

@@ -8,9 +8,8 @@ import os
 
 import torch
 
-from vllm.logger import init_logger
+from vllm.logger import init_logger, log_once_seen, set_log_once_state
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
-from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100.plan import events as _events
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
@@ -31,7 +30,7 @@ def _layer_debug_info(layer: torch.nn.Module) -> dict[str, object]:
 
 class PrefixReferenceObserver:
     def __call__(self, event: _events.PrefillDebugEvent) -> None:
-        k_cont, v_cont = _kv_layout._extract_contiguous_kv_from_paged_cache(
+        k_cont, v_cont = _kv_layout.extract_contiguous_kv_from_paged_cache(
             kv_cache=event.kv_cache,
             block_table=event.attn_metadata.block_table[event.i : event.i + 1],
             seq_lens=event.attn_metadata.seq_lens[event.i : event.i + 1],
@@ -40,7 +39,7 @@ class PrefixReferenceObserver:
             block_size=event.block_size,
             total_tokens=event.seq_len,
         )
-        k_cont, v_cont = _kv_layout._dequantize_fp8_contiguous_kv(
+        k_cont, v_cont = _kv_layout.dequantize_fp8_contiguous_kv(
             k_cont,
             v_cont,
             event.kv_cache_dtype,
@@ -67,7 +66,9 @@ class PrefixReferenceObserver:
             )
         diff = (event.out_seq - ref_out).abs()
         nan_count = int(torch.isnan(event.out_seq).sum().item())
-        if event.debug_compare and (not _state._logged_prefill_compare):
+        if event.debug_compare and (
+            not log_once_seen("flash_v100._logged_prefill_compare")
+        ):
             logger.warning(
                 "FLASH_ATTN_V100 debug prefix compare: "
                 "query_len=%d seq_len=%d max_diff=%.8f mean_diff=%.8f "
@@ -127,7 +128,7 @@ class PrefixReportObserver:
                     cache_k_by_slot = event.key_cache[slot_blocks, slot_offsets]
                     cache_v_by_slot = event.value_cache[slot_blocks, slot_offsets]
                     cache_k_by_slot, cache_v_by_slot = (
-                        _kv_layout._dequantize_fp8_contiguous_kv(
+                        _kv_layout.dequantize_fp8_contiguous_kv(
                             cache_k_by_slot,
                             cache_v_by_slot,
                             event.kv_cache_dtype,
@@ -228,10 +229,10 @@ class PrefixReportObserver:
                 if tail_k_diff is None
                 else f"{float(tail_k_diff.max().item()):.8f}",
             )
-            _state._logged_dflash_prefix_dump = True
+            set_log_once_state("flash_v100.prefix_dump", True)
         if (
             event.debug_compare
-            and (not _state._logged_prefill_compare)
+            and (not log_once_seen("flash_v100._logged_prefill_compare"))
             and (nan_count > 0)
         ):
             dump_path = f"/tmp/flash_v100_prefill_nan_dump_pid{os.getpid()}.pt"
@@ -258,8 +259,10 @@ class PrefixReportObserver:
             logger.warning(
                 "FLASH_ATTN_V100 saved failing prefix prefill dump to %s", dump_path
             )
-        if event.debug_compare and (not _state._logged_prefill_compare):
-            _state._logged_prefill_compare = True
+        if event.debug_compare and (
+            not log_once_seen("flash_v100._logged_prefill_compare")
+        ):
+            set_log_once_state("flash_v100._logged_prefill_compare", True)
 
 
 _events.prefill_debug.subscribe(PrefixReferenceObserver())

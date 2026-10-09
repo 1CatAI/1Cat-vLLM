@@ -85,7 +85,11 @@ def test_forward_fallback_keeps_admission_route_and_base_call(
         assert routes == [
             "dflash_draft_triton_fallback" if draft else "unsupported_triton_fallback"
         ]
-        logger.warning.assert_called_once()
+        logger.warning_once.assert_called_once()
+        assert logger.warning_once.call_args.kwargs == {
+            "scope": "process",
+            "key": "flash_v100._warned_feature_fallback",
+        }
     instance._validate_dflash_attention_contract.assert_called_once_with(
         layer, metadata
     )

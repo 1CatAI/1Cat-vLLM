@@ -43,7 +43,7 @@ _flash_attn_turboquant_decode_checked = False
 _paged_kv_utils = None
 
 
-def _callable_accepts_keyword(fn: object, name: str) -> bool:
+def callable_accepts_keyword(fn: object, name: str) -> bool:
     if not callable(fn):
         return False
     try:
@@ -55,7 +55,7 @@ def _callable_accepts_keyword(fn: object, name: str) -> bool:
     )
 
 
-def _get_flash_ops():
+def get_flash_ops():
     """Lazy-load flash_attn_v100 ops if available."""
     global _flash_attn_func, _flash_attn_bhmd_func
     global _flash_attn_decode_paged, _flash_attn_decode_paged_xqa
@@ -137,8 +137,8 @@ def _get_flash_ops():
     )
 
 
-def _get_flash_grouped_verify_op():
-    """Load the optional exact SM70 DFlash2 grouped verifier."""
+def get_flash_grouped_verify_op():
+    """Load the optional exact SM70 grouped verifier."""
     global _flash_attn_grouped_verify_paged
     global _flash_attn_grouped_verify_max_query_tokens
     global _flash_attn_grouped_verify_request_major_abi_version
@@ -176,7 +176,7 @@ def _get_flash_grouped_verify_op():
     return _flash_attn_grouped_verify_paged
 
 
-def _get_sm70_splitd_d256_ops():
+def get_sm70_splitd_d256_ops():
     """Load the exact SM70 Split-D dense and paged prefill operators."""
     global _sm70_splitd_d256_ops
     global _sm70_splitd_d256_ops_checked
@@ -249,7 +249,7 @@ def _sm70_gqa_has_fp32_accumulation() -> bool:
     return False
 
 
-def _get_sm70_d256_gqa_architecture_op():
+def get_sm70_d256_gqa_architecture_op():
     """Load the optional SM70 GQA long-prefill architecture operator."""
     global _sm70_d256_gqa_architecture_op
     global _sm70_d256_gqa_architecture_op_checked
@@ -269,7 +269,7 @@ def _get_sm70_d256_gqa_architecture_op():
             torch.ops._vllm_fa2_C,
             op_name,
         ):
-            _get_sm70_splitd_d256_ops()
+            get_sm70_splitd_d256_ops()
 
         if (
             not _config.registered("VLLM_FLASH_V100_PREFILL_D256_GQA_V37")
@@ -302,7 +302,7 @@ def _get_sm70_d256_gqa_architecture_op():
     return _sm70_d256_gqa_architecture_op
 
 
-def _get_sm70_d256_gqa_architecture_q8192_op():
+def get_sm70_d256_gqa_architecture_q8192_op():
     """Load the native Q8192 specialization when the extension provides it."""
     global _sm70_d256_gqa_architecture_q8192_op
     global _sm70_d256_gqa_architecture_q8192_op_checked
@@ -313,7 +313,7 @@ def _get_sm70_d256_gqa_architecture_q8192_op():
     op_name = "sm70_d256_gqa_architecture_q8192_fwd"
     try:
         if not hasattr(torch.ops._vllm_fa2_C, op_name):
-            _get_sm70_splitd_d256_ops()
+            get_sm70_splitd_d256_ops()
         if not _sm70_gqa_has_fp32_accumulation():
             _sm70_d256_gqa_architecture_q8192_op = None
             return None
@@ -327,14 +327,14 @@ def _get_sm70_d256_gqa_architecture_q8192_op():
     return _sm70_d256_gqa_architecture_q8192_op
 
 
-def _get_sm70_v37_e4m3_bridge_op():
+def get_sm70_v37_e4m3_bridge_op():
     """Resolve the format-specific bridge from the same FA2 runtime."""
     # E4M3 storage conversion is independent of the dense compute kernel.
-    _get_sm70_splitd_d256_ops()
+    get_sm70_splitd_d256_ops()
     return getattr(torch.ops._vllm_fa2_C, "sm70_v37_e4m3_bridge", None)
 
 
-def _get_fp8_e5m2_paged_kv_bridge_op():
+def get_fp8_e5m2_paged_kv_bridge_op():
     global _fp8_e5m2_paged_kv_to_fp16
     global _fp8_e5m2_paged_kv_to_fp16_checked
     if not _fp8_e5m2_paged_kv_to_fp16_checked:
@@ -354,7 +354,7 @@ _flash_attn_forward_lse: Callable[..., tuple[torch.Tensor, ...]] | None = None
 _flash_attn_forward_lse_checked = False
 
 
-def _get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
+def get_flash_dense_forward() -> Callable[..., tuple[torch.Tensor, ...]] | None:
     """Lazy-load the private LSE-capable forward entry of the FA-V100 wheel."""
     global _flash_attn_forward_lse, _flash_attn_forward_lse_checked
     if not _flash_attn_forward_lse_checked:
@@ -425,7 +425,7 @@ def flash_v100_turboquant_decode(
     )
 
 
-def _get_paged_kv_utils():
+def get_paged_kv_utils():
     """Lazy-load paged KV extraction CUDA extension."""
     global _paged_kv_utils
     if _paged_kv_utils is None:
@@ -441,3 +441,20 @@ def _get_paged_kv_utils():
             except ImportError:
                 _paged_kv_utils = None
     return _paged_kv_utils
+
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {
+    "_get_paged_kv_utils": "get_paged_kv_utils",
+    "_get_fp8_e5m2_paged_kv_bridge_op": "get_fp8_e5m2_paged_kv_bridge_op",
+    "_get_sm70_v37_e4m3_bridge_op": "get_sm70_v37_e4m3_bridge_op",
+    "_get_flash_dense_forward": "get_flash_dense_forward",
+    "_get_sm70_d256_gqa_architecture_op": "get_sm70_d256_gqa_architecture_op",
+    "_get_sm70_splitd_d256_ops": "get_sm70_splitd_d256_ops",
+    "_callable_accepts_keyword": "callable_accepts_keyword",
+    "_get_sm70_d256_gqa_architecture_q8192_op": (
+        "get_sm70_d256_gqa_architecture_q8192_op"
+    ),
+    "_get_flash_grouped_verify_op": "get_flash_grouped_verify_op",
+    "_get_flash_ops": "get_flash_ops",
+}

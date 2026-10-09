@@ -9,7 +9,9 @@ logging statement comes from current source, never a saved branch body.
 import ast
 import copy
 
+from tests.v1.attention.flash_v100_extraction_oracle import LegacyNames
 from vllm.v1.attention.backends.flash_v100 import prefill, prefill_candidates
+from vllm.v1.attention.backends.flash_v100.spec import prefill as spec_prefill
 
 OPS = {
     "tree_requires_branch": "_masks._ddtree_parent_metadata_requires_branch",
@@ -68,6 +70,25 @@ class SequenceLocals(ast.NodeTransformer):
                 return [self.visit(copy.deepcopy(n)) for n in self.logs[name].body]
         return self.generic_visit(node)
 
+    def visit_Call(self, node):
+        if ast.unparse(node.func) == "self.executor.ops.is_draft_layer":
+            import inspect
+
+            helper = ast.parse(inspect.getsource(spec_prefill.is_draft_layer)).body[0]
+            assert isinstance(helper, ast.FunctionDef)
+            assert [ast.unparse(a) for a in node.args] == ["request.layer"]
+            assert len(helper.body) == 1 and isinstance(helper.body[0], ast.Return)
+            predicate = copy.deepcopy(helper.body[0].value)
+            assert isinstance(predicate, ast.Call)
+            assert (
+                ast.unparse(predicate)
+                == "bool(getattr(layer, 'is_dflash_draft_attn', False))"
+            )
+            assert isinstance(predicate.args[0], ast.Call)
+            predicate.args[0].args[0] = parse("request.layer")
+            return self.visit(predicate)
+        return self.generic_visit(node)
+
     def visit_Attribute(self, node):
         owner = ast.unparse(node.value)
         if owner in ("self.executor.ops", "self.ops"):
@@ -89,7 +110,7 @@ class SequenceLocals(ast.NodeTransformer):
 def sequence_calculations():
     from pathlib import Path
 
-    tree = ast.parse(Path(prefill_candidates.__file__).read_text())
+    tree = LegacyNames().visit(ast.parse(Path(prefill_candidates.__file__).read_text()))
     classes = {
         n.name: {f.name: f for f in n.body if isinstance(f, ast.FunctionDef)}
         for n in tree.body
@@ -125,7 +146,8 @@ def sequence_calculations():
     ]
     logs = {
         n.name: n
-        for n in ast.parse(Path(prefill.__file__).read_text()).body
+        for source in (prefill, spec_prefill)
+        for n in ast.parse(Path(source.__file__).read_text()).body
         if isinstance(n, ast.FunctionDef) and n.name.startswith("log_")
     }
     normalizer = SequenceLocals(logs)
@@ -242,7 +264,7 @@ def sequence_calculations():
 def batch_calculations():
     from pathlib import Path
 
-    tree = ast.parse(Path(prefill_candidates.__file__).read_text())
+    tree = LegacyNames().visit(ast.parse(Path(prefill_candidates.__file__).read_text()))
     classes = {
         n.name: {f.name: f for f in n.body if isinstance(f, ast.FunctionDef)}
         for n in tree.body
@@ -273,6 +295,51 @@ def batch_calculations():
         condition = copy.deepcopy(admit[0].value)
         assert condition is not None
         body = copy.deepcopy(classes[name]["run"].body)
+        if name == "NoncausalBatch":
+            assert ast.unparse(body[0]) == (
+                "self.executor.ops.noncausal_batch(self.executor.config, "
+                "self.executor.ops, request, record)"
+            )
+            feature = next(
+                n
+                for n in ast.parse(Path(spec_prefill.__file__).read_text()).body
+                if isinstance(n, ast.FunctionDef) and n.name == "noncausal_batch"
+            )
+
+            class BindOps(ast.NodeTransformer):
+                def visit_Name(self, node):
+                    if node.id == "ops":
+                        return parse("self.executor.ops")
+                    if node.id == "config":
+                        return parse("self.executor.config")
+                    return node
+
+            body = (
+                BindOps().visit(ast.Module(copy.deepcopy(feature.body), [])).body
+                + body[1:]
+            )
+        if name == "TreeBatch":
+
+            class RestoreAnchor(ast.NodeTransformer):
+                def visit_Expr(self, node):
+                    if (
+                        isinstance(node.value, ast.Call)
+                        and ast.unparse(node.value.func)
+                        == "self.executor.ops.reject_tree_anchor"
+                    ):
+                        assert not node.value.args and not node.value.keywords
+                        feature = next(
+                            n
+                            for n in ast.parse(
+                                Path(spec_prefill.__file__).read_text()
+                            ).body
+                            if isinstance(n, ast.FunctionDef)
+                            and n.name == "reject_tree_anchor"
+                        )
+                        return copy.deepcopy(feature.body)
+                    return self.generic_visit(node)
+
+            body = RestoreAnchor().visit(ast.Module(body, [])).body
         returned = body.pop()
         assert isinstance(returned, ast.Return)
         value = returned.value
@@ -295,7 +362,8 @@ def batch_calculations():
         result.append(ast.If(condition, body, []))
     logs = {
         n.name: n
-        for n in ast.parse(Path(prefill.__file__).read_text()).body
+        for source in (prefill, spec_prefill)
+        for n in ast.parse(Path(source.__file__).read_text()).body
         if isinstance(n, ast.FunctionDef) and n.name.startswith("log_")
     }
     return SequenceLocals(logs).visit(ast.Module(result, [])).body
@@ -351,7 +419,7 @@ def prefill_debug_calculations(call):
         "self.kv_cache_dtype",
         "self.scale",
         "self.flash_attn_func",
-        "_masks._torch_attention_reference",
+        "_masks.torch_attention_reference",
         "self._layer_debug_info",
     ]
     tree = ast.parse(

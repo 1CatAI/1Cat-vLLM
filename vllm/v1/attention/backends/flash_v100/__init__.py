@@ -39,6 +39,8 @@ from vllm.v1.attention.backends.flash_v100 import (  # noqa: F401
     verify,
     workspace,
 )
+from vllm.v1.attention.backends.flash_v100.compat import install_owner_aliases
+from vllm.v1.attention.backends.flash_v100.plan import diagnostics
 from vllm.v1.attention.backends.flash_v100.spec import attention as spec_attention
 from vllm.v1.attention.backends.flash_v100.spec import (
     attention_policy as spec_attention_policy,
@@ -52,6 +54,7 @@ from vllm.v1.attention.backends.flash_v100.spec import (
     draft as spec_draft,
 )
 from vllm.v1.attention.backends.flash_v100.spec import policy as spec_policy
+from vllm.v1.attention.backends.flash_v100.spec import prefill as spec_prefill
 from vllm.v1.attention.backends.flash_v100.spec import (
     smallq_metadata,
 )
@@ -62,6 +65,7 @@ from vllm.v1.attention.backends.flash_v100.spec import tree_masks as spec_tree_m
 from vllm.v1.attention.backends.flash_v100.spec import (
     verify_metadata as spec_verify_metadata,
 )
+from vllm.v1.attention.backends.flash_v100.spec.compatibility import PUBLIC_EXPORTS
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.flash_v100.backend import FlashAttnV100Backend
@@ -81,14 +85,11 @@ if TYPE_CHECKING:
         flash_v100_turboquant_decode,
         flash_v100_turboquant_decode_available,
     )
-    from vllm.v1.attention.backends.flash_v100.spec.smallq_metadata import (
-        DFlash2SmallQGroupDescriptor,
-        DFlash2SmallQPreparedMetadata,
-        prepare_dflash2_smallq_group_metadata,
-    )
 
 # Modules searched by the flash_attn_v100 compatibility module.
 SUBMODULES = (
+    diagnostics,
+    spec_prefill,
     config,
     ops,
     routing,
@@ -118,9 +119,27 @@ SUBMODULES = (
     spec_diagnostics,
 )
 
+dense_prefill.LEGACY_OBSERVATIONS = {
+    name: (state, name)
+    for name in (
+        "_warned_prefill_dense_splitkv3_oom",
+        "_warned_prefill_d256_gqa_architecture_oom",
+        "_logged_prefill_fa2_d256",
+        "_logged_prefill_dense_splitkv3",
+        "_logged_prefill_d256_gqa_architecture",
+    )
+}
+for _owner in SUBMODULES:
+    install_owner_aliases(_owner)
+
 # Renamed compatibility bindings resolve to their actual owner. Do not copy
 # function values: old-name writes must also affect the public execution path.
 COMPATIBILITY_ALIASES = {
+    **{
+        old: (module, new)
+        for module in SUBMODULES
+        for old, new in vars(module).get("LEGACY_ALIASES", {}).items()
+    },
     **{name: (state, name) for name in state.LOG_KEYS},
     "_allocate_growing_workspace": (workspace, "allocate_growing_workspace"),
     "_VALID_DECODE_PARTITION_SIZES": (routing, "VALID_DECODE_PARTITION_SIZES"),
@@ -146,8 +165,7 @@ def _compatibility_bindings(name: str):
 
 
 __all__ = [
-    "DFlash2SmallQGroupDescriptor",
-    "DFlash2SmallQPreparedMetadata",
+    *PUBLIC_EXPORTS,
     "FlashAttnV100Backend",
     "FlashAttnV100Impl",
     "FlashAttnV100Metadata",
@@ -159,7 +177,6 @@ __all__ = [
     "flash_v100_dense_prefill_lse_available",
     "flash_v100_turboquant_decode",
     "flash_v100_turboquant_decode_available",
-    "prepare_dflash2_smallq_group_metadata",
 ]
 
 
