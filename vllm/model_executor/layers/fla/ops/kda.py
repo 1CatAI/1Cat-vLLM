@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import RCP_LN2, cdiv, next_power_of_2
 
@@ -32,11 +33,7 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [4, 8, 16, 32]
 
 
 def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
-    )
+    return current_platform.is_cuda() and current_platform.is_device_capability(70)
 
 
 _use_sm70_kda_prefill_schedule = (

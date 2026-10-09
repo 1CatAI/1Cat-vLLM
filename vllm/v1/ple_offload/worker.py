@@ -20,6 +20,7 @@ Class structure mirrors the GPU worker pattern in multiproc_executor.py:
 """
 
 import contextlib
+import copy
 import ctypes
 import multiprocessing.process
 import os
@@ -41,7 +42,12 @@ import zmq
 from cuda.bindings import driver as cuda_driver
 
 import vllm.envs as envs
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import (
+    CompilationMode,
+    CUDAGraphMode,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
@@ -208,7 +214,16 @@ def _prefault_module_storage(modules: Iterable[torch.nn.Module]) -> int:
     if not envs.VLLM_PLE_OFFLOAD_PREFAULT:
         return 0
 
-    storage_views = list(_iter_unique_module_storage_views(modules))
+    active_modules = []
+    for module in modules:
+        if isinstance(module, PleOffloadLayer) and not module.needs_weight_prefault():
+            logger.info(
+                "Skipping PLE RAM prefault for %s: registered ranks own all rows.",
+                type(module).__name__,
+            )
+        else:
+            active_modules.append(module)
+    storage_views = list(_iter_unique_module_storage_views(active_modules))
     required_bytes = sum(view.numel() for view in storage_views)
     if required_bytes == 0:
         return 0
@@ -526,7 +541,10 @@ class PleOffloadWorker:
 
             # READY means that the process can immediately serve requests. Wait
             # for every DP/TP worker to register before notifying the parent.
-            runner.accept_registrations(pull_socket, num_workers)
+            if not runner.accept_registrations(
+                pull_socket, num_workers, shutdown_event
+            ):
+                return
             _prefault_module_storage(runner._layers.values())
             ready_writer.send(
                 {
@@ -605,9 +623,18 @@ class PleOffloadRunner:
         # memory. All transformer, MoE, and vision parameters remain on meta.
         logger.info("Initializing model structure for PLE weight discovery ...")
         model_dtype = cast(torch.dtype, model_config.dtype)
+        # This model only discovers CPU-owned subtrees. Compiling its meta
+        # backbone initializes GPU-only passes and providers unnecessarily.
+        structure_config = copy.copy(self.vllm_config)
+        structure_config.compilation_config = copy.copy(
+            self.vllm_config.compilation_config
+        )
+        structure_config.compilation_config.mode = CompilationMode.NONE
+        structure_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+        structure_config.compilation_config.static_forward_context = {}
         with set_default_torch_dtype(model_dtype), torch.device("meta"):
             model = initialize_model(
-                vllm_config=self.vllm_config,
+                vllm_config=structure_config,
                 model_config=model_config,
             )
 
@@ -726,11 +753,18 @@ class PleOffloadRunner:
         self,
         pull_socket: zmq.Socket,
         num_workers: int,
-    ) -> None:
+        shutdown_event: threading.Event | None = None,
+    ) -> bool:
         """Receive every local DP/TP worker's IPC and shared-memory buffers."""
         logger.info("Waiting for %d GPU worker registration(s) ...", num_workers)
         registrations: list[PleOffloadRegistration] = []
         for index in range(num_workers):
+            if shutdown_event is not None:
+                while not shutdown_event.is_set():
+                    if pull_socket.poll(timeout=100):
+                        break
+                else:
+                    return False
             item = ForkingPickler.loads(pull_socket.recv())
             if not isinstance(item, PleOffloadRegistration):
                 raise RuntimeError(
@@ -871,6 +905,8 @@ class PleOffloadRunner:
             tp_size,
             sorted(self.layer_names),
         )
+
+        return True
 
     def _bind_remote_placements(
         self,

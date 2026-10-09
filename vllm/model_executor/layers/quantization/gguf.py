@@ -72,6 +72,7 @@ class GGUFConfig(QuantizationConfig):
         self.fallback_reasons: dict[str, str] = {}
         self.native_expert_storage = False
         self.canonical_expert_storage = False
+        self._lattice_staging_pools: dict[tuple, Any] = {}
 
     def __repr__(self) -> str:
         return "GGUFConfig()"
@@ -235,6 +236,8 @@ def _fused_mul_mat_gguf(
     qweight_type: int,
     native_enabled: bool = True,
     prefill_min_m: int = 8,
+    prefer_native: bool = False,
+    max_dequant_bytes: int = 0,
 ) -> torch.Tensor:
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
@@ -250,8 +253,10 @@ def _fused_mul_mat_gguf(
     # Preserve established routes for existing formats. Packaged upstream
     # operators are fallbacks for missing formats and explicit benchmark
     # candidates; TurboMind supplies the primary accelerated GGUF routes.
-    if native_enabled and qweight_type not in DEQUANT_TYPES:
-        native_result = native_dense(x, qweight, qweight_type, prefill_min_m)
+    if native_enabled and (prefer_native or qweight_type not in DEQUANT_TYPES):
+        native_result = native_dense(
+            x, qweight, qweight_type, prefill_min_m, max_dequant_bytes
+        )
         if native_result is not None:
             return native_result
     # enable MMVQ in contiguous batching with batch_size=1
@@ -291,6 +296,8 @@ def _fused_mul_mat_gguf_fake(
     qweight_type: int,
     native_enabled: bool = True,
     prefill_min_m: int = 8,
+    prefer_native: bool = False,
+    max_dequant_bytes: int = 0,
 ) -> torch.Tensor:
     return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
 
@@ -542,6 +549,12 @@ class GGUFLinearMethod(LinearMethodBase):
         policy = config.kernel_config.sm70_gguf if config is not None else None
         self.native_enabled = policy.enabled if policy is not None else True
         self.prefill_min_m = policy.prefill_min_m if policy is not None else 8
+        self.dense_storage = getattr(policy, "dense_storage", "canonical")
+        self.max_dequant_bytes = (
+            getattr(policy, "dequant_workspace_bytes", 32 * 1024**2)
+            if self.dense_storage == "original"
+            else 0
+        )
         self.native_prepared = False
         self.canonical_projections = ()
 
@@ -669,6 +682,14 @@ class GGUFLinearMethod(LinearMethodBase):
                     "packaged native operator; check kernel_config.sm70_gguf "
                     "and the _C_gguf extension"
                 )
+        if (
+            ready
+            and layer.qweight.device.type == "cuda"
+            and self.dense_storage == "original"
+        ):
+            self.native_admission["canonical_reason"] = "original_storage_policy"
+            self._prepare_native_weights(layer)
+            return
         if (
             ready
             and layer.qweight.device.type == "cuda"
@@ -911,6 +932,42 @@ class GGUFLinearMethod(LinearMethodBase):
         # materialize the padded weight parameter for CUDA Graph compatibility.
         self._create_padded_weight_param(layer)
 
+    def _prepare_native_weights(self, layer):
+        """Keep independent original rows without constructing canonical banks."""
+        qweight = layer.qweight
+        if qweight.data_container:
+            ids = (
+                ["q", "k", "v"] if "q" in qweight.shard_id else sorted(qweight.shard_id)
+            )
+            layer.gguf_native_shard_weights = torch.nn.ParameterList(
+                Parameter(
+                    pad_weight_tail(
+                        qweight.data_container[qweight.shard_id_map[index]].to(
+                            qweight.device
+                        ),
+                        layer.qweight_type.shard_weight_type[index],
+                    ),
+                    requires_grad=False,
+                )
+                for index in ids
+            )
+            layer.gguf_native_shard_types = tuple(
+                layer.qweight_type.shard_weight_type[index] for index in ids
+            )
+            qweight.data_container.clear()
+            qweight.materialize((0,), dtype=self.params_dtype)
+            prepared = list(
+                zip(layer.gguf_native_shard_weights, layer.gguf_native_shard_types)
+            )
+        else:
+            qweight.data = pad_weight_tail(qweight.data, layer.qweight_type.weight_type)
+            prepared = [(qweight, layer.qweight_type.weight_type)]
+        self.native_prepared = True
+        self.native_admission["projections"] = [
+            dense_admission(weight, kind, self.params_dtype, self.prefill_min_m)
+            for weight, kind in prepared
+        ]
+
     def apply_fused_silu_and_mul(self, layer, x):
         if hasattr(layer, "gguf_dmv_operands"):
             from vllm.model_executor.layers.quantization.gguf_dmv import apply_layer
@@ -1041,7 +1098,13 @@ class GGUFLinearMethod(LinearMethodBase):
             out = torch.cat(
                 [
                     fused_mul_mat_gguf(
-                        x, weight, weight_type, self.native_enabled, self.prefill_min_m
+                        x,
+                        weight,
+                        weight_type,
+                        self.native_enabled,
+                        self.prefill_min_m,
+                        self.dense_storage == "original",
+                        self.max_dequant_bytes,
                     )
                     for weight, weight_type in zip(weights, types)
                 ],
@@ -1067,6 +1130,8 @@ class GGUFLinearMethod(LinearMethodBase):
                         qweight_type,
                         self.native_enabled,
                         self.prefill_min_m,
+                        self.dense_storage == "original",
+                        self.max_dequant_bytes,
                     )
                 )
             out = torch.cat(result, axis=1)
@@ -1074,7 +1139,13 @@ class GGUFLinearMethod(LinearMethodBase):
             qweight = layer.qweight
             qweight_type = layer.qweight_type.weight_type
             out = fused_mul_mat_gguf(
-                x, qweight, qweight_type, self.native_enabled, self.prefill_min_m
+                x,
+                qweight,
+                qweight_type,
+                self.native_enabled,
+                self.prefill_min_m,
+                self.dense_storage == "original",
+                self.max_dequant_bytes,
             )
         if bias is not None:
             out.add_(bias)
@@ -1197,6 +1268,33 @@ class GGUFEmbeddingMethod(GGUFLinearMethod):
         quant_config: The GGUF quantization config.
     """
 
+    def process_weights_after_loading(self, layer):
+        config = get_current_vllm_config_or_none()
+        if (
+            type(self) is GGUFEmbeddingMethod
+            and config is not None
+            and config.kernel_config.sm70_gguf.embedding_storage == "original"
+        ):
+            if self._prepare_dense_weight(layer):
+                return
+            layer.qweight.data = pad_weight_tail(
+                layer.qweight.data, layer.qweight_type.weight_type
+            )
+            self.native_prepared = True
+            self.native_admission = {
+                "canonical_reason": "original_embedding_storage",
+                "projections": [
+                    dense_admission(
+                        layer.qweight,
+                        layer.qweight_type.weight_type,
+                        self.params_dtype,
+                        self.prefill_min_m,
+                    )
+                ],
+            }
+            return
+        super().process_weights_after_loading(layer)
+
     def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         qweight = layer.qweight
         qweight_type = layer.qweight_type.weight_type
@@ -1292,7 +1390,7 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
             reason = "requires_sm70"
         elif calibration is None:
             reason = "lm_head_shape_or_format_has_no_calibration"
-        self.canonical_lm_head = reason is None
+        self.canonical_lm_head = reason is None and self.dense_storage != "original"
         self.lm_head_capability = (
             GGUFOperatorCapability(
                 decoder_family(weight_type),

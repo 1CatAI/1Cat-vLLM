@@ -25,6 +25,28 @@ _SM70_TP4_LONG_PREFILL_BUFFER_BYTES = 8192 * 5120 * 2
 _SEEN_TP_ALLREDUCE_PATHS: set[tuple[str, str, tuple[int, ...], torch.dtype, int]] = (
     set()
 )
+_PYNCCL_GATHER_DTYPES = {
+    torch.int8,
+    torch.uint8,
+    torch.int32,
+    torch.int64,
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+}
+
+
+def _all_gather_existing_pynccl(input_, communicator, world_size, dim):
+    if dim < 0:
+        dim += input_.ndim
+    shape = input_.shape
+    input_ = input_.contiguous()
+    output = input_.new_empty((world_size, *shape))
+    communicator.all_gather(output, input_)
+    return output.movedim(0, dim).reshape(
+        shape[:dim] + (world_size * shape[dim],) + shape[dim + 1 :]
+    )
 
 
 def _trace_all_reduce_path(
@@ -211,6 +233,29 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.hc_ll_comm = Sm70HcLLCommunicator(
             self.cpu_group, self.device, self.unique_name
         )
+        self._sm70_pynccl_gather = current_platform.is_device_capability(70)
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        if config is not None:
+            admitted = bool(
+                self._sm70_pynccl_gather
+                and self.pynccl_comm is not None
+                and not self.pynccl_comm.disabled
+            )
+            config.kernel_config.collective_kernel_selections[
+                "all_gather:" + self.unique_name
+            ] = {
+                "enabled": admitted,
+                "reason": None if admitted else "existing_pynccl_or_sm70_unavailable",
+                "operator": "pynccl_all_gather",
+                "scope": "collective_capability",
+                "runtime_guards": (
+                    "CUDA tensor on communicator device; NCCL-supported dtype"
+                ),
+                "dtypes": sorted(str(t) for t in _PYNCCL_GATHER_DTYPES),
+                "graph_safe": True,
+            }
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 
@@ -345,6 +390,23 @@ class CudaCommunicator(DeviceCommunicatorBase):
             "[" + ", ".join(f"'{b}'" for b in all_potential_ar_backends) + "]",
             scope="global",
         )
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        communicator = self.pynccl_comm
+        if (
+            self._sm70_pynccl_gather
+            and communicator is not None
+            and not communicator.disabled
+            and input_.is_cuda
+            and input_.device == communicator.device
+            and input_.dtype in _PYNCCL_GATHER_DTYPES
+        ):
+            # Reuse the communicator already initialized for all-reduce. A
+            # second lazy ProcessGroupNCCL communicator can exhaust small GPUs.
+            return _all_gather_existing_pynccl(
+                input_, communicator, self.world_size, dim
+            )
+        return super().all_gather(input_, dim)
 
     def all_reduce(self, input_):
         ring_out = self.ring_comm.all_reduce(input_)

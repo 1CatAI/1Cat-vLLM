@@ -58,6 +58,8 @@ def test_alignment_integration_preserves_weighted_expert_outputs(monkeypatch, ma
     )
     method = GGUFTurboMindMoEMethod.__new__(GGUFTurboMindMoEMethod)
     method.num_experts, method.hidden_size = 512, 2560
+    method.dp4a_batches = []
+    method.raw_gate_up = False
     method.small_routing = False
     reference = method.apply(layer, x, weights, ids, None, None)
     method.small_routing = True

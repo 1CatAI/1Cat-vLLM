@@ -487,12 +487,19 @@ class GGUFModelLoader(BaseModelLoader):
         )
         # filter out unquantized modules to skip
         adapter = getattr(self, "_native_adapter", None)
+        if adapter is not None:
+            adapter.packed_token_embeddings = (
+                vllm_config.kernel_config.sm70_gguf.embedding_storage == "original"
+            )
         unquant_names = [
             name.removesuffix(".weight")
             for name, weight_type in weight_type_map.items()
             if weight_type in ("F32", "F16", "BF16")
             and name.endswith(".weight")
-            and (adapter is None or not adapter.is_linear(name))
+            and (
+                adapter is None
+                or not (adapter.is_linear(name) or adapter.is_embedding(name))
+            )
         ]
         if adapter is not None:
             quant_config = cast("GGUFConfig", vllm_config.quant_config)
@@ -506,11 +513,18 @@ class GGUFModelLoader(BaseModelLoader):
             quant_config.canonical_expert_storage = (
                 quant_config.native_expert_storage
                 and vllm_config.kernel_config.sm70_gguf.enabled
+                and getattr(
+                    vllm_config.kernel_config.sm70_gguf,
+                    "expert_storage",
+                    "canonical",
+                )
+                in ("canonical", "staged")
                 and model_config.dtype == torch.float16
                 and current_platform.get_device_capability() == (7, 0)
                 and hasattr(torch.ops._C, "gguf_affine_grouped_gemm_sm70_out")
             )
             adapter.canonical_expert_storage = quant_config.canonical_expert_storage
+            adapter.preserve_expert_blocks = quant_config.native_expert_storage
             if "output.weight" not in self._native_tensors:
                 model_config.hf_config.tie_word_embeddings = True
         logger.debug("GGUF unquantized modules: %s", unquant_names)

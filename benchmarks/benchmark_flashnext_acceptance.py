@@ -32,7 +32,13 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode()).hexdigest()
 
 
-def observed_cohort(llm, fixed_ids, params, width=1):
+def observed_cohort(llm, fixed_ids, params, width=1, cache_salts=None):
+    prompts = [{"prompt_token_ids": fixed_ids} for _ in range(width)]
+    if cache_salts is not None:
+        if len(cache_salts) != width or len(set(cache_salts)) != width:
+            raise ValueError("Cold cohort needs one distinct cache salt per request")
+        for prompt, salt in zip(prompts, cache_salts):
+            prompt["cache_salt"] = salt
     records = []
     client = llm.llm_engine.engine_core
     original = client.get_output
@@ -58,7 +64,7 @@ def observed_cohort(llm, fixed_ids, params, width=1):
     try:
         outputs = generate_cohort(
             llm,
-            [{"prompt_token_ids": fixed_ids} for _ in range(width)],
+            prompts,
             params,
             atomic=True,
         )
@@ -83,6 +89,7 @@ def natural_row(llm, prompt, ids, params):
         output_token_ids=list(output.token_ids),
         text=output.text,
         output_tokens=len(output.token_ids),
+        num_cached_tokens=result.num_cached_tokens,
         finish_reason=output.finish_reason,
         wall_seconds=elapsed,
         acceptance=acceptance,

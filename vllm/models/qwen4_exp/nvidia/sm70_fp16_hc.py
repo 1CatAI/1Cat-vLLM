@@ -9,7 +9,8 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
+from vllm.forward_context import get_forward_kernel_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.fp16_gemv_silu import Sm70Fp16GemvSiluKernel
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
@@ -533,14 +534,10 @@ def _qwen38_sm70_fp16_fused_hc(
         # for prefill and any unsupported runtime shape. This fallback lives
         # inside the opaque op so a prefill-first dynamic compile cannot bake
         # the M > 1 decision into subsequent decode graphs.
-        down_and_injection = torch.nn.functional.linear(x, down_weight)
-        lora = torch.ops.vllm.qwen4_exp_hc_silu(
-            down_and_injection[..., :_HC_RANK], _HC_COUNT
-        )
-        injection = down_and_injection[..., _HC_RANK : _HC_RANK + _HC_COUNT]
-        gate = torch.nn.functional.linear(lora, up_weight)
-        block = torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, _HC_COUNT)
-        return block, injection
+        chunk_size = _hc_prefill_chunk_size(x.shape[0])
+        if chunk_size and x.is_cuda and x.dtype == torch.float16:
+            return _blocked_hc_projection(x, down_weight, up_weight, chunk_size)
+        return _dense_hc_projection(x, down_weight, up_weight)
     try:
         from vllm.distributed.parallel_state import get_tp_group
 
@@ -683,13 +680,141 @@ direct_register_custom_op(
 )
 
 
+def _hc_prefill_chunk_size(rows: int) -> int:
+    policy = get_forward_kernel_config_or_none()
+    size = policy.prefill_hc_chunk_size if policy is not None else 4096
+    return size if size > 0 and rows > size else 0
+
+
+def _dense_hc_projection(x, down_weight, up_weight):
+    from .ops.hc import hc_gate_mix, hc_silu
+
+    down_and_injection = torch.nn.functional.linear(x, down_weight)
+    lora = hc_silu(down_and_injection[..., :_HC_RANK], _HC_COUNT)
+    injection = down_and_injection[..., _HC_RANK : _HC_RANK + _HC_COUNT]
+    gate = torch.nn.functional.linear(lora, up_weight)
+    block = hc_gate_mix(x, gate, _HC_COUNT)
+    return block, injection
+
+
+def _blocked_hc_projection(x, down_weight, up_weight, chunk_size):
+    block = x.new_empty((x.shape[0], _HC_DIM))
+    injection = x.new_empty((x.shape[0], _HC_COUNT))
+    for start in range(0, x.shape[0], chunk_size):
+        stop = min(start + chunk_size, x.shape[0])
+        part, inject = _dense_hc_projection(x[start:stop], down_weight, up_weight)
+        block[start:stop].copy_(part)
+        injection[start:stop].copy_(inject)
+        del part, inject
+    return block, injection
+
+
+def _prefill_hc_projection(
+    x: torch.Tensor, down_weight: torch.Tensor, up_weight: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    chunk_size = _hc_prefill_chunk_size(x.shape[0])
+    if chunk_size and x.is_cuda and x.dtype == torch.float16:
+        logger.info_once(
+            "SM70 HC prefill row blocking selected (M=%d, chunk_rows=%d).",
+            x.shape[0],
+            chunk_size,
+        )
+        return _blocked_hc_projection(x, down_weight, up_weight, chunk_size)
+    block, injection = _dense_hc_projection(x, down_weight, up_weight)
+    return block, injection.contiguous()
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fp16_prefill_hc",
+    op_func=_prefill_hc_projection,
+    fake_impl=_qwen38_sm70_fp16_fused_hc_fake,
+)
+
+
+def _prefill_hc_mix(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    down_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from .ops.hc import grouped_gemma_rmsnorm
+
+    chunk_size = _hc_prefill_chunk_size(x.shape[0])
+    if not chunk_size:
+        xn = grouped_gemma_rmsnorm(x, norm_weight, eps, _HC_COUNT)
+        block, injection = _dense_hc_projection(xn, down_weight, up_weight)
+        return block, injection.contiguous()
+    logger.info_once(
+        "SM70 HC prefill norm/projection row blocking selected (M=%d, chunk_rows=%d).",
+        x.shape[0],
+        chunk_size,
+    )
+    block = x.new_empty((x.shape[0], _HC_DIM))
+    injection = x.new_empty((x.shape[0], _HC_COUNT))
+    for start in range(0, x.shape[0], chunk_size):
+        stop = min(start + chunk_size, x.shape[0])
+        xn = grouped_gemma_rmsnorm(x[start:stop], norm_weight, eps, _HC_COUNT)
+        part, inject = _dense_hc_projection(xn, down_weight, up_weight)
+        block[start:stop].copy_(part)
+        injection[start:stop].copy_(inject)
+        del xn, part, inject
+    return block, injection
+
+
+def _prefill_hc_mix_fake(x, norm_weight, down_weight, up_weight, eps):
+    return _qwen38_sm70_fp16_fused_hc_fake(x, down_weight, up_weight)
+
+
+direct_register_custom_op(
+    op_name="qwen38_sm70_fp16_prefill_hc_mix",
+    op_func=_prefill_hc_mix,
+    fake_impl=_prefill_hc_mix_fake,
+)
+
+
+def maybe_apply_qwen38_sm70_fp16_prefill_hc_mix(
+    down_layer: nn.Module,
+    up_layer: nn.Module,
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    enabled: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not enabled or use_sm70_decode_graph_semantics():
+        return None
+    if not all(
+        isinstance(layer, LinearBase)
+        and type(layer.quant_method)
+        in (UnquantizedLinearMethod, Qwen38SM70FP16LinearMethod)
+        for layer in (down_layer, up_layer)
+    ):
+        return None
+    down_weight, up_weight = down_layer.weight, up_layer.weight
+    if (
+        x.ndim != 2
+        or x.shape[1] != _HC_HIDDEN
+        or x.dtype != torch.float16
+        or down_weight.dtype != x.dtype
+        or up_weight.dtype != x.dtype
+        or down_weight.shape != (_HC_RANK + _HC_COUNT + 12, _HC_HIDDEN)
+        or up_weight.shape != (_HC_HIDDEN, _HC_RANK)
+        or norm_weight.numel() != _HC_HIDDEN
+        or not norm_weight.is_contiguous()
+    ):
+        return None
+    return torch.ops.vllm.qwen38_sm70_fp16_prefill_hc_mix(
+        x, norm_weight, down_weight, up_weight, eps
+    )
+
+
 def maybe_apply_qwen38_sm70_fp16_fused_hc(
     down_layer: nn.Module,
     up_layer: nn.Module,
     x: torch.Tensor,
     enabled: bool,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if not enabled or not use_sm70_decode_graph_semantics():
+    if not enabled:
         return None
     # LoRA wrappers and quantized methods must retain their own forward path.
     # Enabling unrelated FP16 projections must never bypass adapter updates.
@@ -711,6 +836,14 @@ def maybe_apply_qwen38_sm70_fp16_fused_hc(
         _HC_HIDDEN,
     ) or up_weight.shape != (_HC_HIDDEN, _HC_RANK):
         return None
+    if not use_sm70_decode_graph_semantics():
+        config = get_current_vllm_config_or_none()
+        if config is not None and config.kernel_config.prefill_hc_chunk_size <= 0:
+            return None
+        # The dynamic prefill compiler deliberately omits decode operators.
+        # Keep a distinct opaque boundary so actual rows choose blocking at
+        # runtime, including the first HC which has no pending HCX combine.
+        return torch.ops.vllm.qwen38_sm70_fp16_prefill_hc(x, down_weight, up_weight)
     return torch.ops.vllm.qwen38_sm70_fp16_fused_hc(
         x,
         down_weight,

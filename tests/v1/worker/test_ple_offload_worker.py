@@ -14,7 +14,11 @@ import vllm.envs as envs
 import vllm.v1.ple_offload.connector as ple_offload_connector_module
 import vllm.v1.worker.gpu_worker as gpu_worker_module
 from tests.utils import set_lazy_env
-from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config import (
+    CompilationConfig,
+    VllmConfig,
+    get_current_vllm_config_or_none,
+)
 from vllm.config.load import LoadConfig
 from vllm.model_executor.layers import ple_offload_layer
 from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
@@ -119,6 +123,7 @@ def _load_test_ple_weights(
     runner.vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(dtype=torch.float32),
         load_config=load_config or LoadConfig(),
+        compilation_config=CompilationConfig(),
     )
     runner._layers = {}
     runner._load_weights()
@@ -332,6 +337,19 @@ def test_ple_prefault_touches_unique_storage_when_capacity_allows(
     )
 
     assert ple_offload_worker._prefault_module_storage([module]) == required
+
+
+def test_ple_prefault_skips_tables_with_no_cpu_rows(monkeypatch) -> None:
+    layer = _WeightLoadingPleLayer()
+    monkeypatch.setattr(envs, "VLLM_PLE_OFFLOAD_PREFAULT", True)
+    monkeypatch.setattr(layer, "needs_weight_prefault", lambda: False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Unused table must not trigger RAM prefault")
+
+    monkeypatch.setattr(layer, "parameters", forbidden)
+    monkeypatch.setattr(ple_offload_worker.psutil, "Process", forbidden)
+    assert ple_offload_worker._prefault_module_storage([layer]) == 0
 
 
 def test_ple_prefault_skips_when_host_capacity_is_insufficient(
@@ -1371,3 +1389,90 @@ def test_ple_registration_outlives_its_sender(tmp_path) -> None:
     assert result.returncode == 0, result.stderr
     assert "value=7 managers=0" in result.stdout, result.stdout + result.stderr
     assert "released" in result.stdout
+
+
+@pytest.mark.parametrize("already_stopped", [False, True])
+def test_registration_wait_exits_when_parent_stops(already_stopped):
+    import threading
+
+    stopped = threading.Event()
+    if already_stopped:
+        stopped.set()
+
+    class WaitingSocket:
+        def poll(self, timeout):
+            assert timeout <= 100
+            stopped.set()
+            return False
+
+        def recv(self):
+            raise AssertionError(
+                "A stopped worker must not block waiting for registration"
+            )
+
+    runner = object.__new__(ple_offload_worker.PleOffloadRunner)
+    assert not runner.accept_registrations(WaitingSocket(), 4, stopped)
+
+
+@pytest.mark.parametrize("cuda_inputs", [False, True])
+def test_large_prefill_publishes_before_consumer_can_block_notifier(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_inputs: bool,
+) -> None:
+    import threading
+
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.tp_rank = connector.dp_rank = 0
+    connector.device = SimpleNamespace(index=0)
+    connector._uses_cuda_inputs = cuda_inputs
+    connector._request_publish_required = True
+    connector._request_queue = queue.Queue(maxsize=1)
+    connector._d2h_event_pool = queue.Queue(maxsize=1) if cuda_inputs else None
+    event = Mock()
+    if cuda_inputs:
+        connector._d2h_event_pool.put(event)
+    connector._enqueue_cuda_inputs = Mock()
+    connector._copy_cpu_inputs = Mock()
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.accelerator,
+        "device_index",
+        lambda *_: nullcontext(),
+    )
+    monkeypatch.setattr(
+        ple_offload_connector_module.torch.cuda.nvtx, "range", lambda *_: nullcontext()
+    )
+    sent = threading.Event()
+    socket = Mock()
+    socket.send.side_effect = lambda *_: sent.set()
+    errors = []
+
+    def notifier():
+        try:
+            pending = connector._request_queue.get(timeout=5)
+            assert pending.published is not None
+            connector._process_request(pending, socket)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=notifier)
+    thread.start()
+    connector._launch(num_reqs=1, num_tokens=16384, wait_publication=True)
+    # The model may now enter a GIL-holding allocation/stream synchronization.
+    assert sent.is_set()
+    thread.join(timeout=5)
+    assert not thread.is_alive() and not errors
+    if cuda_inputs:
+        event.synchronize.assert_called_once_with()
+        assert connector._d2h_event_pool.get_nowait() is event
+    else:
+        connector._copy_cpu_inputs.assert_called_once()
+
+
+def test_prefill_publication_can_retain_asynchronous_policy():
+    connector = PleOffloadConnector.__new__(PleOffloadConnector)
+    connector.tp_rank = connector.dp_rank = 0
+    connector._uses_cuda_inputs = False
+    connector._request_publish_required = False
+    connector._request_queue = queue.Queue(maxsize=1)
+    connector.prepare_forward(num_reqs=1, num_tokens=16384, dummy_run=False)
+    assert connector._request_queue.get_nowait().published is None

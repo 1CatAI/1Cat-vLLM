@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
+from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import (
     CacheConfig,
     ModelConfig,
@@ -25,7 +26,10 @@ from vllm.config import (
     get_current_vllm_config_or_none,
 )
 from vllm.distributed import tensor_model_parallel_all_reduce
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import (
+    get_forward_context,
+    get_forward_kernel_config_or_none,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.ple.disk_rows import (
     MappedRowGatherKernel,
@@ -106,6 +110,12 @@ from ..common.ple import (
     ple_host_reserve_bytes,
     ple_vram_reserve_bytes,
     total_host_bytes,
+)
+from .ops.ple_prefill_gate import (
+    finish_prefill_gate,
+    prefill_gate_reason,
+    prepare_prefill_gate,
+    report_prefill_gate_fallback,
 )
 
 _MASK64 = (1 << 64) - 1
@@ -1336,6 +1346,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         self._disk_segments = disk_segments
         self._remote_placements = bound
 
+    def needs_weight_prefault(self) -> bool:
+        # Until placements arrive, retain the full CPU-table contract. A bound
+        # empty disk tier only publishes zero rows; resident pinned/device rows
+        # are already owned by the GPU workers and need no second RAM copy.
+        return not self._remote_placements or bool(self._disk_segments)
+
     def _remote_lookup(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
         """Fill the worker's output with the rows the ranks left to it.
 
@@ -2338,6 +2354,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         num_prefills: int,
         num_decode_tokens: int,
         num_prefill_tokens: int,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # ``non_spec_query_start_loc`` covers the non-spec (decode + prefill)
         # requests and equals ``query_start_loc`` when spec-decode is inactive.
@@ -2378,6 +2395,29 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
         hidden_size = x_p.shape[1]
         state_len = self.conv_state_len
+        policy = get_forward_kernel_config_or_none()
+        if policy is None or policy.prefill_ple_short_conv:
+            from .ops.ple_prefill_conv import prefill_conv, prefill_conv_reason
+
+            reason = prefill_conv_reason(
+                x_p, conv_state, conv_weights, num_prefills, self.short_conv_dilation
+            )
+            if reason is None:
+                logger.info_once(
+                    "SM70 PLE prefill uses direct dilated convolution "
+                    "without padded history (FP16 boundary, FP32 accumulation)."
+                )
+                return prefill_conv(
+                    x_p,
+                    conv_state,
+                    conv_weights,
+                    q_starts,
+                    state_indices_tensor_p[:num_prefills],
+                    has_initial_states_p[:num_prefills],
+                    self.short_conv_dilation,
+                    output,
+                )
+            logger.debug_once("PLE prefill convolution fallback: %s.", reason)
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
@@ -2636,6 +2676,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         metadata: PleShortConvAttentionMetadata,
         conv_state: torch.Tensor,
         conv_weights: torch.Tensor,
+        output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_prefills = metadata.num_prefills
         num_decodes = metadata.num_decodes
@@ -2715,6 +2756,11 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                         num_prefills=num_prefills,
                         num_decode_tokens=num_decode_tokens,
                         num_prefill_tokens=num_prefill_tokens,
+                        output=(
+                            output[:num_prefill_tokens]
+                            if output is not None and not has_spec and not has_decode
+                            else None
+                        ),
                     )
                 )
                 # A single part is already the result; vstack would copy it.
@@ -2748,7 +2794,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             return x
         return conv_out_non_spec
 
-    def _short_conv(self, inputs: torch.Tensor) -> torch.Tensor:
+    def _short_conv(
+        self, inputs: torch.Tensor, output: torch.Tensor | None = None
+    ) -> torch.Tensor:
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
@@ -2792,6 +2840,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             layer_attn_metadata,
             conv_state,
             conv_weights.to(dtype=inputs.dtype),
+            output,
         )
 
     def forward(
@@ -2800,6 +2849,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        *,
+        add_residual: bool = False,
     ) -> torch.Tensor:
         diagnostic = self._sm70_hcx_diagnostics
         input_ids = input_ids.reshape(-1)
@@ -2826,6 +2877,46 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         value, _ = self.value_proj(embeddings)
         key = snapshot_ple_diagnostic(key, self.prefix + ":03_key", diagnostic)
         value = snapshot_ple_diagnostic(value, self.prefix + ":04_value", diagnostic)
+        policy = get_forward_kernel_config_or_none()
+        compact_gate = (
+            torch.compiler.is_compiling()
+            and not diagnostic
+            and not use_sm70_decode_graph_semantics()
+            and (policy is None or policy.prefill_ple_compact_gate)
+        )
+        if compact_gate:
+            norms = (self.norm_key, self.norm_query, self.norm_conv)
+            reason = prefill_gate_reason(
+                key,
+                hidden_states,
+                value,
+                tuple(norm.weight for norm in norms),
+                self.hc_count,
+            )
+            if len({norm.eps for norm in norms}) != 1:
+                reason = "different_norm_eps"
+            if reason is None:
+                normalized, gates = prepare_prefill_gate(
+                    key,
+                    hidden_states,
+                    value,
+                    tuple(norm.weight for norm in norms),
+                    self.hc_count,
+                    self.norm_conv.eps,
+                )
+                conv_output = torch.zeros_like(normalized)
+                torch.ops.vllm.qwen4_exp_ple_short_conv(
+                    normalized,
+                    conv_output,
+                    self.prefix,
+                )
+                return finish_prefill_gate(
+                    conv_output,
+                    value,
+                    gates,
+                    hidden_states if add_residual else None,
+                )
+            report_prefill_gate_fallback(reason)
         token_count = hidden_states.shape[0]
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
@@ -2851,7 +2942,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         conv_output = snapshot_ple_diagnostic(
             conv_output, self.prefix + ":08_conv_output", diagnostic
         )
-        return gated_value.flatten(-2) + conv_output
+        contribution = gated_value.flatten(-2) + conv_output
+        return hidden_states + contribution if add_residual else contribution
 
 
 def qwen4_exp_ple_short_conv(
@@ -2860,8 +2952,9 @@ def qwen4_exp_ple_short_conv(
     layer_name: str,
 ) -> None:
     layer = get_forward_context().no_compile_layers[layer_name]
-    result = layer._short_conv(inputs)
-    output[: result.shape[0]].copy_(result)
+    result = layer._short_conv(inputs, output=output)
+    if result.data_ptr() != output.data_ptr():
+        output[: result.shape[0]].copy_(result)
 
 
 def qwen4_exp_ple_short_conv_fake(

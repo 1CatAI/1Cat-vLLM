@@ -516,6 +516,66 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         else [],
         "paths": paths,
     }
+    hc_rows = cfg.kernel_config.prefill_hc_chunk_size
+    report["prefill_hc_blocking"] = {
+        "enabled": sm70 and hc_rows > 0,
+        "reason": None
+        if sm70 and hc_rows > 0
+        else ("requires_sm70" if not sm70 else "disabled_by_kernel_policy"),
+        "scope": "temporary_hc_allocation",
+        "operator": "FP16 HC norm/projection and opaque combine row blocking",
+        "chunk_rows": hc_rows,
+        "runtime_guards": "FP16 dense HC; M exceeds chunk rows; HCX for combine",
+        "precision": "FP16 materialization and FP32 GEMM accumulation",
+    }
+    ple_publish = cfg.kernel_config.ple_request_publish_before_wait
+    report["ple_request_publish_before_wait"] = {
+        "enabled": ple_publish,
+        "reason": None if ple_publish else "disabled_by_kernel_policy",
+        "scope": "cpu_ple_submission",
+        "operator": "publish PLE request before entering the GPU consumer",
+        "runtime_guards": "TP rank0; CPU-owned PLE; local pinned decode bypasses",
+        "precision": "unchanged",
+    }
+    ple_conv = cfg.kernel_config.prefill_ple_short_conv
+    report["prefill_ple_short_conv"] = {
+        "enabled": sm70 and ple_conv,
+        "reason": None
+        if sm70 and ple_conv
+        else ("requires_sm70" if not sm70 else "disabled_by_kernel_policy"),
+        "scope": "prefill_only",
+        "operator": "direct dilated depthwise PLE convolution and state commit",
+        "runtime_guards": "FP16; M>=512; requests1..16; taps2..8; dilation1..8",
+        "precision": "FP32 accumulation; FP16 conv boundary before FP32 SiLU",
+    }
+    prefill_norm = cfg.kernel_config.prefill_rmsnorm_gated
+    report["prefill_rmsnorm_gated"] = {
+        "enabled": sm70 and prefill_norm,
+        "reason": None
+        if sm70 and prefill_norm
+        else ("requires_sm70" if not sm70 else "disabled_by_kernel_policy"),
+        "scope": "large_batch_norm",
+        "operator": "one-pass FLA gated RMSNorm",
+        "runtime_guards": (
+            "contiguous FP16 input/gate/weight; N128; rows>=4096; "
+            "ungrouped normalization before SiLU/sigmoid gate; "
+            "batch-invariant mode excluded"
+        ),
+        "precision": "FP32 normalization/gating; FP16 output",
+    }
+    ple_gate = cfg.kernel_config.prefill_ple_compact_gate
+    report["prefill_ple_compact_gate"] = {
+        "enabled": sm70 and ple_gate,
+        "reason": None
+        if sm70 and ple_gate
+        else ("requires_sm70" if not sm70 else "disabled_by_kernel_policy"),
+        "scope": "compiled_prefill_only",
+        "operator": "scalar PLE gates with key and convolution-output storage reuse",
+        "runtime_guards": (
+            "FP16 operands; HC4/H2560; compatible norms; decode graph excluded"
+        ),
+        "precision": "FP32 gate/norm; FP16 gated-value and convolution boundaries",
+    }
     report["linear_kernel_policies"] = linear_policy_report(cfg.kernel_config)
     report["linear_kernel_selections"] = cfg.kernel_config.linear_kernel_selections
     report["moe_kernel_selections"] = cfg.kernel_config.moe_kernel_selections
@@ -532,6 +592,19 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "reason": cfg.kernel_config.qsa_auto_e4m3_reason,
         "scope": "calibrated_cache_storage",
     }
+    grouped_workspace_bytes = 0
+    if (
+        cfg.kernel_config.qsa_host_kv_active
+        and cfg.kernel_config.qsa_host_kv_prefill
+        and cfg.kernel_config.qsa_host_kv_prefill_grouped
+    ):
+        from vllm.models.qwen4_exp.nvidia.ops.host_kv_prefill import (
+            grouped_prefill_workspace_bytes,
+        )
+
+        grouped_workspace_bytes = grouped_prefill_workspace_bytes(
+            cfg.scheduler_config.max_num_batched_tokens
+        )
     report["qsa_host_kv"] = {
         "enabled": cfg.kernel_config.qsa_host_kv_active,
         "reason": cfg.kernel_config.qsa_host_kv_reason,
@@ -549,6 +622,55 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
         "attention_staging_dtype": "float16",
         "recurrent_state_storage": "device",
+        "prefill_staging": {
+            "enabled": (
+                cfg.kernel_config.qsa_host_kv_active
+                and cfg.kernel_config.qsa_host_kv_prefill
+            ),
+            "reason": (
+                cfg.kernel_config.qsa_host_kv_reason or "host_history_not_admitted"
+                if not cfg.kernel_config.qsa_host_kv_active
+                else None
+                if cfg.kernel_config.qsa_host_kv_prefill
+                else "disabled_by_kernel_policy"
+            ),
+            "operator": "host_qsa_prefill",
+            "min_query_rows": 512,
+            "query_tile_rows": 256,
+            "runtime_guards": (
+                "logical request pages fit the shared FP16 miss workspace"
+            ),
+            "additional_persistent_history_bytes": 0,
+            "additional_persistent_workspace_bytes": grouped_workspace_bytes,
+            "workspace_estimate_scope": (
+                "grouped planner per CUDA stream at scheduler query-row limit; "
+                "existing capacity may already cover the request"
+            ),
+            "grouped_attention": {
+                "enabled": (
+                    cfg.kernel_config.qsa_host_kv_active
+                    and cfg.kernel_config.qsa_host_kv_prefill
+                    and cfg.kernel_config.qsa_host_kv_prefill_grouped
+                ),
+                "reason": (
+                    cfg.kernel_config.qsa_host_kv_reason or "host_history_not_admitted"
+                    if not cfg.kernel_config.qsa_host_kv_active
+                    else "prefill_staging_disabled"
+                    if not cfg.kernel_config.qsa_host_kv_prefill
+                    else None
+                    if cfg.kernel_config.qsa_host_kv_prefill_grouped
+                    else "disabled_by_kernel_policy"
+                ),
+                "operator": "grouped_sparse_page4_fwd",
+                "runtime_guards": (
+                    "SM70; FP16 staged history; six 256-wide query heads; "
+                    "freshly selected canonical four-token groups and causal tail; "
+                    "Flash-V100 grouped ABI available"
+                ),
+                "workspace": "shared per device and CUDA stream, sized by query rows",
+                "fallback": "256-row causal Triton split-K attention",
+            },
+        },
     }
     sparse_policy = cfg.kernel_config.sm70_sparse
     report["sparse_kernel_policy"] = {

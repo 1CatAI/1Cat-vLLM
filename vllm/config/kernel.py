@@ -364,6 +364,25 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    expert_storage: Literal["canonical", "original", "staged"] = "canonical"
+    """Keep accelerated canonical banks or one bank of original GGUF blocks.
+
+    Original storage avoids simultaneous canonical and raw expert weights.
+    It uses the packaged native fallback and zero-pads activations when a TP
+    boundary cuts a source block. It does not change the quantized weights.
+    Staged storage retains original IQ gate/up banks and expands canonical
+    operands into shared scratch for prefill, preserving the small-M routes.
+    """
+
+    dense_storage: Literal["canonical", "original"] = "canonical"
+    """Keep accelerated projection banks or only original quantized rows."""
+
+    dequant_workspace_bytes: int = Field(default=32 * 1024**2, ge=1024**2)
+    """Bound dense matrix tiles for the original projection storage policy."""
+
+    embedding_storage: Literal["dense", "original"] = "dense"
+    """Keep dense token embeddings or decode original GGUF rows on lookup."""
+
     projection_planes: bool = True
     """Use measured M8 shared-activation projection planes with canonical fallback."""
 
@@ -378,6 +397,22 @@ class Sm70GgufConfig:
 
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
+
+    prefill_routing: bool = True
+    """Fuse admitted prefill routing copies and ordered FP32 expert reduction."""
+
+    prefill_unroute: bool = True
+    """Reduce prefill expert outputs without materializing FP32 contributions."""
+
+    prefill_expert_chunk_size: int = 4096
+    """Bound admitted prefill expert scratch by token rows; zero disables blocking."""
+
+    @field_validator("prefill_expert_chunk_size")
+    @classmethod
+    def _nonnegative_expert_chunk_size(cls, value: int) -> int:
+        if value != 0 and value < 33:
+            raise ValueError("GGUF prefill expert chunk size must be zero or >= 33")
+        return value
 
     lut4_expert_dp4a: bool = True
     """Admit canonical IQ4 gate/up integer dots at calibrated expert shapes."""
@@ -526,8 +561,23 @@ class KernelConfig:
     hc_ll_optimized_loads: bool = True
     """Prefetch HC down weights and pad the up shared-memory rows on SM70."""
 
+    prefill_hc_chunk_size: int = 4096
+    """Bound large SM70 FP16 HC intermediates by rows; zero disables blocking."""
+
+    ple_request_publish_before_wait: bool = True
+    """Publish CPU-owned PLE requests before GPU waits can block the notifier."""
+
+    prefill_ple_short_conv: bool = True
+    """Use admitted SM70 dilated PLE prefill without padded history buffers."""
+
+    prefill_ple_compact_gate: bool = True
+    """Reuse PLE key/output storage and retain scalar gates during SM70 prefill."""
+
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
+
+    hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
+    """Keep replicated HC matrices or only the lossless local TP4 LL packs."""
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -619,12 +669,19 @@ class KernelConfig:
     """Preserve speculative cache precision independently of target storage."""
     qsa_host_kv_device_reference: bool = False
     """Keep identical encoded history on device for controlled placement A/B."""
+    qsa_host_kv_prefill: bool = True
+    """Stage admitted prefill histories once in the existing miss workspace."""
+    qsa_host_kv_prefill_grouped: bool = True
+    """Use native SM70 grouped attention for staged canonical QSA selections."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
     qsa_host_kv_active: bool = Field(default=False, init=False)
     """Whether the host QSA cache geometry has been admitted."""
     qsa_host_kv_reason: str | None = Field(default=None, init=False)
     """Reason the requested host QSA storage is unavailable."""
+
+    prefill_rmsnorm_gated: bool = True
+    """Use the existing FP32-compute FLA gated norm for large SM70 FP16 batches."""
 
     ple_disk_cascade: bool = True
     """Allow resident FP8 PLE tiers to spill to mapped checkpoint storage."""

@@ -22,13 +22,17 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+from contextlib import nullcontext
+
 import torch
 from torch import nn
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization.sm70_online_qpn8 import (
     maybe_apply_fused_hc,
 )
@@ -46,7 +50,11 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
-from .sm70_fp16_hc import maybe_apply_qwen38_sm70_fp16_fused_hc
+from .sm70_fp16_hc import (
+    maybe_apply_qwen38_sm70_fp16_fused_hc,
+    maybe_apply_qwen38_sm70_fp16_prefill_hc_mix,
+)
+from .sm70_hc_storage import sharded_hc_project
 
 
 # ---------------------------------------------------------------------------
@@ -97,39 +105,63 @@ class GatedResidual(nn.Module):
         # The merged skinny-GEMM shape is physically padded to 16 rows to ensure
         # good alignment and performant implementation chosen by CuBLAS heuristics.
         self.pad_size = (-(self.lora_rank + self.hc_count)) % 16 if use_combine else 0
-        if use_combine:
-            self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
-                self.hyper_hidden_size,
-                [self.lora_rank, self.hc_count]
-                + ([self.pad_size] if self.pad_size else []),
-                bias=False,
-                params_dtype=config.params_dtype,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
-                return_bias=False,
-                disable_tp=True,
-            )
-        else:
-            self.input_mix_weight_down = ReplicatedLinear(
-                self.hyper_hidden_size,
-                self.lora_rank,
-                bias=False,
-                params_dtype=config.params_dtype,
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "input_mix_weight_down"),
-                return_bias=False,
-            )
-        self.input_mix_weight_up = ReplicatedLinear(
-            self.lora_rank,
-            self.hyper_hidden_size,
-            bias=False,
-            params_dtype=config.params_dtype,
-            quant_config=None,
-            prefix=maybe_prefix(prefix, "input_mix_weight_up"),
-            return_bias=False,
+        runtime = get_current_vllm_config_or_none()
+        sharded_storage = bool(
+            runtime is not None
+            and runtime.kernel_config.hc_weight_storage == "sharded"
+            and not is_offload_process()
         )
+        # Loading staging only: pack on CPU and transfer final local shards.
+        # Replicated GPU allocations leave large unreclaimable allocator holes.
+        storage_context = torch.device("cpu") if sharded_storage else nullcontext()
+        with storage_context:
+            if use_combine:
+                self.input_mix_weight_down_block_inject = MergedColumnParallelLinear(
+                    self.hyper_hidden_size,
+                    [self.lora_rank, self.hc_count]
+                    + ([self.pad_size] if self.pad_size else []),
+                    bias=False,
+                    params_dtype=config.params_dtype,
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "input_mix_weight_down_block_inject"),
+                    return_bias=False,
+                    disable_tp=True,
+                )
+            else:
+                self.input_mix_weight_down = ReplicatedLinear(
+                    self.hyper_hidden_size,
+                    self.lora_rank,
+                    bias=False,
+                    params_dtype=config.params_dtype,
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "input_mix_weight_down"),
+                    return_bias=False,
+                )
+            self.input_mix_weight_up = ReplicatedLinear(
+                self.lora_rank,
+                self.hyper_hidden_size,
+                bias=False,
+                params_dtype=config.params_dtype,
+                quant_config=None,
+                prefix=maybe_prefix(prefix, "input_mix_weight_up"),
+                return_bias=False,
+            )
+        if sharded_storage:
+            down = (
+                self.input_mix_weight_down_block_inject
+                if use_combine
+                else self.input_mix_weight_down
+            )
+            for layer in (down, self.input_mix_weight_up):
+                layer.weight._vllm_keep_on_cpu = True
+                layer._hc_cpu_staging = True
 
     def _project(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if hasattr(self, "hc_shard_down"):
+            block, injection = sharded_hc_project(
+                xn, self.hc_shard_down, self.hc_shard_up
+            )
+            return block, injection if self.use_combine else None
         if self.use_combine:
             fused_fp16 = maybe_apply_qwen38_sm70_fp16_fused_hc(
                 self.input_mix_weight_down_block_inject,
@@ -162,6 +194,17 @@ class GatedResidual(nn.Module):
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self.use_combine:
+            blocked = maybe_apply_qwen38_sm70_fp16_prefill_hc_mix(
+                self.input_mix_weight_down_block_inject,
+                self.input_mix_weight_up,
+                hidden_states,
+                self.hc_norm.weight,
+                self.config.rms_norm_eps,
+                getattr(self, "_sm70_qwen38_fp16_fused_hc", False),
+            )
+            if blocked is not None:
+                return hidden_states, blocked[0], blocked[1]
         xn = grouped_gemma_rmsnorm(
             hidden_states,
             self.hc_norm.weight,
@@ -240,6 +283,42 @@ class GatedResidual(nn.Module):
         prev_block_output: torch.Tensor,
         prev_injection: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        # HCX already supplies an opaque runtime boundary for these modules.
+        # Keep full outputs but avoid full-batch norm and gate intermediates.
+        from .sm70_fp16_hc import _hc_prefill_chunk_size
+
+        chunk_size = _hc_prefill_chunk_size(hidden_states.shape[0])
+        if (
+            chunk_size
+            and getattr(self, "_partial_inputs", False)
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.float16
+        ):
+            hidden = torch.empty_like(hidden_states)
+            block = hidden_states.new_empty((hidden_states.shape[0], self.hidden_size))
+            injection = (
+                hidden_states.new_empty((hidden_states.shape[0], self.hc_count))
+                if self.use_combine
+                else None
+            )
+            for start in range(0, hidden_states.shape[0], chunk_size):
+                stop = min(start + chunk_size, hidden_states.shape[0])
+                part, xn = hc_combine_norm(
+                    hidden_states[start:stop],
+                    prev_block_output[start:stop],
+                    prev_injection[start:stop],
+                    self.hc_norm.weight,
+                    self.config.rms_norm_eps,
+                    self.hc_count,
+                )
+                block_part, inject_part = self._project(xn)
+                hidden[start:stop].copy_(part)
+                block[start:stop].copy_(block_part)
+                if injection is not None:
+                    assert inject_part is not None
+                    injection[start:stop].copy_(inject_part)
+                del part, xn, block_part, inject_part
+            return hidden, block, injection
         hidden_states, xn = hc_combine_norm(
             hidden_states,
             prev_block_output,

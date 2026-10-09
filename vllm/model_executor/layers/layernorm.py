@@ -51,6 +51,66 @@ def _sm70_gated_norm_shape_supported(
     )
 
 
+def _sm70_prefill_gated_norm_shape_supported(
+    x: torch.Tensor, z: torch.Tensor | None, weight: torch.Tensor
+) -> bool:
+    return bool(
+        z is not None
+        and x.ndim == 2
+        and x.shape[0] >= 4096
+        and x.shape[1] == 128
+        and z.shape == x.shape
+        and weight.shape == (128,)
+        and x.dtype == z.dtype == weight.dtype == torch.float16
+        and x.device == z.device == weight.device
+        and x.is_contiguous()
+        and z.is_contiguous()
+        and weight.is_contiguous()
+    )
+
+
+def _sm70_prefill_rmsnorm_gated_impl(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    silu: bool,
+) -> torch.Tensor:
+    from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
+
+    logger.info_once(
+        "SM70 large-batch gated RMSNorm uses the one-pass FLA kernel "
+        "(FP32 normalization/gating, FP16 output)."
+    )
+    return rmsnorm_fn(
+        x,
+        weight,
+        None,
+        z=z,
+        eps=eps,
+        group_size=None,
+        norm_before_gate=True,
+        activation="silu" if silu else "sigmoid",
+    )
+
+
+def _sm70_prefill_rmsnorm_gated_fake(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    silu: bool,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="sm70_prefill_rmsnorm_gated",
+    op_func=_sm70_prefill_rmsnorm_gated_impl,
+    fake_impl=_sm70_prefill_rmsnorm_gated_fake,
+)
+
+
 def _sm70_rmsnorm_gated_exact_impl(
     x: torch.Tensor, z: torch.Tensor, weight: torch.Tensor, eps: float, silu: bool
 ) -> torch.Tensor:
@@ -765,6 +825,9 @@ class RMSNormGated(CustomOp):
             if resolved is not None
             else bool(envs.VLLM_SM70_RMSNORM_GATED_EXACT)
         )
+        self._sm70_prefill_rmsnorm_gated = (
+            cfg.kernel_config.prefill_rmsnorm_gated if cfg else True
+        )
         self.eps = eps
         self.activation = activation
         self.weight = nn.Parameter(torch.empty(hidden_size, **factory_kwargs))
@@ -830,6 +893,19 @@ class RMSNormGated(CustomOp):
         self, x: torch.Tensor, z: torch.Tensor | None = None
     ) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
+        if (
+            self._sm70_prefill_rmsnorm_gated
+            and not envs.VLLM_BATCH_INVARIANT
+            and x.is_cuda
+            and _sm70_gated_norm_device_supported(x.device.index)
+            and self.group_size is None
+            and self.norm_before_gate
+            and self.activation in ("sigmoid", "silu", "swish")
+            and _sm70_prefill_gated_norm_shape_supported(x, z, self.weight)
+        ):
+            return torch.ops.vllm.sm70_prefill_rmsnorm_gated(
+                x, z, self.weight, self.eps, self.activation != "sigmoid"
+            )
         if (
             self._sm70_rmsnorm_gated_exact
             and not envs.VLLM_BATCH_INVARIANT

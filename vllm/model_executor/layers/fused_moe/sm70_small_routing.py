@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import torch
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -38,6 +39,51 @@ class Sm70SmallRoutingCapability:
 
 
 SM70_SMALL_ROUTING = Sm70SmallRoutingCapability()
+
+
+@dataclass(frozen=True)
+class Sm70PrefillRoutingCapability(Sm70SmallRoutingCapability):
+    min_m: int = 33
+    max_m: int = 16384
+
+    def reason(self, x, ids, experts):
+        reason = super().reason(x, ids, experts)
+        return (
+            "outside_prefill_band" if reason == "outside_small_batch_band" else reason
+        )
+
+
+SM70_PREFILL_ROUTING = Sm70PrefillRoutingCapability()
+
+
+def _prefill_enabled():
+    config = get_current_vllm_config_or_none()
+    return config is None or config.kernel_config.sm70_gguf.prefill_routing
+
+
+def _prefill_unroute_enabled():
+    config = get_current_vllm_config_or_none()
+    return config is None or config.kernel_config.sm70_gguf.prefill_unroute
+
+
+@triton.jit
+def _prefill_gather_inverse(
+    X,
+    ORDER,
+    ROUTED,
+    INVERSE,
+    R: tl.constexpr,
+    H: tl.constexpr,
+    TOP_K: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row, h = index // H, index % H
+    original = tl.load(ORDER + row, row < R, other=0)
+    value = tl.load(X + (original // TOP_K) * H + h, index < R * H, other=0)
+    tl.store(ROUTED + index, value, index < R * H)
+    # ORDER is a permutation, so each inverse entry has exactly one writer.
+    tl.store(INVERSE + original, row, (row < R) & (h == 0))
 
 
 @triton.jit
@@ -158,6 +204,16 @@ def _small_route(
     m, top_k = ids.shape
     r, h = m * top_k, x.shape[1]
     if SM70_SMALL_ROUTING.reason(x, ids, experts) is not None:
+        if SM70_PREFILL_ROUTING.reason(x, ids, experts) is None and _prefill_enabled():
+            sorted_ids, order = ids.reshape(-1).int().sort(stable=True)
+            boundaries = torch.arange(experts + 1, device=x.device, dtype=torch.int32)
+            offsets = torch.searchsorted(sorted_ids, boundaries).int()
+            routed = x.new_empty((r, h))
+            inverse = torch.empty(r, device=x.device, dtype=torch.int32)
+            _prefill_gather_inverse[(triton.cdiv(r * h, 1024),)](
+                x, order, routed, inverse, r, h, top_k, 1024, num_warps=4
+            )
+            return routed, offsets, sorted_ids.long(), inverse
         sorted_ids, order = ids.reshape(-1).long().sort()
         boundaries = torch.arange(experts + 1, device=x.device)
         offsets = torch.searchsorted(sorted_ids, boundaries).to(torch.int32)
@@ -206,7 +262,7 @@ def _small_unroute(
         down.is_cuda
         and current_platform.is_device_capability(70)
         and down.dtype == torch.float16
-        and 1 <= m <= 32
+        and (1 <= m <= 32 or (33 <= m <= 16384 and _prefill_unroute_enabled()))
         and h == 2560
         and 1 <= top_k <= 16
         and down.is_contiguous()

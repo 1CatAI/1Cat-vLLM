@@ -71,6 +71,15 @@ from .indexer_qsa import QSAIndexer
 logger = init_logger(__name__)
 
 
+def _qsa_rope_cache_length(config, model_config) -> int:
+    """Bound fixed-frequency text RoPE by the engine's position limit."""
+    mm_config = model_config.multimodal_config
+    text_only = mm_config is None or mm_config.language_model_only
+    if text_only and config.rope_parameters.get("rope_type", "default") == "default":
+        return min(config.max_position_embeddings, model_config.max_model_len)
+    return config.max_position_embeddings
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -288,10 +297,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 raise RuntimeError(
                     "Host QSA requires exact positions and sequence lengths"
                 )
+            block_table = attn_metadata.block_table
+            if layer.host_kv_prefill_enabled:
+                from .ops.host_kv_prefill import PREFILL_MIN_ROWS
+
+                if num_tokens >= PREFILL_MIN_ROWS:
+                    # Capacity follows max_model_len; only this request's
+                    # visible pages belong in the bounded prefill scratch.
+                    # Keep small-M graph table geometry unchanged.
+                    pages = math.ceil(
+                        attn_metadata.max_seq_len / layer.host_kv.page_size
+                    )
+                    block_table = block_table[:, :pages]
             layer.host_kv_forward(
                 query[:num_tokens],
                 logical_indices,
-                attn_metadata.block_table,
+                block_table,
                 token_to_req,
                 query_positions[:num_tokens],
                 sequence_lengths,
@@ -573,7 +594,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=_qsa_rope_cache_length(config, model_config),
             rope_parameters=config.rope_parameters,
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -626,6 +647,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
         self.host_kv_device_reference = (
             vllm_config.kernel_config.qsa_host_kv_device_reference
+        )
+        self.host_kv_prefill_enabled = vllm_config.kernel_config.qsa_host_kv_prefill
+        self.host_kv_prefill_grouped = (
+            vllm_config.kernel_config.qsa_host_kv_prefill_grouped
         )
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
@@ -821,6 +846,41 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         from .ops.host_kv_attention import host_qsa_attention
 
         state = self.host_kv
+        if self.host_kv_prefill_enabled:
+            from .ops.host_kv_prefill import (
+                host_qsa_prefill,
+                prefill_staging_reason,
+            )
+
+            reason = prefill_staging_reason(state, table, query.shape[0])
+            if reason is None:
+                logger.info_once(
+                    "QSA host prefill stages request history once in shared scratch."
+                )
+                if self.host_kv_prefill_grouped and self.indexer.skip_topk:
+                    logger.info_once(
+                        "QSA host prefill grouped route skipped: reused_mtp_selection"
+                    )
+                host_qsa_prefill(
+                    query,
+                    state,
+                    indices,
+                    table,
+                    requests,
+                    positions,
+                    lengths,
+                    output,
+                    gate,
+                    # Reused MTP indices may carry the preceding step's
+                    # compact tail. Only freshly selected rows satisfy the
+                    # native planner's current-position tail contract.
+                    grouped_page4=(
+                        self.host_kv_prefill_grouped and not self.indexer.skip_topk
+                    ),
+                )
+                return
+            if query.shape[0] >= 512:
+                logger.info_once("QSA host prefill staging skipped: %s", reason)
         for start in range(0, query.shape[0], state.rows):
             stop = min(start + state.rows, query.shape[0])
             host_qsa_attention(

@@ -812,6 +812,7 @@ def _make_fp8_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
 
 def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     module = _make_fp8_ngram_embedding_for_load_test()
+    module.layer_name = "model.layers.1.ple"
     module._disk_offload = True
     module._file_backed_shards = True
     module._disk_shards = [None, None]
@@ -916,7 +917,9 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
     assert module.get_offload_output_dtype(torch.bfloat16) == torch.uint8
 
 
-def test_ngram_embedding_retains_and_gathers_disk_shards(tmp_path) -> None:
+def test_ngram_embedding_retains_and_gathers_disk_shards(
+    tmp_path, default_vllm_config
+) -> None:
     # Real file-backed shards, as the loader hands them over: the disk lane
     # refuses anything else, and with kernel_config.ple_disk_release_pages the gather
     # releases the mapped pages, which would destroy anonymous memory.
@@ -963,7 +966,7 @@ def test_ngram_embedding_retains_and_gathers_disk_shards(tmp_path) -> None:
 
 @pytest.mark.parametrize("num_rows", [0, 1, 80, 128, 129, 256])
 def test_ngram_embedding_disk_decode_short_gather_matches_prefill(
-    monkeypatch: pytest.MonkeyPatch, num_rows: int
+    monkeypatch: pytest.MonkeyPatch, num_rows: int, default_vllm_config
 ) -> None:
     module = _make_disk_ngram_embedding_for_load_test()
     shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
@@ -992,7 +995,7 @@ def test_ngram_embedding_disk_decode_short_gather_matches_prefill(
 
 @pytest.mark.parametrize("num_rows,bad_id", [(1, -1), (80, 8), (129, 8)])
 def test_ngram_embedding_disk_gather_rejects_invalid_ids(
-    monkeypatch: pytest.MonkeyPatch, num_rows: int, bad_id: int
+    monkeypatch: pytest.MonkeyPatch, num_rows: int, bad_id: int, default_vllm_config
 ) -> None:
     module = _make_disk_ngram_embedding_for_load_test()
     shard = torch.zeros(4, 2).to(torch.float8_e4m3fn)
@@ -1009,7 +1012,11 @@ def test_ngram_embedding_disk_gather_rejects_invalid_ids(
     )
     ngram_ids = torch.zeros(num_rows, 1, dtype=torch.long)
     ngram_ids[-1] = bad_id
-    with pytest.raises(IndexError, match="PLE disk row id out of range"):
+    # The native mapped reader reports c10 errors as RuntimeError; the
+    # Python fallback uses IndexError. Both must reject invalid row IDs.
+    with pytest.raises(
+        (IndexError, RuntimeError), match="PLE disk row [iI][dD] out of range"
+    ):
         module._disk_embedding_lookup(
             ngram_ids, torch.empty(num_rows, 2, dtype=torch.uint8)
         )
@@ -1289,6 +1296,7 @@ def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
 ) -> None:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
+    module.layer_name = "model.layers.1.ple"
     module._packed_gguf = False
     module.embedding_dim = 1
     module.head_dim = 1
@@ -1390,6 +1398,7 @@ def test_ngram_fp8_cpu_offload_preserves_quantized_output(
 ) -> None:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
+    module.layer_name = "model.layers.1.ple"
     module._packed_gguf = False
     module.embedding_dim = 2
     module.head_dim = 2
@@ -1696,6 +1705,14 @@ def test_ngram_embedding_cascade_worker_keeps_shards_file_backed(
     assert layer.get_offload_output_dtype(torch.float16) == torch.uint8
 
 
+def test_cascade_worker_prefaults_actual_disk_rows(monkeypatch) -> None:
+    layer = _make_cascade_worker_embedding(monkeypatch)
+    placement = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=64)
+    layer.bind_remote_placements([placement])
+    assert layer._disk_segments
+    assert layer.needs_weight_prefault()
+
+
 def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1709,10 +1726,12 @@ def test_cascade_worker_binds_resident_placements_and_serves_no_rows(
     with pytest.raises(TypeError, match="PLERemotePlacement"):
         layer.bind_remote_placements([object()])
 
+    assert layer.needs_weight_prefault()
     resident = PLERemotePlacement(tp_start=0, tp_end=100, local_rows=128)
     layer.bind_remote_placements([resident])
     assert layer._remote_placements == [resident]
     assert layer._disk_segments == []
+    assert not layer.needs_weight_prefault()
 
     input_ids = torch.tensor([5, 6, 7, 8, 9], dtype=torch.int32)
     query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)

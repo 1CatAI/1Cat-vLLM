@@ -12,6 +12,7 @@ import os
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .index import prepare_chunk_indices
@@ -20,11 +21,7 @@ from .utils import FLA_CHUNK_SIZE
 
 
 def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
-    )
+    return current_platform.is_cuda() and current_platform.is_device_capability(70)
 
 
 def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:

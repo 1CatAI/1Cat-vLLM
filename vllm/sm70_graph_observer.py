@@ -156,6 +156,253 @@ class GraphParityWorkerExtension:
     rank: int
     model_runner: Any
 
+    def read_prefill_memory(
+        self,
+        reset_peak: bool = False,
+        release_unused_cache: bool = False,
+        include_segments: bool = False,
+    ):
+        """Capture worker allocation admission between benchmark requests."""
+        import torch
+
+        torch.accelerator.synchronize()
+        if release_unused_cache:
+            # Diagnostic-only: make room for CUPTI after unprofiled requests.
+            # Live tensors and captured graph allocations remain owned.
+            torch.accelerator.empty_cache()
+        free, total = torch.accelerator.get_memory_info()
+        result = {
+            "rank": self.rank,
+            "allocated_bytes": torch.accelerator.memory_allocated(),
+            "reserved_bytes": torch.accelerator.memory_reserved(),
+            "peak_allocated_bytes": torch.accelerator.max_memory_allocated(),
+            "device_free_bytes": free,
+            "device_total_bytes": total,
+        }
+        stats = torch.accelerator.memory_stats()
+        result["allocator"] = {
+            key: stats[key]
+            for key in (
+                "num_alloc_retries",
+                "num_ooms",
+                "num_sync_all_streams",
+                "num_device_alloc",
+                "num_device_free",
+                "allocated_bytes.all.current",
+                "reserved_bytes.all.current",
+                "reserved_bytes.all.peak",
+                "inactive_split_bytes.all.current",
+                "requested_bytes.all.current",
+            )
+            if key in stats
+        }
+        if include_segments:
+            result["segments"] = [
+                {
+                    "address": segment["address"],
+                    "total_size": segment["total_size"],
+                    "allocated_size": segment["allocated_size"],
+                    "active_size": segment["active_size"],
+                    "stream": segment["stream"],
+                    "segment_type": segment["segment_type"],
+                    "segment_pool_id": segment.get("segment_pool_id"),
+                    "is_expandable": segment.get("is_expandable"),
+                    "largest_inactive_block_bytes": max(
+                        (
+                            block["size"]
+                            for block in segment["blocks"]
+                            if block["state"] == "inactive"
+                        ),
+                        default=0,
+                    ),
+                }
+                for segment in torch.cuda.memory_snapshot()
+                if segment["device"] == torch.accelerator.current_device_index()
+            ]
+        if reset_peak:
+            torch.accelerator.reset_peak_memory_stats()
+        return result
+
+    def read_prefill_storages(self):
+        """Inventory live device storage, separating mapped host aliases."""
+        import torch
+        from cuda.bindings import runtime
+        from torch._subclasses.fake_tensor import FakeTensor
+
+        from vllm.model_executor.layers.quantization import gguf_dense_hmma
+        from vllm.v1.worker.workspace import (
+            current_workspace_manager,
+            is_workspace_manager_initialized,
+        )
+
+        seen = set()
+        storages = {}
+        errors = []
+
+        def walk(value, owner, depth=0):
+            if isinstance(
+                value, (torch.nn.parameter.UninitializedParameter, FakeTensor)
+            ):
+                return
+            if isinstance(value, torch.Tensor):
+                if value.is_cuda and value.numel():
+                    storage = value.untyped_storage()
+                    key = (value.device.index, storage.data_ptr())
+                    if key not in storages:
+                        error, attributes = runtime.cudaPointerGetAttributes(key[1])
+                        if error != runtime.cudaError_t.cudaSuccess:
+                            errors.append({"owner": owner, "error": int(error)})
+                            runtime.cudaGetLastError()
+                        else:
+                            storages[key] = {
+                                "bytes": storage.nbytes(),
+                                "memory_type": int(attributes.type),
+                                "owners": [],
+                                "shape": list(value.shape),
+                                "dtype": str(value.dtype),
+                            }
+                    if key in storages and owner not in storages[key]["owners"]:
+                        storages[key]["owners"].append(owner)
+                return
+            if id(value) in seen or depth > 24:
+                return
+            seen.add(id(value))
+            items: Any
+            if isinstance(value, dict):
+                items = value.items()
+            elif isinstance(value, (list, tuple)):
+                items = enumerate(value)
+            elif isinstance(value, torch.nn.Module) or type(
+                value
+            ).__module__.startswith("vllm."):
+                items = vars(value).items() if hasattr(value, "__dict__") else ()
+            else:
+                return
+            for name, child in items:
+                walk(child, owner + "." + str(name), depth + 1)
+
+        walk(self.model_runner, "runner")
+        walk(gguf_dense_hmma._workspaces, "gguf_dense_workspaces")
+        if is_workspace_manager_initialized():
+            walk(current_workspace_manager(), "global_workspace_manager")
+        records = sorted(storages.values(), key=lambda value: -value["bytes"])
+        unreachable = []
+        for segment in torch.cuda.memory_snapshot():
+            address = segment["address"]
+            for block in segment["blocks"]:
+                pointer = block.get("address", address)
+                if (
+                    block["state"] == "active_allocated"
+                    and (segment["device"], pointer) not in storages
+                ):
+                    unreachable.append(
+                        {
+                            "bytes": block["size"],
+                            "requested_bytes": block["requested_size"],
+                            "stream": segment["stream"],
+                        }
+                    )
+                address += block["size"]
+        return {
+            "rank": self.rank,
+            "scope": "reachable Python tensors; excludes native-only allocations",
+            "device_storage_bytes": sum(
+                value["bytes"]
+                for value in records
+                if value["memory_type"]
+                == int(runtime.cudaMemoryType.cudaMemoryTypeDevice)
+            ),
+            "mapped_host_storage_bytes": sum(
+                value["bytes"]
+                for value in records
+                if value["memory_type"]
+                == int(runtime.cudaMemoryType.cudaMemoryTypeHost)
+            ),
+            "storages": records,
+            "pointer_errors": errors,
+            "unreachable_allocator_blocks": sorted(
+                unreachable, key=lambda value: -value["bytes"]
+            ),
+        }
+
+    def set_gguf_prefill_routing_policy(self, enabled: bool):
+        """Compare routing between completed requests without reloading weights."""
+        if type(enabled) is not bool:
+            raise TypeError("GGUF prefill routing requires a boolean policy")
+        runner = self.model_runner
+        configs = [runner.vllm_config]
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None:
+            configs.append(speculator.vllm_config)
+        for config in configs:
+            config.kernel_config.sm70_gguf.prefill_routing = enabled
+        return {"rank": self.rank, "prefill_routing": enabled}
+
+    def set_qsa_host_prefill_policy(self, enabled):
+        """Change only prefill dispatch between completed benchmark cohorts."""
+        if not isinstance(enabled, bool):
+            raise TypeError("Host prefill policy requires a boolean")
+        runner = self.model_runner
+        configs = [runner.vllm_config]
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None:
+            configs.append(speculator.vllm_config)
+        owners = set()
+        for config in configs:
+            for module in config.compilation_config.static_forward_context.values():
+                if getattr(module, "host_kv_enabled", False) and hasattr(
+                    module, "host_kv_prefill_enabled"
+                ):
+                    module.host_kv_prefill_enabled = enabled
+                    owners.add(id(module))
+            config.kernel_config.qsa_host_kv_prefill = enabled
+        if not owners:
+            raise RuntimeError("No admitted host QSA owners")
+        return {"rank": self.rank, "enabled": enabled, "owners": len(owners)}
+
+    def set_qsa_host_prefill_grouped_policy(self, enabled):
+        """Compare staged attention dispatch without changing KV placement."""
+        if not isinstance(enabled, bool):
+            raise TypeError("Grouped host prefill policy requires a boolean")
+        runner = self.model_runner
+        configs = [runner.vllm_config]
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None:
+            configs.append(speculator.vllm_config)
+        owners = set()
+        for config in configs:
+            for module in config.compilation_config.static_forward_context.values():
+                if getattr(module, "host_kv_enabled", False) and hasattr(
+                    module, "host_kv_prefill_grouped"
+                ):
+                    module.host_kv_prefill_grouped = enabled
+                    owners.add(id(module))
+            config.kernel_config.qsa_host_kv_prefill_grouped = enabled
+        if not owners:
+            raise RuntimeError("No admitted host QSA owners")
+        return {"rank": self.rank, "enabled": enabled, "owners": len(owners)}
+
+    def set_prefill_rmsnorm_gated_policy(self, enabled):
+        """Change large gated-norm dispatch between completed cohorts."""
+        if not isinstance(enabled, bool):
+            raise TypeError("Prefill gated norm policy requires a boolean")
+        runner = self.model_runner
+        configs = [runner.vllm_config]
+        speculator = getattr(runner, "speculator", None)
+        if speculator is not None:
+            configs.append(speculator.vllm_config)
+        owners = set()
+        for config in configs:
+            for module in config.compilation_config.static_forward_context.values():
+                norm = getattr(module, "norm", None)
+                if norm is not None and hasattr(norm, "_sm70_prefill_rmsnorm_gated"):
+                    norm._sm70_prefill_rmsnorm_gated = enabled
+                    owners.add(id(norm))
+            config.kernel_config.prefill_rmsnorm_gated = enabled
+        if not owners:
+            raise RuntimeError("No gated norm owners")
+        return {"rank": self.rank, "enabled": enabled, "owners": len(owners)}
+
     def set_mtp_execution_policy(self, draft_single_graph, greedy_verify):
         """Benchmark RPC: change host dispatch between completed cohorts.
 
