@@ -7,6 +7,7 @@ import torch
 from vllm import envs
 from vllm.config import get_current_vllm_config_or_none
 from vllm.platforms import current_platform
+from vllm.v1.attention.kv_codecs import FP16, resolve_kv_codec
 
 OPERATOR = "sm70_grouped_fp16_fwd"
 MAX_GROUPS = 4
@@ -78,7 +79,7 @@ def grouped_fp16_fp32_reason(
 ):
     if getattr(instance, "flash_attn_grouped_fp16_fp32_paged", None) is None:
         return "operator_missing:sm70_grouped_fp16_fwd"
-    if instance.kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+    if resolve_kv_codec(instance.kv_cache_dtype) is not FP16:
         return "kv_dtype"
     if (
         not instance.use_smallq_decode_xqa

@@ -8,6 +8,7 @@ import torch
 
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.v1.attention.kv_codecs import FP8_E4M3, resolve_kv_codec
 from vllm.v1.attention.ops.sm70_e4m3_long import (
     BUILTIN_MAX_CONTEXT,
     load_attention_library,
@@ -148,7 +149,7 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             and k.shape[3] == 256
             and k.dtype == v.dtype == torch.uint8
             and v.shape == k.shape
-            and kv_cache_dtype == "fp8_e4m3"
+            and resolve_kv_codec(kv_cache_dtype) is FP8_E4M3
             and window_size == (-1, -1)
             and anchor_lens is None
             and anchored_window == 0
