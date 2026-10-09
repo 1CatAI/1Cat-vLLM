@@ -10,10 +10,13 @@ from pathlib import Path
 import pytest
 
 
-@pytest.mark.parametrize("module", [
-    "vllm.v1.worker.gpu.spec_decode.dflash2.lookup",
-    "vllm.v1.worker.cpu_worker",
-])
+@pytest.mark.parametrize(
+    "module",
+    [
+        "vllm.v1.worker.gpu.spec_decode.dflash2.lookup",
+        "vllm.v1.worker.cpu_worker",
+    ],
+)
 def test_cpu_import_without_triton(module):
     root = Path(__file__).resolve().parents[3]
     code = """
