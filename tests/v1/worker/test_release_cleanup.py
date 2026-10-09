@@ -75,7 +75,6 @@ def test_worker_shutdown_flushes_route_summary_once(monkeypatch):
 
 def test_sm70_workspace_cleanup_releases_all_tensor_owners():
     from vllm.model_executor.kernels.linear.scaled_mm import sm70_fp8
-
     from vllm.model_executor.layers.quantization import (
         nvfp4_sm70_moe,
         sm70_turbomind,
