@@ -9,6 +9,7 @@ from pydantic import Field, field_validator
 
 from vllm.config.sm70_moe import Sm70MoEConfig
 from vllm.config.sm70_native import Sm70NativeConfig
+from vllm.config.sm70_runtime import Sm70RuntimeConfig
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
 
@@ -501,6 +502,9 @@ class Sm70SparseConfig:
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
+    sm70_runtime: Sm70RuntimeConfig = Field(default_factory=Sm70RuntimeConfig)
+    """Per-engine auxiliary warmup policy, outside compiled computation."""
+
     sm70_mxfp4: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
     """Native MXFP4 linear policy, captured only when its weights are prepared."""
     sm70_moe: Sm70MoEConfig = Field(default_factory=Sm70MoEConfig)
@@ -775,6 +779,7 @@ class KernelConfig:
         """
         ignored_factors = {
             "enable_flashinfer_autotune",
+            "sm70_runtime",  # Warmup does not alter compiled model computation.
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
             "collective_kernel_selections",
