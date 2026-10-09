@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 30
     env:
       GLOO_SOCKET_IFNAME: lo0
-      USE_LIBUV: "0"
+      VLLM_HOST_IP: "::1"
 
     steps:
       - uses: actions/checkout@v6.0.1
@@ -33,17 +33,10 @@ jobs:
           uv venv
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependencies and build vLLM
+      - name: Install dependencies
         run: |
           uv pip install -r requirements/build/cpu.txt --index-strategy unsafe-best-match
           uv pip install -r requirements/cpu.txt --index-strategy unsafe-best-match
-          uv pip install -e . --no-build-isolation
-        env:
-          CMAKE_BUILD_PARALLEL_LEVEL: 4
-
-      - name: Verify installation
-        run: |
-          python -c "import vllm; print(f'vLLM version: {vllm.__version__}')"
 
       - name: Verify single-process Gloo
         timeout-minutes: 2
@@ -55,7 +48,7 @@ jobs:
 
           timeout = timedelta(seconds=30)
           store = dist.TCPStore(
-              "127.0.0.1", 0, 1, True, timeout, use_libuv=False
+              "::1", 0, 1, True, timeout
           )
           dist.init_process_group(
               "gloo", store=store, rank=0, world_size=1, timeout=timeout
@@ -68,6 +61,15 @@ jobs:
           finally:
               dist.destroy_process_group()
           PY
+
+      - name: Build vLLM
+        run: uv pip install -e . --no-build-isolation
+        env:
+          CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+      - name: Verify installation
+        run: |
+          python -c "import vllm; print(f'vLLM version: {vllm.__version__}')"
 
       - name: Smoke test vllm serve
         run: |
