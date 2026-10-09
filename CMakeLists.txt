@@ -832,6 +832,18 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
   define_extension_target(
+    _sm70_gguf_persistent_C DESTINATION vllm LANGUAGE CUDA
+    SOURCES
+      "csrc/sm70_turbomind/ops/gguf_moe_persistent_sm70.cu"
+      "csrc/sm70_turbomind/ops/gguf_moe_tasks_sm70.cu"
+    INCLUDE_DIRECTORIES
+      "${VLLM_SM70_TURBOMIND_ROOT}/lmdeploy"
+      "${CUTLASS_INCLUDE_DIR}"
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES "70"
+    LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
+    WITH_SOABI)
+  define_extension_target(
     _sm70_sparse_attention_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "flash-attention-v100/kernel/h3/forward_sparse.cu"
     INCLUDE_DIRECTORIES
