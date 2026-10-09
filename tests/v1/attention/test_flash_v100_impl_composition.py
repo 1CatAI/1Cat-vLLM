@@ -166,6 +166,14 @@ def test_legacy_state_rebinding_reaches_moved_decode_method(monkeypatch):
     monkeypatch.setattr(legacy, "_logged_decode_dense_reference", False)
     query = torch.empty((0, 6, 256), dtype=torch.float16)
     metadata = SimpleNamespace(num_actual_tokens=0)
+    instance.kv_cache_dtype = "auto"
+    assert (
+        instance._flash_v100_decode_dense_cache(
+            None, query, query, query, query, metadata, query
+        )
+        is query
+    )
+    logger.warning.assert_not_called()
     for _ in range(2):
         assert (
             instance._flash_v100_decode_dense_reference(
@@ -199,6 +207,7 @@ def test_extracted_compare_super_uses_original_class_cell(monkeypatch):
     monkeypatch.setattr(TritonAttentionImpl, "forward", reference)
     # A module export patch must not change the old function's __class__ cell.
     monkeypatch.setattr(legacy, "FlashAttnV100Impl", object)
+    assert legacy.FlashAttnV100Backend.get_impl_cls() is object
     instance._maybe_compare_triton_output(
         layer, query, query, query, query, metadata, output, None, None, "decode"
     )

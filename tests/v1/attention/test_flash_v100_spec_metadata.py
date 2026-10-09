@@ -90,10 +90,34 @@ def test_old_smallq_module_is_the_owner_and_patch_reaches_grouped_function(monke
     from vllm.v1.attention.backends.flash_v100 import smallq_metadata as old
 
     assert old is smallq_metadata
-    sentinel = object()
-    monkeypatch.setattr(legacy, "DFlash2SmallQGroupDescriptor", sentinel)
-    assert smallq_metadata.DFlash2SmallQGroupDescriptor is sentinel
-    assert old.DFlash2SmallQGroupDescriptor is sentinel
+    original = smallq_metadata.DFlash2SmallQGroupDescriptor
+    calls = []
+
+    def descriptor(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(legacy, "DFlash2SmallQGroupDescriptor", descriptor)
+    monkeypatch.setattr(
+        smallq_metadata._sm70_prepare_grouped_smallq_decode_metadata_kernel,
+        "run",
+        lambda *a, **k: None,
+    )
+    table = torch.zeros((1, 2), dtype=torch.int32)
+    seq = torch.tensor([5], dtype=torch.int32)
+    qsl = torch.tensor([0, 2], dtype=torch.int32)
+    result = old._sm70_prepare_grouped_smallq_decode_metadata(
+        [table.repeat(2, 1)],
+        [seq.repeat(2)],
+        [qsl.clone()],
+        [table],
+        seq,
+        qsl,
+        num_reqs=1,
+        num_query_tokens=2,
+        real_num_query_tokens=2,
+    )
+    assert len(calls) == 1 and isinstance(result, original)
 
 
 def test_tree_capture_restores_authoritative_metadata(monkeypatch):

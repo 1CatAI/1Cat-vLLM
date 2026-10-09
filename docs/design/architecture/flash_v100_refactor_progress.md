@@ -10,8 +10,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | Step | PR | Status | Metrics | GPU validation | Open items |
 | --- | --- | --- | --- | --- | --- |
 | 0: scope and codec ownership | — | Decision communicated; #1028 rebased locally | Baseline measured | Runtime parity belongs to 1c | Retest each subsequent step |
-| 1a: immutable CPU trace and owner guard | — | In progress | Production unchanged | CPU-only safety-net portion | Coverage, patch efficacy, exact parent result map |
-| 1b: patch efficacy + dependency ratchet | — | Split out after repeated patch-gate failures | Production unchanged | Same parent/candidate result gate | Must finish before Step 2 |
+| 1a: immutable CPU trace and owner guard | #1071 | Draft; local gates pass, GPU queued | Production unchanged | CPU-only safety-net portion | Coverage, patch efficacy, exact parent result map |
+| 1b: patch efficacy + dependency ratchet | — | Implemented; validating full patch audit | Production unchanged | Same parent/candidate result gate | Must finish before Step 2 |
 | 1c: route/token/output parity tools | — | Not started | — | Required fixtures pending | #1060 baseline, Flash-Next host-FP8 integration |
 | 2: frozen config + explicit dynamic reads | — | Not started | — | CPU trace allowed | Step 1 gates |
 | 3: owned workspaces | — | Not started | — | Required | Step 2 gates |
@@ -120,3 +120,19 @@ passes and the documented shared-ABI failure; it is not accepted as a full
 run. The replacement uses the same task-owned offline model-config cache
 for parent, trace and audit trees, with all original 54 files plus required
 compatibility/composition suites and shared-ABI tests (60 files total).
+
+Step 1b adds the actual import-edge/cycle ratchet and a per-name shim-use
+report. Function replacement requires a production call, including callable
+objects; reading its identity cannot satisfy the gate. State/export patches
+require production reads. The audit retains exact patched test IDs and
+call/read locations. No production import edges or environment reads change.
+
+The final strict CPU run returned 219 passed / 1 skipped / 28 deselected,
+with 40 patched names consumed (16 by calls, 24 by state/export reads).
+The deselected metadata-builder cases require the GPU run; they are not
+claimed as passing CPU tests. Same-code closures are attributed using the
+caller's observed lookup, so one alias cannot satisfy another name's gate.
+Current package ceilings are 14 cycles and 32 forbidden import edges.
+The generated fixture includes all 119 env reads and their current owners;
+39 reads in the implementation constructor and two in the metadata builder
+are captured; the other 78 reads are classified as dynamic by current location.

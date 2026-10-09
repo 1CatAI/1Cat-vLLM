@@ -1000,6 +1000,8 @@ def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch, v37):
     monkeypatch.setattr(flash_v100, "_sm70_d256_gqa_architecture_op", None)
 
     assert flash_v100._get_sm70_d256_gqa_architecture_op() is architecture
+    monkeypatch.setattr(flash_v100, "_sm70_d256_gqa_architecture_op", architecture)
+    assert flash_v100._get_sm70_d256_gqa_architecture_op() is architecture
 
 
 @pytest.mark.parametrize("bits", [None, 16, 32])
@@ -1022,6 +1024,8 @@ def test_sm70_architecture_rejects_stale_accumulation(monkeypatch, bits, q8192):
     monkeypatch.setattr(flash_v100, name, None)
     monkeypatch.setattr(flash_v100, name + "_checked", False)
     loader = getattr(flash_v100, "_get" + name)
+    assert loader() is (architecture if bits == 32 else None)
+    monkeypatch.setattr(flash_v100, name, architecture if bits == 32 else None)
     assert loader() is (architecture if bits == 32 else None)
 
 
