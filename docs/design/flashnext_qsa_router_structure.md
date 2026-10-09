@@ -177,7 +177,7 @@ The M5 native scorer takes 0.1154 ms against its paired 0.2325 ms control.
 These are scoring-only measurements. The bounded-index change saves only
 0.0090/0.0236 ms at model geometry and is not pursued as a structural gain.
 
-### Full-model comparison
+### Initial separate-process model comparison
 
 The same installed wheel was tested with only `sm70_qsa_shared_key` changed.
 The workload was Flash-Next IQ3_S, FP16 MTP4, TP4 on four full-NVLink
@@ -225,8 +225,8 @@ forcing at 64 matched conditions gave mean KL 8.6279e-4, maximum KL 0.0069709,
 and 63/64 matching top-1 results. Repeating those conditions within the
 candidate process was bit-exact.
 
-The distribution difference is unresolved. All teacher contexts contain
-fewer than 512 compressed keys, where the selector returns every causal
+At this stage the distribution difference was unresolved. All teacher contexts
+contain fewer than 512 compressed keys, where the selector returns every causal
 key without consulting scores. All four ranks' captured computation graphs
 and compiled-subgraph keys also match after removing cache-directory names.
 Thus attributing these differences to the scorer's FP32 summation order is
@@ -378,21 +378,26 @@ remain exact for scorer-only; direct attention changes the continuation,
 with 2.3248/2.3263 emitted tokens per request per round. C1 controls drift
 0.6087, 0.7236 and 0.8381 ms between ABBA endpoints. Thus the combined
 1.0353 ms mean difference is provisional, not an admitted model saving.
-The next diagnostic alternates graphs inside a single request in symmetric
+The diagnostic below alternates graphs inside a single request in symmetric
 eight-round blocks and records target/draft GPU envelopes to localize drift.
 This measured diagnostic remains separate from ordinary acceptance timing.
 
 ## Validation and admission
 
-The packaged scorer must pass causal masks, invalid pages, ties, sliced
+The packaged scorer passes causal masks, invalid pages, ties, sliced
 dimensions, both position integer types, changing inputs during graph
-replay, and the M20 fallback. The benchmark compares both scoring alone
-and the score/selection/expansion chain. The final gate compares the same
-wheel with only `sm70_qsa_shared_key` changed: C1/C4 ms per round, tokens
-per round, target teacher-forcing agreement, natural outputs, and acceptance.
-The same-process comparison resolves the scorer's numerical attribution, but
-timing drift and the direct-attention distribution differences still need
-qualification. No model gain or runtime default is admitted.
+replay, and the M20 fallback. The same-loaded-model comparison resolves
+the earlier scorer numerical attribution: teacher logits, natural outputs
+and acceptance counters are identical to control. The direct-history
+reader has a different FP32 probability contract, measured separately.
+
+Admission uses the KernelConfig capability and loaded shape checks. Both
+capabilities are enabled by default for admitted shapes. Host history retains
+its protected reader, and native device-history attention excludes draft
+owners. The model ablation uses ordinary installed production dispatch and
+compares C1/C4 ms per round, emitted tokens, teacher distributions, natural
+completion and paired acceptance. Timing drift is retained in the result;
+isolated service or GPU-event savings are not substituted for round latency.
 
 ## External references
 
@@ -436,3 +441,87 @@ excluded from the new path. The production benchmark changes only capability
 state before capturing each target graph; it does not replace attention
 functions or load private extensions. It also checks three short natural
 completions in addition to the eight-prompt acceptance and teacher forcing.
+
+## Installed production-dispatch validation
+
+The final comparison uses runtime source `eca6e737038e6136b08a787ecd67ab0a2f97ecdb`
+and benchmark revision `eb552a12a849934196860c8252550191ab007182`. The normally
+installed wheel is `1.5.2.dev1434+geca6e7370.cu128`, with SHA256
+`dd24b1c100b484653149081cb26725077ebd4d3b7292b987daefeb0424156861`.
+The integrated GPU suite passes 137 cases, including all 16 scorer and 22
+direct-history cases, host-history checks and four-rank HCX graph replay.
+The benchmark also verifies that draft-owner policy survives target-worker
+cache binding and cannot admit the native target reader for the draft.
+
+The same loaded model reproduces all 64 teacher logits, eight natural
+outputs and eight acceptance counters exactly after control recapture and
+after restoring the original graphs. With both optimizations enabled,
+teacher mean/max KL is 0.000451698/0.004927856 and top-1 agrees at 62/64
+positions. Natural continuations differ, consistent with the native reader's
+FP32 probability contract. The three short completion checks stop normally
+and produce coherent Chinese/English answers in every arm.
+
+The two teacher top-1 disagreements exchange the leading two choices: the
+control logits are tied in one case and differ by 0.03125 in the other.
+The largest absolute-logit-error case retains its top-1, whose probability
+changes from 0.998777 to 0.997708. These observations characterize the measured
+error; they do not make the changed continuations bit-exact.
+
+Mean draft acceptance is 44.7423% for control and 46.1643% with both changes.
+The paired difference is +1.4219 percentage points, with 95% prompt-bootstrap
+interval [-0.7449, +3.5926]. No clear decrease is observed; this interval does
+not establish equivalence or a positive acceptance change.
+
+Each timing entry is one uninstrumented, same-loaded-model ABBA with two
+control and two candidate cohorts. Both arms are warmed first. The workload
+remains I8192/O256 for C1 and I128/O600 for C4, with device E4M3 history,
+FP16 MTP4, TP4, full graphs and disk PLE.
+
+| Target capability | C1 control/candidate ms | C4 control/candidate ms |
+| --- | ---: | ---: |
+| Shared-key scorer | 19.8219 / 19.4180 | 39.0585 / 39.2229 |
+| Native device-history reader | 19.7791 / 19.0889 | 39.4380 / 38.9911 |
+| Both | 19.8134 / 18.7204 | 41.1333 / 39.2898 |
+
+C1 savings are 0.4039, 0.6902 and 1.0930 ms respectively; control endpoint
+drifts are -0.0154, +0.0967 and -0.0470 ms. All C1 outputs agree, at 4.885714
+tokens/round. Scorer-only C4 outputs and 2.334764 tokens/request/round also
+agree; M20 uses the same fallback. Its measured 0.1644-ms increase is retained
+as an observed difference, not relabeled as an optimization. Native and
+combined C4 continuations differ, at 2.326271 tokens/request/round.
+
+C4 control endpoint drifts are -0.0163, +0.8998 and +4.2775 ms. In particular,
+the combined comparison's late slowdown makes its 1.8435-ms apparent mean
+saving inconclusive. This motivates a C4-only repeat with symmetric ABBA and
+BAAB orders; completed quality and C1 checks are not rerun. Historical
+17.401789-ms resident-FP16 performance remains a separate baseline.
+
+### Repeated C4 comparison
+
+The same installed wheel is retested with benchmark revision
+`905f27355f3801be65994415fabee6ac0b9bd9b9` and `--repeat-c4-only`. One newly
+loaded model captures control and combined target graphs, retains the draft
+graphs, warms both arms, then runs twelve I128/O600 cohorts in three symmetric
+groups. There are no GPU-event observers or additional quality measurements.
+The scorer uses its unchanged M20 fallback in both arms.
+
+| Order | Control ms/round | Combined ms/round | Saved ms/round |
+| --- | ---: | ---: | ---: |
+| ABBA | 38.7835 | 38.5543 | 0.2292 |
+| BAAB | 38.9067 | 37.9435 | 0.9632 |
+| ABBA | 38.8167 | 38.5644 | 0.2523 |
+| Mean of six cohorts per arm | 38.8356 | 38.3541 | 0.4815 |
+
+All three groups improve. Mean per-stream throughput is 60.1208 to 60.6562
+tokens/s, including the measured 2.334764 to 2.326271 tokens/request/round
+difference. Outputs are identical across all six repetitions within each arm;
+the two arms retain their different continuations. Outer endpoint drift is
+0.5014, -0.1967 and 0.4391 ms respectively. Thus the repeat supports a modest
+C4 benefit, not the earlier drift-inflated 1.8435-ms estimate.
+
+Five-second GPU samples during the twelve measured cohorts report 1530-MHz
+SM and 877-MHz memory clocks on all four cards; the highest sampled GPU
+temperature is 47 C. Concurrent host samples show no swap-in or swap-out.
+Sampling does not exclude shorter system disturbances. The final production
+comparison retains the qualified C1 reduction of 1.0930 ms and this separate
+C4 repeat; neither is substituted into the historical 17.401789-ms baseline.
