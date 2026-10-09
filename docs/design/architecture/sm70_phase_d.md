@@ -59,7 +59,7 @@ part of the contract.
 | Delivery | State | Evidence / remaining work |
 | --- | --- | --- |
 | D1 registry and ledger | Merged [#1141](https://github.com/1CatAI/1Cat-vLLM/pull/1141); CI passed | Static inventory, structured deprecation metadata, shared registration scanner and explicit-input warn-once support. This establishes visibility; it does not claim execution consumers migrated. |
-| D2 GDN and speculation | CPU validated; GPU queued | Captured projection, proposal/rejection and lookup policies; operator A/B awaits a free owned GPU. |
+| D2 GDN and speculation | Validated [#1143](https://github.com/1CatAI/1Cat-vLLM/pull/1143) | CPU isolation/compatibility, 17 GPU operator cases and matched A/B passed; merge after final self-review. |
 | D3 diagnostics | Pending | Consolidate filters/budgets/dumps and remove engine state from global dictionaries. |
 | D4 attention | Pending | Connect backend, standalone package and versioned native policy; isolate workspaces. |
 | D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
@@ -148,16 +148,39 @@ non-MTP paths. Dynamic target-candidate capture remains represented even for
 non-MTP callers. Initialized engines pass their policy explicitly; only the
 retained independent helper entry points capture legacy inputs themselves.
 
-Validation so far:
+Validation:
 
 - 128 focused configuration, model-adapter and proposer regressions passed.
 - 16 focused policy cases subsequently passed, including five added checks for
   override short-circuiting, missing operators and poisoned getters during
   compile-cache factor generation.
-- Changed-file pre-commit checks passed before the final short-circuit test
-  addition; final hooks and GPU evidence are recorded before merge.
-- GPU operator/capture and matched source-lane A/B scripts are queued on 54633.
-  Other owners occupy the V100s; no model is loaded by this task.
+- All applicable changed-file pre-commit hooks and PR CI passed.
+- 17 GPU operator cases passed on 54633 GPU 2: norm schema/fake/AOT dispatch,
+  changed-input capture/replay, projection-tail layouts and rejection paths.
+- Three alternating source-lane A/B rounds produced identical output hashes
+  for every compared case; temporary allocation peaks were unchanged. The
+  post-freeze source delta only added initialization short-circuit handling
+  and its CPU checks; numerical providers and execution consumers were frozen.
+
+Norm results below are medians across three rounds. GPU time measures graph
+replay per norm; host time measures eager Python enqueue, not end-to-end model
+latency. The 24-row case rejects the 12-row one-pass shape and retains fallback.
+
+| Shape / request | GPU before → after (µs) | Host before → after (µs) | Extra allocation, both |
+| --- | --- | --- | --- |
+| 12x128, ordinary | 1.5744 → 1.5675 | 153.45 → 143.65 | 3584 B |
+| 12x128, one-pass | 1.3859 → 1.3846 | 72.18 → 64.58 | 3072 B |
+| 24x128, ordinary | 1.5771 → 1.5827 | 151.87 → 143.99 | 6656 B |
+| 24x128, one-pass requested | 1.5962 → 1.6003 | 161.98 → 152.42 | 6656 B |
+
+GPU differences (-0.44% to +0.36%) are within the observed small measurement
+variation. CPU proposal host time was 180.57 → 172.90 µs with identical seeded
+outputs. These are operator/configuration measurements only. Torch 2.10.0+cu128,
+CUDA 12.8, V100-SXM2-32GB, driver 580.173.02, TP1; no model loading. The same
+normal compiled libraries served both complete Python source lanes; no native
+source changed, no new private DSO or preload was introduced.
+[Raw rounds and artifact contract](../../../benchmarks/results/phase_d2_policy_operators.json)
+include extension identity and source-freeze details.
 
 Diagnostics remain D3 scope. Provider warmup controls and the paused
 `EMPTY_CORE_OUT` warning remain D5/D6 scope; the latter does not change current
