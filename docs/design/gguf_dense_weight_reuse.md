@@ -97,6 +97,27 @@ relative L2 error against official FP32 GGUF dequantization is 0.0008975;
 candidate outputs are bit-identical to the installed control. Only the M20
 weight-major schedule is incorporated into native dispatch.
 
+The normally compiled full native extension is also compared against the
+matched reference algorithm in one process. Across all real layers and two
+activation inputs, 384 output-bit comparisons pass. M20 improves
+**2.9573 to 2.3808 ms (19.5%)**; M5 measures 1.3268/1.3288 ms, with both
+arms using the original M5 schedule. The reference extension is a benchmark
+oracle, not a runtime dependency of the candidate.
+
+| Native M20 role | Reference us/layer | Candidate us/layer |
+| --- | ---: | ---: |
+| GDN input | 41.73 | 36.47 |
+| GDN output | 22.01 | 14.90 |
+| Attention input | 34.68 | 30.18 |
+| Attention output | 20.52 | 14.11 |
+
+The complete source runtime uses the native core with SHA256
+`150dc80e5dc49b4dbd68e79ab672d3f5bea941ab99845998cc2e2cf28df960e8`.
+The shared-expert translation unit is rebuilt with the normal CMake flags
+and linked into the full core. Other source/native components retain the
+frozen `86e9675964` control; the measured dense translation unit is unchanged
+between that control and the PR base before this patch. No wheel is rebuilt.
+
 The additional GPU suite covers all six dense source types, real admitted
 dimensions, mixed segments, strided output, shared-gate rounding, poisoned
 output/scratch, and changed-input CUDA graph replay. The reproducible native
