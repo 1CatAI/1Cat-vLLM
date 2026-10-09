@@ -200,13 +200,20 @@ class Recorder:
             self.events.append(
                 ["route", frame.f_locals.get("name", frame.f_locals.get("route"))]
             )
-        if event == "call" and name == "_reset_decode_cache":
+        if event == "call" and (
+            name == "_reset_decode_cache"
+            or (
+                name == "invalidate"
+                and frame.f_globals["__name__"] == PACKAGE + ".workspace"
+            )
+        ):
             caller = frame.f_back
             source, start = inspect.getsourcelines(caller.f_code)
             sites = [
                 start + i
                 for i, text in enumerate(source)
                 if "self._reset_decode_cache()" in text
+                or "self.workspace.decode_cache.invalidate()" in text
             ]
             self.events.append(
                 ["reset", caller.f_code.co_name, sites.index(caller.f_lineno)]

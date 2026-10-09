@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.flash_v100 import (  # noqa: F401
     routing,
     state,
     verify,
+    workspace,
 )
 from vllm.v1.attention.backends.flash_v100.spec import attention as spec_attention
 from vllm.v1.attention.backends.flash_v100.spec import (
@@ -96,6 +97,7 @@ SUBMODULES = (
     decode,
     prefill,
     verify,
+    workspace,
     debug_compare,
     spec_builder,
     spec_draft,

@@ -12,10 +12,11 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 0: scope and codec ownership | — | Decision communicated; #1028 rebased locally | Baseline measured | Runtime parity belongs to 1c | Retest each subsequent step |
 | 1a: immutable CPU trace and owner guard | #1071 | Gates passed; ready | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
 | 1b: patch efficacy + dependency ratchet | #1072 | Gates passed; ready | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
-| 1c: route/token/output parity tools | #1073 | Draft; model records pending | Production unchanged | 12 native cases exact; host baseline unit tests 135 passed | Greedy model records and full outcome map |
+| 1c: route/token/output parity tools | #1073 | Draft; host/spec model records pending | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Host/spec model gates |
 | 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | Pending complete outcome map | Prerequisite model and outcome gates |
-| 2b: frozen construction policy | — | Focused CPU and pre-commit passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | Pending complete outcome map | Commit/rebase and prerequisite gates |
-| 3: owned workspaces | — | Not started | — | Required | Step 2 gates |
+| 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | Pending complete outcome map | Prerequisite gates |
+| 3a: per-layer decode cache | — | CPU/golden and pre-commit passed | Private references 390 → 387 | Pending | CPU/rebase and GPU prerequisites |
+| 3b: step plan and persistent metadata buffers | — | Prototype retained; rebuild on 3a next | Expected private references 387 → 380 | Required | Separate scope after retry split |
 | 4: decode executor and ordered candidates | — | Not started | — | Required | Step 3 gates |
 | 5a: per-sequence prefill candidates | — | Not started | — | Required | Step 4 gates |
 | 5b: batch prefill candidates | — | Not started | — | Required | Step 5a gates |
@@ -243,3 +244,44 @@ For #1075, pinned #1028 was rebased to validation head
 `9ea84629e4c0af8fbd757d62714705ff4713f677` exactly matches the clean merge.
 Its CPU suites return 37 passed / 98 skipped. This check will be repeated for
 2b before readiness. All pending GPU gates remain pending; no merge is claimed.
+
+## Step 3 retry split
+
+The combined workspace prototype is preserved, unpublished, at
+`1becac8d7` in `v100-a3-workspace-20261008-162629`. Its final CPU check passes
+238 tests / 1 skip / 28 GPU deselections, including all 813 immutable traces.
+During implementation it encountered a missing moved import, a moved constant
+reference, and new import cycles from workspace back through KV layout; hooks
+also corrected formatting. Under the requested retry rule, work returned to
+exact parent #1076 and was split into smaller rollback scopes. No trace,
+calculation hash, dependency ceiling or GPU requirement was relaxed.
+
+Step 3a owns only the per-layer decode cache. `DecodeCache` holds its tensors,
+length and capacity and receives the extraction callable explicitly, so
+workspace imports neither Impl nor KV layout/metadata. All three original
+prefill invalidation sites remain in place. Cache arithmetic is compared to the
+original method hashes after normalizing explicit receiver/field names; the
+trace observer recognizes the actual invalidate frame and source-site ordinal.
+The capacity test checks reuse, geometric growth, prefix preservation,
+invalidation and instance isolation. Private references drop 390 to 387;
+forward/maximum length, 14 cycles, env and model ceilings remain unchanged.
+The mechanical extraction (`69d6b8595`) and ownership changes are separate.
+
+Step 3b will move the per-step mixed-row plan and builder-persistent metadata
+buffers onto 3a, retaining the tested prototype's lifetime and copy semantics.
+It will have a separate outcome map and GPU gate. Neither scope is complete
+based on CPU evidence alone.
+
+Step 1c's four small Qwen contracts (FP16/E4M3 × eager/graph) compare exactly,
+including all three prompts and chunked prefill. The complete regression map
+has 1684 passes and the same seven inherited failures, zero changed old outcomes,
+and all 16 new tool cases passing. Host-FP8 and DFlash2/DDTree real-model
+records remain pending. Raw evidence is under `a3-step1c/{artifacts,logs}` on
+54633. Failed IPC attempts are retained; short TMPDIR/RPC paths now pass the
+shared-memory IPC preflight.
+
+The rebuilt 3a scope passes 237 focused tests / 1 skip / 28 GPU deselections,
+including all 813 immutable traces, strict shim use and parity-tool controls.
+Pre-commit including mypy/layering passes. Evidence:
+`a3-decode-cache-{strict,precommit}.log` and `a3-decode-cache-shim.json` in the
+local task artifact directory. GPU and #1028 checks remain separate gates.

@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from vllm.v1.attention.backends import flash_attn_v100 as legacy
-from vllm.v1.attention.backends.flash_v100 import impl, state
+from vllm.v1.attention.backends.flash_v100 import impl, state, workspace
 from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
 
 pytestmark = pytest.mark.cpu_test
@@ -76,7 +76,22 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         return node
 
 
+_CACHE_METHODS = {
+    "invalidate": "_reset_decode_cache",
+    "ensure_capacity": "_ensure_decode_cache_capacity",
+    "get_kv_single_seq": "_get_decode_kv_single_seq",
+}
+_CACHE_FIELDS = {
+    "key": "_decode_cache_k",
+    "value": "_decode_cache_v",
+    "length": "_decode_cache_len",
+    "capacity": "_decode_cache_capacity",
+}
+
+
 class _Normalize(ast.NodeTransformer):
+    in_cache = False
+
     def visit_ImportFrom(self, node):
         if node.module == "vllm.v1.attention.ops.sm70_grouped_scalar":
             node.module = "vllm.v1.attention.ops.sm70_e4m3_scalar"
@@ -86,6 +101,12 @@ class _Normalize(ast.NodeTransformer):
         return None
 
     def visit_FunctionDef(self, node):
+        self.in_cache = node.name in _CACHE_METHODS
+        if node.name == "get_kv_single_seq":
+            assert [a.arg for a in node.args.kwonlyargs] == ["extract"]
+            node.args.kwonlyargs = []
+            node.args.kw_defaults = []
+        node.name = _CACHE_METHODS.get(node.name, node.name)
         node = self.generic_visit(node)
         if node.args.args and node.args.args[0].arg == "self":
             node.args.args[0].annotation = None
@@ -101,12 +122,28 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Attribute(self, node):
         node = self.generic_visit(node)
+        if self.in_cache and ast.unparse(node.value) == "self":
+            node.attr = {**_CACHE_FIELDS, **_CACHE_METHODS}.get(node.attr, node.attr)
+        if ast.unparse(node.value) == "self.workspace.decode_cache":
+            node.value = ast.Name(id="self", ctx=ast.Load())
+            node.attr = _CACHE_METHODS.get(node.attr, node.attr)
         if isinstance(node.value, ast.Name) and node.value.id == "_state":
             return ast.Name(id=node.attr, ctx=node.ctx)
         return node
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
+        if self.in_cache and ast.unparse(node.func) == "extract":
+            node.func = ast.parse(
+                "_kv_layout._extract_contiguous_kv_from_paged_cache", mode="eval"
+            ).body
+        if ast.unparse(node.func) == "self._get_decode_kv_single_seq":
+            assert len(node.keywords) == 1 and node.keywords[0].arg == "extract"
+            assert (
+                ast.unparse(node.keywords[0].value)
+                == "_kv_layout._extract_contiguous_kv_from_paged_cache"
+            )
+            node.keywords = []
         if ast.unparse(node.func) == "_config.registered":
             assert len(node.args) == 1 and isinstance(node.args[0], ast.Constant)
             assert isinstance(node.args[0].value, str)
@@ -134,14 +171,18 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
         for node in ast.parse(path.read_text()).body:
             candidates = (
                 node.body
-                if isinstance(node, ast.ClassDef) and node.name == "FlashAttnV100Impl"
+                if isinstance(node, ast.ClassDef)
+                and node.name in ("FlashAttnV100Impl", "DecodeCache")
                 else [node]
             )
             for fn in candidates:
-                if not isinstance(fn, ast.FunctionDef) or fn.name not in fixture:
+                if not isinstance(fn, ast.FunctionDef):
                     continue
-                assert fn.name not in actual
-                actual[fn.name] = hashlib.sha256(
+                name = _CACHE_METHODS.get(fn.name, fn.name)
+                if name not in fixture:
+                    continue
+                assert name not in actual
+                actual[name] = hashlib.sha256(
                     ast.dump(
                         _Normalize().visit(_InlineFeatureHooks().visit(fn))
                     ).encode()
@@ -158,18 +199,19 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
         k: v["sha256"] for k, v in fixture.items() if k not in changed_policy
     }
     for name, descriptor in fixture.items():
-        member = inspect.getattr_static(impl.FlashAttnV100Impl, name)
+        cache_name = {v: k for k, v in _CACHE_METHODS.items()}.get(name)
+        owner = workspace.DecodeCache if cache_name else impl.FlashAttnV100Impl
+        member = inspect.getattr_static(owner, cache_name or name)
         assert isinstance(member, staticmethod) == descriptor["static"]
 
 
 def test_legacy_state_rebinding_reaches_moved_decode_method(monkeypatch):
     instance = object.__new__(impl.FlashAttnV100Impl)
-    instance._decode_cache_k = torch.ones(1)
-    instance._decode_cache_v = torch.ones(1)
-    instance._decode_cache_len = 3
-    instance._decode_cache_capacity = 8
-    instance._reset_decode_cache()
-    assert instance._decode_cache_len == 0
+    instance.workspace = workspace.V100Workspace(
+        workspace.DecodeCache(torch.ones(1), torch.ones(1), 3, 8)
+    )
+    instance.workspace.decode_cache.invalidate()
+    assert instance.workspace.decode_cache.length == 0
     monkeypatch.setattr(legacy, "_logged_decode_dense_cache", True)
     assert state._logged_decode_dense_cache
     assert "_logged_decode_dense_cache" not in vars(impl)

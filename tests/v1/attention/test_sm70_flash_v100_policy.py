@@ -1484,7 +1484,6 @@ def test_flash_v100_prefill_live_token_mismatch_uses_prefix_path(monkeypatch):
     impl._flash_v100_prefill = fail_dense  # type: ignore[method-assign]
     impl._flash_v100_prefill_with_prefix = hit_prefix  # type: ignore[method-assign]
     impl._maybe_compare_triton_output = lambda *args, **kwargs: None  # type: ignore[method-assign]
-    impl._reset_decode_cache = lambda: None  # type: ignore[method-assign]
 
     query = torch.zeros((1, 4, 256), dtype=torch.float16)
     key = torch.zeros((1, 1, 256), dtype=torch.float16)
