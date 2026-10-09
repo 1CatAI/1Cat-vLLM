@@ -50,7 +50,7 @@ diagnostics and warmup-only selection do not.
 
 | Batch | Implementation boundary | Status |
 |---|---|---|
-| C1a | C0 ledger; three profilers share collection/aggregation; ordered warmup; typed runtime and diagnostic configuration | Implemented; validation in progress |
+| C1a | C0 ledger; three profilers share collection/aggregation; ordered warmup; typed runtime and diagnostic configuration | Validated in #1130; merge checks in progress |
 | C1b | Staged input resources and ordinary speculative sampling boundary | Pending |
 | C2a | GDN compute plan, providers and shared stages | Pending |
 | C2b | GDN metadata and state preparation/commit | Pending |
@@ -90,3 +90,51 @@ and resource owners as well as coupling counts. New config type references are
 reported honestly; no layering whitelist is expanded. C is not complete until
 all seven deliveries have merged with evidence. Whole-repository D/E and DDTree
 remain subsequent work.
+
+### C1a validation record
+
+Against the frozen B source: the 54633 GPU suite passed **205 tests**; the final
+collector follow-up passed **10 tests**. Local CPU coverage passed **36 tests**
+with one CUDA-only skip. The baseline's two failures were stale `__new__` fixtures
+missing device/speculator initialization; the same repaired fixture file passed
+all three tests against unchanged baseline source. No correctness tolerance or
+production gate was relaxed to obtain these results.
+
+Both sides used Python 3.12, Torch 2.10.0+cu128, CUDA 12.8 and a
+V100-SXM2-32GB (driver 580.173.02), with device 0 visible. Native code was unchanged;
+the installed Phase B `_C` and `_moe_C` artifacts had SHA256
+`70cfdcc88eb7b8f2c86db0b78b93c59852f55c7911a8c8371d89bdcb0c624881` and
+`4c671824b05e69741be29c39d70c0285062facc4ed9b90d0efba2536a23c7fe3`.
+No model weights were loaded. Replay coverage used changed synthetic inputs;
+Mamba tests also checked that warmup preserves live state.
+
+Cumulative/interval log text and totals matched the actual baseline reporting
+functions for all three layouts (six calls each, including repeated stage names
+and alternating speculative steps). Nine runs of 20,000 disabled five-stage
+synthetic CPU steps measured these medians:
+
+| Consumer | Baseline µs | Shared collector µs |
+|---|---:|---:|
+| V1 runner | 1.001 | 0.886 |
+| V2 runner | 0.960 | 0.888 |
+| Proposer | 1.101 | 0.888 |
+
+These are profiling-glue costs, not GPU or model throughput. A first V2 wrapper
+added 0.75 µs; it was replaced by direct aliases to the common collector before
+promotion. GPU-enabled tests also exposed cached legacy getter values leaking
+between newly constructed configs; initialization now calls the existing raw
+registry parser, while already constructed configurations stay frozen. Unified
+debug/legacy conflicts and serialization are covered explicitly.
+
+Independent profiling state machines: **3 → 1**. Auxiliary task executors:
+**2 → 1**, retaining their separate ordered task lists. Source-inventory parameter
+read sites: **381 → 370**. Initialized alias declarations preserve visibility of
+migrated controls; the unified debug alias is now visible too. Repository-wide
+coupling: platform **3880 → 3756**, model **2325 → 2322**, raw environment **271 →
+271**. This includes the new typed-config reference and report-layout owner;
+the layering ownership whitelist is unchanged.
+
+Validation commands use the affected runner/MTP safety, GDN metadata, Mamba state
+and new `test_step_profiler.py` suites under `tests/v1/`, followed by the normal
+pre-commit checks (including mypy and layering). The C0 ledger and per-batch
+status remain the handoff for C1b–C4b; none of those batches are claimed complete.
