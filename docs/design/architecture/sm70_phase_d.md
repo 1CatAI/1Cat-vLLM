@@ -179,7 +179,7 @@ outputs. These are operator/configuration measurements only. Torch 2.10.0+cu128,
 CUDA 12.8, V100-SXM2-32GB, driver 580.173.02, TP1; no model loading. The same
 normal compiled libraries served both complete Python source lanes; no native
 source changed, no new private DSO or preload was introduced.
-[Raw rounds and artifact contract](../../../benchmarks/results/phase_d2_policy_operators.json)
+[Raw rounds and artifact contract](phase_d2_operators.json)
 include extension identity and source-freeze details.
 
 Diagnostics remain D3 scope. Provider warmup controls and the paused
