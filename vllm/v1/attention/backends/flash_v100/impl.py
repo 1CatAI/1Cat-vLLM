@@ -37,10 +37,8 @@ from vllm.v1.attention.kv_codecs import (
     KVCodec,
     resolve_kv_codec,
 )
-from vllm.v1.attention.ops.sm70_e4m3_grouped import (
+from vllm.v1.attention.ops.sm70_grouped import (
     load_grouped_e4m3_fp32,
-)
-from vllm.v1.attention.ops.sm70_fp16_grouped import (
     load_grouped_fp16_fp32,
 )
 

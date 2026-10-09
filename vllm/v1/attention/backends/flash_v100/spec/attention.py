@@ -35,7 +35,7 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 def initialize_scalar_tail(self: _impl.FlashAttnV100Impl, use_e4m3_fp32: bool) -> None:
     self._sm70_scalar_tail_attention = None
-    from vllm.v1.attention.ops.sm70_e4m3_scalar import (
+    from vllm.v1.attention.ops.sm70_grouped_scalar import (
         load_scalar_tail_attention,
         scalar_tail_attention_available,
     )

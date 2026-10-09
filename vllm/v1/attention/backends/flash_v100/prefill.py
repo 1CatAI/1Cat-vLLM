@@ -29,7 +29,7 @@ from vllm.v1.attention.kv_codecs import (
     FP8_E5M2,
     FP16,
 )
-from vllm.v1.attention.ops.sm70_e4m3_grouped import (
+from vllm.v1.attention.ops.sm70_grouped import (
     MAX_GROUPS_PER_CALL,
     grouped_e4m3_fp32_groups_allowed,
 )

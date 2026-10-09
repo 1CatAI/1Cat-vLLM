@@ -15,7 +15,7 @@ from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.ops.sm70_fp16_grouped import (
+from vllm.v1.attention.ops.sm70_grouped import (
     clear_grouped_fp16_workspaces,
 )
 
