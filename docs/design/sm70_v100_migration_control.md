@@ -54,6 +54,20 @@ research DSO, supports Q4_K/Q6_K with already normalized input, and is not
 part of the installed result or a model speedup. Do not omit producer work
 from the comparison or budget the previous assumed 3.8 µs per fusion.
 
+The 2026-10-10 follow-up targets half the **current** approximately 19-µs
+boundary, or at most approximately 9.5 µs. Five new research screens do not
+reach it. A 94-boundary synthetic recurrent chain, including full block
+delivery every step and full residual delivery at exit, measures 19.350 µs
+per boundary for V6 versus 19.028 for residual carry. Carry saves only
+0.739 µs against the same K-shard arithmetic with materialization every call.
+Its largest changed-chain relative L2 error is 0.001397; this is not a model
+quality gate. Overlapped central norm reduction, earlier mix-input loads,
+per-producer first-join readiness, compact all-row-refresh LoRA packets and
+receiver-only second-join arrivals all regress against their paired V6
+controls. Their raw-bit checks pass. Keep these failures recorded in
+[the local schedule report](flashnext_hcx_local_schedule.md) before reusing
+their layouts. No candidate is promoted and full-model work remains deferred.
+
 The historical approximately 3-ms HC number is 2.9623 ms of profiled target
 HCX service on the earlier two-hop machine, alongside a separate unprofiled
 17.3988-ms model round. It is not the current full-mesh microbenchmark sum.

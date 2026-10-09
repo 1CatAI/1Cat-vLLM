@@ -816,7 +816,9 @@ void sm70_hcx_out(
                    (const void*)hcx::hcx_kernel<true, dmvns::Q6K>,
                    (const void*)hcx::hcx_kernel<false, dmvns::Q6K>,
                    (const void*)hcx::hcx_kernel<true, dmvns::Q8>,
-                   (const void*)hcx::hcx_kernel<false, dmvns::Q8>})
+                   (const void*)hcx::hcx_kernel<false, dmvns::Q8>,
+                   (const void*)hcx::hcx_kernel<true, dmvns::Q4K, true>,
+                   (const void*)hcx::hcx_kernel<true, dmvns::Q6K, true>})
       C10_CUDA_CHECK(cudaFuncSetAttribute(
           f, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
     attr_dev[cur_dev] = true;
@@ -835,6 +837,17 @@ void sm70_hcx_out(
     } else {
       HCXO_F(-1)
     }
+  } else if (full && local_schedule && !gz &&
+             (ofmt == dmvns::Q4K || ofmt == dmvns::Q6K)) {
+    // The producer uses the same eight-warp reduction as the reference path.
+    // Gated normalization has a separate legacy barrier and is not covered by
+    // the two-phase local counter protocol.
+    TORCH_CHECK(bar.numel() >= 4,
+                "HCXO local schedule needs four counter words");
+    if (ofmt == dmvns::Q4K)
+      hcx::hcx_kernel<true, dmvns::Q4K, true><<<hcx::NC, 256, sm, st>>>(a);
+    else
+      hcx::hcx_kernel<true, dmvns::Q6K, true><<<hcx::NC, 256, sm, st>>>(a);
   } else if (ofmt == dmvns::Q4K) {
     HCXO_F(dmvns::Q4K)
   } else if (ofmt == dmvns::Q5K) {

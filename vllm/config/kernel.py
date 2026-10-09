@@ -675,8 +675,9 @@ class KernelConfig:
 
     sm70_hcx_local_schedule: bool = False
     """Experimentally delay HC up-weight prefetch and distribute gate-mix for
-    full-mesh TP4 HCX without a fused output projection. Keeps the reference
-    arithmetic order. Opt in before graph capture; full-model quality
+    full-mesh TP4 HCX, including fused Q4_K/Q6_K output projection when its
+    input normalization is already complete. Keeps the reference arithmetic
+    order. Opt in before graph capture; full-model quality
     qualification remains pending."""
 
     sm70_hcx_output_projection: bool = True

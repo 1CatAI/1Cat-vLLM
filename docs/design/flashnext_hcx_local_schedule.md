@@ -177,6 +177,75 @@ Raw sources, build commands, hashes and per-rank results are retained under
 `coarse-splitk`. The same task directory on the remote host contains the
 executed runners and logs.
 
+### Half-current-latency follow-up, 2026-10-10
+
+The next target is at most approximately 9.5 µs per complete M5 boundary,
+half the current approximately 19-µs V6 result. This is a target, not a new
+measurement or a model wall-time claim. The following screens use the same
+installed V6 control, eight rotating real weight pairs and synthetic inputs.
+All timings include residual, block and injection delivery unless the
+explicit recurrent contract below applies. They remain isolated research
+libraries; no new implementation is selected for the normal model route.
+
+| M5 screen | Installed V6, µs | Candidate, µs | Decision |
+| --- | ---: | ---: | --- |
+| Idle warp reduces tagged norm statistics during down MMA | 18.730 | 19.663 | Reject |
+| Read final mix input immediately after the second join | 18.730 | 18.824 | Reject |
+| Overlapped norm plus mix input retained in registers | 18.730 | 19.083 | Reject |
+| Replace first grid join with per-producer release/acquire readiness | 18.672 | 23.952 | Reject; overlapped-norm control is 19.645 |
+| FP16 payload and 16-bit epoch in one 32-bit LoRA word | 18.747 | 19.790 | Reject this all-row-refresh implementation |
+| Count only LoRA receiver CTAs at the second join, retaining mix locally | 18.680 | 19.598 | Reject; retained-mix control is 19.052 |
+
+All these candidates pass raw-FP16-bit comparisons against installed V6:
+24 eager cases and three changed-input graph cases per candidate per rank,
+plus two counter-wrap/interleaving cases. The compact packet additionally
+passes 18 row-count/short-epoch cases and a graph stress exceeding 65,536
+calls. It refreshes all eight packet rows even when M is smaller, preventing
+old inactive slots from matching a wrapped epoch. That extra work is part of
+its measured cost. A subsequent screen separates buffers and counters by M
+to test the format without per-call padding refresh.
+
+The readiness rewrite publishes complete down partials with device-scoped
+release stores and acquires each producer's flag before loading its payload.
+Its compiled SM70 polling loop includes `CCTL.IVALL` after the acquire load.
+This is an additional cache operation absent from ordinary payload loads;
+the timing does not isolate its contribution from the other costs of the
+new schedule. Fewer named grid barriers alone do not establish a shorter
+dependency path. The source retains the required memory ordering described
+in the [PTX memory consistency model](https://docs.nvidia.com/cuda/archive/12.5.0/parallel-thread-execution/index.html#memory-consistency-model).
+
+The residual-carry experiment uses a recurrent synthetic chain. Each boundary
+delivers the full block output and injection; an identity producer on rank
+zero consumes that block at the following boundary. Other ranks contribute
+zero after the first boundary. Residual slices remain local between calls,
+and the last call delivers the full residual. The first input is already
+replicated, so entry requires no layout conversion. All kernel launches and
+the final materialization remain inside the timing.
+
+| Chain length | Native V6, µs/boundary | K-shard, materialize every call | K-shard, materialize at exit |
+| --- | ---: | ---: | ---: |
+| 1 | 19.016 | 19.360 | 19.326 |
+| 8 | 19.315 | 19.890 | 19.305 |
+| 94 | 19.350 | 19.766 | 19.028 |
+
+At length 94, deferring residual materialization saves 0.739 µs against the
+same K-shard arithmetic, but only 0.322 µs (1.7%) against V6. It does not
+support the earlier hoped-for multi-microsecond gain from residual carry
+alone. Full final outputs and every block/injection in an eight-step trace
+are bit-identical between the two K-shard layouts. Repeated runs are exact;
+the largest relative L2 error against V6 across the changed-input chain
+checks is 0.001397, larger than the earlier single-boundary discrepancy.
+This is a numerical screen with a synthetic identity producer, not a model
+quality gate or a 94-layer model benchmark. PLE, fallback and final-mixer
+layout transitions are not exercised by this chain.
+
+Sources, build hashes, logs and per-rank results are retained in
+`residual-carry`, `norm-overlap`, `norm-handoff`, `compact-lora`,
+`selective-lora`, `round3-build-manifest.json` and `round3-results` under the
+existing artifact root. Each measured variant has zero stack/spills. These
+results leave the admitted native V6 latency and its opt-in/default status
+unchanged; neither halving current latency nor sub-1-ms HC is demonstrated.
+
 ### Output projection plus HC
 
 The `producer-fusion` screen expands the boundary to include the preceding
