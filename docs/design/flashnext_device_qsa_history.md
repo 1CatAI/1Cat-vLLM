@@ -18,6 +18,11 @@ up to 4096. A per-device, per-width workspace is allocated before graph
 capture. Native split states contain both maxima and denominators; M20 at
 width 2051 needs 7920 floats. Unsupported shapes and host history retain
 the protected reader. Speculative draft attention retains its existing path.
+Target and draft caches are bound under the target worker's configuration.
+Each QSA layer therefore retains its construction-time history policy and
+draft identity; binding and subsequent reconfiguration cannot admit a draft
+owner through the target capability. A draft reports
+`speculative_draft_unqualified` even when direct device reads are requested.
 `sm70_qsa_device_history` controls the capability, enabled by default for
 admitted target history. Startup and runtime reports explain fallbacks.
 The extension is built and installed by normal CMake/wheel registration.
@@ -52,6 +57,57 @@ envelopes are not substituted for ordinary acceptance ms/round.
 These results supersede the earlier separate-process quality comparison
 below; they do not change the historical 17.401789-ms baseline or establish
 the 12-ms objective. Final production-dispatch checks are recorded separately.
+
+## Installed production-dispatch validation
+
+The final comparison uses runtime source `eca6e737038e6136b08a787ecd67ab0a2f97ecdb`
+and benchmark revision `eb552a12a849934196860c8252550191ab007182`. The normally
+installed wheel is `1.5.2.dev1434+geca6e7370.cu128`, with SHA256
+`dd24b1c100b484653149081cb26725077ebd4d3b7292b987daefeb0424156861`.
+All 18 native modules have recorded build provenance and installation hashes;
+no diagnostic replacement library is loaded. The integrated suite passes
+137 GPU cases: 22 direct-history, 16 scorer, 98 host-history, and one four-rank
+HCX graph test. Fourteen CPU cache-policy cases also pass.
+
+The hardware and history placement match the same-loaded-model setup above.
+Maximum length is 9216, the prefill budget is 512, maximum sequences are four,
+and GPU memory utilization is 0.95. The benchmark asserts target/draft owner
+identity after binding and rejects explicit native admission for every draft
+owner. It changes production capability state before target graph capture;
+the original draft graphs are reused throughout.
+
+Both control recapture and restoring the original graphs reproduce all 64
+teacher logits, eight natural outputs and eight acceptance counters exactly.
+With both target QSA optimizations enabled, teacher mean/max KL is
+0.000451698/0.004927856 and top-1 agrees at 62/64 positions. Maximum absolute
+logit difference is 1.278320 and maximum relative L2 difference is 0.133410.
+All eight 600-token continuations differ, so this is not a bit-exact path.
+All three short Chinese/English completion checks reach a normal stop in
+every arm and produce coherent answers.
+
+Mean draft acceptance is 44.7423% for control and 46.1643% with both changes.
+The paired eight-prompt difference is +1.4219 percentage points, with 95%
+prompt-bootstrap interval [-0.7449, +3.5926]. No clear decrease is observed;
+the interval does not prove equivalence or an acceptance improvement.
+
+Uninstrumented acceptance probes use I8192/O256 for C1 and I128/O600 for
+C4. Each entry is the mean of two control and two candidate cohorts in ABBA
+order, after warming both arms:
+
+| Target change | C1 control/candidate ms | C4 control/candidate ms |
+| --- | ---: | ---: |
+| Native device-history reader | 19.7791 / 19.0889 | 39.4380 / 38.9911 |
+| Native reader and shared-key scorer | 19.8134 / 18.7204 | 41.1333 / 39.2898 |
+
+Native-only C1 saves 0.6902 ms; both changes save 1.0930 ms. Their C1 control
+endpoint drifts are 0.0967 and -0.0470 ms. All C1 IDs agree, at 4.885714
+tokens/round. C4 emits 2.334764 tokens/request/round for control and 2.326271
+for the candidate, with different continuations. C4 control endpoints drift
+0.8998 ms for native-only and 4.2775 ms for both changes; their apparent mean
+savings are not treated as established C4 gains. Repeated C4 measurements
+are tracked with the [shared-key integration](https://github.com/1CatAI/1Cat-vLLM/pull/1127).
+This device-E4M3/disk-PLE comparison does not replace the historical
+17.401789-ms resident-FP16 baseline or establish the 12-ms objective.
 
 ## Initial FP32-probability experiment
 
