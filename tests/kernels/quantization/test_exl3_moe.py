@@ -255,3 +255,30 @@ def test_dequantize_dense(order):
     assert set(out) == {"model.norm.weight", expert, p + ".weight"}
     ref = exl3_reconstruct(trellis.cuda(), suh.cuda(), svh.cuda(), "mcg", order)
     torch.testing.assert_close(out[p + ".weight"], ref.T.half().cpu())
+
+
+@pytest.mark.parametrize("K", [2, 4])
+def test_decode_tiles_chunked(K):
+    # The decoder works through the tiles in chunks to bound its memory; the
+    # result must not depend on the chunk size (incl. a partial last chunk).
+    words = _strip_words(K).repeat(3, 1, 1)
+    full = exl3_decode_tiles(words, "mcg", "sm80", chunk_tiles=1 << 20)
+    for chunk in (1, 5, 7):
+        torch.testing.assert_close(
+            exl3_decode_tiles(words, "mcg", "sm80", chunk_tiles=chunk),
+            full,
+            rtol=0,
+            atol=0,
+        )
+
+
+def test_dequantize_dense_skip():
+    cfg = Exl3Config(codebook="mcg")
+    p = "model.layers.45.self_attn.o_proj"
+    weights = [
+        (p + ".trellis", torch.zeros(16, 8, 64, dtype=torch.int16)),
+        (p + ".suh", torch.ones(256).half()),
+        (p + ".svh", torch.ones(128).half()),
+    ]
+    out = dict(cfg.dequantize_dense(iter(weights), skip=lambda n: ".layers.45." in n))
+    assert set(out) == {p + ".trellis", p + ".suh", p + ".svh"}

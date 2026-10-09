@@ -28,7 +28,7 @@ order of ``exl3_reconstruct``.
 import json
 import math
 import os
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from functools import cache
 from typing import Any
 
@@ -132,14 +132,22 @@ def _decode_states(states: torch.Tensor, codebook: str) -> torch.Tensor:
 
 
 def exl3_decode_tiles(
-    trellis: torch.Tensor, codebook: str, tile_order: str
+    trellis: torch.Tensor, codebook: str, tile_order: str, chunk_tiles: int = 4096
 ) -> torch.Tensor:
-    """int16 [k/16, n/16, 16K] -> fp16 [k, n] in the trellis (rotated) basis."""
+    """int16 [k/16, n/16, 16K] -> fp16 [k, n] in the trellis (rotated) basis.
+
+    Tiles are decoded chunk_tiles at a time: the intermediate state tensors
+    take ~70 KB per tile, so a whole layer at once would need gigabytes."""
     tk, tn, words = trellis.shape
     K = words // 16
-    values = _decode_states(_trellis_states(trellis, K), codebook)
-    tiles = torch.empty_like(values)
-    tiles[..., tile_perm(tile_order).to(values.device)] = values
+    flat = trellis.reshape(tk * tn, words)
+    perm = tile_perm(tile_order).to(trellis.device)
+    tiles = torch.empty(tk * tn, 256, dtype=torch.float16, device=trellis.device)
+    for start in range(0, tk * tn, chunk_tiles):
+        part = flat[start : start + chunk_tiles]
+        tiles[start : start + part.shape[0], perm] = _decode_states(
+            _trellis_states(part, K), codebook
+        )
     return tiles.view(tk, tn, 16, 16).permute(0, 2, 1, 3).reshape(tk * 16, tn * 16)
 
 
@@ -284,16 +292,23 @@ class Exl3Config(QuantizationConfig):
             )
         return None
 
-    def dequantize_dense(self, weights: Iterable[tuple]) -> Iterator[tuple]:
+    def dequantize_dense(
+        self, weights: Iterable[tuple], skip: Callable[[str], bool] | None = None
+    ) -> Iterator[tuple]:
         """Pass a model's weight iterator through, replacing each dense EXL3
         linear (trellis/suh/svh + codebook marker) by its FP16 ``.weight`` in
-        checkpoint orientation (out_features, in_features). Expert tensors pass
+        checkpoint orientation (out_features, in_features). Expert tensors, and
+        tensors ``skip`` selects (e.g. layers the model does not load), pass
         through unchanged. The dequantized tensors are yielded at the end."""
         parts: dict[str, dict[str, torch.Tensor]] = {}
         suffixes = (".trellis", ".suh", ".svh", ".mcg", ".mul1", ".tile_order")
         for item in weights:
             name = item[0]
-            if name.endswith(suffixes) and not _EXPERT_KEY.search(name):
+            if (
+                name.endswith(suffixes)
+                and not _EXPERT_KEY.search(name)
+                and not (skip is not None and skip(name))
+            ):
                 prefix, _, kind = name.rpartition(".")
                 parts.setdefault(prefix, {})[kind] = item[1]
                 continue
