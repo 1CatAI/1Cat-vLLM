@@ -31,11 +31,12 @@ def test_ampere_priorities_are_untouched():
 def test_backend_priority_cache_isolated_between_engines(monkeypatch):
     from types import SimpleNamespace
 
+    from vllm.config import execution_policy
     from vllm.platforms import cuda
 
     for enabled in (True, False, True, False):
         monkeypatch.setattr(
-            cuda,
+            execution_policy,
             "flash_v100_policy",
             lambda enabled=enabled: SimpleNamespace(enabled=enabled),
         )

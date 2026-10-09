@@ -785,3 +785,76 @@ The C4b normal CMake `_C` build and TP2/TP4 operator A/B are recorded under
 ownership lock; no result is claimed until that job completes. Final paired
 GPU/host/allocation results and extension provenance will replace this pending
 paragraph before merge. TP8 remains a contract-only test on this four-V100 host.
+
+## Phase C structural accounting and retained boundaries
+
+The following counts describe independently maintained protocols, not source-file
+sizes or the number of numerical kernels. The baseline is merged B
+`ec5f5b7eac70`; the per-batch acceptance sections above retain the exact successive
+baselines and do not claim a single end-to-end model benchmark.
+
+| Protocol | Before → after | Remaining real differences |
+|---|---|---|
+| Step event collection/aggregation | 3 → 1 `StepProfiler` | Runner V1, Runner V2 and proposer keep their report layouts and in-flight step owners. |
+| Auxiliary warmup scheduling | 2 loops → 1 ordered executor | Model/proposer kernels and cache layouts remain separate tasks; allocator restoration and capture boundaries are preserved. |
+| Staged input transfer | Runner-managed admission/buffers/events/recovery → 1 transfer owner | Single-request admission and normal synchronous fallback remain. |
+| Ordinary DFlash sampling | 2 runner-specific decisions → speculator result contract | Handled result, existing dense logits and ordinary fallback remain distinct; dense logits are not recomputed on that fallback. |
+| GDN common computation | Shared convolution and allocating/out recurrence entries; 3 external-normalization providers share one normalization stage | 4 prefill algorithms, FlashQLA decode and sequential verification retain distinct layouts, casts and arithmetic. There remains one prefill selector. |
+| Request metadata preparation | 2 token-order/query-offset implementations → 1 | Grouped pointer-table kernel, padding and DDTree arithmetic remain distinct. |
+| Metadata override/restore | 4 manual protocols → 1 borrowed view | Builders own tensors; the view restores references on normal return, nesting and exceptions. |
+| Shared draft weight binding | 3 lifecycles → 1 model adapter | PP qualification, final-stage replication and MTP shared-head relationships remain explicit. |
+| Gemma layer dispatch | 2 dispatch implementations → 1 | Fixed-width, FP32 residual and long-prefill arithmetic remain separate providers. |
+| Collective admission | 3 Gemma admission blocks → 1 parameterized capability contract | TP2/TP4 residual dtypes and long-prefill capacity differ. IPC allocation/registration/destruction still has one owner. |
+| Graph selection | 1 dispatcher before and after; static qualification becomes one initialized plan | Dynamic context buckets, partitions and graph tables remain in the dispatcher. No parallel graph scheduler is added. |
+
+Run `tools/sm70/path_inventory.py --phase c --summary` at each reference using
+the final inventory implementation. Its expanded source scope records **461 →
+260** legacy read sites across **37 → 80** files; C4a to C4b alone is **307 →
+260** across **75 → 80** files. Destination owners are included. The final catalog
+also exposes 146 initialization alias declarations. These are static source
+counts, not per-token execution counts; the parameter-name total is not a
+before/after removal metric because the final declarations reveal indirect
+aliases that the original consumer scan did not enumerate.
+
+The native collective launch files have **27 → 0** direct `getenv` sites.
+Eighteen distinct native inputs are captured once by the configured constructor;
+the legacy constructor captures its compatibility snapshot once. The migrated
+Python policy guard checks consumers against the configuration declarations.
+Generic layering totals at these snapshots are env **271 → 243**, platform
+**3880 → 3431**, model **2325 → 2136**. No whitelist was expanded. These aggregate
+snapshots include intervening main deliveries; the protocol changes and each
+batch's tests, rather than aggregate counts alone, establish C's changes.
+
+| Mutable resource | Sole production owner | Borrowers / lifetime |
+|---|---|---|
+| Timing events and report totals | Each `StepProfiler` | Runner/proposer step context; disabled mode allocates no events. |
+| Pinned staging and copy events | Input transfer component | Keeps source storage alive through completion; restores stream/event state after failure. |
+| GDN layer registrations and common metadata buffers | Engine runtime resources | Forward contexts borrow the same registry; another engine never supplies missing registrations. |
+| State-index tensors and pointer descriptors | Metadata builder / grouped descriptor | Captured descriptors retain the buffers they address across capacity growth. |
+| Accepted counts and conv/SSM movement | `ModelState` and existing state contract | Prepared views borrow live state; compatibility forwarding does not copy state. |
+| GDN tuning winners and profile budgets | Engine GDN runtime resources | JIT arithmetic is shared; mutable winners and budgets are not process-global. |
+| Prepared LM-head/linear packs and scratch | Prepared provider state | Original parameters remain with the layer; replacement invalidates the pack. |
+| Graph objects and replay tables | Existing dispatcher/runner owners | Initialized graph plan is immutable policy, not a second graph owner. |
+| CUDA IPC and collective registrations | `CustomAllreduce` | Bound native namespace receives initialization, execution and destruction for the same pointer. |
+| Collective diagnostic seen sets | Each communicator/layer | Explanation reports borrow records; capture observations are not replay counts. |
+
+Retained entries are deliberately visible in the source ledger:
+
+- DDTree's runner/proposer/scheduler branches, tree-specific GDN algorithms and
+  their controls remain deferred. Ordinary DFlash uses the existing Runner V2
+  selection; the generic Mamba scheduler is retained.
+- The old GDN model adapter retains private projection/core-boundary experiments,
+  standalone legacy helpers and optional tensor/graph dump hooks. Their legacy
+  controls are not described as removed: the new common convolution, recurrence,
+  prefill and metadata components do not depend on these helpers. They remain
+  model-layer maintenance debt, separately identifiable from the shared stages.
+- HC-specific experimental projection kernels and diagnostics remain with the
+  HC model provider. The common communicator consumes its declared tensor and
+  operator contract without owning that composition.
+- External allocator settings, P2P probing and upstream batch-invariant,
+  NCCL/CUBLAS process controls retain their existing initialization contracts.
+  C removes the migrated policy's environment propagation, not every upstream
+  process-global setting in the repository.
+- TP8 topology and non-SM70 capabilities have contract coverage only where the
+  required hardware is absent. Full-repository D/E and model performance
+  acceptance remain separate work.

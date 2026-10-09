@@ -3,6 +3,8 @@
 """Native selection inputs survive worker serialization and engine interleaving."""
 
 import os
+import subprocess
+import sys
 from multiprocessing import Pipe
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +18,34 @@ from vllm.config.execution_policy import CommunicationPolicy
 from vllm.distributed.device_communicators.collective_provider import (
     NativeCollectiveBindings,
 )
+
+
+def test_collective_cold_import_resolves_cuda_platform_before_config():
+    # Exercise the production import order even on CPU CI, without loading a
+    # native binary or creating a CUDA context. Pre-importing config hides it.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+import types
+import torch
+sys.modules['vllm._C'] = types.ModuleType('vllm._C')
+import vllm.platforms as platforms
+platforms.resolve_current_platform_cls_qualname = (
+    lambda: 'vllm.platforms.cuda.CudaPlatform'
+)
+from vllm.distributed.device_communicators.custom_all_reduce import CustomAllreduce
+assert platforms.current_platform.is_cuda()
+assert not torch.cuda.is_initialized()
+""",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("order", [("1stage", "2stage"), ("2stage", "1stage")])

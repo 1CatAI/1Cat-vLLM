@@ -20,7 +20,6 @@ from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
 import vllm._C  # noqa
-from vllm.config.execution_policy import flash_v100_policy
 
 with contextlib.suppress(ImportError):
     import vllm._C_stable_libtorch  # noqa
@@ -87,6 +86,9 @@ def _get_backend_priorities(
     num_heads: int | None = None,
     kv_cache_dtype: CacheDType | None = None,
 ) -> list[AttentionBackendEnum]:
+    # Platform discovery precedes config import in a fresh distributed worker.
+    from vllm.config.execution_policy import flash_v100_policy
+
     return _get_backend_priorities_cached(
         use_mla,
         device_capability,
