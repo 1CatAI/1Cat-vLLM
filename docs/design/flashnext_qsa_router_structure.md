@@ -45,6 +45,24 @@ profiled device-KV chain, not a replacement for the historical unprofiled
 dependency for device history; host history still requires its reader. The
 paired model comparison must determine the actual round-time reduction.
 
+The same trace also distinguishes overlap from dependency slack. Across 48
+MoE layers, router projection and selection total 0.7101 and 0.3802 ms;
+1.0512 ms overlaps shared-expert kernels. However, the routed-expert branch
+finishes after the shared branch at every join and depends on routing first.
+Removing routing while holding every other observed duration fixed therefore
+has an optimistic 1.0906 ms critical-path bound. Subtracting the overlap from
+router service would incorrectly make this bound almost zero. Conversely,
+the bound cannot predict a speedup because changing the overlap changes
+contention, as the complete-chain scheduling screens demonstrate.
+
+QKV preparation/cache write and indexer computation have a different
+dependency: both consume the input hidden state and join before attention.
+Moving them onto independent streams has an optimistic 0.5299 ms bound across
+twelve layers, including 0.2821 ms of QKV projection. This estimate includes
+the measured gaps around main-query preparation and excludes additional
+stream scheduling or contention costs. A complete-chain screen is required
+before model integration.
+
 ## Shared-key indexer
 
 A single request's two to eight queries occupy the MMA output dimension
@@ -325,8 +343,42 @@ the original graphs again. The direct-attention operator is already shipped
 in the installed extension; the diagnostic selects it explicitly instead of
 loading a research library. It separately records teacher distributions,
 eight natural continuations, acceptance and symmetric C1/C4 graph ablations.
-Timing is skipped if either same-process control comparison fails. Results
-are pending; neither path is admitted by this diagnostic design alone.
+Timing is skipped if either same-process control comparison fails.
+
+The final signed-visibility-fix wheel completed this comparison. Original,
+recaptured-control and original-again graphs are identical at all 64 teacher
+positions, all eight 600-token natural continuations and all acceptance
+counters. Scorer-only has the same exact result. This resolves the scorer's
+quality attribution within this process; the earlier cross-start difference
+does not establish a scorer error.
+
+Direct attention, alone or with the scorer, has mean teacher KL 0.00052268,
+maximum 0.00948088 and top-1 agreement 63/64. All eight natural continuations
+diverge. Their paired draft-acceptance difference is -0.0251 percentage points,
+with 95% bootstrap interval [-1.7921, +2.0874]. This finds no clear acceptance
+drop but does not prove strict equivalence. The writer updates hot copies
+from decoded encoded history, so this comparison uses the same stored KV
+precision; attention partitioning and probability arithmetic differ.
+
+Each timing entry below is one same-loaded-model ABBA, using the installed
+wheel, TP4 V100, device E4M3 history, protected FP16 hot cache, disk PLE and
+unchanged FP16 MTP4 draft graphs. C1 uses I8192/O256 and C4 I128/O600. These
+controls do not replace the historical resident-FP16-KV 17.4018 ms baseline.
+
+| Target change | C1 control/candidate ms | C4 control/candidate ms |
+| --- | ---: | ---: |
+| Shared-key scorer | 19.5569 / 18.9428 | 38.8645 / 39.0130 |
+| Direct FP32-probability attention | 19.3522 / 18.7608 | 38.9607 / 38.4102 |
+| Both | 19.4232 / 18.3879 | 38.7403 / 38.5621 |
+
+C1 outputs are identical in every arm, with 4.8857 tokens/round. C4 outputs
+remain exact for scorer-only; direct attention changes the continuation,
+with 2.3248/2.3263 emitted tokens per request per round. C1 controls drift
+0.6087, 0.7236 and 0.8381 ms between ABBA endpoints. Thus the combined
+1.0353 ms mean difference is provisional, not an admitted model saving.
+The next diagnostic alternates graphs inside a single request in symmetric
+eight-round blocks and records target/draft GPU envelopes to localize drift.
+This measured diagnostic remains separate from ordinary acceptance timing.
 
 ## Validation and admission
 
@@ -336,8 +388,9 @@ replay, and the M20 fallback. The benchmark compares both scoring alone
 and the score/selection/expansion chain. The final gate compares the same
 wheel with only `sm70_qsa_shared_key` changed: C1/C4 ms per round, tokens
 per round, target teacher-forcing agreement, natural outputs, and acceptance.
-The first paired model run above did not establish a gain or resolve the
-distribution difference. No model gain is admitted.
+The same-process comparison resolves the scorer's numerical attribution, but
+timing drift and the direct-attention distribution differences still need
+qualification. No model gain or runtime default is admitted.
 
 ## External references
 
