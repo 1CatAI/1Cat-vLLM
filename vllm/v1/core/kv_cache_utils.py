@@ -963,6 +963,8 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         )
     if layout := _get_csa_linear_tensor_layout(kv_cache_groups):
         return layout.bytes_per_block
+    if _is_deepseek_v41_groups(kv_cache_groups):
+        return sum(ps for ps, _ in _deepseek_v41_tensor_plan(kv_cache_groups))
     if all(
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
     ):
@@ -1461,6 +1463,84 @@ def _get_kv_cache_config_deepseek_v4(
     return num_blocks, kv_cache_tensors
 
 
+def _is_deepseek_v41_groups(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+    """True when the groups carry DeepSeek-V4.1 caches (``model_version == "deepseek_v41"``)."""
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        inner = (
+            spec.kv_cache_specs.values()
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else (spec,)
+        )
+        if any(getattr(s, "model_version", None) == "deepseek_v41" for s in inner):
+            return True
+    return False
+
+
+def _deepseek_v41_tensor_plan(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> list[tuple[int, list[str]]]:
+    """Per-block tensor plan of one DeepSeek-V4.1 worker: ``[(page_size, shared_by), ...]``.
+
+    Same sharing rule as ``_get_kv_cache_config_deepseek_v4`` (a tensor is shared by at most one
+    layer per KV cache group, at the same tuple index and page size, so a block id is only ever
+    written through one of them), but the page-size buckets are the union over ALL groups of
+    this worker instead of the full-MLA group's set. Under pipeline parallelism a V4.1 stage may
+    hold only ratio-2 sources (pages {512 B, 128 B} x block) or only ratio-1 sources ({1024 B,
+    256 B} x block) while the globally chosen sliding-window/state pages match only the other
+    set; those layers get their own tensors instead of failing. Tensors nobody shares are not
+    emitted. Requires every group to be ``UniformTypeKVCacheSpecs`` (projected groups may be
+    empty).
+    """
+    bucketed: list[dict[int, list[str]]] = []
+    page_sizes: set[int] = set()
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if not isinstance(spec, UniformTypeKVCacheSpecs):
+            raise ValueError(
+                "DeepSeek-V4.1 KV cache groups must be UniformTypeKVCacheSpecs, got "
+                f"{type(spec).__name__} for {group.layer_names}"
+            )
+        b: dict[int, list[str]] = defaultdict(list)
+        for name in group.layer_names:
+            ps = spec.kv_cache_specs[name].page_size_bytes
+            b[ps].append(name)
+            page_sizes.add(ps)
+        bucketed.append(b)
+    if not page_sizes:
+        return []
+    num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values())
+    plan: list[tuple[int, list[str]]] = []
+    for tuple_idx in range(num_layer_tuples):
+        for ps in sorted(page_sizes):
+            shared_by = [
+                b[ps][tuple_idx]
+                for b in bucketed
+                if ps in b and tuple_idx < len(b[ps])
+            ]
+            if shared_by:
+                plan.append((ps, shared_by))
+    return plan
+
+
+def _get_kv_cache_config_deepseek_v41(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    available_memory: int,
+) -> tuple[int, list[KVCacheTensor]]:
+    """DeepSeek-V4.1 tensor layout (see ``_deepseek_v41_tensor_plan``)."""
+    plan = _deepseek_v41_tensor_plan(kv_cache_groups)
+    bytes_per_block = sum(ps for ps, _ in plan)
+    if bytes_per_block <= 0:
+        raise ValueError("DeepSeek-V4.1 KV cache plan is empty")
+    num_blocks = available_memory // bytes_per_block
+    num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+    return num_blocks, [
+        KVCacheTensor(size=ps * num_blocks, shared_by=shared_by)
+        for ps, shared_by in plan
+    ]
+
+
 def _pp_balanced_mamba_group_count(
     vllm_config: VllmConfig,
     mamba_layer_names: list[str],
@@ -1892,6 +1972,11 @@ def get_kv_cache_config_from_groups(
         vllm_config, kv_cache_groups, available_memory
     ):
         num_blocks, kv_cache_tensors = csa_config
+    elif _is_deepseek_v41_groups(kv_cache_groups):
+        # DeepSeek-V4.1 (SM70 port): union page-size buckets per worker.
+        num_blocks, kv_cache_tensors = _get_kv_cache_config_deepseek_v41(
+            vllm_config, kv_cache_groups, available_memory
+        )
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
@@ -2772,6 +2857,17 @@ def _max_memory_usage_bytes_from_groups(
             if group.layer_names
         )
         return layout.bytes_per_block * blocks_needed
+    elif _is_deepseek_v41_groups(kv_cache_groups):
+        # DeepSeek-V4.1: every block id of the shared pool costs the plan's bytes per block.
+        bytes_per_block = sum(ps for ps, _ in _deepseek_v41_tensor_plan(kv_cache_groups))
+        blocks_needed = sum(
+            cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).max_memory_usage_pages(
+                vllm_config
+            )
+            for group in kv_cache_groups
+            if group.layer_names
+        )
+        return bytes_per_block * blocks_needed
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups

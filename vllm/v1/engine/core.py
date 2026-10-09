@@ -633,6 +633,7 @@ class EngineCore:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
                     trace_sample_t0 = time.perf_counter() if trace_log else 0.0
+                    self._fill_structured_output_drafts(scheduler_output)
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
@@ -754,6 +755,50 @@ class EngineCore:
             )
 
         return engine_core_outputs, model_executed
+
+    def _fill_structured_output_drafts(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Replace draft placeholders with the worker's drafts before the
+        grammar bitmask is built.
+
+        Under async scheduling the spec-token rows are -1 placeholders that
+        are only resolved on the deferred path, which requires a step of the
+        same request to be in flight. With pipeline parallelism a request is
+        not re-scheduled until pp_size steps later, so a single request never
+        takes that path: the bitmask is then built from placeholders (every
+        draft row unconstrained) while the worker still verifies its real
+        drafts. A draft window that crosses the reasoning-end marker is
+        accepted unconstrained and xgrammar rejects it on the next advance
+        (#442). When no step of the structured request is in flight, the
+        worker's latest drafts belong to its last completed step, so fill
+        them in exactly as the deferred path does.
+        """
+        if not (
+            self.use_spec_decode
+            and scheduler_output.has_structured_output_requests
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
+            return
+        needs_drafts = False
+        for req_id, spec in scheduler_output.scheduled_spec_decode_tokens.items():
+            request = self.scheduler.requests.get(req_id)
+            if (
+                request is not None
+                and request.use_structured_output
+                and request.num_output_placeholders <= len(spec) + 1
+                and any(token == -1 for token in spec)
+            ):
+                needs_drafts = True
+                break
+        if not needs_drafts:
+            return
+        draft_token_ids = self.model_executor.take_draft_token_ids()
+        if draft_token_ids is None:
+            return
+        self.scheduler.update_draft_token_ids_in_output(
+            draft_token_ids, scheduler_output
+        )
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():

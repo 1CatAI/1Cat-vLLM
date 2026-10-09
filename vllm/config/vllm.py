@@ -72,6 +72,14 @@ else:
 
 logger = init_logger(__name__)
 
+# Models without @support_torch_compile whose supported PIECEWISE path is the breakable CUDA graph
+# (DeepSeek-V4.1: PORT_DESIGN §9 AM-8; its attention builders declare AttentionCGSupport.NEVER until P5).
+BREAKABLE_CUDAGRAPH_ARCHITECTURES = (
+    "DeepseekV4ForCausalLM",
+    "DeepSeekV4MTPModel",
+    "DeepseekV41ForCausalLM",
+)
+
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
     {
         "Glm5NextForCausalLM",
@@ -1972,13 +1980,13 @@ class VllmConfig:
             self.model_config is not None
             and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
             and any(
-                a in ("DeepseekV4ForCausalLM", "DeepSeekV4MTPModel")
+                a in BREAKABLE_CUDAGRAPH_ARCHITECTURES
                 for a in self.model_config.architectures
             )
         ):
             os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
             logger.info_once(
-                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1 for DeepSeek V4. "
+                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1 for DeepSeek V4/V4.1. "
                 "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
             )
 

@@ -243,6 +243,22 @@ class DeepseekV4ForCausalLMConfig(VerifyAndUpdateConfig):
                 )
 
 
+class DeepseekV41ForCausalLMConfig(VerifyAndUpdateConfig):
+    # = vllm.models.deepseek_v41.sm70.sparse.PREFERRED_BLOCK_SIZE (not imported here: that module pulls in Triton
+    # kernels; tests/models/deepseek_v41/test_core_config.py pins the equality).
+    PREFERRED_BLOCK_SIZE = 256
+
+    @classmethod
+    def verify_and_update_config(cls, vllm_config: "VllmConfig") -> None:
+        """DeepSeek-V4.1 attention builds its cache specs while the model is constructed, i.e. BEFORE
+        Platform.update_block_size_for_backend() runs, so the V4.1 cache block size must already be set here
+        (the generic default 16 is refused by the V4.1 caches: >= 64 and a multiple of 8). A user --block-size
+        is kept and validated by the model."""
+        cache_config = vllm_config.cache_config
+        if not cache_config.user_specified_block_size:
+            cache_config.block_size = cls.PREFERRED_BLOCK_SIZE
+
+
 class GptOssForCausalLMConfig(VerifyAndUpdateConfig):
     @staticmethod
     def verify_and_update_model_config(model_config: "ModelConfig") -> None:
@@ -790,6 +806,7 @@ MODELS_CONFIG_MAP: dict[str, type[VerifyAndUpdateConfig]] = {
     "ColBERTJinaRobertaModel": JinaRobertaModelConfig,
     "ColQwen3_5": Qwen3_5ForConditionalGenerationConfig,
     "DeepseekV4ForCausalLM": DeepseekV4ForCausalLMConfig,
+    "DeepseekV41ForCausalLM": DeepseekV41ForCausalLMConfig,
     "DeepseekV32ForCausalLM": DeepseekV32ForCausalLM,
     "Ernie4_5_VLMoeForConditionalGeneration": Ernie4_5_VLMoeForConditionalGenerationConfig,  # noqa: E501
     "FalconMambaForCausalLM": MambaModelConfig,

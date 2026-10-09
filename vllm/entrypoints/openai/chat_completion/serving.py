@@ -723,6 +723,7 @@ class OpenAIServingChat(OpenAIServing):
                             delta_token_ids=as_list(output.token_ids),
                             request=request,
                             prompt_token_ids=res.prompt_token_ids,
+                            finished=output.finish_reason is not None,
                         )
                         if delta_message and delta_message.tool_calls:
                             tools_streamed[i] = True

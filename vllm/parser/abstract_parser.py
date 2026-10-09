@@ -320,9 +320,11 @@ class Parser:
         delta_token_ids: list[int],
         request: ChatCompletionRequest | ResponsesRequest,
         prompt_token_ids: list[int] | None = None,
+        finished: bool = False,
     ) -> DeltaMessage | None:
         """Parse a single streaming delta, orchestrating reasoning then
-        tool call extraction via internal stream state.
+        tool call extraction via internal stream state. ``finished`` marks the
+        last delta of the stream (finish_reason set).
         """
 
 
@@ -662,6 +664,7 @@ class DelegatingParser(Parser):
         delta_token_ids: list[int],
         request: ChatCompletionRequest | ResponsesRequest,
         prompt_token_ids: list[int] | None = None,
+        finished: bool = False,
     ) -> DeltaMessage | None:
         state = self._stream_state
 
@@ -727,6 +730,24 @@ class DelegatingParser(Parser):
                 if not delta_message:
                     delta_message = DeltaMessage()
                 delta_message.reasoning = reasoning
+
+            # Tool parsers that hold text back until the stream ends (e.g. the
+            # DeepSeek-V4.1 DSML parser) release it here on the final delta.
+            finish = getattr(self._tool_parser, "finish_streaming", None)
+            if finished and callable(finish):
+                tail = finish(request)
+                if tail is not None:
+                    if delta_message is None:
+                        delta_message = tail
+                    else:
+                        if tail.content:
+                            delta_message.content = (
+                                delta_message.content or ""
+                            ) + tail.content
+                        if tail.tool_calls:
+                            delta_message.tool_calls = list(
+                                delta_message.tool_calls or []
+                            ) + list(tail.tool_calls)
 
             if (
                 delta_message

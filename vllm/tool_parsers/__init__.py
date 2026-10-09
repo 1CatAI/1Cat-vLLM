@@ -38,6 +38,10 @@ _TOOL_PARSERS_TO_REGISTER = {
         "deepseekv4_tool_parser",
         "DeepSeekV4ToolParser",
     ),
+    "deepseek_v41": (
+        "deepseekv41_engine_tool_parser",
+        "DeepSeekV41EngineToolParser",
+    ),
     "cohere_command3": (
         "cohere_command_tool_parser",
         "CohereCommand3ToolParser",
