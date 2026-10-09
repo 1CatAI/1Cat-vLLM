@@ -143,6 +143,9 @@ class _Normalize(ast.NodeTransformer):
         node = self.generic_visit(node)
         path = ast.unparse(node)
         callbacks = {
+            "policy.worker_profile_enabled": (
+                "_debug._dflash_ddtree_worker_profile_enabled"
+            ),
             "self.ops.attach_common": "self._attach_common_flash_metadata",
             "self.ops.attach_prefix": "self._attach_prefix_anchored_metadata",
             "self.ops.attach_shape_hints": "self._attach_decode_shape_hints",

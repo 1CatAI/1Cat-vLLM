@@ -472,7 +472,7 @@ _route_counts: dict[str, int] = {}
 _fallback_counts: dict[str, int] = {}
 _decode_active_trace_signatures: set[tuple[object, ...]] = set()
 _DEFAULT_DECODE_PARTITION_SIZE = 256
-_VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
+VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _DEFAULT_Q4_XQA_MIN_SEQ_LEN = 32768
 _DEFAULT_FP8_XQA_MIN_SEQ_LEN = 16384
 
@@ -498,12 +498,12 @@ def _decode_partition_size_for_metadata(
     except ValueError as exc:
         raise ValueError(
             "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
+            f"{VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
         ) from exc
-    if value not in _VALID_DECODE_PARTITION_SIZES:
+    if value not in VALID_DECODE_PARTITION_SIZES:
         raise ValueError(
             "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
+            f"{VALID_DECODE_PARTITION_SIZES}, got {value}"
         )
     return value
 
@@ -945,27 +945,3 @@ def _log_fp8_kv_cache_route(
         )
         _logged_fp8_kv_decode = True
         return
-
-
-def _mtp_context_bucket_partition_size_hint() -> int | None:
-    from vllm.v1.attention.backends.flash_v100.spec import policy
-
-    return policy._mtp_context_bucket_partition_size_hint()
-
-
-def _mtp5_xqa_dual_cta_partition_size_hint() -> int | None:
-    from vllm.v1.attention.backends.flash_v100.spec import policy
-
-    return policy._mtp5_xqa_dual_cta_partition_size_hint()
-
-
-def _ddtree_trace_event(event: str, payload: dict[str, object]) -> None:
-    from vllm.v1.attention.backends.flash_v100.spec import policy
-
-    return policy._ddtree_trace_event(event, payload)
-
-
-def _ddtree_trace_enabled() -> bool:
-    from vllm.v1.attention.backends.flash_v100.spec import policy
-
-    return policy._ddtree_trace_enabled()

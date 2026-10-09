@@ -11,6 +11,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
+from vllm.v1.attention.backends.flash_v100.spec import policy
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -107,7 +108,7 @@ def _stabilize_draft_graph_metadata(
 
 
 def build_for_drafting(self: Any, common_attn_metadata, draft_index: int):
-    profile_enabled = _debug._dflash_ddtree_worker_profile_enabled()
+    profile_enabled = policy.worker_profile_enabled()
     profile_t0 = time.perf_counter() if profile_enabled else 0.0
     profile_stage_t0 = profile_t0
     attn_metadata = self.ops.base_build(

@@ -11,7 +11,12 @@ import torch
 
 from vllm.v1.attention.backends.flash_v100 import routing, state, verify
 from vllm.v1.attention.backends.flash_v100.config import V100AttnConfig
-from vllm.v1.attention.backends.flash_v100.spec import contracts
+from vllm.v1.attention.backends.flash_v100.spec import (
+    contracts,
+)
+from vllm.v1.attention.backends.flash_v100.spec import (
+    policy as feature_policy,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -62,6 +67,7 @@ def operators(native):
         xqa_codec=lambda *args: None,
         decode=native("scalar"),
         validate_contract=contracts.validate_contract,
+        partition_hint=feature_policy.dual_cta_partition_size_hint,
     )
 
 

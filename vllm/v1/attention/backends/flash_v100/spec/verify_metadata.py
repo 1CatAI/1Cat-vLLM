@@ -12,6 +12,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
+from vllm.v1.attention.backends.flash_v100.spec import policy
 from vllm.v1.attention.backends.flash_v100.spec import (
     smallq_metadata as _smallq_metadata,
 )
@@ -118,7 +119,7 @@ def update_decode_metadata(
     partition_size_hint: int | None = None,
 ) -> None:
     flash_metadata = metadata_view(attn_metadata)
-    profile_enabled = _debug._dflash_ddtree_worker_profile_enabled()
+    profile_enabled = policy.worker_profile_enabled()
     profile_t0 = time.perf_counter() if profile_enabled else 0.0
     profile_stage_t0 = profile_t0
     self._clear_smallq_decode_metadata(attn_metadata)

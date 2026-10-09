@@ -18,23 +18,24 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase/native/Qwen passed | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
 | 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict/native/Qwen passed | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Host/spec model gates |
-| 4b: native decode candidates | #1081 | CPU/golden/strict/native passed | Private references 374 → 370 | Corrected head: 1691 passes / same 7 failures; 12 outputs exact; named timings passed | Model gates pending |
-| 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
+| 4b: native decode candidates | #1081 | CPU/golden/strict/native/Qwen passed | Private references 374 → 370 | 1691 passes / same 7 failures; 12 outputs exact; named timings and 4 Qwen contracts pass | Host/spec model gates |
+| 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase/native passed | Forward 597 → 402; private 370 → 358 | 1691 passes / same 7 failures; 12 outputs exact; named timings pass | Model gates |
 | 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
 | 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | GPU gates |
 | 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
-| 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Required | Strict/rebase/GPU gates |
-| 6a: verifier ownership | #1090 | CPU/golden/strict/rebase passed | Cycles 13 → 11; model terms 169 → 158 | Required | Strict/rebase/GPU gates |
-| 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Required | Strict/rebase/GPU gates |
-| 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Required | Strict/rebase/GPU gates |
-| 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Required | Strict/rebase/GPU gates |
-| 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Required | Strict/rebase/GPU gates |
-| 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Required | Strict/rebase/GPU gates |
-| 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Required | Strict/rebase/GPU gates |
-| 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Required | Strict/rebase/GPU gates |
-| 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Required | Strict/rebase/GPU gates |
-| 6j: tree visibility feature ownership | #1107 | CPU/golden/strict/rebase passed | Private 308 → 303; model terms 151 → 137 | Required | Strict/rebase/GPU gates |
-| 6k: feature contract ownership | — | CPU/golden and boundary passed | Private 303 → 301; model terms 137 → 126 | Required | Strict/rebase/GPU gates |
+| 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Queued | GPU gates |
+| 6a: verifier ownership | #1090 | CPU/golden/strict/rebase passed | Cycles 13 → 11; model terms 169 → 158 | Queued | GPU gates |
+| 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Queued | GPU gates |
+| 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Queued | GPU gates |
+| 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Queued | GPU gates |
+| 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Queued | GPU gates |
+| 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Queued | GPU gates |
+| 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Queued | GPU gates |
+| 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Queued | GPU gates |
+| 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Queued | GPU gates |
+| 6j: tree visibility feature ownership | #1107 | CPU/golden/strict/rebase passed | Private 308 → 303; model terms 151 → 137 | Queued | GPU gates |
+| 6k: feature contract ownership | #1108 | CPU/golden/strict/rebase passed | Private 303 → 301; model terms 137 → 126 | Four queues staged | GPU gates |
+| 6l: dynamic feature policies | — | CPU/golden/strict passed | Private 301 → 287; model terms 126 → 83 | Required | Rebase/GPU gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -1158,3 +1159,62 @@ including the unchanged 813 golden traces, original calculation hashes and
 real legacy patch consumption. Pre-commit, mypy and layering pass
 (`a3-spec-contract-precommit.log`). No production or source-oracle files
 changed during the accepted run.
+
+## Step 6l dynamic feature policies
+
+PR #1108 is `4c67986baef2a350a3dc06800ee85fa6356871ec`. Its actual
+integration with #1028 is `3a8be3d1d9658500ceff7659da9fc533af625d25`, tree
+`d9576079a24360a861f7e9758bb4edddfe480152`, equal to clean merge-tree.
+Integration CPU tests pass 37 cases / 98 GPU skips. Four verified queues
+are staged as `a3-step6k` on 54633; model gates remain pending.
+
+Eight feature policies now live in spec/policy.py. Verification and prefill
+receive individual callables; feature metadata preparation uses the same
+owner directly. Common routing/debug no longer exports feature policy bodies.
+The public decode partition-domain constant remains shared, and legacy names
+resolve to live owner bindings. There is no configuration snapshot or new
+registry: environment reads still occur on the original decision/emission
+paths after executor construction. Callback injection does not receive Impl.
+
+The focused suite passes 23 cases, including all 813 unchanged golden traces
+and original calculation hashes (`a3-spec-policy-focused.log`). Metrics reduce
+to 153 / 315 / 287 / 0 / 83 / 0 / 29; no new forbidden edge is introduced.
+The maximum-function reduction is only shorter injected-call spelling; further
+responsibility splits are still required to reach 200 lines.
+
+Corrected Step 4c GPU validation completes at 2026-10-09 07:47:46 +08:00:
+1691 passes / the same seven inherited failures, no changed old outcomes and
+no added cases. All 12 native outputs have max-abs 0. Designated timing deltas
+are FP16 XQA graph +0.0115837%, E4M3 XQA graph +0.0417382%, and 75T-role
+eager prefill +0.708070%, all within 2%. DDTree eager records +11.1154%; it
+is outside the three designated timing gates, with no broad speed claim.
+Evidence remains in `a3-step4c-v2/logs/regression-parity.json`,
+`op-compare.log` and `regression.done`; complete model gates remain pending.
+
+Seven direct boundaries pass with strict shim consumption
+(`a3-spec-policy-boundary.log`): post-construction switch changes, lazy disabled
+partition parsing, unchanged error cause/domain, trace destination/payload
+precedence and nonfatal write failure, and an old partition patch consumed by
+an actual XQA operator call. The first complete strict run reports 355 passes
+and one failure: two metadata calculation hashes still see the old profile
+helper name. The projection now maps the actual Spec-owned helper back to its
+original dependency name; frozen hashes and metadata calculations are intact.
+The new optional prefill operator field is appended to preserve existing
+positional construction. A fresh complete strict run is required after both
+changes. Initial mechanical-import lint failures were corrected with temporary
+lazy delegates; the separate ownership commit removes those delegates.
+
+The corrected fixed-source full strict run passes **356 tests / 1 skip / 28
+GPU exclusions** (`a3-spec-policy-strict-final.log`, `a3-spec-policy-shim.json`).
+All immutable trace, calculation, metadata and real patch-consumption gates
+pass. Pre-commit/mypy/layering pass (`a3-spec-policy-precommit-final.log`).
+An independent AST comparison confirms all eight policy bodies exactly match
+the parent after only explicit function/constant-owner renames. No production
+or source-oracle file changes during the accepted run.
+
+Step 4b Qwen model validation completes at 2026-10-09 07:50:55 +08:00:
+all four FP16/E4M3 × eager/graph contracts report equal routes/tokens for
+three requests each (`a3-step4b-v2/logs/qwen-*-compare.log`, `qwen.done`).
+Host/spec baseline failures remain unresolved; no complete model gate claimed.
+The current upstream heads for #1028 and #1048 were rechecked and still match
+the pinned replay/reference SHAs. No frozen follow-up PR was modified.

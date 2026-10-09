@@ -69,6 +69,11 @@ class VerificationOps:
     admit_xqa_override: Any = None
     run_smallq_override: Any = None
     validate_contract: Any = None
+    partition_hint: Any = None
+    branch_enabled: Any = None
+    branch_strict: Any = None
+    tree_trace_enabled: Any = None
+    tree_trace_event: Any = None
 
 
 @dataclass(frozen=True)
@@ -417,7 +422,7 @@ class VerificationExecutor:
             partition_size_hint=partition_size_hint,
         ):
             verifier_partition_size_hint = (
-                _routing._mtp5_xqa_dual_cta_partition_size_hint()
+                self.ops.partition_hint()
                 if (
                     query.shape[0] == 5
                     and query.shape[2] == 256
@@ -547,7 +552,7 @@ class VerificationExecutor:
         )
         window_size = self.ops.window_size(causal=True)
         if (
-            _debug._dflash_ddtree_triton_branch_attn_enabled()
+            self.ops.branch_enabled()
             and parent_ids is not None
             and self.ops.tree_seq_lens_match(
                 attn_metadata,
@@ -585,13 +590,10 @@ class VerificationExecutor:
                         window_size=window_size,
                     )
                 except Exception:
-                    if (
-                        is_capturing
-                        or _debug._dflash_ddtree_triton_branch_attn_strict()
-                    ):
+                    if is_capturing or self.ops.branch_strict():
                         raise
-                    if _routing._ddtree_trace_enabled():
-                        _routing._ddtree_trace_event(
+                    if self.ops.tree_trace_enabled():
+                        self.ops.tree_trace_event(
                             "flash_ddtree_attention_route",
                             {
                                 "route": "triton_exception_fallback",
@@ -626,8 +628,8 @@ class VerificationExecutor:
                     _routing._record_route(
                         _routing.ROUTE_SPECS["prefill_ddtree_triton"].name
                     )
-                    if _routing._ddtree_trace_enabled():
-                        _routing._ddtree_trace_event(
+                    if self.ops.tree_trace_enabled():
+                        self.ops.tree_trace_event(
                             "flash_ddtree_attention_route",
                             {
                                 "route": "triton",
@@ -669,8 +671,8 @@ class VerificationExecutor:
             _state._logged_prefill_ddtree_dense = True
 
         _routing._record_route(_routing.ROUTE_SPECS["prefill_ddtree_dense"].name)
-        if _routing._ddtree_trace_enabled():
-            _routing._ddtree_trace_event(
+        if self.ops.tree_trace_enabled():
+            self.ops.tree_trace_event(
                 "flash_ddtree_attention_route",
                 {
                     "route": "dense",
@@ -753,7 +755,7 @@ class VerificationExecutor:
                         )
                         key_diff = (cache_k_by_slot - key[start:end]).abs()
                         value_diff = (cache_v_by_slot - value[start:end]).abs()
-                        _routing._ddtree_trace_event(
+                        self.ops.tree_trace_event(
                             "flash_ddtree_kv_cache_diff",
                             {
                                 "layer": str(

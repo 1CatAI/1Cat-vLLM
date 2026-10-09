@@ -763,7 +763,7 @@ def _flash_v100_prefill_with_prefix(
     head_dim = key_cache.shape[3]
     debug_compare = _config.raw("VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE", "0") == "1"
     dflash_dump = (
-        _debug._dflash_prefix_dump_enabled()
+        self.ops.prefix_dump_enabled()
         and not _state._logged_dflash_prefix_dump
         and bool(getattr(layer, "is_dflash_draft_attn", False))
     )
@@ -1518,6 +1518,7 @@ class PrefillDriverOps:
     supports_anchor: bool = False
     supports_bmhd: bool = False
     split_pages: tuple[int, ...] = ()
+    prefix_dump_enabled: Any = None
 
 
 # Calculation bodies keep their old local spelling. Each binding below resolves

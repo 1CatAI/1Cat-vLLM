@@ -50,6 +50,7 @@ from vllm.v1.attention.backends.flash_v100.spec import contracts as spec_contrac
 from vllm.v1.attention.backends.flash_v100.spec import (
     draft as spec_draft,
 )
+from vllm.v1.attention.backends.flash_v100.spec import policy as spec_policy
 from vllm.v1.attention.backends.flash_v100.spec import (
     smallq_metadata,
 )
@@ -111,6 +112,7 @@ SUBMODULES = (
     spec_verify_metadata,
     spec_attention,
     spec_contracts,
+    spec_policy,
     spec_attention_policy,
 )
 
@@ -118,6 +120,11 @@ SUBMODULES = (
 # function values: old-name writes must also affect the public execution path.
 COMPATIBILITY_ALIASES = {
     "_allocate_growing_workspace": (workspace, "allocate_growing_workspace"),
+    "_VALID_DECODE_PARTITION_SIZES": (routing, "VALID_DECODE_PARTITION_SIZES"),
+    **{
+        name: (spec_policy, target)
+        for name, target in spec_policy.COMPATIBILITY_ALIASES.items()
+    },
     **{
         name: (spec_contracts, target)
         for name, target in spec_contracts.COMPATIBILITY_ALIASES.items()

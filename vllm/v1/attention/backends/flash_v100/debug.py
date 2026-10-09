@@ -84,27 +84,3 @@ def _graph_metadata_debug_log(key: str, message: str, *args: object) -> None:
         count,
         message,
     )
-
-
-def _dflash_prefix_dump_enabled() -> bool:
-    from vllm.v1.attention.backends.flash_v100.spec import policy
-
-    return policy._dflash_prefix_dump_enabled()
-
-
-def _dflash_ddtree_triton_branch_attn_enabled() -> bool:
-    from vllm.v1.attention.backends.flash_v100.spec import policy
-
-    return policy._dflash_ddtree_triton_branch_attn_enabled()
-
-
-def _dflash_ddtree_triton_branch_attn_strict() -> bool:
-    from vllm.v1.attention.backends.flash_v100.spec import policy
-
-    return policy._dflash_ddtree_triton_branch_attn_strict()
-
-
-def _dflash_ddtree_worker_profile_enabled() -> bool:
-    from vllm.v1.attention.backends.flash_v100.spec import policy
-
-    return policy._dflash_ddtree_worker_profile_enabled()

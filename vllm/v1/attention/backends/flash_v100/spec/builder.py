@@ -15,8 +15,8 @@ from vllm.config.sm70_dflash2 import (
 from vllm.config.speculative import get_dflash_model_draft_tokens
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
-from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
+from vllm.v1.attention.backends.flash_v100.spec import policy
 from vllm.v1.attention.backends.flash_v100.spec import (
     smallq_metadata as _smallq_metadata,
 )
@@ -127,7 +127,7 @@ def prepare_capture(self: Any, attn_metadata, common_attn_metadata) -> None:
         if workspace_seq_capacity_cap is not None and workspace_seq_capacity_cap < int(
             self.vllm_config.model_config.max_model_len
         ):
-            partition_size_hint = _routing._mtp_context_bucket_partition_size_hint()
+            partition_size_hint = policy.context_bucket_partition_size_hint()
         self._update_smallq_decode_metadata(
             attn_metadata,
             common_attn_metadata,

@@ -351,6 +351,16 @@ class _Normalize(ast.NodeTransformer):
     def visit_Attribute(self, node):
         expression = ast.unparse(node)
         verification = {
+            "self.ops.partition_hint": (
+                "_routing._mtp5_xqa_dual_cta_partition_size_hint"
+            ),
+            "self.ops.branch_enabled": (
+                "_debug._dflash_ddtree_triton_branch_attn_enabled"
+            ),
+            "self.ops.branch_strict": "_debug._dflash_ddtree_triton_branch_attn_strict",
+            "self.ops.tree_trace_enabled": "_routing._ddtree_trace_enabled",
+            "self.ops.tree_trace_event": "_routing._ddtree_trace_event",
+            "self.ops.prefix_dump_enabled": "_debug._dflash_prefix_dump_enabled",
             "self.ops.tree_seq_lens_match": "_masks._ddtree_triton_seq_lens_match",
             "self.ops.tree_query_start_match": (
                 "_masks._ddtree_triton_query_start_loc_match"
