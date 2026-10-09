@@ -10,8 +10,8 @@ Modules, in dependency order:
 - ``kv_layout``: paged/contiguous KV views and gathers.
 - ``masks``: reference attention and block/tree masks.
 - ``dense_prefill``: dense D256 prefill dispatch and workspaces.
-- ``smallq_metadata``: small-query (DFlash2/MTP) group metadata.
-- ``metadata``: metadata and its builder.
+- ``spec``: registered speculative metadata hooks and small-query preparation.
+- ``metadata``: common metadata and its builder.
 - ``impl``: the attention implementation.
 - ``backend``: backend registration.
 
@@ -34,9 +34,23 @@ from vllm.v1.attention.backends.flash_v100 import (  # noqa: F401
     ops,
     prefill,
     routing,
-    smallq_metadata,
     state,
     verify,
+)
+from vllm.v1.attention.backends.flash_v100.spec import (
+    builder as spec_builder,
+)
+from vllm.v1.attention.backends.flash_v100.spec import (
+    draft as spec_draft,
+)
+from vllm.v1.attention.backends.flash_v100.spec import (
+    smallq_metadata,
+)
+from vllm.v1.attention.backends.flash_v100.spec import (
+    tree as spec_tree,
+)
+from vllm.v1.attention.backends.flash_v100.spec import (
+    verify_metadata as spec_verify_metadata,
 )
 
 if TYPE_CHECKING:
@@ -57,7 +71,7 @@ if TYPE_CHECKING:
         flash_v100_turboquant_decode,
         flash_v100_turboquant_decode_available,
     )
-    from vllm.v1.attention.backends.flash_v100.smallq_metadata import (
+    from vllm.v1.attention.backends.flash_v100.spec.smallq_metadata import (
         DFlash2SmallQGroupDescriptor,
         DFlash2SmallQPreparedMetadata,
         prepare_dflash2_smallq_group_metadata,
@@ -80,6 +94,10 @@ SUBMODULES = (
     prefill,
     verify,
     debug_compare,
+    spec_builder,
+    spec_draft,
+    spec_tree,
+    spec_verify_metadata,
 )
 
 __all__ = [
