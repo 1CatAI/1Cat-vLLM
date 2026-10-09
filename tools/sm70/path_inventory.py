@@ -243,6 +243,9 @@ def source_paths(ref: str | None, phase: str = "b") -> list[str]:
                 "vllm/config/sm70_runtime.py",
                 "vllm/config/gdn.py",
                 "vllm/config/gdn_schedule.py",
+                "vllm/config/gdn_state.py",
+                "vllm/runtime_resources.py",
+                "vllm/v1/attention/ops/gdn_state.py",
                 "vllm/model_executor/layers/fla/ops/chunk.py",
                 "vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py",
                 "vllm/model_executor/layers/fla/ops/chunk_delta_h.py",
@@ -310,6 +313,11 @@ def runtime_catalog() -> dict:
                 and legacy.startswith("VLLM_")
             )
     for path, cls_name, tables in (
+        (
+            "vllm/config/gdn_state.py",
+            "KernelConfig.gdn.state",
+            {"GDN_STATE_FIELDS"},
+        ),
         (
             "vllm/config/gdn.py",
             "KernelConfig.gdn",

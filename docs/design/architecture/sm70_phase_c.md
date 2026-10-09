@@ -52,8 +52,8 @@ diagnostics and warmup-only selection do not.
 |---|---|---|
 | C1a | C0 ledger; three profilers share collection/aggregation; ordered warmup; typed runtime and diagnostic configuration | Merged as #1130 (`c31d98d333d90`) |
 | C1b | Staged input resources and ordinary speculative sampling boundary | Merged as #1131 (`dfaeb1ba19ca98`) |
-| C2a | GDN compute plan, providers and shared stages | Implemented; operator acceptance complete |
-| C2b | GDN metadata and state preparation/commit | Pending |
+| C2a | GDN compute plan, providers and shared stages | Merged as #1133 (`ec535b1e69b6`) |
+| C2b | GDN metadata and state preparation/commit | Implemented; operator acceptance complete |
 | C3 | Ordered defaults, model qualification and engine-local effective values | Pending |
 | C4a | Shared embedding, LM-head, norm and linear providers | Pending |
 | C4b | Graph/communication/fusion boundaries and final explanation report | Pending |
@@ -363,3 +363,102 @@ Reproduction artifacts are retained in the task-owned `phase-c2a-20261009`
 validation directory: source patches/checksums, per-lane JUnit results,
 `host-profile.log`, `hostfix-gpu.log`, `hostfix-ab.json` and native hashes. The
 rebase onto main's QSA deliveries changes no GDN kernel source or registration.
+
+## C2b: metadata and state ownership
+
+The baseline is C2a merge `ec535b1e69b6d1b2e6e4e75ce5bd24fc7302972a`.
+C2a's final CI pre-commit job passed (run `37933537976`).
+
+GDN's existing state contract and common request metadata now live below both
+backend and runner. The per-group and shared preparation paths call the same
+token-order/query-offset stage. Stable sorting, the non-decode **-1** sentinel,
+accepted-count versus selected-slot distinction, align-mode authoritative state
+IDs and padded state rows are retained. The grouped pointer-table kernel and
+DDTree arithmetic are unchanged. Capture padding is applied before consumption;
+prepared metadata remains keyed to the exact builder and descriptor addresses.
+
+The process-global layer-name registry previously allowed identical names in
+separate engines to overwrite one another. Each engine now owns its registry
+and reusable common buffers. Forward contexts borrow that exact owner; missing
+engine registrations cannot fall back to another engine or the compatibility
+registry. Capacity changes retain the old capture buffers while allocating the
+new capacity. Builders continue to own their state-index tensors, grouped
+metadata descriptors own pointer tables, and `ModelState` owns accepted counts
+and conv/SSM movement. No state tensors are copied into a compatibility owner.
+
+`KernelConfig.gdn.state` captures metadata routing and speculative-core policy;
+`ObservabilityConfig.gdn_state` captures shadow checks, assertions, metadata
+profiling and state-table dumps. Active consumers use the captured values.
+State-table budgets are independent and filenames add an engine suffix so two
+engines writing into the same directory cannot overwrite one another. Historical
+standalone imports and dictionaries forward to a separate compatibility owner.
+Serialized worker policy retains resolved choices; runtime owners bind after
+configuration transfer and are not computation-hash inputs.
+
+Four handwritten metadata save/replace/restore protocols now use one borrowed
+view that restores on normal return, exceptions and nested use. Explicit tensor
+operands and CustomOp schemas/fakes remain unchanged. The ordinary explicit
+speculative commit also uses C2a's convolution stage. Backend builders declare
+their model-state inputs through the existing metadata boundary: generic hybrid
+state no longer switches on GDN/Mamba/PLE/Flash-V100 implementation classes.
+Flash-V100's verification field mapping stays with its existing speculative
+metadata owner; the generic builder gains no model-specific knowledge.
+
+### C2b validation
+
+- Existing metadata/provider CPU selection: **116 passed, 27 CUDA skips**.
+- New ownership/configuration selection: **35 CPU passes, two CUDA skips**,
+  including 15 owner/contract tests and 20 configuration utility cases. Swapped
+  engine construction order, replacement registrations, neutral accepted counts,
+  reordered/empty requests, nested failure restoration, disabled diagnostics and
+  worker-policy serialization are covered.
+- On 54633: **22 baseline grouped-metadata tests passed** and **214 candidate
+  tests passed**, including metadata replay, mixed speculative execution and
+  exact conv/SSM state comparisons. A final ownership/backend-input/PP follow-up
+  completed **26 tests**, including actual CUDA graph capture/replay with changed
+  indices, accepted lengths and state data. The subsequent unrelated PP runner
+  initialization blocked in a network socket and was interrupted; it is not
+  counted as passing. No weights were loaded and that test is not a C2b gate.
+- Both lanes' cache-group fixtures now use one real configuration per engine;
+  the old fixtures created separate configurations and relied on global buffers.
+  This preserves the intended within-engine grouped test and independently tests
+  cross-engine rejection/isolation. Numerical assertions are unchanged.
+- All three metadata Triton JIT functions/decorators are AST-identical. Full
+  pre-commit, mypy, environment and layering checks pass with no new whitelist.
+
+The paired benchmark runs on the same 54633 environment/native artifacts as
+C2a. It executes the exact old entry-function bodies and new entries in one
+process, alternates order, checks state/metadata equality and traces allocations
+separately from timing. Host classification uses synthetic CPU request tensors;
+grouped preparation additionally uses real V100 CUDA graph replay.
+
+| Operation | Baseline median | C2b median |
+|---|---:|---:|
+| Pure-spec request classification, host µs | 142.140 | 142.873 |
+| Mixed request classification, host µs | 285.390 | 281.623 |
+| Two-group metadata preparation, host µs | 115.154 | 99.924 |
+| Two-group metadata graph replay, GPU µs | 4.116 | 4.127 |
+| Two-field metadata borrowing, host µs | 0.887 | 2.009 |
+| Nine-field metadata borrowing, host µs | 4.358 | 5.431 |
+
+The grouped host paired median improves 15.731 µs; GPU time remains inside the
+baseline 4.024–4.372 µs range. Classification paired differences are +0.613 and
+-0.315 µs, inside observed variation. The shared borrowing owner costs about
+1.1 µs per eager invocation, localized to its object/dictionary lifecycle; it is
+not a claimed speedup and does not execute per replay in a captured graph.
+Classification/grouped Python allocation peaks are unchanged (1,128/1,416/4,837
+bytes). Borrowing peaks change 0→264 and 560→472 bytes. Extra grouped GPU
+allocation is **zero in both lanes**. These are operator/host-step observations,
+not model throughput or TTFT results.
+
+Scope accounting: request token preparation **2 → 1** implementations; temporary
+metadata restoration **4 → 1** protocols; runtime metadata registries **one
+process-wide → one per engine**. Lower state/compute stages do not import runner
+or the old GDN model layer. Expanded C inventory legacy-read sites decrease
+**358 → 340**; generic coupling changes environment **267 → 266**, platform
+**3708 → 3694**, model **2315 → 2313**. Remaining old-layer projection diagnostics,
+model eligibility, graph policies and communication owners belong to C3/C4;
+DDTree-specific fast-build/trace algorithms remain deferred.
+
+Task-owned `phase-c2b-20261009` artifacts retain source/base patches, baseline and
+candidate JUnit records, follow-up results, `bench-state.json` and JIT parity.

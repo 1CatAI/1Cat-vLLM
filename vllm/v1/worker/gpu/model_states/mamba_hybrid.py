@@ -7,9 +7,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.gdn import resolve_gdn_config
+from vllm.config.gdn_state import resolve_state_trace
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
@@ -34,17 +35,15 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
     prepare_dflash2_gdn_group_metadata,
 )
-from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
-from vllm.v1.attention.backends.short_conv_attn import (
-    PleShortConvAttentionMetadataBuilder,
+from vllm.v1.attention.ops.gdn_state import (
+    CommonGDNSpecMetadata,
+    compute_common_gdn_attn_metadata,
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import (
-    CommonGDNSpecMetadata,
     build_attn_metadata,
-    compute_common_gdn_attn_metadata,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mamba_align import (
@@ -89,40 +88,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
         attn_metadata_builder: Any,
         num_reqs: int,
     ) -> dict[str, Any]:
-        if isinstance(attn_metadata_builder, FlashAttnV100MetadataBuilder):
-            return {
-                "prepared_dflash2_smallq_metadata": (
-                    None
-                    if self.prepared_dflash2_smallq_metadata is None
-                    else self.prepared_dflash2_smallq_metadata.get(
-                        id(attn_metadata_builder)
-                    )
-                )
-            }
-        if not isinstance(
-            attn_metadata_builder,
-            (
-                Mamba2AttentionMetadataBuilder,
-                GDNAttentionMetadataBuilder,
-                PleShortConvAttentionMetadataBuilder,
-            ),
-        ):
-            return {}
-        kwargs = {
-            "num_accepted_tokens": None
-            if self.num_accepted_tokens is None
-            else self.num_accepted_tokens[:num_reqs],
-            "num_decode_draft_tokens_cpu": None
-            if self.num_decode_draft_tokens_cpu is None
-            else self.num_decode_draft_tokens_cpu[:num_reqs],
-        }
-        if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
-            kwargs["common_gdn_metadata"] = self.common_gdn_metadata
-            if self.prepared_dflash2_gdn_metadata is not None:
-                kwargs["prepared_dflash2_metadata"] = (
-                    self.prepared_dflash2_gdn_metadata.get(id(attn_metadata_builder))
-                )
-        return kwargs
+        return attn_metadata_builder.get_model_state_kwargs(self, num_reqs)
 
 
 class MambaHybridModelState(DefaultModelState):
@@ -137,6 +103,8 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        self.gdn_state_policy = resolve_gdn_config(vllm_config).state
+        self.gdn_state_trace = resolve_state_trace(vllm_config)
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -153,7 +121,7 @@ class MambaHybridModelState(DefaultModelState):
         # draft depth only through num_spec_state_tokens, so every native MTP
         # depth qualifies. The MTP4 prefix on these names is historical.
         self._use_mtp4_common_gdn_metadata = bool(
-            envs.VLLM_SM70_MTP4_SHARED_GDN_METADATA
+            self.gdn_state_policy.shared_mtp_metadata
             and speculative_config is not None
             and speculative_config.method == "mtp"
             and device.type == "cuda"
@@ -175,7 +143,7 @@ class MambaHybridModelState(DefaultModelState):
         )
         self._use_mtp4_fused_gdn_metadata = bool(
             self._use_mtp4_common_gdn_metadata
-            and envs.VLLM_SM70_MTP4_FUSED_GDN_METADATA
+            and self.gdn_state_policy.fused_mtp_metadata
             and self.cache_config.mamba_cache_mode in ("none", "align")
         )
         self._dflash2_gdn_builders: (
@@ -410,7 +378,7 @@ class MambaHybridModelState(DefaultModelState):
                         speculative_config.num_speculative_state_tokens()
                     ),
                     legacy_mixed_decode_routing=(
-                        envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+                        bool(self.gdn_state_policy.legacy_mixed_decode_routing)
                     ),
                 )
 
@@ -527,7 +495,7 @@ class MambaHybridModelState(DefaultModelState):
             # the same current stream, which already supplies the required
             # device ordering. Retain the old value check as an opt-in debug
             # fence while the no-sync route is quality- and trace-gated.
-            if envs.VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT:
+            if self.gdn_state_trace.sync_assert:
                 assert (
                     common_gdn_metadata.spec_query_start_loc[-1].item()
                     == common_gdn_metadata.num_spec_decode_tokens

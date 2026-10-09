@@ -113,6 +113,8 @@ class Mamba2AttentionMetadata(BaseMambaAttentionMetadata):
 class Mamba2AttentionMetadataBuilder(
     BaseMambaAttentionMetadataBuilder[Mamba2AttentionMetadata]
 ):
+    accepts_speculative_state_metadata = True
+
     metadata_cls = Mamba2AttentionMetadata
 
     def __init__(
