@@ -146,6 +146,34 @@ def main() -> int:
             current.items(), key=lambda item: -sum(item[1].values())
         )[:40]:
             print(f"{sum(counts.values()):6d}  {path}  {counts}")
+        sys.path.insert(0, str(ROOT))
+        from tools.config_inventory import collect as collect_parameters
+        from tools.config_inventory import summary
+
+        inventory = collect_parameters()
+        print("Parameter inventory (source references, not runtime hits):")
+        print(json.dumps(summary(inventory), indent=1))
+        print("Retained deprecated inputs:")
+        for name, row in inventory["parameters"].items():
+            metadata = row["metadata"]
+            if metadata.get("deprecated") or metadata.get("category") == "deprecated":
+                print(
+                    json.dumps(
+                        {
+                            "name": name,
+                            **{
+                                field: metadata.get(field)
+                                for field in (
+                                    "deprecation_kind",
+                                    "deprecation_reason",
+                                    "deprecation_evidence",
+                                    "replacement",
+                                )
+                            },
+                        },
+                        sort_keys=True,
+                    )
+                )
         return 0
 
     if not BASELINE.exists():

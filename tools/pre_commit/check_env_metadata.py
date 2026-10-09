@@ -17,6 +17,13 @@ FIELDS = {
     "user_visible",
 }
 CATEGORIES = {"configuration", "tuning", "experimental", "debug", "deprecated"}
+DEPRECATION_DEFAULTS = {
+    "deprecated": False,
+    "deprecation_kind": None,
+    "deprecation_reason": None,
+    "deprecation_evidence": (),
+    "replacement": None,
+}
 
 
 def static_unset_default(node: ast.expr) -> tuple[bool, object]:
@@ -78,7 +85,10 @@ def read_metadata(source: str) -> tuple[dict[str, dict], list[str]]:
             errors.append(f"{name}: register with env_var and complete metadata")
             continue
         fields = {kw.arg: kw.value for kw in getter.keywords}
-        if set(fields) != FIELDS:
+        if (
+            not set(fields) >= FIELDS
+            or set(fields) - FIELDS - DEPRECATION_DEFAULTS.keys()
+        ):
             errors.append(f"{name}: metadata fields must be {sorted(FIELDS)}")
             continue
         try:
@@ -86,6 +96,37 @@ def read_metadata(source: str) -> tuple[dict[str, dict], list[str]]:
         except (ValueError, TypeError):
             errors.append(f"{name}: metadata must use literals; never evaluate getters")
             continue
+        metadata = DEPRECATION_DEFAULTS | metadata
+        if not isinstance(metadata["deprecated"], bool):
+            errors.append(f"{name}: deprecated must be a literal boolean")
+        elif metadata["deprecated"]:
+            if metadata["deprecation_kind"] not in (
+                "alias",
+                "experiment",
+                "historical",
+            ):
+                errors.append(f"{name}: deprecated input needs a deprecation_kind")
+            reason = metadata["deprecation_reason"]
+            evidence = metadata["deprecation_evidence"]
+            if not isinstance(reason, str) or not reason.strip():
+                errors.append(f"{name}: deprecated input needs a reason")
+            if (
+                not isinstance(evidence, tuple)
+                or not evidence
+                or any(
+                    not isinstance(item, str) or not item.strip() for item in evidence
+                )
+            ):
+                errors.append(f"{name}: deprecated input needs evidence links")
+            if metadata["deprecation_kind"] == "alias" and not metadata["replacement"]:
+                errors.append(f"{name}: deprecated alias needs a replacement")
+        elif any(metadata[key] != value for key, value in DEPRECATION_DEFAULTS.items()):
+            errors.append(f"{name}: deprecation details require deprecated=True")
+        if metadata["replacement"] is not None and (
+            not isinstance(metadata["replacement"], str)
+            or not metadata["replacement"].strip()
+        ):
+            errors.append(f"{name}: replacement must be a nonempty string or None")
         for field in ("description", "declared_default", "effective_default"):
             if not isinstance(metadata[field], str) or not metadata[field].strip():
                 errors.append(f"{name}: {field} must explain its value")

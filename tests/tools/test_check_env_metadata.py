@@ -118,3 +118,92 @@ def test_internal_metadata_is_kept_out_of_public_reference():
 def test_non_boolean_visibility_is_rejected():
     _, errors = read_metadata(source(user_visible="false"))
     assert errors and "literal boolean" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"deprecated": True},
+        {"deprecated": "yes"},
+        {"deprecation_reason": "Missing deprecated flag"},
+        {
+            "deprecated": True,
+            "deprecation_kind": "alias",
+            "deprecation_reason": "Moved to typed config",
+            "deprecation_evidence": ("proof.md",),
+        },
+        {
+            "deprecated": True,
+            "deprecation_kind": "experiment",
+            "deprecation_reason": "Measured regression",
+            "deprecation_evidence": (),
+        },
+    ],
+)
+def test_deprecation_requires_structured_evidence(changes):
+    _, errors = read_metadata(source(**changes))
+    assert errors
+
+
+def test_deprecation_report_does_not_read_getter(tmp_path):
+    target = tmp_path / "getter-called"
+    metadata, errors = read_metadata(
+        source(
+            getter=f"lambda: open({str(target)!r}, 'w')",
+            deprecated=True,
+            deprecation_kind="experiment",
+            deprecation_reason="Regression only in the documented geometry",
+            deprecation_evidence=("docs/design/proof.md",),
+        )
+    )
+    assert not errors
+    assert "Regression only" in render(metadata)
+    assert "docs/design/proof.md" in render(metadata)
+    assert not target.exists()
+
+
+def test_deprecation_warns_once_for_explicit_zero_and_preserves_parser(monkeypatch):
+    import warnings
+
+    import vllm.envs_metadata as implementation
+
+    monkeypatch.setattr(implementation, "_warned_names", set())
+    name = "VLLM_DEPRECATION_TEST"
+    calls = []
+
+    def getter():
+        calls.append("read")
+        return False
+
+    variables = {
+        name: env_var(
+            getter,
+            description="Legacy test",
+            category="deprecated",
+            declared_default="False",
+            effective_default="False",
+            automatic_conditions=(),
+            acceleration_paths=(),
+            user_visible=False,
+            deprecated=True,
+            deprecation_kind="alias",
+            deprecation_reason="Engine policy owns this setting",
+            deprecation_evidence=("docs/design/proof.md",),
+            replacement="engine.policy",
+        )
+    }
+    implementation.bind_env_names(variables)
+    with warnings.catch_warnings(record=True) as observed:
+        warnings.simplefilter("always")
+        monkeypatch.delenv(name, raising=False)
+        assert variables[name]() is False
+        assert not observed
+        monkeypatch.setenv(name, "0")
+        assert variables[name]() is False
+        assert variables[name]() is False
+        # Binding another registry does not reset process-wide warning state.
+        implementation.bind_env_names(variables)
+        variables[name].warn_if_deprecated()
+        assert len(observed) == 1
+        assert "engine.policy" in str(observed[0].message)
+    assert calls == ["read"] * 3

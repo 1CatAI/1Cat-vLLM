@@ -8,11 +8,10 @@ import os
 import sys
 import tempfile
 import uuid
-import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal, cast
 
-from vllm.envs_metadata import env_var
+from vllm.envs_metadata import bind_env_names, env_var, warn_deprecated_once
 
 if TYPE_CHECKING:
     VLLM_SM70_DEBUG: set[str] = set()
@@ -1088,13 +1087,11 @@ def deprecated_env(
     """Wrap an env-var getter to emit a FutureWarning when the var is set."""
 
     def _read() -> Any:
-        if env_name in os.environ:
-            warnings.warn(
-                f"{env_name} is deprecated and will be removed in "
-                f"{removal_version}. {replacement}",
-                FutureWarning,
-                stacklevel=2,
-            )
+        warn_deprecated_once(
+            env_name,
+            f"{env_name} is deprecated and will be removed in "
+            f"{removal_version}. {replacement}",
+        )
         return getter()
 
     return _read
@@ -4585,12 +4582,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "SM70: awq mlp down tile overlap kernel reducer blocks. The "
             "consumer locations and unset defaults are listed below."
         ),
-        category="tuning",
+        category="deprecated",
         declared_default="0",
         effective_default="0",
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="experiment",
+        deprecation_reason=(
+            "Reducer CTA counts 1 and 4 regressed the documented two-GPU AWQ "
+            "512-input/32-output screen by 32.84% and 9.25%; this conclusion "
+            "does not cover other geometries or the tail-worker implementation"
+        ),
+        deprecation_evidence=("docs/design/sm70_tile_runtime_exploration.md",),
+        replacement="parallel_config.communication.awq_overlap_kernel_reducer_blocks=0",
     ),
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))),
@@ -5574,6 +5580,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: verify_fastpath",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason="The per-engine verifier config owns this policy",
+        deprecation_evidence=("docs/design/sm70_environment_surface.md",),
+        replacement="speculative_config.sm70_dflash2.verify_fastpath",
     ),
     # Build all selector-based DFlash target GDN state-index metadata with one
     # pointer-table Triton launch. Keep separate from the shared-classification
@@ -18451,6 +18462,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
 
 
 # --8<-- [end:env-vars-definition]
+
+bind_env_names(environment_variables)
 
 
 def __getattr__(name: str):

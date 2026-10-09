@@ -71,6 +71,34 @@ def render(metadata: dict[str, dict], *, include_internal: bool = False) -> str:
             ", ".join(row["acceleration_paths"]) or "No SM70 path association",
         ]
         lines.append("| " + " | ".join(map(cell, fields)) + " |")
+    deprecated = {
+        name: row
+        for name, row in metadata.items()
+        if row.get("deprecated") and (include_internal or row["user_visible"])
+    }
+    if deprecated:
+        lines.extend(
+            [
+                "",
+                "## Retained deprecated inputs",
+                "",
+                "Explicit legacy inputs warn once per process and name. Deprecating an "
+                "alias does not deprecate its implementation. Experiments retain their "
+                "explicit entry; evidence applies only to the documented workload.",
+                "",
+                "| Variable | Kind | Reason | Evidence | Replacement |",
+                "| --- | --- | --- | --- | --- |",
+            ]
+        )
+        for name, row in sorted(deprecated.items()):
+            fields = [
+                f"`{name}`",
+                row["deprecation_kind"],
+                row["deprecation_reason"],
+                ", ".join(row["deprecation_evidence"]),
+                row["replacement"] or "None",
+            ]
+            lines.append("| " + " | ".join(map(cell, fields)) + " |")
     return "\n".join(lines) + "\n"
 
 

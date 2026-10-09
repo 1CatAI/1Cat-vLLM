@@ -42,9 +42,10 @@ def native_reads(content: str) -> list[tuple[str, int]]:
         return re.sub(r"[^\n]", " ", token) if token.startswith(("//", "/*")) else token
 
     source = tokens.sub(mask_comments, content)
-    aliases = list(re.finditer(r'\b(\w+)\s*=\s*"(VLLM_[A-Z0-9_]+)"', source))
+    key_pattern = r"(?:VLLM_|TM_|FLASH_QLA_)[A-Z0-9_]+"
+    aliases = list(re.finditer(r'\b(\w+)\s*=\s*"(' + key_pattern + r')"', source))
     calls = re.finditer(
-        r'\b(\w+)\s*(?:<[^>\n]*>)?\s*\(\s*(?:"(VLLM_[A-Z0-9_]+)"|(\w+)\b)',
+        r'\b(\w+)\s*(?:<[^>\n]*>)?\s*\(\s*(?:"(' + key_pattern + r')"|(\w+)\b)',
         source,
     )
     reads = []
@@ -69,7 +70,9 @@ def native_reads(content: str) -> list[tuple[str, int]]:
 def scan_native_file(path: str, known: set[str]) -> int:
     content = Path(path).read_text(encoding="utf-8")
     missing = {
-        (name, line) for name, line in native_reads(content) if name not in known
+        (name, line)
+        for name, line in native_reads(content)
+        if name.startswith("VLLM_") and name not in known
     }
     for name, line in sorted(missing):
         print(
@@ -102,12 +105,9 @@ def registered_variables() -> set[str]:
     raise RuntimeError(f"environment_variables not found in {ENVS_FILE}")
 
 
-def scan_file(path: str, known: set[str]) -> int:
-    if Path(path).suffix in NATIVE_SUFFIXES:
-        return scan_native_file(path, known)
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-    tree = ast.parse(content, filename=path)
+def python_reads(content: str) -> list[tuple[str | None, int]]:
+    """Return literal/constant input names, retaining unresolved dynamic reads."""
+    tree = ast.parse(content)
     # Resolve stable module constants, such as DISABLE_ENV. Never substitute
     # a module alias through a function argument/local binding with that name.
     module_constants: dict[str, str] = {}
@@ -186,7 +186,7 @@ def scan_file(path: str, known: set[str]) -> int:
             and is_os(node.value)
         )
 
-    returncode = 0
+    reads = []
     for node in ast.walk(tree):
         key: ast.AST | None = None
         if isinstance(node, ast.Call):
@@ -218,19 +218,29 @@ def scan_file(path: str, known: set[str]) -> int:
             if isinstance(key, ast.Name)
             else None
         )
-        if not isinstance(name, str):
-            continue
-        if not name.startswith("VLLM_"):
-            continue
-        if name in known or name in BASELINE:
-            continue
+        if key is not None:
+            reads.append((name if isinstance(name, str) else None, node.lineno))
+    return reads
+
+
+def scan_file(path: str, known: set[str]) -> int:
+    if Path(path).suffix in NATIVE_SUFFIXES:
+        return scan_native_file(path, known)
+    reads = python_reads(Path(path).read_text(encoding="utf-8"))
+    missing = [
+        (name, line)
+        for name, line in reads
+        if name is not None
+        and name.startswith("VLLM_")
+        and name not in known | BASELINE
+    ]
+    for name, line in missing:
         print(
-            f"{path}:{node.lineno}: \033[91merror:\033[0m {name} is read from "
-            f"os.environ but not registered in {ENVS_FILE}. Register it there "
-            "(and add it to ignored_factors if it never changes compiled code)."
+            f"{path}:{line}: error: {name} is read from os.environ but not "
+            f"registered in {ENVS_FILE}. Register it there (and add it to "
+            "ignored_factors if it never changes compiled code)."
         )
-        returncode = 1
-    return returncode
+    return int(bool(missing))
 
 
 def main() -> int:
