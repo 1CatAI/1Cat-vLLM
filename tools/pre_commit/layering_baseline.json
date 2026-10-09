@@ -33,6 +33,9 @@
  "vllm/config/compilation.py": {
   "model": 3
  },
+ "vllm/config/observability.py": {
+  "platform": 1
+ },
  "vllm/config/parallel.py": {
   "env": 1
  },
@@ -482,8 +485,12 @@
  },
  "vllm/v1/spec_decode/llm_base_proposer.py": {
   "env": 3,
-  "model": 44,
-  "platform": 85
+  "model": 43,
+  "platform": 44
+ },
+ "vllm/v1/spec_decode/profiling.py": {
+  "model": 4,
+  "platform": 3
  },
  "vllm/v1/spec_decode/static_draft_vocab.py": {
   "platform": 36
@@ -503,8 +510,8 @@
  },
  "vllm/v1/worker/gpu/model_runner.py": {
   "env": 2,
-  "model": 16,
-  "platform": 43
+  "model": 15,
+  "platform": 8
  },
  "vllm/v1/worker/gpu/model_states/mamba_hybrid.py": {
   "model": 82,
@@ -552,8 +559,8 @@
  },
  "vllm/v1/worker/gpu_model_runner.py": {
   "env": 41,
-  "model": 670,
-  "platform": 329
+  "model": 665,
+  "platform": 277
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 3,
