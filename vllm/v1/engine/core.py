@@ -778,9 +778,14 @@ class EngineCore:
             and scheduler_output.scheduled_spec_decode_tokens
         ):
             return
+        # Custom schedulers may not expose the request registry. Keep their
+        # existing draft path rather than imposing a new interface requirement.
+        requests = getattr(self.scheduler, "requests", None)
+        if requests is None:
+            return
         needs_drafts = False
         for req_id, spec in scheduler_output.scheduled_spec_decode_tokens.items():
-            request = self.scheduler.requests.get(req_id)
+            request = requests.get(req_id)
             if (
                 request is not None
                 and request.use_structured_output

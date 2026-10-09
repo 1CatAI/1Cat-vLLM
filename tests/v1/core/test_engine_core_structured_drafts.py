@@ -3,6 +3,7 @@
 """EngineCore fills worker drafts into the bitmask path when no step of a
 structured-output request is in flight (the deferred path never runs)."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
@@ -71,4 +72,11 @@ def test_skips_without_structured_requests_or_placeholders():
     core._fill_structured_output_drafts(
         _scheduler_output({"0": [-1, -1]}, structured=False)
     )
+    core.model_executor.take_draft_token_ids.assert_not_called()
+
+
+def test_custom_scheduler_without_registry_retains_existing_path():
+    core = _core({}, None)
+    core.scheduler = SimpleNamespace()
+    core._fill_structured_output_drafts(_scheduler_output({"0": [-1, -1]}))
     core.model_executor.take_draft_token_ids.assert_not_called()
