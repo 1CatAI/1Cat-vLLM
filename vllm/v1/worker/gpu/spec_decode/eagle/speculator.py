@@ -37,6 +37,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     PrefillEagleCudaGraphManager,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+from vllm.v1.worker.gpu.spec_decode.speculator import TargetSamplingHooks
 
 logger = init_logger(__name__)
 
@@ -62,7 +63,7 @@ def _mtp_decode_warmup_request_sizes(
     return tuple(sorted(request_sizes))
 
 
-class EagleSpeculator:
+class EagleSpeculator(TargetSamplingHooks):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.device = device
