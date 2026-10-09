@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Per-engine MoE policy and the sole adapter for migrated legacy switches."""
 
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from pydantic import Field
 
 from vllm.config.diagnostic_dump import TensorDumpConfig
+from vllm.config.execution_policy_base import ExecutionPolicy
 from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.utils import config, hash_factors
 
@@ -576,8 +577,58 @@ class Sm70MxFp4MoEConfig(Sm70MoELegacyConfig):
 
 
 @config
+class Sm70UnquantizedMoEConfig(ExecutionPolicy):
+    """One initialized policy for warmup and unquantized execution."""
+
+    legacy_tiles: bool | None = None
+    """Retain the existing 0.0.3 SM70 tile selection."""
+    functional: bool | None = None
+    """Retain the functional expert implementation at its layout gates."""
+    disable_inplace: bool | None = None
+    """Keep the explicit override disabling in-place output."""
+    mtp_tuned: bool | None = None
+    """Retain exact-shape MTP tiles in warmup and execution."""
+    mtp_fp16_exact: bool | None = None
+    """Retain the exact FP16 MTP native provider."""
+
+    aliases: ClassVar[dict[str, str]] = {
+        "legacy_tiles": "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG",
+        "functional": "VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL",
+        "disable_inplace": "VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE",
+        "mtp_tuned": "VLLM_SM70_MTP_MOE_TUNED_CONFIG",
+        "mtp_fp16_exact": "VLLM_SM70_MTP_MOE_FP16_EXACT",
+    }
+
+    errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Captured parser failures; dynamic admission retains the original ordering."""
+
+    def resolve(self):
+        from vllm.config.utils import resolve_legacy_fields
+
+        resolve_legacy_fields(
+            self,
+            {
+                field: alias
+                for field, alias in self.aliases.items()
+                if field not in self.sources
+            },
+            deferred_errors=self.errors,
+        )
+
+    def value(self, field):
+        if field in self.errors:
+            raise ValueError(self.errors[field])
+        return getattr(self, field)
+
+
+@config
 class Sm70MoEConfig:
     """Resolve only loaded families; unused options do not salt graph caches."""
+
+    unquantized: Sm70UnquantizedMoEConfig = Field(
+        default_factory=Sm70UnquantizedMoEConfig
+    )
+    """Shared policy for native/Triton unquantized execution and its warmup."""
 
     awq: Sm70MoEFormatConfig = Field(default_factory=Sm70MoEFormatConfig)
     """AWQ options, captured only if an AWQ MoE layer is initialized."""
@@ -591,7 +642,7 @@ class Sm70MoEConfig:
 
     @property
     def resolved(self) -> bool:
-        return any(
+        return bool(self.unquantized.sources) or any(
             getattr(self, family).resolved
             for family in ("awq", "fp8", "nvfp4", "mxfp4")
         )
@@ -599,9 +650,16 @@ class Sm70MoEConfig:
     def compute_hash(self) -> str:
         return hash_factors(
             {
-                family: getattr(self, family).hash_options()
-                for family in ("awq", "fp8", "nvfp4", "mxfp4")
-                if getattr(self, family).resolved
+                **{
+                    family: getattr(self, family).hash_options()
+                    for family in ("awq", "fp8", "nvfp4", "mxfp4")
+                    if getattr(self, family).resolved
+                },
+                **(
+                    {"unquantized": self.unquantized.compute_hash()}
+                    if self.unquantized.active and self.unquantized.sources
+                    else {}
+                ),
             }
         )
 
@@ -633,3 +691,11 @@ def capture_mxfp4_moe_config() -> Sm70MxFp4MoEConfig:
     policy = cfg.kernel_config.sm70_moe.mxfp4 if cfg else Sm70MxFp4MoEConfig()
     policy.resolve()
     return policy
+
+
+def unquantized_moe_policy(cfg=None) -> Sm70UnquantizedMoEConfig:
+    from vllm.config.execution_policy import capture_execution_policy
+
+    return capture_execution_policy(
+        "kernel_config.sm70_moe.unquantized", Sm70UnquantizedMoEConfig, cfg
+    )

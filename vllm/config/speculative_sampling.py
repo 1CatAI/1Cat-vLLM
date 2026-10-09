@@ -65,7 +65,15 @@ class SpeculativeSamplingPolicy(ExecutionPolicy):
     dynamic_vocab_default: bool | None = None
     """Allow the existing model-qualified automatic vocabulary policy."""
 
+    shared_batch: bool | None = None
+    """Admit the retained MTP shared-expert batch projection."""
+
+    router_batch: bool | None = None
+    """Admit the retained MTP router batch projection."""
+
     aliases: ClassVar[dict[str, str]] = {
+        "shared_batch": "VLLM_SM70_MTP_SHARED_BATCH",
+        "router_batch": "VLLM_SM70_MTP_ROUTER_BATCH",
         "sync_accept_counts": "VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS",
         "token_matching": "VLLM_MTP_STOCHASTIC_TOKEN_MATCHING",
         "combine_bonus": "VLLM_SM70_REJECTION_COMBINE_BONUS",
@@ -92,12 +100,20 @@ class SpeculativeSamplingPolicy(ExecutionPolicy):
     fused_apply_top_p_error: str | None = Field(default=None, init=False)
     """A legacy parse failure is raised only when the fused path consumes it."""
 
+    batch_errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Retain invalid MTP projection options behind their original batch gates."""
+
     def resolve_fields(self, names) -> None:
         from vllm import envs
 
         pending = {
             field: self.aliases[field] for field in names if field not in self.sources
         }
+        batch_fields = ("shared_batch", "router_batch")
+        batch_pending = {
+            field: pending.pop(field) for field in batch_fields if field in pending
+        }
+        resolve_legacy_fields(self, batch_pending, deferred_errors=self.batch_errors)
         if "draft_apply_top_p" in pending:
             if self.draft_apply_top_p is not None:
                 self.fused_apply_top_p = self.draft_apply_top_p
@@ -124,6 +140,8 @@ class SpeculativeSamplingPolicy(ExecutionPolicy):
         self, *, draft: bool = True, vocab: bool = True, vocab_default: bool = True
     ) -> None:
         names = {
+            "shared_batch",
+            "router_batch",
             "sync_accept_counts",
             "token_matching",
             "combine_bonus",
@@ -185,6 +203,8 @@ class SpeculativeSamplingPolicy(ExecutionPolicy):
                 fused_apply_top_p=self.fused_apply_top_p,
                 fused_apply_top_p_error=self.fused_apply_top_p_error,
             )
+        if self.batch_errors:
+            options["batch_errors"] = self.batch_errors
         return hash_factors(options)
 
 
@@ -195,3 +215,21 @@ def resolve_sampling_policy(spec=None, *, draft=False, vocab=False):
         policy = SpeculativeSamplingPolicy()
     policy.resolve(draft=draft, vocab=vocab)
     return policy
+
+
+def sampling_policy(cfg=None) -> SpeculativeSamplingPolicy | None:
+    """Borrow the initialized owner; non-speculative engines have no MTP policy."""
+    from vllm.config.execution_policy import capture_execution_policy
+
+    return capture_execution_policy(
+        "speculative_config.sampling_policy", SpeculativeSamplingPolicy, cfg
+    )
+
+
+def mtp_batch_enabled(field: str, cfg=None) -> bool:
+    policy = sampling_policy(cfg)
+    if policy is None:
+        return False
+    if field in policy.batch_errors:
+        raise ValueError(policy.batch_errors[field])
+    return bool(getattr(policy, field))

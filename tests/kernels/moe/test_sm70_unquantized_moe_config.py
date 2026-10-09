@@ -3,7 +3,6 @@
 
 import pytest
 
-import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.fused_moe as fused_moe_module
 from vllm.model_executor.layers.fused_moe.fused_moe import (
     _get_sm70_mtp_moe_decode_config,
@@ -14,7 +13,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe import (
 
 @pytest.fixture(autouse=True)
 def _enable_tuned_mtp_config(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", True)
+    monkeypatch.setenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "1")
 
 
 def test_mtp_sm70_decode_config_keeps_legacy_tile_at_m1():
@@ -65,7 +64,7 @@ def test_mtp_sm70_decode_config_is_shape_bounded(shape):
 
 
 def test_mtp_sm70_decode_config_can_be_disabled(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", False)
+    monkeypatch.setenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "0")
 
     assert _get_sm70_mtp_moe_decode_config(2, 256, 128, 2048, 8) is None
 
@@ -104,7 +103,7 @@ def test_mtp_sm70_decode_config_is_selected_when_opted_in(monkeypatch):
 
 def test_mtp_sm70_decode_config_rolls_back_to_0dot3(monkeypatch):
     monkeypatch.setattr(fused_moe_module, "current_platform", _FakeSM70Platform())
-    monkeypatch.setattr(envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", False)
+    monkeypatch.setenv("VLLM_SM70_MTP_MOE_TUNED_CONFIG", "0")
 
     config = fused_moe_module.get_default_config(1, 256, 128, 2048, 8, None)
 

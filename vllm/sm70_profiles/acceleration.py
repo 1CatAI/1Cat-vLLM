@@ -307,9 +307,11 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     }
     from vllm.model_executor.models.config import sm70_flash_next_batch_qualified
 
-    if (
-        not sm70_flash_next_batch_qualified(cfg)
-        and "VLLM_SM70_QWEN38_GDN_INPUT_BATCH" not in envs.os.environ
+    if not sm70_flash_next_batch_qualified(
+        cfg
+    ) and cfg.kernel_config.gdn.projection.sources.get("input_batch") not in (
+        "typed",
+        "VLLM_SM70_QWEN38_GDN_INPUT_BATCH",
     ):
         controls["VLLM_SM70_QWEN38_GDN_INPUT_BATCH"].update(
             enabled=False, reason="speculation_not_quality_qualified"
@@ -341,14 +343,14 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     if reference_layout:
         batch = layer_policy(cfg).batch_fastpath
         gdn_layers = list(getattr(text, "layer_types", ())).count("linear_attention")
-        if batch or envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH:
+        if batch or values["VLLM_SM70_QWEN38_GDN_INPUT_BATCH"]:
             copies["gdn_input"] = gdn_layers * (4096 + 32) * 2560 * 2
         if batch or (draft_layers and layer_policy(cfg).hc_mtp_batch):
             copies["hc_target"] = layers * 2 * (96 * 10240 + 2560 * 320) * 2
             copies["hc_draft"] = draft_layers * 2 * (96 * 10240 + 2560 * 320) * 2
-        if draft_layers and envs.VLLM_SM70_MTP_ROUTER_BATCH:
+        if draft_layers and values["VLLM_SM70_MTP_ROUTER_BATCH"]:
             copies["router"] = (layers + draft_layers) * 512 * 2560 * 2
-        if draft_layers and envs.VLLM_SM70_MTP_SHARED_BATCH:
+        if draft_layers and values["VLLM_SM70_MTP_SHARED_BATCH"]:
             copies["shared_expert"] = (layers + draft_layers) * 320 * 2560 * 2
     return {
         "scope": "configured_capabilities",

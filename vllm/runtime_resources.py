@@ -20,12 +20,13 @@ class _RuntimeResources(dict[str, Any]):
 def runtime_resources_for(config) -> dict[str, Any]:
     resources = getattr(config, "_runtime_resources", None)
     if not resources:
-        from vllm.config.execution_policy import POLICY_OWNERS
+        from vllm.config.execution_policy import BOUND_POLICY_OWNERS
 
         policies = {}
-        for path in POLICY_OWNERS:
-            owner, name = path.split(".")
-            policy = getattr(getattr(config, owner, None), name, None)
+        for path in BOUND_POLICY_OWNERS:
+            policy = config
+            for part in path.split("."):
+                policy = getattr(policy, part, None)
             if policy is not None:
                 policies[path] = policy
         resources = _RuntimeResources(

@@ -729,7 +729,7 @@ def enable_qwen38_sm70_fp16_fused_hc(
     """Mark exact base-model HC modules for the fused M=1 route."""
     if (
         not layer_policy().fused_hc
-        or envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
+        or layer_policy().value("online_qpn8")
         or dtype != torch.float16
         or not current_platform.is_device_capability((7, 0))
         or not _exact_runtime_contract(vllm_config)

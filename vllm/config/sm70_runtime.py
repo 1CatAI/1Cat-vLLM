@@ -16,13 +16,16 @@ from vllm.config.sm70_dflash2 import DFlashDiagnosticsConfig
 from vllm.config.utils import config
 
 
-def resolve_legacy_fields(policy, aliases, *, inactive_defaults=None, reader=None):
+def resolve_legacy_fields(
+    policy, aliases, *, inactive_defaults=None, reader=None, deferred_errors=None
+):
     from vllm.config.utils import resolve_legacy_fields as resolve
 
     resolve(
         policy,
         aliases,
         inactive_defaults=inactive_defaults,
+        deferred_errors=deferred_errors,
         reader=reader,
         source_overrides={"VLLM_SM70_MTP_PROFILE": "VLLM_SM70_DEBUG"}
         if "VLLM_SM70_DEBUG" in os.environ

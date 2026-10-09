@@ -147,8 +147,17 @@ def runtime_policy_reads(path: Path, tree: ast.AST) -> list[str]:
     """Ordered defaults can reference aliases; execution cannot read their envs."""
     if path.as_posix().startswith("vllm/config/"):
         return []
+    from tools.pre_commit.config_lifecycle import initialization_library_loaders
+
+    loading_nodes = {
+        child
+        for function in initialization_library_loaders(tree)
+        for child in ast.walk(function)
+    }
     errors = []
     for node in ast.walk(tree):
+        if node in loading_nodes:
+            continue
         name = None
         if isinstance(node, ast.Attribute) and ast.unparse(node.value) == "envs":
             name = node.attr
@@ -260,6 +269,7 @@ def violations(path: Path) -> list[str]:
 
 
 def main():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     paths = [Path(name) for name in sys.argv[1:]]
     if not paths:
         paths = list(Path("vllm").rglob("*.py"))

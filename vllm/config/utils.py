@@ -478,6 +478,7 @@ def resolve_legacy_fields(
     inactive_defaults: dict[str, int | float] | None = None,
     reader=None,
     source_overrides: dict[str, str] | None = None,
+    deferred_errors: dict[str, str] | None = None,
 ) -> None:
     from vllm import envs
     from vllm.envs_metadata import EnvVar
@@ -500,7 +501,11 @@ def resolve_legacy_fields(
                     if reader is not None
                     else envs.environment_variables[legacy]()
                 )
-            except ValueError:
+            except ValueError as error:
+                if deferred_errors is not None:
+                    deferred_errors[name] = str(error)
+                    policy.sources[name] = source
+                    continue
                 if inactive_defaults is None or name not in inactive_defaults:
                     raise
                 value = inactive_defaults[name]

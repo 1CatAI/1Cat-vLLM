@@ -1483,7 +1483,7 @@ class FlashV100Policy(ExecutionPolicy):
             "package_policy": dict(options.python_policy),
             "prefill_native": {
                 "abi": 1,
-                "values": options.prefill_native_effective,
+                "values": list(options.prefill_native_effective),
                 "resources": "worker runtime_resources.sm70_prefill",
                 "shared_resource": "physical-device execution gate for kernel globals",
             },

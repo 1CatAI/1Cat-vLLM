@@ -62,7 +62,7 @@ part of the contract.
 | D2 GDN and speculation | Merged [#1143](https://github.com/1CatAI/1Cat-vLLM/pull/1143); CI passed | CPU isolation/compatibility, 17 GPU operator cases and matched A/B passed. |
 | D3 diagnostics | Merged [#1146](https://github.com/1CatAI/1Cat-vLLM/pull/1146); CI passed | Shared diagnostic owner, 74 initialized parameters, legacy typed MoE bridge, CPU isolation and 7 GPU cases plus matched operator A/B. |
 | D4a attention package | Merged `d4ce51399`, CI passed [#1148](https://github.com/1CatAI/1Cat-vLLM/pull/1148) | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
-| D4b FA2/79T resources | Validated, ready for review | Native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build; evidence below. |
+| D4b FA2/79T resources | Merged [#1150](https://github.com/1CatAI/1Cat-vLLM/pull/1150), `b14c2ab0a`, CI passed | Native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build; evidence below. |
 | D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
 | D6 closure | Pending | Complete evidence audit, remaining-name ownership, report and execution-time read guards. |
 
@@ -428,3 +428,35 @@ that run was rejected before benchmarking. The corrected build explicitly
 refreshes source timestamps and produces a different baseline artifact. The
 local policy/metadata suite also needs a GPU-capable platform for nine existing
 fixtures; those fixtures pass in the 203-case remote run.
+
+### D5 provider migration (in progress)
+
+The first provider change binds nine QSA controls, two GDN projection controls,
+two MTP batch projection controls, four layer provider controls, five
+unquantized MoE controls and two GLM diagnostic controls. The existing configuration
+owners and initialization checkpoints remain authoritative. No algorithm,
+precision mode, shape bound or native schema changes in this part.
+
+- QSA no longer snapshots computation policy on module import. Its two mutable
+  workspace maps borrow engine storage, retain captured allocations across
+  growth, and keep standalone compatibility storage separate. The QSA library
+  path and grouped ABI capability remain process loading/capability concerns.
+- GDN batch packing and MTP router/shared projection consumers use the same
+  initialized policy as weight preparation. The ordinary top-k20 sampler captures
+  its layer policy at construction; static helper calls retain a standalone
+  compatibility adapter. Invalid dormant settings are recorded at initialization
+  and raised at their original admission checkpoints.
+- Unquantized MoE warmup and execution use one configuration. The temporary
+  legacy-tile warmup override is context-local and restored on exceptions.
+- GLM KDA finite/trace admission uses runtime diagnostics. Seen keys, armed
+  prefixes and token indices belong to the engine diagnostic owner.
+- Online QPN8 workspace pools are engine-local. Its ordinary and fused HC
+  dispatch resolve workspace addresses by layer prefix inside opaque operations,
+  preserving B's export/reload mechanism. Existing native operators are unchanged.
+
+Focused CPU evidence is under `/home/ymzx/arch-ws/tmp/phase-d5`. The remote
+baseline is main `b14c2ab0a`; normal `_C` and `_moe_C` builds are owned by
+`/home/ymzx/arch-ws/phase-d5-20261010`. GPU validation and A/B results are pending.
+This section does not claim completion of D5 or D: DeepSeek/indexer, remaining
+provider/diagnostic consumers and native resource/policy binding still require
+migration and the D6 inventory must account for every boundary.

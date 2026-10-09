@@ -368,6 +368,11 @@ def resolved_sm70_dflash2_config():
 
 @config
 class DFlashDiagnosticsConfig(ExecutionPolicy):
+    proposal_stages: bool | None = None
+    """Retain GLM proposal/target nonfinite stage observations."""
+    target_layer_trace: bool | None = None
+    """Retain armed GLM target-layer trace observations per engine."""
+
     corruption: bool | None = None
     """Existing family-specific corruption diagnostic admission."""
     draft_logits: bool | None = None
@@ -381,6 +386,8 @@ class DFlashDiagnosticsConfig(ExecutionPolicy):
     """Captured parse failures; unused family controls retain short-circuiting."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "proposal_stages": "VLLM_DFLASH_DEBUG_PROPOSAL_STAGES",
+        "target_layer_trace": "VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE",
         "corruption": "VLLM_DFLASH_DEBUG_CORRUPTION",
         "draft_logits": "VLLM_DFLASH_DUMP_DRAFT_LOGITS",
         "profile": "VLLM_DFLASH_PROFILE",

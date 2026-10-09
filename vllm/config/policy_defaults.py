@@ -11,7 +11,11 @@ import os
 from typing import Any
 
 from vllm import envs
-from vllm.config.execution_policy import POLICY_OWNERS, read_execution_legacy
+from vllm.config.execution_policy import (
+    BOUND_POLICY_OWNERS,
+    POLICY_OWNERS,
+    read_execution_legacy,
+)
 from vllm.config.sm70_dflash2 import SM70_DFLASH2_LEGACY_FIELDS
 
 
@@ -368,8 +372,10 @@ def runtime_policy_report(cfg):
 
 def effective_runtime_values(cfg):
     values = {}
-    for path in POLICY_OWNERS:
+    for path in BOUND_POLICY_OWNERS:
         policy = _owner(cfg, path)
+        if policy is None:
+            continue
         values.update(
             {alias: getattr(policy, field) for field, alias in policy.aliases.items()}
         )
@@ -422,6 +428,9 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
         for field, alias in trace.layer_aliases.items():
             if field in trace.sources:
                 ignored.add(alias)
+    unquantized = _owner(cfg, "kernel_config.sm70_moe.unquantized")
+    if unquantized is not None and unquantized.sources:
+        ignored.update(unquantized.aliases.values())
     gdn = _owner(cfg, "kernel_config.gdn")
     if gdn is not None and gdn.resolved:
         ignored.update(gdn.projection.aliases.values())

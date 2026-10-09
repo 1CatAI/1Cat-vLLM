@@ -12,6 +12,7 @@ from vllm.config.gdn import GdnConfig
 from vllm.config.sm70_moe import Sm70MoEConfig
 from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.sm70_runtime import Sm70RuntimeConfig
+from vllm.config.sm70_sparse import Sm70SparseConfig
 from vllm.config.utils import config, get_hash_factors, hash_factors
 from vllm.logger import init_logger
 
@@ -490,22 +491,6 @@ class Sm70RingConfig:
 
 
 @config
-class Sm70SparseConfig:
-    """Per-engine sparse attention policy; individual operators guard layouts."""
-
-    indexer_decode_cublas: bool = True
-    """Share paged index keys between query heads and rows when eligible."""
-    decode_bmm: bool = True
-    """Gather packed FP8 keys for eligible FP16 sparse decode matmuls."""
-    prefill_bmm: bool = True
-    """Use bounded batched matmuls for eligible FP16 sparse prefill."""
-    active: bool = Field(default=False, init=False)
-    """Whether the engine's metadata describes sparse indexed attention."""
-    reason: str | None = Field(default=None, init=False)
-    """Startup capability rejection; individual calls also check tensor layouts."""
-
-
-@config
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
@@ -861,7 +846,7 @@ class KernelConfig:
         if not self.sm70_awq.resolved:
             # An unused format must not perturb another format's graph cache.
             ignored_factors.add("sm70_awq")
-        if not self.sm70_fp8.resolved:
+        if not self.sm70_fp8.resolved and not self.sm70_fp8.native.values:
             ignored_factors.add("sm70_fp8")
         if not self.sm70_moe.resolved:
             ignored_factors.add("sm70_moe")
@@ -875,6 +860,8 @@ class KernelConfig:
             ignored_factors.add("sm70_mxfp4")
         factors = get_hash_factors(self, ignored_factors)
         factors["layer_execution"] = self.layer_execution.compute_hash()
+        if self.sm70_sparse.active:
+            factors["sm70_sparse"] = self.sm70_sparse.compute_hash()
         if self.gdn.resolved:
             factors["gdn"] = self.gdn.compute_hash()
         if self.sm70_moe.resolved:
@@ -912,7 +899,18 @@ class KernelConfig:
 
         model = vllm_config.model_config
         text = getattr(model, "hf_text_config", None)
+        self.sm70_moe.unquantized.resolve()
+        self.sm70_moe.unquantized.active = bool(
+            current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and any(
+                getattr(text, key, 0)
+                for key in ("num_experts", "num_local_experts", "n_routed_experts")
+            )
+        )
         self.sm70_sparse.active = bool(getattr(text, "index_head_dim", None))
+        self.sm70_sparse.resolve()
+        self.sm70_sparse.validate_active()
         self.sm70_sparse.reason = (
             "no indexed sparse-attention metadata"
             if not self.sm70_sparse.active

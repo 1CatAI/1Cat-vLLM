@@ -8,6 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.quantization import sm70_online_qpn8 as online_qpn8
+from vllm.model_executor.layers.quantization.utils import sm70_layer_workspaces as ws
 
 
 def test_qwen4_exp_online_qpn8_defaults_off_and_can_be_enabled(monkeypatch):
@@ -174,7 +175,12 @@ def test_online_qpn8_apply_uses_prepared_state(monkeypatch):
     layer._sm70_qwen4_exp_online_qpn8_split_k = 4
     layer._sm70_qwen4_exp_online_qpn8_nacc = 2
     layer._sm70_qwen4_exp_online_qpn8_prefetch = False
-    layer._sm70_qwen4_exp_online_qpn8_workspace_ptr = 123
+    layer.prefix = "online_qpn8.apply"
+    workspace = torch.zeros(32)
+    ws.register_layer_workspace(layer, workspace)
+    monkeypatch.setattr(
+        torch.ops.vllm, "sm70_fp8_qpn8_dispatch", ws._sm70_fp8_qpn8_dispatch
+    )
     calls = []
 
     def fake_dispatch(*args):
@@ -189,7 +195,8 @@ def test_online_qpn8_apply_uses_prepared_state(monkeypatch):
     out = online_qpn8.maybe_apply_online_qpn8(layer, x, bias)
     assert out is not None and out.shape == (2, 3, 32)
     assert torch.equal(out, torch.full_like(out, 3))
-    assert calls[0][1] == 123
+    assert calls[0][1] == workspace.data_ptr()
+    ws.clear_layer_workspaces()
     assert calls[0][-1] is False
 
 
@@ -207,6 +214,12 @@ def test_fused_hc_uses_prepared_partials_without_global_lookup(monkeypatch):
         layer.register_buffer(
             online_qpn8._SCALES_ATTR, torch.empty((1,), dtype=torch.float16)
         )
+    down.prefix = "online_qpn8.down"
+    workspace = torch.zeros(32)
+    ws.register_layer_workspace(down, workspace)
+    monkeypatch.setattr(
+        torch.ops.vllm, "sm70_online_qpn8_hc_dispatch", ws._sm70_online_qpn8_hc_dispatch
+    )
     partials = torch.empty((32 * 384,), dtype=torch.float32)
     down.register_buffer(
         online_qpn8._HC_PARTIALS_ATTR,
@@ -231,6 +244,8 @@ def test_fused_hc_uses_prepared_partials_without_global_lookup(monkeypatch):
     assert torch.equal(block_out, torch.full_like(block_out, 2))
     assert torch.equal(injection_out, torch.full_like(injection_out, 3))
     assert calls[0][5] is partials
+    assert calls[0][6] == workspace.data_ptr()
+    ws.clear_layer_workspaces()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

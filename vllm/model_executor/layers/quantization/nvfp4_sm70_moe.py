@@ -10,7 +10,6 @@ expert-weight copy.
 
 from __future__ import annotations
 
-import os
 from typing import Final
 
 import torch
@@ -19,6 +18,8 @@ from torch.nn import Parameter
 from vllm import _sm70_ops as sm70_ops
 from vllm._sm70.policy import NativeBindings
 from vllm.config.sm70_moe import Sm70NvFp4MoEConfig, capture_nvfp4_moe_config
+from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import diagnostic_history
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -69,16 +70,10 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
-_DEBUG_DFLASH_NVFP4_TRACE = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE", "0"))
-)
-_DFLASH_NVFP4_TRACE_ARMED = False
-
 
 def arm_dflash_nvfp4_trace() -> None:
-    global _DFLASH_NVFP4_TRACE_ARMED
-    if _DEBUG_DFLASH_NVFP4_TRACE:
-        _DFLASH_NVFP4_TRACE_ARMED = True
+    if capture_runtime_trace().dflash.value("target_layer_trace"):
+        diagnostic_history("nvfp4_dflash")["armed"] = True
 
 
 _SUPPORTED_CONTRACTS: Final = {
@@ -1529,9 +1524,8 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             if glm53_fused_permute_q8
             else buffers["expert_offsets64"],
         )
-        global _DFLASH_NVFP4_TRACE_ARMED
-        if _DFLASH_NVFP4_TRACE_ARMED and num_tokens > 1:
-            _DFLASH_NVFP4_TRACE_ARMED = False
+        if diagnostic_history("nvfp4_dflash").get("armed", False) and num_tokens > 1:
+            diagnostic_history("nvfp4_dflash")["armed"] = False
             actual = output.clone()
             reference_rows = []
             for token_idx in range(num_tokens):

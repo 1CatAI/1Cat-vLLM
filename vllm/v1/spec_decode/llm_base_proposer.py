@@ -17,6 +17,7 @@ from vllm.config import (
     replace,
 )
 from vllm.config.sm70_dflash2 import proposer_diagnostic_flag, proposer_diagnostic_flags
+from vllm.config.sm70_moe import unquantized_moe_policy
 from vllm.config.speculative_sampling import (
     SpeculativeSamplingPolicy,
     resolve_sampling_policy,
@@ -959,7 +960,7 @@ class SpecDecodeBaseProposer:
             self.method != "mtp"
             or self.device.type != "cuda"
             or not current_platform.is_device_capability(70)
-            or not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG
+            or not unquantized_moe_policy(self.vllm_config).value("legacy_tiles")
             or not self.draft_model_config.is_moe
         ):
             return ()
@@ -972,7 +973,7 @@ class SpecDecodeBaseProposer:
         num_experts = self.draft_model_config.get_num_experts()
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         use_qwen36_mtp_decode_tiles = (
-            envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            unquantized_moe_policy(self.vllm_config).value("mtp_tuned")
             and num_experts == 256
             and top_k == 8
             and self.draft_model_config.get_hidden_size() == 2048
@@ -980,7 +981,7 @@ class SpecDecodeBaseProposer:
             and tp_size == 4
         )
         use_qwen38_mtp_decode_tiles = (
-            envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            unquantized_moe_policy(self.vllm_config).value("mtp_tuned")
             and num_experts == 512
             and top_k == 10
             and self.draft_model_config.get_hidden_size() == 2560

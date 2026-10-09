@@ -141,7 +141,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         self._context_only_prefill_logged = False
         self._query_slot_mappings: torch.Tensor | None = None
         self._debug_proposal_stages = bool(
-            int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
+            vllm_config.observability_config.runtime_trace.dflash.value(
+                "proposal_stages"
+            )
         )
         self._debug_real_proposal = False
         self._debug_input_dump_count = 0

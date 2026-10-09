@@ -88,6 +88,10 @@ def config(monkeypatch):
     cfg.compilation_config.runtime = GraphPolicy()
     cfg.parallel_config.communication = CommunicationPolicy()
     cfg.runtime_default_sources = {}
+    from vllm.config.speculative_sampling import resolve_sampling_policy
+
+    cfg.speculative_config.sampling_policy = resolve_sampling_policy()
+    cfg.kernel_config.gdn.projection.resolve()
     PolicyDefaults(cfg).finish()
     return cfg
 
@@ -385,7 +389,11 @@ def test_unqualified_linear_default_reports_reason(config):
 
 def test_flash_next_batch_memory_and_explicit_off(config, monkeypatch):
     config.model_config.architectures = ["Qwen4ExpForCausalLM"]
-    config.speculative_config = NS(method="mtp", num_speculative_tokens=4)
+    config.speculative_config = NS(
+        method="mtp",
+        num_speculative_tokens=4,
+        sampling_policy=config.speculative_config.sampling_policy,
+    )
     config.model_config.hf_text_config = NS(
         hidden_size=2560,
         hc_count=4,
@@ -413,6 +421,15 @@ def test_flash_next_batch_memory_and_explicit_off(config, monkeypatch):
     policy = LayerExecutionPolicy()
     policy.resolve()
     config.kernel_config.layer_execution = policy
+    from vllm.config.gdn_projection import GdnProjectionConfig
+    from vllm.config.sm70_sparse import Sm70SparseConfig
+    from vllm.config.speculative_sampling import resolve_sampling_policy
+
+    config.kernel_config.sm70_sparse = Sm70SparseConfig()
+    config.kernel_config.sm70_sparse.resolve()
+    config.kernel_config.gdn.projection = GdnProjectionConfig()
+    config.kernel_config.gdn.projection.resolve()
+    config.speculative_config.sampling_policy = resolve_sampling_policy()
     report = acc.build_report(config)["flash_next_batch"]
     assert report["packed_weight_memory"]["total_bytes"] == 0
     assert all(row["reason"] == "user_override" for row in report["controls"].values())

@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+from tests.models.qwen4_exp.qsa_policy_utils import set_qsa_option
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     _qsa_indexer_cublas_shape_supported,
@@ -162,8 +163,8 @@ def test_qsa_xqa_page4_route_uses_configured_boundary(monkeypatch):
     token_to_request = torch.zeros(rows, dtype=torch.int32)
     query_positions = torch.arange(rows, dtype=torch.int64)
     sequence_lengths = torch.full((1,), rows, dtype=torch.int32)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", rows)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", rows)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",
@@ -190,7 +191,7 @@ def test_qsa_xqa_page4_route_uses_configured_boundary(monkeypatch):
         query_positions[:-1],
         sequence_lengths,
     )
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", False)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", False)
     assert not qsa_ops._use_sm70_qsa_xqa_page4(query, *args)
 
 
@@ -266,8 +267,8 @@ def test_qsa_e4m3_page4_routes_large_mixed_batch_below_prefill_boundary(
     token_to_request = torch.zeros(rows, dtype=torch.int32)
     query_positions = torch.arange(rows, dtype=torch.int64)
     sequence_lengths = torch.full((4,), rows, dtype=torch.int32)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 4096)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4", True)
+    set_qsa_option(monkeypatch, "qsa_xqa_page4_min_rows", 4096)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",
@@ -312,7 +313,7 @@ def test_qsa_xqa_page4_splits_non_grouped_large_batch(
         "flash_attn_v100.flash_attn_interface",
         flash_interface,
     )
-    monkeypatch.setattr(qsa_ops, "_SM70_QSA_GROUPED_PAGE4", True)
+    set_qsa_option(monkeypatch, "qsa_grouped_page4", True)
 
     calls = []
 
@@ -462,8 +463,8 @@ def test_qsa_xqa_page4_table_rejects_stale_or_invalid_tail_metadata():
 def test_qsa_indexer_cublas_does_not_capture_decode_rows(monkeypatch):
     cache = torch.empty(2, 400, 1, 128, dtype=torch.float16)
     page_table = torch.empty(1, 2, dtype=torch.int32)
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS_MIN_ROWS", 256)
+    set_qsa_option(monkeypatch, "qsa_indexer_cublas", True)
+    set_qsa_option(monkeypatch, "qsa_cublas_min_rows", 256)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",
@@ -479,11 +480,7 @@ def test_qsa_indexer_cublas_does_not_capture_decode_rows(monkeypatch):
 
 
 def test_qsa_indexer_cublas_requires_enough_score_work(monkeypatch):
-    monkeypatch.setattr(
-        qsa_ops,
-        "_SM70_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS",
-        1024**2,
-    )
+    set_qsa_option(monkeypatch, "qsa_cublas_min_score_elements", 1024**2)
 
     assert not qsa_ops._qsa_indexer_cublas_work_supported(1024, 512)
     assert qsa_ops._qsa_indexer_cublas_work_supported(2048, 512)

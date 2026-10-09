@@ -10,6 +10,7 @@ from typing import final
 import torch
 
 import vllm.envs as envs
+from vllm.config.sm70_moe import unquantized_moe_policy
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -1193,9 +1194,9 @@ class FusedMoEKernelModularImpl:
     ) -> bool:
         if shared_experts is not None:
             return False
-        if envs.VLLM_SM70_DISABLE_UNQUANTIZED_MOE_INPLACE:
+        if unquantized_moe_policy().value("disable_inplace"):
             return False
-        if not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG:
+        if not unquantized_moe_policy().value("legacy_tiles"):
             return False
         if not current_platform.is_cuda():
             return False
@@ -1213,9 +1214,9 @@ class FusedMoEKernelModularImpl:
         a1q: torch.Tensor,
         expert_tokens_meta: ExpertTokensMetadata | None,
     ) -> bool:
-        if not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_FUNCTIONAL:
+        if not unquantized_moe_policy().value("functional"):
             return False
-        if not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG:
+        if not unquantized_moe_policy().value("legacy_tiles"):
             return False
         if expert_tokens_meta is not None:
             return False

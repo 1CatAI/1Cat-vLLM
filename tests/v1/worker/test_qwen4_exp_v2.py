@@ -109,7 +109,11 @@ def test_mtp_moe_warmup_executes_each_captured_concurrency(
         "is_device_capability",
         lambda *_args: True,
     )
-    monkeypatch.setattr(eagle_speculator.envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", True)
+    from vllm.config import KernelConfig
+
+    speculator.vllm_config.kernel_config = KernelConfig()
+    speculator.vllm_config.kernel_config.sm70_moe.unquantized.mtp_tuned = True
+    speculator.vllm_config.kernel_config.sm70_moe.unquantized.resolve()
     monkeypatch.setattr(torch.accelerator, "synchronize", mock.Mock())
 
     assert speculator.warmup_sm70_mtp_moe_kernels(dummy_run) == (

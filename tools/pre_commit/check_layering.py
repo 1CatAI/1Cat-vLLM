@@ -74,6 +74,64 @@ def tracked_python() -> list[str]:
     return sorted(set(out.split()))
 
 
+def without_alias_declarations(text: str) -> str:
+    """Literal alias tables describe ownership, rather than execute a provider.
+
+    Recognize their structure, not their file location. Runtime env attributes,
+    getter calls, imports and model/shape branches remain counted; the parameter
+    inventory separately records every removed declaration and its consumers.
+    """
+    lines = text.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    chars = list(text)
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, ast.Dict):
+            continue
+        for key, value in zip(node.keys, node.values):
+            parts = [key, value]
+            if not any(
+                isinstance(part, ast.Constant)
+                and isinstance(part.value, str)
+                and part.value.startswith(("VLLM_", "TM_", "FLASH_QLA_", "PREFIX_"))
+                and part.value.isidentifier()
+                for part in parts
+            ):
+                continue
+            # Calls/comprehensions are computation, even inside an alias table.
+            if any(
+                isinstance(
+                    child,
+                    (
+                        ast.Call,
+                        ast.ListComp,
+                        ast.DictComp,
+                        ast.SetComp,
+                        ast.GeneratorExp,
+                    ),
+                )
+                for part in parts
+                if part is not None
+                for child in ast.walk(part)
+            ):
+                continue
+            if not all(isinstance(part, (ast.Constant, ast.Tuple)) for part in parts):
+                continue
+            for part in parts:
+                for leaf in ast.walk(part):
+                    if not isinstance(leaf, ast.Constant) or not isinstance(
+                        leaf.value, str
+                    ):
+                        continue
+                    start = offsets[leaf.lineno - 1] + leaf.col_offset
+                    end = offsets[leaf.end_lineno - 1] + leaf.end_col_offset
+                    for index in range(start, end):
+                        if chars[index] != "\n":
+                            chars[index] = " "
+    return "".join(chars)
+
+
 def measure(path: str, text: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     if path in CONFIG_OWNERS:
@@ -95,11 +153,12 @@ def measure(path: str, text: str) -> dict[str, int]:
         hits = len(re.findall(r"dflash|ddtree|mtp|qwen|glm", ast.unparse(tree), re.I))
         if hits:
             counts["flash_v100_model"] = hits
+    ownership_text = without_alias_declarations(text)
     owner = bool(OWNER_PATH.search(path))
     for kind, pattern in PATTERNS.items():
         if kind in ("model", "platform") and owner:
             continue
-        hits = len(pattern.findall(text))
+        hits = len(pattern.findall(text if kind == "env" else ownership_text))
         if hits:
             counts[kind] = hits
     return counts

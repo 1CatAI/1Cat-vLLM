@@ -20,6 +20,7 @@ from tools.pre_commit.check_env_registration import (
     native_reads,
     python_reads,
 )
+from tools.pre_commit.config_lifecycle import initialization_library_loaders
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFIXES = ("VLLM_", "TM_", "FLASH_QLA_", "PREFIX_")
@@ -27,6 +28,9 @@ PREFIXES = ("VLLM_", "TM_", "FLASH_QLA_", "PREFIX_")
 
 def python_references(source: str) -> list[dict]:
     tree = ast.parse(source)
+    loading_nodes = {
+        child for fn in initialization_library_loaders(tree) for child in ast.walk(fn)
+    }
     parents = {
         child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
     }
@@ -39,7 +43,10 @@ def python_references(source: str) -> list[dict]:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 scope.append(node.name)
             node = parents.get(node)
-        return dict(name=name, line=line, kind=kind, scope=".".join(reversed(scope)))
+        entry = dict(name=name, line=line, kind=kind, scope=".".join(reversed(scope)))
+        if nodes.get(line) in loading_nodes:
+            entry["lifecycle"] = "process_library_loading"
+        return entry
 
     result = [site(name, line, "raw") for name, line in python_reads(source)]
     env_modules = {"envs"}

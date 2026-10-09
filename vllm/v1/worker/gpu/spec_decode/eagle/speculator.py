@@ -7,9 +7,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from vllm import envs
 from vllm.config import SpeculativeConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.sm70_moe import unquantized_moe_policy
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -246,7 +246,7 @@ class EagleSpeculator(TargetSamplingHooks):
             self.method != "mtp"
             or self.device.type != "cuda"
             or not current_platform.is_device_capability(70)
-            or not envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            or not unquantized_moe_policy(self.vllm_config).value("mtp_tuned")
         ):
             return ()
         if getattr(self, "_sm70_mtp_moe_warmed", False):

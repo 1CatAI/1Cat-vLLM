@@ -9,6 +9,8 @@ import torch
 from torch import nn
 
 from vllm.config import ParallelConfig, VllmConfig
+from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import diagnostic_history
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -99,16 +101,9 @@ from .multimodal import (
 
 logger = init_logger(__name__)
 
-_DEBUG_DFLASH_TARGET_FINITE = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
-)
-_DEBUG_DFLASH_TARGET_TRACE = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE", "0"))
-)
 _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION = int(
     os.getenv("VLLM_DFLASH_DEBUG_TARGET_TRACE_MIN_POSITION", "8")
 )
-_DFLASH_TARGET_TRACE_SEEN: set[tuple[int, str]] = set()
 
 
 def _debug_dflash_target_finite(
@@ -117,7 +112,10 @@ def _debug_dflash_target_finite(
     positions: torch.Tensor,
     **tensors: torch.Tensor | None,
 ) -> None:
-    if not _DEBUG_DFLASH_TARGET_FINITE or positions.numel() <= 1:
+    if (
+        not capture_runtime_trace().dflash.value("proposal_stages")
+        or positions.numel() <= 1
+    ):
         return
     for name, tensor in tensors.items():
         if tensor is None:
@@ -144,16 +142,16 @@ def _debug_dflash_target_trace(
     **tensors: torch.Tensor | None,
 ) -> None:
     if (
-        not _DEBUG_DFLASH_TARGET_TRACE
+        not capture_runtime_trace().dflash.value("target_layer_trace")
         or positions.numel() > 8
         or get_tensor_model_parallel_rank() != 0
         or int(positions[-1].item()) < _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION
     ):
         return
     key = (layer_idx, stage)
-    if key in _DFLASH_TARGET_TRACE_SEEN:
+    if key in diagnostic_history("glm_target_seen"):
         return
-    _DFLASH_TARGET_TRACE_SEEN.add(key)
+    diagnostic_history("glm_target_seen")[key] = True
     token_index = int(
         torch.nonzero(
             positions >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION, as_tuple=False
@@ -507,7 +505,7 @@ class Glm5NextDecoderLayer(nn.Module):
         torch.Tensor | None,
     ]:
         if (
-            _DEBUG_DFLASH_TARGET_TRACE
+            capture_runtime_trace().dflash.value("target_layer_trace")
             and positions.numel() <= 8
             and get_tensor_model_parallel_rank() == 0
             and int(positions[-1].item()) >= _DEBUG_DFLASH_TARGET_TRACE_MIN_POSITION
@@ -690,7 +688,7 @@ class Glm5NextDecoderLayer(nn.Module):
 
         # Fully Connected
         if (
-            _DEBUG_DFLASH_TARGET_TRACE
+            capture_runtime_trace().dflash.value("target_layer_trace")
             and self.layer_idx == 3
             and 1 < positions.numel() <= 8
         ):

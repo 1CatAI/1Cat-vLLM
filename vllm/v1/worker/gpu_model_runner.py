@@ -7583,7 +7583,7 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         spec_decode_metadata: SpecDecodeMetadata | None,
     ) -> bool:
-        if not envs.VLLM_SM70_COMPACT_TOPK20_SAMPLER:
+        if not self.vllm_config.kernel_config.layer_execution.value("compact_topk20"):
             return False
         if not envs.VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER:
             return False

@@ -4,6 +4,8 @@
 
 from typing import ClassVar
 
+from pydantic import Field
+
 from vllm.config.execution_policy import ExecutionPolicy
 from vllm.config.utils import config
 
@@ -51,7 +53,15 @@ class GdnProjectionConfig(ExecutionPolicy):
     qpn8_ba_split: bool | None = None
     """Admit the paired QPN8 b/a projection; validate native ops at binding."""
 
+    batch_split_copy: bool | None = None
+    """Use the existing native split/copy after fused input projection."""
+
+    input_batch: bool | None = None
+    """Admit the existing batched Qwen input projection at its shape gate."""
+
     aliases: ClassVar[dict[str, str]] = {
+        "batch_split_copy": "VLLM_SM70_GDN_BATCH_SPLIT_COPY",
+        "input_batch": "VLLM_SM70_QWEN38_GDN_INPUT_BATCH",
         "input_projection": "VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP",
         "output_projection": "VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP",
         "input_core": "VLLM_SM70_QWEN_GDN_INPUT_CORE_OP",
@@ -67,9 +77,27 @@ class GdnProjectionConfig(ExecutionPolicy):
         "qpn8_ba_split": "VLLM_SM70_GDN_QPN8_BA_SPLIT",
     }
 
+    provider_errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Retain dormant batch-projection parse failures until their admission gate."""
+
+    def value(self, field):
+        if field in self.provider_errors:
+            raise ValueError(self.provider_errors[field])
+        return getattr(self, field)
+
     def resolve(self) -> None:
         from vllm.config.sm70_runtime import resolve_legacy_fields
 
+        batch_fields = ("batch_split_copy", "input_batch")
+        resolve_legacy_fields(
+            self,
+            {
+                field: self.aliases[field]
+                for field in batch_fields
+                if field not in self.sources
+            },
+            deferred_errors=self.provider_errors,
+        )
         pending = {
             field: alias
             for field, alias in self.aliases.items()
@@ -83,3 +111,11 @@ class GdnProjectionConfig(ExecutionPolicy):
                 self.sources["input_core"] = "disabled by disable_input_core"
             else:
                 resolve_legacy_fields(self, {"input_core": self.aliases["input_core"]})
+
+
+def projection_policy(cfg=None) -> GdnProjectionConfig:
+    from vllm.config.execution_policy import capture_execution_policy
+
+    return capture_execution_policy(
+        "kernel_config.gdn.projection", GdnProjectionConfig, cfg
+    )

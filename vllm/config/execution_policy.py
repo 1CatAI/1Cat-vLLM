@@ -41,6 +41,8 @@ def read_execution_legacy(name: str):
             "yes",
             "on",
         )
+    if name == "VLLM_SM70_GLM53_EXACT_KDA_GEMV":
+        return os.getenv(name, "1") != "0"
     if name in ("VLLM_SM70_GLM53_TP8_CUBLASLT", "VLLM_SM70_GLM53_TP8_FUSED_FG_B"):
         return os.getenv(name, "0") != "0"
     if name in (
@@ -280,7 +282,35 @@ class LayerExecutionPolicy(ExecutionPolicy):
     dense_log_error: str | None = Field(default=None, init=False)
     """Legacy logger parse error, raised only at its original checkpoint."""
 
+    provider_errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Keep unused provider parse failures behind their original admission gates."""
+
+    deferred_fields: ClassVar[tuple[str, ...]] = (
+        "online_qpn8",
+        "compact_topk20",
+        "chunked_topk20_chunks",
+        "glm_exact_kda_gemv",
+    )
+
+    def value(self, field):
+        if field in self.provider_errors:
+            raise ValueError(self.provider_errors[field])
+        return getattr(self, field)
+
     def resolve(self, *, dflash=None) -> None:
+        from vllm.config.utils import resolve_legacy_fields
+
+        pending = {
+            field: self.aliases[field]
+            for field in self.deferred_fields
+            if field not in self.sources
+        }
+        resolve_legacy_fields(
+            self,
+            pending,
+            reader=read_execution_legacy,
+            deferred_errors=self.provider_errors,
+        )
         super().resolve()
         from vllm import envs
 
@@ -308,9 +338,28 @@ class LayerExecutionPolicy(ExecutionPolicy):
 
     def compute_hash(self) -> str:
         factors: dict[str, object] = {"policy": super().compute_hash()}
+        errors = {
+            field: error
+            for field, error in self.provider_errors.items()
+            if self.hash_fields is None or field in self.hash_fields
+        }
+        if errors:
+            factors["provider_errors"] = errors
         if self.hash_fields is None or "dense_f16" in self.hash_fields:
             factors["native"] = self.native.hash_options()
         return hash_factors(factors)
+
+    online_qpn8: bool | None = None
+    """Prepare the qualified checkpoint-FP16 weights in online QPN8 layout."""
+
+    compact_topk20: bool | None = None
+    """Admit the exact ordinary top-k20 sampler at its retained metadata gate."""
+
+    chunked_topk20_chunks: int | None = None
+    """Chunk count consumed only by the admitted SM70 248320-vocabulary sampler."""
+
+    glm_exact_kda_gemv: bool | None = None
+    """Retain the GLM exact KDA projection provider and legacy nonzero dialect."""
 
     batch_gemm_layouts: bool | None = None
     """Prepare compatible larger-batch dense weight layouts."""
@@ -373,6 +422,10 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Threads for native multi-token hyperconnection normalization."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "online_qpn8": "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8",
+        "compact_topk20": "VLLM_SM70_COMPACT_TOPK20_SAMPLER",
+        "chunked_topk20_chunks": "VLLM_SM70_CHUNKED_TOPK20_CHUNKS",
+        "glm_exact_kda_gemv": "VLLM_SM70_GLM53_EXACT_KDA_GEMV",
         "batch_fastpath": "VLLM_SM70_QWEN38_BATCH_FASTPATH",
         "hc_mtp_batch": "VLLM_SM70_MTP_HC_BATCH",
         "hc_cooperative": "VLLM_SM70_MTP_HC_COOPERATIVE",
@@ -536,10 +589,21 @@ class PlePlacementPolicy(ExecutionPolicy):
 POLICY_OWNERS = {
     "compilation_config.runtime": "GraphPolicy",
     "kernel_config.layer_execution": "LayerExecutionPolicy",
+    "kernel_config.sm70_sparse": "Sm70SparseConfig",
     "parallel_config.communication": "CommunicationPolicy",
     "offload_config.ple": "PlePlacementPolicy",
     "attention_config.flash_v100": "FlashV100Policy",
 }
+
+
+# These owners resolve at their existing model/speculation checkpoints, after
+# platform defaults. Runtime contexts borrow them without resolving them again.
+BOUND_POLICY_OWNERS = (
+    *POLICY_OWNERS,
+    "kernel_config.gdn.projection",
+    "kernel_config.sm70_moe.unquantized",
+    "speculative_config.sampling_policy",
+)
 
 
 @torch.compiler.assume_constant_result
@@ -573,8 +637,9 @@ def capture_execution_policy(owner: str, cls, cfg=None):
         cfg = get_current_vllm_config_or_none()
     if cfg is None:
         return _standalone_policy(cls)
-    config_name, field = owner.split(".")
-    return getattr(getattr(cfg, config_name), field)
+    for part in owner.split("."):
+        cfg = getattr(cfg, part, None)
+    return cfg
 
 
 def graph_policy(cfg=None) -> GraphPolicy:
