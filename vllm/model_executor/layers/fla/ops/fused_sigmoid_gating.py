@@ -49,37 +49,70 @@ _SM70_FUSED_SIGMOID_HAS_LEGACY_OVERRIDE = any(
 )
 
 
-def _use_sm70_fused_sigmoid_schedule(device: torch.device) -> bool:
+def _use_sm70_fused_sigmoid_schedule(device: torch.device, schedule=None) -> bool:
     from .fused_recurrent import _is_sm70_device
 
     return _is_sm70_device(device) and (
-        _SM70_FUSED_SIGMOID_SCHEDULE or _SM70_FUSED_SIGMOID_HAS_LEGACY_OVERRIDE
+        (
+            schedule.sigmoid_enabled
+            if schedule is not None
+            else _SM70_FUSED_SIGMOID_SCHEDULE
+        )
+        or (
+            schedule.sigmoid_override
+            if schedule is not None
+            else _SM70_FUSED_SIGMOID_HAS_LEGACY_OVERRIDE
+        )
     )
 
 
 def _select_fused_sigmoid_schedule(
-    V: int,
-    N: int,
-    HV: int,
-    device: torch.device,
+    V: int, N: int, HV: int, device: torch.device, schedule=None
 ) -> tuple[int, int, int]:
     del N, HV, device
 
     from .fused_recurrent import _round_num_warps
 
     v_pow2 = triton.next_power_of_2(V)
-    if _SM70_FUSED_SIGMOID_BV_OVERRIDE is not None:
-        BV = min(v_pow2, triton.next_power_of_2(_SM70_FUSED_SIGMOID_BV_OVERRIDE))
+    if (
+        schedule.sigmoid_bv if schedule is not None else _SM70_FUSED_SIGMOID_BV_OVERRIDE
+    ) is not None:
+        BV = min(
+            v_pow2,
+            triton.next_power_of_2(
+                schedule.sigmoid_bv
+                if schedule is not None
+                else _SM70_FUSED_SIGMOID_BV_OVERRIDE
+            ),
+        )
     else:
         BV = min(v_pow2, 32)
     num_warps = (
-        _round_num_warps(_SM70_FUSED_SIGMOID_WARPS_OVERRIDE)
-        if _SM70_FUSED_SIGMOID_WARPS_OVERRIDE is not None
+        _round_num_warps(
+            schedule.sigmoid_warps
+            if schedule is not None
+            else _SM70_FUSED_SIGMOID_WARPS_OVERRIDE
+        )
+        if (
+            schedule.sigmoid_warps
+            if schedule is not None
+            else _SM70_FUSED_SIGMOID_WARPS_OVERRIDE
+        )
+        is not None
         else 4
     )
     num_stages = (
-        _SM70_FUSED_SIGMOID_STAGES_OVERRIDE
-        if _SM70_FUSED_SIGMOID_STAGES_OVERRIDE is not None
+        (
+            schedule.sigmoid_stages
+            if schedule is not None
+            else _SM70_FUSED_SIGMOID_STAGES_OVERRIDE
+        )
+        if (
+            schedule.sigmoid_stages
+            if schedule is not None
+            else _SM70_FUSED_SIGMOID_STAGES_OVERRIDE
+        )
+        is not None
         else 3
     )
     return BV, num_warps, num_stages
@@ -93,11 +126,12 @@ def _select_fused_sigmoid_launch(
     device: torch.device,
     *,
     match_recurrent_schedule: bool,
+    schedule=None,
 ) -> tuple[int, int, int]:
-    if not _use_sm70_fused_sigmoid_schedule(device):
+    if not _use_sm70_fused_sigmoid_schedule(device, schedule=schedule):
         return min(triton.next_power_of_2(V), 32), 4, 3
     if not match_recurrent_schedule:
-        return _select_fused_sigmoid_schedule(V, N, HV, device)
+        return _select_fused_sigmoid_schedule(V, N, HV, device, schedule=schedule)
 
     # The unfused verifier uses this launch geometry. Keeping it for the first
     # fused rollout removes schedule-induced reduction-order changes from the
@@ -108,11 +142,11 @@ def _select_fused_sigmoid_launch(
         _select_sm70_num_warps,
     )
 
-    BV = _select_sm70_bv(V, N, HV, device)
+    BV = _select_sm70_bv(V, N, HV, device, schedule=schedule)
     return (
         BV,
-        _select_sm70_num_warps(BV, N, HV),
-        _select_sm70_num_stages(T),
+        _select_sm70_num_warps(BV, N, HV, schedule=schedule),
+        _select_sm70_num_stages(T, schedule=schedule),
     )
 
 
@@ -377,6 +411,7 @@ def fused_sigmoid_gating_delta_rule_update(
     ddtree_parent_ids: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
+    schedule=None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -387,9 +422,9 @@ def fused_sigmoid_gating_delta_rule_update(
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK = triton.next_power_of_2(K)
-    sm70_schedule = _use_sm70_fused_sigmoid_schedule(q.device)
+    sm70_schedule = _use_sm70_fused_sigmoid_schedule(q.device, schedule=schedule)
     BV, num_warps, num_stages = (
-        _select_fused_sigmoid_schedule(V, N, HV, q.device)
+        _select_fused_sigmoid_schedule(V, N, HV, q.device, schedule=schedule)
         if sm70_schedule
         else (min(triton.next_power_of_2(V), 32), 4, 3)
     )
@@ -505,6 +540,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     ddtree_parent_ids: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     out: torch.Tensor | None = None,
+    schedule=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused update that reads q/k/v directly from a packed mixed-qkv row."""
     if mixed_qkv.ndim != 2:
@@ -530,9 +566,11 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
 
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK = triton.next_power_of_2(K)
-    sm70_schedule = _use_sm70_fused_sigmoid_schedule(mixed_qkv.device)
+    sm70_schedule = _use_sm70_fused_sigmoid_schedule(
+        mixed_qkv.device, schedule=schedule
+    )
     BV, num_warps, num_stages = (
-        _select_fused_sigmoid_schedule(V, N, HV, mixed_qkv.device)
+        _select_fused_sigmoid_schedule(V, N, HV, mixed_qkv.device, schedule=schedule)
         if sm70_schedule
         else (min(triton.next_power_of_2(V), 32), 4, 3)
     )
@@ -656,6 +694,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     precomputed_g: torch.Tensor | None = None,
     precomputed_beta: torch.Tensor | None = None,
     sm70_tp2_q8_bv2: bool = False,
+    schedule=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mixed-QKV update that writes into a caller-provided output buffer.
 
@@ -741,6 +780,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         T,
         mixed_qkv.device,
         match_recurrent_schedule=match_recurrent_schedule,
+        schedule=schedule,
     )
     if (
         sm70_tp2_q8_bv2
@@ -755,7 +795,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         and num_accepted_tokens is not None
         and use_qk_l2norm_in_kernel
         and not quantize_state_each_step
-        and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device)
+        and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device, schedule=schedule)
     ):
         # Same K128 reduction, one warp, gating and recurrent arithmetic.
         # Split the independent V columns across more CTAs for this q8 case.
@@ -772,11 +812,15 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         and num_accepted_tokens is not None
         and use_qk_l2norm_in_kernel
         and not quantize_state_each_step
-        and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device)
+        and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device, schedule=schedule)
     ):
         from .fused_recurrent import _SM70_FLA_HAS_LEGACY_OVERRIDE
 
-        if not _SM70_FLA_HAS_LEGACY_OVERRIDE:
+        if not (
+            schedule.recurrent_override
+            if schedule is not None
+            else _SM70_FLA_HAS_LEGACY_OVERRIDE
+        ):
             # Independent V tiles share the unchanged K128 reduction. Smaller
             # one-warp tiles shorten the single-request verifier's register
             # dependency chains; output and all eight snapshots stay bitwise
@@ -795,11 +839,15 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         and num_accepted_tokens is not None
         and use_qk_l2norm_in_kernel
         and not quantize_state_each_step
-        and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device)
+        and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device, schedule=schedule)
     ):
         from .fused_recurrent import _SM70_FLA_HAS_LEGACY_OVERRIDE
 
-        if not _SM70_FLA_HAS_LEGACY_OVERRIDE:
+        if not (
+            schedule.recurrent_override
+            if schedule is not None
+            else _SM70_FLA_HAS_LEGACY_OVERRIDE
+        ):
             # The q8 verifier writes eight FP32 state snapshots per request.
             # BV32 overfills each one-warp tile as batch grows. Admit the
             # operator family, including non-power-of-two batches such as N6,

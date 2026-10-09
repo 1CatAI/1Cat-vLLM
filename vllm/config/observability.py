@@ -8,6 +8,7 @@ from packaging.version import parse
 from pydantic import Field, field_validator, model_validator
 
 from vllm import version
+from vllm.config.gdn import GdnProfileConfig
 from vllm.config.sm70_runtime import (
     RuntimeTraceConfig,
     SpecDecodeTraceConfig,
@@ -22,6 +23,9 @@ DetailedTraceModules = Literal["model", "worker", "all"]
 @config
 class ObservabilityConfig:
     """Configuration for observability - metrics and tracing."""
+
+    gdn_profile: GdnProfileConfig = Field(default_factory=GdnProfileConfig)
+    """GDN prefill timing policy, excluded from computation graph hashes."""
 
     spec_decode_trace: SpecDecodeTraceConfig = Field(
         default_factory=SpecDecodeTraceConfig

@@ -2078,15 +2078,9 @@ class VllmConfig:
                         "for the SM70 Flash-V100 BFLA Qwen3.5/3.6-27B "
                         "attention shape. Set it explicitly to override."
                     )
+            self.kernel_config.gdn.apply_platform_defaults()
             sm70_baseline_env_defaults = {
-                "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": "1",
-                "VLLM_SM70_GDN_KKT_SCHEDULE": "1",
-                "VLLM_SM70_GDN_DELTA_H_SCHEDULE": "1",
-                "VLLM_SM70_GDN_CHUNK_O_SCHEDULE": "1",
-                "VLLM_SM70_FLA_RECURRENT_SCHEDULE": "1",
-                "VLLM_SM70_FUSED_SIGMOID_GATING_SCHED": "1",
                 "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE": "1",
-                "VLLM_SM70_GDN_DECODE_FLASHQLA": "1",
             }
             if (
                 not sm70_compile_disabled_by_user
@@ -2716,6 +2710,9 @@ class VllmConfig:
                 "to True to enable."
             )
         current_platform.check_and_update_config(self)
+        self.kernel_config.resolve_gdn(self.model_config, self.additional_config)
+        if self.kernel_config.gdn.resolved:
+            self.observability_config.gdn_profile.resolve()
 
         if self.use_v2_model_runner:
             self._validate_v2_model_runner()

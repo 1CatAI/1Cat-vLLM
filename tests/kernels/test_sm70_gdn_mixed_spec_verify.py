@@ -7,6 +7,9 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
+from vllm.config.gdn import GdnConfig, GdnProfileConfig
+from vllm.model_executor.layers.fla.ops.gdn_profiling import GdnPrefillProfiler
+from vllm.model_executor.layers.fla.ops.gdn_stages import GdnHeadContract
 from vllm.model_executor.layers.fla.ops.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -113,7 +116,16 @@ def test_packed_verify_beside_prefill_matches_generic_route(
         weight=torch.randn(QKV_DIM, 1, CONV_WIDTH, device=device, dtype=dtype) * 0.5,
         bias=None,
     )
+    policy = GdnConfig()
+    policy.resolve()
+    profiling = GdnProfileConfig(enabled=False)
+    profiling.resolve()
     common = dict(
+        gdn_policy=policy,
+        gdn_heads=GdnHeadContract(16, 48, 128, 128, 4),
+        _gdn_profiler=GdnPrefillProfiler(profiling),
+        verification_update=None,
+        _can_use_sm70_gdn_preprocess=lambda *args: False,
         prefix="test",
         tp_size=TP,
         num_k_heads=16,
