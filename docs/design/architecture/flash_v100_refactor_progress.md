@@ -22,8 +22,8 @@ locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
 | 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
 | 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
 | 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | GPU gates |
-| 5b: batch prefill candidates | — | CPU/golden/strict passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
-| 5c: debug observer | — | Not started | — | Required | Step 5b gates |
+| 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
+| 5c: debug observer | — | CPU/golden/strict passed | Largest function 414 → 402 | Required | Strict/rebase/GPU gates |
 | 6: registered speculative features | — | Not started | — | Required | Step 5c gates |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
@@ -608,3 +608,42 @@ the requested limit. This is a baseline route/token record, not a finished
 comparison or long-output quality claim. The recorded harness SHA256 is
 `e38d6bebda6a495703fba53d326caec5e553a03f859a192eca1a32b00ad3eebf`.
 DDTree, candidate and host-FP8 model gates remain pending.
+
+## Step 5c prefix debug subscriptions
+
+PR #1086 is `e21545418438f4ea49d2e58da0cd5502fc6f7cf2`. Its actual pinned
+PR #1028 integration is `bbeb4d9ab05d2fc576b2e83462fb6db84a0cd36b`, tree
+`b42901b569aaf40cb5af746f44262a36f895e91e`, matching the clean merge-tree.
+The three host-integration CPU suites pass 37 tests with 98 GPU skips. Its
+source and four dependent GPU queues are staged and verified under `a3-step5b`.
+
+Mechanical extraction `a527f7442` precedes ownership changes. The original
+221-line prefix diagnostic calculation now runs in two ordered subscribers:
+reference gathering/comparison, then dumps/reporting. The prefill path emits
+an explicit event with tensors, geometry, configuration and narrow reference
+callbacks. Neither subscriber takes an Impl receiver. Synchronous subscription
+order, failures, original diagnostic guards, output layouts, slot mapping and
+process-shared flags remain unchanged. Existing decode comparison methods are
+still legacy methods and must be addressed before the final dependency gate.
+
+All 813 immutable traces and original calculation hashes pass. The source
+oracle expands the actual subscriptions, event arguments and reference handoff;
+it does not substitute a saved calculation body. Six direct diagnostic tests
+exercise real CPU cache extraction, draft/dense reference dispatch, valid and
+invalid slots, NaN dumps, shared one-shot flags and subscriber error propagation.
+Evidence: `a3-prefill-debug-focused.log` and `a3-prefill-debug-injection.log`.
+The current ceiling is 402 / 402 / 347 / 13 / 169 / 0 / 29; no new forbidden
+edge or cycle appears. The largest-function ceiling is tightened.
+
+The private #1028 native build is complete. Its `_C.abi3.so` SHA256 is
+`0e17f8c1320bd5c54bc1932c998e7463dc879f50a927f5f5fed84788f1ee3458`.
+An isolated import confirms nine `sm70_hc_ll_down_out` arguments including
+`optimized_loads=True`; host model parity remains queued. DDTree's frozen
+baseline now has a recorded proposer/model slot-mapping type failure, documented
+in `flash_v100_known_issues.md`. The DFlash comparison is queued independently;
+its completion marker cannot mark the combined speculative gate complete.
+
+The fixed-source strict run passes **266 tests / 1 skip / 28 GPU exclusions**,
+including all consumed shim patches. Evidence: `a3-prefill-debug-strict.log`
+and `a3-prefill-debug-shim.json`. All code/type/layering hooks pass; the first
+pre-commit invocation only reformatted an extra Markdown blank line.

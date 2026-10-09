@@ -55,3 +55,17 @@ Baseline: #1060 `8c96e32e56c09d4a3e3112cb5d1a367571f69476`.
   model gate or a backend failure. Snapshot the JSON options before engine
   construction, test nested mutation explicitly, retain the failed log and
   rerun both model arms with the same versioned tool.
+
+- DDTree's real-model #1060 baseline reaches generation but fails before
+  producing its route/token record. `DFlashProposer.build_model_inputs_first_pass`
+  passes a layer-name-to-slot-tensor dictionary into
+  `DFlashQwen3Model.store_context_kv`. That method only recognizes tensor and
+  list/tuple forms, so it forwards the dictionary to Triton KV publication,
+  which raises `TypeError: failed to specialize argument of type: dict`.
+  Both registered DFlash model implementations inherit this method; changing
+  model architecture alone does not remove the mismatch. Preserve
+  `dflash_ddtree-parent-slot-mapping-failure.log` and
+  `spec-queue-slot-mapping-failure.log` on 54633. No A3 attention change fixes
+  this pre-existing proposer/model interface bug, and no successful full-model
+  DDTree gate is claimed. The independent native DDTree FP16 operator cases
+  remain required and do not substitute for the failed model gate.
