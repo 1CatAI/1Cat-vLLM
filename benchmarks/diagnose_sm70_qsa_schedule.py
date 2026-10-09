@@ -55,8 +55,23 @@ def configure(worker, mode):
         assert all(x.host_kv.device_reference for x in owners)
         assert all(x.host_kv.device_history_workspace is None for x in owners)
         assert all(x.indexer.shared_key_scoring is False for x in owners)
+        assert not any(x.host_kv.is_speculative_draft for x in owners)
+        draft_owners = [
+            x
+            for x in runner.speculator.model.modules()
+            if isinstance(x, Qwen4ExpQSAAttention)
+        ]
+        assert draft_owners
+        for owner in draft_owners:
+            assert owner.host_kv.is_speculative_draft
+            initialize_device_history_attention(owner.host_kv, True)
+            assert owner.host_kv.device_history_workspace is None
+            assert (
+                owner.host_kv.device_history_reason == "speculative_draft_unqualified"
+            )
         state = dict(
             owners=owners,
+            draft_owners=draft_owners,
             graphs={"original": dict(runner.cudagraph_manager.graphs)},
             modes={"original": "control"},
             mode="control",
@@ -84,6 +99,7 @@ def configure(worker, mode):
             x.host_kv.device_history_workspace is not None for x in state["owners"]
         ),
         scorer_owners=sum(x.indexer.shared_key_scoring for x in state["owners"]),
+        draft_owners_retained=len(state["draft_owners"]),
         dispatch="production helpers; no operator replacement",
     )
 
