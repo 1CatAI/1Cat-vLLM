@@ -94,7 +94,7 @@ entirely.
 | Concept | Home |
 | --- | --- |
 | KV-cache storage formats | `vllm/v1/attention/kv_codecs.py` (`KVCodec`: FP16, BF16, FP8-E4M3, FP8-E5M2). Routes admit codecs, never `kv_cache_dtype` strings. |
-| Flash-V100 attention | `vllm/v1/attention/backends/flash_v100/`: `ops` (native operator loading), `routing` (route accounting, decode partition/XQA admission), `kv_layout`, `masks`, `dense_prefill`, `smallq_metadata`, `metadata`, `impl`, `backend`. Modules reach each other through the module object (`_routing._record_route`), so rebound globals and monkeypatches have one owner. `flash_attn_v100.py` is a compatibility module that forwards reads and writes, including wildcard imports. Public package re-exports resolve the owning module dynamically. The original logger name and shared one-shot flags are retained. |
+| Flash-V100 attention | `vllm/v1/attention/backends/flash_v100/`: `ops` (native operator loading), `routing` (route accounting, decode partition/XQA admission), `kv_layout`, `masks`, `dense_prefill`, `smallq_metadata`, `metadata`, `impl` (initialization/forward), `decode`, `prefill`, `verify`, `debug_compare`, `state` (shared flags), `backend`. Modules reach each other through the module object (`_routing._record_route`), so rebound globals and monkeypatches have one owner. `flash_attn_v100.py` is a compatibility module that forwards reads and writes, including wildcard imports. Public package re-exports resolve the owning module dynamically. The original logger name and shared one-shot flags are retained. |
 
 A pure move between files keeps every coupling total constant; record it with
 `python tools/pre_commit/check_layering.py --accept-moves`, which refuses to
@@ -120,7 +120,7 @@ performance regression), lands as its own PR and can be reverted alone.
    verify / prefill / KV-codec modules. *(KV codecs and the module split done;
    declarative route table and shared XQA admission introduced;
    next: one grouped/XQA operator family per codec,
-   decode/prefill/verify split of `impl`.)*
+   feature metadata hooks after the decode/prefill/verify/debug method split of `impl`.)*
 5. **Kernels and build** — consolidate extension modules, mark retired variant files deprecated,
    split multi-thousand-line kernels by responsibility.
 6. **Process** — PRs state their coverage in the generated matrix; new knobs go

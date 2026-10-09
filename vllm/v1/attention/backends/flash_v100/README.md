@@ -1,6 +1,8 @@
 # Flash-V100 attention
 
-`backend` owns registration, `impl` owns the forward entry point, `ops` owns
+`backend` owns registration, `impl` owns initialization and the forward entry
+point. It binds methods from `decode`, `prefill`, `verify` and `debug_compare`;
+`state` owns their shared one-shot flags. `ops` owns
 native loading, `kv_layout` owns cache views/gathers, and `metadata` plus
 `smallq_metadata` own host/device metadata construction. `dense_prefill` owns
 dense D256 operators and workspaces; `masks` owns reference visibility masks;
@@ -46,3 +48,18 @@ with CPU operator mocks. These checks do not measure GPU speed or precision.
 The campaign proceeds without V100 verification at the user's request. Native
 operator output, CUDA Graph replay and timings are unmeasured; do not infer GPU
 qualification from the generated structural matrix or the CPU mocks.
+
+## Method composition
+
+The `FlashAttnV100Impl` class, its inheritance and method names stay stable.
+Extracted functions are descriptors bound on that class; static methods retain
+`staticmethod`. Their typed `self` refers to the core class. State reads/writes
+use the `state` module, so legacy patches have one owner. The extracted
+comparison super call uses the original class object, preserving its old
+`__class__` cell semantics even if a public export is patched.
+
+The method fixture records normalized parent calculation hashes for all 47
+methods. Normalize docstring indentation, typed-self annotations, moved state
+qualification and the explicit super receiver; other calculation nodes must
+match. Feature metadata registration and removal of family names from forward
+orchestration remain the next independent scope.
