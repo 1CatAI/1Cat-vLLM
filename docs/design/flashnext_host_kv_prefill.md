@@ -726,6 +726,8 @@ cache evidence rejects the cold-prefill measurement. Five unprofiled repeats
 report median, range and coefficient of variation, with a 5% stability bound.
 Compiler and filesystem caches remain warm; these measurements describe cold
 prefix filling, not cold process startup or cold disk I/O.
+The initial baseline retains a four-request startup limit but measures only
+C1 decode with `--decode-widths 1`; C4 measurement is deferred.
 Concurrent decode checks use distinct cache salts for each request while
 retaining identical token inputs. Resetting once before a C4 cohort cannot
 prevent later requests from hitting prefixes filled by earlier requests in

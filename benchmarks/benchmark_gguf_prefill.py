@@ -55,6 +55,9 @@ def main():
         default="routing",
     )
     parser.add_argument("--decode-check", action="store_true")
+    parser.add_argument(
+        "--decode-widths", type=int, nargs="+", choices=(1, 4), default=[1, 4]
+    )
     parser.add_argument("--completion-check", action="store_true")
     parser.add_argument(
         "--completion-context",
@@ -300,7 +303,7 @@ def main():
 
             for enabled in policies:
                 llm.collective_rpc(method, args=(enabled,))
-                for width in (1, 4):
+                for width in args.decode_widths:
                     reset_cold_prefix_cache(llm, args.enable_prefix_caching)
                     salts = (
                         [f"gguf-cold-cohort-{i}" for i in range(width)]
