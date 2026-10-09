@@ -5,7 +5,10 @@
 import pytest
 import torch
 
-from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_mqa_paged
+from vllm.models.qwen4_exp.nvidia.ops.qsa import (
+    qsa_mqa_paged,
+    qsa_select_paged_tokens,
+)
 from vllm.models.qwen4_exp.nvidia.ops.qsa_shared_key import (
     load_operator,
     shared_key_reason,
@@ -94,3 +97,38 @@ def test_truncated_score_width_retains_causal_lengths():
     assert torch.equal(av, ev)
     mask = torch.arange(64, device="cuda")[None, :] < ev[:, None]
     torch.testing.assert_close(actual[mask], expected[mask], rtol=2e-6, atol=2e-6)
+
+
+def test_short_context_selector_graph_is_exact():
+    """When all keys fit, scorer rounding cannot change the selected history."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 required")
+    assert load_operator()
+    torch.manual_seed(2903)
+    query = torch.randn(5, 4, 128, device="cuda", dtype=torch.float16)
+    # Match the model's 816-token scheduler page, compressed by four.
+    cache = torch.randn(12, 204, 1, 128, device="cuda", dtype=torch.float16)
+    table = torch.randperm(12, device="cuda", dtype=torch.int32)[None, :]
+    requests = torch.zeros(5, device="cuda", dtype=torch.int32)
+    positions = torch.arange(5, device="cuda", dtype=torch.int64) + 63
+    lengths = torch.tensor([68], device="cuda", dtype=torch.int32)
+    args = (query, cache, table, requests, positions, lengths, 2048, 4)
+    graphs, outputs = [], []
+    for native in (False, True):
+        qsa_select_paged_tokens(*args, shared_key_scoring=native)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs.append(qsa_select_paged_tokens(*args, shared_key_scoring=native))
+        graphs.append(graph)
+    for length in (68, 79, 512, 816, 1025, 2048, 0):
+        query.normal_()
+        cache.normal_()
+        lengths.fill_(length)
+        positions.copy_(torch.arange(5, device="cuda") + length - 5)
+        requests.zero_()
+        if length == 512:
+            requests[-1] = -1
+            positions[-1] = -1
+        for graph in graphs:
+            graph.replay()
+        assert torch.equal(*outputs), f"Different selected history at length {length}"

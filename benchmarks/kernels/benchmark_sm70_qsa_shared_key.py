@@ -48,7 +48,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--position-dtype", choices=("int32", "int64"), default="int64")
+    parser.add_argument("--page-size", type=int, default=204)
+    parser.add_argument("--pages-per-request", type=int, default=12)
     args = parser.parse_args()
+    if args.page_size <= 0 or args.pages_per_request <= 0:
+        parser.error("Page dimensions must be positive")
     position_dtype = getattr(torch, args.position_dtype)
     torch.manual_seed(902)
     results = []
@@ -56,12 +60,17 @@ def main():
         layers = []
         for _ in range(12):
             requests = m // 5
-            columns = 2496
+            columns = args.page_size * args.pages_per_request
             cache = torch.randn(
-                requests * columns // 16, 16, 1, 128, device="cuda", dtype=torch.float16
+                requests * args.pages_per_request,
+                args.page_size,
+                1,
+                128,
+                device="cuda",
+                dtype=torch.float16,
             )
             table = torch.randperm(
-                requests * columns // 16, device="cuda", dtype=torch.int32
+                requests * args.pages_per_request, device="cuda", dtype=torch.int32
             ).view(requests, -1)
             q = torch.randn(m, 4, 128, device="cuda", dtype=torch.float16)
             req = torch.arange(m, device="cuda", dtype=torch.int32) // 5
@@ -89,8 +98,8 @@ def main():
                 full_selection=full_selection,
                 layers=12,
                 position_dtype=args.position_dtype,
-                page_size=16,
-                columns=2496,
+                page_size=args.page_size,
+                columns=columns,
                 timing=timing,
             )
             results.append(row)

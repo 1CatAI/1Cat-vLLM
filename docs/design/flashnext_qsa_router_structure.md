@@ -114,6 +114,90 @@ M20, which uses the same fallback in both arms, measured 6.6087 to
 The full-model A/B must establish both the actual dispatch and the benefit
 under production page geometry and concurrent work.
 
+The device-KV model run resolves an 816-token scheduler page, so the
+compressed indexer page contains 204 keys. Offline compilation of that
+geometry has no int64 stack spill (254 registers versus 224 for int32).
+The 16-key-page result therefore does not establish a 1.8 ms model gain.
+The benchmark now defaults to the observed 204-key pages and 12 pages per
+request; the earlier micro geometry is reproducible with `--page-size 16
+--pages-per-request 156`. Position type and page geometry are included in
+each result.
+
+### Full-model comparison
+
+The same installed wheel was tested with only `sm70_qsa_shared_key` changed.
+The workload was Flash-Next IQ3_S, FP16 MTP4, TP4 on four full-NVLink
+V100-SXM2-32GB GPUs at 1530 MHz, CUDA 12.8, Torch 2.10.0+cu128, and FULL
+CUDA graphs. Target history used device-resident E4M3 with an 8192-token
+protected FP16 hot region; draft KV and attention staging were FP16. PLE
+used disk-backed rows. Model length was 9216, the prefill budget was 512,
+maximum sequences were four, and GPU memory utilization was 0.95.
+
+This machine/configuration's control does not replace the historical
+17.4018 ms resident-FP16-KV baseline. The native M5 scorer was reported active
+during model graph capture.
+
+| Measurement | Control | Shared-key scorer |
+| --- | ---: | ---: |
+| C1 before GPU observation, ms/round | 19.5093 | 19.5466 |
+| C1 after GPU observation, ms/round | 19.9484 | 19.5555 |
+| C1 mean of the two unobserved segments, ms/round | 19.7289 | 19.5511 |
+| Emitted tokens per C1 round | 4.8857 | 4.8857 |
+| C4, ms/round | 43.1158 | 42.8130 |
+| Natural-prompt mean draft acceptance | 44.8576% | 45.9460% |
+
+The apparent 0.1778 ms C1 difference is smaller than the control's own
+0.4390 ms before/after drift. It is not an established model speedup.
+The 37 central event-observed rounds also show no target improvement:
+
+| Rank-0 GPU event envelope, ms/round | Control | Shared-key scorer |
+| --- | ---: | ---: |
+| Target | 15.3266 | 15.3816 |
+| Target to draft | 0.6186 | 0.6074 |
+| Four draft steps | 3.3963 | 3.3726 |
+| Draft to next target | 0.2191 | 0.2225 |
+| Round | 19.5606 | 19.5842 |
+
+These are same-rank event envelopes, not kernel-service sums or aligned
+cross-GPU clocks. The native scorer is not enabled by default.
+
+The fixed C1 probe and all four C4 output streams were identical. The eight
+600-token natural continuations differed, with first differences between
+tokens 5 and 292; all stopped at the token limit, so this run does not prove
+natural EOS termination. Paired bootstrap draft-acceptance difference was
++1.0884 percentage points with 95% interval [-1.4020, +3.8124]. Teacher
+forcing at 64 matched conditions gave mean KL 8.6279e-4, maximum KL 0.0069709,
+and 63/64 matching top-1 results. Repeating those conditions within the
+candidate process was bit-exact.
+
+The distribution difference is unresolved. All teacher contexts contain
+fewer than 512 compressed keys, where the selector returns every causal
+key without consulting scores. All four ranks' captured computation graphs
+and compiled-subgraph keys also match after removing cache-directory names.
+Thus attributing these differences to the scorer's FP32 summation order is
+not supported. An actual-input boundary comparison is required before
+claiming a numerical cause or admitting the path.
+
+### Distributed router candidate
+
+The next research prototype partitions the 512 router weight rows across
+TP4 instead of calculating every row on every rank. Each rank keeps its
+local ten largest FP16 logits, exchanges those candidates, then selects and
+normalizes the global top ten. The global top ten must lie in the union of
+the local top tens, including the original lower-expert-ID tie rule. This
+reduces projection weight traffic from about 126 MB to 31.5 MB per rank per
+48-layer chain. FP32 partial-sum reassociation is measured separately from
+the exact selection rule.
+
+Two execution structures are prepared: projection followed by a fused
+reduction/selection/peer exchange, and one kernel with 64 projection
+producers plus five row consumers connected by readiness tags. The latter
+removes the producer/consumer launch boundary. Communication uses tagged
+double-buffered words on direct NVLink peers, with bounded polling. Both
+are research-only and must pass changing-input graph replay and a complete
+four-rank chain before a model comparison. Weight-byte savings alone are
+not a latency result.
+
 ## Validation and admission
 
 The packaged scorer must pass causal masks, invalid pages, ties, sliced
@@ -122,7 +206,8 @@ replay, and the M20 fallback. The benchmark compares both scoring alone
 and the score/selection/expansion chain. The final gate compares the same
 wheel with only `sm70_qsa_shared_key` changed: C1/C4 ms per round, tokens
 per round, target teacher-forcing agreement, natural outputs, and acceptance.
-No model gain is claimed until that gate is recorded.
+The first paired model run above did not establish a gain or resolve the
+distribution difference. No model gain is admitted.
 
 ## External references
 
