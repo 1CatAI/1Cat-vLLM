@@ -318,7 +318,29 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     pf_l2(p + lane * 128);
   }
   if (act) {
-    if (FULL) {
+    if constexpr (LOCAL_SCHEDULE) {
+      // Issue the three independent peer loads before checking their tags.
+      unsigned u1, u2, u3, e1, e2, e3;
+      const auto start = clock64();
+      do {
+        asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(u1), "=r"(e1)
+                     : "l"(a.ar[rk] + (p1 * NC + i) * 256 + t));
+        asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(u2), "=r"(e2)
+                     : "l"(a.ar[rk] + (p2 * NC + i) * 256 + t));
+        asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(u3), "=r"(e3)
+                     : "l"(a.ar[rk] + (p3 * NC + i) * 256 + t));
+        if (clock64() - start > 4000000000LL) __trap();
+      } while (e1 != tag || e2 != tag || e3 != tag);
+      const float x1 = __uint_as_float(u1), x2 = __uint_as_float(u2),
+                  x3 = __uint_as_float(u3);
+      // Preserve (rank0 + rank1) + (rank2 + rank3), including operand order.
+      const float near = (rk & 1) ? x1 + v : v + x1;
+      const float far = (rk & 1) ? x3 + x2 : x2 + x3;
+      v = (rk & 2) ? far + near : near + far;
+    } else if (FULL) {
       float x[4];
 #pragma unroll
       for (int s = 0; s < 4; ++s)
@@ -335,7 +357,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   }
   __shared__ __align__(16) half xs[8][128 + 8];
   __shared__ __align__(16) half ls[8][320 + 8];
-  __shared__ float red[6][8][32];
+  __shared__ float red[6][8][LOCAL_SCHEDULE ? 33 : 32];
   __shared__ __align__(16) half tout[8][8];
   __shared__ float rr[8][4];
   TS(1);
@@ -344,6 +366,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   float o[4];
   {
     const float B = __half2float(__float2half_rn(v));
+    float sums[4];
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
       const half h = __float2half_rn(__half2float(resv[b]) + B * g[b]);
@@ -353,9 +376,25 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
           act ? __float2half_rn(o[b] + o[b] * __half2float(nwv[b]))
               : __float2half_rn(0.f);
       float q = act ? o[b] * o[b] : 0.f;
+      if constexpr (LOCAL_SCHEDULE) {
+        sums[b] = q;
+      } else {
 #pragma unroll
-      for (int s = 16; s > 0; s >>= 1) q += __shfl_xor_sync(0xffffffff, q, s);
-      if (lane == 0 && act) a.sq[(i * 8 + row) * 4 + b] = q;
+        for (int s = 16; s > 0; s >>= 1) q += __shfl_xor_sync(0xffffffff, q, s);
+        if (lane == 0 && act) a.sq[(i * 8 + row) * 4 + b] = q;
+      }
+    }
+    if constexpr (LOCAL_SCHEDULE) {
+      // Interleave independent streams while retaining each XOR reduction tree.
+#pragma unroll
+      for (int s = 16; s > 0; s >>= 1) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+          sums[b] += __shfl_xor_sync(0xffffffff, sums[b], s);
+      }
+      if (lane == 0 && act)
+        *reinterpret_cast<float4*>(a.sq + (i * 8 + row) * 4) =
+            make_float4(sums[0], sums[1], sums[2], sums[3]);
     }
   }
   __syncthreads();
@@ -420,14 +459,32 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
                   ? __ldcg(reinterpret_cast<const float4*>(a.sq) +
                            (lane + 32 * j) * 8 + row)
                   : make_float4(0.f, 0.f, 0.f, 0.f);
+    float sums[4];
+    if constexpr (LOCAL_SCHEDULE) {
+      sums[0] = (qs[0].x + qs[1].x) + qs[2].x;
+      sums[1] = (qs[0].y + qs[1].y) + qs[2].y;
+      sums[2] = (qs[0].z + qs[1].z) + qs[2].z;
+      sums[3] = (qs[0].w + qs[1].w) + qs[2].w;
+#pragma unroll
+      for (int s = 16; s > 0; s >>= 1) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+          sums[b] += __shfl_xor_sync(0xffffffff, sums[b], s);
+      }
+    }
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
-      auto comp = [&](const float4& f) {
-        return b == 0 ? f.x : b == 1 ? f.y : b == 2 ? f.z : f.w;
-      };
-      float q = (comp(qs[0]) + comp(qs[1])) + comp(qs[2]);
+      float q;
+      if constexpr (LOCAL_SCHEDULE) {
+        q = sums[b];
+      } else {
+        auto comp = [&](const float4& f) {
+          return b == 0 ? f.x : b == 1 ? f.y : b == 2 ? f.z : f.w;
+        };
+        q = (comp(qs[0]) + comp(qs[1])) + comp(qs[2]);
 #pragma unroll
-      for (int s = 16; s > 0; s >>= 1) q += __shfl_xor_sync(0xffffffff, q, s);
+        for (int s = 16; s > 0; s >>= 1) q += __shfl_xor_sync(0xffffffff, q, s);
+      }
       const float rrms = rsqrtf(q / HD + a.eps);
       if (lane == 0) rr[row][b] = rrms;
       float y = o[b] * rrms;
@@ -522,45 +579,84 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       mma(acc, x1.z, x1.w, uhi[s].z, uhi[s].w);
     }
 #pragma unroll
-    for (int e = 0; e < 8; ++e) red[uw][e][lane] = acc[e];
-  }
-  __syncthreads();
-  // Independent accumulator slots can be mixed by separate warps. Each slot
-  // keeps the original five-part sum, FP16 rounding and four-stream FMA order.
-  if (LOCAL_SCHEDULE || warp == 0) {
-#pragma unroll
-    for (int e = LOCAL_SCHEDULE ? warp : 0; e < 8;
-         e += LOCAL_SCHEDULE ? 8 : 1) {
-      float acc = red[0][e][lane];
-#pragma unroll
-      for (int q = 1; q < 5; ++q) acc += red[q][e][lane];
-      const int rw = (e & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-      const int hh = (e & 1) | (((lane >> 1) & 1) << 1) | ((e >> 2) << 2);
-      const int h = 640 * rk + 8 * i + hh;
-      const float sg = sigm(__half2float(__float2half_rn(acc)));
-      const float xv =
-          rw < M ? __half2float(__ldcg(a.xn + rw * KD + quad * HD + h)) : 0.f;
-      float mixed = 0.f;
-#pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        const int src = (lane & ~12) | (b << 2);
-        mixed = fmaf(__shfl_sync(0xffffffff, sg, src),
-                     __shfl_sync(0xffffffff, xv, src), mixed);
+    for (int e = 0; e < 8; ++e) {
+      if constexpr (LOCAL_SCHEDULE) {
+        const int rw = (e & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        const int hh = (e & 1) | (lane & 2) | (e & 4);
+        // The padded row stride avoids bank conflicts for both layouts.
+        red[uw][rw][quad * 8 + hh] = acc[e];
+      } else {
+        red[uw][e][lane] = acc[e];
       }
-      if (quad == 0) tout[rw][hh] = __float2half_rn(divf(mixed, 4.0f));
     }
   }
   __syncthreads();
-  TS(7);
-  // push own 8 hidden columns (two 8-byte LL words per 4 halves) to r^1, r^2
-  // and the local output
-  if (t < 2 * M) {
-    const int rw = t >> 1, h4 = (t & 1) * 4, h = 640 * rk + 8 * i + h4;
-    const uint2 d = *reinterpret_cast<const uint2*>(&tout[rw][h4]);
-    st4(a.hb[p1] + (rw * HD + h) / 2, d.x, d.y, tag);
-    st4(a.hb[p2] + (rw * HD + h) / 2, d.x, d.y, tag);
-    if (FULL) st4(a.hb[p3] + (rw * HD + h) / 2, d.x, d.y, tag);
-    *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
+  if constexpr (LOCAL_SCHEDULE) {
+    // One warp owns a row, including all four streams for each hidden column.
+    // It retains the five-part sum and four-stream FMA order, then sends the
+    // packed output directly without another shared-memory rendezvous.
+    if (warp < M) {
+      const int hh = lane & 7, stream = lane >> 3;
+      float acc = red[0][warp][lane];
+#pragma unroll
+      for (int q = 1; q < 5; ++q) acc += red[q][warp][lane];
+      const int h = 640 * rk + 8 * i + hh;
+      const float sg = sigm(__half2float(__float2half_rn(acc)));
+      const float xv = __half2float(__ldcg(a.xn + warp * KD + stream * HD + h));
+      float mixed = 0.f;
+#pragma unroll
+      for (int b = 0; b < 4; ++b)
+        mixed = fmaf(__shfl_sync(0xffffffff, sg, b * 8 + hh),
+                     __shfl_sync(0xffffffff, xv, b * 8 + hh), mixed);
+      const unsigned bits =
+          __half_as_ushort(__float2half_rn(divf(mixed, 4.0f)));
+      const unsigned packed =
+          bits | (__shfl_down_sync(0xffffffff, bits, 1) << 16);
+      const unsigned upper = __shfl_down_sync(0xffffffff, packed, 2);
+      if (lane < 8 && !(lane & 3)) {
+        st4(a.hb[p1] + (warp * HD + h) / 2, packed, upper, tag);
+        st4(a.hb[p2] + (warp * HD + h) / 2, packed, upper, tag);
+        st4(a.hb[p3] + (warp * HD + h) / 2, packed, upper, tag);
+        *reinterpret_cast<uint2*>(a.blk_out + warp * HD + h) =
+            make_uint2(packed, upper);
+      }
+    }
+    TS(7);
+  } else {
+    if (warp == 0) {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        float acc = red[0][e][lane];
+#pragma unroll
+        for (int q = 1; q < 5; ++q) acc += red[q][e][lane];
+        const int rw = (e & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        const int hh = (e & 1) | (((lane >> 1) & 1) << 1) | ((e >> 2) << 2);
+        const int h = 640 * rk + 8 * i + hh;
+        const float sg = sigm(__half2float(__float2half_rn(acc)));
+        const float xv =
+            rw < M ? __half2float(__ldcg(a.xn + rw * KD + quad * HD + h)) : 0.f;
+        float mixed = 0.f;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const int src = (lane & ~12) | (b << 2);
+          mixed = fmaf(__shfl_sync(0xffffffff, sg, src),
+                       __shfl_sync(0xffffffff, xv, src), mixed);
+        }
+        if (quad == 0) tout[rw][hh] = __float2half_rn(divf(mixed, 4.0f));
+      }
+    }
+    __syncthreads();
+    TS(7);
+    // push own 8 hidden columns (two 8-byte LL words per 4 halves) to r^1, r^2
+    // and the local output
+    if (t < 2 * M) {
+      const int rw = t >> 1, h4 = (t & 1) * 4, h = 640 * rk + 8 * i + h4;
+      const uint2 d = *reinterpret_cast<const uint2*>(&tout[rw][h4]);
+      st4(a.hb[p1] + (rw * HD + h) / 2, d.x, d.y, tag);
+      st4(a.hb[p2] + (rw * HD + h) / 2, d.x, d.y, tag);
+      if (FULL) st4(a.hb[p3] + (rw * HD + h) / 2, d.x, d.y, tag);
+      *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
+    }
   }
   if (FULL) {
     if (t >= 32 && t < 32 + 6 * M) {  // collect the three peer slices

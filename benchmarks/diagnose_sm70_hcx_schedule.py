@@ -256,6 +256,14 @@ def local_quality_checks(root, phases):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--reference", type=Path, required=True)
+    parser.add_argument(
+        "--expected-core-sha256",
+        help=(
+            "Validate a rebuilt core against this hash while reusing the reference "
+            "workload and teacher prefixes. All four quality phases run anew. "
+            "Defaults to the reference artifact's core hash."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     # Pass only these trusted benchmark functions over offline RPC.
@@ -269,10 +277,8 @@ def main():
         assert callable(MsgpackDecoder().decode(MsgpackEncoder().encode(function)))
     reference = json.loads(args.reference.read_text())
     assert reference["complete"]
-    assert (
-        hashlib.sha256(Path(core.__file__).read_bytes()).hexdigest()
-        == reference["core_sha256"]
-    )
+    actual_core = hashlib.sha256(Path(core.__file__).read_bytes()).hexdigest()
+    assert actual_core == (args.expected_core_sha256 or reference["core_sha256"])
     assert "/site-packages/vllm/" in str(Path(vllm.__file__))
     # Match the acceptance benchmark's matmul precision contract.
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -287,7 +293,8 @@ def main():
         complete=False,
         scope="same-process quality localization; C1 timing only if controls pass",
         reference=str(args.reference),
-        core_sha256=reference["core_sha256"],
+        core_sha256=actual_core,
+        reference_core_sha256=reference["core_sha256"],
         version=vllm.__version__,
         origin=vllm.__file__,
         config=config,
