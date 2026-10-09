@@ -575,15 +575,24 @@ class DFlash2Speculator(DFlashSpeculator):
             assert speculative_config.prompt_lookup_max is not None
             self._lookup_nmin = int(speculative_config.prompt_lookup_min)
             self._lookup_nmax = int(speculative_config.prompt_lookup_max)
-            self._lookup_nstrong = envs.VLLM_DFLASH2_LOOKUP_NSTRONG
-            self._lookup_agree = envs.VLLM_DFLASH2_LOOKUP_AGREE
-            self._lookup_nmin_tail = envs.VLLM_DFLASH2_LOOKUP_NMIN_TAIL
-            self._lookup_long_min = envs.VLLM_DFLASH2_LOOKUP_LONG_MIN
-            self._lookup_search = envs.VLLM_DFLASH2_LOOKUP_SEARCH
-            self._lookup_adaptive = envs.VLLM_DFLASH2_LOOKUP_ADAPTIVE
-            self._lookup_entry_streak = envs.VLLM_DFLASH2_LOOKUP_ENTRY_STREAK
-            self._lookup_sticky_steps = envs.VLLM_DFLASH2_LOOKUP_STICKY
-            self._lookup_cheap_context = envs.VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT
+            self._sm70_dflash2_policy.lookup.resolve()
+            assert self._sm70_dflash2_policy.lookup.nstrong is not None
+            self._lookup_nstrong = self._sm70_dflash2_policy.lookup.nstrong
+            assert self._sm70_dflash2_policy.lookup.agree is not None
+            self._lookup_agree = self._sm70_dflash2_policy.lookup.agree
+            assert self._sm70_dflash2_policy.lookup.nmin_tail is not None
+            self._lookup_nmin_tail = self._sm70_dflash2_policy.lookup.nmin_tail
+            assert self._sm70_dflash2_policy.lookup.long_min is not None
+            self._lookup_long_min = self._sm70_dflash2_policy.lookup.long_min
+            assert self._sm70_dflash2_policy.lookup.search is not None
+            self._lookup_search = self._sm70_dflash2_policy.lookup.search
+            self._lookup_adaptive = self._sm70_dflash2_policy.lookup.adaptive
+            assert self._sm70_dflash2_policy.lookup.entry_streak is not None
+            self._lookup_entry_streak = self._sm70_dflash2_policy.lookup.entry_streak
+            assert self._sm70_dflash2_policy.lookup.sticky is not None
+            self._lookup_sticky_steps = self._sm70_dflash2_policy.lookup.sticky
+            assert self._sm70_dflash2_policy.lookup.cheap_context is not None
+            self._lookup_cheap_context = self._sm70_dflash2_policy.lookup.cheap_context
             self._lookup_tokens = torch.zeros(
                 self.max_num_reqs,
                 self.num_speculative_steps,

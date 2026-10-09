@@ -3,11 +3,12 @@
 """DFlash2 pipeline policy; operator admission remains beside each operator."""
 
 import os
+from typing import ClassVar
 
 from pydantic import Field
 
 from vllm import envs
-from vllm.config.execution_policy import read_execution_legacy
+from vllm.config.execution_policy import ExecutionPolicy, read_execution_legacy
 from vllm.config.utils import config
 from vllm.envs_metadata import EnvVar
 from vllm.logger import init_logger
@@ -64,6 +65,8 @@ SM70_GLM5_DFLASH_TP8_PP1_DEFAULTS = {
 
 SM70_DFLASH2_LEGACY_FIELDS = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": "fused_gdn_verify",
+    "VLLM_SM70_DFLASH2_TP2_GDN_BV2": "tp2_gdn_bv2",
+    "VLLM_SM70_DFLASH2_FUSED_QKV_PACK": "fused_qkv_pack",
     "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": "fused_gdn_combined_split",
     "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": "context_pipeline",
     "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": "context_kv_graph",
@@ -83,6 +86,50 @@ SM70_DFLASH2_LEGACY_FIELDS = {
     "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "sparse_target_rejection",
     "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC": "sharded_context_fc",
 }
+
+
+@config
+class DFlashLookupPolicy(ExecutionPolicy):
+    """Captured only when lookup assistance can run; does not own request state."""
+
+    adaptive: bool | None = None
+    """Adapt lookup width using the retained acceptance policy."""
+
+    nstrong: int | None = Field(default=None, ge=1)
+    """Strong-match threshold; legacy minimum one."""
+
+    agree: int | None = Field(default=None, ge=0)
+    """Required agreement count; legacy minimum zero."""
+
+    nmin_tail: int | None = Field(default=None, ge=1)
+    """Minimum tail match; legacy minimum one."""
+
+    long_min: int | None = Field(default=None, ge=1)
+    """Minimum long-context match; legacy minimum one."""
+
+    search: int | None = Field(default=None, ge=1)
+    """Maximum lookup search length; legacy minimum one."""
+
+    entry_streak: int | None = Field(default=None, ge=1)
+    """Accepted streak needed to enter long lookup mode."""
+
+    sticky: int | None = Field(default=None, ge=0)
+    """Number of sticky lookup steps; legacy minimum zero."""
+
+    cheap_context: int | None = Field(default=None, ge=0)
+    """Context threshold for the existing cheap lookup mode."""
+
+    aliases: ClassVar[dict[str, str]] = {
+        "adaptive": "VLLM_DFLASH2_LOOKUP_ADAPTIVE",
+        "nstrong": "VLLM_DFLASH2_LOOKUP_NSTRONG",
+        "agree": "VLLM_DFLASH2_LOOKUP_AGREE",
+        "nmin_tail": "VLLM_DFLASH2_LOOKUP_NMIN_TAIL",
+        "long_min": "VLLM_DFLASH2_LOOKUP_LONG_MIN",
+        "search": "VLLM_DFLASH2_LOOKUP_SEARCH",
+        "entry_streak": "VLLM_DFLASH2_LOOKUP_ENTRY_STREAK",
+        "sticky": "VLLM_DFLASH2_LOOKUP_STICKY",
+        "cheap_context": "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT",
+    }
 
 
 @config
@@ -152,6 +199,13 @@ class Sm70DFlash2Config:
 
     sharded_context_fc: bool | None = None
     """Policy for sharded context fc; None retains automatic qualification."""
+
+    tp2_gdn_bv2: bool | None = None
+    """Retain the TP2 GDN verifier tile candidate and its original admission."""
+    fused_qkv_pack: bool | None = None
+    """Retain the admitted post-convolution QKV pack candidate."""
+    lookup: DFlashLookupPolicy = Field(default_factory=DFlashLookupPolicy)
+    """Optional ngram lookup tuning; initialization binds enabled assistance."""
 
     bf16_emulation: bool | None = None
     """Preserve the draft's BF16 emulation contract on FP16-only devices."""
@@ -237,6 +291,14 @@ class Sm70DFlash2Config:
         self.qualified = qualified
         self.resolved = True
 
+    def resolve_lookup(self, spec) -> None:
+        from vllm.config.speculative import get_dflash_model_draft_tokens
+
+        if spec.ngram_assist and (
+            get_dflash_model_draft_tokens(spec) < spec.num_speculative_tokens
+        ):
+            self.lookup.resolve()
+
     def native_overrides(self) -> dict[str, bool | None]:
         """Bridge explicit/model defaults to B's FP16 native policy ABI.
 
@@ -252,8 +314,8 @@ class Sm70DFlash2Config:
             or self.sources.get(field, "").startswith("default:")
         }
 
-    def graph_options(self) -> dict[str, bool | None]:
-        return {
+    def graph_options(self) -> dict:
+        result = {
             field: getattr(self, field)
             for field in (
                 *SM70_DFLASH2_LEGACY_FIELDS.values(),
@@ -261,6 +323,12 @@ class Sm70DFlash2Config:
                 "bf16_emulation",
             )
         }
+
+        if self.lookup.sources:
+            result["lookup"] = {
+                field: getattr(self.lookup, field) for field in self.lookup.aliases
+            }
+        return result
 
 
 def capture_sm70_dflash2_config(vllm_config=None) -> Sm70DFlash2Config | None:

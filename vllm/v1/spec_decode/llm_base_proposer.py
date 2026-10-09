@@ -16,6 +16,10 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
+from vllm.config.speculative_sampling import (
+    SpeculativeSamplingPolicy,
+    resolve_sampling_policy,
+)
 from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
@@ -208,6 +212,11 @@ class SpecDecodeBaseProposer:
         self.vllm_config = vllm_config
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
+        self._sampling_policy = resolve_sampling_policy(
+            self.speculative_config,
+            draft=self.speculative_config.draft_sample_method == "probabilistic",
+            vocab=self.speculative_config.method == "mtp",
+        )
         self.draft_model_config = self.speculative_config.draft_model_config
         method = self.speculative_config.method
         assert method is not None
@@ -275,6 +284,7 @@ class SpecDecodeBaseProposer:
             vllm_config.parallel_config.tensor_parallel_size,
             vllm_config.model_config.architecture,
             vllm_config.model_config.model,
+            policy=self._sampling_policy,
         )
         if draft_vocab_config.gpu_lru_enabled:
             if self.max_batch_size != 1:
@@ -572,7 +582,7 @@ class SpecDecodeBaseProposer:
 
     def _uses_spec_step_idx(self) -> bool:
         if (
-            envs.VLLM_SM70_MTP_LEGACY_QWEN_STEP_IDX
+            self._sampling_policy.legacy_qwen_step_idx
             and self.method == "mtp"
             and self.model.__class__.__name__ in ("Qwen3_5MTP", "Qwen3_5MoeMTP")
         ):
@@ -681,7 +691,7 @@ class SpecDecodeBaseProposer:
                 token_ids = self._static_draft_vocab.token_id_map[token_ids]
             return token_ids, None
         token_ids, probs = compute_probs_and_sample_next_token(
-            logits, sampling_metadata
+            logits, sampling_metadata, policy=self._sampling_policy
         )
         if self._static_draft_vocab is None:
             return token_ids, probs
@@ -751,14 +761,14 @@ class SpecDecodeBaseProposer:
             temperatures is None
             or len(temperatures) != 1
             or abs(float(temperatures[0]) - 1.0) > 1e-6
-            or envs.VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE != 1.0
+            or self._sampling_policy.draft_temperature_scale != 1.0
         ):
             return None
 
-        draft_top_p_override = envs.VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE
+        draft_top_p_override = self._sampling_policy.draft_top_p_override
         if draft_top_p_override is not None:
             top_p = float(draft_top_p_override)
-        elif envs.VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P:
+        elif self._sampling_policy.use_fused_top_p():
             top_ps = sampling_metadata.top_p_cpu
             if top_ps is None or len(top_ps) != 1:
                 return None
@@ -1347,7 +1357,7 @@ class SpecDecodeBaseProposer:
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
             common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
             if (
-                envs.VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU
+                self._sampling_policy.exact_draft_seq_lens_cpu
                 and common_attn_metadata.seq_lens_cpu_upper_bound is not None
             ):
                 common_attn_metadata.seq_lens_cpu_upper_bound -= (
@@ -1851,7 +1861,7 @@ class SpecDecodeBaseProposer:
         seq_lens_cpu_upper_bound = _clone_tensor_or_none(
             common_attn_metadata.seq_lens_cpu_upper_bound
         )
-        if envs.VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU:
+        if self._sampling_policy.exact_draft_seq_lens_cpu:
             seq_lens_cpu_upper_bound = seq_lens.detach().cpu()
 
         spec_common_attn_metadata = CommonAttentionMetadata(
@@ -2195,6 +2205,7 @@ class SpecDecodeBaseProposer:
             self.vllm_config.parallel_config.tensor_parallel_size,
             self.vllm_config.model_config.architecture,
             self.vllm_config.model_config.model,
+            policy=self._sampling_policy,
         )
         ranking_path = vocab_config.ranking_path
         shortlist_size = vocab_config.shortlist_size
@@ -2550,6 +2561,8 @@ class SpecDecodeBaseProposer:
 def compute_probs_and_sample_next_token(
     logits: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    *,
+    policy: SpeculativeSamplingPolicy | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if sampling_metadata.all_greedy:
         # For greedy requests, draft_probs is not used in rejection sampling.
@@ -2558,6 +2571,11 @@ def compute_probs_and_sample_next_token(
         next_token_ids = logits.argmax(dim=-1)
         return next_token_ids, probs
 
+    if policy is None:
+        policy = SpeculativeSamplingPolicy()
+        policy.resolve_fields(
+            field for field in policy.aliases if field.startswith("draft_")
+        )
     assert sampling_metadata.temperature is not None
     logits = logits.float()
 
@@ -2573,7 +2591,8 @@ def compute_probs_and_sample_next_token(
     if not sampling_metadata.all_random:
         is_greedy = temperature < _SAMPLING_EPS
         temperature = torch.where(is_greedy, 1.0, temperature)
-    draft_temperature_scale = envs.VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE
+    draft_temperature_scale = policy.draft_temperature_scale
+    assert draft_temperature_scale is not None
     if draft_temperature_scale <= 0.0:
         raise ValueError(
             "VLLM_SM70_MTP_PROB_DRAFT_TEMPERATURE_SCALE must be positive, "
@@ -2596,11 +2615,9 @@ def compute_probs_and_sample_next_token(
     # sampling corrects the final distribution. The SM70 experiment flag lets us
     # test a closer top-k+top-p proposal while keeping standard rejection
     # correction and official target sampling semantics.
-    draft_top_p_override = os.getenv("VLLM_SM70_MTP_PROB_DRAFT_TOP_P_OVERRIDE")
-    apply_draft_top_p_with_top_k = (
-        os.getenv("VLLM_SM70_MTP_PROB_DRAFT_APPLY_TOP_P", "0") == "1"
-    )
-    if draft_top_p_override:
+    draft_top_p_override = policy.draft_top_p_override
+    apply_draft_top_p_with_top_k = policy.draft_apply_top_p
+    if draft_top_p_override is not None and draft_top_p_override != "":
         draft_top_p_value = float(draft_top_p_override)
         if not 0.0 < draft_top_p_value <= 1.0:
             raise ValueError(
@@ -2629,6 +2646,7 @@ def compute_probs_and_sample_next_token(
         sampling_metadata,
         top_k,
         top_p,
+        enabled=policy.draft_sparse_topk,
     ):
         assert sampling_metadata.top_k_cpu is not None
         return _compute_sparse_topk_draft_probs_and_sample_next_token(
@@ -2662,8 +2680,12 @@ def _can_use_sparse_topk_draft_proposal(
     sampling_metadata: SamplingMetadata,
     top_k: torch.Tensor | None,
     top_p: torch.Tensor | None,
+    *,
+    enabled: bool | None = None,
 ) -> bool:
-    if not envs.VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK:
+    if enabled is None:
+        enabled = envs.VLLM_SM70_MTP_PROB_DRAFT_SPARSE_TOPK
+    if not enabled:
         return False
     if top_k is None or top_p is not None:
         return False

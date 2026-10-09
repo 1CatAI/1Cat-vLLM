@@ -1682,6 +1682,9 @@ class VllmConfig:
 
         finalize_runtime_policy_hashes(self)
         self.kernel_config.resolve_gdn(self.model_config, self.additional_config)
+        if self.speculative_config is not None:
+            self.speculative_config.resolve_execution_policy()
+
         if self.kernel_config.gdn.resolved:
             self.observability_config.gdn_profile.resolve()
             self.observability_config.gdn_state.resolve()

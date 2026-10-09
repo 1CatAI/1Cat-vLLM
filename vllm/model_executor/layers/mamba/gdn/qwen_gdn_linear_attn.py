@@ -703,12 +703,22 @@ def _sm70_assert_standard_core_not_active_spec(
     )
 
 
-def _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(vllm_config: object) -> bool:
+def _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
+    vllm_config: object, policy=None
+) -> bool:
     return (
         _sm70_qwen_gdn_num_speculative_tokens(vllm_config) >= 3
         and _sm70_qwen_gdn_spec_method(vllm_config) == "mtp"
-        and envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
-        and not envs.VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP
+        and (
+            envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
+            if policy is None
+            else policy.spec_core_003
+        )
+        and not (
+            envs.VLLM_SM70_QWEN_GDN_003_SPEC_ALLOW_DEEP_MTP
+            if policy is None
+            else policy.spec_allow_deep_mtp
+        )
     )
 
 
@@ -763,7 +773,9 @@ def _sm70_qwen_gdn_full_forward_enabled(
     return auto_enabled
 
 
-def _sm70_qwen_gdn_input_core_boundary_enabled() -> bool:
+def _sm70_qwen_gdn_input_core_boundary_enabled(policy=None) -> bool:
+    if policy is not None:
+        return bool(policy.input_core and not policy.disable_input_core)
     if envs.VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP:
         return False
     return envs.VLLM_SM70_QWEN_GDN_INPUT_CORE_OP
@@ -802,7 +814,7 @@ def _qwen_gdn_run_recurrent_core(
     Only the recurrent-state commit semantics differ between non-spec and
     active speculative decode, so keep that dispatch localized here.
     """
-    if envs.VLLM_SM70_QWEN_GDN_CONTEXT_CORE:
+    if self.gdn_policy.projection.context_core:
         torch.ops.vllm.qwen_gdn_attention_core_context(
             mixed_qkv,
             b,
@@ -1407,7 +1419,9 @@ def _sm70_compile_graph_slice_dim(
     return tensor.index_select(dim, indices)
 
 
-def _sm70_gdn_rmsnorm_onepass_enabled() -> bool:
+def _sm70_gdn_rmsnorm_onepass_enabled(policy=None) -> bool:
+    if policy is not None:
+        return bool(policy.rmsnorm_onepass)
     return envs.VLLM_SM70_GDN_RMSNORM_ONEPASS
 
 
@@ -1425,115 +1439,35 @@ def _missing_sm70_gdn_qpn8_ba_ops() -> list[str]:
     ]
 
 
-def _sm70_gdn_qpn8_ba_split_enabled() -> bool:
-    if envs.VLLM_SM70_GDN_QPN8_BA_SPLIT and not envs.VLLM_SM70_GDN_RMSNORM_ONEPASS:
+def _sm70_gdn_qpn8_ba_split_enabled(policy=None) -> bool:
+    requested = (
+        envs.VLLM_SM70_GDN_QPN8_BA_SPLIT if policy is None else policy.qpn8_ba_split
+    )
+    if requested and not _sm70_gdn_rmsnorm_onepass_enabled(policy):
         raise RuntimeError(
             "VLLM_SM70_GDN_QPN8_BA_SPLIT=1 requires the accepted "
             "VLLM_SM70_GDN_RMSNORM_ONEPASS=1 pair."
         )
-    if envs.VLLM_SM70_GDN_QPN8_BA_SPLIT:
+    if requested:
         missing_ops = _missing_sm70_gdn_qpn8_ba_ops()
         if missing_ops:
             raise RuntimeError(
                 "VLLM_SM70_GDN_QPN8_BA_SPLIT=1 requires the source-built "
                 f"SM70 GDN extension; missing ops: {missing_ops}."
             )
-    return envs.VLLM_SM70_GDN_QPN8_BA_SPLIT
+    return bool(requested)
 
 
-@triton.jit
-def _sm70_gdn_rmsnorm_gated_onepass_kernel(
-    x_ptr,
-    z_ptr,
-    weight_ptr,
-    out_ptr,
-    D: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offsets = tl.arange(0, D)
-    x = tl.load(x_ptr + row * D + offsets).to(tl.float32)
-    z = tl.load(z_ptr + row * D + offsets).to(tl.float32)
-    weight = tl.load(weight_ptr + offsets).to(tl.float32)
-    sumsq = tl.sum(x * x, axis=0)
-    rstd = tl.rsqrt(sumsq / D + EPS)
-    gated = z * tl.sigmoid(z)
-    tl.store(out_ptr + row * D + offsets, x * rstd * weight * gated)
-
-
-def _sm70_qwen_gdn_rmsnorm_gated_impl(
-    x: torch.Tensor,
-    z: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    group_size: int,
-    norm_before_gate: bool,
-    activation: str,
-) -> torch.Tensor:
-    if (
-        _sm70_gdn_rmsnorm_onepass_enabled()
-        and current_platform.is_device_capability(70)
-        and x.is_cuda
-        and x.dtype == torch.float16
-        and x.shape == (12, 128)
-        and x.is_contiguous()
-        and z.is_cuda
-        and z.device == x.device
-        and z.dtype == x.dtype
-        and z.shape == x.shape
-        and z.is_contiguous()
-        and weight.is_cuda
-        and weight.device == x.device
-        and weight.dtype == x.dtype
-        and weight.shape == (128,)
-        and weight.is_contiguous()
-        and group_size <= 0
-        and norm_before_gate
-        and activation in ("silu", "swish")
-    ):
-        out = torch.empty_like(x)
-        _sm70_gdn_rmsnorm_gated_onepass_kernel[(12,)](
-            x,
-            z,
-            weight,
-            out,
-            D=128,
-            EPS=eps,
-            num_warps=2,
-        )
-        return out
-
-    from vllm.model_executor.layers.fla.ops.layernorm_guard import rmsnorm_fn
-
-    return rmsnorm_fn(
-        x,
-        weight,
-        None,
-        z=z,
-        eps=eps,
-        group_size=None if group_size <= 0 else group_size,
-        norm_before_gate=norm_before_gate,
-        activation=activation,
-    )
-
-
-def _sm70_qwen_gdn_rmsnorm_gated_fake(
-    x: torch.Tensor,
-    z: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    group_size: int,
-    norm_before_gate: bool,
-    activation: str,
-) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-direct_register_custom_op(
-    op_name="sm70_qwen_gdn_rmsnorm_gated",
-    op_func=_sm70_qwen_gdn_rmsnorm_gated_impl,
-    fake_impl=_sm70_qwen_gdn_rmsnorm_gated_fake,
+# Register at the historical checkpoint and retain the private import aliases.
+from vllm.model_executor.layers.fla.ops.sm70 import (  # noqa: E402
+    gdn_norm as _gdn_norm_provider,
 )
+
+_sm70_gdn_rmsnorm_gated_onepass_kernel = (
+    _gdn_norm_provider._sm70_gdn_rmsnorm_gated_onepass_kernel
+)
+_sm70_qwen_gdn_rmsnorm_gated_fake = _gdn_norm_provider._sm70_qwen_gdn_rmsnorm_gated_fake
+_sm70_qwen_gdn_rmsnorm_gated_impl = _gdn_norm_provider._sm70_qwen_gdn_rmsnorm_gated_impl
 
 
 def _sm70_compile_graph_interleaved_indices(
@@ -1856,7 +1790,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             enabled=self.gdn_policy.native_verify,
         )
         self.enable_sm70_gdn_rmsnorm_onepass = (
-            _sm70_gdn_rmsnorm_onepass_enabled()
+            _sm70_gdn_rmsnorm_onepass_enabled(self.gdn_policy.projection)
             and current_platform.is_device_capability(70)
             and self._sm70_spec_cache_stride == 1
             and self.hidden_size in (2560, 5120)
@@ -1875,40 +1809,33 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and not self.gqa_interleaved_layout
             and not self.disable_tp_for_ba_proj
             and self.in_proj_ba is not None
-            and _sm70_gdn_qpn8_ba_split_enabled()
+            and _sm70_gdn_qpn8_ba_split_enabled(self.gdn_policy.projection)
         )
         self.enable_packed_recurrent_decode = self.gdn_policy.packed_recurrent_decode
         self.enable_sm70_fused_sigmoid_mixed_qkv = self.gdn_policy.mixed_qkv_decode
+        verifier_policy = capture_sm70_dflash2_config(vllm_config)
         self.enable_sm70_dflash2_fused_gdn_verify = bool(
-            sm70_dflash2_enabled(
-                "fused_gdn_verify", capture_sm70_dflash2_config(vllm_config)
-            )
+            sm70_dflash2_enabled("fused_gdn_verify", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_tp2_gdn_bv2 = bool(
             self.enable_sm70_dflash2_fused_gdn_verify
             and self.tp_size == 2
-            and envs.VLLM_SM70_DFLASH2_TP2_GDN_BV2
+            and sm70_dflash2_enabled("tp2_gdn_bv2", verifier_policy)
         )
         self.enable_sm70_dflash2_fused_gdn_norm = bool(
-            sm70_dflash2_enabled(
-                "fused_gdn_norm", capture_sm70_dflash2_config(vllm_config)
-            )
+            sm70_dflash2_enabled("fused_gdn_norm", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_split = bool(
-            sm70_dflash2_enabled(
-                "fused_gdn_split", capture_sm70_dflash2_config(vllm_config)
-            )
+            sm70_dflash2_enabled("fused_gdn_split", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
         self.enable_sm70_dflash2_fused_gdn_combined_split = bool(
-            sm70_dflash2_enabled(
-                "fused_gdn_combined_split", capture_sm70_dflash2_config(vllm_config)
-            )
+            sm70_dflash2_enabled("fused_gdn_combined_split", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
@@ -1933,7 +1860,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 self.num_v_heads // self.tp_size,
             )
         self.enable_sm70_dflash2_fused_qkv_pack = bool(
-            envs.VLLM_SM70_DFLASH2_FUSED_QKV_PACK
+            sm70_dflash2_enabled("fused_qkv_pack", verifier_policy)
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
@@ -1944,10 +1871,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.flashqla_decode_admission = FlashQlaDecodeAdmission.bind(
             self.gdn_heads, self.enable_flashqla_decode
         )
-        self.force_sm70_qwen_gdn_full_forward = envs.VLLM_SM70_QWEN_GDN_FULL_FORWARD
+        self.force_sm70_qwen_gdn_full_forward = bool(
+            self.gdn_policy.projection.full_forward
+        )
         num_speculative_tokens = _sm70_qwen_gdn_num_speculative_tokens(vllm_config)
         block_003_deep_mtp = _sm70_qwen_gdn_block_003_spec_for_deep_native_mtp(
-            vllm_config
+            vllm_config, self.gdn_policy.projection
         )
         if block_003_deep_mtp:
             logger.warning_once(
@@ -1960,14 +1889,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "diagnostic reruns of the unsafe route.",
                 num_speculative_tokens,
             )
-        self.disable_sm70_qwen_gdn_full_forward = (
-            envs.VLLM_SM70_QWEN_GDN_DISABLE_FULL_FORWARD and not block_003_deep_mtp
+        self.disable_sm70_qwen_gdn_full_forward = bool(
+            self.gdn_policy.projection.disable_full_forward and not block_003_deep_mtp
         )
         self.auto_sm70_qwen_gdn_full_forward = (
             bool(self._execution_graph_policy.compile_graph)
             and vllm_config.speculative_config is not None
             and not self.gdn_policy.state.spec_core
-            and (not envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP or block_003_deep_mtp)
+            and (not self.gdn_policy.projection.spec_core_003 or block_003_deep_mtp)
         )
         self.auto_sm70_qwen_gdn_spec_core = (
             bool(self._execution_graph_policy.compile_graph)
@@ -1977,7 +1906,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.auto_sm70_qwen_gdn_003_spec_core = (
             bool(self._execution_graph_policy.compile_graph)
             and vllm_config.speculative_config is not None
-            and envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
+            and self.gdn_policy.projection.spec_core_003
             and not block_003_deep_mtp
         )
         # The automatic arm is Volta-only. The wrapper runs the whole layer
@@ -3300,7 +3229,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             _log_runtime_route_once(
                 "SM70 GDN 12x128 RMSNormGated one-pass route enabled."
             )
-            core_attn_out = torch.ops.vllm.sm70_qwen_gdn_rmsnorm_gated(
+            core_attn_out = torch.ops.vllm.sm70_qwen_gdn_rmsnorm_gated_configured(
                 core_attn_out,
                 z,
                 self.norm.weight,
@@ -3308,6 +3237,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 -1,
                 True,
                 self.norm.activation,
+                self.gdn_policy.projection.rmsnorm_onepass,
             )
         else:
             core_attn_out = self.norm(core_attn_out, z)
@@ -3456,7 +3386,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         num_tokens = hidden_states.size(0)
         layer_name = _encode_layer_name(self.prefix)
-        if _sm70_qwen_gdn_input_core_boundary_enabled():
+        if _sm70_qwen_gdn_input_core_boundary_enabled(self.gdn_policy.projection):
             z = torch.empty(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
@@ -3475,7 +3405,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_cache,
                 layer_name,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
+            if self.gdn_policy.projection.output_projection:
                 torch.ops.vllm.qwen_gdn_output_projection(
                     core_attn_out,
                     z,
@@ -3487,7 +3417,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 return self._output_projection(core_attn_out, z, output, num_tokens)
             return None
 
-        if envs.VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP:
+        if self.gdn_policy.projection.input_projection:
             mixed_qkv = torch.empty(
                 (num_tokens, (self.key_dim * 2 + self.value_dim) // self.tp_size),
                 dtype=hidden_states.dtype,
@@ -3527,7 +3457,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_cache=conv_state_cache,
                 ssm_state_cache=ssm_state_cache,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
+            if self.gdn_policy.projection.output_projection:
                 torch.ops.vllm.qwen_gdn_output_projection(
                     core_attn_out,
                     z,
@@ -3607,7 +3537,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ):
                 z = mixed_qkvz.new_empty((num_tokens, 12, 128))
                 mixed_qkv, b, a = _split_gdn_projection_tails(mixed_qkvz, ba, z)
-                if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                if self.gdn_policy.projection.mixed_qkv_contiguous:
                     mixed_qkv = mixed_qkv.contiguous()
                 _log_runtime_route_once(
                     "SM70 default GDN projection tail-copy route hit."
@@ -3630,7 +3560,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv = _sm70_dump_gdn_projection_tensor(
                     "split_mixed_qkv", layer_name, mixed_qkv
                 )
-                if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+                if self.gdn_policy.projection.mixed_qkv_contiguous:
                     mixed_qkv = mixed_qkv.contiguous()
                 z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
                 z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
@@ -3646,8 +3576,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b = b.contiguous()
                 a = a.contiguous()
 
-        if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(
-            70
+        if (
+            self.gdn_policy.projection.z_contiguous
+            and current_platform.is_device_capability(70)
         ):
             z = z.contiguous()
 
@@ -3679,7 +3610,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
+        if self.gdn_policy.projection.output_projection:
             torch.ops.vllm.qwen_gdn_output_projection(
                 core_attn_out,
                 z,
@@ -7007,7 +6938,7 @@ def qwen_gdn_input_projection_core(
         )
         if copied_tails:
             mixed_qkv, b, a = _split_gdn_projection_tails(mixed_qkvz, ba, z_out)
-            if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+            if self.gdn_policy.projection.mixed_qkv_contiguous:
                 mixed_qkv = mixed_qkv.contiguous()
             _log_runtime_route_once("SM70 GDN projection tail-copy route hit.")
         elif self.gqa_interleaved_layout:
@@ -7024,7 +6955,7 @@ def qwen_gdn_input_projection_core(
             qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
             z_size = self.value_dim // self.tp_size
             mixed_qkv = mixed_qkvz[..., :qkv_size]
-            if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
+            if self.gdn_policy.projection.mixed_qkv_contiguous:
                 mixed_qkv = mixed_qkv.contiguous()
             z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
@@ -7041,7 +6972,7 @@ def qwen_gdn_input_projection_core(
 
         if not copied_tails:
             if (
-                envs.VLLM_SM70_GDN_Z_CONTIGUOUS
+                self.gdn_policy.projection.z_contiguous
                 and current_platform.is_device_capability(70)
             ):
                 z = z.contiguous()
@@ -7158,7 +7089,10 @@ def qwen_gdn_input_projection(
             b = b[:, ba_start : ba_start + ba_chunk]
             a = a[:, ba_start : ba_start + ba_chunk]
 
-    if envs.VLLM_SM70_GDN_Z_CONTIGUOUS and current_platform.is_device_capability(70):
+    if (
+        self.gdn_policy.projection.z_contiguous
+        and current_platform.is_device_capability(70)
+    ):
         z = z.contiguous()
     mixed_qkv_out.copy_(mixed_qkv)
     z_out.copy_(z)

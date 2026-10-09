@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn.functional as F
 
-import vllm.envs as envs
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -65,18 +65,27 @@ def resolve_mtp_draft_vocab_config(
     tensor_parallel_size: int = 2,
     model_architecture: str | None = None,
     model_name_or_path: str | None = None,
+    *,
+    policy: SpeculativeSamplingPolicy | None = None,
 ) -> MTPDraftVocabConfig:
     """Resolve explicit controls or the model-specific default MTP vocabulary."""
+    if policy is None:
+        policy = SpeculativeSamplingPolicy()
+    policy.resolve(draft=False, vocab=True, vocab_default=method == "mtp")
+    assert policy.shortlist_size is not None
+    assert policy.dynamic_tail_size is not None
+    assert policy.full_refresh_interval is not None
+    assert policy.fused_proposal_enabled is not None
+    assert policy.gpu_lru_enabled is not None
+    assert policy.prefill_topk is not None
     config = MTPDraftVocabConfig(
-        ranking_path=envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_RANKING,
-        shortlist_size=envs.VLLM_SM70_MTP_STATIC_DRAFT_VOCAB_SIZE,
-        dynamic_tail_size=envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_TAIL_SIZE,
-        full_refresh_interval=(
-            envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FULL_REFRESH_INTERVAL
-        ),
-        fused_proposal_enabled=(envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_FUSED_PROPOSAL),
-        gpu_lru_enabled=envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_GPU_LRU,
-        prefill_topk=envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_PREFILL_TOPK,
+        ranking_path=policy.ranking_path,
+        shortlist_size=policy.shortlist_size,
+        dynamic_tail_size=policy.dynamic_tail_size,
+        full_refresh_interval=(policy.full_refresh_interval),
+        fused_proposal_enabled=(policy.fused_proposal_enabled),
+        gpu_lru_enabled=policy.gpu_lru_enabled,
+        prefill_topk=policy.prefill_topk,
     )
     explicit_config = any(
         (
@@ -91,7 +100,7 @@ def resolve_mtp_draft_vocab_config(
     )
     if (
         method != "mtp"
-        or not envs.VLLM_SM70_MTP_DYNAMIC_DRAFT_VOCAB_DEFAULT
+        or not policy.dynamic_vocab_default
         or explicit_config
         or model_architecture != _DEFAULT_DYNAMIC_DRAFT_VOCAB_ARCHITECTURE
         or tensor_parallel_size not in _DEFAULT_DYNAMIC_DRAFT_VOCAB_TP_SIZES

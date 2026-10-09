@@ -14,6 +14,7 @@ from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.config.sm70_dflash2 import Sm70DFlash2Config
+from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
@@ -369,8 +370,22 @@ class SpeculativeConfig:
     DSpark still generates the checkpoint's complete block; only a prefix is
     scheduled, so values below the checkpoint block size remain lossless."""
 
+    sampling_policy: SpeculativeSamplingPolicy = Field(
+        default_factory=SpeculativeSamplingPolicy
+    )
+    """Per-engine proposal/rejection policy captured before worker transfer."""
+
     sm70_dflash2: Sm70DFlash2Config = Field(default_factory=Sm70DFlash2Config)
     """Per-engine SM70 DFlash2 verifier policy; automatic when not specified."""
+
+    def resolve_execution_policy(self) -> None:
+        """Bind sampling and enabled assistance before worker serialization."""
+        self.sampling_policy.resolve(
+            draft=self.draft_sample_method == "probabilistic",
+            vocab=True,
+            vocab_default=self.method == "mtp",
+        )
+        self.sm70_dflash2.resolve_lookup(self)
 
     def compute_hash(self) -> str:
         """
@@ -391,6 +406,16 @@ class SpeculativeConfig:
             self.use_dflash_family() or self.sm70_dflash2.explicit_fields
         ):
             factors.append(("sm70_dflash2", self.sm70_dflash2.graph_options()))
+        if self.sampling_policy.sources:
+            factors.append(
+                (
+                    "sampling_policy",
+                    self.sampling_policy.compute_hash(
+                        draft=self.draft_sample_method == "probabilistic",
+                        vocab=self.method == "mtp",
+                    ),
+                )
+            )
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
         uses_aux_hidden_states = (

@@ -58,8 +58,8 @@ part of the contract.
 
 | Delivery | State | Evidence / remaining work |
 | --- | --- | --- |
-| D1 registry and ledger | Validated; PR pending | Static inventory, structured deprecation metadata, shared registration scanner and explicit-input warn-once support. This establishes visibility; it does not claim execution consumers migrated. |
-| D2 GDN and speculation | Pending | Bind remaining calculation flags to their engine owners. |
+| D1 registry and ledger | Merged [#1141](https://github.com/1CatAI/1Cat-vLLM/pull/1141); CI passed | Static inventory, structured deprecation metadata, shared registration scanner and explicit-input warn-once support. This establishes visibility; it does not claim execution consumers migrated. |
+| D2 GDN and speculation | CPU validated; GPU queued | Captured projection, proposal/rejection and lookup policies; operator A/B awaits a free owned GPU. |
 | D3 diagnostics | Pending | Consolidate filters/budgets/dumps and remove engine state from global dictionaries. |
 | D4 attention | Pending | Connect backend, standalone package and versioned native policy; isolate workspaces. |
 | D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
@@ -114,3 +114,53 @@ Phase E owns the later repository-wide documentation/workflow restructuring.
 - No GPU computation or native schema changed; GPU testing is reserved for
   subsequent consumer migrations. No numerical or performance conclusion is
   inferred from these configuration-only tests.
+
+### D2 policy and consumer migration
+
+Base: `5dc280bb7f073f76c514a4696c5f434a0080c156` (merged D1).
+
+| Initialized owner | Migrated consumers | Retained boundary |
+| --- | --- | --- |
+| `kernel_config.gdn.projection` (13 controls) | GDN projection/core wrappers, layout materialization and gated norm | Existing dtype/TP/shape admission; paired QPN8/one-pass requirement, missing-op error and deep-MTP safety guard. Explicit input-core disable still short-circuits its legacy input. |
+| `speculative_config.sampling_policy` (17 controls) | Proposer sampling, static/dynamic vocabulary preparation, rejection sampler and async accept-count setup | Greedy/stochastic admission, temperature/top-p validation, RNG ordering and dynamic request/token metadata stay with existing execution. |
+| `speculative_config.sm70_dflash2.lookup` (9 controls) | Runner V2 lookup controller initialization | Resolve only when assistance has a nonempty tail; retain legacy clamp bounds and request-state owner. |
+| Existing `sm70_dflash2` (2 additional controls) | Fused GDN TP2 and QKV-pack admission | Same platform, speculation and shape qualification. |
+| Existing GDN state policy | Old-runner synthetic capture metadata | The warmup checkpoint consumes the same `spec_core` decision as the layer. |
+
+The engine uses a new explicitly configured gated-norm custom op; its old
+name, schema and fake implementation remain available for independent legacy
+callers. Registration stays at the old import checkpoint. Both entries invoke
+the same numerical implementation, including the 12x128 one-pass branch and
+its unchanged general-norm fallback. No CUDA/C++ source or native ABI changes
+in this delivery.
+
+Two historical parsers for draft top-p are deliberately distinct: the dense
+proposal accepts only the exact string `1`; the fused proposal uses `bool(int)`.
+Their results are captured together, including a fused-only malformed-value
+error raised at its original consumption checkpoint. Explicit typed booleans
+override both. The bonus switch retains `!= "0"`, token matching retains
+`== "1"`, and the empty top-p override retains each caller's previous behavior.
+
+Configuration is serialized with provenance. Effective policy hashes replace
+migrated aliases in environment cache factors. Proposal-only controls do not
+invalidate greedy paths; unrelated vocabulary controls do not invalidate
+non-MTP paths. Dynamic target-candidate capture remains represented even for
+non-MTP callers. Initialized engines pass their policy explicitly; only the
+retained independent helper entry points capture legacy inputs themselves.
+
+Validation so far:
+
+- 128 focused configuration, model-adapter and proposer regressions passed.
+- 16 focused policy cases subsequently passed, including five added checks for
+  override short-circuiting, missing operators and poisoned getters during
+  compile-cache factor generation.
+- Changed-file pre-commit checks passed before the final short-circuit test
+  addition; final hooks and GPU evidence are recorded before merge.
+- GPU operator/capture and matched source-lane A/B scripts are queued on 54633.
+  Other owners occupy the V100s; no model is loaded by this task.
+
+Diagnostics remain D3 scope. Provider warmup controls and the paused
+`EMPTY_CORE_OUT` warning remain D5/D6 scope; the latter does not change current
+allocation behavior. Graph/piecewise attention policy belongs to D4. Existing
+DDTree execution and upstream Mamba scheduler controls are not claimed as
+migrated here.
