@@ -45,7 +45,7 @@ class SpecMetadataState:
 
     attach_common = builder.attach_common
     prepare_capture = builder.prepare_capture
-    debug_metadata = draft._debug_draft_metadata
+    debug_metadata = draft.debug_draft_metadata
 
     _is_dflash_draft_model: bool
     _is_dflash_selector_target: bool
@@ -53,16 +53,16 @@ class SpecMetadataState:
     metadata_workspace: _workspace.MetadataWorkspace
 
     _attach_ddtree_metadata = tree.attach_metadata
-    _debug_draft_metadata = draft._debug_draft_metadata
-    _ensure_flash_draft_graph_buffers = draft._ensure_flash_draft_graph_buffers
-    _stabilize_draft_graph_metadata = draft._stabilize_draft_graph_metadata
+    _debug_draft_metadata = draft.debug_draft_metadata
+    _ensure_flash_draft_graph_buffers = draft.ensure_flash_draft_graph_buffers
+    _stabilize_draft_graph_metadata = draft.stabilize_draft_graph_metadata
     copy_dflash_graph_metadata = draft.copy_dflash_graph_metadata
     build_for_drafting = draft.build_for_drafting
-    _configured_smallq_max_query_len = verify_metadata._configured_smallq_max_query_len
-    _configured_smallq_max_model_len = verify_metadata._configured_smallq_max_model_len
-    _smallq_buffer_token_capacity = verify_metadata._smallq_buffer_token_capacity
-    _ensure_smallq_decode_buffers = verify_metadata._ensure_smallq_decode_buffers
-    _clear_smallq_decode_metadata = verify_metadata._clear_smallq_decode_metadata
+    _configured_smallq_max_query_len = verify_metadata.configured_smallq_max_query_len
+    _configured_smallq_max_model_len = verify_metadata.configured_smallq_max_model_len
+    _smallq_buffer_token_capacity = verify_metadata.smallq_buffer_token_capacity
+    _ensure_smallq_decode_buffers = verify_metadata.ensure_smallq_decode_buffers
+    _clear_smallq_decode_metadata = verify_metadata.clear_smallq_decode_metadata
     _attach_prepared_dflash2_smallq_metadata = verify_metadata.attach_prepared_metadata
     _update_smallq_decode_metadata = verify_metadata.update_decode_metadata
     build = builder.build

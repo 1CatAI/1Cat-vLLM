@@ -9,18 +9,17 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
-from vllm.v1.attention.backends.triton_attn import (
-    TritonAttentionMetadata,
-)
+from vllm.v1.attention.backends.flash_v100.spec import tree_masks
+from vllm.v1.attention.backends.flash_v100.spec.compatibility import MASK_ALIASES
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-def _cdiv_int(a: int, b: int) -> int:
+def cdiv_int(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def _build_bfla_block_mask_for_seq(
+def build_bfla_block_mask_for_seq(
     q_seq: torch.Tensor,
     key_cache: torch.Tensor,
     block_table_row: torch.Tensor,
@@ -53,8 +52,8 @@ def _build_bfla_block_mask_for_seq(
     if num_query_heads % num_kv_heads != 0:
         return None
 
-    q_blocks = _cdiv_int(q_len, mask_block_n)
-    kv_tiles = _cdiv_int(seq_len, mask_block_n)
+    q_blocks = cdiv_int(q_len, mask_block_n)
+    kv_tiles = cdiv_int(seq_len, mask_block_n)
     if q_blocks <= 0 or kv_tiles <= 0:
         return None
 
@@ -93,7 +92,7 @@ def _build_bfla_block_mask_for_seq(
     q_pad[:q_len].copy_(q_req)
     q_low = pool_blocks(q_pad.view(q_blocks, mask_block_n, num_query_heads, head_dim))
 
-    num_pages = _cdiv_int(seq_len, block_size)
+    num_pages = cdiv_int(seq_len, block_size)
     pages = block_table_row[:num_pages].to(torch.long)
     k_req = key_cache.index_select(0, pages).reshape(-1, num_kv_heads, head_dim)
     k_req = k_req[:seq_len]
@@ -222,7 +221,7 @@ def _build_bfla_block_mask_for_seq(
     return keep_per_kv.to(torch.int32).unsqueeze(0).contiguous()
 
 
-def _torch_attention_reference(
+def torch_attention_reference(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -268,16 +267,14 @@ def _torch_attention_reference(
     return out.to(dtype=query.dtype).unsqueeze(0)
 
 
-def _ddtree_parent_ids_cpu(
-    attn_metadata: TritonAttentionMetadata,
-) -> torch.Tensor | None:
-    parent_ids = getattr(attn_metadata, "ddtree_parent_ids", None)
-    if parent_ids is None:
-        return None
-    parent_ids_cpu = getattr(attn_metadata, "ddtree_parent_ids_cpu", None)
-    if parent_ids_cpu is None:
-        parent_ids_cpu = parent_ids.detach().cpu()
-        _metadata._as_flash_v100_metadata(
-            attn_metadata
-        ).ddtree_parent_ids_cpu = parent_ids_cpu
-    return parent_ids_cpu
+def parent_ids_cpu(attn_metadata):
+    return tree_masks.parent_ids_cpu(attn_metadata, _metadata.as_flash_v100_metadata)
+
+
+# Public owner operations; legacy bindings are installed by package assembly.
+LEGACY_ALIASES = {
+    **MASK_ALIASES,
+    "_build_bfla_block_mask_for_seq": "build_bfla_block_mask_for_seq",
+    "_cdiv_int": "cdiv_int",
+    "_torch_attention_reference": "torch_attention_reference",
+}

@@ -15,6 +15,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tests.v1.attention.flash_v100_extraction_oracle import (
+    PUBLIC_NAMES,
+    InlineFinalHelpers,
+    LegacyNames,
+)
 from vllm.v1.attention.backends import flash_attn_v100 as legacy
 from vllm.v1.attention.backends.flash_v100 import metadata
 from vllm.v1.attention.backends.flash_v100.spec import smallq_metadata
@@ -200,7 +205,7 @@ def test_moved_metadata_calculations_match_parent():
     for path in Path(metadata.__file__).parent.joinpath("spec").glob("*.py"):
         for fn in ast.parse(path.read_text()).body:
             if isinstance(fn, ast.FunctionDef) and (
-                fn.name in expected
+                PUBLIC_NAMES.get(fn.name, fn.name) in expected
                 or (path.name == "tree.py" and fn.name == "attach_metadata")
                 or (
                     path.name == "verify_metadata.py"
@@ -214,12 +219,16 @@ def test_moved_metadata_calculations_match_parent():
                         "_attach_prepared_dflash2_smallq_metadata"
                     ),
                     "update_decode_metadata": "_update_smallq_decode_metadata",
-                }.get(fn.name, fn.name)
+                }.get(fn.name, PUBLIC_NAMES.get(fn.name, fn.name))
                 assert name not in actual
                 actual[name] = hashlib.sha256(
                     ast.dump(
                         _Normalize().visit(
-                            _InlineWorkspace().visit(_InlineFeature().visit(fn))
+                            _InlineWorkspace().visit(
+                                _InlineFeature().visit(
+                                    LegacyNames().visit(InlineFinalHelpers().visit(fn))
+                                )
+                            )
                         )
                     ).encode()
                 ).hexdigest()

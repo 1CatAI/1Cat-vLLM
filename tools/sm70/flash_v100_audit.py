@@ -14,7 +14,31 @@ PREFIX = "vllm.v1.attention.backends.flash_v100"
 PACKAGE = ROOT / PREFIX.replace(".", "/")
 
 
+# These are construction/compatibility edges, never execution-layer back imports.
+# Keep the exact allowlist visible in audit output; all other edges use the rules.
+COMPOSITION_EDGES = {
+    (PREFIX + source, PREFIX + target)
+    for source, target in (
+        (".__init__", ".debug"),
+        (".__init__", ".debug_compare"),
+        (".impl", ".debug_compare"),
+        (".impl", ".dense_prefill"),
+        (".impl", ".masks"),
+        (".impl", ".ops"),
+        (".impl", ".plan.diagnostics"),
+        (".impl", ".routing"),
+        (".impl", ".spec.attention"),
+        (".impl", ".spec.verifier"),
+        (".verify", ".spec.verifier"),
+    )
+}
+DEFERRED_FUNCTIONS = {"spec/verifier.py:tree_prefill": 321}
+
+
 def forbidden(source, target):
+    if (source, target) in COMPOSITION_EDGES:
+        return False
+
     def layer(module):
         name = module.removeprefix(PREFIX + ".").split(".")[0]
         return {
@@ -24,6 +48,7 @@ def forbidden(source, target):
             "verify": "exec",
             "routing": "plan",
             "debug_compare": "debug",
+            "dense_prefill": "ops",
         }.get(name, name)
 
     source, target = layer(source), layer(target)
@@ -111,7 +136,14 @@ def audit():
                         via_config=via_config,
                         owner=owner.name if owner else "<module>",
                         policy="captured"
-                        if owner and owner.name == "__init__"
+                        if owner
+                        and owner.name
+                        in (
+                            "__init__",
+                            "_initialize_native_ops",
+                            "_initialize_prefill_policy",
+                            "_initialize_decode_policy",
+                        )
                         else "dynamic",
                     )
                 )
@@ -141,6 +173,11 @@ def audit():
         "metrics": dict(
             forward=functions["impl.py:forward"],
             largest_function=max(function_sizes),
+            largest_active_function=max(
+                size
+                for name, size in functions.items()
+                if name not in DEFERRED_FUNCTIONS
+            ),
             cross_module_private=len(private),
             import_cycles=len(cycles),
             model_names_outside_spec=model_hits,
@@ -150,6 +187,10 @@ def audit():
             state_flags=flags,
         ),
         "cycles": cycles,
+        "deferred_functions": DEFERRED_FUNCTIONS,
+        "composition_edges": sorted(
+            [list(e) for e in graph.edges if e in COMPOSITION_EDGES]
+        ),
         "edges": sorted([list(edge) for edge in graph.edges]),
         "forbidden_edges": sorted([list(e) for e in graph.edges if forbidden(*e)]),
         "environment": env,

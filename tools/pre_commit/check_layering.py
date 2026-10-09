@@ -17,6 +17,7 @@ See ``docs/design/architecture/README.md`` for the layering rules.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import subprocess
 import sys
@@ -72,6 +73,23 @@ def measure(path: str, text: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     if path in CONFIG_OWNERS:
         return counts
+    if (
+        path.startswith("vllm/v1/attention/backends/flash_v100/")
+        and "/spec/" not in path
+    ):
+        tree = ast.parse(text)
+        for node in tree.body:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+                if any(
+                    isinstance(t, ast.Name) and t.id == "ROUTE_SPECS" for t in targets
+                ):
+                    node.value = ast.Constant("")
+        hits = len(re.findall(r"dflash|ddtree|mtp|qwen|glm", ast.unparse(tree), re.I))
+        if hits:
+            counts["flash_v100_model"] = hits
     owner = bool(OWNER_PATH.search(path))
     for kind, pattern in PATTERNS.items():
         if kind in ("model", "platform") and owner:

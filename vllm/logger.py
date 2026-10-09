@@ -169,6 +169,13 @@ class _VllmLogger(Logger):
         else:
             _print_keyed_once(self, "info", key, msg, *args)
 
+    def exception_once(
+        self, msg: str, *args: Hashable, scope: LogScope = "local", key: Hashable
+    ) -> None:
+        """Log one exception event, preserving the active exception traceback."""
+        if _should_log_with_scope(scope):
+            _print_keyed_once(self, "exception", key, msg, *args)
+
     def warning_once(
         self,
         msg: str,
@@ -193,6 +200,7 @@ _METHODS_TO_PATCH: dict[str, Callable[..., Any]] = {
     "debug_once": _VllmLogger.debug_once,
     "info_once": _VllmLogger.info_once,
     "warning_once": _VllmLogger.warning_once,
+    "exception_once": _VllmLogger.exception_once,
 }
 
 
