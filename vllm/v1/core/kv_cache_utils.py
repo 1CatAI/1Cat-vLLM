@@ -1095,6 +1095,34 @@ def _compact_sm70_hybrid_sliding_window_pages(
         if spec.block_size % (16 * ratio):
             continue
         result[name] = replace(spec, block_size=spec.block_size // ratio)
+
+    # A 1648-token FP16 draft page cannot be halved to 824 tokens:
+    # Flash-V100 requires multiples of 16. Round the common physical page
+    # up instead (832 draft / 1664 E4M3 target tokens), without doubling
+    # every recurrent-state page. Already compact layouts stay unchanged.
+    if max(spec.page_size_bytes for spec in result.values()) <= target_page:
+        return result
+    if any(
+        type(spec) not in (FullAttentionSpec, SlidingWindowSpec, MambaSpec)
+        or (isinstance(spec, AttentionSpec) and spec.page_size_padded is not None)
+        for spec in result.values()
+    ):
+        return result
+    attention_specs = [
+        spec for spec in result.values() if isinstance(spec, AttentionSpec)
+    ]
+    alignment = math.lcm(
+        *(16 * spec.page_size_bytes // spec.block_size for spec in attention_specs)
+    )
+    common_page = cdiv(target_page, alignment) * alignment
+    if common_page >= max(spec.page_size_bytes for spec in result.values()):
+        return result
+    for name, spec in result.items():
+        if isinstance(spec, AttentionSpec):
+            bytes_per_token = spec.page_size_bytes // spec.block_size
+            result[name] = replace(spec, block_size=common_page // bytes_per_token)
+        elif isinstance(spec, MambaSpec):
+            result[name] = replace(spec, page_size_padded=common_page)
     return result
 
 

@@ -10,6 +10,8 @@ import torch
 
 from vllm import _sm70_ops as sm70_ops
 from vllm import envs
+from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.fused_moe.experts import skinny_sm70_moe
 from vllm.model_executor.layers.quantization import modelopt
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.modelopt import (
@@ -632,8 +634,10 @@ def test_mixed_w4a16_moe_requires_turbomind_on_sm70():
     class FakeRoutedExperts:
         moe_config = _moe_contract()
 
+    # Without an admitted skinny MoE kernel the automatic route needs TurboMind.
     with (
         patch.object(modelopt, "RoutedExperts", FakeRoutedExperts),
+        patch.object(skinny_sm70_moe, "skinny_backend_admitted", return_value=False),
         patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=True),
         patch.object(sm70_tm, "should_use_nvfp4_moe_turbomind", return_value=False),
         pytest.raises(NotImplementedError, match="TurboMind"),
@@ -651,6 +655,7 @@ def test_pure_nvfp4_qwen4_moe_uses_turbomind_w4a16_on_sm70():
         moe_config = _qwen4_moe_contract()
 
     with (
+        set_current_vllm_config(VllmConfig()),
         patch.object(modelopt, "RoutedExperts", FakeRoutedExperts),
         patch.object(sm70_tm, "is_exact_sm70_cuda_platform", return_value=True),
         patch.object(sm70_tm, "should_use_nvfp4_moe_turbomind", return_value=True),

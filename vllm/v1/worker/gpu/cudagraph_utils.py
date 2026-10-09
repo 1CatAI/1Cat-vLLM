@@ -512,12 +512,12 @@ class ModelCudaGraphManager(CudaGraphManager):
         self._long_attention_graphs: dict[
             BatchExecutionDescriptor, BatchExecutionDescriptor
         ] = {}
-        from vllm.v1.attention.ops.sm70_e4m3_long import (
+        from vllm.v1.attention.ops.sm70_grouped_long import (
             long_attention_enabled,
             long_attention_graph_contract,
             long_attention_max_batch_size,
         )
-        from vllm.v1.attention.ops.sm70_e4m3_scalar import (
+        from vllm.v1.attention.ops.sm70_grouped_scalar import (
             scalar_tail_attention_available,
         )
 

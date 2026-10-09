@@ -126,6 +126,7 @@ class Scheduler(SchedulerInterface):
         self.mixed_prefill_budget = MixedPrefillBudget(
             self.max_num_scheduled_tokens,
             self.scheduler_config.mixed_prefill_step_latency_ms,
+            self.scheduler_config.mixed_prefill_min_tokens,
         )
         self.mixed_prefill_enabled = current_platform.device_type == "cuda"
         self.enable_kv_cache_events = (

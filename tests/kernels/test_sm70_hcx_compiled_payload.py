@@ -120,11 +120,12 @@ def _worker_run(rank, port, results):
             materialize(x, hidden, injection)
             torch.accelerator.synchronize()
             graph = torch.cuda.CUDAGraph()
-            # M20 uses custom all-reduce. Its captured peer pointers must be
-            # registered when capture ends, as they are in the model runner.
+            # Register peer buffers just as the model's graph manager does.
+            # A bare CUDA capture leaves custom all-reduce graph pointers
+            # unresolved when the communication fallback is selected.
             with (
-                graph_capture(device=torch.device("cuda", rank)) as capture,
-                torch.cuda.graph(graph, stream=capture.stream),
+                graph_capture(device=torch.device("cuda", rank)) as context,
+                torch.cuda.graph(graph, stream=context.stream),
             ):
                 outputs, scratch = compiled(x, hidden, injection)
                 combined, final_outputs, final_scratch = materialize(

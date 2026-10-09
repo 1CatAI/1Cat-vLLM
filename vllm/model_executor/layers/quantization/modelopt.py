@@ -18,7 +18,7 @@ from vllm.model_executor.kernels.linear import (
     init_mxfp8_linear_kernel,
     init_nvfp4_linear_kernel,
 )
-from vllm.model_executor.kernels.linear.pre_ampere_qpn import (
+from vllm.model_executor.kernels.linear.qpn.pre_ampere import (
     TuringNvFp4LinearLayerConfig,
     TuringQpn2NvFp4LinearKernel,
     TuringQpn8Fp8LinearKernel,
@@ -479,10 +479,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         self.quant_config = quant_config
         self.out_dtype = torch.get_default_dtype()
         self.input_dtype = get_current_vllm_config().model_config.dtype
-        self.use_sm70_fp8_turbomind = (
-            sm70_tm.is_exact_sm70_cuda_platform()
-            and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
-        )
+        self.use_sm70_fp8_turbomind = sm70_tm.fp8_backend_enabled()
         # Turing takes the QPN8 kernels with the QPN8 dense prefill; the
         # TurboMind GEMMs are registered for exact SM70 only.
         self.use_sm75_fp8_qpn8 = False
@@ -583,6 +580,19 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             replace_parameter(layer, "weight", tm_weight)
             replace_parameter(layer, "weight_scale", tm_scales)
             layer.input_scale = None
+            setattr(
+                layer,
+                sm70_tm.STATE_ATTR,
+                sm70_tm.SM70TurboMindLinearState(
+                    tm_weight,
+                    tm_scales,
+                    block_size,
+                    int(meta[0].item()),
+                    int(meta[1].item()),
+                    layer.output_size_per_partition,
+                    "fp8",
+                ),
+            )
             layer.sm70_modelopt_fp8_turbomind = True
             layer.sm70_modelopt_fp8_group_size = block_size
             layer.sm70_modelopt_fp8_k_ld = int(meta[0].item())
@@ -617,26 +627,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 raise TypeError(
                     "ModelOpt FP8 TurboMind on SM70 requires FP16 activations."
                 )
-            from vllm import _sm70_ops as sm70_ops
-
-            x_2d = x.reshape(-1, x.shape[-1])
-            out = torch.empty(
-                (x_2d.shape[0], layer.output_size_per_partition),
-                dtype=x.dtype,
-                device=x.device,
-            )
-            sm70_ops.fp8_gemm_sm70_out(
-                out,
-                x_2d,
-                layer.weight,
-                layer.weight_scale,
-                layer.sm70_modelopt_fp8_group_size,
-                layer.sm70_modelopt_fp8_k_ld,
-                layer.sm70_modelopt_fp8_q_ld,
-            )
-            if bias is not None:
-                out.add_(bias)
-            return out.reshape(*x.shape[:-1], layer.output_size_per_partition)
+            return sm70_tm.apply_prepared_linear(layer, x, bias)
         if sm70_tm.has_prepared_fp8_qpn8_linear(layer):
             return sm70_tm.apply_prepared_fp8_qpn8_linear(layer, x, bias)
         return self.fp8_linear.apply_weights(layer, x, bias)

@@ -135,6 +135,21 @@ class CPUWorker(Worker):
 
         # Note: unique identifier for creating allreduce shared memory
         os.environ["VLLM_DIST_IDENT"] = self.distributed_init_method.split(":")[-1]
+        # A local single-rank CPU group does not need a TCP rendezvous. Keep
+        # network stores for distributed and externally managed groups.
+        if (
+            self.parallel_config.world_size_across_dp == 1
+            and self.parallel_config.nnodes == 1
+            and self.parallel_config.distributed_executor_backend != "external_launcher"
+            and not self.parallel_config.enable_elastic_ep
+            and not torch.distributed.is_initialized()
+        ):
+            torch.distributed.init_process_group(
+                backend=current_platform.dist_backend,
+                store=torch.distributed.HashStore(),
+                world_size=1,
+                rank=self.rank,
+            )
         # Initialize the distributed environment.
         init_worker_distributed_environment(
             self.vllm_config,

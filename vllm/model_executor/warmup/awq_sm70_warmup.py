@@ -7,14 +7,21 @@ from __future__ import annotations
 import tempfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
 import vllm.envs as envs
 from vllm import _sm70_ops as sm70_ops
+from vllm._sm70.policy import NativeBindings
+from vllm.config.sm70_moe import (
+    capture_mxfp4_moe_config,
+    capture_nvfp4_moe_config,
+    capture_sm70_moe_config,
+)
+from vllm.config.sm70_native import NATIVE_FIELDS, UNSET, capture_linear_native_config
 from vllm.logger import init_logger
-from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import _QPN8_MAX_M
+from vllm.model_executor.kernels.linear.qpn.fp8_block import _QPN8_MAX_M
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.awq_sm70_moe import (
     _use_qwen38_active_grouped_decode,
@@ -23,11 +30,45 @@ from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     _prepare_compact_slot_groups,
     _use_compact_grouped,
 )
+from vllm.model_executor.warmup import sm70_native_cache
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_worker import Worker
 
 logger = init_logger(__name__)
+
+
+def _warmup_policy(
+    family: Literal["awq", "fp8", "mxfp4", "nvfp4"], *, moe: bool = False
+):
+    if not moe:
+        policy = capture_linear_native_config(family)
+    elif family == "nvfp4":
+        policy = capture_nvfp4_moe_config().native
+    elif family == "mxfp4":
+        policy = capture_mxfp4_moe_config().native
+    else:
+        policy = capture_sm70_moe_config(family).native
+    return policy
+
+
+def _warmup_native(
+    family: Literal["awq", "fp8", "mxfp4", "nvfp4"], *, moe: bool = False
+):
+    return NativeBindings(_warmup_policy(family, moe=moe).values)
+
+
+def _native_number(
+    family: Literal["awq", "fp8", "mxfp4", "nvfp4"],
+    field: str,
+    default: int,
+    *,
+    moe: bool = False,
+):
+    policy = _warmup_policy(family, moe=moe)
+    index = next(i for i, entry in enumerate(NATIVE_FIELDS) if entry[0] == field)
+    value = policy.values[index]
+    return default if value == UNSET else int(value)
 
 
 def _group_size_from_tm_scales(k_dim: int, tm_scales: torch.Tensor) -> int:
@@ -56,21 +97,27 @@ def _lut_cache_disabled_for_dynamic_quant_dispatch(
 ) -> bool:
     awq_no_preserve = (
         has_awq_dense
-        and envs.VLLM_SM70_AWQ_TUNE_SMALL_SHAPES
-        and not envs.VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS
-        and not envs.VLLM_SM70_AWQ_PRESERVE_DEFAULT_SPLITS_ONLY
+        and _native_number("awq", "awq_tune_small_shapes", 0)
+        and not _native_number("awq", "awq_preserve_default_splits", 1)
+        and not _native_number("awq", "awq_preserve_default_splits_only", 0)
     )
     fp8_dynamic = (
         has_fp8_dense
-        and envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
-        and not envs.VLLM_SM70_FP8_REUSE_IMPORTED_CACHE
+        and _native_number("fp8", "fp8_tune_small_shapes", 1)
+        and not _native_number("fp8", "fp8_reuse_imported_cache", 0)
     )
     mxfp4_dynamic = (
-        "mxfp4" in fp4_kinds or has_mxfp4_moe
-    ) and envs.VLLM_SM70_MXFP4_TUNE_SMALL_SHAPES
+        "mxfp4" in fp4_kinds and _native_number("mxfp4", "mxfp4_tune_small_shapes", 1)
+    ) or (
+        has_mxfp4_moe
+        and _native_number("mxfp4", "mxfp4_tune_small_shapes", 1, moe=True)
+    )
     nvfp4_dynamic = (
-        "nvfp4" in fp4_kinds or has_nvfp4_moe
-    ) and envs.VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES
+        "nvfp4" in fp4_kinds and _native_number("nvfp4", "nvfp4_tune_small_shapes", 1)
+    ) or (
+        has_nvfp4_moe
+        and _native_number("nvfp4", "nvfp4_tune_small_shapes", 1, moe=True)
+    )
     return awq_no_preserve or fp8_dynamic or mxfp4_dynamic or nvfp4_dynamic
 
 
@@ -91,7 +138,7 @@ def _load_lut_cache(device: torch.device, skip_import: bool = False) -> int:
         return 0
     device_hint = torch.empty(0, dtype=torch.uint8, device=device)
     try:
-        return int(sm70_ops.sm70_gemm_import_cache(device_hint, path))
+        return int(sm70_native_cache.import_cache(device_hint, path))
     except Exception as exc:
         logger.warning("SM70 GEMM LUT import failed from %s (%s).", path, exc)
         return 0
@@ -112,7 +159,7 @@ def _save_lut_cache(device: torch.device, skip_export: bool = False) -> int:
     device_hint = torch.empty(0, dtype=torch.uint8, device=device)
     try:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        return int(sm70_ops.sm70_gemm_export_cache(device_hint, path))
+        return int(sm70_native_cache.export_cache(device_hint, path))
     except Exception as exc:
         logger.warning("SM70 GEMM LUT export failed to %s (%s).", path, exc)
         return 0
@@ -124,10 +171,10 @@ def _export_lut_bytes(device: torch.device) -> tuple[bytes | None, int]:
     device_hint = torch.empty(0, dtype=torch.uint8, device=device)
     with tempfile.TemporaryDirectory(prefix="vllm-sm70-gemm-export-") as tmpdir:
         path = Path(tmpdir) / "gemm-lut.bin"
-        records = int(sm70_ops.sm70_gemm_export_cache(device_hint, str(path)))
+        records = int(sm70_native_cache.export_cache(device_hint, str(path)))
         if records <= 0 or not path.exists():
             return None, records
-        return path.read_bytes(), records
+        return sm70_native_cache.packed_cache_bytes(path), records
 
 
 def _import_lut_bytes(device: torch.device, payload: bytes) -> int:
@@ -137,7 +184,7 @@ def _import_lut_bytes(device: torch.device, payload: bytes) -> int:
     with tempfile.TemporaryDirectory(prefix="vllm-sm70-gemm-import-") as tmpdir:
         path = Path(tmpdir) / "gemm-lut.bin"
         path.write_bytes(payload)
-        return int(sm70_ops.sm70_gemm_import_cache(device_hint, str(path)))
+        return int(sm70_native_cache.import_cache(device_hint, str(path)))
 
 
 def _run_coordinated_dense_warmup(
@@ -213,7 +260,7 @@ def _warmup_fp8_dense_layers_coordinated(
     if not layers:
         return 0
     if (
-        not envs.VLLM_SM70_FP8_TUNE_SMALL_SHAPES
+        not _native_number("fp8", "fp8_tune_small_shapes", 1)
         or not envs.VLLM_SM70_FP8_COORDINATED_TUNING
     ):
         return _warmup_fp8_dense_layers(layers, m_values)
@@ -539,6 +586,7 @@ def _warmup_dense_layers(
 ) -> int:
     calls = 0
     for layer in dense_layers:
+        native = _warmup_native("awq", moe=False)
         device = layer._awq_sm70_weight.device
         k_dim = int(layer._awq_sm70_weight.shape[0])
         n_dim = int(layer._awq_sm70_weight.shape[1] * 8)
@@ -546,7 +594,7 @@ def _warmup_dense_layers(
         for m_dim in m_values:
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
-            sm70_ops.awq_gemm_sm70_out(
+            native.awq_gemm_sm70_out(
                 out,
                 x,
                 layer._awq_sm70_weight,
@@ -569,6 +617,7 @@ def _warmup_fp8_dense_layers(
 
     calls = 0
     for layer, gated_silu in dense_layers:
+        native = _warmup_native("fp8", moe=False)
         is_modelopt = getattr(layer, "sm70_modelopt_fp8_turbomind", False)
         batch_qpn8 = getattr(layer, "sm70_fp8_qpn8", False) and getattr(
             layer, "sm70_fp8_batch_tm", False
@@ -627,12 +676,12 @@ def _warmup_fp8_dense_layers(
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
             if batch_qpn8 and layer.sm70_fp8_batch_tm_prescaled:
-                sm70_ops.fp8_gemm_sm70_prefill_prescaled_out(
+                native.fp8_gemm_sm70_prefill_prescaled_out(
                     out, x, weight, scales, 128, k_ld, q_ld
                 )
             else:
                 kwargs = {"preserve_default_partition": True} if batch_qpn8 else {}
-                sm70_ops.fp8_gemm_sm70_out(
+                native.fp8_gemm_sm70_out(
                     out, x, weight, scales, 128, k_ld, q_ld, gated_silu, **kwargs
                 )
             calls += 1
@@ -644,7 +693,7 @@ def _warmup_fp8_dense_layers(
             grouped_out = torch.empty(
                 (group_count, n_dim), dtype=torch.float16, device=device
             )
-            sm70_ops.fp8_moe_gemm_sm70_per_expert_dispatch_out(
+            native.fp8_moe_gemm_sm70_per_expert_dispatch_out(
                 grouped_out,
                 grouped_x,
                 layer.sm70_fp8_bmm_grouped_offsets,
@@ -688,7 +737,7 @@ def _warmup_fp4_dense_layers(
             if state.op_kind == "mxfp4":
                 if not hasattr(torch.ops._C, "mxfp4_gemm_sm70_out"):
                     continue
-                sm70_ops.mxfp4_gemm_sm70_out(
+                state.native_ops.mxfp4_gemm_sm70_out(
                     out,
                     x,
                     state.weight,
@@ -702,7 +751,7 @@ def _warmup_fp4_dense_layers(
                 if not hasattr(torch.ops._C, "nvfp4_gemm_sm70_out"):
                     continue
                 if getattr(state, "use_scale_code", False):
-                    sm70_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
+                    state.native_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
                         out,
                         x,
                         state.weight,
@@ -715,9 +764,9 @@ def _warmup_fp4_dense_layers(
                     calls += 1
                     continue
                 op = (
-                    sm70_ops.nvfp4_gemm_sm70_prescaled_out
+                    state.native_ops.nvfp4_gemm_sm70_prescaled_out
                     if prescaled
-                    else sm70_ops.nvfp4_gemm_sm70_out
+                    else state.native_ops.nvfp4_gemm_sm70_out
                 )
                 op(
                     out,
@@ -744,6 +793,7 @@ def _warmup_moe_dense_stage_layers(
 
     calls = 0
     for layer in moe_layers:
+        native = _warmup_native("awq", moe=True)
         device = layer.w13_tm_scales.device
         top_k = int(layer._awq_moe_buf_top_k)
         num_experts = int(layer.sm70_num_experts)
@@ -755,7 +805,7 @@ def _warmup_moe_dense_stage_layers(
             total_slots = num_tokens * top_k
             expert_offsets = _build_balanced_offsets(total_slots, num_experts, device)
             active_grouped = _use_qwen38_active_grouped_decode(layer, num_tokens, top_k)
-            stage_op: Callable[..., None] = sm70_ops.awq_moe_dense_stage_sm70_out
+            stage_op: Callable[..., None] = native.awq_moe_dense_stage_sm70_out
             stage_metadata: tuple[torch.Tensor, ...] = (
                 expert_offsets,
                 dense_expert_ids,
@@ -764,7 +814,7 @@ def _warmup_moe_dense_stage_layers(
             if active_grouped:
                 # One row per expert warms the same dynamic-offset GEMM used
                 # when repeated experts form multi-row segments at replay.
-                stage_op = sm70_ops.awq_moe_active_dense_stage_sm70_out
+                stage_op = native.awq_moe_active_dense_stage_sm70_out
                 stage_metadata = (
                     dense_expert_ids[:total_slots],
                     torch.empty(total_slots + 1, dtype=torch.int32, device=device),
@@ -826,6 +876,7 @@ def _warmup_mxfp4_moe_b1_layers(moe_layers: list[torch.nn.Module]) -> int:
 
     calls = 0
     for layer in moe_layers:
+        native = _warmup_native("mxfp4", moe=True)
         device = layer.w13_tm_weight.device
         top_k = int(layer.moe_config.experts_per_token)
         num_experts = int(layer.sm70_mxfp4_num_experts)
@@ -855,7 +906,7 @@ def _warmup_mxfp4_moe_b1_layers(moe_layers: list[torch.nn.Module]) -> int:
             dtype=torch.float16,
             device=device,
         )
-        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+        native.mxfp4_moe_dense_stage_sm70_out(
             gate_up,
             permuted_input,
             expert_offsets,
@@ -873,7 +924,7 @@ def _warmup_mxfp4_moe_b1_layers(moe_layers: list[torch.nn.Module]) -> int:
             torch.ops._C.silu_and_mul_with_clamp(
                 intermediate, gate_up, float(layer.swiglu_limit)
             )
-        sm70_ops.mxfp4_moe_dense_stage_sm70_out(
+        native.mxfp4_moe_dense_stage_sm70_out(
             sorted_output,
             intermediate,
             expert_offsets,
@@ -898,6 +949,7 @@ def _warmup_nvfp4_moe_decode_layers(
 
     calls = 0
     for layer in moe_layers:
+        native = _warmup_native("nvfp4", moe=True)
         device = layer.w13_tm_weight.device
         top_k = int(layer.moe_config.experts_per_token)
         max_experts = int(layer.sm70_nvfp4_num_experts)
@@ -956,7 +1008,7 @@ def _warmup_nvfp4_moe_decode_layers(
                 dtype=torch.float16,
                 device=device,
             )
-            sm70_ops.nvfp4_moe_dense_stage_sm70_out(
+            native.nvfp4_moe_dense_stage_sm70_out(
                 gate_up,
                 permuted_input,
                 expert_offsets,
@@ -974,7 +1026,7 @@ def _warmup_nvfp4_moe_decode_layers(
                 torch.ops._C.silu_and_mul_with_clamp(
                     intermediate, gate_up, float(layer.swiglu_limit)
                 )
-            sm70_ops.nvfp4_moe_dense_stage_sm70_out(
+            native.nvfp4_moe_dense_stage_sm70_out(
                 sorted_output,
                 intermediate,
                 expert_offsets,
@@ -1014,9 +1066,9 @@ def _get_nvfp4_moe_token_counts(
         for layer in moe_layers
     )
     max_top_k = max(int(layer.moe_config.experts_per_token) for layer in moe_layers)
-    tuned_max_tokens = max(0, int(envs.VLLM_SM70_NVFP4_MOE_TUNE_MAX_TOKENS)) // max(
-        max_top_k, 1
-    )
+    tuned_max_tokens = max(
+        0, int(_native_number("nvfp4", "nvfp4_moe_tune_max_tokens", 128, moe=True))
+    ) // max(max_top_k, 1)
     max_tokens = max(graph_safe_max_tokens, tuned_max_tokens)
     compilation_config = getattr(
         getattr(worker, "vllm_config", None), "compilation_config", None
@@ -1038,6 +1090,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
 
     calls = 0
     for layer in moe_layers:
+        native = _warmup_native("awq", moe=True)
         device = layer.w13_tm_scales.device
         top_k = int(layer._awq_moe_buf_top_k)
         num_experts = int(layer.sm70_num_experts)
@@ -1076,7 +1129,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
         inv_permuted_idx = torch.empty(top_k, dtype=torch.int32, device=device)
         sorted_expert_ids = torch.empty(top_k, dtype=torch.int32, device=device)
 
-        sm70_ops.awq_moe_single_token_dense_w13_sm70_out(
+        native.awq_moe_single_token_dense_w13_sm70_out(
             gate_up,
             compact_input,
             x,
@@ -1093,7 +1146,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
             hidden_size,
         )
         _silu_and_mul_w13(layer, intermediate, gate_up)
-        sm70_ops.awq_moe_single_token_dense_stage_sm70_out(
+        native.awq_moe_single_token_dense_stage_sm70_out(
             sorted_output,
             intermediate,
             expert_offsets,
@@ -1108,7 +1161,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
         calls += 2
 
         if (
-            envs.VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT
+            capture_sm70_moe_config("awq").legacy_compact
             and hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
             and getattr(layer, "sm70_awq_moe_legacy_single_token_compact", False)
             and hasattr(layer, "w2_strided_ptrs_w_rows")
@@ -1134,7 +1187,7 @@ def _warmup_moe_single_token_layers(moe_layers: list[torch.nn.Module]) -> int:
             )
             legacy_output.zero_()
             legacy_offsets = torch.empty(top_k + 1, dtype=torch.int32, device=device)
-            sm70_ops.awq_moe_single_token_sm70_out(
+            native.awq_moe_single_token_sm70_out(
                 legacy_output,
                 x,
                 topk_weights,

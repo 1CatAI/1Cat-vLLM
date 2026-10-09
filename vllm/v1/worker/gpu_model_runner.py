@@ -52,7 +52,6 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     graph_capture,
     is_global_first_rank,
-    is_last_pp_first_tp_rank,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import (
@@ -138,7 +137,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100MetadataBuilder
+from vllm.v1.attention.backends.flash_v100 import FlashAttnV100MetadataBuilder
 from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadataBuilder
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -264,6 +263,18 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
+from vllm.model_executor.warmup.plan import (
+    run_warmup_tasks,
+    warmup_boolean,
+    warmup_unconditional,
+)
+from vllm.model_executor.warmup.sm70_runtime import (
+    auxiliary_warmup_enabled,
+    model_convolution_warmup_task,
+    proposer_warmup_tasks,
+)
+from vllm.v1.spec_decode.profiling import create_step_profiler
+
 logger = init_logger(__name__)
 _SM70_SAMPLE_TENSOR_DUMP_COUNTER = 0
 _SM70_SAMPLE_SYNC_COUNTER = 0
@@ -379,14 +390,6 @@ def _sm70_cuda_graph_capture_active() -> bool:
         return bool(is_capturing())
     except RuntimeError:
         return False
-
-
-def _sm70_mtp_profile_env_enabled() -> bool:
-    return envs.VLLM_SM70_MTP_PROFILE
-
-
-def _sm70_mtp_profile_interval() -> int:
-    return envs.VLLM_SM70_MTP_PROFILE_INTERVAL
 
 
 def _dflash_ddtree_profile_enabled() -> bool:
@@ -1121,44 +1124,6 @@ def _non_greedy_rows_carry_drafts(
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
-    def _sm70_mtp_profile_enabled(self) -> bool:
-        spec_config = self.speculative_config
-        return (
-            spec_config is not None
-            and self.device.type == "cuda"
-            and (
-                (
-                    spec_config.method in ("mtp", "dflash", "dspark")
-                    and _sm70_mtp_profile_env_enabled()
-                )
-                or (
-                    spec_config.use_dflash_ddtree() and _dflash_ddtree_profile_enabled()
-                )
-            )
-        )
-
-    def _sm70_mtp_profile_start(
-        self,
-        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
-    ) -> torch.cuda.Event | None:
-        if events is None:
-            return None
-        event = torch.cuda.Event(enable_timing=True)
-        event.record()
-        return event
-
-    def _sm70_mtp_profile_finish(
-        self,
-        events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None,
-        name: str,
-        start: torch.cuda.Event | None,
-    ) -> None:
-        if events is None or start is None:
-            return
-        end = torch.cuda.Event(enable_timing=True)
-        end.record()
-        events.append((name, start, end))
-
     @contextmanager
     def _dflash_ddtree_target_forward_profile_scope(
         self,
@@ -1221,106 +1186,6 @@ class GPUModelRunner(
             if pushed_nvtx:
                 torch.cuda.nvtx.range_pop()
 
-    def _sm70_mtp_profile_add_cpu_ms(
-        self,
-        ctx: dict[str, Any] | None,
-        name: str,
-        start: float,
-    ) -> None:
-        if ctx is None:
-            return
-        cpu_ms = ctx["cpu_ms"]
-        cpu_ms[name] = cpu_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000.0
-
-    def _sm70_mtp_profile_report(self, ctx: dict[str, Any] | None) -> None:
-        if ctx is None:
-            return
-        events = ctx["events"]
-        if events:
-            events[-1][2].synchronize()
-
-        timings: dict[str, float] = {}
-        for name, start, end in events:
-            timings[name] = timings.get(name, 0.0) + start.elapsed_time(end)
-        timings.update(ctx["cpu_ms"])
-
-        totals = getattr(self, "_sm70_mtp_runner_profile_totals", None)
-        if totals is None:
-            totals = {}
-            self._sm70_mtp_runner_profile_totals = totals
-        calls = getattr(self, "_sm70_mtp_runner_profile_calls", 0) + 1
-        self._sm70_mtp_runner_profile_calls = calls
-        for name, value in timings.items():
-            totals[name] = totals.get(name, 0.0) + value
-
-        spec_steps = getattr(self, "_sm70_mtp_runner_profile_spec_steps", 0)
-        if ctx["has_spec_decode_metadata"]:
-            spec_steps += 1
-        self._sm70_mtp_runner_profile_spec_steps = spec_steps
-
-        if calls != 1 and calls % _sm70_mtp_profile_interval() != 0:
-            return
-        # The events come from the sampling path, which only the last PP
-        # stage runs; the global first rank never sees them when PP > 1.
-        if not is_last_pp_first_tp_rank():
-            return
-
-        preferred = [
-            "target_forward",
-            "target_logits",
-            "target_rejection_sample",
-            "target_sample_no_spec",
-            "state_update_wall_cpu",
-            "state_update_validate_cpu",
-            "state_update_attn_compact_cpu",
-            "state_update_mamba_compact_cpu",
-            "state_update_input_batch_cpu",
-            "state_update_drafter_context_cpu",
-            "draft_total",
-            "draft_wall_cpu",
-            "bookkeeping",
-            "bookkeeping_wall_cpu",
-        ]
-        keys = [key for key in preferred if key in totals]
-        keys.extend(sorted(key for key in totals if key not in keys))
-        summary = " ".join(f"{key}={totals[key] / calls:.3f}" for key in keys)
-        logger.info(
-            "SM70 spec runner profile avg_ms calls=%d spec_steps=%d "
-            "num_tokens=%s num_reqs=%s %s",
-            calls,
-            spec_steps,
-            ctx["num_tokens"],
-            ctx["num_reqs"],
-            summary,
-        )
-        last_totals = getattr(self, "_sm70_mtp_runner_profile_last_report_totals", {})
-        last_calls = getattr(self, "_sm70_mtp_runner_profile_last_report_calls", 0)
-        last_spec_steps = getattr(
-            self, "_sm70_mtp_runner_profile_last_report_spec_steps", 0
-        )
-        interval_calls = calls - last_calls
-        if interval_calls > 0:
-            interval_spec_steps = spec_steps - last_spec_steps
-            interval_summary = " ".join(
-                f"{key}="
-                f"{(totals[key] - last_totals.get(key, 0.0)) / interval_calls:.3f}"
-                for key in keys
-            )
-            logger.info(
-                "SM70 spec runner profile interval_avg_ms calls=%d "
-                "interval_calls=%d interval_spec_steps=%d num_tokens=%s "
-                "num_reqs=%s %s",
-                calls,
-                interval_calls,
-                interval_spec_steps,
-                ctx["num_tokens"],
-                ctx["num_reqs"],
-                interval_summary,
-            )
-        self._sm70_mtp_runner_profile_last_report_totals = dict(totals)
-        self._sm70_mtp_runner_profile_last_report_calls = calls
-        self._sm70_mtp_runner_profile_last_report_spec_steps = spec_steps
-
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1343,6 +1208,10 @@ class GPUModelRunner(
         scheduler_config = self.scheduler_config
         parallel_config = self.parallel_config
         self.device = device
+        self._auxiliary_warmup_enabled = auxiliary_warmup_enabled(vllm_config)
+        self._step_profiler = create_step_profiler(
+            vllm_config, device, role="runner", logger=logger
+        )
         from vllm.v1.worker.mixed_prefill import MixedPrefillTimer
 
         self.mixed_prefill_timer = MixedPrefillTimer()
@@ -2233,28 +2102,30 @@ class GPUModelRunner(
             self._kv_block_zeroer.zero_block_ids(block_ids)
 
     def _warmup_sm70_aux_kernels(self) -> None:
-        """Warm up V1 helper kernels that otherwise JIT on first request."""
-        if not envs.VLLM_SM70_AUX_KERNEL_WARMUP:
+        """Compatibility hook; resources stay with the runner, order with the plan."""
+        if not self._auxiliary_warmup_enabled:
             return
-        if not current_platform.is_device_capability(70):
-            return
-
-        warmed: list[str] = []
-        if hasattr(self, "_kv_block_zeroer") and self._kv_block_zeroer.warmup_kernel():
-            warmed.append("zero_kv_blocks")
+        tasks = []
+        if hasattr(self, "_kv_block_zeroer"):
+            tasks.append(
+                warmup_boolean("zero_kv_blocks", self._kv_block_zeroer.warmup_kernel)
+            )
         if hasattr(self, "input_batch") and self.input_batch.block_table is not None:
-            self.input_batch.block_table.warmup_slot_mapping_kernel()
-            warmed.append("compute_slot_mapping")
-        if (
-            self.cache_config.mamba_cache_mode == "align"
-            and mamba_utils.warmup_batch_memcpy_kernel(self.device)
-        ):
-            warmed.append("mamba_batch_memcpy")
-        if (
-            self.cache_config.mamba_cache_mode == "align"
-            and self.speculative_config is not None
-            and self.model_config.is_hybrid
-        ):
+            tasks.append(
+                warmup_unconditional(
+                    "compute_slot_mapping",
+                    self.input_batch.block_table.warmup_slot_mapping_kernel,
+                )
+            )
+        if self.cache_config.mamba_cache_mode == "align":
+            tasks.append(
+                warmup_boolean(
+                    "mamba_batch_memcpy",
+                    lambda: mamba_utils.warmup_batch_memcpy_kernel(self.device),
+                )
+            )
+
+        def prepare_and_warm_postprocess():
             mamba_bufs = self._get_mamba_bufs()
             postprocess_ctx = mamba_bufs.postprocess_align
             assert postprocess_ctx is not None
@@ -2268,40 +2139,37 @@ class GPUModelRunner(
                         for group_id in postprocess_ctx.mamba_group_ids
                     ],
                 )
-            if postprocess_ctx.warmup_fused_postprocess():
-                warmed.append("mamba_spec_postprocess")
-        drafter = getattr(self, "drafter", None)
-        mtp_warmup = getattr(drafter, "warmup_sm70_mtp_hotpath_kernels", None)
-        if mtp_warmup is not None:
-            warmed.extend(mtp_warmup())
-        mtp_moe_warmup = getattr(drafter, "warmup_sm70_mtp_moe_kernels", None)
-        if mtp_moe_warmup is not None:
-            warmed.extend(mtp_moe_warmup())
-        dflash_warmup = getattr(drafter, "warmup_sm70_dflash_hotpath_kernels", None)
-        if dflash_warmup is not None:
-            warmed.extend(dflash_warmup())
+            return postprocess_ctx.warmup_fused_postprocess(
+                expanded=self.vllm_config.kernel_config.sm70_runtime.mtp_concurrency_warmup
+            )
+
+        if (
+            self.cache_config.mamba_cache_mode == "align"
+            and self.speculative_config is not None
+            and self.model_config.is_hybrid
+        ):
+            tasks.append(
+                warmup_boolean("mamba_spec_postprocess", prepare_and_warm_postprocess)
+            )
+        tasks.extend(proposer_warmup_tasks(getattr(self, "drafter", None)))
         spec_config = self.speculative_config
         if (
             spec_config is not None
             and spec_config.use_dflash_ddtree()
             and os.getenv("VLLM_DFLASH_DDTREE_GPU_SAMPLER", "1") != "0"
-            and warmup_ddtree_single_top_token_sampler(
-                device=self.device,
-                max_rows=self.max_spec_state_slots,
-            )
         ):
-            warmed.append("ddtree_top_token_sampler")
-        model_modules = getattr(self.model, "modules", None)
-        if model_modules is not None:
-            for module in model_modules():
-                warmup_gdn_conv = getattr(
-                    module, "_warmup_sm70_causal_conv1d_real_state", None
+            tasks.append(
+                warmup_boolean(
+                    "ddtree_top_token_sampler",
+                    lambda: warmup_ddtree_single_top_token_sampler(
+                        device=self.device, max_rows=self.max_spec_state_slots
+                    ),
                 )
-                if warmup_gdn_conv is not None and warmup_gdn_conv():
-                    warmed.append("gdn_causal_conv1d")
-                    break
+            )
+        tasks.append(model_convolution_warmup_task(self.model))
+        warmed = run_warmup_tasks(tasks)
         if warmed:
-            logger.info_once("SM70 auxiliary kernel warmup finished: %s", tuple(warmed))
+            logger.info_once("SM70 auxiliary kernel warmup finished: %s", warmed)
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -8843,8 +8711,20 @@ class GPUModelRunner(
         _sync_sm70_before_compile_graph_forward(cudagraph_mode)
         mtp_profile_events: (
             list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None
-        ) = ([]) if self._sm70_mtp_profile_enabled() else None
-        mtp_forward_start = self._sm70_mtp_profile_start(mtp_profile_events)
+        ) = (
+            ([])
+            if (
+                self._step_profiler.enabled
+                or (
+                    self.speculative_config is not None
+                    and self.speculative_config.use_dflash_ddtree()
+                    and self.device.type == "cuda"
+                    and _dflash_ddtree_profile_enabled()
+                )
+            )
+            else None
+        )
+        mtp_forward_start = self._step_profiler.start(mtp_profile_events)
         trace_forward_t0 = time.perf_counter() if trace_log else 0.0
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.prepare_forward(
@@ -8887,7 +8767,7 @@ class GPUModelRunner(
             self._ple_offload_connector.release_outputs()
         if trace_log:
             trace_forward_submit_ms = (time.perf_counter() - trace_forward_t0) * 1000.0
-        self._sm70_mtp_profile_finish(
+        self._step_profiler.finish(
             mtp_profile_events, "target_forward", mtp_forward_start
         )
 
@@ -8920,7 +8800,7 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                mtp_logits_start = self._sm70_mtp_profile_start(mtp_profile_events)
+                mtp_logits_start = self._step_profiler.start(mtp_profile_events)
                 if (
                     self._can_use_greedy_token_fastpath(
                         scheduler_output, spec_decode_metadata
@@ -8938,7 +8818,7 @@ class GPUModelRunner(
                     logits = None
                 else:
                     logits = self.model.compute_logits(sample_hidden_states)
-                self._sm70_mtp_profile_finish(
+                self._step_profiler.finish(
                     mtp_profile_events, "target_logits", mtp_logits_start
                 )
             else:
@@ -8946,7 +8826,7 @@ class GPUModelRunner(
                 assert not self.is_pooling_model
 
                 sample_hidden_states = hidden_states[logits_indices]
-                mtp_logits_start = self._sm70_mtp_profile_start(mtp_profile_events)
+                mtp_logits_start = self._step_profiler.start(mtp_profile_events)
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(
@@ -8971,7 +8851,7 @@ class GPUModelRunner(
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
-                self._sm70_mtp_profile_finish(
+                self._step_profiler.finish(
                     mtp_profile_events, "target_logits", mtp_logits_start
                 )
 
@@ -9137,7 +9017,7 @@ class GPUModelRunner(
         )
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             trace_sample_t0 = time.perf_counter() if trace_log else 0.0
-            mtp_sample_start = self._sm70_mtp_profile_start(
+            mtp_sample_start = self._step_profiler.start(
                 None if mtp_profile_ctx is None else mtp_profile_ctx["events"]
             )
             sampler_output = self._sample(
@@ -9157,7 +9037,7 @@ class GPUModelRunner(
             ddtree_copy_plan = self._ddtree_accepted_copy_plan(
                 sampler_output, scheduler_output
             )
-            self._sm70_mtp_profile_finish(
+            self._step_profiler.finish(
                 None if mtp_profile_ctx is None else mtp_profile_ctx["events"],
                 "target_rejection_sample"
                 if spec_decode_metadata is not None
@@ -9180,7 +9060,7 @@ class GPUModelRunner(
             scheduler_output,
             ddtree_copy_plan,
         )
-        self._sm70_mtp_profile_add_cpu_ms(
+        self._step_profiler.add_cpu_context(
             mtp_profile_ctx,
             "state_update_validate_cpu",
             mtp_state_update_validate_start,
@@ -9199,7 +9079,7 @@ class GPUModelRunner(
             slot_mappings_by_group,
             ddtree_copy_plan,
         )
-        self._sm70_mtp_profile_add_cpu_ms(
+        self._step_profiler.add_cpu_context(
             mtp_profile_ctx,
             "state_update_attn_compact_cpu",
             mtp_state_update_attn_compact_start,
@@ -9217,7 +9097,7 @@ class GPUModelRunner(
             scheduler_output,
             ddtree_copy_plan,
         )
-        self._sm70_mtp_profile_add_cpu_ms(
+        self._step_profiler.add_cpu_context(
             mtp_profile_ctx,
             "state_update_mamba_compact_cpu",
             mtp_state_update_mamba_compact_start,
@@ -9236,7 +9116,7 @@ class GPUModelRunner(
             sampler_output.ddtree_accepted_node_indices,
             ddtree_mamba_state_compacted,
         )
-        self._sm70_mtp_profile_add_cpu_ms(
+        self._step_profiler.add_cpu_context(
             mtp_profile_ctx,
             "state_update_input_batch_cpu",
             mtp_state_update_input_batch_start,
@@ -9256,7 +9136,7 @@ class GPUModelRunner(
             scheduler_output,
             ddtree_copy_plan,
         )
-        self._sm70_mtp_profile_add_cpu_ms(
+        self._step_profiler.add_cpu_context(
             mtp_profile_ctx,
             "state_update_drafter_context_cpu",
             mtp_state_update_drafter_context_start,
@@ -9265,7 +9145,7 @@ class GPUModelRunner(
             trace_ddtree_drafter_context_ms = (
                 time.perf_counter() - trace_ddtree_drafter_context_t0
             ) * 1000.0
-        self._sm70_mtp_profile_add_cpu_ms(
+        self._step_profiler.add_cpu_context(
             mtp_profile_ctx, "state_update_wall_cpu", mtp_state_update_wall_start
         )
         if self.use_async_scheduling:
@@ -9320,7 +9200,7 @@ class GPUModelRunner(
                 mtp_draft_wall_start = (
                     time.perf_counter() if mtp_profile_ctx is not None else 0.0
                 )
-                mtp_draft_start = self._sm70_mtp_profile_start(
+                mtp_draft_start = self._step_profiler.start(
                     None if mtp_profile_ctx is None else mtp_profile_ctx["events"]
                 )
                 self._draft_token_ids = self.propose_draft_token_ids(
@@ -9334,12 +9214,12 @@ class GPUModelRunner(
                     spec_decode_common_attn_metadata,
                     slot_mappings,
                 )
-                self._sm70_mtp_profile_finish(
+                self._step_profiler.finish(
                     None if mtp_profile_ctx is None else mtp_profile_ctx["events"],
                     "draft_total",
                     mtp_draft_start,
                 )
-                self._sm70_mtp_profile_add_cpu_ms(
+                self._step_profiler.add_cpu_context(
                     mtp_profile_ctx, "draft_wall_cpu", mtp_draft_wall_start
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
@@ -9440,7 +9320,7 @@ class GPUModelRunner(
             mtp_bookkeeping_wall_start = (
                 time.perf_counter() if mtp_profile_ctx is not None else 0.0
             )
-            mtp_bookkeeping_start = self._sm70_mtp_profile_start(
+            mtp_bookkeeping_start = self._step_profiler.start(
                 None if mtp_profile_ctx is None else mtp_profile_ctx["events"]
             )
             (
@@ -9458,12 +9338,12 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
-            self._sm70_mtp_profile_finish(
+            self._step_profiler.finish(
                 None if mtp_profile_ctx is None else mtp_profile_ctx["events"],
                 "bookkeeping",
                 mtp_bookkeeping_start,
             )
-            self._sm70_mtp_profile_add_cpu_ms(
+            self._step_profiler.add_cpu_context(
                 mtp_profile_ctx,
                 "bookkeeping_wall_cpu",
                 mtp_bookkeeping_wall_start,
@@ -9533,7 +9413,7 @@ class GPUModelRunner(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
-            self._sm70_mtp_profile_report(mtp_profile_ctx)
+            self._step_profiler.report(mtp_profile_ctx)
             if trace_log:
                 logger.info(
                     "SM70 async worker trace kind=sample step=%d mode=sync_output "
@@ -9610,7 +9490,7 @@ class GPUModelRunner(
                     time.perf_counter() - trace_set_async_t0
                 ) * 1000.0
 
-        self._sm70_mtp_profile_report(mtp_profile_ctx)
+        self._step_profiler.report(mtp_profile_ctx)
         if trace_log:
             logger.info(
                 "SM70 async worker trace kind=sample step=%d mode=async_output "

@@ -1,3 +1,4 @@
+#include "sm70_policy.h"
 #include <c10/core/ScalarType.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -383,9 +384,10 @@ bool moe_permute_unpermute_supported() {
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
-  m.impl("moe_permute", &moe_permute);
-  m.impl("moe_permute_with_scratch", &moe_permute_with_scratch);
+  m.impl("moe_permute", vllm::sm70::with_policy(&moe_permute));
+  m.impl("moe_permute_with_scratch",
+         vllm::sm70::with_policy(&moe_permute_with_scratch));
   m.impl("moe_permute_metadata_with_scratch",
-         &moe_permute_metadata_with_scratch);
-  m.impl("moe_unpermute", &moe_unpermute);
+         vllm::sm70::with_policy(&moe_permute_metadata_with_scratch));
+  m.impl("moe_unpermute", vllm::sm70::with_policy(&moe_unpermute));
 }

@@ -10,7 +10,7 @@ from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
-from vllm.model_executor.kernels.linear.nvfp4.sm70 import (
+from vllm.model_executor.kernels.linear.qpn.nvfp4 import (
     Qpn4NvFp4LinearKernel,
 )
 from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
@@ -152,7 +152,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
         if sm70_tm.should_prepare_turbomind(
             layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND
         ):
-            from vllm.model_executor.kernels.linear.nvfp4.sm70 import (
+            from vllm.model_executor.kernels.linear.qpn.nvfp4 import (
                 Sm70NvFp4LinearLayerConfig,
             )
             from vllm.model_executor.models.config import (

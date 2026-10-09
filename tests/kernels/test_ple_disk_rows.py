@@ -66,7 +66,7 @@ def test_invalid_rows_are_rejected_before_output_writes():
     pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
     output = torch.full((2, 16), 123, dtype=torch.uint8)
     for invalid in (-1, 3):
-        with pytest.raises(RuntimeError, match="row ID out of range"):
+        with pytest.raises(IndexError, match="row id out of range"):
             torch.ops._C.ple_disk_gather_u8(
                 torch.tensor([0, invalid]), pointers, 3, 3, 16, output
             )

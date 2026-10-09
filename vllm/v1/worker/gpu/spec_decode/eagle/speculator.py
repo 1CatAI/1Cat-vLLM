@@ -184,7 +184,7 @@ class EagleSpeculator:
         if (
             cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY
             and self.num_speculative_steps > 2
-            and self.vllm_config.kernel_config.sm70_draft_single_graph
+            and self.vllm_config.kernel_config.capture_all_draft_steps
         ):
             self.multistep_cudagraph_manager = DecodeEagleCudaGraphManager(
                 self.vllm_config,
@@ -456,7 +456,7 @@ class EagleSpeculator:
         multistep = getattr(self, "multistep_cudagraph_manager", None)
         if (
             multistep is not None
-            and self.vllm_config.kernel_config.sm70_draft_single_graph
+            and self.vllm_config.kernel_config.capture_all_draft_steps
             and batch_desc.cg_mode == CUDAGraphMode.FULL
             and batch_desc in multistep.graphs
         ):
