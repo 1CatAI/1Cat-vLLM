@@ -210,6 +210,22 @@ for the 24 eager cases per rank. This source supports Q4_K/Q6_K and already
 normalized producer inputs only. It has no model quality gate, clean normal
 package, or production dispatch change and remains a research result.
 
+The follow-up `producer-register` variant moves down-weight loads into
+registers before the output projection, instead of relying on L2 prefetch.
+It passes the same raw-bit comparisons but regresses: 28.001 µs versus
+26.498 µs for the fused control in that run. Q6_K register use rises from
+181 to 243 with no spills. The paired complete-chain result rejects this
+placement; early weight fetch cannot be assumed to disappear from the
+producer's critical path. The selected fused design remains research-only.
+
+The owned branch subsequently merges integration commit `4825b6831f`.
+The sole conflict is the equivalent peer-buffer registration fix in the
+compiled-payload test; the integration spelling is retained. The HCX CUDA
+source remains byte-identical to measured V6 source `71fce5ca51`. This merge
+does not make the older V6 wheel a new integration-wide runtime qualification.
+The 25 focused HCX dispatch and compile-cache policy tests pass again on the
+merged source, and the merge's pre-commit checks pass.
+
 ## Related work and interpretation
 
 [mHC's kernel-fusion design](https://arxiv.org/html/2512.24880v2#S4.SS3.SSS1)
