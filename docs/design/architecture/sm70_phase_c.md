@@ -55,7 +55,7 @@ diagnostics and warmup-only selection do not.
 | C2a | GDN compute plan, providers and shared stages | Merged as #1133 (`ec535b1e69b6`) |
 | C2b | GDN metadata and state preparation/commit | Merged as #1135 (`ad19d7ad1166`) |
 | C3 | Ordered defaults, model qualification and engine-local effective values | Merged as #1137 (`51c0f97201a7`) |
-| C4a | Shared embedding, LM-head, norm and linear providers | CPU validated; GPU operator validation pending |
+| C4a | Shared embedding, LM-head, norm and linear providers | Validated in #1139 |
 | C4b | Graph/communication/fusion boundaries and final explanation report | Pending |
 
 Each PR is based on merged main and is reviewed and merged before the next
@@ -670,5 +670,47 @@ weight/pack release, missing native ABI rejection, cached greedy-verification
 results, and row bounds on eager/compiled dispatch. A fresh-process import test
 caught and eliminated the registration cycle before promotion.
 
-GPU correctness and matched A/B evidence will be recorded before merging this
-batch. No model weights, throughput, TTFT or 35B acceptance are claimed.
+On 54633, baseline and candidate each passed **64 GPU tests** (Gemma norm,
+DeepSeek exact/packed projections, fused auxiliary projections and greedy
+verification). The new LM-head replay suite passed **10 tests**. Final follow-up
+passed **37 tests**, including loaded FP16 projection fullgraph views, changed
+inputs, empty inputs and all FP16 gated-norm payloads. The same repaired
+native-norm fixture passed **26 tests** on baseline. These suites overlap.
+The old fixture changed an environment variable after the kernel policy had
+already resolved to disabled; it now explicitly enables the typed policy on
+both sides. No numerical tolerance was relaxed.
+
+Five alternating process pairs measured the following medians. GPU figures use
+CUDA events over repeated captured calls; host figures measure enqueue cost
+separately. Both use Torch 2.10.0+cu128, CUDA 12.8, driver 580.173.02 and one
+V100-SXM2-32GB. LM-head geometry is N1024/K512, normalization width is 5120.
+
+| Operator / M | GPU old → new µs | Host old → new µs |
+|---|---:|---:|
+| Raw top-one / 1 | 5.231 → 5.218 | 77.210 → 69.650 |
+| Packed top-one / 1 | 18.971 → 18.743 | 75.066 → 71.034 |
+| Packed top-one / 8 | 27.845 → 26.903 | 74.121 → 71.828 |
+| Dense FP16 / 1 | 10.209 → 10.146 | 43.006 → 41.077 |
+| Dense FP16 / 8 | 8.481 → 8.471 | 44.152 → 41.484 |
+| FP32 logits / 1 | 5.861 → 5.859 | 37.541 → 32.250 |
+| FP32 logits / 8 | 5.997 → 5.999 | 40.318 → 36.313 |
+| QPN8 rerank / 1 | 40.714 → 40.727 | 295.055 → 280.077 |
+| QPN8 rerank / 8 | 45.531 → 45.472 | 302.103 → 272.619 |
+| Fixed Gemma / 1 | 3.482 → 3.492 | 51.157 → 50.613 |
+| Fixed Gemma / 8 | 3.527 → 3.531 | 51.726 → 49.386 |
+| FP32-residual Gemma / 1 | 3.516 → 3.508 | 75.716 → 74.643 |
+| FP32-residual Gemma / 8 | 3.600 → 3.604 | 76.459 → 75.708 |
+
+GPU timing shows no regression beyond observed baseline variation; temporary
+allocation bytes are unchanged for all 13 cases. Twelve cases have identical
+output digests in every pair. Default dense M1 autotuning produced the same two
+digests on both sides across independent processes; it is not a deterministic
+cross-process baseline. Three further pairs with the same explicit
+`VLLM_SM70_F16_DENSE_TUNE_MAX_M=0` on both sides produced one identical digest.
+This diagnostic setting does not change production defaults.
+
+Raw artifacts are under the task-owned `phase-c4a-20261009/artifacts` directory
+on 54633, including `bench-v2.jsonl`, `bench-fixed-v1.jsonl`, baseline/candidate
+JUnit and `followup-v2.xml`. The unchanged packaged C3 extension has SHA256
+`4df50cb5cc140449a80705b4f7e846dcb4f393b14fb3a9a6b3e82446b0d9ddd1`.
+No model weights, throughput, TTFT or 35B acceptance are claimed.

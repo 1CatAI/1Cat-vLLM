@@ -129,3 +129,37 @@ def test_sparse_rerank_keeps_dense_vocab_tie_order(monkeypatch):
     )
     assert torch.equal(values, expected_values)
     assert torch.equal(ids, expected_ids)
+
+
+@torch.inference_mode()
+def test_dense_projection_loading_and_fullgraph_views(monkeypatch):
+    import vllm.model_executor.parameter as parameters
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+
+    monkeypatch.setattr(parameters, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameters, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    monkeypatch.setenv("VLLM_SM70_F16_DENSE_TUNE_MAX_M", "0")
+    cfg = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    with set_current_vllm_config(cfg):
+        layer = ReplicatedLinear(
+            128,
+            128,
+            bias=False,
+            params_dtype=torch.float16,
+            prefix="model.down_proj",
+            disable_tp=True,
+        ).cuda()
+        layer.weight.normal_(0, 0.02)
+        layer._sm70_f16_force_enable = True
+        layer.quant_method.process_weights_after_loading(layer)
+        assert layer._sm70_dense_state.weight is layer.weight
+        assert layer._sm70_f16_prepared
+        compiled = torch.compile(layer, backend="eager", fullgraph=True)
+        for rows in (1, 8, 1):
+            x = torch.randn((rows, 128), dtype=torch.float16, device="cuda")
+            expected, _ = layer(x)
+            actual, _ = compiled(x)
+            assert torch.equal(actual, expected)
+            flat, _ = compiled(x.view(1, rows, 128))
+            assert torch.equal(flat.view_as(expected), expected)
