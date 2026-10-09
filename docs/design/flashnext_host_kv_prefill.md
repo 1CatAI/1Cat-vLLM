@@ -726,6 +726,10 @@ cache evidence rejects the cold-prefill measurement. Five unprofiled repeats
 report median, range and coefficient of variation, with a 5% stability bound.
 Compiler and filesystem caches remain warm; these measurements describe cold
 prefix filling, not cold process startup or cold disk I/O.
+Concurrent decode checks use distinct cache salts for each request while
+retaining identical token inputs. Resetting once before a C4 cohort cannot
+prevent later requests from hitting prefixes filled by earlier requests in
+the same cohort; every completed request must still report zero cached tokens.
 
 Host-prefill staging now slices the request block table to its actual visible
 history before testing scratch capacity. Unused columns reserved for the 256K
@@ -733,6 +737,9 @@ context limit must not force a 32K request into the scalar fallback. The view
 retains original storage and stride, and M5/M20 graph table geometry remains
 unchanged. Fifteen focused CPU checks pass for cold-prefix evidence and this
 capacity/view policy; device and full-model checks are still required.
+An untimed same-prefix replay separately records cache hits and checks its
+output against the cold warmup. Its latency is excluded from the baseline;
+the next timed request clears the prefix cache again.
 
 The reusable gate/up pool has two disjoint slots. At 512 experts, local width
 160 and K2560, code storage is 100 MiB and group metadata is 100 MiB. IQ3 uses

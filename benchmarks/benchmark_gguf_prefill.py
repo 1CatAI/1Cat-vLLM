@@ -189,6 +189,7 @@ def main():
             "prefill-norm": "set_prefill_rmsnorm_gated_policy",
         }[args.compare]
         report["warmups"] = []
+        report["prefix_reuse_checks"] = []
         policies = (
             (False,)
             if args.control_only
@@ -211,6 +212,25 @@ def main():
                 )
             )
             save()
+            if args.enable_prefix_caching:
+                reuse = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[
+                    0
+                ]
+                matches = reuse.outputs[0].token_ids == warmup.outputs[0].token_ids
+                report["prefix_reuse_checks"].append(
+                    dict(
+                        enabled=enabled,
+                        scope="cache correctness; excluded from speed",
+                        num_cached_tokens=reuse.num_cached_tokens,
+                        output_ids=reuse.outputs[0].token_ids,
+                        matching_output_ids=matches,
+                    )
+                )
+                save()
+                if not matches or reuse.num_cached_tokens is None:
+                    raise RuntimeError(
+                        "Prefix-cache reuse failed output/evidence check"
+                    )
         measured_policies = (
             (False,) * args.repeats
             if args.control_only
@@ -282,16 +302,23 @@ def main():
                 llm.collective_rpc(method, args=(enabled,))
                 for width in (1, 4):
                     reset_cold_prefix_cache(llm, args.enable_prefix_caching)
+                    salts = (
+                        [f"gguf-cold-cohort-{i}" for i in range(width)]
+                        if args.enable_prefix_caching
+                        else None
+                    )
                     steps, outputs = observed_cohort(
                         llm,
                         ids[:8192],
                         SamplingParams(temperature=0, max_tokens=600, ignore_eos=True),
                         width,
+                        cache_salts=salts,
                     )
                     check = dict(
                         enabled=enabled,
                         width=width,
                         input_tokens=8192,
+                        cache_salts=salts,
                         steps=steps,
                         output_ids=[list(row.outputs[0].token_ids) for row in outputs],
                         cold_prefills=[
