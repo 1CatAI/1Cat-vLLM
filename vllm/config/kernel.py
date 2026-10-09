@@ -456,6 +456,11 @@ class Sm70GgufConfig:
     q8_expert_intermediate: bool = True
     """Encode routed intermediates once in qualified integer expert gate/up."""
 
+    device_transcode: bool = True
+    """Transcode IQ2_S/IQ3/IQ4/Q2_0 expert banks on the GPU while loading.
+
+    Byte-identical to the host codecs; only startup time changes."""
+
     grouped_mma_gate_up: bool = False
     """Run routed IQ3 gate/up at M1..8 as expert-grouped FP16 MMA on repacked planes."""
 

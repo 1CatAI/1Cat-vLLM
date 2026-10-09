@@ -7,7 +7,9 @@ import torch
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.kernels.gguf import GGUFOperatorCapability, decoder_family
-from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import pack
+from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import (
+    pack_device,
+)
 from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -84,23 +86,17 @@ def prepare_segment_bank(projection, canonical, device):
     if source == 8:
         codes = ((codes.astype(np.int16) - 128) & 255).astype(np.uint8)
     minimum = canonical.mins if fmt in (0, 1) else None
-    payload = pack(
+    payload = pack_device(
         fmt,
         codes,
         canonical.scales.astype(np.float32),
         minimum.astype(np.float32) if minimum is not None else None,
         canonical.group_size,
+        device,
     )
-    projection.codes = torch.nn.Parameter(
-        torch.from_numpy(payload[0]).to(device), False
-    )
-    projection.stats = torch.nn.Parameter(
-        torch.from_numpy(payload[2]).to(device), False
-    )
-    projection.register_parameter(
-        "segment_high",
-        torch.nn.Parameter(torch.from_numpy(payload[1]).to(device), False),
-    )
+    projection.codes = torch.nn.Parameter(payload[0], False)
+    projection.stats = torch.nn.Parameter(payload[2], False)
+    projection.register_parameter("segment_high", torch.nn.Parameter(payload[1], False))
     projection.segment_format = fmt
     projection.cache_capabilities = ()
     workspace(device, k == 160 or n <= 320)

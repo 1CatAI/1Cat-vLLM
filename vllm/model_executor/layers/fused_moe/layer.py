@@ -5,6 +5,7 @@ from collections.abc import Callable, Iterable
 from enum import Enum
 from typing import Literal, cast, overload
 
+import regex as re
 import torch
 from torch.nn.parameter import UninitializedParameter
 
@@ -1146,6 +1147,33 @@ class FusedMoE(PluggableLayer):
 
         return False if return_success else None
 
+    _EXPERT_ENTRY = re.compile(r"experts\.\d+\.[^.]+\.")
+    _EXPERT_SUBSTRING = re.compile(r"(?=(experts\.\d+\.[^.]+\.))")
+
+    def _matching_expert_entries(self, mapping, qual_name):
+        """Mapping entries whose weight name occurs in ``qual_name``, in order.
+
+        Per-expert names ``experts.<id>.<projection>.`` are looked up from the
+        substrings of that form in ``qual_name``; this is the same set the
+        linear substring scan finds. Other entries keep the scan.
+        """
+        index = getattr(self, "_expert_mapping_index", None)
+        if index is None or index[0] is not mapping:
+            by_name: dict[str, list[int]] = {}
+            others: list[int] = []
+            for position, entry in enumerate(mapping):
+                if self._EXPERT_ENTRY.fullmatch(entry[1]):
+                    by_name.setdefault(entry[1], []).append(position)
+                else:
+                    others.append(position)
+            index = (mapping, by_name, others)
+            self._expert_mapping_index = index
+        _, by_name, others = index
+        positions = {p for p in others if mapping[p][1] in qual_name}
+        for match in self._EXPERT_SUBSTRING.finditer(qual_name):
+            positions.update(by_name.get(match.group(1), ()))
+        return [mapping[p] for p in sorted(positions)]
+
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:
@@ -1156,9 +1184,12 @@ class FusedMoE(PluggableLayer):
             )
         for expert_name, loaded_weight in weights:
             qual_name = f"{self.layer_name}.{expert_name}"
-            for param_name, weight_name, expert_id, shard_id in expert_mapping:
-                if weight_name not in qual_name:
-                    continue
+            for (
+                param_name,
+                weight_name,
+                expert_id,
+                shard_id,
+            ) in self._matching_expert_entries(expert_mapping, qual_name):
                 weight_name = qual_name.replace(weight_name, param_name)
                 param_name = weight_name.removeprefix(f"{self.layer_name}.")
                 param = getattr(self, param_name)

@@ -28,12 +28,14 @@ from vllm.model_executor.layers.fused_moe.sm70.reduction import weighted_reduce_
 from vllm.model_executor.layers.fused_moe.sm70_small_routing import (
     SM70_SMALL_ROUTING,
 )
+from vllm.model_executor.layers.quantization import gguf_device_transcode
 from vllm.model_executor.layers.quantization.gguf_lattice_transcode import (
     LATTICE_TYPES,
     LatticeGGUFProjection,
     transcode_lattice,
 )
 from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
+    LUT4_IQ,
     LUT4_TYPES,
     Lut4GGUFProjection,
     transcode_lut4,
@@ -46,7 +48,7 @@ from vllm.model_executor.layers.quantization.gguf_transcode import (
     transcode_affine,
 )
 from vllm.platforms import current_platform
-from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
+from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
@@ -492,9 +494,66 @@ def _expert_planes(raw: torch.Tensor, source_type: int, n: int, k: int):
     )
 
 
+# Reusable pinned host chunks for staging packed expert rows.
+_STAGING_POOL: list[torch.Tensor] = []
+
+
+def _acquire_staging(nbytes: int) -> torch.Tensor:
+    for i, buf in enumerate(_STAGING_POOL):
+        if buf.numel() >= nbytes:
+            return _STAGING_POOL.pop(i)
+    return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+
+
+def _release_staging(buf: torch.Tensor) -> None:
+    _STAGING_POOL.append(buf)
+
+
+def _tp_rows(source, weight_type, rank, size, axis):
+    """This rank's packed rows as a view, or None when slicing cuts a block."""
+    if size <= 0 or not 0 <= rank < size or axis not in (0, 1):
+        raise ValueError("Invalid GGUF TP rank, size or axis")
+    block, block_bytes = quant_size(weight_type)
+    if source.dtype != np.uint8 or source.ndim != 2 or source.shape[1] % block_bytes:
+        raise ValueError("GGUF projection needs complete packed rows [N,bytes]")
+    shape = (source.shape[0], source.shape[1] // block_bytes * block)
+    span, remainder = divmod(shape[axis], size)
+    if remainder:
+        raise ValueError("GGUF TP dimension is not divisible")
+    if axis == 0:
+        return source[rank * span : (rank + 1) * span]
+    if span % block:
+        return None
+    span = span // block * block_bytes
+    return source[:, rank * span : (rank + 1) * span]
+
+
 class GGUFExpertBank(torch.nn.Module):
-    def __init__(self, source_type, experts, device, dtype, retain_raw=False):
+    # Experts per staged/transcoded chunk; bounds pinned staging and the
+    # device int64 temporaries to a few hundred MiB.
+    DEVICE_CHUNK = 128
+
+    def __init__(
+        self,
+        source_type,
+        experts,
+        device,
+        dtype,
+        retain_raw=False,
+        device_transcode=False,
+    ):
         super().__init__()
+        # Supported formats are staged per rank and transcoded on the device
+        # in chunks; the result is byte-identical to the host codecs below.
+        self.device_transcode = bool(
+            device_transcode
+            and source_type in gguf_device_transcode.DEVICE_TYPES
+            and torch.device(device).type == "cuda"
+        )
+        self.host_tp: tuple[int, int, int] | None = None
+        self.host_presliced = True
+        self.host_shape: tuple[int, ...] | None = None
+        self.staging: dict[int, tuple[torch.Tensor, np.ndarray, set[int]]] = {}
         self.native_ops = NativeBindings(capture_linear_native_config("gguf").values)
         self.source_type = source_type
         self.experts = experts
@@ -520,6 +579,9 @@ class GGUFExpertBank(torch.nn.Module):
             self.pending[index] = local.to(self.device).contiguous()
             return
         source = weight.detach().cpu().numpy()
+        if self.device_transcode:
+            self._stage(index, source, rank, size, axis)
+            return
         canonical: LatticeGGUFProjection | Lut4GGUFProjection | AffineGGUFProjection
         if self.source_type in LATTICE_TYPES:
             canonical = transcode_lattice(source, self.source_type)
@@ -579,7 +641,139 @@ class GGUFExpertBank(torch.nn.Module):
                 )
         self.pending[index] = prepared
 
+    def _stage(self, index, source, rank, size, axis):
+        """Copy this rank's packed rows into a pinned chunk.
+
+        Rows are copied straight from the (mmap-backed) source; every full
+        chunk is uploaded once and transcoded on the device.
+        """
+        if self.host_tp not in (None, (rank, size, axis)):
+            raise ValueError("GGUF expert bank mixes TP slices")
+        rows = _tp_rows(source, self.source_type, rank, size, axis)
+        presliced = rows is not None
+        if rows is None:
+            # Slicing K would cut a source block (Q2_0 TP4 down): decode full
+            # rows and slice the canonical groups, like tp_slice() does.
+            if axis != 1:
+                raise ValueError("GGUF row slice must retain source blocks")
+            rows = source
+        if self.host_tp is None:
+            self.host_tp = (rank, size, axis)
+            self.host_presliced = presliced
+            self.host_shape = rows.shape
+            block, block_bytes = quant_size(self.source_type)
+            self.n = rows.shape[0]
+            self.k = rows.shape[1] // block_bytes * block
+            if not presliced:
+                self.k //= size
+            self.group = 16 if self.source_type == 22 else 32
+            if self.source_type in gguf_device_transcode.DEVICE_LUT4_TYPES:
+                self.decoder = LUT4_IQ
+            elif self.source_type in gguf_device_transcode.DEVICE_AFFINE_TYPES:
+                self.decoder = 2  # unsigned U2 codes
+            if self.n % 32:
+                raise ValueError("Canonical GGUF expert output cuts a 32-row pack")
+            if self.k % self.group:
+                raise ValueError("GGUF canonical TP boundary cuts a group")
+            self.raw_capabilities = raw_grouped_gate_up_capabilities(
+                self.source_type,
+                self.k,
+                self.n,
+                self.experts,
+                self.dtype,
+                is_sm70=current_platform.is_device_capability(70),
+                original_storage_available=self.retain_raw,
+            )
+        elif rows.shape != self.host_shape or presliced != self.host_presliced:
+            raise ValueError("GGUF experts disagree on packed shape")
+        chunk = index // self.DEVICE_CHUNK
+        if chunk not in self.staging:
+            count = len(self._chunk_ids(chunk))
+            buf = _acquire_staging(count * rows.size)
+            host = buf.numpy()[: count * rows.size].reshape(count, *rows.shape)
+            self.staging[chunk] = (buf, host, set())
+        _, host, present = self.staging[chunk]
+        if index in present:
+            raise ValueError("Duplicate canonical GGUF expert")
+        np.copyto(host[index - chunk * self.DEVICE_CHUNK], rows)
+        present.add(index)
+        if len(present) == len(self._chunk_ids(chunk)):
+            self._decode_chunk(chunk)
+
+    def _chunk_ids(self, chunk):
+        start = chunk * self.DEVICE_CHUNK
+        return range(start, min(start + self.DEVICE_CHUNK, self.experts))
+
+    def _decode_chunk(self, chunk):
+        buf, host, _ = self.staging.pop(chunk)
+        ids = self._chunk_ids(chunk)
+        count, rows, width = host.shape
+        # Blocking copy from pinned memory, so the buffer can be reused.
+        data = buf[: host.size].view(count, rows, width).to(self.device)
+        _release_staging(buf)
+        assert self.host_tp is not None
+        rank = self.host_tp[0]
+        transcode = gguf_device_transcode
+        flat = data.view(count * rows, width)
+        if self.retain_raw and any(c.reason is None for c in self.raw_capabilities):
+            # Same storage as RawGGUFProjection: rows padded to 8 bytes.
+            stride = (width + 7) // 8 * 8
+            raw = data
+            if stride != width:
+                raw = torch.zeros(
+                    (count, rows, stride), dtype=torch.uint8, device=self.device
+                )
+                raw[..., :width] = data
+            for j, i in enumerate(ids):
+                self.raw_pending[i] = raw[j]
+        if self.source_type in transcode.DEVICE_LATTICE_TYPES:
+            codes, stats = transcode.lattice_storage(flat, self.source_type)
+            codes = codes.view(count, rows, -1)
+            stats = stats.view(count, rows, -1)
+            for j, i in enumerate(ids):
+                self.pending[i] = torch.ops._C.gguf_lattice_sm70_prepare(
+                    codes[j], stats[j], self.source_type, self.group
+                )
+            return
+        mins = None
+        if self.source_type in transcode.DEVICE_LUT4_TYPES:
+            codes, scales = transcode.lut4_codes(flat, self.source_type)
+        else:
+            codes, scales, mins = transcode.affine_codes(flat, self.source_type)
+        codes = codes.view(count, rows, -1)
+        scales = scales.view(count, rows, -1)
+        if mins is not None:
+            mins = mins.view(count, rows, -1)
+        if not self.host_presliced:
+            c0, g0 = rank * self.k, rank * self.k // self.group
+            g1 = g0 + self.k // self.group
+            codes = codes[..., c0 : c0 + self.k]
+            scales = scales[..., g0:g1]
+            if mins is not None:
+                mins = mins[..., g0:g1]
+        for j, i in enumerate(ids):
+            if mins is None:
+                self.pending[i] = torch.ops._C.gguf_lut4_sm70_prepare(
+                    codes[j].contiguous(),
+                    scales[j].contiguous(),
+                    self.decoder,
+                    self.group,
+                )
+            else:
+                self.pending[i] = torch.ops._C.gguf_affine_sm70_prepare(
+                    codes[j].contiguous(),
+                    scales[j].contiguous(),
+                    mins[j].contiguous(),
+                    self.decoder,
+                    self.group,
+                )
+
     def finalize(self):
+        if self.staging:
+            for buf, _, _ in self.staging.values():
+                _release_staging(buf)
+            self.staging.clear()
+            raise ValueError("Incomplete canonical GGUF expert bank")
         if set(self.pending) != set(range(self.experts)):
             raise ValueError("Incomplete canonical GGUF expert bank")
         prepared = [self.pending[i] for i in range(self.experts)]
@@ -732,6 +926,9 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
             if config is not None
             else True
         )
+        self.device_transcode = bool(
+            config is None or config.kernel_config.sm70_gguf.device_transcode
+        )
 
     def load_expert(self, layer, param, weight, shard_id, expert_id):
         if param.is_gguf_weight_type:
@@ -750,6 +947,7 @@ class GGUFTurboMindMoEMethod(GGUFNativeMoEMethod):
                 retain_raw=self.native_enabled
                 and shard_id in ("w1", "w3")
                 and self.weight_types[shard_id] in (18, 21, 22),
+                device_transcode=self.device_transcode,
             )
         self.builders[shard_id].add(
             expert_id,
