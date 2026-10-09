@@ -302,3 +302,27 @@ def test_warmup_consumes_engine_limit_after_defaults(monkeypatch):
     apply(cfg, monkeypatch)
     monkeypatch.setenv("VLLM_SM70_AWQ_WARMUP_MAX_M", "16")
     assert 64 in _get_decode_m_values(NS(vllm_config=cfg))
+
+
+def test_fullgraph_policy_compatibility_and_engine_isolation(monkeypatch):
+    from vllm.forward_context import set_forward_context
+
+    monkeypatch.setenv("VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH", "1")
+
+    def run(value):
+        return value + (1 if graph_policy().compile_graph else 0)
+
+    compiled = torch.compile(run, backend="eager", fullgraph=True)
+    value = torch.zeros(1)
+    assert torch.equal(compiled(value), value + 1)
+    first = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        compilation_config=CompilationConfig(runtime=GraphPolicy(compile_graph=True)),
+    )
+    second = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        compilation_config=CompilationConfig(runtime=GraphPolicy(compile_graph=False)),
+    )
+    for cfg, expected in ((first, value + 1), (second, value), (first, value + 1)):
+        with set_current_vllm_config(cfg), set_forward_context(None, cfg):
+            assert torch.equal(compiled(value), expected)

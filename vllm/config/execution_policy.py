@@ -5,6 +5,7 @@
 
 from typing import ClassVar
 
+import torch
 from pydantic import Field
 
 from vllm.config.utils import config, hash_factors
@@ -274,6 +275,18 @@ POLICY_OWNERS = {
 }
 
 
+@torch.compiler.assume_constant_result
+def _standalone_policy(cls):
+    """Legacy standalone initialization, folded before tracing tensor work.
+
+    Engine callers never take this path: they borrow their already-resolved
+    owner, so compiling two engines cannot reuse a standalone policy object.
+    """
+    policy = cls()
+    policy.resolve()
+    return policy
+
+
 def capture_execution_policy(owner: str, cls, cfg=None):
     """Initialization adapter for standalone callers and worker-owned objects."""
     if cfg is None:
@@ -292,9 +305,7 @@ def capture_execution_policy(owner: str, cls, cfg=None):
 
         cfg = get_current_vllm_config_or_none()
     if cfg is None:
-        policy = cls()
-        policy.resolve()
-        return policy
+        return _standalone_policy(cls)
     config_name, field = owner.split(".")
     return getattr(getattr(cfg, config_name), field)
 

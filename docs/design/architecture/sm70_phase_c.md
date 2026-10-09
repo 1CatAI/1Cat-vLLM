@@ -568,3 +568,8 @@ omitted the now-lazy qualification imports. Both were corrected before
 acceptance. Native CPU/GPU build configuration initially lacked three unrelated
 CMake source files; the matching source files were supplied, then the normal
 `_C` target was rebuilt. These failures are not passing validation evidence.
+
+Standalone fullgraph admission is also covered: configuration construction is
+constant-folded outside tensor tracing only when no engine owner exists. Active
+engines bypass that compatibility path. A fullgraph CPU test alternates two
+engine forward contexts and verifies the selected policy does not leak.
