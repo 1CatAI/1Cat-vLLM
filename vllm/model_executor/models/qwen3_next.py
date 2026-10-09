@@ -468,6 +468,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             )
             final_hidden_states = final_hidden_states[:num_tokens]
 
+        if getattr(self, "sm70_hcx_packed_outputs", False):
+            # HCX consumes an owned two-plane TP payload at the next boundary.
+            return final_hidden_states
         return final_hidden_states.view(orig_shape)
 
 

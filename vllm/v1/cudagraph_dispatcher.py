@@ -422,22 +422,9 @@ class CudagraphDispatcher:
         self,
         batch_descriptor: BatchDescriptor,
     ) -> tuple[int, ...]:
-        if not batch_descriptor.uniform or batch_descriptor.num_reqs is None:
-            return ()
+        from vllm.sm70_profiles.cudagraph_policy import context_buckets_for_descriptor
 
-        if self.uniform_decode_query_len > 1:
-            if batch_descriptor.num_tokens == self.uniform_decode_query_len:
-                if "VLLM_SM70_MTP_CONTEXT_BUCKETS" in os.environ:
-                    return self.sm70_mtp_context_buckets
-                return self.sm70_dsv4_decode_context_buckets
-            return ()
-
-        buckets: set[int] = set()
-        if batch_descriptor.num_tokens == 1:
-            buckets.update(self.sm70_dsv4_decode_context_buckets)
-            buckets.update(self.sm70_fp8_kv_decode_context_buckets)
-
-        return tuple(sorted(buckets))
+        return context_buckets_for_descriptor(self, batch_descriptor)
 
     @property
     def has_attention_context_buckets(self) -> bool:
@@ -550,6 +537,8 @@ class CudagraphDispatcher:
                 if cudagraph_mode.mixed_mode() == CUDAGraphMode.PIECEWISE:
                     batch_desc = replace(batch_desc, num_reqs=None, uniform=False)
                 self.add_cudagraph_key(cudagraph_mode.mixed_mode(), batch_desc)
+                if cudagraph_mode.mixed_mode() == CUDAGraphMode.FULL:
+                    self._add_context_bucket_keys(batch_desc)
 
         # if decode cudagraph mode is FULL, and we don't already have mixed
         # mode full cudagraphs then add them here.

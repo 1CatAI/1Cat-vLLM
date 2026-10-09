@@ -5,6 +5,7 @@
 import copy
 from collections.abc import Iterable
 from itertools import islice
+from typing import Any
 
 import torch
 from torch import nn
@@ -429,6 +430,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
         if self.ple is not None:
+            from .ple_layer import snapshot_ple_diagnostic
+
+            diagnostic = self.ple._sm70_hcx_diagnostics
+            hidden_states = snapshot_ple_diagnostic(
+                hidden_states, self.ple.prefix + ":00_before_combine", diagnostic
+            )
             # PLE adds directly to the multi-stream state, so pending HC state
             # must be materialized before the addition.
             if prev_block_output is not None and prev_injection is not None:
@@ -437,6 +444,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 )
                 prev_block_output = prev_injection = None
 
+            hidden_states = snapshot_ple_diagnostic(
+                hidden_states, self.ple.prefix + ":01_after_combine", diagnostic
+            )
+
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
             hidden_states = hidden_states + self.ple(
@@ -444,6 +455,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 input_ids,
                 query_start_loc,
                 ngram_context,
+            )
+            hidden_states = snapshot_ple_diagnostic(
+                hidden_states, self.ple.prefix + ":09_after_add", diagnostic
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
@@ -490,6 +504,168 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
         mlp_out = self.mlp(block_input)
         return hidden_states, mlp_out, injection
+
+
+def enable_sm70_hcx(
+    model: nn.Module,
+    device: torch.device,
+    *,
+    fuse_output_projection: bool = True,
+    diagnostic: bool = False,
+) -> bool:
+    """Leave supported small-M outputs partial; retain larger-batch reductions."""
+    from .sm70_hcx import (
+        get_hcx_runtime,
+        pack_output_projection,
+        register_moe_runner,
+        register_output_projection,
+    )
+
+    runtime = get_hcx_runtime(device)
+    runtime.diagnostic = diagnostic
+    status: dict[str, Any] = dict(
+        enabled=False,
+        reason=runtime.reason,
+        scope="hc_operator_capability",
+        min_m=1,
+        max_m=8,
+        prepared_modules=0,
+        deferred_projections=0,
+        output_projection_policy="fused" if fuse_output_projection else "separate",
+        large_m_policy="original_projection_and_reduction",
+    )
+    model.sm70_hcx_status = status
+    if not runtime.enabled:
+        logger.info_once("SM70 HCX not admitted: %s.", runtime.reason)
+        return False
+    layers = [
+        layer for layer in model.layers if isinstance(layer, Qwen4ExpDecoderLayer)
+    ]
+    # A dense FFN already reduces its output. Keep its following HC on the
+    # original path, rather than changing the dense FFN's reduction policy.
+    previous_moe = False
+    modules = []
+    for layer in layers:
+        modules.append(layer.mlp_hyper_connection)
+        if previous_moe:
+            modules.append(layer.attn_hyper_connection)
+        previous_moe = isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
+    for module in modules:
+        down = getattr(module.input_mix_weight_down_block_inject, "weight", None)
+        up = getattr(module.input_mix_weight_up, "weight", None)
+        norm = module.hc_norm.weight
+        if not (
+            isinstance(down, torch.Tensor)
+            and isinstance(up, torch.Tensor)
+            and down.dtype == up.dtype == norm.dtype == torch.float16
+            and tuple(down.shape) == (336, 10240)
+            and tuple(up.shape) == (10240, 320)
+            and norm.numel() in (2560, 10240)
+        ):
+            status["reason"] = "requires_fp16_dense_hc_weights_and_norm"
+            logger.info_once("SM70 HCX not admitted: %s.", status["reason"])
+            return False
+    previous_moe = False
+    for layer in layers:
+        attention = (
+            layer.linear_attn.out_proj
+            if layer.layer_type == "linear_attention"
+            else layer.self_attn.o_proj
+        )
+        attention.reduce_results = False
+        planes = pack_output_projection(attention) if fuse_output_projection else None
+        width = getattr(attention, "input_size_per_partition", None)
+        if planes is not None and planes[0] != width:
+            logger.info_once(
+                "SM70 HCX o-proj fusion skipped: packed K %d != shard K %s.",
+                planes[0],
+                width,
+            )
+            planes = None
+        if planes is not None and planes[0] > attention.output_size:
+            planes = None
+        prefix = f"layer{layer.layer_idx}"
+        register_output_projection(prefix, attention, defer=planes is not None)
+        attention_module = (
+            layer.linear_attn
+            if layer.layer_type == "linear_attention"
+            else layer.self_attn
+        )
+        from functools import partial
+
+        from .sm70_hcx import partial_moe_output, partial_projection
+
+        attention_module.output_projection_override = partial(
+            partial_projection, prefix
+        )
+        # QSA still owns its model-specific projection dispatch.
+        attention_module.sm70_hcx_projection_name = prefix
+        if planes is not None:
+            layer.mlp_hyper_connection._hcx_oproj = (attention, *planes)
+            status["deferred_projections"] += 1
+        if isinstance(layer.mlp, Qwen4ExpSparseMoeBlock):
+            runner = layer.mlp.experts.runner
+            runner.output_transform = partial(partial_moe_output, prefix)
+            layer.mlp.sm70_hcx_packed_outputs = True
+            register_moe_runner(prefix, runner)
+        if previous_moe:
+            layer.attn_hyper_connection._hcx_moe_payload = True
+            layer.attn_hyper_connection.enable_partial_inputs(prefix + ".attn", runtime)
+            status["prepared_modules"] += 1
+        layer.mlp_hyper_connection.enable_partial_inputs(prefix + ".mlp", runtime)
+        status["prepared_modules"] += 1
+        previous_moe = isinstance(layer.mlp, Qwen4ExpSparseMoeBlock)
+    if previous_moe and model.hyper_connection_mixer is not None:
+        model.hyper_connection_mixer._hcx_moe_payload = True
+        model.hyper_connection_mixer.enable_partial_inputs("final")
+    status.update(enabled=True, reason=None)
+    logger.info_once("SM70 HCX loaded operator capability: %s.", str(status))
+    return True
+
+
+def _maybe_fuse_sm70_side_projections(model: nn.Module) -> None:
+    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import attach
+
+    fused = 0
+    for layer in model.layers:
+        if not isinstance(layer, Qwen4ExpDecoderLayer):
+            continue
+        if layer.layer_type == "linear_attention":
+            gdn = layer.linear_attn
+            if gdn.in_proj_ba is not None and attach(
+                gdn.in_proj_qkvz, gdn.in_proj_ba, "sm70_side_projection"
+            ):
+                gdn.input_projection_override = gdn.in_proj_qkvz.sm70_side_projection
+                fused += 1
+        else:
+            attn = layer.self_attn
+            if attach(
+                attn.qkv_proj, attn.indexer.index_qk_proj, "sm70_side_projection"
+            ):
+                attn.sm70_side_projection = attn.qkv_proj.sm70_side_projection
+                fused += 1
+    logger.info_once("SM70 fused side projections attached to %d layers.", fused)
+
+
+def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) -> None:
+    if vllm_config.kernel_config.sm70_fused_side_projections:
+        _maybe_fuse_sm70_side_projections(model)
+    kernel_config = vllm_config.kernel_config
+    if not (kernel_config.sm70_hcx or kernel_config.sm70_top1x):
+        return
+    device = next(model.parameters()).device
+    from .sm70_hcx import get_hcx_runtime
+
+    runtime = get_hcx_runtime(device)
+    runtime.top1_enabled = bool(kernel_config.sm70_top1x and runtime.enabled)
+    if kernel_config.sm70_hcx:
+        enable_sm70_hcx(
+            model,
+            device,
+            fuse_output_projection=kernel_config.sm70_hcx_output_projection,
+            diagnostic=kernel_config.sm70_hcx_diagnostics,
+        )
+        kernel_config.collective_kernel_selections["hcx:target"] = model.sm70_hcx_status
 
 
 class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
@@ -1160,6 +1336,7 @@ class Qwen4ExpForCausalLM(
                     self.vllm_config.kernel_config.qsa_auto_e4m3_active
                 ),
             )
+        _maybe_enable_sm70_peer_paths(self.vllm_config, self.model)
         return loaded
 
 
@@ -1376,6 +1553,9 @@ class Qwen4ExpForConditionalGeneration(
             require_calibrated_target=(
                 self.language_model.vllm_config.kernel_config.qsa_auto_e4m3_active
             ),
+        )
+        _maybe_enable_sm70_peer_paths(
+            self.language_model.vllm_config, self.language_model.model
         )
         return loaded
 

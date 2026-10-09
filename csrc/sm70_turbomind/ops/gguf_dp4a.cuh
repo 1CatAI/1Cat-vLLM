@@ -35,7 +35,7 @@ __device__ __forceinline__ uint32_t load_u32_2(const uint8_t* p) {
 
 // Shared by dense and routed kernels. Only integer codebook values reach
 // dp4a; original weight and activation scales are applied after the dot.
-template <int Type>
+template <int Type, bool BankAware = false>
 struct LatticeDot {
   static_assert(Type == 18 || Type == 21 || Type == 22);
   using Book = turbomind::gemm::LatticeCodebook<Type>;
@@ -43,14 +43,34 @@ struct LatticeDot {
   static constexpr int kBlockBytes = Type == 18 ? 98 : Type == 21 ? 110 : 82;
 
   __device__ static void initialize(uint32_t* book, uint32_t* masks) {
-    for (int i = threadIdx.x; i < kBookWords; i += blockDim.x)
-      book[i] = Book::word(i) ^ 0x80808080U;
-    if (threadIdx.x < 16) {
+    for (int i = threadIdx.x; i < kBookWords; i += blockDim.x) {
+      // IQ2 entries have two words. Separate their planes so each lookup
+      // can address all 32 banks, rather than only even or odd banks.
+      const int slot =
+          BankAware && Type == 22 ? (i / 2 + (i % 2) * (kBookWords / 2)) : i;
+      book[slot] = Book::word(i) ^ 0x80808080U;
+    }
+    if (!BankAware && threadIdx.x < 16) {
       const int s = threadIdx.x;
       masks[s] = ((s & 1) ? 0x000000ffU : 0) | ((s & 2) ? 0x0000ff00U : 0) |
                  ((s & 4) ? 0x00ff0000U : 0) | ((s & 8) ? 0xff000000U : 0);
     }
     __syncthreads();
+  }
+
+  __device__ static uint32_t sign_mask(int nibble) {
+    // Spread the four bits into byte sign positions, then sign-extend each
+    // byte with PRMT. __byte_perm clears selector sign bits; use PTX here.
+    const uint32_t bits = uint32_t(nibble) * 0x10204080U;
+    uint32_t mask;
+    asm("prmt.b32 %0, %1, 0, 0xba98;" : "=r"(mask) : "r"(bits));
+    return mask;
+  }
+
+  __device__ static uint32_t word(const uint32_t* book, int index) {
+    if constexpr (BankAware && Type == 22)
+      return book[index / 2 + (index % 2) * (kBookWords / 2)];
+    return book[index];
   }
 
   __device__ static float dot(const uint8_t* row, int group, const Q8_1& x,
@@ -91,9 +111,10 @@ struct LatticeDot {
       } else {
         sign = (signs >> (8 * octet)) & 255;
       }
-      const uint32_t s0 = masks[sign & 15], s1 = masks[sign >> 4];
-      const int w0 = __vsub4(book[first] ^ s0, s0);
-      const int w1 = __vsub4(book[second] ^ s1, s1);
+      const uint32_t s0 = BankAware ? sign_mask(sign & 15) : masks[sign & 15];
+      const uint32_t s1 = BankAware ? sign_mask(sign >> 4) : masks[sign >> 4];
+      const int w0 = __vsub4(word(book, first) ^ s0, s0);
+      const int w1 = __vsub4(word(book, second) ^ s1, s1);
       if constexpr (Type == 22) {
         if (octet < 2) {
           sum0 = __dp4a(w0, activation[2 * octet], sum0);
@@ -124,6 +145,62 @@ struct LatticeDot {
   }
 };
 using IQ3SDot = LatticeDot<21>;
+
+// Lossless scalar LUT expansion avoids the correlated codebook in shared
+// memory. Records preserve the source base and integer subscales, so dot
+// arithmetic and the final FP16 boundary remain the same as LatticeDot.
+template <int Type>
+struct SignedLutDot {
+  static_assert(Type == 18 || Type == 21 || Type == 22);
+  static constexpr int kBookWords = 1;
+  __device__ static void initialize(uint32_t*, uint32_t*) { __syncthreads(); }
+  __host__ __device__ static constexpr int value(int i) {
+    if constexpr (Type == 21) return 2 * i - 15;
+    if constexpr (Type == 18) {
+      const int levels[16] = {-62, -52, -44, -36, -28, -20, -12, -4,
+                              4,   12,  20,  28,  36,  44,  52,  62};
+      return levels[i];
+    }
+    const int levels[16] = {-43, -25, -8, 8, 25, 43};
+    return levels[i];
+  }
+  __host__ __device__ static constexpr uint32_t table(int start) {
+    uint32_t word = 0;
+    for (int i = 0; i < 4; ++i)
+      word |= uint32_t(value(start + i) + 128) << (8 * i);
+    return word;
+  }
+  __device__ static uint32_t decode(uint32_t nibbles) {
+    const uint32_t selector = nibbles & 0x7777U;
+    const uint32_t low = __byte_perm(table(0), table(4), selector);
+    const uint32_t high = __byte_perm(table(8), table(12), selector);
+    return __byte_perm(low, high, ((nibbles & 0x8888U) >> 1) | 0x3210U) ^
+           0x80808080U;
+  }
+  __device__ static float dot(const uint8_t* row, int group, const Q8_1& x,
+                              const uint32_t*, const uint32_t*) {
+    const uint8_t* b = row + group * 20;
+    const auto* activation = reinterpret_cast<const int*>(x.qs);
+    int sum0 = 0, sum1 = 0;
+#pragma unroll
+    for (int fragment = 0; fragment < 4; ++fragment) {
+      const uint32_t packed = reinterpret_cast<const uint32_t*>(b)[fragment];
+      int& sum = Type == 22 && fragment >= 2 ? sum1 : sum0;
+      const int low = static_cast<int>(decode(packed));
+      const int high = static_cast<int>(decode(packed >> 16));
+      sum = __dp4a(low, activation[2 * fragment], sum);
+      sum = __dp4a(high, activation[2 * fragment + 1], sum);
+    }
+    const float d = __half2float(*reinterpret_cast<const half*>(b + 16)) *
+                    __low2float(x.ds);
+    if constexpr (Type == 18)
+      return d * (float(sum0) * float(b[18]) * .25f);
+    else if constexpr (Type == 21)
+      return d * float(sum0 * b[18]);
+    else
+      return d * float(sum0 * b[18] + sum1 * b[19]) * .125f;
+  }
+};
 
 // Existing N32/K8 storage handles TP boundaries inside Q2_0's source K64
 // blocks without expanded FP16 weights or a second layout. Its scale and

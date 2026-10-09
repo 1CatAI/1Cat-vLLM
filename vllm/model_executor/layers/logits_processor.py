@@ -215,6 +215,9 @@ class LogitsProcessor(PluggableLayer):
         # Whether to use gather or all-gather to gather the logits.
         self.use_all_gather = current_platform.use_all_gather()
         cfg = get_current_vllm_config_or_none()
+        self._top1_exchange = (
+            cfg.kernel_config.top1_exchange_callback() if cfg else None
+        )
         self._packed_topk_enabled = (
             cfg is not None and cfg.kernel_config.sm70_packed_topk_gather
         )
@@ -378,6 +381,10 @@ class LogitsProcessor(PluggableLayer):
                 [local_max_vals.float(), global_indices.float()], dim=-1
             )
         _maybe_sync_top1_all_gather(self, local_pair)
+        if self._top1_exchange is not None:
+            exchanged_tokens = self._top1_exchange(local_pair)
+            if exchanged_tokens is not None:
+                return exchanged_tokens
         custom_top_tokens = self._maybe_custom_top1_argmax(local_pair)
         if custom_top_tokens is not None:
             self._maybe_dump_top_token_margin(

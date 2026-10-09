@@ -480,6 +480,19 @@ class CudaGraphManager:
         self.graphs[desc].replay()
 
 
+def _qsa_dense_short_context_budget(vllm_config: VllmConfig) -> int | None:
+    """Indexer budget when QSA may attend densely within it, else None."""
+    kernel_config = getattr(vllm_config, "kernel_config", None)
+    if not getattr(kernel_config, "qsa_dense_short_context", False):
+        return None
+    model_config = getattr(vllm_config, "model_config", None)
+    text_config = (
+        model_config.hf_config.get_text_config() if model_config is not None else None
+    )
+    budget = getattr(text_config, "indexer_budget", None)
+    return int(budget) if budget else None
+
+
 class ModelCudaGraphManager(CudaGraphManager):
     """CudaGraphManager with model-specific capture and hidden state management."""
 
@@ -559,10 +572,47 @@ class ModelCudaGraphManager(CudaGraphManager):
                     served or "unknown",
                     scope="process",
                 )
+        self._qsa_short_graphs: dict[
+            BatchExecutionDescriptor, BatchExecutionDescriptor
+        ] = {}
+        budget = _qsa_dense_short_context_budget(vllm_config)
+        if budget is not None:
+            descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+            for desc in list(descs):
+                # Uniform MTP verification batches only: every request holds
+                # exactly decode_query_len tokens.
+                if (
+                    desc.attention_context_bucket is None
+                    and desc.num_reqs is not None
+                    and desc.uniform_token_count == self.decode_query_len
+                    and desc.num_tokens == desc.num_reqs * self.decode_query_len
+                ):
+                    variant = replace(desc, attention_context_bucket=budget)
+                    self._qsa_short_graphs[desc] = variant
+                    descs.append(variant)
+            logger.info_once(
+                "QSA short-context graph variants captured at bound=%d for %d "
+                "decode batch shapes.",
+                budget,
+                len(self._qsa_short_graphs),
+                scope="process",
+            )
 
     def select_attention_graph(
         self, desc: BatchExecutionDescriptor, cpu_upper_bounds: torch.Tensor
     ) -> BatchExecutionDescriptor:
+        short = self._qsa_short_graphs.get(desc)
+        if (
+            short is not None
+            and short in self.graphs
+            and short.attention_context_bucket is not None
+            and cpu_upper_bounds.device.type == "cpu"
+            and cpu_upper_bounds.ndim == 1
+            and desc.num_reqs is not None
+            and 0 < cpu_upper_bounds.numel() <= desc.num_reqs
+            and 0 < int(cpu_upper_bounds.max()) <= short.attention_context_bucket
+        ):
+            return short
         variant = self._long_attention_graphs.get(desc)
         if variant is None or variant not in self.graphs:
             return desc

@@ -454,6 +454,12 @@ class Sm70GgufConfig:
     q8_expert_intermediate: bool = True
     """Encode routed intermediates once in qualified integer expert gate/up."""
 
+    grouped_mma_gate_up: bool = False
+    """Run routed IQ3 gate/up at M1..8 as expert-grouped FP16 MMA on repacked planes."""
+
+    grouped_mma_release_raw: bool = True
+    """Free the original-block IQ3 gate/up banks once the MMA planes replace them."""
+
     prefill_min_m: int = 8
     """Use dequantization plus tensor-core FP16 GEMM from this token count."""
 
@@ -472,7 +478,7 @@ class Sm70RingConfig:
     enabled: bool = True
     """Admit the ring operator when topology and peer atomics are supported."""
 
-    max_bytes: int = Field(default=25600, gt=0, le=25600)
+    max_bytes: int = Field(default=25600, gt=0, le=102400)
     """Largest calibrated input payload; larger messages retain NCCL."""
 
 
@@ -599,6 +605,9 @@ class KernelConfig:
     sm70_ring: Sm70RingConfig = Field(default_factory=Sm70RingConfig)
     """SM70 ring collective policy, resolved from actual peer capabilities."""
 
+    hc_ll_optimized_loads: bool = True
+    """Prefetch HC down weights and pad the up shared-memory rows on SM70."""
+
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
     collective_kernel_selections: dict[str, Any] = Field(
@@ -630,6 +639,52 @@ class KernelConfig:
         default_factory=dict, init=False, repr=False
     )
     """Observed selector decisions for loaded local layouts; diagnostic only."""
+
+    sm70_fused_side_projections: bool = False
+    """Compute the GDN a/b and QSA indexer q/k FP16 projections inside the
+    small-M GGUF input projection launch (packed dense_mv planes)."""
+
+    sm70_qsa_prep: bool = False
+    """Fuse QSA q/k GemmaRMSNorm, partial NeoX RoPE and the FP16 K/V cache
+    write into one SM70 launch for decode batches."""
+
+    sm70_draft_hot_vocab: int = 0
+    """Greedy MTP drafts choose among this many lowest token ids (BPE merge
+    order) spread evenly across TP ranks; 0 keeps the full vocabulary. Only
+    the draft proposal changes; verification still uses the full head."""
+
+    sm70_draft_single_graph: bool = False
+    """Capture all MTP draft decode steps, including their slot mappings and
+    attention metadata, as one CUDA graph instead of one replay per step."""
+
+    sm70_top1x: bool = False
+    """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
+    instead of an all-gather."""
+
+    sm70_greedy_verify: bool = False
+    """Verify greedy MTP drafts from TP-local target argmax pairs instead of
+    gathering full-vocabulary logits for the rejection sampler."""
+
+    sm70_gdn_verify: bool = False
+    """Run single-request MTP GDN verification with the SM70 sequential CUDA
+    recurrence instead of the Triton fused kernel."""
+
+    sm70_hcx: bool = False
+    """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
+    HC down and HC up as one SM70 kernel for verification batches up to 8."""
+
+    sm70_hcx_output_projection: bool = True
+    """Fuse eligible output projections into HCX when HCX is enabled. Disable
+    to compare the separate projection and HC boundary with identical weights."""
+
+    sm70_hcx_diagnostics: bool = False
+    """Record M5 HCX inputs and outputs in owned graph buffers for numerical
+    diagnosis. Requires separate output projections; timings are diagnostic."""
+
+    qsa_dense_short_context: bool = False
+    """Attend densely, without index selection, in context-bucketed decode graphs
+    whose bucket does not exceed the indexer budget (where QSA selects every
+    visible token)."""
 
     qsa_auto_e4m3: bool = True
     """Default eligible calibrated QSA caches to E4M3 without speculation."""
@@ -689,6 +744,32 @@ class KernelConfig:
         if isinstance(value, str):
             return value.lower().replace("-", "_")
         return value
+
+    @property
+    def capture_all_draft_steps(self) -> bool:
+        """Policy consumed by the generic multistep draft graph manager."""
+        return self.sm70_draft_single_graph
+
+    def top1_exchange_callback(self):
+        if not self.sm70_top1x:
+            return None
+        from vllm.models.qwen4_exp.nvidia.sm70_hcx import maybe_top1_exchange
+
+        return maybe_top1_exchange
+
+    def gdn_verification_callback(self):
+        if not self.sm70_gdn_verify:
+            return None
+        from vllm.model_executor.layers.mamba.gdn.sm70_verify import native_verifier
+
+        return native_verifier()
+
+    def sample_greedy(self, *args):
+        from vllm.v1.worker.gpu.spec_decode.sm70_greedy_verify import (
+            maybe_sample_greedy,
+        )
+
+        return maybe_sample_greedy(*args)
 
     def compute_hash(self) -> str:
         """

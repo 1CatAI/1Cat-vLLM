@@ -55,7 +55,6 @@ from vllm.model_executor.warmup.sm70_runtime import (
     warmup_v2_convolution,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
@@ -1237,29 +1236,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cached_logits = sparse_result
             else:
                 sampler_output = sparse_result
-        sm70_greedy_decode = (
-            sampler_output is None
-            and input_batch.num_draft_tokens == 0
-            and input_batch.num_reqs == 1
-            and input_batch.num_tokens == 1
-            and not input_batch.is_prefilling_np[0]
-            and grammar_output is None
-            and self.device.type == "cuda"
-            and current_platform.is_device_capability(70)
-            and getattr(self, "lora_config", None) is None
-            and hasattr(self.model, "get_top_tokens")
-            and self.sampler is not None
-            and self.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
+        sampler_output = self.vllm_config.kernel_config.sample_greedy(
+            self,
+            sample_hidden_states,
+            input_batch,
+            grammar_output,
+            sampler_output,
+            cached_logits,
         )
-        if sm70_greedy_decode:
-            sampled = self.model.get_top_tokens(sample_hidden_states)
-            sampler_output = SamplerOutput(
-                sampled_token_ids=sampled.view(-1, 1),
-                logprobs_tensors=None,
-                num_nans=None,
-                num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
-            )
-            logger.info_once("SM70 MRv2 greedy TP-local pair path enabled.")
         if sampler_output is None:
             logits = (
                 cached_logits.logits

@@ -946,6 +946,11 @@ class MoERunner(MoERunnerInterface):
             self.layer_name,
         )
 
+        output_transform = getattr(self, "output_transform", None)
+        if output_transform is not None:
+            result = output_transform(shared_output, fused_output, og_hidden_dim)
+            return self._maybe_add_zero_expert_output(result)
+
         result = self._maybe_sm70_moe_sum2_allreduce(
             shared_output, fused_output, og_hidden_dim
         )
