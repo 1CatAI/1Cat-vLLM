@@ -61,7 +61,7 @@ part of the contract.
 | D1 registry and ledger | Merged [#1141](https://github.com/1CatAI/1Cat-vLLM/pull/1141); CI passed | Static inventory, structured deprecation metadata, shared registration scanner and explicit-input warn-once support. This establishes visibility; it does not claim execution consumers migrated. |
 | D2 GDN and speculation | Merged [#1143](https://github.com/1CatAI/1Cat-vLLM/pull/1143); CI passed | CPU isolation/compatibility, 17 GPU operator cases and matched A/B passed. |
 | D3 diagnostics | Merged [#1146](https://github.com/1CatAI/1Cat-vLLM/pull/1146); CI passed | Shared diagnostic owner, 74 initialized parameters, legacy typed MoE bridge, CPU isolation and 7 GPU cases plus matched operator A/B. |
-| D4a attention package | Validation and self-review | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
+| D4a attention package | Validated [#1148](https://github.com/1CatAI/1Cat-vLLM/pull/1148) | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
 | D4b FA2/79T resources | Pending, next main-based delivery | Remaining native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build. D4 is not closed by D4a. |
 | D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
 | D6 closure | Pending | Complete evidence audit, remaining-name ownership, report and execution-time read guards. |
@@ -334,5 +334,19 @@ The broader GPU-host policy suite initially stopped because its task directory
 lacked the unchanged normal FA2 library; that test setup failure is retained
 in `gpu-final.log`. CPU source review also exposed older test fixtures patching
 retired getters or omitting the new observability owner; those fixtures now
-exercise resolved policies. Final validation totals and artifact identities are
-recorded with the PR after the remaining focused checks finish.
+exercise resolved policies. Final validation passed 227 operator, routing and synthetic metadata cases on
+54633, including all 22 bound native/runtime cases. CPU checks passed 198
+configuration/default/worker cases, 69 prefill/resource cases, 58 focused
+configuration/report cases and 24 final policy/metadata cases; these overlapping
+suites are not added together. All changed-file pre-commit hooks passed.
+
+A subsequent worker-transfer check passed 20 focused cases after adding the
+resource-map transfer rule: live owners are omitted from serialization, so a
+worker creates fresh handles and budgets from the transferred configuration.
+This check includes an intentionally unserializable parent handle and verifies
+that neither the handle nor parent diagnostic counts reaches the worker.
+The final GPU run used the normal rebuilt attention extension plus the unchanged
+normal FA2 dependency; its log/XML and source archives remain in the task
+artifact directory. A legacy atexit route-summary logger writes to pytest’s
+already closed captured stream after the successful suite; this did not affect
+assertions or process exit status.

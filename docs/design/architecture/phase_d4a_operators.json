@@ -736,5 +736,26 @@
     ],
     "rpath_or_runpath": [],
     "raw_dependency_report": "native-artifact.json in the retained artifact directory"
+  },
+  "validation": {
+    "gpu_host_suite": {
+      "passed": 227,
+      "log": "gpu-final-v3.log",
+      "xml": "gpu-final-v3.xml",
+      "includes_bound_runtime_cases": 22
+    },
+    "cpu_suites": {
+      "configuration_and_worker": 198,
+      "prefill_and_resource": 69,
+      "focused_configuration_report": 58,
+      "final_policy_metadata": 24,
+      "worker_owner_transfer": 20
+    },
+    "counts_overlap": true,
+    "checks": "all applicable changed-file pre-commit hooks passed",
+    "limitations": [
+      "Legacy atexit logger emits a closed-pytest-stream logging error after the successful suite; exit status remains zero.",
+      "FA2/79T native policy/workspaces remain the next delivery."
+    ]
   }
 }
