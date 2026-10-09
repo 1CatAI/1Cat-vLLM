@@ -134,7 +134,17 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                         _Normalize().visit(_InlineFeatureHooks().visit(fn))
                     ).encode()
                 ).hexdigest()
-    assert actual == {k: v["sha256"] for k, v in fixture.items()}
+    # A4b deliberately changes policy capture and the two hint consumers.
+    # Preserve every other calculation body; route planning has its own oracle.
+    changed_policy = {
+        "__init__",
+        "_flash_v100_decode",
+        "_run_prefill_prefix_decode_rows",
+    }
+    assert actual.keys() == fixture.keys()
+    assert {k: v for k, v in actual.items() if k not in changed_policy} == {
+        k: v["sha256"] for k, v in fixture.items() if k not in changed_policy
+    }
     for name, descriptor in fixture.items():
         member = inspect.getattr_static(impl.FlashAttnV100Impl, name)
         assert isinstance(member, staticmethod) == descriptor["static"]

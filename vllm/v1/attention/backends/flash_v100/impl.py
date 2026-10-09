@@ -216,6 +216,13 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             self.use_decode_xqa
             and os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", "1") == "1"
         )
+        self.decode_strategy = _routing.resolve_decode_strategy(
+            self.kv_codec,
+            self.flash_attn_decode_paged_xqa,
+            enabled=self.use_decode_xqa
+            and self.head_size == 256
+            and self.num_heads == 6 * self.num_kv_heads,
+        )
         ATTENTION_HOOKS.configure_verifier(self)
         decode_scalar_paged_env = os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
         self.use_decode_scalar_paged = decode_scalar_paged_env != "0"

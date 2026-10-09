@@ -14,6 +14,7 @@ import regex as re
 import torch
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.triton_attn import (
@@ -268,6 +269,13 @@ _declare(
     head_dims=(256,),
 )
 _declare("prefill_prefix_fp8_e4m3_bridge", "prefill", codecs=frozenset((FP8_E4M3,)))
+_declare(
+    "decode_strategy_legacy_revision",
+    "decode",
+    codecs=frozenset((FP8_E4M3,)),
+    fallback=True,
+    observer=True,
+)
 _declare("prefill_prefix_fp8_e5m2_bridge", "prefill", codecs=frozenset((FP8_E5M2,)))
 _declare(
     "prefill_no_prefix_dense_flash prefill_no_prefix_paged_cache_flash "
@@ -500,11 +508,32 @@ def _decode_partition_size_for_metadata(
     return value
 
 
+def resolve_decode_strategy(
+    codec: KVCodec | None, operator, *, enabled: bool
+) -> Literal["shared", "legacy"]:
+    """Capture the requested/effective policy once, before graph construction."""
+    cfg = get_current_vllm_config_or_none()
+    requested = cfg.kernel_config.sm70_decode_strategy if cfg is not None else "shared"
+    if requested == "legacy":
+        return "legacy"
+    if codec is not FP8_E4M3:
+        return "shared"
+    if not enabled or operator is None:
+        return "legacy"
+    revision = getattr(operator, "shared_decode_strategy_revision", 0)
+    if isinstance(revision, int) and revision >= 1:
+        return "shared"
+    _record_route(ROUTE_SPECS["decode_strategy_legacy_revision"].name)
+    return "legacy"
+
+
 def _g6_aligned_page_partition_size_hint(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     kv_cache_dtype: str,
+    *,
+    strategy: Literal["shared", "legacy"] = "legacy",
 ) -> int | None:
     if os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE") is not None:
         return None
@@ -527,11 +556,14 @@ def _g6_aligned_page_partition_size_hint(
     codec = resolve_kv_codec(kv_cache_dtype)
     if codec is None or not codec.stores(key_cache, value_cache):
         return None
-    if codec is FP16 and key_cache.shape[1] == 784:
+    if codec is FP16 or (codec is FP8_E4M3 and strategy == "shared"):
+        # Share shape planning, while retaining each codec's actual storage and
+        # partial precision. The native launch/reducer accepts PARTIAL_T;
+        # E4M3 must keep its mandatory FP32 workspace.
         # The exact FP16 page-784 graph contains p256 and p1024 nodes and
         # selects between them from device seq_lens. Plan the p256 workspace
         # envelope once.
-        return 256
+        return 256 if key_cache.shape[1] == 784 else None
     if codec is FP8_E4M3:
         # Plan a p64 workspace envelope. The native G6 path keeps this captured
         # shape while selecting p64/p256 and long wave partitions from device
