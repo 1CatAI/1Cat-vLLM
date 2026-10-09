@@ -22,6 +22,26 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.spec_decode.eagle import speculator as eagle_speculator
 
 
+def test_mtp_target_hooks_fall_back_to_normal_sampling() -> None:
+    # These hooks are called by MRV2 after the first target forward, including
+    # for MTP/Eagle implementations that do not customize target sampling.
+    speculator = eagle_speculator.EagleSpeculator.__new__(
+        eagle_speculator.EagleSpeculator
+    )
+    input_batch = SimpleNamespace()
+    hidden_states = torch.ones(1, 4)
+    assert speculator.prepare_target_context(input_batch, hidden_states, None) is None
+    assert (
+        speculator.try_sample_target(
+            None, None, hidden_states, input_batch, None, allow_graph=True
+        )
+        is None
+    )
+    speculator.trace_target_logits(hidden_states, input_batch, None)
+    speculator.trace_target_output(input_batch, None, None, None, hidden_states, None)
+    torch.testing.assert_close(hidden_states, torch.ones(1, 4), rtol=0, atol=0)
+
+
 def test_qsa_request_count_is_not_a_triton_compile_key() -> None:
     for kernel in (
         qsa_ops._qsa_mqa_paged_kernel,

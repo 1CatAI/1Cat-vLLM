@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class BaseSpeculator(ABC):
+class TargetSamplingHooks:
     def prepare_target_context(
         self,
         input_batch: InputBatch,
@@ -65,6 +65,8 @@ class BaseSpeculator(ABC):
     ) -> None:
         return None
 
+
+class BaseSpeculator(TargetSamplingHooks, ABC):
     @abstractmethod
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         pass
