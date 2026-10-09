@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 30
     env:
       GLOO_SOCKET_IFNAME: lo0
+      USE_LIBUV: "0"
 
     steps:
       - uses: actions/checkout@v6.0.1
@@ -53,7 +54,9 @@ jobs:
           import torch.distributed as dist
 
           timeout = timedelta(seconds=30)
-          store = dist.TCPStore("127.0.0.1", 0, 1, True, timeout)
+          store = dist.TCPStore(
+              "127.0.0.1", 0, 1, True, timeout, use_libuv=False
+          )
           dist.init_process_group(
               "gloo", store=store, rank=0, world_size=1, timeout=timeout
           )
