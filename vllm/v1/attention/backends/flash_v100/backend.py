@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
-import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import impl as _impl
 from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 from vllm.v1.attention.backends.triton_attn import (
@@ -35,7 +35,7 @@ class FlashAttnV100Backend(TritonAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        if envs.VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16:
+        if _config.registered("VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16"):
             return [16]
         return TritonAttentionBackend.get_supported_kernel_block_sizes()
 

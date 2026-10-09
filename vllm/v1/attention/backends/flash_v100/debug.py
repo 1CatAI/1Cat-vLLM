@@ -4,18 +4,16 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.flash_v100 import config as _config
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
 def _sm70_profile_trace(message: str, *args: object) -> None:
-    if envs.VLLM_SM70_PROFILE_TRACE:
+    if _config.registered("VLLM_SM70_PROFILE_TRACE"):
         if args:
             message = message % args
         logger.info("SM70 Flash-V100 trace: %s", message)
@@ -25,27 +23,27 @@ _draft_graph_debug_counts: dict[str, int] = {}
 
 
 def _draft_graph_debug_enabled() -> bool:
-    return os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG", "0") == "1"
+    return _config.raw("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG", "0") == "1"
 
 
 def _draft_graph_debug_limit() -> int:
-    return int(os.getenv("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT", "12"))
+    return int(_config.raw("VLLM_FLASH_V100_DRAFT_GRAPH_DEBUG_LIMIT", "12"))
 
 
 def _dflash_prefix_dump_enabled() -> bool:
-    return os.getenv("VLLM_FLASH_V100_DFLASH_PREFIX_DUMP", "0") == "1"
+    return _config.raw("VLLM_FLASH_V100_DFLASH_PREFIX_DUMP", "0") == "1"
 
 
 def _dflash_ddtree_triton_branch_attn_enabled() -> bool:
-    return os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN", "1") != "0"
+    return _config.raw("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN", "1") != "0"
 
 
 def _dflash_ddtree_triton_branch_attn_strict() -> bool:
-    return os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT", "0") == "1"
+    return _config.raw("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT", "0") == "1"
 
 
 def _dflash_ddtree_worker_profile_enabled() -> bool:
-    return os.getenv("VLLM_DFLASH_DDTREE_WORKER_PROFILE", "0") == "1"
+    return _config.raw("VLLM_DFLASH_DDTREE_WORKER_PROFILE", "0") == "1"
 
 
 def _format_tensor_debug(tensor: torch.Tensor | None, name: str) -> str:

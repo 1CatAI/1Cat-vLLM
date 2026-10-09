@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
 from vllm.v1.attention.backends.flash_v100.spec import (
     builder,
     draft,
@@ -39,15 +40,7 @@ class SpecMetadataMethods:
     _is_dflash_draft_model: bool
     _is_dflash_selector_target: bool
     _use_sm70_dflash2_fused_smallq_metadata: bool
-    _draft_block_table: torch.Tensor | None
-    _draft_seq_lens: torch.Tensor | None
-    _draft_query_start_loc: torch.Tensor | None
-    _flash_draft_buffer_shape: tuple[int, int] | None
-    _smallq_decode_block_table: torch.Tensor | None
-    _smallq_decode_seq_lens: torch.Tensor | None
-    _smallq_query_start_loc: torch.Tensor | None
-    _smallq_token_indices: torch.Tensor | None
-    _smallq_buffer_shape: tuple[int, int, int] | None
+    metadata_workspace: _workspace.MetadataWorkspace
 
     _attach_ddtree_metadata = tree._attach_ddtree_metadata
     _debug_draft_metadata = draft._debug_draft_metadata

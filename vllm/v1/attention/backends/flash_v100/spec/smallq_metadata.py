@@ -489,19 +489,21 @@ def prepare_dflash2_smallq_group_metadata(
             not builder._use_sm70_dflash2_fused_smallq_metadata
             or group_id < 0
             or group_id >= len(block_tables)
-            or builder._smallq_decode_block_table is None
-            or builder._smallq_decode_seq_lens is None
-            or builder._smallq_query_start_loc is None
-            or builder._smallq_buffer_shape is None
+            or builder.metadata_workspace.smallq.block_table is None
+            or builder.metadata_workspace.smallq.seq_lens is None
+            or builder.metadata_workspace.smallq.query_start_loc is None
+            or builder.metadata_workspace.smallq.shape is None
         ):
             fallback("builder route or persistent buffers")
             return None
 
         input_table = block_tables[group_id]
-        output_table = builder._smallq_decode_block_table
-        output_seq = builder._smallq_decode_seq_lens
-        output_query = builder._smallq_query_start_loc
-        token_capacity, req_capacity, builder_block_cols = builder._smallq_buffer_shape
+        output_table = builder.metadata_workspace.smallq.block_table
+        output_seq = builder.metadata_workspace.smallq.seq_lens
+        output_query = builder.metadata_workspace.smallq.query_start_loc
+        token_capacity, req_capacity, builder_block_cols = (
+            builder.metadata_workspace.smallq.shape
+        )
         input_block_cols = int(input_table.shape[1])
         if (
             input_table.device != seq_lens.device
@@ -526,7 +528,7 @@ def prepare_dflash2_smallq_group_metadata(
                 f"input_dtype={input_table.dtype}, input_device={input_table.device}, "
                 f"input_stride={input_table.stride()}, "
                 f"input_contiguous={input_table.is_contiguous()}, "
-                f"buffer_shape={builder._smallq_buffer_shape}, "
+                f"buffer_shape={builder.metadata_workspace.smallq.shape}, "
                 f"output_dtype={output_table.dtype}, "
                 f"output_stride={output_table.stride()}, "
                 f"output_contiguous={output_table.is_contiguous()}, "

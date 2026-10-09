@@ -4,14 +4,16 @@
 
 from __future__ import annotations
 
-import os
+from dataclasses import fields
+from types import SimpleNamespace
+from typing import cast
 
 import torch
 
-import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import debug_compare as _debug_compare
 from vllm.v1.attention.backends.flash_v100 import decode as _decode
@@ -48,6 +50,78 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
+    allow_triton_fallback = _config.ConfigField[bool]("allow_triton_fallback")
+    compare_bhmd_out_dir = _config.ConfigField[str | None]("compare_bhmd_out_dir")
+    compare_bhmd_out_max_calls = _config.ConfigField[int]("compare_bhmd_out_max_calls")
+    compare_triton_out_dir = _config.ConfigField[str | None]("compare_triton_out_dir")
+    compare_triton_out_max_calls = _config.ConfigField[int](
+        "compare_triton_out_max_calls"
+    )
+    compare_triton_tensor_dump_dir = _config.ConfigField[str | None](
+        "compare_triton_tensor_dump_dir"
+    )
+    compare_triton_tensor_dump_max_tokens = _config.ConfigField[int](
+        "compare_triton_tensor_dump_max_tokens"
+    )
+    decode_strategy = _config.ConfigField[str]("decode_strategy")
+    prefill_bfla_mask_block_n = _config.ConfigField[int]("prefill_bfla_mask_block_n")
+    prefill_bfla_min_kv = _config.ConfigField[int]("prefill_bfla_min_kv")
+    prefill_bfla_min_q = _config.ConfigField[int]("prefill_bfla_min_q")
+    prefill_contig_dense_allow_copy = _config.ConfigField[bool](
+        "prefill_contig_dense_allow_copy"
+    )
+    prefill_contig_dense_min_kv = _config.ConfigField[int](
+        "prefill_contig_dense_min_kv"
+    )
+    prefill_contig_dense_min_q = _config.ConfigField[int]("prefill_contig_dense_min_q")
+    prefill_gather_dense_min_kv = _config.ConfigField[int](
+        "prefill_gather_dense_min_kv"
+    )
+    prefill_gather_dense_min_q = _config.ConfigField[int]("prefill_gather_dense_min_q")
+    prefill_split_kv_max_q = _config.ConfigField[int]("prefill_split_kv_max_q")
+    prefill_split_kv_min_kv = _config.ConfigField[int]("prefill_split_kv_min_kv")
+    prefill_split_kv_min_q = _config.ConfigField[int]("prefill_split_kv_min_q")
+    prefill_split_kv_tokens = _config.ConfigField[int]("prefill_split_kv_tokens")
+    prefix_anchored_decode_window = _config.ConfigField[int | None](
+        "prefix_anchored_decode_window"
+    )
+    smallq_decode_max_model_len = _config.ConfigField[int](
+        "smallq_decode_max_model_len"
+    )
+    smallq_decode_max_query_len = _config.ConfigField[int](
+        "smallq_decode_max_query_len"
+    )
+    use_decode_dense_cache = _config.ConfigField[bool]("use_decode_dense_cache")
+    use_decode_dense_reference = _config.ConfigField[bool]("use_decode_dense_reference")
+    use_decode_paged_prefill = _config.ConfigField[bool]("use_decode_paged_prefill")
+    use_decode_paged_prefill_bhmd_out = _config.ConfigField[bool](
+        "use_decode_paged_prefill_bhmd_out"
+    )
+    use_decode_scalar_paged = _config.ConfigField[bool]("use_decode_scalar_paged")
+    use_decode_wmma_wrapper = _config.ConfigField[bool]("use_decode_wmma_wrapper")
+    use_decode_xqa = _config.ConfigField[bool]("use_decode_xqa")
+    use_flash_v100 = _config.ConfigField[bool]("use_flash_v100")
+    use_flash_v100_decode = _config.ConfigField[bool]("use_flash_v100_decode")
+    use_flash_v100_prefill_bfla = _config.ConfigField[bool](
+        "use_flash_v100_prefill_bfla"
+    )
+    use_flash_v100_prefill_contig_dense = _config.ConfigField[bool](
+        "use_flash_v100_prefill_contig_dense"
+    )
+    use_flash_v100_prefill_gather_dense = _config.ConfigField[bool](
+        "use_flash_v100_prefill_gather_dense"
+    )
+    use_flash_v100_prefill_paged = _config.ConfigField[bool](
+        "use_flash_v100_prefill_paged"
+    )
+    use_flash_v100_prefill_splitkv = _config.ConfigField[bool](
+        "use_flash_v100_prefill_splitkv"
+    )
+    use_fp8_prefill_bridge = _config.ConfigField[bool]("use_fp8_prefill_bridge")
+    use_prefill_paged_cache = _config.ConfigField[bool]("use_prefill_paged_cache")
+    use_smallq_decode_xqa = _config.ConfigField[bool]("use_smallq_decode_xqa")
+    use_triton_prefill = _config.ConfigField[bool]("use_triton_prefill")
+
     def __init__(self, *args, **kwargs):
         self.prefix_anchored_decode_window = kwargs.pop(
             "prefix_anchored_decode_window", None
@@ -70,7 +144,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
         ) = _ops._get_flash_ops()
         self.flash_attn_grouped_verify_paged = _ops._get_flash_grouped_verify_op()
         use_e4m3_fp32 = (
-            envs.VLLM_FLASH_V100_E4M3_GROUPED_FP32
+            _config.registered("VLLM_FLASH_V100_E4M3_GROUPED_FP32")
             and self.kv_codec is FP8_E4M3
             and current_platform.is_device_capability(70)
         )
@@ -121,9 +195,9 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             )
         )
         ATTENTION_HOOKS.configure_prefill(self)
-        paged_prefill_enable = os.getenv("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
+        paged_prefill_enable = _config.raw("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
         paged_prefill_disable = (
-            os.getenv("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1"
+            _config.raw("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1"
         )
         self.use_flash_v100_prefill_paged = (
             self.flash_attn_prefill_paged is not None
@@ -134,87 +208,99 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             self.fp8_e4m3_paged_kv_to_fp16 is not None
             if self.kv_codec is FP8_E4M3
             else self.fp8_e5m2_paged_kv_to_fp16 is not None
-        ) and os.getenv("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1") != "0"
+        ) and _config.raw("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1") != "0"
         self.use_flash_v100_prefill_splitkv = (
             self.flash_attn_prefill_paged_splitkv is not None
-            and envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV
+            and _config.registered("VLLM_FLASH_V100_PREFILL_SPLIT_KV")
             and self.use_flash_v100_prefill_paged
         )
         self.use_flash_v100_prefill_bfla = (
             self.flash_attn_prefill_paged_bfla is not None
-            and envs.VLLM_FLASH_V100_BFLA_PREFILL
+            and _config.registered("VLLM_FLASH_V100_BFLA_PREFILL")
             and self.use_flash_v100_prefill_paged
         )
         self.use_flash_v100_prefill_contig_dense = (
             self.flash_attn_func is not None
             and self.use_flash_v100_prefill_paged
-            and envs.VLLM_FLASH_V100_PREFILL_CONTIG_DENSE
+            and _config.registered("VLLM_FLASH_V100_PREFILL_CONTIG_DENSE")
         )
-        self.prefill_contig_dense_min_q = (
-            envs.VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q
+        self.prefill_contig_dense_min_q = _config.registered(
+            "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_Q"
         )
-        self.prefill_contig_dense_min_kv = (
-            envs.VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV
+        self.prefill_contig_dense_min_kv = _config.registered(
+            "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_MIN_KV"
         )
-        self.prefill_contig_dense_allow_copy = (
-            envs.VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY
+        self.prefill_contig_dense_allow_copy = _config.registered(
+            "VLLM_FLASH_V100_PREFILL_CONTIG_DENSE_ALLOW_COPY"
         )
         self.use_flash_v100_prefill_gather_dense = (
             self.use_flash_v100_prefill_paged
-            and envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE
+            and _config.registered("VLLM_FLASH_V100_PREFILL_GATHER_DENSE")
         )
-        self.prefill_gather_dense_min_q = (
-            envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q
+        self.prefill_gather_dense_min_q = _config.registered(
+            "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_Q"
         )
-        self.prefill_gather_dense_min_kv = (
-            envs.VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV
+        self.prefill_gather_dense_min_kv = _config.registered(
+            "VLLM_FLASH_V100_PREFILL_GATHER_DENSE_MIN_KV"
         )
-        self.prefill_split_kv_tokens = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS
-        self.prefill_split_kv_min_q = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q
-        self.prefill_split_kv_max_q = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q
-        self.prefill_split_kv_min_kv = envs.VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV
-        self.prefill_bfla_min_q = envs.VLLM_FLASH_V100_BFLA_MIN_Q
-        self.prefill_bfla_min_kv = envs.VLLM_FLASH_V100_BFLA_MIN_KV
-        self.prefill_bfla_mask_block_n = envs.VLLM_FLASH_V100_BFLA_MASK_BLOCK_N
+        self.prefill_split_kv_tokens = _config.registered(
+            "VLLM_FLASH_V100_PREFILL_SPLIT_KV_TOKENS"
+        )
+        self.prefill_split_kv_min_q = _config.registered(
+            "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_Q"
+        )
+        self.prefill_split_kv_max_q = _config.registered(
+            "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MAX_Q"
+        )
+        self.prefill_split_kv_min_kv = _config.registered(
+            "VLLM_FLASH_V100_PREFILL_SPLIT_KV_MIN_KV"
+        )
+        self.prefill_bfla_min_q = _config.registered("VLLM_FLASH_V100_BFLA_MIN_Q")
+        self.prefill_bfla_min_kv = _config.registered("VLLM_FLASH_V100_BFLA_MIN_KV")
+        self.prefill_bfla_mask_block_n = _config.registered(
+            "VLLM_FLASH_V100_BFLA_MASK_BLOCK_N"
+        )
         self.use_prefill_paged_cache = (
-            os.getenv("VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE", "0") == "1"
+            _config.raw("VLLM_FLASH_V100_PREFILL_USE_PAGED_CACHE", "0") == "1"
         )
         # Explicit diagnostic fallback only. The production migration target is
         # a complete Flash-V100 backend, so selected Flash routes should not
         # hide Flash prefill issues behind Triton by default.
         self.use_triton_prefill = (
-            os.getenv("VLLM_FLASH_V100_PREFILL_USE_TRITON", "0") != "0"
+            _config.raw("VLLM_FLASH_V100_PREFILL_USE_TRITON", "0") != "0"
         )
         self.allow_triton_fallback = (
-            os.getenv("VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK", "0") == "1"
+            _config.raw("VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK", "0") == "1"
         )
         self.smallq_decode_max_query_len = int(
-            os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")
+            _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")
         )
         self.smallq_decode_max_model_len = int(
-            os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")
+            _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_MODEL_LEN", "0")
         )
         self.use_decode_dense_reference = (
-            os.getenv("VLLM_FLASH_V100_DECODE_DENSE_REFERENCE", "0") == "1"
+            _config.raw("VLLM_FLASH_V100_DECODE_DENSE_REFERENCE", "0") == "1"
         )
         self.use_decode_dense_cache = (
-            os.getenv("VLLM_FLASH_V100_DECODE_DENSE_CACHE", "0") == "1"
+            _config.raw("VLLM_FLASH_V100_DECODE_DENSE_CACHE", "0") == "1"
         )
         # Classified quality rule: long q=1 scalar paged decode is a Type-B
         # reduction-order path, not a Type-A layout bug. Keep it as the
         # production Flash decode default so an explicit FLASH_ATTN_V100
         # selection does not silently become Triton during CUDA graph capture.
-        decode_paged_prefill_env = os.getenv("VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL")
+        decode_paged_prefill_env = _config.raw(
+            "VLLM_FLASH_V100_DECODE_USE_PAGED_PREFILL"
+        )
         self.use_decode_paged_prefill = decode_paged_prefill_env == "1"
-        decode_bhmd_out_env = os.getenv("VLLM_FLASH_V100_DECODE_USE_BHMD_OUT")
+        decode_bhmd_out_env = _config.raw("VLLM_FLASH_V100_DECODE_USE_BHMD_OUT")
         self.use_decode_paged_prefill_bhmd_out = decode_bhmd_out_env != "0"
         self.use_decode_wmma_wrapper = (
-            os.getenv("VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER", "0") == "1"
+            _config.raw("VLLM_FLASH_V100_DECODE_USE_WMMA_WRAPPER", "0") == "1"
         )
-        self.use_decode_xqa = os.getenv("VLLM_FLASH_V100_DECODE_USE_XQA", "1") == "1"
+        self.use_decode_xqa = _config.raw("VLLM_FLASH_V100_DECODE_USE_XQA", "1") == "1"
         self.use_smallq_decode_xqa = (
             self.use_decode_xqa
-            and os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", "1") == "1"
+            and _config.raw("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA", "1") == "1"
         )
         self.decode_strategy = _routing.resolve_decode_strategy(
             self.kv_codec,
@@ -224,30 +310,27 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             and self.num_heads == 6 * self.num_kv_heads,
         )
         ATTENTION_HOOKS.configure_verifier(self)
-        decode_scalar_paged_env = os.getenv("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
+        decode_scalar_paged_env = _config.raw("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
         self.use_decode_scalar_paged = decode_scalar_paged_env != "0"
-        self.compare_bhmd_out_dir = os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR")
+        self.compare_bhmd_out_dir = _config.raw("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR")
         self.compare_bhmd_out_max_calls = int(
-            os.getenv("VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS", "0")
+            _config.raw("VLLM_FLASH_V100_COMPARE_BHMD_OUT_MAX_CALLS", "0")
         )
         self._compare_bhmd_out_calls = 0
-        self.compare_triton_out_dir = os.getenv(
+        self.compare_triton_out_dir = _config.raw(
             "VLLM_FLASH_V100_COMPARE_TRITON_OUT_DIR"
         )
         self.compare_triton_out_max_calls = int(
-            os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS", "0")
+            _config.raw("VLLM_FLASH_V100_COMPARE_TRITON_OUT_MAX_CALLS", "0")
         )
-        self.compare_triton_tensor_dump_dir = os.getenv(
+        self.compare_triton_tensor_dump_dir = _config.raw(
             "VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_DIR"
         )
         self.compare_triton_tensor_dump_max_tokens = int(
-            os.getenv("VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS", "64")
+            _config.raw("VLLM_FLASH_V100_COMPARE_TRITON_TENSOR_DUMP_MAX_TOKENS", "64")
         )
         self._compare_triton_out_calls = 0
-        self._decode_cache_k: torch.Tensor | None = None
-        self._decode_cache_v: torch.Tensor | None = None
-        self._decode_cache_len = 0
-        self._decode_cache_capacity = 0
+        self.workspace = _decode.V100Workspace()
 
         if self.prefix_anchored_decode_window is not None:
             if (
@@ -295,11 +378,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             self.use_flash_v100_prefill_contig_dense = False
             self.use_flash_v100_prefill_gather_dense = False
 
-    _reset_decode_cache = _decode._reset_decode_cache
-
-    _ensure_decode_cache_capacity = _decode._ensure_decode_cache_capacity
-
-    _get_decode_kv_single_seq = _decode._get_decode_kv_single_seq
+        self.config = _config.V100AttnConfig.take_legacy_attributes(vars(self))
 
     _maybe_compare_bhmd_out = _debug_compare._maybe_compare_bhmd_out
 
@@ -377,13 +456,94 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             right = left
         return (left, right)
 
-    _call_flash_attn_decode_paged = _decode._call_flash_attn_decode_paged
+    def _new_decode_executor(self) -> _decode.DecodeExecutor:
+        policy = getattr(self, "config", None)
+        if policy is None:
+            # Compatibility for deliberately partial legacy fixtures only.
+            attributes = vars(self)
+            policy = SimpleNamespace(
+                **{
+                    field.name: attributes[field.name]
+                    for field in fields(_config.V100AttnConfig)
+                    if field.name in attributes
+                }
+            )
+        config = _decode.DecodeConfig(
+            cast(_config.V100AttnConfig, policy),
+            getattr(self, "scale", 1.0),
+            self.kv_cache_dtype,
+            getattr(self, "attn_type", AttentionType.DECODER),
+            getattr(self, "sliding_window", None),
+        )
+        ops = _decode.DecodeOps(
+            dense=getattr(self, "flash_attn_func", None),
+            paged=getattr(self, "flash_attn_decode_paged", None),
+            xqa=getattr(self, "flash_attn_decode_paged_xqa", None),
+            wmma=getattr(self, "flash_attn_decode_paged_wmma", None),
+            prefill=getattr(self, "flash_attn_prefill_paged", None),
+            prefill_bhmd=getattr(self, "flash_attn_prefill_paged_bhmd", None),
+            paged_keywords=getattr(self, "_flash_decode_paged_kwargs", set()),
+            scalar_tail=getattr(self, "_sm70_scalar_tail_attention", None),
+            reject_xqa=ATTENTION_HOOKS.reject_xqa,
+            reserve_bhmd_compare=self._reserve_bhmd_compare_call,
+            write_bhmd_compare=self._write_bhmd_compare_report,
+            compare_bhmd=self._maybe_compare_bhmd_out,
+            scalar_override=vars(self).get("_call_flash_attn_decode_paged"),
+        )
+        workspace = getattr(self, "workspace", None)
+        if workspace is None:
+            workspace = _decode.V100Workspace()
+        return _decode.DecodeExecutor(config, ops, workspace)
+
+    def _call_flash_attn_decode_paged(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        softmax_scale: float,
+        out: torch.Tensor,
+        kv_cache_dtype: str,
+        k_scale: float,
+        v_scale: float,
+        window_size: tuple[int, int] = (-1, -1),
+        max_seq_len_hint: int | None = None,
+        workspace_seq_capacity_hint: int | None = None,
+        active_num_partitions: int | None = None,
+        partition_size_hint: int | None = None,
+        anchor_lens: torch.Tensor | None = None,
+        anchored_window: int = 0,
+    ) -> None:
+        return self._new_decode_executor()._call_flash_attn_decode_paged(
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            softmax_scale=softmax_scale,
+            out=out,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            window_size=window_size,
+            max_seq_len_hint=max_seq_len_hint,
+            workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+            active_num_partitions=active_num_partitions,
+            partition_size_hint=partition_size_hint,
+            anchor_lens=anchor_lens,
+            anchored_window=anchored_window,
+        )
 
     _smallq_decode_xqa_allowed = _verify._smallq_decode_xqa_allowed
 
     _call_flash_attn_smallq_decode_paged = _verify._call_flash_attn_smallq_decode_paged
 
-    _anchored_swa_params = _decode._anchored_swa_params
+    def _anchored_swa_params(
+        self, attn_metadata: TritonAttentionMetadata
+    ) -> tuple[torch.Tensor | None, int]:
+        return self._new_decode_executor()._anchored_swa_params(attn_metadata)
 
     _small_query_decode_enabled = _verify._small_query_decode_enabled
 
@@ -537,7 +697,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                     "forward branch=prefill_triton_safe layer=%s",
                     layer_name,
                 )
-                self._reset_decode_cache()
+                self.workspace.decode_cache.invalidate()
                 _routing._record_route(_routing.ROUTE_SPECS["prefill_triton_safe"].name)
                 return super().forward(
                     layer,
@@ -682,7 +842,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                 _routing._log_fp8_kv_cache_route(
                     "prefill", self.kv_cache_dtype, "prefix"
                 )
-                self._reset_decode_cache()
+                self.workspace.decode_cache.invalidate()
                 result = self._flash_v100_prefill_with_prefix(
                     layer,
                     query,
@@ -713,7 +873,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                     "FLASH_ATTN_V100 prefill path active (no prefix/chunked context)."
                 )
                 _state._logged_prefill_flash = True
-            self._reset_decode_cache()
+            self.workspace.decode_cache.invalidate()
             if self.use_prefill_paged_cache and self.use_flash_v100_prefill_paged:
                 _debug._sm70_profile_trace(
                     "forward branch=prefill_no_prefix_paged_cache layer=%s",
@@ -985,15 +1145,59 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
         )
         return result
 
-    _flash_v100_decode_as_paged_prefill = _decode._flash_v100_decode_as_paged_prefill
+    def _flash_v100_decode_as_paged_prefill(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._new_decode_executor()._flash_v100_decode_as_paged_prefill(
+            layer, query, kv_cache, attn_metadata, output
+        )
 
-    _flash_v100_decode_dense_cache = _decode._flash_v100_decode_dense_cache
+    def _flash_v100_decode_dense_cache(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._new_decode_executor()._flash_v100_decode_dense_cache(
+            layer, query, key, value, kv_cache, attn_metadata, output
+        )
 
-    _flash_v100_decode_dense_reference = _decode._flash_v100_decode_dense_reference
+    def _flash_v100_decode_dense_reference(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._new_decode_executor()._flash_v100_decode_dense_reference(
+            layer, query, kv_cache, attn_metadata, output
+        )
 
     _flash_v100_prefill = _prefill._flash_v100_prefill
 
-    _flash_v100_decode = _decode._flash_v100_decode
+    def _flash_v100_decode(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._new_decode_executor()._flash_v100_decode(
+            layer, query, key, value, kv_cache, attn_metadata, output
+        )
 
     _flash_v100_small_query_prefill_as_decode = (
         _verify._flash_v100_small_query_prefill_as_decode
