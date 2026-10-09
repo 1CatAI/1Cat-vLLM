@@ -359,3 +359,9 @@ lifetime is introduced. Stage messages use the existing keyed log-once facility
 to skip repeated distributed-rank queries after their first accepted event.
 Message text, argument distinctions and rank scope remain intact; execution
 traces and route counters are independent of these informational messages.
+
+Argument-preserving MoE wrappers declare their direct native binding. Prepared
+owners resolve these once and pass the captured token directly, while public
+compatibility entry points and instrumented wrappers keep their old behavior.
+AWQ skips disabled dump callbacks; enabled dumps retain their stage positions.
+Output trimming creates a view only when the physical width differs.

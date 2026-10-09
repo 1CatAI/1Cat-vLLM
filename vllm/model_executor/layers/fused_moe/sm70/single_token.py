@@ -125,7 +125,7 @@ def execute_single_token(
     if observe is not None:
         buffers["sorted_output"] = observe(layer, buffers["sorted_output"], "st_w2_out")
     sorted_output = buffers["sorted_output"]
-    if trim_output:
+    if trim_output and sorted_output.shape[1] != layer.sm70_hidden_logical_size:
         sorted_output = sorted_output[:, : layer.sm70_hidden_logical_size]
     if plan.weighted_reduce:
         codec.log("MoE single-token weighted-reduce path enabled (top_k=%d).", top_k)

@@ -11,7 +11,7 @@ from .common import (
     has_nvfp4_grouped_decode_dispatch,
     register_fake,
 )
-from .policy import call_native
+from .policy import call_native, direct_native
 
 
 def nvfp4_grouped_w13_sm70_out(
@@ -1074,6 +1074,7 @@ if hasattr(torch.ops._C, "awq_moe_gemm_sm70_per_expert_dispatch_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1122,6 +1123,7 @@ if hasattr(torch.ops._C, "awq_moe_dense_stage_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_indexed_dense_w13_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1173,6 +1175,7 @@ if hasattr(torch.ops._C, "awq_moe_indexed_dense_w13_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_active_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1224,6 +1227,7 @@ if hasattr(torch.ops._C, "awq_moe_active_dense_stage_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_chunked_w2_sm70_out(
     out: torch.Tensor,
     chunk_output: torch.Tensor,
@@ -1305,6 +1309,7 @@ if hasattr(torch.ops._C, "awq_moe_chunked_w2_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_single_token_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1353,6 +1358,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_dense_stage_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_single_token_indexed_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1401,6 +1407,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_indexed_dense_stage_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_single_token_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -1461,6 +1468,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_dense_w13_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_single_token_indexed_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -1521,6 +1529,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_indexed_dense_w13_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_single_token_compact_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -1587,6 +1596,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_compact_dense_w13_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_single_token_exact_layout_prepare(
     topk_ids: torch.Tensor,
     x: torch.Tensor,
@@ -1626,6 +1636,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_exact_layout_prepare"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_single_token_weighted_reduce_out(
     sorted_output: torch.Tensor,
     topk_weights: torch.Tensor,
@@ -1662,6 +1673,7 @@ if hasattr(torch.ops._C, "awq_moe_single_token_weighted_reduce_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_qpn_m1_sm70_out(
     out: torch.Tensor,
     intermediate: torch.Tensor,
@@ -1707,6 +1719,7 @@ if hasattr(torch.ops._C, "awq_moe_qpn_m1_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def awq_moe_single_token_sm70_out(
     out: torch.Tensor,
     x: torch.Tensor,
@@ -1918,6 +1931,7 @@ if hasattr(torch.ops._C, "fp8_moe_gemm_sm70_per_expert_dispatch_out"):
         return None
 
 
+@direct_native("_C")
 def fp8_moe_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -1966,6 +1980,7 @@ if hasattr(torch.ops._C, "fp8_moe_dense_stage_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def fp8_moe_single_token_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -2014,6 +2029,7 @@ if hasattr(torch.ops._C, "fp8_moe_single_token_dense_stage_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def fp8_moe_single_token_indexed_dense_stage_sm70_out(
     out: torch.Tensor,
     input: torch.Tensor,
@@ -2062,6 +2078,7 @@ if hasattr(torch.ops._C, "fp8_moe_single_token_indexed_dense_stage_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def fp8_moe_single_token_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -2122,6 +2139,7 @@ if hasattr(torch.ops._C, "fp8_moe_single_token_dense_w13_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def fp8_moe_single_token_indexed_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -2182,6 +2200,7 @@ if hasattr(torch.ops._C, "fp8_moe_single_token_indexed_dense_w13_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def fp8_moe_single_token_compact_dense_w13_sm70_out(
     gate_up: torch.Tensor,
     compact_input: torch.Tensor,
@@ -2248,6 +2267,7 @@ if hasattr(torch.ops._C, "fp8_moe_single_token_compact_dense_w13_sm70_out"):
         return None
 
 
+@direct_native("_C")
 def fp8_moe_single_token_sm70_out(
     out: torch.Tensor,
     x: torch.Tensor,

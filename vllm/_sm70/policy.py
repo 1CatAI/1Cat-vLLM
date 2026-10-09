@@ -122,6 +122,20 @@ ROUTING_OPERATORS = (
 )
 
 
+def direct_native(namespace):
+    """Mark a positional, argument-preserving compatibility wrapper.
+
+    Prepared owners may bind its native callable once. Keep the function itself
+    in the marker so instrumentation using functools.wraps is never bypassed.
+    """
+
+    def decorate(operation):
+        operation._sm70_direct = (operation, namespace)
+        return operation
+
+    return decorate
+
+
 def call_native(operation, native_policy, *args, **kwargs):
     # Historical research fragments have their own unchanged ABI. They may be
     # used with matching legacy values; initialization rejects typed conflicts.
@@ -153,18 +167,22 @@ def call_routing(name, native_policy, *args, **kwargs):
     return call_native(getattr(torch.ops._moe_C, name), native_policy, *args, **kwargs)
 
 
+@direct_native("_moe_C")
 def moe_permute(*args, native_policy=()):
     return call_routing("moe_permute", native_policy, *args)
 
 
+@direct_native("_moe_C")
 def moe_permute_with_scratch(*args, native_policy=()):
     return call_routing("moe_permute_with_scratch", native_policy, *args)
 
 
+@direct_native("_moe_C")
 def moe_permute_metadata_with_scratch(*args, native_policy=()):
     return call_routing("moe_permute_metadata_with_scratch", native_policy, *args)
 
 
+@direct_native("_moe_C")
 def moe_unpermute(*args, native_policy=()):
     return call_routing("moe_unpermute", native_policy, *args)
 
@@ -210,9 +228,14 @@ class NativeBindings:
             for name in CONFIGURED_OPERATORS + ROUTING_OPERATORS:
                 operation = getattr(_sm70_ops, name, None)
                 if operation is not None:
-                    setattr(
-                        self, name, partial(operation, native_policy=self.arguments)
-                    )
+                    arguments: str | tuple[str, ...] = self.arguments
+                    direct = getattr(operation, "_sm70_direct", None)
+                    if direct and direct[0] is operation and len(arguments) == 1:
+                        namespace = getattr(torch.ops, direct[1])
+                        if hasattr(namespace, name):
+                            operation = getattr(namespace, name)
+                            arguments = arguments[0]
+                    setattr(self, name, partial(operation, native_policy=arguments))
 
     def __getattr__(self, name):
         from vllm import _sm70_ops

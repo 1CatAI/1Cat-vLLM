@@ -1214,9 +1214,11 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
 
         topk_ids_i32 = buffers["topk_ids"]
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
-        x = _dump_awq_moe_buffer(layer, x, "input")
-        topk_weights = _dump_awq_moe_buffer(layer, topk_weights, "topk_weights")
-        topk_ids_i32 = _dump_awq_moe_buffer(layer, topk_ids_i32, "topk_ids_i32")
+        dump_enabled = bool(layer.sm70_moe_diagnostics.dump_buffers)
+        if dump_enabled:
+            x = _dump_awq_moe_buffer(layer, x, "input")
+            topk_weights = _dump_awq_moe_buffer(layer, topk_weights, "topk_weights")
+            topk_ids_i32 = _dump_awq_moe_buffer(layer, topk_ids_i32, "topk_ids_i32")
         if (
             num_tokens == 1
             and layer.sm70_awq_moe_batched_gemm
@@ -1259,7 +1261,7 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
                 buffers,
                 self.group_size,
                 activation=_silu_and_mul_w13,
-                observe=_dump_awq_moe_buffer,
+                observe=_dump_awq_moe_buffer if dump_enabled else None,
                 trim_output=True,
             )
         if indexed_w13:
@@ -1299,21 +1301,22 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
                 buffers["topk_ids_for_sort"],
             )
         buffers["expert_offsets"].copy_(buffers["expert_offsets64"], non_blocking=True)
-        buffers["expert_offsets"] = _dump_awq_moe_buffer(
-            layer, buffers["expert_offsets"], "expert_offsets"
-        )
-        buffers["expert_offsets64"] = _dump_awq_moe_buffer(
-            layer, buffers["expert_offsets64"], "expert_offsets64"
-        )
-        buffers["inv_permuted_idx"] = _dump_awq_moe_buffer(
-            layer, buffers["inv_permuted_idx"], "inv_permuted_idx"
-        )
-        buffers["permuted_experts_id"] = _dump_awq_moe_buffer(
-            layer, buffers["permuted_experts_id"], "permuted_experts_id"
-        )
-        buffers["sorted_expert_ids"] = _dump_awq_moe_buffer(
-            layer, buffers["sorted_expert_ids"], "sorted_expert_ids"
-        )
+        if dump_enabled:
+            buffers["expert_offsets"] = _dump_awq_moe_buffer(
+                layer, buffers["expert_offsets"], "expert_offsets"
+            )
+            buffers["expert_offsets64"] = _dump_awq_moe_buffer(
+                layer, buffers["expert_offsets64"], "expert_offsets64"
+            )
+            buffers["inv_permuted_idx"] = _dump_awq_moe_buffer(
+                layer, buffers["inv_permuted_idx"], "inv_permuted_idx"
+            )
+            buffers["permuted_experts_id"] = _dump_awq_moe_buffer(
+                layer, buffers["permuted_experts_id"], "permuted_experts_id"
+            )
+            buffers["sorted_expert_ids"] = _dump_awq_moe_buffer(
+                layer, buffers["sorted_expert_ids"], "sorted_expert_ids"
+            )
         route_plan = select_sm70_quantized_moe_route(
             batched_enabled=layer.sm70_awq_moe_batched_gemm,
             num_tokens=num_tokens,

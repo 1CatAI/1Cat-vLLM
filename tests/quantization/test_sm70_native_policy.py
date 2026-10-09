@@ -333,7 +333,8 @@ def test_opaque_native_policy_survives_export_with_dynamic_rows(monkeypatch, com
             lib._destroy()
 
 
-def test_native_token_survives_direct_operator_export_reload():
+@pytest.mark.parametrize("direct_stage", [False, True])
+def test_native_token_survives_direct_operator_export_reload(direct_stage):
     if not hasattr(torch.ops._C, "sm70_prepare_native_policy_token"):
         pytest.skip("requires the packaged native token ABI")
     policy = Sm70NativeConfig(tm_gemm_trace_filter="路径:1")
@@ -351,14 +352,21 @@ def test_native_token_survives_direct_operator_export_reload():
         observed.append((x.shape[0], native_policy))
         out.copy_(x)
 
+    def reduce(x, weights, indices, out, top_k, hidden, native_policy=None):
+        native(out, x, x, x, 16, 4, 4, False, native_policy)
+
     class Projection(torch.nn.Module):
         def forward(self, x):
             out = torch.empty_like(x)
-            owner.awq_gemm_sm70_out(out, x, x, x, 16, 4, 4, False)
+            if direct_stage:
+                owner.awq_moe_single_token_weighted_reduce_out(x, x, x, out, 1, 4)
+            else:
+                owner.awq_gemm_sm70_out(out, x, x, x, 16, 4, 4, False)
             return out
 
     lib = torch.library.Library("_C", "IMPL", "CPU")
     lib.impl("awq_gemm_sm70_out", native)
+    lib.impl("awq_moe_single_token_weighted_reduce_out", reduce)
     try:
         exported = torch.export.export(
             Projection(),
@@ -402,3 +410,65 @@ def test_channel_fp8_keeps_qualified_default_but_typed_linear_request_wins(
     assert channel._sm70_fp8_qpn8_enabled(False) is (
         True if explicit_qpn8 is None else explicit_qpn8
     )
+
+
+def test_prepared_stage_bindings_preserve_arguments_and_instrumentation(monkeypatch):
+    import functools
+    import inspect
+
+    from vllm._sm70 import moe
+
+    monkeypatch.setattr(binding, "native_policy_abi_available", lambda: True)
+    monkeypatch.setattr(torch.ops, "_C_qwen38", SimpleNamespace())
+    calls = []
+    namespaces = {}
+    for name in ("_C", "_moe_C"):
+        namespaces[name] = SimpleNamespace(
+            sm70_prepare_native_policy_token=lambda s: None
+        )
+        monkeypatch.setattr(torch.ops, name, namespaces[name])
+    stages = []
+    for module in (moe, binding):
+        for name, operation in vars(module).items():
+            marker = getattr(operation, "_sm70_direct", None)
+            if marker and marker[0] is operation:
+                native = lambda *a, **kw: calls.append((a, kw))
+                setattr(namespaces[marker[1]], name, native)
+                stages.append((name, operation, native))
+    policy = Sm70NativeConfig()
+    policy.resolve("fp8")
+    owner = binding.NativeBindings(policy.values)
+    for name, operation, native in stages:
+        if name in binding.ROUTING_OPERATORS:
+            arguments: tuple[object, ...] = (object(), object())
+        else:
+            arguments = tuple(
+                object()
+                for p in inspect.signature(operation).parameters.values()
+                if p.name != "native_policy"
+            )
+        operation(*arguments, native_policy=owner.arguments)
+        getattr(owner, name)(*arguments)
+        assert calls[-2:] == [(arguments, {"native_policy": owner.arguments[0]})] * 2
+        assert getattr(owner, name).func is native
+
+    # functools.wraps copies attributes. An observer remains a public wrapper,
+    # not an invitation to bypass it while resolving the prepared owner.
+    name, operation, native = stages[0]
+    observed = []
+
+    @functools.wraps(operation)
+    def instrument(*a, **kw):
+        observed.append(name)
+        return operation(*a, **kw)
+
+    monkeypatch.setattr(_sm70_ops, name, instrument)
+    instrumented = binding.NativeBindings(policy.values)
+    assert getattr(instrumented, name).func is instrument
+    arguments = tuple(
+        object()
+        for p in inspect.signature(operation).parameters.values()
+        if p.name != "native_policy"
+    )
+    getattr(instrumented, name)(*arguments)
+    assert observed == [name]

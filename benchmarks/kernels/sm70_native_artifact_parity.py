@@ -31,6 +31,13 @@ parser.add_argument(
     type=Path,
     help="Export baseline GGUF tuning choices and reuse them after candidate warmup",
 )
+parser.add_argument(
+    "--families",
+    nargs="+",
+    choices=("awq", "fp8", "nvfp4", "mxfp4", "qpn8", "gguf", "moe_awq", "moe_fp8"),
+    default=("awq", "fp8", "nvfp4", "mxfp4", "qpn8", "gguf", "moe_awq", "moe_fp8"),
+    help="Restrict a follow-up to affected operators; baseline and head must match",
+)
 args = parser.parse_args()
 assert not os.getenv("LD_PRELOAD")
 assert torch.cuda.get_device_capability() == (7, 0)
@@ -313,7 +320,7 @@ def fixture(family):
 
 rows = []
 outputs = {}
-for family in ("awq", "fp8", "nvfp4", "mxfp4", "qpn8", "gguf", "moe_awq", "moe_fp8"):
+for family in args.families:
     k, apply = fixture(family)
     print("prepare " + family, flush=True)
     rows_to_check = (
@@ -418,6 +425,7 @@ record = {
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
         "cpu_affinity": sorted(os.sched_getaffinity(0)),
+        "families": args.families,
         "env": {
             k: v for k, v in os.environ.items() if k.startswith(("VLLM_SM70_", "TM_"))
         },
