@@ -137,6 +137,29 @@ void Registry::sm70_884_8() {
         Add(std::make_unique<Fp8PrescaledBatchKernelImpl<typename Fp8PrescaledBatch16::Kernel>>());
     // clang-format on
   }
+
+  if constexpr (1) {
+    // Block-FP8 with 32 x 32 blocks (e.g. DeepSeek-V4.1 dense weights: E4M3
+    // with one UE8M0 power-of-two scale per block), expanded to per-column
+    // FP16 group scales along K (GroupSizeV = 32). Same tile family as the
+    // group-128 list above; the dispatcher keys on the group size, so
+    // group-128 users are unchanged.
+    // clang-format off
+        using C = Config_E4M3<kColMajor, 0>;
+        Add<C::Type<128, 256,  16, 2, 4, 1, D, D, 2, true, 1, 32, 128, 128>>();
+        Add<C::Type<128, 128,  16, 2, 2, 1, D, D, 2, true, 1, 32,  64, 128>>();
+        Add<C::Type< 64, 128,  32, 1, 4, 1, D, S, 2, true, 1, 32,  32, 128>>();
+        Add<C::Type< 64, 256,  16, 1, 4, 1, D, S, 2, true, 1, 32,  64, 128>>();
+        Add<C::Type< 32, 256,  32, 1, 4, 1, D, S, 2, true, 1, 32,  32, 128>>();
+        Add<C::Type< 32, 128,  32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+        Add<C::Type< 16, 256,  32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+        Add<C::Type< 16, 128,  32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+        Add<C::Type<  8, 128,  64, 1, 4, 1, D, S, 2, true, 1, 32>>();
+        Add<C::Type<  8, 128,  32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+        Add<C::Type<  8, 256,  64, 1, 4, 1, D, S, 2, true, 1, 32>>();
+        Add<C::Type<  8, 256,  32, 1, 4, 1, D, S, 2, true, 1, 32>>();
+    // clang-format on
+  }
 }
 
 }  // namespace turbomind::gemm
