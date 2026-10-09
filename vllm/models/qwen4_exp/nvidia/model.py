@@ -512,6 +512,7 @@ def enable_sm70_hcx(
     *,
     fuse_output_projection: bool = True,
     diagnostic: bool = False,
+    local_schedule: bool = False,
 ) -> bool:
     """Leave supported small-M outputs partial; retain larger-batch reductions."""
     from .sm70_hcx import (
@@ -523,6 +524,7 @@ def enable_sm70_hcx(
 
     runtime = get_hcx_runtime(device)
     runtime.diagnostic = diagnostic
+    runtime.local_schedule = local_schedule
     status: dict[str, Any] = dict(
         enabled=False,
         reason=runtime.reason,
@@ -532,6 +534,7 @@ def enable_sm70_hcx(
         prepared_modules=0,
         deferred_projections=0,
         output_projection_policy="fused" if fuse_output_projection else "separate",
+        local_schedule=bool(local_schedule and runtime.enabled and runtime.full),
         large_m_policy="original_projection_and_reduction",
     )
     model.sm70_hcx_status = status
@@ -664,6 +667,7 @@ def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) -> 
             device,
             fuse_output_projection=kernel_config.sm70_hcx_output_projection,
             diagnostic=kernel_config.sm70_hcx_diagnostics,
+            local_schedule=kernel_config.sm70_hcx_local_schedule,
         )
         kernel_config.collective_kernel_selections["hcx:target"] = model.sm70_hcx_status
 

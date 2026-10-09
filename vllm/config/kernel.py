@@ -673,6 +673,13 @@ class KernelConfig:
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""
 
+    sm70_hcx_local_schedule: bool = False
+    """Experimentally delay HC up-weight prefetch and distribute gate-mix for
+    full-mesh TP4 HCX, including fused Q4_K/Q6_K output projection when its
+    input normalization is already complete. Keeps the reference arithmetic
+    order. Opt in before graph capture; full-model quality
+    qualification remains pending."""
+
     sm70_hcx_output_projection: bool = True
     """Fuse eligible output projections into HCX when HCX is enabled. Disable
     to compare the separate projection and HC boundary with identical weights."""
@@ -803,6 +810,7 @@ class KernelConfig:
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
             "collective_kernel_selections",
+            "sm70_hcx_local_schedule",  # Native dispatch inside the opaque HC op.
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
