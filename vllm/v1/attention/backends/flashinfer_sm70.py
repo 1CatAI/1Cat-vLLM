@@ -266,6 +266,7 @@ class FlashInferSM70MetadataBuilder(FlashAttnV100MetadataBuilder):
         ddtree_parent_ids=None,
         ddtree_num_tree_tokens_cpu=None,
         prepared_dflash2_smallq_metadata: DFlash2SmallQPreparedMetadata | None = None,
+        **feature_inputs,
     ):
         attn_metadata = super().build(
             common_prefix_len,
@@ -274,6 +275,7 @@ class FlashInferSM70MetadataBuilder(FlashAttnV100MetadataBuilder):
             ddtree_parent_ids,
             ddtree_num_tree_tokens_cpu,
             prepared_dflash2_smallq_metadata,
+            **feature_inputs,
         )
         return self._attach_planner_decision(
             attn_metadata,

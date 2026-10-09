@@ -67,34 +67,42 @@ qualification and the explicit super receiver; other calculation nodes must
 match. Mechanical feature hook calls are expanded back into their calculation
 bodies, with argument order checked; the same 47 parent hashes still match.
 
-## Speculative metadata hooks
+## Speculative metadata ownership
 
-The common metadata builder inherits the compatibility method surface from
-`spec.hooks.SpecMetadataMethods` and invokes the frozen `METADATA_HOOKS`
-registration at initialization, common attachment and capture preparation.
-`spec.builder` owns feature selection and the legacy extended build signature;
-`spec.tree` owns tree attachment/restoration; `spec.draft` owns persistent graph
-buffers and drafting refresh; `spec.verify_metadata` owns small-query verifier
-buffers and attachment. `spec.smallq_metadata` owns device/grouped preparation.
-The previous `smallq_metadata` path is a module alias to that owner, preserving
-patch identity. Internal imports use the owner path.
+The common metadata builder owns a `SpecMetadataState` through `spec_state`.
+It injects immutable `MetadataInputs` and five `MetadataOps` callbacks for the
+base builder and common metadata. The state owns persistent draft/small-query
+buffers and speculative configuration. It neither imports nor receives the
+common builder. The old private calls delegate to this owner for compatibility;
+`METADATA_HOOKS` remains an external compatibility adapter, not the production
+registration path. The per-request metadata packet also owns feature fields; neither common class
+inherits a speculative mixin.
 
-The generic `metadata.py` contains no family names. Its prefix-anchored and
-decode shape/partition metadata remain local. Speculative methods preserve
-the old names and arguments, including positional build options. Their super
-calls continue after the feature mixin so the Triton builder executes once.
-Fourteen extracted calculation bodies match frozen parent hashes; CPU tests
-exercise tree restoration, hook ordering, capture length guards and persistent
-buffer addresses across refreshes. Native metadata kernels remain unmeasured.
+`spec.builder` preserves the extended build options; `spec.tree` owns tree
+attachment/restoration; `spec.draft` owns drafting refresh; `spec.verify_metadata`
+owns small-query attachment; `spec.smallq_metadata` owns grouped preparation.
+The previous `smallq_metadata` path aliases the owner and retains patch identity.
+Prepared grouped metadata validates the original common-builder identity from
+immutable inputs. Persistent storage belongs to the same workspace across
+replays. Fourteen calculation hashes remain identical to the frozen parent.
 
-`spec.attention.ATTENTION_HOOKS` registers typed callbacks for scalar-tail
-initialization, verifier ABI/policy, prefill wrapper policy, feature contract
-validation, XQA exclusions, explicit fallback and capture route accounting.
-`SpecAttentionMethods` preserves historical method/field names for external
-callers. Common impl, metadata and backend entrypoints contain no family names;
-the existing route names and compatibility exports remain intact. CPU forward
-tests cover unsupported-layer rejection, allowed fallback and non-causal
-capture, while checking the original route labels and base call count.
+`SpecAttentionState` owns construction-time feature policy. Common assembly
+injects the two native ABI limits and keyword-support probe, and receives the
+configured prefill operator. Dispatch policies consume frozen common policy,
+metadata or an explicit validation callback. Attention no longer inherits a
+feature method mixin or invokes a single-provider hooks registry.
+
+Legacy method names remain delegates at the common assembly boundary; verifier
+calculations receive only VerificationConfig and VerificationOps. The ordinary
+causality guard bypasses executor construction. Tests inject owned policy and
+operators; the trace recorder observes the actual verifier predicate under its
+original canonical event name. The proposer-side `SpecFeatureRegistry` selects per-builder implementations by
+speculative method. The tree provider suppresses query expansion for tree
+verification, the parallel provider consumes prepared grouped metadata, and the
+linear provider expands query rows. All preserve explicit cross-method payloads
+for existing callers. New features implement `SpecFeature.prepare` and register
+a factory in `spec.features.FEATURES`; the common builder has no method names.
+Registration does not alter config read timing or own persistent tensors.
 
 ## Shared decode strategy
 
@@ -120,3 +128,35 @@ evidence. GPU output error, route traces and timing have not been measured;
 no speedup or numerical-equivalence claim is made. The older p256 measurement
 alone does not describe the current p64/p256/wave source, and wave admission
 also depends on the forwarded context bound. Retain those experimental paths.
+
+## Per-request speculative metadata
+
+Common metadata owns one `spec_state` packet. The Triton builder's result is
+adopted as the existing FlashAttnV100Metadata subtype in place: object identity,
+common fields and tensor references remain unchanged. Old field access forwards
+to the packet; feature names are declared only by its Spec owner. Existing raw
+fields migrate without tensor copies. Shallow copies get independent packets
+while sharing tensors, and packets do not retain the enclosing metadata.
+Older duck-typed external metadata remains accepted at the compatibility view.
+
+## Prefill owner boundary
+
+`prefill.PrefillExecutor` owns per-layer policy/geometry, explicit
+`PrefillDriverOps` and the existing `V100Workspace`. Its calculations never
+receive Impl. Common assembly constructs the owner and preserves legacy method
+facades/instance overrides. The inner candidate executor receives native and
+admission callbacks from this owner. Snapshot construction is per legacy call,
+so later operator or policy changes affect subsequent calls without changing an
+already created owner. Speculative callback names and capabilities belong to
+`spec.attention`; no entire attention implementation is passed there.
+
+## Comparison ownership
+
+Comparison calculations receive `ComparisonExecutor`, whose policy, operators
+and `ComparisonState` are separate from Impl. Counters remain local to each
+layer and shared by its comparison calls. Common assembly injects the original
+Triton super callback; legacy counter/method access forwards to the owner.
+Capture keeps the original reservation-before-skip order. Instance overrides,
+including static diagnostic helpers, remain effective. The prefill event
+subscribers remain unchanged; converting remaining direct diagnostic entry
+points to events is still final A3 work.

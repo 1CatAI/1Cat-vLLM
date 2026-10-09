@@ -41,17 +41,23 @@ from vllm.v1.attention.backends.flash_v100 import (  # noqa: F401
 )
 from vllm.v1.attention.backends.flash_v100.spec import attention as spec_attention
 from vllm.v1.attention.backends.flash_v100.spec import (
+    attention_policy as spec_attention_policy,
+)
+from vllm.v1.attention.backends.flash_v100.spec import (
     builder as spec_builder,
 )
+from vllm.v1.attention.backends.flash_v100.spec import contracts as spec_contracts
 from vllm.v1.attention.backends.flash_v100.spec import (
     draft as spec_draft,
 )
+from vllm.v1.attention.backends.flash_v100.spec import policy as spec_policy
 from vllm.v1.attention.backends.flash_v100.spec import (
     smallq_metadata,
 )
 from vllm.v1.attention.backends.flash_v100.spec import (
     tree as spec_tree,
 )
+from vllm.v1.attention.backends.flash_v100.spec import tree_masks as spec_tree_masks
 from vllm.v1.attention.backends.flash_v100.spec import (
     verify_metadata as spec_verify_metadata,
 )
@@ -102,9 +108,40 @@ SUBMODULES = (
     spec_builder,
     spec_draft,
     spec_tree,
+    spec_tree_masks,
     spec_verify_metadata,
     spec_attention,
+    spec_contracts,
+    spec_policy,
+    spec_attention_policy,
 )
+
+# Renamed compatibility bindings resolve to their actual owner. Do not copy
+# function values: old-name writes must also affect the public execution path.
+COMPATIBILITY_ALIASES = {
+    **{name: (state, name) for name in state.LOG_KEYS},
+    "_allocate_growing_workspace": (workspace, "allocate_growing_workspace"),
+    "_VALID_DECODE_PARTITION_SIZES": (routing, "VALID_DECODE_PARTITION_SIZES"),
+    **{
+        name: (spec_policy, target)
+        for name, target in spec_policy.COMPATIBILITY_ALIASES.items()
+    },
+    **{
+        name: (spec_contracts, target)
+        for name, target in spec_contracts.COMPATIBILITY_ALIASES.items()
+    },
+    **{
+        name: (spec_tree_masks, target)
+        for name, target in spec_tree_masks.COMPATIBILITY_ALIASES.items()
+    },
+}
+
+
+def _compatibility_bindings(name: str):
+    if name in COMPATIBILITY_ALIASES:
+        return [COMPATIBILITY_ALIASES[name]]
+    return [(module, name) for module in SUBMODULES if name in vars(module)]
+
 
 __all__ = [
     "DFlash2SmallQGroupDescriptor",

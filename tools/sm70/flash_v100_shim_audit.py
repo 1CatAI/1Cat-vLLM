@@ -53,10 +53,15 @@ def audit_legacy_patches(request):
         yield
         return
     with strict_shim() as legacy:
+        from vllm.logger import log_once_seen
+        from vllm.v1.attention.backends.flash_v100 import state
+
+        log_names = {key: name for name, key in state.LOG_KEYS.items()}
         original_class = type(legacy)
         targets = {}
         c_targets = []
         globals_targets = {}
+        lookup_names = {}
         last_read = {}
         instructions = {}
         report = getattr(request.config, "_flash_shim_report", {})
@@ -73,9 +78,14 @@ def audit_legacy_patches(request):
                     dict(patched_in=[], called_from=[], read_from=[], requires_call=[]),
                 )
                 record["patched_in"].append(request.node.nodeid)
-                if inspect.isfunction(original) and original.__name__ == name:
+                canonical = legacy._canonical_name(name)
+                if inspect.isfunction(original) and original.__name__ in (
+                    name,
+                    canonical,
+                ):
                     record["requires_call"].append(request.node.nodeid)
                 globals_targets[name] = value
+                lookup_names[canonical] = name
                 if callable(original):
                     code = getattr(value, "__code__", None)
                     if code is not None:
@@ -84,6 +94,20 @@ def audit_legacy_patches(request):
                         c_targets.append((name, value))
 
         def observe(frame, event, arg):
+            if event == "return" and frame.f_code is log_once_seen.__code__:
+                name = log_names.get(frame.f_locals.get("key"))
+                caller = frame.f_back
+                if (
+                    name in globals_targets
+                    and arg is globals_targets[name]
+                    and production(caller)
+                ):
+                    # A virtual legacy flag counts only when production reads
+                    # its actual logger key. Shim reads during patch setup do
+                    # not count (their __getattr__ caller is excluded).
+                    report[name]["read_from"].append(
+                        caller.f_globals["__name__"] + ":" + caller.f_code.co_name
+                    )
             if event == "call":
                 names = targets.get(frame.f_code, set())
                 name = next(iter(names)) if len(names) == 1 else None
@@ -117,8 +141,9 @@ def audit_legacy_patches(request):
             if event == "call" and (
                 not production(frame)
                 or not any(
-                    name in globals_targets
-                    and frame.f_globals.get(name) is globals_targets[name]
+                    lookup_names.get(name, name) in globals_targets
+                    and frame.f_globals.get(name)
+                    is globals_targets[lookup_names.get(name, name)]
                     for name in frame.f_code.co_names
                 )
             ):
@@ -132,10 +157,11 @@ def audit_legacy_patches(request):
                 code = instructions[frame.f_code]
                 instruction = code.get(frame.f_lasti)
                 if instruction and instruction.opname == "LOAD_GLOBAL":
-                    name = instruction.argval
+                    actual = instruction.argval
+                    name = lookup_names.get(actual, actual)
                     if (
                         name in globals_targets
-                        and frame.f_globals.get(name) is globals_targets[name]
+                        and frame.f_globals.get(actual) is globals_targets[name]
                     ):
                         last_read[id(frame)] = name
                         report[name]["read_from"].append(
@@ -146,6 +172,7 @@ def audit_legacy_patches(request):
         class ObservedOwner(types.ModuleType):
             def __getattribute__(self, name):
                 value = super().__getattribute__(name)
+                name = lookup_names.get(name, name)
                 if name in globals_targets and value is globals_targets[name]:
                     caller = sys._getframe(1)
                     module_name = caller.f_globals.get("__name__", "")
@@ -157,8 +184,12 @@ def audit_legacy_patches(request):
                 return value
 
         owners = [(module, type(module)) for module in legacy._package.SUBMODULES]
-        for module, _ in owners:
-            module.__class__ = ObservedOwner
+        for module, cls in owners:
+            module.__class__ = (
+                ObservedOwner
+                if cls is types.ModuleType
+                else type("ObservedCustomOwner", (ObservedOwner, cls), {})
+            )
 
         legacy.__class__ = ObservedModule
         previous = sys.getprofile()

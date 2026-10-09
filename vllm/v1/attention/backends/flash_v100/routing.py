@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import atexit
 import json
-import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
@@ -473,7 +472,7 @@ _route_counts: dict[str, int] = {}
 _fallback_counts: dict[str, int] = {}
 _decode_active_trace_signatures: set[tuple[object, ...]] = set()
 _DEFAULT_DECODE_PARTITION_SIZE = 256
-_VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
+VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _DEFAULT_Q4_XQA_MIN_SEQ_LEN = 32768
 _DEFAULT_FP8_XQA_MIN_SEQ_LEN = 16384
 
@@ -499,12 +498,12 @@ def _decode_partition_size_for_metadata(
     except ValueError as exc:
         raise ValueError(
             "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
+            f"{VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
         ) from exc
-    if value not in _VALID_DECODE_PARTITION_SIZES:
+    if value not in VALID_DECODE_PARTITION_SIZES:
         raise ValueError(
             "VLLM_FLASH_V100_DECODE_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
+            f"{VALID_DECODE_PARTITION_SIZES}, got {value}"
         )
     return value
 
@@ -603,44 +602,6 @@ def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
             "KV storage only; model weight quantization is configured "
             "separately."
         )
-
-
-def _mtp_context_bucket_partition_size_hint() -> int | None:
-    raw = _config.raw("VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE")
-    if raw is None:
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in _VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
-
-
-def _mtp5_xqa_dual_cta_partition_size_hint() -> int | None:
-    if _config.raw("VLLM_FLASH_V100_XQA_MTP5_DUAL_CTA", "1") != "1":
-        return None
-    raw = _config.raw("VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE", "1024")
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {raw!r}"
-        ) from exc
-    if value not in _VALID_DECODE_PARTITION_SIZES:
-        raise ValueError(
-            "VLLM_FLASH_V100_XQA_MTP5_PARTITION_SIZE must be one of "
-            f"{_VALID_DECODE_PARTITION_SIZES}, got {value}"
-        )
-    return value
 
 
 def _select_default_decode_partition_size(
@@ -799,23 +760,6 @@ def _record_route(route: str) -> None:
     if not _route_summary_registered:
         atexit.register(_log_route_summary)
         _route_summary_registered = True
-
-
-def _ddtree_trace_event(event: str, payload: dict[str, object]) -> None:
-    trace_path = _config.raw("VLLM_DFLASH_DDTREE_TRACE_JSONL")
-    if not trace_path:
-        return
-    record = {"event": event, "pid": os.getpid(), **payload}
-    try:
-        with open(trace_path, "a", encoding="utf-8") as trace_file:
-            json.dump(record, trace_file, ensure_ascii=True, sort_keys=True)
-            trace_file.write("\n")
-    except OSError:
-        logger.exception("Failed to write DDTree trace event to %s", trace_path)
-
-
-def _ddtree_trace_enabled() -> bool:
-    return bool(_config.raw("VLLM_DFLASH_DDTREE_TRACE_JSONL"))
 
 
 def _decode_active_trace_enabled() -> bool:

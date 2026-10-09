@@ -7,6 +7,7 @@ import copy
 import hashlib
 import inspect
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -88,8 +89,44 @@ class _InlineWorkspace(ast.NodeTransformer):
         return self.inline(node.value) or self.generic_visit(node)
 
 
+class _InlineFeature(ast.NodeTransformer):
+    def visit_Expr(self, node):
+        if not isinstance(node.value, ast.Call):
+            return self.generic_visit(node)
+        call = node.value
+        if ast.unparse(call.func) != "prepare_verification":
+            return self.generic_visit(node)
+        from vllm.v1.attention.backends.flash_v100.spec import features
+
+        tree = ast.parse(Path(features.__file__).read_text())
+        provider = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "DDTreeFeature"
+        )
+        method = next(
+            n
+            for n in provider.body
+            if isinstance(n, ast.FunctionDef) and n.name == "prepare"
+        )
+        assert not call.keywords and len(call.args) == len(method.args.args)
+        substitutions = dict(zip([a.arg for a in method.args.args], call.args))
+
+        class Substitute(ast.NodeTransformer):
+            def visit_Name(self, node):
+                return copy.deepcopy(substitutions.get(node.id, node))
+
+        return [Substitute().visit(copy.deepcopy(n)) for n in method.body]
+
+
 class _Normalize(ast.NodeTransformer):
     def visit_FunctionDef(self, node):
+        renames = {
+            "attach_metadata": "_attach_ddtree_metadata",
+            "attach_prepared_metadata": ("_attach_prepared_dflash2_smallq_metadata"),
+            "update_decode_metadata": "_update_smallq_decode_metadata",
+        }
+        node.name = renames.get(node.name, node.name)
         node = self.generic_visit(node)
         if node.args.args and node.args.args[0].arg == "self":
             node.args.args[0].annotation = None
@@ -105,6 +142,20 @@ class _Normalize(ast.NodeTransformer):
     def visit_Attribute(self, node):
         node = self.generic_visit(node)
         path = ast.unparse(node)
+        callbacks = {
+            "policy.worker_profile_enabled": (
+                "_debug._dflash_ddtree_worker_profile_enabled"
+            ),
+            "self.ops.attach_common": "self._attach_common_flash_metadata",
+            "self.ops.attach_prefix": "self._attach_prefix_anchored_metadata",
+            "self.ops.attach_shape_hints": "self._attach_decode_shape_hints",
+            "self.ops.update_active_partitions": (
+                "self._update_decode_active_num_partitions"
+            ),
+            "self.inputs.builder_id": "id(self)",
+        }
+        if path in callbacks:
+            return ast.parse(callbacks[path], mode="eval").body
         prefix = "self.metadata_workspace."
         if path.startswith(prefix) and path[len(prefix) :] in _BUFFER_FIELDS:
             return ast.Attribute(
@@ -122,6 +173,10 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
+        if ast.unparse(node.func) == "metadata_view":
+            node.func = ast.Name(id="_as_flash_v100_metadata", ctx=ast.Load())
+        if ast.unparse(node.func) == "self.ops.base_build":
+            node.func = ast.parse("super().build", mode="eval").body
         if ast.unparse(node.func) == "_config.raw":
             node.func = ast.Attribute(
                 value=ast.Name(id="os", ctx=ast.Load()), attr="getenv", ctx=ast.Load()
@@ -144,10 +199,29 @@ def test_moved_metadata_calculations_match_parent():
     actual = {}
     for path in Path(metadata.__file__).parent.joinpath("spec").glob("*.py"):
         for fn in ast.parse(path.read_text()).body:
-            if isinstance(fn, ast.FunctionDef) and fn.name in expected:
-                assert fn.name not in actual
-                actual[fn.name] = hashlib.sha256(
-                    ast.dump(_Normalize().visit(_InlineWorkspace().visit(fn))).encode()
+            if isinstance(fn, ast.FunctionDef) and (
+                fn.name in expected
+                or (path.name == "tree.py" and fn.name == "attach_metadata")
+                or (
+                    path.name == "verify_metadata.py"
+                    and fn.name
+                    in {"attach_prepared_metadata", "update_decode_metadata"}
+                )
+            ):
+                name = {
+                    "attach_metadata": "_attach_ddtree_metadata",
+                    "attach_prepared_metadata": (
+                        "_attach_prepared_dflash2_smallq_metadata"
+                    ),
+                    "update_decode_metadata": "_update_smallq_decode_metadata",
+                }.get(fn.name, fn.name)
+                assert name not in actual
+                actual[name] = hashlib.sha256(
+                    ast.dump(
+                        _Normalize().visit(
+                            _InlineWorkspace().visit(_InlineFeature().visit(fn))
+                        )
+                    ).encode()
                 ).hexdigest()
     assert actual == expected
 
@@ -258,6 +332,7 @@ def test_persistent_draft_buffers_keep_addresses_across_replays():
 
 def test_feature_build_calls_base_once_and_keeps_hook_order(monkeypatch):
     instance = _builder()
+    state = instance.spec_state
     attn = SimpleNamespace(query_start_loc=torch.tensor([0, 2]), max_query_len=2)
     events = []
 
@@ -275,11 +350,24 @@ def test_feature_build_calls_base_once_and_keeps_hook_order(monkeypatch):
         "_update_decode_active_num_partitions",
         "_debug_draft_metadata",
     ):
-        setattr(instance, name, lambda *a, _name=name, **kw: events.append(_name))
-    instance._update_smallq_decode_metadata = MagicMock()
+        owner = (
+            state
+            if name in ("_attach_ddtree_metadata", "_debug_draft_metadata")
+            else instance
+        )
+        setattr(owner, name, lambda *a, _name=name, **kw: events.append(_name))
+    state.ops = replace(
+        state.ops,
+        base_build=base.__get__(instance),
+        attach_common=instance._attach_common_flash_metadata,
+        attach_prefix=instance._attach_prefix_anchored_metadata,
+        attach_shape_hints=instance._attach_decode_shape_hints,
+        update_active_partitions=instance._update_decode_active_num_partitions,
+    )
+    state._update_smallq_decode_metadata = MagicMock()
     common = SimpleNamespace(max_seq_len=17)
     assert instance.build(0, common) is attn
-    instance._update_smallq_decode_metadata.assert_called_once_with(
+    state._update_smallq_decode_metadata.assert_called_once_with(
         attn, common, workspace_seq_capacity_cap=17
     )
     assert events == [
@@ -295,21 +383,22 @@ def test_feature_build_calls_base_once_and_keeps_hook_order(monkeypatch):
 
 def test_capture_hook_preserves_small_query_lengths_and_bucket_hint(monkeypatch):
     instance = _builder()
+    state = instance.spec_state
     attn = SimpleNamespace(max_query_len=3, seq_lens=torch.tensor([1]))
     common = SimpleNamespace(max_seq_len=256)
-    instance._update_smallq_decode_metadata = MagicMock()
-    instance._stabilize_draft_graph_metadata = MagicMock()
+    state._update_smallq_decode_metadata = MagicMock()
+    state._stabilize_draft_graph_metadata = MagicMock()
     monkeypatch.setattr(legacy, "_mtp_context_bucket_partition_size_hint", lambda: 64)
     METADATA_HOOKS.prepare_capture(instance, attn, common)
     assert attn.seq_lens.tolist() == [3]
-    instance._update_smallq_decode_metadata.assert_called_once_with(
+    state._update_smallq_decode_metadata.assert_called_once_with(
         attn,
         common,
         force=True,
         workspace_seq_capacity_cap=256,
         partition_size_hint=64,
     )
-    instance._stabilize_draft_graph_metadata.assert_not_called()
+    state._stabilize_draft_graph_metadata.assert_not_called()
     instance._is_dflash_draft_model = True
     METADATA_HOOKS.prepare_capture(instance, attn, common)
-    instance._stabilize_draft_graph_metadata.assert_called_once_with(attn, common)
+    state._stabilize_draft_graph_metadata.assert_called_once_with(attn, common)

@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import sys
-from collections.abc import Generator, Hashable
+from collections.abc import Callable, Generator, Hashable
 from contextlib import contextmanager
 from functools import lru_cache, partial
 from logging import Logger
@@ -92,6 +92,32 @@ def _print_warning_once(logger: Logger, msg: str, *args: Hashable) -> None:
 
 LogScope = Literal["process", "global", "local"]
 
+# Explicit keys describe a process-wide event, independently of its message,
+# arguments or logger instance. Unlike the ordinary message cache, these keys
+# must not expire when unrelated messages fill an LRU cache.
+_log_once_keys: set[Hashable] = set()
+
+
+def log_once_seen(key: Hashable) -> bool:
+    """Check an explicit event key before evaluating expensive log arguments."""
+    return key in _log_once_keys
+
+
+def set_log_once_state(key: Hashable, seen: bool) -> None:
+    """Restore an explicit event's observation state, including legacy controls."""
+    if seen:
+        _log_once_keys.add(key)
+    else:
+        _log_once_keys.discard(key)
+
+
+def _print_keyed_once(
+    logger: Logger, method: str, key: Hashable, msg: str, *args: Hashable
+) -> None:
+    if not log_once_seen(key):
+        getattr(logger, method)(msg, *args, stacklevel=3)
+        set_log_once_state(key, True)
+
 
 def _should_log_with_scope(scope: LogScope) -> bool:
     """Decide whether to log based on scope"""
@@ -124,17 +150,31 @@ class _VllmLogger(Logger):
             return
         _print_debug_once(self, msg, *args)
 
-    def info_once(self, msg: str, *args: Hashable, scope: LogScope = "local") -> None:
+    def info_once(
+        self,
+        msg: str,
+        *args: Hashable,
+        scope: LogScope = "local",
+        key: Hashable | None = None,
+    ) -> None:
         """
         As [`info`][logging.Logger.info], but subsequent calls with
-        the same message are silently dropped.
+        the same message are silently dropped. An explicit, namespaced key
+        instead shares one process-wide event across messages and loggers.
         """
         if not _should_log_with_scope(scope):
             return
-        _print_info_once(self, msg, *args)
+        if key is None:
+            _print_info_once(self, msg, *args)
+        else:
+            _print_keyed_once(self, "info", key, msg, *args)
 
     def warning_once(
-        self, msg: str, *args: Hashable, scope: LogScope = "local"
+        self,
+        msg: str,
+        *args: Hashable,
+        scope: LogScope = "local",
+        key: Hashable | None = None,
     ) -> None:
         """
         As [`warning`][logging.Logger.warning], but subsequent calls with
@@ -142,11 +182,14 @@ class _VllmLogger(Logger):
         """
         if not _should_log_with_scope(scope):
             return
-        _print_warning_once(self, msg, *args)
+        if key is None:
+            _print_warning_once(self, msg, *args)
+        else:
+            _print_keyed_once(self, "warning", key, msg, *args)
 
 
 # Pre-defined methods mapping to avoid repeated dictionary creation
-_METHODS_TO_PATCH = {
+_METHODS_TO_PATCH: dict[str, Callable[..., Any]] = {
     "debug_once": _VllmLogger.debug_once,
     "info_once": _VllmLogger.info_once,
     "warning_once": _VllmLogger.warning_once,

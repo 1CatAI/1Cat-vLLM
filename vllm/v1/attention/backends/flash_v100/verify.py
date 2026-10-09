@@ -60,10 +60,20 @@ class VerificationOps:
     layer_info: Any
     xqa_codec: Any
     decode: Any
+    tree_seq_lens_match: Any = None
+    tree_query_start_match: Any = None
+    tree_parent_ids: Any = None
+    tree_visibility: Any = None
     admit_grouped_override: Any = None
     run_grouped_override: Any = None
     admit_xqa_override: Any = None
     run_smallq_override: Any = None
+    validate_contract: Any = None
+    partition_hint: Any = None
+    branch_enabled: Any = None
+    branch_strict: Any = None
+    tree_trace_enabled: Any = None
+    tree_trace_event: Any = None
 
 
 @dataclass(frozen=True)
@@ -75,62 +85,6 @@ class GroupedAdmission:
     flash_attn_grouped_fp16_fp32_paged: Any
     flash_attn_grouped_e4m3_fp32_paged: Any
     _flash_v100_window_size: Any
-
-
-def validate_contract(
-    layer: torch.nn.Module,
-    attn_metadata: TritonAttentionMetadata,
-    window_size: Any,
-) -> None:
-    if not getattr(layer, "is_dflash_draft_attn", False):
-        return
-
-    actual_causal = bool(getattr(attn_metadata, "causal", True))
-    expected_causal = getattr(layer, "dflash_expected_causal", None)
-    if expected_causal is None:
-        raise RuntimeError(
-            "FLASH_ATTN_V100 DFlash attention is missing its declared "
-            "causality contract."
-        )
-    expected_causal = bool(expected_causal)
-    if actual_causal != expected_causal:
-        raise RuntimeError(
-            "FLASH_ATTN_V100 DFlash causality mismatch: "
-            f"model={expected_causal} metadata={actual_causal}."
-        )
-
-    declared_window = getattr(layer, "dflash_expected_sliding_window", None)
-    expected_window = (
-        (-1, -1)
-        if declared_window is None
-        else (
-            int(declared_window) - 1,
-            0 if expected_causal else int(declared_window) - 1,
-        )
-    )
-    actual_window = window_size(actual_causal)
-    if actual_window != expected_window:
-        raise RuntimeError(
-            "FLASH_ATTN_V100 DFlash sliding-window mismatch: "
-            f"model={expected_window} backend={actual_window}."
-        )
-
-    signature = (
-        getattr(layer, "layer_name", None),
-        actual_causal,
-        actual_window,
-        getattr(layer, "dflash_rope_is_neox_style", None),
-    )
-    if signature not in _state._logged_dflash_attention_contracts:
-        _state._logged_dflash_attention_contracts.add(signature)
-        logger.info(
-            "FLASH_ATTN_V100 DFlash attention contract: layer=%s "
-            "causal=%s window=%s rope_neox=%s.",
-            signature[0],
-            actual_causal,
-            actual_window,
-            signature[3],
-        )
 
 
 class VerificationExecutor:
@@ -166,7 +120,7 @@ class VerificationExecutor:
         )
 
     def validate_contract(self, layer, attn_metadata) -> None:
-        validate_contract(layer, attn_metadata, self.ops.window_size)
+        self.ops.validate_contract(layer, attn_metadata, self.ops.window_size)
 
     def grouped_verify_allowed(
         self,
@@ -468,7 +422,7 @@ class VerificationExecutor:
             partition_size_hint=partition_size_hint,
         ):
             verifier_partition_size_hint = (
-                _routing._mtp5_xqa_dual_cta_partition_size_hint()
+                self.ops.partition_hint()
                 if (
                     query.shape[0] == 5
                     and query.shape[2] == 256
@@ -598,20 +552,20 @@ class VerificationExecutor:
         )
         window_size = self.ops.window_size(causal=True)
         if (
-            _debug._dflash_ddtree_triton_branch_attn_enabled()
+            self.ops.branch_enabled()
             and parent_ids is not None
-            and _masks._ddtree_triton_seq_lens_match(
+            and self.ops.tree_seq_lens_match(
                 attn_metadata,
                 seq_lens,
                 num_reqs,
             )
-            and _masks._ddtree_triton_query_start_loc_match(
+            and self.ops.tree_query_start_match(
                 attn_metadata,
                 query_start_loc,
                 num_reqs,
             )
         ):
-            triton_parent_ids = _masks._ddtree_triton_parent_ids_for_query(
+            triton_parent_ids = self.ops.tree_parent_ids(
                 parent_ids,
                 num_tree_tokens_cpu,
                 query_start_loc,
@@ -636,13 +590,10 @@ class VerificationExecutor:
                         window_size=window_size,
                     )
                 except Exception:
-                    if (
-                        is_capturing
-                        or _debug._dflash_ddtree_triton_branch_attn_strict()
-                    ):
+                    if is_capturing or self.ops.branch_strict():
                         raise
-                    if _routing._ddtree_trace_enabled():
-                        _routing._ddtree_trace_event(
+                    if self.ops.tree_trace_enabled():
+                        self.ops.tree_trace_event(
                             "flash_ddtree_attention_route",
                             {
                                 "route": "triton_exception_fallback",
@@ -677,8 +628,8 @@ class VerificationExecutor:
                     _routing._record_route(
                         _routing.ROUTE_SPECS["prefill_ddtree_triton"].name
                     )
-                    if _routing._ddtree_trace_enabled():
-                        _routing._ddtree_trace_event(
+                    if self.ops.tree_trace_enabled():
+                        self.ops.tree_trace_event(
                             "flash_ddtree_attention_route",
                             {
                                 "route": "triton",
@@ -720,8 +671,8 @@ class VerificationExecutor:
             _state._logged_prefill_ddtree_dense = True
 
         _routing._record_route(_routing.ROUTE_SPECS["prefill_ddtree_dense"].name)
-        if _routing._ddtree_trace_enabled():
-            _routing._ddtree_trace_event(
+        if self.ops.tree_trace_enabled():
+            self.ops.tree_trace_event(
                 "flash_ddtree_attention_route",
                 {
                     "route": "dense",
@@ -804,7 +755,7 @@ class VerificationExecutor:
                         )
                         key_diff = (cache_k_by_slot - key[start:end]).abs()
                         value_diff = (cache_v_by_slot - value[start:end]).abs()
-                        _routing._ddtree_trace_event(
+                        self.ops.tree_trace_event(
                             "flash_ddtree_kv_cache_diff",
                             {
                                 "layer": str(
@@ -858,7 +809,7 @@ class VerificationExecutor:
                 v_f = v_f.repeat_interleave(repeat, dim=1)
 
             scores = torch.einsum("mhd,nhd->hmn", q_f, k_f) * self.config.scale
-            visible = _masks._build_ddtree_visibility_mask(
+            visible = self.ops.tree_visibility(
                 q_len=q_len,
                 seq_len=seq_len,
                 prefix_len=prefix_len,
@@ -1131,150 +1082,3 @@ class VerificationExecutor:
             partition_size_hint=None,
         )
         return output
-
-
-def _validate_dflash_attention_contract(
-    self: Any, layer: torch.nn.Module, attn_metadata: TritonAttentionMetadata
-) -> None:
-    return validate_contract(layer, attn_metadata, self._flash_v100_window_size)
-
-
-def _dflash2_grouped_verify_allowed(
-    self: Any,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    attn_metadata: TritonAttentionMetadata,
-    *,
-    num_query_tokens: int,
-) -> bool:
-    return self._new_verification_executor().grouped_verify_allowed(
-        query, key_cache, value_cache, attn_metadata, num_query_tokens=num_query_tokens
-    )
-
-
-def _call_dflash2_grouped_verify(
-    self: Any,
-    layer: torch.nn.Module,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    attn_metadata: TritonAttentionMetadata,
-    *,
-    out: torch.Tensor,
-) -> None:
-    return self._new_verification_executor().call_grouped_verify(
-        layer, query, key_cache, value_cache, attn_metadata, out=out
-    )
-
-
-def _smallq_decode_xqa_allowed(
-    self: Any,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    seq_lens: torch.Tensor,
-    attn_metadata: TritonAttentionMetadata,
-    *,
-    window_size: tuple[int, int],
-    max_seq_len_hint: int | None,
-    workspace_seq_capacity_hint: int | None,
-    partition_size_hint: int | None,
-) -> bool:
-    return self._new_verification_executor().smallq_xqa_allowed(
-        query,
-        key_cache,
-        value_cache,
-        seq_lens,
-        attn_metadata,
-        window_size=window_size,
-        max_seq_len_hint=max_seq_len_hint,
-        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
-        partition_size_hint=partition_size_hint,
-    )
-
-
-def _call_flash_attn_smallq_decode_paged(
-    self: Any,
-    layer: torch.nn.Module,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    attn_metadata: TritonAttentionMetadata,
-    *,
-    out: torch.Tensor,
-    max_seq_len_hint: int | None,
-    workspace_seq_capacity_hint: int | None,
-    partition_size_hint: int | None,
-) -> None:
-    return self._new_verification_executor().call_smallq_decode_paged(
-        layer,
-        query,
-        key_cache,
-        value_cache,
-        block_table,
-        seq_lens,
-        attn_metadata,
-        out=out,
-        max_seq_len_hint=max_seq_len_hint,
-        workspace_seq_capacity_hint=workspace_seq_capacity_hint,
-        partition_size_hint=partition_size_hint,
-    )
-
-
-def _small_query_decode_enabled(
-    self: Any, attn_metadata: TritonAttentionMetadata
-) -> bool:
-    return self._new_verification_executor().small_query_enabled(attn_metadata)
-
-
-def _flash_v100_ddtree_small_query_prefill_dense(
-    self: Any,
-    layer: torch.nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    attn_metadata: TritonAttentionMetadata,
-    output: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    seq_lens: torch.Tensor,
-) -> torch.Tensor:
-    return self._new_verification_executor().tree_prefill(
-        layer,
-        query,
-        key,
-        value,
-        key_cache,
-        value_cache,
-        attn_metadata,
-        output,
-        query_start_loc,
-        seq_lens,
-    )
-
-
-def _flash_v100_small_query_prefill_as_decode(
-    self: Any,
-    layer: torch.nn.Module,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    value_cache: torch.Tensor,
-    attn_metadata: TritonAttentionMetadata,
-    output: torch.Tensor,
-    query_start_loc: torch.Tensor,
-    _seq_lens: torch.Tensor,
-) -> torch.Tensor:
-    return self._new_verification_executor().small_query_prefill(
-        layer,
-        query,
-        key_cache,
-        value_cache,
-        attn_metadata,
-        output,
-        query_start_loc,
-        _seq_lens,
-    )

@@ -33,7 +33,8 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         source = Path(impl.__file__).parent / "spec/attention.py"
         self.hooks = {
             node.name: node
-            for node in ast.parse(source.read_text()).body
+            for path in (source, source.with_name("attention_policy.py"))
+            for node in ast.parse(path.read_text()).body
             if isinstance(node, ast.FunctionDef)
         }
 
@@ -41,19 +42,69 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         if (
             isinstance(call, ast.Call)
             and isinstance(call.func, ast.Attribute)
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "ATTENTION_HOOKS"
+            and (
+                ast.unparse(call.func.value) == "_feature"
+                or (
+                    ast.unparse(call.func.value) == "self.ops"
+                    and call.func.attr
+                    in (
+                        "capture_prefix_kind",
+                        "record_capture_prefix",
+                        "record_capture_layout",
+                    )
+                )
+            )
         ):
             hook = self.hooks[call.func.attr]
             names = {
                 "feature_fallback": "is_dflash_draft_attn",
                 "capture_prefix": "is_dflash_non_causal",
+                "self._policy()": "policy",
+                "self._contract_validator()": "validator",
             }
             arguments = [names.get(ast.unparse(a), ast.unparse(a)) for a in call.args]
             assert not call.keywords
             assert arguments == [a.arg for a in hook.args.args]
-            return hook
+
+            class Inputs(ast.NodeTransformer):
+                def visit_Name(self, node):
+                    if node.id == "policy":
+                        return ast.Name(id="self", ctx=node.ctx)
+                    if node.id == "validator":
+                        return ast.parse(
+                            "self._validate_dflash_attention_contract", mode="eval"
+                        ).body
+                    return node
+
+            return Inputs().visit(copy.deepcopy(hook))
         return None
+
+    def _prefill_branches(self, helper):
+        assert len(helper.body) == 1 and isinstance(helper.body[0], ast.Return)
+        dispatch = helper.body[0].value
+        assert isinstance(dispatch, ast.Call)
+        assert ast.unparse(dispatch.func) == "self._new_prefill_executor().forward"
+        assert not dispatch.keywords
+        arguments = [a.arg for a in helper.args.args]
+        assert [ast.unparse(a) for a in dispatch.args] == arguments[1:]
+        tree = ast.parse((Path(impl.__file__).parent / "prefill.py").read_text())
+        forward = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "forward"
+        )
+        assert [a.arg for a in forward.args.args] == arguments
+        executor = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "PrefillExecutor"
+        )
+        assert any(
+            isinstance(n, ast.Assign) and ast.unparse(n) == "forward = forward"
+            for n in executor.body
+        )
+        block = ast.Module(body=copy.deepcopy(forward.body), type_ignores=[])
+        return self.visit(block).body
 
     def _decode_branches(self, helper):
         assert len(helper.body) == 1 and isinstance(helper.body[0], ast.Return)
@@ -160,10 +211,11 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         return self.generic_visit(node)
 
     def visit_Return(self, node):
-        if (
-            isinstance(node.value, ast.Call)
-            and ast.unparse(node.value.func) == "self._forward_decode"
+        if isinstance(node.value, ast.Call) and ast.unparse(node.value.func) in (
+            "self._forward_decode",
+            "self._forward_prefill",
         ):
+            assert isinstance(node.value.func, ast.Attribute)
             cls = next(
                 n
                 for n in ast.parse(Path(impl.__file__).read_text()).body
@@ -172,12 +224,14 @@ class _InlineFeatureHooks(ast.NodeTransformer):
             helper = next(
                 n
                 for n in cls.body
-                if isinstance(n, ast.FunctionDef) and n.name == "_forward_decode"
+                if isinstance(n, ast.FunctionDef) and n.name == node.value.func.attr
             )
             assert not node.value.keywords
             assert [ast.unparse(a) for a in node.value.args] == [
                 a.arg for a in helper.args.args[1:]
             ]
+            if helper.name == "_forward_prefill":
+                return self._prefill_branches(helper)
             return self._decode_branches(helper)
         return self.generic_visit(node)
 
@@ -240,6 +294,31 @@ _VERIFY_METHODS = {
 class _Normalize(ast.NodeTransformer):
     in_cache = False
 
+    def _log_flag(self, node):
+        assert isinstance(node, ast.Constant)
+        names = {key: name for name, key in state.LOG_KEYS.items()}
+        assert node.value in names
+        return names[node.value]
+
+    def visit_Expr(self, node):
+        call = node.value
+        if (
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func) == "set_log_once_state"
+        ):
+            assert not call.keywords and len(call.args) == 2
+            assert ast.unparse(call.args[1]) == "True"
+            return ast.Assign(
+                targets=[ast.Name(self._log_flag(call.args[0]), ast.Store())],
+                value=ast.Constant(True),
+            )
+        return self.generic_visit(node)
+
+    def visit_Name(self, node):
+        if node.id == "seen_contracts":
+            return ast.Name(id="_logged_dflash_attention_contracts", ctx=node.ctx)
+        return node
+
     def visit_ImportFrom(self, node):
         if node.module == "vllm.v1.attention.ops.sm70_grouped_scalar":
             node.module = "vllm.v1.attention.ops.sm70_e4m3_scalar"
@@ -292,6 +371,24 @@ class _Normalize(ast.NodeTransformer):
     def visit_Attribute(self, node):
         expression = ast.unparse(node)
         verification = {
+            "self.ops.partition_hint": (
+                "_routing._mtp5_xqa_dual_cta_partition_size_hint"
+            ),
+            "self.ops.branch_enabled": (
+                "_debug._dflash_ddtree_triton_branch_attn_enabled"
+            ),
+            "self.ops.branch_strict": "_debug._dflash_ddtree_triton_branch_attn_strict",
+            "self.ops.tree_trace_enabled": "_routing._ddtree_trace_enabled",
+            "self.ops.tree_trace_event": "_routing._ddtree_trace_event",
+            "self.ops.prefix_dump_enabled": "_debug._dflash_prefix_dump_enabled",
+            "self.ops.tree_seq_lens_match": "_masks._ddtree_triton_seq_lens_match",
+            "self.ops.tree_query_start_match": (
+                "_masks._ddtree_triton_query_start_loc_match"
+            ),
+            "self.ops.tree_parent_ids": "_masks._ddtree_triton_parent_ids_for_query",
+            "self.ops.tree_visibility": "_masks._build_ddtree_visibility_mask",
+            "self.ops.compare_triton": "self._maybe_compare_triton_output",
+            "self.ops.small_query_enabled": "self._small_query_decode_enabled",
             "self.config.grouped_max_query": (
                 "self.dflash2_grouped_verify_max_query_tokens"
             ),
@@ -391,6 +488,19 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
+        if ast.unparse(node.func) == "log_once_seen":
+            assert not node.keywords and len(node.args) == 1
+            return ast.Name(self._log_flag(node.args[0]), ast.Load())
+        if ast.unparse(node.func) in ("logger.info_once", "logger.warning_once"):
+            explicit = [k for k in node.keywords if k.arg == "key"]
+            if explicit:
+                assert len(explicit) == 1
+                self._log_flag(explicit[0].value)
+                assert len(node.keywords) == 2
+                assert ast.unparse(node.keywords[0].value) == "'process'"
+                assert isinstance(node.func, ast.Attribute)
+                node.func.attr = node.func.attr.removesuffix("_once")
+                node.keywords = []
         if ast.unparse(node.func) == "ddtree_branch_attention_correction":
             argument = next(k for k in node.keywords if k.arg == "impl")
             assert ast.unparse(argument.value) == "self.config"
@@ -445,11 +555,19 @@ class _Normalize(ast.NodeTransformer):
 
 
 def test_all_method_bodies_and_static_descriptors_match_parent():
+    from vllm.v1.attention.backends.flash_v100.spec import attention
+
+    assert {
+        legacy_name: method for method, legacy_name in _VERIFY_METHODS.items()
+    } == attention.VERIFICATION_METHODS
     fixture = json.loads(
         (Path(__file__).parent / "fixtures/flash_v100_impl_methods.json").read_text()
     )["methods"]
     actual = {}
-    for path in Path(impl.__file__).parent.glob("*.py"):
+    for path in (
+        *Path(impl.__file__).parent.glob("*.py"),
+        Path(impl.__file__).parent / "spec/contracts.py",
+    ):
         for node in ast.parse(path.read_text()).body:
             candidates = (
                 node.body
@@ -465,6 +583,9 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
             )
             for fn in candidates:
                 if not isinstance(fn, ast.FunctionDef):
+                    continue
+                if path.name == "prefill.py" and fn.name == "forward":
+                    # Expanded and checked through the common forward above.
                     continue
                 if path.name == "decode.py" and fn.name in (
                     "__init__",
@@ -484,7 +605,7 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                     assert isinstance(statement, (ast.Expr, ast.Return))
                     call = statement.value
                     assert isinstance(call, ast.Call)
-                    assert ast.unparse(call.func) == "validate_contract"
+                    assert ast.unparse(call.func) == "self.ops.validate_contract"
                     assert not call.keywords
                     assert [ast.unparse(a) for a in call.args] == [
                         "layer",
@@ -513,7 +634,21 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                         (a.arg, a.arg) for a in fn.args.kwonlyargs
                     ]
                     continue
-                if fn.name == "_forward_decode":
+                if path.name == "impl.py" and fn.name == "_run_prefill_paged_call":
+                    # The typed assembly adapter is not a second calculation body.
+                    # Check its complete delegation, then hash the original owner.
+                    assert [a.arg for a in fn.args.args] == ["self"]
+                    assert [a.arg for a in fn.args.kwonlyargs] == ["route"]
+                    assert fn.args.kwarg is not None
+                    assert fn.args.kwarg.arg == "kwargs"
+                    assert len(fn.body) == 1 and isinstance(fn.body[0], ast.Return)
+                    assert fn.body[0].value is not None
+                    assert ast.unparse(fn.body[0].value) == (
+                        "_prefill.PrefillExecutor.run_paged_call("
+                        "self._new_prefill_executor(), route=route, **kwargs)"
+                    )
+                    continue
+                if fn.name in ("_forward_decode", "_forward_prefill"):
                     # Expanded and validated with the forward body above.
                     continue
                 if any(
@@ -580,7 +715,7 @@ def test_legacy_state_rebinding_reaches_moved_decode_method(monkeypatch):
         )
         is query
     )
-    logger.warning.assert_not_called()
+    logger.warning_once.assert_not_called()
     for _ in range(2):
         assert (
             instance._flash_v100_decode_dense_reference(
@@ -590,7 +725,7 @@ def test_legacy_state_rebinding_reaches_moved_decode_method(monkeypatch):
         )
     assert state._logged_decode_dense_reference
     assert legacy._logged_decode_dense_reference
-    logger.warning.assert_called_once()
+    logger.warning_once.assert_called_once()
 
 
 def test_extracted_compare_super_uses_original_class_cell(monkeypatch):

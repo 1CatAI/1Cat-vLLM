@@ -1,31 +1,52 @@
 # Flash-V100 Phase A3 execution record
 
 Baseline: #1060, `8c96e32e56c09d4a3e3112cb5d1a367571f69476`.
-Updated scope (2026-10-08): complete A3 autonomously. The user subsequently
-authorized the executor to merge after self-review and every required gate.
-No merge is authorized by a passing smoke alone. GPU validation uses the
-explicitly authorized `dx.1catai.com:54633`, with the whole-group and per-GPU
-locks, `VLLM_NO_USAGE_STATS=1`, and task-owned artifacts/dependencies.
+Updated scope (2026-10-09): the user explicitly authorized self-review and
+merging the completed work to main with proportionate acceptance gates. DDTree
+is deferred for this campaign; #1089 is excluded. The earlier requirement to
+wait for every slice's host/spec/GPU matrix no longer blocks merging. Historical
+failed and pending evidence below is retained as history, not relabeled as a pass.
+GPU validation uses the authorized `dx.1catai.com:54633` and task-owned locks,
+artifacts and dependencies. Fifty idle host/spec retry queues were stopped under
+this updated policy; their deferred records replace no test completion markers.
+
+Current merge decision: accept the completed stack through #1110 after the
+FlashInfer-SM70 compatibility fix described below. Keep the still-open A3
+structural targets as follow-up work, rather than accumulating more draft PRs.
+The final 153-line forward, 315-line maximum function, 269 cross-module private
+references, 83 outside-Spec model terms and 20 state flags are **not** full A3
+completion. Import cycles and environment reads outside config are already zero.
 
 | Step | PR | Status | Metrics | GPU validation | Open items |
 | --- | --- | --- | --- | --- | --- |
 | 0: scope and codec ownership | — | Decision communicated; #1028 rebased locally | Baseline measured | Runtime parity belongs to 1c | Retest each subsequent step |
-| 1a: immutable CPU trace and owner guard | #1071 | Gates passed; ready | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
-| 1b: patch efficacy + dependency ratchet | #1072 | Gates passed; ready | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
-| 1c: route/token/output parity tools | #1073 | Draft; host/spec model records pending | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Host/spec model gates |
-| 2a: dynamic environment boundary | #1075 | Draft; focused CPU and rebase passed | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Prerequisite model gates |
-| 2b: frozen construction policy | #1076 | Draft; CPU and rebase passed | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Prerequisite model gates |
-| 3a: per-layer decode cache | #1077 | Draft; CPU/golden/rebase passed | Private references 390 → 387 | Pending | CPU/rebase and GPU prerequisites |
-| 3b: step plan and persistent metadata buffers | #1079 | Draft; CPU/golden/rebase passed | Private references 387 → 380 | Pending | Separate outcome and GPU gates |
-| 4a: explicit decode executor dependencies | #1080 | CPU/golden/strict passed | Private references 380 → 374; cycles 14 → 13 | Queued after Step 3 | Required GPU gates |
-| 4b: native decode candidates | #1081 | CPU/golden/strict passed | Private references 374 → 370 | Required | Parent and GPU gates |
-| 4c: outer decode dispatch candidates | #1083 | CPU/golden/strict/rebase passed | Forward 597 → 402; private 370 → 358 | Required | GPU gates |
-| 1c follow-up: immutable requested workload | #1084 | CPU/golden/strict/rebase passed | Production unchanged | DFlash serialization failure retained; rerun queued | Host/spec token records |
-| 5a: per-sequence prefill candidates | #1085 | CPU/golden/strict/rebase passed | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | GPU gates |
-| 5b: batch prefill candidates | #1086 | CPU/golden/strict/rebase passed | Largest function 529 → 414; private 348 → 347 | Required | Rebase/GPU gates |
-| 5c: debug observer | #1088 | CPU/golden/strict/rebase passed | Largest function 414 → 402 | Required | Strict/rebase/GPU gates |
-| 6a: verifier ownership | — | CPU/golden/strict passed | Cycles 13 → 11; model terms 169 → 158 | Required | Strict/rebase/GPU gates |
-| 6b: registered speculative features | — | Not started | — | Required | Step 6a gates |
+| 1a: immutable CPU trace and owner guard | #1071 | Merged to main | Production unchanged | 1667 passed / 7 inherited failures; no changed outcomes | Merge with prerequisite stack |
+| 1b: patch efficacy + dependency ratchet | #1072 | Merged to main | 14 cycles / 32 forbidden edges frozen | 1668 passed / same 7 failures; 41 patch names consumed | Merge with prerequisite stack |
+| 1c: route/token/output parity tools | #1073 | Merged to main | Production unchanged | 12 native cases and 4 Qwen contracts exact; 1684 passes / same 7 failures | Deferred; not a merge gate |
+| 2a: dynamic environment boundary | #1075 | Merged to main | Outside-config reads 119 → 41; env ratchet 334 → 306 | 1684 passes / same 7 failures; exact old outcome map | Deferred; not a merge gate |
+| 2b: frozen construction policy | #1076 | Merged to main | Remaining 41 → 0; 41 immutable fields; env ratchet 306 → 284 | 1685 passes / same 7 failures; one new pass | Deferred; not a merge gate |
+| 3a: per-layer decode cache | #1077 | Merged to main | Private references 390 → 387 | 1686 passes / same 7 failures; 12 native outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
+| 3b: step plan and persistent metadata buffers | #1079 | Merged to main | Private references 387 → 380 | 1687 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
+| 4a: explicit decode executor dependencies | #1080 | Merged to main | Private references 380 → 374; cycles 14 → 13 | 1689 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts exact | Deferred; not a merge gate |
+| 4b: native decode candidates | #1081 | Merged to main | Private references 374 → 370 | 1691 passes / same 7 failures; 12 outputs exact; named timings and 4 Qwen contracts pass | Deferred; not a merge gate |
+| 4c: outer decode dispatch candidates | #1083 | Merged to main | Forward 597 → 402; private 370 → 358 | 1691 passes / same 7 failures; 12 outputs exact; 4 Qwen contracts pass | Deferred; not a merge gate |
+| 1c follow-up: immutable requested workload | #1084 | Merged to main | Production unchanged | 1692 passes / same 7 failures; no changed old outcomes | Deferred; not a merge gate |
+| 5a: per-sequence prefill candidates | #1085 | Merged to main | Largest function 977 → 529; private 358 → 348 | Queued after prerequisites | Follow-up GPU evidence |
+| 5b: batch prefill candidates | #1086 | Merged to main | Largest function 529 → 414; private 348 → 347 | Follow-up | Follow-up GPU evidence |
+| 5c: debug observer | #1088 | Merged to main | Largest function 414 → 402 | Queued | Follow-up GPU evidence |
+| 6a: verifier ownership | #1090 | Merged to main | Cycles 13 → 11; model terms 169 → 158 | Queued | Follow-up GPU evidence |
+| 6b: metadata builder ownership | #1093 | CPU/golden/strict/rebase passed | Cycles 11 → 4; private 347 → 341 | Queued | Follow-up GPU evidence |
+| 6c: attention policy ownership | #1095 | CPU/golden/strict/rebase passed | Cycles 4 → 3; private 341 → 333; model terms 158 → 154 | Queued | Follow-up GPU evidence |
+| 6d: owned per-request metadata packet | #1096 | CPU/golden/strict/rebase passed | Private 333 → 332; final metadata mixin removed | Queued | Follow-up GPU evidence |
+| 6e: registered speculative features | #1097 | CPU/golden/strict/rebase passed | Private 332 → 330 | Queued | Follow-up GPU evidence |
+| 6f: complete prefill execution ownership | #1101 | CPU/golden/strict/rebase passed | Private 330 → 318; cycles 3 → 2; model terms 154 → 151 | Queued | Follow-up GPU evidence |
+| 6g: owned comparison diagnostics | #1103 | CPU/golden/strict/rebase passed | Private 318 → 309; cycles 2 → 1 | Queued | Follow-up GPU evidence |
+| 6h: shared allocation ownership | #1104 | CPU/golden/strict/rebase passed | Private 309 → 308; final cycle 1 → 0 | Queued | Follow-up GPU evidence |
+| 6i: outer prefill dispatch | #1105 | CPU/golden/strict/rebase passed | Forward 400 → 153; largest function 400 → 318 | Queued | Follow-up GPU evidence |
+| 6j: tree visibility feature ownership | #1107 | CPU/golden/strict/rebase passed | Private 308 → 303; model terms 151 → 137 | Queued | Follow-up GPU evidence |
+| 6k: feature contract ownership | #1108 | CPU/golden/strict/rebase passed | Private 303 → 301; model terms 137 → 126 | Four queues staged | Follow-up GPU evidence |
+| 6l: dynamic feature policies | #1109 | CPU/golden/strict/rebase passed | Private 301 → 287; model terms 126 → 83 | Four queues staged | Follow-up GPU evidence |
+| 6m: decode one-shot logging | #1110 | Full CPU/golden/strict and logger tests passed | State flags 29 → 20; private 287 → 269 | Follow-up | Follow-up GPU evidence |
 | 7: final boundaries, flags, docs, ratchet | — | Not started | — | Final greedy evidence required | Step 6 gates |
 
 ## Step 0 decisions
@@ -703,3 +724,617 @@ exclusions**, with all original shim patches consumed. Evidence:
 `a3-spec-verifier-strict-final.log` and `a3-spec-verifier-shim-final.json`.
 Pre-commit including mypy/layering passes (`a3-spec-verifier-precommit-ready.log`).
 No production files changed while this accepted full run was executing.
+
+## Step 6b metadata builder ownership
+
+PR #1090 is `f917a5f35df0c652c90896bf7f053d73d62022ef`. Its actual pinned
+PR #1028 integration is `674785c0e9495fd9f6feacfaa51bdf490eb1ee28`, tree
+`ffe9ec852916153f1ecb0ba228fcffb53ab7b0a0`, matching the clean merge-tree.
+The integration passes 37 CPU tests with 98 GPU skips; four hash-verified GPU
+queues are staged under `a3-step6a` on authorized 54633.
+
+Mechanical extraction `9a842373f` precedes builder ownership. The common
+builder no longer inherits the speculative method mixin. SpecMetadataState
+owns its configuration and MetadataWorkspace, receives immutable inputs and
+five narrow common callbacks, and never receives/imports the common builder.
+The old MetadataHooks object remains only as a compatibility adapter. Attention
+and metadata field mixins still exist; feature registration is subsequent work.
+
+The original builder identity is passed explicitly: grouped metadata prepared
+by the proposer continues to validate against that identity, not the new state
+object's identity. Persistent draft and small-query buffers retain addresses
+across refreshes. Legacy configuration writes replace immutable inputs while
+legacy state reads/writes reach the single owner. Existing ordering/capture
+tests inject owned callbacks and retain their original assertions and test IDs.
+
+All 813 immutable traces and 14 original metadata calculation hashes pass.
+Six independent ownership cases cover replay pointers, prepared metadata
+identity, two capacity failures before publication, compatibility writes and
+base-build failure propagation. The focused suite passes 24 tests; evidence:
+`a3-spec-metadata-owner-golden.log`. The dependency ceiling is now
+402 / 402 / 341 / 4 / 158 / 0 / 29, without new forbidden edges.
+
+Step 1c host-FP8's rebuilt native parent and candidate unit suites each pass
+135 tests. The parent full model has saved its two greedy records; candidate
+execution is underway. Full host parity is not yet claimed. DFlash2 parity
+passes; the original DDTree baseline failure and separate fix #1089 remain
+recorded, with baseline clarification pending.
+
+The fixed-source strict suite passes **280 tests / 1 skip / 28 GPU exclusions**,
+including actual consumed shim patches. Evidence:
+`a3-spec-metadata-owner-strict.log` and `a3-spec-metadata-owner-shim.json`.
+Pre-commit including mypy/layering passes; no production or oracle file changed
+during the accepted full run. Four GPU queues and #1028 replay are next.
+
+## Step 6c attention policy ownership
+
+PR #1093 is `21b38c8d0436dec88ed5cfe4aed46eacfbc9c3cf`. Actual pinned
+PR #1028 replay produces `1fc3f8c1711d304292ce47ea12c994574b949c0d`, tree
+`980392578b6f0a01eff4eb8814fdbdd95e2597a5`, identical to clean merge-tree.
+Its three integration suites pass 37 CPU cases with 98 GPU skips. Four queues
+and verified source snapshots are staged under `a3-step6b` on 54633.
+
+Mechanical extraction `e5feb51a5` precedes ownership. SpecAttentionState owns
+construction policy and receives native ABI values, a keyword probe and native
+operators. It neither imports nor receives Impl. The attention mixin and
+single-provider AttentionHooks are removed. Fallback dispatch takes common
+policy; contract validation takes a callback. Legacy methods bind at the common
+assembly boundary, preserving bound/unbound calls and instance overrides;
+VerificationExecutor no longer contains adapters receiving an Impl receiver.
+Ordinary validation retains its lightweight guard without executor construction.
+
+All 813 immutable traces and original calculation hashes pass. The recorder
+observes the real verifier predicate, retaining the frozen canonical event name.
+The source oracle checks original method-to-executor bindings and actual narrow
+callback/policy arguments. Six direct owner tests cover layer-local state,
+short-circuit configuration reads with/without an operator, native ABI injection,
+prefill keyword wrapping, the allocation-free ordinary guard and bound/unbound
+compatibility arguments. Focused suites pass 30 + 6 tests.
+
+The first focused run failed only the dependency ratchet: mechanical extraction
+introduced a policy-to-ops import and a second assembly-to-policy edge. Native
+values/probes are now injected, and assembly uses its existing feature boundary.
+The passing run retains the original limits; no new forbidden edge is allowed.
+Evidence: `a3-spec-attention-owner-focused-final.log` and
+`a3-spec-attention-owner-injection.log`. Current metrics are
+400 / 400 / 333 / 3 / 154 / 0 / 29; remaining metadata field mixin and per-method
+feature registration are not complete.
+
+Step 1c host-FP8's first complete comparison fails greedy token identity.
+Both model arms complete and pass 135 native host unit cases each. France is
+identical; the 64-token Chinese answer first diverges at zero-based token 21.
+Both arms have identical 2,705 production source hashes, native-library hashes,
+workload, recorder and GPU state. Only declared private cache/IPC paths differ.
+The failed gate is retained, and an unchanged-parent repeat is queued to test
+baseline reproducibility. No host completion marker or merge approval is inferred.
+
+The complete fixed-source strict suite passes **286 tests / 1 skip / 28 GPU
+exclusions**, with all shim replacements consumed by real calls/reads. Evidence:
+`a3-spec-attention-owner-strict.log` and `a3-spec-attention-owner-shim.json`.
+Pre-commit/mypy/layering passes (`a3-spec-attention-owner-precommit-final.log`).
+No production/source-oracle file changed during the accepted strict run.
+
+## Step 6d per-request metadata packet
+
+PR #1095 is `224119021840522a1860661e8ae2a5f192109053`. Actual pinned
+PR #1028 replay is `3cfa92828870ee90b0fa80b3962d615e112b13c6`, tree
+`94070b3149116d9740aa48b8f07d0fece6c8982f`, equal to the clean merge-tree.
+Three integration suites pass 37 CPU tests with 98 GPU skips. Four GPU queues
+and SHA256-verified source snapshots are staged under `a3-step6c` on 54633.
+
+Mechanical field grouping `1fed2deb4` precedes ownership. The remaining metadata
+field mixin is removed. Common metadata owns a SpecMetadataPacket via spec_state;
+old field reads/writes/deletes forward to that packet. The Triton builder's exact
+metadata class is adopted as the existing Flash subtype in place, preserving
+object identity and all tensor addresses. Other external metadata types retain
+their legacy view. Shallow copies own independent packet containers with shared
+tensors, and packets have no reference back to the metadata object.
+
+The tree attachment operation is now a public owned API, with its old name
+retained as a compatibility alias. All 813 immutable traces and the 14 metadata
+calculation hashes pass. The source oracle maps the public operation's actual
+body to its original name without changing the fixture. Six direct packet tests
+cover in-place adoption, legacy access/deletion, shallow-copy isolation, prompt
+object release, and tree capture's authoritative values and persistent pointers.
+Focused suites pass 24 + 6 tests; evidence: `a3-spec-features-focused.log` and
+`a3-spec-features-packet.log`. The ceiling is 400 / 400 / 332 / 3 / 154 / 0 / 29,
+with no new forbidden edge. Per-method SpecFeature registration is still open.
+
+Step 3b's authorized 54633 regression is complete: 1687 passes and the same
+seven inherited failures, with exactly one new passing workspace case and no
+changed existing outcomes. All 12 native operator cases have max-abs 0.
+Designated timing deltas are FP16 XQA graph 0%, E4M3 XQA graph +0.0127824%,
+and 75T-role prefill -0.0505210%, all within 2%. DDTree eager timing is recorded
+but has no declared performance role; no broader timing acceptance is claimed.
+Evidence: `a3-step3b/logs/regression-parity.json`, `op-compare.log` and
+`regression.done` (2026-10-09 05:32:16 +08:00). Model gates remain pending.
+
+The fixed-source strict suite passes **292 tests / 1 skip / 28 GPU exclusions**,
+with real shim consumption (`a3-spec-features-strict.log`,
+`a3-spec-features-shim.json`). Pre-commit, mypy and layering all pass
+(`a3-spec-features-precommit.log`). Production and source-oracle files remained
+unchanged during the accepted run. GPU completion and feature registration are
+still pending.
+
+## Step 6e method-specific verification providers
+
+PR #1096 is `f92fbed160516cfa6da47680505d3d35826da1e5`. Pinned #1028
+replay is `3f5cf2a6190460ccd6f2194fde63c2b5e5b3409c`, tree
+`0c81e04abe81e1800775ce051e33f9a984abf341`, equal to clean merge-tree;
+37 CPU integration cases pass with 98 GPU skips. Four source-verified queues
+are staged as `a3-step6d` on 54633.
+
+Mechanical extraction `59f4c9c9e` precedes registration. A proposer-side
+SpecFeature protocol and immutable method registry select independent per-builder
+DFlash2Feature, DDTreeFeature or MTPFeature instances. The tree provider preserves
+verification suppression, the parallel provider consumes prepared metadata, and
+the linear provider expands small queries. Explicit tree/prepared inputs retain
+their precedence even when supplied with another configured method. Unknown or
+absent methods retain the original linear fallback; initialization/config reads
+remain before method selection.
+
+The 16-case method/payload matrix verifies actual preparation calls, order and
+lazy capacity reads. Two registry cases check distinct provider instances,
+unknown methods, immutable registrations and external provider injection.
+All 813 golden traces and 14 calculation hashes remain unchanged; the metadata
+oracle expands the actual complete tree-provider body, and the independent
+matrix covers all registered providers. The first focused run caught an
+accidental abbreviated prepared-method name in the extracted tree provider;
+that production call was corrected without changing fixtures or expectations.
+The accepted focused suite has 42 passes (`a3-feature-registration-focused-final.log`).
+Public metadata calculation APIs replace two cross-module private references,
+locking the ceiling at 400 / 400 / 330 / 3 / 154 / 0 / 29.
+
+Host-FP8's unchanged-parent repeat has now failed to reproduce the original
+parent Chinese output at the same token 21 (96378 versus 99505). France is
+identical. This diagnoses baseline non-reproducibility for this workload,
+not its numerical cause and not candidate acceptance. The original and repeat
+artifacts remain separate; no host completion marker is written. See
+`a3-step1c/logs/host-parent-repeat-report.json`. DDTree baseline clarification
+and the complete model gates remain open.
+
+The fixed-source complete strict suite passes **310 tests / 1 skip / 28 GPU
+exclusions**, including actual shim consumption (`a3-feature-registration-strict.log`
+and `a3-feature-registration-shim.json`). No production/source-oracle file
+changed during the run. Subsequent lint corrections only wrap a dictionary value
+and annotate the new test's mixed event list; the affected tests are rerun.
+
+## Step 6f complete prefill execution ownership
+
+PR #1097 is `bad1ad1d0cbce85a3744202d009e4cb92b87e19d`. Actual #1028
+replay is `69cbc10d8e10d5e19a1e247d1c07d633d552d43c`, tree
+`f2228c98f0bf5700774d6ba1ba68d6296ce56144`, equal to clean merge-tree;
+37 CPU integration tests pass with 98 GPU skips. Four source-verified GPU queues
+are staged as `a3-step6e`. Pinned #1028/#1048 heads remain unchanged.
+
+Prefill calculation functions now receive an owned PrefillExecutor configured
+with immutable policy/geometry, explicit native operators and narrow callbacks,
+and the existing workspace. Common assembly retains the external method
+facades and instance overrides, including falsey callables. The candidate
+executor uses this owner; prefill neither imports nor receives Impl. No
+calculation body is moved or rewritten in this slice; ownership adapters and
+dependency construction are the change.
+
+The initial golden run caught one omitted grouped native operator dependency,
+previously retrieved with getattr in mixed-row preparation. The operator is
+now injected and the unchanged golden passes. The 38-case focused suite covers
+all 813 traces and original method hashes (`a3-prefill-owner-focused-final.log`).
+Five boundary cases exercise real bound/unbound profile calls on the owner,
+falsey overrides, native refresh/feature overrides and policy snapshot isolation
+(`a3-prefill-owner-boundary.log`). Metrics tighten to
+400 / 400 / 318 / 2 / 151 / 0 / 29 without new forbidden edges.
+
+Step 4a GPU regression/native gates finish on 54633: 1689 passes / the same
+seven inherited failures, exactly two new passing cases and no changed old
+outcomes. All 12 attention outputs have max-abs 0. Designated timing deltas are
+FP16 XQA graph 0%, E4M3 XQA graph +0.0236434%, and 75T-role prefill +0.778561%,
+all within 2%. Other timings are recorded without broadening their acceptance
+role. Evidence: `a3-step4a/logs/{regression-parity.json,op-compare.log,regression.done}`
+(completed 2026-10-09 06:09:34 +08:00). Complete model gates remain pending.
+
+The complete fixed-source strict suite passes **315 tests / 1 skip / 28 GPU
+exclusions**, including real shim use (`a3-prefill-owner-strict.log` and
+`a3-prefill-owner-shim.json`). Pre-commit/mypy/layering pass
+(`a3-prefill-owner-precommit-final.log`). No production/source-oracle file
+changed during the accepted run.
+
+Step 3a's small Qwen model gate is also complete: FP16/E4M3 crossed with
+eager/graph, three requests each, all token/route records equal. The four
+`a3-step3a/logs/qwen-*-compare.log` files report `equal=True, requests=3`;
+`qwen.done` is dated 2026-10-09 05:16:38 +08:00. Host/spec gates still remain.
+
+## Step 6g comparison diagnostics ownership
+
+PR #1101 is `785d84b7fd62bd7e675dbc517d3b9fa016baf80c`. Actual #1028
+replay is `f0dd2d11a4c1d4ebd061b2dc8256db43bd09c701`, tree
+`b8b9fa02f3963d0b33eae6d54c1f831954bb62ef`, equal to clean merge-tree;
+37 CPU integration tests pass with 98 GPU skips. Four source-verified durable
+queues are staged as `a3-step6f` on 54633.
+
+ComparisonExecutor receives policy, scalar geometry, explicit native/reference
+operators and per-layer ComparisonState. No comparison calculation imports or
+receives Impl. Legacy counter reads/writes reach the owned state; enabled
+partially initialized objects retain their missing-counter error. Common
+assembly binds the original class-cell super().forward as a narrow reference
+callback, preserving export-monkeypatch behavior and per-instance overrides,
+including static helpers. Calculation bodies stay in place; the old super call
+becomes the injected reference callback, already covered by the original AST
+projection. No mechanical code move is included in this slice.
+
+All 813 traces and original calculation hashes pass in 21 focused cases
+(`a3-debug-owner-focused.log`). Six direct tests verify layer-local quotas shared
+across short-lived executors, legacy counter resets, partial initialization,
+capture skipping after quota reservation, reference failure propagation, real
+BHMD JSON output and static helper overrides (`a3-debug-owner-boundary.log`).
+The ceiling tightens to 400 / 400 / 309 / 1 / 151 / 0 / 29 without new forbidden
+edges. The remaining import cycle is KV gather versus dense allocation; complete
+debug event dispatch and the other final A3 gates are still open.
+
+The complete fixed-source strict suite passes **321 tests / 1 skip / 28 GPU
+exclusions**, with real shim consumption (`a3-debug-owner-strict.log`,
+`a3-debug-owner-shim.json`). Pre-commit, mypy and layering pass
+(`a3-debug-owner-precommit.log`). Production and source-oracle files remain
+unchanged throughout the accepted strict run.
+
+## Step 6h shared allocation ownership
+
+PR #1103 is `d75b5f17297fd5330a836274a7f4af176e62219e`. Actual #1028
+replay is `d1519318e057d75644fa2ef35a47cbaab9090b0f`, tree
+`e208f1bbe0efc2ddf9c1e8d8849280d86beef783`, equal to clean merge-tree;
+37 CPU integration tests pass with 98 GPU skips. Four source-verified durable
+queues are staged as `a3-step6g` on 54633.
+
+Growing allocation belongs to workspace. KV gather and dense prefill both
+consume its public allocation API, removing the last package import cycle.
+A separate mechanical commit preserves the original allocation body before
+the public-name rewrite. Legacy shim names resolve to the actual module and
+attribute, so a patch through the old private name reaches both real consumers;
+no stale function-value alias is retained. Strict patch auditing follows this
+canonical binding while still requiring callable invocation from production.
+
+The nine new cases cover initial success, OOM retry with CPU/CUDA cache-release
+ordering, second OOM decline, non-OOM error propagation, real gather/bridge
+allocation through the legacy patch, cache pointer reuse and alias deletion
+and restoration. The initial 19-case focused selection passed its tests but
+failed the suite-wide patch-consumption gate for a pre-existing dense-prefill
+patch; it is retained as a failed run, not accepted as validation. The complete
+strict suite is the gate. Metrics are 400 / 400 / 308 / 0 / 151 / 0 / 29.
+
+Step 3b Qwen model validation completes on 54633 at 2026-10-09 06:35 +08:00:
+FP16/E4M3 crossed with eager/graph, three requests each, all four comparisons
+report equal route/token records. Evidence is `a3-step3b/logs/qwen-*-compare.log`
+and `qwen.done`. Host/spec baseline issues still block complete model gates.
+
+The complete fixed-source strict suite passes **330 tests / 1 skip / 28 GPU
+exclusions**, with unchanged 813 golden traces and original calculation hashes.
+Every audited patch is consumed; the legacy allocator patch reaches both real
+production consumers. Evidence: `a3-allocation-owner-strict.log` and
+`a3-allocation-owner-shim.json`. Production/source-oracle files stay fixed
+throughout the accepted run.
+
+## Step 6i outer prefill dispatch ownership
+
+PR #1104 is `73b8fba61904aa631132b983d21083b026032102`. Actual #1028
+replay is `55c52e03db41716cb192a1bea10f474e8f9cc6f1`, tree
+`7c1827808dceb04f27308f2a6bbeca5972e4c035`, equal to clean merge-tree;
+37 CPU integration tests pass with 98 GPU skips. Four verified durable queues
+are staged as `a3-step6h` on 54633. Pre-commit/mypy/layering passed for #1104.
+
+The common forward now delegates prefill dispatch to PrefillExecutor, which
+owns policy, native/callback dependencies and workspace. A mechanical commit
+extracts the unchanged branch body first. The ownership commit transfers it
+with explicit Triton reference, comparison, small-query admission and capture
+feature callbacks; no Impl receiver/import is added to prefill. Per-instance
+calculation overrides still resolve when the owner is assembled.
+
+All three decode-cache invalidations remain at their original branch positions
+inside the executed prefill forward. Capture's two early returns still preserve
+resident cache state. The trace observer reads real owned policy lookups and
+reset calls; the calculation oracle expands the actual helper/executor body,
+checks its arguments and binding, then compares the unchanged original hashes.
+The initial 20-case focused suite passes all 813 golden traces and calculation
+hashes (`a3-prefill-dispatch-focused.log`). Metrics tighten to
+153 / 318 / 308 / 0 / 151 / 0 / 29, with no new forbidden edges. The final
+150/200 line targets and remaining Spec/private/logging gates are still open.
+
+Seven direct dispatch cases verify invalidation-before-execution at all three
+reset sites, completed None results without a fallback attempt, both capture
+early returns preserving resident cache, the original Triton super binding,
+and refresh/isolation of feature callback overrides. Evidence:
+`a3-prefill-dispatch-boundary.log` (7 passed). Pre-commit removed two unused
+imports and required an explicit AST type assertion; the final pre-commit,
+mypy and layering checks pass (`a3-prefill-dispatch-precommit-final.log`).
+The fixed-source strict suite then passes **337 tests / 1 skip / 28 GPU
+exclusions**, including unchanged traces/hashes and real shim consumption
+(`a3-prefill-dispatch-strict.log`, `a3-prefill-dispatch-shim.json`).
+
+Step 4b's first full GPU regression stopped with 1690 passes / eight failures:
+the seven inherited failures plus the literal-accounting source inventory.
+That checker recognized only attribute `_record_route` calls, missing the
+three typed injected decode calls (41 versus the required 44). Production route
+names are unchanged: all 14 affected published PR source trees have exactly
+the same 44 static accounting names as #1060 when injected calls are included.
+The original failed snapshot/logs remain intact. A test-only correction keeps
+the 44-name requirement and validates the injected parameter's RecordRoute
+type; corrected-head GPU regression is required before the queue proceeds.
+
+## Step 6j tree visibility feature ownership
+
+PR #1105 is `4d653b7ec13ad0c38959fc52db1199c85b8b0919`; its actual
+the #1028 replay is `c0edaf9c64e1eb0a77a400f3ff25b2fdd2821769`, clean tree
+`ef848e6e438b3e340a61a9a19e4bad8943978c9c`. The integration CPU suites
+pass 37 tests / 98 GPU skips. Four verified queues are staged as `a3-step6i`.
+
+Five tree visibility/metadata-contract calculations move mechanically into
+spec/tree_masks.py, then expose public feature APIs. Common verification and
+batch prefill receive explicit callbacks from common assembly. Generic masks
+no longer owns or exports those five algorithms; old facade names resolve to
+the live Spec bindings. No whole Impl receiver or new forbidden import edge
+is introduced. The remaining parent-CPU-cache adapter is still in generic masks
+and remains tracked for the next boundary work.
+
+The focused suite passes 44 cases, including all 813 immutable golden traces
+and original calculation hashes (`a3-tree-masks-focused.log`). Six direct cases
+check sibling exclusion/window visibility, capture restoration without host
+comparison, mixed linear/tree parent-copy behavior and no capture allocation,
+and real batch-admission use of a legacy patch. The latter passes strict shim
+consumption (`a3-tree-masks-boundary.log`, `a3-tree-masks-boundary-shim.json`).
+Maximum-function measurement now considers every AST function, including names
+repeated within one file; the diagnostic name map can no longer hide a larger
+function by overwriting its key. The measured maximum remains 318. Metrics
+reduce to 153 / 318 / 303 / 0 / 137 / 0 / 29.
+
+## Corrected route inventory and preserved GPU evidence
+
+The test-only correction `26db013963221a67d083a76bd28ede9765906067`
+was propagated through ordinary merges into the existing Draft stack; no
+published history was rewritten. Every changed tree differs only in
+`test_flash_v100_routes.py`. Each updated head was actually replayed with the
+pinned #1028, matched clean merge-tree, and passed 37 integration CPU tests
+with 98 GPU skips. The exact 44 original accounting names remain unchanged.
+All tracked source files in the new GPU candidate/host snapshots were checked
+against manifests generated from the corresponding Git commits. New roots
+use the -v2 suffix; only the obsolete owned waiting queues were retired.
+Original snapshots, the Step 4b eight-failure log and all baseline failures
+remain intact. No old failure was turned into a passing marker.
+
+| PR | Corrected head | #1028 replay | GPU root |
+| --- | --- | --- | --- |
+| #1081 | `26db013963221a67d083a76bd28ede9765906067` | `fea00216224b081965cb13e2429eb2fd16c8abc5` | `a3-step4b-v2` |
+| #1083 | `43f17967333b3f6b309533c1ad0e75a0c0b5f3ec` | `cd88482803dc07e3ae7feeca805df47350fb3717` | `a3-step4c-v2` |
+| #1084 | `dd655ad13324b23836b65f6da662ce4230bbfec0` | `672bac94a9d509840b813023daa8ba9b83bbbd88` | `a3-snapshot-v2` |
+| #1085 | `6a3615c0a63403ca808f16dbe3d3030a286d9d48` | `2a1d9701568ecd7cdf9aac9de197a508c0fcad0e` | `a3-step5a-v2` |
+| #1086 | `b020db66b6165b7833b4bed58c2b540fd18132be` | `15e3f84becea3a211401751fa22acc58bf30979a` | `a3-step5b-v2` |
+| #1088 | `aa175e1d079165da40ae06ab63d169b06cd3e899` | `585d607f998eda96c93dee1200aae1a0ef9b7ba0` | `a3-step5c-v2` |
+| #1090 | `33d85a9c9e926ccc151872637418d29668e360db` | `b1c0988d1bc45b44ed027b0a0375aaad1e2c0d90` | `a3-step6a-v2` |
+| #1093 | `94d0b247497d4c6621ebae8725d82325df4e6271` | `79c442a222f4e34cfad88775f966fc80b793aecf` | `a3-step6b-v2` |
+| #1095 | `7ae8924e9936dd45a0935c722e444ee85d5ac319` | `24e614aaeac254781a318256c57d490c49934fb4` | `a3-step6c-v2` |
+| #1096 | `541f156de2ce2f1b286565230047366557d1fec7` | `3c9112ee6ef2cda6943ee508b1ee11636db66fdb` | `a3-step6d-v2` |
+| #1097 | `668bb6972f14f878276afdfa99829d369dea4ad3` | `7a7afa7bf7dd021d3bf5e49131ce2501592ffa0a` | `a3-step6e-v2` |
+| #1101 | `ee9ae8a03373614261528c242e2ebd24803268ee` | `3cdb59e051f3913a4daabb1a2c79ed3749fbec0a` | `a3-step6f-v2` |
+| #1103 | `0fc3e7fe66f65ddd35840a929615bf785c65069a` | `1542ef8d20ca37d64cbb773226576998570d864a` | `a3-step6g-v2` |
+| #1104 | `5bbcf47ccb99489edd4d81790356c8d836304a6a` | `16d4df3ef003b368505d6fee13e80899ec008495` | `a3-step6h-v2` |
+
+Step 4a Qwen model validation completes at 2026-10-09 07:16 +08:00:
+all four FP16/E4M3 × eager/graph contracts report equal route/token records
+for three requests each (`a3-step4a/logs/qwen-*-compare.log`, `qwen.done`).
+Host/spec baseline failures remain separate; no complete model gate is claimed.
+
+The complete fixed-source strict suite passes **344 tests / 1 skip / 28 GPU
+exclusions** (`a3-tree-masks-strict.log`, `a3-tree-masks-shim.json`): six new
+boundary cases plus the already existing 44-name inventory now included in
+this CPU selection. All golden/calculation oracles and real patch consumption
+pass. Pre-commit, mypy and layering pass (`a3-tree-masks-precommit-final.log`).
+No production/source-oracle file changes during the accepted strict run.
+
+## Step 6k declared feature contracts
+
+PR #1107 is `4d892123e96e4dcca8f9d40ee012cbf6b225f4d2`. Its actual
+integration with #1028 is `1c9f2fe07fc654ccfc7c5c7e6bdd574b1266eb33`, tree
+`9817ffd2415f7dcf3dbfbf2661753e28d8985258`, equal to clean merge-tree.
+The integration CPU suites pass 37 tests / 98 GPU skips. Four source-verified
+queues are staged as `a3-step6j` on 54633.
+
+Declared causality/window validation and its process-shared signature set now
+belong to spec/contracts.py. Common assembly and VerificationOps inject the
+validation callback; neither the common verifier nor shared state keeps the
+model-specific contract body/record. The legacy facade resolves both the
+validator and observation-set aliases to the live Spec owner. The fast path
+still performs contract checks without constructing a verifier.
+
+The first focused run passes its golden cases but fails the original contract
+hash because the AST projection left a qualified state name where the existing
+normalizer expects an unqualified global name. Only that projection was
+corrected; the immutable hash and production body were not changed. The next
+8-case run passes all calculation hashes and the five new boundaries under
+strict shim consumption (`a3-spec-contract-boundary.log`,
+`a3-spec-contract-boundary-shim.json`). Cases verify process-wide deduplication
+across two instances/layers, the unchanged layer/causal/window/RoPE signature,
+real legacy validator/set consumption, and causal/window failures before
+observation or premature window evaluation. Metrics reduce to
+153 / 318 / 301 / 0 / 126 / 0 / 29 without new forbidden edges.
+
+The corrected Step 4b GPU run completes at 2026-10-09 07:31:45 +08:00:
+1691 passes / the same seven inherited failures, two new passing cases and
+no changed old outcomes. All 12 native outputs have max-abs 0. Designated
+timing deltas are FP16 XQA graph +0.0168462%, E4M3 XQA graph +0.00916205%,
+and 75T-role eager prefill +0.183613%, within 2%. DDTree eager records
++5.36524%; it is not one of the designated timing cases and no broad speed
+acceptance is claimed. Evidence is under `a3-step4b-v2/logs/`:
+`regression-parity.json`, `op-compare.log` and `regression.done`.
+Model gates remain pending; the original failed Step 4b run stays preserved.
+
+The complete fixed-source strict suite passes **349 tests / 1 skip / 28 GPU
+exclusions** (`a3-spec-contract-strict.log`, `a3-spec-contract-shim.json`),
+including the unchanged 813 golden traces, original calculation hashes and
+real legacy patch consumption. Pre-commit, mypy and layering pass
+(`a3-spec-contract-precommit.log`). No production or source-oracle files
+changed during the accepted run.
+
+## Step 6l dynamic feature policies
+
+PR #1108 is `4c67986baef2a350a3dc06800ee85fa6356871ec`. Its actual
+integration with #1028 is `3a8be3d1d9658500ceff7659da9fc533af625d25`, tree
+`d9576079a24360a861f7e9758bb4edddfe480152`, equal to clean merge-tree.
+Integration CPU tests pass 37 cases / 98 GPU skips. Four verified queues
+are staged as `a3-step6k` on 54633; model gates remain pending.
+
+Eight feature policies now live in spec/policy.py. Verification and prefill
+receive individual callables; feature metadata preparation uses the same
+owner directly. Common routing/debug no longer exports feature policy bodies.
+The public decode partition-domain constant remains shared, and legacy names
+resolve to live owner bindings. There is no configuration snapshot or new
+registry: environment reads still occur on the original decision/emission
+paths after executor construction. Callback injection does not receive Impl.
+
+The focused suite passes 23 cases, including all 813 unchanged golden traces
+and original calculation hashes (`a3-spec-policy-focused.log`). Metrics reduce
+to 153 / 315 / 287 / 0 / 83 / 0 / 29; no new forbidden edge is introduced.
+The maximum-function reduction is only shorter injected-call spelling; further
+responsibility splits are still required to reach 200 lines.
+
+Corrected Step 4c GPU validation completes at 2026-10-09 07:47:46 +08:00:
+1691 passes / the same seven inherited failures, no changed old outcomes and
+no added cases. All 12 native outputs have max-abs 0. Designated timing deltas
+are FP16 XQA graph +0.0115837%, E4M3 XQA graph +0.0417382%, and 75T-role
+eager prefill +0.708070%, all within 2%. DDTree eager records +11.1154%; it
+is outside the three designated timing gates, with no broad speed claim.
+Evidence remains in `a3-step4c-v2/logs/regression-parity.json`,
+`op-compare.log` and `regression.done`; complete model gates remain pending.
+
+Seven direct boundaries pass with strict shim consumption
+(`a3-spec-policy-boundary.log`): post-construction switch changes, lazy disabled
+partition parsing, unchanged error cause/domain, trace destination/payload
+precedence and nonfatal write failure, and an old partition patch consumed by
+an actual XQA operator call. The first complete strict run reports 355 passes
+and one failure: two metadata calculation hashes still see the old profile
+helper name. The projection now maps the actual Spec-owned helper back to its
+original dependency name; frozen hashes and metadata calculations are intact.
+The new optional prefill operator field is appended to preserve existing
+positional construction. A fresh complete strict run is required after both
+changes. Initial mechanical-import lint failures were corrected with temporary
+lazy delegates; the separate ownership commit removes those delegates.
+
+The corrected fixed-source full strict run passes **356 tests / 1 skip / 28
+GPU exclusions** (`a3-spec-policy-strict-final.log`, `a3-spec-policy-shim.json`).
+All immutable trace, calculation, metadata and real patch-consumption gates
+pass. Pre-commit/mypy/layering pass (`a3-spec-policy-precommit-final.log`).
+An independent AST comparison confirms all eight policy bodies exactly match
+the parent after only explicit function/constant-owner renames. No production
+or source-oracle file changes during the accepted run.
+
+Step 4b Qwen model validation completes at 2026-10-09 07:50:55 +08:00:
+all four FP16/E4M3 × eager/graph contracts report equal routes/tokens for
+three requests each (`a3-step4b-v2/logs/qwen-*-compare.log`, `qwen.done`).
+Host/spec baseline failures remain unresolved; no complete model gate claimed.
+The current upstream heads for #1028 and #1048 were rechecked and still match
+the pinned replay/reference SHAs. No frozen follow-up PR was modified.
+
+## Step 6m process-wide decode log events
+
+PR #1109 is `78df907297dfc8d396ad5e458952d6f56cd8042a`. Its actual
+integration with #1028 is `7f4d3e6a61ae9d5351e5d8214a32f6298f833cf8`, tree
+`a252bcd391af331dd9d507c9e1d51e603fe0b5c9`, equal to clean merge-tree.
+Integration tests pass 37 cases / 98 GPU skips. Four verified queues are
+staged as `a3-step6l` on 54633. No complete model gate or main merge claimed.
+
+Nine decode log flags now use explicit process-wide logger keys. Existing
+info_once/warning_once behavior remains unchanged when no key is supplied;
+explicit namespaced keys deduplicate across changing messages, arguments and
+logger instances without LRU expiry. The original outer guards remain, so
+already-observed events do not reevaluate guarded log arguments. Observation
+is recorded only after a successful logging call, at the original assignment
+site even for an injected logger. Log levels, messages and process scope stay
+unchanged. This is a rewrite without a mechanical body move.
+
+Legacy flag names are live module views of the actual logger keys. The strict
+patch auditor retains custom module setters and credits only a production
+read of the matching logger key; patch setup/property reads are not evidence.
+The focused 15-case strict run passes all immutable golden and calculation
+hashes (`a3-decode-once-focused.log`, `a3-decode-once-focused-shim.json`). Its
+flag consumption points are the real dense-cache/reference methods. Five
+boundary cases pass, covering process granularity, changed payload/logger,
+non-expiring event keys, scope decline, emission errors, unchanged unkeyed
+behavior, and reset controls across two real attention instances
+(`a3-decode-once-boundary.log`). All 22 existing logger tests pass
+(`a3-decode-once-logger.log`). Metrics reduce to
+153 / 315 / 269 / 0 / 83 / 0 / 20; full strict and GPU gates remain required.
+
+The complete fixed-source strict suite passes **362 tests / 1 skip / 28 GPU
+exclusions** (`a3-decode-once-strict.log`, `a3-decode-once-shim.json`). All
+813 golden traces, original calculation/metadata hashes and actual patch
+consumption pass. The sixth boundary launches an isolated strict auditor
+and proves that a flag patched/read only by the test is still rejected as
+unconsumed (`a3-decode-once-auditor-negative.log`). Pre-commit/mypy/layering
+pass (`a3-decode-once-precommit-final.log`); the method-binding map needed an
+explicit Callable type after optional keyed signatures diverged. No production
+or source-oracle file changes during the accepted strict run.
+
+Step 4c Qwen validation completes at 2026-10-09 08:10:48 +08:00: all four
+FP16/E4M3 × eager/graph contracts agree on route/token records for three
+requests each (`a3-step4c-v2/logs/qwen-*-compare.log`, `qwen.done`). The
+recorder follow-up completes GPU regression at 08:07:39 +08:00 with 1692
+passes / the same seven failures, one new pass and no changed old outcomes
+(`a3-snapshot-v2/logs/regression-parity.json`, `regression.done`). Both PR
+bodies reflect these results; host/spec baseline failures remain unresolved.
+
+## Merge acceptance and FlashInfer-SM70 compatibility (2026-10-09)
+
+The merge review found CI errors hidden by changed-file local mypy checks:
+FlashInfer-SM70 still passed feature metadata positionally to the newly owned
+builder, while its paged-route observer relied on a dynamically attached parent
+method. Restore positional forwarding through the assembly boundary, declare the
+parent paged-call adapter explicitly, and inject the subclass observer into the
+prefill executor. The adapter invokes the owner's default operation so a subclass
+`super()` call cannot recurse into its own injected override. No native kernels,
+route names, candidate ordering or speculative algorithms change.
+
+Three new tests reach the real parent adapter for positional/keyword metadata
+and the real owned prefill candidate callback. The earlier FlashInfer test
+stubbed the parent build/forward, which concealed this regression. The targeted
+suite passed 25 cases. CI-style mypy for Python 3.12 checks all 61 source files
+changed since the original main and passes. The strict trace suite and final
+integration result are recorded below after completion.
+
+Previously recorded evidence includes 813 unchanged golden traces, strict shim
+consumption, 362 focused CPU passes, pinned #1028 replay (37 passes / 98 GPU
+skips), exact native outputs and four exact Qwen FP16/E4M3 eager/graph contracts
+through Step 5a. Step 5a's GPU regression has 1702 passes and the same seven known
+failures. Later per-slice GPU matrices are follow-up evidence; no unrun result is
+claimed. Host-FP8's original same-source A/A greedy mismatch remains a known
+issue, not a refactor pass or an established regression. DDTree and its separate
+fix #1089 remain deferred. Frozen #1061/#1063/#1064/#1065/#1066 stay excluded.
+
+Merging to main preserves the source commits and their review history. Another
+maintainer merged #956 during this delivery; its two Mamba cache-manager files
+are preserved in the clean integration result, without modifying that work.
+
+Compatibility validation: the full strict run on the repaired production source
+returned 361 passes, one skip and one source-inventory failure: the new typed
+adapter was counted twice as the original calculation. The oracle now verifies
+the adapter's complete delegation separately and still hashes the unchanged
+executor calculation against the immutable fixture. The corrected source-oracle,
+FlashInfer and owned-prefill suites pass all 28 cases with strict shim consumption.
+No golden or stored calculation hash was changed. CI-style mypy (all 61 changed
+source files) and pre-commit pass. Final package metrics remain
+153 / 315 / 269 / 0 / 83 / 0 / 20.
+
+Main delivery: 24 campaign PRs through #1090 have been merged individually and
+verified against their clean integration trees. The remaining 12 reviewed PRs
+are delivered together with the compatibility correction in
+[#1113](https://github.com/1CatAI/1Cat-vLLM/pull/1113), preserving their commits.
+The integrated source at `93226ec38381f9811644c02b826498aa5d7f139a` passed
+**70 focused CPU tests** with strict shim consumption. This includes the real
+FlashInfer adapters and the concurrent main changes in #956/#1005/#1111/#1112.
+Those changes were retained, not authored or independently promoted by A3.
+In particular, #1112 superseded the separate #1089 proposal; DDTree remains
+outside this campaign's current acceptance and development scope.
+
+The final pinned #1028 replay is
+`17089eef4539a53f2e9231775f769a79bb581413`, tree
+`f3f5a36e8dd4d1823ed587c0f81ce50f3ec6541b`, equal to the clean merge result,
+with **37 passes / 98 GPU skips** and unchanged native sources. Local evidence:
+`a3-main-integration-tests.log`, `a3-main-integration-1028.json` and
+`a3-main-integration-1028-cpu.log`. An additional 37 idle per-slice GPU retry
+queues were retired; an already-active regression job was left to finish.
+No deferred queue was given a passing completion marker.

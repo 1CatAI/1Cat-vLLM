@@ -18,18 +18,11 @@ from vllm.v1.attention.backends.flash_v100 import debug as _debug
 from vllm.v1.attention.backends.flash_v100 import debug_compare as _debug_compare
 from vllm.v1.attention.backends.flash_v100 import decode as _decode
 from vllm.v1.attention.backends.flash_v100 import dense_prefill as _dense_prefill
-from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import prefill as _prefill
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
-from vllm.v1.attention.backends.flash_v100 import state as _state
 from vllm.v1.attention.backends.flash_v100 import verify as _verify
-from vllm.v1.attention.backends.flash_v100.spec.attention import (
-    ATTENTION_HOOKS,
-    VERIFICATION_CONFIG_FIELDS,
-    VERIFICATION_OVERRIDES,
-    SpecAttentionMethods,
-)
+from vllm.v1.attention.backends.flash_v100.spec import attention as _feature
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionImpl,
     TritonAttentionMetadata,
@@ -49,7 +42,7 @@ from vllm.v1.attention.ops.sm70_grouped import (
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
+class FlashAttnV100Impl(TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
     allow_triton_fallback = _config.ConfigField[bool]("allow_triton_fallback")
@@ -124,6 +117,57 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
     use_smallq_decode_xqa = _config.ConfigField[bool]("use_smallq_decode_xqa")
     use_triton_prefill = _config.ConfigField[bool]("use_triton_prefill")
 
+    @property
+    def spec_attention(self) -> _feature.SpecAttentionState:
+        attributes = vars(self)
+        if "_spec_attention" not in attributes:
+            attributes["_spec_attention"] = _feature.SpecAttentionState(
+                _ops._callable_accepts_keyword
+            )
+        return attributes["_spec_attention"]
+
+    @property
+    def comparison_state(self):
+        attributes = vars(self)
+        if "_comparison_state" not in attributes:
+            state = _debug_compare.ComparisonState()
+            for name in _debug_compare.COUNTER_FIELDS:
+                if name in attributes:
+                    setattr(state, name, attributes.pop(name))
+            attributes["_comparison_state"] = state
+        return attributes["_comparison_state"]
+
+    def __getattr__(self, name: str) -> Any:
+        if name in _feature.POLICY_FIELDS:
+            return getattr(self.spec_attention, name)
+        if name in _debug_compare.COUNTER_FIELDS:
+            return getattr(self.comparison_state, name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in _feature.POLICY_FIELDS:
+            setattr(self.spec_attention, name, value)
+        elif name in _debug_compare.COUNTER_FIELDS:
+            setattr(self.comparison_state, name, value)
+        else:
+            super().__setattr__(name, value)
+
+    def _policy(self):
+        policy = getattr(self, "config", None)
+        if policy is None:
+            attributes = vars(self)
+            policy = SimpleNamespace(
+                **{
+                    field.name: attributes[field.name]
+                    for field in fields(_config.V100AttnConfig)
+                    if field.name in attributes
+                }
+            )
+        return policy
+
+    def _contract_validator(self):
+        return getattr(self, _feature.VALIDATION_METHOD)
+
     def __init__(self, *args, **kwargs):
         self.prefix_anchored_decode_window = kwargs.pop(
             "prefix_anchored_decode_window", None
@@ -158,7 +202,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             if self.kv_codec is FP16 and current_platform.is_device_capability(70)
             else None
         )
-        ATTENTION_HOOKS.initialize_scalar_tail(self, use_e4m3_fp32)
+        self.spec_attention.initialize_scalar_tail(use_e4m3_fp32)
         if use_e4m3_fp32 and self.flash_attn_grouped_e4m3_fp32_paged is None:
             logger.warning_once(
                 "E4M3 grouped FP32 requires Flash-V100 precision revision 4; "
@@ -166,7 +210,10 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                 "FP32 partial storage. Rebuild the extension and restart workers.",
                 scope="process",
             )
-        ATTENTION_HOOKS.initialize_verify_abi(self)
+        self.spec_attention.initialize_verify_abi(
+            _ops._flash_attn_grouped_verify_max_query_tokens,
+            _ops._flash_attn_grouped_verify_request_major_abi_version,
+        )
         self.fp8_e5m2_paged_kv_to_fp16 = _ops._get_fp8_e5m2_paged_kv_bridge_op()
         self.fp8_e4m3_paged_kv_to_fp16 = (
             _ops._get_sm70_v37_e4m3_bridge_op() if self.kv_codec is FP8_E4M3 else None
@@ -196,7 +243,9 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                 self.flash_attn_prefill_paged, "anchor_lens"
             )
         )
-        ATTENTION_HOOKS.configure_prefill(self)
+        self.flash_attn_prefill_paged = self.spec_attention.configure_prefill(
+            self.flash_attn_prefill_paged
+        )
         paged_prefill_enable = _config.raw("VLLM_FLASH_V100_ENABLE_PAGED_PREFILL")
         paged_prefill_disable = (
             _config.raw("VLLM_FLASH_V100_DISABLE_PAGED_PREFILL", "0") == "1"
@@ -311,7 +360,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             and self.head_size == 256
             and self.num_heads == 6 * self.num_kv_heads,
         )
-        ATTENTION_HOOKS.configure_verifier(self)
+        self.spec_attention.configure_verifier(self.flash_attn_grouped_verify_paged)
         decode_scalar_paged_env = _config.raw("VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED")
         self.use_decode_scalar_paged = decode_scalar_paged_env != "0"
         self.compare_bhmd_out_dir = _config.raw("VLLM_FLASH_V100_COMPARE_BHMD_OUT_DIR")
@@ -382,29 +431,11 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
 
         self.config = _config.V100AttnConfig.take_legacy_attributes(vars(self))
 
-    _maybe_compare_bhmd_out = _debug_compare._maybe_compare_bhmd_out
-
-    _reserve_bhmd_compare_call = _debug_compare._reserve_bhmd_compare_call
-
-    _reserve_triton_compare_call = _debug_compare._reserve_triton_compare_call
-
-    _write_bhmd_compare_report = _debug_compare._write_bhmd_compare_report
-
-    _write_triton_compare_report = _debug_compare._write_triton_compare_report
-
-    _maybe_write_triton_tensor_dump = _debug_compare._maybe_write_triton_tensor_dump
-
     _small_tensor_list = staticmethod(_debug_compare._small_tensor_list)
 
     _layer_debug_info = staticmethod(_debug_compare._layer_debug_info)
 
     _tensor_compare_stats = staticmethod(_debug_compare._tensor_compare_stats)
-
-    _prefill_raw_kv_cache_compare_stats = (
-        _debug_compare._prefill_raw_kv_cache_compare_stats
-    )
-
-    _maybe_compare_triton_output = _debug_compare._maybe_compare_triton_output
 
     @property
     def kv_codec(self) -> KVCodec | None:
@@ -424,7 +455,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
         ):
             return None
         # Feature contracts can require a separate native FP32 verifier route.
-        if ATTENTION_HOOKS.reject_xqa(codec, attn_metadata):
+        if _feature.reject_xqa(codec, attn_metadata):
             return None
         return codec
 
@@ -459,17 +490,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
         return (left, right)
 
     def _new_decode_executor(self) -> _decode.DecodeExecutor:
-        policy = getattr(self, "config", None)
-        if policy is None:
-            # Compatibility for deliberately partial legacy fixtures only.
-            attributes = vars(self)
-            policy = SimpleNamespace(
-                **{
-                    field.name: attributes[field.name]
-                    for field in fields(_config.V100AttnConfig)
-                    if field.name in attributes
-                }
-            )
+        policy = self._policy()
         config = _decode.DecodeConfig(
             cast(_config.V100AttnConfig, policy),
             getattr(self, "scale", 1.0),
@@ -486,7 +507,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             prefill_bhmd=getattr(self, "flash_attn_prefill_paged_bhmd", None),
             paged_keywords=getattr(self, "_flash_decode_paged_kwargs", set()),
             scalar_tail=getattr(self, "_sm70_scalar_tail_attention", None),
-            reject_xqa=ATTENTION_HOOKS.reject_xqa,
+            reject_xqa=_feature.reject_xqa,
             reserve_bhmd_compare=self._reserve_bhmd_compare_call,
             write_bhmd_compare=self._write_bhmd_compare_report,
             compare_bhmd=self._maybe_compare_bhmd_out,
@@ -544,20 +565,88 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             anchored_window=anchored_window,
         )
 
-    def _new_verification_executor(self) -> _verify.VerificationExecutor:
-        policy = getattr(self, "config", None)
-        if policy is None:
-            attributes = vars(self)
-            policy = SimpleNamespace(
-                **{
-                    field.name: attributes[field.name]
-                    for field in fields(_config.V100AttnConfig)
-                    if field.name in attributes
-                }
+    def _new_comparison_executor(self):
+        return _debug_compare.ComparisonExecutor(
+            self._policy(),
+            getattr(self, "scale", 1.0),
+            getattr(self, "kv_cache_dtype", "auto"),
+            _debug_compare.ComparisonOps(
+                triton_forward=super().forward,
+                paged_bhmd=getattr(self, "flash_attn_prefill_paged_bhmd", None),
+            ),
+            self.comparison_state,
+            {
+                name: vars(self)[name]
+                for name in (
+                    *_debug_compare.LEGACY_METHODS,
+                    *_debug_compare.STATIC_METHODS,
+                )
+                if name in vars(self)
+            },
+        )
+
+    def _run_prefill_paged_call(self, *, route: str, **kwargs):
+        return _prefill.PrefillExecutor.run_paged_call(
+            self._new_prefill_executor(), route=route, **kwargs
+        )
+
+    def _new_prefill_executor(self):
+        policy = self._policy()
+        settings = _prefill.PrefillConfig(
+            cast(_config.V100AttnConfig, policy),
+            getattr(self, "scale", 1.0),
+            getattr(self, "kv_cache_dtype", "auto"),
+        )
+        native: dict[str, Any] = {
+            field: getattr(self, legacy_name, None)
+            for legacy_name, field in _prefill.OPERATOR_FIELDS.items()
+            if field != "supports_anchor"
+        }
+        callbacks: dict[str, Any] = {
+            field: getattr(self, legacy_name, None)
+            for field, legacy_name in _feature.PREFILL_CALLBACK_FIELDS.items()
+        }
+        ops = _prefill.PrefillDriverOps(
+            **native,
+            supports_anchor=getattr(
+                self, "_flash_prefill_paged_supports_anchor", False
+            ),
+            **_feature.prefill_dependencies(self.spec_attention),
+            **callbacks,
+            triton_forward=super().forward,
+            compare_triton=self._maybe_compare_triton_output,
+            small_query_enabled=self._small_query_decode_enabled,
+            capture_prefix_kind=_feature.capture_prefix_kind,
+            record_capture_prefix=_feature.record_capture_prefix,
+            record_capture_layout=_feature.record_capture_layout,
+        )
+        overrides = {
+            name: vars(self)[name]
+            for name in _prefill.LEGACY_METHODS
+            if name in vars(self)
+        }
+        if (
+            type(self)._run_prefill_paged_call
+            is not FlashAttnV100Impl._run_prefill_paged_call
+        ):
+            overrides.setdefault(
+                "_run_prefill_paged_call", self._run_prefill_paged_call
             )
+        return _prefill.PrefillExecutor(
+            settings,
+            ops,
+            getattr(self, "workspace", None) or _decode.V100Workspace(),
+            overrides,
+        )
+
+    def _new_verification_executor(self) -> _verify.VerificationExecutor:
+        policy = self._policy()
         limits: dict[str, Any] = {
             name: getattr(self, legacy_name, default)
-            for name, (legacy_name, default) in VERIFICATION_CONFIG_FIELDS.items()
+            for name, (
+                legacy_name,
+                default,
+            ) in _feature.VERIFICATION_CONFIG_FIELDS.items()
         }
         config = _verify.VerificationConfig(
             policy=cast(_config.V100AttnConfig, policy),
@@ -576,23 +665,18 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             layer_info=getattr(self, "_layer_debug_info", None),
             xqa_codec=getattr(self, "_xqa_kv_codec", None),
             decode=getattr(self, "_call_flash_attn_decode_paged", None),
+            **_feature.verification_dependencies(),
             **{
                 name: vars(self).get(legacy_name)
-                for name, legacy_name in VERIFICATION_OVERRIDES.items()
+                for name, legacy_name in _feature.VERIFICATION_OVERRIDES.items()
             },
         )
         return _verify.VerificationExecutor(config, ops)
-
-    _smallq_decode_xqa_allowed = _verify._smallq_decode_xqa_allowed
-
-    _call_flash_attn_smallq_decode_paged = _verify._call_flash_attn_smallq_decode_paged
 
     def _anchored_swa_params(
         self, attn_metadata: TritonAttentionMetadata
     ) -> tuple[torch.Tensor | None, int]:
         return self._new_decode_executor()._anchored_swa_params(attn_metadata)
-
-    _small_query_decode_enabled = _verify._small_query_decode_enabled
 
     def forward(
         self,
@@ -631,11 +715,11 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             )
             return output.fill_(0)
 
-        ATTENTION_HOOKS.validate_contract(self, layer, attn_metadata)
+        _feature.validate_contract(self._contract_validator(), layer, attn_metadata)
 
         if not self._supports_flash_v100_path():
             layer_info = self._layer_debug_info(layer)
-            feature_fallback = ATTENTION_HOOKS.fallback_kind(layer_info)
+            feature_fallback = _feature.fallback_kind(layer_info)
             message = (
                 "FLASH_ATTN_V100 cannot run this layer/config because a required "
                 "Flash op is unavailable or the attention features/KV cache dtype "
@@ -650,7 +734,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                 f"has_sinks={self.sinks is not None}, "
                 f"kv_cache_dtype={self.kv_cache_dtype!r}."
             )
-            ATTENTION_HOOKS.unsupported(self, layer_info, message, feature_fallback)
+            _feature.unsupported(self._policy(), layer_info, message, feature_fallback)
             return super().forward(
                 layer,
                 query,
@@ -720,253 +804,7 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
         )
 
         if is_prefill:
-            available_query_tokens = min(
-                int(query.shape[0]),
-                int(key.shape[0]),
-                int(value.shape[0]),
-                int(output.shape[0]),
-            )
-            metadata_live_token_mismatch = (
-                _kv_layout._metadata_expects_more_query_tokens_than_available(
-                    attn_metadata,
-                    available_query_tokens,
-                )
-            )
-            if self.use_triton_prefill:
-                if not _state._logged_prefill_triton_safe:
-                    logger.info(
-                        "FLASH_ATTN_V100 prefill uses explicit Triton diagnostic "
-                        "fallback because VLLM_FLASH_V100_PREFILL_USE_TRITON=1; "
-                        "this mixed route is not a final performance path."
-                    )
-                    _state._logged_prefill_triton_safe = True
-                _debug._sm70_profile_trace(
-                    "forward branch=prefill_triton_safe layer=%s",
-                    layer_name,
-                )
-                self.workspace.decode_cache.invalidate()
-                _routing._record_route(_routing.ROUTE_SPECS["prefill_triton_safe"].name)
-                return super().forward(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                    output_scale,
-                    output_block_scale,
-                )
-            if is_capturing:
-                # CUDA graph capture uses dummy metadata whose seq_lens can
-                # look like no-prefix prefill, while replayed MTP verification
-                # is a uniform small-query decode over an existing KV prefix.
-                # Capture the same small-query kernel branch that replay needs.
-                capture_prefix = ATTENTION_HOOKS.capture_prefix_kind(
-                    layer, attn_metadata
-                )
-                if capture_prefix:
-                    ATTENTION_HOOKS.record_capture_prefix()
-                    return self._flash_v100_prefill_with_prefix(
-                        layer,
-                        query,
-                        key,
-                        value,
-                        kv_cache,
-                        attn_metadata,
-                        output,
-                    )
-                smallq_decode = self._small_query_decode_enabled(attn_metadata)
-                if smallq_decode:
-                    if _debug._draft_graph_debug_enabled():
-                        _debug._draft_graph_debug_log(
-                            "forward:prefill_capture_smallq",
-                            "layer=%s %s %s %s",
-                            layer_name,
-                            _debug._format_tensor_debug(
-                                getattr(
-                                    attn_metadata,
-                                    "smallq_decode_block_table",
-                                    None,
-                                ),
-                                "smallq_bt",
-                            ),
-                            _debug._format_tensor_debug(
-                                getattr(
-                                    attn_metadata,
-                                    "smallq_decode_seq_lens",
-                                    None,
-                                ),
-                                "smallq_seq",
-                            ),
-                            _debug._format_tensor_debug(
-                                getattr(
-                                    attn_metadata,
-                                    "smallq_query_start_loc",
-                                    None,
-                                ),
-                                "smallq_qsl",
-                            ),
-                        )
-                    _debug._sm70_profile_trace(
-                        "forward branch=prefill_capture_smallq layer=%s",
-                        layer_name,
-                    )
-                    _routing._record_route(
-                        _routing.ROUTE_SPECS["prefill_capture_smallq"].name
-                    )
-                    ATTENTION_HOOKS.record_capture_layout(attn_metadata)
-                    return self._flash_v100_prefill_with_prefix(
-                        layer,
-                        query,
-                        key,
-                        value,
-                        kv_cache,
-                        attn_metadata,
-                        output,
-                    )
-                _debug._sm70_profile_trace(
-                    "forward branch=prefill_capture_full_flash layer=%s",
-                    layer_name,
-                )
-            has_prefix_context = (
-                metadata_live_token_mismatch
-                or _kv_layout._has_prefix_context(attn_metadata)
-            )
-            smallq_decode = has_prefix_context and self._small_query_decode_enabled(
-                attn_metadata
-            )
-            if has_prefix_context:
-                if _debug._draft_graph_debug_enabled():
-                    _debug._draft_graph_debug_log(
-                        "forward:prefill_prefix",
-                        "layer=%s smallq=%s metadata_live_token_mismatch=%s %s %s %s",
-                        layer_name,
-                        smallq_decode,
-                        metadata_live_token_mismatch,
-                        _debug._format_tensor_debug(
-                            getattr(attn_metadata, "smallq_decode_block_table", None),
-                            "smallq_bt",
-                        ),
-                        _debug._format_tensor_debug(
-                            getattr(attn_metadata, "smallq_decode_seq_lens", None),
-                            "smallq_seq",
-                        ),
-                        _debug._format_tensor_debug(
-                            getattr(attn_metadata, "smallq_query_start_loc", None),
-                            "smallq_qsl",
-                        ),
-                    )
-                _debug._sm70_profile_trace(
-                    "forward branch=prefill_prefix layer=%s smallq=%s",
-                    layer_name,
-                    smallq_decode,
-                )
-                if not _state._logged_prefill_prefix_flash:
-                    if smallq_decode:
-                        logger.info(
-                            "FLASH_ATTN_V100 prefill path active "
-                            "(prefix/chunked via small-query paged decode)."
-                        )
-                    elif self.use_flash_v100_prefill_paged:
-                        logger.info(
-                            "FLASH_ATTN_V100 prefill path active "
-                            "(prefix/chunked via direct paged prefill kernel)."
-                        )
-                    else:
-                        logger.info(
-                            "FLASH_ATTN_V100 prefill path active "
-                            "(prefix/chunked via paged-KV gather)."
-                        )
-                    _state._logged_prefill_prefix_flash = True
-                if metadata_live_token_mismatch:
-                    logger.info(
-                        "FLASH_ATTN_V100 prefill switched to prefix/live-token "
-                        "path because layer QKV tokens (%d) are shorter than "
-                        "query metadata span.",
-                        available_query_tokens,
-                    )
-                _routing._log_fp8_kv_cache_route(
-                    "prefill", self.kv_cache_dtype, "prefix"
-                )
-                self.workspace.decode_cache.invalidate()
-                result = self._flash_v100_prefill_with_prefix(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                )
-                self._maybe_compare_triton_output(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                    output_scale,
-                    output_block_scale,
-                    "prefill_prefix",
-                )
-                _routing._record_route(
-                    _routing.ROUTE_SPECS["prefill_prefix_flash"].name
-                )
-                return result
-            if not _state._logged_prefill_flash:
-                logger.info(
-                    "FLASH_ATTN_V100 prefill path active (no prefix/chunked context)."
-                )
-                _state._logged_prefill_flash = True
-            self.workspace.decode_cache.invalidate()
-            if self.use_prefill_paged_cache and self.use_flash_v100_prefill_paged:
-                _debug._sm70_profile_trace(
-                    "forward branch=prefill_no_prefix_paged_cache layer=%s",
-                    layer_name,
-                )
-                if not _state._logged_prefill_paged_cache:
-                    logger.warning(
-                        "FLASH_ATTN_V100 no-prefix prefill is reading paged "
-                        "KV cache for strict input-source diagnostics. This "
-                        "may be slower than dense raw-KV prefill."
-                    )
-                    _state._logged_prefill_paged_cache = True
-                _routing._log_fp8_kv_cache_route(
-                    "prefill", self.kv_cache_dtype, "no_prefix_paged_cache"
-                )
-                result = self._flash_v100_prefill_with_prefix(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                )
-                self._maybe_compare_triton_output(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                    output_scale,
-                    output_block_scale,
-                    "prefill_no_prefix_paged_cache",
-                )
-                _routing._record_route(
-                    _routing.ROUTE_SPECS["prefill_no_prefix_paged_cache_flash"].name
-                )
-                return result
-            _debug._sm70_profile_trace(
-                "forward branch=prefill_no_prefix_dense layer=%s",
-                layer_name,
-            )
-            result = self._flash_v100_prefill(query, key, value, attn_metadata, output)
-            self._maybe_compare_triton_output(
+            return self._forward_prefill(
                 layer,
                 query,
                 key,
@@ -976,14 +814,39 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
                 output,
                 output_scale,
                 output_block_scale,
-                "prefill_no_prefix",
+                is_capturing,
+                layer_name,
             )
-            _routing._record_route(
-                _routing.ROUTE_SPECS["prefill_no_prefix_dense_flash"].name
-            )
-            return result
 
         return self._forward_decode(
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output,
+            output_scale,
+            output_block_scale,
+            is_capturing,
+            layer_name,
+        )
+
+    def _forward_prefill(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None,
+        output_block_scale: torch.Tensor | None,
+        is_capturing: bool,
+        layer_name: object,
+    ) -> torch.Tensor:
+        return self._new_prefill_executor().forward(
             layer,
             query,
             key,
@@ -1065,8 +928,6 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             layer, query, kv_cache, attn_metadata, output
         )
 
-    _flash_v100_prefill = _prefill._flash_v100_prefill
-
     def _flash_v100_decode(
         self,
         layer: torch.nn.Module,
@@ -1081,32 +942,56 @@ class FlashAttnV100Impl(SpecAttentionMethods, TritonAttentionImpl):
             layer, query, key, value, kv_cache, attn_metadata, output
         )
 
-    _flash_v100_small_query_prefill_as_decode = (
-        _verify._flash_v100_small_query_prefill_as_decode
-    )
-
-    _should_use_fp8_prefill_bridge = _prefill._should_use_fp8_prefill_bridge
-
-    _run_fp8_prefill_bridge = _prefill._run_fp8_prefill_bridge
-
-    _should_use_prefill_splitkv = _prefill._should_use_prefill_splitkv
-
-    _should_use_prefill_bfla = _prefill._should_use_prefill_bfla
-
-    _should_use_prefill_contig_dense = _prefill._should_use_prefill_contig_dense
-
-    _should_use_prefill_gather_dense = _prefill._should_use_prefill_gather_dense
-
-    _prefill_prefix_decode_rows_allowed = _prefill._prefill_prefix_decode_rows_allowed
-
-    _run_mixed_rows_grouped_e4m3 = _prefill._run_mixed_rows_grouped_e4m3
-
-    _run_prefill_prefix_decode_rows = _prefill._run_prefill_prefix_decode_rows
-
-    _run_prefill_paged_call = _prefill._run_prefill_paged_call
-
-    _flash_v100_prefill_with_prefix = _prefill._flash_v100_prefill_with_prefix
-
 
 # Preserve the original __class__ cell semantics of the extracted super call.
 _super_owner = FlashAttnV100Impl
+
+
+# External method compatibility lives at the assembly boundary, not in an
+# executor receiving a backend. Instance-level overrides retain Python binding.
+def _verification_method(method):
+    if method == "validate_contract":
+
+        def validate(instance, layer, metadata):
+            return _feature.validate_layer_contract(
+                layer, metadata, instance._flash_v100_window_size
+            )
+
+        return validate
+
+    def call(instance, *args, **kwargs):
+        return getattr(instance._new_verification_executor(), method)(*args, **kwargs)
+
+    return call
+
+
+for _legacy_name, _method in _feature.VERIFICATION_METHODS.items():
+    _compatibility_method = _verification_method(_method)
+    setattr(FlashAttnV100Impl, _legacy_name, _compatibility_method)
+    globals()[_legacy_name] = _compatibility_method
+
+
+def _prefill_method(method):
+    def call(instance, *args, **kwargs):
+        return getattr(instance._new_prefill_executor(), method)(*args, **kwargs)
+
+    return call
+
+
+for _legacy_name in _prefill.LEGACY_METHODS:
+    if _legacy_name in FlashAttnV100Impl.__dict__:
+        continue
+    _compatibility_method = _prefill_method(_legacy_name)
+    setattr(FlashAttnV100Impl, _legacy_name, _compatibility_method)
+
+
+def _comparison_method(method):
+    def call(instance, *args, **kwargs):
+        return getattr(instance._new_comparison_executor(), method)(*args, **kwargs)
+
+    return call
+
+
+for _legacy_name in _debug_compare.LEGACY_METHODS:
+    _compatibility_method = _comparison_method(_legacy_name)
+    setattr(FlashAttnV100Impl, _legacy_name, _compatibility_method)

@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
+from vllm.v1.attention.backends.flash_v100.spec.metadata_contracts import metadata_view
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
@@ -16,14 +18,14 @@ from vllm.v1.attention.backends.triton_attn import (
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
-def _attach_ddtree_metadata(
-    self: _metadata.FlashAttnV100MetadataBuilder,
+def attach_metadata(
+    self: Any,
     attn_metadata: TritonAttentionMetadata,
     *,
     ddtree_parent_ids: torch.Tensor | None,
     ddtree_num_tree_tokens_cpu: torch.Tensor | None,
 ) -> None:
-    flash_metadata = _metadata._as_flash_v100_metadata(attn_metadata)
+    flash_metadata = metadata_view(attn_metadata)
     flash_metadata.ddtree_parent_ids = None
     flash_metadata.ddtree_parent_ids_cpu = None
     flash_metadata.ddtree_num_tree_tokens_cpu = None
@@ -78,3 +80,6 @@ def _attach_ddtree_metadata(
                     non_blocking=True,
                 )
             flash_metadata.ddtree_query_start_loc_restored_for_triton = True
+
+
+_attach_ddtree_metadata = attach_metadata
