@@ -153,7 +153,8 @@ def run_case(args, layer, source, records):
             )
 
         def raw_chain():
-            quantize()
+            if not args.prequantized_input:
+                quantize()
             raw_gu()
             down("raw")
 
@@ -162,6 +163,7 @@ def run_case(args, layer, source, records):
             down("mma")
 
         set_routes(0)
+        quantize()
         raw_chain()
         mma_chain()
         operations = {
@@ -194,6 +196,7 @@ def run_case(args, layer, source, records):
             probabilities.copy_(torch.softmax(torch.randn_like(probabilities), -1))
             for packet in hidden.values():
                 packet.fill_(255)
+            quantize()
             graphs["raw_chain"].replay()
             graphs["mma_chain"].replay()
             check = {"ordinal": ordinal}
@@ -243,6 +246,7 @@ def run_case(args, layer, source, records):
         windows = []
         for ordinal in range(min(args.windows, len(records))):
             set_routes(ordinal)
+            quantize()
             raw_chain()
             mma_chain()
             torch.cuda.synchronize()
@@ -307,7 +311,10 @@ def run_case(args, layer, source, records):
                 name: sum(v) / sum(samples[name]) / 1000 for name, v in payload.items()
             },
             "bandwidth_scope": "weight payload estimate; not measured DRAM traffic",
-            "kernel_count": {"raw_chain": 3, "mma_chain": 2},
+            "kernel_count": {
+                "raw_chain": 2 if args.prequantized_input else 3,
+                "mma_chain": 2,
+            },
         }
         results.append(case)
         print(
@@ -335,6 +342,11 @@ def main():
     p.add_argument("--verify-routes", type=int, default=8)
     p.add_argument("--iterations", type=int, default=15)
     p.add_argument("--seed", type=int, default=20261010)
+    p.add_argument(
+        "--prequantized-input",
+        action="store_true",
+        help="Exclude activation quantization when the router already produces Q8.",
+    )
     args = p.parse_args()
     assert 0 <= args.rank < args.tp
     assert min(args.windows, args.verify_routes, args.iterations) > 0

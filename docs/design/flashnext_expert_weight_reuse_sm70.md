@@ -112,8 +112,38 @@ These checks do not compare whole-model logits or acceptance.
 Raw data: [native operator results](data/flashnext_expert_native_routes_20261010.json).
 Benchmark SHA256:
 `16187588947fa84f0ae7d70fb539c6c4fcd23f6edec560f13a691bf4e2a36b67`.
-The gate/up kernel, dp4a kernel/header, reconstruction header and plane packer
-hashes match the integration source used for this review scope.
+Hashes of the gate/up and dp4a CUDA translation units, reconstruction header,
+and plane packer match the integration source used for this review
+scope. The integration subsequently extracted the unchanged Q8_1 struct and
+quantizer into `gguf_q8_1.cuh`; its complete header hash therefore differs.
+
+At integration source `ec60883ad7`, PR #1147 adds a fused router/Q8 operator
+without wiring its activation output into the GGUF model method. That method
+still allocates and quantizes its input. The table above remains the applicable
+three-kernel expert-chain reference. `--prequantized-input` additionally
+measures the two-kernel expert chain that can consume an upstream Q8 packet;
+that mode is a candidate integration boundary, not a current model route.
+
+The matched prequantized-input run has two kernels in both arms:
+
+| Format | M | Retained dp4a, us | Existing HMMA, us | Mean paired saving, us |
+| --- | ---: | ---: | ---: | ---: |
+| IQ3_S | 5 | 61.649 | 53.504 | 8.320 |
+| IQ3_XXS | 5 | 58.509 | 54.298 | 3.609 |
+| IQ2_S | 5 | 55.842 | 58.871 | -1.499 |
+| IQ3_S | 20 | 197.449 | 142.579 | 55.086 |
+| IQ3_XXS | 20 | 189.577 | 159.932 | 29.376 |
+| IQ2_S | 20 | 172.813 | 163.102 | 11.604 |
+
+This independently timed run preserves the per-format conclusion and passes
+another 48 changed-input/routing checks on both paths. Do not subtract durations
+between the two runs to price input quantization: compare arms within a run.
+The explicit quantizer service samples remain in both reports.
+[Prequantized-input samples](data/flashnext_expert_prequantized_routes_20261010.json)
+record the committed benchmark's SHA256
+`fbdafe52761b6d737937faf3c3a2db0475725dd91aac900509fa54865e0555d7`.
+The earlier FP16-input result fingerprints the benchmark before this optional
+mode was added.
 
 For scale, the 38-window fixtures imply these HBM-only floors at 898 GB/s.
 They count each unique expert once and omit decoder instructions, input/output
@@ -279,6 +309,10 @@ rows, ten distinct expert IDs per row, and IDs in [0, 512). Private routing
 recordings and GGUF weights are not committed. The result fingerprints the
 recording, benchmark and native core. GPU legacy locks and process ownership
 must also be respected where applicable.
+
+Add `--prequantized-input` for the separately measured upstream-Q8 boundary.
+The benchmark refreshes Q8 packets outside timing after every input change;
+quantizer work is excluded from that mode's raw full-chain graph only.
 
 Next admission requires a route that beats the strongest existing path across
 the affected fixture distribution, plus the relevant numerical checks. If a
