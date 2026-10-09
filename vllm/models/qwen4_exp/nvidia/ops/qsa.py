@@ -661,6 +661,11 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     HOST_INDICES=None,
     HOST_VALID_COUNTS=None,
     HOST_CACHE: tl.constexpr = False,
+    HISTORY_SCALES=None,
+    HISTORY_POSITIONS=None,
+    HISTORY_LENGTHS=None,
+    DEVICE_HISTORY: tl.constexpr = False,
+    HISTORY_E4M3: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -702,6 +707,20 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         # the selected complete blocks, including at attention tile boundaries.
         # Keep the original split assignment and only skip empty suffix tiles.
         loop_end = tl.minimum(split_tile_end, tl.cdiv(selected_count, BLOCK_N))
+    elif DEVICE_HISTORY:
+        position = tl.load(HISTORY_POSITIONS + row)
+        length = tl.load(
+            HISTORY_LENGTHS + safe_request,
+            (request >= 0) & (request < num_requests),
+            other=0,
+        )
+        # Match the protected reader's compact page4 selection and open tail.
+        # Computing this scalar in the attention CTA removes page ownership
+        # resolution without changing the split/tile arithmetic.
+        visible = tl.maximum(tl.minimum(position + 1, length), 0)
+        selected_count = tl.minimum(visible // 4, TOPK // 4) * 4
+        selected_count += tl.minimum(visible % 4, TOPK % 4)
+        loop_end = tl.minimum(split_tile_end, tl.cdiv(selected_count, BLOCK_N))
     for tile in range(loop_start, loop_end):
         columns = tile * BLOCK_N + column_offsets
         logical_token = tl.load(
@@ -713,6 +732,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         logical_page = safe_token // PAGE_SIZE
         page_offset = safe_token % PAGE_SIZE
         valid = (request >= 0) & (request < num_requests) & (logical_token >= 0)
+        if DEVICE_HISTORY:
+            valid &= (logical_token <= position) & (logical_token < length)
         if RESOLVED_INDICES:
             physical_page = logical_page
         else:
@@ -762,6 +783,14 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 + dim_offsets[None, :],
                 mask=valid[:, None],
                 other=0.0,
+            )
+        if DEVICE_HISTORY and HISTORY_E4M3:
+            slot = safe_page * PAGE_SIZE + page_offset
+            key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
+            value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
+            keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(query.dtype)
+            values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
+                query.dtype
             )
         if KV_E4M3:
             keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)

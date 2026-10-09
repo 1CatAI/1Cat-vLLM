@@ -693,6 +693,9 @@ class KernelConfig:
     qsa_auto_e4m3_reason: str | None = Field(default=None, init=False)
     """Startup reason when calibrated automatic storage cannot be selected."""
 
+    sm70_qsa_device_history: bool = True
+    """Read target device E4M3/FP16 QSA history directly with FP32 PV at
+    M1..20, H6, D256. Speculative draft attention retains its existing path."""
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
     qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
