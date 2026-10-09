@@ -13,6 +13,9 @@ from vllm.config.kernel import Sm70AwqConfig
 from vllm.config.vllm import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import choose_mp_linear_kernel
+from vllm.model_executor.kernels.linear.mixed_precision import (
+    sm70_awq as _workspace_compat,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.sm70_awq import (
     Sm70AwqLinearLayerConfig,
     TurboMindAwqLinearKernel,
@@ -484,3 +487,12 @@ class AWQLinearMethod(LinearMethodBase):
         if bias is not None:
             out.add_(bias)
         return out.reshape(out_shape)
+
+
+# Historical private helpers used by benchmark and workspace tooling.
+_get_sm70_awq_prefill_exact_dense_workspace = (
+    _workspace_compat._get_sm70_awq_prefill_exact_dense_workspace
+)
+_sm70_awq_prefill_dense_workspaces = (
+    _workspace_compat._sm70_awq_prefill_dense_workspaces
+)

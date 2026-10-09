@@ -1,0 +1,19 @@
+{
+  "base_sha": "fb6b12c5b8013ec43b5c34e0135857f3b0fb74e7",
+  "methods": {
+    "_configured_smallq_max_query_len": "03c48326647269f99ef5ebaf48134effe2acb4f3fb96a7620432aeb1c2629bf2",
+    "_configured_smallq_max_model_len": "e1f00fe1cdeca5d0bed5be30e23626b1c089ff7b756d9fb3b38c7991006e1bb8",
+    "_smallq_buffer_token_capacity": "5cd843820fa4d846dd0bdd92c4e3ebc940b7bffc0e2617cba3b1b0ad099249ab",
+    "_ensure_smallq_decode_buffers": "75c1bc7d1f99aec92c560a75128629a6cf8643b2e456f38f0248197d88479fc5",
+    "_clear_smallq_decode_metadata": "5ce3fbb1465067b61705c71b442ebab82381bfe19331b1845697a0cd8de50f50",
+    "_attach_prepared_dflash2_smallq_metadata": "eeb866379509a02be2d450579cfc93b72b711c46324ee43aeb9a2fc00783ec04",
+    "_update_smallq_decode_metadata": "f28a21a49f91ef5075df18ae1b796815eb4e74a7864637e00a09334db2a3beb0",
+    "_attach_ddtree_metadata": "87e115a43603371223bc749e5e7bb57e19e579f85a59193652dd6db636634934",
+    "_debug_draft_metadata": "765d842b3ef16546cf11dfae26481b2e58fedcc178e5b7f7bfa7501fd9e9651c",
+    "_ensure_flash_draft_graph_buffers": "fb693893f80acf16b09421711ee16f7cb89c8f626ac3b53ccfdd164fd32c1f6a",
+    "_stabilize_draft_graph_metadata": "c2372de0281cd9afb0f8c70195669b30608b4d97b68717af695142ac36ccab23",
+    "copy_dflash_graph_metadata": "47bc40edbd28836c9b30c8ae9d4cd0584fa052dd112bd31bb54db9d5d7678689",
+    "build_for_drafting": "60899fcaf446aca846a3c47021429d72e8bb5fff369f7966bb0866640e43cdc7",
+    "build": "cf6ed8f1cd8fd8c379f7101e115bdce95c47ae0abd16742400f4f478a61e247d"
+  }
+}

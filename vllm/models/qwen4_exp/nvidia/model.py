@@ -591,15 +591,22 @@ def enable_sm70_hcx(
             if layer.layer_type == "linear_attention"
             else layer.self_attn
         )
+        from functools import partial
+
+        from .sm70_hcx import partial_moe_output, partial_projection
+
+        attention_module.output_projection_override = partial(
+            partial_projection, prefix
+        )
+        # QSA still owns its model-specific projection dispatch.
         attention_module.sm70_hcx_projection_name = prefix
         if planes is not None:
             layer.mlp_hyper_connection._hcx_oproj = (attention, *planes)
             status["deferred_projections"] += 1
         if isinstance(layer.mlp, Qwen4ExpSparseMoeBlock):
             runner = layer.mlp.experts.runner
-            runner.sm70_partial_output = True
+            runner.output_transform = partial(partial_moe_output, prefix)
             layer.mlp.sm70_hcx_packed_outputs = True
-            runner.sm70_hcx_name = prefix
             register_moe_runner(prefix, runner)
         if previous_moe:
             layer.attn_hyper_connection._hcx_moe_payload = True
@@ -628,7 +635,7 @@ def _maybe_fuse_sm70_side_projections(model: nn.Module) -> None:
             if gdn.in_proj_ba is not None and attach(
                 gdn.in_proj_qkvz, gdn.in_proj_ba, "sm70_side_projection"
             ):
-                gdn.sm70_side_projection = gdn.in_proj_qkvz.sm70_side_projection
+                gdn.input_projection_override = gdn.in_proj_qkvz.sm70_side_projection
                 fused += 1
         else:
             attn = layer.self_attn

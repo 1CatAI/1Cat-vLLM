@@ -44,3 +44,14 @@ def test_dflash_verifier_cannot_bypass_its_engine_policy(tmp_path):
     assert len(violations(path)) == 1
     path.write_text('enabled = sm70_dflash2_enabled("context_pipeline", policy)\n')
     assert not violations(path)
+
+
+def test_moe_executor_cannot_reparse_legacy_policy(tmp_path):
+    path = tmp_path / "vllm/model_executor/layers/fused_moe/sm70/new_kernel.py"
+    path.parent.mkdir(parents=True)
+    path.write_text("x = envs.VLLM_SM70_MOE_SINGLE_TOKEN_INDEXED_STAGE_FASTPATH\n")
+    assert len(violations(path)) == 1
+    path.write_text('x = os.getenv("VLLM_SM70_AWQ_MOE_BATCHED_GEMM")\n')
+    assert len(violations(path)) == 1
+    path.write_text('label = "VLLM_SM70_AWQ_MOE_BATCHED_GEMM"\nx = plan.w13\n')
+    assert not violations(path)

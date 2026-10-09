@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 import torch
 
+from vllm import envs
 from vllm.model_executor.layers.quantization import awq_qpn_sm70 as qpn
 from vllm.model_executor.layers.quantization import awq_sm70_moe as moe
 
@@ -27,7 +28,7 @@ def layer():
 
 def test_default_on_unsupported_shape_never_loads(monkeypatch):
     monkeypatch.delenv("VLLM_SM70_AWQ_QWEN38_QPN_M1", raising=False)
-    assert qpn.envs.VLLM_SM70_AWQ_QWEN38_QPN_M1
+    assert envs.VLLM_SM70_AWQ_QWEN38_QPN_M1
     monkeypatch.setattr(
         qpn, "_has_native_op", lambda: pytest.fail("unexpected native lookup")
     )

@@ -1439,6 +1439,12 @@ def flash_attn_decode_paged_xqa(
     )
 
 
+# Resolve the ABI once; old extensions keep their legacy captured strategy.
+flash_attn_decode_paged_xqa.shared_decode_strategy_revision = int(  # type: ignore[attr-defined]
+    getattr(flash_attn_v100_cuda, "xqa_shared_decode_strategy_revision", 0)
+)
+
+
 def flash_attn_decode_paged_wmma(
     q: torch.Tensor,
     k_cache: torch.Tensor,

@@ -64,7 +64,7 @@ The earlier same-wheel native-GDN pair is already complete: C1
 17.406 / 17.613 ms and C4 45.025 / 46.229 ms. C1 token IDs agree, while C4
 and natural prompt IDs differ. The paired acceptance delta is -0.150
 percentage points, with 95% interval [-1.829, +1.464]. This interval does not
-establish equivalence. Keep this route disabled. Its isolated M5 gain cannot
+establish equivalence. This candidate was not promoted in that comparison. Its isolated M5 gain cannot
 be used as a projected model win or trigger an identical model rerun.
 
 ## QSA output ownership
@@ -90,3 +90,81 @@ HC readiness changes tested here are rejected; positive expert layout results
 remain small and carry a memory cost. Further work needs a larger structural
 change with an isolated correctness and critical-path screen before another
 same-wheel model A/B. Preserve the negative results and unchanged mean/tails.
+
+## Additional readiness and QSA screens
+
+Four-stream HC partial transposition is distinct from the earlier compact
+partial layout. Eight real weight pairs, four ranks and changed-input graph
+checks are byte-identical; max-rank median is 30.071 / 30.888 us. Amortizing
+watchdog clock reads every 64 polls retains bounded waiting and exact outputs,
+but regresses 28.928 / 29.696 us. Neither is selected.
+
+D64 QSA merge tiling retains FP32 arithmetic. M5/hot8192 complete host resolve
+plus attention measures 89.600 / 88.704 us, M20 392.640 / 393.408 us, and the
+undersized M5 hot cache regresses 1387.520 / 1707.456 us. Query output max
+absolute difference is 1.53e-5; the FP32 reduction layout is not byte-invariant.
+The timing is a cache-plus-attention screen, not an isolated merge result.
+Retain the old merge.
+
+The exact-pair HC screen avoids an explicit MoE concatenation and measures
+33.300 / 29.896 us. Its upper bound across 48 boundaries is 0.163 ms; any
+integration must pass both tensors explicitly through compiler-visible
+ownership, rather than the previously rejected hidden Tensor registry.
+
+## Native IQ3_S hardware counters
+
+Nsight Compute 2022.4.1 profiles the installed native M5/N160/K2560 gate/up
+operator on a real TP4 expert shard: 50 routes, 47 unique experts, 250 CTAs,
+512 threads each. This counter replay is not a new performance baseline.
+Measured duration is 48.736 us at profiler clocks 1.14 GHz SM / 782 MHz HBM.
+
+Registers/thread are 56, theoretical occupancy 50%, achieved occupancy 43.49%.
+There are 51.51% cycles with no eligible warp and 1.18 eligible warps per
+scheduler. L1/TEX scoreboard waits account for 31.0% of issued-instruction
+spacing. Global accesses have 2,216,219 excessive sectors out of 2,899,219
+(76%); shared accesses have 742,358 excessive wavefronts out of 1,576,608 (47%).
+DRAM throughput is 371.48 GB/s, 46.37% of profiler-clock peak; ALU utilization
+is 44% of active cycles. The next decoder experiment should address access
+amplification and latency hiding, rather than assume integer issue saturation.
+
+Lossless compact field planes already coalesce source fields and use 40
+registers/thread at eight warps. Screen their per-specialization shared-memory
+carveout next: separate kernel symbols are required so CUDA graph A/B does not
+mutate a common kernel's launch policy after capture. This experiment remains
+research-only until isolated and model-level gates qualify it.
+
+The IQ3_S carveout screen subsequently completed. With distinct graph-safe
+kernel symbols for default/33/66/100-percent preferences, M5 control is
+48.128 us and every eight-warp compact candidate measures 44.032 us. M1
+regresses 19.456 / 27.648 us; M20 default is 123.904 / 115.712 us, while the
+33-percent preference regresses to 123.904 us. Decoded Q8 outputs agree exactly
+at M5; M20 has three differing sum bytes but identical decoded values.
+Carveout adds no M5 benefit beyond the existing compact layout, so it is not
+selected or propagated to additional formats.
+
+## Validated changes in the host-KV prototype
+
+The following changes were measured in the contributor host-KV prototype
+associated with #1028 and #1039. Recording them here does not enable them
+in main.
+
+QSA preparation reuses the existing native operator with 32 local staging
+slots, then invokes the unchanged authoritative history writer. Fresh
+installed production-helper tests cover M1/M5/M20, FP16/FP32 cosine caches
+and two changed-input/position graph replays. With the representative FP16
+cosine cache, reference / native-helper timings are 16.384 / 11.264 us (M1),
+18.432 / 13.312 us (M5) and 18.944 / 13.312 us (M20). Key/value, gate, history
+codes and FP32 history scales agree exactly. M20 query maximum error is
+0.00012207, relative L2 5.42e-7; M1/M5 queries are byte-identical.
+
+Host H6/D256 SM70 partials use two warps through 32 rows. Separate-state
+four-request M20 tests cover contexts 128/512/1024/8192 and a 64-token hot
+cache. Outputs are bitwise equal, including changed selections and invalid
+rows. Full resolve-plus-attention timing pairs for contexts 128/512/1024 are
+67.968 / 67.008, 100.096 / 89.024 and 176.896 / 110.592 us. The 8192-token
+synthetic result must not be substituted for the short-prefix C4 endpoint.
+
+Twenty-five CPU contract tests pass. A normal source-complete Python wheel
+retains all 16 native libraries and the Rust executable byte-for-byte. These
+changes have an isolated operator basis; preparation remains opt-in. No new
+C1/C4 endpoint, acceptance equivalence or 12-ms achievement is claimed.
