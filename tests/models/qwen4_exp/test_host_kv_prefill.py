@@ -27,6 +27,48 @@ def test_prefill_admission_preserves_decode_and_workspace_bound():
         )
 
 
+@pytest.mark.parametrize("rows", [5, 20, 512, 16384])
+def test_host_prefill_uses_visible_pages_not_context_capacity(rows):
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAFlashAttentionImpl
+
+    page_size = 816
+    table = torch.arange(322, dtype=torch.int32).view(1, -1)
+    captured = []
+    owner = SimpleNamespace(
+        alibi_slopes=None,
+        sinks=None,
+        sliding_window=(-1, -1),
+    )
+    layer = SimpleNamespace(
+        host_kv_enabled=True,
+        host_kv_prefill_enabled=True,
+        host_kv=SimpleNamespace(page_size=page_size),
+        topk_indices_buffer=torch.empty(rows, 2051, dtype=torch.int32),
+        host_kv_forward=lambda query, indices, visible, *args: captured.append(visible),
+    )
+    metadata = SimpleNamespace(
+        num_actual_tokens=rows, max_seq_len=32768, block_table=table
+    )
+    query = torch.empty(rows, 6, 256, dtype=torch.float16)
+    Qwen4ExpQSAFlashAttentionImpl.forward_qsa(
+        owner,
+        layer,
+        query,
+        None,
+        None,
+        None,
+        metadata,
+        torch.empty_like(query),
+        token_to_req=torch.zeros(rows, dtype=torch.int32),
+        query_positions=torch.arange(rows),
+        sequence_lengths=torch.tensor([32768], dtype=torch.int32),
+    )
+    expected = table if rows < 512 else table[:, :41]
+    assert captured[0].data_ptr() == table.data_ptr()
+    assert captured[0].stride() == table.stride()
+    torch.testing.assert_close(captured[0], expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("skip_topk", [False, True])
 def test_grouped_prefill_rejects_reused_mtp_tail(monkeypatch, skip_topk):
     from vllm.models.qwen4_exp.nvidia.ops import host_kv_prefill

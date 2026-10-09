@@ -717,6 +717,23 @@ bitwise. Extra peak allocation stays below 48 MiB, rejecting large compiler
 clones; the M5/M20 dp4a route leaves poisoned staging storage untouched.
 The full-model memory and throughput comparison remains pending.
 
+The next baseline raises the four V100 power limits to 300 W, sets the context
+limit to 262144 tokens, and enables prefix caching. The timed workload remains
+32768 input tokens with a 16384-token scheduler chunk and utilization 0.5.
+Every warmup, timed request and profile starts with a successful idle prefix
+cache reset. Completed outputs must report zero cached tokens; a hit or missing
+cache evidence rejects the cold-prefill measurement. Five unprofiled repeats
+report median, range and coefficient of variation, with a 5% stability bound.
+Compiler and filesystem caches remain warm; these measurements describe cold
+prefix filling, not cold process startup or cold disk I/O.
+
+Host-prefill staging now slices the request block table to its actual visible
+history before testing scratch capacity. Unused columns reserved for the 256K
+context limit must not force a 32K request into the scalar fallback. The view
+retains original storage and stride, and M5/M20 graph table geometry remains
+unchanged. Fifteen focused CPU checks pass for cold-prefix evidence and this
+capacity/view policy; device and full-model checks are still required.
+
 The reusable gate/up pool has two disjoint slots. At 512 experts, local width
 160 and K2560, code storage is 100 MiB and group metadata is 100 MiB. IQ3 uses
 eight-byte group32 metadata and IQ2 uses four-byte group16 metadata, so both

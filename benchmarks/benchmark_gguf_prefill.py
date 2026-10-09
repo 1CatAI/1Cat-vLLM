@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -15,6 +16,23 @@ import torch
 
 import vllm
 from vllm import LLM, SamplingParams
+
+
+def reset_cold_prefix_cache(llm, enabled: bool) -> bool:
+    if enabled and not llm.reset_prefix_cache():
+        raise RuntimeError("Prefix cache reset failed before cold prefill")
+    return enabled
+
+
+def cold_prefill_evidence(result, enabled: bool) -> dict:
+    cached = result.num_cached_tokens
+    if cached not in (None, 0) or (enabled and cached is None):
+        raise RuntimeError(f"Cold prefill requires zero cached tokens, got {cached}")
+    prompt_tokens = len(result.prompt_token_ids)
+    return dict(
+        num_cached_tokens=cached,
+        computed_prompt_tokens=prompt_tokens - (cached or 0),
+    )
 
 
 def main():
@@ -27,6 +45,9 @@ def main():
     parser.add_argument("--tp", type=int, default=4)
     parser.add_argument("--kv-cache-memory-bytes", type=int)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.95)
+    parser.add_argument("--max-model-len", type=int)
+    parser.add_argument("--enable-prefix-caching", action="store_true")
+    parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--kernel-config", type=json.loads, default={})
     parser.add_argument(
         "--compare",
@@ -57,6 +78,10 @@ def main():
     args = parser.parse_args()
     if args.input_tokens <= 0 or args.prefill_chunk <= 0:
         parser.error("input and chunk token counts must be positive")
+    if args.repeats < 2:
+        parser.error("at least two measured repeats are required")
+    if args.max_model_len is not None and args.max_model_len < args.input_tokens + 1:
+        parser.error("context must hold the input and at least one output token")
     if args.completion_context and not args.completion_check:
         parser.error("--completion-context requires --completion-check")
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
@@ -68,12 +93,12 @@ def main():
         tensor_parallel_size=args.tp,
         kv_cache_dtype="float16",
         mamba_ssm_cache_dtype="float32",
-        max_model_len=args.input_tokens + 1024,
+        max_model_len=args.max_model_len or args.input_tokens + 1024,
         max_num_batched_tokens=args.prefill_chunk,
         max_num_seqs=4,
         kv_cache_memory_bytes=args.kv_cache_memory_bytes,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        enable_prefix_caching=False,
+        enable_prefix_caching=args.enable_prefix_caching,
         disable_log_stats=False,
         language_model_only=True,
         compilation_config={"mode": 3, "cudagraph_mode": "FULL"},
@@ -120,6 +145,7 @@ def main():
         acceptance_checks=[],
         completions=[],
         complete=False,
+        prefill_contract="cold prefix cache; warmed compiler and filesystem caches",
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -130,6 +156,16 @@ def main():
     llm = None
     try:
         llm = LLM(**config)
+        effective_cache = llm.llm_engine.vllm_config.cache_config
+        report["effective_prefix_caching"] = effective_cache.enable_prefix_caching
+        report["effective_mamba_cache_mode"] = effective_cache.mamba_cache_mode
+        report["effective_max_model_len"] = (
+            llm.llm_engine.vllm_config.model_config.max_model_len
+        )
+        if effective_cache.enable_prefix_caching != args.enable_prefix_caching:
+            raise RuntimeError("Effective prefix-cache policy differs from request")
+        if report["effective_max_model_len"] != config["max_model_len"]:
+            raise RuntimeError("Effective context limit differs from request")
         report["initialized_memory"] = llm.collective_rpc(
             "read_prefill_memory", args=(True, False, True)
         )
@@ -162,6 +198,7 @@ def main():
         )
         for enabled in policies:
             policy = llm.collective_rpc(method, args=(enabled,))
+            reset = reset_cold_prefix_cache(llm, args.enable_prefix_caching)
             warmup = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
             report["warmups"].append(
                 dict(
@@ -169,18 +206,21 @@ def main():
                     policy=policy,
                     output_ids=warmup.outputs[0].token_ids,
                     memory=llm.collective_rpc("read_prefill_memory", args=(True,)),
+                    prefix_cache_reset=reset,
+                    **cold_prefill_evidence(warmup, args.enable_prefix_caching),
                 )
             )
             save()
         measured_policies = (
-            (False, False)
+            (False,) * args.repeats
             if args.control_only
-            else (True, True)
+            else (True,) * args.repeats
             if args.candidate_only
-            else (False, True, True, False)
+            else (False, True, True, False) * args.repeats
         )
         for enabled in measured_policies:
             policy = llm.collective_rpc(method, args=(enabled,))
+            reset = reset_cold_prefix_cache(llm, args.enable_prefix_caching)
             before_memory = llm.collective_rpc("read_prefill_memory", args=(True,))
             started = time.perf_counter()
             result = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[0]
@@ -195,9 +235,11 @@ def main():
                 after_memory=after_memory,
                 scheduled_to_first_token_seconds=None,
                 output_ids=result.outputs[0].token_ids,
+                prefix_cache_reset=reset,
             )
             report["rows"].append(row)
             save()
+            row.update(cold_prefill_evidence(result, args.enable_prefix_caching))
             if metrics is None or metrics.scheduled_ts <= 0:
                 raise RuntimeError(
                     "Prefill timestamps missing; request statistics must be enabled"
@@ -207,6 +249,30 @@ def main():
             )
             save()
             print(json.dumps(report["rows"][-1]), flush=True)
+        report["prefill_summary"] = []
+        for enabled in policies:
+            times = [
+                row["scheduled_to_first_token_seconds"]
+                for row in report["rows"]
+                if row["enabled"] == enabled
+            ]
+            mean = statistics.mean(times)
+            cv = statistics.pstdev(times) / mean
+            report["prefill_summary"].append(
+                dict(
+                    enabled=enabled,
+                    repeats=len(times),
+                    mean_seconds=mean,
+                    median_seconds=statistics.median(times),
+                    min_seconds=min(times),
+                    max_seconds=max(times),
+                    coefficient_of_variation=cv,
+                    median_input_tokens_per_second=args.input_tokens
+                    / statistics.median(times),
+                    stable=cv <= 0.05,
+                )
+            )
+        save()
         if args.decode_check:
             sys.path.append(str(Path(__file__).resolve().parents[1]))
             from benchmarks.benchmark_flashnext_acceptance import observed_cohort
@@ -215,6 +281,7 @@ def main():
             for enabled in policies:
                 llm.collective_rpc(method, args=(enabled,))
                 for width in (1, 4):
+                    reset_cold_prefix_cache(llm, args.enable_prefix_caching)
                     steps, outputs = observed_cohort(
                         llm,
                         ids[:8192],
@@ -227,6 +294,10 @@ def main():
                         input_tokens=8192,
                         steps=steps,
                         output_ids=[list(row.outputs[0].token_ids) for row in outputs],
+                        cold_prefills=[
+                            cold_prefill_evidence(row, args.enable_prefix_caching)
+                            for row in outputs
+                        ],
                     )
                     report["decode_checks"].append(check)
                     save()
@@ -265,11 +336,16 @@ def main():
                         enable_thinking=False,
                     )
                     prompt_ids = tokenizer.encode(rendered, add_special_tokens=False)
-                    output = llm.generate(
+                    reset_cold_prefix_cache(llm, args.enable_prefix_caching)
+                    request = llm.generate(
                         {"prompt_token_ids": prompt_ids},
                         SamplingParams(temperature=0, max_tokens=512),
                         use_tqdm=False,
-                    )[0].outputs[0]
+                    )[0]
+                    evidence = cold_prefill_evidence(
+                        request, args.enable_prefix_caching
+                    )
+                    output = request.outputs[0]
                     report["completions"].append(
                         dict(
                             enabled=enabled,
@@ -279,6 +355,7 @@ def main():
                             output_ids=list(output.token_ids),
                             text=output.text,
                             finish_reason=output.finish_reason,
+                            **evidence,
                         )
                     )
                     save()
@@ -314,7 +391,12 @@ def main():
                         enable_thinking=False,
                     )
                     prompt_ids = tokenizer.encode(rendered, add_special_tokens=False)
+                    reset_cold_prefix_cache(llm, args.enable_prefix_caching)
                     row = natural_row(llm, prompt, prompt_ids, sampling)
+                    if args.enable_prefix_caching and row["num_cached_tokens"] != 0:
+                        raise RuntimeError(
+                            "Natural acceptance request hit prefix cache"
+                        )
                     report["acceptance_checks"].append(dict(enabled=enabled, **row))
                     save()
         report["matching_output_ids"] = (
@@ -322,6 +404,15 @@ def main():
                 {tuple(row["output_ids"]) for row in report["warmups"] + report["rows"]}
             )
             == 1
+        )
+        report["baseline_valid"] = (
+            report["matching_output_ids"]
+            and all(row["stable"] for row in report["prefill_summary"])
+            and report.get("decode_checks_valid", True)
+            and all(
+                row["output_ids"] and row["finish_reason"] == "stop"
+                for row in report["completions"]
+            )
         )
         save()
         if args.profile_once:
@@ -331,10 +422,15 @@ def main():
             llm.collective_rpc("read_prefill_memory", args=(False, True))
             warm_files = set()
             if args.profile_kind == "torch":
+                reset_cold_prefix_cache(llm, args.enable_prefix_caching)
                 llm.start_profile("prefill32k")
-                llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)
+                warm_profile = llm.generate(
+                    {"prompt_token_ids": ids}, params, use_tqdm=False
+                )[0]
                 llm.stop_profile()
+                cold_prefill_evidence(warm_profile, args.enable_prefix_caching)
                 warm_files = set(trace_directory.glob("*.pt.trace.json.gz"))
+            reset_cold_prefix_cache(llm, args.enable_prefix_caching)
             llm.start_profile("prefill32k")
             started = time.perf_counter()
             profiled = llm.generate({"prompt_token_ids": ids}, params, use_tqdm=False)[
@@ -357,6 +453,7 @@ def main():
                 ),
                 profiler=args.profile_kind,
                 output_ids=profiled.outputs[0].token_ids,
+                **cold_prefill_evidence(profiled, args.enable_prefix_caching),
                 files=[
                     dict(path=str(path), bytes=path.stat().st_size) for path in files
                 ],

@@ -292,10 +292,22 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 raise RuntimeError(
                     "Host QSA requires exact positions and sequence lengths"
                 )
+            block_table = attn_metadata.block_table
+            if layer.host_kv_prefill_enabled:
+                from .ops.host_kv_prefill import PREFILL_MIN_ROWS
+
+                if num_tokens >= PREFILL_MIN_ROWS:
+                    # Capacity follows max_model_len; only this request's
+                    # visible pages belong in the bounded prefill scratch.
+                    # Keep small-M graph table geometry unchanged.
+                    pages = math.ceil(
+                        attn_metadata.max_seq_len / layer.host_kv.page_size
+                    )
+                    block_table = block_table[:, :pages]
             layer.host_kv_forward(
                 query[:num_tokens],
                 logical_indices,
-                attn_metadata.block_table,
+                block_table,
                 token_to_req,
                 query_positions[:num_tokens],
                 sequence_lengths,

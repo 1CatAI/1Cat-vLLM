@@ -83,6 +83,7 @@ def natural_row(llm, prompt, ids, params):
         output_token_ids=list(output.token_ids),
         text=output.text,
         output_tokens=len(output.token_ids),
+        num_cached_tokens=result.num_cached_tokens,
         finish_reason=output.finish_reason,
         wall_seconds=elapsed,
         acceptance=acceptance,
