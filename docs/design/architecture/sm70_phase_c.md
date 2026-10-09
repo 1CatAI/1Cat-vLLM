@@ -51,8 +51,8 @@ diagnostics and warmup-only selection do not.
 | Batch | Implementation boundary | Status |
 |---|---|---|
 | C1a | C0 ledger; three profilers share collection/aggregation; ordered warmup; typed runtime and diagnostic configuration | Merged as #1130 (`c31d98d333d90`) |
-| C1b | Staged input resources and ordinary speculative sampling boundary | Implemented; operator and synthetic validation recorded below |
-| C2a | GDN compute plan, providers and shared stages | Pending |
+| C1b | Staged input resources and ordinary speculative sampling boundary | Merged as #1131 (`dfaeb1ba19ca98`) |
+| C2a | GDN compute plan, providers and shared stages | Implemented; operator acceptance complete |
 | C2b | GDN metadata and state preparation/commit | Pending |
 | C3 | Ordered defaults, model qualification and engine-local effective values | Pending |
 | C4a | Shared embedding, LM-head, norm and linear providers | Pending |
@@ -241,3 +241,125 @@ numeric options; enabling the diagnostic or retained tree worker override still
 raises the original parser error. Source explanations mark the inactive default
 instead of presenting the malformed input as its effective value. This does
 not change typed validation or computation hashes.
+
+## C2a implementation
+
+The C2a source baseline is C1b's merge `dfaeb1ba19ca98c4648edfab4bf297ca61f68dfa`.
+C1b's final queued input-owner GPU follow-up completed with **40 passes**;
+its final CI pre-commit check also passed (run `37925367488`).
+
+The existing prefill selector now supplies `GdnExecutionPlan`. Its declarations
+also feed the C0 explanation catalog: backend, actual operator entry, state and
+output layout, external/in-kernel Q/K normalization, and gate conversion order.
+The report explicitly labels selection as static evidence, not a native launch.
+The existing auto-candidate ordering is retained, including SM75 prefill
+rejection, FP16 admission, CUDA/package checks and dtype fallback. No second
+backend selector is introduced.
+
+`KernelConfig.gdn` captures backend/compute policy; `gdn.schedule` captures FLA
+launch geometry and autotune candidate lists. Typed values win, the historical
+FlashQLA alias order remains, and invalid legacy numeric tuning continues to be
+ignored according to the old parsers. Initialization captures values using raw
+legacy getters, without inheriting the worker's getter cache. The original
+platform checkpoint now supplies GDN defaults directly instead of writing seven
+environment keys. Effective backend/compute policy enters graph hashes;
+profiling and decode-warmup controls do not. Inactive GDN does not affect another
+model's cache. FlashInfer/CuteDSL plans ignore unused FLA chunk-tuning controls.
+
+Both ordinary and explicit packed decode call the same convolution and mixed-QKV
+recurrence stages. Their original validation modes, caller-owned output views,
+and allocating versus preallocated-output semantics remain explicit. FlashQLA
+bindings live under `fla/ops/sm70`; the native verifier receives a head contract
+and current tensor operands instead of the entire model layer. The binding does
+not retain an early parameter address, allowing later weight replacement/reload.
+The three externally normalized prefill providers share Q/K normalization while
+retaining their different conversion order: FlashInfer's half-precision log,
+FP32 cast and exp round-trip is unchanged. CuteDSL normalizes before converting
+the gate; native FLA normalizes internally. These differences are part of the
+stage declarations rather than silently replaced arithmetic.
+
+The old layer remains the registration/model-lifecycle boundary and orchestrates
+compute stages. Its ordinary metadata gathering/commit and deferred DDTree flow
+are C2b's remaining work, not counted as removed by moving provider functions.
+Old imports and CustomOp registration locations remain available. Common compute
+modules do not import the old model layer, accept it as context, or read legacy
+environment policy during execution.
+
+Prefill autotuners are created once per engine and shared by that engine's layers;
+JIT arithmetic is reused without sharing mutable winner caches between engines.
+The worker binds these runtime resources after configuration transfer. GDN
+prefill profiling similarly has one engine-owned budget, preserving per-stage
+limits and capture/compile guards. Its serialized policy belongs to
+`ObservabilityConfig.gdn_profile`; compatibility-only helpers retain the old
+standalone import behavior.
+
+### C2a validation ledger
+
+Validation remains operator/synthetic only. The first candidate run exposed a
+missing compatibility export and fixtures that bypassed initialization. The new
+replay comparison also initially reused convolution's in-place input between
+lanes; independent input storage and explicit replay resets correct the harness.
+Padding rows have unspecified allocating-output values in the original kernel:
+compare all live output rows and every conv/SSM state slot, retaining the `-1`
+index semantics. No arithmetic tolerance was relaxed.
+
+Native validation uses the same artifact for both lanes. Its `_C` SHA256 is
+`d258385a58f891a5b5bb926ee2050d5fb1e3399ccca9edb37f1bb922a993ba81`;
+installed source identity is `eca6e7370`. GDN verifier source, `ops.h` and Torch
+registration source match this batch's baseline exactly. That artifact also
+contains unrelated QSA additions, which these tests do not invoke. Python,
+Torch, CUDA, V100 and driver settings remain those recorded for C1a. Results and
+same-process alternating A/B measurements are recorded before promotion.
+
+The new configuration/provider suite passes **27 CPU tests**. The existing
+backend/device/projection integration selection passes **49 CPU tests**, with
+61 CUDA-only skips. The configuration utility suite also passes. Full pre-commit,
+mypy, environment-registration and layering checks pass without a new whitelist.
+Six modified FLA JIT bodies/decorators are AST-identical to the baseline.
+
+On 54633 the corrected candidate selection passed **107 GPU tests**, with four
+remaining launch-metadata expectations. Running the old source reproduced the
+same four failures: TP4 single-request q8 already selects BV2, while its old test
+expected BV8. Correcting only that expectation passes all four on both sources;
+output/state equality and canary checks are unchanged. Two additional bound
+native-verifier cases pass, including parameters supplied after provider binding.
+After the host-call refinement, all **10 affected shared-stage/native-provider
+GPU tests** pass again (the two already-passing native-prefill cases are not
+repeated). Counts from successive targeted runs overlap and are not summed.
+
+The final paired microbenchmark alternates lane order over nine rounds. Both
+lanes use the same two kernels, inputs, states and native artifact; all outputs
+and conv/SSM states are exactly equal. CUDA graph replay isolates device time;
+eager Python launch timing and allocation tracing run separately.
+
+| Rows | GPU baseline/shared µs | Eager host baseline/shared µs | Extra GPU bytes baseline/shared |
+|---|---:|---:|---:|
+| 1 | 6.932 / 6.902 | 214.179 / 216.978 | 0 / 0 |
+| 4 | 8.970 / 8.950 | 235.128 / 240.101 | 0 / 0 |
+
+An initial approximately 10 µs host increase was localized to temporary argument
+dictionaries in the shared wrappers. Fixed argument calls reduce it. Residual
+paired host median deltas are +5.194/+8.689 µs; baseline round ranges are
+206.625–223.111 and 223.450–240.026 µs. This is a small eager-call cost, not a
+claimed host speedup; captured replay adds no stage dispatch. Python allocation
+peaks are 15,822/18,563 and 15,822/15,846 bytes, with no additional device allocation.
+GPU medians remain inside baseline variation. No model performance is inferred.
+
+Scope accounting: the standard speculative/non-speculative and explicit packed
+convolution sites now share one stage; allocating/out mixed-QKV dispatch has one
+entry. Three external-normalization prefill providers share the normalization
+stage. Four prefill algorithms remain because their layout/cast contracts differ;
+FlashQLA decode and the native sequential verifier likewise remain distinct
+algorithms. Prefill selection still has one selector. Layer-owned execution no
+longer reads the migrated compute/tuning controls; import-time standalone FLA
+compatibility defaults and deferred state/diagnostic consumers are explicitly
+remaining C2b/C3 work. With the expanded inventory scanned at both revisions,
+legacy read sites decrease **374 → 358**; the catalog now detects 265 names
+(including previously indirect tuning aliases), not 265 active per-token reads.
+The generic coupling ratchet decreases environment **269 → 267** and platform
+**3718 → 3708**, with model **2315 → 2315**. No claim is based on file size.
+
+Reproduction artifacts are retained in the task-owned `phase-c2a-20261009`
+validation directory: source patches/checksums, per-lane JUnit results,
+`host-profile.log`, `hostfix-gpu.log`, `hostfix-ab.json` and native hashes. The
+rebase onto main's QSA deliveries changes no GDN kernel source or registration.

@@ -377,6 +377,7 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     use_exp2: bool = False,
+    kernel=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
@@ -405,7 +406,9 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
+    (kernel if kernel is not None else chunk_gated_delta_rule_fwd_kernel_h_blockdim64)[
+        grid
+    ](
         k=k,
         v=u,
         w=w,

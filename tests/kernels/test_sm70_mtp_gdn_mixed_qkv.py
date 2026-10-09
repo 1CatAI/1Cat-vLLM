@@ -7,6 +7,9 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
+from vllm.config.gdn import GdnConfig, GdnProfileConfig
+from vllm.model_executor.layers.fla.ops.gdn_profiling import GdnPrefillProfiler
+from vllm.model_executor.layers.fla.ops.gdn_stages import GdnHeadContract
 from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as mod
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
@@ -70,7 +73,15 @@ def test_standard_mtp_core_keeps_output_conv_and_ssm_bits(
     conv = SimpleNamespace(
         weight=torch.randn(2560, 1, 4, device=device, dtype=dtype), bias=None
     )
+    policy = GdnConfig()
+    policy.resolve()
+    profiling = GdnProfileConfig(enabled=False)
+    profiling.resolve()
     common = dict(
+        gdn_policy=policy,
+        gdn_heads=GdnHeadContract(16, 48, 128, 128, 4),
+        _gdn_profiler=GdnPrefillProfiler(profiling),
+        verification_update=None,
         prefix="test",
         tp_size=4,
         num_k_heads=16,

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import Field, field_validator
 
+from vllm.config.gdn import GdnConfig
 from vllm.config.sm70_moe import Sm70MoEConfig
 from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.sm70_runtime import Sm70RuntimeConfig
@@ -502,6 +503,9 @@ class Sm70SparseConfig:
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
+    gdn: GdnConfig = Field(default_factory=GdnConfig)
+    """Initialized GDN computation policy; inactive models ignore it in hashes."""
+
     sm70_runtime: Sm70RuntimeConfig = Field(default_factory=Sm70RuntimeConfig)
     """Per-engine auxiliary warmup policy, outside compiled computation."""
 
@@ -789,6 +793,21 @@ class KernelConfig:
 
         return native_verifier()
 
+    def resolve_gdn(self, model_config, additional_config) -> None:
+        """Capture active GDN policy before worker serialization/cache hashing."""
+        configs = (
+            getattr(model_config, "hf_text_config", None),
+            getattr(model_config, "hf_config", None),
+        )
+        if any(
+            getattr(config, "linear_key_head_dim", None) is not None
+            for config in configs
+        ):
+            self.gdn.resolve(
+                additional_config=additional_config,
+                native_verify=self.sm70_gdn_verify,
+            )
+
     def sample_greedy(self, *args):
         from vllm.v1.worker.gpu.spec_decode.sm70_greedy_verify import (
             maybe_sample_greedy,
@@ -804,6 +823,8 @@ class KernelConfig:
         """
         ignored_factors = {
             "enable_flashinfer_autotune",
+            "gdn",  # Hash only initialized computation policy below.
+            "sm70_gdn_verify",  # Compatibility input is represented by gdn policy.
             "sm70_runtime",  # Warmup does not alter compiled model computation.
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
@@ -851,6 +872,8 @@ class KernelConfig:
         if not self.sm70_mxfp4.values:
             ignored_factors.add("sm70_mxfp4")
         factors = get_hash_factors(self, ignored_factors)
+        if self.gdn.resolved:
+            factors["gdn"] = self.gdn.compute_hash()
         if self.sm70_moe.resolved:
             factors["sm70_moe"] = self.sm70_moe.compute_hash()
         for family in ("awq", "fp8", "nvfp4", "gguf"):

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config.gdn import GdnConfig
 from vllm.model_executor.layers.fla.ops import fused_recurrent_gated_delta_rule
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -77,7 +78,10 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
     cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * 8
     expected = torch.empty((tokens, v_heads, dim), device="cuda", dtype=torch.float16)
     actual = torch.empty_like(expected)
+    policy = GdnConfig()
+    policy.resolve()
     layer = SimpleNamespace(
+        gdn_policy=policy,
         A_log=a_log,
         dt_bias=bias,
         num_k_heads=16,
@@ -172,7 +176,9 @@ def test_packed_entry_preserves_fp32_beta_and_strided_state(
                 initial.index_select(0, retired),
             )
             assert torch.all(mixed_storage[:, width:] == -3.0)
-    expected_bv = (2 if use_bv2 else 16) if tp_size == 2 else 8
+    # Current main already uses BV2 for the single-request TP4 q8 verifier;
+    # numerical equality and every resident-state canary above remain exact.
+    expected_bv = (2 if use_bv2 else 16) if tp_size == 2 else 2
     if batch > 1:
         expected_bv = 32 if tp_size == 2 or batch > 32 else 8
     assert launches

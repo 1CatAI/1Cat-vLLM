@@ -33,6 +33,13 @@
  "vllm/config/compilation.py": {
   "model": 3
  },
+ "vllm/config/gdn.py": {
+  "env": 1,
+  "platform": 15
+ },
+ "vllm/config/gdn_schedule.py": {
+  "platform": 46
+ },
  "vllm/config/observability.py": {
   "platform": 1
  },
@@ -46,7 +53,7 @@
  "vllm/config/vllm.py": {
   "env": 16,
   "model": 171,
-  "platform": 314
+  "platform": 308
  },
  "vllm/distributed/communication_op.py": {
   "platform": 6
@@ -141,6 +148,18 @@
   "model": 22,
   "platform": 45
  },
+ "vllm/model_executor/layers/fla/ops/gdn_chunk_kernels.py": {
+  "platform": 5
+ },
+ "vllm/model_executor/layers/fla/ops/gdn_prefill.py": {
+  "platform": 9
+ },
+ "vllm/model_executor/layers/fla/ops/gdn_profiling.py": {
+  "platform": 1
+ },
+ "vllm/model_executor/layers/fla/ops/gdn_selector.py": {
+  "platform": 20
+ },
  "vllm/model_executor/layers/fla/ops/kda.py": {
   "env": 1,
   "platform": 7
@@ -193,9 +212,9 @@
   "platform": 24
  },
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
-  "env": 47,
+  "env": 44,
   "model": 239,
-  "platform": 650
+  "platform": 550
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1

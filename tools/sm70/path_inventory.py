@@ -75,6 +75,7 @@ C_OWNERS = (
     "vllm/platforms/sm70/",
     "vllm/model_executor/warmup/",
     "vllm/model_executor/layers/fla/ops/sm70/",
+    "vllm/model_executor/layers/fla/ops/gdn_",
 )
 
 
@@ -240,6 +241,14 @@ def source_paths(ref: str | None, phase: str = "b") -> list[str]:
         sources.update(
             {
                 "vllm/config/sm70_runtime.py",
+                "vllm/config/gdn.py",
+                "vllm/config/gdn_schedule.py",
+                "vllm/model_executor/layers/fla/ops/chunk.py",
+                "vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py",
+                "vllm/model_executor/layers/fla/ops/chunk_delta_h.py",
+                "vllm/model_executor/layers/fla/ops/chunk_o.py",
+                "vllm/model_executor/layers/fla/ops/fused_recurrent.py",
+                "vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py",
                 "vllm/v1/spec_decode/profiling.py",
                 "vllm/v1/spec_decode/diagnostics.py",
                 "vllm/utils/staged_copy.py",
@@ -300,9 +309,64 @@ def runtime_catalog() -> dict:
                 and isinstance(legacy, str)
                 and legacy.startswith("VLLM_")
             )
+    for path, cls_name, tables in (
+        (
+            "vllm/config/gdn.py",
+            "KernelConfig.gdn",
+            {"GDN_LEGACY_FIELDS", "GDN_TEXT_FLAGS"},
+        ),
+        (
+            "vllm/config/gdn_schedule.py",
+            "KernelConfig.gdn.schedule",
+            {"GDN_SCHEDULE_FIELDS"},
+        ),
+    ):
+        for node in ast.parse(read_source(path, None)).body:
+            if not isinstance(node, ast.Assign) or not isinstance(
+                node.targets[0], ast.Name
+            ):
+                continue
+            if node.targets[0].id not in tables:
+                continue
+            for field, entry in ast.literal_eval(node.value).items():
+                legacy = entry if isinstance(entry, str) else entry[0]
+                aliases.append(
+                    dict(
+                        legacy=legacy,
+                        typed=f"{cls_name}.{field}",
+                        timing="initialization only",
+                        declaration=path,
+                    )
+                )
+    stages = {}
+    tree = ast.parse(
+        read_source("vllm/model_executor/layers/fla/ops/gdn_selector.py", None)
+    )
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "GDN_BACKEND_STAGES"
+        ):
+            for name, value in zip(node.value.keys, node.value.values):
+                stages[ast.literal_eval(name)] = {
+                    **dict(
+                        zip(
+                            (
+                                "backend",
+                                "operator",
+                                "qk_normalization",
+                                "gate_conversion",
+                            ),
+                            (ast.literal_eval(arg) for arg in value.args),
+                        )
+                    ),
+                    **{kw.arg: ast.literal_eval(kw.value) for kw in value.keywords},
+                }
     return {
         "evidence": "configuration declarations; not runtime launches",
         "aliases": aliases,
+        "gdn_stages": stages,
     }
 
 

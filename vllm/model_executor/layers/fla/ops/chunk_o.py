@@ -192,6 +192,7 @@ def chunk_fwd_o(
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
     core_attn_out: torch.Tensor | None = None,
+    kernel=None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
@@ -217,7 +218,7 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_fwd_kernel_o[grid](
+    (kernel if kernel is not None else chunk_fwd_kernel_o)[grid](
         q,
         k,
         v,
