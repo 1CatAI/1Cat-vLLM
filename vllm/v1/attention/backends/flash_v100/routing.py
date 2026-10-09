@@ -7,6 +7,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -962,15 +963,22 @@ def _uses_fp8_kv_cache(kv_cache_dtype: str) -> bool:
     return isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8")
 
 
-def _log_fp8_kv_cache_route(stage: str, kv_cache_dtype: str, route: str) -> None:
+def _log_fp8_kv_cache_route(
+    stage: str,
+    kv_cache_dtype: str,
+    route: str,
+    *,
+    record: Callable[[str], None] | None = None,
+) -> None:
     global _logged_fp8_kv_decode, _logged_fp8_kv_prefill
 
     if not _uses_fp8_kv_cache(kv_cache_dtype):
         return
     if stage not in ("prefill", "decode"):
         raise ValueError(f"Unsupported FP8 KV cache route stage: {stage}")
-    _record_route(f"fp8_kv_{stage}")
-    _record_route(f"fp8_kv_{stage}_{route}")
+    emit = _record_route if record is None else record
+    emit(f"fp8_kv_{stage}")
+    emit(f"fp8_kv_{stage}_{route}")
     if stage == "prefill":
         if _logged_fp8_kv_prefill:
             return

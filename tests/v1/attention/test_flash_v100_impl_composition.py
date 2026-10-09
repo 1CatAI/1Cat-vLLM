@@ -102,6 +102,19 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_FunctionDef(self, node):
         self.in_cache = node.name in _CACHE_METHODS
+        if node.name == "_call_flash_attn_decode_paged":
+            pairs = list(zip(node.args.kwonlyargs, node.args.kw_defaults))
+            for argument, default in pairs:
+                if argument.arg == "record":
+                    assert default is not None
+                    assert ast.unparse(default) == "_plan.record_legacy"
+            pairs = [
+                (argument, default)
+                for argument, default in pairs
+                if argument.arg != "record"
+            ]
+            node.args.kwonlyargs = [argument for argument, _ in pairs]
+            node.args.kw_defaults = [default for _, default in pairs]
         if node.name == "get_kv_single_seq":
             assert [a.arg for a in node.args.kwonlyargs] == ["extract"]
             node.args.kwonlyargs = []
@@ -165,6 +178,9 @@ class _Normalize(ast.NodeTransformer):
 
     def visit_Call(self, node):
         node = self.generic_visit(node)
+        if ast.unparse(node.func) == "record":
+            node.func = ast.parse("_routing._record_route", mode="eval").body
+
         if self.in_cache and ast.unparse(node.func) == "extract":
             node.func = ast.parse(
                 "_kv_layout._extract_contiguous_kv_from_paged_cache", mode="eval"
