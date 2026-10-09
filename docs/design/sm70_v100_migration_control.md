@@ -4,10 +4,13 @@ Date: 2026-05-30
 
 ## Full-mesh HCX local schedule, 2026-10-09
 
-The Flash-Next TP4 HCX screen retains two changes: defer up-weight prefetch
-until combine completes and distribute the eight gate-mix accumulator slots
-across warps. The arithmetic order is unchanged. The M5 installed-wheel comparison
-is 23.710 to 21.131 µs per complete boundary; M1 is 18.723 to 16.332 µs.
+The Flash-Next TP4 HCX schedule defers up-weight prefetch until combine
+completes, overlaps independent peer loads and stream norm reductions, and
+assigns gate-mix to one warp per row. Persistent counters remove the completion
+arrival/reset phase; acquire/release publication replaces thread-wide barrier
+fences. The arithmetic order is unchanged. Source `71fce5ca51` in the normal
+installed wheel measures 23.753 to 19.013 µs per complete M5 boundary;
+M1 is 18.680 to 14.424 µs and M8 30.525 to 25.927 µs.
 These are boundary measurements with actual weights and synthetic activations,
 not model round latency. Installed-artifact and model results are tracked in
 [the local schedule report](flashnext_hcx_local_schedule.md).
@@ -22,6 +25,41 @@ has top-1 agreement 63/64 and different natural outputs, so the earlier A/B
 differences do not isolate a native scheduling effect. The underlying startup
 variation remains unresolved. Two symmetric C1 timing blocks give -0.024 and
 -0.771 ms; keep these exploratory and quote the reproducible boundary gain.
+
+Those model results apply to the first-round wheel. V6 source `71fce5ca51`
+passes 73 raw-bit comparisons per rank for every M1–8 shape, including six
+counter-wrap and interleaved-route checks. A separate M5 process measures
+23.737 to 19.004 µs. The V4 model diagnostic was stopped during loading
+at the user's request to prioritize larger kernel scheduling changes; no
+V4–V6 model result is claimed. M5's achieved reduction is about 20%, below the
+requested 30–50% target. Keep the default false and defer full-model work.
+Interleaved up ownership retains norm inputs in the producing CTA and screens
+at 19.804 µs, but is research-only. Raw LoRA-to-register paths, compact
+receiver/consumer pipelines and direct batched polling all regress; do not
+repeat them without a materially different schedule.
+
+The structural reassessment records every warp's phase timing. Norm/partial
+handoffs, grid joins and LoRA staging remain material; up MMA is a small span.
+These are instrumented phase spans, not an additive model latency ledger.
+Three concrete rewrites fail the paired complete-boundary screen against V6:
+joint norm/down exchange with coalesced compact receivers is 21.881 versus
+19.062 µs; one full-K down column per CTA is 24.716 versus 19.005 µs; twenty
+Tensor Core K partitions are 23.093 versus 19.025 µs. Changed-sum-order screens
+are deterministic with maximum relative L2 error 7.07e-5, but are research-only
+and have no model quality gate. Record these failures before trying another
+layout. A real-weight output-projection-plus-HC screen measures 28.481 µs
+for production projection plus V6 and 26.464 µs for fused local scheduling.
+The 2.017-µs saving is measured over the complete chain. This remains a
+research DSO, supports Q4_K/Q6_K with already normalized input, and is not
+part of the installed result or a model speedup. Do not omit producer work
+from the comparison or budget the previous assumed 3.8 µs per fusion.
+
+The historical approximately 3-ms HC number is 2.9623 ms of profiled target
+HCX service on the earlier two-hop machine, alongside a separate unprofiled
+17.3988-ms model round. It is not the current full-mesh microbenchmark sum.
+At 94 boundaries, 19.004 µs gives a 1.786-ms isolated estimate; less than
+1 ms requires an average below 10.64 µs before draft/remaining HC. Neither
+an under-1-ms HC result nor a new model speedup has been demonstrated.
 
 Do not repeat the K-shard implementations as presumed wins: a centralized
 receiver takes 77–82 µs; distributed receivers take 44–48 µs versus a 23.7-µs

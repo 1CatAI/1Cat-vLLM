@@ -1,10 +1,11 @@
 # Flash-Next HCX local schedule on full-mesh V100
 
 The full-mesh HCX schedule delays up-weight prefetch until combine finishes,
-and assigns the eight gate-mix accumulator slots to eight warps. Previously,
-up-weight prefetch overlapped the initial down-weight loads, and warp 0 mixed
-all eight slots serially. Each output retains the original five-part FP32
-sum, FP16 casts, sigmoid and four-stream FMA order.
+issues independent peer loads together, interleaves the four stream norm
+reductions, and assigns the final gate-mix to one warp per row. Each output
+retains the original FP32 sum trees, FP16 casts, sigmoid and four-stream FMA
+order. Persistent barrier counters remove the completion-counter/reset phase;
+acquire/release atomics publish the two remaining grid barriers.
 
 The normal `_C` implementation offers this experimental schedule for TP4
 full-mesh HCX, M1–8, with a separate output projection. Fused output projections
@@ -13,6 +14,201 @@ existing model fallback. The kernel policy `sm70_hcx_local_schedule=true`
 opts in before graph capture. The default is false at both the Python policy
 and native operator schema pending repeatable fresh-process model qualification.
 HCX itself remains controlled by `sm70_hcx`.
+
+## Current installed result: second optimization round
+
+Source `71fce5ca51a923c9bf52cd4016d0a63df63d32e4` is built by the normal
+CMake `_C` target and installed in
+`1cat_vllm-1.5.2.dev1202+g71fce5ca51.cu128-cp312-cp312-linux_x86_64.whl`.
+Wheel SHA256 is
+`c65f0b5f9da6475a39386defc5fd727544fccf0b05011a2d1ab025756011f420`;
+core SHA256 is
+`8f33440ccead32d95d2e3be6b4f7fa3b0c06bba97155ee5c977b75af8afa2096`.
+The fresh runtime has no research DSO, RPATH/RUNPATH or private loader
+override. The selected kernel uses 94 registers, 13,888 bytes of shared
+memory and zero stack/spills. The reference full-mesh kernel's extracted
+SASS is identical across the V3–V6 wheels.
+
+| Rows | Reference, µs | Local schedule, µs | Reduction |
+| --- | ---: | ---: | ---: |
+| 1 | 18.680 | 14.424 | 22.8% |
+| 5 | 23.753 | 19.013 | 20.0% |
+| 8 | 30.525 | 25.927 | 15.1% |
+
+The measurement contract below is unchanged: eight actual weight pairs,
+synthetic activations, 512 complete boundaries per graph, 24 observations
+per arm, and the critical rank for each observation. M5 observed ranges
+are 23.628–24.078 µs and 18.912–19.216 µs. All M1–8 shapes pass 73 raw FP16
+bit-pattern comparisons per rank and shape, including changed-input graph
+replays, optional secondary inputs, shared/per-branch norm weights and zero
+inputs. Six of those checks exercise counter wrap and interleaved reference /
+candidate calls. A separate M5 process measures 23.737 to 19.004 µs. The M2/3/4/6/7
+follow-up is a correctness run with fewer timing samples. Targeted pre-commit
+checks and fresh CLI startup pass.
+
+V4 (`ce2606b95f`) measured 23.812 to 20.140 µs at M5. V5 (`0f1361e81f`)
+removed the final arrival/reset phase and measured 23.714 to 19.599 µs.
+V6 replaces thread-wide fences around barrier arrival with a CTA join,
+GPU-scope acquire/release RMW chain, acquire load, and consumer CTA join.
+Each benchmark arm remains in the normal installed `_C`; research libraries
+are not needed. Do not subtract results from these different runs to infer
+the independent cost of either change.
+
+At the user's request, the second-round model diagnostic was stopped during
+model loading to prioritize kernel scheduling experiments toward a 30–50%
+boundary reduction. It produced no new model-quality or model-speed result.
+The same-process quality evidence later in this report applies to the older
+wheel only. V4–V6 have no new model-quality or model-speed result. The default
+remains false. The achieved boundary reduction is approximately 20% at M5;
+30–50% and less than 1 ms of HC per round remain targets.
+
+The diagnostic now accepts an explicit `--expected-core-sha256` when reusing
+a reference workload with a rebuilt core. It records the current and
+reference core identities separately and reruns all four quality phases;
+it does not reuse the older candidate's quality result.
+
+## Second-round research screens
+
+The following measurements use isolated research DSOs. They are complete
+boundary screens, not installed-route or model-speed claims. Controls and
+candidates are paired within each row; different rows are different runs.
+
+| M5 screen | Paired control, µs | Candidate, µs | Decision |
+| --- | ---: | ---: | --- |
+| Norm ILP + independent peer loads + row-owned wide output pushes | 21.094 | 20.088 | Integrated into the normal wheel above |
+| Grouped readiness flags, groups 8 / 16 / all 80 | 21.082 | 22.141 / 22.128 / 22.972 | Reject |
+| Raw LoRA-to-register operands, prefetched / streamed | 20.079 | 22.272 / 22.517 | Reject |
+| Five compact LoRA receivers, shared / register consumer | 20.090 | 24.505 / 22.042 | Reject |
+| Interleaved up ownership, norm input retained by its producer CTA | 20.058 | 19.804 | Small research gain; not integrated |
+| Interleaved ownership plus direct batched LoRA polling | 20.058 | 51.143 | Reject |
+| Row-aligned norm/down reduction, separate / interleaved trees | 19.879 | 19.893 / 19.763 | No substantial extra gain; not integrated |
+| Persistent counter, without final CTA join | 20.071 | 19.203 | Integrated in V5 |
+| Acquire/release barrier against the persistent-counter arm | 19.262 | 18.700 | Integrated in V6 |
+| Four counter banks against acquire/release | 18.700 | 19.532 | Reject |
+| Cooperative grid synchronization | 19.173 | 18.703 | Similar to acquire/release; additional launch constraints |
+| Six warps against eight-warp acquire/release | 18.609 | 18.575 | Too small to justify a separate route |
+
+The interleaved ownership experiment assigns up columns `32 * CTA + 8 * rank`
+and repacks up weights accordingly. It preserves the arithmetic and keeps
+norm/mix inputs in the same CTA, without changing the K summation order.
+These ownership and reduction screens pass changing-input raw-bit checks,
+including graph replays. Simply removing the second global barrier performs
+poorly: duplicated packet polling and readiness publication can cost more
+than the barrier it replaces. Retain the negative results when choosing the
+next structural rewrite.
+
+Raw second-round source, commands, hashes and per-rank results are retained
+in the task's `hcx-local-fuse-20261009` artifacts, including `norm-ilp`,
+`selected-followup`, `barrier-screen`, `direct-up`, `lora-pipeline`,
+`hidden-owner` and `row-reduce`.
+
+## Structural reassessment toward less than 1 ms
+
+For 94 target HCX boundaries, an isolated average below 10.64 µs is a
+necessary microbenchmark budget for a 1-ms sum. It is not sufficient to
+establish a model wall-time result and excludes draft and remaining target HC.
+The current installed 19.004-µs M5 result corresponds to 1.786 ms when simply
+multiplied by 94. The historical model trace below is a different measurement.
+
+The new diagnostic records `clock64` from every warp in every CTA, including
+the output-receiving warp that thread-0-only timing misses. It contrasts one
+warm weight pair with eight rotating pairs. In the eight-pair capture, the
+longest CTA's phase spans, averaged across four ranks and four captures, are:
+
+| Instrumented phase | Mean SM cycles |
+| --- | ---: |
+| Entry, input exchange and down-weight readiness | 5,246 |
+| Down MMA and partial stores | 2,458 |
+| First grid join | 3,629 |
+| Partial preloads, norm reduction and normalized-input publication | 3,652 |
+| Down reduction and LoRA publication | 975 |
+| Second grid join | 3,019 |
+| LoRA copy to shared memory and CTA join | 2,679 |
+| Up MMA | 514 |
+| Mix/output publication and remote-output collection | 2,495 |
+
+These spans include concurrent work and straggler waits. They are not
+independent causal costs or a complete additive model ledger. `clock64`
+differences are taken only within a CTA; clocks on different SMs or ranks are
+not aligned. Raw results retain all phases and snapshots. The old JSON field
+name `stage_timestamps_ns` is historical: the new capture contains cycles.
+No-instrumentation controls in this diagnostic measure 23.820 µs original,
+18.693 µs installed V6, and 18.867 µs copied/instrumentable V6. The numerical
+checks are bit-exact; the instrumented source changes register allocation and
+does not replace the formal installed result.
+
+The large data-handoff spans justify testing the partition, but their
+elimination is not a free saving. The following rewrites preserve complete
+residual, block-output and injection delivery in the timed boundary:
+
+| Structural M5 screen | Installed V6 control, µs | Candidate, µs | Decision |
+| --- | ---: | ---: | --- |
+| Rank-local K tiles, overlapping norm exchange with down MMA | 19.123 | 19.433 | No gain |
+| Joint norm statistics and four FP32 down-stream partials, direct consumers | 19.123 | 66.804 | Reject |
+| Joint payload, compact receivers | 19.123 | 25.800 | Reject |
+| Joint payload with contiguous consumer planes, direct / compact | 19.062 | 30.652 / 21.881 | Better than the strided prototype, still reject |
+| One down column per CTA, full K reduced inside the CTA | 19.005 | 24.716 | Reject |
+| Tensor Core down with 20 K partitions instead of 80 | 19.025 | 23.093 | Reject |
+
+The joint-payload variants remove a communication round but exchange four
+FP32 stream partials per latent element and may duplicate their consumption
+across 80 CTAs. The one-column variant removes the global down-partial table
+but uses SIMT dot products and repeatedly reads the residual. The coarser
+Tensor Core variant reduces the partial table fourfold, while duplicating
+combine work across N groups and adding a CTA-local reduction. Their paired
+results reject these concrete implementations; they do not prove that every
+sharded or coarser layout must be slower.
+
+Each changed-reduction candidate passes 27 numerical cases and repeated-run
+determinism checks per rank, using real weights and changed synthetic inputs.
+The largest relative L2 error across these screens is 7.07e-5; the residual
+output is bit-exact. These are screening tolerances, not teacher-forcing or
+acceptance-rate approval. None of these rewrites enters the model route.
+The one-column prototype first failed its numerical gate because the reused
+K-shard harness reserved too little space for its larger all-reduce packet
+layout. The corrected buffer partition passes; its failed log is preserved.
+Its initial one-block-per-SM build was never launched because 84 CTAs on
+80 SMs could not all be resident; the measured build has an occupancy guard,
+82 registers, and zero stack/spills.
+
+Raw sources, build commands, hashes and per-rank results are retained under
+`/home/ymzx/codex-artifacts/hcx-local-fuse-20261009` in `warp-ledger`,
+`joint-statistics`, `joint-statistics-coalesced`, `column-owned-down`, and
+`coarse-splitk`. The same task directory on the remote host contains the
+executed runners and logs.
+
+### Output projection plus HC
+
+The `producer-fusion` screen expands the boundary to include the preceding
+output projection. It extracts the first eight real Q4_K/Q6_K output-projection
+tensors and their matching FFN HC weights from the GGUF, with K=1536 per rank
+and N=2560. Inputs are synthetic, in GGUF column order, after any GDN input
+normalization. It does not load the model or exercise the Python projection
+layout adapter. Both separate producer implementations use eight warps,
+split=1 and one output tile per CTA, matching the configured K=1536 projection.
+
+| M5 complete-chain arm | Median, µs |
+| --- | ---: |
+| DMV13 projection + original HCX schedule | 32.840 |
+| DMV13 projection + installed V6 HCX schedule | 28.316 |
+| Production dense-segments projection + installed V6 HCX | 28.481 |
+| Existing fused HCXO | 30.225 |
+| Fused HCXO with V6 local scheduling, research DSO | 26.464 |
+
+The production producer alone measures 8.898 µs. Subtracting it from the
+fused graph is an incremental chain-cost estimate, not an independently
+observed HC kernel or model wall-time partition. The directly measured
+complete-chain saving against the production producer plus V6 is 2.017 µs,
+or 7.1%. Multiplying that saving by 48 attention boundaries gives a 0.097-ms
+projection under this microbenchmark contract; it is not a model result or
+the earlier assumed 3.8-µs saving per fusion.
+
+The three original/fused arms pass 81 raw-FP16-bit comparisons per rank
+against separate DMV13 + V6, including changed-input graph replays. The
+production dense-segments chain also matches all three outputs bit-for-bit
+for the 24 eager cases per rank. This source supports Q4_K/Q6_K and already
+normalized producer inputs only. It has no model quality gate, clean normal
+package, or production dispatch change and remains a research result.
 
 ## Related work and interpretation
 
@@ -37,6 +233,34 @@ below loses on these V100s. Likewise, removing several operations in an
 ablation does not make their individual latency differences additive: overlap,
 cache pressure and scheduling change together. The 12–14 µs target is not an
 achieved result of this work.
+
+## Historical 17.4-ms model baseline and reporting scope
+
+The [repaired HCX model report](flashnext_mtp4_round12.md#repaired-hcx-matched-endpoint-comparison)
+records 17.3988 ms per unprofiled complete MTP4 round. Its separate graph-node
+trace records 2.9623375625 ms of target HCX kernel service per round, averaged
+over four ranks and 36 stable composition windows. This is the source of the
+historical approximately 3-ms HC figure. The retained trace is
+`round12/trace-hcx-materialized/steady-service.json`; the complete ledger is
+`ledger-closed.json` in the same artifact directory. Draft HC service is
+separate: combine/mix, down and up total approximately 0.2794 ms per round.
+The trace itself has a median 18.5346-ms window; its kernel-service categories
+are not an additive partition of the unprofiled 17.3988-ms endpoint.
+
+Those historical workers report missing direct links for rank pairs 0/3 and
+1/2 and execute the two-hop HCX kernel. The current scheduling experiments
+use a different machine with a full NV2 mesh. The local schedule is admitted
+only by the full-mesh, separate-output-projection branch; its benefits have
+not been measured or implemented for the historical two-hop branch.
+
+Multiplying 94 target boundaries by an isolated approximately 19-us graph
+measurement gives an approximately 1.8-ms microbenchmark service estimate.
+It does not establish the latest model's HC latency and cannot be subtracted
+from the historical 3-ms trace as an observed optimization. Cache state,
+surrounding work, rank arrival times, topology and instrumentation differ.
+A comparison against the historical endpoint must preserve its deployment
+contract and distinguish target HCX, remaining target HC and draft HC. No
+new whole-model measurement is claimed while model work remains deferred.
 
 ## Measurement contract
 
