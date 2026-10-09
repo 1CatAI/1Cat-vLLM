@@ -988,6 +988,9 @@ class Worker(WorkerBase):
             "ple_result_transports": transports,
             "ple_disk_row_readers": row_readers,
             "ple_pinned_decoders": self.vllm_config.kernel_config.ple_pinned_decoders,
+            "ple_packed_result_decoders": (
+                self.vllm_config.kernel_config.ple_packed_result_decoders
+            ),
             "ple_pinned_tables": [
                 {
                     "layer": name,

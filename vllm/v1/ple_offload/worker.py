@@ -772,6 +772,7 @@ class PleOffloadRunner:
                     f"got {tp_ranks}"
                 )
 
+        self._bind_result_layouts(registrations)
         for registration in registrations:
             cpu_buffers = registration.cpu_output_buffers or {}
             if set(cpu_buffers) & set(registration.gpu_output_buffers):
@@ -804,7 +805,9 @@ class PleOffloadRunner:
                     or cpu_buffer.shape[0]
                     < self.vllm_config.scheduler_config.max_num_batched_tokens
                     or cpu_buffer.shape[1]
-                    != int(self.vllm_config.model_config.hf_text_config.ple_embed_dim)
+                    != self._layers[layer_name].get_offload_output_dim(
+                        int(self.vllm_config.model_config.hf_text_config.ple_embed_dim)
+                    )
                     or cpu_buffer.dtype
                     != self._layers[layer_name].get_offload_output_dtype(
                         self.vllm_config.model_config.dtype
@@ -859,7 +862,7 @@ class PleOffloadRunner:
                     continue
                 self._pinned_bufs[dp_rank][layer_name] = torch.empty(
                     max_tokens,
-                    embedding_dim,
+                    self._layers[layer_name].get_offload_output_dim(embedding_dim),
                     dtype=self._layers[layer_name].get_offload_output_dtype(
                         self.vllm_config.model_config.dtype
                     ),
@@ -871,6 +874,23 @@ class PleOffloadRunner:
             tp_size,
             sorted(self.layer_names),
         )
+
+    def _bind_result_layouts(self, registrations: list[PleOffloadRegistration]) -> None:
+        """Negotiate post-load GPU geometry before validating result buffers."""
+        layouts = registrations[0].result_layouts
+        if any(item.result_layouts != layouts for item in registrations[1:]):
+            raise ValueError("PLE result layouts differ between DP/TP consumers")
+        if set(layouts) - set(self._layers):
+            raise ValueError("PLE result layout names an unknown CPU layer")
+        if not layouts:
+            return
+        policy = self.vllm_config.kernel_config
+        if not policy.ple_packed_gguf_results:
+            raise ValueError("Packed PLE results are disabled in the CPU configuration")
+        for name, layout in layouts.items():
+            self._layers[name].bind_offload_result_layout(layout)
+        if layouts:
+            logger.info("Bound packed PLE result layouts: %s", layouts)
 
     def _bind_remote_placements(
         self,

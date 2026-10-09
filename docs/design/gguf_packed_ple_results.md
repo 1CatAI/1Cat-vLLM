@@ -1,0 +1,128 @@
+# Packed GGUF PLE results
+
+When a complete PLE table cannot fit the fair pinned-host budget, the CPU
+offloader gathers requested GGUF rows and normally dequantizes them before
+publishing FP16 embeddings. The GPU then waits for the CPU result inside its
+graph. IQ4_NL rows can cross this boundary in their original packed form.
+
+## Data flow and numerical contract
+
+The loader declares the source format, head count, row width and output dtype.
+An eligible CPU-owned IQ4_NL table uses byte results; local pinned and cascade
+table paths retain their existing behavior. Other formats, dtypes and devices
+report an admission reason and use the existing result path. The policy is
+`KernelConfig.ple_packed_gguf_results` and is enabled by default.
+
+The CPU computes the same n-gram IDs, copies complete packed rows in request
+order, and publishes the existing release flag. The consumer stream waits,
+copies the small packet and reconstructs `FP32(scale) * FP32(codebook[code])`
+before the final FP16 conversion. No quantization code or coefficient changes.
+Finite and FP16-overflow checks remain on the CPU; uncommon large scales use
+the official decoder for the value-dependent overflow check.
+
+For 16 heads of width 160, each token transfers 1,440 packed bytes instead of
+5,120 FP16 bytes. Table placement and ownership remain unchanged. No complete
+table copy, second weight representation, private DSO or environment variable
+is introduced. Output buffers retain fixed graph addresses, and consumers
+acknowledge them only after decoding and using the result. CUDA and mapped
+transports share the same negotiated result shape.
+
+The CPU process is spawned from a configuration snapshot taken before GPU
+weight loading. Result geometry therefore travels in each GPU registration,
+after loading resolves capabilities. The CPU checks agreement across all
+DP/TP consumers and validates the descriptor against its actual loaded row
+type and dimensions before validating or allocating transport buffers. No
+live model or loader closure crosses the spawn boundary.
+
+## Measurement
+
+The initial four-V100 control uses TP4, device E4M3 target history, FP16 draft
+history, MTP4, FULL graphs, CUDA 12.8 and Torch 2.10.0. Its unprofiled C1 is
+19.809 ms/round and C4 is 43.113 ms/round. Full-table pinned PLE admission was
+rejected by host capacity. A separate graph-node trace has an early target
+wait of roughly 2.3 ms before copying the 25,600-byte M5 PLE result. This
+profiled wait is not an unprofiled end-to-end speedup estimate.
+
+A same-process ABBA diagnostic on real IQ4_NL rows observed the following warm,
+rotating-prefix producer costs. Both arms use the normally installed wheel
+from `ec0e22c17d`, Torch 2.10.0 and one CPU thread. All 32 prefix batches per
+shape produce identical FP16 result bytes after official GGUF dequantization.
+These measurements exclude IPC and GPU consumption.
+
+| Tokens | Existing producer | Packed producer | Possible CPU reduction |
+| --- | ---: | ---: | ---: |
+| 5 | 0.832 ms | 0.242 ms | 0.590 ms |
+| 20 | 2.557 ms | 0.366 ms | 2.192 ms |
+
+The wheel SHA-256 is
+`5ed7c3151b4241ba00f3b6a0cee2abd8af5d4eb5d8fd9d60de13c6ce6f05e371`.
+All 17 native modules are unchanged from the device-history measurement
+artifact. The packed-result decoder is registered Python/Triton source in the
+wheel. No separate extension is loaded.
+
+Flattening the official CPU decoder's small row batches reduced M5 by only
+0.24 ms and is not implemented. Transferring packed rows removes that CPU
+dequantization work rather than changing its batch size. The packed M20 path
+also admits the existing exact scalar n-gram algorithm through 32 tokens.
+
+The reproducible producer diagnostic compares both arms in alternating ABBA
+order in one process, checks every warmup result byte against official GGUF
+dequantization, and reads only requested rows from retained file mappings:
+
+```bash
+CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 .venv/bin/python \
+  benchmarks/benchmark_packed_ple_results.py MODEL.gguf acceptance.json \
+  --output producer-ab.json
+```
+
+CPU producer checks, GPU decoder/transport replay checks and same-wheel model
+C1/C4/teacher-forcing/acceptance are separate gates. No model improvement is
+admitted until the last gate passes. Both model arms must have identical
+actual PLE placement; requested kernel flags alone do not establish that.
+
+The normally installed wheel passes all 19 packed-result tests on V100,
+including M1/5/20/512 official decoder comparisons, changing graph inputs,
+and M5/20 mapped-buffer consumption followed by acknowledgement. The model
+A/B disables direct QSA and complete-table pinned decode in both arms, and
+changes only the packed-result capability.
+
+The post-spawn registration revision is `6bca559d35`; its normally installed
+wheel SHA-256 is
+`ba8eba58ed6fb4ad79b341a7e53a82cf3b5ff284d9cebd312dcb5afded4417b7`.
+All 17 native modules and the GPU result decoder retain the initial measured
+implementation. Six added CPU tests pass in this wheel, including real
+four-rank mapped-buffer registrations from a frozen configuration snapshot.
+Both model arms use this revision; earlier producer timings and GPU replay
+checks remain isolated evidence, not model qualification.
+
+The completed matched A/B holds device E4M3 target history, FP16 draft history,
+MTP4, TP4, FULL graphs, complete-table pinned decode disabled and direct QSA
+disabled in both arms. All other reported worker routes match.
+
+| Measurement | FP16 results | Packed results |
+| --- | ---: | ---: |
+| C1 mean ms/round, two probes | 19.886 | 18.089 |
+| C4 ms/round | 43.256 | 41.111 |
+| Probe tokens/round | 4.886 | 4.886 |
+| Eight-prompt mean acceptance | 46.655% | 44.310% |
+
+The 256-token probe and all four C4 outputs are identical, but all eight
+natural completions diverge. Paired acceptance changes by -2.344 percentage
+points, with a 95% interval of [-5.758, +1.103]. At 64 identical teacher-forcing
+conditions, mean KL is 0.001032, maximum KL is 0.010656 and top-1 agrees at
+63/64 positions. Repeated captures within the candidate are identical.
+This fails the model quality gate; the measured 1.797 ms C1 reduction is not
+an admitted improvement. The packed result path must not be promoted until
+the source of the difference is localized and corrected. Decoder byte
+checks alone do not establish compiled model equivalence.
+
+An isolated consumer check with real IQ4_NL rows and PLE projection weights
+passes all 144 comparisons at M5/20/512: eager, compiled and graph execution,
+both allocating and fixed-output decoder interfaces. Embeddings, projections,
+normalization and gate stages are identical. This does not locate the model
+difference or establish model equivalence. The fixed-output revision returns
+a view of an owned, preallocated FP16 workspace rather than a graph-pool
+allocation; its additional activation storage is 2.5 MiB per rank at the
+512-token workload. It requires another matched model test. Teacher capture
+also retains the actual transported packet, decoded rows and codebook after
+replay so the model boundary can be checked independently of logits.

@@ -524,6 +524,13 @@ class GGUFModelLoader(BaseModelLoader):
             )
 
             prepare_pinned_gguf_ple(vllm_config, self._native_tensors, gguf_weights_map)
+            from vllm.model_executor.kernels.ple.packed_result import (
+                prepare_packed_gguf_results,
+            )
+
+            prepare_packed_gguf_results(
+                vllm_config, self._native_tensors, gguf_weights_map
+            )
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):

@@ -50,3 +50,27 @@ class PackedGGUFRowReader:
         if dtype == np.float16 and np.any(np.abs(values) > np.finfo(dtype).max):
             raise ValueError("GGUF selected rows overflow FP16 output")
         return values.astype(dtype)[inverse].reshape(output_shape)
+
+    def lookup_packed_iq4nl(self, ids: np.ndarray) -> np.ndarray:
+        """Copy selected IQ4_NL rows, retaining the FP16 decoder checks.
+
+        A finite half scale with magnitude at most 512 cannot overflow the
+        largest IQ4_NL code (127). Unusual larger scales use the official
+        decoder to preserve its value-dependent overflow check.
+        """
+        if self.source_type != 20:
+            raise ValueError("Packed result transport requires IQ4_NL rows")
+        ids = np.asarray(ids)
+        if not np.issubdtype(ids.dtype, np.integer):
+            raise TypeError("GGUF row IDs must be integers")
+        if ids.size and (ids.min() < 0 or ids.max() >= self.logical_rows):
+            raise IndexError("GGUF row ID outside the logical vocabulary")
+        packed = self.data[ids.reshape(-1)]
+        scales = packed.reshape(-1, 18)[:, :2].copy().view("<f2").astype(np.float32)
+        if not np.isfinite(scales).all():
+            raise ValueError("GGUF selected rows contain nonfinite values")
+        if np.any(np.abs(scales) > 512):
+            values = dequantize(packed, self.source_type)
+            if np.any(np.abs(values) > np.finfo(np.float16).max):
+                raise ValueError("GGUF selected rows overflow FP16 output")
+        return packed.reshape(*ids.shape, self.data.shape[1])

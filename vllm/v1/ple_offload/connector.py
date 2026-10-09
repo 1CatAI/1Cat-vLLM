@@ -191,7 +191,7 @@ class PleOffloadConnector:
                 # placeholder waits on the paired cross-process semaphore.
                 output_buffer = torch.empty(
                     max_num_tokens,
-                    int(config.ple_embed_dim),
+                    layer.get_offload_output_dim(int(config.ple_embed_dim)),
                     dtype=layer.get_offload_output_dtype(
                         vllm_config.model_config.dtype
                     ),
@@ -226,6 +226,8 @@ class PleOffloadConnector:
                     "mode": "mapped" if region is not None else "cuda",
                     "reason": reason,
                     "pinned_result_bytes": region.pinned_bytes if region else 0,
+                    "result_dtype": str(output_buffer.dtype),
+                    "result_width": output_buffer.shape[1],
                     "scope": "prepared_layer_transport",
                 }
         except Exception:
@@ -301,6 +303,11 @@ class PleOffloadConnector:
                 name: placement
                 for name, layer in self._layers.items()
                 if (placement := layer.remote_placement()) is not None
+            },
+            result_layouts={
+                name: layout
+                for name, layer in self._layers.items()
+                if (layout := layer.offload_result_layout()) is not None
             },
         )
 

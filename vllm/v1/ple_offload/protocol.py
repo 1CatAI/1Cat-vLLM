@@ -33,6 +33,9 @@ class PleOffloadRegistration:
     remote_placements: dict[str, Any] = field(default_factory=dict)
     # Mapped consumers own the H2D graph node; no CUDA output IPC is needed.
     cpu_output_buffers: dict[str, torch.Tensor] | None = None
+    # GPU loading resolves result formats after the CPU spawn config freezes.
+    # Transfer only primitive geometry, never the live model/config graph.
+    result_layouts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
