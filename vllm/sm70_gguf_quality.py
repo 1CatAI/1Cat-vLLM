@@ -11,6 +11,35 @@ from vllm.sm70_graph_observer import GraphParityWorkerExtension
 
 
 class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
+    def reset_round_cost_routes(self):
+        """Reset diagnostic routing rings before an untimed capture."""
+        from vllm.sm70_round_cost import reset_routes
+
+        return reset_routes()
+
+    def read_round_cost_ledger(self):
+        """Read actual routes and loaded tensor storage outside replay."""
+        from vllm.sm70_round_cost import read_routes, read_selections, tensor_inventory
+
+        runner = self.model_runner
+        models = {"target": runner.model}
+        for name in ("drafter", "speculator"):
+            owner = getattr(runner, name, None)
+            model = getattr(owner, "model", None)
+            if isinstance(model, torch.nn.Module):
+                models.setdefault("draft", model)
+        if "draft" not in models:
+            raise RuntimeError("Draft model inventory is required for an MTP ledger")
+        return {
+            "rank": self.rank,
+            "scope": "diagnostic routing and storage; not a latency result",
+            "routes": read_routes(),
+            "selections": read_selections(),
+            "tensors": {
+                name: tensor_inventory(model) for name, model in models.items()
+            },
+        }
+
     def read_host_kv_memory(self):
         """Read storage accounting and cache counters outside timed replay."""
         runner = self.model_runner

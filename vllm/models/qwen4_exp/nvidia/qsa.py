@@ -702,6 +702,20 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             topk_indices_buffer=topk_indices_buffer,
         )
 
+        self._round_cost_selection = None
+        if (
+            vllm_config.kernel_config.sm70_round_cost_diagnostics
+            and self.topk_indices_buffer.is_cuda
+        ):
+            from vllm.sm70_round_cost import attach_selection_recorder
+
+            self._round_cost_selection = attach_selection_recorder(
+                self.layer_name,
+                self.indexer.output_width,
+                self.topk_indices_buffer.device,
+                self,
+            )
+
         static_context = vllm_config.compilation_config.static_forward_context
         if self.layer_name in static_context:
             raise ValueError(f"Duplicate layer name: {self.layer_name}")
@@ -963,6 +977,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "qsa",
             selected,
         )
+        recorder = self._round_cost_selection
+        if recorder is not None and not dense:
+            recorder.capture(
+                selected,
+                side_metadata.token_to_req[:num_tokens],
+                side_metadata.logical_positions[:num_tokens],
+            )
         impl = cast(Qwen4ExpQSAFlashAttentionImpl, self.impl)
         if self.host_kv_enabled:
             self.host_kv.write(key, value, main_metadata.slot_mapping)
@@ -1006,6 +1027,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             sequence_lengths=side_metadata.seq_lens,
             dense_short_context=dense,
         )
+        if recorder is not None and self.host_kv_enabled and not dense:
+            recorder.capture_cache(self.host_kv._stats, num_tokens)
         _sm70_dump_qwen_layer_tensor(
             "qsa_core_out",
             self.indexer.layer_id,
