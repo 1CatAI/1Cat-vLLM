@@ -873,6 +873,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("qwen38_shared_gate_sigmoid_mul_out", torch::kCUDA,
            &qwen38_shared_gate_sigmoid_mul_out);
 
+  ops.def("sm70_set_fp8_small_shape_tuning(bool enabled) -> ()");
+  ops.impl("sm70_set_fp8_small_shape_tuning", &sm70_set_fp8_small_shape_tuning);
+
   ops.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
   ops.impl("sm70_gemm_import_cache", torch::kCUDA, &sm70_gemm_import_cache);
 

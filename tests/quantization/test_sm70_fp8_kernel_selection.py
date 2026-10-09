@@ -136,6 +136,38 @@ def test_explicit_config_and_two_engine_isolation(monkeypatch):
     assert not explicit.qpn8 and explicit.prefill_exact_dense
 
 
+@pytest.mark.parametrize(
+    ("env", "explicit", "expected"),
+    [(None, None, False), ("1", None, True), ("0", None, False), ("1", False, False)],
+)
+def test_small_shape_tuning_policy(monkeypatch, env, explicit, expected):
+    name = "VLLM_SM70_FP8_TUNE_SMALL_SHAPES"
+    if env is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, env)
+    envs.disable_envs_cache()
+    before = dict(os.environ)
+    policy = Sm70Fp8Config(small_shape_tuning=explicit)
+    # Unresolved engines (other FP8 formats) reach the same native selector.
+    assert policy.native_small_shape_tuning() is expected
+    policy.resolve()
+    assert policy.small_shape_tuning is expected
+    assert os.environ == before
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.ops._C, "sm70_set_fp8_small_shape_tuning"),
+    reason="native SM70 FP8 selector is not built",
+)
+def test_small_shape_tuning_native_setter():
+    from vllm import _sm70_ops as sm70_ops
+
+    sm70_ops.sm70_set_fp8_small_shape_tuning(False)
+    sm70_ops.sm70_set_fp8_small_shape_tuning(True)
+    sm70_ops.sm70_set_fp8_small_shape_tuning(False)
+
+
 def test_unused_fp8_policy_preserves_nvfp4_fingerprint():
     config = KernelConfig()
     config.sm70_nvfp4.resolve(qualified=True)

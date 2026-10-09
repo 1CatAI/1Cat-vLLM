@@ -608,7 +608,6 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
         broadcast_object=broadcast_object,
         barrier=lambda: barriers.append(True),
     )
-    monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
     warmup.envs.disable_envs_cache()
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
@@ -631,6 +630,7 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
         layers,
         [1, 4],
         torch.device("cuda:0"),
+        fp8_small_shape_tuning=True,
     )
 
     assert count == 5
@@ -661,7 +661,6 @@ def test_fp8_coordinated_warmup_follower_imports_rank0_lut(monkeypatch):
         broadcast_object=lambda payload, src: b"lut",
         barrier=lambda: barriers.append(True),
     )
-    monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
     warmup.envs.disable_envs_cache()
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
@@ -687,6 +686,7 @@ def test_fp8_coordinated_warmup_follower_imports_rank0_lut(monkeypatch):
         layers,
         [1, 4],
         torch.device("cuda:2"),
+        fp8_small_shape_tuning=True,
     )
 
     assert count == 5
@@ -696,7 +696,6 @@ def test_fp8_coordinated_warmup_follower_imports_rank0_lut(monkeypatch):
 
 
 def test_fp8_explicit_lut_reuse_allows_dynamic_cache_import(monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "1")
     warmup.envs.disable_envs_cache()
 
@@ -704,16 +703,23 @@ def test_fp8_explicit_lut_reuse_allows_dynamic_cache_import(monkeypatch):
         has_awq_dense=False,
         has_fp8_dense=True,
         fp4_kinds=set(),
+        fp8_small_shape_tuning=True,
     )
 
 
-def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
-    monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
+@pytest.mark.parametrize(("tuning", "skipped"), [(True, True), (False, False)])
+def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch, tuning, skipped):
+    # The engine's kernel_config.sm70_fp8.small_shape_tuning decides, not the
+    # environment: a fixed selector can reuse an imported LUT.
     monkeypatch.delenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", raising=False)
     warmup.envs.disable_envs_cache()
 
-    assert warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
-        has_awq_dense=False,
-        has_fp8_dense=True,
-        fp4_kinds=set(),
+    assert (
+        warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
+            has_awq_dense=False,
+            has_fp8_dense=True,
+            fp4_kinds=set(),
+            fp8_small_shape_tuning=tuning,
+        )
+        is skipped
     )
