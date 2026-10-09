@@ -714,14 +714,18 @@ class MambaSpecDecodeGPUContext:
             HAS_DDTREE_ACCEPTED_NODES=has_ddtree,
         )
 
-    def warmup_fused_postprocess(self) -> bool:
+    def warmup_fused_postprocess(self, *, expanded: bool | None = None) -> bool:
         """Compile MTP postprocess signatures without copying model state."""
         if not self.is_initialized:
             return False
 
         device = self.state_base_addrs.device
         warmup_sizes = {1}
-        if envs.VLLM_SM70_MTP_CONCURRENCY_WARMUP:
+        if expanded is None:
+            from vllm.config.sm70_runtime import capture_runtime_config
+
+            expanded = capture_runtime_config().mtp_concurrency_warmup
+        if expanded:
             max_num_reqs = int(self.num_accepted_tokens_out.shape[0])
             warmup_sizes.add(max(1, min(max_num_reqs, 4)))
         for num_reqs in sorted(warmup_sizes):
