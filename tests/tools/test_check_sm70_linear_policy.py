@@ -55,3 +55,18 @@ def test_moe_executor_cannot_reparse_legacy_policy(tmp_path):
     assert len(violations(path)) == 1
     path.write_text('label = "VLLM_SM70_AWQ_MOE_BATCHED_GEMM"\nx = plan.w13\n')
     assert not violations(path)
+
+
+def test_runtime_consumers_cannot_bypass_resolved_engine_policy(tmp_path):
+    path = tmp_path / "vllm" / "new_runner.py"
+    path.parent.mkdir()
+    for expression in (
+        "envs.VLLM_USE_AOT_COMPILE",
+        'os.getenv("VLLM_SM70_GLM_MHC_PRE_THREADS")',
+        'os.environ["VLLM_SM70_AWQ_WARMUP_MAX_M"]',
+        'getattr(envs, "VLLM_SM70_QWEN38_FP16_GEMV")',
+    ):
+        path.write_text(f"choice = {expression}\n")
+        assert len(violations(path)) == 1
+    path.write_text('label = "VLLM_USE_AOT_COMPILE"\nchoice = policy.aot_compile\n')
+    assert not violations(path)

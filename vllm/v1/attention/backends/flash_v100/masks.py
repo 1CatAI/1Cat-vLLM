@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 
+from vllm.config.execution_policy import flash_v100_policy
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import metadata as _metadata
@@ -122,7 +125,7 @@ def build_bfla_block_mask_for_seq(
 
     threshold = float(_config.registered("VLLM_FLASH_V100_BFLA_THRESHOLD"))
     keep_mass = float(_config.registered("VLLM_FLASH_V100_BFLA_KEEP_MASS"))
-    keep_ratio = float(_config.registered("VLLM_FLASH_V100_BFLA_KEEP_RATIO"))
+    keep_ratio = float(cast(float, flash_v100_policy().bfla_keep_ratio))
     min_keep_blocks = int(_config.registered("VLLM_FLASH_V100_BFLA_MIN_KEEP_BLOCKS"))
     for kv_h in range(num_kv_heads):
         q_h0 = kv_h * num_queries_per_kv

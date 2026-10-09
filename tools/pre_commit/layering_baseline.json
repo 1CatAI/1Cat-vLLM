@@ -25,13 +25,17 @@
   "platform": 18
  },
  "vllm/config/attention.py": {
-  "platform": 2
+  "platform": 8
  },
  "vllm/config/cache.py": {
   "platform": 3
  },
  "vllm/config/compilation.py": {
   "model": 3
+ },
+ "vllm/config/execution_policy.py": {
+  "model": 14,
+  "platform": 49
  },
  "vllm/config/gdn.py": {
   "env": 1,
@@ -49,16 +53,21 @@
   "platform": 1
  },
  "vllm/config/parallel.py": {
-  "env": 1
+  "env": 1,
+  "platform": 1
+ },
+ "vllm/config/policy_defaults.py": {
+  "model": 16,
+  "platform": 34
  },
  "vllm/config/speculative.py": {
   "model": 140,
   "platform": 16
  },
  "vllm/config/vllm.py": {
-  "env": 16,
-  "model": 171,
-  "platform": 308
+  "env": 2,
+  "model": 80,
+  "platform": 70
  },
  "vllm/distributed/communication_op.py": {
   "platform": 6
@@ -72,14 +81,14 @@
  },
  "vllm/distributed/device_communicators/custom_all_reduce.py": {
   "model": 22,
-  "platform": 83
+  "platform": 80
  },
  "vllm/distributed/parallel_state.py": {
   "platform": 57
  },
  "vllm/engine/arg_utils.py": {
   "model": 14,
-  "platform": 31
+  "platform": 30
  },
  "vllm/entrypoints/cli/video.py": {
   "model": 2,
@@ -108,15 +117,13 @@
   "platform": 4
  },
  "vllm/model_executor/kernels/mhc/tilelang.py": {
-  "model": 1,
-  "platform": 70
+  "platform": 69
  },
  "vllm/model_executor/kernels/mhc/tilelang_kernels.py": {
   "platform": 2
  },
  "vllm/model_executor/kernels/mhc/triton.py": {
-  "model": 1,
-  "platform": 36
+  "platform": 35
  },
  "vllm/model_executor/kernels/ple/ngram.py": {
   "platform": 7
@@ -130,7 +137,7 @@
   "platform": 2
  },
  "vllm/model_executor/layers/batch_invariant.py": {
-  "env": 2
+  "env": 1
  },
  "vllm/model_executor/layers/fla/ops/chunk_delta_h.py": {
   "env": 1,
@@ -194,8 +201,8 @@
  },
  "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": {
   "env": 9,
-  "model": 4,
-  "platform": 61
+  "model": 3,
+  "platform": 59
  },
  "vllm/model_executor/layers/fused_moe/runner/shared_experts.py": {
   "platform": 1
@@ -205,7 +212,7 @@
  },
  "vllm/model_executor/layers/layernorm.py": {
   "model": 33,
-  "platform": 99
+  "platform": 90
  },
  "vllm/model_executor/layers/linear.py": {
   "model": 20,
@@ -219,7 +226,7 @@
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 44,
   "model": 239,
-  "platform": 548
+  "platform": 536
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -231,8 +238,7 @@
   "platform": 5
  },
  "vllm/model_executor/layers/ple_offload_layer.py": {
-  "model": 3,
-  "platform": 6
+  "platform": 3
  },
  "vllm/model_executor/layers/quantization/auto_gptq.py": {
   "platform": 10
@@ -308,16 +314,13 @@
  },
  "vllm/model_executor/layers/vocab_parallel_embedding.py": {
   "model": 124,
-  "platform": 231
+  "platform": 219
  },
  "vllm/model_executor/models/qwen2_moe.py": {
   "env": 1
  },
  "vllm/model_executor/models/qwen3_5_mtp.py": {
   "env": 2
- },
- "vllm/model_executor/models/qwen3_dflash2.py": {
-  "env": 1
  },
  "vllm/model_executor/models/qwen3_next.py": {
   "env": 14
@@ -329,7 +332,7 @@
   "env": 6
  },
  "vllm/models/glm5next/nvidia/kda.py": {
-  "env": 5
+  "env": 3
  },
  "vllm/models/glm5next/nvidia/model.py": {
   "env": 7
@@ -352,6 +355,10 @@
  },
  "vllm/platforms/rocm.py": {
   "env": 1
+ },
+ "vllm/platforms/runtime_defaults.py": {
+  "model": 34,
+  "platform": 202
  },
  "vllm/platforms/xpu.py": {
   "env": 1
@@ -458,7 +465,7 @@
  },
  "vllm/v1/cudagraph_dispatcher.py": {
   "env": 3,
-  "platform": 76
+  "platform": 74
  },
  "vllm/v1/engine/core.py": {
   "env": 2,
@@ -466,26 +473,20 @@
   "platform": 9
  },
  "vllm/v1/executor/multiproc_executor.py": {
-  "model": 3,
-  "platform": 4
+  "platform": 1
  },
  "vllm/v1/executor/ray_executor.py": {
   "env": 1,
   "platform": 1
  },
  "vllm/v1/executor/uniproc_executor.py": {
-  "model": 3,
-  "platform": 4
+  "platform": 1
  },
  "vllm/v1/kv_cache_interface.py": {
   "model": 1
  },
  "vllm/v1/outputs.py": {
   "model": 8
- },
- "vllm/v1/ple_offload/connector.py": {
-  "model": 2,
-  "platform": 2
  },
  "vllm/v1/sample/ops/topk_topp_triton.py": {
   "platform": 7
@@ -533,7 +534,7 @@
  },
  "vllm/v1/worker/gpu/cudagraph_utils.py": {
   "model": 13,
-  "platform": 33
+  "platform": 30
  },
  "vllm/v1/worker/gpu/mamba_align.py": {
   "model": 2
@@ -589,11 +590,11 @@
  "vllm/v1/worker/gpu_model_runner.py": {
   "env": 41,
   "model": 669,
-  "platform": 248
+  "platform": 238
  },
  "vllm/v1/worker/gpu_worker.py": {
-  "model": 3,
-  "platform": 27
+  "model": 1,
+  "platform": 25
  },
  "vllm/v1/worker/mamba_utils.py": {
   "env": 1,

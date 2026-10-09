@@ -21,6 +21,7 @@ from torch import nn
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
+from vllm.config.execution_policy import layer_policy
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
@@ -767,7 +768,7 @@ def enable_qwen38_sm70_fp16_gemv(
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
         torch.backends.cuda.matmul.allow_fp16_accumulation = False
         logger.info_once("SM70 Qwen3.8 FP32 GEMM accumulation/reductions required.")
-    if not envs.VLLM_SM70_QWEN38_FP16_GEMV:
+    if not layer_policy().fp16_gemv:
         return
     if (
         envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
@@ -830,7 +831,7 @@ def enable_qwen38_sm70_fp16_gemv(
         replaced += 1
 
     fused_gdn_inputs = 0
-    if envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16:
+    if layer_policy().fused_gdn_input:
         for child in module.modules():
             qkvz = getattr(child, "in_proj_qkvz", None)
             ba = getattr(child, "in_proj_ba", None)
@@ -883,7 +884,7 @@ def enable_qwen38_sm70_fp16_gemv(
             "Prepared %d Qwen3.8 fused checkpoint-FP16 GDN inputs.",
             fused_gdn_inputs,
         )
-    elif envs.VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16:
+    elif layer_policy().fused_gdn_input:
         logger.warning_once(
             "Qwen3.8 fused checkpoint-FP16 GDN input opt-in found no targets."
         )

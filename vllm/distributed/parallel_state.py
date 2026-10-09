@@ -509,6 +509,8 @@ class GroupCoordinator:
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
     ):
+        from vllm.config.execution_policy import communication_policy
+
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
@@ -591,7 +593,7 @@ class GroupCoordinator:
         self.mq_broadcaster: MessageQueue | None = None
         if use_message_queue_broadcaster and self.world_size > 1:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
-                self.cpu_group, 1 << 22, envs.VLLM_MQ_BROADCASTER_MAX_CHUNKS
+                self.cpu_group, 1 << 22, communication_policy().mq_max_chunks
             )
 
         # TODO(#35915): Remove is_tpu() check once tpu_inference
@@ -624,12 +626,13 @@ class GroupCoordinator:
     def create_mq_broadcaster(
         self, writer_rank=0, external_writer_handle=None, blocking=True
     ):
+        from vllm.config.execution_policy import communication_policy
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
         return MessageQueue.create_from_process_group(
             self.cpu_group,
             1 << 22,
-            envs.VLLM_MQ_BROADCASTER_MAX_CHUNKS,
+            communication_policy().mq_max_chunks,
             writer_rank=writer_rank,
             external_writer_handle=external_writer_handle,
             blocking=blocking,
@@ -638,12 +641,13 @@ class GroupCoordinator:
     def create_single_reader_mq_broadcasters(
         self, reader_rank_in_group=0, blocking=False
     ):
+        from vllm.config.execution_policy import communication_policy
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
         return MessageQueue.create_from_process_group_single_reader(
             self.cpu_group,
             1 << 22,
-            envs.VLLM_MQ_BROADCASTER_MAX_CHUNKS,
+            communication_policy().mq_max_chunks,
             reader_rank=self.ranks[reader_rank_in_group],
             blocking=blocking,
         )

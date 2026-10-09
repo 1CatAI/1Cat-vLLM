@@ -11,6 +11,7 @@ import vllm.kernels  # noqa: F401
 from vllm import envs, ir
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
+from vllm.config.execution_policy import graph_policy, layer_policy
 from vllm.config.sm70_dflash2 import (
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
@@ -144,10 +145,11 @@ def _use_sm70_dflash2_fixed_gemma_rms(
     residual: torch.Tensor | None,
     weight: torch.Tensor,
     policy=None,
+    graph=None,
 ) -> bool:
     return bool(
         sm70_dflash2_enabled("fixed_gemma_rms", policy)
-        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and (graph if graph is not None else graph_policy()).compile_graph
         and _sm70_gemma_long_prefill_available()
         and x.is_cuda
         and x.dtype == torch.float16
@@ -257,13 +259,14 @@ def _use_sm70_dflash2_gemma_fused_add_rms(
     residual: torch.Tensor | None,
     weight: torch.Tensor,
     policy=None,
+    graph=None,
 ) -> bool:
     # Keep the dynamic token dimension out of this Python predicate. AOT traces
     # the target once at a large warmup shape; a decode-only row bound would be
     # constant-folded there and would leave the M=8 replay on the decomposed path.
     return bool(
         sm70_dflash2_enabled("fused_gemma_rms", policy)
-        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and (graph if graph is not None else graph_policy()).compile_graph
         # Keep the cached platform query out of the AOT fullgraph. The helper
         # below is explicitly constant-foldable by Dynamo.
         and _sm70_gemma_long_prefill_available()
@@ -533,6 +536,8 @@ class GemmaRMSNorm(CustomOp):
     ) -> None:
         super().__init__()
         self._sm70_dflash2_policy = capture_sm70_dflash2_config()
+        self._execution_graph_policy = graph_policy()
+        self._layer_policy = layer_policy()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
 
@@ -569,12 +574,11 @@ class GemmaRMSNorm(CustomOp):
         x = x * (1.0 + weight.float())
         return x.to(orig_dtype), residual
 
-    @staticmethod
-    def _use_sm70_compile_native(x: torch.Tensor) -> bool:
+    def _use_sm70_compile_native(self, x: torch.Tensor) -> bool:
         return (
-            envs.VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
-            and use_sm70_decode_graph_semantics()
+            bool(self._layer_policy.gemma_compile_native)
+            and bool(self._execution_graph_policy.compile_graph)
+            and use_sm70_decode_graph_semantics(self._execution_graph_policy)
             and torch.compiler.is_compiling()
             and x.is_cuda
         )
@@ -608,13 +612,21 @@ class GemmaRMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
         if _use_sm70_dflash2_fixed_gemma_rms(
-            x, residual, self.weight, self._sm70_dflash2_policy
+            x,
+            residual,
+            self.weight,
+            self._sm70_dflash2_policy,
+            self._execution_graph_policy,
         ):
             return _sm70_dflash2_fixed_gemma_rms_norm(
                 x, residual, self.weight, self.variance_epsilon
             )
         if _use_sm70_dflash2_gemma_fused_add_rms(
-            x, residual, self.weight, self._sm70_dflash2_policy
+            x,
+            residual,
+            self.weight,
+            self._sm70_dflash2_policy,
+            self._execution_graph_policy,
         ):
             assert residual is not None
             return torch.ops.vllm.sm70_dflash2_gemma_fused_add_rms_norm(
@@ -670,13 +682,21 @@ class GemmaRMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if _use_sm70_dflash2_fixed_gemma_rms(
-            x, residual, self.weight, self._sm70_dflash2_policy
+            x,
+            residual,
+            self.weight,
+            self._sm70_dflash2_policy,
+            self._execution_graph_policy,
         ):
             return _sm70_dflash2_fixed_gemma_rms_norm(
                 x, residual, self.weight, self.variance_epsilon
             )
         if _use_sm70_dflash2_gemma_fused_add_rms(
-            x, residual, self.weight, self._sm70_dflash2_policy
+            x,
+            residual,
+            self.weight,
+            self._sm70_dflash2_policy,
+            self._execution_graph_policy,
         ):
             assert residual is not None
             return torch.ops.vllm.sm70_dflash2_gemma_fused_add_rms_norm(
@@ -699,7 +719,7 @@ class GemmaRMSNorm(CustomOp):
             )
         if (
             envs.VLLM_SM70_GEMMA_RMS_NORM_EAGER
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and bool(self._execution_graph_policy.compile_graph)
             and x.is_cuda
             and current_platform.is_device_capability(70)
         ):

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import Field, field_validator
 
+from vllm.config.execution_policy import LayerExecutionPolicy
 from vllm.config.gdn import GdnConfig
 from vllm.config.sm70_moe import Sm70MoEConfig
 from vllm.config.sm70_native import Sm70NativeConfig
@@ -503,6 +504,9 @@ class Sm70SparseConfig:
 class KernelConfig:
     """Configuration for kernel selection and warmup behavior."""
 
+    layer_execution: LayerExecutionPolicy = Field(default_factory=LayerExecutionPolicy)
+    """Per-engine execution decisions and initialization provenance."""
+
     gdn: GdnConfig = Field(default_factory=GdnConfig)
     """Initialized GDN computation policy; inactive models ignore it in hashes."""
 
@@ -872,6 +876,7 @@ class KernelConfig:
         if not self.sm70_mxfp4.values:
             ignored_factors.add("sm70_mxfp4")
         factors = get_hash_factors(self, ignored_factors)
+        factors["layer_execution"] = self.layer_execution.compute_hash()
         if self.gdn.resolved:
             factors["gdn"] = self.gdn.compute_hash()
         if self.sm70_moe.resolved:

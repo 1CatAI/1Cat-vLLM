@@ -64,6 +64,53 @@ MOE_NAMES = {
     and node.value.isidentifier()
 }
 
+_CONFIG_ROOT = _POLICY.parent
+_EXECUTION_TREE = ast.parse((_CONFIG_ROOT / "execution_policy.py").read_text())
+RUNTIME_NAMES = {
+    node.value
+    for node in ast.walk(_EXECUTION_TREE)
+    if isinstance(node, ast.Constant)
+    and isinstance(node.value, str)
+    and node.value.startswith("VLLM_")
+    and node.value.isidentifier()
+}
+for _node in ast.parse((_CONFIG_ROOT / "policy_defaults.py").read_text()).body:
+    if isinstance(_node, ast.Assign) and any(
+        isinstance(target, ast.Name) and target.id == "EXTRA_BINDINGS"
+        for target in _node.targets
+    ):
+        RUNTIME_NAMES.update(ast.literal_eval(_node.value))
+
+
+def runtime_policy_reads(path: Path, tree: ast.AST) -> list[str]:
+    """Ordered defaults can reference aliases; execution cannot read their envs."""
+    if path.as_posix().startswith("vllm/config/"):
+        return []
+    errors = []
+    for node in ast.walk(tree):
+        name = None
+        if isinstance(node, ast.Attribute) and ast.unparse(node.value) == "envs":
+            name = node.attr
+        elif (
+            isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ"
+        ):
+            if isinstance(node.slice, ast.Constant):
+                name = node.slice.value
+        elif isinstance(node, ast.Call):
+            call = ast.unparse(node.func)
+            index = 1 if call == "getattr" else 0
+            if (
+                call in {"os.getenv", "os.environ.get", "getattr"}
+                and len(node.args) > index
+                and isinstance(node.args[index], ast.Constant)
+            ):
+                name = node.args[index].value
+        if name in RUNTIME_NAMES:
+            errors.append(
+                f"{path}:{node.lineno}: {name} belongs to initialized execution policy"
+            )
+    return errors
+
 
 def moe_policy_reads(path: Path, tree: ast.AST) -> list[str]:
     if not (
@@ -107,7 +154,7 @@ def violations(path: Path) -> list[str]:
     if path.as_posix() in ALLOWED or "vllm" not in path.parts:
         return []
     tree = ast.parse(path.read_text())
-    errors = moe_policy_reads(path, tree)
+    errors = moe_policy_reads(path, tree) + runtime_policy_reads(path, tree)
     fp8_nodes = set()
     if path.name == "sm70_fp8.py" or path.as_posix().endswith(
         "kernels/linear/qpn/fp8.py"

@@ -968,7 +968,14 @@ def override_envs_for_invariance():
     os.environ["NCCL_SOCKET_NTHREADS"] = "1"
 
     # torch.compile settings
-    os.environ["VLLM_USE_AOT_COMPILE"] = "0"
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is not None:
+        cfg.compilation_config.runtime.aot_compile = False
+        cfg.compilation_config.runtime.sources["aot_compile"] = "safety:batch_invariant"
+        if cfg.compilation_config.runtime.sources.get("mega_aot") == "default":
+            cfg.compilation_config.runtime.mega_aot = False
 
 
 def init_batch_invariance():

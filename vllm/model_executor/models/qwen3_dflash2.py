@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 from collections.abc import Callable
 from functools import cache
 
@@ -59,8 +58,10 @@ def _use_sm70_bf16_emulation(config) -> bool:
         "bf16",
         "torch.bfloat16",
     }
-    enabled = os.getenv("VLLM_SM70_DFLASH2_BF16_EMULATION", "1").strip().lower()
-    enabled = enabled in ("1", "true", "yes", "on")
+    policy = capture_sm70_dflash2_config()
+    from vllm.config.sm70_dflash2 import dflash2_bf16_emulation
+
+    enabled = dflash2_bf16_emulation(policy)
     if not (enabled and is_bf16 and current_platform.is_cuda()):
         return False
     # Native BF16 arithmetic arrives with SM80. Volta and Turing both run the

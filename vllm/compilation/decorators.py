@@ -523,7 +523,7 @@ def _support_torch_compile(
         ds_type = self.compilation_config.dynamic_shapes_config.type
         cache_dir = None
         aot_compilation_path = None
-        if envs.VLLM_USE_AOT_COMPILE:
+        if self.compilation_config.runtime.aot_compile:
             """
             When using torch.compile in AOT mode, we store the cache artifacts
             under VLLM_CACHE_ROOT/torch_compile_cache/torch_aot_compile/{hash}
@@ -576,7 +576,7 @@ def _support_torch_compile(
 
         if self.compiled:
             assert (
-                not envs.VLLM_USE_AOT_COMPILE
+                not self.compilation_config.runtime.aot_compile
                 or self.vllm_config.compilation_config.backend == "eager"
             )
             return TorchCompileWithNoGuardsWrapper.__call__(self, *args, **kwargs)  # type: ignore[arg-type]
@@ -650,7 +650,7 @@ def _support_torch_compile(
             torch.fx.experimental._config.patch(**fx_config_patches),
             torch._inductor.config.patch(**inductor_config_patches),
         ):
-            use_aot_compile = envs.VLLM_USE_AOT_COMPILE
+            use_aot_compile = self.compilation_config.runtime.aot_compile
             if self.vllm_config.compilation_config.backend == "eager":
                 logger.warning("Detected eager backend, disabling AOT compile.")
                 use_aot_compile = False

@@ -14,6 +14,7 @@ from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.execution_policy import graph_policy
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -1116,7 +1117,7 @@ class Qwen4ExpForCausalLM(
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture."""
-        if not envs.VLLM_SM70_QWEN38_DUAL_COMPILE:
+        if not graph_policy().dual_compile:
             return False
         if self._sm70_decode_graph_model is None:
             decode_config = _make_qwen38_decode_compile_config(self.vllm_config)
@@ -1150,7 +1151,7 @@ class Qwen4ExpForCausalLM(
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
         backbone = self.model
-        if envs.VLLM_SM70_QWEN38_DUAL_COMPILE and is_sm70_decode_graph_compiling():
+        if graph_policy().dual_compile and is_sm70_decode_graph_compiling():
             decode_backbone = self._sm70_decode_graph_model
             if decode_backbone is None:
                 raise RuntimeError(

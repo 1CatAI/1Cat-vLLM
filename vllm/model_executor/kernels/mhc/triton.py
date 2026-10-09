@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 import vllm._sm70_ops as sm70_ops
-import vllm.envs as envs
+from vllm.config.execution_policy import layer_policy
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -398,7 +398,8 @@ def sm70_mhc_pre_norm_from_staging(
     if norm_weight.dtype != torch.float16:
         raise TypeError("SM70 mHC staging kernel requires FP16 norm weights")
 
-    use_native_verify = num_tokens == 8 and envs.VLLM_SM70_GLM53_MHC_NATIVE_VERIFY
+    policy = layer_policy()
+    use_native_verify = num_tokens == 8 and policy.mhc_native_verify
     if num_tokens == 1 or use_native_verify:
         if not hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
             raise RuntimeError(
@@ -425,6 +426,7 @@ def sm70_mhc_pre_norm_from_staging(
             hc_post_mult_value,
             sinkhorn_repeat,
             norm_eps,
+            threads=policy.mhc_pre_threads,
         )
         return
 

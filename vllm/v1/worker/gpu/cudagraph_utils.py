@@ -15,6 +15,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.sm70_decode_graph import sm70_decode_graph_compilation
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.execution_policy import graph_policy
 from vllm.config.speculative import (
     get_dflash_model_draft_tokens,
     uses_adaptive_dflash_lookup,
@@ -111,7 +112,7 @@ def get_sm70_cudagraph_memory_reserve(
 def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     return bool(
-        envs.VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS
+        vllm_config.compilation_config.runtime.split_draft_graphs
         and speculative_config is not None
         and speculative_config.method == "mtp"
         and _worker_device_is_pre_ampere()
@@ -422,7 +423,7 @@ class CudaGraphManager:
                                 f"Graph already captured for {desc}"
                             )
                             if (
-                                envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+                                graph_policy().compile_graph
                                 and _worker_device_is_pre_ampere()
                             ):
                                 logger.info_once(

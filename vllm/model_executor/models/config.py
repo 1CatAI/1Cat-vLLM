@@ -17,6 +17,12 @@ logger = init_logger(__name__)
 
 class VerifyAndUpdateConfig:
     @staticmethod
+    def apply_runtime_defaults(vllm_config, defaults, phase: str, *, is_sm70: bool):
+        from vllm.model_executor.models.runtime_defaults import apply_runtime_defaults
+
+        return apply_runtime_defaults(vllm_config, defaults, phase, is_sm70=is_sm70)
+
+    @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         return
 

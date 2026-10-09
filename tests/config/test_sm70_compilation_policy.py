@@ -7,8 +7,6 @@ pytest --confcutdir=tests/config tests/config/test_sm70_compilation_policy.py
 """
 
 import ast
-import enum
-import importlib.util
 import os
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -23,105 +21,63 @@ DECODE_POLICY = "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE"
 
 @pytest.fixture(scope="module")
 def policy_module():
-    env_spec = importlib.util.spec_from_file_location(
-        "_sm70_test_envs", ROOT / "vllm/envs.py"
+    from vllm import envs
+    from vllm.config.compilation import CompilationMode, CUDAGraphMode
+    from vllm.config.policy_defaults import PolicyDefaults
+    from vllm.model_executor.models.runtime_defaults import (
+        _is_sm70_dflash2_verifier_contract,
+        _is_sm70_qwen38_decode_compile_contract,
     )
-    assert env_spec is not None and env_spec.loader is not None
-    envs = importlib.util.module_from_spec(env_spec)
-    env_spec.loader.exec_module(envs)
+    from vllm.platforms import runtime_defaults
 
-    compilation_tree = ast.parse((ROOT / "vllm/config/compilation.py").read_text())
-    enums = [
-        node
-        for node in compilation_tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name in ("CompilationMode", "CUDAGraphMode")
-    ]
-    compilation = next(
-        node
-        for node in compilation_tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "CompilationConfig"
-    )
-    for field in ("mode", "cudagraph_mode"):
-        default = next(
-            node.value
-            for node in compilation.body
-            if isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.target.id == field
-        )
-        assert isinstance(default, ast.Constant) and default.value is None
-
-    path = ROOT / "vllm/config/vllm.py"
+    path = ROOT / "vllm/platforms/runtime_defaults.py"
     tree = ast.parse(path.read_text())
-    config = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "VllmConfig"
-    )
     post_init = next(
         node
-        for node in config.body
-        if isinstance(node, ast.FunctionDef) and node.name == "__post_init__"
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "apply_runtime_policy_defaults"
     )
-    starts = [
+    start = next(
         i
         for i, node in enumerate(post_init.body)
         if isinstance(node, ast.Assign)
         and any(
-            isinstance(target, ast.Name)
-            and target.id == "sm70_compile_disabled_by_user"
-            for target in node.targets
+            isinstance(t, ast.Name) and t.id == "sm70_compile_disabled_by_user"
+            for t in node.targets
         )
-    ]
-    ends = [
+    )
+    end = next(
         i
         for i, node in enumerate(post_init.body)
         if isinstance(node, ast.If)
         and isinstance(node.test, ast.Name)
         and node.test.id == "sm70_flash_no_compile_graph"
-    ]
-    assert len(starts) == len(ends) == 1 and starts[0] < ends[0]
+    )
     policy = ast.parse("def apply_policy(self):\n    pass\n").body[0]
     assert isinstance(policy, ast.FunctionDef)
-    # Execute the entire real baseline and both policy branches, not copied
-    # assignments. Leave model loading and later compatibility checks outside.
-    policy.body = post_init.body[starts[0] : ends[0] + 1]
-    helper_names = {
-        "_is_sm70_dflash2_verifier_contract",
-        "_is_sm70_qwen38_decode_compile_contract",
-        "_apply_sm70_qwen38_decode_defaults",
-        "_sm70_nomtp_cudagraph_capture_sizes",
-        "_sm70_max_cudagraph_capture_size",
-        "_configure_sm70_dflash2_graph_cache",
-    }
-    helpers = [
-        node
-        for node in tree.body
-        if (isinstance(node, ast.FunctionDef) and node.name in helper_names)
-        or (
-            isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name)
-                and target.id == "_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES"
-                for target in node.targets
-            )
-        )
+    policy.body = [
+        *ast.parse("defaults = PolicyDefaults(self)").body,
+        *post_init.body[start : end + 1],
+        *ast.parse("defaults.finish()").body,
     ]
     module = ModuleType("_sm70_test_policy")
+    module.__dict__.update(runtime_defaults.__dict__)
     module.__dict__.update(
-        enum=enum,
-        os=os,
         envs=envs,
         logger=Mock(),
+        PolicyDefaults=PolicyDefaults,
+        CompilationMode=CompilationMode,
+        CUDAGraphMode=CUDAGraphMode,
         sm70_glm5_dflash_tp8_pp1_verifier=False,
+        _is_sm70_dflash2_verifier_contract=_is_sm70_dflash2_verifier_contract,
+        _is_sm70_qwen38_decode_compile_contract=(
+            _is_sm70_qwen38_decode_compile_contract
+        ),
     )
-    future = ast.parse("from __future__ import annotations").body
     exec(
         compile(
-            ast.fix_missing_locations(
-                ast.Module(body=[*future, *enums, *helpers, policy], type_ignores=[])
-            ),
+            ast.fix_missing_locations(ast.Module(body=[policy], type_ignores=[])),
             str(path),
             "exec",
         ),
@@ -168,7 +124,7 @@ def _config(**overrides: object) -> SimpleNamespace:
         inductor_compile_config={},
     )
     compilation.update(overrides)
-    return SimpleNamespace(
+    cfg = SimpleNamespace(
         model_config=None,
         speculative_config=None,
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
@@ -179,6 +135,21 @@ def _config(**overrides: object) -> SimpleNamespace:
         compilation_config=SimpleNamespace(**compilation),
         use_v2_model_runner=False,
     )
+    from types import MethodType
+
+    from vllm.config import AttentionConfig, KernelConfig, OffloadConfig, VllmConfig
+    from vllm.config.execution_policy import CommunicationPolicy, GraphPolicy
+
+    cfg.kernel_config = KernelConfig()
+    cfg.attention_config = AttentionConfig()
+    cfg.offload_config = OffloadConfig()
+    cfg.compilation_config.runtime = GraphPolicy()
+    cfg.parallel_config.communication = CommunicationPolicy()
+    cfg.runtime_default_sources = {}
+    cfg.apply_model_runtime_defaults = MethodType(
+        VllmConfig.apply_model_runtime_defaults, cfg
+    )
+    return cfg
 
 
 @pytest.mark.parametrize("policy_name", [COMPILE_POLICY, DECODE_POLICY])
@@ -217,7 +188,7 @@ def test_baseline_still_auto_enables_unset_fields(policy):
     assert COMPILE_POLICY not in os.environ
     config = _config()
     policy.apply_policy(config)
-    assert os.environ[COMPILE_POLICY] == "1"
+    assert config.compilation_config.runtime.compile_graph is True
     assert config.compilation_config.mode == policy.CompilationMode.VLLM_COMPILE
     assert (
         config.compilation_config.cudagraph_mode
@@ -243,7 +214,7 @@ def test_automatic_baseline_preserves_explicit_fields(policy, field, value):
     explicit = getattr(modes, value)
     config = _config(**{field: explicit})
     policy.apply_policy(config)
-    assert os.environ[COMPILE_POLICY] == "1"
+    assert config.compilation_config.runtime.compile_graph is True
     assert getattr(config.compilation_config, field) == explicit
 
 

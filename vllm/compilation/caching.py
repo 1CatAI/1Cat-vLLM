@@ -21,6 +21,7 @@ from vllm.compilation.codegen import compile_execution_fn
 from vllm.compilation.compiler_interface import get_inductor_factors
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig, get_current_vllm_config
+from vllm.config.execution_policy import graph_policy
 from vllm.config.utils import hash_factors
 from vllm.logger import init_logger
 from vllm.utils.hashing import safe_hash
@@ -380,7 +381,7 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
 
         # The non-mega path reconstructs an FX graph before loading Inductor
         # artifacts. Torch's bundled-AOT serializer does not cover that graph.
-        if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+        if not bool(graph_policy().mega_aot):
             state["triton_side_table"] = _serialize_triton_side_table(
                 state["graph_module"]
             )
@@ -419,7 +420,7 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
         else:
             functorch_ctx = contextlib.nullcontext()
 
-        if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+        if bool(graph_policy().mega_aot):
             assert standalone_compile_artifacts is not None
             submod_names = standalone_compile_artifacts.submodule_names()
             num_submods = len(submod_names)
@@ -670,7 +671,9 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     factors = []
     # 0. factors come from the env, for example, The values of
     # VLLM_PP_LAYER_PARTITION will affect the computation graph.
-    env_hash = hash_factors(envs.compile_factors(vllm_config.kernel_config))
+    env_hash = hash_factors(
+        envs.compile_factors(vllm_config.kernel_config, vllm_config=vllm_config)
+    )
     factors.append(env_hash)
 
     # 1. factors come from the vllm_config (it mainly summarizes how the
@@ -679,7 +682,7 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     factors.append(config_hash)
 
     # 2. inductor factors if applicable
-    if envs.VLLM_USE_MEGA_AOT_ARTIFACT:
+    if bool(vllm_config.compilation_config.runtime.mega_aot):
         factors.extend(get_inductor_factors())
 
     return factors

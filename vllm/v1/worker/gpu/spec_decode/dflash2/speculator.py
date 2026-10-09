@@ -10,6 +10,7 @@ from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.sm70_dflash2 import (
+    Sm70DFlash2Config,
     capture_sm70_dflash2_config,
     sm70_dflash2_enabled,
 )
@@ -382,7 +383,10 @@ class DFlash2Speculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
-        self._sm70_dflash2_policy = capture_sm70_dflash2_config(vllm_config)
+        self._sm70_dflash2_policy = (
+            capture_sm70_dflash2_config(vllm_config) or Sm70DFlash2Config()
+        )
+        self._sm70_dflash2_policy.resolve(qualified=False)
         self._context_kv_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._context_compute_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._context_store_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -393,10 +397,12 @@ class DFlash2Speculator(DFlashSpeculator):
         self._debug_token_dump_count = 0
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
+        assert self._sm70_dflash2_policy.proposal_temperature_scale is not None
+        assert self._sm70_dflash2_policy.proposal_top_p is not None
         self.proposal_temperature_scale = (
-            envs.VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE
+            self._sm70_dflash2_policy.proposal_temperature_scale
         )
-        self.proposal_top_p = envs.VLLM_SM70_DFLASH2_PROPOSAL_TOP_P
+        self.proposal_top_p = self._sm70_dflash2_policy.proposal_top_p
         if self.proposal_temperature_scale <= 0.0:
             raise ValueError(
                 "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE must be positive"

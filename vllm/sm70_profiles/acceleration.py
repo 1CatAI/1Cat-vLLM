@@ -11,6 +11,7 @@ from dataclasses import asdict, fields, is_dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm import envs
+from vllm.config.execution_policy import graph_policy
 from vllm.envs_metadata import EnvVar
 from vllm.logger import init_logger
 
@@ -252,8 +253,14 @@ def _row(reason: str | None = None, **values: Any) -> dict[str, Any]:
     return {"enabled": reason is None, "reason": reason, **values}
 
 
-def _switches(defaults: dict[str, str]) -> dict[str, Any]:
-    return {name: getattr(envs, name) for name in defaults}
+def _switches(defaults: dict[str, str], cfg) -> dict[str, Any]:
+    from vllm.config.policy_defaults import effective_runtime_values
+
+    effective = effective_runtime_values(cfg)
+    return {
+        name: effective[name] if name in effective else getattr(envs, name)
+        for name in defaults
+    }
 
 
 def _switches_match(values: dict[str, Any], defaults: dict[str, str]) -> bool:
@@ -613,7 +620,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         report["linear_kernel_policy"] = {
             "scope": "ct_nvfp4_linear",
             "status": "runtime_guarded",
-            "configuration": asdict(policy),
+            "configuration": json.loads(json.dumps(asdict(policy))),
             "qpn2_reason": (
                 "configuration_not_resolved"
                 if not policy.resolved
@@ -627,6 +634,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
                 else "draft_selector_state_contract_not_quality_qualified"
             ),
         }
+    from vllm.config.policy_defaults import runtime_policy_report
+
+    report["runtime_policies"] = runtime_policy_report(cfg)
     if not sm70:
         names = set(load_profile()["expected_acceleration"]) | {
             "qwen38_decode",
@@ -668,7 +678,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
                 for alias, field in SM70_DFLASH2_LEGACY_FIELDS.items()
             }
         else:
-            values = _switches(defaults)
+            values = _switches(defaults, cfg)
         paths[name] = _row(
             reason or (None if _switches_match(values, defaults) else "user_override"),
             switches=values,
@@ -681,7 +691,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP",
         "VLLM_SM70_MOE_ADD_ALLREDUCE",
     )
-    decode_values = {name: getattr(envs, name) for name in decode_names}
+    decode_values = _switches(dict.fromkeys(decode_names, ""), cfg)
     decode_contract = _is_sm70_qwen38_decode_compile_contract(
         cfg.model_config, cfg.speculative_config, cfg.parallel_config
     )
@@ -871,7 +881,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         mode=getattr(compilation.mode, "name", None),
         switches={
             "VLLM_DISABLE_COMPILE_CACHE": envs.VLLM_DISABLE_COMPILE_CACHE,
-            "VLLM_USE_AOT_COMPILE": envs.VLLM_USE_AOT_COMPILE,
+            "VLLM_USE_AOT_COMPILE": graph_policy(cfg).aot_compile,
             "force_disable_caches": cache_config.get("force_disable_caches", False),
             "torch_force_disable_caches": inductor_config.force_disable_caches,
         },
