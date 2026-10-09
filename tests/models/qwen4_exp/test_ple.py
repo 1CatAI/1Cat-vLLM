@@ -819,6 +819,10 @@ def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     # Off unless a test maps real file-backed shards: releasing the pages of
     # anonymous memory would destroy it.
     module._release_disk_pages = False
+    # No engine config around the module: the default row-gather policy, nothing
+    # to record the admission in.
+    module._kernel_config = None
+    module._disk_row_gather = True
     module._disk_shard_size = 4
     module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
     module.head_dim = 2
