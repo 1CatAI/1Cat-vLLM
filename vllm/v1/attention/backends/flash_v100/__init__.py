@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.flash_v100 import (  # noqa: F401
     state,
     verify,
 )
+from vllm.v1.attention.backends.flash_v100.spec import attention as spec_attention
 from vllm.v1.attention.backends.flash_v100.spec import (
     builder as spec_builder,
 )
@@ -98,6 +99,7 @@ SUBMODULES = (
     spec_draft,
     spec_tree,
     spec_verify_metadata,
+    spec_attention,
 )
 
 __all__ = [

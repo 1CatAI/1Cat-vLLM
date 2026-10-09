@@ -3,6 +3,7 @@
 """Method calculation/descriptor invariants after implementation extraction."""
 
 import ast
+import copy
 import hashlib
 import inspect
 import json
@@ -18,6 +19,61 @@ from vllm.v1.attention.backends.flash_v100 import impl, state
 from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
 
 pytestmark = pytest.mark.cpu_test
+
+
+class _InlineFeatureHooks(ast.NodeTransformer):
+    """Expand mechanical feature extractions before comparing original bodies."""
+
+    def __init__(self):
+        source = Path(impl.__file__).parent / "spec/attention.py"
+        self.hooks = {
+            node.name: node
+            for node in ast.parse(source.read_text()).body
+            if isinstance(node, ast.FunctionDef)
+        }
+
+    def _hook(self, call):
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "ATTENTION_HOOKS"
+        ):
+            hook = self.hooks[call.func.attr]
+            names = {
+                "feature_fallback": "is_dflash_draft_attn",
+                "capture_prefix": "is_dflash_non_causal",
+            }
+            arguments = [names.get(ast.unparse(a), ast.unparse(a)) for a in call.args]
+            assert not call.keywords
+            assert arguments == [a.arg for a in hook.args.args]
+            return hook
+        return None
+
+    def visit_Expr(self, node):
+        hook = self._hook(node.value)
+        if hook is not None:
+            # Statement hooks use the original local names; predicate hooks
+            # return an expression and are handled separately below.
+            assert not any(isinstance(n, ast.Return) for n in hook.body)
+            return copy.deepcopy(hook.body)
+        return self.generic_visit(node)
+
+    def visit_Call(self, node):
+        hook = self._hook(node)
+        if hook is not None:
+            assert len(hook.body) == 1 and isinstance(hook.body[0], ast.Return)
+            return copy.deepcopy(hook.body[0].value)
+        return self.generic_visit(node)
+
+    def visit_Name(self, node):
+        names = {
+            "feature_fallback": "is_dflash_draft_attn",
+            "capture_prefix": "is_dflash_non_causal",
+        }
+        if node.id in names:
+            return ast.Name(id=names[node.id], ctx=node.ctx)
+        return node
 
 
 class _Normalize(ast.NodeTransformer):
@@ -69,11 +125,13 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                     continue
                 assert fn.name not in actual
                 actual[fn.name] = hashlib.sha256(
-                    ast.dump(_Normalize().visit(fn)).encode()
+                    ast.dump(
+                        _Normalize().visit(_InlineFeatureHooks().visit(fn))
+                    ).encode()
                 ).hexdigest()
     assert actual == {k: v["sha256"] for k, v in fixture.items()}
     for name, descriptor in fixture.items():
-        member = vars(impl.FlashAttnV100Impl)[name]
+        member = inspect.getattr_static(impl.FlashAttnV100Impl, name)
         assert isinstance(member, staticmethod) == descriptor["static"]
 
 
