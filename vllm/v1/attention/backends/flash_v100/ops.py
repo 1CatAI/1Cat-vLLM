@@ -7,6 +7,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable
 from contextlib import suppress
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -458,3 +459,17 @@ LEGACY_ALIASES = {
     "_get_flash_grouped_verify_op": "get_flash_grouped_verify_op",
     "_get_flash_ops": "get_flash_ops",
 }
+
+
+if TYPE_CHECKING:
+    # Static compatibility only; runtime writes use live owner aliases.
+    _get_paged_kv_utils = get_paged_kv_utils
+    _get_fp8_e5m2_paged_kv_bridge_op = get_fp8_e5m2_paged_kv_bridge_op
+    _get_sm70_v37_e4m3_bridge_op = get_sm70_v37_e4m3_bridge_op
+    _get_flash_dense_forward = get_flash_dense_forward
+    _get_sm70_d256_gqa_architecture_op = get_sm70_d256_gqa_architecture_op
+    _get_sm70_splitd_d256_ops = get_sm70_splitd_d256_ops
+    _callable_accepts_keyword = callable_accepts_keyword
+    _get_sm70_d256_gqa_architecture_q8192_op = get_sm70_d256_gqa_architecture_q8192_op
+    _get_flash_grouped_verify_op = get_flash_grouped_verify_op
+    _get_flash_ops = get_flash_ops

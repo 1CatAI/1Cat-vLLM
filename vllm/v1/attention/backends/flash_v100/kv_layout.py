@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from vllm.logger import init_logger
@@ -501,3 +503,20 @@ LEGACY_ALIASES = {
     "_contiguous_paged_kv_view": "contiguous_paged_kv_view",
     "_has_prefix_context": "has_prefix_context",
 }
+
+
+if TYPE_CHECKING:
+    # Static compatibility only; runtime writes use live owner aliases.
+    _gather_paged_kv_to_exact_dense = gather_paged_kv_to_exact_dense
+    _contiguous_paged_kv_bhmd = contiguous_paged_kv_bhmd
+    _dequantize_fp8_contiguous_kv = dequantize_fp8_contiguous_kv
+    _extract_contiguous_kv_from_paged_cache = extract_contiguous_kv_from_paged_cache
+    _metadata_expects_more_query_tokens_than_available = (
+        metadata_expects_more_query_tokens_than_available
+    )
+    _split_paged_kv_cache = split_paged_kv_cache
+    _normalize_query_start_loc_for_available_tokens = (
+        normalize_query_start_loc_for_available_tokens
+    )
+    _contiguous_paged_kv_view = contiguous_paged_kv_view
+    _has_prefix_context = has_prefix_context

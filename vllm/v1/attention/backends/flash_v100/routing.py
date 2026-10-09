@@ -8,7 +8,7 @@ import atexit
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import regex as re
 import torch
@@ -1021,3 +1021,23 @@ LEGACY_ALIASES = {
     "_log_fp8_kv_cache_route": "log_fp8_kv_cache_route",
     "_same_storage": "same_storage",
 }
+
+
+if TYPE_CHECKING:
+    # Static compatibility only; runtime writes use live owner aliases.
+    _g6_aligned_page_partition_size_hint = g6_aligned_page_partition_size_hint
+    _uses_fp8_kv_cache = uses_fp8_kv_cache
+    _log_kv_dtype_contract = log_kv_dtype_contract
+    _normalize_flash_v100_kv_cache_dtype = normalize_flash_v100_kv_cache_dtype
+    _trace_decode_active = trace_decode_active
+    _record_route = record_route
+    _decode_partition_size_for_metadata = decode_partition_size_for_metadata
+    _is_cuda_graph_capturing = is_cuda_graph_capturing
+    _batch_context_routing_for_graph_variant = batch_context_routing_for_graph_variant
+    _batch_context_routing_cache_dtype_supported = (
+        batch_context_routing_cache_dtype_supported
+    )
+    _decode_dynamic_partitions_enabled = decode_dynamic_partitions_enabled
+    _trace_decode_active_metadata = trace_decode_active_metadata
+    _log_fp8_kv_cache_route = log_fp8_kv_cache_route
+    _same_storage = same_storage
