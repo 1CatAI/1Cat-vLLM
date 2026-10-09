@@ -239,6 +239,132 @@ Use nonblocking readiness tests, prioritize ready work, and prove forward
 progress for all routing patterns. A simple fixed-shape queue is preferable
 to importing an entire model interpreter before this boundary succeeds.
 
+## Other operator references and the remaining boundaries
+
+The October 9 source audit distinguishes mechanisms that are already present
+from experiments that would change the remaining dependency structure. The
+latest four-rank diagnostic on the replacement host uses the frozen native
+core and device-resident E4M3 history. Its 37 central windows average 20.812 ms
+with graph-node profiling; the corresponding unprofiled control is about
+19.81 ms. Neither replaces the historical 17.4018 ms resident-FP16-KV result
+or the 17.8493 ms device-E4M3 result on the previous host. Actual PLE placement
+also differs between the two hosts.
+
+Rank 0 has 12.731 ms of target kernel activity and 3.002 ms of draft activity.
+The auxiliary-stream overlap is 1.223 ms. The following family service times
+overlap and **must not be added to produce a round latency or a saving**.
+
+| Family | Service ms/round | Existing mechanism | Remaining experiment |
+| --- | ---: | --- | --- |
+| Routed gate/up and down/unroute | 2.717 | Q8 input, fused activation/unroute, no token M8 padding | Cross-expert lookahead and deferred epilogues with chunk readiness |
+| HC complete TP boundary | 2.559 | One-launch HCX, LL exchange, down/up prefetch, deferred RMS scaling | Consume arriving low-rank chunks before the full-buffer wait |
+| GGUF dense projection | 2.304 | Projection segments share input, offline repack, weight and activation lookahead | Decoder/task resource redesign and qualified mainline raw-format routes |
+| Router projection and selection | 1.084 | Native FP16 projection and deterministic packed-key top-k | Selection and task-map production in the projection/consumer boundary |
+| QSA | 1.637 | Sparse GQA with index branch and protected FP16 operands | Inline selected KV reads; qualify the exact direct-reader chain first |
+| GDN | 0.775 | Fused FLA recurrent update with speculative snapshots | State reuse only with unchanged rollback semantics |
+| Four draft steps | 3.002 | Per-step graphs and a tested multistep graph candidate | Fuse metadata/sample preparation with its actual producers |
+
+### HC: mKernel, FLUX, and mHC prenormalization
+
+[mKernel](https://github.com/uccl-project/mKernel) assigns compute and
+communication roles and lets consumers start on available tiles.
+[FLUX](https://github.com/bytedance/flux/blob/main/docs/design.md) reschedules
+independent output tiles and separates remote I/O from computation where
+inline I/O would stall a resident pipeline. These are useful scheduling
+references; their shipped hardware paths do not provide an SM70 HC operator.
+
+HCX already sends block partials before loading down weights, prefetches up
+weights during exchange, computes down partials before applying the global
+RMS coefficient, and combines the previous block output with the next HC
+input. Those are not new fusion opportunities. The inspected low-rank phase
+still cooperatively polls the entire LoRA buffer, executes a grid barrier,
+then loads all 320 low-rank values before up computation. A bounded prototype
+can publish low-rank chunk readiness and begin fixed-order up partials while
+other chunks arrive. The experiment must account for additional partial
+traffic, registers, polling and SM capacity rather than assuming overlap is
+free. It must retain the true global RMS and final reduction dependencies.
+
+[DeepSeek TileKernels](https://github.com/deepseek-ai/TileKernels) and
+[DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend) include mHC
+prenormalization work. TileKernels revision
+`66258df6175d2f630ffecb04c5ab66bff8a2ae6a` reduces split dot products and
+sum-of-squares, then applies group RMS coefficients. The inspected
+[SGLang integration](https://github.com/sgl-project/sglang/pull/33616) uses
+prenorm GEMM followed by a fused mixing/Sinkhorn stage. Flash-Next uses
+feature-dependent 320-dimensional down/up gating, rather than DeepSeek's
+24-coefficient Sinkhorn mixing. Its existing delayed RMS mechanism already
+shares part of the prenorm idea. Different hardware, shape and FP16 rounding
+prevent using the published prenorm timings as an HC latency estimate.
+
+The earlier HC-to-dense chain regresses from 46.688 to 58.660 us; full-mesh
+XOR exchange also loses to direct exchange. Both remain rejected. A new
+chunk-consumer experiment needs a distinct schedule and a complete-chain
+gain before another model measurement.
+
+### Router: selection and expert-task production
+
+The router service separates into 0.703 ms of projection and 0.382 ms of
+selection. The selected top-k kernel still sorts 512 packed keys per token
+using eight warps. TileKernels'
+[top-k implementation](https://github.com/deepseek-ai/TileKernels/blob/66258df6175d2f630ffecb04c5ab66bff8a2ae6a/tile_kernels/moe/topk_gate_cuda.py)
+keeps scores in a warp, selects repeated maxima and resolves ties by the
+lowest expert index. This motivates a selection-plus-normalization and
+token-mask producer for the weight-major MoE chain. Retain this model's
+softmax, degenerate-row behavior, FP16 score rounding and route order;
+TileKernels' nonfinite assertion is not the same numerical contract.
+
+Projection results span multiple CTAs. A fused implementation still needs
+an explicit final-producer handoff; putting top-k inside a kernel does not
+remove that dependency. Router projection, input quantization and task-map
+production can share input preparation when lifetimes permit. Do not claim
+that the inspected MonoMoE entry point already includes router projection.
+HC/router changes belong in the common Flash-Next implementation, with GGUF
+capability and route-hit verification rather than another model-specific copy.
+
+### Dense decoding, sparse attention, and draft preparation
+
+FLUTE's vectorized lookup and table-layout ideas remain relevant to IQ
+decoders. The installed dense segment loop already loads the next weight
+chunk before decoding/MMA and double-buffers warp-private activations.
+Another generic prefetch rewrite is not a missing structural feature.
+The next dense decision needs an instruction/resource audit and comparison
+with the GGUF mainline's raw-format Q8/dp4a routes at the actual shapes.
+Keep one decoder implementation and preserve the agreed numerical contract.
+
+[FlashMLA's sparse pipeline](https://github.com/deepseek-ai/FlashMLA/blob/main/docs/20260930-ascend-prefill-deep-dive.md)
+is a reference for selected-block reads and attention epilogues, not a
+replacement for Flash-Next's sparse GQA/index semantics. The revised local
+direct device reader preserves FP16 PV operands: its synthetic target/draft
+chain saves 0.192 ms at M5 and 0.146 ms at M20, passing 21 GPU checks. These
+are chain measurements, not admitted round savings; they place this version
+below the first structural MoE/HC experiment. The earlier FP32-PV model
+variant fails the acceptance gate and remains rejected.
+
+The selected GDN update already uses a fused FLA kernel. The previous native
+verifier changes C1 17.406 to 17.613 ms and C4 45.025 to 46.229 ms; it is not
+an optimization to retry without a different state/snapshot design.
+
+MPK and Hazy's producer/consumer task scheduling can inform draft metadata
+and sampling fusion. Merely wrapping the existing draft steps in one graph
+has already regressed same-engine C1 18.273 to 18.600 ms and C4 43.277 to
+43.467 ms. The four autoregressive steps and their head reads remain causal
+dependencies. Draft work belongs to the MTP implementation; this path checks
+GGUF route and head compatibility.
+
+### Priority and admission
+
+Continue the cross-expert MoE pipeline first, then evaluate HC low-rank
+chunk consumption and router/task production. Check dense route coverage
+against the GGUF mainline. Keep the smaller direct-QSA chain result and
+rejected graph/GDN/HC variants recorded without assigning hypothetical
+end-to-end savings. Shared-expert work already overlaps routed work, GPU
+entry-skew p90 is 0.056 ms, and concatenation plus copy service is only
+0.179 ms; these are not the first large structural experiments.
+
+For every candidate retain numerical isolation, complete-chain timing,
+same-wheel C1/C4 A/B and acceptance checks. None of this source review adds
+an admitted inference route or changes the measured baseline.
+
 The launch must check register/shared-memory occupancy and admissible
 resident blocks. `__launch_bounds__(threads, 1)` is a compiler resource
 hint, not proof that the whole grid is resident. Avoid a grid-wide barrier.
