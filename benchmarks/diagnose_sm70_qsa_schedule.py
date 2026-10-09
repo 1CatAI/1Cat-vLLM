@@ -270,6 +270,50 @@ def interleaved_probes(llm, reference, report, save):
                 )
 
 
+def repeated_c4_probes(llm, reference, report, save):
+    """Check endpoint drift without repeating completed quality measurements."""
+    for label, mode in (("recaptured_control", "control"), ("both", "both")):
+        report["captures"][label] = llm.collective_rpc(
+            capture, args=(label, mode), timeout=180
+        )
+    fixed = reference["rows"][1]["prompt_token_ids"]
+    ids = (fixed * (128 // len(fixed) + 1))[:128]
+    params = SamplingParams(
+        temperature=0, top_p=1, top_k=-1, max_tokens=600, ignore_eos=True
+    )
+    labels = {"A": "recaptured_control", "B": "both"}
+    for arm in labels.values():
+        llm.collective_rpc(select, args=(arm,), timeout=30)
+        observed_cohort(llm, ids, params, 4)
+    for repetition, schedule in enumerate(("ABBA", "BAAB", "ABBA")):
+        for code in schedule:
+            arm = labels[code]
+            llm.collective_rpc(select, args=(arm,), timeout=30)
+            steps, outputs = observed_cohort(llm, ids, params, 4)
+            probe = dict(
+                width=4,
+                candidate="both",
+                arm=arm,
+                repetition=repetition,
+                schedule=schedule,
+                steps=steps,
+                summary=summarize(steps, 4),
+                output_token_ids=[list(o.outputs[0].token_ids) for o in outputs],
+            )
+            report["probes"].append(probe)
+            save()
+            print(
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in probe.items()
+                        if k not in ("steps", "output_token_ids")
+                    }
+                ),
+                flush=True,
+            )
+
+
 def quality(root, phases, left, right):
     a, b = phases[left], phases[right]
     records = []
@@ -330,7 +374,14 @@ def main():
         action="store_true",
         help="Diagnose timing drift with symmetric eight-round blocks and GPU events.",
     )
+    p.add_argument(
+        "--repeat-c4-only",
+        action="store_true",
+        help="Repeat uninstrumented C4 ABBA/BAAB; skip completed quality checks.",
+    )
     args = p.parse_args()
+    if args.interleaved_only and args.repeat_c4_only:
+        p.error("Choose one timing-only diagnostic mode.")
     for fn in (configure, capture, select, start_interleave, stop_interleave):
         assert callable(MsgpackDecoder().decode(MsgpackEncoder().encode(fn)))
     reference = json.loads(args.reference.read_text())
@@ -378,6 +429,12 @@ def main():
             SamplingParams(temperature=0, max_tokens=16),
             use_tqdm=False,
         )
+        if args.repeat_c4_only:
+            report["scope"] += "; repeated C4 timing only, no new quality claim"
+            repeated_c4_probes(llm, reference, report, save)
+            report["complete"] = True
+            save()
+            return
         if args.interleaved_only:
             for label, mode in (
                 ("recaptured_control", "control"),
