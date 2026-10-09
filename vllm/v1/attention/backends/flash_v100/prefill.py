@@ -770,148 +770,33 @@ def _flash_v100_prefill_with_prefix(
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     max_query_len = int(query_lens.max().item()) if num_seqs > 0 else 0
-    if (
-        self.use_flash_v100_prefill_paged
-        and not causal
-        and bool(getattr(layer, "is_dflash_draft_attn", False))
-        and anchor_lens is None
-        and (
-            num_seqs > 1
-            or (
-                num_seqs == 1
-                and (
-                    (
-                        self._flash_prefill_paged_supports_dflash2_bmhd
-                        and block_size in (1024, 2048)
-                    )
-                    or block_size in self._flash_prefill_paged_dflash2_split_pages
-                )
-                and max_query_len == 8
-                and query.shape[1:] == (8, 128)
-                and query.dtype == torch.float16
-                and key_cache.dtype == value_cache.dtype == torch.float16
-                and window_size == (2047, 2047)
-            )
-        )
-        and 0 < max_query_len <= 16
-        and query.shape[0] == num_seqs * max_query_len
-        and bool(torch.all(query_lens == max_query_len).item())
-        and out_view.is_contiguous()
-        and not debug_compare
-        and not dflash_dump
-    ):
-        # The native paged kernel already has a batch grid dimension.
-        # Keep all uniform draft rows in one launch instead of capturing
-        # one small attention kernel per request. Only the query shape is
-        # static: live GPU sequence lengths and block tables must remain
-        # inputs so replay can advance or replace individual requests.
-        shape = (num_seqs, max_query_len, query.shape[1], head_dim)
-        logger.info_once(
-            "FLASH_ATTN_V100 DFlash uniform noncausal paged batch route "
-            "active (batch=%d, q=%d, page=%d).",
-            num_seqs,
-            max_query_len,
-            block_size,
-        )
-        _routing._record_route(
-            _routing.ROUTE_SPECS["prefill_prefix_dflash_noncausal_batch"].name
-        )
-        self._run_prefill_paged_call(
-            route="prefill_prefix_dflash_noncausal_batch",
-            q_len=max_query_len,
-            seq_len=int(seq_lens.max().item()),
-            heads_q=query.shape[1],
-            heads_kv=num_kv_heads,
-            head_dim=head_dim,
-            block_size=block_size,
-            fn=lambda: self.flash_attn_prefill_paged(
-                query.reshape(shape),
-                key_cache,
-                value_cache,
-                attn_metadata.block_table[:num_seqs],
-                attn_metadata.seq_lens[:num_seqs],
-                out=out_view.view(shape),
-                softmax_scale=self.scale,
-                kv_cache_dtype=self.kv_cache_dtype,
-                k_scale=float(layer._k_scale_float),
-                v_scale=float(layer._v_scale_float),
-                causal=False,
-                window_size=window_size,
-            ),
-        )
-        return output
-    if causal and _masks._ddtree_parent_metadata_requires_branch(
+    batch_complete, batch_output, decode_rows = execute_prefill_batch(
+        self,
+        layer,
+        query,
+        key,
+        value,
+        key_cache,
+        value_cache,
         attn_metadata,
+        output,
+        out_view,
         query_start_loc,
-    ):
-        if anchor_lens is not None:
-            raise RuntimeError(
-                "FLASH_ATTN_V100 anchored decode-window mask does not "
-                "support ddtree drafting metadata."
-            )
-        return self._flash_v100_ddtree_small_query_prefill_dense(
-            layer,
-            query,
-            key,
-            value,
-            key_cache,
-            value_cache,
-            attn_metadata,
-            output,
-            query_start_loc,
-            seq_lens,
-        )
-
-    if (
-        causal
-        and anchor_lens is None
-        and self.use_flash_v100_decode
-        and self.smallq_decode_max_query_len > 0
-        and max_query_len <= self.smallq_decode_max_query_len
-        and (
-            self.smallq_decode_max_model_len <= 0
-            or getattr(attn_metadata, "max_model_len", 0)
-            <= self.smallq_decode_max_model_len
-        )
-        and not self.use_decode_paged_prefill
-    ):
-        if not _state._logged_prefill_smallq_decode:
-            logger.info(
-                "FLASH_ATTN_V100 prefix prefill small-query path active "
-                "(paged decode verifier, max_query_len<=%d).",
-                self.smallq_decode_max_query_len,
-            )
-            _state._logged_prefill_smallq_decode = True
-        return self._flash_v100_small_query_prefill_as_decode(
-            layer,
-            query,
-            key_cache,
-            value_cache,
-            attn_metadata,
-            output,
-            query_start_loc,
-            seq_lens,
-        )
-
-    decode_rows: set[int] = set()
-    if self._prefill_prefix_decode_rows_allowed(
-        causal=causal,
-        anchor_lens=anchor_lens,
-        num_seqs=num_seqs,
-        query=query,
-        window_size=window_size,
-    ):
-        decode_rows = self._run_prefill_prefix_decode_rows(
-            layer,
-            query,
-            key_cache,
-            value_cache,
-            attn_metadata,
-            out_view,
-            query_start_loc,
-            seq_lens,
-            window_size,
-        )
+        seq_lens,
+        query_lens,
+        num_seqs,
+        max_query_len,
+        num_kv_heads,
+        head_dim,
+        block_size,
+        causal,
+        window_size,
+        anchor_lens,
+        debug_compare,
+        dflash_dump,
+    )
+    if batch_complete:
+        return batch_output
 
     for i in range(num_seqs):
         if i in decode_rows:
@@ -1340,6 +1225,33 @@ def execute_prefill_sequence(
     causal,
     window_size,
 ):
+    executor = create_prefill_executor(self)
+    result = executor.sequence(
+        _sequence.PrefillRequest(
+            layer,
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            out_view,
+            i,
+            start,
+            end,
+            q_len,
+            seq_len,
+            q_seq,
+            num_seqs,
+            num_kv_heads,
+            head_dim,
+            block_size,
+            causal,
+            window_size,
+        )
+    )
+    return result.output, result.is_destination, result.skip_debug
+
+
+def create_prefill_executor(self):
     policy = getattr(self, "config", None)
     if policy is None:
         attributes = vars(self)
@@ -1375,30 +1287,93 @@ def execute_prefill_sequence(
         log_dense_fa2=log_dense_fa2,
         log_fp8_bridge=log_fp8_bridge,
         log_splitkv=log_splitkv,
+        supports_bmhd=getattr(
+            self, "_flash_prefill_paged_supports_dflash2_bmhd", False
+        ),
+        split_pages=getattr(self, "_flash_prefill_paged_dflash2_split_pages", ()),
+        tree_prefill=getattr(
+            self, "_flash_v100_ddtree_small_query_prefill_dense", None
+        ),
+        small_query=getattr(self, "_flash_v100_small_query_prefill_as_decode", None),
+        allow_rows=getattr(self, "_prefill_prefix_decode_rows_allowed", None),
+        decode_rows=getattr(self, "_run_prefill_prefix_decode_rows", None),
+        log_noncausal=log_noncausal,
+        log_small_query=log_small_query,
     )
-    executor = _sequence.PrefillExecutor(
+    return _sequence.PrefillExecutor(
         config, ops, getattr(self, "workspace", None) or _workspace.V100Workspace()
     )
-    result = executor.sequence(
-        _sequence.PrefillRequest(
+
+
+def log_noncausal(config, num_seqs, max_query_len, block_size):
+    logger.info_once(
+        "FLASH_ATTN_V100 DFlash uniform noncausal paged batch route "
+        "active (batch=%d, q=%d, page=%d).",
+        num_seqs,
+        max_query_len,
+        block_size,
+    )
+
+
+def log_small_query(config):
+    if not _state._logged_prefill_smallq_decode:
+        logger.info(
+            "FLASH_ATTN_V100 prefix prefill small-query path active "
+            "(paged decode verifier, max_query_len<=%d).",
+            config.policy.smallq_decode_max_query_len,
+        )
+        _state._logged_prefill_smallq_decode = True
+
+
+def execute_prefill_batch(
+    self,
+    layer,
+    query,
+    key,
+    value,
+    key_cache,
+    value_cache,
+    attn_metadata,
+    output,
+    out_view,
+    query_start_loc,
+    seq_lens,
+    query_lens,
+    num_seqs,
+    max_query_len,
+    num_kv_heads,
+    head_dim,
+    block_size,
+    causal,
+    window_size,
+    anchor_lens,
+    debug_compare,
+    dump_enabled,
+):
+    result = create_prefill_executor(self).batch(
+        _sequence.PrefillBatchRequest(
             layer,
             query,
+            key,
+            value,
             key_cache,
             value_cache,
             attn_metadata,
+            output,
             out_view,
-            i,
-            start,
-            end,
-            q_len,
-            seq_len,
-            q_seq,
+            query_start_loc,
+            seq_lens,
+            query_lens,
             num_seqs,
+            max_query_len,
             num_kv_heads,
             head_dim,
             block_size,
             causal,
             window_size,
+            anchor_lens,
+            debug_compare,
+            dump_enabled,
         )
     )
-    return result.output, result.is_destination, result.skip_debug
+    return result.complete, result.output, result.rows

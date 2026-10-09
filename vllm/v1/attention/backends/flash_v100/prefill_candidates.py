@@ -57,6 +57,15 @@ class PrefillOps:
     log_fp8_bridge: Any
     log_splitkv: Any
 
+    supports_bmhd: bool = False
+    split_pages: tuple[int, ...] = ()
+    tree_prefill: Any = None
+    small_query: Any = None
+    allow_rows: Any = None
+    decode_rows: Any = None
+    log_noncausal: Any = None
+    log_small_query: Any = None
+
 
 @dataclass
 class PrefillRequest:
@@ -97,6 +106,12 @@ class PrefillExecutor:
         self.config = config
         self.ops = ops
         self.workspace = workspace
+
+    def batch(self, request: PrefillBatchRequest) -> PrefillBatchResult:
+        result = _plan.try_execute(
+            request, (candidate(self) for candidate in BATCH_CANDIDATES)
+        )
+        return PrefillBatchResult(False, None, set()) if result is None else result
 
     def sequence(self, request: PrefillRequest) -> PrefillResult:
         return _plan.execute(request, self.candidates(request))
@@ -595,3 +610,219 @@ PREPARED_CANDIDATES = (
     ContiguousDensePrefill,
 )
 FALLBACK_CANDIDATES = (Fp8BridgePrefill, SplitKvPrefill, PagedPrefill)
+
+
+@dataclass
+class PrefillBatchRequest:
+    layer: torch.nn.Module
+    query: torch.Tensor
+    key: torch.Tensor | None
+    value: torch.Tensor | None
+    key_cache: torch.Tensor
+    value_cache: torch.Tensor
+    attn_metadata: Any
+    output: torch.Tensor
+    out_view: torch.Tensor
+    query_start_loc: torch.Tensor
+    seq_lens: torch.Tensor
+    query_lens: torch.Tensor
+    num_seqs: int
+    max_query_len: int
+    num_kv_heads: int
+    head_dim: int
+    block_size: int
+    causal: bool
+    window_size: tuple[int, int]
+    anchor_lens: torch.Tensor | None
+    debug_compare: bool
+    dump_enabled: bool
+
+
+@dataclass(frozen=True)
+class PrefillBatchResult:
+    complete: bool
+    output: Any
+    rows: set[int]
+
+
+class BatchCandidate(_plan.Candidate[PrefillBatchRequest, PrefillBatchResult]):
+    def __init__(self, executor: PrefillExecutor):
+        self.executor = executor
+
+
+class NoncausalBatch(BatchCandidate):
+    def admit(self, request: PrefillBatchRequest) -> bool:
+        return (
+            self.executor.config.policy.use_flash_v100_prefill_paged
+            and (not request.causal)
+            and bool(getattr(request.layer, "is_dflash_draft_attn", False))
+            and (request.anchor_lens is None)
+            and (
+                request.num_seqs > 1
+                or (
+                    request.num_seqs == 1
+                    and (
+                        self.executor.ops.supports_bmhd
+                        and request.block_size in (1024, 2048)
+                        or request.block_size in self.executor.ops.split_pages
+                    )
+                    and (request.max_query_len == 8)
+                    and (request.query.shape[1:] == (8, 128))
+                    and (request.query.dtype == torch.float16)
+                    and (
+                        request.key_cache.dtype
+                        == request.value_cache.dtype
+                        == torch.float16
+                    )
+                    and (request.window_size == (2047, 2047))
+                )
+            )
+            and (0 < request.max_query_len <= 16)
+            and (request.query.shape[0] == request.num_seqs * request.max_query_len)
+            and bool(torch.all(request.query_lens == request.max_query_len).item())
+            and request.out_view.is_contiguous()
+            and (not request.debug_compare)
+            and (not request.dump_enabled)
+        )
+
+    def run(
+        self, request: PrefillBatchRequest, record: _plan.RecordRoute
+    ) -> PrefillBatchResult:
+        shape = (
+            request.num_seqs,
+            request.max_query_len,
+            request.query.shape[1],
+            request.head_dim,
+        )
+        self.executor.ops.log_noncausal(
+            self.executor.config,
+            request.num_seqs,
+            request.max_query_len,
+            request.block_size,
+        )
+        record(_routing.ROUTE_SPECS["prefill_prefix_dflash_noncausal_batch"].name)
+        self.executor.ops.run_paged(
+            route="prefill_prefix_dflash_noncausal_batch",
+            q_len=request.max_query_len,
+            seq_len=int(request.seq_lens.max().item()),
+            heads_q=request.query.shape[1],
+            heads_kv=request.num_kv_heads,
+            head_dim=request.head_dim,
+            block_size=request.block_size,
+            fn=lambda: self.executor.ops.paged(
+                request.query.reshape(shape),
+                request.key_cache,
+                request.value_cache,
+                request.attn_metadata.block_table[: request.num_seqs],
+                request.attn_metadata.seq_lens[: request.num_seqs],
+                out=request.out_view.view(shape),
+                softmax_scale=self.executor.config.scale,
+                kv_cache_dtype=self.executor.config.kv_cache_dtype,
+                k_scale=float(request.layer._k_scale_float),
+                v_scale=float(request.layer._v_scale_float),
+                causal=False,
+                window_size=request.window_size,
+            ),
+        )
+        return PrefillBatchResult(True, request.output, set())
+
+
+class TreeBatch(BatchCandidate):
+    def admit(self, request: PrefillBatchRequest) -> bool:
+        return request.causal and _masks._ddtree_parent_metadata_requires_branch(
+            request.attn_metadata, request.query_start_loc
+        )
+
+    def run(
+        self, request: PrefillBatchRequest, record: _plan.RecordRoute
+    ) -> PrefillBatchResult:
+        if request.anchor_lens is not None:
+            raise RuntimeError(
+                "FLASH_ATTN_V100 anchored decode-window mask does not "
+                "support ddtree drafting metadata."
+            )
+        return PrefillBatchResult(
+            True,
+            self.executor.ops.tree_prefill(
+                request.layer,
+                request.query,
+                request.key,
+                request.value,
+                request.key_cache,
+                request.value_cache,
+                request.attn_metadata,
+                request.output,
+                request.query_start_loc,
+                request.seq_lens,
+            ),
+            set(),
+        )
+
+
+class SmallQueryBatch(BatchCandidate):
+    def admit(self, request: PrefillBatchRequest) -> bool:
+        return (
+            request.causal
+            and request.anchor_lens is None
+            and self.executor.config.policy.use_flash_v100_decode
+            and (self.executor.config.policy.smallq_decode_max_query_len > 0)
+            and (
+                request.max_query_len
+                <= self.executor.config.policy.smallq_decode_max_query_len
+            )
+            and (
+                self.executor.config.policy.smallq_decode_max_model_len <= 0
+                or getattr(request.attn_metadata, "max_model_len", 0)
+                <= self.executor.config.policy.smallq_decode_max_model_len
+            )
+            and (not self.executor.config.policy.use_decode_paged_prefill)
+        )
+
+    def run(
+        self, request: PrefillBatchRequest, record: _plan.RecordRoute
+    ) -> PrefillBatchResult:
+        self.executor.ops.log_small_query(self.executor.config)
+        return PrefillBatchResult(
+            True,
+            self.executor.ops.small_query(
+                request.layer,
+                request.query,
+                request.key_cache,
+                request.value_cache,
+                request.attn_metadata,
+                request.output,
+                request.query_start_loc,
+                request.seq_lens,
+            ),
+            set(),
+        )
+
+
+class DecodeRowsBatch(BatchCandidate):
+    def admit(self, request: PrefillBatchRequest) -> bool:
+        return self.executor.ops.allow_rows(
+            causal=request.causal,
+            anchor_lens=request.anchor_lens,
+            num_seqs=request.num_seqs,
+            query=request.query,
+            window_size=request.window_size,
+        )
+
+    def run(
+        self, request: PrefillBatchRequest, record: _plan.RecordRoute
+    ) -> PrefillBatchResult:
+        decode_rows = self.executor.ops.decode_rows(
+            request.layer,
+            request.query,
+            request.key_cache,
+            request.value_cache,
+            request.attn_metadata,
+            request.out_view,
+            request.query_start_loc,
+            request.seq_lens,
+            request.window_size,
+        )
+        return PrefillBatchResult(False, None, decode_rows)
+
+
+BATCH_CANDIDATES = (NoncausalBatch, TreeBatch, SmallQueryBatch, DecodeRowsBatch)

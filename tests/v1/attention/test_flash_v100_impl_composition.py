@@ -14,7 +14,10 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from tests.v1.attention.flash_v100_sequence_oracle import sequence_calculations
+from tests.v1.attention.flash_v100_sequence_oracle import (
+    batch_calculations,
+    sequence_calculations,
+)
 from vllm.v1.attention.backends import flash_attn_v100 as legacy
 from vllm.v1.attention.backends.flash_v100 import decode, impl, state, workspace
 from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
@@ -109,39 +112,48 @@ class _InlineFeatureHooks(ast.NodeTransformer):
         return result
 
     def visit_Assign(self, node):
-        if (
-            isinstance(node.value, ast.Call)
-            and ast.unparse(node.value.func) == "execute_prefill_sequence"
-        ):
-            assert (
-                ast.unparse(node.targets[0])
-                == "(out_seq, out_is_destination, skip_debug)"
-            )
-            assert not node.value.keywords
-            helper = next(
-                n
-                for n in ast.parse(
-                    (Path(impl.__file__).parent / "prefill.py").read_text()
-                ).body
-                if isinstance(n, ast.FunctionDef)
-                and n.name == "execute_prefill_sequence"
-            )
-            arguments = [a.arg for a in helper.args.args]
-            assert [ast.unparse(a) for a in node.value.args] == arguments
-            request = next(
-                n
-                for n in ast.walk(helper)
-                if isinstance(n, ast.Call)
-                and ast.unparse(n.func) == "_sequence.PrefillRequest"
-            )
-            assert not request.keywords
-            assert [ast.unparse(a) for a in request.args] == arguments[1:]
-            return sequence_calculations()
-        return self.generic_visit(node)
+        if not isinstance(node.value, ast.Call):
+            return self.generic_visit(node)
+        callee = ast.unparse(node.value.func)
+        if callee not in ("execute_prefill_sequence", "execute_prefill_batch"):
+            return self.generic_visit(node)
+        sequence = callee == "execute_prefill_sequence"
+        assert ast.unparse(node.targets[0]) == (
+            "(out_seq, out_is_destination, skip_debug)"
+            if sequence
+            else "(batch_complete, batch_output, decode_rows)"
+        )
+        assert not node.value.keywords
+        helper = next(
+            n
+            for n in ast.parse(
+                (Path(impl.__file__).parent / "prefill.py").read_text()
+            ).body
+            if isinstance(n, ast.FunctionDef) and n.name == callee
+        )
+        arguments = [a.arg for a in helper.args.args]
+        assert [ast.unparse(a) for a in node.value.args] == [
+            "dflash_dump" if a == "dump_enabled" else a for a in arguments
+        ]
+        constructor = (
+            "_sequence.PrefillRequest" if sequence else "_sequence.PrefillBatchRequest"
+        )
+        request = next(
+            n
+            for n in ast.walk(helper)
+            if isinstance(n, ast.Call) and ast.unparse(n.func) == constructor
+        )
+        assert not request.keywords
+        assert [ast.unparse(a) for a in request.args] == arguments[1:]
+        return sequence_calculations() if sequence else batch_calculations()
 
     def visit_If(self, node):
         if ast.unparse(node.test) == "skip_debug":
             assert len(node.body) == 1 and isinstance(node.body[0], ast.Continue)
+            assert not node.orelse
+            return []
+        if ast.unparse(node.test) == "batch_complete":
+            assert [ast.unparse(n) for n in node.body] == ["return batch_output"]
             assert not node.orelse
             return []
         return self.generic_visit(node)
