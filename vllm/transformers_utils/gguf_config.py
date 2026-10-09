@@ -10,10 +10,9 @@ to the model loader's architecture adapters.
 from pathlib import Path
 from typing import Any
 
-import gguf
 from transformers import AutoConfig, PretrainedConfig
 
-from vllm.transformers_utils.gguf_fast_fields import FastFieldsMixin
+from vllm.transformers_utils.gguf_fast_fields import FastFieldsReader
 
 # GGUF architecture, HF configuration type, vLLM model implementation.
 _ARCHITECTURES = {
@@ -27,7 +26,7 @@ _ARCHITECTURES = {
 }
 
 
-class _MetadataReader(FastFieldsMixin, gguf.GGUFReader):
+class _MetadataReader(FastFieldsReader):
     def _build_tensors(self, _offset, _fields):
         # The config/tokenizer stage must work even when a checkpoint contains
         # a newer GGML type unknown to the installed gguf package. Tensor

@@ -147,7 +147,7 @@ def test_expert_bank_device_matches_host(weight_type, rows, k, axis, size):
         for name in ("weights", "stats", "raw_weights"):
             a, b = getattr(host, name, None), getattr(device, name, None)
             assert (a is None) == (b is None), name
-            if a is not None:
+            if a is not None and b is not None:
                 assert a.dtype == b.dtype and a.shape == b.shape
                 assert torch.equal(a, b), name
         for attr in ("n", "k", "group", "decoder"):

@@ -12,7 +12,7 @@ from typing import cast
 import gguf
 import numpy as np
 
-from vllm.transformers_utils.gguf_fast_fields import FastFieldsMixin
+from vllm.transformers_utils.gguf_fast_fields import FastFieldsReader
 
 Q2_0 = 42
 
@@ -42,7 +42,7 @@ def dequantize(data: np.ndarray, value: int) -> np.ndarray:
     return result.reshape(*data.shape[:-1], data.shape[-1] // size * block)
 
 
-class GGUFReader(FastFieldsMixin, gguf.GGUFReader):
+class GGUFReader(FastFieldsReader):
     def _build_tensors(self, start_offs, fields):
         extra = [field for field in fields if int(field.parts[4][0]) == Q2_0]
         regular = [field for field in fields if int(field.parts[4][0]) != Q2_0]
