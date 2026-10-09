@@ -12,6 +12,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.config.sm70_moe import Sm70MoEFormatConfig
+from vllm.model_executor.layers.fused_moe.sm70.weight_codec import Sm70MoEWeightCodec
 from vllm.model_executor.layers.quantization import awq_sm70_moe as awq
 from vllm.model_executor.layers.quantization import nvfp4_sm70_moe as nvfp4
 
@@ -41,19 +43,6 @@ def _awq_case(monkeypatch):
         _parameter(layer, f"{prefix}_qweight", (2, k, n // 8), torch.int32)
         _parameter(layer, f"{prefix}_scales", (2, k // 32, n), torch.float16)
         _parameter(layer, f"{prefix}_qzeros", (2, k // 32, n // 8), torch.int32)
-    monkeypatch.setattr(
-        awq,
-        "envs",
-        SimpleNamespace(
-            VLLM_SM70_AWQ_MOE_COMPACT_METADATA=False,
-            VLLM_SM70_AWQ_MOE_LEGACY_SINGLE_TOKEN_COMPACT=False,
-            VLLM_SM70_AWQ_QWEN38_MOE_INDEXED_PREFILL=False,
-            VLLM_SM70_AWQ_QWEN38_MOE_COMPACT_GROUPED_DECODE=False,
-            VLLM_SM70_AWQ_QWEN38_MOE_W2_CHUNK_TOKENS=0,
-            VLLM_SM70_AWQ_MOE_BATCHED_LAYER_ALLOWLIST=None,
-            VLLM_SM70_AWQ_MOE_BATCHED_LAYER_DENYLIST=None,
-        ),
-    )
     monkeypatch.setattr(awq, "_batched_gemm_enabled_for_layer", lambda *_: False)
     monkeypatch.setattr(awq, "_get_layer_id", lambda _: 0)
 
@@ -64,7 +53,16 @@ def _awq_case(monkeypatch):
     method = SimpleNamespace(
         group_size=32,
         pack_factor=8,
+        weight_codec=Sm70MoEWeightCodec("AWQ", awq.logger),
         use_batched_gemm=False,
+        moe=SimpleNamespace(experts_per_token=2),
+        sm70_moe_policy=Sm70MoEFormatConfig(
+            compact_metadata=False,
+            legacy_compact=False,
+            indexed_prefill=False,
+            active_grouped_decode=False,
+            w2_chunk_tokens=0,
+        ),
         _allocate_buffers=lambda layer: setattr(layer, "test_buffer", torch.ones(4)),
     )
     source_names = tuple(layer._parameters)

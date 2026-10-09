@@ -55,7 +55,12 @@ OWNER_PATH = re.compile(
     re.IGNORECASE,
 )
 # Configuration registries own every kind of knob by design.
-CONFIG_OWNERS = {"vllm/envs.py", "vllm/envs_metadata.py", "vllm/config/kernel.py"}
+CONFIG_OWNERS = {
+    "vllm/envs.py",
+    "vllm/envs_metadata.py",
+    "vllm/config/kernel.py",
+    "vllm/config/sm70_moe.py",
+}
 
 
 def tracked_python() -> list[str]:

@@ -11,6 +11,11 @@ class Sm70MoeStageRoute(str, Enum):
     PER_EXPERT_DISPATCH = "per_expert_dispatch"
     DENSE = "dense"
     ACTIVE_DENSE = "active_dense"
+    INDEXED = "indexed"
+    COMPACT = "compact"
+    INDEXED_PREFILL = "indexed_prefill"
+    ACTIVE_GROUPED = "active_grouped"
+    CHUNKED = "chunked"
 
 
 @dataclass(frozen=True)
@@ -21,6 +26,10 @@ class Sm70MoeRoutePlan:
     use_batched_active_exact_w2: bool
     w13: Sm70MoeStageRoute
     w2: Sm70MoeStageRoute
+    chunk_tokens: int = 0
+    weighted_reduce: bool = False
+    strict: bool = False
+    batched_indexed: bool = False
 
 
 def select_sm70_quantized_moe_route(
@@ -83,4 +92,33 @@ def select_sm70_quantized_moe_route(
         use_batched_active_exact_w2=use_batched_active_exact_w2,
         w13=w13,
         w2=w2,
+    )
+
+
+def select_single_token_plan(
+    *,
+    compact_w13: bool,
+    indexed_w13: bool,
+    indexed_w2: bool,
+    weighted_reduce: bool,
+    strict: bool = False,
+    batched_indexed: bool = False,
+) -> Sm70MoeRoutePlan:
+    """Keep compact > indexed > dense and the legacy strict-W2 override."""
+    return Sm70MoeRoutePlan(
+        use_batched_moe_gemm=False,
+        use_batched_strict_w13=strict,
+        use_batched_exact_w2=False,
+        use_batched_active_exact_w2=False,
+        w13=Sm70MoeStageRoute.COMPACT
+        if compact_w13
+        else Sm70MoeStageRoute.INDEXED
+        if indexed_w13 and not strict
+        else Sm70MoeStageRoute.ACTIVE_DENSE,
+        w2=Sm70MoeStageRoute.INDEXED
+        if indexed_w2 and not strict
+        else Sm70MoeStageRoute.ACTIVE_DENSE,
+        weighted_reduce=weighted_reduce,
+        strict=strict,
+        batched_indexed=batched_indexed,
     )

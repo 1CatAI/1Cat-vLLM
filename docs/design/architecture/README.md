@@ -86,7 +86,8 @@ Rules:
 Owner modules (excluded from the model/platform counts) are model packages and
 files whose path names their platform or feature (`*sm70*`, `*turbomind*`,
 `*gguf*`, `*dflash*`, `qwen4_exp`, ...). `vllm/envs.py`, `vllm/envs_metadata.py`
-and `vllm/config/kernel.py` are configuration registries and are excluded
+`vllm/config/kernel.py` and its typed `vllm/config/sm70_moe.py` adapter are
+configuration registries and are excluded
 entirely.
 
 ## Where things live
@@ -135,3 +136,7 @@ performance regression), lands as its own PR and can be reverted alone.
 6. **Process** — PRs state their coverage in the generated matrix; new knobs go
    into `KernelConfig`; design notes become one overview plus per-component
    READMEs and decision records, with data files out of `docs/`.
+
+Phase B's current integration map, compatibility rules and delivery boundaries
+are recorded in [SM70 Phase B](sm70_phase_b.md), with a generated
+[B0 parameter/native-path ledger](sm70_phase_b_parameters.md).
