@@ -16,15 +16,16 @@ from vllm.model_executor.kernels.linear import (
     init_fp8_linear_kernel,
     init_sm70_fp8_linear_kernel,
 )
+from vllm.model_executor.kernels.linear.qpn import fp8 as _workspace_compat
+from vllm.model_executor.kernels.linear.qpn.fp8 import (
+    TurboMindFp8LinearKernel,
+)
+from vllm.model_executor.kernels.linear.qpn.fp8_block import (
+    QPN8Fp8BlockScaledMMLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm import (
     CutlassFP8ScaledMMLinearKernel,
     MarlinFP8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
-    QPN8Fp8BlockScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
-    TurboMindFp8LinearKernel,
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -1405,3 +1406,12 @@ class Fp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
+
+
+# Historical private helpers used by benchmark and workspace tooling.
+_get_sm70_fp8_prefill_exact_dense_workspace = (
+    _workspace_compat._get_sm70_fp8_prefill_exact_dense_workspace
+)
+_sm70_fp8_prefill_dense_workspaces = (
+    _workspace_compat._sm70_fp8_prefill_dense_workspaces
+)

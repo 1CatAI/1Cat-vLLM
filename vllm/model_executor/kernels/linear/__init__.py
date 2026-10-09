@@ -128,13 +128,20 @@ from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
 from vllm.model_executor.kernels.linear.nvfp4.marlin import (
     MarlinNvFp4LinearKernel,
 )
-from vllm.model_executor.kernels.linear.nvfp4.sm70 import (
+from vllm.model_executor.kernels.linear.qpn.fp8 import (
+    Sm70Fp8LinearLayerConfig,
+    TurboMindFp8LinearKernel,
+)
+from vllm.model_executor.kernels.linear.qpn.fp8_block import (
+    QPN8Fp8BlockScaledMMLinearKernel,
+)
+from vllm.model_executor.kernels.linear.qpn.nvfp4 import (
     Qpn2NvFp4LinearKernel,
     Qpn4NvFp4LinearKernel,
     Sm70NvFp4LinearLayerConfig,
     TurboMindNvFp4LinearKernel,
 )
-from vllm.model_executor.kernels.linear.pre_ampere_qpn import (
+from vllm.model_executor.kernels.linear.qpn.pre_ampere import (
     TuringNvFp4LinearLayerConfig,
     TuringQpn2NvFp4LinearKernel,
     TuringQpn8Fp8LinearKernel,
@@ -177,15 +184,8 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     RowWiseTorchFP8ScaledMMLinearKernel,
 )
-from vllm.model_executor.kernels.linear.scaled_mm.qpn8_blk import (
-    QPN8Fp8BlockScaledMMLinearKernel,
-)
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
-)
-from vllm.model_executor.kernels.linear.scaled_mm.sm70_fp8 import (
-    Sm70Fp8LinearLayerConfig,
-    TurboMindFp8LinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.triton import (
     TritonFp8BlockScaledMMKernel,
@@ -1031,6 +1031,7 @@ def select_sm70_nvfp4_linear_kernel(
     Capability checks live in the kernels. Retained workload/projection quality
     boundaries are supplied by model policy, outside can_implement.
     """
+    config.policy.active = True
     decisions: dict[str, str | None] = {}
     for kernel in _POSSIBLE_NVFP4_KERNELS[PlatformEnum.CUDA]:
         if not issubclass(kernel, TurboMindNvFp4LinearKernel):

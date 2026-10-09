@@ -15,10 +15,16 @@ class MixedPrefillBudget:
     not a hard deadline: even a decode-only step can exceed the target.
     """
 
-    def __init__(self, max_tokens: int, target_ms: float) -> None:
+    def __init__(
+        self,
+        max_tokens: int,
+        target_ms: float,
+        min_tokens: int = 0,
+    ) -> None:
         self.max_tokens = max_tokens
         self.target_ms = target_ms
-        self.tokens = min(512, max_tokens)
+        self.min_tokens = min(min_tokens, max_tokens)
+        self.tokens = max(min(512, max_tokens), self.min_tokens)
         self.ms_per_token: float | None = None
 
     def update(self, sample: MixedPrefillTiming | None) -> None:
@@ -45,5 +51,6 @@ class MixedPrefillBudget:
         quantum = min(16, self.max_tokens)
         self.tokens = max(
             quantum,
+            self.min_tokens,
             min(self.max_tokens, int(desired) // quantum * quantum),
         )

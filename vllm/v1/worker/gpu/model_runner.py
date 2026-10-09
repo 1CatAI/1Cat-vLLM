@@ -1345,65 +1345,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cached_logits = sparse_result
             else:
                 sampler_output = sparse_result
-        sm70_greedy_decode = (
-            sampler_output is None
-            and input_batch.num_draft_tokens == 0
-            and input_batch.num_reqs == 1
-            and input_batch.num_tokens == 1
-            and not input_batch.is_prefilling_np[0]
-            and grammar_output is None
-            and self.device.type == "cuda"
-            and current_platform.is_device_capability(70)
-            and getattr(self, "lora_config", None) is None
-            and hasattr(self.model, "get_top_tokens")
-            and self.sampler is not None
-            and self.sampler.can_use_sm70_greedy_token_fastpath(input_batch)
+        sampler_output = self.vllm_config.kernel_config.sample_greedy(
+            self,
+            sample_hidden_states,
+            input_batch,
+            grammar_output,
+            sampler_output,
+            cached_logits,
         )
-        sm70_greedy_verify = (
-            sampler_output is None
-            and cached_logits is None
-            and input_batch.num_draft_tokens > 0
-            and grammar_output is None
-            and self.device.type == "cuda"
-            and current_platform.is_device_capability(70)
-            and getattr(self, "lora_config", None) is None
-            and hasattr(self.model, "get_top_tokens")
-            and self.rejection_sampler is not None
-            and self.rejection_sampler.synthetic_conditional_rates is None
-            and self.vllm_config.kernel_config.sm70_greedy_verify
-            and self.rejection_sampler.sampler.can_use_sm70_greedy_token_fastpath(
-                input_batch
-            )
-        )
-        if sm70_greedy_verify:
-            from vllm.v1.worker.gpu.spec_decode.sm70_greedy_verify import (
-                greedy_verify,
-            )
-
-            assert self.rejection_sampler is not None
-            target_ids = self.model.get_top_tokens(sample_hidden_states).view(-1)
-            sampled, num_sampled = greedy_verify(
-                target_ids,
-                input_batch.input_ids[input_batch.logits_indices],
-                input_batch.cu_num_logits,
-                self.rejection_sampler.num_speculative_steps,
-            )
-            sampler_output = SamplerOutput(
-                sampled_token_ids=sampled,
-                logprobs_tensors=None,
-                num_nans=None,
-                num_sampled=num_sampled,
-            )
-            logger.info_once("SM70 greedy MTP verification from TP-local argmax.")
-        if sm70_greedy_decode:
-            sampled = self.model.get_top_tokens(sample_hidden_states)
-            sampler_output = SamplerOutput(
-                sampled_token_ids=sampled.view(-1, 1),
-                logprobs_tensors=None,
-                num_nans=None,
-                num_sampled=input_batch.seq_lens.new_ones(input_batch.num_reqs),
-            )
-            logger.info_once("SM70 MRv2 greedy TP-local pair path enabled.")
         if sampler_output is None:
             logits = (
                 cached_logits.logits

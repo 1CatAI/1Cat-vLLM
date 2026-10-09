@@ -11,7 +11,8 @@ from vllm.model_executor.kernels import gguf as kernel
 
 
 @pytest.mark.parametrize("kinds", [(21, 23, 12), (18, 23, 12), (12, 23, 21)])
-def test_measured_three_format_admission(monkeypatch, kinds):
+@pytest.mark.parametrize("widths", [(3072, 256, 256), (6144, 512, 512)])
+def test_measured_three_format_admission(monkeypatch, kinds, widths):
     monkeypatch.setattr(
         torch,
         "ops",
@@ -19,9 +20,7 @@ def test_measured_three_format_admission(monkeypatch, kinds):
             _C=SimpleNamespace(gguf_dmv_three_formats_sm70_supported=lambda: True)
         ),
     )
-    caps = kernel.three_format_qkv_capabilities(
-        kinds, 5120, (3072, 256, 256), torch.float16
-    )
+    caps = kernel.three_format_qkv_capabilities(kinds, 5120, widths, torch.float16)
     assert all(c.reason is None and c.graph_safe for c in caps)
     assert all(
         c.supports_m(8) and not c.supports_m(7) and not c.supports_m(9) for c in caps

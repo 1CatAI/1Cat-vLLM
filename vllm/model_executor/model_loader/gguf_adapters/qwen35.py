@@ -44,10 +44,8 @@ _LAYERS = {
 }
 
 
-def _dequantize_embedding(tensor, dtype, name, rows_per_chunk=1024):
-    """Bound temporary decode/range-check memory for dense vocabulary tables."""
+def _embedding_chunks(tensor, dtype, name, rows_per_chunk=1024):
     rows, columns = map(int, tensor.shape[::-1])
-    weight = torch.empty((rows, columns), dtype=dtype, device="cpu")
     for start in range(0, rows, rows_per_chunk):
         stop = min(start + rows_per_chunk, rows)
         data = gguf.quants.dequantize(tensor.data[start:stop], tensor.tensor_type)
@@ -57,6 +55,16 @@ def _dequantize_embedding(tensor, dtype, name, rows_per_chunk=1024):
             raise ValueError(
                 f"GGUF {name}: values overflow {dtype}; use --dtype float32"
             )
+        yield start, stop, converted
+
+
+def _dequantize_embedding(tensor, dtype, name, rows_per_chunk=1024):
+    """Bound temporary decode/range-check memory for dense vocabulary tables."""
+    rows, columns = map(int, tensor.shape[::-1])
+    weight = torch.empty((rows, columns), dtype=dtype, device="cpu")
+    for start, stop, converted in _embedding_chunks(
+        tensor, dtype, name, rows_per_chunk
+    ):
         weight[start:stop].copy_(converted)
     return weight
 
@@ -65,6 +73,7 @@ class Qwen35Adapter:
     global_names = _GLOBALS
     layer_names = _LAYERS
     architecture_label = "Qwen3.5"
+    packed_embeddings = True
 
     def __init__(self, config, tp_size=1):
         self.config = config
@@ -170,7 +179,18 @@ class Qwen35Adapter:
         # All linear type descriptors must arrive before any weight payload,
         # including F16/F32 shards mixed with packed GGML shards.
         for raw, name in name_map.items():
-            if self.is_linear(name):
+            packed_embedding = (
+                self.packed_embeddings
+                and not getattr(self.config, "tie_word_embeddings", False)
+                and name.endswith("embed_tokens.weight")
+                and tensors[raw].tensor_type
+                not in (
+                    gguf.GGMLQuantizationType.F32,
+                    gguf.GGMLQuantizationType.F16,
+                    gguf.GGMLQuantizationType.BF16,
+                )
+            )
+            if self.is_linear(name) or packed_embedding:
                 yield (
                     name.removesuffix(".weight") + ".qweight_type",
                     torch.tensor(
@@ -187,6 +207,19 @@ class Qwen35Adapter:
                 gguf.GGMLQuantizationType.BF16,
             )
             if quantized and name.endswith("embed_tokens.weight"):
+                if self.packed_embeddings and not getattr(
+                    self.config, "tie_word_embeddings", False
+                ):
+                    # Validate the same FP16 range as the dense loader, using
+                    # only a bounded row chunk. Serving decodes selected rows
+                    # from the original GGML bytes through GGUFEmbeddingMethod.
+                    for _ in _embedding_chunks(tensor, dtype, raw):
+                        pass
+                    yield (
+                        name.removesuffix(".weight") + ".qweight",
+                        torch.from_numpy(tensor.data.copy()),
+                    )
+                    continue
                 # Embedding row order is unchanged by restoration. Keep the
                 # existing global-table contract for the TP weight loader,
                 # without full FP32 decode and boolean temporary tables.

@@ -1,3 +1,4 @@
+#include "sm70_policy.h"
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -38,7 +39,8 @@ using Sm70Fp8PrefillCutlassGemm =
     cutlass::gemm::device::GemmUniversalAdapter<Sm70Fp8PrefillCutlassKernel>;
 
 void maybe_log_sm70_fp8_prefill_cutlass_route(int64_t m, int64_t n, int64_t k) {
-  const char* raw = std::getenv("VLLM_SM70_PROFILE_TRACE");
+  const char* raw =
+      vllm::sm70::policy_value(vllm::sm70::PolicyField::profile_trace);
   if (raw == nullptr || std::strcmp(raw, "1") != 0) {
     return;
   }
@@ -60,7 +62,8 @@ void maybe_log_sm70_fp8_prefill_cutlass_route(int64_t m, int64_t n, int64_t k) {
 
 bool sm70_fp8_prefill_cutlass_out(torch::Tensor out, torch::Tensor in_feats,
                                   torch::Tensor dense_weight, bool gated_silu) {
-  const char* raw = std::getenv("VLLM_SM70_FP8_PREFILL_CUTLASS");
+  const char* raw =
+      vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_prefill_cutlass);
   if ((raw != nullptr && std::atoi(raw) == 0) || gated_silu ||
       in_feats.dim() != 2 || dense_weight.dim() != 2) {
     return false;
