@@ -295,12 +295,9 @@ def _expert_dp4a(
                 4 if quantized_hidden else 16,
             )
         else:
-            # Byte-identical schedules measured on real TP4 expert rows at
-            # M5: the unrolled K2560 loop (lanes 0) for IQ3_S/IQ2_S and the
-            # bank-aware codebook alone for IQ3_XXS.
-            unrolled = (
-                quantized_hidden and x.shape[1] == 2560 and source_type in (21, 22)
-            )
+            # Bank-aware codebook loads: byte-identical and faster in the full
+            # model. The fully unrolled K2560 loop (lanes 0) wins in isolation
+            # but loses in-model next to the concurrent shared expert.
             torch.ops._C.gguf_dp4a_gate_up_sm70_out(
                 hidden,
                 q8,
@@ -309,7 +306,7 @@ def _expert_dp4a(
                 raw_up,
                 source_type,
                 True,
-                0 if unrolled else 16,
+                16,
                 quantized_hidden,
             )
         torch.ops._C.gguf_dp4a_down_unroute_sm70_out(
