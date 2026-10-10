@@ -138,8 +138,140 @@ class MTPQPN8Head(nn.Module):
         return None
 
 
+class MTPGGUFHotHead(nn.Module):
+    """FR-Spec draft head for a GGUF (e.g. Q6_K) shared LM head.
+
+    Draft argmax reads only the hottest token rows, dequantized once to the
+    same channel-QPN8 pack the FP16 head uses. Every other request, and the
+    target's verification, keeps the original GGUF head.
+    """
+
+    def __init__(self, head, count: int, world: int, rank: int, group) -> None:
+        super().__init__()
+        from vllm.model_executor.layers.quantization.gguf import (
+            dequantize_gguf_rows,
+        )
+
+        self.head = head
+        self.shard_indices = head.shard_indices
+        rows_per_rank = self.shard_indices.org_vocab_end_index - (
+            self.shard_indices.org_vocab_start_index
+        )
+        raw = head.gguf_lm_head_raw
+        row_bytes = raw.shape[-1] if raw.ndim == 2 else raw.numel() // rows_per_rank
+        # The hottest ids are the lowest; with contiguous vocabulary shards
+        # they all live on rank 0, which shares just those packed rows.
+        hot_raw = torch.empty((count, row_bytes), dtype=torch.uint8, device=raw.device)
+        if rank == 0:
+            hot_raw.copy_(raw.reshape(-1)[: count * row_bytes].view(count, row_bytes))
+        group.broadcast(hot_raw, src=0)
+        ids = torch.arange(rank, count, world, device=raw.device)
+        pad = (-ids.numel()) % 32
+        if pad:
+            ids = torch.cat([ids, ids[-1:].expand(pad)])
+        weight = dequantize_gguf_rows(
+            hot_raw[ids].contiguous(),
+            int(head.qweight_type.weight_type),
+            2560,
+            torch.float16,
+        )
+        del hot_raw
+        codes, scales = prepare_channel_qpn8_weight(weight)
+        del weight
+        self.register_buffer("hot_codes", codes, persistent=False)
+        self.register_buffer("hot_scales", scales, persistent=False)
+        self.hot_ids = ids.to(torch.int32)
+        logger.info_once(
+            "SM70 GGUF draft hot vocabulary: %d ids, %d rows per rank.",
+            count,
+            ids.numel(),
+        )
+
+    @property
+    def quant_method(self):
+        return self
+
+    @property
+    def weight(self):
+        return self.head.weight
+
+    def apply(self, layer, x, bias=None):
+        # Full logits (e.g. non-greedy drafts) keep the original GGUF head.
+        return self.head.quant_method.apply(self.head, x, bias)
+
+    def maybe_get_sm70_lm_head_top1_pair(self, hidden_states, bias=None):
+        if (
+            bias is not None
+            or hidden_states.ndim != 2
+            or hidden_states.dtype != torch.float16
+            or not hidden_states.is_cuda
+            or not 1 <= hidden_states.shape[0] <= 8
+            or not hasattr(torch.ops._C, "qwen38_mtp_local_top1_sm70_out")
+        ):
+            return None
+        rows = hidden_states.shape[0]
+        hot = self.hot_ids.numel()
+        logits = hidden_states.new_empty(rows, hot)
+        ops.fp8_qpn8_gemm_sm70_out(
+            logits,
+            hidden_states.contiguous(),
+            self.hot_codes,
+            self.hot_scales,
+            8,
+            2,
+            True,
+            False,
+        )
+        pairs = logits.new_empty((rows, 2), dtype=torch.float32)
+        partial = logits.new_empty((rows, (hot + 511) // 512, 2), dtype=torch.float32)
+        torch.ops._C.qwen38_mtp_local_top1_sm70_out(pairs, partial, logits, hot, 0)
+        local = pairs[:, 1].long()
+        pairs[:, 1] = self.hot_ids[local].float()
+        return pairs
+
+    def maybe_get_sm70_lm_head_top1(self, hidden_states, bias=None):
+        return None
+
+
+def prepare_mtp_gguf_hot_head(head, hot: int):
+    """Hot-vocabulary draft head for a GGUF-quantized shared LM head."""
+    from vllm.distributed import get_tp_group
+
+    raw = getattr(head, "gguf_lm_head_raw", None)
+    shard = getattr(head, "shard_indices", None)
+    if (
+        hot <= 0
+        or raw is None
+        or shard is None
+        or envs.VLLM_BATCH_INVARIANT
+        or not current_platform.is_device_capability(70)
+        or get_tensor_model_parallel_world_size() != 4
+        or not raw.is_cuda
+        or getattr(shard, "num_added_elements", 0)
+        or any(
+            not hasattr(torch.ops._C, name)
+            for name in (
+                "fp8_qpn8_prepare_sm70",
+                "fp8_qpn8_gemm_sm70_out",
+                "qwen38_mtp_local_top1_sm70_out",
+            )
+        )
+    ):
+        return None
+    group = get_tp_group()
+    rows = shard.org_vocab_end_index - shard.org_vocab_start_index
+    if rows * group.world_size != 248320:
+        logger.info_once("SM70 GGUF draft hot vocabulary skipped: padded shards.")
+        return None
+    # Hot ids must lie in rank 0's contiguous shard.
+    count = min(hot, rows)
+    return MTPGGUFHotHead(head, count, group.world_size, group.rank_in_group, group)
+
+
 def prepare_mtp_qpn8_head(head, hot: int = 0):
     weight = getattr(head, "weight", None)
+    if hot > 0 and hasattr(head, "gguf_lm_head_raw"):
+        return prepare_mtp_gguf_hot_head(head, hot)
     if not isinstance(weight, torch.Tensor):
         return None
     if (
