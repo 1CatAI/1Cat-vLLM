@@ -175,6 +175,10 @@ class RowCache {
 };
 
 struct LaneConfig {
+  // The lane owns references to the shared buffers it reads, so their
+  // storage outlives every pointer below regardless of the caller.
+  torch::Tensor request_owner;
+  torch::Tensor ring_owner;
   int64_t* request;  // host-mapped request buffer (int64)
   int64_t max_reqs;
   int64_t max_tokens;
@@ -503,6 +507,7 @@ int64_t ple_fast_lane_start(torch::Tensor request, int64_t max_reqs,
   TORCH_CHECK(!result_ptrs.empty() && result_ptrs.size() == flag_ptrs.size(),
               "PLE fast lane needs one result buffer per completion flag");
   LaneConfig config;
+  config.request_owner = request;
   config.request = request.data_ptr<int64_t>();
   config.max_reqs = max_reqs;
   config.max_tokens = max_tokens;
@@ -532,6 +537,7 @@ int64_t ple_fast_lane_start(torch::Tensor request, int64_t max_reqs,
                     ring.is_contiguous() &&
                     ring.numel() >= kHeader + ring_reqs * (3 + ring_spec),
                 "PLE draft ring must be a large enough CPU int64 tensor");
+    config.ring_owner = ring;
     config.ring = ring.data_ptr<int64_t>();
     config.ring_reqs = ring_reqs;
     config.ring_spec = ring_spec;
