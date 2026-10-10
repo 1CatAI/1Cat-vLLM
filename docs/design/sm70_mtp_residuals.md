@@ -1,6 +1,6 @@
 # Retained SM70 MTP optimizations
 
-This change is based on main `22c4d22f4b2f0e5bb794a3d4c457afead19c920d`.
+This change is based on main `7ab8b4477adb4137a1172de0e66c6806e997a49c`.
 It retains the parts of PR903 that are absent from that revision. Ordinary
 upstream collective, graph, GDN projection, attention and native resource
 owners remain authoritative. Core native sources, CMake and package build
@@ -40,6 +40,8 @@ format, weights, quantization or global runtime dtype is changed.
 Build normal `_C` and `_moe_C` extensions for native policy ABI 67 and runtime
 ABI 1. Rebuild Flash-V100 for this tree. Old native binaries are not valid
 substitutes for the initialized upstream runtime interfaces.
+The bundled FlashQLA extension must expose GDN policy ABI 1, as required by
+the current upstream GDN owner.
 
 Qualification uses the same FP16/TP4/MTP4 serving configuration, request bytes
 and weights on both arms. Prefill-only and normal generation are measured

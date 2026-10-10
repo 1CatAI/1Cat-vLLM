@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import torch
 
-from vllm import envs
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.sm70_dflash2 import capture_sm70_dflash2_config, sm70_dflash2_enabled
 from vllm.model_executor.layers import sm70_fuse47 as _fuse47
@@ -134,7 +133,8 @@ def note_dispatch(
     runner, num_reqs, num_toks, max_query_len, uniform_tok_count, batch_desc, logger
 ):
     """Log bounded dispatch diagnostics without changing graph selection."""
-    if not envs.VLLM_SM70_CG_DISPATCH_DEBUG or max_query_len <= 1:
+    trace = runner.vllm_config.observability_config.runtime_trace
+    if not trace.value("cg_dispatch") or max_query_len <= 1:
         return
     n = getattr(runner, "_cg_dispatch_debug_count", 0) + 1
     runner._cg_dispatch_debug_count = n

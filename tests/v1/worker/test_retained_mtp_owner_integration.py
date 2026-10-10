@@ -34,6 +34,25 @@ def _output():
     )
 
 
+def test_dispatch_diagnostics_follow_each_initialized_runner(monkeypatch):
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.config.observability import ObservabilityConfig
+
+    runners = []
+    for value in ("1", "0"):
+        monkeypatch.setenv("VLLM_SM70_CG_DISPATCH_DEBUG", value)
+        runners.append(NS(vllm_config=NS(observability_config=ObservabilityConfig())))
+    monkeypatch.setenv("VLLM_SM70_CG_DISPATCH_DEBUG", "changed-after-initialization")
+    logger = Mock()
+    descriptor = NS(cg_mode=CUDAGraphMode.FULL)
+    for runner in reversed(runners):
+        sm70_runner_ops.note_dispatch(runner, 2, 10, 5, True, descriptor, logger)
+        sm70_runner_ops.note_dispatch(runner, 2, 2, 1, True, descriptor, logger)
+    logger.info.assert_called_once()
+    assert runners[0]._cg_dispatch_debug_count == 1
+    assert not hasattr(runners[1], "_cg_dispatch_debug_count")
+
+
 @pytest.mark.parametrize("completed", ["sampled", "logits", "non_gather"])
 def test_completed_target_work_preempts_retained_projection(monkeypatch, completed):
     output = _output() if completed == "sampled" else None
