@@ -50,10 +50,11 @@ simultaneous complete 256K requests. Reported concurrency is the minimum of the
 state and history capacities.
 
 An allocator-only check using the TP4/MTP4 geometry, 36 GDN layers, 13 target/draft
-QSA owners, and the replicated PLE state produces 357 logical blocks at 256K.
-The device pools need about 532 MiB per rank, including about 301 MiB of recurrent
-state. Authoritative FP16 history pools need about 14.45 GiB across the four
-workers. These are calculated allocation sizes, not measured process peaks;
+QSA owners, and the replicated PLE state uses 29 state blocks, the minimum
+derived for one request with MTP4. The device pools reserve 502.1 MiB per rank,
+including 272.9 MiB of recurrent state. Larger concurrency requires a newly
+derived state quota. Authoritative FP16 history pools need about 14.33 GiB
+across the four workers. These are calculated allocation sizes, not measured process peaks;
 hot caches, staging, weights, graph pools and non-Torch allocations are separate.
 Startup requires at least 21 GiB of available host memory before loading.
 
@@ -133,3 +134,20 @@ Collect a storage ledger after target loading, draft sharing, cache allocation,
 and graph capture. Distinguish unique weight storage, recurrent state, KV hot
 cache, staging, BLAS/workspaces, graph pools, and non-Torch allocations. Capacity
 checks must use the actual ledger rather than checkpoint size alone.
+
+### Single-bank floating router and HC lifetime
+
+The capacity profile selects `sm70_router_weight_storage=row_major`. The M5/M10
+batched FP16 router reads its existing contiguous checkpoint matrix, while
+M1, M20 and prefill retain the original dense fallback. The default `dual`
+layout remains unchanged for other profiles. Across 48 real router matrices,
+packed and row-major M5/M10 outputs are bitwise equal; changed-input graph
+replay is also exact. Removing the second bank saves 120 MiB per rank. Same-GPU
+M5 chain timing was close to the packed control; M10 showed greater variability
+and a regression in one repeat. This is a capacity option, not a speed claim.
+
+After HC sharding, the generic dense provider's borrowed checkpoint reference
+is released. Both the LL and larger-batch schedules consume the shard bank.
+A lifetime test proves the former CPU parameter can be collected and the
+sharded fallback reconstructs the correct matrix. Full-process host savings
+must still be measured after loading.

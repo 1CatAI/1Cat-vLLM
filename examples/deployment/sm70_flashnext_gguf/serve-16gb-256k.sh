@@ -10,7 +10,7 @@ SRC_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 CACHE_DIR=${CACHE_DIR:-$HOME/.cache/onecat-flashnext-16gb}
 PORT=${PORT:-8000}
 HOST=${HOST:-127.0.0.1}
-GPU_UTIL=${GPU_UTIL:-0.97}
+GPU_UTIL=${GPU_UTIL:-0.95}
 mkdir -p "$CACHE_DIR"
 export PATH="$(dirname "$VLLM_PYTHON"):$PATH"
 export PYTHONPATH="$SRC_ROOT${PYTHONPATH:+:$PYTHONPATH}"
@@ -36,7 +36,7 @@ if info['MemAvailable'] < 21 * 1024**3:
     raise SystemExit('Not enough available host memory for 256K FP16 history and workers')
 PY
 
-KERNEL_CONFIG='{"sm70_gguf":{"expert_storage":"original","embedding_storage":"original","dense_storage":"canonical","small_m_dp4a":true,"q8_expert_intermediate":true,"small_m_hmma":true,"lut4_expert_dp4a":true,"device_transcode":true,"dequant_workspace_bytes":33554432},"hc_weight_storage":"sharded","hc_ll_shard":true,"hc_ll_optimized_loads":false,"sm70_hcx":true,"sm70_hcx_output_projection":false,"sm70_hcx_local_schedule":true,"sm70_qsa_shared_key":true,"sm70_qsa_device_history":true,"qsa_host_kv":true,"qsa_host_kv_dtype":"float16","qsa_host_kv_draft_dtype":"float16","qsa_host_kv_device_reference":false,"qsa_host_kv_hot_tokens":8192,"qsa_host_kv_state_blocks":32,"qsa_auto_e4m3":false,"ple_disk_only":true,"ple_row_cache_mib":512,"ple_input_prepare":true,"ple_pinned_decode":false,"sm70_greedy_verify":true,"sm70_draft_single_graph":true,"sm70_fused_side_projections":true,"sm70_top1x":true}'
+KERNEL_CONFIG='{"sm70_gguf":{"expert_storage":"original","embedding_storage":"original","dense_storage":"canonical","small_m_dp4a":true,"q8_expert_intermediate":true,"small_m_hmma":true,"lut4_expert_dp4a":true,"device_transcode":true,"dequant_workspace_bytes":33554432},"sm70_router_weight_storage":"row_major","hc_weight_storage":"sharded","hc_ll_shard":true,"hc_ll_optimized_loads":false,"sm70_hcx":true,"sm70_hcx_output_projection":false,"sm70_hcx_local_schedule":true,"sm70_qsa_shared_key":true,"sm70_qsa_device_history":true,"qsa_host_kv":true,"qsa_host_kv_dtype":"float16","qsa_host_kv_draft_dtype":"float16","qsa_host_kv_device_reference":false,"qsa_host_kv_hot_tokens":8192,"qsa_host_kv_state_blocks":29,"qsa_auto_e4m3":false,"ple_disk_only":true,"ple_row_cache_mib":512,"ple_input_prepare":true,"ple_pinned_decode":false,"sm70_greedy_verify":true,"sm70_draft_single_graph":true,"sm70_fused_side_projections":true,"sm70_top1x":true}'
 SPEC_CONFIG=$("$VLLM_PYTHON" - "$DRAFT" <<'PY'
 import json, sys
 print(json.dumps({'method': 'mtp', 'model': sys.argv[1], 'num_speculative_tokens': 4,

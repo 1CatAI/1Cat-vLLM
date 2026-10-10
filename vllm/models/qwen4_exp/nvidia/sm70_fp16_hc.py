@@ -936,6 +936,11 @@ def prepare_sharded_hc_storage(model, vllm_config) -> None:
                 "weight",
                 nn.Parameter(layer.weight.new_empty((0,)), requires_grad=False),
             )
+            # The ordinary dense provider borrows the former weight through
+            # an unregistered reference. Both HC schedules now read the shard
+            # bank, so this provider must not keep staged checkpoint pages.
+            if hasattr(layer, "_sm70_dense_state"):
+                del layer._sm70_dense_state
             if hasattr(layer, "_sm70_qwen38_hc_batch_packed"):
                 delattr(layer, "_sm70_qwen38_hc_batch_packed")
         count += 1

@@ -702,6 +702,8 @@ class KernelConfig:
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
     hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
     """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
+    sm70_router_weight_storage: Literal["dual", "row_major"] = "dual"
+    """Read the FP16 checkpoint router directly or retain its packed duplicate."""
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )

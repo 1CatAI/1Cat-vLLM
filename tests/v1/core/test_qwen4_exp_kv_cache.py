@@ -262,7 +262,10 @@ def test_host_state_pool_rejects_insufficient_active_capacity():
         _bounded_host_cache_config(state_blocks=2)
 
 
-def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget():
+@pytest.mark.parametrize("state_blocks, device_budget_mib", [(29, 504), (32, 560)])
+def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget(
+    state_blocks, device_budget_mib
+):
     config = _vllm_config()
     config.model_config = SimpleNamespace(
         max_model_len=262144,
@@ -273,7 +276,7 @@ def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget():
     config.scheduler_config.max_num_batched_tokens = 512
     config.cache_config.mamba_cache_mode = "align"
     config.cache_config.enable_prefix_caching = True
-    config.kernel_config = SimpleNamespace(qsa_host_kv_state_blocks=32)
+    config.kernel_config = SimpleNamespace(qsa_host_kv_state_blocks=state_blocks)
     specs = {}
     for layer in range(49):
         prefix = f"model.layers.{layer}" if layer < 48 else "mtp.layers.48"
@@ -319,12 +322,12 @@ def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget():
     )
     groups = get_kv_cache_groups(config, specs)
     # Includes target/draft history, compressor and speculative recurrent state.
-    cache = get_kv_cache_config_from_groups(config, groups, 560 * 1024**2)
+    cache = get_kv_cache_config_from_groups(config, groups, device_budget_mib * 1024**2)
     device_bytes = sum(t.size for t in cache.kv_cache_tensors if not t.host_backed)
     host_bytes = sum(t.size for t in cache.kv_cache_tensors if t.host_backed)
-    assert device_bytes <= 560 * 1024**2
+    assert device_bytes <= device_budget_mib * 1024**2
     assert 13 * 1024**3 <= host_bytes * 4 <= 15 * 1024**3
-    assert cache.device_state_blocks == 32
+    assert cache.device_state_blocks == state_blocks
     assert get_max_concurrency_for_kv_cache_config(config, cache) >= 1
 
 
