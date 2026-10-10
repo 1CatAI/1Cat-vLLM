@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -520,6 +521,35 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
         self.final_logit_softcapping = softcap if softcap > 0 else None
 
+    def prepare_sm70_nvfp4_draft_head(self) -> None:
+        policy = self._sm70_dflash2_policy
+        head = self.lm_head
+        if (
+            getattr(self, "sm70_nvfp4_draft_head", None) is not None
+            or policy is None
+            or not policy.qualified
+            or envs.VLLM_BATCH_INVARIANT
+            or not current_platform.is_device_capability(70)
+            or not getattr(head, "sm70_fp8_turbomind", False)
+            or not getattr(head, "sm70_fp8_channel_scale", False)
+            or (head.num_embeddings_per_partition, head.embedding_dim) != (62080, 5120)
+            or not all(
+                hasattr(torch.ops._C, name)
+                for name in (
+                    "fp8_sm70_dequantize_out",
+                    "nvfp4_qpn2_prepare_sm70",
+                    "nvfp4_qpn2_gemm_sm70_out",
+                )
+            )
+        ):
+            return
+        from vllm.model_executor.layers.quantization.sm70_dflash2_nvfp4_head import (
+            SM70DFlash2NVFP4Head,
+        )
+
+        self.sm70_nvfp4_draft_head = SM70DFlash2NVFP4Head.from_turbomind_head(head)
+        logger.info_once("SM70 DFlash2 private NVFP4 M8 candidate head prepared.")
+
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
@@ -547,14 +577,22 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             )
 
         selector = self.model.candidate_selector
+        private_head = getattr(self, "sm70_nvfp4_draft_head", None)
+        private_logits = (
+            private_head(hidden_states) if private_head is not None else None
+        )
         local_candidates = (
             self.lm_head.maybe_get_sm70_dflash2_top20(hidden_states, selector.top_k)
-            if unquantized_head
+            if unquantized_head and private_logits is None
             else None
         )
         if local_candidates is None:
-            logits = self.lm_head.quant_method.apply(
-                self.lm_head, hidden_states, bias=None
+            logits = (
+                private_logits
+                if private_logits is not None
+                else self.lm_head.quant_method.apply(
+                    self.lm_head, hidden_states, bias=None
+                )
             )
             num_pad = self.lm_head.shard_indices.num_org_vocab_padding
             if num_pad > 0:
