@@ -294,6 +294,20 @@ def test_closure_rejects_new_forward_and_dynamic_reader_inside_config_directory(
     assert any("unclassified legacy consumer" in error for error in errors)
 
 
+def test_startup_consumers_cannot_reinterpret_migrated_aliases():
+    from tools.config_boundaries import consumer_lifecycle
+
+    for scope in (
+        "VllmConfig.__post_init__",
+        "VllmConfig.__post_init__.enable_quant_fp8_custom_op_for_blocked_weights",
+        "VllmConfig._set_compile_ranges",
+    ):
+        site = dict(path="vllm/config/vllm.py", scope=scope, line=1, kind="envs")
+        assert (
+            consumer_lifecycle("VLLM_SM70_FP8_TURBOMIND", site, None) == "unclassified"
+        )
+
+
 def test_native_copied_helpers_must_be_unreachable_from_registered_entry():
     from tools.config_inventory import native_retained_lifecycles, native_scopes
 

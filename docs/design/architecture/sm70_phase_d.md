@@ -8,6 +8,37 @@ state on the authorized 54633 machine; no model throughput claim is made.
 
 ## Parameter and consumer ledger
 
+### Startup consistency follow-up
+
+Audit baseline: `16628e2f0` (after Phase E). Ownership classification alone
+did not prove that startup consumers honored the final typed policy. The
+DFlash adaptive-lookup scheduling guard, blocked-FP8 custom-op admission and
+compile-range endpoint now consume their existing owners. Lookup binds only
+the adaptive flag at the scheduling checkpoint; unrelated tuning errors keep
+their later validation point. The same policy then reaches the speculator.
+
+Engine startup excludes policy-owned aliases from eager process-environment
+caching using the same declarations as compile hashing. It does not inject
+engine values into the process cache. Independent compatibility reads retain
+their parsers, and a failed cache initialization is never published. The
+inventory gate no longer exempts the three migrated startup consumers merely
+because they are initialization code.
+
+CPU regression coverage:
+
+```bash
+.venv/bin/python -m pytest --confcutdir=tests/config -q \
+  tests/config/test_startup_policy_consistency.py \
+  tests/config/test_runtime_default_ownership.py \
+  tests/config/test_sm70_provider_lifecycle.py \
+  tests/config/test_flash_v100_lifecycle.py
+```
+
+Result: 87 passed, one CUDA capture test skipped on the CPU host. The new
+tests execute the original startup statements with synthetic device/model
+metadata and check conflicting overrides, deferred errors and process-cache
+failure recovery. No model, GPU numerical or throughput claim is made.
+
 The reproducible, individual-parameter ledger is generated from the actual
 registry, typed alias declarations and consumer source:
 
