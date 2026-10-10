@@ -59,5 +59,4 @@ exec "$VLLM_PYTHON" -m vllm.entrypoints.cli.main serve "$MODEL" \
   --gpu-memory-utilization "$GPU_UTIL" --enable-prefix-caching --mamba-cache-mode align \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --language-model-only --compilation-config '{"mode":3,"cudagraph_mode":"FULL"}' \
-  --offload-config '{"ple":{"cpu":true,"hybrid":true,"disk":true,"host_gib":0}}' \
   --kernel-config "$KERNEL_CONFIG" --speculative-config "$SPEC_CONFIG"
