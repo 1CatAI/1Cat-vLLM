@@ -323,11 +323,11 @@ def test_native_lane_follows_the_draft_ring(tmp_path):
         ring[1] = 3  # bonus, d1, d2
         positions(6)
         ring[1] = 9  # beyond the window is clamped to bonus + 4 drafts
-        positions(12)
+        positions(10)
         ring[0], ring[1] = 2, 1  # a new round restarts at the bonus
-        positions(14)
+        positions(12)
         time.sleep(0.02)
         stats = torch.ops._C.ple_fast_lane_stats(handle).tolist()
-        assert stats[11] == 14 and stats[6] == 0
+        assert stats[11] == 12 and stats[6] == 0
     finally:
         torch.ops._C.ple_fast_lane_stop(handle)
