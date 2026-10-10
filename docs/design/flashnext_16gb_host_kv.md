@@ -220,3 +220,38 @@ cache allocation, actual graph capture and prefill peak checks.
 The source runtime also requires TileLang 0.1.10 from the CUDA requirements.
 A missing package caused the FlashQLA prefill warmup import to fail; the source
 launcher now checks its presence before loading weights.
+
+### Pinned history allocation
+
+The sixth startup passed GPU KV admission (0.35 GiB available versus 0.27 GiB
+required), then hit its 27 GiB host-memory service limit while allocating
+history. The CUDA pinned caching allocator rounds individual allocations to
+powers of two. Thirteen 295,796,736-byte main history banks and thirteen
+18,487,296-byte compressed banks request 3.805 GiB per rank, but independent
+allocation reserves 6.906 GiB per rank, or 27.625 GiB across TP4.
+
+Both model runners now place host cache banks in one 256-byte-aligned pinned
+pool per worker. Individual views preserve sharing, mapped storage ownership,
+zero initialization and graph pointers. The same payload rounds to 4 GiB per
+rank, saving 11.625 GiB of host reservations across TP4. This changes storage
+allocation, not KV values or block addressing.
+
+A four-rank allocation test using the complete 256K geometry passed layer
+boundary checks and changed-input graph replay. Process-group memory peaked
+at 18.7 GiB without swap, and host available memory remained 9.64 GiB.
+Three targeted pool tests also passed. These tests establish pool capacity
+and ownership; whole-model startup and acceptance remain pending.
+
+The original TileLang prefill route also passed a 512-token comparison with
+an independent FP32 recurrence: maximum absolute error 1.69e-6, relative L2
+4.45e-4, and changed-input graph output/state identical to eager. Its SM70
+NVRTC callback needs the CUDA runtime, NVCC and CCCL pip header packages even
+when a system CUDA toolkit is installed. Install the two additional header
+packages with the CUDA 12.8 constraints and retain the declared Torch runtime:
+
+```bash
+python -m pip install -c examples/deployment/sm70_flashnext_gguf/constraints-cu128.txt \
+  nvidia-cuda-nvcc-cu12 nvidia-cuda-cccl-cu12
+```
+
+The source launcher checks these header packages before loading weights.

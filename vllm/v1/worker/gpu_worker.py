@@ -1028,7 +1028,10 @@ class Worker(WorkerBase):
                 {
                     "target": self.model_runner.model,
                     "draft": getattr(
-                        getattr(self.model_runner, "drafter", None), "model", None
+                        getattr(self.model_runner, "speculator", None)
+                        or getattr(self.model_runner, "drafter", None),
+                        "model",
+                        None,
                     ),
                 }
             ),

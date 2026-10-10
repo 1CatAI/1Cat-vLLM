@@ -24,11 +24,23 @@ export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 # Host history pools are about 15.3 GiB for this geometry. Reserve another 6 GiB
 # for workers, staging and the bounded CPU row cache before any GPU is touched.
 "$VLLM_PYTHON" - <<'PY'
+import importlib.metadata
 import importlib.util
 import shutil
 from pathlib import Path
 if importlib.util.find_spec('tilelang') is None:
     raise SystemExit('TileLang from requirements/cuda.txt is required for FlashQLA')
+for name, relative in (
+    ('nvidia-cuda-runtime-cu12', 'nvidia/cuda_runtime/include'),
+    ('nvidia-cuda-nvcc-cu12', 'nvidia/cuda_nvcc/include'),
+    ('nvidia-cuda-cccl-cu12', 'nvidia/cuda_cccl/include'),
+):
+    try:
+        headers = importlib.metadata.distribution(name).locate_file(relative)
+    except importlib.metadata.PackageNotFoundError:
+        raise SystemExit(f'FlashQLA NVRTC requires CUDA headers from {name}')
+    if not Path(headers).is_dir():
+        raise SystemExit(f'FlashQLA CUDA header directory is missing for {name}')
 if not shutil.which('ninja'):
     raise SystemExit('Ninja is required in the source environment for FlashQLA')
 if not shutil.which('nvcc'):
