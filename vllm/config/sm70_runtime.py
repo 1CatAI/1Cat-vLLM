@@ -9,20 +9,28 @@ from typing import ClassVar
 import torch
 from pydantic import Field
 
-from vllm.config.diagnostic_dump import TensorDiagnosticsConfig
+from vllm.config.diagnostic_dump import (
+    DUMP_BINDINGS,
+    TensorDiagnosticsConfig,
+    TensorDumpConfig,
+)
 from vllm.config.diagnostic_sampling import SamplingDiagnosticsConfig
 from vllm.config.flash_v100 import FlashV100Diagnostics
 from vllm.config.sm70_dflash2 import DFlashDiagnosticsConfig
+from vllm.config.turboquant_runtime import TurboQuantDiagnostics
 from vllm.config.utils import config
 
 
-def resolve_legacy_fields(policy, aliases, *, inactive_defaults=None, reader=None):
+def resolve_legacy_fields(
+    policy, aliases, *, inactive_defaults=None, reader=None, deferred_errors=None
+):
     from vllm.config.utils import resolve_legacy_fields as resolve
 
     resolve(
         policy,
         aliases,
         inactive_defaults=inactive_defaults,
+        deferred_errors=deferred_errors,
         reader=reader,
         source_overrides={"VLLM_SM70_MTP_PROFILE": "VLLM_SM70_DEBUG"}
         if "VLLM_SM70_DEBUG" in os.environ
@@ -33,6 +41,30 @@ def resolve_legacy_fields(policy, aliases, *, inactive_defaults=None, reader=Non
 @config
 class Sm70RuntimeConfig:
     """Warmup policy; does not alter the compiled model computation."""
+
+    legacy_output_token_repair: bool | None = None
+    """Retain the async output-history rollback for speculative and ordinary runs."""
+    input_aliases: ClassVar[dict[str, str]] = {
+        "legacy_output_token_repair": "VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR",
+    }
+
+    awq_warmup: bool | None = None
+    """Run the existing quantized-kernel warmup at the original checkpoint."""
+    awq_warmup_max_moe_tokens: int | None = None
+    """Largest MoE warmup shape, clamped by the consumer's decode sizes."""
+    fp8_coordinated_tuning: bool | None = None
+    """Share the existing authoritative tensor-parallel tuning plan."""
+    gemm_lut_path: str | None = None
+    """Optional tuning-cache template; device/rank expansion remains worker-local."""
+    errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Deferred errors for options skipped by the original warmup gates."""
+
+    warmup_aliases: ClassVar[dict[str, str]] = {
+        "awq_warmup": "VLLM_SM70_AWQ_WARMUP",
+        "awq_warmup_max_moe_tokens": "VLLM_SM70_AWQ_WARMUP_MAX_MOE_TOKENS",
+        "fp8_coordinated_tuning": "VLLM_SM70_FP8_COORDINATED_TUNING",
+        "gemm_lut_path": "VLLM_SM70_GEMM_LUT_PATH",
+    }
 
     awq_warmup_max_m: int | None = None
     """Largest dense AWQ warmup shape; platform default applies at engine init."""
@@ -47,7 +79,21 @@ class Sm70RuntimeConfig:
     sources: dict[str, str] = Field(default_factory=dict, init=False)
     """Initialization provenance, excluded from compiled computation."""
 
+    def value(self, field):
+        if field in self.errors:
+            raise ValueError(self.errors[field])
+        return getattr(self, field)
+
     def __post_init__(self) -> None:
+        resolve_legacy_fields(
+            self,
+            {
+                field: alias
+                for field, alias in (self.warmup_aliases | self.input_aliases).items()
+                if field not in self.sources
+            },
+            deferred_errors=self.errors,
+        )
         resolve_legacy_fields(
             self,
             {
@@ -57,6 +103,20 @@ class Sm70RuntimeConfig:
                 "mtp_concurrency_warmup": "VLLM_SM70_MTP_CONCURRENCY_WARMUP",
             },
         )
+
+
+def bind_output_token_repair(policy=None):
+    """Bind a narrow deferred value; old standalone batches capture only their flag."""
+    from functools import partial
+
+    if policy is not None:
+        return partial(policy.value, "legacy_output_token_repair")
+    from vllm.config.legacy_inputs import LegacyInputs
+
+    inputs = LegacyInputs()
+    alias = Sm70RuntimeConfig.input_aliases["legacy_output_token_repair"]
+    inputs.capture((alias,))
+    return partial(inputs.value, alias)
 
 
 @config
@@ -92,6 +152,9 @@ def capture_runtime_config() -> Sm70RuntimeConfig:
 class RuntimeTraceConfig:
     """Captured runner diagnostics; never part of compiled computation."""
 
+    turboquant: TurboQuantDiagnostics = Field(default_factory=TurboQuantDiagnostics)
+    """Packed-cache compare policy; counters and outputs share engine diagnostics."""
+
     flash_v100: FlashV100Diagnostics = Field(default_factory=FlashV100Diagnostics)
     """Attention comparison, native trace and route observations."""
 
@@ -107,6 +170,9 @@ class RuntimeTraceConfig:
     """Shared tensor-diagnostic policy; mutable observations are engine-owned."""
 
     layer_aliases: ClassVar[dict[str, str]] = {
+        "gdn_empty_output_notice": "VLLM_SM70_GDN_EMPTY_CORE_OUT",
+        "gdn_legacy_fused_notice": "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING",
+        "require_profile_acceleration": "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
         "gdn_route_debug": "VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG",
         "gdn_mixed_compare": "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE",
         "sync_before_compile": "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD",
@@ -116,8 +182,19 @@ class RuntimeTraceConfig:
         "qwen_next_trace": "VLLM_QWEN3_NEXT_SM70_TRACE",
         "unquant_debug": "VLLM_SM70_UNQUANT_DEBUG",
         "profile_trace": "VLLM_SM70_PROFILE_TRACE",
+        "qwen_mlp_internals": "VLLM_SM70_DUMP_QWEN_MLP_INTERNALS",
+        "mtp_load": "VLLM_DEBUG_MTP_LOAD",
+        "mtp_load_verbose": "VLLM_DEBUG_MTP_LOAD_VERBOSE",
         "greedy_token_trace": "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE",
     }
+
+    gdn_empty_output_notice: bool | None = None
+    """Explain the retained paused empty-output experiment; allocation stays zeroed."""
+    gdn_legacy_fused_notice: bool | None = None
+    """Explain the replaced coarse gate when its legacy name was explicitly set."""
+
+    require_profile_acceleration: bool | None = None
+    """Fail initialization when required profile capabilities are unavailable."""
 
     gdn_route_debug: bool | None = None
     """Bounded GDN decode-admission reports."""
@@ -139,6 +216,12 @@ class RuntimeTraceConfig:
     """Explain unquantized fallback projections."""
     profile_trace: bool | None = None
     """Trace retained model/layer route events without changing computation."""
+    qwen_mlp_internals: bool | None = None
+    """Admit the retained intermediate MLP tensor observation points."""
+    mtp_load: bool | None = None
+    """Report draft weight preparation at the original loading checkpoints."""
+    mtp_load_verbose: bool | None = None
+    """Include detailed draft parameter names only when loading trace is enabled."""
     greedy_token_trace: bool | None = None
     """Explain local greedy-token fastpath admission."""
     async_cpu: bool | None = None
@@ -157,6 +240,21 @@ class RuntimeTraceConfig:
     errors: dict[str, str] = Field(default_factory=dict, init=False)
     """Deferred parse errors from model-qualified diagnostic inputs."""
 
+    def dump_channels(self):
+        return {
+            **{name: getattr(self.dumps, name) for name in DUMP_BINDINGS},
+            **self.dflash.dump_channels(),
+            **self.turboquant.dump_channels(),
+        }
+
+    @staticmethod
+    def legacy_dump_channel(name):
+        if name in DUMP_BINDINGS:
+            policy = TensorDumpConfig()
+            policy.resolve(name)
+            return policy
+        return DFlashDiagnosticsConfig.legacy_dump_channel(name)
+
     def value(self, field: str):
         if field in self.errors:
             raise ValueError(self.errors[field])
@@ -166,16 +264,27 @@ class RuntimeTraceConfig:
         if self.sources:
             return
         self.flash_v100.resolve()
+        self.turboquant.resolve()
         from vllm import envs
 
         def read_flag(name):
+            if name == "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING":
+                return name in os.environ
+            if name == "VLLM_SM70_DUMP_QWEN_MLP_INTERNALS":
+                return os.getenv(name) == "1"
             try:
                 value = envs.environment_variables[name]()
             except ValueError as exc:
                 field = next(
                     (
                         field
-                        for field in ("gdn_route_debug", "gdn_mixed_compare")
+                        for field in (
+                            "gdn_route_debug",
+                            "gdn_empty_output_notice",
+                            "gdn_mixed_compare",
+                            "mtp_load",
+                            "mtp_load_verbose",
+                        )
                         if self.layer_aliases[field] == name
                     ),
                     None,
@@ -235,6 +344,8 @@ class SpecDecodeTraceConfig:
     """Legacy target-logit trace, enabled only by the exact string '1'."""
     target_min_position: int | None = None
     """First traced target position, default 8; not a computation policy."""
+    min_position_error: str | None = Field(default=None, init=False)
+    """Deferred malformed threshold, parsed once with its compatibility input."""
     legacy_min_position: str | None = Field(default=None, init=False, repr=False)
     """Captured raw threshold; parse only when a speculative consumer initializes."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)
@@ -252,21 +363,22 @@ class SpecDecodeTraceConfig:
         alias = self.legacy_fields["target_min_position"]
         if self.target_min_position is None:
             # The legacy threshold was not parsed when tracing was disabled.
-            raw = envs.environment_variables[alias]() if self.target_logits else None
+            raw = envs.environment_variables[alias]()
             self.legacy_min_position = raw
+            try:
+                self.target_min_position = int(raw if raw is not None else "8")
+            except ValueError as exc:
+                self.target_min_position = 8
+                self.min_position_error = str(exc)
             self.sources["target_min_position"] = (
                 alias if alias in os.environ and raw is not None else "default"
             )
         else:
             self.sources["target_min_position"] = "typed"
 
-    def resolve(self) -> "SpecDecodeTraceConfig":
-        if self.target_min_position is None:
-            self.target_min_position = int(
-                self.legacy_min_position
-                if self.legacy_min_position is not None
-                else "8"
-            )
+    def resolve(self, *, required=False) -> "SpecDecodeTraceConfig":
+        if self.min_position_error is not None and (self.target_logits or required):
+            raise ValueError(self.min_position_error)
         return self
 
 
@@ -283,3 +395,16 @@ def capture_runtime_trace():
 @torch.compiler.assume_constant_result
 def _standalone_runtime_trace():
     return RuntimeTraceConfig()
+
+
+def capture_spec_decode_trace():
+    from vllm.runtime_resources import current_runtime_resources
+
+    resources = current_runtime_resources()
+    if resources is not None and resources.get("spec_decode_trace") is not None:
+        return resources["spec_decode_trace"]
+    return SpecDecodeTraceConfig()
+
+
+def target_trace_min_position() -> int:
+    return capture_spec_decode_trace().resolve(required=True).target_min_position

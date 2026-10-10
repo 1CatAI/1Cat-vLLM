@@ -9,7 +9,6 @@ from itertools import islice
 import torch
 from torch import nn
 
-import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
@@ -244,7 +243,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 prefix=f"{prefix}.shared_expert",
             )
             if (
-                envs.VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP
+                layer_policy().value("disable_shared_moe_overlap")
                 or not layer_policy().shared_moe_overlap
             ):
                 self.shared_expert._vllm_disable_shared_experts_stream = True

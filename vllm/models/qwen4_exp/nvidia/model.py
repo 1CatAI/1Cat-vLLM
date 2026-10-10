@@ -10,11 +10,11 @@ from typing import Any
 import torch
 from torch import nn
 
-from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.execution_policy import communication_policy, graph_policy
+from vllm.config.sm70_sparse import sparse_policy
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -174,7 +174,7 @@ def _validate_qsa_e4m3_scale_load(
     missing_scales = sorted(required_scales - loaded)
     if not missing_scales:
         return set()
-    if envs.VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES:
+    if sparse_policy().value("qsa_strict_scales"):
         raise ValueError(
             "QSA E4M3 scale overlay is incomplete; refusing to start. "
             f"Loaded {len(required_scales) - len(missing_scales)}/"

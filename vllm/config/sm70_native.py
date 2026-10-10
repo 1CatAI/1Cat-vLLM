@@ -201,6 +201,27 @@ NATIVE_FIELDS = (
         ("awq", "fp8", "mxfp4", "nvfp4", "gguf"),
         True,
     ),
+    ("fp8_qpn8_m16", "VLLM_SM70_FP8_QPN8_M16", ("fp8",), False),
+    ("fp8_qpn8_m32_chunked", "VLLM_SM70_FP8_QPN8_M32_CHUNKED", ("fp8",), False),
+    ("fp8_qpn8_m32_native", "VLLM_SM70_FP8_QPN8_M32_NATIVE", ("fp8",), False),
+    (
+        "glm_exact_kda_half2_rows",
+        "VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS",
+        ("f16",),
+        False,
+    ),
+    (
+        "dflash_sharded_context_fc",
+        "VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC",
+        ("f16",),
+        False,
+    ),
+    (
+        "tm_gemm_cache_summary",
+        "TM_GEMM_CACHE_SUMMARY",
+        ("awq", "fp8", "mxfp4", "nvfp4", "gguf", "f16"),
+        True,
+    ),
 )
 
 UNSET = "\x1f"
@@ -324,14 +345,37 @@ class Sm70NativeConfig:
     """Native compatibility input VLLM_SM70_NVFP4_TUNE_SMALL_SHAPES."""
     profile_trace: bool | None = None
     """Native compatibility input VLLM_SM70_PROFILE_TRACE."""
+    fp8_qpn8_m16: bool | None = None
+    """Native initialization input VLLM_SM70_FP8_QPN8_M16."""
+    fp8_qpn8_m32_chunked: bool | None = None
+    """Native initialization input VLLM_SM70_FP8_QPN8_M32_CHUNKED."""
+    fp8_qpn8_m32_native: bool | None = None
+    """Native initialization input VLLM_SM70_FP8_QPN8_M32_NATIVE."""
+    glm_exact_kda_half2_rows: int | None = None
+    """Native initialization input VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS."""
+    dflash_sharded_context_fc: bool | None = None
+    """Native initialization input VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC."""
+    tm_gemm_cache_summary: bool | None = None
+    """Native initialization input TM_GEMM_CACHE_SUMMARY."""
     values: tuple[str, ...] = Field(default=(), init=False)
     """Frozen native ABI values, prepared once for this format."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)
     """Provenance of the captured values; excluded from graph fingerprints."""
 
+    legacy_inputs: dict[str, str] | None = Field(default=None, init=False)
+    """Raw native dialect captured by the parent engine before worker transfer."""
+
+    def capture_inputs(self) -> None:
+        if self.legacy_inputs is None:
+            self.legacy_inputs = {
+                alias: os.getenv(alias, UNSET) for _, alias, _, _ in NATIVE_FIELDS
+            }
+
     def resolve(self, family: str, overrides: dict[str, Any] | None = None) -> None:
         if self.values:
             return
+        self.capture_inputs()
+        assert self.legacy_inputs is not None
         overrides = overrides or {}
         values = []
         for field, alias, families, diagnostic in NATIVE_FIELDS:
@@ -350,7 +394,7 @@ class Sm70NativeConfig:
                 value = overrides[alias]
                 source = "configuration"
             if value is None:
-                value = os.getenv(alias, UNSET)
+                value = self.legacy_inputs[alias]
                 source = alias if value != UNSET else "default"
             elif isinstance(value, bool):
                 value = "1" if value else "0"
@@ -438,6 +482,11 @@ def compile_ignored_aliases(kernel) -> set[str]:
         and field not in {"awq_tune_small_shapes"}
         and not field.startswith("moe_single_token_")
     }
+    for family in ("awq", "fp8", "nvfp4"):
+        policy = getattr(kernel, "sm70_" + family)
+        if policy.legacy.captured:
+            ignored.update(policy.input_aliases)
+            ignored.update(policy.loader_aliases.values())
     ignored.update(SM70_NVFP4_LINEAR_ALIASES.values())
     ignored.update(
         name for field, name in SM70_AWQ_LINEAR_ALIASES.items() if field != "enabled"

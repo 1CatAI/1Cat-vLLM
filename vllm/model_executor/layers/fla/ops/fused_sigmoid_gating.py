@@ -7,114 +7,45 @@
 # the following copyright notice:
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-import os
-
 import torch
 
+from vllm.config.gdn_schedule import resolve_schedule
 from vllm.triton_utils import tl, triton
 
 from .op import exp
 
 
-def _parse_positive_int_env(name: str) -> int | None:
-    value = os.getenv(name)
-    if value is None:
-        return None
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
-_SM70_FUSED_SIGMOID_SCHEDULE = (
-    os.getenv("VLLM_SM70_FUSED_SIGMOID_GATING_SCHED", "1") == "1"
-)
-_SM70_FUSED_SIGMOID_BV_OVERRIDE = _parse_positive_int_env(
-    "VLLM_SM70_FUSED_SIGMOID_GATING_BV"
-)
-_SM70_FUSED_SIGMOID_WARPS_OVERRIDE = _parse_positive_int_env(
-    "VLLM_SM70_FUSED_SIGMOID_GATING_WARPS"
-)
-_SM70_FUSED_SIGMOID_STAGES_OVERRIDE = _parse_positive_int_env(
-    "VLLM_SM70_FUSED_SIGMOID_GATING_STAGES"
-)
-_SM70_FUSED_SIGMOID_HAS_LEGACY_OVERRIDE = any(
-    os.getenv(name) not in (None, "")
-    for name in (
-        "VLLM_SM70_FUSED_SIGMOID_GATING_BV",
-        "VLLM_SM70_FUSED_SIGMOID_GATING_WARPS",
-        "VLLM_SM70_FUSED_SIGMOID_GATING_STAGES",
-    )
-)
-
-
 def _use_sm70_fused_sigmoid_schedule(device: torch.device, schedule=None) -> bool:
+    schedule = resolve_schedule(schedule)
     from .fused_recurrent import _is_sm70_device
 
     return _is_sm70_device(device) and (
-        (
-            schedule.sigmoid_enabled
-            if schedule is not None
-            else _SM70_FUSED_SIGMOID_SCHEDULE
-        )
-        or (
-            schedule.sigmoid_override
-            if schedule is not None
-            else _SM70_FUSED_SIGMOID_HAS_LEGACY_OVERRIDE
-        )
+        schedule.sigmoid_enabled or schedule.sigmoid_override
     )
 
 
 def _select_fused_sigmoid_schedule(
     V: int, N: int, HV: int, device: torch.device, schedule=None
 ) -> tuple[int, int, int]:
+    schedule = resolve_schedule(schedule)
     del N, HV, device
 
     from .fused_recurrent import _round_num_warps
 
     v_pow2 = triton.next_power_of_2(V)
-    if (
-        schedule.sigmoid_bv if schedule is not None else _SM70_FUSED_SIGMOID_BV_OVERRIDE
-    ) is not None:
+    if schedule.sigmoid_bv is not None:
         BV = min(
             v_pow2,
-            triton.next_power_of_2(
-                schedule.sigmoid_bv
-                if schedule is not None
-                else _SM70_FUSED_SIGMOID_BV_OVERRIDE
-            ),
+            triton.next_power_of_2(schedule.sigmoid_bv),
         )
     else:
         BV = min(v_pow2, 32)
     num_warps = (
-        _round_num_warps(
-            schedule.sigmoid_warps
-            if schedule is not None
-            else _SM70_FUSED_SIGMOID_WARPS_OVERRIDE
-        )
-        if (
-            schedule.sigmoid_warps
-            if schedule is not None
-            else _SM70_FUSED_SIGMOID_WARPS_OVERRIDE
-        )
-        is not None
+        _round_num_warps(schedule.sigmoid_warps)
+        if schedule.sigmoid_warps is not None
         else 4
     )
-    num_stages = (
-        (
-            schedule.sigmoid_stages
-            if schedule is not None
-            else _SM70_FUSED_SIGMOID_STAGES_OVERRIDE
-        )
-        if (
-            schedule.sigmoid_stages
-            if schedule is not None
-            else _SM70_FUSED_SIGMOID_STAGES_OVERRIDE
-        )
-        is not None
-        else 3
-    )
+    num_stages = schedule.sigmoid_stages if schedule.sigmoid_stages is not None else 3
     return BV, num_warps, num_stages
 
 
@@ -128,6 +59,7 @@ def _select_fused_sigmoid_launch(
     match_recurrent_schedule: bool,
     schedule=None,
 ) -> tuple[int, int, int]:
+    schedule = resolve_schedule(schedule)
     if not _use_sm70_fused_sigmoid_schedule(device, schedule=schedule):
         return min(triton.next_power_of_2(V), 32), 4, 3
     if not match_recurrent_schedule:
@@ -418,6 +350,7 @@ def fused_sigmoid_gating_delta_rule_update(
     This function uses a single fused kernel that combines both sigmoid gating
     computation and the recurrent delta rule update for better performance.
     """
+    schedule = resolve_schedule(schedule)
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
@@ -543,6 +476,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     schedule=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused update that reads q/k/v directly from a packed mixed-qkv row."""
+    schedule = resolve_schedule(schedule)
     if mixed_qkv.ndim != 2:
         raise ValueError("mixed_qkv must have shape [T, qkv_hidden].")
     if mixed_qkv.stride(1) != 1:
@@ -703,6 +637,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     Omitting both computes gating inside the recurrent kernel.
     Row-strided QKV views with contiguous features are consumed without a copy.
     """
+    schedule = resolve_schedule(schedule)
     if mixed_qkv.ndim != 2:
         raise ValueError("mixed_qkv must have shape [T, qkv_hidden].")
     # Qwen's QKV view shares rows with Z/b/a; convolution preserves that
@@ -813,19 +748,13 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         and use_qk_l2norm_in_kernel
         and not quantize_state_each_step
         and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device, schedule=schedule)
+        and not schedule.recurrent_override
     ):
-        from .fused_recurrent import _SM70_FLA_HAS_LEGACY_OVERRIDE
-
-        if not (
-            schedule.recurrent_override
-            if schedule is not None
-            else _SM70_FLA_HAS_LEGACY_OVERRIDE
-        ):
-            # Independent V tiles share the unchanged K128 reduction. Smaller
-            # one-warp tiles shorten the single-request verifier's register
-            # dependency chains; output and all eight snapshots stay bitwise
-            # identical. Batched requests retain their qualified geometry.
-            BV = 2
+        # Independent V tiles share the unchanged K128 reduction. Smaller
+        # one-warp tiles shorten the single-request verifier's register
+        # dependency chains; output and all eight snapshots stay bitwise
+        # identical. Batched requests retain their qualified geometry.
+        BV = 2
     if (
         4 <= N <= 32
         and (T, H, HV, K, V) == (N * 8, 4, 12, 128, 128)
@@ -840,22 +769,16 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         and use_qk_l2norm_in_kernel
         and not quantize_state_each_step
         and _use_sm70_fused_sigmoid_schedule(mixed_qkv.device, schedule=schedule)
+        and not schedule.recurrent_override
     ):
-        from .fused_recurrent import _SM70_FLA_HAS_LEGACY_OVERRIDE
-
-        if not (
-            schedule.recurrent_override
-            if schedule is not None
-            else _SM70_FLA_HAS_LEGACY_OVERRIDE
-        ):
-            # The q8 verifier writes eight FP32 state snapshots per request.
-            # BV32 overfills each one-warp tile as batch grows. Admit the
-            # operator family, including non-power-of-two batches such as N6,
-            # rather than selected service concurrency counts. Larger batches
-            # retain BV32, where the extra CTAs no longer help. BV8 keeps the
-            # same K reduction and recurrence while exposing more independent
-            # V tiles; output and every stored state remain bitwise identical.
-            BV = 8
+        # The q8 verifier writes eight FP32 state snapshots per request.
+        # BV32 overfills each one-warp tile as batch grows. Admit the
+        # operator family, including non-power-of-two batches such as N6,
+        # rather than selected service concurrency counts. Larger batches
+        # retain BV32, where the extra CTAs no longer help. BV8 keeps the
+        # same K reduction and recurrence while exposing more independent
+        # V tiles; output and every stored state remain bitwise identical.
+        BV = 8
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
     assert NK == 1, "NK > 1 is not supported yet"
 

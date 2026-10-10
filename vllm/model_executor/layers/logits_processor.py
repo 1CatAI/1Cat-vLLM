@@ -2,16 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A layer that compute logits from hidden_stats."""
 
-import json
 import os
 import time
 from collections.abc import Callable
 
 import torch
 
-from vllm import envs
 from vllm.config import get_current_vllm_config_or_none
+from vllm.config.diagnostic_dump import (
+    parse_margin_steps as _parse_step_filter,  # noqa: F401 - legacy import
+)
+from vllm.config.diagnostic_dump import (
+    parse_token_probe as _parse_token_probe,  # noqa: F401 - legacy import
+)
 from vllm.config.execution_policy import communication_policy
+from vllm.diagnostics import diagnostic_channel, diagnostics_for
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -69,78 +74,33 @@ def _cuda_stage_ms(
     return start_event.elapsed_time(end_event)
 
 
-def _parse_step_filter(raw: str | None) -> set[int] | None:
-    if raw is None:
-        return None
-    steps: set[int] = set()
-    for item in raw.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "-" in item:
-            start_text, end_text = item.split("-", 1)
-            start = int(start_text)
-            end = int(end_text)
-            if start < 0 or end < start:
-                raise ValueError(f"invalid top-token margin step range: {item}")
-            steps.update(range(start, end + 1))
-            continue
-        step = int(item)
-        if step < 0:
-            raise ValueError(f"invalid top-token margin step: {item}")
-        steps.add(step)
-    return steps
-
-
-def _parse_token_probe(raw: str | None) -> list[int]:
-    if raw is None:
-        return []
-    token_ids: list[int] = []
-    for item in raw.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        token_id = int(item)
-        if token_id < 0:
-            raise ValueError(f"invalid top-token margin probe token: {item}")
-        token_ids.append(token_id)
-    return token_ids
+def _logits_channel(module, name):
+    return diagnostic_channel(name, owner=getattr(module, "_diagnostics", None))
 
 
 def _top_token_margin_dump_step(module: torch.nn.Module) -> int | None:
-    out_dir = envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR
-    if not out_dir:
+    channel = _logits_channel(module, "top_token_margin")
+    policy = channel.policy
+    if not policy.can_save():
         return None
-    enable_file = envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_ENABLE_FILE
-    if enable_file and not os.path.exists(enable_file):
+    key = str(id(module))
+    step = channel.advance(key)
+    if not policy.allows("steps", step):
         return None
-    step = int(getattr(module, "_sm70_top_token_margin_step", 0))
-    module._sm70_top_token_margin_step = step + 1
-    steps = _parse_step_filter(envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS)
-    if steps is not None and step not in steps:
+    if not channel.take(key, policy.value("max_dumps"), unlimited=True):
         return None
-    reports = int(getattr(module, "_sm70_top_token_margin_reports", 0))
-    max_reports = envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_MAX_REPORTS
-    if max_reports > 0 and reports >= max_reports:
-        return None
-    module._sm70_top_token_margin_reports = reports + 1
     return step
 
 
-def _write_top_token_margin_record(record: dict[str, object]) -> None:
-    out_dir = envs.VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_DIR
-    if not out_dir:
+def _write_top_token_margin_record(record: dict[str, object], *, channel=None) -> None:
+    if channel is None:
+        channel = diagnostic_channel("top_token_margin")
+    if not channel.policy.directory:
         return
-    os.makedirs(out_dir, exist_ok=True)
     device = (
         torch.accelerator.current_device_index() if torch.cuda.is_available() else "cpu"
     )
-    path = os.path.join(
-        out_dir,
-        f"top_token_margin_pid{os.getpid()}_cuda{device}.jsonl",
-    )
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, sort_keys=True) + "\n")
+    channel.append_json(f"top_token_margin_pid{os.getpid()}_cuda{device}.jsonl", record)
 
 
 def _cuda_graph_capture_active() -> bool:
@@ -158,19 +118,19 @@ def _cuda_graph_capture_active() -> bool:
 def _maybe_sync_top1_all_gather(
     module: torch.nn.Module, local_pair: torch.Tensor
 ) -> None:
-    raw_steps = envs.VLLM_SM70_SYNC_TOP1_ALLGATHER_STEPS
+    channel = _logits_channel(module, "top1_sync")
+    policy = channel.policy
+    raw_steps = policy.steps
     if not raw_steps or not local_pair.is_cuda:
         return
     if torch.compiler.is_compiling() or _cuda_graph_capture_active():
         return
 
-    step = int(getattr(module, "_sm70_top1_allgather_sync_step", 0)) + 1
-    module._sm70_top1_allgather_sync_step = step
-    target_steps = _parse_step_filter(raw_steps)
-    if target_steps is not None and step not in target_steps:
+    step = channel.advance(str(id(module)), start=1)
+    if not policy.allows("steps", step):
         return
 
-    mode = envs.VLLM_SM70_SYNC_TOP1_ALLGATHER_MODE.strip().lower()
+    mode = policy.mode.strip().lower()
     if mode == "d2h":
         _ = local_pair.detach().cpu()
     elif mode == "device":
@@ -217,6 +177,7 @@ class LogitsProcessor(PluggableLayer):
         # Whether to use gather or all-gather to gather the logits.
         self.use_all_gather = current_platform.use_all_gather()
         cfg = get_current_vllm_config_or_none()
+        self._diagnostics = diagnostics_for(cfg)
         self._top1_exchange = (
             cfg.kernel_config.top1_exchange_callback() if cfg else None
         )
@@ -793,8 +754,8 @@ class LogitsProcessor(PluggableLayer):
             selected_tokens = selected_tokens.to(logits.device).view(-1, 1)
             selected_vals = logits.gather(dim=-1, index=selected_tokens).squeeze(-1)
             margins = top_vals[:, 0] - top_vals[:, 1] if top_k > 1 else top_vals[:, 0]
-            probe_token_ids = _parse_token_probe(
-                os.getenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_PROBE_TOKENS")
+            probe_token_ids = _logits_channel(self, "top_token_margin").policy.parsed(
+                "probes"
             )
             if probe_token_ids:
                 valid_probe_token_ids = [
@@ -842,7 +803,8 @@ class LogitsProcessor(PluggableLayer):
                 "top1_top2_margins": margins.detach().float().cpu().tolist(),
                 "probe_token_ids": valid_probe_token_ids,
                 "probe_values": probe_values,
-            }
+            },
+            channel=_logits_channel(self, "top_token_margin"),
         )
 
     def _maybe_custom_top1_argmax(

@@ -4,6 +4,7 @@
 import pytest
 import torch
 
+from tests.models.qwen4_exp.qsa_policy_utils import set_qsa_option
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
@@ -31,8 +32,8 @@ def test_request_segments(query_start_loc, expected):
 
 
 def _enable_cublas(monkeypatch):
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS", True)
-    monkeypatch.setattr(qsa_ops, "_SM70_INDEXER_CUBLAS_MIN_ROWS", 512)
+    set_qsa_option(monkeypatch, "qsa_indexer_cublas", True)
+    set_qsa_option(monkeypatch, "qsa_cublas_min_rows", 512)
     monkeypatch.setattr(
         qsa_ops.current_platform,
         "is_device_capability",

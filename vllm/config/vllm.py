@@ -655,7 +655,7 @@ class VllmConfig:
         # scheduling, else the PP pipeline depth).
         pp_size = self.parallel_config.pipeline_parallel_size
         if pp_size <= 1 and self.scheduler_config.async_scheduling:
-            return max(2, envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH)
+            return max(2, self.scheduler_config.sm70_queue_depth())
         return pp_size
 
     @property
@@ -1161,6 +1161,7 @@ class VllmConfig:
                 and sm70_flash_next_batch_qualified(self)
             )
         )
+        self.kernel_config.capture_provider_inputs()
         self.kernel_config.sm70_nvfp4.resolve(
             qualified=sm70_dflash2_nvfp4_qualified(self), active=False
         )

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+#include "sm70_policy.h"
 #include <torch/all.h>
 #include <torch/library.h>
 
@@ -419,8 +420,8 @@ void sm70_glm53_fp16_gemv_out(torch::Tensor output, torch::Tensor input,
               "sm70_glm53_fp16_gemv_out: requires SM70");
   const cudaStream_t stream =
       at::cuda::getCurrentCUDAStream(input.device().index());
-  const char* variant_raw = std::getenv("VLLM_SM70_GLM53_EXACT_KDA_HALF2_ROWS");
-  const int variant = variant_raw == nullptr ? -5 : std::atoi(variant_raw);
+  const int variant = vllm::sm70::policy_atoi(
+      vllm::sm70::PolicyField::glm_exact_kda_half2_rows, -5, true);
   if (input.size(0) == 8 && variant != 0) {
     if (variant == -5) {
       glm53_fp16_gemv_half2_broadcast_staged_sm70_kernel<8, 4, true, false>

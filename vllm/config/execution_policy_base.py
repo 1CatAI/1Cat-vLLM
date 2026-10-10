@@ -45,3 +45,28 @@ class ExecutionPolicy:
             if self.active
             else {}
         )
+
+
+@config
+class DeferredExecutionPolicy(ExecutionPolicy):
+    """Capture all inputs once while retaining the consumer's error admission."""
+
+    errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Initialization parse failures raised only when the field is consumed."""
+
+    def resolve(self):
+        resolve_legacy_fields(
+            self,
+            {
+                field: alias
+                for field, alias in self.aliases.items()
+                if field not in self.sources
+            },
+            reader=type(self).legacy_reader,
+            deferred_errors=self.errors,
+        )
+
+    def value(self, field):
+        if field in self.errors:
+            raise ValueError(self.errors[field])
+        return getattr(self, field)

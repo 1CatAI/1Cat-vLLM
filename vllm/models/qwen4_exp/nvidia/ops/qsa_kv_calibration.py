@@ -4,11 +4,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
 import torch
+
+from vllm.diagnostics import diagnostic_channel
 
 _CALIBRATION_DIR_ENV = "VLLM_QSA_KV_CALIBRATION_DIR"
 _CORPUS_SHARD_ENV = "VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD"
@@ -39,7 +40,8 @@ def _summarize(tensor: torch.Tensor) -> dict[str, object]:
 
 def observe_qsa_kv(layer_id: int, key: torch.Tensor, value: torch.Tensor) -> None:
     """Append one normal-forward K/V observation when calibration is enabled."""
-    output_dir = os.getenv(_CALIBRATION_DIR_ENV)
+    channel = diagnostic_channel("qsa_calibration")
+    output_dir = channel.policy.directory
     if not output_dir:
         return
     path = Path(output_dir)
@@ -52,9 +54,7 @@ def observe_qsa_kv(layer_id: int, key: torch.Tensor, value: torch.Tensor) -> Non
     # Reading the tiny marker at each forward lets one initialized engine
     # collect multiple explicit corpus shards without admitting its startup
     # warmup into any shard. The environment remains a compatibility fallback.
-    corpus_shard = marker.read_text(encoding="utf-8").strip() or os.getenv(
-        _CORPUS_SHARD_ENV, "unspecified"
-    )
+    corpus_shard = marker.read_text(encoding="utf-8").strip() or channel.policy.mode
     path.mkdir(parents=True, exist_ok=True)
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         rank = str(torch.distributed.get_rank())
@@ -74,9 +74,9 @@ def observe_qsa_kv(layer_id: int, key: torch.Tensor, value: torch.Tensor) -> Non
         "k": _summarize(key),
         "v": _summarize(value),
     }
-    output_file = path / f"qsa-kv-rank{rank}-pid{os.getpid()}.jsonl"
-    with output_file.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+    channel.append_json(
+        f"qsa-kv-rank{rank}-pid{os.getpid()}.jsonl", record, compact=True
+    )
 
 
 __all__ = ["observe_qsa_kv"]

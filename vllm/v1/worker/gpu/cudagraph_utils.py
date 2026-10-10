@@ -523,7 +523,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         )
 
         if (
-            long_attention_enabled()
+            long_attention_enabled(vllm_config.attention_config.flash_v100.options)
             and current_platform.is_cuda()
             and current_platform.is_device_capability((7, 0))
             and self.dp_size == 1
@@ -534,8 +534,15 @@ class ModelCudaGraphManager(CudaGraphManager):
             # no model config leaves the bound at the declared capability.
             model_config = getattr(vllm_config, "model_config", None)
             served = int(getattr(model_config, "max_model_len", 0) or 0)
-            context_limit, query_rows = long_attention_graph_contract(served or None)
-            max_batch_size = min(self.max_num_reqs, long_attention_max_batch_size())
+            context_limit, query_rows = long_attention_graph_contract(
+                served or None, policy=vllm_config.attention_config.flash_v100.options
+            )
+            max_batch_size = min(
+                self.max_num_reqs,
+                long_attention_max_batch_size(
+                    policy=vllm_config.attention_config.flash_v100.options
+                ),
+            )
             if not _supports_sm70_long_batch_graphs(vllm_config):
                 max_batch_size = 1
             if context_limit is not None:

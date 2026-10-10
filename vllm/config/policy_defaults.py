@@ -11,7 +11,11 @@ import os
 from typing import Any
 
 from vllm import envs
-from vllm.config.execution_policy import POLICY_OWNERS, read_execution_legacy
+from vllm.config.execution_policy import (
+    BOUND_POLICY_OWNERS,
+    POLICY_OWNERS,
+    read_execution_legacy,
+)
 from vllm.config.sm70_dflash2 import SM70_DFLASH2_LEGACY_FIELDS
 
 
@@ -28,6 +32,15 @@ class PolicyDefaults:
         self.cfg = cfg
         self.phase = "platform.runtime"
         self.raw = dict(os.environ)
+        cfg.runtime_default_sources.setdefault(
+            "VLLM_DISABLE_COMPILE_CACHE",
+            [
+                {
+                    "source": "process_startup",
+                    "raw": self.raw.get("VLLM_DISABLE_COMPILE_CACHE", "0"),
+                }
+            ],
+        )
         self.bindings: dict[str, list[tuple[Any, str]]] = {}
         for path in POLICY_OWNERS:
             policy = _owner(cfg, path)
@@ -149,6 +162,7 @@ class PolicyDefaults:
             graph.mega_aot = bool(
                 graph.aot_compile and is_torch_equal_or_newer("2.12.0.dev")
             )
+        self.cfg.kernel_config.capture_provider_inputs()
         for name in EXTRA_BINDINGS:
             for policy, field in self.bindings[name]:
                 resolve_legacy_fields(
@@ -194,6 +208,7 @@ def finalize_runtime_policy_hashes(cfg):
     """Fingerprint computation, excluding diagnostics and unused feature knobs."""
     from vllm.model_executor.models.runtime_defaults import (
         _is_sm70_qwen38_decode_compile_contract,
+        uses_mtp_weight_policy,
     )
     from vllm.platforms.runtime_defaults import _any_participating_device_is_pre_ampere
 
@@ -203,6 +218,8 @@ def finalize_runtime_policy_hashes(cfg):
     graph_fields = ["aot_compile", "breakable", "mega_aot"]
     if pre_ampere:
         graph_fields.append("compile_graph")
+        if spec is not None:
+            graph_fields.append("gdn_spec_piecewise")
         graph_fields.extend(("decode_only_capture", "decode_partition_size"))
         if _is_sm70_qwen38_decode_compile_contract(
             cfg.model_config, spec, cfg.parallel_config
@@ -243,6 +260,12 @@ def finalize_runtime_policy_hashes(cfg):
     layers.hash_fields = (
         tuple(layers.aliases) if pre_ampere else ("shared_moe_overlap",)
     )
+    if not uses_mtp_weight_policy(cfg.model_config, spec):
+        layers.hash_fields = tuple(
+            field for field in layers.hash_fields if not field.startswith("mtp_")
+        )
+    elif not pre_ampere:
+        layers.hash_fields += ("mtp_share_io_weights", "mtp_keep_quant")
     tp = cfg.parallel_config.tensor_parallel_size
     comm = cfg.parallel_config.communication
     comm.native.active = tp > 1 and (
@@ -266,6 +289,13 @@ def finalize_runtime_policy_hashes(cfg):
                 field == "pp_layer_partition"
                 and cfg.parallel_config.pipeline_parallel_size > 1
             )
+            or (pre_ampere and field == "moe_sum2_q8" and tp == 8)
+            or (
+                pre_ampere
+                and field == "pp_static_hidden_transfer"
+                and tp == 4
+                and cfg.parallel_config.pipeline_parallel_size == 2
+            )
             or (pre_ampere and field == "tp4_push" and tp == 4)
             or (pre_ampere and field in ("tp8_hierarchical", "tp8_push") and tp == 8)
             or (pre_ampere and field == "moe_add_allreduce" and tp > 1)
@@ -279,6 +309,7 @@ def finalize_runtime_policy_hashes(cfg):
     cfg.offload_config.ple.active = bool(getattr(text, "ple_layer_ids", None))
     attention = cfg.attention_config
     backend_name = getattr(attention.backend, "name", attention.backend)
+    attention.sm70_triton.active = pre_ampere and backend_name in (None, "TRITON_ATTN")
     attention.flash_v100.active = pre_ampere and backend_name in (
         None,
         "FLASH_ATTN_V100",
@@ -368,8 +399,10 @@ def runtime_policy_report(cfg):
 
 def effective_runtime_values(cfg):
     values = {}
-    for path in POLICY_OWNERS:
+    for path in BOUND_POLICY_OWNERS:
         policy = _owner(cfg, path)
+        if policy is None:
+            continue
         values.update(
             {alias: getattr(policy, field) for field, alias in policy.aliases.items()}
         )
@@ -387,6 +420,8 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
     ignored: set[str] = set()
     for path in POLICY_OWNERS:
         policy = _owner(cfg, path)
+        if policy is None:
+            continue
         extra_aliases = getattr(policy, "compile_ignored_aliases", None)
         if extra_aliases is not None:
             ignored.update(extra_aliases())
@@ -398,10 +433,11 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
         for alias, paths in EXTRA_BINDINGS.items()
         if all(_owner(cfg, path) is not None for path in paths)
     )
-    native = cfg.parallel_config.communication.native
-    ignored.update(
-        alias for field, alias in native.aliases.items() if field in native.sources
-    )
+    native = _owner(cfg, "parallel_config.communication.native")
+    if native is not None:
+        ignored.update(
+            alias for field, alias in native.aliases.items() if field in native.sources
+        )
     trace = _owner(cfg, "observability_config.runtime_trace")
     if trace is not None:
         from vllm.config.diagnostic_dump import DUMP_BINDINGS
@@ -422,7 +458,27 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
         for field, alias in trace.layer_aliases.items():
             if field in trace.sources:
                 ignored.add(alias)
+    runtime = _owner(cfg, "kernel_config.sm70_runtime")
+    if runtime is not None:
+        ignored.update(
+            alias
+            for field, alias in (runtime.warmup_aliases | runtime.input_aliases).items()
+            if field in runtime.sources
+        )
+    scheduler = _owner(cfg, "scheduler_config")
+    if getattr(getattr(scheduler, "sm70_inputs", None), "captured", False):
+        ignored.update(scheduler.sm70_aliases.values())
+    routing = _owner(cfg, "kernel_config.sm70_moe.routing")
+    if routing is not None and routing.sources:
+        ignored.update(routing.aliases.values())
+    unquantized = _owner(cfg, "kernel_config.sm70_moe.unquantized")
+    if unquantized is not None and unquantized.sources:
+        ignored.update(unquantized.aliases.values())
     gdn = _owner(cfg, "kernel_config.gdn")
+    if gdn is not None and gdn.schedule.resolved:
+        from vllm.config.gdn_schedule import GDN_SCHEDULE_FIELDS
+
+        ignored.update(alias for alias, _, _ in GDN_SCHEDULE_FIELDS.values())
     if gdn is not None and gdn.resolved:
         ignored.update(gdn.projection.aliases.values())
     spec = _owner(cfg, "speculative_config.sm70_dflash2")
@@ -444,4 +500,7 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
             for field, alias in sampling.aliases.items()
             if field in sampling.sources
         )
+    if getattr(cfg, "speculative_config", None) is None:
+        # These projection paths cannot run without a speculative engine.
+        ignored.update(("VLLM_SM70_MTP_SHARED_BATCH", "VLLM_SM70_MTP_ROUTER_BATCH"))
     return ignored

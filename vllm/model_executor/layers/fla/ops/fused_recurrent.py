@@ -8,42 +8,12 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-import os
-
 import torch
 
+from vllm.config.gdn_schedule import resolve_schedule
 from vllm.triton_utils import tl, triton
 
 from .op import exp
-
-
-def _parse_positive_int_env(name: str) -> int | None:
-    value = os.getenv(name)
-    if value is None:
-        return None
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _parse_positive_int_list_env(name: str, default: list[int]) -> list[int]:
-    value = os.getenv(name)
-    if value is None or not value.strip():
-        return default
-    out: list[int] = []
-    for token in value.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            parsed = int(token)
-        except ValueError:
-            continue
-        if parsed > 0:
-            out.append(parsed)
-    return out or default
 
 
 def _round_num_warps(value: int) -> int:
@@ -54,26 +24,6 @@ def _round_num_warps(value: int) -> int:
     if value <= 4:
         return 4
     return 8
-
-
-_SM70_FLA_RECURRENT_SCHEDULE = os.getenv("VLLM_SM70_FLA_RECURRENT_SCHEDULE", "1") == "1"
-_SM70_FLA_BV_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_BV")
-_SM70_FLA_WARPS_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_WARPS")
-_SM70_FLA_STAGES_OVERRIDE = _parse_positive_int_env("VLLM_SM70_FLA_STAGES")
-_SM70_FLA_TARGET_WAVES = _parse_positive_int_env("VLLM_SM70_FLA_TARGET_WAVES") or 2
-_SM70_FLA_BV_CANDIDATES = _parse_positive_int_list_env(
-    "VLLM_SM70_FLA_BV_CANDIDATES", [32, 16, 8]
-)
-_SM70_FLA_HAS_LEGACY_OVERRIDE = any(
-    os.getenv(name) not in (None, "")
-    for name in (
-        "VLLM_SM70_FLA_BV",
-        "VLLM_SM70_FLA_WARPS",
-        "VLLM_SM70_FLA_STAGES",
-        "VLLM_SM70_FLA_TARGET_WAVES",
-        "VLLM_SM70_FLA_BV_CANDIDATES",
-    )
-)
 
 
 def _is_sm70_device(device: torch.device) -> bool:
@@ -87,40 +37,25 @@ def _is_sm70_device(device: torch.device) -> bool:
 
 
 def _use_sm70_fla_recurrent_schedule(device: torch.device, schedule=None) -> bool:
+    schedule = resolve_schedule(schedule)
     return _is_sm70_device(device) and (
-        (
-            schedule.recurrent_enabled
-            if schedule is not None
-            else _SM70_FLA_RECURRENT_SCHEDULE
-        )
-        or (
-            schedule.recurrent_override
-            if schedule is not None
-            else _SM70_FLA_HAS_LEGACY_OVERRIDE
-        )
+        schedule.recurrent_enabled or schedule.recurrent_override
     )
 
 
 def _select_sm70_bv(
     V: int, N: int, HV: int, device: torch.device, schedule=None
 ) -> int:
+    schedule = resolve_schedule(schedule)
     v_pow2 = triton.next_power_of_2(V)
-    if (
-        schedule.recurrent_bv if schedule is not None else _SM70_FLA_BV_OVERRIDE
-    ) is not None:
+    if schedule.recurrent_bv is not None:
         return min(
             v_pow2,
-            triton.next_power_of_2(
-                schedule.recurrent_bv if schedule is not None else _SM70_FLA_BV_OVERRIDE
-            ),
+            triton.next_power_of_2(schedule.recurrent_bv),
         )
 
     candidates: list[int] = []
-    for candidate in (
-        schedule.recurrent_bv_candidates
-        if schedule is not None
-        else _SM70_FLA_BV_CANDIDATES
-    ):
+    for candidate in schedule.recurrent_bv_candidates:
         candidate_pow2 = min(v_pow2, triton.next_power_of_2(candidate))
         if candidate_pow2 not in candidates:
             candidates.append(candidate_pow2)
@@ -132,11 +67,7 @@ def _select_sm70_bv(
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
     sm_count = torch.cuda.get_device_properties(device_index).multi_processor_count
-    target_ctas = sm_count * (
-        schedule.recurrent_target_waves
-        if schedule is not None
-        else _SM70_FLA_TARGET_WAVES
-    )
+    target_ctas = sm_count * schedule.recurrent_target_waves
     fallback = candidates[-1]
     for candidate in candidates:
         ctas = triton.cdiv(V, candidate) * N * HV
@@ -146,26 +77,16 @@ def _select_sm70_bv(
 
 
 def _select_sm70_num_warps(BV: int, N: int, HV: int, schedule=None) -> int:
-    if (
-        schedule.recurrent_warps if schedule is not None else _SM70_FLA_WARPS_OVERRIDE
-    ) is not None:
-        return _round_num_warps(
-            schedule.recurrent_warps
-            if schedule is not None
-            else _SM70_FLA_WARPS_OVERRIDE
-        )
+    schedule = resolve_schedule(schedule)
+    if schedule.recurrent_warps is not None:
+        return _round_num_warps(schedule.recurrent_warps)
     return 1
 
 
 def _select_sm70_num_stages(T: int, schedule=None) -> int:
-    if (
-        schedule.recurrent_stages if schedule is not None else _SM70_FLA_STAGES_OVERRIDE
-    ) is not None:
-        return (
-            schedule.recurrent_stages
-            if schedule is not None
-            else _SM70_FLA_STAGES_OVERRIDE
-        )
+    schedule = resolve_schedule(schedule)
+    if schedule.recurrent_stages is not None:
+        return schedule.recurrent_stages
     return 3
 
 
@@ -361,6 +282,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     schedule=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    schedule = resolve_schedule(schedule)
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
@@ -541,6 +463,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
     use_qk_l2norm_in_kernel: bool = False,
     schedule=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    schedule = resolve_schedule(schedule)
     if mixed_qkv.ndim != 2:
         raise ValueError(
             f"`mixed_qkv` must be a 2D tensor (got ndim={mixed_qkv.ndim})."
@@ -698,6 +621,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         schedule=None,
     ):
+        schedule = resolve_schedule(schedule)
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q.contiguous(),
             k=k.contiguous(),
@@ -796,6 +720,7 @@ def fused_recurrent_gated_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
+    schedule = resolve_schedule(schedule)
     if cu_seqlens is not None and q.shape[0] != 1:
         raise ValueError(
             f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."

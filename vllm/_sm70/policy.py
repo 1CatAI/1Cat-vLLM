@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Explicit native arguments and initialization-only binding capture."""
 
+from collections.abc import Callable
 from functools import partial
 
 import torch
@@ -195,20 +196,15 @@ class NativeBindings:
         sidecar = torch.ops._C_qwen38
         legacy_sidecar = any(hasattr(sidecar, name) for name in CONFIGURED_OPERATORS)
         if values and (not available or legacy_sidecar):
-            import os
+            raise RuntimeError(
+                "Explicit SM70 native policy requires the policy-argument ABI "
+                "in both _C and _moe_C; rebuild the normal extensions and remove "
+                "legacy computation sidecars. Captured engine policy cannot be "
+                "silently replaced by process environment."
+            )
+        from vllm._sm70.runtime import BoundNativeCall, bind_native_runtime
 
-            from vllm.config.sm70_native import NATIVE_FIELDS, UNSET
-
-            conflicts = [
-                alias
-                for (_, alias, _, _), value in zip(NATIVE_FIELDS, values)
-                if value != UNSET and value != os.getenv(alias, UNSET)
-            ]
-            if conflicts:
-                raise RuntimeError(
-                    "Explicit SM70 native policy requires the policy-argument ABI: "
-                    + ", ".join(conflicts)
-                )
+        self.owner = bind_native_runtime()
         self.values = values if available else ()
         self.arguments = self.values
         namespaces = (torch.ops._C, torch.ops._moe_C)
@@ -219,8 +215,11 @@ class NativeBindings:
             token = "sm70:1:" + "".join(
                 f"{len(value.encode('utf-8'))}:{value}" for value in self.values
             )
-            for namespace in namespaces:
-                namespace.sm70_prepare_native_policy_token(token)
+            if self.owner is None:
+                for namespace in namespaces:
+                    namespace.sm70_prepare_native_policy_token(token)
+            else:
+                token = self.owner.bind(self.values, token)
             self.arguments = (token,)
         if self.values:
             from vllm import _sm70_ops
@@ -235,12 +234,32 @@ class NativeBindings:
                         if hasattr(namespace, name):
                             operation = getattr(namespace, name)
                             arguments = arguments[0]
-                    setattr(self, name, partial(operation, native_policy=arguments))
+                    call: Callable = partial(operation, native_policy=arguments)
+                    if self.owner is not None:
+                        call = BoundNativeCall(call, self.owner)
+                    setattr(self, name, call)
+
+    def invoke(self, operation, *args, **kwargs):
+        if torch.compiler.is_compiling() or self.owner is None:
+            return operation(*args, **kwargs)
+        from vllm._sm70.runtime import _active_owner
+
+        if _active_owner.get() is self.owner:
+            return operation(*args, **kwargs)
+        with self.owner.activate():
+            return operation(*args, **kwargs)
 
     def __getattr__(self, name):
         from vllm import _sm70_ops
 
-        return getattr(_sm70_ops, name)
+        operation = getattr(_sm70_ops, name)
+        owner = self.__dict__.get("owner")
+        if owner is not None:
+            from vllm._sm70.runtime import BoundNativeCall
+
+            operation = BoundNativeCall(operation, owner)
+            setattr(self, name, operation)
+        return operation
 
 
 def register_policy_op(name, schema, operation, fake):

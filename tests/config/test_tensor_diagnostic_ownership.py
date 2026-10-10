@@ -270,3 +270,113 @@ def test_gdn_empty_step_filter_and_shape_selection_keep_distinct_semantics():
     graph = TensorDumpConfig(shapes=",")
     graph.resolve("gdn_graph")
     assert not graph.allows("shapes", "8x128")
+
+
+@pytest.mark.parametrize("order", [(1, 2), (2, 1)])
+def test_logits_diagnostic_budget_and_probe_order_are_engine_local(tmp_path, order):
+    from vllm.model_executor.layers.logits_processor import _top_token_margin_dump_step
+
+    modules = []
+    for budget in order:
+        dumps = TensorDiagnosticsConfig(
+            top_token_margin=TensorDumpConfig(
+                directory=str(tmp_path), steps="0-4", max_dumps=budget, probes="4,2,4"
+            )
+        )
+        owner = diagnostics_for(config_for(dumps))
+        modules.append(SimpleNamespace(_diagnostics=owner))
+        assert owner.channels["top_token_margin"].policy.parsed("probes") == (4, 2, 4)
+    for module, budget in zip(modules, order):
+        assert [_top_token_margin_dump_step(module) for _ in range(3)] == (
+            list(range(budget)) + [None] * (3 - budget)
+        )
+
+
+def test_logits_trigger_and_strict_error_checkpoint(monkeypatch, tmp_path):
+    from vllm.model_executor.layers.logits_processor import _top_token_margin_dump_step
+
+    trigger = tmp_path / "enabled"
+    policy = TensorDumpConfig(
+        directory=str(tmp_path), enable_file=str(trigger), steps="3-1"
+    )
+    owner = diagnostics_for(
+        config_for(TensorDiagnosticsConfig(top_token_margin=policy))
+    )
+    module = SimpleNamespace(_diagnostics=owner)
+    assert _top_token_margin_dump_step(module) is None
+    monkeypatch.setenv("VLLM_SM70_DUMP_TOP_TOKEN_MARGIN_STEPS", "0-9")
+    trigger.touch()
+    with pytest.raises(ValueError, match="invalid top-token margin step range: 3-1"):
+        _top_token_margin_dump_step(module)
+
+
+@pytest.mark.parametrize(
+    "raw,integer,exact",
+    [("0", False, False), ("1", True, True), ("2", True, False), ("", None, False)],
+)
+def test_coordinate_trace_keeps_consumer_dialects(monkeypatch, raw, integer, exact):
+    monkeypatch.setenv("VLLM_DFLASH_DEBUG_COORD_TRACE", raw)
+    policy = RuntimeTraceConfig().dflash
+    monkeypatch.setenv("VLLM_DFLASH_DEBUG_COORD_TRACE", "wrong-after-init")
+    assert policy.coord_exact_one is exact
+    if integer is None:
+        with pytest.raises(ValueError):
+            policy.value("coord_integer")
+    else:
+        assert policy.value("coord_integer") is integer
+
+
+def test_shared_dflash_dump_directory_and_separate_budgets(tmp_path):
+    from vllm.config.sm70_dflash2 import DFlashDiagnosticsConfig
+
+    cfg = DFlashDiagnosticsConfig(
+        tensors=TensorDumpConfig(directory=str(tmp_path), max_dumps=1),
+        pp_aux=TensorDumpConfig(max_dumps=2),
+    )
+    assert cfg.pp_aux.directory == str(tmp_path)
+    assert cfg.pp_aux.sources["directory"] == "typed"
+    engine = SimpleNamespace(
+        observability_config=SimpleNamespace(
+            runtime_trace=RuntimeTraceConfig(dflash=cfg)
+        )
+    )
+    owner = diagnostics_for(engine)
+    owner.channels["dflash_tensor"].reports = 1
+    assert owner.channels["dflash_pp_aux"].reports == 0
+
+
+def test_qsa_calibration_uses_frozen_destination_and_dynamic_marker(
+    monkeypatch, tmp_path
+):
+    import json
+
+    from tests.config.runtime_policy_utils import make_policy_defaults
+    from vllm.config import set_current_vllm_config
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_kv_calibration import observe_qsa_kv
+
+    cfg = make_policy_defaults().cfg
+    policy = cfg.observability_config.runtime_trace.dumps.qsa_calibration
+    policy.directory = str(tmp_path)
+    policy.mode = "fallback-shard"
+    monkeypatch.setenv("VLLM_QSA_KV_CALIBRATION_DIR", "/unused-after-init")
+    monkeypatch.setenv("VLLM_QSA_KV_CALIBRATION_CORPUS_SHARD", "changed-after-init")
+    data = torch.ones(1, 1, 8)
+    with set_current_vllm_config(cfg):
+        observe_qsa_kv(0, data, data)
+        assert not list(tmp_path.glob("*.jsonl"))
+        marker = tmp_path / "COLLECTING"
+        marker.write_text("")
+        observe_qsa_kv(0, data, data)
+        marker.write_text("second-shard")
+        observe_qsa_kv(0, data, data)
+        marker.unlink()
+        observe_qsa_kv(0, data, data)
+    records = [
+        json.loads(line)
+        for path in tmp_path.glob("*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert [record["corpus_shard"] for record in records] == [
+        "fallback-shard",
+        "second-shard",
+    ]

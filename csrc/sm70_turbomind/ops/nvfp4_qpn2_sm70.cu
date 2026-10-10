@@ -688,11 +688,10 @@ void launch_qpn2_gated(const uint8_t* codes, const uint8_t* scales,
 }
 
 bool qpn2_m16_native_enabled(int m) {
-  const char* value =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_qpn2_m16_native);
   const bool enabled =
       m > kQpn2RowsPerCta && m <= 16 &&
-      (value == nullptr || (value[0] == '1' && value[1] == '\0'));
+      vllm::sm70::policy_exact_one(
+          vllm::sm70::PolicyField::nvfp4_qpn2_m16_native, true);
   if (enabled) {
     static std::once_flag m16_log_once;
     std::call_once(m16_log_once, []() {

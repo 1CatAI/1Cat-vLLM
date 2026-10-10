@@ -159,7 +159,12 @@ def test_dense_projection_loading_and_fullgraph_views(monkeypatch):
         for rows in (1, 8, 1):
             x = torch.randn((rows, 128), dtype=torch.float16, device="cuda")
             expected, _ = layer(x)
-            actual, _ = compiled(x)
+            # Compiled engine calls borrow the runner's runtime scope. Eager
+            # layer calls above activate their own bound owner automatically.
+            from vllm._sm70.runtime import bind_native_runtime
+
+            with bind_native_runtime().activate():
+                actual, _ = compiled(x)
+                flat, _ = compiled(x.view(1, rows, 128))
             assert torch.equal(actual, expected)
-            flat, _ = compiled(x.view(1, rows, 128))
             assert torch.equal(flat.view_as(expected), expected)

@@ -130,10 +130,7 @@ class AWQConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        if (
-            sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
-            or sm70_tm.forces_marlin()
-        ):
+        if sm70_tm.format_enabled("awq") or sm70_tm.forces_marlin():
             return 70
         # The default AWQ kernel only supports Turing or newer GPUs.
         return 75
@@ -206,9 +203,9 @@ class AWQConfig(QuantizationConfig):
                 current_platform.is_cuda()
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
-                and sm70_tm.use_turbomind(envs.VLLM_SM70_AWQ_TURBOMIND)
+                and sm70_tm.format_enabled("awq")
             ):
-                if envs.VLLM_SM70_AWQ_MOE_DISABLE:
+                if sm70_tm.format_option("awq", "moe_disable"):
                     logger.warning_once(
                         "Layer '%s' SM70 AWQ TurboMind MoE path disabled by "
                         "VLLM_SM70_AWQ_MOE_DISABLE=1. Falling back to MoeWNA16.",

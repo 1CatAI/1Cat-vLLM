@@ -856,7 +856,8 @@ class GGUFExpertBank(torch.nn.Module):
                 x.shape[0],
             )
         if self.source_type in (20, 42) and self.down_vector_batches:
-            torch.ops.vllm.gguf_expert_down(
+            self.native_ops.invoke(
+                torch.ops.vllm.gguf_expert_down,
                 output,
                 x,
                 offsets,

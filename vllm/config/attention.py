@@ -6,6 +6,7 @@ from typing import Any, Literal
 from pydantic import Field, field_validator
 
 from vllm.config.execution_policy import FlashV100Policy
+from vllm.config.sm70_triton_attention import Sm70TritonAttentionPolicy
 from vllm.config.utils import config
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -17,6 +18,11 @@ class AttentionConfig:
 
     flash_v100: FlashV100Policy = Field(default_factory=FlashV100Policy)
     """Per-engine execution decisions and initialization provenance."""
+
+    sm70_triton: Sm70TritonAttentionPolicy = Field(
+        default_factory=Sm70TritonAttentionPolicy
+    )
+    """SM70 fallback schedule; independent of the Flash-V100 backend policy."""
 
     backend: AttentionBackendEnum | None = None
     """Attention backend to use. Use "auto" or None for automatic selection."""
@@ -97,6 +103,7 @@ class AttentionConfig:
         ignored_factors: set[str] = set()
         factors = get_hash_factors(self, ignored_factors)
         factors["flash_v100"] = self.flash_v100.compute_hash()
+        factors["sm70_triton"] = self.sm70_triton.compute_hash()
         return hash_factors(factors)
 
     @field_validator("backend", mode="before")

@@ -116,9 +116,7 @@ void sm70_silu_and_mul_interleaved_fp16_out(torch::Tensor out,
 }
 
 bool sm70_profile_trace_enabled() {
-  const char* value =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::profile_trace);
-  return value != nullptr && std::strcmp(value, "1") == 0;
+  return vllm::sm70::policy_exact_one(vllm::sm70::PolicyField::profile_trace);
 }
 
 const char* sm70_scalar_type_name(at::ScalarType scalar_type) {
@@ -160,13 +158,13 @@ unsigned sm70_capture_status_bit(cudaStreamCaptureStatus status) {
   }
 }
 
-void maybe_log_sm70_moe_route_once(std::atomic<unsigned>& logged_mask,
-                                   const char* route,
+void maybe_log_sm70_moe_route_once(const char* counter_name, const char* route,
                                    const torch::Tensor& input, int64_t tokens,
                                    int64_t experts_or_top_k) {
   if (!sm70_profile_trace_enabled()) {
     return;
   }
+  auto& logged_mask = vllm::sm70::diagnostic_counter(counter_name);
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   AT_CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
@@ -1037,19 +1035,49 @@ struct StreamWorkspaceKeyHash {
   }
 };
 
-std::mutex workspace_mutex;
-std::mutex gemm_mutex;
-std::mutex tune_mutex;
-std::mutex sm70_f16_weight_cache_mutex;
-std::unordered_map<StreamWorkspaceKey, WorkspaceHolder, StreamWorkspaceKeyHash>
-    workspace_cache;
-std::map<std::pair<int, uint64_t>, GemmHolder> gemm_cache;
-std::unordered_set<DenseTuneKey, DenseTuneKeyHash> dense_tuned_shapes;
-std::unordered_set<MoeTuneKey, MoeTuneKeyHash> moe_tuned_shapes;
-std::set<std::pair<int, uint64_t>> imported_cache_devices;
-std::unordered_map<Sm70F16WeightCacheKey, Sm70F16WeightCacheEntry,
-                   Sm70F16WeightCacheKeyHash>
-    sm70_f16_weight_cache;
+struct TurboMindRuntime : vllm::sm70::RuntimeResource {
+  std::mutex workspace_mutex;
+  std::mutex gemm_mutex;
+  std::mutex tune_mutex;
+  std::mutex sm70_f16_weight_cache_mutex;
+  std::unordered_map<StreamWorkspaceKey, WorkspaceHolder,
+                     StreamWorkspaceKeyHash>
+      workspace_cache;
+  std::map<std::pair<int, uint64_t>, GemmHolder> gemm_cache;
+  std::unordered_set<DenseTuneKey, DenseTuneKeyHash> dense_tuned_shapes;
+  std::unordered_set<MoeTuneKey, MoeTuneKeyHash> moe_tuned_shapes;
+  std::set<std::pair<int, uint64_t>> imported_cache_devices;
+  std::unordered_map<Sm70F16WeightCacheKey, Sm70F16WeightCacheEntry,
+                     Sm70F16WeightCacheKeyHash>
+      sm70_f16_weight_cache;
+
+  void close() override {
+    // Engine shutdown drains graphs before releasing owners. Also wait for
+    // outstanding eager work before freeing native scratch or packed weights.
+    std::set<int> devices;
+    for (const auto& [key, holder] : workspace_cache)
+      devices.insert(key.device);
+    for (const auto& [key, holder] : sm70_f16_weight_cache)
+      devices.insert(key.device);
+    for (int device : devices) {
+      c10::cuda::CUDAGuard guard(device);
+      AT_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+  }
+};
+
+TurboMindRuntime& runtime() {
+  auto& state = vllm::sm70::current_native_runtime();
+  thread_local uint64_t cached_id = 0;
+  thread_local TurboMindRuntime* cached = nullptr;
+  if (cached_id == state.id) return *cached;
+  std::lock_guard<std::mutex> lock(state.mutex);
+  auto& resource = state.resources["turbomind"];
+  if (!resource) resource = std::make_unique<TurboMindRuntime>();
+  cached = static_cast<TurboMindRuntime*>(resource.get());
+  cached_id = state.id;
+  return *cached;
+}
 
 turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
     int device, int m, int n, int k, int group_size, cudaStream_t stream);
@@ -1075,81 +1103,69 @@ turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
     cudaStream_t stream);
 
 bool tune_small_shapes_enabled() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_tune_small_shapes);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::awq_tune_small_shapes,
+                                 1) != 0;
 }
 
 bool awq_tune_small_shapes_enabled() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_tune_small_shapes);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::awq_tune_small_shapes,
+                                 0) != 0;
 }
 
 bool fp8_tune_small_shapes_enabled() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_tune_small_shapes);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_tune_small_shapes,
+                                 1) != 0;
 }
 
 bool mxfp4_tune_small_shapes_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::mxfp4_tune_small_shapes);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::mxfp4_tune_small_shapes, 1) != 0;
 }
 
 bool mxfp4_moe_compact_grouped_decode_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::mxfp4_moe_compact_grouped_decode);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::mxfp4_moe_compact_grouped_decode, 1) != 0;
 }
 
 bool mxfp4_moe_broadcast_input_decode_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::mxfp4_moe_broadcast_input_decode);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::mxfp4_moe_broadcast_input_decode, 1) != 0;
 }
 
 bool mxfp4_moe_grouped_m8_enabled() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::mxfp4_moe_grouped_m8);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::mxfp4_moe_grouped_m8,
+                                 0) != 0;
 }
 
 bool mxfp4_moe_grouped_verifier_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::mxfp4_moe_grouped_verifier);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::mxfp4_moe_grouped_verifier, 0) != 0;
 }
 
 bool mxfp4_moe_grouped_m8_expert_rows_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::mxfp4_moe_grouped_m8_expert_rows);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::mxfp4_moe_grouped_m8_expert_rows, 0) != 0;
 }
 
 bool mxfp4_moe_grouped_m8_fast_selector_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::mxfp4_moe_grouped_m8_fast_selector);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::mxfp4_moe_grouped_m8_fast_selector, 1) !=
+         0;
 }
 
 bool nvfp4_tune_small_shapes_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::nvfp4_tune_small_shapes);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::nvfp4_tune_small_shapes, 1) != 0;
 }
 
 bool nvfp4_moe_grouped_prefill_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::nvfp4_moe_grouped_prefill);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::nvfp4_moe_grouped_prefill, 1) != 0;
 }
 
 bool nvfp4_moe_grouped_expert_rows_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::nvfp4_moe_grouped_expert_rows);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::nvfp4_moe_grouped_expert_rows, 0) != 0;
 }
 
 int glm_mhc_pre_threads() {
@@ -1162,75 +1178,66 @@ int glm_mhc_pre_threads() {
 }
 
 bool nvfp4_qwen38_tp4_m1_fast_selector_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::nvfp4_qwen38_tp4_m1_fast_selector);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::nvfp4_qwen38_tp4_m1_fast_selector, 1) !=
+         0;
 }
 
 bool fp8_moe_single_token_per_expert_dispatch_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::fp8_moe_single_token_per_expert_dispatch);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::fp8_moe_single_token_per_expert_dispatch,
+             0) != 0;
 }
 
 bool fp8_0dot3_dense_selector_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::fp8_0dot3_dense_selector);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::fp8_0dot3_dense_selector, 0) != 0;
 }
 
 bool fp8_safe_fast_selector_enabled() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_safe_fast_selector);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::fp8_safe_fast_selector, 0) != 0;
 }
 
 bool fp8_grouped_bmm_decode_enabled() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_grouped_bmm_decode);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::fp8_grouped_bmm_decode, 1) != 0;
 }
 
 bool awq_reuse_imported_cache_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::awq_reuse_imported_cache);
   // An imported plan is produced by the coordinated warmup on rank 0.  Keep
   // it as the default source of truth on the other TP ranks; an explicit 0
   // remains available for cache-debugging and old standalone warmups.
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::awq_reuse_imported_cache, 1) != 0;
 }
 
 bool fp8_reuse_imported_cache_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::fp8_reuse_imported_cache);
   // See awq_reuse_imported_cache_enabled().  The Python warmup only marks an
   // imported cache after rank 0 has finished measuring the shape, so this
   // does not change the no-cache path.
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::fp8_reuse_imported_cache, 1) != 0;
 }
 
 bool awq_preserve_default_splits_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::awq_preserve_default_splits);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::awq_preserve_default_splits, 1) != 0;
 }
 
 bool awq_preserve_default_splits_only_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::awq_preserve_default_splits_only);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::awq_preserve_default_splits_only, 0) != 0;
 }
 
 bool fp8_preserve_default_splits_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::fp8_preserve_default_splits);
-  return raw == nullptr || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::fp8_preserve_default_splits, 1) != 0;
 }
 
 bool fp8_preserve_default_splits_only_enabled() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::fp8_preserve_default_splits_only);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::fp8_preserve_default_splits_only, 0) != 0;
 }
 
 inline turbomind::gemm::DispatchPolicy maybe_preserve_default_splits(
@@ -1267,18 +1274,17 @@ inline turbomind::gemm::DispatchPolicy maybe_preserve_fp8_default_splits(
 
 std::optional<turbomind::gemm::DispatchPolicy> dispatch_policy_override(
     vllm::sm70::PolicyField field) {
-  const char* raw = vllm::sm70::policy_value(field);
-  if (raw == nullptr || std::strcmp(raw, "") == 0) {
-    return std::nullopt;
-  }
-  if (std::strcmp(raw, "default") == 0) {
-    return turbomind::gemm::DispatchPolicy::kDefault;
-  }
-  if (std::strcmp(raw, "reuse") == 0) {
-    return turbomind::gemm::DispatchPolicy::kReuse;
-  }
-  if (std::strcmp(raw, "measure") == 0) {
-    return turbomind::gemm::DispatchPolicy::kMeasure;
+  switch (vllm::sm70::policy_dispatch_override(field)) {
+    case vllm::sm70::DispatchOverride::Unset:
+      return std::nullopt;
+    case vllm::sm70::DispatchOverride::Default:
+      return turbomind::gemm::DispatchPolicy::kDefault;
+    case vllm::sm70::DispatchOverride::Reuse:
+      return turbomind::gemm::DispatchPolicy::kReuse;
+    case vllm::sm70::DispatchOverride::Measure:
+      return turbomind::gemm::DispatchPolicy::kMeasure;
+    case vllm::sm70::DispatchOverride::Invalid:
+      break;
   }
   TORCH_CHECK(false, vllm::sm70::policy_name(field),
               " must be one of: default, reuse, measure.");
@@ -1292,51 +1298,50 @@ awq_moe_dispatch_policy_override() {
 }
 
 int awq_dense_tune_max_m() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_dense_tune_max_m);
-  return raw ? std::max(std::atoi(raw), 0) : 16;
+  return std::max(vllm::sm70::policy_atoi(
+                      vllm::sm70::PolicyField::awq_dense_tune_max_m, 16),
+                  0);
 }
 
 int generic_dense_tune_max_m() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::f16_dense_tune_max_m);
-  return raw ? std::max(std::atoi(raw), 0) : 16;
+  return std::max(vllm::sm70::policy_atoi(
+                      vllm::sm70::PolicyField::f16_dense_tune_max_m, 16),
+                  0);
 }
 
 int fp8_dense_tune_max_m() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_dense_tune_max_m);
-  return raw ? std::max(std::atoi(raw), 0) : 16;
+  return std::max(vllm::sm70::policy_atoi(
+                      vllm::sm70::PolicyField::fp8_dense_tune_max_m, 16),
+                  0);
 }
 
 int mxfp4_dense_tune_max_m() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::mxfp4_dense_tune_max_m);
-  return raw ? std::max(std::atoi(raw), 0) : 16;
+  return std::max(vllm::sm70::policy_atoi(
+                      vllm::sm70::PolicyField::mxfp4_dense_tune_max_m, 16),
+                  0);
 }
 
 int nvfp4_dense_tune_max_m() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_dense_tune_max_m);
-  return raw ? std::max(std::atoi(raw), 0) : 16;
+  return std::max(vllm::sm70::policy_atoi(
+                      vllm::sm70::PolicyField::nvfp4_dense_tune_max_m, 16),
+                  0);
 }
 
 int moe_tune_max_tokens() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::awq_moe_tune_max_tokens);
-  return raw ? std::max(std::atoi(raw), 0) : 128;
+  return std::max(vllm::sm70::policy_atoi(
+                      vllm::sm70::PolicyField::awq_moe_tune_max_tokens, 128),
+                  0);
 }
 
 int nvfp4_moe_tune_max_tokens() {
-  const char* raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::nvfp4_moe_tune_max_tokens);
-  return raw ? std::max(std::atoi(raw), 0) : 128;
+  return std::max(vllm::sm70::policy_atoi(
+                      vllm::sm70::PolicyField::nvfp4_moe_tune_max_tokens, 128),
+                  0);
 }
 
 int sm70_f16_dense_max_m() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::f16_dense_max_m);
-  return raw ? std::max(std::atoi(raw), 0) : 64;
+  return std::max(
+      vllm::sm70::policy_atoi(vllm::sm70::PolicyField::f16_dense_max_m, 64), 0);
 }
 
 bool is_stream_capturing(cudaStream_t stream) {
@@ -1350,9 +1355,10 @@ bool is_stream_capturing(cudaStream_t stream) {
 }
 
 bool has_imported_cache(int device) {
-  std::lock_guard<std::mutex> lock(tune_mutex);
-  return imported_cache_devices.find({device, vllm::sm70::active_policy_key}) !=
-         imported_cache_devices.end();
+  std::lock_guard<std::mutex> lock(runtime().tune_mutex);
+  return runtime().imported_cache_devices.find(
+             {device, vllm::sm70::active_policy_key}) !=
+         runtime().imported_cache_devices.end();
 }
 
 turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
@@ -1369,20 +1375,23 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy_impl(
   }
 
   DenseTuneKey key{kind, device, m, n, k, group_size};
-  std::lock_guard<std::mutex> lock(tune_mutex);
-  if (dense_tuned_shapes.find(key) != dense_tuned_shapes.end()) {
+  std::lock_guard<std::mutex> lock(runtime().tune_mutex);
+  if (runtime().dense_tuned_shapes.find(key) !=
+      runtime().dense_tuned_shapes.end()) {
     return turbomind::gemm::DispatchPolicy::kReuse;
   }
   if (is_stream_capturing(stream)) {
-    // tune_mutex is already held here. Calling has_imported_cache() would
-    // acquire it recursively and deadlock on the first uncached graph shape.
-    if (imported_cache_devices.find({device, vllm::sm70::active_policy_key}) !=
-        imported_cache_devices.end()) {
+    // runtime().tune_mutex is already held here. Calling has_imported_cache()
+    // would acquire it recursively and deadlock on the first uncached graph
+    // shape.
+    if (runtime().imported_cache_devices.find(
+            {device, vllm::sm70::active_policy_key}) !=
+        runtime().imported_cache_devices.end()) {
       return turbomind::gemm::DispatchPolicy::kReuse;
     }
     return turbomind::gemm::DispatchPolicy::kDefault;
   }
-  dense_tuned_shapes.insert(key);
+  runtime().dense_tuned_shapes.insert(key);
   return turbomind::gemm::DispatchPolicy::kMeasure;
 }
 
@@ -1392,13 +1401,12 @@ turbomind::gemm::DispatchPolicy select_dense_dispatch_policy(
       turbomind::gemm::UseSm70DflashContextFcStableReduction(m, n, k)) {
     return turbomind::gemm::DispatchPolicy::kDefault;
   }
-  const char* dflash2_rerank =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::dflash2_qpn8_rerank);
-  const char* dflash2_shadow = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::dflash2_qpn8_rerank_shadow);
+
   const bool exact_dflash2_rerank =
-      (dflash2_rerank && std::atoi(dflash2_rerank) != 0) ||
-      (dflash2_shadow && std::atoi(dflash2_shadow) != 0);
+      (vllm::sm70::policy_atoi(vllm::sm70::PolicyField::dflash2_qpn8_rerank,
+                               0) != 0) ||
+      (vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::dflash2_qpn8_rerank_shadow, 0) != 0);
   if (exact_dflash2_rerank && m >= 1 && m <= 8 && n == 62080 && k == 5120 &&
       group_size == 0) {
     // The sparse reranker reproduces this exact split-K contract. Do not let
@@ -1467,18 +1475,20 @@ turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
   }
 
   MoeTuneKey key{kind, device, total_tokens, n, k, num_experts, group_size};
-  std::lock_guard<std::mutex> lock(tune_mutex);
-  if (moe_tuned_shapes.find(key) != moe_tuned_shapes.end()) {
+  std::lock_guard<std::mutex> lock(runtime().tune_mutex);
+  if (runtime().moe_tuned_shapes.find(key) !=
+      runtime().moe_tuned_shapes.end()) {
     return turbomind::gemm::DispatchPolicy::kReuse;
   }
   if (is_stream_capturing(stream)) {
-    if (imported_cache_devices.find({device, vllm::sm70::active_policy_key}) !=
-        imported_cache_devices.end()) {
+    if (runtime().imported_cache_devices.find(
+            {device, vllm::sm70::active_policy_key}) !=
+        runtime().imported_cache_devices.end()) {
       return turbomind::gemm::DispatchPolicy::kReuse;
     }
     return turbomind::gemm::DispatchPolicy::kDefault;
   }
-  moe_tuned_shapes.insert(key);
+  runtime().moe_tuned_shapes.insert(key);
   return turbomind::gemm::DispatchPolicy::kMeasure;
 }
 
@@ -1531,10 +1541,12 @@ turbomind::gemm::DispatchPolicy select_nvfp4_moe_dispatch_policy(
 
 WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
   thread_local int cached_device = -1;
+  thread_local uint64_t cached_owner = 0;
+  const auto owner = vllm::sm70::current_native_runtime().id;
   thread_local cudaStream_t cached_stream = nullptr;
   thread_local WorkspaceHolder* cached_holder = nullptr;
-  if (cached_holder != nullptr && cached_device == device &&
-      cached_stream == stream) {
+  if (cached_holder != nullptr && cached_owner == owner &&
+      cached_device == device && cached_stream == stream) {
     return *cached_holder;
   }
 
@@ -1542,9 +1554,10 @@ WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
 
   // Fast path: check if workspace exists without lock
   {
-    std::lock_guard<std::mutex> lock(workspace_mutex);
-    auto it = workspace_cache.find(key);
-    if (it != workspace_cache.end()) {
+    std::lock_guard<std::mutex> lock(runtime().workspace_mutex);
+    auto it = runtime().workspace_cache.find(key);
+    if (it != runtime().workspace_cache.end()) {
+      cached_owner = owner;
       cached_device = device;
       cached_stream = stream;
       cached_holder = &it->second;
@@ -1577,8 +1590,10 @@ WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
   holder.workspace.tensormaps_size = holder.tensormaps.numel();
   holder.workspace.flags = holder.flags.data_ptr<int>();
 
-  std::lock_guard<std::mutex> lock(workspace_mutex);
-  auto [insert_it, _] = workspace_cache.emplace(key, std::move(holder));
+  std::lock_guard<std::mutex> lock(runtime().workspace_mutex);
+  auto [insert_it, _] =
+      runtime().workspace_cache.emplace(key, std::move(holder));
+  cached_owner = owner;
   cached_device = device;
   cached_stream = stream;
   cached_holder = &insert_it->second;
@@ -1587,17 +1602,20 @@ WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
 
 turbomind::gemm::Gemm& get_gemm(int device) {
   thread_local int cached_device = -1;
+  thread_local uint64_t cached_owner = 0;
+  const auto owner = vllm::sm70::current_native_runtime().id;
   thread_local uint64_t cached_policy = 0;
   const auto policy = vllm::sm70::active_policy_key;
   thread_local turbomind::gemm::Gemm* cached_gemm = nullptr;
-  if (cached_gemm != nullptr && cached_device == device &&
-      cached_policy == policy) {
+  if (cached_gemm != nullptr && cached_owner == owner &&
+      cached_device == device && cached_policy == policy) {
     return *cached_gemm;
   }
 
-  std::lock_guard<std::mutex> lock(gemm_mutex);
-  auto it = gemm_cache.find({device, policy});
-  if (it != gemm_cache.end()) {
+  std::lock_guard<std::mutex> lock(runtime().gemm_mutex);
+  auto it = runtime().gemm_cache.find({device, policy});
+  if (it != runtime().gemm_cache.end()) {
+    cached_owner = owner;
     cached_device = device;
     cached_policy = policy;
     cached_gemm = it->second.gemm.get();
@@ -1605,8 +1623,9 @@ turbomind::gemm::Gemm& get_gemm(int device) {
   }
   GemmHolder holder;
   holder.gemm = std::make_unique<turbomind::gemm::Gemm>();
-  auto [insert_it, _] =
-      gemm_cache.emplace(std::make_pair(device, policy), std::move(holder));
+  auto [insert_it, _] = runtime().gemm_cache.emplace(
+      std::make_pair(device, policy), std::move(holder));
+  cached_owner = owner;
   cached_device = device;
   cached_policy = policy;
   cached_gemm = insert_it->second.gemm.get();
@@ -1889,9 +1908,9 @@ Sm70F16WeightCacheEntry get_sm70_f16_cached_weight(torch::Tensor weight,
   const auto key = make_sm70_f16_weight_cache_key(weight);
 
   {
-    std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
-    auto it = sm70_f16_weight_cache.find(key);
-    if (it != sm70_f16_weight_cache.end()) {
+    std::lock_guard<std::mutex> lock(runtime().sm70_f16_weight_cache_mutex);
+    auto it = runtime().sm70_f16_weight_cache.find(key);
+    if (it != runtime().sm70_f16_weight_cache.end()) {
       return it->second;
     }
   }
@@ -1901,8 +1920,8 @@ Sm70F16WeightCacheEntry get_sm70_f16_cached_weight(torch::Tensor weight,
 
   auto entry = prepare_sm70_f16_weight(weight, stream);
 
-  std::lock_guard<std::mutex> lock(sm70_f16_weight_cache_mutex);
-  auto [it, _] = sm70_f16_weight_cache.emplace(key, entry);
+  std::lock_guard<std::mutex> lock(runtime().sm70_f16_weight_cache_mutex);
+  auto [it, _] = runtime().sm70_f16_weight_cache.emplace(key, entry);
   return it->second;
 }
 
@@ -5153,12 +5172,11 @@ void fp8_gemm_sm70_out(torch::Tensor out, torch::Tensor in_feats,
 
 bool sm70_fp8_prefill_cutlass_gated_silu_enabled(
     const torch::Tensor& in_feats, const torch::Tensor& dense_weight) {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_prefill_cutlass);
-  return (raw == nullptr || std::atoi(raw) != 0) && in_feats.size(0) >= 8000 &&
-         in_feats.size(0) <= 8192 && in_feats.size(1) > 0 &&
-         in_feats.size(1) % 128 == 0 && dense_weight.size(1) > 0 &&
-         dense_weight.size(1) % 128 == 0;
+  return (vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_prefill_cutlass,
+                                  1) != 0) &&
+         in_feats.size(0) >= 8000 && in_feats.size(0) <= 8192 &&
+         in_feats.size(1) > 0 && in_feats.size(1) % 128 == 0 &&
+         dense_weight.size(1) > 0 && dense_weight.size(1) % 128 == 0;
 }
 
 void fp8_gemm_sm70_prefill_dispatch_out(
@@ -7160,9 +7178,8 @@ torch::Tensor sm70_f16_gemm(torch::Tensor _in_feats, torch::Tensor _kernel) {
 }
 
 bool sm70_fp8_moe_prepare_vec_enabled() {
-  const char* raw =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_moe_prepare_vec);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::fp8_moe_prepare_vec,
+                                 0) != 0;
 }
 
 void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
@@ -7466,8 +7483,8 @@ int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
   auto& gemm = vllm::awq_sm70::get_gemm(device);
   const int64_t imported = gemm.Import(ifs);
   if (imported > 0) {
-    std::lock_guard<std::mutex> lock(vllm::awq_sm70::tune_mutex);
-    vllm::awq_sm70::imported_cache_devices.insert(
+    std::lock_guard<std::mutex> lock(vllm::awq_sm70::runtime().tune_mutex);
+    vllm::awq_sm70::runtime().imported_cache_devices.insert(
         {device, vllm::sm70::active_policy_key});
   }
   return imported;
@@ -8995,9 +9012,8 @@ void awq_moe_indexed_dense_w13_sm70_out(
                   out.size(1) == n && out.stride(1) == 1,
               "awq_moe_indexed_dense_w13_sm70_out: output shape mismatch.");
 
-  static std::atomic<unsigned> logged_awq_indexed_prefill{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_indexed_prefill,
+      "logged_awq_indexed_prefill",
       "SM70 Qwen3.8 AWQ indexed-A W13 prefill path enabled C++ op reached",
       input, input_row_indices.numel(), num_experts);
   awq_moe_gemm_sm70_out_impl(
@@ -9059,9 +9075,8 @@ void awq_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "awq_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_awq_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_dense_stage,
+      "logged_awq_dense_stage",
       "SM70 AWQ MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   for (int expert = 0; expert < static_cast<int>(num_experts); ++expert) {
@@ -9305,10 +9320,10 @@ void sm70_glm53_moe_permute_q8_out(torch::Tensor input, torch::Tensor topk_ids,
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
               "sm70_glm53_moe_permute_q8_out: requires SM70.");
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  const char* shuffle_sort_raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::glm53_moe_shuffle_sort_q8);
+
   const bool use_shuffle_sort =
-      shuffle_sort_raw == nullptr || std::atoi(shuffle_sort_raw) != 0;
+      vllm::sm70::policy_atoi(
+          vllm::sm70::PolicyField::glm53_moe_shuffle_sort_q8, 1) != 0;
   if (use_shuffle_sort) {
     sm70_glm53_moe_sort_q8_kernel<<<1, kGlm53MoeQ8Slots, 0, stream>>>(
         topk_ids.data_ptr<int>(), sorted_row_idx.data_ptr<int>(),
@@ -9374,22 +9389,22 @@ void awq_moe_active_dense_stage_sm70_out(
       static_cast<int>(total_slots));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  static std::atomic<unsigned> logged_awq_active_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_active_dense_stage,
+      "logged_awq_active_dense_stage",
       "SM70 AWQ MoE active dense-stage path enabled C++ op reached", input,
       total_slots, total_slots);
 
   // Reuse the active-segment ABI for the narrow Qwen3.8 TP4 decode shapes.
   // Equal trailing offsets describe empty groups; nonempty groups may contain
   // multiple rows. Keep offsets-based scheduling (not one-row slot dispatch).
-  const char* grouped = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::awq_qwen38_moe_compact_grouped_decode);
-  const char* exact_w2 = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::awq_moe_batched_active_exact_w2);
-  if ((grouped == nullptr || std::atoi(grouped) != 0) &&
-      (exact_w2 == nullptr || std::atoi(exact_w2) == 0) && group_size == 32 &&
-      total_slots >= 20 && total_slots <= 80 && total_slots % 10 == 0 &&
+
+  if ((vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::awq_qwen38_moe_compact_grouped_decode, 1) !=
+       0) &&
+      (vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::awq_moe_batched_active_exact_w2, 0) == 0) &&
+      group_size == 32 && total_slots >= 20 && total_slots <= 80 &&
+      total_slots % 10 == 0 &&
       ((k == 2560 && n == 320) || (k == 160 && n == 2560))) {
     awq_moe_gemm_sm70_out_impl(out, input, active_expert_offsets, ptrs_w,
                                ptrs_s, total_slots, k, n, group_size, false,
@@ -9827,8 +9842,7 @@ void awq_moe_single_token_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_awq_single_token{0u};
-  maybe_log_sm70_moe_route_once(logged_awq_single_token,
+  maybe_log_sm70_moe_route_once("logged_awq_single_token",
                                 "SM70 AWQ MoE single-token active-expert dense "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);
@@ -9925,9 +9939,8 @@ void awq_moe_single_token_indexed_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_awq_single_token_indexed{0u};
   maybe_log_sm70_moe_route_once(
-      logged_awq_single_token_indexed,
+      "logged_awq_single_token_indexed",
       "SM70 AWQ MoE single-token indexed dense path enabled C++ op reached", x,
       x.size(0), top_k);
   constexpr int kThreads = 256;
@@ -10036,8 +10049,7 @@ void awq_moe_single_token_compact_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_awq_single_token_compact{0u};
-  maybe_log_sm70_moe_route_once(logged_awq_single_token_compact,
+  maybe_log_sm70_moe_route_once("logged_awq_single_token_compact",
                                 "SM70 AWQ MoE single-token compact grouped W13 "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);
@@ -10368,9 +10380,8 @@ void fp8_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "fp8_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_fp8_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_fp8_dense_stage,
+      "logged_fp8_dense_stage",
       "SM70 FP8 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   for (int expert = 0; expert < static_cast<int>(num_experts); ++expert) {
@@ -10595,9 +10606,8 @@ void mxfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "mxfp4_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_mxfp4_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_mxfp4_dense_stage,
+      "logged_mxfp4_dense_stage",
       "SM70 MXFP4 MoE CUDA-graph-safe dense-stage path enabled C++ op reached",
       input, input.size(0), num_experts);
   const bool compact_decode_shape = input.size(0) == num_experts &&
@@ -10825,11 +10835,11 @@ void nvfp4_moe_indexed_dense_stage_sm70_out_impl(
     torch::Tensor ptrs_w, torch::Tensor ptrs_s, int64_t num_experts, int64_t k,
     int64_t n, int64_t group_size, bool fused_swiglu) {
   constexpr int kQwen38TopK = 10;
-  const char* split_w13_raw = vllm::sm70::policy_value(
-      vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill);
+
   const bool split_w13_candidate =
-      (!split_w13_raw || std::atoi(split_w13_raw) != 0) && fused_swiglu &&
-      (n == 256 || n == 64);
+      (vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill, 1) != 0) &&
+      fused_swiglu && (n == 256 || n == 64);
   TORCH_CHECK(input.dim() == 2 && input.size(0) > 0 && input.size(1) == 2560 &&
                   input.scalar_type() == torch::kFloat16 && input.is_cuda(),
               "nvfp4_moe_indexed_dense_stage_sm70_out: exact Qwen3.8 CUDA "
@@ -10851,11 +10861,9 @@ void nvfp4_moe_indexed_dense_stage_sm70_out_impl(
               "nvfp4_moe_indexed_dense_stage_sm70_out requires grouped "
               "prefill dispatch.");
 
-  static std::atomic<unsigned> logged_nvfp4_indexed_prefill{0u};
-  static std::atomic<unsigned> logged_nvfp4_indexed_fused_prefill{0u};
   maybe_log_sm70_moe_route_once(
-      fused_swiglu ? logged_nvfp4_indexed_fused_prefill
-                   : logged_nvfp4_indexed_prefill,
+      fused_swiglu ? "logged_nvfp4_indexed_fused_prefill"
+                   : "logged_nvfp4_indexed_prefill",
       fused_swiglu
           ? "SM70 Qwen3.8 NVFP4 MoE indexed-A fused-SwiGLU W13 prefill "
             "path enabled C++ op reached"
@@ -10926,9 +10934,8 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
               "nvfp4_moe_dense_stage_sm70_out: dense_expert_ids too small.");
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  static std::atomic<unsigned> logged_nvfp4_dense_stage{0u};
   maybe_log_sm70_moe_route_once(
-      logged_nvfp4_dense_stage,
+      "logged_nvfp4_dense_stage",
       "SM70 NVFP4 MoE CUDA-graph-safe TurboMind path enabled C++ op reached",
       input, input.size(0), num_experts);
   constexpr int kNvfp4LegacyCompactGroups = 8 * 8;
@@ -10954,9 +10961,8 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       ((k == 2560 && n == 320) || (k == 160 && n == 2560));
   if (vllm::awq_sm70::nvfp4_moe_grouped_prefill_enabled() &&
       (exact_qwen36_prefill_shape || exact_qwen4_exp_prefill_shape)) {
-    static std::atomic<unsigned> logged_nvfp4_grouped_prefill{0u};
     maybe_log_sm70_moe_route_once(
-        logged_nvfp4_grouped_prefill,
+        "logged_nvfp4_grouped_prefill",
         "SM70 NVFP4 MoE grouped TurboMind prefill path enabled C++ op reached",
         input, input.size(0), num_experts);
     nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
@@ -11039,9 +11045,8 @@ void mxfp4_moe_single_token_prepare_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_mxfp4_direct_top6{0u};
   maybe_log_sm70_moe_route_once(
-      logged_mxfp4_direct_top6,
+      "logged_mxfp4_direct_top6",
       "SM70 MXFP4 MoE direct top-6 prepare/W13 path enabled C++ op reached", x,
       x.size(0), kTopK);
 
@@ -11253,8 +11258,7 @@ void fp8_moe_single_token_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_fp8_single_token{0u};
-  maybe_log_sm70_moe_route_once(logged_fp8_single_token,
+  maybe_log_sm70_moe_route_once("logged_fp8_single_token",
                                 "SM70 FP8 MoE single-token active-expert dense "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);
@@ -11352,9 +11356,8 @@ void fp8_moe_single_token_indexed_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_fp8_single_token_indexed{0u};
   maybe_log_sm70_moe_route_once(
-      logged_fp8_single_token_indexed,
+      "logged_fp8_single_token_indexed",
       "SM70 FP8 MoE single-token indexed dense path enabled C++ op reached", x,
       x.size(0), top_k);
   constexpr int kThreads = 256;
@@ -11464,8 +11467,7 @@ void fp8_moe_single_token_compact_dense_w13_sm70_out(
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  static std::atomic<unsigned> logged_fp8_single_token_compact{0u};
-  maybe_log_sm70_moe_route_once(logged_fp8_single_token_compact,
+  maybe_log_sm70_moe_route_once("logged_fp8_single_token_compact",
                                 "SM70 FP8 MoE single-token compact grouped W13 "
                                 "path enabled C++ op reached",
                                 x, x.size(0), top_k);

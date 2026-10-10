@@ -14,6 +14,7 @@ from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from .chunk_o import chunk_fwd_o
 from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
+from .gdn_chunk_kernels import resolve_chunk_kernels
 from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import FLA_CHUNK_SIZE, SUPPRESS_LEVEL, input_guard
@@ -35,6 +36,7 @@ def chunk_gated_delta_rule_fwd(
     core_attn_out: torch.Tensor | None = None,
     kernels=None,
 ):
+    kernels = resolve_chunk_kernels(kernels)
     g = chunk_local_cumsum(
         g, chunk_size=FLA_CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
     )

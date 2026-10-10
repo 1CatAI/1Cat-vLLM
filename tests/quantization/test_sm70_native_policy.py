@@ -191,17 +191,17 @@ def test_prepared_argument_is_registered_once_and_preserves_utf8(monkeypatch):
     assert len(registered) == 2
 
 
-def test_old_native_abi_accepts_legacy_but_rejects_silent_typed_override(monkeypatch):
+def test_old_native_abi_rejects_every_captured_engine_policy(monkeypatch):
     monkeypatch.setattr(binding, "native_policy_abi_available", lambda: False)
     monkeypatch.setattr(torch.ops, "_C_qwen38", SimpleNamespace())
-    monkeypatch.setenv("VLLM_SM70_FP8_DENSE_TUNE_MAX_M", "8")
-    legacy = Sm70NativeConfig()
-    legacy.resolve("fp8")
-    assert binding.NativeBindings(legacy.values).values == ()
-    explicit = Sm70NativeConfig(fp8_dense_tune_max_m=16)
-    explicit.resolve("fp8")
-    with pytest.raises(RuntimeError, match="policy-argument ABI"):
-        binding.NativeBindings(explicit.values)
+    assert binding.NativeBindings().values == ()  # Standalone compatibility.
+    for override in (None, 8, 16):
+        policy = Sm70NativeConfig(fp8_dense_tune_max_m=override)
+        policy.resolve("fp8")
+        with monkeypatch.context() as capture:
+            capture.setattr(os, "getenv", lambda *args: pytest.fail("second capture"))
+            with pytest.raises(RuntimeError, match="policy-argument ABI"):
+                binding.NativeBindings(policy.values)
 
 
 def test_compile_key_uses_effective_policy_not_overridden_env(monkeypatch):
@@ -211,7 +211,13 @@ def test_compile_key_uses_effective_policy_not_overridden_env(monkeypatch):
     kernel = KernelConfig()
     kernel.sm70_moe.fp8.native.fp8_dense_tune_max_m = 8
     kernel.sm70_moe.fp8.resolve("fp8")
-    cfg = SimpleNamespace(kernel_config=kernel, compute_hash=kernel.compute_hash)
+    from vllm.config import CompilationConfig
+
+    cfg = SimpleNamespace(
+        kernel_config=kernel,
+        compute_hash=kernel.compute_hash,
+        compilation_config=CompilationConfig(),
+    )
     before = aot_compile_hash_factors(cfg)
     monkeypatch.setenv("VLLM_SM70_FP8_DENSE_TUNE_MAX_M", "16")
     monkeypatch.setenv("VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL", "1")

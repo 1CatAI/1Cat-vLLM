@@ -7,7 +7,7 @@ import os
 import torch
 import torch.nn as nn
 
-from vllm import envs
+from vllm.config.execution_policy import layer_policy
 from vllm.config.model import LogprobsMode
 from vllm.diagnostics import bind_diagnostics, diagnostic_channel
 from vllm.logger import init_logger
@@ -121,6 +121,7 @@ class Sampler(nn.Module):
         self, logprobs_mode: LogprobsMode = "raw_logprobs", *, diagnostics=None
     ):
         super().__init__()
+        self._layer_policy = layer_policy()
         self._diagnostics = bind_diagnostics() if diagnostics is None else diagnostics
         self.topk_topp_sampler = TopKTopPSampler(logprobs_mode)
         self.pin_memory = is_pin_memory_available()
@@ -305,9 +306,10 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         logprobs_mode: LogprobsMode,
+        policy=None,
     ) -> torch.Tensor | None:
         if not Sampler._sm70_compact_topk20_metadata_supported(
-            sampling_metadata, logprobs_mode
+            sampling_metadata, logprobs_mode, policy
         ):
             return None
         if (
@@ -318,7 +320,8 @@ class Sampler(nn.Module):
         ):
             return None
 
-        chunks = envs.VLLM_SM70_CHUNKED_TOPK20_CHUNKS
+        policy = layer_policy() if policy is None else policy
+        chunks = policy.value("chunked_topk20_chunks")
         if (
             chunks > 0
             and 248320 % chunks == 0
@@ -382,8 +385,10 @@ class Sampler(nn.Module):
     def _sm70_compact_topk20_metadata_supported(
         sampling_metadata: SamplingMetadata,
         logprobs_mode: LogprobsMode,
+        policy=None,
     ) -> bool:
-        if not envs.VLLM_SM70_COMPACT_TOPK20_SAMPLER:
+        policy = layer_policy() if policy is None else policy
+        if not policy.value("compact_topk20"):
             return False
         if logprobs_mode in ("processed_logits", "processed_logprobs"):
             return False
@@ -506,7 +511,7 @@ class Sampler(nn.Module):
     ) -> torch.Tensor | None:
         """Sample exact global top-20 pairs while preserving native RNG use."""
         if not self._sm70_compact_topk20_metadata_supported(
-            sampling_metadata, self.logprobs_mode
+            sampling_metadata, self.logprobs_mode, self._layer_policy
         ):
             return None
         return self._sm70_sample_top20_pairs(top_values, top_indices, sampling_metadata)
@@ -554,7 +559,7 @@ class Sampler(nn.Module):
             logits = processor.apply(logits)
 
         compact_sampled = self._try_sm70_compact_topk20_sample(
-            logits, sampling_metadata, logprobs_mode
+            logits, sampling_metadata, logprobs_mode, self._layer_policy
         )
         if compact_sampled is not None:
             return compact_sampled, None

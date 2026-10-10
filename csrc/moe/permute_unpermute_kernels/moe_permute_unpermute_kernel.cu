@@ -69,8 +69,7 @@ namespace {
 constexpr int kSingleTokenFastPathMaxTopK = 32;
 
 bool policyFlagEnabled(vllm::sm70::PolicyField field) {
-  const char* raw = vllm::sm70::policy_value(field);
-  return raw != nullptr && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(field, 0) != 0;
 }
 
 bool singleTokenPermuteFastPathEnabled() {

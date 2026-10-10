@@ -47,17 +47,19 @@ std::vector<int> ArgSort(size_t size, const Cmp& cmp) {
 }
 
 bool GemmTraceEnabled() {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_trace);
-  return raw && std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::tm_gemm_trace, 0) !=
+         0;
 }
 
 int GemmTraceLimit() {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_trace_limit);
-  return raw ? std::max(std::atoi(raw), 0) : 256;
+  return std::max(vllm::sm70::policy_atoi(
+                      vllm::sm70::PolicyField::tm_gemm_trace_limit, 256),
+                  0);
 }
 
 bool GemmTraceFilterAllows(const std::string& desc) {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_trace_filter);
+  const char* raw =
+      vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_trace_filter);
   return !raw || !*raw || desc.find(raw) != std::string::npos;
 }
 
@@ -93,51 +95,53 @@ bool SameSm70SplitKPartition(const LaunchSpec& control,
 }
 
 bool Sm70AwqTp2FastSelectorEnabled() {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_tp2_fast_selector);
-  return !raw || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::awq_tp2_fast_selector,
+                                 1) != 0;
 }
 
 // Keep the accepted QKVZ route enabled by default, while allowing an isolated
 // end-to-end A/B comparison without disabling the other exact small-M routes.
 bool Sm70AwqTp4QkvCta64Enabled() {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_tp4_qkv_cta64);
-  return !raw || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(vllm::sm70::PolicyField::awq_tp4_qkv_cta64,
+                                 1) != 0;
 }
 
 // Default-on A/B gate for the exact TP4 MTP verifier M=5 routes.
 bool Sm70AwqMtpM5FastSelectorEnabled() {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_mtp_m5_fast_selector);
-  return !raw || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::awq_mtp_m5_fast_selector, 1) != 0;
 }
 
 bool Sm70Mxfp4MoeGroupedM8FastSelectorEnabled() {
-  const char* grouped = vllm::sm70::policy_value(vllm::sm70::PolicyField::mxfp4_moe_grouped_m8);
-  if (!grouped || std::atoi(grouped) == 0) {
+  if (vllm::sm70::policy_atoi(vllm::sm70::PolicyField::mxfp4_moe_grouped_m8,
+                              0) == 0) {
     return false;
   }
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::mxfp4_moe_grouped_m8_fast_selector);
-  return !raw || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::mxfp4_moe_grouped_m8_fast_selector, 1) !=
+         0;
 }
 
 bool Sm70Nvfp4Qwen38Tp4M1FastSelectorEnabled() {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_qwen38_tp4_m1_fast_selector);
-  return !raw || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::nvfp4_qwen38_tp4_m1_fast_selector, 1) !=
+         0;
 }
 
 bool Sm70Nvfp4Qwen38MoeFastPrefillEnabled() {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill);
-  return !raw || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::nvfp4_qwen38_moe_fast_prefill, 1) != 0;
 }
 
 // Default-on gate for exact block-FP8 8K prefill GEMM descriptors.
 bool Sm70Fp8BlockPrefillFastSelectorEnabled() {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_prefill_fast_selector);
-  return !raw || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::fp8_prefill_fast_selector, 1) != 0;
 }
 
 bool Sm70Fp8GroupedBmmDecodeEnabled() {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::fp8_grouped_bmm_decode);
-  return !raw || std::atoi(raw) != 0;
+  return vllm::sm70::policy_atoi(
+             vllm::sm70::PolicyField::fp8_grouped_bmm_decode, 1) != 0;
 }
 
 struct Sm70AwqTp2FastTarget {
@@ -176,59 +180,24 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70DflashContextFcFastTarget(
 
 std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2EnvFastTarget(
     const GemmDesc& desc, const std::string_view desc_str) {
-  const char* raw = vllm::sm70::policy_value(vllm::sm70::PolicyField::awq_tp2_fast_targets);
-  if (!raw || !*raw) {
-    return std::nullopt;
-  }
-  const std::string targets(raw);
-  size_t begin = 0;
-  while (begin <= targets.size()) {
-    const size_t end = targets.find(';', begin);
-    const auto entry = targets.substr(
-        begin, end == std::string::npos ? std::string::npos : end - begin);
-    const size_t sep = entry.find('|');
-    if (sep != std::string::npos && entry.substr(0, sep) == desc_str) {
-      std::string spec = entry.substr(sep + 1);
-      std::string name_contains;
-      if (const size_t name_sep = spec.find('@');
-          name_sep != std::string::npos) {
-        name_contains = spec.substr(name_sep + 1);
-        spec.resize(name_sep);
-      }
-      std::replace(spec.begin(), spec.end(), 'x', ',');
-      std::replace(spec.begin(), spec.end(), ':', ',');
-      for (char& ch : spec) {
-        if (ch == ',') {
-          ch = ' ';
-        }
-      }
-      std::istringstream is(spec);
-      int cta_m{};
-      int cta_n{};
-      int cta_k{};
-      int splits{};
-      int swizzle{};
-      int require_mgroup{};
-      if (is >> cta_m >> cta_n >> cta_k >> splits >> swizzle >>
-          require_mgroup) {
-        if (name_contains.empty()) {
-          is >> name_contains;
-        }
-        return Sm70AwqTp2FastTarget{
-            desc.n,       desc.k, cta_m,   cta_n,
-            cta_k,        splits, swizzle, require_mgroup != 0,
-            name_contains};
-      }
-      if (GemmTraceEnabled() && GemmTraceFilterAllows(std::string(desc_str))) {
-        std::cerr << "[TM_GEMM_FAST_SELECTOR] desc=" << desc_str
-                  << " stage=invalid_env_target entry=" << entry << std::endl;
-      }
-      return std::nullopt;
+  for (const auto& target : vllm::sm70::policy_gemm_targets()) {
+    if (target.descriptor != desc_str) continue;
+    if (target.valid) {
+      return Sm70AwqTp2FastTarget{desc.n,
+                                  desc.k,
+                                  target.cta_m,
+                                  target.cta_n,
+                                  target.cta_k,
+                                  target.splits,
+                                  target.swizzle,
+                                  target.require_mgroup != 0,
+                                  target.name_contains};
     }
-    if (end == std::string::npos) {
-      break;
+    if (GemmTraceEnabled() && GemmTraceFilterAllows(std::string(desc_str))) {
+      std::cerr << "[TM_GEMM_FAST_SELECTOR] desc=" << desc_str
+                << " stage=invalid_env_target entry=" << target.entry
+                << std::endl;
     }
-    begin = end + 1;
   }
   return std::nullopt;
 }
@@ -283,12 +252,12 @@ std::optional<Sm70AwqTp2FastTarget> GetSm70AwqTp2FastTarget(
       return target;
     }
   }
-  const char* selector_rerank = vllm::sm70::policy_value(vllm::sm70::PolicyField::dflash2_qpn8_rerank);
-  const char* selector_shadow =
-      vllm::sm70::policy_value(vllm::sm70::PolicyField::dflash2_qpn8_rerank_shadow);
+
   const bool exact_selector_rerank =
-      (selector_rerank && std::atoi(selector_rerank) != 0) ||
-      (selector_shadow && std::atoi(selector_shadow) != 0);
+      (vllm::sm70::policy_atoi(vllm::sm70::PolicyField::dflash2_qpn8_rerank,
+                               0) != 0) ||
+      (vllm::sm70::policy_atoi(
+           vllm::sm70::PolicyField::dflash2_qpn8_rerank_shadow, 0) != 0);
   if (exact_selector_rerank && desc.arch == 700 && desc.type_a == kHalf &&
       desc.type_b == kHalf && desc.type_c == kHalf && desc.m >= 1 &&
       desc.m <= 8 && desc.n == 62080 && desc.k == 5120 && desc.num == 1) {
@@ -520,9 +489,9 @@ void MaybeTraceGemmDispatch(const GemmDesc& desc, DispatchPolicy policy,
   if (!GemmTraceFilterAllows(desc_str)) {
     return;
   }
-  static std::atomic<int> logged{0};
+  auto& logged = vllm::sm70::diagnostic_counter("tm_gemm_dispatch");
   const int limit = GemmTraceLimit();
-  if (limit > 0 && logged.fetch_add(1, std::memory_order_relaxed) >= limit) {
+  if (limit > 0 && logged.fetch_add(1, std::memory_order_relaxed) >= static_cast<unsigned>(limit)) {
     return;
   }
 
@@ -567,7 +536,8 @@ struct Gemm::Impl {
       tuning_.max_iter = 20;
       tuning_.max_time = 2.f;
     }
-    if (auto str = vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_tune)) {
+    if (auto str =
+            vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_tune)) {
       try {
         ParseTuningParams(tuning_, str);
       } catch (...) {
@@ -750,7 +720,9 @@ struct Gemm::Impl {
           }
         }
       }
-      if (vllm::sm70::policy_value(vllm::sm70::PolicyField::tm_gemm_warn_cache_miss) && (policy & DispatchPolicy::kReuse)) {
+      if (vllm::sm70::policy_value(
+              vllm::sm70::PolicyField::tm_gemm_warn_cache_miss) &&
+          (policy & DispatchPolicy::kReuse)) {
         std::cerr << "Failed to find a feasible kernel in the cache, will "
                      "dispatch by heuristic: "
                   << to_string(ctx.desc()) << std::endl;
@@ -921,13 +893,12 @@ struct Gemm::Impl {
                          }),
           batch_candidates.end());
       if (!batch_candidates.empty()) {
-        if (ctx.desc().type_b == kFloat4_e2m1 ||
-            preserve_default_partition) {
+        if (ctx.desc().type_b == kFloat4_e2m1 || preserve_default_partition) {
           // Timer noise must not redefine the compressed-weight reduction
           // partition before supply tuning. This also keeps newly warmed FP8
-          // batch layouts on their previous graph-capture fallback's arithmetic.
-          // Already tuned ordinary FP8 layers retain their existing reference.
-          // Timing can change M/N tiles only within that partition.
+          // batch layouts on their previous graph-capture fallback's
+          // arithmetic. Already tuned ordinary FP8 layers retain their existing
+          // reference. Timing can change M/N tiles only within that partition.
           auto reference = Find(ctx, barriers_size, partials_size, 1, false);
           if (!reference.empty()) {
             specs = {reference.front()};
@@ -1034,7 +1005,8 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
 
   const auto launch = [=](LaunchSpec spec, cudaStream_t st) {
     if ((operation.dispatch & DispatchPolicy::kSm70Nvfp4Prescaled) &&
-        spec.kernel->name().find("_sm70_nvfp4_prescaled") == std::string::npos) {
+        spec.kernel->name().find("_sm70_nvfp4_prescaled") ==
+            std::string::npos) {
       // Measure the transform that will actually consume the shifted scales.
       // The cache still stores an ordinary descriptor, shared by both formats.
       spec.kernel = Sm70Nvfp4PrescaledCounterpart(*spec.kernel);
@@ -1089,10 +1061,10 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
   {
     std::lock_guard<std::mutex> lock(impl_->dispatch_mutex_);
     if (measured) {
-      impl_->Measure(*dispatch_context, workspace.barriers_size,
-                     workspace.partials_size, 1, launch, stream,
-                     operation.dispatch &
-                         DispatchPolicy::kPreserveDefaultPartition);
+      impl_->Measure(
+          *dispatch_context, workspace.barriers_size, workspace.partials_size,
+          1, launch, stream,
+          operation.dispatch & DispatchPolicy::kPreserveDefaultPartition);
     }
 
     spec = impl_->Dispatch(*dispatch_context, operation.dispatch,

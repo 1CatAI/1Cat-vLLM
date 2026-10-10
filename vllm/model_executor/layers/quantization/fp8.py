@@ -165,9 +165,9 @@ class Fp8Config(QuantizationConfig):
             and current_platform.has_device_capability(70)
             and not current_platform.has_device_capability(75)
             and (
-                envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
+                sm70_tm.format_option("fp8", "dequant_fallback")
                 or sm70_tm.forces_marlin()
-                or sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+                or sm70_tm.format_enabled("fp8")
             )
         ):
             return 70
@@ -239,8 +239,8 @@ class Fp8Config(QuantizationConfig):
                 and current_platform.is_cuda()
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
-                and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
-                and not sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+                and sm70_tm.format_option("fp8", "moe_dequant_fallback")
+                and not sm70_tm.format_enabled("fp8")
                 and not sm70_tm.forces_marlin()
             ):
                 return Fp8MoEMethod(self, layer)
@@ -249,7 +249,7 @@ class Fp8Config(QuantizationConfig):
                 and current_platform.is_cuda()
                 and current_platform.has_device_capability(70)
                 and not current_platform.has_device_capability(75)
-                and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+                and sm70_tm.format_enabled("fp8")
             ):
                 from vllm.model_executor.layers.quantization.fp8_sm70_moe import (
                     Fp8SM70MoEMethod,
@@ -810,9 +810,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             current_platform.is_cuda()
             and current_platform.has_device_capability(70)
             and not current_platform.has_device_capability(75)
-            and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
-            and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
-            and not sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+            and sm70_tm.format_option("fp8", "dequant_fallback")
+            and sm70_tm.format_option("fp8", "moe_dequant_fallback")
+            and not sm70_tm.format_enabled("fp8")
             and not sm70_tm.forces_marlin()
         )
         self._fallback_unquantized_method: UnquantizedFusedMoEMethod | None = None

@@ -62,7 +62,7 @@ part of the contract.
 | D2 GDN and speculation | Merged [#1143](https://github.com/1CatAI/1Cat-vLLM/pull/1143); CI passed | CPU isolation/compatibility, 17 GPU operator cases and matched A/B passed. |
 | D3 diagnostics | Merged [#1146](https://github.com/1CatAI/1Cat-vLLM/pull/1146); CI passed | Shared diagnostic owner, 74 initialized parameters, legacy typed MoE bridge, CPU isolation and 7 GPU cases plus matched operator A/B. |
 | D4a attention package | Merged `d4ce51399`, CI passed [#1148](https://github.com/1CatAI/1Cat-vLLM/pull/1148) | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
-| D4b FA2/79T resources | Validated, ready for review | Native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build; evidence below. |
+| D4b FA2/79T resources | Merged [#1150](https://github.com/1CatAI/1Cat-vLLM/pull/1150), `b14c2ab0a`, CI passed | Native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build; evidence below. |
 | D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
 | D6 closure | Pending | Complete evidence audit, remaining-name ownership, report and execution-time read guards. |
 
@@ -428,3 +428,74 @@ that run was rejected before benchmarking. The corrected build explicitly
 refreshes source timestamps and produces a different baseline artifact. The
 local policy/metadata suite also needs a GPU-capable platform for nine existing
 fixtures; those fixtures pass in the 203-case remote run.
+
+### D5a: provider configuration and resource lifecycle
+
+QSA/indexer, GDN/FLA schedules, quantized loaders, MTP projections, ordinary
+sampling, fallback attention, TurboQuant and the remaining HC/PLE provider gates
+now consume their initialized owners. Deferred compatibility inputs travel with
+worker configuration; malformed dormant inputs still raise at their original
+admission checkpoints. Capturing a format does not activate it. Explicit typed
+values take precedence without changing the process environment.
+
+- QSA's two workspace maps, online-QPN8 address pools, sampler scratch and
+  TurboQuant caches borrow the worker resource map. Captured allocations survive
+  growth; AOT resolves new addresses by the existing layer prefix/owner slot.
+- Native runtime ABI 1 owns TurboMind packing, tuning, scratch and observation
+  counters in both normal extensions. Policy ABI 61 parses scalars and target
+  lists once. Existing custom-op schemas remain compatible. An explicit engine
+  configuration fails initialization against an insufficient binary.
+- Six FLA modules no longer snapshot launch policy on import. GDN and KDA reuse
+  `GdnScheduleConfig`; the model adapter declares the applicable hash fields.
+  Live autotuners belong to worker resources and are omitted from serialization.
+  Independent operator calls retain separate lazy compatibility caches.
+- Diagnostic budgets and buffers use engine owners. The paused empty-output and
+  replaced coarse GDN gates retain their original notices, including presence-only
+  parsing for the latter. No empty-allocation experiment is reactivated.
+- Async queue depth remains in the scheduler. The old output-token repair switch
+  also affects ordinary async runs, so its canonical owner is `sm70_runtime`.
+  Both batch constructors bind it once; request-history repair reads no env.
+- Library paths, capabilities and upstream loading controls remain loading inputs.
+  The six native `SM70_MARLIN_*` launch overrides still need D5b. DDTree remains
+  deferred. D6 must audit the full inventory with one common counter.
+
+**Validation.** Focused CPU suites cover worker serialization, hash qualification,
+two-engine initialization/execution order, malformed inputs, original golden
+route/call-order snapshots, forbidden getters after initialization and resource
+release. Logs reside under `/home/ymzx/arch-ws/tmp/phase-d5`. Final notice/default
+coverage passes 32 tests. The remote provider suites initially stopped after
+170 and 197 passes on fixture/package failures; all seven corresponding cases
+pass after supplying the unchanged standard extension and using production
+initialization scopes. The fallback-attention suite passes 34 tests. The final
+FLA/GDN/native-owner/async-state suite passes 35 tests (8 unrelated deselections),
+including changed-input/state graph replay and release of one of two owners.
+
+Normal `_C`, `_moe_C` and `_C_stable_libtorch` components were built from source;
+both arms use the same unchanged FA2/Flash-V100 components. Fresh-process ABI and
+loader checks passed. Artifact hashes, raw samples and workload contracts are in
+[phase_d5a_operators.json](phase_d5a_operators.json).
+
+| Operator | GPU/event median change | Host median change | Output/state and allocation |
+| --- | --- | --- | --- |
+| QSA M512/K2048 | -0.16% | +4.90% | Exact |
+| MTP router M5/N512/K2560 | +0.32% | +7.65% | Exact |
+| FP16 M16/N512/K1024, fixed selector | -0.06% | -1.84% | Exact |
+| QPN8 M8/M17/M32 | -0.16% / 0% / 0% | +8.64% / +7.69% / -1.73% | Exact |
+| Triton attention M1/M33 | -0.21% / -0.21% | -16.83% / -11.97% | Exact |
+| TurboQuant prefill M33, eager events | +0.43% | +0.67% | Exact |
+| KDA/GDN prefill M64/H4/K64 | +0.11% / 0% | +0.65% / -0.24% | Exact |
+
+All entries use three alternating A/B rounds. GPU differences are small; the
+host overhead is **not** uniformly unchanged. Entering/exiting both native owners
+adds about 25–27 microseconds per host boundary after caching ScriptObject method
+wrappers (previously about 35 microseconds). It is paid at the runner boundary,
+not per captured GPU node. QPN8's eager wrapper costs about 1.6–1.8 microseconds
+and QSA about 5.5 microseconds in these samples. D5b will retain this measurement
+and narrow the owner transition cost. No model-performance conclusion is made.
+
+Rejected evidence is retained: TurboQuant prefill cannot use the attempted graph
+capture because the original path calls `.item()`; its final A/B uses eager events
+on both sides. FP16's first autotuned baseline changed its own digest across
+rounds, so deterministic parity uses fixed selection on both sides. Initial CPU
+fixtures that inferred a GPU or re-registered custom ops are not counted as
+passes; corrected tests exercise the actual initialized policies.

@@ -7,6 +7,7 @@ fields stay serializable and hashable; this private runtime map is not a policy
 input. A forward borrows the same owners, never a copy of their mutable state.
 """
 
+from contextlib import ExitStack, contextmanager
 from typing import Any
 
 
@@ -20,17 +21,28 @@ class _RuntimeResources(dict[str, Any]):
 def runtime_resources_for(config) -> dict[str, Any]:
     resources = getattr(config, "_runtime_resources", None)
     if not resources:
-        from vllm.config.execution_policy import POLICY_OWNERS
+        from vllm.config.execution_policy import BOUND_POLICY_OWNERS
 
         policies = {}
-        for path in POLICY_OWNERS:
-            owner, name = path.split(".")
-            policy = getattr(getattr(config, owner, None), name, None)
+        for path in BOUND_POLICY_OWNERS:
+            policy = config
+            for part in path.split("."):
+                policy = getattr(policy, part, None)
             if policy is not None:
                 policies[path] = policy
         resources = _RuntimeResources(
             {
                 "execution_policies": policies,
+                "fla_schedule": getattr(
+                    getattr(getattr(config, "kernel_config", None), "gdn", None),
+                    "schedule",
+                    None,
+                ),
+                "spec_decode_trace": getattr(
+                    getattr(config, "observability_config", None),
+                    "spec_decode_trace",
+                    None,
+                ),
                 "runtime_trace": getattr(
                     getattr(config, "observability_config", None), "runtime_trace", None
                 ),
@@ -66,3 +78,12 @@ def release_runtime_resources(config) -> None:
         if close is not None:
             close()
     resources.clear()
+
+
+@contextmanager
+def activate_runtime_resources(resources):
+    """Borrow provider execution contexts registered during initialization."""
+    with ExitStack() as stack:
+        for owner in resources.get("execution_context_owners", ()):
+            stack.enter_context(owner.activate())
+        yield

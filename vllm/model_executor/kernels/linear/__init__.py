@@ -1042,7 +1042,7 @@ def select_sm70_nvfp4_linear_kernel(
         elif kernel is Qpn4NvFp4LinearKernel:
             if skip_qpn4:
                 reason = "insufficient QPN4 workspace"
-            elif not config.qpn4_qualified or not envs.VLLM_SM70_NVFP4_QPN4:
+            elif not config.qpn4_qualified or not config.policy.loader_value("qpn4"):
                 reason = "QPN4 disabled or outside the qualified workload"
         elif kernel is Qpn2NvFp4LinearKernel:
             if not config.policy.qpn2:

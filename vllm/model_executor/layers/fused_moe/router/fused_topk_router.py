@@ -5,8 +5,8 @@ from collections.abc import Callable
 import torch
 
 import vllm._custom_ops as ops
-from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.config.sm70_moe import moe_routing_policy
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import (
@@ -134,7 +134,7 @@ def _sm70_qwen38_router_topk(
             gating_output.dtype == torch.float16 and 1 <= num_tokens <= 16
         ),
         SELECT_TOP16=(
-            envs.VLLM_SM70_MTP_ROUTER_TOP16
+            moe_routing_policy().value("mtp_top16")
             and gating_output.dtype == torch.float16
             and num_tokens in (5, 10)
         ),
@@ -221,7 +221,7 @@ def fused_topk(
 
     if scoring_func == "softmax":
         if (
-            envs.VLLM_SM70_QWEN38_ROUTER_TOPK
+            moe_routing_policy().value("exact_topk")
             and 1 <= M <= 16
             and gating_output.shape == (M, 512)
             and gating_output.dtype == torch.float16

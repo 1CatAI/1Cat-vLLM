@@ -1130,7 +1130,7 @@ def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
     ``amax / (6 * 448)`` (the Marlin multiplier). TurboMind combine is
     ``block * global``. Do not infer convention from scale magnitude.
     """
-    if sm70_tm.should_prepare_turbomind(layer.weight, envs.VLLM_SM70_NVFP4_TURBOMIND):
+    if sm70_tm.is_exact_sm70_cuda(layer.weight, sm70_tm.format_enabled("nvfp4")):
         logger.info_once(
             "SM70 ModelOpt NVFP4 TurboMind dense path enabled "
             "(weight-only; activations remain half)."
@@ -1239,10 +1239,7 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         # admitted only when a proven software backend is selected.
         # Exact-device routing still happens later via
         # sm70_tm.should_prepare_turbomind (capability == (7, 0)).
-        if (
-            sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND)
-            or sm70_tm.forces_marlin()
-        ):
+        if sm70_tm.format_enabled("nvfp4") or sm70_tm.forces_marlin():
             return 70
         if _explicit_nvfp4_emulation_requested():
             return 70
@@ -2503,8 +2500,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
     def get_min_capability(cls) -> int:
         if (
             sm70_tm.is_pre_ampere_cuda_platform()
-            and sm70_tm.use_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
-            and sm70_tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND)
+            and sm70_tm.format_enabled("fp8")
+            and sm70_tm.format_enabled("nvfp4")
         ):
             return 70
         return 89

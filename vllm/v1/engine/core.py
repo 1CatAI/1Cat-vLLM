@@ -195,7 +195,7 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
-            if envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH > 0:
+            if vllm_config.scheduler_config.sm70_queue_depth() > 0:
                 logger.info(
                     "SM70 async scheduling queue depth override active: %d",
                     self.batch_queue_size,
@@ -585,11 +585,11 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
-        trace_enabled = envs.VLLM_SM70_ASYNC_CPU_TRACE
+        trace_enabled = self.vllm_config.observability_config.runtime_trace.async_cpu
         trace_step = self._sm70_async_cpu_trace_step
-        trace_log = trace_enabled and (
-            trace_step % envs.VLLM_SM70_ASYNC_CPU_TRACE_EVERY == 0
-        )
+        trace_every = self.vllm_config.observability_config.runtime_trace.async_every
+        assert trace_every is not None
+        trace_log = trace_enabled and trace_step % trace_every == 0
         if trace_enabled:
             self._sm70_async_cpu_trace_step += 1
         trace_t0 = time.perf_counter() if trace_log else 0.0

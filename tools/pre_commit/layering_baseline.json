@@ -25,7 +25,7 @@
   "platform": 18
  },
  "vllm/config/attention.py": {
-  "platform": 8
+  "platform": 17
  },
  "vllm/config/cache.py": {
   "platform": 3
@@ -37,30 +37,30 @@
   "model": 3
  },
  "vllm/config/diagnostic_dump.py": {
-  "platform": 57
+  "platform": 64
  },
  "vllm/config/diagnostic_sampling.py": {
   "env": 2,
-  "platform": 7
+  "platform": 5
  },
  "vllm/config/execution_policy.py": {
-  "model": 17,
-  "platform": 102
+  "model": 9,
+  "platform": 53
  },
  "vllm/config/gdn.py": {
   "env": 1,
-  "platform": 15
+  "platform": 12
  },
  "vllm/config/gdn_projection.py": {
-  "platform": 14
+  "platform": 1
  },
  "vllm/config/gdn_schedule.py": {
-  "platform": 46
+  "platform": 47
  },
  "vllm/config/gdn_state.py": {
   "env": 5,
   "model": 6,
-  "platform": 14
+  "platform": 9
  },
  "vllm/config/observability.py": {
   "platform": 1
@@ -70,15 +70,22 @@
   "platform": 1
  },
  "vllm/config/policy_defaults.py": {
-  "model": 19,
-  "platform": 36
+  "model": 14,
+  "platform": 28
+ },
+ "vllm/config/scheduler.py": {
+  "platform": 13
  },
  "vllm/config/speculative.py": {
-  "model": 141,
+  "model": 142,
   "platform": 17
  },
  "vllm/config/speculative_sampling.py": {
-  "platform": 19
+  "model": 1,
+  "platform": 3
+ },
+ "vllm/config/turboquant_runtime.py": {
+  "platform": 7
  },
  "vllm/config/vllm.py": {
   "env": 2,
@@ -86,7 +93,7 @@
   "platform": 71
  },
  "vllm/diagnostics.py": {
-  "platform": 1
+  "platform": 2
  },
  "vllm/distributed/communication_op.py": {
   "platform": 6
@@ -133,7 +140,7 @@
   "platform": 9
  },
  "vllm/model_executor/kernels/linear/__init__.py": {
-  "platform": 30
+  "platform": 29
  },
  "vllm/model_executor/kernels/linear/fp16_gemv_silu.py": {
   "platform": 4
@@ -142,7 +149,7 @@
   "platform": 1
  },
  "vllm/model_executor/kernels/mhc/tilelang.py": {
-  "platform": 69
+  "platform": 68
  },
  "vllm/model_executor/kernels/mhc/tilelang_kernels.py": {
   "platform": 2
@@ -161,29 +168,15 @@
   "model": 3,
   "platform": 2
  },
- "vllm/model_executor/layers/fla/ops/chunk_delta_h.py": {
-  "env": 1,
-  "platform": 10
- },
- "vllm/model_executor/layers/fla/ops/chunk_o.py": {
-  "env": 1,
-  "platform": 9
- },
- "vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py": {
-  "env": 1,
-  "platform": 8
- },
  "vllm/model_executor/layers/fla/ops/fused_recurrent.py": {
-  "env": 1,
-  "platform": 50
+  "platform": 22
  },
  "vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py": {
-  "env": 1,
   "model": 22,
-  "platform": 45
+  "platform": 21
  },
  "vllm/model_executor/layers/fla/ops/gdn_chunk_kernels.py": {
-  "platform": 5
+  "platform": 6
  },
  "vllm/model_executor/layers/fla/ops/gdn_prefill.py": {
   "platform": 9
@@ -195,18 +188,17 @@
   "platform": 20
  },
  "vllm/model_executor/layers/fla/ops/kda.py": {
-  "env": 1,
-  "platform": 7
+  "platform": 1
  },
  "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py": {
   "platform": 1
  },
  "vllm/model_executor/layers/fused_moe/fused_moe.py": {
   "model": 1,
-  "platform": 29
+  "platform": 25
  },
  "vllm/model_executor/layers/fused_moe/modular_kernel.py": {
-  "platform": 10
+  "platform": 7
  },
  "vllm/model_executor/layers/fused_moe/oracle/mxfp4.py": {
   "platform": 15
@@ -215,15 +207,15 @@
   "platform": 15
  },
  "vllm/model_executor/layers/fused_moe/router/fused_topk_router.py": {
-  "model": 7,
-  "platform": 8
+  "model": 6,
+  "platform": 7
  },
  "vllm/model_executor/layers/fused_moe/router/gate_linear.py": {
   "platform": 5
  },
  "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": {
-  "model": 3,
-  "platform": 41
+  "model": 2,
+  "platform": 40
  },
  "vllm/model_executor/layers/fused_moe/runner/shared_experts.py": {
   "platform": 1
@@ -240,14 +232,14 @@
   "platform": 52
  },
  "vllm/model_executor/layers/logits_processor.py": {
-  "env": 2,
+  "env": 1,
   "model": 12,
-  "platform": 23
+  "platform": 9
  },
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 14,
   "model": 236,
-  "platform": 445
+  "platform": 439
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -265,10 +257,10 @@
   "platform": 10
  },
  "vllm/model_executor/layers/quantization/awq.py": {
-  "platform": 44
+  "platform": 42
  },
  "vllm/model_executor/layers/quantization/awq_marlin.py": {
-  "platform": 44
+  "platform": 43
  },
  "vllm/model_executor/layers/quantization/base_config.py": {
   "platform": 1
@@ -280,13 +272,13 @@
   "platform": 3
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a16_nvfp4.py": {
-  "platform": 8
+  "platform": 9
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxfp4.py": {
   "platform": 13
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py": {
-  "platform": 21
+  "platform": 20
  },
  "vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w8a16_fp8.py": {
   "model": 4,
@@ -296,16 +288,13 @@
   "platform": 13
  },
  "vllm/model_executor/layers/quantization/fp8.py": {
-  "platform": 66
+  "platform": 62
  },
  "vllm/model_executor/layers/quantization/modelopt.py": {
-  "platform": 89
+  "platform": 87
  },
  "vllm/model_executor/layers/quantization/mxfp4.py": {
   "platform": 25
- },
- "vllm/model_executor/layers/quantization/nvfp4_sm70_moe.py": {
-  "env": 1
  },
  "vllm/model_executor/layers/quantization/utils/marlin_utils.py": {
   "platform": 4
@@ -326,9 +315,9 @@
   "platform": 18
  },
  "vllm/model_executor/layers/sparse_attn_indexer_kpool.py": {
-  "env": 4,
-  "model": 8,
-  "platform": 17
+  "env": 2,
+  "model": 3,
+  "platform": 18
  },
  "vllm/model_executor/layers/utils.py": {
   "platform": 5
@@ -337,31 +326,10 @@
   "model": 18,
   "platform": 53
  },
- "vllm/model_executor/models/qwen2_moe.py": {
-  "env": 1
- },
- "vllm/model_executor/models/qwen3_5_mtp.py": {
-  "env": 2
- },
  "vllm/model_executor/warmup/kernel_warmup.py": {
   "platform": 3
  },
- "vllm/models/deepseek_v4/sm70/indexer.py": {
-  "env": 6
- },
- "vllm/models/glm5next/nvidia/kda.py": {
-  "env": 3
- },
- "vllm/models/glm5next/nvidia/model.py": {
-  "env": 7
- },
- "vllm/models/glm5next/sm70/sparse.py": {
-  "env": 2
- },
  "vllm/models/qwen4_exp/nvidia/ops/qsa.py": {
-  "env": 5
- },
- "vllm/models/qwen4_exp/nvidia/qsa.py": {
   "env": 1
  },
  "vllm/platforms/cpu.py": {
@@ -376,7 +344,7 @@
  },
  "vllm/platforms/runtime_defaults.py": {
   "model": 34,
-  "platform": 202
+  "platform": 197
  },
  "vllm/platforms/xpu.py": {
   "env": 1
@@ -449,8 +417,7 @@
   "platform": 7
  },
  "vllm/v1/attention/backends/turboquant_attn.py": {
-  "env": 6,
-  "platform": 79
+  "platform": 38
  },
  "vllm/v1/attention/ops/gdn_state.py": {
   "model": 1
@@ -465,7 +432,7 @@
   "platform": 1
  },
  "vllm/v1/attention/ops/triton_unified_attention.py": {
-  "platform": 78
+  "platform": 46
  },
  "vllm/v1/core/kv_cache_utils.py": {
   "model": 31,
@@ -484,7 +451,7 @@
  "vllm/v1/engine/core.py": {
   "env": 2,
   "model": 33,
-  "platform": 9
+  "platform": 7
  },
  "vllm/v1/executor/multiproc_executor.py": {
   "platform": 1
@@ -503,14 +470,14 @@
   "model": 8
  },
  "vllm/v1/sample/ops/topk_topp_triton.py": {
-  "platform": 7
+  "platform": 4
  },
  "vllm/v1/sample/rejection_sampler.py": {
   "env": 2,
   "platform": 2
  },
  "vllm/v1/sample/sampler.py": {
-  "platform": 39
+  "platform": 37
  },
  "vllm/v1/spec_decode/ddtree_payload.py": {
   "env": 2
@@ -530,7 +497,7 @@
  "vllm/v1/spec_decode/llm_base_proposer.py": {
   "env": 1,
   "model": 40,
-  "platform": 36
+  "platform": 34
  },
  "vllm/v1/spec_decode/profiling.py": {
   "model": 4,
@@ -547,7 +514,7 @@
  },
  "vllm/v1/worker/gpu/cudagraph_utils.py": {
   "model": 11,
-  "platform": 30
+  "platform": 33
  },
  "vllm/v1/worker/gpu/mamba_align.py": {
   "model": 2
@@ -564,16 +531,13 @@
   "model": 1
  },
  "vllm/v1/worker/gpu/sample/sampler.py": {
-  "platform": 2
+  "platform": 1
  },
  "vllm/v1/worker/gpu/shutdown.py": {
   "platform": 11
  },
  "vllm/v1/worker/gpu/spec_decode/__init__.py": {
   "model": 16
- },
- "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py": {
-  "env": 3
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py": {
   "model": 6
@@ -595,16 +559,16 @@
   "model": 5
  },
  "vllm/v1/worker/gpu_input_batch.py": {
-  "platform": 1
+  "platform": 3
  },
  "vllm/v1/worker/gpu_model_runner.py": {
   "env": 18,
   "model": 669,
-  "platform": 169
+  "platform": 165
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 1,
-  "platform": 25
+  "platform": 24
  },
  "vllm/v1/worker/mamba_utils.py": {
   "env": 1,

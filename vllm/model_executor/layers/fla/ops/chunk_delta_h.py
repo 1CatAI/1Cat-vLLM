@@ -8,12 +8,11 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-import os
-
 import torch
 
 from vllm.triton_utils import tl, triton
 
+from .gdn_chunk_kernels import resolve_chunk_kernels
 from .index import prepare_chunk_indices, prepare_chunk_offsets
 from .op import exp, exp2
 from .utils import FLA_CHUNK_SIZE, use_cuda_graph
@@ -21,55 +20,12 @@ from .utils import FLA_CHUNK_SIZE, use_cuda_graph
 NUM_WARPS = [2, 4, 8, 16]
 
 
-def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
-    )
-
-
-def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
-    raw = os.getenv(env_name)
-    if raw is None or not raw.strip():
-        return default_vals
-    out: list[int] = []
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            value = int(token)
-        except ValueError:
-            continue
-        if value > 0:
-            out.append(value)
-    return out or default_vals
-
-
-_use_sm70_delta_h_schedule = (
-    os.getenv("VLLM_SM70_GDN_DELTA_H_SCHEDULE", "1") == "1" and _is_sm70()
-)
-_delta_h_configs = (
-    [
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        # The SM70 schedule gate is intentionally canonical by default:
-        # BV=16/warps=8/stages=1 was the fastest strict-equal candidate on the
-        # Qwen-like V100 fixture. Env overrides keep the old broader search
-        # space available for diagnostics without making the accepted route
-        # depend on Triton autotune winner variability.
-        for BV in _parse_int_list("VLLM_SM70_GDN_DELTA_H_BV", [16])
-        for num_warps in _parse_int_list("VLLM_SM70_GDN_DELTA_H_WARPS", [8])
-        for num_stages in _parse_int_list("VLLM_SM70_GDN_DELTA_H_STAGES", [1])
-    ]
-    if _use_sm70_delta_h_schedule
-    else [
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-        for BV in [32, 64]
-    ]
-)
+_delta_h_configs = [
+    triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+    for num_warps in [2, 4]
+    for num_stages in [2, 3, 4]
+    for BV in [32, 64]
+]
 
 
 @triton.heuristics(
@@ -381,6 +337,8 @@ def chunk_gated_delta_rule_fwd_h(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # This kernel is slightly different from fla to support Q/K with different head numbers.
     # In fla, Q/K always have the same head number, so Hg is always equal to H.
+    if kernel is None:
+        kernel = resolve_chunk_kernels().delta_h
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = chunk_size

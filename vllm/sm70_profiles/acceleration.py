@@ -257,15 +257,13 @@ def _switches(defaults: dict[str, str], cfg) -> dict[str, Any]:
     from vllm.config.policy_defaults import effective_runtime_values
 
     effective = effective_runtime_values(cfg)
-    return {
-        name: effective[name] if name in effective else getattr(envs, name)
-        for name in defaults
-    }
+    return {name: effective.get(name) for name in defaults}
 
 
 def _switches_match(values: dict[str, Any], defaults: dict[str, str]) -> bool:
     return all(
-        (
+        value is not None
+        and (
             int(value) >= int(defaults[name])
             if int(defaults[name]) > 1
             else str(int(value) if isinstance(value, bool) else value) == defaults[name]
@@ -290,7 +288,7 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
 
     effective = effective_runtime_values(cfg)
     values = {
-        name: effective[name] if name in effective else getattr(envs, name)
+        name: effective.get(name)
         for name, getter in envs.environment_variables.items()
         if "Flash-Next qualified batch"
         in cast(EnvVar, getter).metadata.acceleration_paths
@@ -307,9 +305,11 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     }
     from vllm.model_executor.models.config import sm70_flash_next_batch_qualified
 
-    if (
-        not sm70_flash_next_batch_qualified(cfg)
-        and "VLLM_SM70_QWEN38_GDN_INPUT_BATCH" not in envs.os.environ
+    if not sm70_flash_next_batch_qualified(
+        cfg
+    ) and cfg.kernel_config.gdn.projection.sources.get("input_batch") not in (
+        "typed",
+        "VLLM_SM70_QWEN38_GDN_INPUT_BATCH",
     ):
         controls["VLLM_SM70_QWEN38_GDN_INPUT_BATCH"].update(
             enabled=False, reason="speculation_not_quality_qualified"
@@ -341,14 +341,14 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     if reference_layout:
         batch = layer_policy(cfg).batch_fastpath
         gdn_layers = list(getattr(text, "layer_types", ())).count("linear_attention")
-        if batch or envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH:
+        if batch or values["VLLM_SM70_QWEN38_GDN_INPUT_BATCH"]:
             copies["gdn_input"] = gdn_layers * (4096 + 32) * 2560 * 2
         if batch or (draft_layers and layer_policy(cfg).hc_mtp_batch):
             copies["hc_target"] = layers * 2 * (96 * 10240 + 2560 * 320) * 2
             copies["hc_draft"] = draft_layers * 2 * (96 * 10240 + 2560 * 320) * 2
-        if draft_layers and envs.VLLM_SM70_MTP_ROUTER_BATCH:
+        if draft_layers and values["VLLM_SM70_MTP_ROUTER_BATCH"]:
             copies["router"] = (layers + draft_layers) * 512 * 2560 * 2
-        if draft_layers and envs.VLLM_SM70_MTP_SHARED_BATCH:
+        if draft_layers and values["VLLM_SM70_MTP_SHARED_BATCH"]:
             copies["shared_expert"] = (layers + draft_layers) * 320 * 2560 * 2
     return {
         "scope": "configured_capabilities",
@@ -385,7 +385,7 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     }
 
 
-def _native_capabilities(page_size: int) -> dict[str, bool]:
+def _native_capabilities(page_size: int, policy) -> dict[str, bool]:
     import torch
 
     # Register FA2 operators before probing availability.
@@ -421,7 +421,7 @@ def _native_capabilities(page_size: int) -> dict[str, bool]:
         ),
         "grouped_fp32": bool(flash_attn_grouped_e4m3_fp32_available()),
         "long_operator": builtin_long_attention() is not None,
-        "long_enabled": long_attention_enabled(),
+        "long_enabled": long_attention_enabled(policy),
         "page_supported": long_attention_page_supported(page_size, BUILTIN_MANIFEST),
         "scalar": scalar_tail_attention_available(),
         "q8000": _get_sm70_d256_gqa_architecture_q8192_op() is not None,
@@ -524,7 +524,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         _dflash_reason(cfg) is None
         and not cfg.kernel_config.sm70_awq.resolved
         and not cfg.kernel_config.sm70_fp8.resolved
-    ) or envs.VLLM_SM70_REQUIRE_PROFILE_ACCELERATION
+    ) or cfg.observability_config.runtime_trace.require_profile_acceleration
     paths: dict[str, dict[str, Any]] = {}
     report = {
         "profile": "qwen38_27b_nvfp4_dflash2" if release_profile else None,
@@ -678,12 +678,13 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             from vllm.config.sm70_dflash2 import (
                 SM70_DFLASH2_LEGACY_FIELDS,
                 capture_sm70_dflash2_config,
-                sm70_dflash2_enabled,
             )
 
             policy = capture_sm70_dflash2_config(cfg)
+            if policy is None or not policy.resolved:
+                reason = reason or "policy_unresolved"
             values = {
-                alias: sm70_dflash2_enabled(field, policy)
+                alias: getattr(policy, field) if policy is not None else None
                 for alias, field in SM70_DFLASH2_LEGACY_FIELDS.items()
             }
         else:
@@ -734,7 +735,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     attention_options = cfg.attention_config.flash_v100.options
     page_size = int(cfg.cache_config.block_size or 0)
     try:
-        native = _native_capabilities(page_size)
+        native = _native_capabilities(
+            page_size, cfg.attention_config.flash_v100.options
+        )
     except (ImportError, AttributeError, RuntimeError, OSError) as exc:
         native = dict.fromkeys(
             (
@@ -830,7 +833,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             "user_override"
             if (
                 not cfg.attention_config.flash_v100.options.value("tail_cudagraphs")
-                or graph_policy().decode_partition_size
+                or graph_policy(cfg).decode_partition_size
             )
             else (
                 "page_size"
@@ -848,7 +851,7 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
                 "tail_cudagraphs"
             ),
             "VLLM_FLASH_V100_DECODE_PARTITION_SIZE": (
-                graph_policy().decode_partition_size
+                graph_policy(cfg).decode_partition_size
             ),
         },
     )
@@ -885,24 +888,28 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     )
     from torch._inductor import config as inductor_config
 
-    from vllm.compilation.compiler_interface import is_compile_cache_enabled
-
+    startup = getattr(cfg, "runtime_default_sources", {}).get(
+        "VLLM_DISABLE_COMPILE_CACHE", []
+    )
+    cache_disabled = bool(int(startup[-1]["raw"])) if startup else None
     cache_config = compilation.inductor_compile_config
     cache_reason = None
-    if envs.VLLM_DISABLE_COMPILE_CACHE:
+    if cache_disabled:
         cache_reason = "compile_cache_disabled"
     elif cfg.model_config.enforce_eager or compilation.mode in (
         None,
         CompilationMode.NONE,
     ):
         cache_reason = "compilation_disabled"
-    elif not is_compile_cache_enabled(cache_config):
+    elif inductor_config.force_disable_caches or cache_config.get(
+        "force_disable_caches", False
+    ):
         cache_reason = "inductor_cache_disabled"
     paths["compile_cache"] = _row(
         cache_reason,
         mode=getattr(compilation.mode, "name", None),
         switches={
-            "VLLM_DISABLE_COMPILE_CACHE": envs.VLLM_DISABLE_COMPILE_CACHE,
+            "VLLM_DISABLE_COMPILE_CACHE": cache_disabled,
             "VLLM_USE_AOT_COMPILE": graph_policy(cfg).aot_compile,
             "force_disable_caches": cache_config.get("force_disable_caches", False),
             "torch_force_disable_caches": inductor_config.force_disable_caches,
@@ -919,7 +926,10 @@ def log_and_validate(cfg: VllmConfig) -> dict[str, Any]:
     # Diagnostic state must not become part of additional_config's compile hash.
     cfg.sm70_acceleration_report = report
     failures = []
-    if report["sm70"] or envs.VLLM_SM70_REQUIRE_PROFILE_ACCELERATION:
+    if (
+        report["sm70"]
+        or cfg.observability_config.runtime_trace.require_profile_acceleration
+    ):
         for name in report["expected_acceleration"]:
             row = report["paths"][name]
             if not row["enabled"]:
@@ -933,7 +943,7 @@ def log_and_validate(cfg: VllmConfig) -> dict[str, Any]:
                 )
         logger.info("SM70 acceleration status: %s", report)
     report["expected_failures"] = failures
-    if envs.VLLM_SM70_REQUIRE_PROFILE_ACCELERATION and failures:
+    if cfg.observability_config.runtime_trace.require_profile_acceleration and failures:
         raise ValueError(
             "SM70 profile acceleration requirement failed: " + "; ".join(failures)
         )

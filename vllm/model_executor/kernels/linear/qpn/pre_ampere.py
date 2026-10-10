@@ -7,7 +7,6 @@ from dataclasses import dataclass
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.model_executor.kernels.linear.nvfp4.base import (
     NvFp4LinearKernel,
@@ -60,7 +59,7 @@ class TuringQpn2NvFp4LinearKernel(NvFp4LinearKernel):
         policy.active = True
         if not policy.dense_qpn2:
             return False, "dense QPN2 disabled by KernelConfig"
-        if not tm.use_turbomind(envs.VLLM_SM70_NVFP4_TURBOMIND):
+        if not tm.format_enabled("nvfp4"):
             return False, "disabled by the legacy quantization backend override"
         if c.input_dtype != torch.float16:
             return False, "requires FP16 activations"

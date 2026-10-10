@@ -5,7 +5,7 @@
 
 from collections.abc import Callable
 from contextlib import suppress
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 import torch
 from pydantic import Field
@@ -31,6 +31,7 @@ def read_execution_legacy(name: str):
         "VLLM_SM70_DFLASH2_BF16_EMULATION",
         "VLLM_SM70_ENABLE_LM_HEAD_FASTPATH",
         "VLLM_SM70_LM_HEAD_TOP1_TC",
+        "VLLM_GLM53_PP_MHC_MATERIALIZE",
     ):
         if name != "VLLM_SM70_DFLASH2_BF16_EMULATION":
             return os.getenv(name, "0").strip().lower() in ("1", "true", "yes", "on")
@@ -41,6 +42,10 @@ def read_execution_legacy(name: str):
             "yes",
             "on",
         )
+    if name == "VLLM_QWEN35_MTP_KEEP_QUANT":
+        return os.getenv(name, "0") == "1"
+    if name in ("VLLM_SM70_GLM53_EXACT_KDA_GEMV", "VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS"):
+        return os.getenv(name, "1") != "0"
     if name in ("VLLM_SM70_GLM53_TP8_CUBLASLT", "VLLM_SM70_GLM53_TP8_FUSED_FG_B"):
         return os.getenv(name, "0") != "0"
     if name in (
@@ -176,6 +181,11 @@ class GraphPolicy(ExecutionPolicy):
                     values[field] = int(values[field])
         return hash_factors(values if self.active else {})
 
+    gdn_spec_piecewise: bool | None = None
+    """Retain the SM70 aligned-cache speculative decode capture restriction."""
+    eager_profile_run: bool | None = None
+    """Skip compiled execution during the existing SM70 profiling step."""
+
     mtp_context_buckets: str | tuple[int, ...] | None = None
     """Explicit verification context buckets; empty disables, None uses defaults."""
     dsv4_context_buckets: str | tuple[int, ...] | None = None
@@ -231,6 +241,8 @@ class GraphPolicy(ExecutionPolicy):
     """Use the existing graph memory admission estimator."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "gdn_spec_piecewise": "VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE",
+        "eager_profile_run": "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN",
         "mtp_context_partition_size": "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE",
         "aot_compile": "VLLM_USE_AOT_COMPILE",
         "mega_aot": "VLLM_USE_MEGA_AOT_ARTIFACT",
@@ -260,6 +272,21 @@ class GraphPolicy(ExecutionPolicy):
 class LayerExecutionPolicy(ExecutionPolicy):
     """Execution policy owned by kernel_config.layer_execution."""
 
+    mhc_fp32_stage: bool | None = None
+    """Retain DeepSeek's shape-qualified FP32 mHC intermediate."""
+    disable_shared_moe_overlap: bool | None = None
+    """Retain the independent SM70 shared-expert overlap rollback."""
+    ple_spec_conv: bool | None = None
+    """Retain the existing PLE MTP convolution and state-commit kernel."""
+    quant_backend: Literal["auto", "marlin", "turbomind"] | None = None
+    """Shared pre-Ampere quantization backend; format flags retain their gates."""
+    gptq_turbomind: bool | None = None
+    """Retained opt-in GPTQ weight-only provider."""
+    compressed_tensors_turbomind: bool | None = None
+    """Retained opt-in integer compressed-tensors provider."""
+    mxfp4_turbomind: bool | None = None
+    """MXFP4 loader admission; native tuning stays with its existing owner."""
+
     batch_fastpath: bool | None = None
     """Retain the existing batch fastpath model strategy."""
 
@@ -280,7 +307,47 @@ class LayerExecutionPolicy(ExecutionPolicy):
     dense_log_error: str | None = Field(default=None, init=False)
     """Legacy logger parse error, raised only at its original checkpoint."""
 
+    provider_errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Keep unused provider parse failures behind their original admission gates."""
+
+    deferred_fields: ClassVar[tuple[str, ...]] = (
+        "mhc_fp32_stage",
+        "disable_shared_moe_overlap",
+        "ple_spec_conv",
+        "quant_backend",
+        "gptq_turbomind",
+        "compressed_tensors_turbomind",
+        "mxfp4_turbomind",
+        "online_qpn8",
+        "tp_local_topk20",
+        "mtp_dense_fastpath",
+        "shared_gate_fusion",
+        "compact_topk20",
+        "chunked_topk20_chunks",
+        "glm_exact_kda_gemv",
+        "topk_topp_b8_b16_warps8",
+        "topk_topp_warps8",
+    )
+
+    def value(self, field):
+        if field in self.provider_errors:
+            raise ValueError(self.provider_errors[field])
+        return getattr(self, field)
+
     def resolve(self, *, dflash=None) -> None:
+        from vllm.config.utils import resolve_legacy_fields
+
+        pending = {
+            field: self.aliases[field]
+            for field in self.deferred_fields
+            if field not in self.sources
+        }
+        resolve_legacy_fields(
+            self,
+            pending,
+            reader=read_execution_legacy,
+            deferred_errors=self.provider_errors,
+        )
         super().resolve()
         from vllm import envs
 
@@ -308,9 +375,55 @@ class LayerExecutionPolicy(ExecutionPolicy):
 
     def compute_hash(self) -> str:
         factors: dict[str, object] = {"policy": super().compute_hash()}
+        errors = {
+            field: error
+            for field, error in self.provider_errors.items()
+            if self.hash_fields is None or field in self.hash_fields
+        }
+        if errors:
+            factors["provider_errors"] = errors
         if self.hash_fields is None or "dense_f16" in self.hash_fields:
             factors["native"] = self.native.hash_options()
         return hash_factors(factors)
+
+    topk_topp_b8_b16_warps8: bool | None = None
+    """Use eight warps at the retained ordinary-sampling vocabulary/row gates."""
+    topk_topp_warps8: bool | None = None
+    """Enable the retained eight-warp schedule for verifier sampling rows."""
+
+    glm_pp_mhc_materialize: bool | None = None
+    """Materialize completed mHC states at the existing PP boundary."""
+
+    greedy_token_fastpath: bool | None = None
+    """Admit the retained runner greedy-token path at its dynamic eligibility gate."""
+    tp_local_topk20: bool | None = None
+    """Use local TP top-k20 only after the compact-sampler gate passes."""
+
+    moe_dense_allowlist: str | None = None
+    """Optional model-qualified projection suffixes for dense expert preparation."""
+    shared_gate_fusion: bool | None = None
+    """Fuse only the shared-expert projection shapes accepted by their adapter."""
+
+    mtp_dense_fastpath: bool | None = None
+    """Permit the model adapter's MTP FP16 projection allowlist."""
+    mtp_dense_allowlist: str | None = None
+    """Optional suffix list; the model adapter retains the historical defaults."""
+    mtp_share_io_weights: bool | None = None
+    """Share target embeddings and output weights on the qualified MTP model."""
+    mtp_keep_quant: bool | None = None
+    """Retain draft quantization despite a checkpoint exclusion rule."""
+
+    online_qpn8: bool | None = None
+    """Prepare the qualified checkpoint-FP16 weights in online QPN8 layout."""
+
+    compact_topk20: bool | None = None
+    """Admit the exact ordinary top-k20 sampler at its retained metadata gate."""
+
+    chunked_topk20_chunks: int | None = None
+    """Chunk count consumed only by the admitted SM70 248320-vocabulary sampler."""
+
+    glm_exact_kda_gemv: bool | None = None
+    """Retain the GLM exact KDA projection provider and legacy nonzero dialect."""
 
     batch_gemm_layouts: bool | None = None
     """Prepare compatible larger-batch dense weight layouts."""
@@ -373,6 +486,28 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Threads for native multi-token hyperconnection normalization."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "mhc_fp32_stage": "VLLM_SM70_DSV4_MHC_FP32_STAGE",
+        "disable_shared_moe_overlap": "VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP",
+        "ple_spec_conv": "VLLM_SM70_MTP_PLE_CONV",
+        "quant_backend": "VLLM_SM70_QUANT_BACKEND",
+        "gptq_turbomind": "VLLM_SM70_GPTQ_TURBOMIND",
+        "compressed_tensors_turbomind": "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND",
+        "mxfp4_turbomind": "VLLM_SM70_MXFP4_TURBOMIND",
+        "topk_topp_b8_b16_warps8": "VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS",
+        "topk_topp_warps8": "VLLM_SM70_TOPK_TOPP_8_WARPS",
+        "glm_pp_mhc_materialize": "VLLM_GLM53_PP_MHC_MATERIALIZE",
+        "greedy_token_fastpath": "VLLM_SM70_GREEDY_TOKEN_FASTPATH",
+        "tp_local_topk20": "VLLM_SM70_TP_LOCAL_TOPK20_SAMPLER",
+        "moe_dense_allowlist": "VLLM_SM70_MOE_DENSE_ALLOWLIST",
+        "shared_gate_fusion": "VLLM_SM70_QWEN3NEXT_SHARED_GATE_FUSION",
+        "mtp_dense_fastpath": "VLLM_SM70_MTP_DENSE_F16_FASTPATH",
+        "mtp_dense_allowlist": "VLLM_SM70_MTP_DENSE_F16_ALLOWLIST",
+        "mtp_share_io_weights": "VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS",
+        "mtp_keep_quant": "VLLM_QWEN35_MTP_KEEP_QUANT",
+        "online_qpn8": "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8",
+        "compact_topk20": "VLLM_SM70_COMPACT_TOPK20_SAMPLER",
+        "chunked_topk20_chunks": "VLLM_SM70_CHUNKED_TOPK20_CHUNKS",
+        "glm_exact_kda_gemv": "VLLM_SM70_GLM53_EXACT_KDA_GEMV",
         "batch_fastpath": "VLLM_SM70_QWEN38_BATCH_FASTPATH",
         "hc_mtp_batch": "VLLM_SM70_MTP_HC_BATCH",
         "hc_cooperative": "VLLM_SM70_MTP_HC_COOPERATIVE",
@@ -408,7 +543,26 @@ class CommunicationPolicy(ExecutionPolicy):
     native: CollectiveNativeConfig = Field(default_factory=CollectiveNativeConfig)
     """Immutable per-communicator native selection and launch parameters."""
 
+    provider_errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Captured errors for optional transfer and MoE communication gates."""
+
+    def value(self, field):
+        if field in self.provider_errors:
+            raise ValueError(self.provider_errors[field])
+        return getattr(self, field)
+
     def resolve(self, native_overrides=None, *, layers=None, trace=None):
+        from vllm.config.utils import resolve_legacy_fields
+
+        resolve_legacy_fields(
+            self,
+            {
+                field: self.aliases[field]
+                for field in ("pp_static_hidden_transfer", "moe_sum2_q8")
+                if field not in self.sources
+            },
+            deferred_errors=self.provider_errors,
+        )
         super().resolve()
         overrides = dict(native_overrides or {})
         source = self.sources.get("tp8_hierarchical", "")
@@ -428,6 +582,10 @@ class CommunicationPolicy(ExecutionPolicy):
             {"policy": super().compute_hash(), "native": self.native.compute_hash()}
         )
 
+    pp_static_hidden_transfer: bool | None = None
+    """Retain the metadata-free single-token pipeline transfer contract."""
+    moe_sum2_q8: bool | None = None
+    """Retain the qualified eight-row GLM expert sum/reduction implementation."""
     top1_custom_ar: bool | None = None
     """Provision the existing compact greedy-token collective."""
 
@@ -485,6 +643,8 @@ class CommunicationPolicy(ExecutionPolicy):
     """Explicit comma-separated pipeline layer counts, or automatic."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "pp_static_hidden_transfer": "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER",
+        "moe_sum2_q8": "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8",
         "top1_custom_ar": "VLLM_SM70_TOP1_CUSTOM_AR",
         "symm_mem": "VLLM_ALLREDUCE_USE_SYMM_MEM",
         "flashinfer": "VLLM_ALLREDUCE_USE_FLASHINFER",
@@ -536,10 +696,24 @@ class PlePlacementPolicy(ExecutionPolicy):
 POLICY_OWNERS = {
     "compilation_config.runtime": "GraphPolicy",
     "kernel_config.layer_execution": "LayerExecutionPolicy",
+    "kernel_config.sm70_sparse": "Sm70SparseConfig",
     "parallel_config.communication": "CommunicationPolicy",
     "offload_config.ple": "PlePlacementPolicy",
     "attention_config.flash_v100": "FlashV100Policy",
+    "attention_config.sm70_triton": "Sm70TritonAttentionPolicy",
+    "attention_config.flash_v100.turboquant": "TurboQuantRuntimePolicy",
 }
+
+
+# These owners resolve at their existing model/speculation checkpoints, after
+# platform defaults. Runtime contexts borrow them without resolving them again.
+BOUND_POLICY_OWNERS = (
+    *POLICY_OWNERS,
+    "kernel_config.gdn.projection",
+    "kernel_config.sm70_moe.unquantized",
+    "kernel_config.sm70_moe.routing",
+    "speculative_config.sampling_policy",
+)
 
 
 @torch.compiler.assume_constant_result
@@ -568,13 +742,17 @@ def capture_execution_policy(owner: str, cls, cfg=None):
             )
             if owner in policies:
                 return policies[owner]
+            parent, _, field = owner.rpartition(".")
+            if parent in policies:
+                return getattr(policies[parent], field)
         from vllm.config import get_current_vllm_config_or_none
 
         cfg = get_current_vllm_config_or_none()
     if cfg is None:
         return _standalone_policy(cls)
-    config_name, field = owner.split(".")
-    return getattr(getattr(cfg, config_name), field)
+    for part in owner.split("."):
+        cfg = getattr(cfg, part, None)
+    return cfg
 
 
 def graph_policy(cfg=None) -> GraphPolicy:
@@ -599,3 +777,11 @@ def ple_policy(cfg=None) -> PlePlacementPolicy:
 
 def flash_v100_policy(cfg=None) -> FlashV100Policy:
     return capture_execution_policy("attention_config.flash_v100", FlashV100Policy, cfg)
+
+
+def flash_v100_options(cfg=None):
+    from vllm.config.flash_v100 import FlashV100Options
+
+    return capture_execution_policy(
+        "attention_config.flash_v100.options", FlashV100Options, cfg
+    )

@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config.sm70_sparse import sparse_policy
 from vllm.models.deepseek_v4.sm70 import indexer as sm70_indexer
 from vllm.models.deepseek_v4.sm70.indexer import (
     sm70_indexer_decode_logits,
@@ -103,7 +104,7 @@ def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas)
     torch.manual_seed(20260819)
     generator = torch.Generator().manual_seed(20260819)
     num_queries, num_heads, num_keys = 5, 8, 37
-    monkeypatch.setattr(sm70_indexer, "_PREFILL_CUBLAS", use_cublas)
+    monkeypatch.setattr(sparse_policy(), "indexer_prefill_cublas", use_cublas)
 
     q, weights = _make_queries(num_queries, num_heads)
     bits, values = _random_fp8_keys(num_keys, generator)
@@ -128,7 +129,7 @@ def test_prefill_relu_off_restores_the_factored_form(monkeypatch):
     torch.manual_seed(20260819)
     generator = torch.Generator().manual_seed(20260819)
     num_queries, num_heads, num_keys = 4, 8, 23
-    monkeypatch.setattr(sm70_indexer, "_RELU_LOGITS", False)
+    monkeypatch.setattr(sparse_policy(), "indexer_relu", False)
 
     q, weights = _make_queries(num_queries, num_heads)
     bits, values = _random_fp8_keys(num_keys, generator)
@@ -158,8 +159,8 @@ def test_decode_reads_the_block_major_paged_cache(monkeypatch, relu, fused):
     """
     torch.manual_seed(20260819)
     generator = torch.Generator().manual_seed(20260819)
-    monkeypatch.setattr(sm70_indexer, "_RELU_LOGITS", relu)
-    monkeypatch.setattr(sm70_indexer, "_FUSED_DECODE_LOGITS", fused)
+    monkeypatch.setattr(sparse_policy(), "indexer_relu", relu)
+    monkeypatch.setattr(sparse_policy(), "indexer_fused_logits", fused)
 
     num_heads = 8
     seq_lens_list = [1, _BLOCK_SIZE + 1, 3 * _BLOCK_SIZE - 5]
@@ -268,7 +269,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
         ).contiguous()
     q, weights = _make_queries(num_rows * num_requests, num_heads)
 
-    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_cublas_enabled", False)
     baseline = sm70_indexer_decode_logits(
         q,
         cache,
@@ -299,8 +300,8 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
             workspace_requests.append(specs)
             return static_workspace
 
-    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", True)
-    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS_MIN_KEYS", 1)
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_cublas_enabled", True)
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_min_keys", 1)
     monkeypatch.setattr(
         sm70_indexer, "current_workspace_manager", lambda: StaticWorkspace()
     )
@@ -346,7 +347,7 @@ def test_decode_cublas_keeps_the_fp32_topk_set_and_masks_graph_tail(
     # Replay the same graph with a shorter live request. This exercises the
     # device-derived bound instead of merely validating the capture-time row.
     seq_lens.sub_(127)
-    monkeypatch.setattr(sm70_indexer, "_DECODE_CUBLAS", False)
+    monkeypatch.setattr(sparse_policy(), "indexer_decode_cublas_enabled", False)
     replay_baseline = sm70_indexer_decode_logits(
         q,
         cache,

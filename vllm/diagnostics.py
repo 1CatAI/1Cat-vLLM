@@ -11,7 +11,6 @@ from typing import Any
 import torch
 
 from vllm.config.diagnostic_dump import (
-    DUMP_BINDINGS,
     TensorDumpConfig,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -68,6 +67,21 @@ class DiagnosticChannel:
         os.makedirs(self.policy.directory, exist_ok=True)
         return output_path(self.policy.directory, filename, self.engine_tag)
 
+    def append_json(self, filename: str, payload: dict, *, compact=False) -> None:
+        with open(self.output_path(filename), "a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(payload, separators=(",", ":")) + "\n"
+                if compact
+                else json.dumps(payload, sort_keys=True) + "\n"
+            )
+
+    def append_json_path(self, path: str, payload: dict) -> None:
+        # Explicit JSONL paths retain their parent-creation/error behavior.
+        parent, filename = os.path.split(path)
+        path = output_path(parent, filename, self.engine_tag)
+        with open(path, "a", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, sort_keys=True) + "\n")
+
     def flush_graph(self, step: int, stage: str, *, gdn=False, trigger=True) -> None:
         policy = self.policy
         if not policy.directory or trigger and not policy.can_save():
@@ -111,13 +125,24 @@ class EngineDiagnostics:
         self.timing_calls = 0
         self.histories: dict[str, dict] = {}
         self.channels = {
-            name: DiagnosticChannel(getattr(config, name), engine_tag=self.engine_tag)
-            for name in DUMP_BINDINGS
+            name: DiagnosticChannel(policy, engine_tag=self.engine_tag)
+            for name, policy in trace.dump_channels().items()
         }
         # MoE and model layers share selection, not counters or capture buffers.
         self.channels["moe_runner"] = DiagnosticChannel(
             config.qwen_layer, engine_tag=self.engine_tag
         )
+
+    def close(self):
+        for channel in self.channels.values():
+            channel.counts.clear()
+            channel.saves.clear()
+            channel.buffers.clear()
+            channel.metadata.clear()
+            channel.retired_buffers.clear()
+        self.counters.clear()
+        self.timing_sums.clear()
+        self.histories.clear()
 
 
 # Historical imports can access these independent, unconfigured helper owners.
@@ -158,9 +183,11 @@ def diagnostic_channel(name: str, *, owner=None) -> DiagnosticChannel:
         return owner.channels[name]
     channel = legacy_channel(name)
     # Old no-config calls deliberately remain a separate compatibility adapter.
-    policy = TensorDumpConfig()
-    policy.resolve("qwen_layer" if name == "moe_runner" else name)
-    channel.policy = policy
+    from vllm.config.sm70_runtime import RuntimeTraceConfig
+
+    channel.policy = RuntimeTraceConfig.legacy_dump_channel(
+        "qwen_layer" if name == "moe_runner" else name
+    )
     return channel
 
 

@@ -530,7 +530,7 @@ class MoERunner(MoERunnerInterface):
 
         tp_size = self.moe_config.tp_size
         glm53_q8 = bool(
-            envs.VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8
+            communication_policy().value("moe_sum2_q8")
             and tp_size == 8
             and shared_output.dtype == torch.float16
             and tuple(shared_output.shape) == (8, 4096)

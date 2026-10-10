@@ -12,6 +12,7 @@ from typing import ClassVar
 from pydantic import Field
 
 from vllm.config.execution_policy_base import ExecutionPolicy
+from vllm.config.turboquant_runtime import TurboQuantRuntimePolicy
 from vllm.config.utils import config, hash_factors
 
 NATIVE_FIELDS = (
@@ -423,6 +424,9 @@ class CapturedFlashOptions:
                     value = value == "1"
                 elif parser == "ne0":
                     value = value != "0"
+                elif parser == "not_false":
+                    assert isinstance(value, str)
+                    value = value.strip().lower() not in ("0", "false", "no", "off")
                 elif parser.startswith("native:"):
                     if parser == "native:scalar_alias" and raw is None:
                         raw = self.legacy_inputs[self.legacy_aliases[field][0]]
@@ -486,6 +490,11 @@ class FlashV100Options(CapturedFlashOptions):
     legacy_aliases: ClassVar[dict[str, tuple[str, ...]]] = {
         "e4m3_scalar_fast": ("VLLM_FLASH_V100_TP2_E4M3_SCALAR_FAST",),
     }
+
+    e4m3_long_enabled: bool | None = None
+    """Retain long-context attention unless the legacy explicit-off rule matches."""
+    e4m3_long_manifest: str | None = None
+    """Experimental long-context provider manifest, captured before execution."""
 
     tail_cudagraphs: bool | None = None
     """Scalar-tail attention also serves ordinary E4M3 decode, beyond DFlash."""
@@ -851,6 +860,8 @@ class FlashV100Options(CapturedFlashOptions):
     """Retained VLLM_FLASH_V100_XQA_STAGED_PV input."""
 
     bindings: ClassVar[dict[str, tuple[str, str, object]]] = {
+        "e4m3_long_enabled": ("VLLM_SM70_E4M3_LONG_ATTENTION", "not_false", ""),
+        "e4m3_long_manifest": ("VLLM_SM70_E4M3_LONG_ATTENTION_MANIFEST", "raw", ""),
         "prefill_qk_algorithm": (
             "PREFIX_QK_CUBLAS_ALGO_RUNTIME",
             "native:optional_atoi",
@@ -1462,6 +1473,7 @@ class FlashV100Policy(ExecutionPolicy):
 
     def bind_consumers(self, graph, trace, cache_dtype):
         self.options.finalize(graph, trace.flash_v100, cache_dtype)
+        self.turboquant.active = cache_dtype.startswith("turboquant")
 
     def compile_ignored_aliases(self):
         return self.options.compile_ignored_aliases()
@@ -1483,12 +1495,15 @@ class FlashV100Policy(ExecutionPolicy):
             "package_policy": dict(options.python_policy),
             "prefill_native": {
                 "abi": 1,
-                "values": options.prefill_native_effective,
+                "values": list(options.prefill_native_effective),
                 "resources": "worker runtime_resources.sm70_prefill",
                 "shared_resource": "physical-device execution gate for kernel globals",
             },
             "resources": "worker runtime_resources.flash_v100",
         }
+
+    turboquant: TurboQuantRuntimePolicy = Field(default_factory=TurboQuantRuntimePolicy)
+    """Packed-cache provider choices, qualified independently of dense attention."""
 
     options: FlashV100Options = Field(default_factory=FlashV100Options)
     """Backend, package and native choices bound to this attention owner."""
@@ -1496,13 +1511,17 @@ class FlashV100Policy(ExecutionPolicy):
     def resolve(self) -> None:
         super().resolve()
         self.options.resolve()
+        self.turboquant.resolve()
 
     def compute_hash(self) -> str:
-        return hash_factors(
+        factors = (
             {"base": super().compute_hash(), "options": self.options.hash_values()}
             if self.active
             else {}
         )
+        if self.turboquant.active:
+            factors["turboquant"] = self.turboquant.compute_hash()
+        return hash_factors(factors)
 
     enabled: bool | None = None
     """Retain the platform's Flash-V100 backend qualification switch."""

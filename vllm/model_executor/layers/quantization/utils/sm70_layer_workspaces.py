@@ -314,3 +314,66 @@ direct_register_custom_op(
     mutates_args=["out"],
     fake_impl=_sm70_nvfp4_qpn4_dispatch_fake,
 )
+
+
+def _sm70_online_qpn8_hc_dispatch(
+    block_out: torch.Tensor,
+    injection_out: torch.Tensor,
+    down_staging: torch.Tensor,
+    lora_staging: torch.Tensor,
+    gate_staging: torch.Tensor,
+    partials: torch.Tensor,
+    layer_name: str,
+    x: torch.Tensor,
+    down_codes: torch.Tensor,
+    down_scales: torch.Tensor,
+    up_codes: torch.Tensor,
+    up_scales: torch.Tensor,
+) -> None:
+    binding = _workspace_binding(layer_name)
+    binding.native.fp8_qpn8_hc_dispatch_sm70_out(
+        block_out,
+        injection_out,
+        down_staging,
+        lora_staging,
+        gate_staging,
+        partials,
+        binding.workspace.data_ptr(),
+        x,
+        down_codes,
+        down_scales,
+        up_codes,
+        up_scales,
+    )
+
+
+def _sm70_online_qpn8_hc_dispatch_fake(
+    block_out: torch.Tensor,
+    injection_out: torch.Tensor,
+    down_staging: torch.Tensor,
+    lora_staging: torch.Tensor,
+    gate_staging: torch.Tensor,
+    partials: torch.Tensor,
+    layer_name: str,
+    x: torch.Tensor,
+    down_codes: torch.Tensor,
+    down_scales: torch.Tensor,
+    up_codes: torch.Tensor,
+    up_scales: torch.Tensor,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    "sm70_online_qpn8_hc_dispatch",
+    _sm70_online_qpn8_hc_dispatch,
+    mutates_args=[
+        "block_out",
+        "injection_out",
+        "down_staging",
+        "lora_staging",
+        "gate_staging",
+        "partials",
+    ],
+    fake_impl=_sm70_online_qpn8_hc_dispatch_fake,
+)

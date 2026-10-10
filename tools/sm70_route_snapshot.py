@@ -154,6 +154,11 @@ def snapshot_layer(
         patch.object(module, "get_current_vllm_config", lambda: cfg),
         patch.object(tm, "use_turbomind", lambda enabled: True),
         patch.object(tm, "should_prepare_turbomind", lambda tensor, enabled: True),
+        patch.object(tm, "is_exact_sm70_cuda", lambda tensor, enabled: True),
+        patch(
+            "vllm.config.sm70_native.capture_linear_native_config",
+            return_value=NS(values=()),
+        ),
         patch.object(tm, "use_batched_gemm_layouts", lambda: batch),
         patch.object(tm, "prepare_nvfp4_linear", prepare),
         patch.object(

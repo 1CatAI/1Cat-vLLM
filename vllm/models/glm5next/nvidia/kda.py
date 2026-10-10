@@ -2,15 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
 
-import os
-
 import torch
 from torch import nn
 
 import vllm._sm70_ops as sm70_ops
+from vllm._sm70.policy import NativeBindings
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.execution_policy import layer_policy
+from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import diagnostic_history
 from vllm.distributed import divide, get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -49,28 +50,18 @@ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 logger = init_logger(__name__)
 
-_DEBUG_DFLASH_TARGET_FINITE = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_PROPOSAL_STAGES", "0"))
-)
-_DEBUG_DFLASH_TARGET_TRACE = bool(
-    int(os.getenv("VLLM_DFLASH_DEBUG_TARGET_LAYER_TRACE", "0"))
-)
-_DFLASH_KDA_TRACE_SEEN: set[tuple[str, str]] = set()
-_DFLASH_KDA_TRACE_ARMED_PREFIXES: set[str] = set()
-_DFLASH_KDA_TRACE_TOKEN_INDEX: dict[str, int] = {}
-
 
 def arm_dflash_target_kda_trace(prefix: str, token_index: int) -> None:
-    if _DEBUG_DFLASH_TARGET_TRACE:
-        _DFLASH_KDA_TRACE_ARMED_PREFIXES.add(prefix)
-        _DFLASH_KDA_TRACE_TOKEN_INDEX[prefix] = token_index
+    if capture_runtime_trace().dflash.value("target_layer_trace"):
+        diagnostic_history("glm_kda_armed")[prefix] = True
+        diagnostic_history("glm_kda_token_index")[prefix] = token_index
 
 
 def _debug_dflash_kda_finite(
     prefix: str, stage: str, tensor: torch.Tensor | None
 ) -> None:
     if (
-        not _DEBUG_DFLASH_TARGET_FINITE
+        not capture_runtime_trace().dflash.value("proposal_stages")
         or tensor is None
         or tensor.shape[-2 if tensor.ndim >= 2 else 0] <= 1
     ):
@@ -113,19 +104,20 @@ def _debug_dflash_kda_trace(
     num_accepted_tokens: torch.Tensor | None,
 ) -> None:
     if (
-        not _DEBUG_DFLASH_TARGET_TRACE
+        not capture_runtime_trace().dflash.value("target_layer_trace")
         or get_tensor_model_parallel_rank() != 0
-        or prefix not in _DFLASH_KDA_TRACE_ARMED_PREFIXES
+        or prefix not in diagnostic_history("glm_kda_armed")
         or tensor.shape[token_dim] > 8
         or (state_indices is not None and not bool((state_indices >= 0).any().item()))
     ):
         return
     key = (prefix, stage)
-    if key in _DFLASH_KDA_TRACE_SEEN:
+    if key in diagnostic_history("glm_kda_seen"):
         return
-    _DFLASH_KDA_TRACE_SEEN.add(key)
+    diagnostic_history("glm_kda_seen")[key] = True
     token_index = min(
-        _DFLASH_KDA_TRACE_TOKEN_INDEX.get(prefix, 0), tensor.shape[token_dim] - 1
+        diagnostic_history("glm_kda_token_index").get(prefix, 0),
+        tensor.shape[token_dim] - 1,
     )
     row = tensor.select(token_dim, token_index).detach().float().reshape(-1)
     state_row = (
@@ -161,15 +153,15 @@ def _debug_dflash_sequence_delta(
     token_dim: int,
 ) -> None:
     if (
-        not _DEBUG_DFLASH_TARGET_TRACE
+        not capture_runtime_trace().dflash.value("target_layer_trace")
         or get_tensor_model_parallel_rank() != 0
-        or prefix not in _DFLASH_KDA_TRACE_ARMED_PREFIXES
+        or prefix not in diagnostic_history("glm_kda_armed")
     ):
         return
     key = (prefix, stage)
-    if key in _DFLASH_KDA_TRACE_SEEN:
+    if key in diagnostic_history("glm_kda_seen"):
         return
-    _DFLASH_KDA_TRACE_SEEN.add(key)
+    diagnostic_history("glm_kda_seen")[key] = True
     delta = (actual - reference).detach().float().movedim(token_dim, 0)
     delta = delta.reshape(delta.shape[0], -1)
     logger.warning(
@@ -184,7 +176,7 @@ def _debug_dflash_sequence_delta(
 
 
 def _sm70_exact_kda_gemv_enabled() -> bool:
-    return os.getenv("VLLM_SM70_GLM53_EXACT_KDA_GEMV", "1") != "0"
+    return bool(layer_policy().value("glm_exact_kda_gemv"))
 
 
 def _sm70_glm53_tp8_cublaslt_enabled() -> bool:
@@ -372,6 +364,11 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             and self.hidden_size == 4096
             and _sm70_exact_kda_gemv_enabled()
         )
+        self._exact_gemv_ops = (
+            NativeBindings(layer_policy().native.values)
+            if self._use_sm70_exact_kda_gemv
+            else None
+        )
         self._use_sm70_fp32_recurrent_output = (
             current_platform.is_cuda()
             and current_platform.get_device_capability() == (7, 0)
@@ -535,7 +532,10 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
-            sm70_ops.sm70_glm53_fp16_gemv_out(projected, hidden_states, weight)
+            assert self._exact_gemv_ops is not None
+            self._exact_gemv_ops.sm70_glm53_fp16_gemv_out(
+                projected, hidden_states, weight
+            )
             logger.info_once("SM70 GLM KDA exact FP16 B1-B8 projection path enabled.")
         else:
             projected = self.in_proj_qkvbfg_a(hidden_states)[0]
@@ -758,9 +758,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
             conv_idx = spec_state_indices_tensor[:, 0][:num_spec_decodes]
             conv_mql = spec_state_indices_tensor.size(-1)
             debug_spec_sequence = (
-                _DEBUG_DFLASH_TARGET_TRACE
+                capture_runtime_trace().dflash.value("target_layer_trace")
                 and get_tensor_model_parallel_rank() == 0
-                and self.prefix in _DFLASH_KDA_TRACE_ARMED_PREFIXES
+                and self.prefix in diagnostic_history("glm_kda_armed")
                 and self.prefix.endswith(".layers.0.self_attn")
                 and num_spec_decodes == 1
             )
@@ -1022,7 +1022,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     spec_state_indices_tensor,
                     num_accepted_tokens,
                 )
-            if _DEBUG_DFLASH_TARGET_FINITE and not bool(
+            if capture_runtime_trace().dflash.value("proposal_stages") and not bool(
                 torch.isfinite(core_attn_out_spec).all().item()
             ):
                 state_rows = torch.arange(
@@ -1087,6 +1087,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 cu_seqlens=non_spec_query_start_loc,
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
+                kernels=self.chunk_kernels,
             )
             # Init cache
             scatter_states(

@@ -1,8 +1,9 @@
-#include "sm70_policy.h"
+#include "sm70_runtime.h"
 #include "core/registration.h"
 #include "moe_ops.h"
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
+  vllm::sm70::register_native_runtime<1>(m);
   m.def("sm70_native_policy_abi() -> int",
         []() -> int64_t { return vllm::sm70::policy_size; });
   m.def("sm70_prepare_native_policy_token(str token) -> ()",

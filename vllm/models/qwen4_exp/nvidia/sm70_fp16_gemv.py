@@ -11,7 +11,6 @@ linear path.
 
 from __future__ import annotations
 
-import os
 from types import MethodType
 from typing import NamedTuple
 
@@ -22,6 +21,8 @@ import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config import get_current_vllm_config
 from vllm.config.execution_policy import layer_policy
+from vllm.config.gdn_projection import projection_policy
+from vllm.config.speculative_sampling import mtp_batch_enabled
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.platforms import current_platform
@@ -142,7 +143,7 @@ def _can_fuse_gdn_projection_split(qkvz: torch.Tensor, ba: torch.Tensor) -> bool
     # This copy-only operation does not change either GEMM. Keep the existing
     # M1 path and all unsupported layouts; no maximum batch/sequence binding.
     return bool(
-        envs.VLLM_SM70_GDN_BATCH_SPLIT_COPY
+        projection_policy().value("batch_split_copy")
         and _is_packed_row_major(qkvz)
         and _is_packed_row_major(ba)
         and qkvz.shape[0] > 1
@@ -278,7 +279,7 @@ def _pack_router_batch_weight(weight: torch.Tensor) -> torch.Tensor:
 
 def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
     return bool(
-        envs.VLLM_SM70_MTP_SHARED_BATCH
+        mtp_batch_enabled("shared_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
         and x.shape[0] in (5, 10)
@@ -360,7 +361,7 @@ def _forward_shared_batch_silu(layer, x):
 
 def _router_batch_runtime_ok(x, packed) -> bool:
     return bool(
-        envs.VLLM_SM70_MTP_ROUTER_BATCH
+        mtp_batch_enabled("router_batch")
         and not envs.VLLM_BATCH_INVARIANT
         and x.ndim == 2
         and x.shape[0] in (5, 10)
@@ -506,7 +507,7 @@ def _pack_gdn_input_weight(weight: torch.Tensor) -> torch.Tensor:
 
 def _can_use_packed_gdn_input(x, packed_qkvz, packed_ba) -> bool:
     return bool(
-        (envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH or layer_policy().batch_fastpath)
+        (projection_policy().value("input_batch") or layer_policy().batch_fastpath)
         and not envs.VLLM_BATCH_INVARIANT
         # The packed MMA preserves the original FP32 accumulation contract.
         # Let cuBLAS honor an explicit request for FP16 accumulation.
@@ -771,7 +772,7 @@ def enable_qwen38_sm70_fp16_gemv(
     if not layer_policy().fp16_gemv:
         return
     if (
-        envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8
+        layer_policy().value("online_qpn8")
         or dtype != torch.float16
         or not capability_ok
         or not contract_ok
@@ -779,7 +780,7 @@ def enable_qwen38_sm70_fp16_gemv(
         logger.warning_once(
             "Qwen3.8 checkpoint-FP16 GEMV opt-in rejected: "
             "online_qpn8=%s dtype=%s sm70=%s exact_contract=%s.",
-            envs.VLLM_SM70_QWEN4_EXP_ONLINE_QPN8,
+            layer_policy().value("online_qpn8"),
             dtype,
             capability_ok,
             contract_ok,
@@ -802,7 +803,7 @@ def enable_qwen38_sm70_fp16_gemv(
         shape = (int(weight.shape[0]), int(weight.shape[1]))
         prefix = str(getattr(child, "prefix", ""))
         shared_batch = False
-        if envs.VLLM_SM70_MTP_SHARED_BATCH:
+        if mtp_batch_enabled("shared_batch"):
             from .sm70_fp16_hc import _mtp_batch_runtime_contract
 
             shared_batch = (
@@ -821,7 +822,7 @@ def enable_qwen38_sm70_fp16_gemv(
             child.forward_fused_silu_and_mul = MethodType(
                 _forward_shared_batch_silu, child
             )
-        if envs.VLLM_SM70_MTP_ROUTER_BATCH and str(
+        if mtp_batch_enabled("router_batch") and str(
             getattr(child, "prefix", "")
         ).endswith(_ROUTER_SUFFIX):
             from .sm70_fp16_hc import _mtp_batch_runtime_contract
@@ -859,9 +860,12 @@ def enable_qwen38_sm70_fp16_gemv(
             # explicit legacy opt-in for other proposers; they need paired
             # quality before this default can be widened.
             batch_qualified = _batch_runtime_contract(vllm_config)
-            explicit_gdn_batch = "VLLM_SM70_QWEN38_GDN_INPUT_BATCH" in os.environ
+            explicit_gdn_batch = projection_policy().sources.get("input_batch") in (
+                "typed",
+                "VLLM_SM70_QWEN38_GDN_INPUT_BATCH",
+            )
             if (
-                envs.VLLM_SM70_QWEN38_GDN_INPUT_BATCH
+                projection_policy().value("input_batch")
                 and (batch_qualified or explicit_gdn_batch)
             ) or (layer_policy().batch_fastpath and batch_qualified):
                 assert qkvz is not None and ba is not None

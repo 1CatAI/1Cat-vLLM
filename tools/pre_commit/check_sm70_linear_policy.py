@@ -85,12 +85,15 @@ RUNTIME_NAMES.update(
     and node.value.isidentifier()
 )
 for _class in ast.parse((_CONFIG_ROOT / "sm70_runtime.py").read_text()).body:
-    if isinstance(_class, ast.ClassDef) and _class.name == "RuntimeTraceConfig":
+    if isinstance(_class, ast.ClassDef) and _class.name in (
+        "RuntimeTraceConfig",
+        "Sm70RuntimeConfig",
+    ):
         for _field in _class.body:
             if (
                 isinstance(_field, ast.AnnAssign)
                 and isinstance(_field.target, ast.Name)
-                and _field.target.id == "layer_aliases"
+                and _field.target.id in ("layer_aliases", "warmup_aliases")
             ):
                 RUNTIME_NAMES.update(ast.literal_eval(_field.value).values())
 
@@ -101,6 +104,36 @@ for _node in ast.parse((_CONFIG_ROOT / "policy_defaults.py").read_text()).body:
     ):
         RUNTIME_NAMES.update(ast.literal_eval(_node.value))
 
+
+# Newly migrated provider declarations share the same runtime rule.
+for _name in (
+    "sm70_sparse.py",
+    "gdn_projection.py",
+    "sm70_triton_attention.py",
+    "turboquant_runtime.py",
+):
+    RUNTIME_NAMES.update(
+        node.value
+        for node in ast.walk(ast.parse((_CONFIG_ROOT / _name).read_text()))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.startswith("VLLM_")
+        and node.value.isidentifier()
+    )
+# MoE route and unquantized policies now cover generic modular consumers too.
+for _cls in ast.parse(_MOE_POLICY.read_text()).body:
+    if isinstance(_cls, ast.ClassDef) and _cls.name in (
+        "Sm70MoERoutingPolicy",
+        "Sm70UnquantizedMoEConfig",
+    ):
+        RUNTIME_NAMES.update(
+            node.value
+            for node in ast.walk(_cls)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("VLLM_")
+            and node.value.isidentifier()
+        )
 
 # Read the canonical diagnostic declarations statically, never invoke getters.
 for _name in ("diagnostic_dump.py", "diagnostic_sampling.py"):
@@ -147,8 +180,17 @@ def runtime_policy_reads(path: Path, tree: ast.AST) -> list[str]:
     """Ordered defaults can reference aliases; execution cannot read their envs."""
     if path.as_posix().startswith("vllm/config/"):
         return []
+    from tools.pre_commit.config_lifecycle import initialization_library_loaders
+
+    loading_nodes = {
+        child
+        for function in initialization_library_loaders(tree)
+        for child in ast.walk(function)
+    }
     errors = []
     for node in ast.walk(tree):
+        if node in loading_nodes:
+            continue
         name = None
         if isinstance(node, ast.Attribute) and ast.unparse(node.value) == "envs":
             name = node.attr
@@ -260,6 +302,7 @@ def violations(path: Path) -> list[str]:
 
 
 def main():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     paths = [Path(name) for name in sys.argv[1:]]
     if not paths:
         paths = list(Path("vllm").rglob("*.py"))

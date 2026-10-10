@@ -94,7 +94,7 @@ class UniProcExecutor(Executor):
     @cached_property
     def max_concurrent_batches(self) -> int:
         if self.scheduler_config.async_scheduling:
-            return max(2, envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH)
+            return max(2, self.scheduler_config.sm70_queue_depth())
         return 1
 
     def collective_rpc(  # type: ignore[override]

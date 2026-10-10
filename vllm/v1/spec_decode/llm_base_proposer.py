@@ -17,6 +17,7 @@ from vllm.config import (
     replace,
 )
 from vllm.config.sm70_dflash2 import proposer_diagnostic_flag, proposer_diagnostic_flags
+from vllm.config.sm70_moe import unquantized_moe_policy
 from vllm.config.speculative_sampling import (
     SpeculativeSamplingPolicy,
     resolve_sampling_policy,
@@ -44,6 +45,7 @@ from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.topk_topp_runtime import bind_topk_topp_runtime
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.rejection_sampler import (
     MAX_SPEC_LEN,
@@ -213,6 +215,7 @@ class SpecDecodeBaseProposer:
         runner=None,
     ):
         self.vllm_config = vllm_config
+        self._topk_runtime = bind_topk_topp_runtime(vllm_config)
         self._diagnostics = bind_diagnostics(vllm_config)
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
@@ -698,7 +701,10 @@ class SpecDecodeBaseProposer:
                 token_ids = self._static_draft_vocab.token_id_map[token_ids]
             return token_ids, None
         token_ids, probs = compute_probs_and_sample_next_token(
-            logits, sampling_metadata, policy=self._sampling_policy
+            logits,
+            sampling_metadata,
+            policy=self._sampling_policy,
+            runtime=self._topk_runtime,
         )
         if self._static_draft_vocab is None:
             return token_ids, probs
@@ -911,7 +917,9 @@ class SpecDecodeBaseProposer:
                 dtype=torch.int32,
                 device=self.device,
             )
-            apply_top_k_top_p(draft_logits, draft_top_k, None)
+            apply_top_k_top_p(
+                draft_logits, draft_top_k, None, runtime=self._topk_runtime
+            )
 
     def warmup_sm70_mtp_hotpath_kernels(self) -> tuple[str, ...]:
         """Warm MTP helper kernels that otherwise JIT on the first request."""
@@ -959,7 +967,7 @@ class SpecDecodeBaseProposer:
             self.method != "mtp"
             or self.device.type != "cuda"
             or not current_platform.is_device_capability(70)
-            or not envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG
+            or not unquantized_moe_policy(self.vllm_config).value("legacy_tiles")
             or not self.draft_model_config.is_moe
         ):
             return ()
@@ -972,7 +980,7 @@ class SpecDecodeBaseProposer:
         num_experts = self.draft_model_config.get_num_experts()
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
         use_qwen36_mtp_decode_tiles = (
-            envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            unquantized_moe_policy(self.vllm_config).value("mtp_tuned")
             and num_experts == 256
             and top_k == 8
             and self.draft_model_config.get_hidden_size() == 2048
@@ -980,7 +988,7 @@ class SpecDecodeBaseProposer:
             and tp_size == 4
         )
         use_qwen38_mtp_decode_tiles = (
-            envs.VLLM_SM70_MTP_MOE_TUNED_CONFIG
+            unquantized_moe_policy(self.vllm_config).value("mtp_tuned")
             and num_experts == 512
             and top_k == 10
             and self.draft_model_config.get_hidden_size() == 2560
@@ -2583,6 +2591,7 @@ def compute_probs_and_sample_next_token(
     sampling_metadata: SamplingMetadata,
     *,
     policy: SpeculativeSamplingPolicy | None = None,
+    runtime=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if sampling_metadata.all_greedy:
         # For greedy requests, draft_probs is not used in rejection sampling.
@@ -2675,7 +2684,7 @@ def compute_probs_and_sample_next_token(
             int(sampling_metadata.top_k_cpu[0]),
         )
 
-    logits = apply_top_k_top_p(logits, top_k, top_p)
+    logits = apply_top_k_top_p(logits, top_k, top_p, runtime=runtime)
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
     q = torch.empty_like(probs)

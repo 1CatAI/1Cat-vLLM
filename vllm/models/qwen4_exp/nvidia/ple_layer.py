@@ -24,7 +24,7 @@ from vllm.config import (
     get_current_vllm_config,
     get_current_vllm_config_or_none,
 )
-from vllm.config.execution_policy import ple_policy
+from vllm.config.execution_policy import layer_policy, ple_policy
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -2491,7 +2491,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         num_reqs = spec_state_indices_tensor.numel()
         hidden_size = x_spec.size(-1)
         if (
-            envs.VLLM_SM70_MTP_PLE_CONV
+            layer_policy().value("ple_spec_conv")
             and num_reqs == 1
             and spec_query_len == 5
             and self.conv_state_len == 9

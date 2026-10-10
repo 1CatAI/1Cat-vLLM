@@ -1087,7 +1087,12 @@ class Worker(WorkerBase):
 
     def _use_sm70_static_pp_hidden_transfer(self, num_tokens: int) -> bool:
         """Whether this step has the exact metadata-free PP tensor contract."""
-        if not envs.VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER or num_tokens != 1:
+        if (
+            not self.vllm_config.parallel_config.communication.value(
+                "pp_static_hidden_transfer"
+            )
+            or num_tokens != 1
+        ):
             return False
         cached = getattr(self, "_sm70_static_pp_hidden_contract", None)
         if cached is not None:

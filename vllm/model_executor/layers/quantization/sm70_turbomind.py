@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Literal
 
 import torch
 
-from vllm import envs
 from vllm.config.execution_policy import layer_policy
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     register_layer_workspace,
@@ -83,11 +82,64 @@ def clear_sm70_turbomind_workspaces() -> None:
 
 
 def quant_backend() -> SM70QuantBackend:
-    return envs.get_sm70_quant_backend()
+    return layer_policy().value("quant_backend")
 
 
 def use_turbomind(default_enabled: bool) -> bool:
-    return envs.use_sm70_turbomind(default_enabled)
+    backend = quant_backend()
+    return backend == "turbomind" or (backend == "auto" and bool(default_enabled))
+
+
+def format_option(family: str, field: str) -> bool:
+    """Loader admission from B's canonical format owner, before weight preparation.
+
+    Raw enabled flags are retained for the two historical AWQMarlin gates that
+    intentionally did not consult the shared backend selector.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config.kernel import (
+        SM70_AWQ_LINEAR_ALIASES,
+        SM70_FP8_LINEAR_ALIASES,
+        SM70_LOADER_ALIASES,
+        Sm70AwqConfig,
+        Sm70Fp8Config,
+        Sm70NvFp4Config,
+    )
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is None:
+        cls = {"awq": Sm70AwqConfig, "fp8": Sm70Fp8Config, "nvfp4": Sm70NvFp4Config}[
+            family
+        ]
+        policy = cls()
+        policy.capture_inputs()
+    else:
+        policy = getattr(cfg.kernel_config, "sm70_" + family)
+    value = getattr(policy, field)
+    source = policy.sources.get(field)
+    if value is not None and (field != "enabled" or source in (None, "configuration")):
+        return bool(value)
+    aliases = dict(SM70_LOADER_ALIASES[family])
+    aliases.update(
+        {"awq": SM70_AWQ_LINEAR_ALIASES, "fp8": SM70_FP8_LINEAR_ALIASES}.get(family, {})
+    )
+    return bool(policy.legacy.value(aliases[field]))
+
+
+def format_enabled(family: str) -> bool:
+    """Explicit format configuration wins over a conflicting legacy backend."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    value = format_option(family, "enabled")
+    cfg = get_current_vllm_config_or_none()
+    if cfg is not None:
+        policy = getattr(cfg.kernel_config, "sm70_" + family)
+        if policy.enabled is not None and policy.sources.get("enabled") in (
+            None,
+            "configuration",
+        ):
+            return value
+    return use_turbomind(value)
 
 
 def use_batched_gemm_layouts() -> bool:
@@ -134,7 +186,7 @@ def fp8_backend_enabled() -> bool:
 
 
 def forces_marlin() -> bool:
-    return envs.force_sm70_marlin()
+    return quant_backend() == "marlin"
 
 
 def is_exact_sm70_cuda(tensor: torch.Tensor, enabled: bool) -> bool:
@@ -166,15 +218,13 @@ def is_exact_sm70_cuda_platform() -> bool:
 def should_use_mxfp4_moe_turbomind() -> bool:
     """Select the native MXFP4 MoE path only on exact SM70."""
     return is_exact_sm70_cuda_platform() and use_turbomind(
-        envs.VLLM_SM70_MXFP4_TURBOMIND
+        layer_policy().value("mxfp4_turbomind")
     )
 
 
 def should_use_nvfp4_moe_turbomind() -> bool:
     """Select the native NVFP4 MoE path only on exact SM70."""
-    return is_exact_sm70_cuda_platform() and use_turbomind(
-        envs.VLLM_SM70_NVFP4_TURBOMIND
-    )
+    return is_exact_sm70_cuda_platform() and format_enabled("nvfp4")
 
 
 def should_prepare_turbomind(
@@ -744,7 +794,7 @@ def prepare_nvfp4_qpn4_linear(
     from vllm import _sm70_ops as sm70_ops
 
     qweight = unpack_mxfp4_weight(layer.weight.data)
-    use_scale_code = gated_silu or envs.VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE
+    use_scale_code = gated_silu or format_option("nvfp4", "down_scale_code")
     global_scale = 0.0
     if use_scale_code:
         global_scale = float(layer.weight_global_scale.detach().float().item())
