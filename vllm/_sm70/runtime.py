@@ -16,6 +16,7 @@ _active_owner: ContextVar["NativeRuntimeOwner | None"] = ContextVar(
 
 NATIVE_OWNERS = (
     "kernel_config.layer_execution.native",
+    "kernel_config.sm70_marlin",
     "kernel_config.sm70_mxfp4",
     *(
         f"kernel_config.sm70_{family}.native"

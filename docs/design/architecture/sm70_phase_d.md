@@ -499,3 +499,22 @@ on both sides. FP16's first autotuned baseline changed its own digest across
 rounds, so deterministic parity uses fixed selection on both sides. Initial CPU
 fixtures that inferred a GPU or re-registered custom ops are not counted as
 passes; corrected tests exercise the actual initialized policies.
+
+### D5b: retained Marlin launch overrides (in validation)
+
+The six dense/MoE `SM70_MARLIN_*` inputs use the existing native policy vector
+(ABI 67), under `KernelConfig.sm70_marlin`. The parent captures their
+raw dialect before worker transfer; the existing Marlin workspace preparation
+activates that provider and binds its immutable owner slot. Unused Marlin fields
+do not affect other providers' hashes. Existing operator schemas and fake
+implementations are unchanged; inside an engine scope the native selector borrows
+the bound policy, while independent no-config calls retain the old env adapter.
+
+Geometry and split-K share the original `strtol`/integer parser. Empty inputs,
+metadata spelling, error order, shape validation and model-specific automatic
+selection remain unchanged. Parsing is done once; native dispatch still evaluates
+dynamic shapes. Missing policy ABI fails during preparation rather than silently
+using process defaults. Inventory scanning now includes the previously omitted
+`SM70_MARLIN_` prefix. Initial native-policy/loader/inventory regression passes
+108 tests with two CUDA-only skips; six targeted parser/serialization/hash tests
+pass. Normal native rebuild and GPU validation are pending.

@@ -25,7 +25,7 @@ from tools.pre_commit.check_env_registration import (
 from tools.pre_commit.config_lifecycle import initialization_library_loaders
 
 ROOT = Path(__file__).resolve().parents[1]
-PREFIXES = ("VLLM_", "TM_", "FLASH_QLA_", "PREFIX_")
+PREFIXES = ("VLLM_", "TM_", "FLASH_QLA_", "PREFIX_", "SM70_MARLIN_")
 
 
 def python_references(source: str) -> list[dict]:
@@ -290,7 +290,9 @@ def collect(root: Path = ROOT) -> dict:
             entry = dict(path=filename, **item)
             if name is None:
                 unresolved.append(entry)
-            elif name in names or name.startswith(("TM_", "FLASH_QLA_", "PREFIX_")):
+            elif name in names or name.startswith(
+                ("TM_", "FLASH_QLA_", "PREFIX_", "SM70_MARLIN_")
+            ):
                 names.add(name)
                 consumers[name].append(entry)
     names.update(declarations)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "sm70_runtime_state.h"
+#include "sm70_marlin_policy.h"
 
 #include <array>
 #include <algorithm>
@@ -131,12 +132,23 @@ struct PreparedPolicy {
   std::array<bool, policy_size> present{};
   DispatchOverride dispatch_override = DispatchOverride::Unset;
   std::vector<GemmTargetPolicy> gemm_targets;
+  MarlinOverrides marlin_dense, marlin_moe;
 
   void parse_scalars() {
     dispatch_override = parse_dispatch_override(
         values[static_cast<size_t>(PolicyField::awq_moe_dispatch_policy)]);
     gemm_targets = parse_gemm_targets(
         values[static_cast<size_t>(PolicyField::awq_tp2_fast_targets)]);
+    marlin_dense.parse(
+        "DENSE",
+        values[static_cast<size_t>(PolicyField::marlin_dense_cta_geometry)],
+        values[static_cast<size_t>(PolicyField::marlin_dense_split_k)],
+        values[static_cast<size_t>(PolicyField::marlin_dense_metadata_cache)]);
+    marlin_moe.parse(
+        "MOE",
+        values[static_cast<size_t>(PolicyField::marlin_moe_cta_geometry)],
+        values[static_cast<size_t>(PolicyField::marlin_moe_split_k)],
+        values[static_cast<size_t>(PolicyField::marlin_moe_metadata_cache)]);
     for (size_t i = 0; i < policy_size; ++i) {
       present[i] = values[i] != "\x1f";
       integers[i] = present[i] ? std::atoi(values[i].c_str()) : 0;
@@ -200,6 +212,14 @@ inline const PreparedPolicy& prepared_policy(const std::string& token) {
   }
   previous = found->second.get();
   return *previous;
+}
+
+// Marlin's retained schemas borrow an immutable initialization binding. They
+// never resolve compatibility inputs while an engine owns the native scope.
+inline const MarlinOverrides* bound_marlin_policy(bool moe) {
+  if (!active_runtime) return nullptr;
+  const auto& policy = prepared_policy("sm70:slot:kernel_config.sm70_marlin");
+  return moe ? &policy.marlin_moe : &policy.marlin_dense;
 }
 
 inline void prepare_native_policy(const std::string& token) {

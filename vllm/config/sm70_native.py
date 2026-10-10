@@ -222,6 +222,17 @@ NATIVE_FIELDS = (
         ("awq", "fp8", "mxfp4", "nvfp4", "gguf", "f16"),
         True,
     ),
+    ("marlin_dense_cta_geometry", "SM70_MARLIN_DENSE_CTA_GEOMETRY", ("marlin",), False),
+    ("marlin_dense_split_k", "SM70_MARLIN_DENSE_SPLIT_K", ("marlin",), False),
+    (
+        "marlin_dense_metadata_cache",
+        "SM70_MARLIN_DENSE_METADATA_CACHE",
+        ("marlin",),
+        False,
+    ),
+    ("marlin_moe_cta_geometry", "SM70_MARLIN_MOE_CTA_GEOMETRY", ("marlin",), False),
+    ("marlin_moe_split_k", "SM70_MARLIN_MOE_SPLIT_K", ("marlin",), False),
+    ("marlin_moe_metadata_cache", "SM70_MARLIN_MOE_METADATA_CACHE", ("marlin",), False),
 )
 
 UNSET = "\x1f"
@@ -357,6 +368,18 @@ class Sm70NativeConfig:
     """Native initialization input VLLM_SM70_DFLASH2_SHARDED_CONTEXT_FC."""
     tm_gemm_cache_summary: bool | None = None
     """Native initialization input TM_GEMM_CACHE_SUMMARY."""
+    marlin_dense_cta_geometry: str | None = None
+    """Native Marlin dense cta geometry override; None retains selection."""
+    marlin_dense_split_k: int | None = None
+    """Native Marlin dense split k override; None retains selection."""
+    marlin_dense_metadata_cache: str | None = None
+    """Native Marlin dense metadata cache override; None retains selection."""
+    marlin_moe_cta_geometry: str | None = None
+    """Native Marlin moe cta geometry override; None retains selection."""
+    marlin_moe_split_k: int | None = None
+    """Native Marlin moe split k override; None retains selection."""
+    marlin_moe_metadata_cache: str | None = None
+    """Native Marlin moe metadata cache override; None retains selection."""
     values: tuple[str, ...] = Field(default=(), init=False)
     """Frozen native ABI values, prepared once for this format."""
     sources: dict[str, str] = Field(default_factory=dict, init=False)

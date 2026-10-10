@@ -1373,6 +1373,14 @@ def marlin_int4_fp8_preprocess(
     return torch.ops._C.marlin_int4_fp8_preprocess(qweight, qzeros_or_none, inplace)
 
 
+def prepare_marlin_workspace_policy(device: torch.device) -> None:
+    """Initialize the selected native Marlin provider with its workspace."""
+    if sm70_marlin_available():
+        from vllm._sm70.marlin import bind_marlin_workspace
+
+        bind_marlin_workspace(device)
+
+
 def marlin_gemm(
     a: torch.Tensor,
     c: torch.Tensor | None,
