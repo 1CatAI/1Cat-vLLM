@@ -15,9 +15,11 @@ independently of authoritative host attention history.
   Down/unroute reads original
   IQ4_NL or Q2_0 blocks, including TP boundaries inside Q2_0's 64-element blocks.
   FP32 dots and routing accumulation retain the existing FP16 epilogue boundary.
-- Large batches keep the native per-expert dequantization and BLAS fallback.
-  There is no persistent second bank of all experts. Dense canonical storage
-  remains available to preserve qualified small-M projection routes.
+- Uncovered batches retain the shipped native GGUF fallback without a
+  persistent second bank of all experts. The original-block MoE route currently
+  uses chunked MMVQ; grouped dequantization/BLAS is an eager fallback that needs
+  separate prefill qualification. Dense canonical storage remains available to
+  preserve qualified small-M projection routes.
 - HC matrices are staged on CPU and only their TP4 packs move to the GPU. When
   HCX already prepared a pack, the storage owner reuses it. Larger batches
   recover local checkpoint rows from that same pack for the ordinary collective
@@ -85,6 +87,9 @@ Use `examples/deployment/sm70_flashnext_gguf/serve-16gb-256k.sh` with `MODEL`,
 `DRAFT`, and `VLLM_PYTHON` pointing to the verified checkpoint and source runtime.
 Build native extensions from that source with CUDA 12.8 and SM70, including the
 policy ABI in both `_C` and `_moe_C`. Do not reuse private extension binaries.
+Apply `examples/deployment/sm70_flashnext_gguf/constraints-cu128.txt` when
+installing runtime requirements. It pins XGrammar 0.2.0 for the declared
+TVM-FFI 0.1.10 runtime; XGrammar 0.2.8 requires a newer library-loading interface.
 The script enables TP4, FP16 MTP4, 256K context, prefix caching, Qwen tool and
 reasoning parsing, FULL graphs, prefill chunks of 512, disk PLE, and FP16 host
 history. It holds the shared four-GPU and per-GPU locks for the service lifetime.

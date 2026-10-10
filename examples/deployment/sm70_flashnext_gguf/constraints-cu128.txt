@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Compatible with apache-tvm-ffi==0.1.10 in requirements/cuda.txt.
+xgrammar==0.2.0
