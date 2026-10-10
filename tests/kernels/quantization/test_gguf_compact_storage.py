@@ -9,9 +9,9 @@ import torch
 
 
 def test_original_embedding_adapter_preserves_packed_rows():
-    from vllm.model_executor.model_loader.gguf_adapters.qwen35 import Qwen35Adapter
+    from vllm.model_executor.model_loader.gguf_adapters.qwen4exp import Qwen4ExpAdapter
 
-    adapter = Qwen35Adapter(
+    adapter = Qwen4ExpAdapter(
         SimpleNamespace(
             num_hidden_layers=0,
             linear_num_value_heads=4,
@@ -20,7 +20,7 @@ def test_original_embedding_adapter_preserves_packed_rows():
             linear_value_head_dim=2,
         )
     )
-    adapter.packed_token_embeddings = True
+    adapter.packed_embeddings = True
     data = np.arange(4 * 136, dtype=np.uint8).reshape(4, 136)
     tensor = SimpleNamespace(shape=np.array([256, 4]), tensor_type=23, data=data)
     tensors = {"token_embd.weight": tensor}

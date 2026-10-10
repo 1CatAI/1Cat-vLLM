@@ -488,7 +488,7 @@ class GGUFModelLoader(BaseModelLoader):
         # filter out unquantized modules to skip
         adapter = getattr(self, "_native_adapter", None)
         if adapter is not None:
-            adapter.packed_token_embeddings = (
+            adapter.packed_embeddings = (
                 getattr(
                     vllm_config.kernel_config.sm70_gguf, "embedding_storage", "dense"
                 )
@@ -499,10 +499,7 @@ class GGUFModelLoader(BaseModelLoader):
             for name, weight_type in weight_type_map.items()
             if weight_type in ("F32", "F16", "BF16")
             and name.endswith(".weight")
-            and (
-                adapter is None
-                or not (adapter.is_linear(name) or adapter.is_embedding(name))
-            )
+            and (adapter is None or not adapter.is_linear(name))
         ]
         if adapter is not None:
             quant_config = cast("GGUFConfig", vllm_config.quant_config)
