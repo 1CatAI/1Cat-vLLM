@@ -6399,8 +6399,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GLM53_MHC_NATIVE_VERIFY": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_GLM53_MHC_NATIVE_VERIFY", "0"))),
         description=(
-            "Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited "
-            "model and topology contracts enable it while the global default "
+            "Native SM70 final stage for the GLM-5.3 mHC verifier. Unset, the "
+            "GLM-5.3 route uses it for 2-8 tokens; set 0 to force the Triton "
+            "program there. Audited model and topology contracts enable the "
+            "eight-token q8 path while the global default "
             "remains off."
         ),
         category="configuration",
@@ -6509,7 +6511,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GLM_MHC_PRE_THREADS": env_var(
         lambda: int(os.getenv("VLLM_SM70_GLM_MHC_PRE_THREADS", "256")),
         description=(
-            "SM70: glm mhc pre threads. The consumer locations and unset "
+            "SM70: glm mhc pre threads. Unset, the GLM-5.3 route uses 1024 "
+            "above one token (128 at one). The consumer locations and unset "
             "defaults are listed below."
         ),
         category="tuning",
