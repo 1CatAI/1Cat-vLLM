@@ -102,78 +102,81 @@ def test_iq4_nl_decoder_is_bit_identical_to_gguf():
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
 
-def test_row_cache_serves_repeats_without_decoding(monkeypatch):
-    from vllm.transformers_utils import gguf_rows
-
-    source = iq4_rows(16)
-    official = gguf.quants.dequantize(source, gguf.GGMLQuantizationType.IQ4_NL)
-    reader = PackedGGUFRowReader(source, 20, 160, cache_bytes=4 * 160 * 2)
-    assert reader.cache is not None and reader.cache.capacity == 4
-    original = gguf_rows._decode_rows
-    decoded = []
-
-    def record(data, source_type):
-        decoded.append(len(data))
-        return original(data, source_type)
-
-    monkeypatch.setattr(gguf_rows, "_decode_rows", record)
-
-    def check(ids):
-        ids = np.asarray(ids, dtype=np.int64)
-        actual = reader.lookup(ids)
-        expected = official[ids].astype(np.float16)
-        np.testing.assert_array_equal(actual.view(np.uint16), expected.view(np.uint16))
-
-    check([[1, 2], [1, 3]])
-    check([3, 2, 1])
-    assert decoded == [3]
-    # Row 5 fills the last slot; row 6 then evicts the least recent row, 2.
-    check([5, 1])
-    check([6])
-    check([1, 5, 6, 4])
-    assert decoded == [3, 1, 1, 1]
-    check([2, 3])
-    assert decoded == [3, 1, 1, 1, 2]
-    assert (reader.cache.hits, reader.cache.misses) == (7, 8)
-
-
-def test_row_cache_bypasses_wide_batches_and_fp32():
-    source = iq4_rows(16)
-    official = gguf.quants.dequantize(source, gguf.GGMLQuantizationType.IQ4_NL)
-    reader = PackedGGUFRowReader(source, 20, 160, cache_bytes=2 * 160 * 2)
-    ids = np.array([0, 1, 2, 1], dtype=np.int64)
-    np.testing.assert_array_equal(reader.lookup(ids), official[ids].astype(np.float16))
-    np.testing.assert_array_equal(reader.lookup(ids[:2], np.float32), official[:2])
-    assert reader.cache is not None and not reader.cache.slots
-    assert PackedGGUFRowReader(source, 20, 160, cache_bytes=100).cache is None
-    with pytest.raises(ValueError, match="non-negative"):
-        PackedGGUFRowReader(source, 20, 160, cache_bytes=-1)
-
-
-def test_row_cache_never_stores_rejected_rows():
-    data = iq4_rows(2)
-    blocks = data.reshape(2, 5, 18)
-    blocks[0, :, :2] = np.full(5, 1024, dtype=np.float16).view(np.uint8).reshape(5, 2)
-    blocks[0, :, 2:] = 0xFF
-    reader = PackedGGUFRowReader(data, 20, 160, cache_bytes=1 << 20)
-    with pytest.raises(ValueError, match="overflow FP16"):
-        reader.lookup(np.array([0, 1]))
-    assert reader.cache is not None and not reader.cache.slots
-
-
-def test_gather_hook_reads_only_cache_misses():
-    source = iq4_rows(16)
-    official = gguf.quants.dequantize(source, gguf.GGMLQuantizationType.IQ4_NL)
+def _recording_reader(source, cache_rows, logical_rows=None):
     requested = []
 
     def gather(rows):
         requested.append(rows.tolist())
         return source[rows]
 
-    reader = PackedGGUFRowReader(source, 20, 160, cache_bytes=1 << 20, gather=gather)
-    for ids in ([4, 9, 4], [9, 2]):
+    reader = PackedGGUFRowReader(
+        source,
+        20,
+        160,
+        logical_rows,
+        cache_bytes=cache_rows * source.shape[1],
+        gather=gather,
+    )
+    return reader, requested
+
+
+def test_row_cache_reads_only_misses_in_lru_order():
+    source = iq4_rows(16)
+    official = gguf.quants.dequantize(source, gguf.GGMLQuantizationType.IQ4_NL)
+    reader, requested = _recording_reader(source, 4)
+    assert reader.cache is not None and reader.cache.capacity == 4
+
+    def check(ids):
         ids = np.asarray(ids, dtype=np.int64)
-        np.testing.assert_array_equal(
-            reader.lookup(ids), official[ids].astype(np.float16)
-        )
-    assert requested == [[4, 9], [2]]
+        actual = reader.lookup(ids)
+        expected = official[ids].astype(np.float16)
+        np.testing.assert_array_equal(actual.view(np.uint16), expected.view(np.uint16))
+        packed = reader.lookup_packed_iq4nl(ids)
+        np.testing.assert_array_equal(packed, source[ids])
+
+    check([[1, 2], [1, 3]])
+    check([3, 2, 1])
+    assert requested == [[1, 2, 3]]
+    # Row 5 fills the last slot; row 6 then evicts the least recent row, 2.
+    check([5, 1])
+    check([6])
+    check([1, 5, 6, 4])
+    assert requested == [[1, 2, 3], [5], [6], [4]]
+    check([2, 3])
+    assert requested == [[1, 2, 3], [5], [6], [4], [2, 3]]
+
+
+def test_row_cache_bypasses_wide_batches():
+    source = iq4_rows(16)
+    official = gguf.quants.dequantize(source, gguf.GGMLQuantizationType.IQ4_NL)
+    reader, requested = _recording_reader(source, 2)
+    ids = np.array([0, 1, 2, 1], dtype=np.int64)
+    np.testing.assert_array_equal(reader.lookup(ids), official[ids].astype(np.float16))
+    np.testing.assert_array_equal(reader.lookup(ids[:2], np.float32), official[:2])
+    assert requested == [[0, 1, 2], [0, 1]]
+    assert reader.cache is not None and list(reader.cache.slots) == [0, 1]
+    assert PackedGGUFRowReader(source, 20, 160, cache_bytes=89).cache is None
+    with pytest.raises(ValueError, match="non-negative"):
+        PackedGGUFRowReader(source, 20, 160, cache_bytes=-1)
+
+
+def test_row_cache_keeps_value_checks_and_stores_only_fp16_rows():
+    data = iq4_rows(3)
+    blocks = data.reshape(3, 5, 18)
+    blocks[0, :, :2] = np.full(5, 1024, dtype=np.float16).view(np.uint8).reshape(5, 2)
+    blocks[0, :, 2:] = 0xFF
+    blocks[2, 0, :2] = np.array([np.inf], dtype=np.float16).view(np.uint8)
+    reader, _ = _recording_reader(data, 8)
+    with pytest.raises(ValueError, match="overflow FP16"):
+        reader.lookup(np.array([0, 1]))
+    with pytest.raises(ValueError, match="overflow FP16"):
+        reader.lookup_packed_iq4nl(np.array([0]))
+    with pytest.raises(ValueError, match="nonfinite"):
+        reader.lookup(np.array([2]), np.float32)
+    assert reader.cache is not None and not reader.cache.slots
+    # FP32 output admits the finite row, which must not later leak into FP16.
+    expected = gguf.quants.dequantize(data[:2], gguf.GGMLQuantizationType.IQ4_NL)
+    np.testing.assert_array_equal(reader.lookup(np.array([0, 1]), np.float32), expected)
+    assert list(reader.cache.slots) == [1]
+    with pytest.raises(ValueError, match="overflow FP16"):
+        reader.lookup(np.array([0]))

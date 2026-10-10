@@ -803,7 +803,7 @@ class KernelConfig:
     """Startup reason when the disk cascade cannot serve this configuration."""
 
     ple_row_cache_mib: int = Field(default=1536, ge=0)
-    """Decoded FP16 LRU (MiB) for CPU-served packed GGUF PLE rows; 0 disables."""
+    """LRU of validated packed rows (MiB) for CPU-owned GGUF PLE; 0 disables."""
 
     ple_pinned_decode: bool = True
     """Admit calibrated packed PLE decode rows from rank-local pinned storage."""
@@ -813,6 +813,13 @@ class KernelConfig:
         default_factory=dict, init=False, repr=False
     )
     """Observed pinned row decoder admission, capacity and fallback reasons."""
+
+    ple_packed_gguf_results: bool = True
+    """Transfer eligible CPU-owned GGUF PLE rows without CPU dequantization."""
+    ple_packed_result_decoders: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed packed result geometry and decoder fallback reasons."""
 
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
@@ -921,6 +928,7 @@ class KernelConfig:
             "ple_disk_cascade_reason",
             "ple_result_transports",
             "ple_pinned_decoders",
+            "ple_packed_result_decoders",
             "ple_input_prepare",  # Input staging is outside the compiled model.
             "ple_input_preparations",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change

@@ -1343,6 +1343,9 @@ def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
         ([0, 5, 10, 15, 20], 20),
         ([0, 64], 64),
         ([0, 60, 65], 65),
+        ([0, 0, 5, 5, 20], 20),
+        ([0, 5, 10, 15, 18], 20),
+        ([0, 32], 32),
     ],
 )
 def test_ngram_cpu_small_ids_match_torch_with_eos_and_padding(
@@ -1355,6 +1358,7 @@ def test_ngram_cpu_small_ids_match_torch_with_eos_and_padding(
     module.ngram_size = 3
     module.heads_per_ngram = 8
     module.ngram_heads = 16
+    module._packed_result_layout = {"enabled": True}
     module.eos_token_id = 248044
     module.register_buffer("positions_buffer", torch.arange(128))
     module.register_buffer("padded_buffer", torch.empty(4, 128, dtype=torch.long))
