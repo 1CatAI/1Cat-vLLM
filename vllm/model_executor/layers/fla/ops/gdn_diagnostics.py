@@ -6,8 +6,13 @@ import os
 
 import torch
 
-from vllm.diagnostics import diagnostic_channel, safe_name
+from vllm.config.sm70_runtime import capture_runtime_trace
+from vllm.diagnostics import diagnostic_channel, diagnostic_history, safe_name
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fla.ops.gdn_stages import mixed_qkv_decode_layout
 from vllm.utils.torch_utils import LayerNameType
+
+logger = init_logger("vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn")
 
 
 def layer_index(layer_name: LayerNameType) -> int | None:
@@ -165,3 +170,85 @@ def compare_request(layer_name):
     return channel.output_path(
         f"pid{os.getpid()}_step{step:04d}_layer{safe_name(layer_name)}.pt",
     ), step
+
+
+def capture_state_slice(
+    label: str,
+    layer_name: LayerNameType,
+    state: torch.Tensor,
+    state_indices: torch.Tensor | None,
+    num_tokens: int,
+) -> None:
+    if state_indices is None or num_tokens <= 0:
+        return
+    if not diagnostic_channel("gdn_graph").policy.capture:
+        return
+    indices = state_indices[:num_tokens].to(device=state.device, dtype=torch.long)
+    indices = indices.clamp(0, state.shape[0] - 1)
+    capture_tensor(
+        label,
+        layer_name,
+        state.index_select(0, indices),
+        "state",
+    )
+    if diagnostic_channel("gdn_graph").policy.state_indices:
+        capture_tensor(
+            f"{label}_indices",
+            layer_name,
+            indices.to(dtype=torch.int32),
+            "state",
+        )
+
+
+def log_decode_route(
+    *,
+    layer_name: LayerNameType,
+    stage: str,
+    decision: str,
+    reason: str,
+    mixed_qkv: torch.Tensor,
+    state_indices: torch.Tensor | None,
+    num_decode_tokens: int,
+) -> None:
+    if not capture_runtime_trace().value("gdn_route_debug"):
+        return
+    if torch.compiler.is_compiling():
+        return
+    mixed_layout = mixed_qkv_decode_layout(mixed_qkv)
+    key = f"{os.getpid()}:{stage}:{decision}:{reason}:{mixed_layout}:{layer_name}"
+    counts = diagnostic_history("gdn_route")
+    count = counts.get(key, 0)
+    if count >= 1:
+        return
+    if len(counts) >= 96:
+        return
+    counts[key] = count + 1
+    state_desc = "None"
+    if state_indices is not None:
+        state_desc = (
+            f"shape={tuple(state_indices.shape)} "
+            f"dtype={state_indices.dtype} "
+            f"stride={tuple(state_indices.stride())} "
+            f"contiguous={state_indices.is_contiguous()}"
+        )
+    logger.info(
+        "SM70 FlashQLA GDN decode route debug: layer=%s stage=%s "
+        "decision=%s reason=%s capture=%s tokens=%s "
+        "mixed_shape=%s mixed_dtype=%s mixed_stride=%s "
+        "mixed_contiguous=%s mixed_layout=%s logical_width=%s "
+        "row_stride=%s state_indices=%s",
+        layer_name,
+        stage,
+        decision,
+        reason,
+        torch.cuda.is_current_stream_capturing(),
+        num_decode_tokens,
+        tuple(mixed_qkv.shape),
+        mixed_qkv.dtype,
+        tuple(mixed_qkv.stride()),
+        mixed_qkv.is_contiguous(),
+        mixed_layout,
+        mixed_qkv.shape[1] if mixed_qkv.dim() == 2 else None,
+        mixed_qkv.stride(0) if mixed_qkv.dim() == 2 else None,
+        state_desc,
+    )

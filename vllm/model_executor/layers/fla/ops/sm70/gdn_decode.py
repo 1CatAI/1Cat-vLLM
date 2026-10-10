@@ -6,18 +6,15 @@ from dataclasses import dataclass
 
 import torch
 
-from vllm.model_executor.layers.fla.ops.gdn_stages import GdnHeadContract
+from vllm.model_executor.layers.fla.ops.gdn_stages import (
+    GdnHeadContract,
+)
+from vllm.model_executor.layers.fla.ops.gdn_stages import (
+    mixed_qkv_decode_layout as mixed_qkv_decode_layout,
+)
 from vllm.model_executor.layers.fla.ops.sm70.gdn_prefill import (
     _flashqla_sm70_decode_available,
 )
-
-
-def mixed_qkv_decode_layout(mixed_qkv):
-    if mixed_qkv.dim() != 2 or mixed_qkv.stride(1) != 1:
-        return "unsupported"
-    if mixed_qkv.stride(0) < mixed_qkv.shape[1]:
-        return "unsupported"
-    return "compact" if mixed_qkv.stride(0) == mixed_qkv.shape[1] else "row_strided"
 
 
 @dataclass(frozen=True)
