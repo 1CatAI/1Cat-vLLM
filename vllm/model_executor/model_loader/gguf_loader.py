@@ -476,9 +476,11 @@ class GGUFModelLoader(BaseModelLoader):
         self._gguf_prepared_weights_map = gguf_weights_map
         # we can only know if tie word embeddings after mapping weights
         gguf_files = self._get_all_gguf_files(local_model_path)
-        all_extra_names = []
+        all_extra_names = set(gguf_weights_map.values())
         for f in gguf_files:
-            all_extra_names.extend(get_gguf_extra_tensor_names(f, gguf_weights_map))
+            all_extra_names.intersection_update(
+                get_gguf_extra_tensor_names(f, gguf_weights_map)
+            )
         if "lm_head.weight" in all_extra_names:
             model_config.hf_config.update({"tie_word_embeddings": True})
 

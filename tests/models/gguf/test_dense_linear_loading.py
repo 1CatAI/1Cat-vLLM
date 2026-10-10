@@ -219,8 +219,19 @@ def test_flashnext_loader_configures_embedding_and_floating_modules(
         "model.layers.0.linear_attn.in_proj_a.weight": "BF16",
     }
     monkeypatch.setattr(loader, "_prepare_weights", lambda *_: "fixture.gguf")
-    monkeypatch.setattr(loader, "_get_gguf_weights_map", lambda *_: {})
-    monkeypatch.setattr(loader, "_get_all_gguf_files", lambda *_: [])
+    monkeypatch.setattr(
+        loader,
+        "_get_gguf_weights_map",
+        lambda *_: {"output.weight": "lm_head.weight"},
+    )
+    monkeypatch.setattr(
+        loader, "_get_all_gguf_files", lambda *_: ["main.gguf", "ple.gguf"]
+    )
+    monkeypatch.setattr(
+        gguf_loader,
+        "get_gguf_extra_tensor_names",
+        lambda filename, _: ["lm_head.weight"] if filename == "ple.gguf" else [],
+    )
     monkeypatch.setattr(loader, "_get_gguf_weight_type", lambda *_: types)
     monkeypatch.setattr(gguf_pinned, "prepare_pinned_gguf_ple", lambda *_: None)
 
@@ -229,6 +240,7 @@ def test_flashnext_loader_configures_embedding_and_floating_modules(
 
     def check_config(**kwargs):
         config = kwargs["vllm_config"]
+        assert not hf_config.tie_word_embeddings
         assert adapter.packed_embeddings == (embedding_storage == "original")
         expected = {
             "model.layers.0.mlp.gate",
