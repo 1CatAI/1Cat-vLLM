@@ -387,7 +387,11 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
     ) -> None:
         from vllm.distributed import get_dcp_group
 
-        from .ops.qsa import _qsa_output_gate, qsa_sparse_paged_attention
+        from .ops.qsa import (
+            _qsa_output_gate,
+            qsa_dcp_sparse_paged_attention_sm70_grouped_page4,
+            qsa_sparse_paged_attention,
+        )
         from .ops.qsa_dcp import (
             qsa_dcp_local_selection_width,
             qsa_localize_dcp_indices,
@@ -427,19 +431,35 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             layer.cp_kv_cache_interleave_size,
             local_indices.shape[1],
         )
-        qsa_sparse_paged_attention(
+        # Prefill-sized batches use the grouped page4 route for their leading
+        # multiple of eight rows; decode batches and the rest stay on Triton.
+        grouped_rows = qsa_dcp_sparse_paged_attention_sm70_grouped_page4(
             gathered_query,
             key_cache,
             value_cache,
-            local_indices[:, :local_width],
+            local_indices,
             block_table,
             token_to_req,
             partial_output,
-            kv_cache_dtype=self.kv_cache_dtype,
-            k_scale=layer._k_scale_float,
-            v_scale=layer._v_scale_float,
-            lse=partial_lse,
+            partial_lse,
+            self.kv_cache_dtype,
+            layer._k_scale_float,
+            layer._v_scale_float,
         )
+        if grouped_rows < query.shape[0]:
+            qsa_sparse_paged_attention(
+                gathered_query[grouped_rows:],
+                key_cache,
+                value_cache,
+                local_indices[grouped_rows:, :local_width],
+                block_table,
+                token_to_req[grouped_rows:],
+                partial_output[grouped_rows:],
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=layer._k_scale_float,
+                v_scale=layer._v_scale_float,
+                lse=partial_lse[grouped_rows:],
+            )
         merged = cast(
             torch.Tensor,
             self.dcp_combine(
@@ -703,6 +723,30 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self._set_topk_indices_buffer(
             max_tokens=max_tokens,
             topk_indices_buffer=topk_indices_buffer,
+        )
+        from .ops import qsa as qsa_ops
+
+        self._sm70_qsa_dcp_grouped_page4_reason = (
+            qsa_ops.qsa_dcp_grouped_page4_config_reason(
+                sharded=self.qsa_dcp_sharded,
+                query_heads=(
+                    self.num_heads * parallel_config.decode_context_parallel_size
+                ),
+                kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                dtype=model_config.dtype,
+                kv_cache_dtype=self.kv_cache_dtype,
+                selection_width=self.topk_indices_buffer.shape[1],
+                max_rows=max_tokens,
+            )
+        )
+        self._sm70_qsa_dcp_grouped_page4 = (
+            self._sm70_qsa_dcp_grouped_page4_reason is None
+        )
+        qsa_ops.logger.info_once(
+            "SM70 QSA DCP grouped page4 capability: %s; row alignment, "
+            "batch size and tensor strides are checked at execution.",
+            self._sm70_qsa_dcp_grouped_page4_reason or "available",
         )
 
         static_context = vllm_config.compilation_config.static_forward_context
