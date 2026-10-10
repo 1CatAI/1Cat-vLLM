@@ -155,6 +155,16 @@ def test_loaded_dense_projection_prepares_existing_fp16_method(monkeypatch):
         "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": False,
     }.items():
         monkeypatch.setattr(envs, name, value)
+    from vllm.config.execution_policy import LayerExecutionPolicy
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv
+
+    policy = LayerExecutionPolicy(
+        fp16_gemv=True,
+        batch_fastpath=False,
+        fused_gdn_input=False,
+        online_qpn8=False,
+    )
+    monkeypatch.setattr(sm70_fp16_gemv, "layer_policy", lambda: policy)
     layer = LinearBase.__new__(LinearBase)
     torch.nn.Module.__init__(layer)
     layer.prefix = "model.layers.0.linear_attn.in_proj_ba"
