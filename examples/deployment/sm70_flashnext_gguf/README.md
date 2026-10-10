@@ -97,13 +97,13 @@ therefore sizes the hot cache to `MAX_MODEL_LEN` (1 KiB/token/layer, about
 - Clocks and power limits change absolute numbers; record
   `nvidia-smi -q -d CLOCK,POWER` with any measurement.
 - Known issues:
-  - `PREFILL_CHUNK=8192` runs out of memory on 32 GB V100s with this model;
+    - `PREFILL_CHUNK=8192` runs out of memory on 32 GB V100s with this model;
     keep 2048.
-  - The host-history hot cache is allocated after the KV budget is profiled
+    - The host-history hot cache is allocated after the KV budget is profiled
     (not counted by `--gpu-memory-utilization`); `GPU_UTIL=0.92` leaves room
     for a 32K hot cache.
-  - The first requests at new batch shapes trigger Triton JIT compiles
+    - The first requests at new batch shapes trigger Triton JIT compiles
     (seconds each); send a short warmup burst after startup.
-  - Several concurrent long prompts serialize behind chunked prefill: with
+    - Several concurrent long prompts serialize behind chunked prefill: with
     four 8K prompts the last stream waits for the earlier prefills, and
     decode of running streams slows while prefill chunks are mixed in.

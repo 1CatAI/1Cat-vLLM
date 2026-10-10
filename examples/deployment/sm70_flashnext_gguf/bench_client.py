@@ -10,9 +10,10 @@ measured with the server's own usage counts.
 import argparse
 import concurrent.futures
 import json
-import re
 import time
 import urllib.request
+
+import regex as re
 
 FILLER = (
     "The history of computing spans mechanical calculators, vacuum tubes, "
