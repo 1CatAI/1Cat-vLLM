@@ -84,6 +84,23 @@ Legacy names are initialization adapters. The
 metadata; [Phase D](sm70_phase_d.md) records parsing, provenance, effective hashes,
 native ABI and retained process/standalone boundaries.
 
+## Source-derived reference
+
+The [architecture reference](runtime_reference.md) is generated from reachable
+configuration types, KV codecs, attention routes and MoE stage declarations.
+It describes source contracts, not effective engine policy or observed launches.
+After changing those declarations, run:
+
+```bash
+.venv/bin/python -m tools.generate_architecture_reference --write
+.venv/bin/python -m tools.generate_architecture_reference --check
+```
+
+The default invocation checks without writing. `--json` emits the same facts.
+Checks cover this overview, the three component READMEs, the INT8 proposal, E
+record and generated reference. Historical evidence is linked, not regenerated
+or subjected to a repository-wide link cleanup.
+
 ## Inspection and evidence
 
 Run from the repository root with the project environment:

@@ -533,6 +533,28 @@ def markdown(result: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def stage_binding_declarations(root: Path = ROOT) -> dict:
+    """Read the executor's literal stage tables; unknown expressions fail closed."""
+    path = root / "vllm/model_executor/layers/fused_moe/sm70/declarations.py"
+    result = {}
+    for node in ast.parse(path.read_text()).body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        name = getattr(node.targets[0], "id", None)
+        if name in ("STAGE_BINDINGS", "FP4_STAGE_BINDINGS"):
+            if name in result:
+                raise ValueError(f"{path}:{node.lineno}: duplicate {name}")
+            try:
+                result[name] = ast.literal_eval(node.value)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(f"{path}:{node.lineno}: nonliteral {name}") from exc
+            if not isinstance(result[name], dict):
+                raise ValueError(f"{path}:{node.lineno}: {name} must be a mapping")
+    if result.keys() != {"STAGE_BINDINGS", "FP4_STAGE_BINDINGS"}:
+        raise ValueError(f"{path}: missing stage binding declaration")
+    return result
+
+
 def binding_catalog() -> dict:
     """Read the very declarations consumed by codecs, without importing Torch."""
 
@@ -554,9 +576,7 @@ def binding_catalog() -> dict:
             "SM70_" + family.upper() + "_LINEAR_ALIASES"
         ]
     registry = registrations(read_source("vllm/envs.py", None))
-    bindings = assignments("vllm/model_executor/layers/fused_moe/sm70/declarations.py")[
-        "FP4_STAGE_BINDINGS"
-    ]
+    bindings = stage_binding_declarations()["FP4_STAGE_BINDINGS"]
     native = assignments("vllm/config/sm70_native.py")["NATIVE_FIELDS"]
     cpp_paths = (
         "csrc/moe/permute_unpermute_kernels/moe_permute_unpermute_kernel.cu",
