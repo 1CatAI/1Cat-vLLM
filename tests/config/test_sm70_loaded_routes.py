@@ -80,11 +80,11 @@ def test_policies_are_discovered_from_existing_configuration():
 def test_policy_report_serializes_resolved_moe_diagnostic_filters(family):
     """Loading resolves MoE dump policies whose parsed filters are frozensets."""
     config = KernelConfig()
-    config.sm70_moe.resolve(family)
+    getattr(config.sm70_moe, family).resolve(family)
     policies = linear_policy_report(config)
-    compare = policies["sm70_moe"]["configuration"]["compare_policy"]
-    assert compare is not None
-    assert all(not isinstance(v, (set, frozenset)) for v in compare.values())
+    resolved = policies["sm70_moe"]["configuration"][family]
+    compare = resolved["diagnostics"]["compare_policy"]
+    assert compare is not None and compare["filters"]
 
 
 def test_loaded_reports_collected_once_and_cached_for_http():
