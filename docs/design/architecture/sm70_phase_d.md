@@ -539,3 +539,51 @@ without changing its expected routes. The common ledger records 119 -> 119 raw
 references, 3130 -> 3121 platform references and 2111 -> 2111 model references;
 the worker-isolation tests, rather than these aggregate counts, establish the
 loader lifecycle change.
+
+The provider-tail candidate captures the existing async queue override in its
+scheduler owner, including deferred integer errors and unchanged no-PP gates.
+HC staging, PLE convolution, shared-expert overlap, QSA scale validation, private
+compressor state, QNorm/KV fusion, static PP transfer and QPN4 loader admission now
+consume their existing typed owners. Legacy aliases cease contributing duplicate
+environment hash inputs once the corresponding owner has captured them.
+
+Focused CPU validation records 53 passes (`providers-e-v6.log`), followed by
+33 passes with real sparse-policy objects (`providers-e-v7.log`). The original
+NVFP4 selector/call-order golden remains unchanged. Five affected queue cases
+pass; unrelated scheduler integration tests require a GPU-resolvable device
+fixture and are not counted as passes. No new hardware topology is claimed.
+
+The FLA follow-up removes six import-time schedule snapshots and shares the
+existing `GdnScheduleConfig` parsers. KDA adds its previously independent launch
+gate to that owner, with the original candidate order. Kimi, GLM, Bailing and
+OLMo initialize tuners before execution; recurrent and chunk helpers receive the
+resolved schedule/tuners. Live tuners now reside in the existing worker resource
+map, so configuration transfer cannot serialize tuning winners or CUDA objects.
+Independent operator calls retain an explicitly separate lazy compatibility
+cache. The model adapter declares which schedule fields affect calculation hashes.
+
+The historical MTP output-token repair rollback also affects ordinary async
+execution. It therefore belongs to `sm70_runtime` input/output lifecycle policy,
+not exclusively to an absent `SpeculativeConfig`. Both old-runner batch
+construction sites bind its deferred value. A standalone batch captures only
+this one legacy input; no repair loop reads the environment. Five CPU async
+history/reordering tests pass, including both repair modes after environment
+mutation (`input-repair-v2.log`). No sampler algorithm is changed.
+
+Three alternating A/B rounds completed for QSA scoring, MTP routing and QPN8.
+Their output digests and temporary allocations agree; GPU median deltas are
+-0.16%, +0.32%, and -0.11% to +0.33%, respectively. These are operator results.
+The first native-owner benchmark exposed additional host scope overhead; method
+wrappers are now bound once, and the host measurement will be repeated. The FP16
+baseline's own autotuning produced three output digests across rounds, so that
+case is not counted as deterministic parity. It will be repeated with an
+identical fixed selection policy on both sides. Failed runs remain in the worklog.
+
+The final focused FLA/provider/native-owner CPU suite passes 41 tests
+(`fla-cpu-v6.log`). The import guard runs in a fresh process; it forbids legacy
+FLA schedule reads without re-registering custom ops in the test process.
+A further three-round attention comparison has identical outputs and allocations:
+Triton M1/M33 GPU medians change by -0.21%; host medians change by -16.83% and
+-11.97%. TurboQuant prefill uses the same eager CUDA-event measurement on both
+sides (including host submission gaps), changing by +0.43%; host changes +0.67%.
+The original unsupported prefill capture attempt is not represented as a pass.

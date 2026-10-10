@@ -33,6 +33,11 @@ def runtime_resources_for(config) -> dict[str, Any]:
         resources = _RuntimeResources(
             {
                 "execution_policies": policies,
+                "fla_schedule": getattr(
+                    getattr(getattr(config, "kernel_config", None), "gdn", None),
+                    "schedule",
+                    None,
+                ),
                 "spec_decode_trace": getattr(
                     getattr(config, "observability_config", None),
                     "spec_decode_trace",

@@ -8,61 +8,21 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # ruff: noqa: E501
 
-import os
-
 import torch
 
 from vllm.triton_utils import tl, triton
 
+from .gdn_chunk_kernels import resolve_chunk_kernels
 from .index import prepare_chunk_indices
 from .op import exp
 from .utils import FLA_CHUNK_SIZE
 
-
-def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
-    )
-
-
-def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
-    raw = os.getenv(env_name)
-    if raw is None or not raw.strip():
-        return default_vals
-    out: list[int] = []
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            value = int(token)
-        except ValueError:
-            continue
-        if value > 0:
-            out.append(value)
-    return out or default_vals
-
-
-_use_sm70_kkt_schedule = (
-    os.getenv("VLLM_SM70_GDN_KKT_SCHEDULE", "1") == "1" and _is_sm70()
-)
-_kkt_configs = (
-    [
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in _parse_int_list("VLLM_SM70_GDN_KKT_BK", [32, 64])
-        for num_warps in _parse_int_list("VLLM_SM70_GDN_KKT_WARPS", [4])
-        for num_stages in _parse_int_list("VLLM_SM70_GDN_KKT_STAGES", [2])
-    ]
-    if _use_sm70_kkt_schedule
-    else [
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ]
-)
+_kkt_configs = [
+    triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
+    for BK in [32, 64, 128]
+    for num_warps in [2, 4, 8]
+    for num_stages in [2, 3, 4]
+]
 
 
 @triton.heuristics(
@@ -152,6 +112,8 @@ def chunk_scaled_dot_kkt_fwd(
     output_dtype: torch.dtype = torch.float32,
     kernel=None,
 ) -> torch.Tensor:
+    if kernel is None:
+        kernel = resolve_chunk_kernels().kkt
     r"""
     Compute beta * K * K^T.
 

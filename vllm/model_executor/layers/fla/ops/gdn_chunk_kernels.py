@@ -3,11 +3,13 @@
 """Engine-owned autotuners; JIT functions and arithmetic are unchanged."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 from itertools import product
 
 import torch
 
 from vllm.config.gdn_schedule import GdnScheduleConfig
+from vllm.runtime_resources import current_runtime_resources, runtime_resources_for
 from vllm.triton_utils import triton
 
 
@@ -87,6 +89,96 @@ def create_chunk_kernels(schedule: GdnScheduleConfig) -> GdnChunkKernels | None:
 
 
 def bind_chunk_kernels(vllm_config, schedule):
-    if not hasattr(vllm_config, "_gdn_chunk_kernels"):
-        vllm_config._gdn_chunk_kernels = create_chunk_kernels(schedule)
-    return vllm_config._gdn_chunk_kernels
+    resources = runtime_resources_for(vllm_config)
+    if "gdn_chunk_kernels" not in resources:
+        schedule.resolve()
+        resources["gdn_chunk_kernels"] = create_chunk_kernels(schedule)
+    return resources["gdn_chunk_kernels"]
+
+
+@lru_cache(maxsize=1)
+def _legacy_chunk_kernels():
+    # No-config operator clients retain a process-owned compatibility tuner.
+    from vllm.config.gdn_schedule import resolve_schedule
+
+    return create_chunk_kernels(resolve_schedule())
+
+
+def resolve_chunk_kernels(kernels=None):
+    if kernels is not None:
+        return kernels
+    resources = current_runtime_resources()
+    if resources is not None:
+        return resources["gdn_chunk_kernels"]
+    return _legacy_chunk_kernels()
+
+
+@dataclass
+class KdaChunkKernels:
+    recompute: object
+    delta_h: object
+    output: object
+
+
+def create_kda_kernels(schedule, delta_h):
+    if delta_h is None:
+        return None
+    from .kda import (
+        _chunk_gla_o_configs,
+        _recompute_w_u_configs,
+        chunk_gla_fwd_kernel_o,
+        recompute_w_u_fwd_kernel,
+    )
+
+    enabled = (
+        torch.cuda.get_device_capability() == (7, 0) and schedule.kda_prefill_enabled
+    )
+    recompute = _configs({}, [4, 8], [2]) if enabled else _recompute_w_u_configs
+    output = (
+        [
+            triton.Config({"BK": bk, "BV": bv}, num_warps=w, num_stages=2)
+            for bk in [32, 64]
+            for bv in [64, 128]
+            for w in [4, 8]
+            if bv == 64 or w == 8
+        ]
+        if enabled
+        else _chunk_gla_o_configs
+    )
+    return KdaChunkKernels(
+        _retune(
+            recompute_w_u_fwd_kernel,
+            recompute,
+            ["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+        ),
+        delta_h,
+        _retune(chunk_gla_fwd_kernel_o, output, ["BT"]),
+    )
+
+
+def bind_kda_kernels(vllm_config):
+    resources = runtime_resources_for(vllm_config)
+    if "kda_chunk_kernels" not in resources:
+        schedule = vllm_config.kernel_config.gdn.schedule
+        chunk = bind_chunk_kernels(vllm_config, schedule)
+        resources["kda_chunk_kernels"] = create_kda_kernels(
+            schedule, chunk.delta_h if chunk is not None else None
+        )
+    return resources["kda_chunk_kernels"]
+
+
+@lru_cache(maxsize=1)
+def _legacy_kda_kernels():
+    from vllm.config.gdn_schedule import resolve_schedule
+
+    chunk = _legacy_chunk_kernels()
+    return create_kda_kernels(resolve_schedule(), chunk.delta_h if chunk else None)
+
+
+def resolve_kda_kernels(kernels=None):
+    if kernels is not None:
+        return kernels
+    resources = current_runtime_resources()
+    if resources is not None:
+        return resources["kda_chunk_kernels"]
+    return _legacy_kda_kernels()

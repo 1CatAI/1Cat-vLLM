@@ -195,7 +195,7 @@ class EngineCore:
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
             self.batch_queue = deque(maxlen=self.batch_queue_size)
-            if envs.VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH > 0:
+            if vllm_config.scheduler_config.sm70_queue_depth() > 0:
                 logger.info(
                     "SM70 async scheduling queue depth override active: %d",
                     self.batch_queue_size,

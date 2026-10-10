@@ -1087,6 +1087,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 cu_seqlens=non_spec_query_start_loc,
                 safe_gate=safe_gate,
                 lower_bound=lower_bound,
+                kernels=self.chunk_kernels,
             )
             # Init cache
             scatter_states(

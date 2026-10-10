@@ -1473,6 +1473,7 @@ class GPUModelRunner(
         self._init_kernel_block_sizes = [placeholder_block_size]
         self._init_dcp_sharded = [True]
         self.input_batch = InputBatch(
+            runtime_policy=self.vllm_config.kernel_config.sm70_runtime,
             max_num_reqs=self.max_num_reqs,
             # We need to use the encoder length for encoder-decoder
             # because of KV cache for cross-attention.
@@ -12321,6 +12322,7 @@ class GPUModelRunner(
             self._init_kernel_block_sizes = kernel_block_sizes
             self._init_dcp_sharded = dcp_sharded
             self.input_batch = InputBatch(
+                runtime_policy=self.vllm_config.kernel_config.sm70_runtime,
                 max_num_reqs=self.max_num_reqs,
                 max_model_len=max_model_len,
                 max_num_batched_tokens=self.max_num_tokens,

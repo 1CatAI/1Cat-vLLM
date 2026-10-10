@@ -41,6 +41,9 @@ class NativeRuntimeOwner:
             torch.classes._C.Sm70NativeRuntime(),
             torch.classes._moe_C.Sm70NativeRuntime(),
         )
+        # Torch ScriptObject attribute lookup constructs a method wrapper. Bind
+        # these once; the host boundary must not rebuild four wrappers per step.
+        self._contexts = tuple((handle.enter, handle.exit) for handle in self.handles)
         self.closed = False
 
     def bind(self, values, token):
@@ -85,13 +88,13 @@ class NativeRuntimeOwner:
         token = _active_owner.set(self)
         entered = []
         try:
-            for handle in self.handles:
-                handle.enter()
-                entered.append(handle)
+            for enter, leave in self._contexts:
+                enter()
+                entered.append(leave)
             yield
         finally:
-            for handle in reversed(entered):
-                handle.exit()
+            for leave in reversed(entered):
+                leave()
             _active_owner.reset(token)
 
     def close(self):

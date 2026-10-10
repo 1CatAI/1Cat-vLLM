@@ -31,6 +31,25 @@ class VerifyAndUpdateConfig:
         return
 
 
+def fla_schedule_family(model_config) -> str | None:
+    """Existing FLA consumers; this describes ownership, not new admission."""
+    if any(
+        getattr(getattr(model_config, name, None), "linear_key_head_dim", None)
+        is not None
+        for name in ("hf_text_config", "hf_config")
+    ):
+        return "gdn"
+    if getattr(model_config, "architecture", None) in {
+        "KimiLinearForCausalLM",
+        "BailingMoeV3ForCausalLM",
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
+    }:
+        return "kda"
+    return None
+
+
 def sm70_flash_next_batch_qualified(vllm_config: "VllmConfig") -> bool:
     """Batch quality covers ordinary decode and MTP; other proposers await gates."""
     speculative = vllm_config.speculative_config

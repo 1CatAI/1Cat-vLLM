@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from pydantic import Field, field_validator
 from typing_extensions import Self
 
+from vllm.config.legacy_inputs import LegacyInputs
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.utils.hashing import safe_hash
@@ -162,6 +163,22 @@ class SchedulerConfig:
     checking the first chunk. Prevents over-admission and KV cache thrashing
     with chunked prefill."""
 
+    sm70_async_queue_depth: int | None = Field(default=None, ge=0)
+    """Override no-PP asynchronous queue depth; zero preserves the old default."""
+    sm70_inputs: LegacyInputs = Field(default_factory=LegacyInputs, init=False)
+    """Initialization snapshot for deferred scheduler override errors."""
+    sm70_aliases: ClassVar[dict[str, str]] = {
+        "sm70_async_queue_depth": "VLLM_SM70_ASYNC_SCHEDULING_QUEUE_DEPTH",
+    }
+
+    def capture_sm70_inputs(self) -> None:
+        self.sm70_inputs.capture(self.sm70_aliases.values())
+
+    def sm70_queue_depth(self) -> int:
+        if self.sm70_async_queue_depth is not None:
+            return self.sm70_async_queue_depth
+        return self.sm70_inputs.value(self.sm70_aliases["sm70_async_queue_depth"])
+
     async_scheduling: bool | None = None
     """If set to False, disable async scheduling. Async scheduling helps to
     avoid gaps in GPU utilization, leading to better latency and throughput.
@@ -245,6 +262,7 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        self.capture_sm70_inputs()
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True

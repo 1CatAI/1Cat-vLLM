@@ -289,6 +289,13 @@ def finalize_runtime_policy_hashes(cfg):
                 field == "pp_layer_partition"
                 and cfg.parallel_config.pipeline_parallel_size > 1
             )
+            or (pre_ampere and field == "moe_sum2_q8" and tp == 8)
+            or (
+                pre_ampere
+                and field == "pp_static_hidden_transfer"
+                and tp == 4
+                and cfg.parallel_config.pipeline_parallel_size == 2
+            )
             or (pre_ampere and field == "tp4_push" and tp == 4)
             or (pre_ampere and field in ("tp8_hierarchical", "tp8_push") and tp == 8)
             or (pre_ampere and field == "moe_add_allreduce" and tp > 1)
@@ -455,9 +462,12 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
     if runtime is not None:
         ignored.update(
             alias
-            for field, alias in runtime.warmup_aliases.items()
+            for field, alias in (runtime.warmup_aliases | runtime.input_aliases).items()
             if field in runtime.sources
         )
+    scheduler = _owner(cfg, "scheduler_config")
+    if getattr(getattr(scheduler, "sm70_inputs", None), "captured", False):
+        ignored.update(scheduler.sm70_aliases.values())
     routing = _owner(cfg, "kernel_config.sm70_moe.routing")
     if routing is not None and routing.sources:
         ignored.update(routing.aliases.values())
@@ -465,6 +475,10 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
     if unquantized is not None and unquantized.sources:
         ignored.update(unquantized.aliases.values())
     gdn = _owner(cfg, "kernel_config.gdn")
+    if gdn is not None and gdn.schedule.resolved:
+        from vllm.config.gdn_schedule import GDN_SCHEDULE_FIELDS
+
+        ignored.update(alias for alias, _, _ in GDN_SCHEDULE_FIELDS.values())
     if gdn is not None and gdn.resolved:
         ignored.update(gdn.projection.aliases.values())
     spec = _owner(cfg, "speculative_config.sm70_dflash2")

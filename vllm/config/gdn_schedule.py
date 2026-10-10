@@ -10,6 +10,7 @@ from pydantic import Field
 from vllm.config.utils import config
 
 GDN_SCHEDULE_FIELDS = {
+    "kda_prefill_enabled": ("VLLM_SM70_KDA_PREFILL_SCHEDULE", True, "exact"),
     "recurrent_enabled": ("VLLM_SM70_FLA_RECURRENT_SCHEDULE", True, "exact"),
     "recurrent_bv": ("VLLM_SM70_FLA_BV", None, "positive"),
     "recurrent_warps": ("VLLM_SM70_FLA_WARPS", None, "positive"),
@@ -48,6 +49,8 @@ def _positive(raw):
 class GdnScheduleConfig:
     """Explicit launch choices override the captured historical environment."""
 
+    kda_prefill_enabled: bool | None = None
+    """Retain the KDA prefill launch search space on the qualified device."""
     recurrent_enabled: bool | None = None
     """Launch control formerly provided by VLLM_SM70_FLA_RECURRENT_SCHEDULE."""
     recurrent_bv: int | None = Field(default=None, gt=0)
@@ -151,9 +154,33 @@ class GdnScheduleConfig:
             setattr(self, name, value)
         self.resolved = True
 
+    active_family: str | None = Field(default=None, init=False)
+    """Model-declared schedule consumers; None retains independent API hashing."""
+
     def graph_options(self):
-        return {
+        options = {
             **{name: getattr(self, name) for name in GDN_SCHEDULE_FIELDS},
             "recurrent_override": self.recurrent_override,
             "sigmoid_override": self.sigmoid_override,
         }
+        if self.active_family == "gdn":
+            options.pop("kda_prefill_enabled")
+        elif self.active_family == "kda":
+            options = {
+                k: v for k, v in options.items() if k.startswith(("kda_", "delta_h_"))
+            }
+        return options
+
+
+def resolve_schedule(schedule=None):
+    """Use an initialized owner; only independent no-config calls adapt env."""
+    if schedule is not None:
+        return schedule
+    from vllm.runtime_resources import current_runtime_resources
+
+    resources = current_runtime_resources()
+    if resources is not None and resources.get("fla_schedule") is not None:
+        return resources["fla_schedule"]
+    schedule = GdnScheduleConfig()
+    schedule.resolve()
+    return schedule

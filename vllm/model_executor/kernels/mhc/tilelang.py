@@ -3,7 +3,6 @@
 import torch
 
 import vllm._sm70_ops as sm70_ops
-from vllm import envs
 from vllm.config.execution_policy import layer_policy
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -782,7 +781,7 @@ def mhc_fused_post_pre_tilelang(
         current_platform.get_device_capability() if current_platform.is_cuda() else None
     )
     use_sm70_fp32_stage = (
-        envs.VLLM_SM70_DSV4_MHC_FP32_STAGE
+        layer_policy().value("mhc_fp32_stage")
         and use_small_fma
         and use_fp16
         and capability is not None

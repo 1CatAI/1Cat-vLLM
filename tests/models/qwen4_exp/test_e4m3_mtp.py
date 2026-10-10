@@ -13,7 +13,6 @@ import pytest
 import torch
 from torch import nn
 
-from vllm import envs
 from vllm.models.qwen4_exp.nvidia import model as model_mod
 from vllm.models.qwen4_exp.nvidia.model import (
     _finalize_qsa_e4m3_scale_load,
@@ -104,7 +103,7 @@ def test_e4m3_gate_non_e4m3_cache_is_noop():
 # D2: strict draft-side scale validation lists the missing tensor names.
 # --------------------------------------------------------------------------- #
 def test_validate_scale_overlay_lists_missing_names(monkeypatch):
-    monkeypatch.setattr(envs, "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", True)
+    monkeypatch.setenv("VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES", "1")
     required = {
         "model.layers.0.self_attn.k_scale",
         "model.layers.0.self_attn.v_scale",

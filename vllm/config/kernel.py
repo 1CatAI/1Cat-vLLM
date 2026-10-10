@@ -55,6 +55,7 @@ SM70_LOADER_ALIASES = {
     "awq": {"moe_disable": "VLLM_SM70_AWQ_MOE_DISABLE"},
     "fp8": {"moe_dequant_fallback": "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK"},
     "nvfp4": {
+        "qpn4": "VLLM_SM70_NVFP4_QPN4",
         "enabled": "VLLM_SM70_NVFP4_TURBOMIND",
         "gated_silu": "VLLM_SM70_NVFP4_DENSE_GATED_SILU",
         "down_scale_code": "VLLM_SM70_NVFP4_QPN4_DOWN_SCALE_CODE",
@@ -221,6 +222,11 @@ class Sm70LinearCompatibility:
             )
         )
 
+    def loader_value(self, field):
+        self.capture_inputs()
+        value = getattr(self, field)
+        return self.legacy.value(self.loader_aliases[field]) if value is None else value
+
     def use_turbomind(self, value):
         backend = self.legacy.value("VLLM_SM70_QUANT_BACKEND")
         return backend == "turbomind" or (backend == "auto" and bool(value))
@@ -246,6 +252,8 @@ class Sm70NvFp4Config(Sm70LinearCompatibility):
     """Initialization provenance for explanations, excluded from graph hashing."""
     native: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
     """Captured native selectors/tuning; unused formats do not affect graph keys."""
+    qpn4: bool | None = None
+    """Retain the shape/model-qualified QPN4 provider."""
     dense_qpn2: bool = True
     """Allow native QPN2 with FP16 dense prefill on supported Turing workers."""
     qpn2: bool | None = None
@@ -853,14 +861,11 @@ class KernelConfig:
 
     def resolve_gdn(self, model_config, additional_config) -> None:
         """Capture active GDN policy before worker serialization/cache hashing."""
-        configs = (
-            getattr(model_config, "hf_text_config", None),
-            getattr(model_config, "hf_config", None),
-        )
-        if any(
-            getattr(config, "linear_key_head_dim", None) is not None
-            for config in configs
-        ):
+        from vllm.model_executor.models.config import fla_schedule_family
+
+        family = fla_schedule_family(model_config)
+        self.gdn.schedule.active_family = family
+        if family == "gdn":
             self.gdn.resolve(
                 additional_config=additional_config,
                 native_verify=self.sm70_gdn_verify,
@@ -868,6 +873,7 @@ class KernelConfig:
 
     def capture_provider_inputs(self) -> None:
         """Freeze worker inputs without activating unused formats or parsing errors."""
+        self.gdn.schedule.resolve()
         for family in ("awq", "fp8", "nvfp4"):
             policy = getattr(self, "sm70_" + family)
             policy.capture_inputs()
@@ -945,6 +951,8 @@ class KernelConfig:
             factors["sm70_sparse"] = self.sm70_sparse.compute_hash()
         if self.gdn.resolved:
             factors["gdn"] = self.gdn.compute_hash()
+        elif self.gdn.schedule.active_family == "kda":
+            factors["fla_schedule"] = self.gdn.schedule.graph_options()
         if self.sm70_moe.resolved:
             factors["sm70_moe"] = self.sm70_moe.compute_hash()
         for family in ("awq", "fp8", "nvfp4", "gguf"):

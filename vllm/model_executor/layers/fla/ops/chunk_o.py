@@ -9,12 +9,11 @@
 
 # ruff: noqa: E501
 
-import os
-
 import torch
 
 from vllm.triton_utils import tl, triton
 
+from .gdn_chunk_kernels import resolve_chunk_kernels
 from .index import prepare_chunk_indices
 from .op import exp
 from .utils import FLA_CHUNK_SIZE, check_shared_mem, is_nvidia_hopper
@@ -23,52 +22,13 @@ BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
-def _is_sm70() -> bool:
-    return (
-        torch.cuda.is_available()
-        and torch.cuda.get_device_capability()[0] == 7
-        and torch.cuda.get_device_capability()[1] == 0
-    )
-
-
-def _parse_int_list(env_name: str, default_vals: list[int]) -> list[int]:
-    raw = os.getenv(env_name)
-    if raw is None or not raw.strip():
-        return default_vals
-    out: list[int] = []
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            value = int(token)
-        except ValueError:
-            continue
-        if value > 0:
-            out.append(value)
-    return out or default_vals
-
-
-_use_sm70_chunk_o_schedule = (
-    os.getenv("VLLM_SM70_GDN_CHUNK_O_SCHEDULE", "1") == "1" and _is_sm70()
-)
-_chunk_o_configs = (
-    [
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in _parse_int_list("VLLM_SM70_GDN_CHUNK_O_BK", [32, 64])
-        for BV in _parse_int_list("VLLM_SM70_GDN_CHUNK_O_BV", [32, 64])
-        for num_warps in _parse_int_list("VLLM_SM70_GDN_CHUNK_O_WARPS", [4, 8])
-        for num_stages in _parse_int_list("VLLM_SM70_GDN_CHUNK_O_STAGES", [2])
-    ]
-    if _use_sm70_chunk_o_schedule
-    else [
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in BKV_LIST
-        for BV in BKV_LIST
-        for num_warps in NUM_WARPS
-        for num_stages in [2, 3, 4]
-    ]
-)
+_chunk_o_configs = [
+    triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+    for BK in BKV_LIST
+    for BV in BKV_LIST
+    for num_warps in NUM_WARPS
+    for num_stages in [2, 3, 4]
+]
 
 
 @triton.heuristics(
@@ -194,6 +154,8 @@ def chunk_fwd_o(
     core_attn_out: torch.Tensor | None = None,
     kernel=None,
 ) -> torch.Tensor:
+    if kernel is None:
+        kernel = resolve_chunk_kernels().output
     B, T, Hg, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = chunk_size

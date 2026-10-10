@@ -482,6 +482,11 @@ def compile_ignored_aliases(kernel) -> set[str]:
         and field not in {"awq_tune_small_shapes"}
         and not field.startswith("moe_single_token_")
     }
+    for family in ("awq", "fp8", "nvfp4"):
+        policy = getattr(kernel, "sm70_" + family)
+        if policy.legacy.captured:
+            ignored.update(policy.input_aliases)
+            ignored.update(policy.loader_aliases.values())
     ignored.update(SM70_NVFP4_LINEAR_ALIASES.values())
     ignored.update(
         name for field, name in SM70_AWQ_LINEAR_ALIASES.items() if field != "enabled"

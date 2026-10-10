@@ -272,6 +272,12 @@ class GraphPolicy(ExecutionPolicy):
 class LayerExecutionPolicy(ExecutionPolicy):
     """Execution policy owned by kernel_config.layer_execution."""
 
+    mhc_fp32_stage: bool | None = None
+    """Retain DeepSeek's shape-qualified FP32 mHC intermediate."""
+    disable_shared_moe_overlap: bool | None = None
+    """Retain the independent SM70 shared-expert overlap rollback."""
+    ple_spec_conv: bool | None = None
+    """Retain the existing PLE MTP convolution and state-commit kernel."""
     quant_backend: Literal["auto", "marlin", "turbomind"] | None = None
     """Shared pre-Ampere quantization backend; format flags retain their gates."""
     gptq_turbomind: bool | None = None
@@ -305,6 +311,9 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Keep unused provider parse failures behind their original admission gates."""
 
     deferred_fields: ClassVar[tuple[str, ...]] = (
+        "mhc_fp32_stage",
+        "disable_shared_moe_overlap",
+        "ple_spec_conv",
         "quant_backend",
         "gptq_turbomind",
         "compressed_tensors_turbomind",
@@ -477,6 +486,9 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Threads for native multi-token hyperconnection normalization."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "mhc_fp32_stage": "VLLM_SM70_DSV4_MHC_FP32_STAGE",
+        "disable_shared_moe_overlap": "VLLM_SM70_DISABLE_QWEN3NEXT_SHARED_MOE_OVERLAP",
+        "ple_spec_conv": "VLLM_SM70_MTP_PLE_CONV",
         "quant_backend": "VLLM_SM70_QUANT_BACKEND",
         "gptq_turbomind": "VLLM_SM70_GPTQ_TURBOMIND",
         "compressed_tensors_turbomind": "VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND",
@@ -531,7 +543,26 @@ class CommunicationPolicy(ExecutionPolicy):
     native: CollectiveNativeConfig = Field(default_factory=CollectiveNativeConfig)
     """Immutable per-communicator native selection and launch parameters."""
 
+    provider_errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Captured errors for optional transfer and MoE communication gates."""
+
+    def value(self, field):
+        if field in self.provider_errors:
+            raise ValueError(self.provider_errors[field])
+        return getattr(self, field)
+
     def resolve(self, native_overrides=None, *, layers=None, trace=None):
+        from vllm.config.utils import resolve_legacy_fields
+
+        resolve_legacy_fields(
+            self,
+            {
+                field: self.aliases[field]
+                for field in ("pp_static_hidden_transfer", "moe_sum2_q8")
+                if field not in self.sources
+            },
+            deferred_errors=self.provider_errors,
+        )
         super().resolve()
         overrides = dict(native_overrides or {})
         source = self.sources.get("tp8_hierarchical", "")
@@ -551,6 +582,10 @@ class CommunicationPolicy(ExecutionPolicy):
             {"policy": super().compute_hash(), "native": self.native.compute_hash()}
         )
 
+    pp_static_hidden_transfer: bool | None = None
+    """Retain the metadata-free single-token pipeline transfer contract."""
+    moe_sum2_q8: bool | None = None
+    """Retain the qualified eight-row GLM expert sum/reduction implementation."""
     top1_custom_ar: bool | None = None
     """Provision the existing compact greedy-token collective."""
 
@@ -608,6 +643,8 @@ class CommunicationPolicy(ExecutionPolicy):
     """Explicit comma-separated pipeline layer counts, or automatic."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "pp_static_hidden_transfer": "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER",
+        "moe_sum2_q8": "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8",
         "top1_custom_ar": "VLLM_SM70_TOP1_CUSTOM_AR",
         "symm_mem": "VLLM_ALLREDUCE_USE_SYMM_MEM",
         "flashinfer": "VLLM_ALLREDUCE_USE_FLASHINFER",

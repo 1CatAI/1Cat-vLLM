@@ -42,6 +42,12 @@ def resolve_legacy_fields(
 class Sm70RuntimeConfig:
     """Warmup policy; does not alter the compiled model computation."""
 
+    legacy_output_token_repair: bool | None = None
+    """Retain the async output-history rollback for speculative and ordinary runs."""
+    input_aliases: ClassVar[dict[str, str]] = {
+        "legacy_output_token_repair": "VLLM_SM70_MTP_LEGACY_OUTPUT_TOKEN_REPAIR",
+    }
+
     awq_warmup: bool | None = None
     """Run the existing quantized-kernel warmup at the original checkpoint."""
     awq_warmup_max_moe_tokens: int | None = None
@@ -83,7 +89,7 @@ class Sm70RuntimeConfig:
             self,
             {
                 field: alias
-                for field, alias in self.warmup_aliases.items()
+                for field, alias in (self.warmup_aliases | self.input_aliases).items()
                 if field not in self.sources
             },
             deferred_errors=self.errors,
@@ -97,6 +103,20 @@ class Sm70RuntimeConfig:
                 "mtp_concurrency_warmup": "VLLM_SM70_MTP_CONCURRENCY_WARMUP",
             },
         )
+
+
+def bind_output_token_repair(policy=None):
+    """Bind a narrow deferred value; old standalone batches capture only their flag."""
+    from functools import partial
+
+    if policy is not None:
+        return partial(policy.value, "legacy_output_token_repair")
+    from vllm.config.legacy_inputs import LegacyInputs
+
+    inputs = LegacyInputs()
+    alias = Sm70RuntimeConfig.input_aliases["legacy_output_token_repair"]
+    inputs.capture((alias,))
+    return partial(inputs.value, alias)
 
 
 @config

@@ -45,7 +45,7 @@
  },
  "vllm/config/execution_policy.py": {
   "model": 9,
-  "platform": 52
+  "platform": 53
  },
  "vllm/config/gdn.py": {
   "env": 1,
@@ -55,7 +55,7 @@
   "platform": 1
  },
  "vllm/config/gdn_schedule.py": {
-  "platform": 46
+  "platform": 47
  },
  "vllm/config/gdn_state.py": {
   "env": 5,
@@ -71,7 +71,10 @@
  },
  "vllm/config/policy_defaults.py": {
   "model": 14,
-  "platform": 26
+  "platform": 28
+ },
+ "vllm/config/scheduler.py": {
+  "platform": 13
  },
  "vllm/config/speculative.py": {
   "model": 142,
@@ -137,7 +140,7 @@
   "platform": 9
  },
  "vllm/model_executor/kernels/linear/__init__.py": {
-  "platform": 30
+  "platform": 29
  },
  "vllm/model_executor/kernels/linear/fp16_gemv_silu.py": {
   "platform": 4
@@ -146,7 +149,7 @@
   "platform": 1
  },
  "vllm/model_executor/kernels/mhc/tilelang.py": {
-  "platform": 69
+  "platform": 68
  },
  "vllm/model_executor/kernels/mhc/tilelang_kernels.py": {
   "platform": 2
@@ -165,29 +168,15 @@
   "model": 3,
   "platform": 2
  },
- "vllm/model_executor/layers/fla/ops/chunk_delta_h.py": {
-  "env": 1,
-  "platform": 10
- },
- "vllm/model_executor/layers/fla/ops/chunk_o.py": {
-  "env": 1,
-  "platform": 9
- },
- "vllm/model_executor/layers/fla/ops/chunk_scaled_dot_kkt.py": {
-  "env": 1,
-  "platform": 8
- },
  "vllm/model_executor/layers/fla/ops/fused_recurrent.py": {
-  "env": 1,
-  "platform": 50
+  "platform": 22
  },
  "vllm/model_executor/layers/fla/ops/fused_sigmoid_gating.py": {
-  "env": 1,
   "model": 22,
-  "platform": 45
+  "platform": 21
  },
  "vllm/model_executor/layers/fla/ops/gdn_chunk_kernels.py": {
-  "platform": 5
+  "platform": 6
  },
  "vllm/model_executor/layers/fla/ops/gdn_prefill.py": {
   "platform": 9
@@ -199,8 +188,7 @@
   "platform": 20
  },
  "vllm/model_executor/layers/fla/ops/kda.py": {
-  "env": 1,
-  "platform": 7
+  "platform": 1
  },
  "vllm/model_executor/layers/fused_moe/experts/marlin_moe.py": {
   "platform": 1
@@ -226,8 +214,8 @@
   "platform": 5
  },
  "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": {
-  "model": 3,
-  "platform": 41
+  "model": 2,
+  "platform": 40
  },
  "vllm/model_executor/layers/fused_moe/runner/shared_experts.py": {
   "platform": 1
@@ -571,16 +559,16 @@
   "model": 5
  },
  "vllm/v1/worker/gpu_input_batch.py": {
-  "platform": 1
+  "platform": 3
  },
  "vllm/v1/worker/gpu_model_runner.py": {
   "env": 18,
   "model": 669,
-  "platform": 163
+  "platform": 165
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 1,
-  "platform": 25
+  "platform": 24
  },
  "vllm/v1/worker/mamba_utils.py": {
   "env": 1,

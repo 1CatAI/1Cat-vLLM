@@ -39,7 +39,10 @@ def read_sparse_legacy(name):
     }
     if name in defaults:
         return defaults[name] if raw is None else int(raw)
-    if name == "VLLM_SM70_QSA_MTP_TOPK" or name.startswith("VLLM_SM70_DSV4_"):
+    if name in (
+        "VLLM_SM70_QSA_MTP_TOPK",
+        "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES",
+    ) or name.startswith("VLLM_SM70_DSV4_"):
         return raw  # Registered bool(int(...)) dialect and error behavior.
     return raw is None or raw == "1"
 
@@ -62,6 +65,12 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
     """Whether the engine metadata describes sparse indexed attention."""
     reason: str | None = Field(default=None, init=False)
     """Startup qualification; calls also validate dynamic tensor layouts."""
+    qsa_strict_scales: bool | None = None
+    """Refuse incomplete E4M3 QSA scales at the existing loader checkpoint."""
+    private_compressor_state: bool | None = None
+    """Retain single-chain private compressed-KV storage admission."""
+    qnorm_kv_fused_tp4: bool | None = None
+    """Retain the one-token DeepSeek Q-norm and KV insertion kernel."""
     qsa_indexer_cublas: bool | None = None
     """Use the qualified tiled cuBLAS scorer; exact legacy equality to 1."""
     qsa_mtp_topk: bool | None = None
@@ -112,6 +121,9 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
     """Retain the independent split-QK numerical implementation."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "qsa_strict_scales": "VLLM_QWEN4EXP_QSA_E4M3_STRICT_SCALES",
+        "private_compressor_state": "VLLM_SM70_DSV4_PRIVATE_COMPRESSOR_STATE",
+        "qnorm_kv_fused_tp4": "VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4",
         "indexer_fused_logits": "VLLM_SM70_INDEXER_FUSED_LOGITS",
         "indexer_relu": "VLLM_SM70_INDEXER_RELU",
         "indexer_prefill_cublas": "VLLM_SM70_INDEXER_PREFILL_CUBLAS",

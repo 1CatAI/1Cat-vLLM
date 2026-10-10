@@ -5,7 +5,7 @@
 
 import torch
 
-import vllm.envs as envs
+from vllm.config.sm70_sparse import sparse_policy
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
     quantize_and_insert_k_cache,
 )
@@ -221,7 +221,11 @@ def sm70_qnorm_rope_kv_fp8_insert(
     assert q.is_contiguous() and kv.is_contiguous()
 
     num_tokens, num_heads, _ = q.shape
-    if envs.VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4 and num_tokens == 1 and num_heads == 16:
+    if (
+        sparse_policy().value("qnorm_kv_fused_tp4")
+        and num_tokens == 1
+        and num_heads == 16
+    ):
         cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
         _sm70_qnorm_rope_parallel_kv_insert_kernel[(num_tokens, num_heads + 8)](
             q,
