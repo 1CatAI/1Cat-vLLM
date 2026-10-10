@@ -57,7 +57,11 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.mem_utils import (
+    DeviceMemoryProfiler,
+    format_gib,
+    loaded_cuda_model_storage,
+)
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -400,6 +404,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if self.speculator is not None:
+                logger.info(
+                    "Target CUDA storage before speculative loading: %s",
+                    loaded_cuda_model_storage({"target": self.model}),
+                )
                 self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights

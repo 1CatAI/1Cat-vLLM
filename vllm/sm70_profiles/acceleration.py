@@ -14,6 +14,7 @@ from vllm import envs
 from vllm.config.execution_policy import graph_policy, layer_policy
 from vllm.envs_metadata import EnvVar
 from vllm.logger import init_logger
+from vllm.utils.mem_utils import loaded_cuda_model_storage as loaded_cuda_model_storage
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -198,44 +199,6 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "scope": "prepared_gguf_storage_and_operator_capability",
         }
     return result
-
-
-def loaded_cuda_model_storage(models: Mapping[str, Any]) -> dict[str, Any]:
-    """Count registered backing storage once across target/draft aliases.
-
-    This is model storage, not allocator usage. Unregistered scratch buffers,
-    graph pools and CUDA library allocations require separate measurements.
-    """
-    storages: dict[tuple[str, int], dict[str, Any]] = {}
-    for owner, model in models.items():
-        if model is None:
-            continue
-        for name, layer in model.named_modules():
-            tensors = list(layer.named_parameters(recurse=False)) + list(
-                layer.named_buffers(recurse=False)
-            )
-            for key, tensor in tensors:
-                if not tensor.is_cuda or not tensor.numel():
-                    continue
-                storage = tensor.untyped_storage()
-                identity = (str(tensor.device), storage.data_ptr())
-                row = storages.setdefault(
-                    identity,
-                    {
-                        "device": str(tensor.device),
-                        "bytes": storage.nbytes(),
-                        "names": [],
-                    },
-                )
-                row["names"].append(
-                    ".".join(part for part in (owner, name, key) if part)
-                )
-    rows = sorted(storages.values(), key=lambda row: row["bytes"], reverse=True)
-    return {
-        "bytes": sum(row["bytes"] for row in rows),
-        "storages": rows,
-        "scope": "registered_cuda_model_backing_excluding_allocator_overhead",
-    }
 
 
 def loaded_qsa_cache_storage(forward_context: Mapping[str, Any]) -> dict[str, int]:

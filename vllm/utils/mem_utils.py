@@ -3,9 +3,10 @@
 import contextlib
 import gc
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field
 from functools import cache
+from typing import Any
 
 import psutil
 import torch
@@ -14,6 +15,44 @@ import torch.types
 from vllm.platforms import current_platform
 
 from .mem_constants import GiB_bytes, KiB_bytes, MiB_bytes
+
+
+def loaded_cuda_model_storage(models: Mapping[str, Any]) -> dict[str, Any]:
+    """Count registered backing storage once across target/draft aliases.
+
+    This is model storage, not allocator usage. Unregistered scratch buffers,
+    graph pools and CUDA library allocations require separate measurements.
+    """
+    storages: dict[tuple[str, int], dict[str, Any]] = {}
+    for owner, model in models.items():
+        if model is None:
+            continue
+        for name, layer in model.named_modules():
+            tensors = list(layer.named_parameters(recurse=False)) + list(
+                layer.named_buffers(recurse=False)
+            )
+            for key, tensor in tensors:
+                if not tensor.is_cuda or not tensor.numel():
+                    continue
+                storage = tensor.untyped_storage()
+                identity = (str(tensor.device), storage.data_ptr())
+                row = storages.setdefault(
+                    identity,
+                    {
+                        "device": str(tensor.device),
+                        "bytes": storage.nbytes(),
+                        "names": [],
+                    },
+                )
+                row["names"].append(
+                    ".".join(part for part in (owner, name, key) if part)
+                )
+    rows = sorted(storages.values(), key=lambda row: row["bytes"], reverse=True)
+    return {
+        "bytes": sum(row["bytes"] for row in rows),
+        "storages": rows,
+        "scope": "registered_cuda_model_backing_excluding_allocator_overhead",
+    }
 
 
 def format_kib(b: int) -> str:

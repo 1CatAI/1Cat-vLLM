@@ -127,3 +127,34 @@ def test_gdn_norm_follows_parameter_device(monkeypatch, default_vllm_config, dev
         attention = module.QwenGatedDeltaNetAttention(config, runtime, "layers.0")
     assert attention.norm.weight.device == attention.dt_bias.device
     assert attention.norm.weight.device.type == device
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta", "cuda"])
+def test_shared_expert_stream_requires_accelerator_storage(monkeypatch, device):
+    from vllm.model_executor.layers.fused_moe.runner import shared_experts as module
+    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+    from vllm.model_executor.layers.quantization.gguf_moe import GGUFNativeMoEMethod
+
+    layer = nn.Linear(8, 16, device="cpu" if device == "cuda" else device)
+    if device == "cuda":
+        # Admission-only fixture: exercise the CUDA branch without allocating.
+        monkeypatch.setattr(
+            layer,
+            "parameters",
+            lambda: iter([SimpleNamespace(device=torch.device(device))]),
+        )
+    stream = object()
+    calls = []
+    monkeypatch.setattr(module.envs, "VLLM_DISABLE_SHARED_EXPERTS_STREAM", False)
+
+    def make_stream():
+        calls.append(device)
+        return stream
+
+    monkeypatch.setattr(module, "aux_stream", make_stream)
+    moe = SimpleNamespace()
+    shared = module.SharedExperts(
+        layer, moe, GGUFNativeMoEMethod(GGUFConfig(), moe), enable_dbo=False
+    )
+    assert calls == (["cuda"] if device == "cuda" else [])
+    assert shared._stream is (stream if device == "cuda" else None)
