@@ -7,15 +7,15 @@ import numpy as np
 import pytest
 import torch
 
-import vllm.v1.worker.gpu.sample.sampler as sampler_module
 from vllm.v1.worker.gpu import model_runner as model_runner_module
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 
 
-def _sampler() -> Sampler:
+def _sampler(*, greedy_token_fastpath: bool = True) -> Sampler:
     sampler = object.__new__(Sampler)
     sampler.compute_nans = False
+    sampler.greedy_token_fastpath = greedy_token_fastpath
     sampler.sampling_states = SimpleNamespace(
         temperature=SimpleNamespace(np=np.array([0.0, 0.0], dtype=np.float32)),
         max_num_logprobs=lambda _indices: -1,
@@ -34,7 +34,6 @@ def _sampler() -> Sampler:
 def test_sm70_v2_greedy_fastpath_accepts_plain_temperature_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sampler_module.envs, "VLLM_SM70_GREEDY_TOKEN_FASTPATH", True)
     sampler = _sampler()
     input_batch = SimpleNamespace(idx_mapping_np=np.array([1], dtype=np.int32))
 
@@ -60,6 +59,7 @@ def test_sm70_v2_decode_uses_model_top_tokens(
     )
     runner.device = torch.device("cuda")
     runner.rejection_sampler = None
+    runner.speculator = None
     runner._sm70_greedy_capability = True
     runner.vllm_config = SimpleNamespace(
         kernel_config=SimpleNamespace(sm70_greedy_verify=False)
@@ -114,12 +114,7 @@ def test_sm70_v2_decode_uses_model_top_tokens(
 def test_sm70_v2_greedy_fastpath_rejects_non_equivalent_sampling(
     monkeypatch: pytest.MonkeyPatch, blocker: str
 ) -> None:
-    monkeypatch.setattr(
-        sampler_module.envs,
-        "VLLM_SM70_GREEDY_TOKEN_FASTPATH",
-        blocker != "disabled",
-    )
-    sampler = _sampler()
+    sampler = _sampler(greedy_token_fastpath=blocker != "disabled")
     input_batch = SimpleNamespace(idx_mapping_np=np.array([1], dtype=np.int32))
 
     if blocker == "nan_count":

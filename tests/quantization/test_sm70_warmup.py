@@ -337,9 +337,7 @@ def test_nvfp4_warmup_uses_converter_padded_output_size(monkeypatch, compact):
         global_scale=0.125,
     )
     calls = []
-    monkeypatch.setattr(
-        torch.ops._C, "nvfp4_gemm_sm70_out_meta", object(), raising=False
-    )
+    monkeypatch.setattr(torch.ops._C, "nvfp4_gemm_sm70_out", object(), raising=False)
     monkeypatch.setattr(
         warmup.sm70_ops,
         "nvfp4_gemm_sm70_out",
@@ -616,7 +614,7 @@ def test_fp8_coordinated_warmup_leader_broadcasts_rank0_lut(monkeypatch):
     )
     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
-    warmup.envs.disable_envs_cache()
+    envs.disable_envs_cache()
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(
         warmup,
@@ -669,7 +667,7 @@ def test_fp8_coordinated_warmup_follower_imports_rank0_lut(monkeypatch):
     )
     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_COORDINATED_TUNING", "1")
-    warmup.envs.disable_envs_cache()
+    envs.disable_envs_cache()
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(
         warmup,
@@ -704,7 +702,7 @@ def test_fp8_coordinated_warmup_follower_imports_rank0_lut(monkeypatch):
 def test_fp8_explicit_lut_reuse_allows_dynamic_cache_import(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.setenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", "1")
-    warmup.envs.disable_envs_cache()
+    envs.disable_envs_cache()
 
     assert not warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
         has_awq_dense=False,
@@ -716,7 +714,7 @@ def test_fp8_explicit_lut_reuse_allows_dynamic_cache_import(monkeypatch):
 def test_fp8_dynamic_tuning_skips_stale_lut_by_default(monkeypatch):
     monkeypatch.setenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1")
     monkeypatch.delenv("VLLM_SM70_FP8_REUSE_IMPORTED_CACHE", raising=False)
-    warmup.envs.disable_envs_cache()
+    envs.disable_envs_cache()
 
     assert warmup._lut_cache_disabled_for_dynamic_quant_dispatch(
         has_awq_dense=False,

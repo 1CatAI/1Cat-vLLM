@@ -2067,6 +2067,7 @@ def test_sm70_qwen_gdn_003_spec_core_route_has_priority(
     )
 
     class FakeSelf:
+        gdn_policy = spec_builder.gdn_policy
         auto_sm70_qwen_gdn_003_spec_core = True
         auto_sm70_qwen_gdn_spec_core = True
         auto_sm70_qwen_gdn_full_forward = True
@@ -2176,6 +2177,7 @@ def test_sm70_qwen_gdn_spec_commit_route_is_compile_stable(
     )
 
     class FakeSelf:
+        gdn_policy = regular_builder.gdn_policy
         auto_sm70_qwen_gdn_003_spec_core = False
         auto_sm70_qwen_gdn_spec_core = True
         auto_sm70_qwen_gdn_full_forward = False
