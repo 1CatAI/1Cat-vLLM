@@ -802,6 +802,9 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_row_cache_mib: int = Field(default=1536, ge=0)
+    """Decoded FP16 LRU (MiB) for CPU-served packed GGUF PLE rows; 0 disables."""
+
     ple_pinned_decode: bool = True
     """Admit calibrated packed PLE decode rows from rank-local pinned storage."""
     ple_pinned_decode_active: bool = Field(default=False, init=False)
@@ -921,6 +924,7 @@ class KernelConfig:
             "ple_input_prepare",  # Input staging is outside the compiled model.
             "ple_input_preparations",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
+            "ple_row_cache_mib",  # CPU-only reuse of bit-identical rows
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",

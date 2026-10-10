@@ -116,6 +116,9 @@ _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
+# Offload-worker batches up to this size (four MTP4 verify requests = 20) hash
+# n-grams in plain Python instead of many small Torch CPU ops.
+_CPU_SMALL_NGRAM_TOKENS = 64
 
 logger = init_logger(__name__)
 _PLE_DIAGNOSTIC_BUFFERS: dict[str, torch.Tensor] = {}
@@ -1544,7 +1547,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
 
         if (
             is_offload_process()
-            and num_tokens <= 16
+            and num_tokens <= _CPU_SMALL_NGRAM_TOKENS
             and self.ngram_size == 3
             and self.heads_per_ngram == 8
             and self.ngram_heads == 16

@@ -28,14 +28,14 @@ def test_selected_rows_match_official_dequantization(tmp_path, monkeypatch, dtyp
     assert reader.data is mapped
     ids = np.array([[20, 2, 20], [0, 2, 7]], dtype=np.int64)
     official = gguf.quants.dequantize(source, gguf.GGMLQuantizationType.IQ4_NL)
-    original = gguf_rows.dequantize
+    original = gguf_rows._decode_rows
     calls = []
 
     def requested_only(data, source_type):
         calls.append(data.shape)
         return original(data, source_type)
 
-    monkeypatch.setattr(gguf_rows, "dequantize", requested_only)
+    monkeypatch.setattr(gguf_rows, "_decode_rows", requested_only)
     actual = reader.lookup(ids, dtype)
     np.testing.assert_array_equal(actual, official[ids].astype(dtype))
     assert calls == [(4, source.shape[1])]
@@ -83,3 +83,97 @@ def test_reports_fp16_overflow_without_clipping():
     actual = reader.lookup(np.array([0]), np.float32)
     expected = gguf.quants.dequantize(data, gguf.GGMLQuantizationType.IQ4_NL)
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_iq4_nl_decoder_is_bit_identical_to_gguf():
+    from vllm.transformers_utils import gguf_rows
+
+    rng = np.random.default_rng(941)
+    data = rng.integers(0, 256, (257, 5, 18), dtype=np.uint8)
+    # Cover signs, subnormals, zero and large scales; only skip non-finite ones.
+    scales = rng.integers(0, 2**16, (257, 5), dtype=np.uint16).view(np.float16)
+    scales[~np.isfinite(scales)] = np.float16(1.5)
+    scales[0] = [0, -0.0, 6e-8, -65504, 2**-14]
+    data[:, :, :2] = scales.view(np.uint8).reshape(257, 5, 2)
+    data = data.reshape(257, -1)
+    expected = gguf.quants.dequantize(data, gguf.GGMLQuantizationType.IQ4_NL)
+    actual = gguf_rows._decode_rows(data, 20)
+    assert actual.dtype == expected.dtype == np.float32
+    np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+
+
+def test_row_cache_serves_repeats_without_decoding(monkeypatch):
+    from vllm.transformers_utils import gguf_rows
+
+    source = iq4_rows(16)
+    official = gguf.quants.dequantize(source, gguf.GGMLQuantizationType.IQ4_NL)
+    reader = PackedGGUFRowReader(source, 20, 160, cache_bytes=4 * 160 * 2)
+    assert reader.cache is not None and reader.cache.capacity == 4
+    original = gguf_rows._decode_rows
+    decoded = []
+
+    def record(data, source_type):
+        decoded.append(len(data))
+        return original(data, source_type)
+
+    monkeypatch.setattr(gguf_rows, "_decode_rows", record)
+
+    def check(ids):
+        ids = np.asarray(ids, dtype=np.int64)
+        actual = reader.lookup(ids)
+        expected = official[ids].astype(np.float16)
+        np.testing.assert_array_equal(actual.view(np.uint16), expected.view(np.uint16))
+
+    check([[1, 2], [1, 3]])
+    check([3, 2, 1])
+    assert decoded == [3]
+    # Row 5 fills the last slot; row 6 then evicts the least recent row, 2.
+    check([5, 1])
+    check([6])
+    check([1, 5, 6, 4])
+    assert decoded == [3, 1, 1, 1]
+    check([2, 3])
+    assert decoded == [3, 1, 1, 1, 2]
+    assert (reader.cache.hits, reader.cache.misses) == (7, 8)
+
+
+def test_row_cache_bypasses_wide_batches_and_fp32():
+    source = iq4_rows(16)
+    official = gguf.quants.dequantize(source, gguf.GGMLQuantizationType.IQ4_NL)
+    reader = PackedGGUFRowReader(source, 20, 160, cache_bytes=2 * 160 * 2)
+    ids = np.array([0, 1, 2, 1], dtype=np.int64)
+    np.testing.assert_array_equal(reader.lookup(ids), official[ids].astype(np.float16))
+    np.testing.assert_array_equal(reader.lookup(ids[:2], np.float32), official[:2])
+    assert reader.cache is not None and not reader.cache.slots
+    assert PackedGGUFRowReader(source, 20, 160, cache_bytes=100).cache is None
+    with pytest.raises(ValueError, match="non-negative"):
+        PackedGGUFRowReader(source, 20, 160, cache_bytes=-1)
+
+
+def test_row_cache_never_stores_rejected_rows():
+    data = iq4_rows(2)
+    blocks = data.reshape(2, 5, 18)
+    blocks[0, :, :2] = np.full(5, 1024, dtype=np.float16).view(np.uint8).reshape(5, 2)
+    blocks[0, :, 2:] = 0xFF
+    reader = PackedGGUFRowReader(data, 20, 160, cache_bytes=1 << 20)
+    with pytest.raises(ValueError, match="overflow FP16"):
+        reader.lookup(np.array([0, 1]))
+    assert reader.cache is not None and not reader.cache.slots
+
+
+def test_gather_hook_reads_only_cache_misses():
+    source = iq4_rows(16)
+    official = gguf.quants.dequantize(source, gguf.GGMLQuantizationType.IQ4_NL)
+    requested = []
+
+    def gather(rows):
+        requested.append(rows.tolist())
+        return source[rows]
+
+    reader = PackedGGUFRowReader(source, 20, 160, cache_bytes=1 << 20, gather=gather)
+    for ids in ([4, 9, 4], [9, 2]):
+        ids = np.asarray(ids, dtype=np.int64)
+        np.testing.assert_array_equal(
+            reader.lookup(ids), official[ids].astype(np.float16)
+        )
+    assert requested == [[4, 9], [2]]

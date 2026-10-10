@@ -4,11 +4,13 @@
 
 from typing import cast
 
+import numpy as np
 import torch
 from torch.nn import Parameter
 
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization.gguf import (
     GGUFEmbeddingMethod,
@@ -22,6 +24,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .ple_layer import Qwen4ExpPinnedHostEmbedding, _advise_random_file_access
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -198,7 +202,14 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
         self._cpu_reader = None
         self._cpu_owned = is_offload_process()
         self.layer_name = prefix
-        context = get_current_vllm_config().compilation_config.static_forward_context
+        vllm_config = get_current_vllm_config()
+        # Weight loading may run outside the config context; read it now.
+        cache_mib = getattr(vllm_config.kernel_config, "ple_row_cache_mib", 0)
+        self._row_cache_bytes = int(cache_mib) << 20 if self._cpu_owned else 0
+        self._row_gather = bool(
+            getattr(vllm_config.kernel_config, "ple_disk_row_gather", True)
+        )
+        context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         context[prefix] = self
@@ -236,7 +247,12 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
             self.qweight = Parameter(data, False)
             self.qweight._vllm_keep_on_cpu = True
             self._cpu_reader = PackedGGUFRowReader(
-                data.numpy(), self._source_type, self.embedding_dim, self.org_vocab_size
+                data.numpy(),
+                self._source_type,
+                self.embedding_dim,
+                self.org_vocab_size,
+                cache_bytes=self._row_cache_bytes,
+                gather=self._prepare_row_gather(data),
             )
         else:
             from vllm.model_executor.kernels.ple.gguf_pinned import (
@@ -254,6 +270,33 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
                     local[self._device_rows : self._device_rows + self._host_rows]
                 )
         self._checkpoint_shard_loaded = True
+
+    def _prepare_row_gather(self, data: torch.Tensor):
+        """Read cache-missed rows with page prefetch instead of serial faults."""
+        from vllm.model_executor.kernels.ple.disk_rows import (
+            prepare_mapped_row_gather,
+        )
+
+        kernel, admission = prepare_mapped_row_gather(
+            pointers=[data.data_ptr()],
+            shard_size=data.shape[0],
+            num_rows=data.shape[0],
+            row_bytes=data.shape[1],
+            file_backed=True,
+            enabled=self._row_gather,
+        )
+        logger.info("PLE GGUF row-reader admission: %s", admission)
+        if kernel is None:
+            return None
+        row_bytes = data.shape[1]
+
+        def gather(rows: np.ndarray) -> np.ndarray:
+            output = torch.empty((rows.shape[0], row_bytes), dtype=torch.uint8)
+            ids = np.ascontiguousarray(rows, dtype=np.int64)
+            kernel.apply(torch.from_numpy(ids), output)
+            return output.numpy()
+
+        return gather
 
     def materialize_tables(self):
         if self._cpu_owned or self.ple_device_table is not None:
