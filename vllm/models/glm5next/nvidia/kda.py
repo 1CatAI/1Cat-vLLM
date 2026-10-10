@@ -512,9 +512,13 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_tokens = hidden_states.size(0)
         # One merged GEMM for q, k, v, b, f_a, g_a (replaces 6 separate GEMMs).
         weight = self.in_proj_qkvbfg_a.weight
+        # The exact native GEMV only beats cuBLAS at a single token (736 vs
+        # 629 GB/s on V100). At the 2..8-token verify batch cuBLAS is ~2x faster
+        # (74 vs 143 us per call, 34 calls per step), so those rows take the
+        # standard projection; both accumulate in FP32.
         use_sm70_exact_gemv = (
             self._use_sm70_exact_kda_gemv
-            and 1 <= num_tokens <= 8
+            and num_tokens == 1
             and hidden_states.dtype == torch.float16
             and weight.dtype == torch.float16
             and hidden_states.is_contiguous()

@@ -399,7 +399,18 @@ def sm70_mhc_pre_norm_from_staging(
         raise TypeError("SM70 mHC staging kernel requires FP16 norm weights")
 
     policy = layer_policy()
-    use_native_verify = num_tokens == 8 and policy.mhc_native_verify
+    # The native final stage handles any token count with one CTA per token. On
+    # V100 it runs the 2..8-token verify batch in 6.8-8.4 us against 35 us for
+    # the Triton program (3,600 calls per decode step at MTP k=3 on GLM-5.3-Flash
+    # TP4: -1.4 ms of a 38 ms step). Default on for that range; the policy field
+    # still forces it either way.
+    # The policy resolves an unset field to the environment default (off, 256
+    # threads) and records that provenance; only an explicit setting overrides.
+    sources = getattr(policy, "sources", {})
+    native_verify = policy.mhc_native_verify
+    if sources.get("mhc_native_verify", "default") == "default":
+        native_verify = True
+    use_native_verify = 2 <= num_tokens <= 8 and bool(native_verify)
     if num_tokens == 1 or use_native_verify:
         if not hasattr(torch.ops._C, "sm70_glm_mhc_pre_norm_out"):
             raise RuntimeError(
@@ -407,7 +418,9 @@ def sm70_mhc_pre_norm_from_staging(
                 "Rebuild vLLM from source with CUDA arch 7.0."
             )
         if use_native_verify:
-            logger.info_once("SM70 GLM mHC native CUDA q8 final stage enabled.")
+            logger.info_once(
+                "SM70 GLM mHC native CUDA final stage enabled for 2-8 tokens."
+            )
         else:
             logger.info_once("SM70 GLM mHC native CUDA decode final stage enabled.")
         sm70_ops.sm70_glm_mhc_pre_norm_out(
@@ -426,7 +439,11 @@ def sm70_mhc_pre_norm_from_staging(
             hc_post_mult_value,
             sinkhorn_repeat,
             norm_eps,
-            threads=policy.mhc_pre_threads,
+            # 1024 threads measured fastest for 2..8 tokens (6.8 us vs 8.4 us at
+            # 256); the kernel keeps 128 for a single token.
+            threads=policy.mhc_pre_threads
+            if sources.get("mhc_pre_threads", "default") != "default"
+            else (1024 if num_tokens > 1 else 128),
         )
         return
 
