@@ -897,6 +897,12 @@ class KernelConfig:
             native.capture_inputs()
         self.sm70_moe.capture_inputs()
 
+    def policy_aliases(self) -> set[str]:
+        """Compatibility inputs represented by kernel policy or inactive features."""
+        from vllm.config.sm70_native import compile_ignored_aliases
+
+        return compile_ignored_aliases(self)
+
     def compute_hash(self) -> str:
         """
         Produces a hash unique to the pass configuration.

@@ -8,7 +8,7 @@ import os
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from vllm.envs_metadata import bind_env_names, env_var, warn_deprecated_once
@@ -19040,7 +19040,7 @@ def _is_envs_cache_enabled() -> bool:
     return hasattr(__getattr__, "cache_clear")
 
 
-def enable_envs_cache() -> None:
+def enable_envs_cache(*, exclude: Collection[str] = ()) -> None:
     """
     Enables caching of environment variables. This is useful for performance
     reasons, as it avoids the need to re-evaluate environment variables on
@@ -19049,17 +19049,28 @@ def enable_envs_cache() -> None:
     NOTE: Currently, it's invoked after service initialization to reduce
     runtime overhead. This also means that environment variables should NOT
     be updated after the service is initialized.
+
+    Engine callers exclude aliases already owned by their serialized policies.
+    Standalone callers retain the complete legacy cache. Excluded getters are
+    not evaluated eagerly; explicit compatibility reads still work normally.
     """
     if _is_envs_cache_enabled():
         # Avoid wrapping functools.cache multiple times
         return
     # Tag __getattr__ with functools.cache
     global __getattr__
-    __getattr__ = functools.cache(__getattr__)
+    uncached_getattr = __getattr__
+    __getattr__ = functools.cache(uncached_getattr)
 
-    # Cache all environment variables
-    for key in environment_variables:
-        __getattr__(key)
+    # Nested getters must share the cache too. Roll back on failure so the
+    # next startup cannot skip validation through a partially warmed cache.
+    try:
+        for key in environment_variables:
+            if key not in exclude:
+                __getattr__(key)
+    except BaseException:
+        __getattr__ = uncached_getattr
+        raise
 
 
 def disable_envs_cache() -> None:
@@ -19174,9 +19185,9 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         ignored_factors.update(compile_ignored_aliases(kernel_config))
 
     if vllm_config is not None:
-        from vllm.config.policy_defaults import runtime_compile_ignored_aliases
+        from vllm.config.policy_defaults import engine_policy_aliases
 
-        ignored_factors.update(runtime_compile_ignored_aliases(vllm_config))
+        ignored_factors.update(engine_policy_aliases(vllm_config))
 
     from vllm.config.utils import normalize_value
 

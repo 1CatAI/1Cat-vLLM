@@ -436,6 +436,16 @@ def effective_runtime_values(cfg):
     return values
 
 
+def engine_policy_aliases(cfg) -> set[str]:
+    """Inputs owned by engine policies, also when their feature is inactive.
+
+    Neither the process cache nor environment hashing may re-interpret these
+    inputs. Use the same ownership declarations for both startup consumers.
+    This only inspects captured configuration; it never executes a getter.
+    """
+    return runtime_compile_ignored_aliases(cfg) | cfg.kernel_config.policy_aliases()
+
+
 def runtime_compile_ignored_aliases(cfg) -> set[str]:
     """Resolved owner hashes replace their legacy inputs, including provenance.
 
