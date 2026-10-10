@@ -178,6 +178,37 @@ def test_failed_load_missing_file(fs_tier):
     assert not results[0].success
 
 
+@pytest.mark.parametrize("size_delta", (-2 * 1024 * 1024, -4096, 4096))
+def test_wrong_sized_page_is_rejected_before_copy_and_can_be_replaced(
+    fs_tier, size_delta
+):
+    tier, tensor = fs_tier
+    tensor[0].fill_(13)
+    tier.submit_store(make_job(1, [key(1)], [0]))
+    assert all(r.success for r in drain(tier))
+    path = tier.file_mapper.get_file_name(key(1))
+    with open(path, "r+b") as page:
+        page.truncate(_BLOCK_ELEMENTS * tensor.element_size() + size_delta)
+
+    tensor[1].fill_(-17)
+    tier.submit_load(make_job(2, [key(1)], [1], is_promotion=True))
+    results = drain(tier)
+    assert len(results) == 1 and not results[0].success
+    assert torch.all(tensor[1] == -17)
+    assert not os.path.exists(path)
+    assert tier.lookup(key(1), _CTX) is False
+
+    # Failure invalidates the stale file without killing the worker. A fresh
+    # store of the same key must repair it and load into the requested slot.
+    tier.submit_store(make_job(3, [key(1)], [0]))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    tier.submit_load(make_job(4, [key(1)], [1], is_promotion=True))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    assert torch.equal(tensor[0], tensor[1])
+
+
 def test_multiple_jobs_tracked_independently(fs_tier):
     tier, _ = fs_tier
     job1 = make_job(1, [key(1)], [0])
