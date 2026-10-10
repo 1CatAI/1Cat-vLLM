@@ -118,9 +118,7 @@ def test_prefetch_thread_follows_rounds_and_positions():
         calls.append((list(tokens), list(context)))
         return np.empty(0, dtype=np.int64)
 
-    prefetcher = DraftRowPrefetcher(
-        ring, 1, 4, [(row_ids, 4096, 90, 10)], poll_s=1e-4
-    )
+    prefetcher = DraftRowPrefetcher(ring, 1, 4, [(row_ids, 4096, 90, 10)], poll_s=1e-4)
     header = ring[:8]
     body = ring[8:]
 
@@ -186,9 +184,7 @@ def test_ring_publishes_window_from_eager_and_graph_work():
             torch.accelerator.synchronize()
             assert host[1].item() == value + 2
             published = host[8 + 9 :].view(3, 4)
-            assert published[0, : value + 1].tolist() == list(
-                range(500, 501 + value)
-            )
+            assert published[0, : value + 1].tolist() == list(range(500, 501 + value))
         assert host[0].item() == 1  # graph work never advances the round
     finally:
         ring.close()

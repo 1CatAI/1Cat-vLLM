@@ -76,6 +76,17 @@ def test_policies_are_discovered_from_existing_configuration():
     assert all(row["status"] == "runtime_guarded" for row in policies.values())
 
 
+@pytest.mark.parametrize("family", ["awq", "fp8"])
+def test_policy_report_serializes_resolved_moe_diagnostic_filters(family):
+    """Loading resolves MoE dump policies whose parsed filters are frozensets."""
+    config = KernelConfig()
+    config.sm70_moe.resolve(family)
+    policies = linear_policy_report(config)
+    compare = policies["sm70_moe"]["configuration"]["compare_policy"]
+    assert compare is not None
+    assert all(not isinstance(v, (set, frozenset)) for v in compare.values())
+
+
 def test_loaded_reports_collected_once_and_cached_for_http():
     calls = []
     expected = [{"rank": 0, "linear_kernel_selections": {"selected": "native"}}]
