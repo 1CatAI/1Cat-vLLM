@@ -14,6 +14,12 @@ from vllm.transformers_utils.gguf_tensor_reader import quant_type_name
 from vllm.utils.torch_utils import direct_register_custom_op
 
 _FORMATS = {12: 0, 13: 1, 14: 2, 20: 3, 23: 3, 8: 4}
+_Q8_M8_SHAPES = {
+    (25600, 1280),  # TP4 DFlash2 context FC
+    (5120, 1536),
+    (1024, 5120),
+    (4352, 5120),
+}
 # The two streams may overlap shared and routed work. Keep shared scratch
 # separate from ordinary dense projections; layers within each stream are ordered.
 _workspaces = {}
@@ -37,12 +43,13 @@ def prepare_segment_bank(projection, canonical, device):
     cfg = get_current_vllm_config_or_none()
     source = projection.source_type
     k, n = projection.kernel.config.partition_weight_shape
+    m8_only = source == 8 and (k, n) in _Q8_M8_SHAPES
     reason = None
     if cfg is None or not cfg.kernel_config.sm70_gguf.small_m_hmma:
         reason = "disabled_by_kernel_config"
     elif source not in _FORMATS:
         reason = "segment_format_not_supported"
-    elif (k, n) not in (
+    elif not m8_only and (k, n) not in (
         {
             (2560, width)
             for width in (128, 160, 256, 320, 512, 1536, 2560, 3072, 3328, 3584, 4096)
@@ -66,7 +73,7 @@ def prepare_segment_bank(projection, canonical, device):
         quant_type_name(source),
         "gguf_dense_segments_sm70_out",
         True,
-        min_m=1,
+        min_m=8 if m8_only else 1,
         max_m=8,
         reason=reason,
     )
@@ -77,7 +84,7 @@ def prepare_segment_bank(projection, canonical, device):
         True,
         min_m=20,
         max_m=20,
-        reason=reason,
+        reason=reason or ("segment_m20_shape_has_no_calibration" if m8_only else None),
     )
     if reason:
         return False
@@ -98,20 +105,35 @@ def prepare_segment_bank(projection, canonical, device):
     projection.stats = torch.nn.Parameter(payload[2], False)
     projection.register_parameter("segment_high", torch.nn.Parameter(payload[1], False))
     projection.segment_format = fmt
+    projection.segment_m8_only = m8_only
     projection.cache_capabilities = ()
-    workspace(device, k == 160 or n <= 320)
+    scratch = workspace(device, k == 160 or n <= 320)
+    if m8_only and scratch["weight"].numel() < k * n:
+        # Canonical restoration is transient and shared by ordered layers.
+        # Size it before capture, including the larger context FC.
+        scratch["weight"] = torch.empty(k * n, device=device, dtype=torch.uint8)
     return True
 
 
-def apply_segments(rows, codes, scales, high, formats, ns, output, views):
+def apply_segments(
+    rows, codes, scales, high, formats, ns, output, views, m8_only=False
+):
     k = rows.shape[1]
     shared = k == 160 or sum(ns) <= 320
     scratch = workspace(rows.device, shared)
-    if 1 <= rows.shape[0] <= 8 or rows.shape[0] == 20:
+    admitted = (
+        rows.shape[0] == 8
+        if m8_only
+        else (1 <= rows.shape[0] <= 8 or rows.shape[0] == 20)
+    )
+    if admitted:
         warps = 4 if k == 2560 and sum(ns) > 320 else 8
         if k == 1536:
             warps = 8
         split = 5 if k == 2560 and sum(ns) <= 320 else 1
+        if m8_only:
+            warps = 8 if k == 5120 else 4
+            split = 4 if k == 25600 else 1
         torch.ops._C.gguf_dense_segments_sm70_out(
             rows,
             codes,
@@ -133,7 +155,9 @@ def apply_segments(rows, codes, scales, high, formats, ns, output, views):
     return output
 
 
-def restore_and_apply(rows, codes, scale, high, fmt, n, output, k_ld=None, q_ld=None):
+def restore_and_apply(
+    rows, codes, scale, high, fmt, n, output, k_ld=None, q_ld=None, blas_bands=()
+):
     k = rows.shape[1]
     scratch = workspace(rows.device, k == 160 or n <= 320)
     bits = (4, 5, 6, 4, 8)[fmt]
@@ -152,6 +176,18 @@ def restore_and_apply(rows, codes, scale, high, fmt, n, output, k_ld=None, q_ld=
     torch.ops._C.gguf_dense_restore_canonical_sm70_out(
         weight, stats, codes, high, scale, fmt, k, n
     )
+    if blas_bands:
+        from .gguf_turbomind import _get_affine_blas_workspace, _supports_band
+
+        if _supports_band(rows.shape[0], blas_bands):
+            buffer = _get_affine_blas_workspace(codes)
+            if buffer is None:
+                raise RuntimeError("Admitted GGUF BLAS workspace is unavailable")
+            dequant = buffer[: k * n].view(k, n)
+            torch.ops._C.gguf_affine_blas_sm70_out(
+                output, rows, weight, stats, bits, dequant, group
+            )
+            return
     # The descriptor is carried from the original converter, before its bank
     # is replaced. Defaults are supplied only by the multi-segment wrapper.
     if k_ld is None:
