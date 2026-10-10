@@ -831,6 +831,7 @@ class Worker(WorkerBase):
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+        self.cudagraph_memory_bytes = cuda_graph_memory_bytes
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -962,6 +963,7 @@ class Worker(WorkerBase):
             loaded_cuda_model_storage,
             loaded_gguf_layers,
             loaded_linear_kernels,
+            loaded_qsa_cache_storage,
             loaded_sm70_preparations,
         )
 
@@ -978,6 +980,8 @@ class Worker(WorkerBase):
             if manager is None
             else manager.cudagraph_mode
         )
+        snapshot = MemorySnapshot(device=self.device)
+        cache = self.model_runner.kv_cache_config
         report = {
             "rank": self.rank,
             "scope": "loaded_layer_selection",
@@ -1012,6 +1016,31 @@ class Worker(WorkerBase):
                     ),
                 }
             ),
+            "memory_accounting": {
+                "torch_allocated_bytes": torch.accelerator.memory_allocated(
+                    self.device
+                ),
+                "torch_reserved_bytes": snapshot.torch_memory,
+                "driver_used_bytes": snapshot.cuda_memory,
+                "driver_non_torch_bytes": snapshot.non_torch_memory,
+                "model_load_delta_bytes": self.model_runner.model_memory_usage,
+                "device_cache_pool_bytes": sum(
+                    t.size for t in cache.kv_cache_tensors if not t.host_backed
+                ),
+                "host_cache_pool_bytes": sum(
+                    t.size for t in cache.kv_cache_tensors if t.host_backed
+                ),
+                "recurrent_state_pool_bytes": sum(
+                    t.size for t in cache.kv_cache_tensors if t.physical_num_blocks
+                ),
+                "graph_capture_delta_bytes": getattr(
+                    self, "cudagraph_memory_bytes", None
+                ),
+                "qsa": loaded_qsa_cache_storage(
+                    self.compilation_config.static_forward_context
+                ),
+                "scope": "post_warmup; graph_delta_may_overlap_registered_workspaces",
+            },
             "model_input_preparation": {
                 "scope": "model_state_capability",
                 "full_graph_phase": (

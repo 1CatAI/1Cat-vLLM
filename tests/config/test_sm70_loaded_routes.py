@@ -211,3 +211,57 @@ def test_cuda_storage_deduplicates_target_draft_and_partial_views():
         "target.partial_view",
         "draft.shared_weight",
     ]
+
+
+def test_cache_storage_deduplicates_shared_staging_and_owner_aliases():
+    import torch
+
+    from vllm.sm70_profiles.acceleration import loaded_qsa_cache_storage
+
+    shared = torch.empty(64, dtype=torch.uint8)
+    owners = []
+    for reference in (False, True):
+        hot = {
+            key: torch.empty(4, dtype=torch.int32)
+            for key in (
+                "hot_values",
+                "tags",
+                "stamps",
+                "hands",
+                "page_slots",
+                "epoch",
+                "_stats",
+            )
+        }
+        workspace = {
+            key: shared[8:24]
+            for key in (
+                "staging",
+                "remapped",
+                "requests",
+                "positions",
+                "lengths",
+                "initial",
+                "resolved",
+            )
+        }
+        owners.append(
+            NS(
+                host_kv=NS(
+                    **hot,
+                    **workspace,
+                    device_reference=reference,
+                    device_history_workspace=(shared,),
+                    history=torch.empty(32, dtype=torch.uint8),
+                    scales=torch.empty(2),
+                )
+            )
+        )
+    report = loaded_qsa_cache_storage(
+        {"target": owners[0], "alias": owners[0], "draft": owners[1]}
+    )
+    assert report == {
+        "hot_bytes": 224,
+        "workspace_bytes": 64,
+        "device_history_bytes": 40,
+    }

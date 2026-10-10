@@ -235,6 +235,54 @@ def loaded_cuda_model_storage(models: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def loaded_qsa_cache_storage(forward_context: Mapping[str, Any]) -> dict[str, int]:
+    """Read actual QSA cache backing, deduplicating shared staging buffers."""
+    seen = set()
+    totals = {"hot_bytes": 0, "workspace_bytes": 0, "device_history_bytes": 0}
+    for module in forward_context.values():
+        state = getattr(module, "host_kv", None)
+        if state is None:
+            continue
+        categories = {
+            "hot_bytes": [
+                getattr(state, key)
+                for key in (
+                    "hot_values",
+                    "tags",
+                    "stamps",
+                    "hands",
+                    "page_slots",
+                    "epoch",
+                    "_stats",
+                )
+            ],
+            "workspace_bytes": [
+                getattr(state, key)
+                for key in (
+                    "staging",
+                    "remapped",
+                    "requests",
+                    "positions",
+                    "lengths",
+                    "initial",
+                    "resolved",
+                )
+            ]
+            + list(state.device_history_workspace or ()),
+            "device_history_bytes": [state.history, state.scales]
+            if state.device_reference
+            else [],
+        }
+        for category, tensors in categories.items():
+            for tensor in tensors:
+                storage = tensor.untyped_storage()
+                identity = (str(tensor.device), storage.data_ptr())
+                if storage.nbytes() and identity not in seen:
+                    seen.add(identity)
+                    totals[category] += storage.nbytes()
+    return totals
+
+
 def loaded_sm70_preparations(model) -> dict[str, Any]:
     """Read existing preparation flags and packed buffers; never select a route."""
     variants = {}
