@@ -888,8 +888,9 @@ class PleOffloadRunner:
             return "requires_cpu_owned_iq4nl_rows"
         if getattr(layer, "_packed_result_layout", None) is None:
             return "requires_packed_results"
-        if getattr(layer, "_cascade", False) or getattr(layer, "_disk_offload", False):
-            return "tiered_storage_uses_the_python_owner"
+        if getattr(layer, "_cascade", False):
+            # Packed rows split across device/host tiers merge in Python.
+            return "tiered_cascade_uses_the_python_owner"
         if (layer.ngram_size, layer.heads_per_ngram, layer.ngram_heads) != (3, 8, 16):
             return "requires_trigram_16_head_hashing"
         targets = next(iter(self._worker_targets[0].values()))
