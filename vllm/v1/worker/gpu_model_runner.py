@@ -813,7 +813,9 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
         routed_experts: RoutedExpertsTensors | None = None,
+        synchronize=None,
     ):
+        self._synchronize = synchronize or sm70_trace_event_sync
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
 
@@ -852,7 +854,7 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         This function blocks until the copy is finished.
         """
         max_gen_len = self.sampled_token_ids_cpu.shape[-1]
-        sm70_trace_event_sync(
+        self._synchronize(
             self.async_copy_ready_event,
             "AsyncGPUModelRunnerOutput.async_copy_ready_event.synchronize",
         )
@@ -938,7 +940,9 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         raw_pooler_output: PoolerOutput,
         finished_mask: list[bool],
         async_output_copy_stream: torch.cuda.Stream,
+        synchronize=None,
     ):
+        self._synchronize = synchronize or sm70_trace_event_sync
         self._model_runner_output = model_runner_output
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
@@ -962,7 +966,7 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
         """Copy the device tensors to the host and return a ModelRunnerOutput.
         This function blocks until the copy is finished.
         """
-        sm70_trace_event_sync(
+        self._synchronize(
             self.async_copy_ready_event,
             "AsyncGPUPoolingModelRunnerOutput.async_copy_ready_event.synchronize",
         )
@@ -1248,6 +1252,9 @@ class GPUModelRunner(
         self._sm70_async_worker_execute_trace_step = 0
         self._sm70_async_worker_sample_trace_step = 0
         self._input_transfer = create_input_transfer(vllm_config, device, logger=logger)
+        from vllm.diagnostics import bind_event_tracer
+
+        self._event_tracer = bind_event_tracer(vllm_config)
         self._runtime_trace = vllm_config.observability_config.runtime_trace
         assert self._runtime_trace.async_every is not None
         self._async_trace_every = self._runtime_trace.async_every
@@ -4841,7 +4848,7 @@ class GPUModelRunner(
         # _update_states_after_model_execute for hybrid models).
         profile_stage_t0 = time.perf_counter() if profile_inputs else 0.0
         if self.num_accepted_tokens_event is not None:
-            sm70_trace_event_sync(
+            self._event_tracer.synchronize(
                 self.num_accepted_tokens_event,
                 "GPUModelRunner.num_accepted_tokens_event.synchronize",
             )
@@ -6451,6 +6458,7 @@ class GPUModelRunner(
             return model_runner_output
 
         return AsyncGPUPoolingModelRunnerOutput(
+            synchronize=self._event_tracer.synchronize,
             model_runner_output=model_runner_output,
             raw_pooler_output=raw_pooler_output,
             finished_mask=finished_mask,
@@ -9341,6 +9349,7 @@ class GPUModelRunner(
                 )
 
             async_output = AsyncGPUModelRunnerOutput(
+                synchronize=self._event_tracer.synchronize,
                 model_runner_output=output,
                 sampled_token_ids=sampler_output.sampled_token_ids,
                 logprobs_tensors=sampler_output.logprobs_tensors,
@@ -9689,7 +9698,7 @@ class GPUModelRunner(
             return [], []
         assert self.draft_token_ids_event is not None
         assert self.draft_token_ids_cpu is not None
-        sm70_trace_event_sync(
+        self._event_tracer.synchronize(
             self.draft_token_ids_event,
             "GPUModelRunner.draft_token_ids_event.synchronize",
         )
@@ -9735,7 +9744,7 @@ class GPUModelRunner(
 
         counts_cpu = self.valid_sampled_token_count_cpu
         assert counts_cpu is not None
-        sm70_trace_event_sync(
+        self._event_tracer.synchronize(
             sampled_count_event,
             "GPUModelRunner.valid_sampled_token_count_event.synchronize",
         )
@@ -12852,7 +12861,7 @@ class GPUModelRunner(
         pinned = self.sampled_token_ids_pinned_cpu[: sampled_token_ids.shape[0]]
         pinned.copy_(sampled_token_ids, non_blocking=True)
         self.transfer_event.record()
-        sm70_trace_event_sync(
+        self._event_tracer.synchronize(
             self.transfer_event,
             "GPUModelRunner.transfer_event.synchronize",
         )

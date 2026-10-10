@@ -175,6 +175,20 @@ def diagnostics_for(config=None) -> EngineDiagnostics | None:
     return owner
 
 
+def bind_event_tracer(config):
+    """Share event observation counts across an engine's runner and graph calls."""
+    from vllm.sm70_decode_trace import DecodeEventTracer
+
+    resources = runtime_resources_for(config)
+    tracer = resources.get("decode_event_tracer")
+    if tracer is None:
+        owner = diagnostics_for(config)
+        assert owner is not None
+        tracer = DecodeEventTracer(owner.trace, owner.counters)
+        resources["decode_event_tracer"] = tracer
+    return tracer
+
+
 def diagnostic_channel(name: str, *, owner=None) -> DiagnosticChannel:
     if owner is None and is_forward_context_available():
         owner = get_forward_context().runtime_resources.get("diagnostics")

@@ -63,7 +63,7 @@ part of the contract.
 | D3 diagnostics | Merged [#1146](https://github.com/1CatAI/1Cat-vLLM/pull/1146); CI passed | Shared diagnostic owner, 74 initialized parameters, legacy typed MoE bridge, CPU isolation and 7 GPU cases plus matched operator A/B. |
 | D4a attention package | Merged `d4ce51399`, CI passed [#1148](https://github.com/1CatAI/1Cat-vLLM/pull/1148) | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
 | D4b FA2/79T resources | Merged [#1150](https://github.com/1CatAI/1Cat-vLLM/pull/1150), `b14c2ab0a`, CI passed | Native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build; evidence below. |
-| D5 remaining providers | Pending | Model/provider import snapshots, remaining native knobs and loading boundaries. |
+| D5 remaining providers | D5a merged [#1151](https://github.com/1CatAI/1Cat-vLLM/pull/1151), `e2a52d519`, CI passed; D5b in validation | Provider/native resource lifecycle is merged. Marlin, remaining event-trace consumers and loader-aware native scope coalescing are under validation. |
 | D6 closure | Pending | Complete evidence audit, remaining-name ownership, report and execution-time read guards. |
 
 Baseline layering report: 243 literal raw environment reads in counted generic
@@ -518,3 +518,20 @@ using process defaults. Inventory scanning now includes the previously omitted
 `SM70_MARLIN_` prefix. Initial native-policy/loader/inventory regression passes
 108 tests with two CUDA-only skips; six targeted parser/serialization/hash tests
 pass. Normal native rebuild and GPU validation are pending.
+
+The D5b consumer audit additionally found event-trace helpers still called by
+the old runner and both graph wrappers. Their existing event policy now binds
+call/synchronization methods at initialization; async outputs retain that bound
+callback after returning from the engine context. Input transfer, runner and
+graph observations share the engine diagnostic counter owner. Standalone
+no-config helper imports remain compatible. Disabled diagnostics add no timing,
+CUDA query or tensor allocation. Focused coverage passes 83 tests (11 CUDA-only
+skips), plus 29 graph-policy/owner/profiler tests (8 CUDA-only skips).
+
+Native host measurements identified duplicate scope transitions on loaders that
+already coalesce the two extensions' inline TLS. An initialization-only capability
+probe checks whether entering one owner changes the other extension's context ID.
+Only proven shared domains coalesce to one handle; separate domains and old
+binaries retain both handles. No assumption about linker behavior is required.
+Nested-owner restoration and both probe outcomes have CPU coverage; final native
+rebuild, GPU isolation and host A/B are pending.

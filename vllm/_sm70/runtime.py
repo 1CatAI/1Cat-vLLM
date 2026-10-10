@@ -5,6 +5,7 @@
 import hashlib
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import Any
 
 import torch
 
@@ -38,10 +39,28 @@ class NativeRuntimeOwner:
                     "Engine-owned SM70 native resources require runtime ABI 1; "
                     "rebuild both normal _C and _moe_C extensions."
                 )
-        self.handles = (
+        self.handles: tuple[Any, ...] = (
             torch.classes._C.Sm70NativeRuntime(),
             torch.classes._moe_C.Sm70NativeRuntime(),
         )
+        probes = tuple(
+            getattr(namespace, "sm70_native_runtime_context_id", None)
+            for namespace in (torch.ops._C, torch.ops._moe_C)
+        )
+        dense_probe, moe_probe = probes
+        if dense_probe is not None and moe_probe is not None:
+            previous_moe = moe_probe()
+            self.handles[0].enter()
+            try:
+                dense_id, moe_id = dense_probe(), moe_probe()
+                shared = dense_id != 0 and dense_id == moe_id and moe_id != previous_moe
+            finally:
+                self.handles[0].exit()
+            if shared:
+                # GNU-unique TLS may already give both DSOs the same owner.
+                # Retain two handles on toolchains that keep separate domains.
+                self.handles[1].close()
+                self.handles = self.handles[:1]
         # Torch ScriptObject attribute lookup constructs a method wrapper. Bind
         # these once; the host boundary must not rebuild four wrappers per step.
         self._contexts = tuple((handle.enter, handle.exit) for handle in self.handles)

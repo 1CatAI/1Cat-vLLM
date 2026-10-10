@@ -3,8 +3,8 @@
 
 """Bind platform lifecycle policy once; dynamic inputs stay in runtime components."""
 
+from vllm.diagnostics import bind_event_tracer
 from vllm.platforms import current_platform
-from vllm.sm70_decode_trace import DecodeEventTracer
 from vllm.v1.worker.runtime.input_transfer import InputTransferSession
 
 
@@ -28,5 +28,5 @@ def create_input_transfer(config, device, *, logger) -> InputTransferSession:
         logger=logger,
         trace_prefix="SM70 async worker trace",
         staged_message="SM70 async staged input prep enabled for no-MTP decode.",
-        synchronize=DecodeEventTracer(trace).synchronize,
+        synchronize=bind_event_tracer(config).synchronize,
     )

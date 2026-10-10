@@ -35,7 +35,7 @@ def _rank() -> int:
 def _should_log_values(label, elapsed_ms, threshold_ms, every, counts) -> bool:
     if elapsed_ms < threshold_ms:
         return False
-    counts[label] += 1
+    counts[label] = counts.get(label, 0) + 1
     count = counts[label]
     return count <= 4 or count % max(1, every) == 0
 
@@ -93,9 +93,9 @@ def sm70_decode_trace_range(label: str) -> Iterator[None]:
 class DecodeEventTracer:
     """Engine-local trace counts and policy for migrated runtime consumers."""
 
-    def __init__(self, policy):
+    def __init__(self, policy, counts: dict[str, int] | None = None):
         self.policy = policy
-        self.counts: defaultdict[str, int] = defaultdict(int)
+        self.counts: dict[str, int] = {} if counts is None else counts
 
     def _should_log(self, label: str, elapsed_ms: float) -> bool:
         return _should_log_values(
@@ -105,6 +105,12 @@ class DecodeEventTracer:
             self.policy.event_every,
             self.counts,
         )
+
+    def call(self, label: str, fn: Callable[[], T]) -> T:
+        if not self.policy.events:
+            return fn()
+        with _trace_range(label, self._should_log):
+            return fn()
 
     def synchronize(self, event: torch.Event, label: str) -> None:
         if not self.policy.events:

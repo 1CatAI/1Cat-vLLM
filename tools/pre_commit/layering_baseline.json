@@ -8,12 +8,6 @@
  "vllm/benchmarks/startup.py": {
   "env": 4
  },
- "vllm/compilation/breakable_cudagraph.py": {
-  "platform": 4
- },
- "vllm/compilation/cuda_graph.py": {
-  "platform": 4
- },
  "vllm/compilation/passes/fusion/allreduce_rms_fusion.py": {
   "model": 1,
   "platform": 77
@@ -93,7 +87,7 @@
   "platform": 71
  },
  "vllm/diagnostics.py": {
-  "platform": 2
+  "platform": 3
  },
  "vllm/distributed/communication_op.py": {
   "platform": 6
@@ -239,7 +233,7 @@
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 14,
   "model": 236,
-  "platform": 439
+  "platform": 438
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -564,7 +558,7 @@
  "vllm/v1/worker/gpu_model_runner.py": {
   "env": 18,
   "model": 669,
-  "platform": 165
+  "platform": 161
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 1,
