@@ -120,6 +120,7 @@ def test_gdn_norm_follows_parameter_device(monkeypatch, default_vllm_config, dev
     from vllm.config import get_current_vllm_config
 
     runtime = get_current_vllm_config()
+    monkeypatch.setattr(runtime, "model_config", SimpleNamespace(dtype=torch.float16))
     with torch.device(device):
         attention = module.QwenGatedDeltaNetAttention(config, runtime, "layers.0")
     assert attention.norm.weight.device == attention.dt_bias.device

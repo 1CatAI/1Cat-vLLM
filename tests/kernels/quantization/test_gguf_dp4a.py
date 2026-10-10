@@ -313,9 +313,12 @@ def test_original_down_handles_all_tp4_block_boundaries(
     def run():
         x = hidden
         if quantized_input:
-            torch.ops._C.gguf_quantize_q8_1_sm70_out(
-                packet, hidden.reshape(m * top_k, k)
-            )
+            # The down kernel consumes routed K=160 intermediates, whereas
+            # the standalone input encoder admits K%256=0 and at most 20
+            # tokens. Supply independently encoded intermediate packets.
+            q, d, s = quantize_reference(hidden.reshape(m * top_k, k))
+            packet[..., :4].copy_(torch.stack((d, s), -1).view(torch.uint8))
+            packet[..., 4:].copy_(q.view(torch.uint8))
             x = packet.reshape(m, top_k, k // 32, 36)
         torch.ops._C.gguf_dp4a_raw_down_unroute_sm70_out(
             output,
