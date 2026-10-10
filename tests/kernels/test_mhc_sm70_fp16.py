@@ -415,6 +415,184 @@ def test_mhc_sm70_native_q8_post_dot_matches_fp32_stage_bitwise() -> None:
     torch.testing.assert_close(native_sqrsum, staged_sqrsum, rtol=0, atol=0)
 
 
+def _mhc_post_dot_reference(x, residual, post_mix, comb_mix, fn, n_splits):
+    """FP64 oracle for the fused post+dot stage, split-K partials included."""
+    num_tokens, hc_mult, hidden = residual.shape
+    x64 = x.double()
+    res64 = residual.double()
+    mapped = post_mix.double()[:, :, None] * x64[:, None, :] + torch.einsum(
+        "tij,tih->tjh", comb_mix.double(), res64
+    )
+    residual_out = mapped.clamp(-65504.0, 65504.0).half()
+    # Split-K partials run over a hidden-dimension range of every stream.
+    width = hidden // n_splits
+    fn64 = fn.double()
+    gemm = torch.stack(
+        [
+            torch.einsum(
+                "tsh,osh->to",
+                mapped[:, :, i * width : (i + 1) * width],
+                fn64[:, :, i * width : (i + 1) * width],
+            )
+            for i in range(n_splits)
+        ]
+    )
+    sqrsum = torch.stack(
+        [
+            (mapped[:, :, i * width : (i + 1) * width] ** 2).sum(dim=(1, 2))
+            for i in range(n_splits)
+        ]
+    )
+    return residual_out, gemm.float(), sqrsum.float()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (7, 0)
+    or not hasattr(torch.ops._C, "sm70_glm_mhc_post_dot_q8_out"),
+    reason="requires the SM70 native mHC post+dot op",
+)
+@pytest.mark.parametrize(
+    "num_tokens,n_splits", [(1, 8), (2, 8), (4, 8), (7, 8), (8, 4)]
+)
+@pytest.mark.parametrize("tile_n", [6, 12])
+def test_mhc_sm70_native_post_dot_matches_fp64_for_1_to_8_tokens(
+    num_tokens: int, n_splits: int, tile_n: int
+) -> None:
+    torch.manual_seed(20261010 + num_tokens)
+    device = "cuda"
+    hidden_size, hc_mult, hc_out = 4096, 4, 24
+    x = torch.randn((num_tokens, hidden_size), device=device, dtype=torch.float16)
+    residual = torch.randn(
+        (num_tokens, hc_mult, hidden_size), device=device, dtype=torch.float16
+    )
+    post_mix = torch.sigmoid(
+        torch.randn((num_tokens, hc_mult), device=device, dtype=torch.float32)
+    )
+    comb_mix = torch.softmax(
+        torch.randn((num_tokens, hc_mult, hc_mult), device=device, dtype=torch.float32),
+        dim=1,
+    )
+    fn = torch.randn(
+        (hc_out, hc_mult, hidden_size), device=device, dtype=torch.float32
+    ).mul_(1e-4)
+    ref_residual, ref_gemm, ref_sqrsum = _mhc_post_dot_reference(
+        x, residual, post_mix, comb_mix, fn, n_splits
+    )
+
+    native_residual = torch.empty_like(residual)
+    native_gemm = torch.empty(
+        (n_splits, num_tokens, hc_out), device=device, dtype=torch.float32
+    )
+    native_sqrsum = torch.empty(
+        (n_splits, num_tokens), device=device, dtype=torch.float32
+    )
+    sm70_ops.sm70_glm_mhc_post_dot_q8_out(
+        native_residual,
+        native_gemm,
+        native_sqrsum,
+        comb_mix,
+        residual,
+        post_mix,
+        x,
+        fn,
+        tile_n,
+    )
+    torch.cuda.synchronize()
+
+    # The residual is rounded to FP16 from an FP32 sum; against the FP64
+    # oracle that is at most one FP16 ulp on a few elements.
+    torch.testing.assert_close(native_residual, ref_residual, rtol=1e-3, atol=5e-4)
+    torch.testing.assert_close(native_gemm, ref_gemm, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(native_sqrsum, ref_sqrsum, rtol=1e-5, atol=1e-2)
+
+    # Mutation check: a wrong split stride (the old fixed 8-token layout) is
+    # visible as a mismatch, so the staging layout is pinned to the token count.
+    if num_tokens != 8:
+        shifted = torch.empty((n_splits, 8, hc_out), device=device, dtype=torch.float32)
+        shifted.view(-1)[: n_splits * num_tokens * hc_out].copy_(native_gemm.view(-1))
+        assert not torch.equal(shifted[:, :num_tokens], native_gemm)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (7, 0)
+    or not hasattr(torch.ops._C, "sm70_glm_mhc_post_dot_q8_out"),
+    reason="requires the SM70 native mHC post+dot op",
+)
+@pytest.mark.parametrize("num_tokens", [1, 4, 8])
+def test_mhc_sm70_fused_post_dot_default_dispatch(
+    num_tokens: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the policy field unset, 1-8 tokens take the fused native op and
+    match the torch reference; an explicit False keeps the two-kernel FP32
+    staging path."""
+    calls: list[int] = []
+    real_op = sm70_ops.sm70_glm_mhc_post_dot_q8_out
+
+    def spy(residual_out, gemm_mul, *args):
+        calls.append(gemm_mul.shape[0])
+        return real_op(residual_out, gemm_mul, *args)
+
+    monkeypatch.setattr(sm70_ops, "sm70_glm_mhc_post_dot_q8_out", spy)
+    real_policy = mhc_tilelang.layer_policy()
+
+    def patch(fused: bool | None, source: str) -> None:
+        class _Policy:
+            mhc_fused_post_dot = fused
+            sources = {
+                **dict(getattr(real_policy, "sources", {})),
+                "mhc_fused_post_dot": source,
+            }
+
+            def __getattr__(self, name):
+                return getattr(real_policy, name)
+
+        policy = _Policy()
+        monkeypatch.setattr(mhc_tilelang, "layer_policy", lambda cfg=None: policy)
+
+    torch.manual_seed(20261010 + num_tokens)
+    hidden_size, hc_mult = 4096, 4
+    device = "cuda"
+    x = torch.randn((num_tokens, hidden_size), device=device, dtype=torch.float16).mul_(
+        0.1
+    )
+    residual = torch.randn(
+        (num_tokens, hc_mult, hidden_size), device=device, dtype=torch.float16
+    ).mul_(0.1)
+    post_mix = torch.sigmoid(
+        torch.randn((num_tokens, hc_mult, 1), device=device, dtype=torch.float32)
+    )
+    comb_mix = torch.softmax(
+        torch.randn((num_tokens, hc_mult, hc_mult), device=device, dtype=torch.float32),
+        dim=-1,
+    )
+    fn = torch.randn(
+        (24, hc_mult * hidden_size), device=device, dtype=torch.float32
+    ).mul_(0.01)
+    scale = torch.tensor([0.5, 0.75, 0.25], device=device, dtype=torch.float32)
+    base = torch.randn((24,), device=device, dtype=torch.float32).mul_(0.1)
+    norm_weight = torch.randn((hidden_size,), device=device, dtype=torch.float16).mul_(
+        0.1
+    )
+    args = (x, residual, post_mix, comb_mix, fn, scale, base, 1e-6, 1e-6, 1e-6, 1.0, 20)
+    kwargs = dict(norm_weight=norm_weight, norm_eps=1e-6)
+    expected = mhc_fused_post_pre_torch(*args, **kwargs)
+
+    patch(None, "default")
+    fused = mhc_tilelang.mhc_fused_post_pre_tilelang(*args, **kwargs)
+    assert calls == [8 if num_tokens < 8 else 4], calls
+
+    patch(False, "typed")
+    staged = mhc_tilelang.mhc_fused_post_pre_tilelang(*args, **kwargs)
+    assert calls == [8 if num_tokens < 8 else 4], calls
+
+    tolerances = ((2e-3, 2e-3), (2e-3, 2e-4), (3e-3, 3e-4), (5e-3, 5e-4))
+    for a, b, ref, (rtol, atol) in zip(fused, staged, expected, tolerances):
+        torch.testing.assert_close(a, ref, rtol=rtol, atol=atol)
+        torch.testing.assert_close(b, ref, rtol=rtol, atol=atol)
+
+
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 17])
 @pytest.mark.skipif(
     not (

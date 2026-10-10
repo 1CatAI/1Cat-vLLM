@@ -1939,17 +1939,16 @@ __device__ __forceinline__ float warp_reduce_sum_bfly(float val) {
   return val;
 }
 
-template <int kTileN>
+template <int kTileN, int kSplits>
 __global__ __launch_bounds__(256) void sm70_glm_mhc_post_dot_q8_kernel(
     half* __restrict__ residual_out, float* __restrict__ gemm_mul,
     float* __restrict__ gemm_sqrsum, const float* __restrict__ comb_mix,
     const half* __restrict__ residual, const float* __restrict__ post_mix,
-    const half* __restrict__ x, const float* __restrict__ weight) {
-  constexpr int kTokens = 8;
+    const half* __restrict__ x, const float* __restrict__ weight,
+    const int num_tokens) {
   constexpr int kStreams = 4;
   constexpr int kHidden = 4096;
   constexpr int kOutputs = 24;
-  constexpr int kSplits = 4;
   constexpr int kThreads = 256;
   constexpr int kWarps = kThreads / 32;
   constexpr int kHiddenPerSplit = kHidden / kSplits;
@@ -2047,7 +2046,7 @@ __global__ __launch_bounds__(256) void sm70_glm_mhc_post_dot_q8_kernel(
     for (int source_warp = 0; source_warp < kWarps; ++source_warp) {
       total += warp_shared[source_warp][lane];
     }
-    gemm_mul[(split * kTokens + token) * kOutputs + output_tile * kTileN +
+    gemm_mul[(split * num_tokens + token) * kOutputs + output_tile * kTileN +
              lane] = total;
   }
   if (output_tile == 0 && warp == 0 && lane == 0) {
@@ -2056,7 +2055,7 @@ __global__ __launch_bounds__(256) void sm70_glm_mhc_post_dot_q8_kernel(
     for (int source_warp = 0; source_warp < kWarps; ++source_warp) {
       total += warp_shared[source_warp][kTileN];
     }
-    gemm_sqrsum[split * kTokens + token] = total;
+    gemm_sqrsum[split * num_tokens + token] = total;
   }
 }
 
@@ -2396,15 +2395,26 @@ void sm70_glm_mhc_post_dot_q8_out(torch::Tensor residual_out,
                   residual.is_contiguous() && post_mix.is_contiguous() &&
                   x.is_contiguous() && weight.is_contiguous(),
               "sm70_glm_mhc_post_dot_q8_out: tensors must be contiguous.");
-  TORCH_CHECK(residual_out.sizes() == torch::IntArrayRef({8, 4, 4096}) &&
-                  residual.sizes() == torch::IntArrayRef({8, 4, 4096}) &&
-                  x.sizes() == torch::IntArrayRef({8, 4096}) &&
-                  comb_mix.sizes() == torch::IntArrayRef({8, 4, 4}) &&
-                  post_mix.sizes() == torch::IntArrayRef({8, 4}) &&
-                  weight.sizes() == torch::IntArrayRef({24, 4, 4096}) &&
-                  gemm_mul.sizes() == torch::IntArrayRef({4, 8, 24}) &&
-                  gemm_sqrsum.sizes() == torch::IntArrayRef({4, 8}),
-              "sm70_glm_mhc_post_dot_q8_out: invalid GLM-5.3 q8 shape.");
+  TORCH_CHECK(residual.dim() == 3 && gemm_mul.dim() == 3,
+              "sm70_glm_mhc_post_dot_q8_out: residual and gemm_mul must be "
+              "rank 3.");
+  const int64_t num_tokens = residual.size(0);
+  const int64_t num_splits = gemm_mul.size(0);
+  TORCH_CHECK(num_tokens >= 1 && num_tokens <= 8,
+              "sm70_glm_mhc_post_dot_q8_out: 1 to 8 tokens.");
+  TORCH_CHECK(num_splits == 4 || num_splits == 8,
+              "sm70_glm_mhc_post_dot_q8_out: 4 or 8 splits.");
+  TORCH_CHECK(
+      residual_out.sizes() == torch::IntArrayRef({num_tokens, 4, 4096}) &&
+          residual.sizes() == torch::IntArrayRef({num_tokens, 4, 4096}) &&
+          x.sizes() == torch::IntArrayRef({num_tokens, 4096}) &&
+          comb_mix.sizes() == torch::IntArrayRef({num_tokens, 4, 4}) &&
+          post_mix.sizes() == torch::IntArrayRef({num_tokens, 4}) &&
+          weight.sizes() == torch::IntArrayRef({24, 4, 4096}) &&
+          gemm_mul.sizes() ==
+              torch::IntArrayRef({num_splits, num_tokens, 24}) &&
+          gemm_sqrsum.sizes() == torch::IntArrayRef({num_splits, num_tokens}),
+      "sm70_glm_mhc_post_dot_q8_out: invalid GLM-5.3 q8 shape.");
   const auto device = residual.device();
   TORCH_CHECK(residual_out.device() == device && gemm_mul.device() == device &&
                   gemm_sqrsum.device() == device &&
@@ -2414,28 +2424,36 @@ void sm70_glm_mhc_post_dot_q8_out(torch::Tensor residual_out,
   TORCH_CHECK(tile_n == 6 || tile_n == 8 || tile_n == 12,
               "sm70_glm_mhc_post_dot_q8_out: tile_n must be 6, 8, or 12.");
   const at::cuda::OptionalCUDAGuard device_guard(device_of(residual));
-  const dim3 grid(8, 24 / tile_n, 4);
+  const dim3 grid(static_cast<unsigned>(num_tokens), 24 / tile_n,
+                  static_cast<unsigned>(num_splits));
   const auto stream = at::cuda::getCurrentCUDAStream();
-#define VLLM_LAUNCH_GLM_MHC_POST_DOT(tile)                          \
-  sm70_glm_mhc_post_dot_q8_kernel<tile><<<grid, 256, 0, stream>>>(  \
-      reinterpret_cast<half*>(residual_out.data_ptr<at::Half>()),   \
-      gemm_mul.data_ptr<float>(), gemm_sqrsum.data_ptr<float>(),    \
-      comb_mix.data_ptr<float>(),                                   \
-      reinterpret_cast<const half*>(residual.data_ptr<at::Half>()), \
-      post_mix.data_ptr<float>(),                                   \
-      reinterpret_cast<const half*>(x.data_ptr<at::Half>()),        \
-      weight.data_ptr<float>())
+#define VLLM_LAUNCH_GLM_MHC_POST_DOT(tile, splits)                         \
+  sm70_glm_mhc_post_dot_q8_kernel<tile, splits><<<grid, 256, 0, stream>>>( \
+      reinterpret_cast<half*>(residual_out.data_ptr<at::Half>()),          \
+      gemm_mul.data_ptr<float>(), gemm_sqrsum.data_ptr<float>(),           \
+      comb_mix.data_ptr<float>(),                                          \
+      reinterpret_cast<const half*>(residual.data_ptr<at::Half>()),        \
+      post_mix.data_ptr<float>(),                                          \
+      reinterpret_cast<const half*>(x.data_ptr<at::Half>()),               \
+      weight.data_ptr<float>(), static_cast<int>(num_tokens))
+#define VLLM_LAUNCH_GLM_MHC_POST_DOT_SPLITS(tile) \
+  if (num_splits == 8) {                          \
+    VLLM_LAUNCH_GLM_MHC_POST_DOT(tile, 8);        \
+  } else {                                        \
+    VLLM_LAUNCH_GLM_MHC_POST_DOT(tile, 4);        \
+  }
   switch (tile_n) {
     case 6:
-      VLLM_LAUNCH_GLM_MHC_POST_DOT(6);
+      VLLM_LAUNCH_GLM_MHC_POST_DOT_SPLITS(6);
       break;
     case 8:
-      VLLM_LAUNCH_GLM_MHC_POST_DOT(8);
+      VLLM_LAUNCH_GLM_MHC_POST_DOT_SPLITS(8);
       break;
     default:
-      VLLM_LAUNCH_GLM_MHC_POST_DOT(12);
+      VLLM_LAUNCH_GLM_MHC_POST_DOT_SPLITS(12);
       break;
   }
+#undef VLLM_LAUNCH_GLM_MHC_POST_DOT_SPLITS
 #undef VLLM_LAUNCH_GLM_MHC_POST_DOT
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
