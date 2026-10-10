@@ -49565,3 +49565,23 @@ syntax exit 0. No CUDA driver repair or GPU execution was attempted.
   `/home/ymzx/arch-ws/phase-d5b-20261010/artifacts`.
 - D6 remains pending; full inventory, retained boundaries and FlashQLA's remaining
   native column-policy binding are being completed there.
+
+### 2026-10-10 Phase D closure
+
+- D5b merged as #1153 (`22c4d22f4`), after native ABI 67 / event-owner CI and
+  47 GPU cases. D6 is based on that merged main; #1152 is retained.
+- D6 closes the full Python/native/FlashQLA parameter inventory: 757 names,
+  zero unassigned names/consumer scopes/dynamic domains. The same scanner counts
+  914 → 355 legacy source positions, including dynamic readers including retained boundaries; these are
+  not per-token execution counts. The always-run ownership hook checks each
+  boundary instead of excluding directories.
+- Final integrated CPU suite: 162 passed. FlashQLA normal-source build: 24 GPU
+  operator/configuration cases on 54633 GPU 1. Three A/B rounds retain exact
+  output/state digests and allocations across nine cases. No model testing.
+- Retain failed/negative evidence: missing-patchelf first build; five pre-existing
+  broad PLE fixture failures reproduced on clean D5b; Marlin legacy split-K=8
+  random-input nondeterminism; native owner host-boundary overhead. Do not rerun
+  model screens to reinterpret these operator contracts.
+- See [the Phase D closure](architecture/sm70_phase_d.md), its machine-readable
+  counts, exact retained boundaries and operator artifacts. DDTree and full E
+  documentation/workflow work remain outside this delivery.

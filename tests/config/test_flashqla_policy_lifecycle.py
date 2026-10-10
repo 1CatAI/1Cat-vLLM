@@ -25,7 +25,16 @@ def worker_roundtrip(value):
 
 @pytest.mark.parametrize(
     "raw,expected",
-    [(None, -1), ("", -1), (" 2junk", 2), ("bad", 0), ("0", 0), ("8", 8)],
+    [
+        (None, -1),
+        ("", -1),
+        (" 2junk", 2),
+        ("bad", 0),
+        ("0", 0),
+        ("-1", 0),
+        ("4294967295", 0),
+        ("8", 8),
+    ],
 )
 def test_flashqla_native_legacy_parser_and_worker_snapshot(monkeypatch, raw, expected):
     name = "FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK"

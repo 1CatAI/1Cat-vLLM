@@ -113,6 +113,11 @@ def test_target_profiler_preserves_primary_before_tree_alias(
     monkeypatch.setenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP", fallback)
     policy = RuntimeTraceConfig()
     assert policy.spec_target_profiler_step == expected
+    assert policy.sources["spec_target_profiler_step"] == (
+        alias
+        if primary is not None
+        else "VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP"
+    )
     assert (
         RuntimeTraceConfig(spec_target_profiler_step=7).spec_target_profiler_step == 7
     )

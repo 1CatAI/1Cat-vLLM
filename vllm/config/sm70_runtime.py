@@ -42,6 +42,13 @@ def resolve_legacy_fields(
 class Sm70RuntimeConfig:
     """Warmup policy; does not alter the compiled model computation."""
 
+    runtime_aliases: ClassVar[dict[str, str]] = {
+        "awq_warmup_max_m": "VLLM_SM70_AWQ_WARMUP_MAX_M",
+        "staged_input": "VLLM_SM70_ASYNC_STAGED_INPUT_PREP",
+        "auxiliary_warmup": "VLLM_SM70_AUX_KERNEL_WARMUP",
+        "mtp_concurrency_warmup": "VLLM_SM70_MTP_CONCURRENCY_WARMUP",
+    }
+
     legacy_output_token_repair: bool | None = None
     """Retain the async output-history rollback for speculative and ordinary runs."""
     input_aliases: ClassVar[dict[str, str]] = {
@@ -96,12 +103,12 @@ class Sm70RuntimeConfig:
         )
         resolve_legacy_fields(
             self,
-            {
-                "awq_warmup_max_m": "VLLM_SM70_AWQ_WARMUP_MAX_M",
-                "staged_input": "VLLM_SM70_ASYNC_STAGED_INPUT_PREP",
-                "auxiliary_warmup": "VLLM_SM70_AUX_KERNEL_WARMUP",
-                "mtp_concurrency_warmup": "VLLM_SM70_MTP_CONCURRENCY_WARMUP",
-            },
+            self.runtime_aliases,
+        )
+
+    def compile_ignored_aliases(self):
+        return set(
+            (self.warmup_aliases | self.input_aliases | self.runtime_aliases).values()
         )
 
 
@@ -123,6 +130,11 @@ def bind_output_token_repair(policy=None):
 class StepProfilerConfig:
     """Diagnostic-only policy; CUDA eligibility belongs to the consumer."""
 
+    aliases: ClassVar[dict[str, str]] = {
+        "enabled": "VLLM_SM70_MTP_PROFILE",
+        "interval": "VLLM_SM70_MTP_PROFILE_INTERVAL",
+    }
+
     enabled: bool | None = None
     """Collect eligible speculative step timings; legacy default off."""
     interval: int | None = Field(default=None, ge=1)
@@ -133,11 +145,11 @@ class StepProfilerConfig:
     def __post_init__(self) -> None:
         resolve_legacy_fields(
             self,
-            {
-                "enabled": "VLLM_SM70_MTP_PROFILE",
-                "interval": "VLLM_SM70_MTP_PROFILE_INTERVAL",
-            },
+            self.aliases,
         )
+
+    def compile_ignored_aliases(self):
+        return set(self.aliases.values())
 
 
 def capture_runtime_config() -> Sm70RuntimeConfig:
@@ -151,6 +163,17 @@ def capture_runtime_config() -> Sm70RuntimeConfig:
 @config
 class RuntimeTraceConfig:
     """Captured runner diagnostics; never part of compiled computation."""
+
+    interval_aliases: ClassVar[dict[str, str]] = {
+        "async_every": "VLLM_SM70_ASYNC_CPU_TRACE_EVERY",
+        "event_every": "VLLM_SM70_DECODE_EVENT_TRACE_EVERY",
+        "event_threshold_ms": "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS",
+    }
+
+    event_aliases: ClassVar[dict[str, str]] = {
+        "async_cpu": "VLLM_SM70_ASYNC_CPU_TRACE",
+        "events": "VLLM_SM70_DECODE_EVENT_TRACE",
+    }
 
     turboquant: TurboQuantDiagnostics = Field(default_factory=TurboQuantDiagnostics)
     """Packed-cache compare policy; counters and outputs share engine diagnostics."""
@@ -191,6 +214,12 @@ class RuntimeTraceConfig:
     }
 
     legacy_layer_aliases: ClassVar[dict[str, tuple[str, ...]]] = {
+        "profile_trace": (
+            "VLLM_SM70_PROFILE_TRACE",
+            "VLLM_SM70_DECODE_TILE_PROFILE",
+            "VLLM_SM70_DEBUG",
+        ),
+        "events": ("VLLM_SM70_DECODE_EVENT_TRACE", "VLLM_SM70_DEBUG"),
         "spec_target_profiler_step": (
             "VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP",
             "VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP",
@@ -334,15 +363,19 @@ class RuntimeTraceConfig:
         resolve_legacy_fields(
             self,
             {
-                "async_cpu": "VLLM_SM70_ASYNC_CPU_TRACE",
+                "async_cpu": self.event_aliases["async_cpu"],
                 **self.layer_aliases,
-                "events": "VLLM_SM70_DECODE_EVENT_TRACE",
+                "events": self.event_aliases["events"],
             },
             reader=read_flag,
         )
         for field, aliases in self.legacy_layer_aliases.items():
             if self.sources[field] != "typed":
                 present = [alias for alias in aliases if alias in os.environ]
+                if field == "spec_target_profiler_step":
+                    present = present[:1]
+                elif field in ("events", "profile_trace") and aliases[-1] in present:
+                    present = [aliases[-1]]
                 self.sources[field] = "+".join(present) if present else "default"
         # Disabled legacy diagnostics never parsed their numeric options.
         # Retain valid captured values, but do not reject an unused malformed
@@ -358,15 +391,14 @@ class RuntimeTraceConfig:
             inactive.update(event_every=16, event_threshold_ms=1.0)
         resolve_legacy_fields(
             self,
-            {
-                "async_every": "VLLM_SM70_ASYNC_CPU_TRACE_EVERY",
-                "event_every": "VLLM_SM70_DECODE_EVENT_TRACE_EVERY",
-                "event_threshold_ms": "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS",
-            },
+            self.interval_aliases,
             inactive_defaults=inactive,
         )
-        if "VLLM_SM70_DEBUG" in os.environ and self.sources["events"] != "typed":
-            self.sources["events"] = "VLLM_SM70_DEBUG"
+
+    def compile_ignored_aliases(self):
+        return set(
+            (self.layer_aliases | self.event_aliases | self.interval_aliases).values()
+        ) | {name for aliases in self.legacy_layer_aliases.values() for name in aliases}
 
 
 @config
@@ -418,6 +450,9 @@ class SpecDecodeTraceConfig:
         if self.min_position_error is not None and (self.target_logits or required):
             raise ValueError(self.min_position_error)
         return self
+
+    def compile_ignored_aliases(self):
+        return set(self.legacy_fields.values())
 
 
 def capture_runtime_trace():

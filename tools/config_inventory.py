@@ -537,6 +537,16 @@ def collect(root: Path = ROOT, *, strict_metadata=True) -> dict:
 
 def summary(inventory: dict) -> dict:
     rows = inventory["parameters"]
+    named_sites = {
+        (site["path"], site["line"], site["kind"])
+        for row in rows.values()
+        for site in row["consumers"]
+        if site["kind"] != "native_bound"
+    }
+    dynamic_sites = {
+        (site["path"], site["line"], site["kind"])
+        for site in inventory["unresolved_dynamic_readers"]
+    }
     return dict(
         parameters=len(rows),
         unassigned_parameters=[
@@ -544,14 +554,9 @@ def summary(inventory: dict) -> dict:
             for name, row in rows.items()
             if not row["owners"] and not row.get("boundary")
         ],
-        unique_read_sites=len(
-            {
-                (site["path"], site["line"], site["kind"])
-                for row in rows.values()
-                for site in row["consumers"]
-                if site["kind"] != "native_bound"
-            }
-        ),
+        unique_read_sites=len(named_sites | dynamic_sites),
+        unique_named_read_sites=len(named_sites),
+        unique_dynamic_read_sites=len(dynamic_sites),
         references=dict(
             Counter(site["kind"] for row in rows.values() for site in row["consumers"])
         ),

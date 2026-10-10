@@ -16,14 +16,11 @@ from vllm.config.execution_policy import (
     POLICY_OWNERS,
     read_execution_legacy,
 )
-from vllm.config.sm70_dflash2 import SM70_DFLASH2_LEGACY_FIELDS
-
-# These non-boolean fields share the ordered defaults bridge and hash filtering.
-SPEC_DEFAULT_ALIASES = {
-    "VLLM_SM70_DFLASH2_BF16_EMULATION": "bf16_emulation",
-    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "proposal_temperature_scale",
-    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "proposal_top_p",
-}
+from vllm.config.sm70_dflash2 import (
+    SM70_DFLASH2_LEGACY_FIELDS,
+    SPEC_DEFAULT_ALIASES,
+    speculation_compile_ignored_aliases,
+)
 
 
 def _owner(cfg, path):
@@ -442,10 +439,24 @@ def effective_runtime_values(cfg):
 def runtime_compile_ignored_aliases(cfg) -> set[str]:
     """Resolved owner hashes replace their legacy inputs, including provenance.
 
-    Standalone callers retain environment hashing. Do not drop aliases for an
-    unresolved owner: a plugin may compile before the normal init checkpoint.
+    Standalone callers retain environment hashing. Engine aliases belong to
+    their initialized owner or an inactive feature; native provider aliases
+    without captured inputs retain the independent compatibility behavior.
     """
     ignored: set[str] = set()
+    for path in (
+        "kernel_config.gdn",
+        "kernel_config.sm70_runtime",
+        "observability_config.runtime_trace",
+        "observability_config.step_profiler",
+        "observability_config.spec_decode_trace",
+        "observability_config.gdn_profile",
+        "observability_config.gdn_state",
+    ):
+        owner = _owner(cfg, path)
+        if owner is not None:
+            ignored.update(owner.compile_ignored_aliases())
+
     for path in POLICY_OWNERS:
         policy = _owner(cfg, path)
         if policy is None:
@@ -483,16 +494,6 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
             for bindings in DUMP_BINDINGS.values()
             for alias, _, _ in bindings.values()
         )
-        for field, alias in trace.layer_aliases.items():
-            if field in trace.sources:
-                ignored.add(alias)
-    runtime = _owner(cfg, "kernel_config.sm70_runtime")
-    if runtime is not None:
-        ignored.update(
-            alias
-            for field, alias in (runtime.warmup_aliases | runtime.input_aliases).items()
-            if field in runtime.sources
-        )
     scheduler = _owner(cfg, "scheduler_config")
     if getattr(getattr(scheduler, "sm70_inputs", None), "captured", False):
         ignored.update(scheduler.sm70_aliases.values())
@@ -502,27 +503,7 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
     unquantized = _owner(cfg, "kernel_config.sm70_moe.unquantized")
     if unquantized is not None and unquantized.sources:
         ignored.update(unquantized.aliases.values())
-    gdn = _owner(cfg, "kernel_config.gdn")
-    if gdn is not None and gdn.schedule.resolved:
-        from vllm.config.gdn_schedule import GDN_SCHEDULE_FIELDS
-
-        ignored.update(alias for alias, _, _ in GDN_SCHEDULE_FIELDS.values())
-    if gdn is not None and gdn.resolved:
-        ignored.update(gdn.projection.aliases.values())
-    spec = _owner(cfg, "speculative_config.sm70_dflash2")
-    if spec is not None and spec.resolved:
-        ignored.update(SM70_DFLASH2_LEGACY_FIELDS)
-        ignored.update(SPEC_DEFAULT_ALIASES)
-    if spec is not None and spec.lookup.sources:
-        ignored.update(spec.lookup.aliases.values())
-    sampling = _owner(cfg, "speculative_config.sampling_policy")
-    if sampling is not None:
-        ignored.update(
-            alias
-            for field, alias in sampling.aliases.items()
-            if field in sampling.sources
-        )
-    if getattr(cfg, "speculative_config", None) is None:
-        # These projection paths cannot run without a speculative engine.
-        ignored.update(("VLLM_SM70_MTP_SHARED_BATCH", "VLLM_SM70_MTP_ROUTER_BATCH"))
+    ignored.update(
+        speculation_compile_ignored_aliases(getattr(cfg, "speculative_config", None))
+    )
     return ignored

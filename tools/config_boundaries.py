@@ -31,7 +31,10 @@ DYNAMIC_DOMAINS = {
     ),
     ("vllm/config/gdn.py", "GdnConfig.resolve"): (
         "initialization",
-        "GDN_LEGACY_FIELDS, GDN_TEXT_FLAGS and GDN_FALLBACK_ALIASES",
+        (
+            "GDN_LEGACY_FIELDS, GDN_TEXT_FLAGS, GDN_NATIVE_ALIASES "
+            "and GDN_FALLBACK_ALIASES"
+        ),
     ),
     ("vllm/config/gdn.py", "GdnConfig.apply_platform_defaults"): (
         "initialization",
@@ -39,7 +42,7 @@ DYNAMIC_DOMAINS = {
     ),
     ("vllm/config/gdn.py", "GdnProfileConfig.resolve"): (
         "initialization",
-        "the max_logs / max_per_stage tuples, only when enabled",
+        "GdnProfileConfig.aliases; numeric budgets parse only when enabled",
     ),
     ("vllm/config/gdn_projection.py", "legacy_projection_value"): (
         "initialization_or_standalone",
@@ -55,7 +58,11 @@ DYNAMIC_DOMAINS = {
     ),
     ("vllm/config/gdn_state.py", "GdnStateTraceConfig.resolve"): (
         "initialization",
-        "explicit state-diagnostic field/name tuples",
+        "GdnStateTraceConfig.aliases; disabled numeric inputs retain short-circuiting",
+    ),
+    ("vllm/config/kernel.py", "KernelConfig.resolve_sm70_rmsnorm_gated"): (
+        "initialization",
+        "KernelConfig.sm70_rmsnorm_gated_aliases at the layer admission checkpoint",
     ),
     ("vllm/config/legacy_inputs.py", "LegacyInputs.capture"): (
         "initialization",

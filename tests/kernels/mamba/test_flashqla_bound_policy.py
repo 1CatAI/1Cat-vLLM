@@ -102,3 +102,27 @@ def test_two_decode_owners_preserve_reordered_state_and_capture(monkeypatch):
             torch.accelerator.synchronize()
             assert torch.equal(state, expected_state)
             assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("raw", ["-1", "4294967295", "0", "bad"])
+def test_native_binding_keeps_invalid_legacy_groups_invalid(monkeypatch, raw):
+    from vllm.config.gdn import GdnConfig
+
+    monkeypatch.setenv("FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK", raw)
+    ext = _load_ext()
+    policy = GdnConfig()
+    policy.resolve()
+    message = "must be one of 1, 2, 4, 8"
+    with pytest.raises(RuntimeError, match=message):
+        ext.resolve_column_groups_per_block(33, 4, 8)
+    with pytest.raises(RuntimeError, match=message):
+        ext.GdnPolicy(policy.flashqla_column_groups)
+    # An explicit typed automatic choice overrides the invalid compatibility input.
+    typed = GdnConfig(flashqla_column_groups=-1)
+    typed.resolve()
+    assert (
+        ext.GdnPolicy(typed.flashqla_column_groups).resolve_column_groups_per_block(
+            33, 4, 8
+        )
+        == 1
+    )

@@ -337,3 +337,20 @@ def invoke():
         getters={"package.flags.read": 0},
     )
     assert len(rows) == 1 and rows[0]["name"] == "VLLM_SM70_TEST"
+
+
+def test_census_keeps_dynamic_reads_in_the_full_denominator():
+    from tools.config_inventory import summary
+
+    inventory = {
+        "parameters": {},
+        "unresolved_dynamic_readers": [
+            {"path": "vllm/runner.py", "line": 7, "kind": "raw", "input_domain": None},
+            {"path": "vllm/runner.py", "line": 7, "kind": "raw", "input_domain": None},
+        ],
+    }
+    report = summary(inventory)
+    assert report["unique_read_sites"] == 1
+    assert report["unique_named_read_sites"] == 0
+    assert report["unique_dynamic_read_sites"] == 1
+    assert report["unregistered_dynamic_readers"] == 2

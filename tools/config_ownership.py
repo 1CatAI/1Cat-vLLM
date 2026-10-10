@@ -119,6 +119,7 @@ class ConfigOwnership:
                         "resolve_fields",
                         "capture_inputs",
                         "compute_hash",
+                        "compile_ignored_aliases",
                         "graph_options",
                         "hash_options",
                         "finalize_hash",

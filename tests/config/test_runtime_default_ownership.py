@@ -397,3 +397,73 @@ def test_unused_model_and_quantization_policies_do_not_salt_other_engines(monkey
     apply(first, monkeypatch)
     apply(second, monkeypatch)
     assert first.kernel_config.compute_hash() == second.kernel_config.compute_hash()
+
+
+def test_all_captured_gdn_and_diagnostic_aliases_leave_environment_hash(monkeypatch):
+    from unittest.mock import Mock
+
+    cfg = engine()
+    apply(cfg, monkeypatch)
+    # Dormant GDN has no computation hash; an admitted GDN hashes its own policy.
+    aliases = set()
+    for owner in (
+        cfg.kernel_config.gdn,
+        cfg.kernel_config.sm70_runtime,
+        cfg.observability_config.runtime_trace,
+        cfg.observability_config.step_profiler,
+        cfg.observability_config.spec_decode_trace,
+        cfg.observability_config.gdn_profile,
+        cfg.observability_config.gdn_state,
+    ):
+        aliases.update(owner.compile_ignored_aliases())
+    readers = {}
+    for name in aliases & envs.environment_variables.keys():
+        readers[name] = Mock(side_effect=AssertionError(name))
+        monkeypatch.setitem(envs.environment_variables, name, readers[name])
+    before = envs.compile_factors(cfg.kernel_config, vllm_config=cfg)
+    for name in aliases:
+        monkeypatch.setenv(name, "1")
+    assert envs.compile_factors(cfg.kernel_config, vllm_config=cfg) == before
+    for reader in readers.values():
+        reader.assert_not_called()
+
+
+def test_native_shared_stage_aliases_use_captured_owner_hash(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.config.sm70_native import NATIVE_FIELDS
+
+    cfg = engine()
+    apply(cfg, monkeypatch)
+    aliases = {alias for _, alias, _, _ in NATIVE_FIELDS}
+    readers = {}
+    for name in aliases & envs.environment_variables.keys():
+        readers[name] = Mock(side_effect=AssertionError(name))
+        monkeypatch.setitem(envs.environment_variables, name, readers[name])
+    before = envs.compile_factors(cfg.kernel_config, vllm_config=cfg)
+    for name in aliases:
+        monkeypatch.setenv(name, "1")
+    assert envs.compile_factors(cfg.kernel_config, vllm_config=cfg) == before
+    for reader in readers.values():
+        reader.assert_not_called()
+
+
+def test_inactive_speculation_and_gated_norm_do_not_salt_other_engines(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.config.sm70_dflash2 import speculation_compile_ignored_aliases
+
+    cfg = engine()
+    apply(cfg, monkeypatch)
+    aliases = speculation_compile_ignored_aliases(None)
+    aliases.update(cfg.kernel_config.sm70_rmsnorm_gated_aliases.values())
+    readers = {}
+    for name in aliases & envs.environment_variables.keys():
+        readers[name] = Mock(side_effect=AssertionError(name))
+        monkeypatch.setitem(envs.environment_variables, name, readers[name])
+    before = envs.compile_factors(cfg.kernel_config, vllm_config=cfg)
+    for name in aliases:
+        monkeypatch.setenv(name, "1")
+    assert envs.compile_factors(cfg.kernel_config, vllm_config=cfg) == before
+    for reader in readers.values():
+        reader.assert_not_called()
