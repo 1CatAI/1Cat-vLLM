@@ -942,7 +942,11 @@ class Worker(WorkerBase):
         from vllm.triton_utils.jit_monitor import (
             activate as activate_triton_jit_monitor,
         )
+        from vllm.triton_utils.jit_monitor import preload_recorded_kernels
 
+        # Compile the specializations earlier servers first compiled during
+        # inference, so a shape seen once never compiles while serving again.
+        preload_recorded_kernels()
         activate_triton_jit_monitor()
 
         return CompilationTimes(
