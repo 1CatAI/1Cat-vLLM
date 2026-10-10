@@ -365,3 +365,53 @@ owners resolve these once and pass the captured token directly, while public
 compatibility entry points and instrumented wrappers keep their old behavior.
 AWQ skips disabled dump callbacks; enabled dumps retain their stage positions.
 Output trimming creates a view only when the physical width differs.
+
+## Follow-up: native packed GEMM and runtime ownership
+
+The post-E follow-up uses main `44276e971` as its integration base. Native
+AWQ, FP8, MXFP4 and NVFP4 dense/grouped wrappers now construct their packed
+weight and scale descriptors through `csrc/sm70_turbomind/ops/packed_gemm.h`.
+Eight descriptor implementations become two shared builders; four dense
+launch sequences become `run_dense_packed_gemm`. Grouped routing still owns
+expert offsets, index maps and dispatch counts. The shared builders receive
+codec choices and do not interpret policy.
+
+`ops/gemm_runtime.cpp` owns the existing TurboMind workspace, tuner decisions,
+GEMM instances and prepared FP16 weight cache. Consumers receive a workspace
+view, rather than the holder's owning tensors/maps. The runtime remains keyed
+by engine, device and stream; GEMM/tuning caches also retain their effective
+policy key. Release and capture synchronization, imported cache behavior and
+AOT owner resolution are unchanged. `gemm_runtime.h` is the narrow interface.
+The normal CMake `_C` target builds this host-only owner with the wrappers;
+there is no sidecar library or new custom-op ABI.
+
+Retained differences include AWQ's contiguous input contract and compact
+metadata pointer tag, FP8 block grouping, MXFP4 E8M0 scales, NVFP4 prescaled
+flags, gated logical/output widths, indexed/grouped routing, GGUF mixed
+formats and the existing fused epilogues. All 58 device functions in the
+original wrapper retain the same code apart from formatting. The original
+12,034-line wrapper becomes 10,790 lines; the maintenance result is the shared
+layout/launch implementation and private resource owner, not that line count.
+
+Minimal affected validation:
+
+```bash
+.venv/bin/python -m pytest -q \
+  tests/kernels/quantization/test_sm70_packed_gemm_lifecycle.py \
+  tests/kernels/quantization/test_sm70_native_owner.py
+.venv/bin/python benchmarks/kernels/sm70_native_artifact_parity.py \
+  --families awq fp8 nvfp4 mxfp4 gguf moe_awq moe_fp8 \
+  --gguf-cache tuning.txt --output baseline.pt
+# In the candidate installation, with the same GPU and configuration:
+.venv/bin/python benchmarks/kernels/sm70_native_artifact_parity.py \
+  --families awq fp8 nvfp4 mxfp4 gguf moe_awq moe_fp8 \
+  --gguf-cache tuning.txt --output candidate.pt --reference baseline.pt
+```
+
+The lifecycle test records an output digest for each case in JUnit XML so
+separate baseline/candidate processes can compare exact bits. It covers dense
+row thresholds, padded output views, real input strides, fused gate output,
+compact AWQ metadata and grouped replay with changed expert/offset inputs.
+Owner tests separately cover releasing one engine while another replays and
+export/reload using the current engine slot. Timing evidence is operator scope;
+this follow-up does not establish model throughput or TTFT.

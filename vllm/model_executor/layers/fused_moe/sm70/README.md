@@ -39,6 +39,11 @@ must outlive capture/replay, capacity growth and AOT reload. Weight replacement
 and release invalidate the corresponding prepared state. Diagnostics borrow the
 engine's owner and retain historical labels.
 
+Native packed dense/grouped descriptors share `csrc/sm70_turbomind/ops/packed_gemm.h`.
+The native `gemm_runtime.cpp` owns workspace, tuning and prepared FP16 caches;
+consumers borrow views with the existing engine/device/stream lifetime. Format
+wrappers retain codec types, grouping and numerical epilogues.
+
 GGUF keeps mixed formats and separate gate/up preparation. Skinny keeps modular
 MoE integration. They share applicable contracts, stages and diagnostics, not an
 interchangeable codec interface with all four formats. Clamping, interleaved
