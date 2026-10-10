@@ -274,3 +274,45 @@ def test_host_qsa_only_initializes_graph_padding(active: int) -> None:
     assert torch.equal(output[:active], query[:active] * 2)
     assert torch.count_nonzero(output[active:]).item() == 0
     assert calls == ([active] if active else [])
+
+
+@pytest.mark.parametrize("active", [1, 5, 20])
+def test_host_qsa_preparation_uses_local_slots(active, monkeypatch):
+    attention = _bare_qsa_attention(4)
+    attention.num_heads = 6
+    attention.head_dim = 256
+    attention.rotary_emb = SimpleNamespace(cos_sin_cache=torch.zeros(64, 64))
+    attention.q_norm = SimpleNamespace(weight=torch.ones(256), variance_epsilon=1e-6)
+    attention.k_norm = SimpleNamespace(weight=torch.ones(256))
+    attention._host_prep_slots = torch.arange(32, dtype=torch.int64)
+    qkv = torch.ones(32, 3584, dtype=torch.float16)
+    positions = torch.arange(32, dtype=torch.int32).repeat(3, 1)
+    calls = []
+
+    def prepare(rows, pos, cache, qw, kw, eps, query, key, value, slots):
+        assert rows.shape == (active, 3584)
+        assert torch.equal(pos, positions[0, :active].long())
+        assert torch.equal(slots, torch.arange(active))
+        assert slots.data_ptr() == attention._host_prep_slots.data_ptr()
+        assert key.shape == value.shape == (active, 1, 1, 256)
+        assert len({query.data_ptr(), key.data_ptr(), value.data_ptr()}) == 3
+        query.fill_(2)
+        key.fill_(3)
+        value.fill_(4)
+        calls.append(True)
+
+    monkeypatch.setattr(torch.ops._C, "qsa_prep_sm70_out", prepare)
+    query, key, value = attention._prepare_host_qsa_rows(qkv, positions, active)
+    assert calls == [True]
+    assert query.shape == (active, 6, 256)
+    assert key.shape == value.shape == (active, 1, 256)
+    assert torch.all(query == 2) and torch.all(key == 3) and torch.all(value == 4)
+
+
+@pytest.mark.parametrize("active", [0, 9, 33])
+def test_host_qsa_preparation_rejects_invalid_active_count(active):
+    attention = _bare_qsa_attention(4)
+    with pytest.raises(ValueError, match="active rows"):
+        attention._prepare_host_qsa_rows(
+            torch.ones(8, 3584, dtype=torch.float16), torch.arange(8), active
+        )

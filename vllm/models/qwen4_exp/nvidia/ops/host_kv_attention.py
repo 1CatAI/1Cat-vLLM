@@ -10,6 +10,7 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     _qsa_sparse_paged_gqa_splitk_kernel,
     _use_sm70_qsa_two_warp_partial,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 
 
@@ -24,7 +25,12 @@ def host_qsa_attention(
     group = query.shape[1]  # Host admission requires one TP-local KV head.
     block_m = triton.next_power_of_2(group)
     block_n, target, warps = _qsa_sparse_launch_profile(query.shape[0], block_m, True)
-    if _use_sm70_qsa_two_warp_partial(query.shape[0], group, state.dim):
+    if _use_sm70_qsa_two_warp_partial(query.shape[0], group, state.dim) or (
+        0 < query.shape[0] <= 32
+        and group == 6
+        and state.dim == 256
+        and current_platform.is_device_capability(70)
+    ):
         warps = 2
     tiles = triton.cdiv(indices.shape[1], block_n)
     splits = min(1 << (tiles.bit_length() - 1), target)
