@@ -6,8 +6,8 @@ INT8 implementation and runtime/performance changes remain deferred.
 
 | Delivery | Scope | Status |
 | --- | --- | --- |
-| E1 | Ownership map and attention/KV/MoE contracts; rework useful #1064 documentation from merged main | In review in #1064 |
-| E2 | Source-derived reference, drift/link checks and correct source URLs | Planned |
+| E1 | Ownership map and attention/KV/MoE contracts; rework useful #1064 documentation from merged main | Merged in #1064 (`7ab8b4477`) |
+| E2 | Source-derived reference, drift/link checks and correct source URLs | Implemented; validation below |
 | E3 | Developer entry, coverage template and lightweight CI | Planned |
 
 Historical A–D reports and the migration control log retain their paths.
@@ -32,3 +32,26 @@ E1 checks: all applicable pre-commit hooks passed, including existing runtime
 parameter ownership and metadata gates. All local links in the six maintained
 Markdown files resolve. Source scope is documentation only; no GPU allocation,
 model loading or numerical/performance claim.
+
+## E2 validation
+
+The offline generator derives reachable configuration ownership with the D
+reader and shares literal MoE binding extraction with the B inventory. It reads
+KV and route declarations without importing vLLM, Torch, Triton or native code.
+Its default/`--check` mode does not write; unknown declaration forms fail with an
+error. It checks only the explicitly maintained E documents, including source
+line references and local heading anchors. Existing environment documentation
+and runtime selectors remain independent authoritative sources.
+
+Fifteen focused CPU cases pass in a minimal documentation environment, including
+read-only CLI behavior, deterministic output, declaration drift, unsupported
+expressions, missing targets, duplicate-heading anchors and poisoned imports /
+environment getters. Source URLs follow the configured repository and preserve
+explicit upstream links. The documentation-only Torch mock now shares a real
+Python `Module` base across both import styles, fixing the baseline CLI-doc
+metaclass conflict without touching PLE or other runtime modules.
+
+`API_AUTONAV_EXCLUDE=vllm` MkDocs build passed. Unrelated existing navigation and
+missing-anchor messages (including `api/vllm`, pooling scoring and serving pages)
+remain in the build log; they are outside E's maintained-document scope. No GPU,
+model or runtime numerical tests are claimed for this tool/documentation change.
