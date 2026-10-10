@@ -1,0 +1,873 @@
+{
+  "research_only": true,
+  "serving_dispatch": false,
+  "rank_records": [
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "family_variant": true,
+      "compact_variant": true,
+      "rank": 0,
+      "source_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+      "generated_cuda_sha256": "e7f1f9121964d999f6cc26099fc5f400cf3c065293c03f4248b4972af1f31d2e",
+      "cases": [
+        {
+          "layer": 22,
+          "types": [
+            18,
+            21
+          ],
+          "formats": [
+            6,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005832018214277923,
+            0.0005990907666273415,
+            0.0006073042168281972
+          ]
+        },
+        {
+          "layer": 38,
+          "types": [
+            21,
+            18
+          ],
+          "formats": [
+            5,
+            6
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.00058726966381073,
+            0.0005930504994466901,
+            0.0006225028773769736
+          ]
+        }
+      ],
+      "performance": {
+        "original_chain_us": 79.60979318618774,
+        "common_chain_us": 83.22873497009277,
+        "samples_us": {
+          "False": [
+            69.61152076721191,
+            69.40671920776367,
+            69.71392154693604,
+            77.1072006225586,
+            77.1072006225586,
+            83.74272346496582,
+            83.57824325561523,
+            88.2688045501709,
+            88.20735931396484,
+            89.35423851013184
+          ],
+          "True": [
+            73.8918399810791,
+            73.78943920135498,
+            73.76895904541016,
+            79.25759792327881,
+            81.73567771911621,
+            82.45247840881348,
+            88.35071563720703,
+            91.46431922912598,
+            93.2863998413086,
+            94.2899227142334
+          ]
+        },
+        "timing_intervals": [
+          {
+            "common": false,
+            "chain_us": 69.61152076721191,
+            "wall_start": 1791451031.5227706,
+            "wall_end": 1791451031.5268605
+          },
+          {
+            "common": true,
+            "chain_us": 73.8918399810791,
+            "wall_start": 1791451031.5280163,
+            "wall_end": 1791451031.5323417
+          },
+          {
+            "common": true,
+            "chain_us": 73.78943920135498,
+            "wall_start": 1791451031.5330098,
+            "wall_end": 1791451031.5373964
+          },
+          {
+            "common": false,
+            "chain_us": 69.40671920776367,
+            "wall_start": 1791451031.5379968,
+            "wall_end": 1791451031.5421193
+          },
+          {
+            "common": false,
+            "chain_us": 69.71392154693604,
+            "wall_start": 1791451031.5428715,
+            "wall_end": 1791451031.5469463
+          },
+          {
+            "common": true,
+            "chain_us": 73.76895904541016,
+            "wall_start": 1791451031.5475292,
+            "wall_end": 1791451031.5518935
+          },
+          {
+            "common": true,
+            "chain_us": 79.25759792327881,
+            "wall_start": 1791451031.5529332,
+            "wall_end": 1791451031.557545
+          },
+          {
+            "common": false,
+            "chain_us": 77.1072006225586,
+            "wall_start": 1791451031.5582724,
+            "wall_end": 1791451031.562832
+          },
+          {
+            "common": false,
+            "chain_us": 77.1072006225586,
+            "wall_start": 1791451031.5634892,
+            "wall_end": 1791451031.5679832
+          },
+          {
+            "common": true,
+            "chain_us": 81.73567771911621,
+            "wall_start": 1791451031.5685282,
+            "wall_end": 1791451031.5733507
+          },
+          {
+            "common": true,
+            "chain_us": 82.45247840881348,
+            "wall_start": 1791451031.5744653,
+            "wall_end": 1791451031.5793219
+          },
+          {
+            "common": false,
+            "chain_us": 83.74272346496582,
+            "wall_start": 1791451031.580158,
+            "wall_end": 1791451031.5850873
+          },
+          {
+            "common": false,
+            "chain_us": 83.57824325561523,
+            "wall_start": 1791451031.5856934,
+            "wall_end": 1791451031.5905802
+          },
+          {
+            "common": true,
+            "chain_us": 88.35071563720703,
+            "wall_start": 1791451031.5912924,
+            "wall_end": 1791451031.5965192
+          },
+          {
+            "common": true,
+            "chain_us": 91.46431922912598,
+            "wall_start": 1791451031.597318,
+            "wall_end": 1791451031.6026502
+          },
+          {
+            "common": false,
+            "chain_us": 88.2688045501709,
+            "wall_start": 1791451031.6032112,
+            "wall_end": 1791451031.6084437
+          },
+          {
+            "common": false,
+            "chain_us": 88.20735931396484,
+            "wall_start": 1791451031.6089828,
+            "wall_end": 1791451031.614172
+          },
+          {
+            "common": true,
+            "chain_us": 93.2863998413086,
+            "wall_start": 1791451031.614887,
+            "wall_end": 1791451031.620415
+          },
+          {
+            "common": true,
+            "chain_us": 94.2899227142334,
+            "wall_start": 1791451031.6209545,
+            "wall_end": 1791451031.6265552
+          },
+          {
+            "common": false,
+            "chain_us": 89.35423851013184,
+            "wall_start": 1791451031.627117,
+            "wall_end": 1791451031.6324239
+          }
+        ],
+        "changed_input_graph_replays": 20
+      },
+      "clocks_after_timing": "1530 MHz, 877 MHz"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "family_variant": true,
+      "compact_variant": true,
+      "rank": 1,
+      "source_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+      "generated_cuda_sha256": "e7f1f9121964d999f6cc26099fc5f400cf3c065293c03f4248b4972af1f31d2e",
+      "cases": [
+        {
+          "layer": 22,
+          "types": [
+            18,
+            21
+          ],
+          "formats": [
+            6,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005785325774922967,
+            0.0006063556647859514,
+            0.0006109037203714252
+          ]
+        },
+        {
+          "layer": 38,
+          "types": [
+            21,
+            18
+          ],
+          "formats": [
+            5,
+            6
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005880185053683817,
+            0.000592441763728857,
+            0.0006195079768076539
+          ]
+        }
+      ],
+      "performance": {
+        "original_chain_us": 77.75424003601074,
+        "common_chain_us": 83.9434871673584,
+        "samples_us": {
+          "False": [
+            69.3452787399292,
+            69.46815967559814,
+            71.12703800201416,
+            73.27744007110596,
+            73.01119804382324,
+            80.83456039428711,
+            80.48640251159668,
+            85.79008102416992,
+            86.77311897277832,
+            87.42912292480469
+          ],
+          "True": [
+            73.87135982513428,
+            73.8918399810791,
+            77.57823944091797,
+            77.63967990875244,
+            85.54495811462402,
+            85.52448272705078,
+            90.54271697998047,
+            90.50111770629883,
+            92.2214412689209,
+            92.1190357208252
+          ]
+        },
+        "timing_intervals": [
+          {
+            "common": false,
+            "chain_us": 69.3452787399292,
+            "wall_start": 1791451031.52274,
+            "wall_end": 1791451031.526886
+          },
+          {
+            "common": true,
+            "chain_us": 73.87135982513428,
+            "wall_start": 1791451031.5280373,
+            "wall_end": 1791451031.5323725
+          },
+          {
+            "common": true,
+            "chain_us": 73.8918399810791,
+            "wall_start": 1791451031.5329773,
+            "wall_end": 1791451031.5373712
+          },
+          {
+            "common": false,
+            "chain_us": 69.46815967559814,
+            "wall_start": 1791451031.5380375,
+            "wall_end": 1791451031.5421102
+          },
+          {
+            "common": false,
+            "chain_us": 71.12703800201416,
+            "wall_start": 1791451031.542783,
+            "wall_end": 1791451031.5469632
+          },
+          {
+            "common": true,
+            "chain_us": 77.57823944091797,
+            "wall_start": 1791451031.5476494,
+            "wall_end": 1791451031.552245
+          },
+          {
+            "common": true,
+            "chain_us": 77.63967990875244,
+            "wall_start": 1791451031.5529032,
+            "wall_end": 1791451031.5574934
+          },
+          {
+            "common": false,
+            "chain_us": 73.27744007110596,
+            "wall_start": 1791451031.558211,
+            "wall_end": 1791451031.5625365
+          },
+          {
+            "common": false,
+            "chain_us": 73.01119804382324,
+            "wall_start": 1791451031.563527,
+            "wall_end": 1791451031.5678334
+          },
+          {
+            "common": true,
+            "chain_us": 85.54495811462402,
+            "wall_start": 1791451031.5686674,
+            "wall_end": 1791451031.5737083
+          },
+          {
+            "common": true,
+            "chain_us": 85.52448272705078,
+            "wall_start": 1791451031.5743806,
+            "wall_end": 1791451031.5794265
+          },
+          {
+            "common": false,
+            "chain_us": 80.83456039428711,
+            "wall_start": 1791451031.5800686,
+            "wall_end": 1791451031.584853
+          },
+          {
+            "common": false,
+            "chain_us": 80.48640251159668,
+            "wall_start": 1791451031.5858135,
+            "wall_end": 1791451031.5905797
+          },
+          {
+            "common": true,
+            "chain_us": 90.54271697998047,
+            "wall_start": 1791451031.591247,
+            "wall_end": 1791451031.5965972
+          },
+          {
+            "common": true,
+            "chain_us": 90.50111770629883,
+            "wall_start": 1791451031.5972724,
+            "wall_end": 1791451031.6026204
+          },
+          {
+            "common": false,
+            "chain_us": 85.79008102416992,
+            "wall_start": 1791451031.6032124,
+            "wall_end": 1791451031.6082761
+          },
+          {
+            "common": false,
+            "chain_us": 86.77311897277832,
+            "wall_start": 1791451031.6091487,
+            "wall_end": 1791451031.614271
+          },
+          {
+            "common": true,
+            "chain_us": 92.2214412689209,
+            "wall_start": 1791451031.6148052,
+            "wall_end": 1791451031.620258
+          },
+          {
+            "common": true,
+            "chain_us": 92.1190357208252,
+            "wall_start": 1791451031.621022,
+            "wall_end": 1791451031.6264722
+          },
+          {
+            "common": false,
+            "chain_us": 87.42912292480469,
+            "wall_start": 1791451031.6271524,
+            "wall_end": 1791451031.632352
+          }
+        ],
+        "changed_input_graph_replays": 20
+      },
+      "clocks_after_timing": "1522 MHz, 877 MHz"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "family_variant": true,
+      "compact_variant": true,
+      "rank": 2,
+      "source_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+      "generated_cuda_sha256": "e7f1f9121964d999f6cc26099fc5f400cf3c065293c03f4248b4972af1f31d2e",
+      "cases": [
+        {
+          "layer": 22,
+          "types": [
+            18,
+            21
+          ],
+          "formats": [
+            6,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005917392554692924,
+            0.0005805609398521483,
+            0.0006191448774188757
+          ]
+        },
+        {
+          "layer": 38,
+          "types": [
+            21,
+            18
+          ],
+          "formats": [
+            5,
+            6
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005806272965855896,
+            0.0005957927787676454,
+            0.0006100909085944295
+          ]
+        }
+      ],
+      "performance": {
+        "original_chain_us": 77.25062465667725,
+        "common_chain_us": 82.76998519897461,
+        "samples_us": {
+          "False": [
+            69.48863983154297,
+            69.55008029937744,
+            69.48863983154297,
+            69.69344139099121,
+            72.23296165466309,
+            78.23359966278076,
+            82.63744354248047,
+            84.2137622833252,
+            88.49408149719238,
+            88.47359657287598
+          ],
+          "True": [
+            73.95328044891357,
+            73.95328044891357,
+            73.8918399810791,
+            73.8918399810791,
+            83.02592277526855,
+            82.9849624633789,
+            89.72288131713867,
+            89.37536239624023,
+            93.49120140075684,
+            93.40928077697754
+          ]
+        },
+        "timing_intervals": [
+          {
+            "common": false,
+            "chain_us": 69.48863983154297,
+            "wall_start": 1791451031.5228195,
+            "wall_end": 1791451031.5269027
+          },
+          {
+            "common": true,
+            "chain_us": 73.95328044891357,
+            "wall_start": 1791451031.5279853,
+            "wall_end": 1791451031.5323474
+          },
+          {
+            "common": true,
+            "chain_us": 73.95328044891357,
+            "wall_start": 1791451031.5329905,
+            "wall_end": 1791451031.5373895
+          },
+          {
+            "common": false,
+            "chain_us": 69.55008029937744,
+            "wall_start": 1791451031.537978,
+            "wall_end": 1791451031.5421102
+          },
+          {
+            "common": false,
+            "chain_us": 69.48863983154297,
+            "wall_start": 1791451031.5427885,
+            "wall_end": 1791451031.5469117
+          },
+          {
+            "common": true,
+            "chain_us": 73.8918399810791,
+            "wall_start": 1791451031.547555,
+            "wall_end": 1791451031.5519345
+          },
+          {
+            "common": true,
+            "chain_us": 73.8918399810791,
+            "wall_start": 1791451031.5529406,
+            "wall_end": 1791451031.5572507
+          },
+          {
+            "common": false,
+            "chain_us": 69.69344139099121,
+            "wall_start": 1791451031.5582757,
+            "wall_end": 1791451031.5623457
+          },
+          {
+            "common": false,
+            "chain_us": 72.23296165466309,
+            "wall_start": 1791451031.5634067,
+            "wall_end": 1791451031.5676486
+          },
+          {
+            "common": true,
+            "chain_us": 83.02592277526855,
+            "wall_start": 1791451031.5685086,
+            "wall_end": 1791451031.5734296
+          },
+          {
+            "common": true,
+            "chain_us": 82.9849624633789,
+            "wall_start": 1791451031.5744023,
+            "wall_end": 1791451031.579296
+          },
+          {
+            "common": false,
+            "chain_us": 78.23359966278076,
+            "wall_start": 1791451031.5800097,
+            "wall_end": 1791451031.5846431
+          },
+          {
+            "common": false,
+            "chain_us": 82.63744354248047,
+            "wall_start": 1791451031.585616,
+            "wall_end": 1791451031.5904717
+          },
+          {
+            "common": true,
+            "chain_us": 89.72288131713867,
+            "wall_start": 1791451031.591217,
+            "wall_end": 1791451031.5965364
+          },
+          {
+            "common": true,
+            "chain_us": 89.37536239624023,
+            "wall_start": 1791451031.5971692,
+            "wall_end": 1791451031.6024768
+          },
+          {
+            "common": false,
+            "chain_us": 84.2137622833252,
+            "wall_start": 1791451031.6031291,
+            "wall_end": 1791451031.6081336
+          },
+          {
+            "common": false,
+            "chain_us": 88.49408149719238,
+            "wall_start": 1791451031.6089256,
+            "wall_end": 1791451031.614171
+          },
+          {
+            "common": true,
+            "chain_us": 93.49120140075684,
+            "wall_start": 1791451031.614811,
+            "wall_end": 1791451031.6203742
+          },
+          {
+            "common": true,
+            "chain_us": 93.40928077697754,
+            "wall_start": 1791451031.6209538,
+            "wall_end": 1791451031.626512
+          },
+          {
+            "common": false,
+            "chain_us": 88.47359657287598,
+            "wall_start": 1791451031.6270576,
+            "wall_end": 1791451031.632319
+          }
+        ],
+        "changed_input_graph_replays": 20
+      },
+      "clocks_after_timing": "1522 MHz, 877 MHz"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "family_variant": true,
+      "compact_variant": true,
+      "rank": 3,
+      "source_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+      "generated_cuda_sha256": "e7f1f9121964d999f6cc26099fc5f400cf3c065293c03f4248b4972af1f31d2e",
+      "cases": [
+        {
+          "layer": 22,
+          "types": [
+            18,
+            21
+          ],
+          "formats": [
+            6,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005756475729867816,
+            0.0006130990223027766,
+            0.0006126876105554402
+          ]
+        },
+        {
+          "layer": 38,
+          "types": [
+            21,
+            18
+          ],
+          "formats": [
+            5,
+            6
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005916923983022571,
+            0.0005994345992803574,
+            0.000585633039008826
+          ]
+        }
+      ],
+      "performance": {
+        "original_chain_us": 78.94227266311646,
+        "common_chain_us": 81.72140836715698,
+        "samples_us": {
+          "False": [
+            75.34592151641846,
+            69.67296123504639,
+            69.52960014343262,
+            76.65664196014404,
+            76.98431968688965,
+            82.35008239746094,
+            82.57599830627441,
+            85.44256210327148,
+            85.31968116760254,
+            85.54495811462402
+          ],
+          "True": [
+            74.03520107269287,
+            73.91232013702393,
+            73.8918399810791,
+            76.88191890716553,
+            81.44895553588867,
+            81.42848014831543,
+            86.99904441833496,
+            88.37183952331543,
+            90.1734447479248,
+            90.0710391998291
+          ]
+        },
+        "timing_intervals": [
+          {
+            "common": false,
+            "chain_us": 75.34592151641846,
+            "wall_start": 1791451031.5226414,
+            "wall_end": 1791451031.527187
+          },
+          {
+            "common": true,
+            "chain_us": 74.03520107269287,
+            "wall_start": 1791451031.527924,
+            "wall_end": 1791451031.5323339
+          },
+          {
+            "common": true,
+            "chain_us": 73.91232013702393,
+            "wall_start": 1791451031.5329888,
+            "wall_end": 1791451031.5373857
+          },
+          {
+            "common": false,
+            "chain_us": 69.67296123504639,
+            "wall_start": 1791451031.537997,
+            "wall_end": 1791451031.5421517
+          },
+          {
+            "common": false,
+            "chain_us": 69.52960014343262,
+            "wall_start": 1791451031.5427806,
+            "wall_end": 1791451031.546912
+          },
+          {
+            "common": true,
+            "chain_us": 73.8918399810791,
+            "wall_start": 1791451031.5475883,
+            "wall_end": 1791451031.551986
+          },
+          {
+            "common": true,
+            "chain_us": 76.88191890716553,
+            "wall_start": 1791451031.5528848,
+            "wall_end": 1791451031.5574296
+          },
+          {
+            "common": false,
+            "chain_us": 76.65664196014404,
+            "wall_start": 1791451031.5581334,
+            "wall_end": 1791451031.562696
+          },
+          {
+            "common": false,
+            "chain_us": 76.98431968688965,
+            "wall_start": 1791451031.5634289,
+            "wall_end": 1791451031.568014
+          },
+          {
+            "common": true,
+            "chain_us": 81.44895553588867,
+            "wall_start": 1791451031.5685675,
+            "wall_end": 1791451031.5734196
+          },
+          {
+            "common": true,
+            "chain_us": 81.42848014831543,
+            "wall_start": 1791451031.5744214,
+            "wall_end": 1791451031.57925
+          },
+          {
+            "common": false,
+            "chain_us": 82.35008239746094,
+            "wall_start": 1791451031.5800114,
+            "wall_end": 1791451031.5849118
+          },
+          {
+            "common": false,
+            "chain_us": 82.57599830627441,
+            "wall_start": 1791451031.5858655,
+            "wall_end": 1791451031.5907183
+          },
+          {
+            "common": true,
+            "chain_us": 86.99904441833496,
+            "wall_start": 1791451031.591584,
+            "wall_end": 1791451031.5966632
+          },
+          {
+            "common": true,
+            "chain_us": 88.37183952331543,
+            "wall_start": 1791451031.5972724,
+            "wall_end": 1791451031.6024783
+          },
+          {
+            "common": false,
+            "chain_us": 85.44256210327148,
+            "wall_start": 1791451031.6032124,
+            "wall_end": 1791451031.6082566
+          },
+          {
+            "common": false,
+            "chain_us": 85.31968116760254,
+            "wall_start": 1791451031.6091487,
+            "wall_end": 1791451031.6141944
+          },
+          {
+            "common": true,
+            "chain_us": 90.1734447479248,
+            "wall_start": 1791451031.6148052,
+            "wall_end": 1791451031.6201336
+          },
+          {
+            "common": true,
+            "chain_us": 90.0710391998291,
+            "wall_start": 1791451031.6210465,
+            "wall_end": 1791451031.626373
+          },
+          {
+            "common": false,
+            "chain_us": 85.54495811462402,
+            "wall_start": 1791451031.6271524,
+            "wall_end": 1791451031.6321967
+          }
+        ],
+        "changed_input_graph_replays": 20
+      },
+      "clocks_after_timing": "1530 MHz, 877 MHz"
+    }
+  ],
+  "mean_original_chain_us": 78.38923263549805,
+  "mean_candidate_chain_us": 82.91590392589569,
+  "counter_clock_control": "base",
+  "counter_records": [
+    {
+      "kernel": "void <unnamed>::dense_mv<(int)4, (int)4, (int)6, (int)5, (int)-1, (bool)0>(<unnamed>::Segs, const __half *, int, int, int, int, int, int, float *, int *, unsigned long *)",
+      "metrics": {
+        "gpu__time_duration.sum": {
+          "value": "48.192000",
+          "unit": "usecond"
+        },
+        "gpc__cycles_elapsed.avg.per_second": {
+          "value": "1.104755",
+          "unit": "cycle/nsecond"
+        },
+        "dram__cycles_elapsed.avg.per_second": {
+          "value": "766.932271",
+          "unit": "cycle/usecond"
+        },
+        "dram__bytes.sum.per_second": {
+          "value": "391.916335",
+          "unit": "Gbyte/second"
+        },
+        "smsp__inst_executed.sum": {
+          "value": "7294768.000000",
+          "unit": "inst"
+        },
+        "smsp__average_warps_issue_stalled_no_instruction_per_issue_active.ratio": {
+          "value": "1.024945",
+          "unit": "inst"
+        },
+        "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio": {
+          "value": "0.198017",
+          "unit": "inst"
+        }
+      }
+    },
+    {
+      "kernel": "void <unnamed>::compact_family_dense_mv<(int)4, (int)4, (int)6, (int)5, (int)-1, (bool)0>(<unnamed>::Segs, const __half *, int, int, int, int, int, int, float *, int *, unsigned long *)",
+      "metrics": {
+        "gpu__time_duration.sum": {
+          "value": "48.608000",
+          "unit": "usecond"
+        },
+        "gpc__cycles_elapsed.avg.per_second": {
+          "value": "1.157745",
+          "unit": "cycle/nsecond"
+        },
+        "dram__cycles_elapsed.avg.per_second": {
+          "value": "803.159974",
+          "unit": "cycle/usecond"
+        },
+        "dram__bytes.sum.per_second": {
+          "value": "402.887426",
+          "unit": "Gbyte/second"
+        },
+        "smsp__inst_executed.sum": {
+          "value": "9493480.000000",
+          "unit": "inst"
+        },
+        "smsp__average_warps_issue_stalled_no_instruction_per_issue_active.ratio": {
+          "value": "0.028118",
+          "unit": "inst"
+        },
+        "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio": {
+          "value": "0.148081",
+          "unit": "inst"
+        }
+      }
+    }
+  ]
+}
