@@ -13,18 +13,21 @@ pytestmark = pytest.mark.skipif(
     reason="requires SM70 and sm70_dmv13_out",
 )
 
-BLOCK = {12: 144, 14: 210}
+BLOCK = {8: 34, 12: 144, 13: 176, 14: 210, 20: 18, 23: 136}
 
 
 def _raw(rng, rows, k, qtype):
     size = BLOCK[qtype]
-    raw = rng.integers(0, 256, (rows, k // 256, size), dtype=np.uint8)
-    d = np.full((rows, k // 256), 0.002, np.float16).view(np.uint8)
-    if qtype == 12:
-        raw[..., 0:2] = d.reshape(rows, k // 256, 2)
-        raw[..., 2:4] = d.reshape(rows, k // 256, 2)
+    block = 32 if qtype in (8, 20) else 256
+    raw = rng.integers(0, 256, (rows, k // block, size), dtype=np.uint8)
+    d = np.full((rows, k // block), 0.002, np.float16).view(np.uint8)
+    if qtype in (12, 13):
+        raw[..., 0:2] = d.reshape(rows, k // block, 2)
+        raw[..., 2:4] = d.reshape(rows, k // block, 2)
+    elif qtype == 14:
+        raw[..., 208:210] = d.reshape(rows, k // block, 2)
     else:
-        raw[..., 208:210] = d.reshape(rows, k // 256, 2)
+        raw[..., :2] = d.reshape(rows, k // block, 2)
     return raw.reshape(rows, -1)
 
 
@@ -78,3 +81,84 @@ def test_side_projection_matches_dequant(qtype, tokens, merged_bf16):
     torch.testing.assert_close(
         extra_out.float(), (x.float() @ extra.half().float().T), atol=2e-2, rtol=2e-2
     )
+
+
+@pytest.mark.parametrize("qtype", [8, 12, 13, 14, 20, 23])
+def test_shared_segment_planes_preserve_side_and_m20_graph(qtype):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import (
+        decode,
+        pack,
+    )
+    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
+        Dmv13Projection,
+        _register_banks,
+        share_prepared_banks,
+    )
+
+    n, k = 256, 2560
+    raw = _raw(np.random.default_rng(3000 + qtype), n, k, qtype)
+    fmt, codes, scales, minimum, group = decode(raw, qtype)
+    payload = [
+        torch.from_numpy(t).cuda() for t in pack(fmt, codes, scales, minimum, group)
+    ]
+    p = torch.nn.Module()
+    p.codes, p.segment_high, p.stats = payload
+    p.kernel = SimpleNamespace(config=SimpleNamespace(partition_weight_shape=(k, n)))
+    p.source_output_sizes = (n,)
+    p.segment_format, p.output_padding, p.input_layout_restored = fmt, 0, False
+    layer = torch.nn.Module()
+    layer.gguf_tm_projections = torch.nn.ModuleList([p])
+    extra = (torch.randn(24, k, device="cuda") * 0.02).half()
+    proj = Dmv13Projection(_Shard(raw, qtype), _Extra(extra))
+    assert proj.ready
+    layer.sm70_side_projection = proj
+    _register_banks(layer, "sm70_side_projection", proj)
+    x = torch.randn(5, k, device="cuda", dtype=torch.float16)
+    before = tuple(t.clone() for t in proj.run(x))
+    assert share_prepared_banks(layer) == 1
+    after = proj.run(x)
+    for got, expected in zip(after, before):
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = proj.run(x)
+    for _ in range(3):
+        x.normal_()
+        graph.replay()
+        for got, expected in zip(captured, proj.run(x)):
+            torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    # C4 still reads the same resident planes through the existing M20 route.
+    x20 = torch.randn(20, k, device="cuda", dtype=torch.float16)
+    y20 = torch.empty(20, n, device="cuda", dtype=torch.float16)
+    workspace = torch.empty(8192, device="cuda", dtype=torch.float32)
+    counters = torch.zeros(32, device="cuda", dtype=torch.int32)
+
+    def run20():
+        torch.ops._C.gguf_dense_segments_sm70_out(
+            x20,
+            [p.codes],
+            [p.segment_high],
+            [p.stats],
+            [y20],
+            [fmt],
+            [n],
+            k,
+            1,
+            4,
+            workspace,
+            counters,
+            None,
+        )
+
+    run20()
+    graph20 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph20):
+        run20()
+    for _ in range(3):
+        x20.normal_()
+        graph20.replay()
+        got = y20.clone()
+        run20()
+        torch.testing.assert_close(got, y20, rtol=0, atol=0)

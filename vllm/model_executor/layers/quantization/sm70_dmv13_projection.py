@@ -181,4 +181,89 @@ def attach(layer, extra, attr: str) -> bool:
         return False
     _PROJECTIONS[projection.name] = projection
     setattr(layer, attr, projection)
+    _register_banks(layer, attr, projection)
     return True
+
+
+def _register_banks(layer, attr, projection):
+    """Expose backing storage to normal model accounting without copying it."""
+    if not isinstance(layer, torch.nn.Module):
+        return
+    for family in ("codes", "high", "scale"):
+        for index, tensor in enumerate(getattr(projection, family)):
+            layer.register_buffer(f"_{attr}_{family}_{index}", tensor, persistent=False)
+    for family in ("workspace", "counters", "extra"):
+        layer.register_buffer(
+            f"_{attr}_{family}", getattr(projection, family), persistent=False
+        )
+
+
+def share_prepared_banks(layer):
+    """Share resident segment planes with the fused side projection.
+
+    Both readers use the same row and bit-plane layout. LUT4's fused reader
+    uses compact half scales; only that small coefficient stream is separate.
+    No weight is reconstructed or requantized here.
+    """
+    prepared = getattr(layer, "gguf_tm_projections", None)
+    if prepared is None:
+        return 0
+    projections = [
+        (attr, value)
+        for attr, value in vars(layer).items()
+        if isinstance(value, Dmv13Projection) and value.ready
+    ]
+    reused = 0
+    for attr, projection in projections:
+        banks = []
+        for p in prepared:
+            if not hasattr(p, "segment_format") or p.input_layout_restored:
+                break
+            k, n = p.kernel.config.partition_weight_shape
+            if k != projection.k or p.output_padding:
+                break
+            groups = (k + 127) // 128
+            strides = (
+                groups * 2048 * (2 if p.segment_format == dense.Q8 else 1),
+                groups * 512 * (2 if p.segment_format == dense.Q6K else 1)
+                if p.segment_format in (dense.Q5K, dense.Q6K)
+                else 0,
+                groups * 512,
+            )
+            tile = 0
+            for width in p.source_output_sizes:
+                if width % 32:
+                    break
+                end = tile + width // 32
+                planes = [
+                    tensor[tile * stride : end * stride]
+                    for tensor, stride in zip(
+                        (p.codes, p.segment_high, p.stats), strides
+                    )
+                ]
+                banks.append((width, p.segment_format, planes))
+                tile = end
+            if tile * 32 != n:
+                break
+        else:
+            if [(b[0], b[1]) for b in banks] != list(
+                zip(projection.widths, projection.formats)
+            ):
+                continue
+            for family, index in (("codes", 0), ("high", 1), ("scale", 2)):
+                values = []
+                for _, fmt, planes in banks:
+                    tensor = planes[index].detach()
+                    if family == "scale" and fmt == dense.LUT4:
+                        tensor = (
+                            tensor.view(torch.int16)
+                            .reshape(-1, 4, 2)[:, :, 0]
+                            .contiguous()
+                            .view(torch.uint8)
+                            .reshape(-1)
+                        )
+                    values.append(tensor)
+                setattr(projection, family, values)
+            _register_banks(layer, attr, projection)
+            reused += 1
+    return reused
