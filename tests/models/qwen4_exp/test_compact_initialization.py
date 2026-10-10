@@ -103,6 +103,8 @@ def test_gdn_norm_follows_parameter_device(monkeypatch, default_vllm_config, dev
         monkeypatch.setattr(source, "get_tensor_model_parallel_rank", lambda: 0)
         monkeypatch.setattr(source, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(module.current_platform, "current_device", forbidden)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", forbidden)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", forbidden)
     monkeypatch.setattr(
         module, "_resolve_gdn_prefill_backend", lambda _: ("triton", "triton")
     )

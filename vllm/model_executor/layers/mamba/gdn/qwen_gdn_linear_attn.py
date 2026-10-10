@@ -1441,7 +1441,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         self.enable_flashqla_decode = self.gdn_policy.flashqla_decode
         self.flashqla_decode_admission = FlashQlaDecodeAdmission.bind(
-            self.gdn_heads, self.enable_flashqla_decode
+            self.gdn_heads, self.enable_flashqla_decode, device=self.dt_bias.device
         )
         self._flashqla_native_policy = (
             flashqla_prefill_provider.bind_flashqla_native_policy(
