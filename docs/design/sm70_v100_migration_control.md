@@ -2,19 +2,6 @@
 
 Date: 2026-05-30
 
-## QSA comparison with sglang-sxm2, 2026-10-11
-
-The [operator comparison](../benchmarks/qsa_sxm2_20261011/README.md) pins
-1Cat `c39f53abae` and sglang-sxm2 `73abfe1dd7` on one V100-SXM2-16GB,
-CUDA 12.8 and Torch 2.9.1. Identical FP16 logical inputs cover 8K/32K/128K,
-one/four requests and one/five query rows. With each implementation's page
-layout, SGLang wins most cases; 1Cat's native device-history chain wins the
-8K single-request M5 case. At 32K, four-request M5 is 341 versus 179 us.
-Common four-key pages severely penalize 1Cat's generic scorer and must not
-be quoted as its production-layout result. Prioritize multi-request scoring
-and exact long-context top-k; no model throughput, FP8 or prefill conclusion
-is established. Runtime algorithms and defaults are unchanged.
-
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:
