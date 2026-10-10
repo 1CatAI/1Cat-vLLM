@@ -10,7 +10,9 @@ independently of authoritative host attention history.
 
 - Gate/up use the existing SM70 Q8_1/dp4a lattice decoder for M=1..20, including
   exact M=5 verification and graph-padded M=8.
-  IQ4_NL uses the same four-value lookup as TurboMind. Down/unroute reads original
+  IQ4_NL and IQ4_XS use the same four-value lookup as TurboMind. IQ4_XS
+  reconstructs each group coefficient with the canonical FP16 rounding boundary.
+  Down/unroute reads original
   IQ4_NL or Q2_0 blocks, including TP boundaries inside Q2_0's 64-element blocks.
   FP32 dots and routing accumulation retain the existing FP16 epilogue boundary.
 - Large batches keep the native per-expert dequantization and BLAS fallback.
@@ -43,6 +45,14 @@ The profile supports one complete 256K request. It does not advertise four
 simultaneous complete 256K requests. Reported concurrency is the minimum of the
 state and history capacities.
 
+An allocator-only check using the TP4/MTP4 geometry, 36 GDN layers, 13 target/draft
+QSA owners, and the replicated PLE state produces 357 logical blocks at 256K.
+The device pools need about 532 MiB per rank, including about 301 MiB of recurrent
+state. Authoritative FP16 history pools need about 14.45 GiB across the four
+workers. These are calculated allocation sizes, not measured process peaks;
+hot caches, staging, weights, graph pools and non-Torch allocations are separate.
+Startup requires at least 21 GiB of available host memory before loading.
+
 ## Disk PLE with bounded caching
 
 `ple_disk_only` retains the mapped compressed table and a sentinel row per rank.
@@ -61,7 +71,7 @@ state lifetime, exact HC shard recovery, compact expert block boundaries, and
 packed-row official dequantization. These checks do not establish GPU speed or
 full-model correctness.
 
-GPU tests cover IQ4_NL gate/up, raw down across all TP4 ranks, FP16 and Q8_1
+GPU test cases cover IQ4_NL/IQ4_XS gate/up, raw down across all TP4 ranks, FP16 and Q8_1
 intermediates, M=5/M=20, and changed inputs during CUDA graph replay. Run them
 before admitting the constrained-memory route. Then record C1/C4, target outputs,
 accepted tokens per round, long prefill, repeated-prefix hits, and tool calls.

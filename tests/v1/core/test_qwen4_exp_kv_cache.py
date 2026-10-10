@@ -262,6 +262,72 @@ def test_host_state_pool_rejects_insufficient_active_capacity():
         _bounded_host_cache_config(state_blocks=2)
 
 
+def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget():
+    config = _vllm_config()
+    config.model_config = SimpleNamespace(
+        max_model_len=262144,
+        get_num_kv_heads=lambda _: 1,
+        get_total_num_hidden_layers=lambda: 49,
+    )
+    config.scheduler_config.max_num_seqs = 1
+    config.scheduler_config.max_num_batched_tokens = 512
+    config.cache_config.mamba_cache_mode = "align"
+    config.cache_config.enable_prefix_caching = True
+    config.kernel_config = SimpleNamespace(qsa_host_kv_state_blocks=32)
+    specs = {}
+    for layer in range(49):
+        prefix = f"model.layers.{layer}" if layer < 48 else "mtp.layers.48"
+        if layer % 4 == 3 or layer == 48:
+            name = prefix + ".self_attn"
+            specs[name] = FullAttentionSpec(
+                block_size=816,
+                num_kv_heads=1,
+                head_size=256,
+                head_size_v=256,
+                dtype=torch.float16,
+                host_backed=True,
+            )
+            specs[name + ".compressed"] = MLAAttentionSpec(
+                block_size=816,
+                num_kv_heads=1,
+                head_size=128,
+                dtype=torch.float16,
+                compress_ratio=4,
+            )
+            specs[name + ".compressor_state"] = CircularBufferSpec(
+                block_size=8,
+                num_kv_heads=1,
+                head_size=128,
+                head_size_v=0,
+                dtype=torch.float16,
+            )
+        else:
+            specs[prefix + ".linear_attn"] = MambaSpec(
+                block_size=816,
+                shapes=((2560, 7), (12, 128, 128)),
+                dtypes=(torch.float16, torch.float32),
+                mamba_cache_mode="align",
+                num_speculative_blocks=4,
+            )
+    specs["model.layers.2.ple"] = MambaSpec(
+        block_size=816,
+        shapes=((10240, 13),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=4,
+        tp_replicated=True,
+    )
+    groups = get_kv_cache_groups(config, specs)
+    # Includes target/draft history, compressor and speculative recurrent state.
+    cache = get_kv_cache_config_from_groups(config, groups, 560 * 1024**2)
+    device_bytes = sum(t.size for t in cache.kv_cache_tensors if not t.host_backed)
+    host_bytes = sum(t.size for t in cache.kv_cache_tensors if t.host_backed)
+    assert device_bytes <= 560 * 1024**2
+    assert 13 * 1024**3 <= host_bytes * 4 <= 15 * 1024**3
+    assert cache.device_state_blocks == 32
+    assert get_max_concurrency_for_kv_cache_config(config, cache) >= 1
+
+
 def test_partitioned_block_pool_keeps_prefix_lifetime_and_quota():
     init_none_hash(sha256)
     pool = BlockPool(12, True, 16, device_state_blocks=4, device_state_group_ids=(1, 2))

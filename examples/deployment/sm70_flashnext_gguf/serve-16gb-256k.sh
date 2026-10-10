@@ -19,13 +19,13 @@ export VLLM_CACHE_ROOT="$CACHE_DIR/vllm" TRITON_CACHE_DIR="$CACHE_DIR/triton"
 export TORCHINDUCTOR_CACHE_DIR="$CACHE_DIR/inductor"
 export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 
-# Host history alone is about 13 GiB for this geometry. Reserve another 6 GiB
+# Host history pools are about 14.5 GiB for this geometry. Reserve another 6 GiB
 # for workers, staging and the bounded CPU row cache before any GPU is touched.
 "$VLLM_PYTHON" - <<'PY'
 from pathlib import Path
 info = {line.split(':')[0]: int(line.split()[1]) * 1024
         for line in Path('/proc/meminfo').read_text().splitlines()}
-if info['MemAvailable'] < 19 * 1024**3:
+if info['MemAvailable'] < 21 * 1024**3:
     raise SystemExit('Not enough available host memory for 256K FP16 history and workers')
 PY
 
