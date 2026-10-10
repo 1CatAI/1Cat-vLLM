@@ -336,6 +336,7 @@ class Lane {
     // The writer releases the round after its count, and each later count.
     const int64_t round = __atomic_load_n(&ring[0], __ATOMIC_ACQUIRE);
     const int64_t valid = __atomic_load_n(&ring[1], __ATOMIC_ACQUIRE);
+    if (round == 0) return false;  // nothing published yet
     if (round != ring_round_) {
       ring_round_ = round;
       ring_done_ = 0;
