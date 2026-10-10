@@ -12,7 +12,7 @@
 #   PORT (8000)  MAX_MODEL_LEN (32768)  MAX_NUM_SEQS (4)  PREFILL_CHUNK (2048)
 #   KV_PLACEMENT (host|device, default host)  CACHE_DIR (~/.cache/onecat-flashnext)
 #   GPUS (0,1,2,3)  LOCK (1: follow the shared /tmp GPU lock protocol)
-#   HOT_TOKENS (MAX_MODEL_LEN)  HCX_LOCAL_SCHEDULE (0; 1 needs a build with KernelConfig.sm70_hcx_local_schedule)
+#   HOT_TOKENS (MAX_MODEL_LEN)  GPU_UTIL (0.92)  HCX_LOCAL_SCHEDULE (0; 1 needs a build with KernelConfig.sm70_hcx_local_schedule)
 set -euo pipefail
 
 : "${MODEL:?set MODEL to the first GGUF shard}"
@@ -28,6 +28,8 @@ LOCK=${LOCK:-1}
 HCX_LOCAL_SCHEDULE=${HCX_LOCAL_SCHEDULE:-0}
 # Device hot cache per QSA layer; keep >= the longest prompt (1 KiB/token/layer).
 HOT_TOKENS=${HOT_TOKENS:-$MAX_MODEL_LEN}
+# The hot cache is allocated after the KV budget is profiled; keep headroom.
+GPU_UTIL=${GPU_UTIL:-0.92}
 LOCAL_SCHEDULE_FIELD=""
 if [ "$HCX_LOCAL_SCHEDULE" = 1 ]; then
   LOCAL_SCHEDULE_FIELD='"sm70_hcx_local_schedule": true,'
@@ -84,7 +86,7 @@ cmd=(vllm serve "$MODEL"
   --max-model-len "$MAX_MODEL_LEN"
   --max-num-seqs "$MAX_NUM_SEQS"
   --max-num-batched-tokens "$PREFILL_CHUNK"
-  --gpu-memory-utilization 0.95
+  --gpu-memory-utilization "$GPU_UTIL"
   --no-enable-prefix-caching
   --language-model-only
   --compilation-config '{"mode": 3, "cudagraph_mode": "FULL"}'
