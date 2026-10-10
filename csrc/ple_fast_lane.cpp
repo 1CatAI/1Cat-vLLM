@@ -23,6 +23,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -61,6 +62,8 @@ enum Stat : int64_t {
   kHashNs,
   kLookupNs,
   kResetWaitNs,
+  kPrefetchPositions,
+  kPrefetchPages,
   kStats
 };
 
@@ -134,6 +137,14 @@ class RowCache {
     return nullptr;
   }
 
+  bool contains(int64_t row) const {
+    int64_t base = set_of(row) * kWays;
+    for (int64_t way = 0; way < kWays; ++way) {
+      if (tags_[base + way] == row) return true;
+    }
+    return false;
+  }
+
   void insert(int64_t row, const uint8_t* bytes) {
     int64_t base = set_of(row) * kWays;
     int64_t victim = base;
@@ -178,6 +189,10 @@ struct LaneConfig {
   std::vector<int32_t*> flags;
   int64_t idle_spin_us;
   bool clamp_tokens;
+  // Optional draft ring: header[8] | context+bonus [reqs, 3] | drafts [reqs, K]
+  const int64_t* ring = nullptr;
+  int64_t ring_reqs = 0;
+  int64_t ring_spec = 0;
 };
 
 class Lane {
@@ -220,6 +235,10 @@ class Lane {
           stats_[kError].store(error);
           return;  // The owner surfaces the error; never publish bad rows.
         }
+        idle_since = now_ns();
+        continue;
+      }
+      if (config_.ring != nullptr && prefetch_drafts()) {
         idle_since = now_ns();
         continue;
       }
@@ -283,6 +302,85 @@ class Lane {
     return kOk;
   }
 
+  // 16 rows of one window position: token after (previous2, previous).
+  void hash_position(uint64_t current, int64_t previous_value,
+                     int64_t previous2_value, int64_t* out) const {
+    const int64_t eos = config_.eos;
+    const uint64_t* m = config_.multipliers;
+    uint64_t previous = static_cast<uint64_t>(previous_value);
+    uint64_t previous2 = static_cast<uint64_t>(
+        previous_value == eos ? eos : previous2_value);
+    uint64_t mixed2 = (current * m[0]) ^ (previous * m[1]);
+    uint64_t mixed3 = mixed2 ^ (previous2 * m[2]);
+    for (int64_t h = 0; h < 8; ++h) {
+      out[h] = python_mod(mixed2, config_.sizes[h]) + config_.offsets[h];
+    }
+    for (int64_t h = 8; h < kHeads; ++h) {
+      out[h] = python_mod(mixed3, config_.sizes[h]) + config_.offsets[h];
+    }
+  }
+
+  // Ask the kernel to read the table pages of newly drafted tokens. Only
+  // readahead is issued (never a blocking read), and only for rows that are
+  // neither cached here nor resident, so a request is never delayed by it.
+  bool prefetch_drafts() {
+    const int64_t* ring = config_.ring;
+    const int64_t valid = __atomic_load_n(&ring[1], __ATOMIC_ACQUIRE);
+    const int64_t round = ring[0];
+    if (round != ring_round_) {
+      ring_round_ = round;
+      ring_done_ = 0;
+    }
+    const int64_t limit = std::min<int64_t>(valid, config_.ring_spec + 1);
+    const int64_t num_reqs = ring[2];
+    if (limit <= ring_done_ || num_reqs <= 0 || num_reqs > config_.ring_reqs) {
+      return false;
+    }
+    const int64_t* context = ring + kHeader;
+    const int64_t* drafts = context + config_.ring_reqs * 3;
+    int64_t rows[kHeads];
+    int64_t pages = 0;
+#ifdef __linux__
+    static const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGE_SIZE));
+#endif
+    for (int64_t r = 0; r < num_reqs; ++r) {
+      // window: context0, context1, bonus, d1 .. dK
+      auto token = [&](int64_t index) -> int64_t {
+        return index < 3 ? context[r * 3 + index]
+                         : drafts[r * config_.ring_spec + index - 3];
+      };
+      for (int64_t p = ring_done_; p < limit; ++p) {
+        hash_position(static_cast<uint64_t>(token(p + 2)), token(p + 1),
+                      token(p), rows);
+        for (int64_t h = 0; h < kHeads; ++h) {
+          int64_t row = rows[h];
+          if (row < 0 || row >= config_.num_rows) continue;
+          if (cache_.enabled() && cache_.contains(row)) continue;
+#ifdef __linux__
+          uintptr_t address = reinterpret_cast<uintptr_t>(
+              config_.table + row * config_.row_bytes);
+          uintptr_t first = address / page * page;
+          uintptr_t last = (address + config_.row_bytes - 1) / page * page;
+          for (uintptr_t q = first; q <= last; q += page) {
+            unsigned char resident = 0;
+            if (mincore(reinterpret_cast<void*>(q), page, &resident) == 0 &&
+                !(resident & 1)) {
+              madvise(reinterpret_cast<void*>(q), page, MADV_WILLNEED);
+              ++pages;
+            }
+          }
+#endif
+        }
+      }
+    }
+    // A newer round may have replaced the window while it was read; the
+    // advice is then merely wasted, never wrong.
+    stats_[kPrefetchPositions].fetch_add((limit - ring_done_) * num_reqs);
+    stats_[kPrefetchPages].fetch_add(pages);
+    ring_done_ = limit;
+    return true;
+  }
+
   // Port of Qwen4ExpNGramEmbedding._compute_ngram_ids_cpu_small.
   void hash(const int64_t* tokens, const int64_t* starts, const int64_t* context,
             int64_t num_tokens, int64_t num_reqs) {
@@ -305,25 +403,13 @@ class Lane {
       }
       return eos;
     };
-    const uint64_t* m = config_.multipliers;
     int64_t req = 0;
     for (int64_t pos = 0; pos < num_tokens; ++pos) {
       while (req + 1 < num_reqs && pos >= starts[req + 1]) ++req;
       int64_t col = std::min(std::max<int64_t>(pos - starts[req], 0), max_seq - 1);
-      uint64_t current = static_cast<uint64_t>(token_at(req, col + 2));
-      int64_t previous_value = token_at(req, col + 1);
-      uint64_t previous = static_cast<uint64_t>(previous_value);
-      uint64_t previous2 = static_cast<uint64_t>(
-          previous_value == eos ? eos : token_at(req, col));
-      uint64_t mixed2 = (current * m[0]) ^ (previous * m[1]);
-      uint64_t mixed3 = mixed2 ^ (previous2 * m[2]);
-      int64_t* out = rows_.data() + pos * kHeads;
-      for (int64_t h = 0; h < 8; ++h) {
-        out[h] = python_mod(mixed2, config_.sizes[h]) + config_.offsets[h];
-      }
-      for (int64_t h = 8; h < kHeads; ++h) {
-        out[h] = python_mod(mixed3, config_.sizes[h]) + config_.offsets[h];
-      }
+      hash_position(static_cast<uint64_t>(token_at(req, col + 2)),
+                    token_at(req, col + 1), token_at(req, col),
+                    rows_.data() + pos * kHeads);
     }
   }
 
@@ -378,6 +464,8 @@ class Lane {
   std::vector<int64_t> rows_;
   std::vector<int64_t> misses_;
   int64_t last_seq_ = 0;
+  int64_t ring_round_ = -1;
+  int64_t ring_done_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<int64_t> stats_[kStats];
   std::thread thread_;
@@ -397,7 +485,9 @@ int64_t ple_fast_lane_start(torch::Tensor request, int64_t max_reqs,
                             std::vector<int64_t> offsets, int64_t eos,
                             std::vector<int64_t> result_ptrs,
                             std::vector<int64_t> flag_ptrs, int64_t cache_bytes,
-                            int64_t idle_spin_us, bool clamp_tokens) {
+                            int64_t idle_spin_us, bool clamp_tokens,
+                            std::optional<torch::Tensor> draft_ring,
+                            int64_t ring_reqs, int64_t ring_spec) {
   TORCH_CHECK(request.device().is_cpu() && request.scalar_type() == at::kLong &&
                   request.is_contiguous(),
               "PLE fast lane request must be a contiguous CPU int64 tensor");
@@ -436,6 +526,16 @@ int64_t ple_fast_lane_start(torch::Tensor request, int64_t max_reqs,
   }
   config.idle_spin_us = std::max<int64_t>(idle_spin_us, 0);
   config.clamp_tokens = clamp_tokens;
+  if (draft_ring.has_value() && ring_reqs > 0 && ring_spec > 0) {
+    const torch::Tensor& ring = *draft_ring;
+    TORCH_CHECK(ring.device().is_cpu() && ring.scalar_type() == at::kLong &&
+                    ring.is_contiguous() &&
+                    ring.numel() >= kHeader + ring_reqs * (3 + ring_spec),
+                "PLE draft ring must be a large enough CPU int64 tensor");
+    config.ring = ring.data_ptr<int64_t>();
+    config.ring_reqs = ring_reqs;
+    config.ring_spec = ring_spec;
+  }
   std::lock_guard<std::mutex> guard(lanes_mutex);
   int64_t handle = next_lane++;
   lanes.emplace(handle,

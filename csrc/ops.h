@@ -962,7 +962,9 @@ int64_t ple_fast_lane_start(torch::Tensor request, int64_t max_reqs,
                             std::vector<int64_t> offsets, int64_t eos,
                             std::vector<int64_t> result_ptrs,
                             std::vector<int64_t> flag_ptrs, int64_t cache_bytes,
-                            int64_t idle_spin_us, bool clamp_tokens);
+                            int64_t idle_spin_us, bool clamp_tokens,
+                            std::optional<torch::Tensor> draft_ring,
+                            int64_t ring_reqs, int64_t ring_spec);
 torch::Tensor ple_fast_lane_stats(int64_t handle);
 void ple_fast_lane_stop(int64_t handle);
 

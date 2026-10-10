@@ -78,6 +78,9 @@ class Lane:
             cache_rows * 90,
             1000,
             clamp,
+            None,
+            0,
+            0,
         )
 
     def stats(self):
@@ -240,6 +243,9 @@ def test_gpu_published_requests_are_served_natively(monkeypatch):
         1 << 20,
         1000,
         True,
+        None,
+        0,
+        0,
     )
     input_ids = torch.zeros(MAX_TOKENS, dtype=torch.int32, device=device)
     starts = torch.zeros(MAX_REQS + 1, dtype=torch.int32, device=device)
@@ -268,3 +274,60 @@ def test_gpu_published_requests_are_served_natively(monkeypatch):
     finally:
         torch.ops._C.ple_fast_lane_stop(handle)
         slot.close()
+
+
+def test_native_lane_follows_the_draft_ring(tmp_path):
+    from vllm.v1.ple_offload.draft_prefetch import ring_shape
+
+    path = tmp_path / "table.bin"
+    table().tofile(path)
+    data = np.memmap(path, dtype=np.uint8, mode="r", shape=(TABLE_ROWS, 90))
+    ring = torch.zeros(ring_shape(MAX_REQS, 4), dtype=torch.long)
+    request = torch.zeros(request_shape(MAX_REQS, MAX_TOKENS), dtype=torch.long)
+    results = [torch.zeros((MAX_TOKENS, 1440), dtype=torch.uint8)]
+    flags = [torch.zeros(16, dtype=torch.int32)]
+    handle = torch.ops._C.ple_fast_lane_start(
+        request,
+        MAX_REQS,
+        MAX_TOKENS,
+        data.ctypes.data,
+        90,
+        TABLE_ROWS,
+        MULTIPLIERS,
+        SIZES,
+        OFFSETS,
+        EOS,
+        [r.data_ptr() for r in results],
+        [f.data_ptr() for f in flags],
+        0,
+        1000,
+        True,
+        ring,
+        MAX_REQS,
+        4,
+    )
+
+    def positions(count):
+        deadline = time.monotonic() + 5
+        while torch.ops._C.ple_fast_lane_stats(handle)[11].item() < count:
+            assert time.monotonic() < deadline
+            time.sleep(1e-3)
+
+    try:
+        context = ring[8 : 8 + MAX_REQS * 3].view(MAX_REQS, 3)
+        drafts = ring[8 + MAX_REQS * 3 :].view(MAX_REQS, 4)
+        context[:2] = torch.tensor([[1, 2, 3], [4, EOS, 6]])
+        ring[2], ring[0], ring[1] = 2, 1, 1  # two requests, bonus known
+        positions(2)
+        drafts[:2] = torch.tensor([[7, 8, 9, 10], [11, 12, 13, 14]])
+        ring[1] = 3  # bonus, d1, d2
+        positions(6)
+        ring[1] = 9  # beyond the window is clamped to bonus + 4 drafts
+        positions(12)
+        ring[0], ring[1] = 2, 1  # a new round restarts at the bonus
+        positions(14)
+        time.sleep(0.02)
+        stats = torch.ops._C.ple_fast_lane_stats(handle).tolist()
+        assert stats[11] == 14 and stats[6] == 0
+    finally:
+        torch.ops._C.ple_fast_lane_stop(handle)

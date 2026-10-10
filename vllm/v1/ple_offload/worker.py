@@ -872,8 +872,9 @@ class PleOffloadRunner:
             tp_size,
             sorted(self.layer_names),
         )
-        self._start_draft_prefetch(registrations)
         self._start_fast_lane(registrations)
+        if self._fast_lane is None:
+            self._start_draft_prefetch(registrations)
 
     def _fast_lane_reason(self, registrations: list[PleOffloadRegistration]):
         """Return why the native lane cannot serve, or None when it can."""
@@ -897,6 +898,15 @@ class PleOffloadRunner:
         if any(t.cpu_output_buffer is None for t in targets):
             return "requires_mapped_result_transport"
         return None
+
+    @staticmethod
+    def _native_draft_ring(registrations: list[PleOffloadRegistration]):
+        """Draft ring arguments for the native lane's page prefetch."""
+        rings = [r for r in registrations if r.draft_ring is not None]
+        if len(rings) != 1 or rings[0].draft_ring_geometry is None:
+            return None, 0, 0
+        max_reqs, num_spec = rings[0].draft_ring_geometry
+        return rings[0].draft_ring, max_reqs, num_spec
 
     def _start_fast_lane(self, registrations: list[PleOffloadRegistration]) -> None:
         """Serve requests from a native thread when every condition holds."""
@@ -931,6 +941,7 @@ class PleOffloadRunner:
             int(self.vllm_config.kernel_config.ple_row_cache_mib) << 20,
             50_000,
             self._clamp_input_ids,
+            *self._native_draft_ring(registrations),
         )
         self._fast_lane = FastLaneOwner(request, handle)
         logger.info(
