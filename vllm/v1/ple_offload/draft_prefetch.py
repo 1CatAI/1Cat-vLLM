@@ -67,9 +67,11 @@ def _publish_round_kernel(
         tl.store(context + lane * 3 + offset, token, mask=valid)
     tl.debug_barrier()
     tl.store(header + 2, num_reqs.to(tl.int64))
-    tl.store(header + 0, round_id.to(tl.int64))
-    # Release the window before the reader can observe this round's header.
-    tl.atomic_xchg(header + 1, 1, sem="release", scope="sys")
+    tl.store(header + 1, 1)
+    tl.debug_barrier()
+    # Release the window and its position count before the new round number:
+    # a reader that sees this round also sees its count, never a stale one.
+    tl.atomic_xchg(header + 0, round_id.to(tl.int64), sem="release", scope="sys")
 
 
 @triton.jit(do_not_specialize=["rows"])

@@ -317,14 +317,15 @@ def test_native_lane_follows_the_draft_ring(tmp_path):
         context = ring[8 : 8 + MAX_REQS * 3].view(MAX_REQS, 3)
         drafts = ring[8 + MAX_REQS * 3 :].view(MAX_REQS, 4)
         context[:2] = torch.tensor([[1, 2, 3], [4, EOS, 6]])
-        ring[2], ring[0], ring[1] = 2, 1, 1  # two requests, bonus known
+        # Writer order: requests and count first, the round number last.
+        ring[2], ring[1], ring[0] = 2, 1, 1  # two requests, bonus known
         positions(2)
         drafts[:2] = torch.tensor([[7, 8, 9, 10], [11, 12, 13, 14]])
         ring[1] = 3  # bonus, d1, d2
         positions(6)
         ring[1] = 9  # beyond the window is clamped to bonus + 4 drafts
         positions(10)
-        ring[0], ring[1] = 2, 1  # a new round restarts at the bonus
+        ring[1], ring[0] = 1, 2  # a new round restarts at the bonus
         positions(12)
         time.sleep(0.02)
         stats = torch.ops._C.ple_fast_lane_stats(handle).tolist()
