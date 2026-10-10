@@ -1143,10 +1143,34 @@ class VllmConfig:
         self.parallel_config.set_dcp_defaults()
 
         if self.kernel_config.resolve_attention_history(self):
+            policy = self.kernel_config
             logger.info_once(
-                "QSA host KV enabled: per-vector E4M3 history, bounded device "
-                "hot pages and FP16 staging; active recurrent states stay on GPU."
+                "QSA history KV enabled: target %s / draft %s history in %s, "
+                "%d device hot tokens per layer and FP16 staging; active "
+                "recurrent states stay on GPU.",
+                policy.qsa_host_kv_dtype,
+                policy.qsa_host_kv_draft_dtype,
+                "device memory"
+                if policy.qsa_host_kv_device_reference
+                else "pinned host memory",
+                policy.qsa_host_kv_hot_tokens,
             )
+            max_len = self.model_config.max_model_len if self.model_config else 0
+            if (
+                not policy.qsa_host_kv_device_reference
+                and policy.qsa_host_kv_hot_tokens < max_len
+            ):
+                # Measured with TP4: with 8192 hot tokens a
+                # 30K-token prefill took 101 s; with 32768 it took 17 s.
+                logger.warning_once(
+                    "qsa_host_kv_hot_tokens=%d is below max_model_len=%d: "
+                    "prompts longer than the hot cache re-stage host history "
+                    "per query tile and prefill becomes superlinear. Set "
+                    "kernel_config.qsa_host_kv_hot_tokens to at least the "
+                    "longest expected context (1 KiB/token/layer of GPU memory).",
+                    policy.qsa_host_kv_hot_tokens,
+                    max_len,
+                )
 
         from vllm.model_executor.models.config import (
             sm70_dflash2_nvfp4_qualified,
