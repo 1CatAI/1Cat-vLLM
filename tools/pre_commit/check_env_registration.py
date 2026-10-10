@@ -44,7 +44,7 @@ def native_reads(
         return re.sub(r"[^\n]", " ", token) if token.startswith(("//", "/*")) else token
 
     source = tokens.sub(mask_comments, content)
-    key_pattern = r"(?:VLLM_|TM_|FLASH_QLA_|PREFIX_)[A-Z0-9_]+"
+    key_pattern = r"(?:VLLM_|TM_|FLASH_QLA_|PREFIX_|SM70_MARLIN_)[A-Z0-9_]+"
     aliases = list(re.finditer(r'\b(\w+)\s*=\s*"(' + key_pattern + r')"', source))
     arrays = list(re.finditer(r"\b(\w+)\s*\[\s*\]\s*=\s*\{([^}]+)\}", source))
     calls = re.finditer(

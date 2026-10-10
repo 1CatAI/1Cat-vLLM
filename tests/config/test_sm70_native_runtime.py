@@ -96,3 +96,29 @@ def test_native_runtime_requires_both_binary_owners(monkeypatch):
     monkeypatch.setattr(torch.ops, "_moe_C", SimpleNamespace())
     with pytest.raises(RuntimeError, match="runtime ABI 1"):
         NativeRuntimeOwner()
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_native_owner_probes_shared_tls_without_assuming_loader_behavior(
+    monkeypatch, fake_handles, shared
+):
+    monkeypatch.setattr(
+        torch.ops._C,
+        "sm70_native_runtime_context_id",
+        lambda: fake_handles[0].depth,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops._moe_C,
+        "sm70_native_runtime_context_id",
+        lambda: fake_handles[0].depth if shared else 0,
+        raising=False,
+    )
+    owner = NativeRuntimeOwner()
+    assert len(owner.handles) == (1 if shared else 2)
+    assert fake_handles[1].closed == shared
+    assert all(handle.depth == 0 for handle in fake_handles)
+    with owner.activate():
+        assert all(handle.depth == 1 for handle in owner.handles)
+    owner.close()
+    assert all(handle.closed and handle.depth == 0 for handle in fake_handles)

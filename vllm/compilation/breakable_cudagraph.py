@@ -36,6 +36,7 @@ import vllm.envs as envs
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.config.execution_policy import graph_policy
+from vllm.diagnostics import bind_event_tracer
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import (
     BatchDescriptor,
@@ -45,7 +46,6 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
-from vllm.sm70_decode_trace import sm70_trace_call
 from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 
 logger = init_logger(__name__)
@@ -280,6 +280,7 @@ class BreakableCUDAGraphWrapper:
         # BatchDescriptor which already encodes batch shape / uniformity.
         self.runnable = runnable
         self.vllm_config = vllm_config
+        self._trace_call = bind_event_tracer(vllm_config).call
         self.compilation_config = vllm_config.compilation_config
         self.graph_pool = current_platform.get_global_graph_pool()
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
@@ -420,10 +421,10 @@ class BreakableCUDAGraphWrapper:
             )
         # Sync the offloader's copy stream before replay so any external
         # dependencies from pre-capture prefetches are satisfied.
-        sm70_trace_call(
+        self._trace_call(
             "breakable_cudagraph.sync_prev_onload",
             get_offloader().sync_prev_onload,
         )
         assert entry.capture is not None
-        sm70_trace_call("breakable_cudagraph.replay", entry.capture.replay)
+        self._trace_call("breakable_cudagraph.replay", entry.capture.replay)
         return entry.output

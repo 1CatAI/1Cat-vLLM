@@ -45,5 +45,10 @@ void register_native_runtime(Library& library) {
       .def("policy_count", &NativeRuntime<Domain>::policy_count);
   library.def("sm70_native_runtime_abi() -> int",
               []() -> int64_t { return 1; });
+  // Probe actual loader behavior instead of assuming inline TLS is either
+  // shared or private between the two normal extension libraries.
+  library.def("sm70_native_runtime_context_id() -> int", []() -> int64_t {
+    return active_runtime ? static_cast<int64_t>(active_runtime->id) : 0;
+  });
 }
 }  // namespace vllm::sm70

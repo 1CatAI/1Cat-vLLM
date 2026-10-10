@@ -29,6 +29,10 @@ def engine(family, **overrides):
     )
     for field, value in overrides.items():
         setattr(policy, field, value)
+    if family == "f16":
+        # Compare the same deterministic selector, not independent autotuning
+        # winners with different rounding (observed in the legacy baseline).
+        policy.f16_dense_tune_max_m = 0
     policy.resolve(family)
     with set_current_vllm_config(cfg):
         binding = NativeBindings(policy.values)

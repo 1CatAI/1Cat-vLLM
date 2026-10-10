@@ -871,9 +871,13 @@ class KernelConfig:
                 native_verify=self.sm70_gdn_verify,
             )
 
+    sm70_marlin: Sm70NativeConfig = Field(default_factory=Sm70NativeConfig)
+    """B's native policy binding for the selected SM70 Marlin provider."""
+
     def capture_provider_inputs(self) -> None:
         """Freeze worker inputs without activating unused formats or parsing errors."""
         self.gdn.schedule.resolve()
+        self.sm70_marlin.capture_inputs()
         for family in ("awq", "fp8", "nvfp4"):
             policy = getattr(self, "sm70_" + family)
             policy.capture_inputs()
@@ -898,6 +902,7 @@ class KernelConfig:
         ignored_factors = {
             "enable_flashinfer_autotune",
             "gdn",  # Hash only initialized computation policy below.
+            "sm70_marlin",  # Hash only when the provider is prepared.
             "sm70_gdn_verify",  # Compatibility input is represented by gdn policy.
             "sm70_runtime",  # Warmup does not alter compiled model computation.
             "ir_op_priority",  # handled separately below
@@ -980,6 +985,8 @@ class KernelConfig:
                 factors[name] = (type_name, tuple(sorted(entries.items())))
         if self.sm70_mxfp4.values:
             factors["sm70_mxfp4"] = self.sm70_mxfp4.hash_options()
+        if self.sm70_marlin.values:
+            factors["sm70_marlin"] = self.sm70_marlin.hash_options()
         factors["ir_op_priority"] = self.ir_op_priority.compute_hash()
         return hash_factors(factors)
 
