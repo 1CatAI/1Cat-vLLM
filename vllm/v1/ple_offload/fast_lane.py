@@ -39,6 +39,9 @@ _STAT_NAMES = (
     "reset_wait_ns",
     "prefetch_positions",
     "prefetch_pages",
+    "cold_pages",
+    "window_checked",
+    "window_matched",
 )
 _ERRORS = {1: "malformed request", 2: "nonfinite rows", 3: "FP16 overflow"}
 
@@ -196,7 +199,7 @@ class FastLaneOwner:
         logger.info(
             "PLE fast lane: %d requests, mean %.1f us (hash %.1f, reset wait "
             "%.1f, rows %.1f), max %.1f us, row hit %.1f%%, prefetched %d "
-            "positions / %d pages",
+            "positions / %d pages, cold pages/request %.1f, window match %d/%d",
             delta["requests"],
             delta["total_ns"] / requests / 1e3,
             delta["hash_ns"] / requests / 1e3,
@@ -206,6 +209,9 @@ class FastLaneOwner:
             100 * delta["hits"] / rows,
             delta["prefetch_positions"],
             delta["prefetch_pages"],
+            delta["cold_pages"] / requests,
+            delta["window_matched"],
+            delta["window_checked"],
         )
 
     def close(self) -> None:

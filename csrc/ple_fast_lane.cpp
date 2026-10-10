@@ -64,6 +64,9 @@ enum Stat : int64_t {
   kResetWaitNs,
   kPrefetchPositions,
   kPrefetchPages,
+  kColdPages,
+  kWindowChecked,
+  kWindowMatched,
   kStats
 };
 
@@ -274,6 +277,7 @@ class Lane {
     const int64_t* context = starts + config_.max_reqs + 1;
     const int64_t* tokens = context + config_.max_reqs * 2;
     hash(tokens, starts, context, num_tokens, num_reqs);
+    if (config_.ring != nullptr) check_window(tokens, starts, context, num_reqs);
     const int64_t hashed = now_ns();
 
     // The consumers must have released the previous result.
@@ -418,6 +422,28 @@ class Lane {
     }
   }
 
+  // Diagnostics: whether a verify request equals the last published window
+  // (context, bonus, drafts), i.e. whether prefetch named the right rows.
+  void check_window(const int64_t* tokens, const int64_t* starts,
+                    const int64_t* context, int64_t num_reqs) {
+    const int64_t* ring = config_.ring;
+    if (ring[2] != num_reqs) return;
+    const int64_t window = config_.ring_spec + 1;
+    const int64_t* ring_context = ring + kHeader;
+    const int64_t* drafts = ring_context + config_.ring_reqs * 3;
+    for (int64_t r = 0; r < num_reqs; ++r) {
+      if (starts[r + 1] - starts[r] != window) continue;
+      stats_[kWindowChecked].fetch_add(1);
+      bool same = ring_context[r * 3] == context[r * 2] &&
+                  ring_context[r * 3 + 1] == context[r * 2 + 1] &&
+                  ring_context[r * 3 + 2] == tokens[starts[r]];
+      for (int64_t k = 1; same && k < window; ++k) {
+        same = drafts[r * config_.ring_spec + k - 1] == tokens[starts[r] + k];
+      }
+      if (same) stats_[kWindowMatched].fetch_add(1);
+    }
+  }
+
   int64_t gather(int64_t num_tokens) {
     const int64_t count = num_tokens * kHeads;
     const int64_t row_bytes = config_.row_bytes;
@@ -449,6 +475,7 @@ class Lane {
         if (mincore(reinterpret_cast<void*>(p), page, &resident) == 0 &&
             !(resident & 1)) {
           madvise(reinterpret_cast<void*>(p), page, MADV_WILLNEED);
+          stats_[kColdPages].fetch_add(1);
         }
       }
     }
