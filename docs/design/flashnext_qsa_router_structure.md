@@ -1,5 +1,77 @@
 # Flash-Next QSA and router execution structure on SM70
 
+## Exact long-context selection
+
+The existing SM70 selector uses the registered `_C.qsa_lexicographic_topk`
+operator in the normal `_C_stable_libtorch` build. For at most 32 rows and
+at least 32,768 live scores, it first narrows the cutoff bucket with a
+monotone half-precision key, then resolves the full FP32 score pivot. The
+scores themselves retain their original precision. Selected block indices
+are emitted in increasing order, preserving sparse-attention accumulation
+order and the lower-index tie rule.
+
+Candidate storage is bounded to 2,304 indices. Oversized buckets, NaNs and
+ambiguous cutoff ties use the original exact selector within the same
+kernel. Bounded probes across the row decline narrowing for visibly concentrated
+score tiles. An unrepresentative probe can forgo a speedup, but cannot discard
+candidates: selection still considers the complete live row. A concentrated
+region missed by the probes can pay the cost of one additional histogram scan.
+Live lengths remain device inputs: a graph with a large capacity
+can replay short or empty rows through the original short-row behavior.
+The existing scorer and block-to-token expansion provide the surrounding
+stages through their current interfaces.
+
+Temporary selection storage belongs to each CUDA block. There is no new
+persistent workspace, address cache, configuration flag or registration.
+The Python selection pipeline also avoids allocating its unused 1 MiB
+scratch when the exact native operator is selected; generic selection
+retains one scratch allocation across all row chunks.
+
+The focused regression commands are:
+
+```bash
+python -m pytest -q tests/models/qwen4_exp/test_qsa_ops.py
+python -m pytest -q tests/models/qwen4_exp/test_qsa_batch_topk.py
+```
+
+The first covers routing and scratch ownership on CPU. The second requires
+SM70 and checks independent stable-sort results, row strides, padding,
+empty input, boundary ties, FP16 overflow, dynamic graph lengths and separate
+captures with different buffer addresses. The native operator schema and
+its fake implementation remain compatible.
+
+### Operator validation
+
+Matched measurements used V100-SXM2-16GB, CUDA 12.8 and Torch 2.10.0+cu128,
+with the normal CMake `_C_stable_libtorch` component built before and after
+the change. The baseline is main `01d241fd90`. Two fresh processes alternated
+AB/BA on the same GPU with warm score buffers: 64 calls per timed graph,
+64 warmup replays per group, and four groups of 24 samples per implementation.
+Input preparation is outside the selection interval; neither implementation
+converts its input layout. These are selector timings, not full QSA or model
+throughput measurements.
+
+| Rows | Live scores per row | Before GPU time (us) | After GPU time (us) |
+| ---: | ---: | ---: | ---: |
+| 20 | 2,244 | 25.904 | 25.920 |
+| 20 | 8,364 | 39.088 | 39.088 |
+| 20 | 32,844 | 105.304 | 79.984 |
+| 20 | 65,688 | 191.376 | 108.288 |
+
+All 20 measured cases produced identical selected indices; 22 GPU regression
+cases passed against independent stable-sort oracles and graph checks. Uniform,
+narrow-band and sampled-NaN fallbacks stayed near baseline. Large-capacity
+buffers with 2,048 live scores added 0.23--0.42 us in the measured M=4/5 cases.
+Host eager submission for the two long M=20 cases was 43.41 to 45.56 us and
+46.66 to 47.00 us; host measurements were noisy and do not establish a gain.
+Both native operators allocated zero additional global tensor storage.
+The new kernel uses 37,056 bytes of block shared memory, 32 registers per
+thread and no local-memory spills in the SM70 build. Caller-owned inputs and
+outputs retain the same size and lifetime. The separate Python routing tests
+verify removal of the unused 1 MiB allocation and generic scratch reuse.
+
+## Historical workload
+
 The historical target service totals are 1.63 ms for QSA/indexing and 1.10 ms
 for routing. The corresponding 0.101 ms and 0.140 ms estimates account for
 ideal operand traffic at 900 GB/s, not complete operator latency. They exclude

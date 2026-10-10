@@ -1660,8 +1660,11 @@ def qsa_select_paged_tokens(
     blocks_buffer = torch.empty(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
     )
-    topk_workspace = torch.empty(
-        (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
+    exact_topk = _use_sm70_qsa_lexicographic_topk(block_topk)
+    topk_workspace = (
+        None
+        if exact_topk
+        else torch.empty((_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device)
     )
     for row_start in range(0, rows, rows_per_chunk):
         row_end = min(row_start + rows_per_chunk, rows)
@@ -1692,7 +1695,7 @@ def qsa_select_paged_tokens(
             and current_platform.has_device_capability(90)
             and not current_platform.is_device_capability_family(120)
         )
-        if _use_sm70_qsa_lexicographic_topk(block_topk):
+        if exact_topk:
             logger.info_once(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
