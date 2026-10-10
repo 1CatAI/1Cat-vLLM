@@ -485,14 +485,23 @@ struct Fp8PairReader {
   }
 };
 
-// M32 needs four independent 8-row accumulator tiles. Keeping all logical
-// split-K warps resident would require 64 KiB of static reduction storage for
-// split-16. Instead, half as many physical warps execute the original logical
-// warp ranges in two ordered phases. The compact first-half sum lets the final
-// reduction retain the exact p0 + ... + p(SplitK-1) order. Each projection uses
-// (SplitK / 2 + 1) * 4 KiB of reduction storage and reuses B over all 32 rows.
+// M32-class two-phase GEMM with a templated row-tile count: RowTiles=4 covers
+// M=17..32 (four independent 8-row accumulator tiles), RowTiles=2 covers
+// M=9..16. Keeping all logical split-K warps resident would require 64 KiB of
+// static reduction storage for split-16. Instead, half as many physical warps
+// execute the original logical warp ranges in two ordered phases. The compact
+// first-half sum lets the final reduction retain the exact
+// p0 + ... + p(SplitK-1) order. Each projection uses
+// (SplitK / 2 + 1) * RowTiles * 1 KiB of reduction storage and reuses B over
+// all RowTiles * 8 rows.
+// BlockScaled=true switches the scale operand from the channel layout
+// [N] (K-invariant, loaded once per column) to the block layout
+// [K/128, N_total/32] consumed in-loop every eight k16-groups, mirroring the
+// M<=8 packed kernel's reload pattern. false preserves the original channel
+// semantics bit-for-bit.
 template <int SplitK, bool PackedInput = false, bool Gated = false,
-          bool FullRows = false>
+          bool FullRows = false, bool BlockScaled = false, int RowTiles = 4,
+          int KUnroll = 0>
 __global__ __launch_bounds__(
     32 * (SplitK / 2) * (Gated ? 2 : 1),
     FullRows
@@ -504,15 +513,19 @@ __global__ __launch_bounds__(
                                                     int n, int k, int m) {
   static_assert(SplitK == 8 || SplitK == 12 || SplitK == 16,
                 "M32 two-phase QPN8 supports split-8, split-12 or split-16");
-  if constexpr (FullRows) m = 32;
+  static_assert(RowTiles == 2 || RowTiles == 4,
+                "M32 two-phase QPN8 supports two or four row tiles");
+  static_assert(KUnroll == 0 || KUnroll == 1 || KUnroll == 2 || KUnroll == 4,
+                "M32 two-phase QPN8 K-unroll must be 0 (auto), 1, 2 or 4");
+  if constexpr (FullRows) m = RowTiles * 8;
   constexpr int kPhysicalWarps = SplitK / 2;
-  constexpr int kRowTiles = 4;
+  constexpr int kRowTiles = RowTiles;
   constexpr int kOutputElements = kRowTiles * 256;
   // With four row tiles, unrolling four K groups exceeds 128 registers and
   // prevents a second CTA from residing on an SM70 SM. Packing the activation
   // makes the lower-unroll variant useful: reducing registers alone leaves
   // the scattered row loads as the limiting factor.
-  constexpr int kKUnroll = PackedInput ? 1 : 4;
+  constexpr int kKUnroll = KUnroll > 0 ? KUnroll : (PackedInput ? 1 : 4);
   constexpr int kProjections = Gated ? 2 : 1;
   __shared__ float reduction_storage[kProjections][kPhysicalWarps + 1]
                                     [kOutputElements];
@@ -528,9 +541,24 @@ __global__ __launch_bounds__(
   const int groups_per_warp = groups_k16 / SplitK;
   const uint4* code_ptr = reinterpret_cast<const uint4*>(codes) +
                           static_cast<size_t>(tile) * groups_k16 * 32 + lane;
-  const half scale =
-      __ldg(channel_scales + tile * 32 + qpn8_col_from_lane(lane));
-  const half2 scale2 = __halves2half2(scale, scale);
+  // Block scales reuse the [K/128, N_total/32] layout of the M<=8 packed
+  // kernel: one half per (scale_group, tile) pair, broadcast into a half2 for
+  // the weight dequant. With Gated, both projections' codes live in one tile
+  // stream, so the scale row stride spans both projections' tiles. Channel
+  // scales keep their per-column K-invariant semantics.
+  const int scale_row_tiles = (Gated ? 2 : 1) * (n >> 5);
+  const half* block_scale_ptr = channel_scales + tile;
+  half loaded_scale;
+  int loaded_scale_group = -1;
+  half next_scale = __float2half(0.0f);
+  half2 scale2;
+  if constexpr (BlockScaled) {
+    loaded_scale = __float2half(0.0f);
+  } else {
+    loaded_scale =
+        __ldg(channel_scales + tile * 32 + qpn8_col_from_lane(lane));
+  }
+  scale2 = __halves2half2(loaded_scale, loaded_scale);
 
 #pragma unroll
   for (int phase = 0; phase < 2; ++phase) {
@@ -552,9 +580,40 @@ __global__ __launch_bounds__(
     if constexpr (FullRows) {
       next_codes = __ldcs(code_ptr + static_cast<size_t>(group_begin) * 32);
     }
+    if constexpr (BlockScaled) {
+      loaded_scale_group = -1;
+      next_scale = __float2half(0.0f);
+      if constexpr (FullRows) {
+        // Mirror the next_codes rhythm: hold the current boundary's scale and
+        // prefetch the next one a scale group ahead.
+        next_scale =
+            __ldg(block_scale_ptr + static_cast<size_t>(group_begin >> 3) *
+                                           scale_row_tiles);
+      }
+    }
 #pragma unroll kKUnroll
     for (int group = group_begin; group < group_begin + groups_per_warp;
          ++group) {
+      if constexpr (BlockScaled) {
+        const int scale_group = group >> 3;
+        if (scale_group != loaded_scale_group) {
+          if constexpr (FullRows) {
+            loaded_scale = next_scale;
+            const int next_sg = scale_group + 1;
+            if ((next_sg << 3) < group_begin + groups_per_warp) {
+              next_scale = __ldg(block_scale_ptr +
+                                 static_cast<size_t>(next_sg) *
+                                     scale_row_tiles);
+            }
+          } else {
+            loaded_scale = __ldg(block_scale_ptr +
+                                 static_cast<size_t>(scale_group) *
+                                     scale_row_tiles);
+          }
+          loaded_scale_group = scale_group;
+          scale2 = __halves2half2(loaded_scale, loaded_scale);
+        }
+      }
       const uint4 packed =
           FullRows ? next_codes
                    : __ldcs(code_ptr + static_cast<size_t>(group) * 32);
@@ -640,16 +699,24 @@ __global__ __launch_bounds__(
     __syncthreads();
   }
 }
-template <int SplitK, bool PackedInput = false, bool Gated = false>
+template <int SplitK, bool PackedInput = false, bool Gated = false,
+          bool BlockScaled = false, int RowTiles = 4, int KUnroll = 0,
+          bool FullRows = false>
 void launch_fp8_qpn8_m32_twophase_sm70(const uint8_t* codes,
                                        const half* channel_scales,
                                        const half* input, half* output, int n,
                                        int k, int m, cudaStream_t stream) {
   constexpr int kPhysicalWarps = SplitK / 2;
-  auto kernel = fp8_qpn8_m32_twophase_sm70_kernel<SplitK, PackedInput, Gated>;
-  if constexpr (PackedInput) {
-    if (m == 32) {
-      kernel = fp8_qpn8_m32_twophase_sm70_kernel<SplitK, true, Gated, true>;
+  auto kernel = fp8_qpn8_m32_twophase_sm70_kernel<SplitK, PackedInput, Gated,
+                                                  FullRows, BlockScaled,
+                                                  RowTiles, KUnroll>;
+  if constexpr (!FullRows) {
+    // A full row-tile set drops the per-group row guard; the math per row is
+    // identical, so this only fires when the batch fills the tile set.
+    if (m == RowTiles * 8) {
+      kernel = fp8_qpn8_m32_twophase_sm70_kernel<SplitK, PackedInput, Gated,
+                                                 true, BlockScaled, RowTiles,
+                                                 KUnroll>;
     }
   }
   kernel<<<(n / 32), (32 * kPhysicalWarps * (Gated ? 2 : 1)), 0, stream>>>(
@@ -1997,6 +2064,12 @@ void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out, torch::Tensor input,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+void fp8_qpn8_block_native_sm70_out(torch::Tensor out, torch::Tensor input,
+                                    torch::Tensor codes,
+                                    torch::Tensor group_scales,
+                                    int64_t split_k, int64_t k_unroll,
+                                    bool packed_input, bool gated);
+
 void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
                                 torch::Tensor input, torch::Tensor codes,
                                 torch::Tensor group_scales, int64_t split_k,
@@ -2099,6 +2172,61 @@ void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
   // independent dot product over the same packed weight, so per-row
   // reduction order (and therefore numerics) match the single-stream M<=8
   // path exactly. Gated by env so the old route stays one flip away.
+  // SP-43 P2: opt-in block-native route for block-scaled weights at
+  // M = 17..32. The env var is re-read on every call (no caching), so a lane
+  // run can flip it per request without a restart. Every miss below falls
+  // through to the production BLOCKSCALED_CHUNKED route, which keeps env=0
+  // bit-identical to qpn8_chunked_589a.
+  if (m >= 17 && m <= 32 && !channel_scales && input.is_contiguous() &&
+      codes.is_contiguous() && group_scales.is_contiguous()) {
+    const char* bs_native_env =
+        std::getenv("VLLM_SM70_FP8_QPN8_BLOCKSCALED_NATIVE");
+    const bool bs_native_on = bs_native_env != nullptr &&
+                              bs_native_env[0] == '1' &&
+                              bs_native_env[1] == '\0';
+    const int64_t n = out.size(1);
+    const int64_t n_total = gated_silu ? 2 * n : n;
+    const bool block_scales = group_scales.dim() == 2 &&
+                              group_scales.size(0) == k / 128 &&
+                              group_scales.size(1) == n_total / 32 &&
+                              codes.numel() == n_total * k;
+    const bool native_split_ok =
+        gated_silu ? split_k == 8 : (split_k == 12 || split_k == 16);
+    const bool native_shape_ok =
+        split_k > 0 && block_scales && native_split_ok && n > 0 &&
+        n % 64 == 0 && k > 0 && k % 128 == 0 && (k / 16) % split_k == 0;
+    if (bs_native_on && native_shape_ok) {
+      // Pack [M, K] -> [K/16, M, 16]: a pure activation layout copy with
+      // unchanged numerics; the two-phase kernels then run the packed
+      // unroll-1 variant for every route (全路由固定 packed unroll-1).
+      // sweep32 的 u>1 标签系 op 未接通该参数（packed 分支硬编码 UROLL=1，
+      // k_unroll 仅进 TORCH_CHECK），实测全为 u1，sweep32 相应结论作废。
+      auto packed_input = torch::empty({k / 16, m, 16}, input.options());
+      const half* pack_src =
+          reinterpret_cast<const half*>(input.data_ptr<at::Half>());
+      half* pack_dst =
+          reinterpret_cast<half*>(packed_input.data_ptr<at::Half>());
+      const int64_t pack_pairs = m * k / 2;
+      const int pack_threads = 256;
+      vllm::sm70::pack_k16_input<<<static_cast<unsigned int>(
+                                      (pack_pairs + pack_threads - 1) /
+                                      pack_threads),
+                                  pack_threads, 0,
+                                  at::cuda::getCurrentCUDAStream()>>>(
+          pack_src, pack_dst, static_cast<int>(m), static_cast<int>(k));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      // Fixed packed unroll-1 for all routes: the op's packed branch
+      // hardcodes UROLL=1, so k_unroll is validation-only there and 1 is
+      // within the accepted set {1, 2, 4} (0 = auto also resolves to 1 for
+      // packed input).
+      constexpr int64_t k_unroll = 1;
+      fp8_qpn8_block_native_sm70_out(out, packed_input, codes, group_scales,
+                                     split_k, k_unroll,
+                                     /*packed_input=*/true, gated_silu);
+      return;
+    }
+  }
+
   if (m > 8 && m <= 32 && env_enabled("VLLM_SM70_FP8_QPN8_BLOCKSCALED_CHUNKED")) {
     static std::once_flag block_chunked_log_once;
     std::call_once(block_chunked_log_once, []() {
@@ -2201,6 +2329,162 @@ void fp8_qpn8_hc_dispatch_sm70_out(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// D2 (SP-43): native block-scale [K/128, N_total/32] consumption for M=9..32
+// on the M32-class two-phase kernel. M=17..32 dispatches RowTiles=4, M=9..16
+// RowTiles=2; anything else is rejected. The caller supplies QPN8-packed codes
+// and block scales (as produced by fp8_qpn8_prepare_sm70) and either a
+// scattered [M, K] or pre-packed [K/16, M, 16] fp16 activation.
+void fp8_qpn8_block_native_sm70_out(torch::Tensor out, torch::Tensor input,
+                                    torch::Tensor codes,
+                                    torch::Tensor group_scales,
+                                    int64_t split_k, int64_t k_unroll,
+                                    bool packed_input, bool gated) {
+  TORCH_CHECK(input.is_cuda() && out.is_cuda() && codes.is_cuda() &&
+                  group_scales.is_cuda(),
+              "fp8_qpn8_block_native_sm70_out: tensors must be CUDA tensors");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16,
+              "fp8_qpn8_block_native_sm70_out: input and output must be "
+              "float16");
+  TORCH_CHECK(codes.scalar_type() == torch::kUInt8,
+              "fp8_qpn8_block_native_sm70_out: codes must be uint8");
+  TORCH_CHECK(group_scales.scalar_type() == torch::kFloat16,
+              "fp8_qpn8_block_native_sm70_out: group scales must be float16");
+  TORCH_CHECK(out.dim() == 2 && group_scales.dim() == 2,
+              "fp8_qpn8_block_native_sm70_out: expected 2D out/scales");
+  TORCH_CHECK(input.dim() == (packed_input ? 3 : 2),
+              "fp8_qpn8_block_native_sm70_out: input must be [M, K] or packed "
+              "[K/16, M, 16]");
+  TORCH_CHECK(input.is_contiguous() && out.is_contiguous() &&
+                  codes.is_contiguous() && group_scales.is_contiguous(),
+              "fp8_qpn8_block_native_sm70_out: tensors must be contiguous");
+  TORCH_CHECK(input.get_device() == out.get_device() &&
+                  input.get_device() == codes.get_device() &&
+                  input.get_device() == group_scales.get_device(),
+              "fp8_qpn8_block_native_sm70_out: tensors must share one device");
+
+  const int64_t m = packed_input ? input.size(1) : input.size(0);
+  const int64_t k = packed_input ? input.size(0) * input.size(2)
+                                 : input.size(1);
+  const int64_t n = out.size(1);
+  const int64_t n_total = gated ? 2 * n : n;
+  TORCH_CHECK(m >= 9 && m <= 32,
+              "fp8_qpn8_block_native_sm70_out: M must be in [9, 32], got ", m);
+  TORCH_CHECK(out.size(0) == m,
+              "fp8_qpn8_block_native_sm70_out: output M mismatch");
+  TORCH_CHECK(n > 0 && n % 32 == 0,
+              "fp8_qpn8_block_native_sm70_out: N must be a positive multiple "
+              "of 32");
+  TORCH_CHECK(k > 0 && k % 128 == 0,
+              "fp8_qpn8_block_native_sm70_out: K must be a positive multiple "
+              "of 128");
+  TORCH_CHECK(
+      !packed_input || (input.size(0) == k / 16 && input.size(2) == 16),
+      "fp8_qpn8_block_native_sm70_out: packed input must be [K/16, M, 16]");
+  TORCH_CHECK(group_scales.size(0) == k / 128 &&
+                  group_scales.size(1) == n_total / 32,
+              "fp8_qpn8_block_native_sm70_out: expected block scales "
+              "[K/128, N_total/32]");
+  TORCH_CHECK(codes.numel() == n_total * k,
+              "fp8_qpn8_block_native_sm70_out: code size mismatch");
+  TORCH_CHECK(split_k == 8 || split_k == 12 || split_k == 16,
+              "fp8_qpn8_block_native_sm70_out: split_k must be 8, 12, or 16");
+  TORCH_CHECK((k / 16) % split_k == 0,
+              "fp8_qpn8_block_native_sm70_out: invalid split_k for K");
+  TORCH_CHECK(k_unroll == 0 || k_unroll == 1 || k_unroll == 2 || k_unroll == 4,
+              "fp8_qpn8_block_native_sm70_out: k_unroll must be 0 (auto), 1, "
+              "2, or 4");
+  const int unroll =
+      k_unroll == 0 ? (packed_input ? 1 : 4) : static_cast<int>(k_unroll);
+  TORCH_CHECK(packed_input || unroll != 1,
+              "fp8_qpn8_block_native_sm70_out: k_unroll 1 requires packed "
+              "input");
+  TORCH_CHECK(!gated || split_k == 8,
+              "fp8_qpn8_block_native_sm70_out: gated route is split-8");
+  TORCH_CHECK(!gated || packed_input,
+              "fp8_qpn8_block_native_sm70_out: gated route requires packed "
+              "input");
+  TORCH_CHECK(!gated || unroll == 1,
+              "fp8_qpn8_block_native_sm70_out: gated route uses the packed "
+              "unroll-1 variant");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const auto* code_ptr = codes.data_ptr<uint8_t>();
+  const auto* scale_ptr =
+      reinterpret_cast<const half*>(group_scales.data_ptr<at::Half>());
+  const auto* input_ptr =
+      reinterpret_cast<const half*>(input.data_ptr<at::Half>());
+  auto* output_ptr = reinterpret_cast<half*>(out.data_ptr<at::Half>());
+
+  const int row_tiles = m > 16 ? 4 : 2;
+#define VLLM_QPN8_BLOCK_NATIVE_CALL(SPLIT, UROLL, RT, PK, GT)                 \
+  launch_fp8_qpn8_m32_twophase_sm70<SPLIT, PK, GT, true, RT, UROLL>(          \
+      code_ptr, scale_ptr, input_ptr, output_ptr, static_cast<int>(n),        \
+      static_cast<int>(k), static_cast<int>(m), stream)
+
+  if (gated) {
+    // Frozen GDN gate/up route: split-8, packed, two projections per block.
+    if (row_tiles == 4) {
+      VLLM_QPN8_BLOCK_NATIVE_CALL(8, 1, 4, true, true);
+    } else {
+      VLLM_QPN8_BLOCK_NATIVE_CALL(8, 1, 2, true, true);
+    }
+  } else if (packed_input) {
+    TORCH_CHECK(split_k != 8,
+                "fp8_qpn8_block_native_sm70_out: non-gated packed route "
+                "supports split_k 12 or 16");
+    if (row_tiles == 4) {
+      if (split_k == 12) {
+        VLLM_QPN8_BLOCK_NATIVE_CALL(12, 1, 4, true, false);
+      } else {
+        VLLM_QPN8_BLOCK_NATIVE_CALL(16, 1, 4, true, false);
+      }
+    } else {
+      if (split_k == 12) {
+        VLLM_QPN8_BLOCK_NATIVE_CALL(12, 1, 2, true, false);
+      } else {
+        VLLM_QPN8_BLOCK_NATIVE_CALL(16, 1, 2, true, false);
+      }
+    }
+  } else {
+    TORCH_CHECK(split_k == 12 || split_k == 16,
+                "fp8_qpn8_block_native_sm70_out: non-gated scattered route "
+                "supports split_k 12 or 16");
+    if (row_tiles == 4) {
+      if (unroll == 2) {
+        if (split_k == 12) {
+          VLLM_QPN8_BLOCK_NATIVE_CALL(12, 2, 4, false, false);
+        } else {
+          VLLM_QPN8_BLOCK_NATIVE_CALL(16, 2, 4, false, false);
+        }
+      } else {
+        if (split_k == 12) {
+          VLLM_QPN8_BLOCK_NATIVE_CALL(12, 4, 4, false, false);
+        } else {
+          VLLM_QPN8_BLOCK_NATIVE_CALL(16, 4, 4, false, false);
+        }
+      }
+    } else {
+      if (unroll == 2) {
+        if (split_k == 12) {
+          VLLM_QPN8_BLOCK_NATIVE_CALL(12, 2, 2, false, false);
+        } else {
+          VLLM_QPN8_BLOCK_NATIVE_CALL(16, 2, 2, false, false);
+        }
+      } else {
+        if (split_k == 12) {
+          VLLM_QPN8_BLOCK_NATIVE_CALL(12, 4, 2, false, false);
+        } else {
+          VLLM_QPN8_BLOCK_NATIVE_CALL(16, 4, 2, false, false);
+        }
+      }
+    }
+  }
+#undef VLLM_QPN8_BLOCK_NATIVE_CALL
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 #ifdef VLLM_QPN8_STANDALONE
   // Lets the exact same source file be compiled as an operator-race harness
   // before paying for a complete vLLM rebuild. Production builds register the
@@ -2278,5 +2562,11 @@ TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor up_scales) -> ()");
   ops.impl("fp8_qpn8_hc_dispatch_sm70_out", torch::kCUDA,
            &fp8_qpn8_hc_dispatch_sm70_out);
+  ops.def(
+      "fp8_qpn8_block_native_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor codes, Tensor group_scales, int split_k, int k_unroll, "
+      "bool packed_input, bool gated) -> ()");
+  ops.impl("fp8_qpn8_block_native_sm70_out", torch::kCUDA,
+           &fp8_qpn8_block_native_sm70_out);
 }
 #endif
