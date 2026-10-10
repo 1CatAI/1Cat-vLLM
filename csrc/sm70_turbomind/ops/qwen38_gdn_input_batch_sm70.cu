@@ -191,6 +191,57 @@ __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
   }
 }
 
+// Same arithmetic as router_split_quad_kernel: warp 0 issues the identical
+// HMMA sequence and ordered split reduction. Only the weight source changes.
+// One warp alone streamed its 40 KiB tile with few loads in flight, so the
+// projection was latency-bound; four warps now stage the whole tile into
+// shared memory with all 16-byte loads in flight first.
+__global__ __launch_bounds__(128, 4) void router_staged_kernel(const half* x,
+                                                               const half* w,
+                                                               half* out,
+                                                               int m) {
+  constexpr int kTileVectors = 40 * 64 * 8 / 8;  // uint4 per 8-expert tile
+  __shared__ uint4 tile[kTileVectors];
+  const uint4* source =
+      reinterpret_cast<const uint4*>(w) + size_t(blockIdx.x) * kTileVectors;
+#pragma unroll 4
+  for (int i = threadIdx.x; i < kTileVectors; i += blockDim.x)
+    tile[i] = source[i];
+  __syncthreads();
+  if (threadIdx.x >= 32) return;
+  const int lane = threadIdx.x, split = (lane >> 2) & 3;
+  const int r = (lane & 3) + ((lane & 16) ? 4 : 0), row = blockIdx.y * 8 + r;
+  float acc[8] = {};
+#pragma unroll 8
+  for (int g = 0; g < 40; ++g) {
+    const uint4 lo = tile[g * 64 + split * 8 + r];
+    const uint4 hi = tile[g * 64 + split * 8 + r + 32];
+    uint4 a = {}, b = {};
+    if (row < m) {
+      const half* input = x + row * 2560 + split * 640 + g * 16;
+      a = *reinterpret_cast<const uint4*>(input);
+      b = *reinterpret_cast<const uint4*>(input + 8);
+    }
+    GDN_MMA(acc, a.x, a.y, lo.x, lo.y);
+    GDN_MMA(acc, a.z, a.w, lo.z, lo.w);
+    GDN_MMA(acc, b.x, b.y, hi.x, hi.y);
+    GDN_MMA(acc, b.z, b.w, hi.z, hi.w);
+  }
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const int rr =
+        blockIdx.y * 8 + ((i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1));
+    const int cc =
+        blockIdx.x * 8 + ((i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2));
+    float value = __shfl_sync(0xffffffff, acc[i], lane & ~12);
+#pragma unroll
+    for (int s = 1; s < 4; ++s)
+      value = __fadd_rn(
+          value, __shfl_sync(0xffffffff, acc[i], (lane & ~12) | (s << 2)));
+    if (split == 0 && rr < m) out[rr * 512 + cc] = __float2half_rn(value);
+  }
+}
+
 // The shared expert's original cuBLASLt projection uses eight K320
 // partitions. Keep the legacy FP16 partial schedule and support FP32
 // partials when reduced-precision reduction is disabled.
@@ -345,7 +396,9 @@ void gdn_input_batch(torch::Tensor qkv, torch::Tensor z, torch::Tensor b,
       reinterpret_cast<half*>(a.data_ptr()), m);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
+template <bool Staged>
+void router_batch_impl(torch::Tensor output, torch::Tensor x,
+                       torch::Tensor packed) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.size(0) >= 2 &&
                   x.size(0) <= 16 && x.size(1) == 2560,
               "SM70 batch router requires M2..16, K2560");
@@ -360,12 +413,27 @@ void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
   TORCH_CHECK(packed.sizes() == at::IntArrayRef({64, 40, 2, 4, 8, 8}) &&
                   output.sizes() == at::IntArrayRef({x.size(0), 512}),
               "Invalid batch router geometry");
-  router_split_quad_kernel<40><<<dim3(64, (x.size(0) + 7) / 8), 32, 0,
-                                 at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const half*>(x.data_ptr()),
-      reinterpret_cast<const half*>(packed.data_ptr()),
-      reinterpret_cast<half*>(output.data_ptr()), x.size(0));
+  if constexpr (Staged)
+    router_staged_kernel<<<dim3(64, (x.size(0) + 7) / 8), 128, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const half*>(x.data_ptr()),
+        reinterpret_cast<const half*>(packed.data_ptr()),
+        reinterpret_cast<half*>(output.data_ptr()), x.size(0));
+  else
+    router_split_quad_kernel<40><<<dim3(64, (x.size(0) + 7) / 8), 32, 0,
+                                   at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const half*>(x.data_ptr()),
+        reinterpret_cast<const half*>(packed.data_ptr()),
+        reinterpret_cast<half*>(output.data_ptr()), x.size(0));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
+  router_batch_impl<true>(output, x, packed);
+}
+// Byte-identity reference for the staged schedule.
+void router_batch_unstaged(torch::Tensor output, torch::Tensor x,
+                           torch::Tensor packed) {
+  router_batch_impl<false>(output, x, packed);
 }
 
 void shared_up_batch(torch::Tensor output, torch::Tensor partial,
@@ -460,6 +528,9 @@ TORCH_LIBRARY_FRAGMENT(_C, m) {
       "qwen38_router_batch_sm70_out(Tensor(a!) out, Tensor x, Tensor packed) "
       "-> ()");
   m.def(
+      "qwen38_router_batch_unstaged_sm70_out(Tensor(a!) out, Tensor x, "
+      "Tensor packed) -> ()");
+  m.def(
       "qwen38_dense_batch_sm70_out(Tensor(a!) out, Tensor x, Tensor weight) -> "
       "()");
   m.def(
@@ -471,6 +542,7 @@ TORCH_LIBRARY_IMPL(_C, CUDA, m) {
   m.impl("qwen38_shared_up_batch_fp32_sm70_out", &shared_up_batch_fp32);
   m.impl("qwen38_shared_gate_mul_sm70_out", &shared_gate_mul);
   m.impl("qwen38_router_batch_sm70_out", &router_batch);
+  m.impl("qwen38_router_batch_unstaged_sm70_out", &router_batch_unstaged);
   m.impl("qwen38_dense_batch_sm70_out", &dense_batch);
   m.impl("qwen38_gdn_input_batch_sm70_out", &gdn_input_batch);
 }
