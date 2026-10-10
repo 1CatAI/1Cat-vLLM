@@ -51,9 +51,10 @@ state and history capacities.
 
 An allocator-only check using the TP4/MTP4 geometry, 36 GDN layers, 13 target/draft
 QSA owners, and the replicated PLE state uses 29 state blocks, the minimum
-derived for one request with MTP4. The device pools reserve 502.1 MiB per rank,
-including 272.9 MiB of recurrent state. Larger concurrency requires a newly
-derived state quota. Authoritative FP16 history pools need about 14.33 GiB
+derived for one request with MTP4. With host-backed compressed indexer history, device pools reserve 272.9 MiB
+of recurrent state per rank. Keeping indexer history on device instead adds
+229.2 MiB per rank. Larger concurrency requires a newly
+derived state quota. Authoritative FP16 history pools need about 15.22 GiB
 across the four workers. These are calculated allocation sizes, not measured process peaks;
 hot caches, staging, weights, graph pools and non-Torch allocations are separate.
 Startup requires at least 21 GiB of available host memory before loading.
@@ -151,3 +152,52 @@ is released. Both the LL and larger-batch schedules consume the shard bank.
 A lifetime test proves the former CPU parameter can be collected and the
 sharded fallback reconstructs the correct matrix. Full-process host savings
 must still be measured after loading.
+
+### Exact MTP storage and prefill peak
+
+The 16 GiB profile enables `sm70_mtp_lossless_storage`. BF16-origin expert
+values are first converted by the existing FP16 loading rule. Normal values
+have three zero low mantissa bits; subnormal magnitudes and signed zero are
+retained in full. A checked 13-bit representation stores 32 values in 52 bytes.
+Every input value must be exactly representable, otherwise loading fails.
+This saves 225 MiB per rank (975 versus 1200 MiB for draft experts), with no
+change to weight values, sequential FP32 accumulation or FP16 epilogues.
+The complete projection/SiLU/down/reduction chain is bitwise equal to the
+FP16 reference for M1, M5 and M20; original FP16 kernel regressions also pass.
+An isolated four-rank real-checkpoint load reports 1,087,571,472 bytes
+of registered draft storage per rank, including 1,022,361,600 expert bytes.
+All four ranks compare the selected real experts bitwise with BF16-to-FP16
+checkpoint values; complete chains and changed-input graphs agree exactly.
+Same-process ABBA chain timings are below. M1/M5 controls use the existing
+FP16 native kernel, M4/M20 the tuned BM2 Triton fallback. Timings exclude
+attention, HC, target work and inter-rank output reduction.
+
+| M | FP16 control, ranks 0–3 | Lossless storage, ranks 0–3 |
+| --- | --- | --- |
+| 1 | 49–90 µs | 70–95 µs |
+| 4 | 285–322 µs | 165–169 µs |
+| 5 | 114–148 µs | 193–229 µs |
+| 20 | 1010–1118 µs | 595–671 µs |
+
+M1 increases by 5–21 µs per draft step. This is a measured capacity tradeoff,
+not an end-to-end speed claim. Whole-model acceptance remains pending.
+
+Original-bank expert reduction now accumulates routing-weighted outputs in
+FP32 without materializing FP32 copies of the full routed tensor. At M512,
+top-k 10 and hidden size 2560, extra allocated memory is 2.5 MiB versus
+100 MiB for the previous expression. This removes 97.5 MiB of profiling peak.
+
+`qsa_host_indexer_history` places compressed keys in mapped pinned memory,
+while recurrent state remains on device. GPU writers and score kernels use
+the same FP16 values and block layout. Tests at 8K and 256K compare all visible
+scores, changed inputs and graph replay bitwise against device storage. The
+main attention history still has the 8K GPU hot cache; compressed indexer
+history currently uses direct UVA. Its PCIe cost, especially at long context,
+is separate from the historical device-KV benchmark.
+
+The fourth full startup loaded target and FP16 draft successfully, then failed
+during M512 profiling before cache allocation or graph capture. Its target
+registered storage was 14,134,449,834 bytes per rank; the old reduction needed
+an additional 50 MiB allocation. This is capacity evidence, not serving or
+acceptance evidence. Startup-only CPU allocator reclamation releases unused
+checkpoint-conversion pages before allocating pinned histories.

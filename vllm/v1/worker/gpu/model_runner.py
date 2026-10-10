@@ -61,6 +61,7 @@ from vllm.utils.mem_utils import (
     DeviceMemoryProfiler,
     format_gib,
     loaded_cuda_model_storage,
+    reclaim_cpu_allocator_pages,
 )
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
@@ -409,6 +410,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 allocated_before = torch.accelerator.memory_allocated()
                 gc.collect()
                 torch.accelerator.empty_cache()
+                if self.vllm_config.kernel_config.qsa_host_kv_active:
+                    before, after = reclaim_cpu_allocator_pages()
+                    logger.info(
+                        "Checkpoint CPU allocator RSS: %d -> %d bytes", before, after
+                    )
                 logger.info(
                     "Target loading cleanup: allocated %d -> %d bytes, "
                     "reserved %d bytes",
@@ -421,6 +427,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     loaded_cuda_model_storage({"target": self.model}),
                 )
                 self.speculator.load_model(self.model)
+                if self.vllm_config.kernel_config.qsa_host_kv_active:
+                    before, after = reclaim_cpu_allocator_pages()
+                    logger.info(
+                        "Draft checkpoint CPU allocator RSS: %d -> %d bytes",
+                        before,
+                        after,
+                    )
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )

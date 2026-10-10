@@ -637,6 +637,13 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "hot_tokens_per_layer": cfg.kernel_config.qsa_host_kv_hot_tokens,
         "attention_staging_dtype": "float16",
         "recurrent_state_storage": "device",
+        "compressed_indexer_history_storage": (
+            "host"
+            if cfg.kernel_config.qsa_host_indexer_history
+            and cfg.kernel_config.qsa_host_kv_active
+            and not cfg.kernel_config.qsa_host_kv_device_reference
+            else "device"
+        ),
     }
     device_history_reason = None
     if not cfg.kernel_config.sm70_qsa_device_history:

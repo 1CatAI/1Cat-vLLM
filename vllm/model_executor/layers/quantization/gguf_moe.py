@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     MoEActivation,
 )
+from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import moe_fused_mul_sum
 from vllm.model_executor.layers.quantization.gguf_native import (
     NATIVE_TYPES,
     empty_guarded_weight,
@@ -104,6 +105,22 @@ register_policy_op(
     "bool quantized_hidden, bool bank_aware) -> Tensor",
     _original_expert_dp4a,
     _original_expert_dp4a_fake,
+)
+
+
+def _original_expert_reduce(down, probabilities):
+    return moe_fused_mul_sum(down, probabilities)
+
+
+def _original_expert_reduce_fake(down, probabilities):
+    return down.new_empty((down.shape[0], down.shape[2]))
+
+
+register_policy_op(
+    "gguf_original_expert_reduce",
+    "(Tensor down, Tensor probabilities) -> Tensor",
+    _original_expert_reduce,
+    _original_expert_reduce_fake,
 )
 
 
@@ -395,4 +412,10 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         down = down.view(tokens, top_k, self.hidden_size)
         if mask is not None:
             down = torch.where(mask[..., None], down, 0)
+        if down.is_cuda:
+            # Reuse the existing FP32 weighted reduction without materializing
+            # two [tokens, top_k, hidden] FP32 checkpoint-sized temporaries.
+            return torch.ops.vllm.gguf_original_expert_reduce(
+                down, topk_weights.contiguous()
+            )
         return (down.float() * topk_weights[..., None].float()).sum(1).to(x.dtype)

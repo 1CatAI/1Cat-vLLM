@@ -1833,7 +1833,7 @@ def _get_kv_cache_config_csa_linear(
             sum(layout.owner_page_size(i) for i in range(len(layout.main_kv_owners)))
             * state_blocks
         )
-        history_page = sum(layout.compressed_page_sizes)
+        history_page = layout.device_compressed_page_bytes
         num_blocks = state_blocks + history_blocks
         required = state_bytes + history_page * num_blocks
         if required > available_memory:
@@ -1899,6 +1899,7 @@ def _get_kv_cache_config_csa_linear(
         KVCacheTensor(
             size=layout.compressed_page_sizes[index] * num_blocks,
             shared_by=[compressed_name, layout.compressor_state_names[index]],
+            host_backed=compressed_name in layout.host_compressed_names,
         )
         for index, compressed_name in enumerate(layout.compressed_names)
     )
@@ -2211,13 +2212,23 @@ class _CSALinearTensorLayout:
     # Physical main-KV owners, as indices into ``main_kv_names``.
     main_kv_owners: list[list[int]]
     host_main_kv_names: tuple[str, ...] = ()
+    host_compressed_names: tuple[str, ...] = ()
     device_owner_page_sizes: list[int] | None = None
+
+    @property
+    def device_compressed_page_bytes(self) -> int:
+        return sum(
+            size
+            for name, size in zip(self.compressed_names, self.compressed_page_sizes)
+            if name not in self.host_compressed_names
+        )
 
     @property
     def bytes_per_block(self) -> int:
         pages = self.device_owner_page_sizes
-        return sum(pages if pages is not None else self.main_kv_page_sizes) + sum(
-            self.compressed_page_sizes
+        return (
+            sum(pages if pages is not None else self.main_kv_page_sizes)
+            + self.device_compressed_page_bytes
         )
 
     def owner_page_size(self, owner: int) -> int:
@@ -2592,6 +2603,11 @@ def _get_csa_linear_tensor_layout(
             compressed_sparse[name].page_size_bytes for name in compressed_names
         ],
         host_main_kv_names=host_owners,
+        host_compressed_names=tuple(
+            name
+            for name in compressed_names
+            if cast(MLAAttentionSpec, compressed_sparse[name]).host_backed
+        ),
         device_owner_page_sizes=device_pages,
         main_kv_owners=[[i] for i in range(len(main_kv_names))]
         if host_owners

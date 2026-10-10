@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import ctypes
 import gc
 import time
 from collections.abc import Generator, Mapping
@@ -53,6 +54,25 @@ def loaded_cuda_model_storage(models: Mapping[str, Any]) -> dict[str, Any]:
         "storages": rows,
         "scope": "registered_cuda_model_backing_excluding_allocator_overhead",
     }
+
+
+def reclaim_cpu_allocator_pages() -> tuple[int, int]:
+    """Return inactive libc pages after checkpoint conversion, when supported.
+
+    Live tensors and mapped checkpoint data keep their storage. This only
+    returns allocator-owned free pages before allocating pinned history.
+    """
+    gc.collect()
+    process = psutil.Process()
+    before = process.memory_info().rss
+    try:
+        trim = ctypes.CDLL(None).malloc_trim
+    except (AttributeError, OSError):
+        return before, before
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    trim(0)
+    return before, process.memory_info().rss
 
 
 def format_kib(b: int) -> str:

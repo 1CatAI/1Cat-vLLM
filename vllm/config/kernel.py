@@ -750,6 +750,10 @@ class KernelConfig:
     sm70_draft_single_graph: bool = False
     """Capture all MTP draft decode steps, including their slot mappings and
     attention metadata, as one CUDA graph instead of one replay per step."""
+    sm70_mtp_lossless_storage: bool = False
+    """Store BF16-origin FP16 MTP expert values in exact 13-bit planes on SM70
+    TP4. Preserve subnormals, signed zero and FP32 accumulation; reject weights
+    outside the lossless representation instead of requantizing."""
 
     sm70_top1x: bool = False
     """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
@@ -809,6 +813,10 @@ class KernelConfig:
     """Keep identical encoded history on device for controlled placement A/B."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_indexer_history: bool = False
+    """Keep the FP16 compressed indexer history and its co-owned compressor
+    state in mapped host storage when QSA host KV is active. Exact score
+    readers retain their arithmetic; host traffic is measured separately."""
     qsa_host_kv_state_blocks: int = Field(default=0, ge=0)
     """Bound the recurrent-state ID range with authoritative host KV.
 

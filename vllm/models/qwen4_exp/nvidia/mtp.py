@@ -263,6 +263,20 @@ def _make_draft_vllm_config(
             checkpoint_prefixes,
             quantize_unquantized=online_fp8,
         )
+    if draft_vllm_config.kernel_config.sm70_mtp_lossless_storage:
+        from .mtp_lossless_experts import MTPLosslessConfig
+
+        if (
+            draft_quant_config is not None
+            or not is_exact_sm70_cuda_platform()
+            or draft_vllm_config.model_config.dtype != torch.float16
+            or draft_vllm_config.parallel_config.tensor_parallel_size != 4
+            or draft_vllm_config.parallel_config.enable_expert_parallel
+        ):
+            raise ValueError(
+                "Lossless MTP storage requires unquantized FP16, SM70, TP4"
+            )
+        draft_quant_config = MTPLosslessConfig()
     draft_vllm_config.quant_config = draft_quant_config
     return draft_vllm_config
 

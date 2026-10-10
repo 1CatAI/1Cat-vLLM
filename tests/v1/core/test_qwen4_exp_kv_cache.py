@@ -262,9 +262,12 @@ def test_host_state_pool_rejects_insufficient_active_capacity():
         _bounded_host_cache_config(state_blocks=2)
 
 
-@pytest.mark.parametrize("state_blocks, device_budget_mib", [(29, 504), (32, 560)])
+@pytest.mark.parametrize(
+    "state_blocks, device_budget_mib, host_indexer",
+    [(29, 504, False), (32, 560, False), (29, 274, True)],
+)
 def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget(
-    state_blocks, device_budget_mib
+    state_blocks, device_budget_mib, host_indexer
 ):
     config = _vllm_config()
     config.model_config = SimpleNamespace(
@@ -296,6 +299,7 @@ def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget(
                 head_size=128,
                 dtype=torch.float16,
                 compress_ratio=4,
+                host_backed=host_indexer,
             )
             specs[name + ".compressor_state"] = CircularBufferSpec(
                 block_size=8,
@@ -326,7 +330,13 @@ def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget(
     device_bytes = sum(t.size for t in cache.kv_cache_tensors if not t.host_backed)
     host_bytes = sum(t.size for t in cache.kv_cache_tensors if t.host_backed)
     assert device_bytes <= device_budget_mib * 1024**2
-    assert 13 * 1024**3 <= host_bytes * 4 <= 15 * 1024**3
+    assert 13 * 1024**3 <= host_bytes * 4 <= (16 if host_indexer else 15) * 1024**3
+    side_pools = [
+        t
+        for t in cache.kv_cache_tensors
+        if any(name.endswith(".compressed") for name in t.shared_by)
+    ]
+    assert all(t.host_backed == host_indexer for t in side_pools)
     assert cache.device_state_blocks == state_blocks
     assert get_max_concurrency_for_kv_cache_config(config, cache) >= 1
 
