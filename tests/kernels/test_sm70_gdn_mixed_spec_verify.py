@@ -8,7 +8,13 @@ import pytest
 import torch
 
 from vllm.config.gdn import GdnConfig, GdnProfileConfig
+from vllm.model_executor.layers.fla.ops.gdn_prefill import GdnPrefill
+from vllm.model_executor.layers.fla.ops.gdn_preparation import GdnPreparation
 from vllm.model_executor.layers.fla.ops.gdn_profiling import GdnPrefillProfiler
+from vllm.model_executor.layers.fla.ops.gdn_selector import (
+    GDN_BACKEND_STAGES,
+    GdnExecutionPlan,
+)
 from vllm.model_executor.layers.fla.ops.gdn_stages import GdnHeadContract
 from vllm.model_executor.layers.fla.ops.index import (
     prepare_chunk_indices,
@@ -23,17 +29,6 @@ WIDTH = 8
 CONV_WIDTH = 4
 QKV_DIM = 2560
 TP = 4
-
-
-def _chunk_rule(**kwargs):
-    for name in (
-        "state_indices",
-        "has_initial_state",
-        "inplace_final_state",
-        "gate_is_exp",
-    ):
-        kwargs.pop(name, None)
-    return mod.fla_chunk_gated_delta_rule(**kwargs)
 
 
 @pytest.mark.parametrize("prefill_len", [40, 300])
@@ -120,10 +115,19 @@ def test_packed_verify_beside_prefill_matches_generic_route(
     policy.resolve()
     profiling = GdnProfileConfig(enabled=False)
     profiling.resolve()
+    heads = GdnHeadContract(16, 48, 128, 128, 4)
+    profiler = GdnPrefillProfiler(profiling)
+    prefill = GdnPrefill(
+        GdnExecutionPlan(
+            "triton", GDN_BACKEND_STAGES["triton"], True, False, False, None
+        ),
+        profiler,
+    )
     common = dict(
         gdn_policy=policy,
-        gdn_heads=GdnHeadContract(16, 48, 128, 128, 4),
-        _gdn_profiler=GdnPrefillProfiler(profiling),
+        gdn_heads=heads,
+        gdn_preparation=GdnPreparation(heads),
+        _gdn_profiler=profiler,
         verification_update=None,
         _can_use_sm70_gdn_preprocess=lambda *args: False,
         prefix="test",
@@ -143,7 +147,7 @@ def test_packed_verify_beside_prefill_matches_generic_route(
         enable_sm70_dflash2_tp2_gdn_bv2=False,
         enable_sm70_dflash2_fused_qkv_pack=False,
         gdn_prefill_backend="triton",
-        chunk_gated_delta_rule=_chunk_rule,
+        chunk_gated_delta_rule=prefill,
         A_log=torch.randn(12, device=device, dtype=torch.float32),
         dt_bias=torch.randn(12, device=device, dtype=dtype),
     )

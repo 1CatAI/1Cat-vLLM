@@ -936,3 +936,77 @@ Retained entries are deliberately visible in the source ledger:
 - TP8 topology and non-SM70 capabilities have contract coverage only where the
   required hardware is absent. Full-repository D/E and model performance
   acceptance remain separate work.
+
+## Post-E GDN consolidation follow-up
+
+The size audit on `16628e2f0` found that C's provider boundary still left operand
+preparation, prefill state orchestration and a 592-line warmup in the model layer.
+This follow-up integrates on `8216c055d` (the startup-policy repair changes no GDN
+arithmetic). It does not claim that every large source file has been refactored.
+
+- `GdnPreparation` binds the retained preparation policy at layer initialization.
+  Recurrent unpacking and prefill consume that object; actual prefill and warmup
+  share operand preparation. Materialized gating and fused post-conv preparation
+  retain their distinct dtype, normalization and gate-encoding contracts.
+- `GdnPrefill.execute_prefill` owns gather/indexed state admission, recurrence and
+  cast/scatter sequencing. The model owns request classification and output-buffer
+  admission. The existing CustomOp invocation and forward hooks remain intact.
+- `GdnWarmup` receives head geometry, weights, policies and a narrow prefill
+  operator. Four ordered tasks own their temporary tensors. Shape deduplication
+  remains engine-owned; there is no model callback, copied cache or new global
+  state. Decode warmup reuses the existing recurrence stage.
+- State-slice diagnostics and mixed-QKV layout classification each have one
+  implementation; old helper imports forward to these owners. Custom-op names,
+  schemas, fake implementations and registration order remain unchanged.
+
+The model file drops from 7,047 to 6,116 lines, but the substantive changes are
+shared preparation/recurrence stages and explicit temporary/state ownership.
+The forward core drops from 888 to 767 lines. DDTree, packed verification,
+model qualification and different numerical algorithms retain their separate
+branches. DDTree and PLE remain deferred. No layering exemption is added: the
+existing move ratchet records relocated references with no aggregate growth.
+
+One retained warmup detail is explicit: the recurrence uses T=64 tensors with
+`cu_seqlens=[0,63]` after normal convolution warmup, or `[0,64]` if the first
+convolution attempt fails. This matches the original cross-stage local variable;
+it is not a claim that every T=64 metadata variant was warmed.
+
+### Follow-up validation
+
+CPU contracts: **46 passed**. On 54633: **54 passed, 6 skipped** across
+`test_gdn_prefill_stages.py`, `test_gdn_execution_stages.py`,
+`test_sm70_gdn_mixed_spec_verify.py` and `test_sm70_mtp_gdn_mixed_qkv.py`.
+The six skips are the latter suite's pre-existing restrictions on unmeasured
+row-strided verifier shapes. New tests require bitwise equality for operands,
+outputs and all resident state slots, including changed inputs/request indices
+and initial-state masks on graph replay. Coverage includes materialized/fused
+preparation, Triton, FlashQLA VLK, original indexed prefill, direct output,
+MTP and mixed prefill/verification. Warmup CPU tests exercise order, strided
+views, exceptions and independent engine budgets.
+
+The matched synthetic prefill-stage A/B below uses the original state-stage
+statements extracted unchanged from `16628e2f0` and the common executor, with
+identical provider/CustomOp boundaries, disabled diagnostics, FP16 inputs,
+FP32 state, local 4/12 heads of dimension 128 and two requests. Seven rounds
+alternate A/B order; each samples 400 graph replays and 20 eager submissions.
+Times are medians in microseconds; temporary allocation is identical in each pair.
+
+| Backend / tokens | Graph GPU old → new | Host submission old → new | Temporary bytes, both |
+|---|---:|---:|---:|
+| Triton / 64 | 247.798 → 247.985 | 1115.02 → 1133.68 | 5,147,648 |
+| Triton / 300 | 360.292 → 360.492 | 1138.36 → 1126.51 | 9,531,904 |
+| Original indexed FlashQLA / 64 | 76.902 → 76.805 | 562.83 → 555.50 | 2,200,576 |
+| Original indexed FlashQLA / 300 | 119.749 → 119.329 | 559.13 → 560.75 | 2,574,848 |
+
+GPU deltas are -0.35% to +0.08%; this is structural parity, not a throughput
+improvement claim. No model weights were loaded. Environment: V100-SXM2-32GB,
+GPU UUID `GPU-21ce94f8-4245-7412-bf75-63622e125ae5`, Python 3.12,
+Torch 2.10.0+cu128, CUDA 12.8, TileLang 0.1.10. Native source/ABI is unchanged;
+the declared Phase D6 precompiled binaries are reused, with hashes retained in
+`native-sha256.txt`. No preloaded/private sidecar is used.
+
+Raw test results, scripts, extracted baseline, binary hashes and benchmark samples
+are retained on 54633 under
+`/home/ymzx/arch-ws/gdn-stage-convergence-20261010-093800/`.
+Local implementation/test logs are under
+`/home/ymzx/arch-ws/tmp/startup-policy-audit/`.
