@@ -513,6 +513,7 @@ def enable_sm70_hcx(
     *,
     fuse_output_projection: bool = True,
     diagnostic: bool = False,
+    local_schedule: bool = False,
 ) -> bool:
     """Leave supported small-M outputs partial; retain larger-batch reductions."""
     from .sm70_hcx import (
@@ -524,6 +525,7 @@ def enable_sm70_hcx(
 
     runtime = get_hcx_runtime(device)
     runtime.diagnostic = diagnostic
+    runtime.local_schedule = local_schedule
     status: dict[str, Any] = dict(
         enabled=False,
         reason=runtime.reason,
@@ -533,6 +535,7 @@ def enable_sm70_hcx(
         prepared_modules=0,
         deferred_projections=0,
         output_projection_policy="fused" if fuse_output_projection else "separate",
+        local_schedule=bool(local_schedule and runtime.enabled and runtime.full),
         large_m_policy="original_projection_and_reduction",
     )
     model.sm70_hcx_status = status
@@ -665,6 +668,7 @@ def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) -> 
             device,
             fuse_output_projection=kernel_config.sm70_hcx_output_projection,
             diagnostic=kernel_config.sm70_hcx_diagnostics,
+            local_schedule=kernel_config.sm70_hcx_local_schedule,
         )
         kernel_config.collective_kernel_selections["hcx:target"] = model.sm70_hcx_status
 
@@ -784,7 +788,18 @@ class Qwen4ExpModel(nn.Module):
                 self.dcp_local_indices_buffer = dcp_local_indices_buffer
                 self.dcp_partial_output_buffer = dcp_partial_output_buffer
                 self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        embedding_quant = (
+            vllm_config.quant_config
+            if vllm_config.model_config.quantization == "gguf"
+            and vllm_config.kernel_config.sm70_gguf.embedding_storage == "original"
+            else None
+        )
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+            quant_config=embedding_quant,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
+        )
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
@@ -1114,6 +1129,13 @@ class Qwen4ExpForCausalLM(
             method = getattr(module, "quant_method", None)
             if method is not None and method is not previous.get(module):
                 method.process_weights_after_loading(module)
+        from .sm70_fp16_hc import prepare_sharded_hc_storage
+
+        prepare_sharded_hc_storage(self, self.vllm_config)
+        if self.vllm_config.kernel_config.hc_weight_storage == "sharded":
+            # Return released replicated-bank pages before draft construction.
+            # This is a loading boundary, never an inference-time operation.
+            torch.accelerator.empty_cache()
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture.

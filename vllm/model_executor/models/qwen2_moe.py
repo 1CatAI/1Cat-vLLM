@@ -62,6 +62,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
@@ -98,10 +99,10 @@ def _sm70_dump_qwen_mlp_tensor(
 def _sm70_force_shared_expert_silu_custom_op(prefix: str) -> bool:
     if ".shared_expert" not in prefix:
         return False
-    if not torch.cuda.is_available():
+    if not current_platform.is_cuda():
         return False
     try:
-        return torch.cuda.get_device_capability() == (7, 0)
+        return current_platform.is_device_capability((7, 0))
     except RuntimeError:
         return False
 

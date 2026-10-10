@@ -14,6 +14,7 @@ class PackedGGUFRowReader:
         source_type: int,
         hidden_size: int,
         logical_rows: int | None = None,
+        packed_row_gather=None,
     ):
         block, size = quant_size(source_type)
         if data.dtype != np.uint8 or data.ndim != 2:
@@ -30,6 +31,7 @@ class PackedGGUFRowReader:
         self.source_type = int(source_type)
         self.hidden_size = hidden_size
         self.logical_rows = rows
+        self.packed_row_gather = packed_row_gather
 
     def lookup(self, ids: np.ndarray, dtype=np.float16) -> np.ndarray:
         ids = np.asarray(ids)
@@ -44,7 +46,17 @@ class PackedGGUFRowReader:
         if ids.min() < 0 or ids.max() >= self.logical_rows:
             raise IndexError("GGUF row ID outside the logical vocabulary")
         unique, inverse = np.unique(ids.reshape(-1), return_inverse=True)
-        values = dequantize(self.data[unique], self.source_type)
+        if self.packed_row_gather is None:
+            packed = self.data[unique]
+        else:
+            import torch
+
+            packed = np.empty((unique.size, self.data.shape[1]), dtype=np.uint8)
+            self.packed_row_gather.apply(
+                torch.from_numpy(unique.astype(np.int64, copy=False)),
+                torch.from_numpy(packed),
+            )
+        values = dequantize(packed, self.source_type)
         if not np.isfinite(values).all():
             raise ValueError("GGUF selected rows contain nonfinite values")
         if dtype == np.float16 and np.any(np.abs(values) > np.finfo(dtype).max):

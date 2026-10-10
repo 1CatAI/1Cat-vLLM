@@ -953,6 +953,11 @@ void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
 void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
                         int64_t shard_size, int64_t num_rows, int64_t row_bytes,
                         torch::Tensor out);
+void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+                               int64_t shard_size, int64_t num_rows,
+                               int64_t row_bytes, torch::Tensor out,
+                               torch::Tensor cache_ids,
+                               torch::Tensor cache_rows);
 
 void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
                                       torch::Tensor stats, int64_t source_type,
@@ -999,6 +1004,12 @@ void gguf_dp4a_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor weight_ptrs,
                                      torch::Tensor stats_ptrs,
                                      int64_t source_type, int64_t num_experts);
+
+void gguf_dp4a_raw_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
+                                         torch::Tensor ids,
+                                         torch::Tensor probabilities,
+                                         torch::Tensor weights,
+                                         int64_t source_type, int64_t left);
 void gguf_quantize_q8_1_sm70_out(torch::Tensor out, torch::Tensor input);
 void gguf_dp4a_scalar_lut_gate_up_sm70_out(torch::Tensor out,
                                            torch::Tensor activation,
@@ -1076,7 +1087,7 @@ void sm70_hcx_out(
     std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
     int64_t ofmt, std::optional<torch::Tensor> gz,
     std::optional<torch::Tensor> gw, double geps,
-    std::optional<torch::Tensor> gscr);
+    std::optional<torch::Tensor> gscr, bool local_schedule);
 
 void sm70_dmv13_out(torch::Tensor x, std::vector<torch::Tensor> codes,
                     std::vector<torch::Tensor> high,

@@ -505,6 +505,22 @@ class Sm70GgufConfig:
     enabled: bool = True
     """Admit the packaged native extension when the operator supports the format."""
 
+    expert_storage: Literal["canonical", "original"] = "canonical"
+    """Keep canonical expert banks or use the packaged original-block fallback.
+
+    Original storage avoids retaining both canonical and original expert banks.
+    It trades the calibrated TurboMind expert schedules for the native fallback
+    and covers TP boundaries with original blocks and zero activation padding.
+    """
+
+    dense_storage: Literal["canonical", "original"] = "canonical"
+    """Keep calibrated canonical projections or dispatch original packed rows."""
+
+    embedding_storage: Literal["dense", "original"] = "dense"
+    """Keep a dense token embedding or decode its original GGUF rows on lookup."""
+    dequant_workspace_bytes: int = Field(default=32 * 1024**2, ge=1024**2)
+    """Bound dequantized matrix chunks for the original dense storage policy."""
+
     projection_planes: bool = True
     """Use measured M8 shared-activation projection planes with canonical fallback."""
 
@@ -684,6 +700,8 @@ class KernelConfig:
 
     hc_ll_shard: bool = True
     """Use qualified TP4 sharded HC for M1..20 with direct NVLink forwarding."""
+    hc_weight_storage: Literal["replicated", "sharded"] = "replicated"
+    """Keep only losslessly packed TP4 HC shards; large M uses gathered GEMM."""
     collective_kernel_selections: dict[str, Any] = Field(
         default_factory=dict, init=False
     )
@@ -747,6 +765,13 @@ class KernelConfig:
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""
 
+    sm70_hcx_local_schedule: bool = False
+    """Experimentally delay HC up-weight prefetch and distribute gate-mix for
+    full-mesh TP4 HCX, including fused Q4_K/Q6_K output projection when its
+    input normalization is already complete. Keeps the reference arithmetic
+    order. Opt in before graph capture; full-model quality
+    qualification remains pending."""
+
     sm70_hcx_output_projection: bool = True
     """Fuse eligible output projections into HCX when HCX is enabled. Disable
     to compare the separate projection and HC boundary with identical weights."""
@@ -782,6 +807,12 @@ class KernelConfig:
     """Keep identical encoded history on device for controlled placement A/B."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_state_blocks: int = Field(default=0, ge=0)
+    """Bound the recurrent-state ID range with authoritative host KV.
+
+    Zero retains the shared capacity. A nonzero pool retains active states and
+    bounded prefix checkpoints while history IDs use a separate range.
+    """
     qsa_host_kv_active: bool = Field(default=False, init=False)
     """Whether the host QSA cache geometry has been admitted."""
     qsa_host_kv_reason: str | None = Field(default=None, init=False)
@@ -793,6 +824,10 @@ class KernelConfig:
     """Release file-backed PLE mappings after gathers to reduce resident RAM."""
     ple_disk_row_gather: bool = True
     """Admit byte-preserving native CPU gathers for retained mapped PLE rows."""
+    ple_row_cache_mib: int = Field(default=0, ge=0)
+    """Total native packed-row cache budget in the shared CPU PLE process."""
+    ple_disk_only: bool = False
+    """Keep PLE tables on disk with only a sentinel row in each rank's staging."""
     ple_disk_row_readers: dict[str, Any] = Field(
         default_factory=dict, init=False, repr=False
     )
@@ -918,6 +953,7 @@ class KernelConfig:
             "ir_op_priority",  # handled separately below
             "linear_kernel_selections",
             "collective_kernel_selections",
+            "sm70_hcx_local_schedule",  # Native dispatch inside the opaque HC op.
             "moe_kernel_selections",
             "sm70_skinny_moe_applicable",
             "fused_fp16_aux_gemv_applicable",
@@ -928,6 +964,7 @@ class KernelConfig:
             "ple_input_preparations",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
             "ple_disk_row_readers",
+            "ple_row_cache_mib",  # CPU cache does not change compiled computation.
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",
         }

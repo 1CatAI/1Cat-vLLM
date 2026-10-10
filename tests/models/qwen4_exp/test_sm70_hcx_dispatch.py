@@ -256,7 +256,9 @@ def test_hcx_only_consumes_partial_producers(monkeypatch):
     monkeypatch.setattr(model_module, "Qwen4ExpDecoderLayer", Decoder)
     monkeypatch.setattr(model_module, "Qwen4ExpSparseMoeBlock", MoE)
     monkeypatch.setattr(
-        hcx, "get_hcx_runtime", lambda _: SimpleNamespace(enabled=True, reason=None)
+        hcx,
+        "get_hcx_runtime",
+        lambda _: SimpleNamespace(enabled=True, reason=None, full=True),
     )
     monkeypatch.setattr(hcx, "pack_output_projection", lambda _: None)
     model = SimpleNamespace(
@@ -343,6 +345,7 @@ def test_large_m_injection_matches_contiguous_fake_contract():
 def test_diagnostic_snapshots_own_storage_and_reuse_addresses(monkeypatch):
     runtime = hcx.Sm70HcxRuntime.__new__(hcx.Sm70HcxRuntime)
     runtime.diagnostic, runtime.snapshots = True, {}
+    runtime.local_schedule = True
     runtime.xn = runtime.sq = runtime.dpart = runtime.bar = None
     runtime.seq = torch.zeros(1, dtype=torch.int32)
     runtime.ar = runtime.lora = runtime.hb = []

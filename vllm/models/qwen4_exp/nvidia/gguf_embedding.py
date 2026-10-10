@@ -230,13 +230,32 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
             raise ValueError("PLE GGUF requires complete packed CPU rows")
         if data.shape[0] < self.org_vocab_size:
             raise ValueError("PLE GGUF table is shorter than the logical vocabulary")
-        _advise_random_file_access(data)
+        mapped_path = _advise_random_file_access(data)
         if self._cpu_owned:
+            from vllm.model_executor.kernels.ple.disk_rows import (
+                prepare_mapped_row_gather,
+            )
+
+            policy = get_current_vllm_config().kernel_config
+            reader, admission = prepare_mapped_row_gather(
+                pointers=[data.data_ptr()],
+                shard_size=data.shape[0],
+                num_rows=self.org_vocab_size,
+                row_bytes=self._storage_dim,
+                file_backed=bool(mapped_path),
+                enabled=policy.ple_disk_row_gather,
+                cache_bytes=policy.ple_row_cache_mib << 20,
+            )
+            policy.ple_disk_row_readers[self.layer_name] = admission
             # The parameter and reader retain the mmap owner, with no table copy.
             self.qweight = Parameter(data, False)
             self.qweight._vllm_keep_on_cpu = True
             self._cpu_reader = PackedGGUFRowReader(
-                data.numpy(), self._source_type, self.embedding_dim, self.org_vocab_size
+                data.numpy(),
+                self._source_type,
+                self.embedding_dim,
+                self.org_vocab_size,
+                packed_row_gather=reader,
             )
         else:
             from vllm.model_executor.kernels.ple.gguf_pinned import (

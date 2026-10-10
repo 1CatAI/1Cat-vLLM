@@ -100,7 +100,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       ", Tensor(g!) bar, Tensor(h!) seq, int[] ar, int[] lora, int[] hb, int "
       "rank, Tensor? dbg, int full, Tensor? ox, Tensor? ocodes, Tensor? ohigh"
       ", Tensor? oscale, int ofmt, Tensor? gz, Tensor? gw, float geps, Tensor"
-      "(i!)? gscr) -> ()");
+      "(i!)? gscr, bool local_schedule=False) -> ()");
   ops.impl("sm70_hcx_out", torch::kCUDA, &sm70_hcx_out);
   ops.def(
       "sm70_dmv13_out(Tensor x, Tensor[] codes, Tensor[] high, Tensor[] scale, "
@@ -199,6 +199,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "ple_disk_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
       "int num_rows, int row_bytes, Tensor(a!) out) -> ()");
   ops.impl("ple_disk_gather_u8", torch::kCPU, &ple_disk_gather_u8);
+  ops.def(
+      "ple_disk_cached_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
+      "int num_rows, int row_bytes, Tensor(a!) out, Tensor(b!) cache_ids, "
+      "Tensor(c!) cache_rows) -> ()");
+  ops.impl("ple_disk_cached_gather_u8", torch::kCPU,
+           &ple_disk_cached_gather_u8);
 
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
 #ifdef VLLM_REGISTER_BASIC_ACTIVATION_IN_C
@@ -358,6 +364,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "source_type, int num_experts) -> ()");
   ops.impl("gguf_dp4a_down_unroute_sm70_out", torch::kCUDA,
            &gguf_dp4a_down_unroute_sm70_out);
+  ops.def(
+      "gguf_dp4a_raw_down_unroute_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor ids, Tensor probabilities, Tensor weights, int source_type, "
+      "int left=0) -> ()");
+  ops.impl("gguf_dp4a_raw_down_unroute_sm70_out", torch::kCUDA,
+           &gguf_dp4a_raw_down_unroute_sm70_out);
   ops.def(
       "gguf_dense_restore_canonical_sm70_out(Tensor(a!) weight, Tensor(b!) "
       "stats, "

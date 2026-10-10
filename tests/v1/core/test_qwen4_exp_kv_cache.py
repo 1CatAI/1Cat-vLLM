@@ -226,6 +226,66 @@ def test_qwen4_exp_circular_cache_stores_keys_without_unused_values() -> None:
     assert spec.max_memory_usage_bytes(_vllm_config()) == spec.page_size_bytes
 
 
+def _bounded_host_cache_config(max_len=8192, state_blocks=32):
+    config = _vllm_config()
+    config.model_config.max_model_len = max_len
+    config.scheduler_config.max_num_seqs = 1
+    config.cache_config.mamba_cache_mode = "align"
+    config.cache_config.enable_prefix_caching = True
+    config.kernel_config = SimpleNamespace(qsa_host_kv_state_blocks=state_blocks)
+    specs = _qwen4_exp_cache_specs()
+    for name, spec in list(specs.items()):
+        if type(spec) is FullAttentionSpec:
+            specs[name] = replace(spec, host_backed=True)
+        elif isinstance(spec, MambaSpec):
+            specs[name] = replace(spec, mamba_cache_mode="align")
+    groups = get_kv_cache_groups(config, specs)
+    return config, get_kv_cache_config_from_groups(config, groups, 1 << 30)
+
+
+def test_host_history_grows_without_growing_device_state():
+    _, short = _bounded_host_cache_config()
+    config, long = _bounded_host_cache_config(262144)
+    assert long.num_blocks > short.num_blocks
+    short_states = [t for t in short.kv_cache_tensors if t.physical_num_blocks]
+    long_states = [t for t in long.kv_cache_tensors if t.physical_num_blocks]
+    assert [t.size for t in short_states] == [t.size for t in long_states]
+    assert all(t.physical_num_blocks == 32 for t in long_states)
+    scheduler = generate_scheduler_kv_cache_config([long])
+    assert scheduler.device_state_blocks == 32
+    assert scheduler.device_state_group_ids == long.device_state_group_ids
+    assert get_max_concurrency_for_kv_cache_config(config, long) == 1
+
+
+def test_host_state_pool_rejects_insufficient_active_capacity():
+    with pytest.raises(ValueError, match="State pool needs at least"):
+        _bounded_host_cache_config(state_blocks=2)
+
+
+def test_partitioned_block_pool_keeps_prefix_lifetime_and_quota():
+    init_none_hash(sha256)
+    pool = BlockPool(12, True, 16, device_state_blocks=4, device_state_group_ids=(1, 2))
+    state = pool.get_new_blocks(3, kv_cache_group_id=1)
+    history = pool.get_new_blocks(4, kv_cache_group_id=0)
+    assert [b.block_id for b in state] == [1, 2, 3]
+    assert [b.block_id for b in history] == [4, 5, 6, 7]
+    assert not pool.can_allocate_group_blocks({2: 1})
+    assert pool.can_allocate_group_blocks({0: 4})
+    with pytest.raises(ValueError, match="Cannot get"):
+        pool.get_new_blocks(1, kv_cache_group_id=2)
+    pool.free_blocks(state)
+    pool.touch(state[:1])
+    assert state[0].ref_cnt == 1
+    assert pool.get_num_free_blocks(1) == 2
+    assert not pool.can_allocate_group_blocks({1: 2, 2: 1})
+    assert pool.can_allocate_group_blocks({1: 1, 2: 1, 0: 4})
+    recycled = pool.get_new_blocks(2, kv_cache_group_id=2)
+    assert [b.block_id for b in recycled] == [2, 3]
+    pool.free_blocks(state[:1] + recycled + history)
+    assert pool.get_num_free_blocks(1) == 3
+    assert pool.get_num_free_blocks(0) == 8
+
+
 def _mixed_dcp_specs():
     specs = _qwen4_exp_cache_specs()
     for name, spec in list(specs.items()):

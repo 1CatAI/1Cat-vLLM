@@ -326,6 +326,10 @@ class PleOffloadLayer(nn.Module, ABC):
             f"{type(self).__name__} does not serve tiered PLE placements"
         )
 
+    def needs_weight_prefault(self) -> bool:
+        """Whether this worker serves any table rows after registration."""
+        return True
+
     def wait_offloaded_output(
         self, hidden_states: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
