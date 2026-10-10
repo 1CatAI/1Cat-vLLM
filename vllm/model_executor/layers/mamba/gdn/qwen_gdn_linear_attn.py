@@ -3,6 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import os
+import sys
 from types import SimpleNamespace
 
 import torch
@@ -108,6 +109,9 @@ from vllm.model_executor.layers.linear import (
     LinearBase,
     MergedColumnParallelLinear,
     RowParallelLinear,
+)
+from vllm.model_executor.layers.mamba.gdn import (
+    sm70_verify_dispatch as _verify_dispatch,
 )
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_mixer2 import mamba_v2_sharded_weight_loader
@@ -2745,6 +2749,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
         num_tokens: int,
+        exact_fused_norm: bool = False,
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
@@ -2755,6 +2760,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         layer_name = _encode_layer_name(self.prefix)
         total_start = self._gdn_profiler.start()
         z_shape_og = z.shape
+        if exact_fused_norm:
+            return _verify_dispatch.norm_and_projection(self, core_attn_out, z)
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = _sm70_dump_gdn_projection_tensor(
@@ -2846,6 +2853,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         z: torch.Tensor,
         output: torch.Tensor | None,
         num_tokens: int,
+        exact_fused_norm: bool = False,
     ) -> torch.Tensor:
         layer_name = _encode_layer_name(self.prefix)
         from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -2854,6 +2862,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         direct_write = bool(
             output is not None
+            and not exact_fused_norm
             and self.enable_sm70_dflash2_fused_gdn_verify
             and current_platform.is_device_capability(70)
             and self.tp_size == 4
@@ -2867,7 +2876,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and isinstance(self.out_proj.scheme, CompressedTensorsW8A16Fp8)
         )
         proj_out = self._compute_output_projection(
-            core_attn_out, z, num_tokens, output if direct_write else None
+            core_attn_out,
+            z,
+            num_tokens,
+            exact_fused_norm=exact_fused_norm,
+            output=output if direct_write else None,
         )
         if output is not None:
             if not direct_write:
@@ -3052,11 +3065,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and use_sm70_decode_graph_semantics(self._execution_graph_policy)
             and not _sm70_gdn_projection_dump_requested(layer_name)
         )
-        from vllm.model_executor.layers.quantization.sm70_gdn_ba_verify import (
-            apply_gdn_ba_verify,
+        verify_fuse: frozenset[str] = frozenset()
+        fused_verify_projection = _verify_dispatch.try_projection(
+            sys.modules[__name__], self, hidden_states, layer_name
         )
-
-        fused_verify_projection = apply_gdn_ba_verify(self, hidden_states)
         if fused_verify_projection is not None:
             mixed_qkv, z, b, a = fused_verify_projection
             z = z.reshape(z.size(0), -1, self.head_v_dim)
@@ -3117,24 +3129,36 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
                 z_size = self.value_dim // self.tp_size
                 mixed_qkv = mixed_qkvz[..., :qkv_size]
+                verify_fuse = _verify_dispatch.plan(
+                    sys.modules[__name__], self, layer_name, mixed_qkv
+                )
                 mixed_qkv = _sm70_dump_gdn_projection_tensor(
                     "split_mixed_qkv", layer_name, mixed_qkv
                 )
                 if self.gdn_policy.projection.mixed_qkv_contiguous:
                     mixed_qkv = mixed_qkv.contiguous()
-                z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
+                if "u1" in verify_fuse and "u4" in verify_fuse:
+                    # The exact fused norm reads z in place.
+                    z = mixed_qkvz[..., qkv_size : qkv_size + z_size]
+                else:
+                    z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
                 z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
                 z = z.reshape(z.size(0), -1, self.head_v_dim)
                 ba_size = ba.shape[-1] // 2
-                b = ba[..., :ba_size]
-                a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
-                if self.disable_tp_for_ba_proj and self.tp_size > 1:
-                    ba_chunk = self.num_v_heads // self.tp_size
-                    ba_start = self.tp_rank * ba_chunk
-                    b = b[:, ba_start : ba_start + ba_chunk]
-                    a = a[:, ba_start : ba_start + ba_chunk]
-                b = b.contiguous()
-                a = a.contiguous()
+                if "u1" in verify_fuse and "u3" in verify_fuse:
+                    # The fused recurrent kernel reads b and a in place.
+                    b = ba[..., :ba_size]
+                    a = ba[..., ba_size:]
+                else:
+                    b = ba[..., :ba_size]
+                    a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
+                    if self.disable_tp_for_ba_proj and self.tp_size > 1:
+                        ba_chunk = self.num_v_heads // self.tp_size
+                        ba_start = self.tp_rank * ba_chunk
+                        b = b[:, ba_start : ba_start + ba_chunk]
+                        a = a[:, ba_start : ba_start + ba_chunk]
+                    b = b.contiguous()
+                    a = a.contiguous()
 
         if (
             self.gdn_policy.projection.z_contiguous
@@ -3147,7 +3171,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        core_attn_out = torch.zeros(
+        # STEP-47 u3z: the fused u3 kernel writes every row itself.
+        u3z = _verify_dispatch.skip_zero_fill(verify_fuse)
+        core_attn_out = (torch.empty if u3z else torch.zeros)(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
@@ -3156,16 +3182,30 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             layer_name,
             core_attn_out,
         )
-        core_attn_out = _qwen_gdn_run_recurrent_core(
-            self,
-            mixed_qkv=mixed_qkv,
-            b=b,
-            a=a,
-            core_attn_out=core_attn_out,
-            layer_name=layer_name,
-            conv_state_cache=conv_state_cache,
-            ssm_state_cache=ssm_state_cache,
-        )
+        if verify_fuse:
+            core_attn_out = _verify_dispatch.run_core(
+                sys.modules[__name__],
+                self,
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                layer_name=layer_name,
+                conv_state_cache=conv_state_cache,
+                ssm_state_cache=ssm_state_cache,
+                units=verify_fuse,
+            )
+        else:
+            core_attn_out = _qwen_gdn_run_recurrent_core(
+                self,
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                layer_name=layer_name,
+                conv_state_cache=conv_state_cache,
+                ssm_state_cache=ssm_state_cache,
+            )
 
         # ============================================================
         # Part 3: Output Projection
@@ -3179,7 +3219,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 layer_name,
             )
         else:
-            return self._output_projection(core_attn_out, z, output, num_tokens)
+            return self._output_projection(
+                core_attn_out, z, output, num_tokens, "u4" in verify_fuse
+            )
         return None
 
     def forward_xpu(
@@ -4472,6 +4514,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             == core_attn_out[:num_non_spec_tokens].data_ptr()
         ):
             core_attn_out[:num_non_spec_tokens] = core_attn_out_non_spec.squeeze(0)
+
+    def _forward_core_verify_fused(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        units: frozenset[str],
+    ) -> None:
+        """Delegate the exact verifier operator to its platform owner."""
+        return _verify_dispatch.forward_core_verify_fused(
+            sys.modules[__name__],
+            self,
+            mixed_qkv,
+            b,
+            a,
+            core_attn_out,
+            attn_metadata,
+            kv_cache,
+            units,
+        )
 
     def _forward_core_decode_fast(
         self,

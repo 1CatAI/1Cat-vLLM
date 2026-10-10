@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -9,12 +11,10 @@ import torch.nn as nn
 
 from vllm.config import SpeculativeConfig, VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
-from vllm.config.sm70_moe import unquantized_moe_policy
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
@@ -32,9 +32,13 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.eagle import sm70_draft_ops as _draft_ops
 from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
     PrefillEagleCudaGraphManager,
+)
+from vllm.v1.worker.gpu.spec_decode.eagle.prefill_moe_rows import (
+    DraftMoERowSelector,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 from vllm.v1.worker.gpu.spec_decode.speculator import TargetSamplingHooks
@@ -61,6 +65,33 @@ def _mtp_decode_warmup_request_sizes(
         if 1 <= num_reqs <= max_num_reqs:
             request_sizes.add(num_reqs)
     return tuple(sorted(request_sizes))
+
+
+def _is_context_only_prefill(input_batch: InputBatch) -> bool:
+    """Whether every request's scheduled chunk leaves its prefill unfinished."""
+    incomplete_prefill = input_batch.is_incomplete_prefilling_np
+    return bool(
+        incomplete_prefill is not None
+        and incomplete_prefill.size == input_batch.num_reqs
+        and np.all(incomplete_prefill)
+    )
+
+
+def _has_single_mtp_decoder_block(model: nn.Module) -> bool:
+    """Whether the draft exposes the verified one-block MTP topology.
+
+    Selective MoE prefill is safe only when there is no later draft block whose
+    attention/KV depends on the omitted rows' MoE output. Unknown model layouts
+    therefore use the original full prefill path.
+    """
+    predictor = getattr(model, "model", None)
+    layers = getattr(predictor, "layers", None)
+    if getattr(predictor, "num_mtp_layers", None) != 1 or layers is None:
+        return False
+    try:
+        return len(layers) == 1
+    except TypeError:
+        return False
 
 
 class EagleSpeculator(TargetSamplingHooks):
@@ -150,6 +181,19 @@ class EagleSpeculator(TargetSamplingHooks):
         self.prefill_cudagraph_manager: PrefillEagleCudaGraphManager | None = None
         self.decode_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
 
+        # Eager MTP draft prefill: run the draft MoE only for the sampled rows,
+        # and skip draft sampling and decode steps when every request in the
+        # batch is mid-prefill (the scheduler drops drafts of prefill chunks).
+        # Not VLLM_-prefixed on purpose: vllm.envs.compile_factors() hashes
+        # every VLLM_* variable into the torch.compile cache key, and this
+        # switch only changes code outside the compiled graphs.
+        self.prefill_kv_only = os.getenv("ONECAT_MTP_PREFILL_KV_ONLY", "1") != "0"
+        self.prefill_moe_rows: DraftMoERowSelector | None = None
+        # The serving batch of the current propose() call (None for dummy and
+        # profile runs), and whether that call skips its draft decode steps.
+        self._prefill_batch: InputBatch | None = None
+        self._skip_draft_decode = False
+
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         cudagraph_mode = self.vllm_config.compilation_config.cudagraph_mode
         # Initialize cudagraph manager for draft prefill (draft position 0).
@@ -179,6 +223,8 @@ class EagleSpeculator(TargetSamplingHooks):
         # Share a single pool between prefill and decode since they never
         # execute concurrently.
         self.decode_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
+        # ONECAT_DRAFT47 d2b: FULL decode graphs for 6-8 requests as well.
+        _draft_ops.extend_decode_graphs(self.decode_cudagraph_manager, self.vllm_config)
         # Optionally record every draft decode step in one graph, so the
         # per-step host work (slot mappings, metadata) leaves the critical path.
         self.multistep_cudagraph_manager: DecodeEagleCudaGraphManager | None = None
@@ -194,6 +240,9 @@ class EagleSpeculator(TargetSamplingHooks):
                 decode_query_len=1,
             )
             self.multistep_cudagraph_manager.pool = self.prefill_cudagraph_manager.pool
+            _draft_ops.extend_decode_graphs(
+                self.multistep_cudagraph_manager, self.vllm_config
+            )
 
     def load_model(self, target_model: nn.Module) -> None:
         target_attn_layer_names = get_layers_from_vllm_config(
@@ -213,6 +262,45 @@ class EagleSpeculator(TargetSamplingHooks):
         )
         if self.share_mtp_topk_indices:
             logger.info("Reusing target-aligned step-0 QSA indices for MTP steps 1+.")
+
+        if self.prefill_kv_only and self.method == "mtp":
+            predictor = getattr(self.model, "model", None)
+            declared_layers = getattr(predictor, "num_mtp_layers", None)
+            mtp_layers = getattr(predictor, "layers", None)
+            try:
+                layer_count = len(mtp_layers) if mtp_layers is not None else None
+            except TypeError:
+                layer_count = None
+            single_block = _has_single_mtp_decoder_block(self.model)
+            selector = (
+                DraftMoERowSelector.from_model(
+                    self.model,
+                    exclude=target_model.modules(),
+                    pad_ops=_draft_ops.capture_pad_ops(self.vllm_config),
+                )
+                if single_block
+                else None
+            )
+            if selector is not None:
+                self._enable_prefill_rows(selector)
+                route = "selected_rows"
+            else:
+                route = (
+                    "full_prefill_no_draft_moe"
+                    if single_block
+                    else "full_prefill_unverified_topology"
+                )
+            logger.info(
+                "Eager MTP prefill row-selection gate: model=%s predictor=%s "
+                "declared_num_mtp_layers=%s actual_layers=%s route=%s "
+                "selected_moe_layers=%d",
+                type(self.model).__name__,
+                type(predictor).__name__ if predictor is not None else "unknown",
+                declared_layers,
+                layer_count,
+                route,
+                len(selector.layers) if selector is not None else 0,
+            )
 
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
@@ -241,65 +329,9 @@ class EagleSpeculator(TargetSamplingHooks):
     def warmup_sm70_mtp_moe_kernels(
         self, dummy_run: Callable[..., Any]
     ) -> tuple[str, ...]:
-        """Warm the finite Qwen3.8 MTP-MoE prefill and decode signatures."""
-        if (
-            self.method != "mtp"
-            or self.device.type != "cuda"
-            or not current_platform.is_device_capability(70)
-            or not unquantized_moe_policy(self.vllm_config).value("mtp_tuned")
-        ):
-            return ()
-        if getattr(self, "_sm70_mtp_moe_warmed", False):
-            return ()
-
-        text_config = self.draft_model_config.hf_text_config
-        if not (
-            self.draft_model_config.get_num_experts() == 512
-            and int(getattr(text_config, "num_experts_per_tok", 0)) == 10
-            and self.draft_model_config.get_hidden_size() == 2560
-            and int(getattr(text_config, "moe_intermediate_size", 0)) == 640
-            and self.vllm_config.parallel_config.tensor_parallel_size == 4
-        ):
-            return ()
-        self._sm70_mtp_moe_warmed = True
-
-        warmed: list[str] = []
-        try:
-            if self.max_num_tokens >= 16:
-                # M16 is the smallest sorted-assignment shape with
-                # M * topk divisible by 16. It covers the Triton
-                # specialization used by longer aligned prompt prefills such
-                # as the 152-token HumanEval request; M18 graph capture covers
-                # only the non-divisible specialization.
-                dummy_run(16)
-                warmed.append("mtp_draft_moe_prefill_m16")
-
-            decode_query_len = 1 + self.num_speculative_steps
-            request_sizes = _mtp_decode_warmup_request_sizes(
-                self.vllm_config.compilation_config.cudagraph_capture_sizes,
-                decode_query_len,
-                self.max_num_reqs,
-            )
-            executed_request_sizes = []
-            for num_reqs in request_sizes:
-                num_tokens = decode_query_len * num_reqs
-                if num_tokens > self.max_num_tokens:
-                    continue
-                # Exercise the same verifier/draft row counts that production
-                # graphs advertise. This avoids a first-request JIT without
-                # tying the tuned MoE path to a fixed concurrency.
-                dummy_run(num_tokens, uniform_decode=True)
-                executed_request_sizes.append(num_reqs)
-            torch.accelerator.synchronize()
-            if executed_request_sizes:
-                warmed.append(
-                    "mtp_draft_moe_decode_reqs_"
-                    + "_".join(str(size) for size in executed_request_sizes)
-                )
-        except Exception as err:  # pragma: no cover - best-effort warmup
-            logger.warning_once("SM70 V2 MTP MoE warmup skipped: %s", err)
-            return ()
-        return tuple(warmed)
+        return _draft_ops.warmup_moe(
+            self, dummy_run, _mtp_decode_warmup_request_sizes, logger
+        )
 
     @torch.inference_mode()
     def run_model(
@@ -413,6 +445,33 @@ class EagleSpeculator(TargetSamplingHooks):
         if self.share_mtp_topk_indices:
             self.model.model.set_skip_topk(False)
 
+    def _enable_prefill_rows(self, selector: DraftMoERowSelector) -> None:
+        self.prefill_moe_rows = selector
+        # Stage-marker tooling verifies the reviewed source of propose(), so the
+        # batch is recorded by this instance-level entry point, not inside it.
+        self.propose = self._propose_recording_batch  # type: ignore[method-assign]
+
+    def _propose_recording_batch(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        # Without a recorded serving batch, prefill() and multi_step_decode()
+        # keep the full path, so a failure here must not change behavior.
+        try:
+            serving = not kwargs.get("dummy_run", False) and not kwargs.get(
+                "is_profile", False
+            )
+            input_batch = kwargs["input_batch"] if "input_batch" in kwargs else args[0]
+            self._prefill_batch = input_batch if serving else None
+        except Exception:
+            logger.warning_once(
+                "Could not record the propose() batch; eager MTP draft prefill "
+                "keeps the full path."
+            )
+            self._prefill_batch = None
+        try:
+            return type(self).propose(self, *args, **kwargs)
+        finally:
+            self._prefill_batch = None
+            self._skip_draft_decode = False
+
     def prefill(
         self,
         num_reqs: int,
@@ -427,14 +486,30 @@ class EagleSpeculator(TargetSamplingHooks):
         pos = self.input_buffers.positions[last_token_indices]
         idx_mapping = self.idx_mapping[:num_reqs]
 
-        last_hidden_states, hidden_states = self.run_model(
+        # An eager draft prefill of a serving batch needs the draft K/V of every
+        # position but samples only the last row of each request. When every
+        # request is mid-prefill, the scheduler discards the drafts.
+        batch = self._prefill_batch
+        moe_rows = None
+        if (
+            batch is not None
+            and self.prefill_moe_rows is not None
+            and cudagraph_runtime_mode == CUDAGraphMode.NONE
+        ):
+            moe_rows = last_token_indices
+            self._skip_draft_decode = _is_context_only_prefill(batch)
+
+        last_hidden_states, hidden_states = self._run_prefill_model(
             num_tokens,
             attn_metadata,
             slot_mappings,
-            num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            mm_inputs=mm_inputs,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
+            mm_inputs,
+            moe_rows=moe_rows,
         )
+        if self._skip_draft_decode:
+            return
         sample_hidden_states = last_hidden_states[last_token_indices]
 
         self.draft_tokens[:num_reqs, 0] = self._sample_draft(
@@ -447,6 +522,41 @@ class EagleSpeculator(TargetSamplingHooks):
         self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = pos
 
+    def _run_prefill_model(
+        self,
+        num_tokens: int,
+        attn_metadata: dict[str, Any] | None,
+        slot_mappings: dict[str, torch.Tensor] | None,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+        moe_rows: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the draft prefill forward.
+
+        With ``moe_rows``, the draft MoE computes only those rows; the other
+        output rows are not valid. Everything before the MoE, including the
+        draft K/V cache writes, is unchanged.
+        """
+        if moe_rows is None or self.prefill_moe_rows is None:
+            return self.run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                mm_inputs=mm_inputs,
+            )
+        with self.prefill_moe_rows.select(moe_rows):
+            return self.run_model(
+                num_tokens,
+                attn_metadata,
+                slot_mappings,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                mm_inputs=mm_inputs,
+            )
+
     def multi_step_decode(
         self,
         num_reqs: int,
@@ -454,6 +564,9 @@ class EagleSpeculator(TargetSamplingHooks):
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
     ) -> None:
+        if self._skip_draft_decode:
+            # Every request is mid-prefill; the scheduler drops these drafts.
+            return
         multistep = getattr(self, "multistep_cudagraph_manager", None)
         if (
             multistep is not None
@@ -658,15 +771,16 @@ class EagleSpeculator(TargetSamplingHooks):
         assert self.decode_cudagraph_manager is not None
         self._mtp_decode_begin()
         try:
-            self.decode_cudagraph_manager.capture(
-                self.generate_draft,
-                self.model_state,
-                self.input_buffers,
-                self.block_tables,
-                self.attn_groups,
-                self.kv_cache_config,
-                progress_bar_desc="Capturing eagle decode CUDA graphs",
-            )
+            with self._draft_decode_pad_rows():
+                self.decode_cudagraph_manager.capture(
+                    self.generate_draft,
+                    self.model_state,
+                    self.input_buffers,
+                    self.block_tables,
+                    self.attn_groups,
+                    self.kv_cache_config,
+                    progress_bar_desc="Capturing eagle decode CUDA graphs",
+                )
         finally:
             self._mtp_decode_end()
 
@@ -674,21 +788,29 @@ class EagleSpeculator(TargetSamplingHooks):
         if multistep is not None:
             self._mtp_decode_begin()
             try:
-                multistep.capture(
-                    self._generate_all_draft_steps,
-                    self.model_state,
-                    self.input_buffers,
-                    self.block_tables,
-                    self.attn_groups,
-                    self.kv_cache_config,
-                    progress_bar_desc="Capturing single-graph MTP draft decode",
-                )
+                with self._draft_decode_pad_rows():
+                    multistep.capture(
+                        self._generate_all_draft_steps,
+                        self.model_state,
+                        self.input_buffers,
+                        self.block_tables,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        progress_bar_desc="Capturing single-graph MTP draft decode",
+                    )
                 logger.info(
                     "Captured %d single-graph MTP draft decode shapes.",
                     len(multistep.graphs),
                 )
             finally:
                 self._mtp_decode_end()
+
+    def _draft_decode_pad_rows(self) -> contextlib.AbstractContextManager[None]:
+        """ONECAT_DRAFT47 d2a: the captured decode graphs route their padded
+        rows to expert -1. prepare_eagle_decode sets
+        query_start_loc[max_num_reqs] to the real request count before the
+        decode steps of every propose() call."""
+        return _draft_ops.decode_pad_rows(self)
 
     @torch.inference_mode()
     def propose(

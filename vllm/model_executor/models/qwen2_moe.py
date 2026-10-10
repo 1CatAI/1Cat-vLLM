@@ -41,6 +41,7 @@ from vllm.config.execution_policy import layer_policy
 from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.model_executor.layers import sm70_fuse47 as _fuse47
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -268,6 +269,17 @@ class Qwen2MoeMLP(nn.Module):
             ):
                 out = torch.ops.vllm.qwen38_sm70_shared_gate_mul(expert_gate, out)
                 used_batch_epilogue = True
+            # Prefer the model-scoped upstream batch epilogues above for their
+            # supported Qwen3.8 shapes. Keep FUSE47 h1 as a fallback for other
+            # SM70 FP16 gate/output shapes when no upstream route handled it.
+            if (
+                not used_batch_epilogue
+                and _fuse47.unit_enabled("h1")
+                and not capture_runtime_trace().qwen_mlp_internals
+                and _fuse47.h1_supported(expert_gate, out)
+            ):
+                _fuse47.note_route("h1", "fallback")
+                return _fuse47.shared_gate_sigmoid_mul(expert_gate, out)
             if not used_batch_epilogue:
                 expert_gate = F.sigmoid(expert_gate)
                 expert_gate = _sm70_dump_qwen_mlp_tensor(

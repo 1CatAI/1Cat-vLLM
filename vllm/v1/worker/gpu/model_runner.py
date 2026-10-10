@@ -50,6 +50,7 @@ from vllm.model_executor.offloader import (
 from vllm.model_executor.warmup.plan import run_warmup_tasks, warmup_boolean
 from vllm.model_executor.warmup.sm70_runtime import (
     auxiliary_warmup_enabled,
+    note_runner_dispatch,
     speculator_warmup_tasks,
     warmup_v2_convolution,
 )
@@ -88,6 +89,7 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     ModelCudaGraphManager,
     get_explicit_cudagraph_memory_reserve,
     get_uniform_decode_token_count,
+    is_speculative_uniform_batch,
 )
 from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.eplb_utils import EPLBController, step_eplb_after
@@ -627,7 +629,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             tasks.append(
                 warmup_boolean("zero_kv_blocks", self._kv_block_zeroer.warmup_kernel)
             )
-        tasks.extend(speculator_warmup_tasks(self.speculator, self._dummy_run))
+        tasks.extend(
+            speculator_warmup_tasks(
+                self.speculator, self._dummy_run, runner=self, logger=logger
+            )
+        )
         warmed = run_warmup_tasks(tasks)
         if warmed:
             logger.info_once("SM70 V2 auxiliary kernel warmup finished: %s", warmed)
@@ -1248,6 +1254,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             grammar_output,
             sampler_output,
             cached_logits,
+            speculator=self.speculator,
         )
         if sampler_output is None:
             logits = (
@@ -1398,9 +1405,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
+        max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = self._get_uniform_decode_token_count(
             scheduler_output, dummy_run
         )
+        if uniform_tok_count is not None and not is_speculative_uniform_batch(
+            uniform_tok_count,
+            scheduler_output.num_scheduled_tokens,
+            scheduler_output.scheduled_spec_decode_tokens,
+        ):
+            # Uniform by shape only (e.g. a prefill chunk of exactly
+            # 1 + num_draft tokens): the captured verify graph would consume
+            # stale spec-state metadata. Run it as a regular batch.
+            logger.info_once(
+                "Uniform %d-token batch without matching draft tokens is not "
+                "dispatched to the speculative-decode cudagraph.",
+                uniform_tok_count,
+            )
+            uniform_tok_count = None
 
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
@@ -1417,6 +1439,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
+        )
+
+        note_runner_dispatch(
+            self,
+            num_reqs,
+            num_toks,
+            max_query_len,
+            uniform_tok_count,
+            batch_desc,
+            logger,
         )
 
         if batch_desc.num_tokens == 0:

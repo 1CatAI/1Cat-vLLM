@@ -156,6 +156,31 @@ def test_explicit_typed_choices_override_legacy_without_writing_env(monkeypatch)
 
 
 @pytest.mark.parametrize(
+    "options",
+    [
+        {},
+        {"combo_kernels": False},
+        {"benchmark_combo_kernel": False},
+        {"combo_kernels": False, "benchmark_combo_kernel": False},
+        {
+            "deterministic": True,
+            "combo_kernels": True,
+            "benchmark_combo_kernel": False,
+        },
+    ],
+)
+def test_sm70_combo_defaults_preserve_explicit_compiler_choices(monkeypatch, options):
+    cfg = engine(spec="mtp")
+    cfg.compilation_config = CompilationConfig(inductor_compile_config=options.copy())
+    before = dict(os.environ)
+    expected = {"combo_kernels": True, "benchmark_combo_kernel": True, **options}
+    apply(cfg, monkeypatch)
+    for name, value in expected.items():
+        assert cfg.compilation_config.inductor_compile_config[name] is value
+    assert os.environ == before
+
+
+@pytest.mark.parametrize(
     "tp,pp,temp,partition", [(8, 1, 0.9, None), (4, 2, 0.8, "24,21")]
 )
 def test_glm_defaults_preserve_checkpoint_order(monkeypatch, tp, pp, temp, partition):

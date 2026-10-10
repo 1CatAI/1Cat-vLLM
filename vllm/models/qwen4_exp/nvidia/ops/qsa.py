@@ -2018,6 +2018,7 @@ def _qsa_grouped_page4_forward(
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
+    token_to_req: torch.Tensor | None = None,
 ) -> None:
     forward_args = (
         q,
@@ -2032,6 +2033,19 @@ def _qsa_grouped_page4_forward(
     )
     abi_version = _qsa_grouped_page4_abi_version(flash_attn_v100_cuda)
     if abi_version >= 2:
+        if (
+            sparse_policy().value("qsa_segmented_page4")
+            and token_to_req is not None
+            and q.shape[0] <= 64
+        ):
+            split = getattr(
+                flash_attn_v100_cuda, "grouped_sparse_page4_split_fwd", None
+            )
+            if split is not None:
+                logger.info_once("ONECAT_FUSE47 q48 route: split")
+                split(*forward_args, kv_cache_dtype, k_scale, v_scale, token_to_req)
+                return
+            logger.info_once("ONECAT_FUSE47 q48 route: fallback:no_split_entry")
         flash_attn_v100_cuda.grouped_sparse_page4_fwd(
             *forward_args,
             kv_cache_dtype,
@@ -2105,6 +2119,7 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
         kv_cache_dtype,
         k_scale,
         v_scale,
+        token_to_req=token_to_req,
     )
     logger.info_once(
         "Using SM70 grouped QSA Flash-V100 page4 prefill route (rows=%d, groups=%d).",
