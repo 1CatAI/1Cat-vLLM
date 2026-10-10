@@ -128,7 +128,9 @@ def random_case(
 def test_segmented_page4_matches_packed(groups, width, segments, fp16):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("Requires SM70")
-    module = pytest.importorskip("flash_attn_v100_cuda")
+    interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
+    module = interface.flash_attn_v100_cuda
+    assert module is not None, "Requires the source-built Flash-V100 extension"
     if not hasattr(module, "grouped_sparse_page4_split_fwd"):
         pytest.skip("Requires segmented page4 extension")
     assert module.grouped_sparse_page4_split_abi_version() >= 1
