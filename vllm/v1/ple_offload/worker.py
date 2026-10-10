@@ -69,6 +69,7 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.ple_offload.draft_prefetch import DraftRowPrefetcher
+from vllm.v1.ple_offload.fast_lane import FastLaneOwner
 from vllm.v1.ple_offload.protocol import (
     _PLE_OFFLOAD_REQUEST_DECODER,
     PleOffloadRegistration,
@@ -872,6 +873,68 @@ class PleOffloadRunner:
             sorted(self.layer_names),
         )
         self._start_draft_prefetch(registrations)
+        self._start_fast_lane(registrations)
+
+    def _fast_lane_reason(self, registrations: list[PleOffloadRegistration]):
+        """Return why the native lane cannot serve, or None when it can."""
+        lanes = [r for r in registrations if r.fast_lane_request is not None]
+        if len(lanes) != 1 or lanes[0].fast_lane_geometry is None:
+            return "no_mapped_request_slot"
+        if set(self._worker_targets) != {0} or len(self._layers) != 1:
+            return "requires_one_dp_rank_and_one_ple_layer"
+        layer = next(iter(self._layers.values()))
+        reader = getattr(getattr(layer, "ngram_embedding", None), "_cpu_reader", None)
+        if reader is None or reader.source_type != 20:
+            return "requires_cpu_owned_iq4nl_rows"
+        if getattr(layer, "_packed_result_layout", None) is None:
+            return "requires_packed_results"
+        if getattr(layer, "_cascade", False) or getattr(layer, "_disk_offload", False):
+            return "tiered_storage_uses_the_python_owner"
+        if (layer.ngram_size, layer.heads_per_ngram, layer.ngram_heads) != (3, 8, 16):
+            return "requires_trigram_16_head_hashing"
+        targets = next(iter(self._worker_targets[0].values()))
+        if any(t.cpu_output_buffer is None for t in targets):
+            return "requires_mapped_result_transport"
+        return None
+
+    def _start_fast_lane(self, registrations: list[PleOffloadRegistration]) -> None:
+        """Serve requests from a native thread when every condition holds."""
+        self._fast_lane = None
+        if not self.vllm_config.kernel_config.ple_fast_lane:
+            return
+        reason = self._fast_lane_reason(registrations)
+        if reason is not None:
+            logger.info("PLE fast lane not used: %s", reason)
+            return
+        registration = next(r for r in registrations if r.fast_lane_request is not None)
+        request = registration.fast_lane_request
+        max_reqs, max_tokens = registration.fast_lane_geometry
+        layer = next(iter(self._layers.values()))
+        reader = layer.ngram_embedding._cpu_reader
+        targets = sorted(
+            next(iter(self._worker_targets[0].values())), key=lambda t: t.tp_rank
+        )
+        handle = torch.ops._C.ple_fast_lane_start(
+            request,
+            max_reqs,
+            max_tokens,
+            reader.data.ctypes.data,
+            reader.data.shape[1],
+            reader.logical_rows,
+            layer.layer_multipliers.tolist(),
+            layer.ngram_heads_vocab_sizes.tolist(),
+            layer.ngram_heads_offsets.tolist(),
+            int(layer.eos_token_id),
+            [t.cpu_output_buffer.data_ptr() for t in targets],
+            [t.sem.flag_tensor.data_ptr() for t in targets],
+            int(self.vllm_config.kernel_config.ple_row_cache_mib) << 20,
+            50_000,
+            self._clamp_input_ids,
+        )
+        self._fast_lane = FastLaneOwner(request, handle)
+        logger.info(
+            "PLE fast lane serving %d TP result buffer(s) natively.", len(targets)
+        )
 
     def _start_draft_prefetch(self, registrations: list[PleOffloadRegistration]):
         """Read drafted tokens' table pages ahead of their verify request."""

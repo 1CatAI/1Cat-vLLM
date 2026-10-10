@@ -954,6 +954,18 @@ void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
                         int64_t shard_size, int64_t num_rows, int64_t row_bytes,
                         torch::Tensor out);
 
+int64_t ple_fast_lane_start(torch::Tensor request, int64_t max_reqs,
+                            int64_t max_tokens, int64_t table_ptr,
+                            int64_t row_bytes, int64_t num_rows,
+                            std::vector<int64_t> multipliers,
+                            std::vector<int64_t> sizes,
+                            std::vector<int64_t> offsets, int64_t eos,
+                            std::vector<int64_t> result_ptrs,
+                            std::vector<int64_t> flag_ptrs, int64_t cache_bytes,
+                            int64_t idle_spin_us, bool clamp_tokens);
+torch::Tensor ple_fast_lane_stats(int64_t handle);
+void ple_fast_lane_stop(int64_t handle);
+
 void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
                                       torch::Tensor stats, int64_t source_type,
                                       int64_t group_size);

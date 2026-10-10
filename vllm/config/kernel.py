@@ -802,6 +802,8 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_fast_lane: bool = True
+    """Serve eligible CPU PLE requests from a native owner thread."""
     ple_draft_prefetch: bool = True
     """Read PLE table pages of drafted tokens into page cache while drafting."""
     ple_row_cache_mib: int = Field(default=1536, ge=0)
@@ -936,6 +938,7 @@ class KernelConfig:
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
             "ple_row_cache_mib",  # CPU-only reuse of bit-identical rows
             "ple_draft_prefetch",  # Page-cache readahead; results unchanged
+            "ple_fast_lane",  # Same packed rows through a native owner thread
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",

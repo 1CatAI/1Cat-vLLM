@@ -39,6 +39,9 @@ class PleOffloadRegistration:
     # TP0's host-mapped verify-window tokens, published while drafting.
     draft_ring: torch.Tensor | None = None
     draft_ring_geometry: tuple[int, int] | None = None
+    # TP0's mapped request slot for the owner's native request lane.
+    fast_lane_request: torch.Tensor | None = None
+    fast_lane_geometry: tuple[int, int] | None = None
 
 
 @dataclass
