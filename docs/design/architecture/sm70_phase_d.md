@@ -535,3 +535,45 @@ Only proven shared domains coalesce to one handle; separate domains and old
 binaries retain both handles. No assumption about linker behavior is required.
 Nested-owner restoration and both probe outcomes have CPU coverage; final native
 rebuild, GPU isolation and host A/B are pending.
+
+### D5b: Marlin compatibility policy and shared native scope
+
+Six `SM70_MARLIN_{DENSE,MOE}_{CTA_GEOMETRY,SPLIT_K,METADATA_CACHE}` inputs
+now belong to `KernelConfig.sm70_marlin`. The normal native policy ABI grows
+append-only to 67. Initialization parses the original geometry, `strtol` and
+metadata dialect once; native shape qualification, defaults, error priority and
+old operator schemas stay unchanged. Workspace preparation binds the policy;
+runner execution borrows its stable slot. Independent no-config calls retain
+the original compatibility adapter. Explicit policy against an older binary
+fails before execution.
+
+Both normal extensions now expose their active context identity. Initialization
+coalesces handles only after proving that entering `_C` also changes `_moe_C` to
+the same nonzero identity. Builds with separate TLS domains or without this
+optional probe keep two owners. On 54633 the proof selects one handle. Event
+tracing's remaining old-runner and graph-wrapper call sites now borrow the engine
+tracer and its diagnostic budget; disabled tracing adds no CUDA timing or sync.
+
+Validation passes 47 GPU/operator and lifecycle cases on 54633, including two
+Marlin configurations, changed-input capture/replay, independent release, native
+AOT slot reload, E8M0 subnormals and retained invalid-override errors. CPU policy,
+worker/hash and loader-domain tests pass; the full changed-file hooks pass.
+Source/build identities and raw A/B samples are in
+[phase_d5b_operators.json](phase_d5b_operators.json).
+
+Three alternating A/B rounds preserve every deterministic output digest and
+allocation count. GPU time differs by -0.08% to +0.19%. Existing FP16/QPN8 host
+calls including the native boundary improve by 4.6–8.9 microseconds (9–15%).
+Marlin's eager operator host differences range from -3.9% to +6.5%; samples
+include ordinary host scheduling variation. Its newly required engine boundary
+adds about 20–26 microseconds compared with the old standalone call. That cost
+is once per enclosing runner boundary, shared by its layers, and is reported
+separately from GPU time. No model speed claim is made.
+
+The first GPU run had eight failures and is retained. A focused repeat probe
+proved the legacy Marlin split-K=8 path itself changes low bits on random FP16
+inputs; the largest observed MoE spread was 0.00048828125. The exact policy oracle
+uses the existing fixed-E8M0 fixture with binary-exact activations for both arms;
+random-input split-K error tests remain enabled. Two FP16 owner tests also needed
+the same fixed selector on both arms instead of comparing independent autotuning
+winners. Neither fix changes production computation or defaults.

@@ -14,9 +14,6 @@ from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_make_workspace_new,
 )
-from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-    rand_marlin_weight_mxfp4_like,
-)
 from vllm.platforms import current_platform
 from vllm.runtime_resources import release_runtime_resources
 from vllm.scalar_type import scalar_types
@@ -31,12 +28,14 @@ pytestmark = pytest.mark.skipif(
 def test_marlin_engine_policy_matches_legacy_and_survives_replay(
     monkeypatch, moe, rows
 ):
-    torch.manual_seed(319)
+    from tests.kernels.quantization.test_sm70_mxfp4_e8m0 import _make_fixed_e8m0_case
+
+    # Split-K=8 has order-dependent rounding on arbitrary FP16 input even in
+    # the old export. Fixed E8M0 scales and binary-exact inputs exercise both
+    # policies with an exact oracle, including changed-input graph replay.
+    x, weight, scales, _ = _make_fixed_e8m0_case(monkeypatch, 112)
     n, k = 512, 1024
-    x = torch.randn(rows, k, device="cuda", dtype=torch.float16)
-    _, weight, scales = rand_marlin_weight_mxfp4_like(
-        torch.empty(n, k, device="cuda", dtype=torch.float16), 32
-    )
+    x = x.expand(rows, -1).contiguous()
     ids = torch.zeros(rows, 1, device="cuda", dtype=torch.long)
     sorted_ids, expert_ids, padded = moe_align_block_size(ids, 8, 1)
     scores = torch.ones(rows, 1, device="cuda", dtype=torch.float32)

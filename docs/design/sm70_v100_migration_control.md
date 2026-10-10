@@ -49547,3 +49547,21 @@ syntax exit 0. No CUDA driver repair or GPU execution was attempted.
   operator-only acceptance. Model throughput, pure 35B decode and TTFT were not
   run or claimed. DDTree and broad C/D remain subsequent work. GPU leases and
   task benchmark processes are released; no model service or port was created.
+
+### 2026-10-10 Phase D5b operator handoff
+
+- Base `e2a52d519`, owned branch `agent/v100-phase-d5b-marlin-20261010-003032`.
+  Native ABI 67 binds six Marlin controls; normal `_C`/`_moe_C` context probes
+  coalesce only proven shared TLS. Old-runner/graph event traces use engine owners.
+- 54633: final 47 GPU tests pass, no models loaded; three AB/BA/AB rounds retain
+  deterministic digests and allocation counts. GPU changes within 0.2%; FP16/QPN8
+  native-boundary host cost falls 5–9 us. New Marlin owner boundary costs 20–26 us
+  vs the old standalone path; no model throughput claim.
+- Negative evidence: random split-K=8 legacy rounding variability and independent
+  FP16 tuning winners cannot be used as bitwise reference pairs. Exact checks now
+  use the matched fixed oracle; existing random split-K tests remain.
+- Source, binary hashes, raw samples and detailed limits:
+  `docs/design/architecture/phase_d5b_operators.json`; raw remote artifacts under
+  `/home/ymzx/arch-ws/phase-d5b-20261010/artifacts`.
+- D6 remains pending; full inventory, retained boundaries and FlashQLA's remaining
+  native column-policy binding are being completed there.
