@@ -248,6 +248,11 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
+
+    VLLM_1CAT_PREFILL_PACE_STEPS: int = 0
+    VLLM_KERNEL_WARMUP_COVERAGE: bool = True
+    VLLM_TRITON_JIT_MANIFEST: str | None = None
+    VLLM_SM70_CG_DISPATCH_DEBUG: bool = False
     VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS: bool = False
     VLLM_1CAT_ENABLE_QWEN35_MTP_DEFAULTS: bool = False
     VLLM_1CAT_DISABLE_SM70_MTP_DEFAULTS: bool = False
@@ -3109,6 +3114,61 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 1Cat SM70 public-profile MTP opt-ins/opt-outs. These are consumed while
     # building EngineArgs and must be registered so environment validation does
     # not warn users that our own documented knobs are unknown.
+    "VLLM_1CAT_PREFILL_PACE_STEPS": env_var(
+        lambda: int(os.getenv("VLLM_1CAT_PREFILL_PACE_STEPS", "0")),
+        description=(
+            "Minimum scheduler steps between unfinished prefill chunks "
+            "while another request decodes. Zero disables fixed pacing; "
+            "lone prefills remain unpaced."
+        ),
+        category="tuning",
+        declared_default="0",
+        effective_default="0",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_KERNEL_WARMUP_COVERAGE": env_var(
+        lambda: bool(int(os.getenv("VLLM_KERNEL_WARMUP_COVERAGE", "1"))),
+        description=(
+            "Warm representative request-count, sampling, and kernel "
+            "buckets before serving. This changes startup coverage, not "
+            "inference arithmetic."
+        ),
+        category="debug",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_TRITON_JIT_MANIFEST": env_var(
+        lambda: os.getenv("VLLM_TRITON_JIT_MANIFEST") or None,
+        description=(
+            "Optional private JSONL path for bounded Triton compilation "
+            "telemetry. Unset disables manifest writes."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_SM70_CG_DISPATCH_DEBUG": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_CG_DISPATCH_DEBUG", "0"))),
+        description=(
+            "Log scheduler shape and speculative CUDA graph dispatch "
+            "diagnostics. Disabled by default; does not change graph "
+            "selection."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
     "VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS": env_var(
         lambda: bool(int(os.getenv("VLLM_1CAT_ENABLE_SM70_MTP_DEFAULTS", "0"))),
         description=(
@@ -19101,6 +19161,10 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
     hash everything else. This keeps the cache key aligned across workers."""
 
     ignored_factors: set[str] = {
+        "VLLM_1CAT_PREFILL_PACE_STEPS",
+        "VLLM_KERNEL_WARMUP_COVERAGE",
+        "VLLM_TRITON_JIT_MANIFEST",
+        "VLLM_SM70_CG_DISPATCH_DEBUG",
         "MAX_JOBS",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",

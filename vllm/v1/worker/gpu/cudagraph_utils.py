@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, NamedTuple
 
@@ -196,6 +196,33 @@ def get_uniform_decode_token_count(
     if has_prefill or num_reqs == 0:
         return None
     return get_uniform_token_count(num_reqs, num_tokens, max_query_len)
+
+
+def is_speculative_uniform_batch(
+    uniform_token_count: int,
+    num_scheduled_tokens: Mapping[str, int],
+    scheduled_spec_decode_tokens: Mapping[str, Sequence[int]] | None,
+) -> bool:
+    """Return whether a uniform batch is a real speculative verify batch.
+
+    A batch of ``uniform_token_count > 1`` tokens per request is dispatched to
+    the FULL cudagraph captured for the speculative query length. That graph
+    replays the verify kernels, which read the per-request spec-state metadata
+    buffers (state slot page ids, slot selectors, verify block tables). Those
+    buffers are rebuilt only for requests that carry draft tokens, so a prefill
+    chunk that merely happens to be ``1 + num_draft`` tokens per request would
+    run the verify kernels on whatever the previous occupant left there. Such
+    a batch must fall back to the piecewise or eager path instead.
+    """
+    num_draft = uniform_token_count - 1
+    if num_draft <= 0:
+        return True
+    if not scheduled_spec_decode_tokens:
+        return False
+    return all(
+        len(scheduled_spec_decode_tokens.get(req_id, ())) == num_draft
+        for req_id in num_scheduled_tokens
+    )
 
 
 class CudaGraphManager:

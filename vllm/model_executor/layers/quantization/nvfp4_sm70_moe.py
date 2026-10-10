@@ -22,6 +22,7 @@ from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.diagnostics import diagnostic_history
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.model_executor.layers import sm70_fuse47 as _fuse47
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
@@ -1410,6 +1411,16 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
             stage_offsets = buffers["compact_offsets"]
             stage_expert_ids = buffers["active_expert_ids"]
             stage_experts = slots
+        elif (
+            not indexed_w13
+            and not _use_compact_grouped(num_tokens, top_k)
+            and _fuse47.unit_enabled("h2")
+            and _fuse47.h2_supported(layer, x, topk_ids, buffers)
+        ):
+            # STEP-47 h2: output zero fill, top-k id copy, radix sort, expert
+            # offsets (int64 and int32) and row expansion in one kernel.
+            _fuse47.note_route("h2", "fused")
+            _fuse47.moe_permute_fused(layer, x, topk_ids, buffers)
         else:
             output.zero_()
             topk_ids_i32 = buffers["topk_ids"]

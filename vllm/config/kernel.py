@@ -10,6 +10,7 @@ from pydantic import Field, field_validator
 from vllm.config.execution_policy import LayerExecutionPolicy
 from vllm.config.gdn import GdnConfig
 from vllm.config.legacy_inputs import LegacyInputs
+from vllm.config.sm70_draft import Sm70DraftConfig
 from vllm.config.sm70_moe import Sm70MoEConfig
 from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.sm70_runtime import Sm70RuntimeConfig
@@ -580,6 +581,9 @@ class KernelConfig:
     sm70_moe: Sm70MoEConfig = Field(default_factory=Sm70MoEConfig)
     """Per-engine MoE stage policy; legacy switches resolve at construction."""
 
+    sm70_draft: Sm70DraftConfig = Field(default_factory=Sm70DraftConfig)
+    """Drafter graph and exact top1 policy captured at engine construction."""
+
     ir_op_priority: IrOpPriorityConfig = Field(default_factory=IrOpPriorityConfig)
     """
     vLLM IR op priority for dispatching/lowering during the forward pass.
@@ -849,6 +853,14 @@ class KernelConfig:
         """Policy consumed by the generic multistep draft graph manager."""
         return self.sm70_draft_single_graph
 
+    def shortconv_metadata_provider(self, config, device, cache_mode):
+        """Bind per-engine grouped short-convolution resources at state init."""
+        from vllm.v1.worker.gpu.model_states.sm70_mtp_metadata import (
+            ShortConvMetadataProvider,
+        )
+
+        return ShortConvMetadataProvider(config, device, cache_mode)
+
     def top1_exchange_callback(self):
         if not self.sm70_top1x:
             return None
@@ -946,6 +958,8 @@ class KernelConfig:
             ignored_factors.add("sm70_fp8")
         if not self.sm70_moe.resolved:
             ignored_factors.add("sm70_moe")
+        if not self.sm70_draft.units:
+            ignored_factors.add("sm70_draft")
         if not self.sm70_sparse.active:
             ignored_factors.add("sm70_sparse")
         for family in ("nvfp4", "gguf"):
