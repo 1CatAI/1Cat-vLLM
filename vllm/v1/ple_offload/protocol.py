@@ -36,6 +36,9 @@ class PleOffloadRegistration:
     # GPU loading resolves result formats after the CPU spawn config freezes.
     # Transfer only primitive geometry, never the live model/config graph.
     result_layouts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # TP0's host-mapped verify-window tokens, published while drafting.
+    draft_ring: torch.Tensor | None = None
+    draft_ring_geometry: tuple[int, int] | None = None
 
 
 @dataclass

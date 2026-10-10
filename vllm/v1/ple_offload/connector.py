@@ -19,11 +19,15 @@ from vllm.config import VllmConfig
 from vllm.config.execution_policy import ple_policy
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
-from vllm.model_executor.kernels.ple.host_result import HostResultRegion
+from vllm.model_executor.kernels.ple.host_result import (
+    HostResultRegion,
+    host_result_capability,
+)
 from vllm.model_executor.layers.ple_offload_layer import (
     CpuGpuSemaphore,
     PleOffloadLayer,
 )
+from vllm.v1.ple_offload.draft_prefetch import DraftTokenRing
 from vllm.v1.ple_offload.protocol import (
     PleOffloadRegistration,
     PleOffloadRequest,
@@ -129,6 +133,7 @@ class PleOffloadConnector:
         self._validate_input_sources()
 
         self._pinned_input_buffers: list[torch.Tensor] = []
+        self.draft_ring = self._create_draft_ring(vllm_config)
         # MRV2 may queue more than one batch under asynchronous scheduling.
         # MRV1 remains strictly serialized and retains its existing depth-one
         # CPU staging contract.
@@ -165,6 +170,26 @@ class PleOffloadConnector:
         except Exception:
             self.close()
             raise
+
+    def _create_draft_ring(self, vllm_config: VllmConfig) -> DraftTokenRing | None:
+        """TP0 publishes drafted tokens so the worker can prefetch their rows."""
+        speculative = vllm_config.speculative_config
+        num_spec = getattr(speculative, "num_speculative_tokens", 0) or 0
+        if (
+            self.tp_rank != 0
+            or not self._uses_cuda_inputs
+            or num_spec <= 0
+            or not vllm_config.kernel_config.ple_draft_prefetch
+            or host_result_capability(self.device) is not None
+        ):
+            return None
+        try:
+            return DraftTokenRing(
+                self.device, vllm_config.scheduler_config.max_num_seqs, num_spec
+            )
+        except RuntimeError as error:
+            logger.warning("PLE draft prefetch unavailable: %s", error)
+            return None
 
     def _setup_layers(
         self,
@@ -310,11 +335,19 @@ class PleOffloadConnector:
                 for name, layer in self._layers.items()
                 if (layout := layer.offload_result_layout()) is not None
             },
+            draft_ring=None if self.draft_ring is None else self.draft_ring.host,
+            draft_ring_geometry=(
+                None
+                if self.draft_ring is None
+                else (self.draft_ring.max_reqs, self.draft_ring.num_spec)
+            ),
         )
 
         payload = _dump_registration(registration)
         for region in self._host_result_regions.values():
             region.validate_registration()
+        if self.draft_ring is not None:
+            self.draft_ring.validate_registration()
         assert self._registration_socket is not None
         self._registration_socket.send(payload)
 
@@ -559,6 +592,9 @@ class PleOffloadConnector:
         for region in getattr(self, "_host_result_regions", {}).values():
             region.close()
         self._host_result_regions = {}
+        if getattr(self, "draft_ring", None) is not None:
+            self.draft_ring.close()
+            self.draft_ring = None
         self._d2h_event_pool = None
         if self._registration_socket is not None:
             self._registration_socket.close(linger=0)

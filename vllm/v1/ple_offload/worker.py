@@ -68,6 +68,7 @@ from vllm.model_executor.model_loader.weight_utils import initialize_dummy_weigh
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.system_utils import decorate_logs, get_mp_context
 from vllm.utils.torch_utils import set_default_torch_dtype
+from vllm.v1.ple_offload.draft_prefetch import DraftRowPrefetcher
 from vllm.v1.ple_offload.protocol import (
     _PLE_OFFLOAD_REQUEST_DECODER,
     PleOffloadRegistration,
@@ -869,6 +870,33 @@ class PleOffloadRunner:
             dp_size,
             tp_size,
             sorted(self.layer_names),
+        )
+        self._start_draft_prefetch(registrations)
+
+    def _start_draft_prefetch(self, registrations: list[PleOffloadRegistration]):
+        """Read drafted tokens' table pages ahead of their verify request."""
+        rings = [r for r in registrations if r.draft_ring is not None]
+        if len(rings) != 1 or rings[0].draft_ring_geometry is None:
+            return
+        tables = []
+        for layer in self._layers.values():
+            row_ids = getattr(layer, "draft_prefetch_row_ids", None)
+            reader = getattr(
+                getattr(layer, "ngram_embedding", None), "_cpu_reader", None
+            )
+            if row_ids is None or reader is None:
+                continue
+            data = reader.data
+            tables.append((row_ids, data.ctypes.data, data.shape[1], data.shape[0]))
+        if not tables:
+            return
+        max_reqs, num_spec = rings[0].draft_ring_geometry
+        self._draft_prefetcher = DraftRowPrefetcher(
+            rings[0].draft_ring, max_reqs, num_spec, tables
+        )
+        self._draft_prefetcher.start()
+        logger.info(
+            "PLE draft-token page prefetch enabled for %d table(s).", len(tables)
         )
 
     def _bind_result_layouts(self, registrations: list[PleOffloadRegistration]) -> None:

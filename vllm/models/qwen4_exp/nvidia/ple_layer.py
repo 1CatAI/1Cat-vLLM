@@ -1457,6 +1457,28 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
             output.extend(mixed3 % sizes[h] + offsets[h] for h in range(8, 16))
         return torch.tensor(output, dtype=torch.long).reshape(num_tokens, 16)
 
+    def draft_prefetch_row_ids(
+        self, tokens: list[int], context: list[int]
+    ) -> np.ndarray:
+        """Table rows of consecutive tokens following two context tokens.
+
+        Used only to warm storage for drafted tokens; it shares the verify
+        path's hashing, so prefetched rows are exactly the rows it will read.
+        """
+        if (
+            not tokens
+            or self.ngram_size != 3
+            or self.heads_per_ngram != 8
+            or self.ngram_heads != 16
+        ):
+            return np.empty(0, dtype=np.int64)
+        rows = self._compute_ngram_ids_cpu_small(
+            torch.tensor(tokens, dtype=torch.int64),
+            torch.tensor([0, len(tokens)], dtype=torch.int64),
+            torch.tensor([context], dtype=torch.int64),
+        )
+        return rows.numpy().reshape(-1)
+
     def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
