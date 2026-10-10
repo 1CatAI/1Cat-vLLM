@@ -23,7 +23,7 @@ __global__ void quantize_q8(Q8_1* out, const half* input, int k) {
 
 template <int Type, bool Activated, class Index, int Lanes = 16,
           bool Quantized = false, bool Canonical = false,
-          bool ScalarLut = false, bool BankAware = false>
+          bool ScalarLut = false, bool BankAware = false, int FixedGroups = 0>
 __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
                         const uint8_t* gate, const uint8_t* up, int n, int k,
                         int stride, int top_k,
@@ -55,6 +55,19 @@ __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
   const uint8_t* g = gate + expert_row * stride;
   const uint8_t* u = up + expert_row * stride;
   float gs = 0.f, us = 0.f;
+  if constexpr (FixedGroups > 0 && !Canonical) {
+    // Compile-time K: each lane's groups are a fixed, fully unrolled list, so
+    // every group's weight loads can be in flight together instead of one
+    // dependent global round trip per loop iteration. The accumulation order
+    // (lane's groups ascending, gate and up separately) is unchanged.
+    static_assert(FixedGroups % Lanes == 0);
+#pragma unroll
+    for (int i = 0; i < FixedGroups / Lanes; ++i) {
+      const int group = lane % Lanes + i * Lanes;
+      gs += Dot::dot(g, group, shared_x[group], book, masks);
+      us += Dot::dot(u, group, shared_x[group], book, masks);
+    }
+  } else
   for (int group = lane % Lanes; group < groups; group += Lanes) {
     if constexpr (Canonical) {
       const int expert = ids[route];
@@ -137,12 +150,13 @@ void dispatch_lut4_gate_up(torch::Tensor out, torch::Tensor activation,
                                          up, up_stats, n);
 }
 
-template <int Type, class Index, int Lanes, bool BankAware = false>
+template <int Type, class Index, int Lanes, bool BankAware = false,
+          int FixedGroups = 0>
 void launch_quantized_gate_up(torch::Tensor out, torch::Tensor activation,
                               torch::Tensor ids, torch::Tensor gate,
                               torch::Tensor up) {
   const int n = gate.size(1), top_k = ids.size(1);
-  gate_up<Type, true, Index, Lanes, true, false, false, BankAware>
+  gate_up<Type, true, Index, Lanes, true, false, false, BankAware, FixedGroups>
       <<<dim3(n / 32, activation.size(0) * top_k), 32 * Lanes,
          activation.size(1) * sizeof(Q8_1), at::cuda::getCurrentCUDAStream()>>>(
           out.data_ptr(), reinterpret_cast<const Q8_1*>(activation.data_ptr()),
@@ -151,94 +165,14 @@ void launch_quantized_gate_up(torch::Tensor out, torch::Tensor activation,
           top_k);
 }
 
-// Staged variant of the quantized routed gate/up (16 lanes, 32 rows per CTA).
-// The CTA's 32 gate rows and then its 32 up rows are each one contiguous,
-// 16-byte-aligned region; copying them with coalesced 16-byte loads into
-// shared memory replaces ~7 small unaligned global loads per 32-value group.
-// Lane/group assignment, accumulation order, the shuffle reduction, the FP16
-// gate/up boundary and the Q8_1 output are identical to gate_up<..., true>.
-template <int Type, class Index>
-__global__ void __launch_bounds__(512, 2)
-    gate_up_staged(Q8_1* output, const Q8_1* activation, const Index* ids,
-                   const uint8_t* gate, const uint8_t* up, int n, int k,
-                   int stride, int top_k) {
-  using Dot = LatticeDot<Type, false>;
-  constexpr int Lanes = 16, Rows = 32;
-  __shared__ uint32_t book[Dot::kBookWords];
-  __shared__ uint32_t masks[16];
-  __shared__ half intermediate[Rows];
-  extern __shared__ __align__(16) uint8_t staged_shared[];
-  const int groups = k / 32, route = blockIdx.y;
-  Q8_1* shared_x = reinterpret_cast<Q8_1*>(staged_shared);
-  uint8_t* rows = staged_shared + ((groups * sizeof(Q8_1) + 15) / 16) * 16;
-  const Q8_1* x = activation + (route / top_k) * groups;
-  for (int i = threadIdx.x; i < groups * 9; i += blockDim.x)
-    reinterpret_cast<uint32_t*>(shared_x)[i] =
-        reinterpret_cast<const uint32_t*>(x)[i];
-  const int64_t first_row = int64_t(ids[route]) * n + int64_t(blockIdx.x) * Rows;
-  const uint4* gate_src =
-      reinterpret_cast<const uint4*>(gate + first_row * stride);
-  const uint4* up_src = reinterpret_cast<const uint4*>(up + first_row * stride);
-  const int vectors = Rows * stride / 16;
-  uint4* staged = reinterpret_cast<uint4*>(rows);
-  for (int i = threadIdx.x; i < vectors; i += blockDim.x) staged[i] = gate_src[i];
-  // Start pulling the up rows toward L2 while the gate rows are decoded.
-  for (int i = threadIdx.x * 8; i < vectors; i += blockDim.x * 8)
-    asm volatile("prefetch.global.L2 [%0];" ::"l"(up_src + i));
-  Dot::initialize(book, masks);  // includes __syncthreads()
-  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-  const int local_row = warp * (32 / Lanes) + lane / Lanes;
-  const uint8_t* row = rows + local_row * stride;
-  float gs = 0.f, us = 0.f;
-  for (int group = lane % Lanes; group < groups; group += Lanes)
-    gs += Dot::dot(row, group, shared_x[group], book, masks);
-  __syncthreads();
-  for (int i = threadIdx.x; i < vectors; i += blockDim.x) staged[i] = up_src[i];
-  __syncthreads();
-  for (int group = lane % Lanes; group < groups; group += Lanes)
-    us += Dot::dot(row, group, shared_x[group], book, masks);
-#pragma unroll
-  for (int offset = Lanes / 2; offset; offset >>= 1) {
-    gs += __shfl_down_sync(__activemask(), gs, offset, Lanes);
-    us += __shfl_down_sync(__activemask(), us, offset, Lanes);
-  }
-  if (lane % Lanes == 0) {
-    const float g16 = __half2float(__float2half_rn(gs));
-    const float u16 = __half2float(__float2half_rn(us));
-    const half silu = __float2half_rn(g16 / (1.f + expf(-g16)));
-    intermediate[local_row] = __hmul(silu, __float2half_rn(u16));
-  }
-  __syncthreads();
-  if (threadIdx.x < 32)
-    vllm::sm70_gguf::quantize_q8_1_warp(
-        output + int64_t{route} * (n / 32) + blockIdx.x,
-        __half2float(intermediate[threadIdx.x]));
-}
-
-template <int Type, class Index>
-void launch_staged_gate_up(torch::Tensor out, torch::Tensor activation,
-                           torch::Tensor ids, torch::Tensor gate,
-                           torch::Tensor up) {
-  const int n = gate.size(1), top_k = ids.size(1), stride = gate.size(2);
-  const int groups = activation.size(1);
-  const size_t shared =
-      ((groups * sizeof(Q8_1) + 15) / 16) * 16 + size_t(32) * stride;
-  gate_up_staged<Type, Index>
-      <<<dim3(n / 32, activation.size(0) * top_k), 512, shared,
-         at::cuda::getCurrentCUDAStream()>>>(
-          reinterpret_cast<Q8_1*>(out.data_ptr()),
-          reinterpret_cast<const Q8_1*>(activation.data_ptr()),
-          ids.data_ptr<Index>(), gate.data_ptr<uint8_t>(),
-          up.data_ptr<uint8_t>(), n, groups * 32, stride, top_k);
-}
-
 template <int Type, class Index, bool BankAware = false>
 void launch_gate_up(torch::Tensor out, torch::Tensor activation,
                     torch::Tensor ids, torch::Tensor gate, torch::Tensor up,
                     bool activated, int lanes) {
   if (out.scalar_type() == torch::kUInt8) {
-    if (lanes == 0 && !BankAware)
-      launch_staged_gate_up<Type, Index>(out, activation, ids, gate, up);
+    if (lanes == 0)  // K2560, 16 lanes, unrolled bank-aware schedule
+      launch_quantized_gate_up<Type, Index, 16, true, 80>(out, activation, ids,
+                                                          gate, up);
     else if (lanes == 4)
       launch_quantized_gate_up<Type, Index, 4, BankAware>(out, activation, ids,
                                                           gate, up);
@@ -468,17 +402,11 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
               "Expected aligned original GGUF lattice expert rows");
   const int n = gate.size(1), top_k = ids.size(1);
   const bool quantized = out.scalar_type() == torch::kUInt8;
-  // lanes_per_row 0 selects the staged 16-lane quantized schedule.
+  // lanes_per_row 0: K2560 16-lane schedule with a fully unrolled group loop.
   TORCH_CHECK(lanes_per_row == 16 ||
                   (quantized && (lanes_per_row == 4 || lanes_per_row == 8 ||
-                                 (lanes_per_row == 0 && !bank_aware))),
+                                 (lanes_per_row == 0 && k == 2560))),
               "Unsupported expert integer-dot row partition");
-  TORCH_CHECK(lanes_per_row != 0 ||
-                  ((32 * gate.size(2)) % 16 == 0 &&
-                   (gate.size(1) * gate.size(2)) % 16 == 0 &&
-                   reinterpret_cast<uintptr_t>(gate.data_ptr()) % 16 == 0 &&
-                   reinterpret_cast<uintptr_t>(up.data_ptr()) % 16 == 0),
-              "Staged gate/up requires 16-byte aligned expert rows");
   TORCH_CHECK(
       out.device() == activation.device() && out.is_contiguous() &&
           (quantized ? activated && n % 32 == 0 && out.dim() == 4 &&
