@@ -2524,7 +2524,9 @@ class EngineArgs:
         from vllm.models.qwen4_exp.common.ple import check_ple_host_share
 
         check_ple_host_share(
-            model_config.hf_text_config, parallel_config.tensor_parallel_size
+            model_config.hf_text_config,
+            parallel_config.tensor_parallel_size,
+            policy=config.offload_config.ple,
         )
 
         return config

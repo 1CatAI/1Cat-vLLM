@@ -1039,7 +1039,12 @@ def fused_gdr_fwd(
         o = output
 
     target_compute_version = tilelang.contrib.nvcc.get_target_compute_version()
-    enable_sm70_original = os.getenv("FLASH_QLA_SM70_ORIGINAL_FUSED_FWD", "0") == "1"
+    # Engine original-TileLang calls already supply sm70_original=True.
+    # Keep the independent package's compatibility override only when needed.
+    enable_sm70_original = (
+        False if sm70_original else
+        os.getenv("FLASH_QLA_SM70_ORIGINAL_FUSED_FWD", "0") == "1"
+    )
     use_sm70_original_fused = target_compute_version in ("7.0", "7.5") and (
         enable_sm70_original or sm70_original
     )

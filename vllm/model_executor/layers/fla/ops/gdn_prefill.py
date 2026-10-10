@@ -70,8 +70,13 @@ class GdnPrefill:
     """Bound computation only: no model/layer callbacks and no legacy inputs."""
 
     def __init__(
-        self, plan: GdnExecutionPlan, profiler: GdnPrefillProfiler, chunk_kernels=None
+        self,
+        plan: GdnExecutionPlan,
+        profiler: GdnPrefillProfiler,
+        chunk_kernels=None,
+        native_policy=None,
     ):
+        self.native_policy = native_policy
         self.chunk_kernels = chunk_kernels
         self.execution_plan = plan
         self.profiler = profiler
@@ -181,6 +186,7 @@ class GdnPrefill:
             inplace_final_state=inplace_final_state,
             use_original_tilelang=self.execution_plan.original_prefill,
             profiler=self.profiler,
+            native_policy=self.native_policy,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             core_attn_out=core_attn_out,
             gate_is_exp=gate_is_exp,

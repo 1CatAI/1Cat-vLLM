@@ -170,6 +170,8 @@ class RuntimeTraceConfig:
     """Shared tensor-diagnostic policy; mutable observations are engine-owned."""
 
     layer_aliases: ClassVar[dict[str, str]] = {
+        "spec_target_profiler_step": "VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP",
+        "shared_gate_replaced_notice": "VLLM_SM70_SHARED_GATE_MAX_M",
         "gdn_empty_output_notice": "VLLM_SM70_GDN_EMPTY_CORE_OUT",
         "gdn_legacy_fused_notice": "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING",
         "require_profile_acceleration": "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
@@ -187,6 +189,23 @@ class RuntimeTraceConfig:
         "mtp_load_verbose": "VLLM_DEBUG_MTP_LOAD_VERBOSE",
         "greedy_token_trace": "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE",
     }
+
+    legacy_layer_aliases: ClassVar[dict[str, tuple[str, ...]]] = {
+        "spec_target_profiler_step": (
+            "VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP",
+            "VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP",
+        ),
+        "spec_target_nvtx": (
+            "VLLM_SM70_SPEC_TARGET_FORWARD_NVTX",
+            "VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX",
+        ),
+    }
+
+    spec_target_profiler_step: int | None = None
+    """DSpark/legacy tree target step profiler; zero preserves disabled state."""
+
+    shared_gate_replaced_notice: bool | None = None
+    """Record the explicit obsolete M-limit input without parsing its value."""
 
     gdn_empty_output_notice: bool | None = None
     """Explain the retained paused empty-output experiment; allocation stays zeroed."""
@@ -268,7 +287,22 @@ class RuntimeTraceConfig:
         from vllm import envs
 
         def read_flag(name):
-            if name == "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING":
+            if name == "VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP":
+                primary, fallback = self.legacy_layer_aliases[
+                    "spec_target_profiler_step"
+                ]
+                raw = os.getenv(primary, os.getenv(fallback, "0"))
+                try:
+                    return max(0, int(raw))
+                except ValueError:
+                    return 0
+            if name == "VLLM_SM70_SPEC_TARGET_FORWARD_NVTX":
+                primary, fallback = self.legacy_layer_aliases["spec_target_nvtx"]
+                return os.getenv(fallback, "0") == "1" or os.getenv(primary, "0") == "1"
+            if name in (
+                "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING",
+                "VLLM_SM70_SHARED_GATE_MAX_M",
+            ):
                 return name in os.environ
             if name == "VLLM_SM70_DUMP_QWEN_MLP_INTERNALS":
                 return os.getenv(name) == "1"
@@ -306,6 +340,10 @@ class RuntimeTraceConfig:
             },
             reader=read_flag,
         )
+        for field, aliases in self.legacy_layer_aliases.items():
+            if self.sources[field] != "typed":
+                present = [alias for alias in aliases if alias in os.environ]
+                self.sources[field] = "+".join(present) if present else "default"
         # Disabled legacy diagnostics never parsed their numeric options.
         # Retain valid captured values, but do not reject an unused malformed
         # interval/threshold. The deferred worker override still enables its

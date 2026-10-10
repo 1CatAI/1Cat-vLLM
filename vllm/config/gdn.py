@@ -26,6 +26,14 @@ GDN_TEXT_FLAGS = {
     "decode_warmup": ("VLLM_SM70_FLASHQLA_DECODE_WARMUP", False),
 }
 
+GDN_NATIVE_ALIASES = {
+    "flashqla_column_groups": "FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK",
+}
+
+GDN_FALLBACK_ALIASES = {
+    "original_prefill": "FLASH_QLA_SM70_USE_ORIGINAL_TILELANG",
+}
+
 
 @config
 class GdnConfig:
@@ -63,6 +71,8 @@ class GdnConfig:
     """Supply the existing preallocated output when its tensor contract matches."""
     decode_warmup: bool | None = None
     """Warm the optional FlashQLA decode provider; not a computation hash input."""
+    flashqla_column_groups: int | None = None
+    """Native FlashQLA columns; -1 retains its dynamic M/head heuristic."""
     native_verify: bool | None = None
     """Existing sequential CUDA verifier; legacy KernelConfig flag remains valid."""
     resolved: bool = Field(default=False, init=False)
@@ -119,9 +129,9 @@ class GdnConfig:
             raw = os.environ.get(legacy)
             source = legacy if raw is not None else "default"
             if raw is None and field == "original_prefill":
-                raw = os.environ.get("FLASH_QLA_SM70_USE_ORIGINAL_TILELANG")
+                raw = os.environ.get(GDN_FALLBACK_ALIASES[field])
                 if raw is not None:
-                    source = "FLASH_QLA_SM70_USE_ORIGINAL_TILELANG"
+                    source = GDN_FALLBACK_ALIASES[field]
             value = (
                 default
                 if raw is None
@@ -136,6 +146,19 @@ class GdnConfig:
             )
         else:
             self.sources["native_verify"] = "typed"
+        if self.flashqla_column_groups is None:
+            from vllm.config.flash_v100 import native_value
+
+            alias = GDN_NATIVE_ALIASES["flashqla_column_groups"]
+            raw = os.environ.get(alias)
+            self.flashqla_column_groups = (
+                -1 if raw is None or raw == "" else native_value("optional_atoi", raw)
+            )
+            self.sources["flashqla_column_groups"] = (
+                alias if raw is not None else "default"
+            )
+        else:
+            self.sources["flashqla_column_groups"] = "typed"
         self.projection.resolve()
         self.state.resolve()
         self.schedule.resolve()
@@ -177,6 +200,10 @@ class GdnConfig:
                     for name, value in self.schedule.graph_options().items()
                     if name.startswith(("recurrent_", "sigmoid_"))
                 }
+        if not self.flashqla_decode and (
+            self.active_prefill_backend != "flashqla_sm70" or self.original_prefill
+        ):
+            options.pop("flashqla_column_groups")
         return options
 
 

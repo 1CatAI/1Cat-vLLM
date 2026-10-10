@@ -188,7 +188,7 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
 
     sm70_gemma_tp = (
         (
-            envs.VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION
+            cfg.parallel_config.communication.value("gemma_rms_tp2")
             and cfg.parallel_config.tensor_parallel_size == 2
         )
         # TP4 admission is checked against the active communicator by the pass.
@@ -2087,7 +2087,7 @@ class VllmConfig:
                 # sort to make sure the sizes are in ascending order
                 cudagraph_capture_sizes.sort()
             else:
-                use_dense_sm70_cudagraph = envs.VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE
+                use_dense_sm70_cudagraph = self.compilation_config.runtime.dense_capture
                 if use_dense_sm70_cudagraph:
                     from vllm.platforms import current_platform
 

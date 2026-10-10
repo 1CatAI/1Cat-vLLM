@@ -18,6 +18,27 @@ def log_runtime_route_once(message: str, *args) -> None:
         logger.info_once(message, *args)
 
 
+def bind_flashqla_native_policy(config, policy, *, needed):
+    """Bind a versioned native policy before forward/capture, once per engine."""
+    if not needed:
+        return None
+    from flash_qla.ops.gated_delta_rule.chunk.sm70.fused_fwd import _load_ext
+    from vllm.runtime_resources import runtime_resources_for
+
+    resources = runtime_resources_for(config)
+    if "flashqla_native_policy" not in resources:
+        ext = _load_ext()
+        abi = getattr(ext, "gdn_policy_abi_version", None)
+        if abi is None or abi() != 1:
+            raise RuntimeError(
+                "FlashQLA GDN policy ABI 1 is required; rebuild the bundled extension"
+            )
+        resources["flashqla_native_policy"] = ext.GdnPolicy(
+            policy.flashqla_column_groups
+        )
+    return resources["flashqla_native_policy"]
+
+
 def flashqla_sm70_chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -38,6 +59,7 @@ def flashqla_sm70_chunk_gated_delta_rule(
     *,
     use_original_tilelang: bool,
     profiler: GdnPrefillProfiler,
+    native_policy=None,
 ):
     if use_original_tilelang:
         from flash_qla.ops.gated_delta_rule.chunk import (
@@ -149,6 +171,7 @@ def flashqla_sm70_chunk_gated_delta_rule(
             validate_cu_seqlens=False,
             output=output,
             gate_is_exp=gate_is_exp,
+            native_policy=native_policy,
         )
     profiler.end(
         "flashqla",

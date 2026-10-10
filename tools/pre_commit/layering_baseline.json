@@ -64,8 +64,8 @@
   "platform": 1
  },
  "vllm/config/policy_defaults.py": {
-  "model": 14,
-  "platform": 28
+  "model": 11,
+  "platform": 26
  },
  "vllm/config/scheduler.py": {
   "platform": 13
@@ -84,7 +84,7 @@
  "vllm/config/vllm.py": {
   "env": 2,
   "model": 80,
-  "platform": 71
+  "platform": 69
  },
  "vllm/diagnostics.py": {
   "platform": 3
@@ -209,7 +209,7 @@
  },
  "vllm/model_executor/layers/fused_moe/runner/moe_runner.py": {
   "model": 2,
-  "platform": 40
+  "platform": 37
  },
  "vllm/model_executor/layers/fused_moe/runner/shared_experts.py": {
   "platform": 1
@@ -233,7 +233,7 @@
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 14,
   "model": 236,
-  "platform": 438
+  "platform": 436
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -556,9 +556,9 @@
   "platform": 3
  },
  "vllm/v1/worker/gpu_model_runner.py": {
-  "env": 18,
-  "model": 669,
-  "platform": 161
+  "env": 15,
+  "model": 665,
+  "platform": 160
  },
  "vllm/v1/worker/gpu_worker.py": {
   "model": 1,

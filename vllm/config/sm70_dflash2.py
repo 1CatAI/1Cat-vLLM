@@ -227,13 +227,9 @@ class Sm70DFlash2Config:
     """Explicit configuration or legacy settings, used by mixed-format defaults."""
 
     def resolve(self, *, qualified: bool) -> None:
-        if "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER" in os.environ:
-            logger.warning_once(
-                "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER is deprecated and ignored: "
-                "dense tie ordering is mandatory after retiring the failed "
-                "candidate-order experiment. No replacement switch is needed. "
-                "The alias remains for one full released compatibility cycle."
-            )
+        variable = envs.environment_variables["VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER"]
+        if isinstance(variable, EnvVar):
+            variable.warn_if_deprecated()
         if self.resolved:
             return
         explicit = []

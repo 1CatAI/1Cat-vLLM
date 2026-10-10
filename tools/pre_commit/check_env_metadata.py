@@ -97,6 +97,8 @@ def read_metadata(source: str) -> tuple[dict[str, dict], list[str]]:
             errors.append(f"{name}: metadata must use literals; never evaluate getters")
             continue
         metadata = DEPRECATION_DEFAULTS | metadata
+        if metadata["category"] == "deprecated" and not metadata["deprecated"]:
+            errors.append(f"{name}: deprecated category needs structured evidence")
         if not isinstance(metadata["deprecated"], bool):
             errors.append(f"{name}: deprecated must be a literal boolean")
         elif metadata["deprecated"]:

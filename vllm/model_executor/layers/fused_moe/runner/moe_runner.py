@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
-import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
 from vllm.config.diagnostic_dump import parse_int_filter
 from vllm.config.execution_policy import communication_policy, graph_policy
@@ -326,14 +325,6 @@ class MoERunner(MoERunnerInterface):
         # in a single launch.
         self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
         self._combined_gate_weight: torch.Tensor | None = None
-        if self._fse_fuse_gate and envs.is_set("VLLM_SM70_SHARED_GATE_MAX_M"):
-            logger.info_once(
-                "VLLM_SM70_SHARED_GATE_MAX_M is upstream-replaced by "
-                "generic FusedMoE shared gate fusion; latest vLLM has no "
-                "SM70 shared-gate custom-kernel M limit.",
-                scope="local",
-            )
-
         self._shared_experts: SharedExperts | None = None
         if shared_experts is not None:
             self._shared_experts = SharedExperts(

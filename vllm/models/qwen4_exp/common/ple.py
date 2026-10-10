@@ -425,13 +425,28 @@ def env_gib_bytes(name: str) -> int | None:
     return int(value_gib * 1024**3)
 
 
-def ple_host_budget_bytes() -> int | None:
+def _placement_gib_bytes(field: str, policy=None) -> int | None:
+    from vllm.config import get_current_vllm_config_or_none
+
+    if policy is None:
+        config = get_current_vllm_config_or_none()
+        if config is not None:
+            policy = config.offload_config.ple
+    if policy is not None:
+        return policy.gib_bytes(field)
+    # Independent pre-config compatibility entry uses the canonical alias table.
+    from vllm.config.execution_policy import PlePlacementPolicy
+
+    return env_gib_bytes(PlePlacementPolicy.aliases[field])
+
+
+def ple_host_budget_bytes(*, policy=None) -> int | None:
     """Configured host bytes per rank for the PLE table, or None to derive them."""
 
-    return env_gib_bytes("VLLM_QWEN4EXP_PLE_HOST_GIB")
+    return _placement_gib_bytes("host_gib", policy)
 
 
-def ple_host_reserve_bytes(host_total_bytes: int) -> int:
+def ple_host_reserve_bytes(host_total_bytes: int, *, policy=None) -> int:
     """Host memory the placement leaves to everything else.
 
     The engine processes, the checkpoint loading and other tenants of the
@@ -439,13 +454,13 @@ def ple_host_reserve_bytes(host_total_bytes: int) -> int:
     default keeps 7.5 GiB.
     """
 
-    reserve = env_gib_bytes("VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB")
+    reserve = _placement_gib_bytes("host_reserve_gib", policy)
     if reserve is not None:
         return reserve
     return host_total_bytes // 4
 
 
-def ple_vram_reserve_bytes(device_total_bytes: int) -> int:
+def ple_vram_reserve_bytes(device_total_bytes: int, *, policy=None) -> int:
     """Device memory the automatic placement keeps free.
 
     It covers the activation peak and the graph pool, which the engine only
@@ -456,7 +471,7 @@ def ple_vram_reserve_bytes(device_total_bytes: int) -> int:
     allocator fail late.
     """
 
-    reserve = env_gib_bytes("VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB")
+    reserve = _placement_gib_bytes("vram_reserve_gib", policy)
     if reserve is not None:
         return reserve
     return min(int(device_total_bytes * 0.08), 4 * 1024**3)
@@ -473,7 +488,9 @@ def ple_cascade_configured() -> bool:
     return bool(getattr(kernel, "ple_disk_cascade_active", False))
 
 
-def check_ple_host_share(text_config: Any, ranks_sharing_host: int) -> None:
+def check_ple_host_share(
+    text_config: Any, ranks_sharing_host: int, *, policy=None
+) -> None:
     """Refuse a configured pinned-host share the host cannot hold.
 
     Runs once before any rank starts. The ranks place their tables at the same
@@ -484,12 +501,20 @@ def check_ple_host_share(text_config: Any, ranks_sharing_host: int) -> None:
 
     if not getattr(text_config, "ple_layer_ids", None):
         return
-    budget = ple_host_budget_bytes()
+    budget = (
+        ple_host_budget_bytes(policy=policy)
+        if policy is not None
+        else ple_host_budget_bytes()
+    )
     available = available_host_bytes()
     total = total_host_bytes()
     if not budget or available is None or total is None:
         return
-    reserve = ple_host_reserve_bytes(total)
+    reserve = (
+        ple_host_reserve_bytes(total, policy=policy)
+        if policy is not None
+        else ple_host_reserve_bytes(total)
+    )
     share = cap_host_budget_bytes(
         budget_bytes=budget,
         available_bytes=available,

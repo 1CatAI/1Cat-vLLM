@@ -50,6 +50,44 @@ def fla_schedule_family(model_config) -> str | None:
     return None
 
 
+def effective_layer_policy_hash_fields(model, speculative, fields):
+    """Omit policy families with no consumer in the model contract.
+
+    This only selects cache factors; provider admission and dynamic dispatch
+    remain unchanged. Unknown/plugin architectures conservatively keep factors.
+    """
+    selected = set(fields)
+    architecture = getattr(model, "architecture", None)
+    if architecture is not None and architecture not in {
+        "Glm5NextForCausalLM",
+        "Glm5NextForConditionalGeneration",
+        "Glm5NextMTPModel",
+    }:
+        selected.difference_update(
+            {
+                "glm_exact_kda_gemv",
+                "glm_cublaslt",
+                "glm_fused_fg_b",
+                "glm_pp_mhc_materialize",
+            }
+        )
+    text = getattr(model, "hf_text_config", None)
+    if text is not None and not getattr(text, "ple_layer_ids", None):
+        selected.discard("ple_spec_conv")
+    # A speculative draft can have a different quantization format. Keep the
+    # shared loader inputs until its own worker config describes that format.
+    if model is not None and speculative is None:
+        quantization = getattr(model, "quantization", None)
+        for field, formats in (
+            ("gptq_turbomind", ("gptq", "gptq_marlin")),
+            ("compressed_tensors_turbomind", ("compressed-tensors",)),
+            ("mxfp4_turbomind", ("mxfp4",)),
+        ):
+            if quantization not in formats:
+                selected.discard(field)
+    return tuple(field for field in fields if field in selected)
+
+
 def sm70_flash_next_batch_qualified(vllm_config: "VllmConfig") -> bool:
     """Batch quality covers ordinary decode and MTP; other proposers await gates."""
     speculative = vllm_config.speculative_config

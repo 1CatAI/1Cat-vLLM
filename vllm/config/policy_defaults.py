@@ -18,6 +18,13 @@ from vllm.config.execution_policy import (
 )
 from vllm.config.sm70_dflash2 import SM70_DFLASH2_LEGACY_FIELDS
 
+# These non-boolean fields share the ordered defaults bridge and hash filtering.
+SPEC_DEFAULT_ALIASES = {
+    "VLLM_SM70_DFLASH2_BF16_EMULATION": "bf16_emulation",
+    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "proposal_temperature_scale",
+    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "proposal_top_p",
+}
+
 
 def _owner(cfg, path):
     for part in path.split("."):
@@ -49,15 +56,7 @@ class PolicyDefaults:
         spec = _owner(cfg, "speculative_config.sm70_dflash2")
         if spec is not None:
             aliases = dict(SM70_DFLASH2_LEGACY_FIELDS)
-            aliases.update(
-                {
-                    "VLLM_SM70_DFLASH2_BF16_EMULATION": "bf16_emulation",
-                    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": (
-                        "proposal_temperature_scale"
-                    ),
-                    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "proposal_top_p",
-                }
-            )
+            aliases.update(SPEC_DEFAULT_ALIASES)
             self.bindings.update(
                 {name: [(spec, field)] for name, field in aliases.items()}
             )
@@ -66,6 +65,23 @@ class PolicyDefaults:
                 (_owner(cfg, path.rsplit(".", 1)[0]), path.rsplit(".", 1)[1])
                 for path in paths
             ]
+
+        # Record the compatibility input even when typed configuration wins.
+        # This is captured once, serialized with the engine and never refreshed
+        # by report generation. Only declared strategy aliases are retained.
+        for alias, bindings in self.bindings.items():
+            if alias in self.raw:
+                cfg.runtime_default_sources.setdefault(alias, []).append(
+                    {
+                        "source": "legacy_environment",
+                        "raw": self.raw[alias],
+                        "overridden_by_typed": any(
+                            policy is not None
+                            and self._source(policy, field) == "typed"
+                            for policy, field in bindings
+                        ),
+                    }
+                )
 
     def _source(self, policy, field):
         source = getattr(policy, "sources", {}).get(field)
@@ -221,6 +237,8 @@ def finalize_runtime_policy_hashes(cfg):
         if spec is not None:
             graph_fields.append("gdn_spec_piecewise")
         graph_fields.extend(("decode_only_capture", "decode_partition_size"))
+        if cfg.compilation_config.cudagraph_capture_sizes is None:
+            graph_fields.append("dense_capture")
         if _is_sm70_qwen38_decode_compile_contract(
             cfg.model_config, spec, cfg.parallel_config
         ):
@@ -266,6 +284,11 @@ def finalize_runtime_policy_hashes(cfg):
         )
     elif not pre_ampere:
         layers.hash_fields += ("mtp_share_io_weights", "mtp_keep_quant")
+    from vllm.model_executor.models.config import effective_layer_policy_hash_fields
+
+    layers.hash_fields = effective_layer_policy_hash_fields(
+        cfg.model_config, spec, layers.hash_fields
+    )
     tp = cfg.parallel_config.tensor_parallel_size
     comm = cfg.parallel_config.communication
     comm.native.active = tp > 1 and (
@@ -302,14 +325,19 @@ def finalize_runtime_policy_hashes(cfg):
             or (pre_ampere and field == "long_prefill_norm" and tp == 4)
             or (pre_ampere and field.startswith("awq_") and tp == 2)
             or (pre_ampere and field == "top1_custom_ar" and tp > 1)
+            or (pre_ampere and field == "gemma_rms_tp2" and tp == 2)
             or (field in ("symm_mem", "flashinfer") and tp > 1)
         )
     )
     text = getattr(cfg.model_config, "hf_text_config", None)
     cfg.offload_config.ple.active = bool(getattr(text, "ple_layer_ids", None))
+    from vllm.platforms.runtime_defaults import _any_participating_device_is_capability
+
     attention = cfg.attention_config
     backend_name = getattr(attention.backend, "name", attention.backend)
-    attention.sm70_triton.active = pre_ampere and backend_name in (None, "TRITON_ATTN")
+    attention.sm70_triton.active = _any_participating_device_is_capability(
+        cfg, (7, 0)
+    ) and backend_name in (None, "TRITON_ATTN")
     attention.flash_v100.active = pre_ampere and backend_name in (
         None,
         "FLASH_ATTN_V100",
@@ -484,13 +512,7 @@ def runtime_compile_ignored_aliases(cfg) -> set[str]:
     spec = _owner(cfg, "speculative_config.sm70_dflash2")
     if spec is not None and spec.resolved:
         ignored.update(SM70_DFLASH2_LEGACY_FIELDS)
-        ignored.update(
-            (
-                "VLLM_SM70_DFLASH2_BF16_EMULATION",
-                "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE",
-                "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P",
-            )
-        )
+        ignored.update(SPEC_DEFAULT_ALIASES)
     if spec is not None and spec.lookup.sources:
         ignored.update(spec.lookup.aliases.values())
     sampling = _owner(cfg, "speculative_config.sampling_policy")

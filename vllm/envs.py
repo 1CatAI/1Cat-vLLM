@@ -3206,6 +3206,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "AWQSM70MoEMethod",
         ),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_awq.enabled",
     ),
     # Experimental SM70 TurboMind routes for latest LMDeploy-compatible
     # weight-only formats. These broad compressed-tensor gates stay default-off;
@@ -3694,6 +3703,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_awq.fused_silu",
     ),
     # Expand selected full 4096-token TP4 AWQ projections into one reusable
     # bounded FP16 workspace before their exact dense GEMM.
@@ -3711,6 +3729,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMindAwqLinearKernel",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_awq.prefill_exact_dense",
     ),
     # Expand selected large-M TP4 FP8 projections into one reusable bounded
     # FP16 workspace before their exact dense GEMM. The allowlist and M gate
@@ -3733,6 +3760,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_fp8.prefill_exact_dense",
     ),
     # Memory-neutral QPN8 layout for shape- and runtime-gated TP4 block-FP8
     # dense projections. Pure-FP8 checkpoints must opt in. The Qwen4Exp
@@ -3766,6 +3802,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("FP8 QPN8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement=(
+            "kernel_config.sm70_fp8.qpn8; "
+            "speculative_config.sm70_dflash2.target_fp8_qpn8"
+        ),
     ),
     # Opt-in Qwen3.8 DFlash2 B2 candidate. It keeps channel-FP8 weights in
     # QPN8 form for exact M=9..16 projection shapes instead of reconstructing
@@ -4147,6 +4195,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("FP8 QPN8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=(
+            "docs/design/architecture/sm70_phase_b_bindings.md",
+            "docs/design/sm70_v100_migration_control.md",
+        ),
+        replacement="kernel_config.sm70_fp8.qpn8_pp2_tp4",
     ),
     # Experimental non-fused QPN8 route for the exact PP2 x TP4 shared-expert
     # gate/up tensor. The model-level clamp-SwiGLU remains external. This
@@ -4169,6 +4229,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("FP8 QPN8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=(
+            "docs/design/architecture/sm70_phase_b_bindings.md",
+            "docs/design/sm70_v100_migration_control.md",
+        ),
+        replacement="kernel_config.sm70_fp8.qpn8_shared_gate",
     ),
     # Optional source-built QPN8-only extension. Production builds leave this
     # unset because the same operators are linked into vllm._C.
@@ -4287,6 +4359,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_fp8.prefill_visible_dense_mm",
     ),
     # QPN2 is an explicit opt-in for compatible NVFP4 small-M shapes; larger M
     # stays on the existing TurboMind path.
@@ -4313,6 +4394,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_nvfp4.qpn2",
     ),
     # Share TurboMind B/Pack1 codes with compatible QPN2 projections. Compact
     # scales additionally require native support for reusable graph scratch.
@@ -4330,6 +4420,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_nvfp4.shared_weight",
     ),
     "VLLM_SM70_NVFP4_QPN2_SHARED_SCALES": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_NVFP4_QPN2_SHARED_SCALES", "1"))),
@@ -4355,6 +4454,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_nvfp4.shared_scales",
     ),
     # Reuse each packed NVFP4 tile across two eight-row verifier groups in one
     # CTA. This is a default-off Qwen3.8 DFlash2 B2 operator candidate.
@@ -4400,6 +4508,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_nvfp4.prefill",
     ),
     "VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY": env_var(
         lambda: os.getenv("VLLM_SM70_NVFP4_QPN2_PREFILL_LIBRARY"),
@@ -4429,6 +4546,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("Qpn2NvFp4LinearKernel",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_nvfp4.prefill_min_m",
     ),
     # Experimental TileRT-inspired down-proj lane: after the row-parallel AWQ
     # GEMM, use the local tile-runtime TP2 all-reduce substrate for the MLP
@@ -4692,6 +4818,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_fp8.prefill_prescaled",
     ),
     "VLLM_SM70_FP8_PRESCALED_M1_DECODE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESCALED_M1_DECODE", "1"))),
@@ -4709,6 +4844,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_fp8.prescaled_decode",
     ),
     # Exact prescaled route for the measured PP2 x TP4 shared-expert gate/up
     # tensor. Missing operators or non-reversible scales fall back safely.
@@ -4729,6 +4873,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_fp8.prescaled_shared_gate",
     ),
     "VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_FP8_PRESERVE_DEFAULT_SPLITS", "1"))),
@@ -5476,6 +5629,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: qpn8_rerank",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.qpn8_rerank",
     ),
     # Explicit precision contract: retain FP32 candidate and dense logits
     # for the SM70 TP4 DFlash2 LM head, including reference fallback.
@@ -5504,6 +5666,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: fp32_logits",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fp32_logits",
     ),
     # Audit-only eager mode: execute QPN8+rerank, compare it with the dense
     # local top-k, and return the dense result so the baseline trajectory is
@@ -5530,6 +5701,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("SM70 verifier diagnostics",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.qpn8_rerank_shadow",
     ),
     # Compatibility-only: the scored dense vocabulary tie order is mandatory.
     "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER": env_var(
@@ -5549,6 +5729,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("DFlash2 verifier: qpn8_dense_order",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="historical",
+        deprecation_reason=(
+            "The candidate-order override was retired after the retained "
+            "paired quality screen; dense vocabulary tie ordering is now "
+            "mandatory and this input is ignored"
+        ),
+        deprecation_evidence=("docs/design/sm70_dflash2_retired_candidate_order.md",),
+        replacement=None,
     ),
     # Candidate-order tie handling is a benchmark-only experiment. Requiring
     # a second opt-in prevents stale deployment scripts from silently trading
@@ -5615,6 +5804,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: fused_gdn_metadata",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_metadata",
     ),
     # Classify native MTP batches (any draft depth; the MTP4 prefix is
     # historical) once per step and share it across GDN cache groups. Set 0 to
@@ -5717,6 +5915,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: fused_gdn_verify",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_verify",
     ),
     # Independently gated q8/TP2 packed GDN schedule; other shapes retain the
     # accepted recurrent launch geometry.
@@ -5760,6 +5967,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: fused_gdn_norm",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_norm",
     ),
     # Fuse compatible nonzero-offset GDN z/b/a materialization into one
     # copy kernel. This must stay separate from the plain-view path because
@@ -5789,6 +6005,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: fused_gdn_split",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_split",
     ),
     # Independently gate the TP4 q8 all-NVFP4 QKVZBA projection layout.
     "VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT": env_var(
@@ -5817,6 +6042,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: fused_gdn_combined_split",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gdn_combined_split",
     ),
     # Return the existing projection tensor across the GDN opaque boundary.
     # This does not enable collective/norm fusion or change state arithmetic.
@@ -5864,6 +6098,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: fused_smallq_metadata",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_smallq_metadata",
     ),
     # Collapse five compatible target small-query metadata launches into one
     # heterogeneous-width pointer-table kernel. The paired
@@ -5895,6 +6138,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: grouped_smallq_metadata",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.grouped_smallq_metadata",
     ),
     # Copy the post-convolution Q/K/V row slices into the recurrent kernel's
     # packed contiguous layout with one bitwise Triton launch. This replaces
@@ -5941,6 +6193,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: fused_gemma_rms",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fused_gemma_rms",
     ),
     # Fixed 8192/16-warp reduction for the FP16 no-residual and
     # FP16-residual Gemma norms not covered by the existing FP32-residual path.
@@ -5971,6 +6232,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: fixed_gemma_rms",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.fixed_gemma_rms",
     ),
     # Avoid materializing/gathering full-vocabulary target logits when the
     # DFlash2 proposal and target sampling distributions both have compact
@@ -6003,6 +6273,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: sparse_target_rejection",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.sparse_target_rejection",
     ),
     # Compute the compatible 25600->5120 target-hidden projection as four output
     # shards, then all-gather only the 80-KiB block-eight result. The global
@@ -6033,6 +6312,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: sharded_context_fc",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.sharded_context_fc",
     ),
     "VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_KV_GRAPH", "0"))),
@@ -6060,6 +6348,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: context_kv_graph",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.context_kv_graph",
     ),
     "VLLM_SM70_DFLASH2_CONTEXT_PIPELINE": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_DFLASH2_CONTEXT_PIPELINE", "0"))),
@@ -6087,6 +6384,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: context_pipeline",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.context_pipeline",
     ),
     # Native SM70 final stage for the GLM-5.3 q8 mHC verifier. Audited model and
     # topology contracts enable it while the global default remains off.
@@ -6389,6 +6695,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("DFlash2 verifier: quant_lm_head",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="speculative_config.sm70_dflash2.quant_lm_head",
     ),
     # Default-on SGLang-style push collective for the validated FP16 80-KiB
     # verifier and 8-KiB decode payloads on fully-connected SM70 TP4 CUDA
@@ -6587,6 +6902,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("SM70 verifier diagnostics",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="observability_config.runtime_trace.greedy_token_trace",
     ),
     # Opt-in V100 launch for the exact validated combined top-k/top-p shapes.
     "VLLM_SM70_TOPK_TOPP_8_WARPS": env_var(
@@ -6893,6 +7217,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="historical",
+        deprecation_reason=(
+            "The SM70 shared-gate custom-kernel M limit was replaced by generic "
+            "FusedMoE shared gate fusion; this input now records only a notice"
+        ),
+        deprecation_evidence=("docs/design/sm70_v100_migration_control.md",),
+        replacement="generic fused shared-expert gate (automatic)",
     ),
     # Compatibility fallback for serialized FP8 checkpoints on SM70 shapes not
     # handled by the TurboMind W8A16 dense kernel: dequantize once at load time
@@ -6914,6 +7246,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_fp8.dequant_fallback",
     ),
     # V100/SM70 block-FP8 dense path using TurboMind W8A16. Default-on matches
     # 0.0.3 for SM70 dense FP8; MoE route policy is controlled below.
@@ -6933,6 +7274,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_fp8.enabled",
     ),
     # Fused gate_up_proj + SiluAndMul epilogue for SM70 dense FP8. It prepares
     # a single interleaved primary layout for gate_up_proj, avoiding the older
@@ -6956,6 +7306,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("TurboMind FP8",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_fp8.gated_silu",
     ),
     # Accepted SM70 FP4-family dense routes. Default-on keeps NVFP4/MXFP4
     # checkpoints loadable and fast on V100; set either env to 0 to force the
@@ -7828,6 +8187,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="observability_config.runtime_trace.profile_trace",
     ),
     "VLLM_SM70_DECODE_EVENT_TRACE": env_var(
         deprecated_env(
@@ -7847,6 +8215,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="observability_config.runtime_trace.events",
     ),
     "VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS": env_var(
         lambda: float(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_THRESHOLD_MS", "1.0")),
@@ -7892,6 +8269,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("MTP verifier",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="observability_config.step_profiler.enabled",
     ),
     "VLLM_SM70_MTP_PROFILE_INTERVAL": env_var(
         lambda: max(1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))),
@@ -8383,6 +8769,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("SM70 runtime/kernel policy",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="observability_config.runtime_trace.profile_trace",
     ),
     "VLLM_FLASH_V100_ROUTE_SUMMARY": env_var(
         deprecated_env(
@@ -8402,6 +8797,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="observability_config.runtime_trace.flash_v100.route_summary",
     ),
     "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_REQUIRE_PROFILE_ACCELERATION", "0"))),
@@ -13038,6 +13442,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement=(
+            "use --moe-backend marlin (MoE) or --linear-backend marlin (linear) instead"
+        ),
     ),
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_var(
@@ -13318,6 +13733,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement="use --moe-backend to select a kernel explicitly",
     ),
     # Allow use of FlashInfer FP8 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
@@ -13338,6 +13762,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement="use --moe-backend to select a kernel explicitly",
     ),
     # Allow use of FlashInfer NVFP4 MoE kernels for fused moe ops.
     # Deprecated: use --moe-backend to select a kernel explicitly.
@@ -13359,6 +13792,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement="use --moe-backend to select a kernel explicitly",
     ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": env_var(
@@ -13395,6 +13837,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement=(
+            "use --moe-backend flashinfer_trtllm combined with "
+            "--quantization_config.moe.activation mxfp8"
+        ),
     ),
     # If set to 1, use the FlashInfer CUTLASS backend for
     # MXFP8 (activation) x MXFP4 (weight) MoE.
@@ -13422,6 +13876,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement=(
+            "use --moe-backend flashinfer_cutlass combined with "
+            "--quantization_config.moe.activation mxfp8"
+        ),
     ),
     # If set to 1, use the FlashInfer
     # BF16 (activation) x MXFP4 (weight) MoE backend.
@@ -13444,6 +13910,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement="use --moe-backend to select a kernel explicitly",
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
@@ -13636,6 +14111,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement="pass --moe-backend flashinfer_{trtllm,cutlass,cutedsl} directly",
     ),
     # Override the directory for the FlashInfer autotune config cache.
     "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR": env_var(
@@ -13865,6 +14349,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement="use --linear-backend emulation instead",
     ),
     # Timeout (in seconds) for MooncakeConnector in PD disaggregated setup.
     "VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT": env_var(
@@ -13941,6 +14434,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement="use --linear-backend instead",
     ),
     # Controls garbage collection during CUDA graph capture.
     # If set to 0 (default), enables GC freezing to speed up capture time.
@@ -14421,6 +14923,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         automatic_conditions=(),
         acceleration_paths=(),
         user_visible=True,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The retained backend selector now accepts explicit kernel "
+            "configuration; this input remains an initialization "
+            "compatibility alias"
+        ),
+        deprecation_evidence=("vllm/config/kernel.py",),
+        replacement="use --linear-backend fbgemm instead",
     ),
     # GC debug config
     # - VLLM_GC_DEBUG=0: disable GC debugger
@@ -15936,6 +16447,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("FlashAttentionV100Backend",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="observability_config.runtime_trace.flash_v100.route_summary",
     ),
     "VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA": env_var(
         lambda: os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_USE_XQA"),
@@ -17294,6 +17814,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_sparse.qsa_cublas_min_rows",
     ),
     "VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_INDEXER_CUBLAS_MIN_SCORE_ELEMENTS"),
@@ -17314,6 +17843,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_sparse.qsa_cublas_min_score_elements",
     ),
     "VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB": env_var(
         lambda: os.getenv("VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB"),
@@ -17334,6 +17872,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_sparse.qsa_score_tile_mb",
     ),
     "VLLM_SM70_QSA_MTP_TOPK": env_var(
         lambda: bool(int(os.getenv("VLLM_SM70_QSA_MTP_TOPK", "1"))),
@@ -17402,6 +17949,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         ),
         acceleration_paths=("QSA sparse attention/indexer",),
         user_visible=False,
+        deprecated=True,
+        deprecation_kind="alias",
+        deprecation_reason=(
+            "The legacy name is an initialization compatibility alias; "
+            "use the serialized per-engine owner with explicit typed "
+            "precedence"
+        ),
+        deprecation_evidence=("docs/design/architecture/sm70_phase_d.md",),
+        replacement="kernel_config.sm70_sparse.qsa_xqa_page4_min_rows",
     ),
     "VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG": env_var(
         lambda: os.getenv("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG"),
