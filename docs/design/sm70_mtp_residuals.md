@@ -1,0 +1,59 @@
+# Retained SM70 MTP optimizations
+
+This change is based on main `22c4d22f4b2f0e5bb794a3d4c457afead19c920d`.
+It retains the parts of PR903 that are absent from that revision. Ordinary
+upstream collective, graph, GDN projection, attention and native resource
+owners remain authoritative. Core native sources, CMake and package build
+rules have no residual diff from the base.
+
+## Scope
+
+| Area | Retained behavior | Upstream behavior preserved |
+| --- | --- | --- |
+| Sparse attention | Segmented page4 queries and grouped E4M3 multi-KV-head FP32 accumulation | Existing attention runtime and unsupported-shape fallback |
+| GDN verification | Fused small speculative recurrence, BA preparation and shared state metadata | Higher-priority context-core and mixed-QKV routes |
+| Auxiliary MTP kernels | Exact shared gate, n-gram, short-convolution and MoE permutation fusions | Native PLE admission and ordinary fallback |
+| Drafter | TP-local greedy exchange, padded-row routing and selective eager prefill MoE | Captured communication policy and full prefill for unsupported topology |
+| MoE tuning | Additional drafter row counts through M40 | Native-compatible M1/M5 tiles and temporary legacy warmup scope |
+| Startup | Request-count/kernel warmup coverage and optional JIT telemetry | Ordinary compilation and loading |
+| Mixed prefill | Existing opt-in fixed-step pacing compatibility | Disabled by default and in the comparison serving configuration |
+
+Selective prefill requires a verified single-block MTP model. It preserves
+all draft attention/KV writes, computes MoE only for rows that can be sampled,
+and omits discarded draft decode for batches whose prompts remain incomplete.
+Graph captures retain the ordinary full path. Tests include unsupported
+topologies, mixed batches, exception cleanup and padded-row scope restoration.
+
+The MoE selector reads the value of upstream's legacy-scope ContextVar.
+Treating the ContextVar object as a boolean would disable tuned tiles. The
+selector also uses the initialized upstream MoE policy. GDN/PLE admission
+and diagnostic exclusions consume their corresponding upstream owners.
+
+## Configuration and validation
+
+Legacy `ONECAT_*` aliases remain available for existing deployments. The
+production comparison enables the retained GDN, auxiliary and drafter
+fusions, segmented page4 attention, grouped short-convolution metadata and
+selective eager MTP prefill. Fixed-step prefill pacing remains zero. No model
+format, weights, quantization or global runtime dtype is changed.
+
+Build normal `_C` and `_moe_C` extensions for native policy ABI 67 and runtime
+ABI 1. Rebuild Flash-V100 for this tree. Old native binaries are not valid
+substitutes for the initialized upstream runtime interfaces.
+
+Qualification uses the same FP16/TP4/MTP4 serving configuration, request bytes
+and weights on both arms. Prefill-only and normal generation are measured
+separately, with repeated C1/C4/C8 runs and full 32K/64K uncached prompts.
+Report queue, prefill, TTFT and total completion time separately. Verify
+cached-token counters and computed KV work. A total-time improvement does
+not excuse a reproducible prefill or TTFT regression.
+
+Kernel choices are compared only for matching generated source and candidate
+sets. Each arm has a separate ordinary compiler cache. Timing excludes code
+warmup; cache changes during measurement are reported. No loader interception
+or kernel allowlist is introduced.
+
+Results and commands for this exact revision are supplied with PR903 after
+qualification. Earlier measurements are retained as
+[historical evidence](https://github.com/areslp/1Cat-vLLM/tree/b352d3967a166bdc468b21b959ebe98529032d1a/docs/sm70-c73-qualification)
+and do not qualify this revision. AI assistance was used.
