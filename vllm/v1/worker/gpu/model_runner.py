@@ -404,6 +404,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if self.speculator is not None:
+                # Checkpoint conversion can leave cycles holding replaced tensor
+                # banks. Reclaim them before allocating the independent draft.
+                allocated_before = torch.accelerator.memory_allocated()
+                gc.collect()
+                torch.accelerator.empty_cache()
+                logger.info(
+                    "Target loading cleanup: allocated %d -> %d bytes, "
+                    "reserved %d bytes",
+                    allocated_before,
+                    torch.accelerator.memory_allocated(),
+                    torch.accelerator.memory_reserved(),
+                )
                 logger.info(
                     "Target CUDA storage before speculative loading: %s",
                     loaded_cuda_model_storage({"target": self.model}),
