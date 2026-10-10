@@ -12,6 +12,7 @@ PORT=${PORT:-8000}
 HOST=${HOST:-127.0.0.1}
 GPU_UTIL=${GPU_UTIL:-0.97}
 mkdir -p "$CACHE_DIR"
+export PATH="$(dirname "$VLLM_PYTHON"):$PATH"
 export PYTHONPATH="$SRC_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTORCH_ALLOC_CONF=expandable_segments:True OMP_NUM_THREADS=1 MALLOC_ARENA_MAX=2
@@ -23,7 +24,12 @@ export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 # Host history pools are about 14.5 GiB for this geometry. Reserve another 6 GiB
 # for workers, staging and the bounded CPU row cache before any GPU is touched.
 "$VLLM_PYTHON" - <<'PY'
+import shutil
 from pathlib import Path
+if not shutil.which('ninja'):
+    raise SystemExit('Ninja is required in the source environment for FlashQLA')
+if not shutil.which('nvcc'):
+    raise SystemExit('The CUDA source toolchain is required in PATH')
 info = {line.split(':')[0]: int(line.split()[1]) * 1024
         for line in Path('/proc/meminfo').read_text().splitlines()}
 if info['MemAvailable'] < 21 * 1024**3:
