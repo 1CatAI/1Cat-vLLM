@@ -43,8 +43,11 @@
 namespace {
 
 constexpr int kWarps = 4;      // gemv: warps per block, each a k-slice
+constexpr int kPrefetch = 8;   // gemv: k-tiles whose window words are in flight per warp
 constexpr int kGlueWarps = 4;  // glue kernels: one warp per 128-chunk
 constexpr int kMaxGridY = 65535;
+// Trellis tensors reach these ops in strip-major order: [.., n/32, k/16, 2 tiles, 16K words]
+// (exl3.exl3_strip_major_), so a warp streams its 32-column strip sequentially along k.
 
 __device__ __forceinline__ void mma884(float (&d)[8], const uint32_t (&a)[2],
                                        const uint32_t (&b)[2]) {
@@ -83,33 +86,6 @@ __device__ __forceinline__ void decode_run(uint32_t wa, uint32_t wb, int o,
   }
 }
 
-// A warp's two-tile block (16K words) is loaded once, coalesced; lanes fetch
-// their window words by shuffle.
-template <int K>
-struct TileWords {
-  uint32_t r0, r1;
-  __device__ __forceinline__ void load(const uint32_t* __restrict__ blk,
-                                       int lane) {
-    if (K == 2) {
-      r0 = blk[lane];
-      r1 = 0;
-    } else if (2 * lane < 16 * K) {
-      uint2 v = reinterpret_cast<const uint2*>(blk)[lane];
-      r0 = v.x;
-      r1 = v.y;
-    } else {
-      r0 = 0;
-      r1 = 0;
-    }
-  }
-  __device__ __forceinline__ uint32_t word(int j) const {
-    if (K == 2) return __shfl_sync(0xffffffffu, r0, j);
-    uint32_t x0 = __shfl_sync(0xffffffffu, r0, j >> 1);
-    uint32_t x1 = __shfl_sync(0xffffffffu, r1, j >> 1);
-    return (j & 1) ? x1 : x0;
-  }
-};
-
 // Lane-constant window geometry for tile t (0/1 within the strip), column c.
 // colmajor: runs h = 0, 1 at positions 16c + 8h. sm80: run 0 only (the base);
 // runs 1-3 follow at +8K bits each.
@@ -130,16 +106,52 @@ struct Window {
   }
 };
 
+// The words of the two-tile block this lane's windows need, loaded directly
+// (every lane's words sit in the same 128 B line, so DRAM traffic equals one
+// coalesced block read, but each lane can decode as soon as its own loads
+// land instead of waiting for a broadcast and shuffles).
+template <int K, bool kColMajor>
+struct LaneWords {
+  static constexpr int kTW = 8 * K;
+  static constexpr int kCount = kColMajor ? 4 : ((24 * K) >> 5) + 3;
+  uint32_t w[kCount];
+  __device__ __forceinline__ void load(const uint32_t* __restrict__ blk,
+                                       const Window<K, kColMajor>& win) {
+    if constexpr (kColMajor) {
+      w[0] = __ldg(blk + win.ja[0]);
+      w[1] = __ldg(blk + win.jb[0]);
+      w[2] = __ldg(blk + win.ja[1]);
+      w[3] = __ldg(blk + win.jb[1]);
+    } else {
+      const int base = win.ja[0] % kTW, t0 = win.ja[0] - base;
+#pragma unroll
+      for (int m = 0; m < kCount; ++m) w[m] = __ldg(blk + t0 + (base + m) % kTW);
+    }
+  }
+  __device__ __forceinline__ void zero() {
+#pragma unroll
+    for (int m = 0; m < kCount; ++m) w[m] = 0;
+  }
+};
+
+// Strip-major trellis address of k-tile tk for the strip starting at column
+// n0: tile pairs of one strip are contiguous along k.
+__device__ __forceinline__ const uint32_t* strip_block(
+    const uint32_t* __restrict__ tr, int n0, int tk, int ktiles, int kTW) {
+  return tr + (static_cast<int64_t>(n0 >> 5) * ktiles + tk) * (2 * kTW);
+}
+
 // One 16-row k-tile of this lane's column. xr points at the tile's 16
 // activations (row 0 of the m8n8k4 A operand; other rows pass on = false).
 template <int K, bool kColMajor>
-__device__ __forceinline__ void tile_mma(float (&d)[8], const TileWords<K>& tw,
+__device__ __forceinline__ void tile_mma(float (&d)[8],
+                                         const LaneWords<K, kColMajor>& lw,
                                          const Window<K, kColMajor>& win,
                                          const half* __restrict__ xr, bool on) {
   if constexpr (kColMajor) {
     uint32_t bb[2][4];
-    decode_run<K, 8>(tw.word(win.ja[0]), tw.word(win.jb[0]), win.o[0], bb[0]);
-    decode_run<K, 8>(tw.word(win.ja[1]), tw.word(win.jb[1]), win.o[1], bb[1]);
+    decode_run<K, 8>(lw.w[0], lw.w[1], win.o[0], bb[0]);
+    decode_run<K, 8>(lw.w[2], lw.w[3], win.o[1], bb[1]);
 #pragma unroll
     for (int h = 0; h < 2; ++h) {
       uint32_t b0[2] = {bb[h][0], bb[h][1]}, b1[2] = {bb[h][2], bb[h][3]};
@@ -150,16 +162,15 @@ __device__ __forceinline__ void tile_mma(float (&d)[8], const TileWords<K>& tw,
       mma884(d, a1, b1);
     }
   } else {
-    constexpr int kTW = 8 * K, kNW = ((24 * K) >> 5) + 3;
+    constexpr int kNW = ((24 * K) >> 5) + 3;
     uint4 lo =
         on ? *reinterpret_cast<const uint4*>(xr) : make_uint4(0, 0, 0, 0);
     uint4 hi =
         on ? *reinterpret_cast<const uint4*>(xr + 8) : make_uint4(0, 0, 0, 0);
     const uint32_t xw[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
-    int base = win.ja[0] % kTW, t0 = win.ja[0] - base, o0 = win.o[0] & 31;
-    uint32_t w[kNW];
-#pragma unroll
-    for (int m = 0; m < kNW; ++m) w[m] = tw.word(t0 + (base + m) % kTW);
+    const int o0 = win.o[0] & 31;
+    static_assert(LaneWords<K, kColMajor>::kCount == kNW);
+    const uint32_t* w = lw.w;
 #pragma unroll
     for (int u = 0; u < 4; ++u) {
       // Run u holds rows (2u, 2u+1, 2u+8, 2u+9): A = activation pairs u, u+4.
@@ -199,7 +210,6 @@ __global__ void __launch_bounds__(kWarps * 32)
   int nw = 8 * q + (lane >> 4) * 4 + lane % 4;
   int t = nw >> 4, c = nw & 15;
   int row = (lane >> 4) * 4 + lane % 4;
-  int tiles_n = n >> 4;
   int tk0 = warp * ktiles_per_warp;
   const uint32_t* tr = trellis + static_cast<int64_t>(eid[s]) * expert_words;
   const half* xr = x + static_cast<int64_t>(s) * k;
@@ -207,11 +217,23 @@ __global__ void __launch_bounds__(kWarps * 32)
   Window<K, kColMajor> win(t, c);
 
   float d[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  for (int it = 0; it < ktiles_per_warp; ++it) {
-    int tk = tk0 + it;
-    TileWords<K> tw;
-    tw.load(tr + (static_cast<int64_t>(tk) * tiles_n + (n0 >> 4)) * kTW, lane);
-    tile_mma<K, kColMajor>(d, tw, win, xr + tk * 16, row == 0);
+  const int ktiles = ktiles_per_warp * kWarps;
+  for (int it0 = 0; it0 < ktiles_per_warp; it0 += kPrefetch) {
+    LaneWords<K, kColMajor> lw[kPrefetch];
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+      if (it0 + p < ktiles_per_warp) {
+        lw[p].load(strip_block(tr, n0, tk0 + it0 + p, ktiles, kTW), win);
+      } else {
+        lw[p].zero();
+      }
+    }
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+      if (it0 + p >= ktiles_per_warp) break;
+      int tk = tk0 + it0 + p;
+      tile_mma<K, kColMajor>(d, lw[p], win, xr + tk * 16, row == 0);
+    }
   }
 
   // D fragment: lane L, reg i -> row (L&1) + ((i>>1)&1)*2 + (L>=16 ? 4 : 0),
@@ -259,7 +281,6 @@ __global__ void __launch_bounds__(kWarps * 32) exl3_gemv_grouped_kernel(
   int t = nw >> 4, c = nw & 15;
   int row = (lane >> 4) * 4 + lane % 4;  // A-operand row held by this lane
   int slot = gr[row];
-  int tiles_n = n >> 4;
   int tk0 = warp * ktiles_per_warp;
   const uint32_t* tr = trellis + static_cast<int64_t>(gexp[g]) * expert_words;
   const half* xr = x + static_cast<int64_t>(slot < 0 ? 0 : slot) * k;
@@ -267,11 +288,23 @@ __global__ void __launch_bounds__(kWarps * 32) exl3_gemv_grouped_kernel(
   Window<K, kColMajor> win(t, c);
 
   float d[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  for (int it = 0; it < ktiles_per_warp; ++it) {
-    int tk = tk0 + it;
-    TileWords<K> tw;
-    tw.load(tr + (static_cast<int64_t>(tk) * tiles_n + (n0 >> 4)) * kTW, lane);
-    tile_mma<K, kColMajor>(d, tw, win, xr + tk * 16, slot >= 0);
+  const int ktiles = ktiles_per_warp * kWarps;
+  for (int it0 = 0; it0 < ktiles_per_warp; it0 += kPrefetch) {
+    LaneWords<K, kColMajor> lw[kPrefetch];
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+      if (it0 + p < ktiles_per_warp) {
+        lw[p].load(strip_block(tr, n0, tk0 + it0 + p, ktiles, kTW), win);
+      } else {
+        lw[p].zero();
+      }
+    }
+#pragma unroll
+    for (int p = 0; p < kPrefetch; ++p) {
+      if (it0 + p >= ktiles_per_warp) break;
+      int tk = tk0 + it0 + p;
+      tile_mma<K, kColMajor>(d, lw[p], win, xr + tk * 16, slot >= 0);
+    }
   }
 
   __shared__ float red[kWarps][8][32];
