@@ -181,6 +181,9 @@ class GraphPolicy(ExecutionPolicy):
                     values[field] = int(values[field])
         return hash_factors(values if self.active else {})
 
+    dense_capture: bool | None = None
+    """Capture every qualified small batch when sizes were not supplied."""
+
     gdn_spec_piecewise: bool | None = None
     """Retain the SM70 aligned-cache speculative decode capture restriction."""
     eager_profile_run: bool | None = None
@@ -241,6 +244,7 @@ class GraphPolicy(ExecutionPolicy):
     """Use the existing graph memory admission estimator."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "dense_capture": "VLLM_SM70_DENSE_CUDAGRAPH_CAPTURE",
         "gdn_spec_piecewise": "VLLM_SM70_QWEN_GDN_SPEC_DECODE_PIECEWISE",
         "eager_profile_run": "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN",
         "mtp_context_partition_size": "VLLM_SM70_MTP_CONTEXT_BUCKET_PARTITION_SIZE",
@@ -558,7 +562,11 @@ class CommunicationPolicy(ExecutionPolicy):
             self,
             {
                 field: self.aliases[field]
-                for field in ("pp_static_hidden_transfer", "moe_sum2_q8")
+                for field in (
+                    "pp_static_hidden_transfer",
+                    "moe_sum2_q8",
+                    "gemma_rms_tp2",
+                )
                 if field not in self.sources
             },
             deferred_errors=self.provider_errors,
@@ -581,6 +589,9 @@ class CommunicationPolicy(ExecutionPolicy):
         return hash_factors(
             {"policy": super().compute_hash(), "native": self.native.compute_hash()}
         )
+
+    gemma_rms_tp2: bool | None = None
+    """Retain the existing TP2 Gemma all-reduce/RMS fusion qualification."""
 
     pp_static_hidden_transfer: bool | None = None
     """Retain the metadata-free single-token pipeline transfer contract."""
@@ -643,6 +654,7 @@ class CommunicationPolicy(ExecutionPolicy):
     """Explicit comma-separated pipeline layer counts, or automatic."""
 
     aliases: ClassVar[dict[str, str]] = {
+        "gemma_rms_tp2": "VLLM_SM70_TP2_AR_GEMMA_RMS_FUSION",
         "pp_static_hidden_transfer": "VLLM_SM70_PP_STATIC_HIDDEN_TRANSFER",
         "moe_sum2_q8": "VLLM_SM70_GLM53_MOE_SUM2_ALLREDUCE_Q8",
         "top1_custom_ar": "VLLM_SM70_TOP1_CUSTOM_AR",
@@ -686,7 +698,47 @@ class PlePlacementPolicy(ExecutionPolicy):
     disk: bool | None = None
     """Read offloaded embedding rows from mapped checkpoint storage."""
 
+    host_gib: float | None = None
+    """Explicit pinned-host budget per rank; None derives placement."""
+    host_reserve_gib: float | None = None
+    """Explicit host reserve; None retains one quarter of host memory."""
+    vram_reserve_gib: float | None = None
+    """Explicit device reserve; None retains the bounded eight-percent rule."""
+    placement_errors: dict[str, str] = Field(default_factory=dict, init=False)
+    """Invalid inputs remain deferred until their original allocation gate."""
+
+    def resolve(self):
+        from vllm.config.utils import resolve_legacy_fields
+
+        resolve_legacy_fields(
+            self,
+            {
+                field: self.aliases[field]
+                for field in ("host_gib", "host_reserve_gib", "vram_reserve_gib")
+                if field not in self.sources
+            },
+            deferred_errors=self.placement_errors,
+        )
+        super().resolve()
+
+    def gib_bytes(self, field: str) -> int | None:
+        import math
+
+        if field in self.placement_errors:
+            raise ValueError(self.placement_errors[field])
+        value = getattr(self, field)
+        if value is None:
+            return None
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(
+                f"{self.aliases[field]} must be finite and non-negative, got {value}"
+            )
+        return int(value * 1024**3)
+
     aliases: ClassVar[dict[str, str]] = {
+        "host_gib": "VLLM_QWEN4EXP_PLE_HOST_GIB",
+        "host_reserve_gib": "VLLM_QWEN4EXP_PLE_HOST_RESERVE_GIB",
+        "vram_reserve_gib": "VLLM_QWEN4EXP_PLE_VRAM_RESERVE_GIB",
         "hybrid": "VLLM_SM70_QWEN38_HYBRID_PLE",
         "cpu": "VLLM_PLE_CPU_OFFLOAD",
         "disk": "VLLM_PLE_DISK_OFFLOAD",

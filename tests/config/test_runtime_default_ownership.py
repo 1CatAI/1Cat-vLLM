@@ -112,9 +112,7 @@ def apply(cfg, monkeypatch, capability=70):
             uses_host_device_handling=lambda: False,
             device_count=lambda: 8,
             get_device_capability=lambda: cap,
-            is_device_capability=lambda value, device_id=0: (
-                value in (capability, tuple(cap))
-            ),
+            is_device_capability=lambda value, device_id=0: (value == tuple(cap)),
         ),
     )
     runtime_defaults.apply_runtime_policy_defaults(cfg)
@@ -373,3 +371,99 @@ def test_diagnostic_report_is_json_safe_without_environment_getters(monkeypatch)
         "layers"
     ] == [0, 1]
     json.dumps(report)
+
+
+@pytest.mark.parametrize("capability,active", [(70, True), (75, False), (80, False)])
+def test_only_sm70_hashes_its_triton_schedule(monkeypatch, capability, active):
+    first, second = engine(), engine()
+    second.attention_config.sm70_triton.num_warps = 2
+    apply(first, monkeypatch, capability=capability)
+    apply(second, monkeypatch, capability=capability)
+    assert first.attention_config.sm70_triton.active is active
+    assert (
+        first.attention_config.compute_hash() != second.attention_config.compute_hash()
+    ) is active
+
+
+def test_unused_model_and_quantization_policies_do_not_salt_other_engines(monkeypatch):
+    first, second = engine(), engine()
+    for cfg in (first, second):
+        cfg.model_config.architecture = "LlamaForCausalLM"
+        cfg.model_config.quantization = None
+        cfg.model_config.hf_text_config.ple_layer_ids = []
+    second.kernel_config.layer_execution.glm_fused_fg_b = True
+    second.kernel_config.layer_execution.ple_spec_conv = True
+    second.kernel_config.layer_execution.mxfp4_turbomind = False
+    apply(first, monkeypatch)
+    apply(second, monkeypatch)
+    assert first.kernel_config.compute_hash() == second.kernel_config.compute_hash()
+
+
+def test_all_captured_gdn_and_diagnostic_aliases_leave_environment_hash(monkeypatch):
+    from unittest.mock import Mock
+
+    cfg = engine()
+    apply(cfg, monkeypatch)
+    # Dormant GDN has no computation hash; an admitted GDN hashes its own policy.
+    aliases = set()
+    for owner in (
+        cfg.kernel_config.gdn,
+        cfg.kernel_config.sm70_runtime,
+        cfg.observability_config.runtime_trace,
+        cfg.observability_config.step_profiler,
+        cfg.observability_config.spec_decode_trace,
+        cfg.observability_config.gdn_profile,
+        cfg.observability_config.gdn_state,
+    ):
+        aliases.update(owner.compile_ignored_aliases())
+    readers = {}
+    for name in aliases & envs.environment_variables.keys():
+        readers[name] = Mock(side_effect=AssertionError(name))
+        monkeypatch.setitem(envs.environment_variables, name, readers[name])
+    before = envs.compile_factors(cfg.kernel_config, vllm_config=cfg)
+    for name in aliases:
+        monkeypatch.setenv(name, "1")
+    assert envs.compile_factors(cfg.kernel_config, vllm_config=cfg) == before
+    for reader in readers.values():
+        reader.assert_not_called()
+
+
+def test_native_shared_stage_aliases_use_captured_owner_hash(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.config.sm70_native import NATIVE_FIELDS
+
+    cfg = engine()
+    apply(cfg, monkeypatch)
+    aliases = {alias for _, alias, _, _ in NATIVE_FIELDS}
+    readers = {}
+    for name in aliases & envs.environment_variables.keys():
+        readers[name] = Mock(side_effect=AssertionError(name))
+        monkeypatch.setitem(envs.environment_variables, name, readers[name])
+    before = envs.compile_factors(cfg.kernel_config, vllm_config=cfg)
+    for name in aliases:
+        monkeypatch.setenv(name, "1")
+    assert envs.compile_factors(cfg.kernel_config, vllm_config=cfg) == before
+    for reader in readers.values():
+        reader.assert_not_called()
+
+
+def test_inactive_speculation_and_gated_norm_do_not_salt_other_engines(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm.config.sm70_dflash2 import speculation_compile_ignored_aliases
+
+    cfg = engine()
+    apply(cfg, monkeypatch)
+    aliases = speculation_compile_ignored_aliases(None)
+    aliases.update(cfg.kernel_config.sm70_rmsnorm_gated_aliases.values())
+    readers = {}
+    for name in aliases & envs.environment_variables.keys():
+        readers[name] = Mock(side_effect=AssertionError(name))
+        monkeypatch.setitem(envs.environment_variables, name, readers[name])
+    before = envs.compile_factors(cfg.kernel_config, vllm_config=cfg)
+    for name in aliases:
+        monkeypatch.setenv(name, "1")
+    assert envs.compile_factors(cfg.kernel_config, vllm_config=cfg) == before
+    for reader in readers.values():
+        reader.assert_not_called()

@@ -224,6 +224,7 @@ class GdnBackendStages:
     state_layout: str = "NHVK"
     output_layout: str = "BLHD"
     stages: tuple[str, ...] = ("recurrence",)
+    native_policy_abi: int | None = None
 
 
 GDN_BACKEND_STAGES = {
@@ -250,6 +251,7 @@ GDN_BACKEND_STAGES = {
         "flash_qla.chunk (original TileLang or VLK)",
         "external l2norm_fwd when requested",
         "original consumes log gate; VLK preserves gate_is_exp",
+        native_policy_abi=1,
     ),
 }
 
@@ -264,6 +266,10 @@ class GdnExecutionPlan:
     indexed_prefill: bool
     direct_prefill_output: bool
     fallback_reason: str | None
+
+    @property
+    def needs_native_flashqla(self) -> bool:
+        return self.prefill.native_policy_abi is not None and not self.original_prefill
 
     def explain(self) -> dict:
         from dataclasses import asdict

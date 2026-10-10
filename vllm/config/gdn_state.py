@@ -4,6 +4,7 @@
 
 import os
 from dataclasses import asdict
+from typing import ClassVar
 
 from pydantic import Field
 
@@ -56,6 +57,20 @@ class GdnStateConfig:
 
 @config
 class GdnStateTraceConfig:
+    aliases: ClassVar[dict[str, str]] = {
+        "table_dir": "VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR",
+        "table_seqs": "VLLM_SM70_DUMP_GDN_STATE_TABLE_SEQS",
+        "table_start": "VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ",
+        "table_end": "VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ",
+        "table_limit": "VLLM_SM70_DUMP_GDN_STATE_TABLE_MAX_DUMPS",
+        "debug_state_table": "VLLM_DFLASH_DEBUG_STATE_TABLE",
+        "metadata_profile": "VLLM_DFLASH_DDTREE_METADATA_PROFILE",
+        "assert_standard_boundary": "VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD",
+        "assert_contract": "VLLM_SM70_GDN_STATE_CONTRACT_ASSERT",
+        "metadata_shadow": "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW",
+        "sync_assert": "VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT",
+    }
+
     table_dir: str | None = None
     """Optional state-table dump directory."""
     table_seqs: str | None = None
@@ -87,13 +102,13 @@ class GdnStateTraceConfig:
         from vllm import envs
 
         if self.table_dir is None:
-            self.table_dir = os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR")
+            self.table_dir = os.getenv(self.aliases["table_dir"])
         if self.table_seqs is None and self.table_dir:
-            self.table_seqs = os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_SEQS")
+            self.table_seqs = os.getenv(self.aliases["table_seqs"])
         for field, name, default in (
-            ("table_start", "VLLM_SM70_DUMP_GDN_STATE_TABLE_START_SEQ", 0),
-            ("table_end", "VLLM_SM70_DUMP_GDN_STATE_TABLE_END_SEQ", 0),
-            ("table_limit", "VLLM_SM70_DUMP_GDN_STATE_TABLE_MAX_DUMPS", 32),
+            ("table_start", self.aliases["table_start"], 0),
+            ("table_end", self.aliases["table_end"], 0),
+            ("table_limit", self.aliases["table_limit"], 32),
         ):
             if getattr(self, field) is None:
                 # Disabled diagnostics never parse unused numeric inputs.
@@ -104,27 +119,28 @@ class GdnStateTraceConfig:
                 )
         if self.debug_state_table is None:
             self.debug_state_table = envs.environment_variables[
-                "VLLM_DFLASH_DEBUG_STATE_TABLE"
+                self.aliases["debug_state_table"]
             ]()
         if self.metadata_profile is None:
             self.metadata_profile = (
-                os.getenv("VLLM_DFLASH_DDTREE_METADATA_PROFILE", "0") == "1"
+                os.getenv(self.aliases["metadata_profile"], "0") == "1"
             )
         if self.assert_standard_boundary is None:
             self.assert_standard_boundary = (
-                os.getenv("VLLM_SM70_QWEN_GDN_ASSERT_NO_ACTIVE_SPEC_STANDARD") == "1"
+                os.getenv(self.aliases["assert_standard_boundary"]) == "1"
             )
         if self.assert_contract is None:
-            self.assert_contract = (
-                os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1"
-            )
+            self.assert_contract = os.getenv(self.aliases["assert_contract"]) == "1"
         for field, name in (
-            ("metadata_shadow", "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW"),
-            ("sync_assert", "VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT"),
+            ("metadata_shadow", self.aliases["metadata_shadow"]),
+            ("sync_assert", self.aliases["sync_assert"]),
         ):
             if getattr(self, field) is None:
                 setattr(self, field, envs.environment_variables[name]())
         self.resolved = True
+
+    def compile_ignored_aliases(self):
+        return set(self.aliases.values())
 
 
 def resolve_state_trace(vllm_config) -> GdnStateTraceConfig:

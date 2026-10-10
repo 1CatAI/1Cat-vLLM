@@ -9,6 +9,7 @@ def test_records_aliases_helpers_and_dynamic_readers_without_evaluation():
     source = """
 import vllm.envs as flags
 from os import getenv as read
+from vllm.v1.attention.backends.flash_v100 import config as _config
 KEY = "VLLM_SM70_EXAMPLE"
 class Layer:
     def forward(self):
@@ -117,3 +118,239 @@ def test_native_policy_inventory_uses_shipped_declarations(tmp_path):
         "PolicyField::example": "VLLM_EXAMPLE",
         "flash_v100::policy::Field::test": "PREFIX_TEST",
     }
+
+
+def test_forwarded_getters_and_assignments_cannot_hide_reads():
+    source = """
+import os as process
+from vllm import envs as flags
+read = process.getenv
+second_read = read
+KEY = "VLLM_SM70_TEST"
+def enabled(name):
+    return second_read(name) == "1"
+def forward():
+    return enabled(KEY), flags.VLLM_SM70_TEST
+"""
+    rows = python_references(source)
+    consumers = [row for row in rows if row["scope"] == "forward"]
+    assert len(consumers) == 2
+    assert {row["name"] for row in consumers} == {"VLLM_SM70_TEST"}
+    assert {row["kind"] for row in consumers} == {"registered", "getter"}
+    assert any(row["name"] is None and row["scope"] == "enabled" for row in rows)
+
+
+def test_frozen_policy_raw_method_is_not_an_environment_getter():
+    source = """
+def report(policy):
+    return policy.raw("VLLM_SM70_TEST")
+"""
+    assert python_references(source) == []
+
+
+def test_argument_shadowing_an_import_is_not_a_process_read():
+    source = """
+import os
+from vllm import envs
+
+def read_fixture(os, envs):
+    return os.getenv("VLLM_SM70_TEST"), envs.VLLM_SM70_TEST
+"""
+    assert python_references(source) == []
+
+
+def test_wrapped_reader_import_alias_uses_its_actual_identity():
+    import ast
+
+    from tools.pre_commit.environment_readers import forwarding_getters
+
+    getters = forwarding_getters(
+        ast.parse("""
+import os
+
+def query(name):
+    return os.environ.get(name)
+"""),
+        "package.flags",
+    )
+    source = """
+from package.flags import query as enabled
+value = enabled("TM_GEMM_TUNE")
+"""
+    assert python_references(source, getters=getters)[0]["name"] == "TM_GEMM_TUNE"
+
+
+def test_reader_assignment_is_scoped_and_shadowing_is_respected():
+    source = """
+import os
+KEY = "VLLM_SM70_TEST"
+def other():
+    os = object()
+    return os.getenv(KEY)
+def forward():
+    read = os.getenv
+    return read(KEY)
+def dynamic(KEY):
+    return os.getenv(KEY)
+"""
+    rows = python_references(source)
+    assert [(r["scope"], r["name"]) for r in rows] == [
+        ("forward", "VLLM_SM70_TEST"),
+        ("dynamic", None),
+    ]
+
+
+def test_nested_helper_does_not_make_outer_function_a_reader():
+    import ast
+
+    from tools.pre_commit.environment_readers import forwarding_getters
+
+    getters = forwarding_getters(
+        ast.parse("""
+import os
+def outer(name):
+    def inner(name):
+        return os.getenv(name)
+    return name
+"""),
+        "mod",
+    )
+    assert getters == {"mod.outer.inner": 0}
+
+
+def test_ownership_follows_types_and_reexports_not_alias_words():
+    from tools.config_ownership import ConfigOwnership
+
+    sources = {
+        "vllm/config/vllm.py": """
+from vllm.config.public import Kernel
+class VllmConfig:
+    kernel_config: Kernel
+""",
+        "vllm/config/public.py": "from vllm.config.kernel import Kernel",
+        "vllm/config/kernel.py": """
+class Kernel:
+    weight_layout: bool = False
+    aliases = {"weight_layout": "VLLM_SM70_MTP_WEIGHT_LAYOUT"}
+""",
+    }
+    declaration = typed_declarations(sources["vllm/config/kernel.py"])
+    owners = ConfigOwnership(sources).owners(
+        "vllm/config/kernel.py",
+        declaration["VLLM_SM70_MTP_WEIGHT_LAYOUT"][0],
+        "VLLM_SM70_MTP_WEIGHT_LAYOUT",
+    )
+    assert [(owner["owner"], owner["field"]) for owner in owners] == [
+        ("kernel_config", "weight_layout")
+    ]
+
+
+def test_direct_initialized_assignment_has_a_field_and_dynamic_key_does_not():
+    source = """
+import os
+class Policy:
+    def resolve(self):
+        raw = os.getenv("VLLM_SM70_TEST", "0")
+        self.enabled = raw == "1"
+"""
+    assert typed_declarations(source)["VLLM_SM70_TEST"][0]["field"] == "enabled"
+    source = source.replace('"VLLM_SM70_TEST"', "name")
+    assert not typed_declarations(source)
+
+
+def test_real_native_declarations_do_not_attribute_fp8_to_awq_or_diagnostics():
+    from pathlib import Path
+
+    from tools.config_ownership import ConfigOwnership
+
+    sources = {str(path): path.read_text() for path in Path("vllm/config").glob("*.py")}
+    source = "vllm/config/sm70_native.py"
+    alias = "VLLM_SM70_FP8_SAFE_FAST_SELECTOR"
+    entry = typed_declarations(sources[source])[alias][0]
+    owners = ConfigOwnership(sources).owners(source, entry, alias)
+    assert {owner["owner"] for owner in owners} == {
+        "kernel_config.sm70_fp8.native",
+        "kernel_config.sm70_moe.fp8.native",
+    }
+
+
+def test_closure_rejects_new_forward_and_dynamic_reader_inside_config_directory():
+    from tools.config_boundaries import consumer_lifecycle
+    from tools.config_inventory import closure_errors
+
+    site = dict(
+        path="vllm/config/example.py", scope="Policy.forward", line=9, kind="raw"
+    )
+    site["lifecycle"] = consumer_lifecycle("VLLM_SM70_NEW", site, None)
+    assert site["lifecycle"] == "unclassified"
+    inventory = dict(
+        parameters={"VLLM_SM70_NEW": dict(owners=[], boundary=None, consumers=[site])},
+        unresolved_dynamic_readers=[dict(site, input_domain=None)],
+    )
+    errors = closure_errors(inventory)
+    assert len(errors) == 3
+    assert any("no typed owner" in error for error in errors)
+    assert any("input domain" in error for error in errors)
+    assert any("unclassified legacy consumer" in error for error in errors)
+
+
+def test_native_copied_helpers_must_be_unreachable_from_registered_entry():
+    from tools.config_inventory import native_retained_lifecycles, native_scopes
+
+    source = """
+namespace {
+bool old_flag() { return std::getenv("VLLM_SM70_TEST") != nullptr; }
+void entry() { kernel(); }
+}
+TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
+ ops.impl("entry", &entry);
+}
+"""
+    scopes = native_scopes(source)
+    assert "old_flag" in native_retained_lifecycles(source, scopes)
+    source = source.replace("kernel();", "old_flag(); kernel();")
+    assert "old_flag" not in native_retained_lifecycles(source, native_scopes(source))
+
+
+def test_native_extension_and_standalone_compile_branches_remain_distinct():
+    from tools.config_inventory import native_compile_guards
+
+    source = """#if defined(PREFIX_TORCH_EXTENSION)
+explicit_policy();
+#else
+std::getenv("PREFIX_TEST");
+#endif
+"""
+    guards = native_compile_guards(source)
+    assert guards[2] == ("defined(PREFIX_TORCH_EXTENSION)",)
+    assert guards[4] == ("!(defined(PREFIX_TORCH_EXTENSION))",)
+
+
+def test_relative_import_inside_function_keeps_module_identity():
+    rows = python_references(
+        """
+def invoke():
+    from .flags import read
+    return read("VLLM_SM70_TEST")
+""",
+        module="package.consumer",
+        getters={"package.flags.read": 0},
+    )
+    assert len(rows) == 1 and rows[0]["name"] == "VLLM_SM70_TEST"
+
+
+def test_census_keeps_dynamic_reads_in_the_full_denominator():
+    from tools.config_inventory import summary
+
+    inventory = {
+        "parameters": {},
+        "unresolved_dynamic_readers": [
+            {"path": "vllm/runner.py", "line": 7, "kind": "raw", "input_domain": None},
+            {"path": "vllm/runner.py", "line": 7, "kind": "raw", "input_domain": None},
+        ],
+    }
+    report = summary(inventory)
+    assert report["unique_read_sites"] == 1
+    assert report["unique_named_read_sites"] == 0
+    assert report["unique_dynamic_read_sites"] == 1
+    assert report["unregistered_dynamic_readers"] == 2

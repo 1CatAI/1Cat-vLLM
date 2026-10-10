@@ -13,6 +13,10 @@ from vllm.config.sm70_native import Sm70NativeConfig
 from vllm.config.utils import config, hash_factors
 
 MoEFormat = Literal["awq", "fp8"]
+FP8_STAGE_ALIASES = {
+    "single_token_w2": "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH",
+}
+FP4_DIAGNOSTIC_ALIASES = {"route_debug": "VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG"}
 FP8_COMPACT_ALIASES = {
     "compact_exact_layout": (
         "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT"
@@ -308,7 +312,7 @@ class Sm70MoEFormatConfig:
             names.extend(aliases)
         if family == "fp8":
             names.extend(FP8_COMPACT_ALIASES.values())
-            names.append("VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH")
+            names.extend(FP8_STAGE_ALIASES.values())
         self.legacy.capture(names)
         self.native.capture_inputs()
 
@@ -377,7 +381,7 @@ class Sm70MoEFormatConfig:
             elif field == "single_token_w2":
                 if family == "fp8":
                     names = (
-                        "VLLM_SM70_FP8_MOE_SINGLE_TOKEN_INDEXED_W2_FASTPATH",
+                        FP8_STAGE_ALIASES[field],
                         *names,
                     )
                 value = (
@@ -499,7 +503,7 @@ class Sm70MoELegacyConfig:
 
     def capture_inputs(self, family: str) -> None:
         aliases = NVFP4_ALIASES if family == "nvfp4" else MXFP4_ALIASES
-        self.legacy.capture((*aliases.values(), "VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG"))
+        self.legacy.capture((*aliases.values(), *FP4_DIAGNOSTIC_ALIASES.values()))
         self.native.capture_inputs()
 
     def _resolve(self, aliases: dict[str, str], family: str) -> None:
@@ -583,7 +587,7 @@ class Sm70NvFp4MoEConfig(Sm70MoELegacyConfig):
         self.capture_inputs("nvfp4")
         if self.route_debug is None:
             self.route_debug = (
-                self.legacy.value("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG") == "1"
+                self.legacy.value(FP4_DIAGNOSTIC_ALIASES["route_debug"]) == "1"
             )
         self._resolve(NVFP4_ALIASES, "nvfp4")
 

@@ -89,6 +89,27 @@ SM70_DFLASH2_LEGACY_FIELDS = {
 }
 
 
+# These non-boolean fields share the ordered defaults bridge and hash filtering.
+SPEC_DEFAULT_ALIASES = {
+    "VLLM_SM70_DFLASH2_BF16_EMULATION": "bf16_emulation",
+    "VLLM_SM70_DFLASH2_PROPOSAL_TEMPERATURE_SCALE": "proposal_temperature_scale",
+    "VLLM_SM70_DFLASH2_PROPOSAL_TOP_P": "proposal_top_p",
+}
+
+
+def speculation_compile_ignored_aliases(spec):
+    """Initialized engine strategies replace aliases, including inactive features."""
+    from vllm.config.speculative_sampling import SpeculativeSamplingPolicy
+
+    ignored = set(SpeculativeSamplingPolicy.aliases.values())
+    ignored.update(DFlashLookupPolicy.aliases.values())
+    policy = getattr(spec, "sm70_dflash2", None)
+    if policy is None or policy.resolved:
+        ignored.update(SM70_DFLASH2_LEGACY_FIELDS)
+        ignored.update(SPEC_DEFAULT_ALIASES)
+    return ignored
+
+
 @config
 class DFlashLookupPolicy(ExecutionPolicy):
     """Captured only when lookup assistance can run; does not own request state."""
@@ -227,13 +248,9 @@ class Sm70DFlash2Config:
     """Explicit configuration or legacy settings, used by mixed-format defaults."""
 
     def resolve(self, *, qualified: bool) -> None:
-        if "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER" in os.environ:
-            logger.warning_once(
-                "VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER is deprecated and ignored: "
-                "dense tie ordering is mandatory after retiring the failed "
-                "candidate-order experiment. No replacement switch is needed. "
-                "The alias remains for one full released compatibility cycle."
-            )
+        variable = envs.environment_variables["VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER"]
+        if isinstance(variable, EnvVar):
+            variable.warn_if_deprecated()
         if self.resolved:
             return
         explicit = []

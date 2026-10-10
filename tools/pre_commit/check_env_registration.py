@@ -35,6 +35,8 @@ def native_reads(
     Native wrappers such as env_flag_enabled and *_from_env are readers too.
     This is a lexical check, not an evaluator of dynamic string construction.
     """
+    if not re.search(r"\b\w*env\w*\s*(?:<[^>\n]*>)?\s*\(", content, re.I):
+        return []
     tokens = re.compile(
         r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*[\s\S]*?\*/'
     )

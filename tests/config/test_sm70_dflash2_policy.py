@@ -162,7 +162,10 @@ def test_loaded_report_includes_actual_verifier_flags_and_reason():
     assert row["reasons"]["_sm70_dflash2_combined_split_reason"] == "local_tail_layout"
 
 
-def test_failed_order_switch_is_removed_and_dense_alias_warns(monkeypatch, caplog):
+def test_failed_order_switch_is_removed_and_dense_alias_warns(monkeypatch):
+    from vllm import envs_metadata
+
+    monkeypatch.setattr(envs_metadata, "_warned_names", set())
     assert (
         "VLLM_SM70_DFLASH2_QPN8_ALLOW_CANDIDATE_ORDER" not in envs.environment_variables
     )
@@ -170,5 +173,7 @@ def test_failed_order_switch_is_removed_and_dense_alias_warns(monkeypatch, caplo
     assert not hasattr(policy, "qpn8_allow_candidate_order")
     assert not hasattr(policy, "qpn8_dense_order")
     monkeypatch.setenv("VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER", "0")
-    policy.resolve(qualified=True)
-    assert "dense tie ordering is mandatory" in caplog.text
+    with pytest.warns(
+        FutureWarning, match="dense vocabulary tie ordering is now mandatory"
+    ):
+        policy.resolve(qualified=True)

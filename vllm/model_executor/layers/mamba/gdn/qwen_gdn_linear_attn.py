@@ -81,18 +81,12 @@ from vllm.model_executor.layers.fla.ops.gdn_stages import (
     convolve_decode,
     mixed_qkv_recurrence,
 )
+from vllm.model_executor.layers.fla.ops.sm70 import (
+    gdn_prefill as flashqla_prefill_provider,
+)
 from vllm.model_executor.layers.fla.ops.sm70.gdn_decode import (
     FlashQlaDecodeAdmission,
     flashqla_decode,
-)
-from vllm.model_executor.layers.fla.ops.sm70.gdn_prefill import (
-    _flashqla_sm70_decode_available as _flashqla_sm70_decode_available,
-)
-from vllm.model_executor.layers.fla.ops.sm70.gdn_prefill import (
-    flashqla_sm70_chunk_gated_delta_rule as _flashqla_prefill,
-)
-from vllm.model_executor.layers.fla.ops.sm70.gdn_prefill import (
-    flashqla_sm70_chunk_gated_delta_rule_vllm_decode as flashqla_sm70_chunk_gated_delta_rule_vllm_decode,  # noqa: E501
 )
 from vllm.model_executor.layers.fla.ops.sm70.gdn_verify import bind_native_verifier
 from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
@@ -155,6 +149,15 @@ if GDN_AITER_TRITON_AVAILABLE:
     )
 
 fla_chunk_gated_delta_rule = _fla_chunk_rule  # Legacy import path.
+
+# Retain historical imports while binding the provider once.
+_flashqla_sm70_decode_available = (
+    flashqla_prefill_provider._flashqla_sm70_decode_available
+)
+_flashqla_prefill = flashqla_prefill_provider.flashqla_sm70_chunk_gated_delta_rule
+flashqla_sm70_chunk_gated_delta_rule_vllm_decode = (
+    flashqla_prefill_provider.flashqla_sm70_chunk_gated_delta_rule_vllm_decode
+)
 
 logger = init_logger(__name__)
 
@@ -1326,6 +1329,11 @@ class ChunkGatedDeltaRule(GdnPrefill, CustomOp):
             bind_chunk_kernels(config, resolve_gdn_config(config).schedule)
             if plan.prefill.backend in ("triton", "flashqla_sm70")
             else None,
+            native_policy=flashqla_prefill_provider.bind_flashqla_native_policy(
+                config,
+                resolve_gdn_config(config),
+                needed=plan.needs_native_flashqla,
+            ),
         )
         if (
             plan.requested_backend in ("flashinfer", "cutedsl", "flashqla_sm70")
@@ -1585,6 +1593,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.enable_flashqla_decode = self.gdn_policy.flashqla_decode
         self.flashqla_decode_admission = FlashQlaDecodeAdmission.bind(
             self.gdn_heads, self.enable_flashqla_decode
+        )
+        self._flashqla_native_policy = (
+            flashqla_prefill_provider.bind_flashqla_native_policy(
+                vllm_config,
+                self.gdn_policy,
+                needed=self.flashqla_decode_admission.needs_native_policy(
+                    vllm_config.model_config.dtype
+                ),
+            )
         )
         self.force_sm70_qwen_gdn_full_forward = bool(
             self.gdn_policy.projection.full_forward
@@ -2852,7 +2869,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return reason is None
 
     def _forward_core_decode_flashqla(self, **kwargs):
-        return flashqla_decode(self.gdn_heads, self.A_log, self.dt_bias, **kwargs)
+        return flashqla_decode(
+            self.gdn_heads,
+            self.A_log,
+            self.dt_bias,
+            native_policy=self._flashqla_native_policy,
+            **kwargs,
+        )
 
     def forward(
         self,

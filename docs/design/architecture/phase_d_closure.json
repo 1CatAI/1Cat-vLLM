@@ -1,0 +1,320 @@
+{
+  "schema": 1,
+  "baseline": "8cbaf7edda7a0148152b9731a013faf710a76b76",
+  "integrated_base": "22c4d22f4b2f0e5bb794a3d4c457afead19c920d",
+  "candidate_code": "ec1484d7e",
+  "method": "Same final static scanner on C and D checkouts, without running getters. Read positions deduplicate file/line/kind and include both named and dynamic readers; parameter edges are counted separately. No per-token execution count is inferred.",
+  "before": {
+    "parameters": 736,
+    "unassigned_parameters": 361,
+    "unique_read_sites": 914,
+    "unique_named_read_sites": 790,
+    "unique_dynamic_read_sites": 124,
+    "references": {
+      "native": 190,
+      "raw": 235,
+      "native_bound": 68,
+      "registered": 232,
+      "getter": 135
+    },
+    "consumer_lifecycles": {
+      "standalone_compatibility": 24,
+      "deferred_ddtree": 61,
+      "process_library_loading": 16,
+      "initialization": 18,
+      "standalone_benchmark": 5,
+      "unclassified": 563,
+      "bound_native_policy": 68,
+      "process_logging": 3,
+      "engine_argument_initialization": 4,
+      "unreachable_copied_native_helper": 98
+    },
+    "unresolved_dynamic_readers": 127,
+    "unregistered_dynamic_readers": 53,
+    "deprecated_count": 0,
+    "metadata_errors": 60,
+    "unclassified_scopes": 291
+  },
+  "after": {
+    "parameters": 757,
+    "unassigned_parameters": 0,
+    "unique_read_sites": 355,
+    "unique_named_read_sites": 234,
+    "unique_dynamic_read_sites": 121,
+    "references": {
+      "native": 248,
+      "raw": 90,
+      "native_bound": 154,
+      "registered": 18,
+      "getter": 11
+    },
+    "consumer_lifecycles": {
+      "standalone_compatibility": 171,
+      "deferred_ddtree": 61,
+      "process_library_loading": 16,
+      "standalone_benchmark": 6,
+      "bound_native_policy": 154,
+      "process_logging": 3,
+      "engine_argument_initialization": 4,
+      "initialization": 8,
+      "unreachable_copied_native_helper": 98
+    },
+    "unresolved_dynamic_readers": 125,
+    "unregistered_dynamic_readers": 0,
+    "deprecated_count": 51,
+    "metadata_errors": 0,
+    "unclassified_scopes": 0
+  },
+  "closure_errors": [],
+  "state_census": {
+    "scope": "44 explicitly audited engine-serving diagnostic/warmup/cache containers; not every unrelated module variable in vLLM. D5 provider resources listed separately below, without mixing resource types into a misleading total.",
+    "before_shared_engine_containers": 44,
+    "after_shared_engine_containers": 0,
+    "after_independent_owner_groups": 5,
+    "diagnostics": {
+      "before": 27,
+      "after_owners": [
+        "EngineDiagnostics",
+        "GDN prefill warmup-key set"
+      ],
+      "containers": [
+        {
+          "path": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "name": "_SM70_MOE_RUNNER_DUMP_BUFFERS"
+        },
+        {
+          "path": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "name": "_SM70_MOE_RUNNER_DUMP_META"
+        },
+        {
+          "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "name": "_SM70_GDN_DUMP_COUNTS"
+        },
+        {
+          "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "name": "_SM70_GDN_PROJ_DUMP_COUNTS"
+        },
+        {
+          "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "name": "_SM70_GDN_PACKED_COMPARE_COUNTS"
+        },
+        {
+          "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "name": "_SM70_GDN_PACKED_COMPARE_REPORTS"
+        },
+        {
+          "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "name": "_SM70_GDN_GRAPH_BUFFERS"
+        },
+        {
+          "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "name": "_SM70_GDN_GRAPH_META"
+        },
+        {
+          "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "name": "_SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS"
+        },
+        {
+          "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+          "name": "_SM70_GDN_PREFILL_WARMUP_KEYS"
+        },
+        {
+          "path": "vllm/model_executor/models/qwen3_next.py",
+          "name": "_SM70_QWEN_LAYER_DUMP_COUNTS"
+        },
+        {
+          "path": "vllm/model_executor/models/qwen3_next.py",
+          "name": "_SM70_QWEN_LAYER_DUMP_SAVE_COUNTS"
+        },
+        {
+          "path": "vllm/model_executor/models/qwen3_next.py",
+          "name": "_SM70_QWEN_LAYER_GRAPH_BUFFERS"
+        },
+        {
+          "path": "vllm/model_executor/models/qwen3_next.py",
+          "name": "_SM70_QWEN_LAYER_GRAPH_META"
+        },
+        {
+          "path": "vllm/v1/sample/rejection_sampler.py",
+          "name": "_SPEC_ALIGNMENT_DUMP_COUNT"
+        },
+        {
+          "path": "vllm/v1/sample/rejection_sampler.py",
+          "name": "_SPEC_ALIGNMENT_STEP_COUNTER"
+        },
+        {
+          "path": "vllm/v1/sample/rejection_sampler.py",
+          "name": "_REJECTION_PROFILE_INTERVAL_SUMS"
+        },
+        {
+          "path": "vllm/v1/sample/rejection_sampler.py",
+          "name": "_REJECTION_PROFILE_INTERVAL_CALLS"
+        },
+        {
+          "path": "vllm/v1/sample/sampler.py",
+          "name": "_SM70_LOGITS_DUMP_COUNTER"
+        },
+        {
+          "path": "vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py",
+          "name": "_SELECTOR_ALIGNMENT_DUMP_COUNT"
+        },
+        {
+          "path": "vllm/v1/worker/gpu/spec_decode/dflash2/sparse_rejection.py",
+          "name": "_SELECTOR_ALIGNMENT_STEP"
+        },
+        {
+          "path": "vllm/v1/worker/gpu_model_runner.py",
+          "name": "_SM70_SAMPLE_TENSOR_DUMP_COUNTER"
+        },
+        {
+          "path": "vllm/v1/worker/gpu_model_runner.py",
+          "name": "_SM70_SAMPLE_SYNC_COUNTER"
+        },
+        {
+          "path": "vllm/v1/worker/gpu_model_runner.py",
+          "name": "_SM70_QWEN_LAYER_GRAPH_DUMP_COUNTER"
+        },
+        {
+          "path": "vllm/v1/worker/gpu_model_runner.py",
+          "name": "_SM70_MTP_STEP_DUMP_COUNTER"
+        },
+        {
+          "path": "vllm/v1/worker/gpu_model_runner.py",
+          "name": "_SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED"
+        },
+        {
+          "path": "vllm/v1/worker/gpu_model_runner.py",
+          "name": "_SM70_COMPILE_GRAPH_INPUT_DUMP_STEP"
+        }
+      ]
+    },
+    "attention_python": {
+      "before": 14,
+      "after_owners": [
+        "FlashV100Runtime",
+        "AttentionWorkspaces"
+      ],
+      "package_caches": [
+        "decode_plan_cache",
+        "decode_workspace_cache",
+        "xqa_staged_rescale_workspace_cache",
+        "turboquant_decode_workspace_cache",
+        "prefill_splitkv3_workspace_cache",
+        "grouped_verify_workspace_cache"
+      ],
+      "backend_caches": [
+        {
+          "path": "vllm/v1/attention/ops/sm70_fp16_grouped.py",
+          "name": "grouped_fp16"
+        },
+        {
+          "path": "vllm/v1/attention/backends/flash_v100/dense_prefill.py",
+          "name": "sm70_fa2_cu_seqlens_cache"
+        },
+        {
+          "path": "vllm/v1/attention/backends/flash_v100/dense_prefill.py",
+          "name": "prefill_dense_splitkv3_workspaces"
+        },
+        {
+          "path": "vllm/v1/attention/backends/flash_v100/dense_prefill.py",
+          "name": "prefill_profiled"
+        },
+        {
+          "path": "vllm/v1/attention/backends/flash_v100/dense_prefill.py",
+          "name": "sm70_79t_q8192_padding_workspaces"
+        },
+        {
+          "path": "vllm/v1/attention/backends/flash_v100/dense_prefill.py",
+          "name": "fp8_prefill_bridge_workspaces"
+        },
+        {
+          "path": "vllm/v1/attention/backends/flash_v100/dense_prefill.py",
+          "name": "fp8_prefill_bridge_tail_workspaces"
+        },
+        {
+          "path": "vllm/v1/attention/backends/flash_v100/kv_layout.py",
+          "name": "prefill_gather_dense_workspaces"
+        }
+      ]
+    },
+    "attention_native": {
+      "before": 3,
+      "after_owners": [
+        "Sm70PrefillRuntime"
+      ],
+      "containers": [
+        "shared score cache",
+        "Q8000 workspace cache",
+        "Q8192 workspace cache"
+      ],
+      "retained": "One physical-device execution gate coordinates unchanged device-global kernel pointers; no score tensor or calculation policy is owned by it."
+    },
+    "additional_provider_owners": [
+      "QSA workspace maps",
+      "online QPN8 address pools",
+      "sampler scratch",
+      "TurboQuant tables/buffers",
+      "FLA autotuners",
+      "TurboMind packing/tuning/scratch and counters",
+      "event-trace engine counters",
+      "FlashQLA immutable native policy"
+    ],
+    "retained_process_state": [
+      "native registration and DSO loader caches",
+      "immutable prepared policies and compiled code",
+      "scoped TLS/context references restored after execution",
+      "warn-once registry per process/name",
+      "separate standalone compatibility caches",
+      "deferred DDTree state"
+    ]
+  },
+  "duplicate_flows": {
+    "layer_capture_record": [
+      2,
+      1
+    ],
+    "graph_flush": [
+      3,
+      1
+    ],
+    "marlin_dense_moe_parser_implementations": [
+      2,
+      1
+    ],
+    "engine_execution_native_marlin_env_reads": [
+      6,
+      0
+    ],
+    "engine_execution_79t_env_reads": [
+      6,
+      0
+    ],
+    "engine_execution_flashqla_column_group_env_reads": [
+      1,
+      0
+    ],
+    "note": "Parser dialect differences remain explicit, rather than replacing bool(int), presence, exact-string and libc parsing with one new dialect."
+  },
+  "validation": {
+    "integrated_cpu_passed": 162,
+    "flashqla_gpu_cases": 24,
+    "models_loaded": false,
+    "diagnostics": "Static selection and captured host observations are reported separately; graph replay is not counted as a new host dispatch.",
+    "final_integration": {
+      "passed": 35,
+      "skipped": 16,
+      "machine": "54633",
+      "gpu_index": 4,
+      "gpu": "Quadro P400 SM61",
+      "note": "V100 GPUs 0-3 were occupied by an unrelated workload; the task did not interrupt it. All 16 SM70 numerical cases skipped on SM61. This run only validates remaining configuration/plan contracts; the 24-case V100 native run and matched A/B remain the numerical evidence."
+    },
+    "post_hash_config_passed": 129,
+    "post_error_config_passed": 31,
+    "tools_passed": 52,
+    "native_invalid_input_checks": {
+      "passed": 4,
+      "gpu": "Quadro P400 SM61",
+      "scope": "Host-side error/admission checks in the normal SM70 extension, no GPU kernel execution; legacy -1, atoi overflow, zero and malformed input remain rejected, typed automatic choice overrides them."
+    }
+  }
+}

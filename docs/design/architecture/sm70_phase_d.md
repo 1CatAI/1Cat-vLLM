@@ -14,6 +14,7 @@ registry, typed alias declarations and consumer source:
 ```bash
 .venv/bin/python -m tools.config_inventory --json > /tmp/phase-d-parameters.json
 .venv/bin/python -m tools.config_inventory
+.venv/bin/python -m tools.config_inventory --check
 .venv/bin/python tools/pre_commit/check_layering.py --report
 ```
 
@@ -64,7 +65,7 @@ part of the contract.
 | D4a attention package | Merged `d4ce51399`, CI passed [#1148](https://github.com/1CatAI/1Cat-vLLM/pull/1148) | Backend/package/versioned native policy, graph projections, diagnostics and Python workspace isolation; evidence below. |
 | D4b FA2/79T resources | Merged [#1150](https://github.com/1CatAI/1Cat-vLLM/pull/1150), `b14c2ab0a`, CI passed | Native 79T policy, cuBLAS/stream/event/workspace ownership and normal FA2 build; evidence below. |
 | D5 remaining providers | D5a merged [#1151](https://github.com/1CatAI/1Cat-vLLM/pull/1151), `e2a52d519`, CI passed; D5b in validation | Provider/native resource lifecycle is merged. Marlin, remaining event-trace consumers and loader-aware native scope coalescing are under validation. |
-| D6 closure | Pending | Complete evidence audit, remaining-name ownership, report and execution-time read guards. |
+| D6 closure | This delivery, based on merged D5b | Full ownership gate, retained boundary inventory, FlashQLA binding and final evidence below. |
 
 Baseline layering report: 243 literal raw environment reads in counted generic
 modules. This excludes some registered reads, helper indirection and native
@@ -76,9 +77,8 @@ and migrating actual active consumers, not reducing this one regex count.
 
 `EnvVarMetadata` now distinguishes `alias`, `experiment` and `historical`
 deprecations, with a reason, evidence and optional replacement. New structured
-deprecations require evidence; aliases require a replacement. Existing category-
-only entries remain visible in the report with missing details until audited
-in D6. Default-off controls are not automatically deprecated.
+deprecations require evidence; aliases require a replacement. D6 completes the existing category-only entries; the metadata check now
+rejects a deprecated category without structured reason and evidence. Default-off controls are not automatically deprecated.
 
 Explicit legacy settings (including `0`) warn at most once per process and
 name, independently of Python warning filters. Metadata inspection and report
@@ -456,8 +456,8 @@ values take precedence without changing the process environment.
   also affects ordinary async runs, so its canonical owner is `sm70_runtime`.
   Both batch constructors bind it once; request-history repair reads no env.
 - Library paths, capabilities and upstream loading controls remain loading inputs.
-  The six native `SM70_MARLIN_*` launch overrides still need D5b. DDTree remains
-  deferred. D6 must audit the full inventory with one common counter.
+  The six native `SM70_MARLIN_*` launch overrides are completed in D5b. DDTree
+  remains deferred; the final common-counter audit is recorded in D6.
 
 **Validation.** Focused CPU suites cover worker serialization, hash qualification,
 two-engine initialization/execution order, malformed inputs, original golden
@@ -500,42 +500,6 @@ rounds, so deterministic parity uses fixed selection on both sides. Initial CPU
 fixtures that inferred a GPU or re-registered custom ops are not counted as
 passes; corrected tests exercise the actual initialized policies.
 
-### D5b: retained Marlin launch overrides (in validation)
-
-The six dense/MoE `SM70_MARLIN_*` inputs use the existing native policy vector
-(ABI 67), under `KernelConfig.sm70_marlin`. The parent captures their
-raw dialect before worker transfer; the existing Marlin workspace preparation
-activates that provider and binds its immutable owner slot. Unused Marlin fields
-do not affect other providers' hashes. Existing operator schemas and fake
-implementations are unchanged; inside an engine scope the native selector borrows
-the bound policy, while independent no-config calls retain the old env adapter.
-
-Geometry and split-K share the original `strtol`/integer parser. Empty inputs,
-metadata spelling, error order, shape validation and model-specific automatic
-selection remain unchanged. Parsing is done once; native dispatch still evaluates
-dynamic shapes. Missing policy ABI fails during preparation rather than silently
-using process defaults. Inventory scanning now includes the previously omitted
-`SM70_MARLIN_` prefix. Initial native-policy/loader/inventory regression passes
-108 tests with two CUDA-only skips; six targeted parser/serialization/hash tests
-pass. Normal native rebuild and GPU validation are pending.
-
-The D5b consumer audit additionally found event-trace helpers still called by
-the old runner and both graph wrappers. Their existing event policy now binds
-call/synchronization methods at initialization; async outputs retain that bound
-callback after returning from the engine context. Input transfer, runner and
-graph observations share the engine diagnostic counter owner. Standalone
-no-config helper imports remain compatible. Disabled diagnostics add no timing,
-CUDA query or tensor allocation. Focused coverage passes 83 tests (11 CUDA-only
-skips), plus 29 graph-policy/owner/profiler tests (8 CUDA-only skips).
-
-Native host measurements identified duplicate scope transitions on loaders that
-already coalesce the two extensions' inline TLS. An initialization-only capability
-probe checks whether entering one owner changes the other extension's context ID.
-Only proven shared domains coalesce to one handle; separate domains and old
-binaries retain both handles. No assumption about linker behavior is required.
-Nested-owner restoration and both probe outcomes have CPU coverage; final native
-rebuild, GPU isolation and host A/B are pending.
-
 ### D5b: Marlin compatibility policy and shared native scope
 
 Six `SM70_MARLIN_{DENSE,MOE}_{CTA_GEOMETRY,SPLIT_K,METADATA_CACHE}` inputs
@@ -577,3 +541,147 @@ uses the existing fixed-E8M0 fixture with binary-exact activations for both arms
 random-input split-K error tests remain enabled. Two FP16 owner tests also needed
 the same fixed selector on both arms instead of comparing independent autotuning
 winners. Neither fix changes production computation or defaults.
+
+### D6: final ownership, deprecation and native closure
+
+Base: merged D5b `22c4d22f4b2f0e5bb794a3d4c457afead19c920d`. The unrelated
+serving change in #1152 is retained. The final gate is
+`python -m tools.config_inventory --check`, installed as an always-run hook.
+It inspects all tracked Python/native sources in vLLM, csrc, Flash-V100,
+FlashQLA and the bundled lmdeploy tree. No directory was added to an exclusion.
+
+The common reader resolves import/assignment aliases, registered attributes,
+subscripts, `getattr`, presence tests and proven forwarding helpers. Dynamic
+names need a declared input domain and exact consumer scope. Ownership comes
+from reachable configuration annotations, inheritance and actual alias tables;
+a destination guessed from a name is not accepted as an owner. The JSON ledger
+links resolver, admission and hash implementations without evaluating getters.
+Static predictions remain separate from native observations and graph replay.
+
+The final pass also completes these consumers:
+
+- PLE budgets belong to `offload_config.ple`, including the early EngineArgs
+  capacity check. Automatic/empty values and deferred invalid-budget errors are
+  preserved. Graph dense-capture and Gemma TP2 communication gates use their
+  existing owners. Inactive model/provider choices do not salt unrelated hashes.
+- Ordinary DSpark target profiling consumes `runtime_trace`, including the
+  historically DDTree-named aliases. The primary profiler-step name wins even
+  when empty; the two NVTX names retain their original OR semantics. Typed
+  values win. Captured raw inputs and typed overrides appear in the explanation.
+- Native FlashQLA column groups belong to `kernel_config.gdn`. ABI 1 binds an
+  immutable policy in the normal bundled extension before execution; no new
+  workspace is introduced. The existing native bodies and exports remain.
+  Unset/empty input retains the dynamic token/head heuristic, libc `atoi` and
+  invalid-value errors are preserved, and an old binary fails at initialization.
+  The original-TileLang provider explicitly bypasses its standalone env adapter. Legacy negative/overflow `atoi` results remain invalid instead of
+  colliding with the binding's internal automatic-selection marker.
+
+The final hash audit also closes GDN/state, profiler, event, warmup, native
+shared-stage and inactive-speculation aliases. Parsing and legacy-hash filtering
+consume the same owner declarations. Poisoned-getter tests cover both named
+overrides and dormant features; standalone no-config hashes retain compatibility.
+
+The same expanded scanner was run on the C baseline and final D source. Raw
+JSON and counting definitions are retained in
+[phase_d_closure.json](phase_d_closure.json).
+
+| Measure | C baseline | Final D |
+| --- | ---: | ---: |
+| Individually enumerated parameters | 736 | 757 |
+| Parameters without typed owner or retained boundary | 361 | 0 |
+| All legacy source read positions, including dynamic and retained entries | 914 | 355 |
+| Positions with a statically resolved name (subset of the previous row) | 790 | 234 |
+| Unclassified parameter-to-consumer edges | 563 | 0 |
+| Unclassified consumer scopes | 291 | 0 |
+| Dynamic-name readers without declared input domain | 53 | 0 |
+| Bound native policy references | 68 | 154 |
+| Incomplete registry metadata entries under the final rules | 60 | 0 |
+
+The extra enumerated names come from complete alias/domain declarations; this
+is not a count of new algorithms. These are source counts, **not per-token
+execution counts**. The 355 remaining positions include initialization and
+compatibility; the native edge count can increase when a dynamic helper's
+supported names become explicit. No unclassified engine execution, forward or
+capture reader is accepted by the final gate. Engine-isolation and poisoned-
+getter tests validate the configured paths separately from this static census.
+
+Of 757 parameters, 693 have reachable typed owners. The other 64 have explicit
+retained destinations: 39 DDTree, 10 library/build loading, five standalone
+benchmark controls, four early EngineArgs MTP defaults, three process logger
+controls, one standalone FlashQLA override, one registered dormant attention
+control and one historical no-op notice. The ledger lists their exact names,
+consumers and reasons. It also exposes all 125 dynamic reader records (121 distinct positions).
+
+Retained consumer edges comprise 171 standalone compatibility, 61 DDTree,
+16 library loading, six standalone benchmark, three process logger, four early
+EngineArgs and eight initialization edges. Another 98 are copied FA2 native helper
+references unreachable from registered exports; the checker follows local
+references from those exports and will reject a newly reachable legacy reader.
+These helpers and the two unbuilt `paged_to_contiguous_old.cu` /
+`paged_to_contiguous_fixed.cu` variants are retained with their history. The
+normal Flash-V100 recipe builds `paged_to_contiguous.cu`; suffixes such as `_vN`
+alone do not establish deprecation.
+
+All 62 deprecated registry names now carry kind, reason, evidence and a
+replacement where applicable (51 are in this acceleration inventory). Alias
+retirement is distinct from an algorithm's negative result: the QPN8 PP2/TP4
+alias does not condemn QPN8, and the AWQ reducer measurement applies only to its
+recorded geometry. Default-off experiments remain accessible. Explicit settings
+warn once per process/name, including when a typed value overrides them. The
+warn registry is intentionally process-owned; diagnostic budgets are not.
+
+| Scoped structural result | Before | After |
+| --- | --- | --- |
+| Layer capture/record implementations | 2 | 1 shared flow |
+| Graph dump flush implementations | 3 | 1 shared flow |
+| Dense/MoE Marlin override parsers | 2 copies | 1 common native parser, prepared once |
+| Engine native env consumers: Marlin / 79T / FlashQLA groups | 6 / 6 / 1 | 0 / 0 / 0 |
+| Audited shared diagnostic/warmup and attention cache containers | 27 + 14 + 3 | 0 serve engines through process globals |
+| Independent owner groups for those 44 containers | Process lifetime | 5 engine owner groups |
+
+The five groups are diagnostics, GDN warmup keys, Flash-V100 package resources,
+backend attention workspaces and native prefill resources. Their individual
+names are in the closure artifact. This is a scoped, reproducible census, not a
+claim that every unrelated vLLM global was removed. D5 additionally assigns QSA,
+QPN8 address pools, sampler scratch, TurboQuant caches, FLA autotuners and native
+packing/tuning/scratch to worker resources. FlashQLA's new owner is immutable.
+
+Shared process boundaries remain: DSO/custom-op registration, immutable compiled
+code and prepared-policy registries, restored TLS/context references, the native
+prefill device execution gate, warn-once names, standalone compatibility caches
+and deferred DDTree state. The device gate is necessary for the unchanged native
+device-global pointer contract; it owns neither policy nor score tensors.
+Worker serialization excludes live owners, and close/release is engine-scoped.
+
+**Validation.** The integrated CPU suite passes 162 cases, covering the
+reader/ownership checker, alias precedence, metadata, deferred errors, hashes,
+worker transfer, event/native owners and GDN plan compatibility. After the
+cache-alias review, 129 related configuration/plan tests pass, followed by 31
+parser/provenance cases; these overlap and are not added together. Final schema,
+registration and layering checks require reductions without increasing limits.
+The broad pre-existing PLE suite has five failures also reproduced on clean
+D5b: four stale environment/field fixtures and one CPU device-inference fixture;
+these are not reported as passing. The new placement contracts pass.
+
+On 54633 V100 GPU 1, the normal FlashQLA build passes 24 operator/configuration
+cases: empty/prefill input, every retained column-group choice, mixed decode,
+reordered state including `-1` rows, two owners and changed-input graph replay.
+Three alternating A/B rounds cover nine prefill/decode cases. Every output and
+state digest matches exactly; temporary allocation is unchanged. GPU medians
+vary from -1.01% to +0.09%, host medians from -5.46% to +8.65% with overlapping
+sample ranges. No speedup claim is made. Native hashes, measurements and build
+contract are in [phase_d6_operators.json](phase_d6_operators.json).
+
+After source integration, 35 configuration/plan cases also pass on the free
+54633 GPU 4 (Quadro P400, SM61); all 16 SM70 operator cases correctly skip.
+The busy V100 workload was not interrupted, and this run does not replace the
+24-case V100 evidence. Four additional native host-side admission checks pass
+against that normal extension, including negative and overflow legacy inputs.
+
+The first build lacked `patchelf`; the same normal bundler succeeded after
+installing that build utility, and the failed log is retained. The final source
+integration changes import organization and initialization qualification only;
+the measured native numerical source is unchanged. D5b's measured 20–26 µs
+native host boundary remains disclosed above. No model, TTFT, throughput, 35B
+performance or untested topology conclusion is made. DDTree and the full Phase E
+documentation/workflow reorganization remain separate follow-up work.

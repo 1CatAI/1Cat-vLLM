@@ -37,6 +37,17 @@ class FlashQlaDecodeAdmission:
         )
         return cls(heads, bool(enabled), capability, device)
 
+    def needs_native_policy(self, dtype):
+        return (
+            self.enabled
+            and dtype == torch.float16
+            and self.capability in ((7, 0), (7, 5))
+            and self.heads.head_k_dim == 128
+            and self.heads.head_v_dim == 128
+            and self.heads.num_k_heads % self.heads.tp_size == 0
+            and self.heads.num_v_heads % self.heads.tp_size == 0
+        )
+
     def rejection(self, mixed_qkv, state_indices, tokens):
         return flashqla_decode_rejection(
             self.heads,
@@ -95,6 +106,7 @@ def flashqla_decode(
     num_decode_tokens: int,
     cu_seqlens: torch.Tensor | None = None,
     core_attn_out: torch.Tensor | None = None,
+    native_policy=None,
 ) -> torch.Tensor:
     del cu_seqlens
     from flash_qla.ops.gated_delta_rule.chunk.sm70.fused_fwd import (
@@ -127,6 +139,7 @@ def flashqla_decode(
         output=kernel_out,
         scale=contract.head_k_dim**-0.5,
         use_qk_l2norm_in_kernel=True,
+        native_policy=native_policy,
     )
     if kernel_out is not out:
         out.copy_(kernel_out)

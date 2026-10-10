@@ -348,3 +348,21 @@ This is the user reference. Internal tuning, diagnostics and compatibility alias
 | `VLLM_XPU_USE_SAMPLER_KERNEL` | configuration | whether use xpu specific sample kernel | True | True | None | No SM70 path association |
 | `VLLM_ZENTORCH_WEIGHT_PREPACK` | configuration | (Zen CPU backend) eagerly prepack weights into ZenDNN blocked layout at model load time. Eliminates per-inference layout conversion overhead. | True | True | None | No SM70 path association |
 | `V_SCALE_CONSTANT` | configuration | Divisor for dynamic value scale factor calculation for FP8 KV Cache | 100 | 100 | None | No SM70 path association |
+
+## Retained deprecated inputs
+
+Explicit legacy inputs warn once per process and name. Deprecating an alias does not deprecate its implementation. Experiments retain their explicit entry; evidence applies only to the documented workload.
+
+| Variable | Kind | Reason | Evidence | Replacement |
+| --- | --- | --- | --- | --- |
+| `VLLM_FLASHINFER_MOE_BACKEND` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | pass --moe-backend flashinfer\_{trtllm,cutlass,cutedsl} directly |
+| `VLLM_MXFP4_USE_MARLIN` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --moe-backend marlin (MoE) or --linear-backend marlin (linear) instead |
+| `VLLM_NVFP4_GEMM_BACKEND` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --linear-backend instead |
+| `VLLM_USE_FBGEMM` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --linear-backend fbgemm instead |
+| `VLLM_USE_FLASHINFER_MOE_FP16` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --moe-backend to select a kernel explicitly |
+| `VLLM_USE_FLASHINFER_MOE_FP4` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --moe-backend to select a kernel explicitly |
+| `VLLM_USE_FLASHINFER_MOE_FP8` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --moe-backend to select a kernel explicitly |
+| `VLLM_USE_FLASHINFER_MOE_MXFP4_BF16` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --moe-backend to select a kernel explicitly |
+| `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --moe-backend flashinfer\_trtllm combined with --quantization\_config.moe.activation mxfp8 |
+| `VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --moe-backend flashinfer\_cutlass combined with --quantization\_config.moe.activation mxfp8 |
+| `VLLM_USE_NVFP4_CT_EMULATIONS` | alias | The retained backend selector now accepts explicit kernel configuration; this input remains an initialization compatibility alias | vllm/config/kernel.py | use --linear-backend emulation instead |

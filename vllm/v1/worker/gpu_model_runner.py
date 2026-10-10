@@ -403,18 +403,12 @@ def _dflash_ddtree_metadata_profile_enabled() -> bool:
 
 
 def _dflash_ddtree_target_forward_nvtx_enabled() -> bool:
-    return os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_NVTX", "0") == "1"
+    return capture_runtime_trace().spec_target_nvtx
 
 
 def _dflash_ddtree_target_forward_profiler_step() -> int:
-    raw = os.getenv(
-        "VLLM_SM70_SPEC_TARGET_FORWARD_PROFILER_STEP",
-        os.getenv("VLLM_DFLASH_DDTREE_TARGET_FORWARD_PROFILER_STEP", "0"),
-    )
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 0
+    # Compatibility name; initialized engines borrow their diagnostic policy.
+    return capture_runtime_trace().spec_target_profiler_step
 
 
 def _maybe_dump_sm70_mtp_step(
@@ -1069,10 +1063,7 @@ class GPUModelRunner(
             yield
             return
 
-        nvtx_enabled = bool(
-            _dflash_ddtree_target_forward_nvtx_enabled()
-            or capture_runtime_trace().spec_target_nvtx
-        )
+        nvtx_enabled = _dflash_ddtree_target_forward_nvtx_enabled()
         profiler_step = _dflash_ddtree_target_forward_profiler_step()
         if not nvtx_enabled and profiler_step <= 0:
             yield

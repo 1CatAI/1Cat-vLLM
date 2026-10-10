@@ -646,6 +646,10 @@ class KernelConfig:
     sm70_rmsnorm_gated_exact: bool | None = None
     """Native gated norm; auto follows the Flash-Next model quality boundary."""
 
+    sm70_rmsnorm_gated_aliases: ClassVar[dict[str, str]] = {
+        "sm70_rmsnorm_gated_exact": "VLLM_SM70_RMSNORM_GATED_EXACT",
+    }
+
     def resolve_sm70_rmsnorm_gated(self, *, qualified: bool) -> None:
         if self.sm70_rmsnorm_gated_exact is not None:
             return
@@ -653,7 +657,7 @@ class KernelConfig:
 
         from vllm import envs
 
-        name = "VLLM_SM70_RMSNORM_GATED_EXACT"
+        name = self.sm70_rmsnorm_gated_aliases["sm70_rmsnorm_gated_exact"]
         self.sm70_rmsnorm_gated_exact = (
             bool(envs.environment_variables[name]())
             if name in os.environ

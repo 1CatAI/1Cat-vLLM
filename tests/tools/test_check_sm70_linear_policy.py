@@ -98,3 +98,23 @@ def test_prefill_prefix_alias_is_rejected_in_execution():
         ast.parse('def forward():\n    return os.getenv("PREFIX_TORCH_EXACT_TAIL")'),
     )
     assert errors and "PREFIX_TORCH_EXACT_TAIL" in errors[0]
+
+
+def test_reader_aliases_and_helpers_do_not_evade_runtime_guard(tmp_path):
+    path = tmp_path / "vllm/new_runner.py"
+    path.parent.mkdir()
+    path.write_text("""
+from os import getenv as query
+from vllm import envs as flags
+alias = query
+def option(name):
+    return alias(name)
+def forward():
+    return option("VLLM_SM70_QWEN38_FP16_GEMV"), flags.VLLM_USE_AOT_COMPILE
+""")
+    assert len(violations(path)) == 2
+    path.write_text("""
+def forward(policy):
+    return policy.raw("VLLM_SM70_QWEN38_FP16_GEMV")
+""")
+    assert not violations(path)

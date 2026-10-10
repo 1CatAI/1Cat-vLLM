@@ -283,6 +283,13 @@ repos:
     language: python
     pass_filenames: false
     always_run: true
+  - id: check-runtime-config-ownership
+    name: Require complete runtime parameter and consumer ownership
+    entry: python -m tools.config_inventory --check
+    language: python
+    pass_filenames: false
+    always_run: true
+    additional_dependencies: [regex]
   - id: validate-docker-versions
     name: Validate docker/versions.json matches Dockerfile
     entry: python tools/generate_versions_json.py --check

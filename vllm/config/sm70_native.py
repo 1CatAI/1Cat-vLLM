@@ -480,8 +480,8 @@ def capture_linear_native_config(family: str) -> Sm70NativeConfig:
 def compile_ignored_aliases(kernel) -> set[str]:
     """Migrated values are hashed by their effective engine config instead.
 
-    Generic FP16/auxiliary controls and legacy modular permutation remain
-    independently hashed until those consumers have a prepared policy owner.
+    Native generic/stage aliases are excluded after engine input capture.
+    Unconfigured standalone calls retain their original environment factors.
     """
     from vllm.config.kernel import (
         SM70_AWQ_LINEAR_ALIASES,
@@ -493,7 +493,9 @@ def compile_ignored_aliases(kernel) -> set[str]:
         AWQ_COMPARE_ALIASES,
         AWQ_DUMP_ALIASES,
         COMMON_ALIASES,
+        FP8_COMPACT_ALIASES,
         FP8_COMPARE_ALIASES,
+        FP8_STAGE_ALIASES,
         MXFP4_ALIASES,
         NVFP4_ALIASES,
     )
@@ -535,6 +537,11 @@ def compile_ignored_aliases(kernel) -> set[str]:
         for field, alias, _, _ in NATIVE_FIELDS
         if field.startswith("moe_single_token_")
     )
+    if kernel.layer_execution.native.legacy_inputs is not None:
+        ignored.update(alias for _, alias, _, _ in NATIVE_FIELDS)
+    ignored.update(FP8_STAGE_ALIASES.values())
+    ignored.update(FP8_COMPACT_ALIASES.values())
+    ignored.update(kernel.sm70_rmsnorm_gated_aliases.values())
     ignored.add("VLLM_SM70_QWEN38_QPN_ROUTE_DEBUG")
     return ignored
 

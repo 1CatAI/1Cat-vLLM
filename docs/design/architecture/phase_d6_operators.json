@@ -1,0 +1,1361 @@
+{
+  "contract": {
+    "baseline": "e2a52d519ddf17d7b5256888a7004ef73cfcfa01",
+    "candidate_patch_sha256": "783b908241e2126f79e20e40ed66775bb1d9e75427546639cb3278efaefeba22",
+    "machine": "54633",
+    "gpu_index": 1,
+    "gpu": "Tesla V100-SXM2-32GB",
+    "driver": "580.173.02",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "tp": 1,
+    "models_loaded": false,
+    "sequence": "AB/BA/AB",
+    "measurement": "Five samples per process; GPU graph events / 20 replays, host enqueue / 20 calls; median of three process medians",
+    "build": "Unmodified setup.py bundle_flash_qla_sm70 for each source arm; standard bundled extension; no preload or external extension path",
+    "baseline_native_sha256": "7b7150fc7ae9bdeae5e37841413769205a547e9eb4641ddad0ac4047e4da169a",
+    "candidate_native_sha256": "bb39ace4057537d963473b54e25f31df43a38a44422444ccd4a0eaadcc32165f",
+    "native_policy_abi": 1,
+    "dependency_check": "Torch/CUDA and system libraries only; no RPATH/RUNPATH",
+    "artifacts": "/home/ymzx/arch-ws/phase-d6-20261010",
+    "script_sha256": "af53a939e4d415cfb5343c6769452c6fefd47cdcf8382e61b67dc135d9af444c"
+  },
+  "validation": {
+    "gpu_passed": 24,
+    "coverage": "Empty/prefill tokens 0,1,33 and groups auto,1,2,4,8; mixed decode reordered indices including -1; two owners; changed-input graph replay; output and state exact; init-time ABI rejection and worker policy transfer",
+    "build_initial_failure": "patchelf absent; installed build utility and reran the same normal bundler; retained failed log",
+    "limitations": "No model, topology, throughput or TTFT claim. Host sample ranges overlap; no operator speedup claim.",
+    "final_integration": {
+      "passed": 35,
+      "skipped": 16,
+      "machine": "54633",
+      "gpu_index": 4,
+      "gpu": "Quadro P400 SM61",
+      "note": "V100 GPUs 0-3 were occupied by an unrelated workload; the task did not interrupt it. All 16 SM70 numerical cases skipped on SM61. This run only validates remaining configuration/plan contracts; the 24-case V100 native run and matched A/B remain the numerical evidence."
+    },
+    "native_invalid_input_checks": {
+      "passed": 4,
+      "gpu": "Quadro P400 SM61",
+      "scope": "Host-side error/admission checks in the normal SM70 extension, no GPU kernel execution; legacy -1, atoi overflow, zero and malformed input remain rejected, typed automatic choice overrides them."
+    }
+  },
+  "summary": [
+    {
+      "name": "prefill_T33_H4_Hv8_groups-1",
+      "output_and_state_bitwise_equal": true,
+      "temporary_bytes": 1116160,
+      "gpu_us": {
+        "baseline": 17.817600071430206,
+        "candidate": 17.817600071430206,
+        "delta_pct": 0.0
+      },
+      "host_us": {
+        "baseline": 12.8385,
+        "candidate": 13.37575,
+        "delta_pct": 4.184678895509597
+      }
+    },
+    {
+      "name": "prefill_T512_H4_Hv8_groups-1",
+      "output_and_state_bitwise_equal": true,
+      "temporary_bytes": 2097152,
+      "gpu_us": {
+        "baseline": 222.25921154022217,
+        "candidate": 222.25921154022217,
+        "delta_pct": 0.0
+      },
+      "host_us": {
+        "baseline": 13.5108,
+        "candidate": 12.78925,
+        "delta_pct": -5.340542380910096
+      }
+    },
+    {
+      "name": "decode_T4_H4_Hv8_groups-1",
+      "output_and_state_bitwise_equal": true,
+      "temporary_bytes": 0,
+      "gpu_us": {
+        "baseline": 15.15520066022873,
+        "candidate": 15.001599490642548,
+        "delta_pct": -1.0135211867518978
+      },
+      "host_us": {
+        "baseline": 16.05115,
+        "candidate": 17.4395,
+        "delta_pct": 8.649536014553473
+      }
+    },
+    {
+      "name": "prefill_T33_H4_Hv8_groups1",
+      "output_and_state_bitwise_equal": true,
+      "temporary_bytes": 1116160,
+      "gpu_us": {
+        "baseline": 17.817600071430206,
+        "candidate": 17.817600071430206,
+        "delta_pct": 0.0
+      },
+      "host_us": {
+        "baseline": 13.3934,
+        "candidate": 13.2019,
+        "delta_pct": -1.429808711753544
+      }
+    },
+    {
+      "name": "prefill_T512_H4_Hv8_groups1",
+      "output_and_state_bitwise_equal": true,
+      "temporary_bytes": 2097152,
+      "gpu_us": {
+        "baseline": 222.15681076049805,
+        "candidate": 222.36158847808838,
+        "delta_pct": 0.09217710539204393
+      },
+      "host_us": {
+        "baseline": 13.45385,
+        "candidate": 12.7197,
+        "delta_pct": -5.456802327958165
+      }
+    },
+    {
+      "name": "decode_T4_H4_Hv8_groups1",
+      "output_and_state_bitwise_equal": true,
+      "temporary_bytes": 0,
+      "gpu_us": {
+        "baseline": 15.308800339698792,
+        "candidate": 15.20639955997467,
+        "delta_pct": -0.6689013995340609
+      },
+      "host_us": {
+        "baseline": 15.89745,
+        "candidate": 15.9622,
+        "delta_pct": 0.40729802578400864
+      }
+    },
+    {
+      "name": "prefill_T33_H4_Hv8_groups4",
+      "output_and_state_bitwise_equal": true,
+      "temporary_bytes": 1116160,
+      "gpu_us": {
+        "baseline": 17.919999361038208,
+        "candidate": 17.868800461292267,
+        "delta_pct": -0.2857081560910024
+      },
+      "host_us": {
+        "baseline": 13.0398,
+        "candidate": 12.4799,
+        "delta_pct": -4.293777511925024
+      }
+    },
+    {
+      "name": "prefill_T512_H4_Hv8_groups4",
+      "output_and_state_bitwise_equal": true,
+      "temporary_bytes": 2097152,
+      "gpu_us": {
+        "baseline": 224.56319332122803,
+        "candidate": 224.61440563201904,
+        "delta_pct": 0.02280530038498707
+      },
+      "host_us": {
+        "baseline": 14.3431,
+        "candidate": 14.85545,
+        "delta_pct": 3.5721008708019752
+      }
+    },
+    {
+      "name": "decode_T4_H4_Hv8_groups4",
+      "output_and_state_bitwise_equal": true,
+      "temporary_bytes": 0,
+      "gpu_us": {
+        "baseline": 15.257599949836731,
+        "candidate": 15.257599949836731,
+        "delta_pct": 0.0
+      },
+      "host_us": {
+        "baseline": 15.63025,
+        "candidate": 16.1802,
+        "delta_pct": 3.518497784744312
+      }
+    }
+  ],
+  "samples": {
+    "baseline": [
+      {
+        "torch": "2.10.0+cu128",
+        "cuda": "12.8",
+        "gpu": "Tesla V100-SXM2-32GB",
+        "results": [
+          {
+            "name": "prefill_T33_H4_Hv8_groups-1",
+            "sha256": "b586f6e908f8c7a6a426f93bf025002252edc7f3688e00189c7fda13d4a281a9",
+            "gpu_us": 17.817600071430206,
+            "gpu_samples": [
+              18.1551992893219,
+              17.919999361038208,
+              17.817600071430206,
+              17.817600071430206,
+              17.817600071430206
+            ],
+            "host_us": 12.8385,
+            "host_samples": [
+              13.9796,
+              13.4182,
+              12.8004,
+              12.74695,
+              12.8385
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups-1",
+            "sha256": "de07764baf77175f733a06a0068996eb50b9b29fbe0b9251f37af92bb4e52c9e",
+            "gpu_us": 222.25921154022217,
+            "gpu_samples": [
+              222.6111888885498,
+              222.36158847808838,
+              222.25921154022217,
+              222.15681076049805,
+              222.20799922943115
+            ],
+            "host_us": 13.5108,
+            "host_samples": [
+              22.591,
+              14.2353,
+              13.5108,
+              13.01755,
+              13.2995
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups-1",
+            "sha256": "da83af605e700f3a2a3a154394c1d918dd03c666ecbff6cea564f76d679364bc",
+            "gpu_us": 15.15520066022873,
+            "gpu_samples": [
+              15.372799336910248,
+              15.104000270366669,
+              15.20639955997467,
+              15.15520066022873,
+              15.104000270366669
+            ],
+            "host_us": 17.22615,
+            "host_samples": [
+              17.22615,
+              15.79235,
+              17.4683,
+              18.6523,
+              16.3249
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups1",
+            "sha256": "7c189da0aacafe5aa3ea83a017911cbeeb3150b3d4ffb64e718aa9bf23680584",
+            "gpu_us": 17.817600071430206,
+            "gpu_samples": [
+              18.081599473953247,
+              17.817600071430206,
+              17.817600071430206,
+              17.817600071430206,
+              17.766399681568146
+            ],
+            "host_us": 13.3934,
+            "host_samples": [
+              14.66075,
+              13.7575,
+              13.3934,
+              12.8865,
+              13.35445
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups1",
+            "sha256": "2d2aefdcb646b254fb47992e802df8f32cc6c36229e14652955b618fecd75074",
+            "gpu_us": 222.20799922943115,
+            "gpu_samples": [
+              222.39680290222168,
+              222.20799922943115,
+              222.15681076049805,
+              222.31040000915527,
+              222.10559844970703
+            ],
+            "host_us": 13.45385,
+            "host_samples": [
+              24.96835,
+              13.45385,
+              13.21845,
+              13.11455,
+              15.20175
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups1",
+            "sha256": "93cdee79e336b6272c28e288589f6f68b8ebf94d3de0c25db66324c78386d5e5",
+            "gpu_us": 15.308800339698792,
+            "gpu_samples": [
+              15.723200142383575,
+              15.15520066022873,
+              15.462400019168854,
+              15.308800339698792,
+              15.257599949836731
+            ],
+            "host_us": 15.89745,
+            "host_samples": [
+              17.86875,
+              15.89745,
+              15.695,
+              17.75595,
+              15.4984
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups4",
+            "sha256": "b4a312886fc3745b9e733e614813db6226e68a28942008bffa10f8d51321cf93",
+            "gpu_us": 17.97119975090027,
+            "gpu_samples": [
+              18.193599581718445,
+              17.97119975090027,
+              17.868800461292267,
+              17.97119975090027,
+              17.868800461292267
+            ],
+            "host_us": 13.0398,
+            "host_samples": [
+              14.8916,
+              13.3285,
+              13.0042,
+              13.0398,
+              12.7901
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups4",
+            "sha256": "d5959ad8cc12d864944081647b1e711298c6f6b3733add91d41ca7ec82dfebee",
+            "gpu_us": 224.56319332122803,
+            "gpu_samples": [
+              224.7648000717163,
+              224.66559410095215,
+              224.4607925415039,
+              224.56319332122803,
+              224.56319332122803
+            ],
+            "host_us": 14.3431,
+            "host_samples": [
+              23.58185,
+              14.7039,
+              14.3431,
+              13.0842,
+              13.67905
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups4",
+            "sha256": "f5f81319a39761b26d0d1ddf33693c6a57350259d6b82141846d8d7469bd59b8",
+            "gpu_us": 15.257599949836731,
+            "gpu_samples": [
+              15.635199844837189,
+              15.360000729560852,
+              15.104000270366669,
+              15.20639955997467,
+              15.257599949836731
+            ],
+            "host_us": 15.63025,
+            "host_samples": [
+              17.89675,
+              15.818,
+              15.63025,
+              15.48095,
+              15.3068
+            ],
+            "temporary_bytes": 0
+          }
+        ]
+      },
+      {
+        "torch": "2.10.0+cu128",
+        "cuda": "12.8",
+        "gpu": "Tesla V100-SXM2-32GB",
+        "results": [
+          {
+            "name": "prefill_T33_H4_Hv8_groups-1",
+            "sha256": "b586f6e908f8c7a6a426f93bf025002252edc7f3688e00189c7fda13d4a281a9",
+            "gpu_us": 17.919999361038208,
+            "gpu_samples": [
+              18.199999630451202,
+              17.97119975090027,
+              17.919999361038208,
+              17.817600071430206,
+              17.868800461292267
+            ],
+            "host_us": 13.4185,
+            "host_samples": [
+              14.61175,
+              13.8853,
+              13.4185,
+              13.34425,
+              13.36985
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups-1",
+            "sha256": "de07764baf77175f733a06a0068996eb50b9b29fbe0b9251f37af92bb4e52c9e",
+            "gpu_us": 222.25921154022217,
+            "gpu_samples": [
+              222.50878810882568,
+              222.20799922943115,
+              222.25921154022217,
+              222.4128007888794,
+              222.15681076049805
+            ],
+            "host_us": 13.5667,
+            "host_samples": [
+              23.01065,
+              13.4404,
+              13.5667,
+              13.2512,
+              13.752
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups-1",
+            "sha256": "da83af605e700f3a2a3a154394c1d918dd03c666ecbff6cea564f76d679364bc",
+            "gpu_us": 15.104000270366669,
+            "gpu_samples": [
+              15.404799580574036,
+              15.104000270366669,
+              15.20639955997467,
+              15.104000270366669,
+              15.052799880504608
+            ],
+            "host_us": 16.05115,
+            "host_samples": [
+              17.4777,
+              15.82975,
+              16.5536,
+              15.61595,
+              16.05115
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups1",
+            "sha256": "7c189da0aacafe5aa3ea83a017911cbeeb3150b3d4ffb64e718aa9bf23680584",
+            "gpu_us": 17.868800461292267,
+            "gpu_samples": [
+              18.089599907398224,
+              17.868800461292267,
+              17.766399681568146,
+              17.868800461292267,
+              17.817600071430206
+            ],
+            "host_us": 13.6621,
+            "host_samples": [
+              17.46085,
+              13.6621,
+              15.0916,
+              13.4307,
+              13.35255
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups1",
+            "sha256": "2d2aefdcb646b254fb47992e802df8f32cc6c36229e14652955b618fecd75074",
+            "gpu_us": 222.10559844970703,
+            "gpu_samples": [
+              222.36320972442627,
+              222.10559844970703,
+              222.20799922943115,
+              222.10559844970703,
+              222.05440998077393
+            ],
+            "host_us": 13.948,
+            "host_samples": [
+              23.6988,
+              13.9429,
+              14.16105,
+              13.53995,
+              13.948
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups1",
+            "sha256": "93cdee79e336b6272c28e288589f6f68b8ebf94d3de0c25db66324c78386d5e5",
+            "gpu_us": 15.308800339698792,
+            "gpu_samples": [
+              15.535999834537506,
+              15.308800339698792,
+              15.411199629306793,
+              15.15520066022873,
+              15.20639955997467
+            ],
+            "host_us": 16.8501,
+            "host_samples": [
+              17.38335,
+              16.8501,
+              15.929,
+              15.8642,
+              17.46505
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups4",
+            "sha256": "b4a312886fc3745b9e733e614813db6226e68a28942008bffa10f8d51321cf93",
+            "gpu_us": 17.919999361038208,
+            "gpu_samples": [
+              18.171200156211853,
+              17.97119975090027,
+              17.919999361038208,
+              17.868800461292267,
+              17.919999361038208
+            ],
+            "host_us": 13.6268,
+            "host_samples": [
+              14.67115,
+              13.6268,
+              13.42455,
+              13.9405,
+              13.4368
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups4",
+            "sha256": "d5959ad8cc12d864944081647b1e711298c6f6b3733add91d41ca7ec82dfebee",
+            "gpu_us": 224.81920719146729,
+            "gpu_samples": [
+              224.82080459594727,
+              225.12640953063965,
+              224.81920719146729,
+              224.56319332122803,
+              224.56319332122803
+            ],
+            "host_us": 15.53445,
+            "host_samples": [
+              25.64655,
+              16.12255,
+              13.4432,
+              15.53445,
+              13.4036
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups4",
+            "sha256": "f5f81319a39761b26d0d1ddf33693c6a57350259d6b82141846d8d7469bd59b8",
+            "gpu_us": 15.257599949836731,
+            "gpu_samples": [
+              15.540799498558044,
+              15.360000729560852,
+              15.20639955997467,
+              15.257599949836731,
+              15.15520066022873
+            ],
+            "host_us": 16.0897,
+            "host_samples": [
+              18.04485,
+              16.0897,
+              15.92045,
+              16.20285,
+              15.65175
+            ],
+            "temporary_bytes": 0
+          }
+        ]
+      },
+      {
+        "torch": "2.10.0+cu128",
+        "cuda": "12.8",
+        "gpu": "Tesla V100-SXM2-32GB",
+        "results": [
+          {
+            "name": "prefill_T33_H4_Hv8_groups-1",
+            "sha256": "b586f6e908f8c7a6a426f93bf025002252edc7f3688e00189c7fda13d4a281a9",
+            "gpu_us": 17.817600071430206,
+            "gpu_samples": [
+              18.23199987411499,
+              17.919999361038208,
+              17.817600071430206,
+              17.817600071430206,
+              17.817600071430206
+            ],
+            "host_us": 11.55425,
+            "host_samples": [
+              12.1802,
+              11.17475,
+              11.55425,
+              11.9182,
+              10.9641
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups-1",
+            "sha256": "de07764baf77175f733a06a0068996eb50b9b29fbe0b9251f37af92bb4e52c9e",
+            "gpu_us": 222.31040000915527,
+            "gpu_samples": [
+              222.5248098373413,
+              222.4128007888794,
+              222.20799922943115,
+              222.31040000915527,
+              222.10559844970703
+            ],
+            "host_us": 11.55015,
+            "host_samples": [
+              20.45845,
+              11.86665,
+              11.10755,
+              11.55015,
+              11.1276
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups-1",
+            "sha256": "da83af605e700f3a2a3a154394c1d918dd03c666ecbff6cea564f76d679364bc",
+            "gpu_us": 15.15520066022873,
+            "gpu_samples": [
+              15.44640064239502,
+              15.104000270366669,
+              15.257599949836731,
+              14.950400590896606,
+              15.15520066022873
+            ],
+            "host_us": 15.3674,
+            "host_samples": [
+              16.45005,
+              15.19445,
+              15.7885,
+              15.1119,
+              15.3674
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups1",
+            "sha256": "7c189da0aacafe5aa3ea83a017911cbeeb3150b3d4ffb64e718aa9bf23680584",
+            "gpu_us": 17.817600071430206,
+            "gpu_samples": [
+              18.10079962015152,
+              17.919999361038208,
+              17.817600071430206,
+              17.817600071430206,
+              17.766399681568146
+            ],
+            "host_us": 11.7639,
+            "host_samples": [
+              12.88195,
+              11.1785,
+              11.7639,
+              10.82415,
+              12.12955
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups1",
+            "sha256": "2d2aefdcb646b254fb47992e802df8f32cc6c36229e14652955b618fecd75074",
+            "gpu_us": 222.15681076049805,
+            "gpu_samples": [
+              222.28479385375977,
+              222.15681076049805,
+              222.25921154022217,
+              222.05440998077393,
+              222.10559844970703
+            ],
+            "host_us": 11.45595,
+            "host_samples": [
+              22.47275,
+              11.59445,
+              11.3957,
+              11.3366,
+              11.45595
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups1",
+            "sha256": "93cdee79e336b6272c28e288589f6f68b8ebf94d3de0c25db66324c78386d5e5",
+            "gpu_us": 15.257599949836731,
+            "gpu_samples": [
+              15.572799742221832,
+              15.257599949836731,
+              15.104000270366669,
+              15.360000729560852,
+              15.257599949836731
+            ],
+            "host_us": 15.78455,
+            "host_samples": [
+              17.88415,
+              15.74585,
+              15.78455,
+              16.38955,
+              15.69335
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups4",
+            "sha256": "b4a312886fc3745b9e733e614813db6226e68a28942008bffa10f8d51321cf93",
+            "gpu_us": 17.817600071430206,
+            "gpu_samples": [
+              18.13119947910309,
+              17.919999361038208,
+              17.817600071430206,
+              17.817600071430206,
+              17.817600071430206
+            ],
+            "host_us": 11.2976,
+            "host_samples": [
+              12.49335,
+              11.2976,
+              11.1853,
+              11.5604,
+              11.08135
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups4",
+            "sha256": "d5959ad8cc12d864944081647b1e711298c6f6b3733add91d41ca7ec82dfebee",
+            "gpu_us": 224.56319332122803,
+            "gpu_samples": [
+              224.7040033340454,
+              224.56319332122803,
+              224.56319332122803,
+              224.4607925415039,
+              224.4607925415039
+            ],
+            "host_us": 11.3731,
+            "host_samples": [
+              21.21755,
+              11.3731,
+              11.4646,
+              11.20195,
+              11.23525
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups4",
+            "sha256": "f5f81319a39761b26d0d1ddf33693c6a57350259d6b82141846d8d7469bd59b8",
+            "gpu_us": 15.20639955997467,
+            "gpu_samples": [
+              16.657599806785583,
+              15.104000270366669,
+              15.257599949836731,
+              15.20639955997467,
+              15.20639955997467
+            ],
+            "host_us": 14.89985,
+            "host_samples": [
+              16.942,
+              14.82885,
+              14.89985,
+              15.59005,
+              14.8136
+            ],
+            "temporary_bytes": 0
+          }
+        ]
+      }
+    ],
+    "candidate": [
+      {
+        "torch": "2.10.0+cu128",
+        "cuda": "12.8",
+        "gpu": "Tesla V100-SXM2-32GB",
+        "results": [
+          {
+            "name": "prefill_T33_H4_Hv8_groups-1",
+            "sha256": "b586f6e908f8c7a6a426f93bf025002252edc7f3688e00189c7fda13d4a281a9",
+            "gpu_us": 17.817600071430206,
+            "gpu_samples": [
+              18.172800540924072,
+              17.817600071430206,
+              17.817600071430206,
+              17.817600071430206,
+              17.715199291706085
+            ],
+            "host_us": 13.37575,
+            "host_samples": [
+              13.81685,
+              12.4954,
+              14.03205,
+              13.37575,
+              12.26815
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups-1",
+            "sha256": "de07764baf77175f733a06a0068996eb50b9b29fbe0b9251f37af92bb4e52c9e",
+            "gpu_us": 222.25921154022217,
+            "gpu_samples": [
+              222.50559329986572,
+              222.31040000915527,
+              222.25921154022217,
+              222.25921154022217,
+              222.15681076049805
+            ],
+            "host_us": 12.78925,
+            "host_samples": [
+              21.4485,
+              12.92255,
+              12.64525,
+              12.78925,
+              12.29635
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups-1",
+            "sha256": "da83af605e700f3a2a3a154394c1d918dd03c666ecbff6cea564f76d679364bc",
+            "gpu_us": 15.052799880504608,
+            "gpu_samples": [
+              15.73600023984909,
+              15.052799880504608,
+              15.360000729560852,
+              15.052799880504608,
+              15.001599490642548
+            ],
+            "host_us": 17.4395,
+            "host_samples": [
+              18.73425,
+              17.0986,
+              17.8237,
+              17.05405,
+              17.4395
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups1",
+            "sha256": "7c189da0aacafe5aa3ea83a017911cbeeb3150b3d4ffb64e718aa9bf23680584",
+            "gpu_us": 17.766399681568146,
+            "gpu_samples": [
+              18.07679980993271,
+              17.817600071430206,
+              17.766399681568146,
+              17.715199291706085,
+              17.766399681568146
+            ],
+            "host_us": 12.47825,
+            "host_samples": [
+              13.6429,
+              12.47825,
+              12.8719,
+              12.01235,
+              12.02765
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups1",
+            "sha256": "2d2aefdcb646b254fb47992e802df8f32cc6c36229e14652955b618fecd75074",
+            "gpu_us": 222.36158847808838,
+            "gpu_samples": [
+              222.53119945526123,
+              222.25921154022217,
+              222.10559844970703,
+              222.56639003753662,
+              222.36158847808838
+            ],
+            "host_us": 12.7197,
+            "host_samples": [
+              22.39345,
+              12.53105,
+              12.80615,
+              12.24835,
+              12.7197
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups1",
+            "sha256": "93cdee79e336b6272c28e288589f6f68b8ebf94d3de0c25db66324c78386d5e5",
+            "gpu_us": 15.20639955997467,
+            "gpu_samples": [
+              15.588800609111786,
+              15.20639955997467,
+              15.360000729560852,
+              15.15520066022873,
+              15.052799880504608
+            ],
+            "host_us": 17.3423,
+            "host_samples": [
+              18.3679,
+              17.9316,
+              17.0251,
+              16.88885,
+              17.3423
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups4",
+            "sha256": "b4a312886fc3745b9e733e614813db6226e68a28942008bffa10f8d51321cf93",
+            "gpu_us": 17.868800461292267,
+            "gpu_samples": [
+              18.15679967403412,
+              17.919999361038208,
+              17.817600071430206,
+              17.868800461292267,
+              17.817600071430206
+            ],
+            "host_us": 12.2097,
+            "host_samples": [
+              13.3324,
+              12.8279,
+              12.11125,
+              12.2097,
+              12.1276
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups4",
+            "sha256": "d5959ad8cc12d864944081647b1e711298c6f6b3733add91d41ca7ec82dfebee",
+            "gpu_us": 224.4607925415039,
+            "gpu_samples": [
+              224.73280429840088,
+              224.61440563201904,
+              224.4607925415039,
+              224.4607925415039,
+              224.4607925415039
+            ],
+            "host_us": 12.5696,
+            "host_samples": [
+              22.2242,
+              12.58535,
+              12.5696,
+              12.49235,
+              12.36775
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups4",
+            "sha256": "f5f81319a39761b26d0d1ddf33693c6a57350259d6b82141846d8d7469bd59b8",
+            "gpu_us": 15.257599949836731,
+            "gpu_samples": [
+              15.756799280643463,
+              15.257599949836731,
+              15.15520066022873,
+              15.8720001578331,
+              15.001599490642548
+            ],
+            "host_us": 17.8747,
+            "host_samples": [
+              18.70585,
+              16.85395,
+              16.78185,
+              18.6331,
+              17.8747
+            ],
+            "temporary_bytes": 0
+          }
+        ]
+      },
+      {
+        "torch": "2.10.0+cu128",
+        "cuda": "12.8",
+        "gpu": "Tesla V100-SXM2-32GB",
+        "results": [
+          {
+            "name": "prefill_T33_H4_Hv8_groups-1",
+            "sha256": "b586f6e908f8c7a6a426f93bf025002252edc7f3688e00189c7fda13d4a281a9",
+            "gpu_us": 17.817600071430206,
+            "gpu_samples": [
+              18.217599391937256,
+              17.868800461292267,
+              17.766399681568146,
+              17.766399681568146,
+              17.817600071430206
+            ],
+            "host_us": 14.10185,
+            "host_samples": [
+              15.19425,
+              14.82315,
+              13.99715,
+              13.91555,
+              14.10185
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups-1",
+            "sha256": "de07764baf77175f733a06a0068996eb50b9b29fbe0b9251f37af92bb4e52c9e",
+            "gpu_us": 222.25921154022217,
+            "gpu_samples": [
+              222.53758907318115,
+              222.36158847808838,
+              222.20799922943115,
+              222.10559844970703,
+              222.25921154022217
+            ],
+            "host_us": 14.38365,
+            "host_samples": [
+              23.7904,
+              14.38365,
+              14.3338,
+              14.24235,
+              16.1982
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups-1",
+            "sha256": "da83af605e700f3a2a3a154394c1d918dd03c666ecbff6cea564f76d679364bc",
+            "gpu_us": 15.001599490642548,
+            "gpu_samples": [
+              15.468800067901611,
+              15.308800339698792,
+              15.001599490642548,
+              15.001599490642548,
+              14.950400590896606
+            ],
+            "host_us": 17.72505,
+            "host_samples": [
+              17.57885,
+              20.26305,
+              17.72505,
+              15.99985,
+              18.00125
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups1",
+            "sha256": "7c189da0aacafe5aa3ea83a017911cbeeb3150b3d4ffb64e718aa9bf23680584",
+            "gpu_us": 17.817600071430206,
+            "gpu_samples": [
+              18.107199668884277,
+              18.07360053062439,
+              17.817600071430206,
+              17.766399681568146,
+              17.715199291706085
+            ],
+            "host_us": 14.35905,
+            "host_samples": [
+              17.4314,
+              14.35905,
+              14.3069,
+              13.92845,
+              15.41025
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups1",
+            "sha256": "2d2aefdcb646b254fb47992e802df8f32cc6c36229e14652955b618fecd75074",
+            "gpu_us": 222.15681076049805,
+            "gpu_samples": [
+              222.23200798034668,
+              222.20799922943115,
+              222.10559844970703,
+              222.15681076049805,
+              222.0031976699829
+            ],
+            "host_us": 14.70385,
+            "host_samples": [
+              24.123,
+              14.70385,
+              14.51495,
+              14.42025,
+              14.9327
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups1",
+            "sha256": "93cdee79e336b6272c28e288589f6f68b8ebf94d3de0c25db66324c78386d5e5",
+            "gpu_us": 15.308800339698792,
+            "gpu_samples": [
+              15.507200360298157,
+              15.308800339698792,
+              15.257599949836731,
+              15.360000729560852,
+              15.15520066022873
+            ],
+            "host_us": 15.9622,
+            "host_samples": [
+              17.67765,
+              15.9622,
+              16.3191,
+              15.6576,
+              15.66575
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups4",
+            "sha256": "b4a312886fc3745b9e733e614813db6226e68a28942008bffa10f8d51321cf93",
+            "gpu_us": 17.817600071430206,
+            "gpu_samples": [
+              18.15679967403412,
+              17.817600071430206,
+              17.817600071430206,
+              17.817600071430206,
+              17.817600071430206
+            ],
+            "host_us": 14.38415,
+            "host_samples": [
+              15.93565,
+              14.38415,
+              14.7042,
+              14.1415,
+              14.0397
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups4",
+            "sha256": "d5959ad8cc12d864944081647b1e711298c6f6b3733add91d41ca7ec82dfebee",
+            "gpu_us": 224.66559410095215,
+            "gpu_samples": [
+              224.7584104537964,
+              224.61440563201904,
+              224.66559410095215,
+              224.66559410095215,
+              224.56319332122803
+            ],
+            "host_us": 14.85545,
+            "host_samples": [
+              23.6001,
+              15.0822,
+              14.34135,
+              14.85545,
+              14.4294
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups4",
+            "sha256": "f5f81319a39761b26d0d1ddf33693c6a57350259d6b82141846d8d7469bd59b8",
+            "gpu_us": 15.15520066022873,
+            "gpu_samples": [
+              15.750400722026825,
+              15.308800339698792,
+              15.15520066022873,
+              15.15520066022873,
+              15.001599490642548
+            ],
+            "host_us": 16.1802,
+            "host_samples": [
+              20.61025,
+              16.66655,
+              16.1802,
+              15.7443,
+              15.6725
+            ],
+            "temporary_bytes": 0
+          }
+        ]
+      },
+      {
+        "torch": "2.10.0+cu128",
+        "cuda": "12.8",
+        "gpu": "Tesla V100-SXM2-32GB",
+        "results": [
+          {
+            "name": "prefill_T33_H4_Hv8_groups-1",
+            "sha256": "b586f6e908f8c7a6a426f93bf025002252edc7f3688e00189c7fda13d4a281a9",
+            "gpu_us": 17.868800461292267,
+            "gpu_samples": [
+              18.17920058965683,
+              17.868800461292267,
+              17.919999361038208,
+              17.817600071430206,
+              17.766399681568146
+            ],
+            "host_us": 12.86255,
+            "host_samples": [
+              13.9062,
+              13.4094,
+              12.6119,
+              12.5705,
+              12.86255
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups-1",
+            "sha256": "de07764baf77175f733a06a0068996eb50b9b29fbe0b9251f37af92bb4e52c9e",
+            "gpu_us": 222.36158847808838,
+            "gpu_samples": [
+              222.54719734191895,
+              222.4639892578125,
+              222.36158847808838,
+              222.25921154022217,
+              222.20799922943115
+            ],
+            "host_us": 12.7379,
+            "host_samples": [
+              22.2174,
+              13.0027,
+              12.7379,
+              12.6272,
+              12.63095
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups-1",
+            "sha256": "da83af605e700f3a2a3a154394c1d918dd03c666ecbff6cea564f76d679364bc",
+            "gpu_us": 15.001599490642548,
+            "gpu_samples": [
+              15.318399667739868,
+              15.052799880504608,
+              15.001599490642548,
+              14.899200201034546,
+              15.001599490642548
+            ],
+            "host_us": 15.1803,
+            "host_samples": [
+              16.53175,
+              15.1763,
+              15.5579,
+              14.8009,
+              15.1803
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups1",
+            "sha256": "7c189da0aacafe5aa3ea83a017911cbeeb3150b3d4ffb64e718aa9bf23680584",
+            "gpu_us": 17.919999361038208,
+            "gpu_samples": [
+              18.134400248527527,
+              17.919999361038208,
+              18.278400599956512,
+              17.919999361038208,
+              17.919999361038208
+            ],
+            "host_us": 13.2019,
+            "host_samples": [
+              13.85235,
+              12.74645,
+              14.31895,
+              13.2019,
+              13.02165
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups1",
+            "sha256": "2d2aefdcb646b254fb47992e802df8f32cc6c36229e14652955b618fecd75074",
+            "gpu_us": 222.36158847808838,
+            "gpu_samples": [
+              222.41439819335938,
+              222.51520156860352,
+              222.36158847808838,
+              222.25921154022217,
+              222.15681076049805
+            ],
+            "host_us": 12.62215,
+            "host_samples": [
+              22.2684,
+              12.7863,
+              12.62215,
+              12.5667,
+              12.43565
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups1",
+            "sha256": "93cdee79e336b6272c28e288589f6f68b8ebf94d3de0c25db66324c78386d5e5",
+            "gpu_us": 15.104000270366669,
+            "gpu_samples": [
+              15.907199680805206,
+              15.15520066022873,
+              15.104000270366669,
+              15.052799880504608,
+              15.001599490642548
+            ],
+            "host_us": 15.1924,
+            "host_samples": [
+              17.16285,
+              14.91265,
+              14.73165,
+              15.1924,
+              15.70475
+            ],
+            "temporary_bytes": 0
+          },
+          {
+            "name": "prefill_T33_H4_Hv8_groups4",
+            "sha256": "b4a312886fc3745b9e733e614813db6226e68a28942008bffa10f8d51321cf93",
+            "gpu_us": 18.278400599956512,
+            "gpu_samples": [
+              18.518400192260742,
+              18.278400599956512,
+              18.17599982023239,
+              18.278400599956512,
+              18.227200210094452
+            ],
+            "host_us": 12.4799,
+            "host_samples": [
+              14.1579,
+              12.38655,
+              12.4799,
+              12.78415,
+              12.39575
+            ],
+            "temporary_bytes": 1116160
+          },
+          {
+            "name": "prefill_T512_H4_Hv8_groups4",
+            "sha256": "d5959ad8cc12d864944081647b1e711298c6f6b3733add91d41ca7ec82dfebee",
+            "gpu_us": 224.61440563201904,
+            "gpu_samples": [
+              224.76160526275635,
+              224.61440563201904,
+              224.66559410095215,
+              224.51200485229492,
+              224.56319332122803
+            ],
+            "host_us": 15.59115,
+            "host_samples": [
+              22.9304,
+              16.12485,
+              12.6441,
+              15.59115,
+              12.67765
+            ],
+            "temporary_bytes": 2097152
+          },
+          {
+            "name": "decode_T4_H4_Hv8_groups4",
+            "sha256": "f5f81319a39761b26d0d1ddf33693c6a57350259d6b82141846d8d7469bd59b8",
+            "gpu_us": 15.257599949836731,
+            "gpu_samples": [
+              15.587200224399567,
+              15.257599949836731,
+              15.360000729560852,
+              15.15520066022873,
+              15.15520066022873
+            ],
+            "host_us": 15.63435,
+            "host_samples": [
+              16.2411,
+              15.06975,
+              16.55495,
+              15.63435,
+              14.76755
+            ],
+            "temporary_bytes": 0
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -187,30 +187,13 @@ def runtime_policy_reads(path: Path, tree: ast.AST) -> list[str]:
         for function in initialization_library_loaders(tree)
         for child in ast.walk(function)
     }
+    from tools.pre_commit.environment_readers import registered_and_wrapped_reads
+
     errors = []
-    for node in ast.walk(tree):
+    for key, node, _ in registered_and_wrapped_reads(tree):
         if node in loading_nodes:
             continue
-        name = None
-        if isinstance(node, ast.Attribute) and ast.unparse(node.value) == "envs":
-            name = node.attr
-        elif (
-            isinstance(node, ast.Subscript) and ast.unparse(node.value) == "os.environ"
-        ):
-            if isinstance(node.slice, ast.Constant):
-                name = node.slice.value
-        elif isinstance(node, ast.Call):
-            call = ast.unparse(node.func)
-            index = 1 if call == "getattr" else 0
-            if (
-                (
-                    call in {"os.getenv", "os.environ.get", "getattr"}
-                    or call.rsplit(".", 1)[-1] in ("registered", "raw", "env_is_set")
-                )
-                and len(node.args) > index
-                and isinstance(node.args[index], ast.Constant)
-            ):
-                name = node.args[index].value
+        name = key.value if isinstance(key, ast.Constant) else None
         if name in RUNTIME_NAMES:
             errors.append(
                 f"{path}:{node.lineno}: {name} belongs to initialized execution policy"

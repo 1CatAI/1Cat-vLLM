@@ -5,6 +5,7 @@
 
 import os
 from dataclasses import fields
+from typing import ClassVar
 
 from pydantic import Field
 
@@ -24,6 +25,14 @@ GDN_TEXT_FLAGS = {
     "indexed_prefill": ("VLLM_SM70_FLASHQLA_INDEXED_PREFILL", False),
     "direct_prefill_output": ("VLLM_SM70_FLASHQLA_DIRECT_OUTPUT", True),
     "decode_warmup": ("VLLM_SM70_FLASHQLA_DECODE_WARMUP", False),
+}
+
+GDN_NATIVE_ALIASES = {
+    "flashqla_column_groups": "FLASH_QLA_SM70_COLUMN_GROUPS_PER_BLOCK",
+}
+
+GDN_FALLBACK_ALIASES = {
+    "original_prefill": "FLASH_QLA_SM70_USE_ORIGINAL_TILELANG",
 }
 
 
@@ -63,6 +72,8 @@ class GdnConfig:
     """Supply the existing preallocated output when its tensor contract matches."""
     decode_warmup: bool | None = None
     """Warm the optional FlashQLA decode provider; not a computation hash input."""
+    flashqla_column_groups: int | None = None
+    """Native FlashQLA columns; -1 retains its dynamic M/head heuristic."""
     native_verify: bool | None = None
     """Existing sequential CUDA verifier; legacy KernelConfig flag remains valid."""
     resolved: bool = Field(default=False, init=False)
@@ -119,9 +130,9 @@ class GdnConfig:
             raw = os.environ.get(legacy)
             source = legacy if raw is not None else "default"
             if raw is None and field == "original_prefill":
-                raw = os.environ.get("FLASH_QLA_SM70_USE_ORIGINAL_TILELANG")
+                raw = os.environ.get(GDN_FALLBACK_ALIASES[field])
                 if raw is not None:
-                    source = "FLASH_QLA_SM70_USE_ORIGINAL_TILELANG"
+                    source = GDN_FALLBACK_ALIASES[field]
             value = (
                 default
                 if raw is None
@@ -136,10 +147,41 @@ class GdnConfig:
             )
         else:
             self.sources["native_verify"] = "typed"
+        if self.flashqla_column_groups is None:
+            from vllm.config.flash_v100 import native_value
+
+            alias = GDN_NATIVE_ALIASES["flashqla_column_groups"]
+            raw = os.environ.get(alias)
+            self.flashqla_column_groups = (
+                -1 if raw is None or raw == "" else native_value("optional_atoi", raw)
+            )
+            # The owner uses -1 for an absent override. An explicit legacy
+            # atoi result of -1 was invalid and must not become automatic.
+            if raw and self.flashqla_column_groups == -1:
+                self.flashqla_column_groups = 0
+            self.sources["flashqla_column_groups"] = (
+                alias if raw is not None else "default"
+            )
+        else:
+            self.sources["flashqla_column_groups"] = "typed"
         self.projection.resolve()
         self.state.resolve()
         self.schedule.resolve()
         self.resolved = True
+
+    def compile_ignored_aliases(self):
+        from vllm.config.gdn_schedule import GDN_SCHEDULE_FIELDS
+        from vllm.config.gdn_state import GDN_STATE_FIELDS
+
+        return (
+            set(GDN_LEGACY_FIELDS.values())
+            | {name for name, _ in GDN_TEXT_FLAGS.values()}
+            | set(GDN_NATIVE_ALIASES.values())
+            | set(GDN_FALLBACK_ALIASES.values())
+            | set(GDN_STATE_FIELDS.values())
+            | {name for name, _, _ in GDN_SCHEDULE_FIELDS.values()}
+            | set(self.projection.aliases.values())
+        )
 
     def compute_hash(self) -> str:
         return hash_factors(self.graph_options())
@@ -177,6 +219,10 @@ class GdnConfig:
                     for name, value in self.schedule.graph_options().items()
                     if name.startswith(("recurrent_", "sigmoid_"))
                 }
+        if not self.flashqla_decode and (
+            self.active_prefill_backend != "flashqla_sm70" or self.original_prefill
+        ):
+            options.pop("flashqla_column_groups")
         return options
 
 
@@ -197,6 +243,12 @@ def resolve_gdn_config(vllm_config) -> GdnConfig:
 class GdnProfileConfig:
     """Prefill synchronization/timing diagnostics; never a graph hash input."""
 
+    aliases: ClassVar[dict[str, str]] = {
+        "enabled": "VLLM_SM70_GDN_PREFILL_PROFILE",
+        "max_logs": "VLLM_SM70_GDN_PREFILL_PROFILE_MAX_LOGS",
+        "max_per_stage": "VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE",
+    }
+
     enabled: bool | None = None
     """Enable the existing per-stage prefill timing log."""
     max_logs: int | None = None
@@ -210,11 +262,11 @@ class GdnProfileConfig:
         if self.resolved:
             return
         if self.enabled is None:
-            raw = os.environ.get("VLLM_SM70_GDN_PREFILL_PROFILE", "")
+            raw = os.environ.get(self.aliases["enabled"], "")
             self.enabled = raw.strip().lower() in ("1", "true", "yes", "on")
         for name, legacy, default in (
-            ("max_logs", "VLLM_SM70_GDN_PREFILL_PROFILE_MAX_LOGS", 256),
-            ("max_per_stage", "VLLM_SM70_GDN_PREFILL_PROFILE_MAX_PER_STAGE", 2),
+            ("max_logs", self.aliases["max_logs"], 256),
+            ("max_per_stage", self.aliases["max_per_stage"], 2),
         ):
             if getattr(self, name) is None:
                 value = (
@@ -224,3 +276,6 @@ class GdnProfileConfig:
                 )
                 setattr(self, name, value)
         self.resolved = True
+
+    def compile_ignored_aliases(self):
+        return set(self.aliases.values())
