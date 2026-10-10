@@ -1160,7 +1160,7 @@ class VllmConfig:
                 not policy.qsa_host_kv_device_reference
                 and policy.qsa_host_kv_hot_tokens < max_len
             ):
-                # Measured on 4x V100 (Flash-Next TP4): with 8192 hot tokens a
+                # Measured with TP4: with 8192 hot tokens a
                 # 30K-token prefill took 101 s; with 32768 it took 17 s.
                 logger.warning_once(
                     "qsa_host_kv_hot_tokens=%d is below max_model_len=%d: "
