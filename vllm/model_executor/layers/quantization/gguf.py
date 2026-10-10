@@ -1358,17 +1358,23 @@ class GGUFLMHeadMethod(GGUFEmbeddingMethod):
         super().process_weights_after_loading(layer)
         if self.canonical_lm_head and self.canonical_projections:
             assert self.lm_head_capability is not None
-            # Keep the faster M1 route and unmeasured M intervals. This raw
-            # parameter is separate from the canonical streams and embedding.
-            layer.register_parameter(
-                "gguf_lm_head_raw", Parameter(pad_weight_tail(raw, weight_type), False)
-            )
+            # Q4_K keeps its faster raw M1 route. The calibrated Q6_K head
+            # already uses canonical storage at M1, including draft decode;
+            # larger batches can use that same general GEMM without a second
+            # resident vocabulary bank.
+            if minimum_m > 1:
+                layer.register_parameter(
+                    "gguf_lm_head_raw",
+                    Parameter(pad_weight_tail(raw, weight_type), False),
+                )
             self.native_admission["lm_head"] = {
                 "operator": self.lm_head_capability.operator,
                 "min_m": minimum_m,
                 "max_m": maximum_m,
                 "reason": None,
-                "raw_fallback": "outside_measured_m_band",
+                "raw_fallback": "outside_measured_m_band"
+                if minimum_m > 1
+                else "canonical_storage_for_all_m",
             }
         else:
             self.native_admission["lm_head"] = {
