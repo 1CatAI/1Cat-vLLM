@@ -1,0 +1,78 @@
+name: architecture-docs
+
+on:
+  pull_request:
+    paths:
+      - 'vllm/config/**.py'
+      - 'vllm/v1/attention/kv_codecs.py'
+      - 'vllm/v1/attention/kv_codecs.README.md'
+      - 'vllm/v1/attention/backends/flash_v100/routing.py'
+      - 'vllm/v1/attention/backends/flash_v100/README.md'
+      - 'vllm/model_executor/layers/fused_moe/sm70/declarations.py'
+      - 'vllm/model_executor/layers/fused_moe/sm70/README.md'
+      - 'tools/generate_architecture_reference.py'
+      - 'tools/config_ownership.py'
+      - 'tools/sm70/path_inventory.py'
+      - 'tools/pre_commit/environment_readers.py'
+      - 'tests/tools/test_architecture_*.py'
+      - 'docs/mkdocs/hooks/**.py'
+      - 'docs/design/architecture/README.md'
+      - 'docs/design/architecture/runtime_reference.md'
+      - 'docs/design/architecture/int8_g64_codec.md'
+      - 'docs/design/architecture/sm70_phase_e.md'
+      - 'docs/contributing/README.md'
+      - 'docs/contributing/1cat-development.md'
+      - 'CONTRIBUTING.md'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/workflows/architecture-docs.yml'
+      - '.github/workflows/pre-commit.yml'
+      - '.pre-commit-config.yaml'
+      - 'mkdocs.yaml'
+  push:
+    branches: [main]
+    paths:
+      - 'vllm/config/**.py'
+      - 'vllm/v1/attention/kv_codecs.py'
+      - 'vllm/v1/attention/kv_codecs.README.md'
+      - 'vllm/v1/attention/backends/flash_v100/routing.py'
+      - 'vllm/v1/attention/backends/flash_v100/README.md'
+      - 'vllm/model_executor/layers/fused_moe/sm70/declarations.py'
+      - 'vllm/model_executor/layers/fused_moe/sm70/README.md'
+      - 'tools/generate_architecture_reference.py'
+      - 'tools/config_ownership.py'
+      - 'tools/sm70/path_inventory.py'
+      - 'tools/pre_commit/environment_readers.py'
+      - 'tests/tools/test_architecture_*.py'
+      - 'docs/mkdocs/hooks/**.py'
+      - 'docs/design/architecture/README.md'
+      - 'docs/design/architecture/runtime_reference.md'
+      - 'docs/design/architecture/int8_g64_codec.md'
+      - 'docs/design/architecture/sm70_phase_e.md'
+      - 'docs/contributing/README.md'
+      - 'docs/contributing/1cat-development.md'
+      - 'CONTRIBUTING.md'
+      - '.github/PULL_REQUEST_TEMPLATE.md'
+      - '.github/workflows/architecture-docs.yml'
+      - '.github/workflows/pre-commit.yml'
+      - '.pre-commit-config.yaml'
+      - 'mkdocs.yaml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.12'
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        with:
+          extra_args: check-architecture-reference --all-files
+      - run: pre-commit run test-architecture-reference --all-files

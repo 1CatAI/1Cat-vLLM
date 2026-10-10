@@ -265,6 +265,31 @@ repos:
     pass_filenames: false
     additional_dependencies: [regex]
     files: ^(vllm/envs.*\.py|tools/generate_env_reference\.py|tools/pre_commit/check_env_metadata\.py|docs/configuration/env_var_reference\.md)$
+  - id: check-architecture-reference
+    name: Check architecture declarations and maintained documentation links
+    entry: python -m tools.generate_architecture_reference --check
+    language: python
+    pass_filenames: false
+    additional_dependencies: [regex]
+    files: &architecture_files >-
+      (?x)^(vllm/config/.*\.py|
+      vllm/v1/attention/kv_codecs\.(py|README\.md)|
+      vllm/v1/attention/backends/flash_v100/(routing\.py|README\.md)|
+      vllm/model_executor/layers/fused_moe/sm70/(declarations\.py|README\.md)|
+      tools/(generate_architecture_reference|config_ownership)\.py|
+      tools/sm70/path_inventory\.py|tools/pre_commit/environment_readers\.py|
+      tests/tools/test_architecture_.*\.py|docs/mkdocs/hooks/.*\.py|
+      docs/design/architecture/(README|runtime_reference|int8_g64_codec|sm70_phase_e)\.md|
+      docs/contributing/(README|1cat-development)\.md|CONTRIBUTING\.md|
+      \.github/PULL_REQUEST_TEMPLATE\.md|\.github/workflows/(architecture-docs|pre-commit)\.yml|
+      \.pre-commit-config\.yaml|mkdocs\.yaml)$
+  - id: test-architecture-reference
+    name: Test offline architecture reference and documentation checks
+    entry: python -m pytest --confcutdir=tests/tools -q tests/tools/test_architecture_reference.py tests/tools/test_architecture_doc_urls.py tests/tools/test_architecture_check_scope.py
+    language: python
+    pass_filenames: false
+    additional_dependencies: [regex, pytest, "mkdocs<2"]
+    files: *architecture_files
   - id: validate-config
     name: Validate configuration has default values and that each field has a docstring
     entry: python tools/pre_commit/validate_config.py
