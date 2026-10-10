@@ -359,6 +359,23 @@ def exl3_group_slots(
     return gexp, rows.view(G, 8)
 
 
+def exl3_strip_major_(trellis: torch.Tensor) -> torch.Tensor:
+    """Reorder trellis tiles in place from [.., k/16, n/16, W] to the strip-major
+    order the SM70 MoE kernels read: [.., n/32, k/16, 2, W], so the two 16-column
+    tiles a warp needs per k step are contiguous and a strip streams along k.
+    A pure permutation of whole tiles; done per leading index to avoid a second
+    copy of the expert weights."""
+    *lead, a, b, w = trellis.shape
+    if b % 2:
+        raise ValueError("EXL3 strip-major order needs an even number of column tiles")
+    flat = trellis.reshape(-1, a, b, w)
+    for i in range(flat.shape[0]):
+        flat[i].view(-1).copy_(
+            flat[i].view(a, b // 2, 2, w).permute(1, 0, 2, 3).reshape(-1)
+        )
+    return trellis
+
+
 def exl3_moe_forward(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -373,7 +390,8 @@ def exl3_moe_forward(
 ) -> torch.Tensor:
     """Routed experts: x [T, H] fp16, topk_ids [T, topk] int32, topk_weights
     [T, topk] fp32 -> this rank's partial output [T, H] fp32. Weights are laid
-    out as in Exl3MoEMethod."""
+    out as in Exl3MoEMethod, trellis tensors in strip-major order
+    (``exl3_strip_major_``)."""
     T, H = x.shape
     S = T * topk_ids.shape[1]
     inter = w2_trellis.shape[1] * 16
@@ -523,6 +541,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         for name in ("w13_mcg", "w2_mcg", "w13_tile_order", "w2_tile_order"):
             delattr(layer, name)
         del layer.exl3_loaded
+        exl3_strip_major_(layer.w13_trellis.data)
+        exl3_strip_major_(layer.w2_trellis.data)
         logger.info_once(
             "EXL3 routed experts: mcg, K=%d, %s tile order, decoded in the matmul.",
             self.bits,

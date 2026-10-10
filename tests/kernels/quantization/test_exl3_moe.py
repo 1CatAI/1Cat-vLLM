@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.exl3 import (
     exl3_group_slots,
     exl3_moe_forward,
     exl3_reconstruct,
+    exl3_strip_major_,
     tile_perm,
 )
 
@@ -106,6 +107,14 @@ def _make_layer(E, H, inter, K, device, seed=0):
     return {k: v.to(device) for k, v in w.items()}
 
 
+def _kernel_layout(layer):
+    """The ops read strip-major trellis tiles; the oracle keeps the checkpoint order."""
+    out = dict(layer)
+    for name in ("w13_trellis", "w2_trellis"):
+        out[name] = exl3_strip_major_(layer[name].clone())
+    return out
+
+
 def _oracle(x, ids, wts, layer, order):
     """sum_j w * (silu(x Wg) * (x Wu)) Wd with weights from the decoder."""
     E = layer["w2_trellis"].shape[0]
@@ -151,7 +160,9 @@ def test_exl3_moe_kernel(order, K, T):
     x = (torch.randn(T, H, device=device) * 0.5).half()
     ids = torch.stack([torch.randperm(E, device=device)[:topk] for _ in range(T)]).int()
     wts = torch.rand(T, topk, device=device)
-    y = exl3_moe_forward(x, ids, wts, **layer, colmajor=order == "colmajor")
+    y = exl3_moe_forward(
+        x, ids, wts, **_kernel_layout(layer), colmajor=order == "colmajor"
+    )
     # Prefill shapes are checked on a sample of tokens (the oracle is slow).
     rows = list(range(T)) if T <= 5 else [0, 1, T // 2, T - 2, T - 1]
     ref = _oracle(x[rows], ids[rows], wts[rows], layer, order)
@@ -164,7 +175,7 @@ def test_exl3_moe_kernel(order, K, T):
 def test_exl3_moe_cuda_graph():
     device = torch.device("cuda")
     E, H, inter, topk, T = 16, 512, 512, 8, 4
-    layer = _make_layer(E, H, inter, 2, device)
+    layer = _kernel_layout(_make_layer(E, H, inter, 2, device))
     x = torch.zeros(T, H, device=device, dtype=torch.half)
     ids = torch.zeros(T, topk, device=device, dtype=torch.int32)
     wts = torch.zeros(T, topk, device=device)
@@ -282,3 +293,33 @@ def test_dequantize_dense_skip():
     ]
     out = dict(cfg.dequantize_dense(iter(weights), skip=lambda n: ".layers.45." in n))
     assert set(out) == {p + ".trellis", p + ".suh", p + ".svh"}
+
+
+def test_strip_major_is_a_tile_permutation():
+    t = torch.arange(2 * 3 * 8 * 4 * 32, dtype=torch.int16).view(2, 3, 8, 4, 32)
+    p = exl3_strip_major_(t.clone())
+    ref = t.view(2, 3, 8, 2, 2, 32).permute(0, 1, 3, 2, 4, 5).reshape(2, 3, 8, 4, 32)
+    assert torch.equal(p, ref)
+    # tiles move, words inside a tile do not
+    assert torch.equal(
+        p.view(-1, 32).sort(dim=0).values, t.view(-1, 32).sort(dim=0).values
+    )
+    with pytest.raises(ValueError):
+        exl3_strip_major_(torch.zeros(1, 4, 3, 32, dtype=torch.int16))
+
+
+@requires_kernels
+def test_exl3_moe_kernel_needs_strip_major():
+    """Mutation: the checkpoint tile order fed straight to the ops is wrong."""
+    device = torch.device("cuda")
+    E, H, inter, topk, T = 16, 512, 512, 8, 4
+    layer = _make_layer(E, H, inter, 2, device, seed=7)
+    torch.manual_seed(7)
+    x = (torch.randn(T, H, device=device) * 0.5).half()
+    ids = torch.stack([torch.randperm(E, device=device)[:topk] for _ in range(T)]).int()
+    wts = torch.rand(T, topk, device=device)
+    ref = _oracle(x, ids, wts, layer, "colmajor")
+    good = exl3_moe_forward(x, ids, wts, **_kernel_layout(layer), colmajor=True)
+    bad = exl3_moe_forward(x, ids, wts, **layer, colmajor=True)
+    assert ((good.double() - ref).norm() / ref.norm()).item() < 2e-3
+    assert ((bad.double() - ref).norm() / ref.norm()).item() > 0.1
