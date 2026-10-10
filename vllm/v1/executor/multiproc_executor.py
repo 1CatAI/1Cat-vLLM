@@ -654,7 +654,9 @@ class WorkerProc:
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
-        enable_envs_cache()
+        from vllm.config.policy_defaults import engine_policy_aliases
+
+        enable_envs_cache(exclude=engine_policy_aliases(vllm_config))
 
     @staticmethod
     def make_worker_process(

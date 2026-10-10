@@ -4,7 +4,6 @@
 
 import os
 import sys
-import time
 from types import SimpleNamespace
 
 import torch
@@ -30,7 +29,6 @@ from vllm.config.sm70_dflash2 import (
 from vllm.config.sm70_runtime import capture_runtime_trace
 from vllm.diagnostics import (
     diagnostic_channel,
-    diagnostic_history,
     legacy_channel,
     legacy_history,
 )
@@ -42,7 +40,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
 from vllm.model_executor.layers.fla.ops import chunk_gated_delta_rule as _fla_chunk_rule
 from vllm.model_executor.layers.fla.ops import (
-    fused_post_conv_prep,
     fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
@@ -57,6 +54,21 @@ from vllm.model_executor.layers.fla.ops.gdn_prefill import (
 )
 from vllm.model_executor.layers.fla.ops.gdn_prefill import (
     fi_chunk_gated_delta_rule as fi_chunk_gated_delta_rule,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    GdnPreparation,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    _sm70_pack_qwen_gdn_qkv as _sm70_pack_qwen_gdn_qkv,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    _sm70_pack_qwen_gdn_qkv_kernel as _sm70_pack_qwen_gdn_qkv_kernel,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    fused_gdn_gating as fused_gdn_gating,
+)
+from vllm.model_executor.layers.fla.ops.gdn_preparation import (
+    fused_gdn_gating_kernel as fused_gdn_gating_kernel,
 )
 from vllm.model_executor.layers.fla.ops.gdn_profiling import (
     GdnPrefillProfiler,
@@ -122,7 +134,6 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
-from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -195,80 +206,6 @@ def _warmup_sm70_qwen_gdn_causal_conv1d(
             and current_platform.is_device_capability(70)
         ),
     )
-
-
-@triton.jit
-def _sm70_pack_qwen_gdn_qkv_kernel(
-    mixed_qkv,
-    packed,
-    input_row_stride: tl.int64,
-    num_rows: tl.constexpr,
-    q_dim: tl.constexpr,
-    k_dim: tl.constexpr,
-    v_dim: tl.constexpr,
-    BLOCK_Q: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    BLOCK_V: tl.constexpr,
-):
-    """Bitwise row-slice copy into [all Q][all K][all V] storage."""
-    row = tl.program_id(0)
-    input_row = mixed_qkv + row * input_row_stride
-
-    q_cols = tl.arange(0, BLOCK_Q)
-    q_mask = q_cols < q_dim
-    q = tl.load(input_row + q_cols, mask=q_mask)
-    tl.store(packed + row * q_dim + q_cols, q, mask=q_mask)
-
-    k_cols = tl.arange(0, BLOCK_K)
-    k_mask = k_cols < k_dim
-    k = tl.load(input_row + q_dim + k_cols, mask=k_mask)
-    q_numel = num_rows * q_dim
-    tl.store(packed + q_numel + row * k_dim + k_cols, k, mask=k_mask)
-
-    v_cols = tl.arange(0, BLOCK_V)
-    v_mask = v_cols < v_dim
-    v = tl.load(input_row + q_dim + k_dim + v_cols, mask=v_mask)
-    qk_numel = q_numel + num_rows * k_dim
-    tl.store(packed + qk_numel + row * v_dim + v_cols, v, mask=v_mask)
-
-
-def _sm70_pack_qwen_gdn_qkv(
-    mixed_qkv: torch.Tensor,
-    q_dim: int,
-    k_dim: int,
-    v_dim: int,
-) -> torch.Tensor:
-    """Materialize the recurrent Q/K/V layout with one copy launch."""
-    if mixed_qkv.ndim != 2:
-        raise ValueError("mixed_qkv must be rank two")
-    if mixed_qkv.stride(1) != 1:
-        raise ValueError("mixed_qkv must be contiguous by row")
-    if min(q_dim, k_dim, v_dim) <= 0:
-        raise ValueError("Q/K/V widths must be positive")
-    if mixed_qkv.shape[1] < q_dim + k_dim + v_dim:
-        raise ValueError("mixed_qkv is narrower than the Q/K/V widths")
-
-    num_rows = mixed_qkv.shape[0]
-    packed = torch.empty(
-        num_rows * (q_dim + k_dim + v_dim),
-        dtype=mixed_qkv.dtype,
-        device=mixed_qkv.device,
-    )
-    _sm70_pack_qwen_gdn_qkv_kernel[(num_rows,)](
-        mixed_qkv,
-        packed,
-        mixed_qkv.stride(0),
-        num_rows=num_rows,
-        q_dim=q_dim,
-        k_dim=k_dim,
-        v_dim=v_dim,
-        BLOCK_Q=triton.next_power_of_2(q_dim),
-        BLOCK_K=triton.next_power_of_2(k_dim),
-        BLOCK_V=triton.next_power_of_2(v_dim),
-        num_warps=8,
-        num_stages=1,
-    )
-    return packed
 
 
 def _ddtree_parent_ids_require_branch(
@@ -480,16 +417,6 @@ def _sm70_flashqla_decode_warmup_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
-def _sm70_mixed_qkv_decode_layout(mixed_qkv: torch.Tensor) -> str:
-    if mixed_qkv.dim() != 2 or mixed_qkv.stride(1) != 1:
-        return "unsupported"
-    if mixed_qkv.stride(0) < mixed_qkv.shape[1]:
-        return "unsupported"
-    if mixed_qkv.stride(0) == mixed_qkv.shape[1]:
-        return "compact"
-    return "row_strided"
-
-
 def _sm70_gdn_prefill_profile_start():
     return _legacy_gdn_profiler().start()
 
@@ -498,58 +425,7 @@ def _sm70_gdn_prefill_profile_end(*args, **kwargs):
     return _legacy_gdn_profiler().end(*args, **kwargs)
 
 
-def _sm70_log_flashqla_decode_route(
-    *,
-    layer_name: LayerNameType,
-    stage: str,
-    decision: str,
-    reason: str,
-    mixed_qkv: torch.Tensor,
-    state_indices: torch.Tensor | None,
-    num_decode_tokens: int,
-) -> None:
-    if not capture_runtime_trace().value("gdn_route_debug"):
-        return
-    if torch.compiler.is_compiling():
-        return
-    mixed_layout = _sm70_mixed_qkv_decode_layout(mixed_qkv)
-    key = f"{os.getpid()}:{stage}:{decision}:{reason}:{mixed_layout}:{layer_name}"
-    counts = diagnostic_history("gdn_route")
-    count = counts.get(key, 0)
-    if count >= 1:
-        return
-    if len(counts) >= 96:
-        return
-    counts[key] = count + 1
-    state_desc = "None"
-    if state_indices is not None:
-        state_desc = (
-            f"shape={tuple(state_indices.shape)} "
-            f"dtype={state_indices.dtype} "
-            f"stride={tuple(state_indices.stride())} "
-            f"contiguous={state_indices.is_contiguous()}"
-        )
-    logger.info(
-        "SM70 FlashQLA GDN decode route debug: layer=%s stage=%s "
-        "decision=%s reason=%s capture=%s tokens=%s "
-        "mixed_shape=%s mixed_dtype=%s mixed_stride=%s "
-        "mixed_contiguous=%s mixed_layout=%s logical_width=%s "
-        "row_stride=%s state_indices=%s",
-        layer_name,
-        stage,
-        decision,
-        reason,
-        torch.cuda.is_current_stream_capturing(),
-        num_decode_tokens,
-        tuple(mixed_qkv.shape),
-        mixed_qkv.dtype,
-        tuple(mixed_qkv.stride()),
-        mixed_qkv.is_contiguous(),
-        mixed_layout,
-        mixed_qkv.shape[1] if mixed_qkv.dim() == 2 else None,
-        mixed_qkv.stride(0) if mixed_qkv.dim() == 2 else None,
-        state_desc,
-    )
+_sm70_log_flashqla_decode_route = _gdn_diagnostics.log_decode_route
 
 
 _sm70_dump_gdn_core_tensor = _gdn_diagnostics.dump_core
@@ -945,32 +821,7 @@ def _qwen_gdn_non_spec_metadata_tensors(
 _sm70_gdn_graph_buffer_copy = _gdn_diagnostics.capture_tensor
 
 
-def _sm70_gdn_graph_buffer_copy_state_slice(
-    label: str,
-    layer_name: LayerNameType,
-    state: torch.Tensor,
-    state_indices: torch.Tensor | None,
-    num_tokens: int,
-) -> None:
-    if state_indices is None or num_tokens <= 0:
-        return
-    if not diagnostic_channel("gdn_graph").policy.capture:
-        return
-    indices = state_indices[:num_tokens].to(device=state.device, dtype=torch.long)
-    indices = indices.clamp(0, state.shape[0] - 1)
-    _sm70_gdn_graph_buffer_copy(
-        label,
-        layer_name,
-        state.index_select(0, indices),
-        "state",
-    )
-    if diagnostic_channel("gdn_graph").policy.state_indices:
-        _sm70_gdn_graph_buffer_copy(
-            f"{label}_indices",
-            layer_name,
-            indices.to(dtype=torch.int32),
-            "state",
-        )
+_sm70_gdn_graph_buffer_copy_state_slice = _gdn_diagnostics.capture_state_slice
 
 
 def _sm70_dump_gdn_spec_metadata_graph_buffers(
@@ -1339,6 +1190,8 @@ class ChunkGatedDeltaRule(GdnPrefill, CustomOp):
                 needed=plan.needs_native_flashqla,
             ),
         )
+        # Preserve the CustomOp/nn.Module call boundary and its forward hooks.
+        self._call_prefill = self.__call__
         if (
             plan.requested_backend in ("flashinfer", "cutedsl", "flashqla_sm70")
             and plan.prefill.backend != plan.requested_backend
@@ -1675,6 +1528,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "SM70 Qwen GDN 0.0.3-style spec recurrent-core route armed."
             )
         self.enable_sm70_legacy_prefill_prep = self.gdn_policy.legacy_prefill_prep
+        self.gdn_preparation = GdnPreparation(
+            self.gdn_heads,
+            legacy=bool(self.enable_sm70_legacy_prefill_prep),
+            fused_pack=self.enable_sm70_dflash2_fused_qkv_pack,
+            gate_is_exp=(
+                not self.enable_sm70_legacy_prefill_prep
+                and self.gdn_prefill_backend == "flashqla_sm70"
+                and not self.gdn_policy.original_prefill
+            ),
+        )
         if current_platform.is_device_capability(70) and (
             self.gdn_policy.schedule.kkt_enabled
             or self.gdn_policy.schedule.delta_h_enabled
@@ -2070,48 +1933,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return mixed_qkv_out, z_out, b_out, a_out
 
     def rearrange_mixed_qkv(self, mixed_qkv):
-        """Split packed qkv into contiguous (1, seq, heads, dim) tensors.
-
-        The original code used ``rearrange(x, "l (h d) -> 1 l h d", d=...)``
-        followed by ``.contiguous()`` on each tensor.  This version flattens
-        all three splits into a single buffer via ``torch.cat`` so that
-        torch.compile emits one Triton copy kernel instead of three separate
-        contiguous() calls.
-        """
-        if mixed_qkv is None:
-            return None, None, None
-
-        seq_len = mixed_qkv.shape[0]
-        q_dim = self.key_dim // self.tp_size
-        k_dim = self.key_dim // self.tp_size
-        v_dim = self.value_dim // self.tp_size
-
-        if (
-            self.enable_sm70_dflash2_fused_qkv_pack
-            and seq_len == 8
-            and mixed_qkv.is_cuda
-            and mixed_qkv.dtype == torch.float16
-            and mixed_qkv.stride(1) == 1
-        ):
-            fused = _sm70_pack_qwen_gdn_qkv(mixed_qkv, q_dim, k_dim, v_dim)
-        else:
-            query, key, value = torch.split(mixed_qkv, [q_dim, k_dim, v_dim], dim=-1)
-            fused = torch.cat(
-                [query.reshape(-1), key.reshape(-1), value.reshape(-1)], dim=0
-            )
-
-        q_size = seq_len * q_dim
-        k_size = seq_len * k_dim
-
-        q_contig = fused[0:q_size]
-        k_contig = fused[q_size : q_size + k_size]
-        v_contig = fused[q_size + k_size :]
-
-        query = q_contig.view(1, seq_len, -1, self.head_k_dim)
-        key = k_contig.view(1, seq_len, -1, self.head_k_dim)
-        value = v_contig.view(1, seq_len, -1, self.head_v_dim)
-
-        return query, key, value
+        return self.gdn_preparation.unpack(mixed_qkv)
 
     def _probe_ddtree_path_replay_states(
         self,
@@ -3652,597 +3474,44 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         return True
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
-        """Warm up GDN prefill kernels during V1 profiling.
-
-        During V1 profile runs, ``_forward_core`` returns early because
-        ``attn_metadata`` is ``None``, so the autotuned kernels used by
-        ``chunk_gated_delta_rule`` (e.g. ``solve_tril``,
-        ``chunk_scaled_dot_kkt``) are never invoked.  After profiling,
-        vLLM allocates KV cache using most of the remaining GPU memory.
-        When the first real inference triggers the autotuner it OOMs
-        because there is not enough memory left for benchmarking.
-
-        This method runs minimal forward passes through
-        ``chunk_gated_delta_rule`` and the decode recurrent kernel with
-        small dummy tensors to force compilation/autotuning while GPU memory
-        is still plentiful.  The autotuner results are cached globally, so
-        only the first layer incurs actual benchmarking cost.
-
-        All kernels including ``chunk_fwd_kernel_o`` now use a fixed
-        ``BT = chunk_size`` (64).  A single warmup pass with T = 64
-        is sufficient to populate the autotuner cache.
-
-        The decode path uses fixed-parameter kernels, but they are still
-        JIT-compiled on first use. Warm them here so the first real decode
-        step does not trip the JIT monitor.
-        """
+        """Bind the model's weights/layout; the warmup owner runs ordered stages."""
         if self._prefill_kernels_warmed_up:
             return
         self._prefill_kernels_warmed_up = True
+        from vllm.model_executor.warmup.gdn import GdnWarmup
 
-        device = qkv_or_qkvz.device
-        dtype = qkv_or_qkvz.dtype
-        num_k_heads = self.num_k_heads // self.tp_size
-        num_v_heads = self.num_v_heads // self.tp_size
-        _, state_dtype = self.get_state_dtype()
         qkv_dim = qkv_or_qkvz.shape[-1] - v_dim
-        qkv_row_stride = qkv_or_qkvz.stride(0) if qkv_or_qkvz.dim() >= 2 else qkv_dim
-        self._sm70_gdn_prefill_qkv_row_stride = max(qkv_dim, int(qkv_row_stride))
-        prefill_token_counts = (FLA_CHUNK_SIZE, max(1, FLA_CHUNK_SIZE - 1))
-        warmup_key = (
-            qkv_or_qkvz.device.type,
-            qkv_or_qkvz.device.index,
-            dtype,
-            state_dtype,
-            self.gdn_prefill_backend,
-            self.gdn_policy.original_prefill,
-            self.gdn_policy.direct_prefill_output,
-            self.gdn_policy.indexed_prefill,
-            num_k_heads,
-            num_v_heads,
-            self.head_k_dim,
-            self.head_v_dim,
-            qkv_dim,
-            qkv_row_stride,
-            prefill_token_counts,
-            is_conv_state_dim_first(),
-        )
-        if warmup_key in self._prefill_warmup_keys:
-            if _sm70_profile_trace_enabled():
-                logger.info(
-                    "SM70 profile trace: GDN prefill/decode warmup skip "
-                    "layer=%s reason=shape_already_warmed",
-                    self.prefix,
-                )
-            return
-        self._prefill_warmup_keys.add(warmup_key)
-
-        # All kernels use BT = chunk_size, so a single pass with T = chunk_size
-        # is sufficient to populate every autotuner cache. Also run the
-        # conv1d prefill kernel once; otherwise Qwen3.5/Next can still JIT
-        # _causal_conv1d_fwd_kernel on the first real request after the JIT
-        # monitor has been activated.
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
-        if is_conv_state_dim_first():
-            dummy_conv_state = torch.zeros(
+        row_stride = qkv_or_qkvz.stride(0) if qkv_or_qkvz.dim() >= 2 else qkv_dim
+        self._sm70_gdn_prefill_qkv_row_stride = max(qkv_dim, int(row_stride))
+        _, state_dtype = self.get_state_dtype()
+        GdnWarmup(
+            heads=self.gdn_heads,
+            prefill=self.chunk_gated_delta_rule,
+            decode_admission=self.flashqla_decode_admission,
+            native_policy=self._flashqla_native_policy,
+            schedule=self.gdn_policy.schedule,
+            conv_weight=self.conv1d.weight,
+            conv_bias=self.conv1d.bias,
+            activation=self.activation,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            state_dtype=state_dtype,
+            device=qkv_or_qkvz.device,
+            dtype=qkv_or_qkvz.dtype,
+            input_width=qkv_or_qkvz.shape[-1],
+            qkv_dim=qkv_dim,
+            qkv_row_stride=row_stride,
+            spec_cache_stride=max(
                 1,
-                conv_weights.shape[0],
-                conv_weights.shape[1] - 1,
-                device=device,
-                dtype=dtype,
-            )
-        else:
-            dummy_conv_state = torch.zeros(
-                1,
-                conv_weights.shape[1] - 1,
-                conv_weights.shape[0],
-                device=device,
-                dtype=dtype,
-            ).transpose(-1, -2)
-        spec_cache_stride = max(
-            1,
-            int(getattr(self, "num_spec", 1)),
-            int(getattr(self, "_sm70_spec_cache_stride", 1)),
-            _sm70_spec_cache_stride_from_config(),
-        )
-        dummy_cache_indices_variants = [
-            torch.zeros(1, device=device, dtype=torch.int32)
-        ]
-        if spec_cache_stride > 1:
-            dummy_cache_base = torch.zeros(
-                spec_cache_stride, device=device, dtype=torch.int32
-            )
-            dummy_cache_indices_variants.append(
-                torch.as_strided(
-                    dummy_cache_base,
-                    size=(1,),
-                    stride=(spec_cache_stride,),
-                )
-            )
-        dummy_has_initial_state = torch.ones(1, device=device, dtype=torch.bool)
-        try:
-            for prefill_tokens in prefill_token_counts:
-                dummy_conv_inputs = [
-                    torch.randn(
-                        prefill_tokens,
-                        qkv_dim,
-                        device=device,
-                        dtype=dtype,
-                    ).transpose(0, 1)
-                ]
-                if qkv_row_stride > qkv_dim:
-                    dummy_qkv = torch.randn(
-                        prefill_tokens,
-                        qkv_row_stride,
-                        device=device,
-                        dtype=dtype,
-                    )
-                    dummy_conv_inputs.append(dummy_qkv[:, :qkv_dim].transpose(0, 1))
-                cu_seqlens = torch.tensor(
-                    [0, prefill_tokens], device=device, dtype=torch.int32
-                )
-                for dummy_conv_in in dummy_conv_inputs:
-                    for dummy_cache_indices in dummy_cache_indices_variants:
-                        causal_conv1d_fn(
-                            dummy_conv_in,
-                            conv_weights,
-                            self.conv1d.bias,
-                            activation=self.activation,
-                            conv_states=dummy_conv_state,
-                            cache_indices=dummy_cache_indices,
-                            has_initial_state=dummy_has_initial_state,
-                            query_start_loc=cu_seqlens,
-                        )
-                        dummy_conv_state.zero_()
-        except Exception:
-            logger.warning(
-                "GDN causal-conv prefill warmup failed for layer %s. "
-                "First inference may JIT _causal_conv1d_fwd_kernel.",
-                self.prefix,
-                exc_info=True,
-            )
-        else:
-            logger.debug(
-                "GDN causal-conv prefill warmup completed for layer %s",
-                self.prefix,
-            )
-
-        # Mirror the real prefill path here: build q/k/v/g/beta via
-        # fused_post_conv_prep and then run chunk_gated_delta_rule with
-        # in-kernel L2 norm disabled.
-        for prefill_tokens in prefill_token_counts:
-            compact_a = torch.randn(
-                prefill_tokens, num_v_heads, device=device, dtype=dtype
-            )
-            compact_b = torch.randn(
-                prefill_tokens, num_v_heads, device=device, dtype=dtype
-            )
-            gate_inputs = [(compact_a, compact_b)]
-            gate_row_stride = 2 * num_v_heads
-            if gate_row_stride > num_v_heads:
-                dummy_ba = torch.randn(
-                    prefill_tokens,
-                    gate_row_stride,
-                    device=device,
-                    dtype=dtype,
-                )
-                # Split-projection Qwen keeps b as a view into [b, a], while
-                # a is contiguous when compile-graph slicing uses index_select.
-                gate_inputs.append((compact_a, dummy_ba[:, :num_v_heads]))
-                # Keep the pure view case warmed as well for non-graph runs.
-                gate_inputs.append(
-                    (
-                        dummy_ba[:, num_v_heads:gate_row_stride],
-                        dummy_ba[:, :num_v_heads],
-                    )
-                )
-            dummy_post_conv_inputs = [
-                torch.randn(prefill_tokens, qkv_dim, device=device, dtype=dtype)
-            ]
-            if qkv_row_stride > qkv_dim:
-                dummy_qkv_post = torch.randn(
-                    prefill_tokens,
-                    qkv_row_stride,
-                    device=device,
-                    dtype=dtype,
-                )
-                dummy_post_conv_inputs.append(dummy_qkv_post[:, :qkv_dim])
-            for dummy_mixed_qkv in dummy_post_conv_inputs:
-                for dummy_a, dummy_b in gate_inputs:
-                    q, k, v, g, beta = fused_post_conv_prep(
-                        conv_output=dummy_mixed_qkv,
-                        a=dummy_a,
-                        b=dummy_b,
-                        A_log=self.A_log,
-                        dt_bias=self.dt_bias,
-                        num_k_heads=num_k_heads,
-                        head_k_dim=self.head_k_dim,
-                        head_v_dim=self.head_v_dim,
-                        apply_l2norm=True,
-                        output_g_exp=False,
-                    )
-                    del q, k, v, g, beta
-        # The warmup is only meant to compile/autotune the GDN prefill
-        # kernels. Keep the actual kernel inputs deterministic and bounded so
-        # random profile tensors cannot trigger pathological TileLang runtime
-        # waits before real inference starts.
-        T = FLA_CHUNK_SIZE
-        q = torch.full(
-            (1, T, num_k_heads, self.head_k_dim),
-            1.0e-3,
-            device=device,
-            dtype=dtype,
-        )
-        k = torch.full(
-            (1, T, num_k_heads, self.head_k_dim),
-            1.0e-3,
-            device=device,
-            dtype=dtype,
-        )
-        v = torch.full(
-            (1, T, num_v_heads, self.head_v_dim),
-            1.0e-3,
-            device=device,
-            dtype=dtype,
-        )
-        g = torch.zeros(
-            1,
-            T,
-            num_v_heads,
-            device=device,
-            dtype=torch.float32,
-        )
-        beta = torch.full(
-            (1, T, num_v_heads),
-            1.0e-2,
-            device=device,
-            dtype=torch.float32,
-        )
-        state = torch.zeros(
-            1,
-            num_v_heads,
-            self.head_v_dim,
-            self.head_k_dim,
-            device=device,
-            dtype=state_dtype,
-        )
-        dummy_prefill_core_attn_out = None
-        if (
-            self.gdn_prefill_backend == "flashqla_sm70"
-            and self.gdn_policy.original_prefill
-            and self.gdn_policy.direct_prefill_output
-        ):
-            dummy_prefill_core_attn_out = torch.empty(
-                T,
-                num_v_heads,
-                self.head_v_dim,
-                device=device,
-                dtype=dtype,
-            )
-        # CuteDSL kernels require metadata
-        chunk_indices = None
-        chunk_offsets = None
-        if self.gdn_prefill_backend == "cutedsl":
-            from vllm.model_executor.layers.mamba.ops.gdn_chunk_cutedsl import (
-                prepare_metadata_cutedsl,
-            )
-
-            chunk_indices, chunk_offsets = prepare_metadata_cutedsl(cu_seqlens, T)
-
-        trace_prefill_warmup = (
-            _sm70_profile_trace_enabled()
-            and self.gdn_prefill_backend == "flashqla_sm70"
-            and self.gdn_policy.original_prefill
-        )
-        prefill_warmup_start = time.perf_counter()
-        if trace_prefill_warmup:
-            logger.info(
-                "SM70 profile trace: GDN prefill warmup enter layer=%s "
-                "T=%d q_shape=%s v_shape=%s direct_output=%s",
-                self.prefix,
-                T,
-                tuple(q.shape),
-                tuple(v.shape),
-                dummy_prefill_core_attn_out is not None,
-            )
-        try:
-            self.chunk_gated_delta_rule(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=state,
-                output_final_state=True,
-                cu_seqlens=cu_seqlens,
-                chunk_indices=chunk_indices,
-                chunk_offsets=chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-                core_attn_out=dummy_prefill_core_attn_out,
-            )
-        except Exception:
-            logger.warning(
-                "GDN prefill kernel warmup (T=%d) failed for "
-                "layer %s. First inference may OOM due to "
-                "autotuner.",
-                T,
-                self.prefix,
-                exc_info=True,
-            )
-        else:
-            if trace_prefill_warmup:
-                torch.accelerator.synchronize()
-                logger.info(
-                    "SM70 profile trace: GDN prefill warmup exit layer=%s "
-                    "T=%d elapsed_ms=%.3f",
-                    self.prefix,
-                    T,
-                    (time.perf_counter() - prefill_warmup_start) * 1000.0,
-                )
-            logger.debug(
-                "GDN prefill kernel warmup (T=%d) completed for layer %s",
-                T,
-                self.prefix,
-            )
-            if (
-                self.gdn_prefill_backend == "flashqla_sm70"
-                and self.gdn_policy.original_prefill
-                and self.gdn_policy.indexed_prefill
-            ):
-                indexed_state = torch.zeros(
-                    1,
-                    num_v_heads,
-                    self.head_v_dim,
-                    self.head_k_dim,
-                    device=device,
-                    dtype=state_dtype,
-                )
-                indexed_out = torch.empty(
-                    T,
-                    num_v_heads,
-                    self.head_v_dim,
-                    device=device,
-                    dtype=dtype,
-                )
-                indexed_state_indices = torch.zeros(1, device=device, dtype=torch.long)
-                indexed_has_initial_state = torch.ones(
-                    1, device=device, dtype=torch.bool
-                )
-                try:
-                    self.chunk_gated_delta_rule(
-                        q=q,
-                        k=k,
-                        v=v,
-                        g=g,
-                        beta=beta,
-                        initial_state=indexed_state,
-                        output_final_state=False,
-                        cu_seqlens=cu_seqlens,
-                        chunk_indices=chunk_indices,
-                        chunk_offsets=chunk_offsets,
-                        state_indices=indexed_state_indices,
-                        has_initial_state=indexed_has_initial_state,
-                        inplace_final_state=True,
-                        use_qk_l2norm_in_kernel=False,
-                        core_attn_out=(
-                            indexed_out
-                            if self.gdn_policy.direct_prefill_output
-                            else None
-                        ),
-                    )
-                except Exception:
-                    logger.warning(
-                        "GDN indexed/direct FlashQLA prefill warmup (T=%d) "
-                        "failed for layer %s. First real prefill may JIT the "
-                        "indexed original TileLang variant.",
-                        T,
-                        self.prefix,
-                        exc_info=True,
-                    )
-                else:
-                    logger.debug(
-                        "GDN indexed/direct FlashQLA prefill warmup (T=%d) "
-                        "completed for layer %s",
-                        T,
-                        self.prefix,
-                    )
-                finally:
-                    del (
-                        indexed_state,
-                        indexed_out,
-                        indexed_state_indices,
-                        indexed_has_initial_state,
-                    )
-        finally:
-            del (
-                dummy_mixed_qkv,
-                dummy_conv_in,
-                dummy_conv_state,
-                dummy_cache_indices,
-                dummy_has_initial_state,
-                q,
-                k,
-                v,
-                dummy_a,
-                dummy_b,
-                g,
-                beta,
-                state,
-                dummy_prefill_core_attn_out,
-                cu_seqlens,
-                chunk_indices,
-                chunk_offsets,
-            )
-
-        decode_qkv_dim = qkv_or_qkvz.shape[-1] - v_dim
-        for decode_tokens in (1, 2):
-            dummy_decode_views = [
-                torch.zeros(
-                    decode_tokens,
-                    decode_qkv_dim,
-                    device=device,
-                    dtype=dtype,
-                )
-            ]
-            if qkv_or_qkvz.shape[-1] > decode_qkv_dim:
-                dummy_decode_qkvz = torch.zeros(
-                    decode_tokens,
-                    qkv_or_qkvz.shape[-1],
-                    device=device,
-                    dtype=dtype,
-                )
-                dummy_decode_views.append(dummy_decode_qkvz[:, :decode_qkv_dim])
-            for dummy_decode_mixed_qkv in dummy_decode_views:
-                dummy_decode_a = torch.zeros(
-                    decode_tokens, num_v_heads, device=device, dtype=dtype
-                )
-                dummy_decode_b = torch.zeros(
-                    decode_tokens, num_v_heads, device=device, dtype=dtype
-                )
-                dummy_decode_state = torch.zeros(
-                    1,
-                    num_v_heads,
-                    self.head_v_dim,
-                    self.head_k_dim,
-                    device=device,
-                    dtype=state_dtype,
-                )
-                dummy_decode_out = torch.empty(
-                    decode_tokens,
-                    1,
-                    num_v_heads,
-                    self.head_v_dim,
-                    device=device,
-                    dtype=dtype,
-                )
-                dummy_decode_indices = torch.zeros(
-                    decode_tokens, device=device, dtype=torch.int32
-                )
-                dummy_decode_query_start_loc = torch.arange(
-                    decode_tokens + 1, device=device, dtype=torch.int32
-                )
-                trace_decode_warmup = _sm70_profile_trace_enabled()
-                mixed_decode_warmup_start = time.perf_counter()
-                if trace_decode_warmup:
-                    logger.info(
-                        "SM70 profile trace: GDN mixed-QKV decode warmup enter "
-                        "layer=%s tokens=%d mixed_shape=%s mixed_stride=%s "
-                        "layout=%s",
-                        self.prefix,
-                        decode_tokens,
-                        tuple(dummy_decode_mixed_qkv.shape),
-                        tuple(dummy_decode_mixed_qkv.stride()),
-                        _sm70_mixed_qkv_decode_layout(dummy_decode_mixed_qkv),
-                    )
-                try:
-                    fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
-                        A_log=self.A_log,
-                        a=dummy_decode_a,
-                        b=dummy_decode_b,
-                        dt_bias=self.dt_bias,
-                        mixed_qkv=dummy_decode_mixed_qkv,
-                        num_q_heads=self.num_k_heads // self.tp_size,
-                        num_v_heads=num_v_heads,
-                        head_k_dim=self.head_k_dim,
-                        head_v_dim=self.head_v_dim,
-                        scale=self.head_k_dim**-0.5,
-                        initial_state=dummy_decode_state,
-                        out=dummy_decode_out,
-                        cu_seqlens=dummy_decode_query_start_loc,
-                        ssm_state_indices=dummy_decode_indices,
-                        use_qk_l2norm_in_kernel=True,
-                        schedule=self.gdn_policy.schedule,
-                    )
-                except Exception:
-                    logger.warning(
-                        "GDN mixed-QKV decode warmup failed for layer %s. "
-                        "First inference may JIT "
-                        "fused_sigmoid_gating_delta_rule_update_kernel.",
-                        self.prefix,
-                        exc_info=True,
-                    )
-                else:
-                    if trace_decode_warmup:
-                        torch.accelerator.synchronize()
-                        logger.info(
-                            "SM70 profile trace: GDN mixed-QKV decode warmup "
-                            "exit layer=%s elapsed_ms=%.3f",
-                            self.prefix,
-                            (time.perf_counter() - mixed_decode_warmup_start) * 1000.0,
-                        )
-                    logger.debug(
-                        "GDN mixed-QKV decode warmup completed for layer %s",
-                        self.prefix,
-                    )
-                if self._can_use_flashqla_decode(
-                    dummy_decode_mixed_qkv,
-                    dummy_decode_indices,
-                    decode_tokens,
-                    layer_name=_encode_layer_name(self.prefix),
-                    stage="warmup",
-                ):
-                    if not self.gdn_policy.decode_warmup:
-                        if trace_decode_warmup:
-                            logger.info(
-                                "SM70 profile trace: GDN FlashQLA decode "
-                                "warmup skip layer=%s reason=disabled",
-                                self.prefix,
-                            )
-                    else:
-                        flashqla_decode_warmup_start = time.perf_counter()
-                        if trace_decode_warmup:
-                            logger.info(
-                                "SM70 profile trace: GDN FlashQLA decode "
-                                "warmup enter layer=%s tokens=%d layout=%s",
-                                self.prefix,
-                                decode_tokens,
-                                _sm70_mixed_qkv_decode_layout(dummy_decode_mixed_qkv),
-                            )
-                        try:
-                            self._forward_core_decode_flashqla(
-                                mixed_qkv=dummy_decode_mixed_qkv,
-                                a=dummy_decode_a,
-                                b=dummy_decode_b,
-                                ssm_state=dummy_decode_state,
-                                state_indices=dummy_decode_indices,
-                                num_decode_tokens=decode_tokens,
-                                cu_seqlens=dummy_decode_query_start_loc,
-                                core_attn_out=dummy_decode_out.squeeze(1),
-                            )
-                        except Exception:
-                            logger.warning(
-                                "GDN FlashQLA decode warmup failed for layer %s. "
-                                "First inference may JIT flash_qla_sm70_gdn.",
-                                self.prefix,
-                                exc_info=True,
-                            )
-                        else:
-                            if trace_decode_warmup:
-                                torch.accelerator.synchronize()
-                                logger.info(
-                                    "SM70 profile trace: GDN FlashQLA decode "
-                                    "warmup exit layer=%s elapsed_ms=%.3f",
-                                    self.prefix,
-                                    (time.perf_counter() - flashqla_decode_warmup_start)
-                                    * 1000.0,
-                                )
-                            logger.debug(
-                                "GDN FlashQLA decode warmup completed for layer %s",
-                                self.prefix,
-                            )
-                del (
-                    dummy_decode_a,
-                    dummy_decode_b,
-                    dummy_decode_state,
-                    dummy_decode_out,
-                    dummy_decode_indices,
-                    dummy_decode_query_start_loc,
-                )
-            del dummy_decode_views
-
-        torch.accelerator.empty_cache()
+                int(getattr(self, "num_spec", 1)),
+                int(getattr(self, "_sm70_spec_cache_stride", 1)),
+                _sm70_spec_cache_stride_from_config(),
+            ),
+            conv_dim_first=is_conv_state_dim_first(),
+            prefix=self.prefix,
+            trace=_sm70_profile_trace_enabled(),
+            decode_warmup=bool(self.gdn_policy.decode_warmup),
+        ).run(self._prefill_warmup_keys)
 
     def _forward_core_rocm(
         self,
@@ -4905,7 +4174,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         prefill_l2norm_in_kernel = False
-        use_original_flashqla_prefill = self.gdn_policy.original_prefill
         prefill_gate_is_exp = False
         if attn_metadata.num_prefills > 0:
             profile_start = self._gdn_profiler.start()
@@ -4919,42 +4187,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 a_non_spec = a
                 b_non_spec = b
 
-            if self.enable_sm70_legacy_prefill_prep:
-                query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
-                    mixed_qkv_non_spec
-                )
-                g_non_spec, beta_non_spec = fused_gdn_gating(
-                    self.A_log, a_non_spec, b_non_spec, self.dt_bias
-                )
-                prefill_l2norm_in_kernel = True
-            else:
-                prefill_gate_is_exp = (
-                    self.gdn_prefill_backend == "flashqla_sm70"
-                    and not use_original_flashqla_prefill
-                )
-                (
-                    query_non_spec,
-                    key_non_spec,
-                    value_non_spec,
-                    g_non_spec,
-                    beta_non_spec,
-                ) = fused_post_conv_prep(
-                    conv_output=mixed_qkv_non_spec,
-                    a=a_non_spec,
-                    b=b_non_spec,
-                    A_log=self.A_log,
-                    dt_bias=self.dt_bias,
-                    num_k_heads=self.num_k_heads // self.tp_size,
-                    head_k_dim=self.head_k_dim,
-                    head_v_dim=self.head_v_dim,
-                    apply_l2norm=True,
-                    output_g_exp=prefill_gate_is_exp,
-                )
-                query_non_spec = query_non_spec.unsqueeze(0)
-                key_non_spec = key_non_spec.unsqueeze(0)
-                value_non_spec = value_non_spec.unsqueeze(0)
-                g_non_spec = g_non_spec.unsqueeze(0)
-                beta_non_spec = beta_non_spec.unsqueeze(0)
+            prefill_l2norm_in_kernel = self.gdn_preparation.legacy
+            prefill_gate_is_exp = self.gdn_preparation.gate_is_exp
+            (
+                query_non_spec,
+                key_non_spec,
+                value_non_spec,
+                g_non_spec,
+                beta_non_spec,
+            ) = self.gdn_preparation.prefill(
+                mixed_qkv_non_spec,
+                a_non_spec,
+                b_non_spec,
+                self.A_log,
+                self.dt_bias,
+            )
             self._gdn_profiler.end(
                 layer_name,
                 "post_conv_prep",
@@ -5038,7 +4285,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_spec_decodes=attn_metadata.num_spec_decodes,
                     precomputed_gating=precomputed_gating,
                 )
-                last_recurrent_state = ssm_state
+                _last_recurrent_state = ssm_state
                 _log_runtime_route_once(
                     "SM70 DFlash2 packed GDN target-verification route hit."
                     if spec_rows_are_batch
@@ -5076,7 +4323,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ],
                     num_spec_decodes=attn_metadata.num_spec_decodes,
                 )
-                last_recurrent_state = ssm_state
+                _last_recurrent_state = ssm_state
             elif use_sm70_mixed_qkv_verify:
                 assert mixed_qkv_spec is not None
                 assert spec_query_start_loc is not None
@@ -5110,9 +4357,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     else None
                 )
                 if verified is not None:
-                    core_attn_out_spec, last_recurrent_state = verified
+                    core_attn_out_spec, _last_recurrent_state = verified
                 else:
-                    core_attn_out_spec, last_recurrent_state = (
+                    core_attn_out_spec, _last_recurrent_state = (
                         fused_sigmoid_gating_delta_rule_update_mixed_qkv(
                             A_log=self.A_log,
                             a=a_spec,
@@ -5150,7 +4397,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # kernel computes the sigmoid gating itself, so g/beta never
                 # materialize and the surrounding elementwise work disappears.
                 # Same routine the DFlash2 branch above already uses.
-                core_attn_out_spec, last_recurrent_state = (
+                core_attn_out_spec, _last_recurrent_state = (
                     fused_sigmoid_gating_delta_rule_update(
                         A_log=self.A_log,
                         a=a_spec,
@@ -5172,139 +4419,40 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     )
                 )
         else:
-            core_attn_out_spec, last_recurrent_state = None, None
+            core_attn_out_spec, _last_recurrent_state = None, None
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            assert non_spec_state_indices_tensor is not None
-            assert has_initial_state is not None
-            use_indexed_original_prefill = (
-                self.gdn_prefill_backend == "flashqla_sm70"
-                and use_original_flashqla_prefill
-                and self.gdn_policy.indexed_prefill
-                and non_spec_state_indices_tensor.ndim == 1
-            )
-            profile_start = self._gdn_profiler.start()
-            if use_indexed_original_prefill:
-                initial_state = ssm_state
-            else:
-                initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()  # type: ignore[index]
-                initial_state[~has_initial_state, ...] = 0  # type: ignore[operator]
-            self._gdn_profiler.end(
-                layer_name,
-                "state_gather",
-                profile_start,
-                tokens=num_non_spec_tokens,
-                details=(
-                    f"state_shape={tuple(initial_state.shape)} "
-                    f"indices_contig={non_spec_state_indices_tensor.is_contiguous()} "
-                    f"indexed={use_indexed_original_prefill}"
-                ),
-            )
-            if use_indexed_original_prefill:
-                _sm70_gdn_graph_buffer_copy_state_slice(
-                    "prefill_initial_state",
-                    layer_name,
-                    ssm_state,
-                    non_spec_state_indices_tensor,
-                    int(has_initial_state.shape[0]),
-                )
-            else:
-                _sm70_gdn_graph_buffer_copy(
-                    "prefill_initial_state",
-                    layer_name,
-                    initial_state,
-                    "state",
-                )
-            prefill_core_attn_out = None
-            if (
-                self.gdn_policy.direct_prefill_output
+            prefill_core_attn_out = (
+                core_attn_out
+                if self.gdn_policy.direct_prefill_output
                 and spec_sequence_masks is None
                 and core_attn_out.shape[0] >= num_non_spec_tokens
-            ):
-                prefill_core_attn_out = core_attn_out
-
-            profile_start = self._gdn_profiler.start()
-            chunk_kwargs = {
-                "q": query_non_spec,
-                "k": key_non_spec,
-                "v": value_non_spec,
-                "g": g_non_spec,
-                "beta": beta_non_spec,
-                "initial_state": initial_state,
-                "output_final_state": not use_indexed_original_prefill,
-                "cu_seqlens": non_spec_query_start_loc,
-                "chunk_indices": attn_metadata.chunk_indices,
-                "chunk_offsets": attn_metadata.chunk_offsets,
-                "use_qk_l2norm_in_kernel": prefill_l2norm_in_kernel,
-                "gate_is_exp": prefill_gate_is_exp,
-                "core_attn_out": prefill_core_attn_out,
-            }
-            if self.gdn_prefill_backend == "flashqla_sm70":
-                chunk_kwargs.update(
-                    {
-                        "state_indices": (
-                            non_spec_state_indices_tensor
-                            if use_indexed_original_prefill
-                            else None
-                        ),
-                        "has_initial_state": (
-                            has_initial_state if use_indexed_original_prefill else None
-                        ),
-                        "inplace_final_state": use_indexed_original_prefill,
-                    }
-                )
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(**chunk_kwargs)
-            self._gdn_profiler.end(
-                layer_name,
-                "core_call",
-                profile_start,
-                tokens=num_non_spec_tokens,
-                details=f"backend={self.gdn_prefill_backend}",
+                else None
             )
-            _sm70_gdn_graph_buffer_copy(
-                "prefill_core_out",
-                layer_name,
-                core_attn_out_non_spec,
-                "core",
-            )
-            if last_recurrent_state is not None:
-                _sm70_gdn_graph_buffer_copy(
-                    "prefill_last_recurrent_state",
-                    layer_name,
-                    last_recurrent_state,
-                    "state",
+            core_attn_out_non_spec, _last_recurrent_state = (
+                self.chunk_gated_delta_rule.execute_prefill(
+                    query_non_spec,
+                    key_non_spec,
+                    value_non_spec,
+                    g_non_spec,
+                    beta_non_spec,
+                    ssm_state=ssm_state,
+                    state_indices=non_spec_state_indices_tensor,
+                    has_initial_state=has_initial_state,
+                    cu_seqlens=non_spec_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=prefill_l2norm_in_kernel,
+                    gate_is_exp=prefill_gate_is_exp,
+                    core_attn_out=prefill_core_attn_out,
+                    layer_name=layer_name,
+                    num_tokens=num_non_spec_tokens,
                 )
-            # Init cache
-            profile_start = self._gdn_profiler.start()
-            if not use_indexed_original_prefill:
-                assert last_recurrent_state is not None
-                ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                    ssm_state.dtype
-                )
-            self._gdn_profiler.end(
-                layer_name,
-                "state_writeback",
-                profile_start,
-                tokens=num_non_spec_tokens,
-                details=(
-                    f"state_dtype={ssm_state.dtype} "
-                    f"indexed={use_indexed_original_prefill}"
-                ),
-            )
-            _sm70_gdn_graph_buffer_copy_state_slice(
-                "prefill_post_ssm_state",
-                layer_name,
-                ssm_state,
-                non_spec_state_indices_tensor,
-                int(has_initial_state.shape[0]),
             )
         elif attn_metadata.num_decodes > 0:
             assert non_spec_state_indices_tensor is not None
-            core_attn_out_non_spec, last_recurrent_state = (
+            core_attn_out_non_spec, _last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
                     a=a,
@@ -5340,7 +4488,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_non_spec_tokens,
             )
         else:
-            core_attn_out_non_spec, last_recurrent_state = None, None
+            core_attn_out_non_spec, _last_recurrent_state = None, None
 
         # 3. Merge core attention output
         if spec_sequence_masks is not None and core_attn_out_non_spec is not None:
@@ -7031,82 +6179,3 @@ direct_register_custom_op(
     ],
     fake_impl=qwen_gdn_attention_core_003_spec_fake,
 )
-
-
-@triton.jit
-def fused_gdn_gating_kernel(
-    g,
-    beta_output,
-    A_log,
-    a,
-    b,
-    dt_bias,
-    seq_len,
-    NUM_HEADS: tl.constexpr,
-    beta: tl.constexpr,
-    threshold: tl.constexpr,
-    BLK_HEADS: tl.constexpr,
-):
-    i_b, i_s, i_d = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    head_off = i_d * BLK_HEADS + tl.arange(0, BLK_HEADS)
-    off = i_b * seq_len * NUM_HEADS + i_s * NUM_HEADS + head_off
-    mask = head_off < NUM_HEADS
-    blk_A_log = tl.load(A_log + head_off, mask=mask)
-    blk_a = tl.load(a + off, mask=mask)
-    blk_b = tl.load(b + off, mask=mask)
-    blk_bias = tl.load(dt_bias + head_off, mask=mask)
-    # If the model is loaded in fp16, without the .float() here, A might be -inf
-    x = blk_a.to(tl.float32) + blk_bias.to(tl.float32)
-    softplus_x = tl.where(
-        beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x
-    )
-    blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
-    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
-    # compute beta_output = sigmoid(b)
-    blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(
-        beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
-    )
-
-
-def fused_gdn_gating(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-    beta: float = 1.0,
-    threshold: float = 20.0,
-    *,
-    beta_dtype: torch.dtype | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Fused computation of g and beta for Gated Delta Net.
-    g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-    beta_output = b.sigmoid(), materialized in beta_dtype when provided.
-
-    Speculative recurrent updates request FP32 beta to match the fused packed
-    decode transition. Other callers retain the historical b.dtype output.
-    TODO maybe use torch.compile to replace this triton kernel
-    """
-    batch, num_heads = a.shape
-    seq_len = 1
-    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
-    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
-    if beta_dtype is None:
-        beta_dtype = b.dtype
-    beta_output = torch.empty(1, batch, num_heads, dtype=beta_dtype, device=b.device)
-    fused_gdn_gating_kernel[grid](
-        g,
-        beta_output,
-        A_log,
-        a,
-        b,
-        dt_bias,
-        seq_len,
-        num_heads,
-        beta,
-        threshold,
-        8,
-        num_warps=1,
-    )
-    return g, beta_output

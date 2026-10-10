@@ -1,10 +1,21 @@
 # Retained SM70 MTP optimizations
 
-This change is based on main `16628e2f0a70761ba6525bf46e5e844c04b3e66f`.
-The full serving comparison was frozen on main
-`4e5357b59294edd31c46e66ae8219503a843b2bd`; the later rebase replaces an
-equivalent report serializer with upstream PR1160 and updates its tests.
-GPU computation and native source are unchanged by that rebase.
+This PR is synchronized with main
+`c39f53abae51df6bf8ef122e34975a9f3596a93c`.
+The full serving comparison remains frozen on main
+`4e5357b59294edd31c46e66ae8219503a843b2bd`. Its measured E commit is
+`d686ca549b6087ad36211d4a2cb771c840399925`. The subsequent report-only rebase
+onto `16628e2f0a70761ba6525bf46e5e844c04b3e66f` replaced the equivalent
+serializer with upstream PR1160; that deployed runtime is
+`69801806572ea094b91d5f18864beb22c6c8b6fb`.
+
+This later conflict synchronization includes upstream PR1162 startup-policy
+checks, PR1163 GDN lifecycle sharing and PR1164 native GEMM ownership changes.
+It has CPU/static checks only: no native rebuild, GPU run, model-performance
+remeasurement or production deployment was performed. In particular, the
+historical results do not validate PR1164's changed native implementation.
+The measured numbers and their original source revisions remain unchanged.
+
 This change retains the parts of PR903 that are absent from main. Ordinary
 upstream collective, graph, GDN projection, attention and native resource
 owners remain authoritative. Core native sources, CMake and package build

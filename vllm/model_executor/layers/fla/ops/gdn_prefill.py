@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fla.ops import (
     chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
 )
+from vllm.model_executor.layers.fla.ops import gdn_diagnostics as diagnostics
 from vllm.model_executor.layers.fla.ops.gdn_profiling import GdnPrefillProfiler
 from vllm.model_executor.layers.fla.ops.gdn_selector import GdnExecutionPlan
 from vllm.model_executor.layers.fla.ops.gdn_stages import normalize_qk
@@ -87,6 +88,148 @@ class GdnPrefill:
             "cutedsl": self.forward_cutedsl,
             "triton": self.forward_native,
         }[self.gdn_prefill_backend]
+        self._call_prefill = self._forward_method
+
+    def execute_prefill(
+        self,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        *,
+        ssm_state,
+        state_indices,
+        has_initial_state,
+        cu_seqlens,
+        chunk_indices,
+        chunk_offsets,
+        use_qk_l2norm_in_kernel,
+        gate_is_exp,
+        core_attn_out,
+        layer_name,
+        num_tokens,
+    ):
+        """Gather or index state, execute the selected provider, then commit.
+
+        The caller owns request ordering and output-buffer admission. Indexed
+        original FlashQLA writes the pool in place; other providers return a
+        final state which is cast and scattered in the original order.
+        """
+        assert state_indices is not None
+        assert has_initial_state is not None
+        use_indexed_original_prefill = (
+            self.gdn_prefill_backend == "flashqla_sm70"
+            and self.execution_plan.original_prefill
+            and self.execution_plan.indexed_prefill
+            and state_indices.ndim == 1
+        )
+        profile_start = self.profiler.start()
+        if use_indexed_original_prefill:
+            initial_state = ssm_state
+        else:
+            initial_state = ssm_state[state_indices].contiguous()  # type: ignore[index]
+            initial_state[~has_initial_state, ...] = 0  # type: ignore[operator]
+        self.profiler.end(
+            layer_name,
+            "state_gather",
+            profile_start,
+            tokens=num_tokens,
+            details=(
+                f"state_shape={tuple(initial_state.shape)} "
+                f"indices_contig={state_indices.is_contiguous()} "
+                f"indexed={use_indexed_original_prefill}"
+            ),
+        )
+        if use_indexed_original_prefill:
+            diagnostics.capture_state_slice(
+                "prefill_initial_state",
+                layer_name,
+                ssm_state,
+                state_indices,
+                int(has_initial_state.shape[0]),
+            )
+        else:
+            diagnostics.capture_tensor(
+                "prefill_initial_state",
+                layer_name,
+                initial_state,
+                "state",
+            )
+        profile_start = self.profiler.start()
+        chunk_kwargs = {
+            "q": q,
+            "k": k,
+            "v": v,
+            "g": g,
+            "beta": beta,
+            "initial_state": initial_state,
+            "output_final_state": not use_indexed_original_prefill,
+            "cu_seqlens": cu_seqlens,
+            "chunk_indices": chunk_indices,
+            "chunk_offsets": chunk_offsets,
+            "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+            "gate_is_exp": gate_is_exp,
+            "core_attn_out": core_attn_out,
+        }
+        if self.gdn_prefill_backend == "flashqla_sm70":
+            chunk_kwargs.update(
+                {
+                    "state_indices": (
+                        state_indices if use_indexed_original_prefill else None
+                    ),
+                    "has_initial_state": (
+                        has_initial_state if use_indexed_original_prefill else None
+                    ),
+                    "inplace_final_state": use_indexed_original_prefill,
+                }
+            )
+        (
+            core_attn_out_non_spec,
+            last_recurrent_state,
+        ) = self._call_prefill(**chunk_kwargs)
+        self.profiler.end(
+            layer_name,
+            "core_call",
+            profile_start,
+            tokens=num_tokens,
+            details=f"backend={self.gdn_prefill_backend}",
+        )
+        diagnostics.capture_tensor(
+            "prefill_core_out",
+            layer_name,
+            core_attn_out_non_spec,
+            "core",
+        )
+        if last_recurrent_state is not None:
+            diagnostics.capture_tensor(
+                "prefill_last_recurrent_state",
+                layer_name,
+                last_recurrent_state,
+                "state",
+            )
+        # Init cache
+        profile_start = self.profiler.start()
+        if not use_indexed_original_prefill:
+            assert last_recurrent_state is not None
+            ssm_state[state_indices] = last_recurrent_state.to(ssm_state.dtype)
+        self.profiler.end(
+            layer_name,
+            "state_writeback",
+            profile_start,
+            tokens=num_tokens,
+            details=(
+                f"state_dtype={ssm_state.dtype} indexed={use_indexed_original_prefill}"
+            ),
+        )
+        diagnostics.capture_state_slice(
+            "prefill_post_ssm_state",
+            layer_name,
+            ssm_state,
+            state_indices,
+            int(has_initial_state.shape[0]),
+        )
+        return core_attn_out_non_spec, last_recurrent_state
 
     def forward_cuda(
         self,

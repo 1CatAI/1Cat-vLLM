@@ -235,7 +235,9 @@ class EngineCore:
         maybe_attach_gc_debug_callback()
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
-        enable_envs_cache()
+        from vllm.config.policy_defaults import engine_policy_aliases
+
+        enable_envs_cache(exclude=engine_policy_aliases(vllm_config))
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:

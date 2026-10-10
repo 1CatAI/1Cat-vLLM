@@ -460,9 +460,6 @@ COMPATIBILITY_CONSUMERS = {
 }
 
 CONFIG_INITIALIZERS = {
-    "VllmConfig.__post_init__",
-    "VllmConfig.__post_init__.enable_quant_fp8_custom_op_for_blocked_weights",
-    "VllmConfig._set_compile_ranges",
     "RuntimeTraceConfig.__post_init__",
     "FlashV100Diagnostics.resolve",
     "LayerExecutionPolicy.resolve",

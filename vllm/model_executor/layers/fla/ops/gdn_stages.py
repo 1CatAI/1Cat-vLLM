@@ -133,3 +133,11 @@ def mixed_qkv_recurrence(
 def normalize_qk(q, k):
     """Shared external normalization; callers preserve gate-conversion order."""
     return l2norm_fwd(q), l2norm_fwd(k)
+
+
+def mixed_qkv_decode_layout(mixed_qkv):
+    if mixed_qkv.dim() != 2 or mixed_qkv.stride(1) != 1:
+        return "unsupported"
+    if mixed_qkv.stride(0) < mixed_qkv.shape[1]:
+        return "unsupported"
+    return "compact" if mixed_qkv.stride(0) == mixed_qkv.shape[1] else "row_strided"

@@ -1276,7 +1276,7 @@ class VllmConfig:
         adaptive_dflash_lookup = bool(
             self.speculative_config is not None
             and uses_adaptive_dflash_lookup(self.speculative_config)
-            and envs.VLLM_DFLASH2_LOOKUP_ADAPTIVE
+            and self.speculative_config.sm70_dflash2.lookup.resolve_adaptive()
         )
 
         if self.scheduler_config.async_scheduling:
@@ -1450,7 +1450,7 @@ class VllmConfig:
                 and self.model_config.quantization == "fp8"
                 and current_platform.is_cuda()
                 and _any_participating_device_is_capability(self, (7, 0))
-                and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
+                and self.kernel_config.sm70_fp8.enabled
             )
 
         # Enable quant_fp8 CUDA ops (TODO disable in follow up)
@@ -2201,7 +2201,7 @@ class VllmConfig:
         compile_range_end = self.scheduler_config.max_num_batched_tokens
         if (
             compile_range_end is not None
-            and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            and compilation_config.runtime.compile_graph
             and compilation_config.mode == CompilationMode.VLLM_COMPILE
             and compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
         ):

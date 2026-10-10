@@ -10,7 +10,7 @@ from pydantic import Field
 from vllm import envs
 from vllm.config.diagnostic_dump import TensorDumpConfig
 from vllm.config.execution_policy import ExecutionPolicy, read_execution_legacy
-from vllm.config.utils import config
+from vllm.config.utils import config, resolve_legacy_fields
 from vllm.envs_metadata import EnvVar
 from vllm.logger import init_logger
 
@@ -152,6 +152,21 @@ class DFlashLookupPolicy(ExecutionPolicy):
         "sticky": "VLLM_DFLASH2_LOOKUP_STICKY",
         "cheap_context": "VLLM_DFLASH2_LOOKUP_CHEAP_CONTEXT",
     }
+
+    def resolve_adaptive(self) -> bool:
+        """Bind the scheduling constraint before resolving lookup tuning.
+
+        Keep unrelated tuning errors at the later speculator checkpoint. The
+        regular resolve() reuses this value and its original provenance.
+        """
+        if "adaptive" not in self.sources:
+            resolve_legacy_fields(
+                self,
+                {"adaptive": self.aliases["adaptive"]},
+                reader=type(self).legacy_reader,
+            )
+        assert self.adaptive is not None
+        return self.adaptive
 
 
 @config
