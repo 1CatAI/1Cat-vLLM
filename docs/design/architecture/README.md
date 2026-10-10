@@ -6,6 +6,9 @@ Phase E starts from main `18784e027` (D1–D6 merged). Merged scope is not a cla
 that every model, topology or experiment is qualified. PLE and DDTree follow-up
 remain deferred.
 
+For implementation steps and validation commands, use the
+[1Cat development guide](../../contributing/1cat-development.md).
+
 ## Responsibilities and dependency direction
 
 ```text
@@ -98,7 +101,8 @@ After changing those declarations, run:
 
 The default invocation checks without writing. `--json` emits the same facts.
 Checks cover this overview, the three component READMEs, the INT8 proposal, E
-record and generated reference. Historical evidence is linked, not regenerated
+record, generated reference, development guide, contributing entry points and
+PR template. Historical evidence is linked, not regenerated
 or subjected to a repository-wide link cleanup.
 
 ## Inspection and evidence
@@ -128,7 +132,7 @@ Neither permits widening exclusions to conceal new coupling.
 | B MoE/linear paths and bindings | Merged; [integration and operator evidence](sm70_phase_b.md) |
 | C model/platform, execution and state | Seven deliveries merged; [protocol/resource accounting](sm70_phase_c.md#phase-c-structural-accounting-and-retained-boundaries) |
 | D configuration lifetime and deprecation | D1–D6 merged; [closure](sm70_phase_d.md), with PLE follow-up deferred and validation limitations retained |
-| E maintained documentation and checks | In progress; [delivery record](sm70_phase_e.md) |
+| E maintained documentation and checks | E1–E3 delivered; [validation and retained boundaries](sm70_phase_e.md) |
 | DDTree / PLE follow-up | Deferred; no repair or new qualification in E |
 | INT8-G64 | [Design handoff](int8_g64_codec.md) only; not implemented or qualified |
 

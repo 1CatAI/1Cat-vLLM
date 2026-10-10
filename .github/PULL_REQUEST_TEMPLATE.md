@@ -5,6 +5,16 @@ PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTT
 
 ## Test Plan
 
+## Path coverage
+
+For documentation-only changes, write **N/A — documentation/offline tooling only**
+and list the applicable CPU/documentation checks. GPU tests are not required.
+See the [1Cat development guide](https://github.com/1CatAI/1Cat-vLLM/blob/main/docs/contributing/1cat-development.md).
+
+| Path / provider | Format | Key conditions (shape, TP/EP, graph, capability) | Expected selection / fallback | Evidence (source / static / executed / measured) | Unverified scope |
+| --- | --- | --- | --- | --- | --- |
+| | | | | | |
+
 ## Acceleration and benchmark contract (required for performance changes)
 
 - Default enabled or opt-in:

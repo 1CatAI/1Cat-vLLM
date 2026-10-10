@@ -1,5 +1,10 @@
 # Contributing to vLLM
 
+For this fork's runtime extensions, use the
+[1Cat development guide](1cat-development.md) for component owners, extension
+recipes and the smallest relevant checks. The upstream workflow below remains
+useful for general vLLM contributions.
+
 Thank you for your interest in contributing to vLLM! Our community is open to everyone and welcomes all kinds of contributions, no matter how small or large. There are several ways you can contribute to the project:
 
 - Identify and report any issues or bugs.

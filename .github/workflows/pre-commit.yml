@@ -56,5 +56,9 @@ jobs:
     - run: echo "::add-matcher::.github/workflows/matchers/markdownlint.json"
     - run: echo "::add-matcher::.github/workflows/matchers/mypy.json"
     - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+      env:
+        # The path-filtered architecture-docs workflow owns these checks.
+        # Running them here with --all-files would ignore their change scope.
+        SKIP: check-architecture-reference,test-architecture-reference
       with:
         extra_args: --all-files --hook-stage manual
