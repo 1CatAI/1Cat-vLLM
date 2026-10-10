@@ -210,3 +210,61 @@ def test_native_lane_waits_for_consumers_and_reports_bad_rows(monkeypatch):
         assert all(int(f[0]) == 0 for f in lane.flags)
     finally:
         lane.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_gpu_published_requests_are_served_natively(monkeypatch):
+    from vllm.v1.ple_offload.fast_lane import FastLaneRequest
+
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    data = table()
+    reader = PackedGGUFRowReader(data, 20, 160)
+    module = ngram_module()
+    slot = FastLaneRequest(device, MAX_REQS, MAX_TOKENS)
+    results = [torch.zeros((MAX_TOKENS, 1440), dtype=torch.uint8) for _ in range(2)]
+    flags = [torch.zeros(16, dtype=torch.int32) for _ in range(2)]
+    handle = torch.ops._C.ple_fast_lane_start(
+        slot.host,
+        MAX_REQS,
+        MAX_TOKENS,
+        data.ctypes.data,
+        90,
+        data.shape[0],
+        MULTIPLIERS,
+        SIZES,
+        OFFSETS,
+        EOS,
+        [r.data_ptr() for r in results],
+        [f.data_ptr() for f in flags],
+        1 << 20,
+        1000,
+        True,
+    )
+    input_ids = torch.zeros(MAX_TOKENS, dtype=torch.int32, device=device)
+    starts = torch.zeros(MAX_REQS + 1, dtype=torch.int32, device=device)
+    context = torch.zeros((MAX_REQS, 2), dtype=torch.int32, device=device)
+    try:
+        rng = np.random.default_rng(11)
+        for step in range(6):
+            reqs = 1 + step % MAX_REQS
+            lengths = rng.integers(1, 6, reqs)
+            qsl = [0, *np.cumsum(lengths).tolist()]
+            tokens = rng.integers(-1, 200000, qsl[-1]).tolist()
+            ctx = rng.integers(0, 200000, (reqs, 2)).tolist()
+            input_ids[: len(tokens)] = torch.tensor(tokens, dtype=torch.int32)
+            starts[: reqs + 1] = torch.tensor(qsl, dtype=torch.int32)
+            context[:reqs] = torch.tensor(ctx, dtype=torch.int32)
+            slot.publish(input_ids, starts, context, reqs, len(tokens))
+            deadline = time.monotonic() + 5
+            while not all(int(f[0]) == 1 for f in flags):
+                assert time.monotonic() < deadline
+                time.sleep(1e-4)
+            want = expected(module, reader, tokens, qsl, ctx, True)
+            for r in results:
+                assert torch.equal(r[: len(tokens)], want)
+            for f in flags:
+                f[0] = 0
+    finally:
+        torch.ops._C.ple_fast_lane_stop(handle)
+        slot.close()
