@@ -39,7 +39,8 @@ def ring_shape(max_reqs: int, num_spec: int) -> tuple[int]:
     return (_HEADER + max_reqs * 3 + max_reqs * num_spec,)
 
 
-@triton.jit
+# Per-round scalars vary every call; never specialize (or recompile) on them.
+@triton.jit(do_not_specialize=["num_reqs", "round_id", "eos"])
 def _publish_round_kernel(
     idx_mapping,
     num_computed,
@@ -71,7 +72,7 @@ def _publish_round_kernel(
     tl.atomic_xchg(header + 1, 1, sem="release", scope="sys")
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _publish_drafts_kernel(
     draft_tokens,
     draft_stride,
