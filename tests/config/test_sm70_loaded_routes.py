@@ -66,6 +66,7 @@ def test_policies_are_discovered_from_existing_configuration():
         "sm70_nvfp4",
         "sm70_awq",
         "sm70_fp8",
+        "sm70_marlin",
         "sm70_gguf",
         "sm70_ring",
         "sm70_sparse",
@@ -74,6 +75,17 @@ def test_policies_are_discovered_from_existing_configuration():
         "sm70_runtime",
     }
     assert all(row["status"] == "runtime_guarded" for row in policies.values())
+
+
+@pytest.mark.parametrize("family", ["awq", "fp8"])
+def test_policy_report_serializes_resolved_moe_diagnostic_filters(family):
+    """Loading resolves MoE dump policies whose parsed filters are frozensets."""
+    config = KernelConfig()
+    getattr(config.sm70_moe, family).resolve(family)
+    policies = linear_policy_report(config)
+    resolved = policies["sm70_moe"]["configuration"][family]
+    compare = resolved["diagnostics"]["compare_policy"]
+    assert compare is not None and compare["filters"]
 
 
 def test_loaded_reports_collected_once_and_cached_for_http():
