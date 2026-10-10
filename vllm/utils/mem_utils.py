@@ -135,6 +135,7 @@ class MemorySnapshot:
     total_memory: int = 0
     cuda_memory: int = 0
     torch_memory: int = 0
+    torch_allocated_memory: int = 0
     non_torch_memory: int = 0
     timestamp: float = 0.0
 
@@ -180,6 +181,7 @@ class MemorySnapshot:
         # PyTorch gets from cuda (by calling cudaMalloc, etc.)
         # this is used to measure the non-torch memory usage
         self.torch_memory = torch.accelerator.memory_reserved(device)
+        self.torch_allocated_memory = torch.accelerator.memory_allocated(device)
 
         self.non_torch_memory = self.cuda_memory - self.torch_memory
         self.timestamp = time.time()
@@ -197,6 +199,9 @@ class MemorySnapshot:
             total_memory=self.total_memory - other.total_memory,
             cuda_memory=self.cuda_memory - other.cuda_memory,
             torch_memory=self.torch_memory - other.torch_memory,
+            torch_allocated_memory=(
+                self.torch_allocated_memory - other.torch_allocated_memory
+            ),
             non_torch_memory=self.non_torch_memory - other.non_torch_memory,
             timestamp=self.timestamp - other.timestamp,
             device=self.device_,
@@ -210,6 +215,7 @@ class MemorySnapshot:
             f"total_memory={format_gib(self.total_memory)}GiB, "
             f"{current_platform.device_name}_memory={format_gib(self.cuda_memory)}GiB, "
             f"torch_memory={format_gib(self.torch_memory)}GiB, "
+            f"torch_allocated_memory={format_gib(self.torch_allocated_memory)}GiB, "
             f"non_torch_memory={format_gib(self.non_torch_memory)}GiB, "
             f"timestamp={self.timestamp}, "
             f"auto_measure={self.auto_measure}"

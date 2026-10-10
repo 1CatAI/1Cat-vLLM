@@ -201,3 +201,22 @@ registered storage was 14,134,449,834 bytes per rank; the old reduction needed
 an additional 50 MiB allocation. This is capacity evidence, not serving or
 acceptance evidence. Startup-only CPU allocator reclamation releases unused
 checkpoint-conversion pages before allocating pinned histories.
+
+### Allocator reservation accounting
+
+The fifth startup completed target and exact MTP loading at 14.36 GiB per
+rank and passed M512 profiling. Its admission budget then reported only
+0.02 GiB for KV versus 0.27 GiB required. The warmup residual calculation
+used reserved allocator bytes rather than active tensor bytes, charging idle
+space in partially occupied segments as persistent warmup tensors. Snapshots
+now record both values; the residual uses allocated bytes. Reserved memory
+continues to determine non-Torch usage, preserving the CUDA accounting identity.
+Regression fixtures retain a real 64 MiB warmup tensor and a 256 MiB simulated
+idle pool independently, and cover graph reserve on/off. Real startup logs
+report weights, activation peak, live warmup tensors, idle reservation,
+non-Torch usage and graph reserve separately. Physical fit still requires
+cache allocation, actual graph capture and prefill peak checks.
+
+The source runtime also requires TileLang 0.1.10 from the CUDA requirements.
+A missing package caused the FlashQLA prefill warmup import to fail; the source
+launcher now checks its presence before loading weights.

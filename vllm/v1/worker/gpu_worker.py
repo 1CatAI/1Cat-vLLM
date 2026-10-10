@@ -629,8 +629,8 @@ class Worker(WorkerBase):
         )
         warmup_torch_residual = max(
             0,
-            profile_result.before_profile.torch_memory
-            - self.init_snapshot.torch_memory
+            profile_result.before_profile.torch_allocated_memory
+            - self.init_snapshot.torch_allocated_memory
             - profile_result.weights_memory,
         )
         profile_result.non_kv_cache_memory = (
@@ -687,6 +687,22 @@ class Worker(WorkerBase):
         logger.info_once(
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),
+        )
+        logger.info(
+            "GPU startup budget bytes: requested=%d weights=%d activation_peak=%d "
+            "warmup_live=%d idle_reserved=%d non_torch=%d graph=%d kv=%d",
+            self.requested_memory,
+            profile_result.weights_memory,
+            profile_result.torch_peak_increase,
+            warmup_torch_residual,
+            max(
+                0,
+                profile_result.before_profile.torch_memory
+                - profile_result.before_profile.torch_allocated_memory,
+            ),
+            profile_result.non_torch_increase,
+            cudagraph_memory_estimate_applied,
+            self.available_kv_cache_memory_bytes,
         )
 
         if cudagraph_memory_estimate > 0:

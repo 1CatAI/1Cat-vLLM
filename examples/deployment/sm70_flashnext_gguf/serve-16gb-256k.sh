@@ -24,8 +24,11 @@ export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 # Host history pools are about 15.3 GiB for this geometry. Reserve another 6 GiB
 # for workers, staging and the bounded CPU row cache before any GPU is touched.
 "$VLLM_PYTHON" - <<'PY'
+import importlib.util
 import shutil
 from pathlib import Path
+if importlib.util.find_spec('tilelang') is None:
+    raise SystemExit('TileLang from requirements/cuda.txt is required for FlashQLA')
 if not shutil.which('ninja'):
     raise SystemExit('Ninja is required in the source environment for FlashQLA')
 if not shutil.which('nvcc'):
