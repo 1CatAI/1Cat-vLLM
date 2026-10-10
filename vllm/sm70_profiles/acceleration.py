@@ -178,6 +178,9 @@ def loaded_gguf_layers(model) -> dict[str, Any]:
             "original_expert_projections": getattr(method, "native_admission", {}).get(
                 "projections"
             ),
+            "original_prefill_projections": getattr(method, "native_admission", {}).get(
+                "prefill_projections"
+            ),
             "small_m_dp4a": getattr(method, "native_admission", {}).get("small_m_dp4a"),
             "canonical_projections": [
                 projection.admission()

@@ -14,6 +14,7 @@ from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
     admit_moe_fallback,
     decoder_family,
+    original_moe_prefill_capability,
 )
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
@@ -27,6 +28,7 @@ from vllm.model_executor.layers.quantization.gguf_native import (
     pad_weight_tail,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
 
 if TYPE_CHECKING:
@@ -248,6 +250,8 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             "projections": {},
         }
         self.projection_capabilities = {}
+        self.prefill_capabilities = {}
+        self.native_admission["prefill_projections"] = {}
         for shard in ("w1", "w3", "w2"):
             if self.loaded_experts[shard] != set(range(self.num_experts)):
                 raise ValueError(f"Incomplete GGUF {shard} expert payloads")
@@ -261,6 +265,23 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             setattr(layer, "gguf_" + shard, prepared)
             capability = admit_moe_fallback(prepared, value, self.params_dtype)
             self.projection_capabilities[shard] = capability
+            block, size = quant_size(value)
+            k = (
+                prepared.shape[-1] // size * block
+                if prepared.dtype == torch.uint8
+                else prepared.shape[-1]
+            )
+            prefill = original_moe_prefill_capability(
+                value,
+                k,
+                prepared.shape[1],
+                self.num_experts,
+                self.params_dtype,
+                is_sm70=current_platform.is_device_capability(70),
+                enabled=self.native_enabled,
+            )
+            self.prefill_capabilities[shard] = prefill
+            self.native_admission["prefill_projections"][shard] = asdict(prefill)
             self.native_admission["projections"][shard] = {
                 **asdict(capability),
                 "shape": list(weight.shape),
@@ -331,6 +352,10 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
 
         def projection(shard):
             capability = self.projection_capabilities[shard]
+            prefill = getattr(self, "prefill_capabilities", {}).get(shard)
+            m = tokens * top_k if shard == "w2" else tokens
+            if prefill is not None and prefill.reason is None and prefill.supports_m(m):
+                capability = prefill
             return getattr(native, capability.operator)
 
         gate = projection("w1")(

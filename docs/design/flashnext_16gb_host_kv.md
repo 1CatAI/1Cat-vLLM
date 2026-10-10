@@ -17,9 +17,11 @@ independently of authoritative host attention history.
   FP32 dots and routing accumulation retain the existing FP16 epilogue boundary.
 - Uncovered batches retain the shipped native GGUF fallback without a
   persistent second bank of all experts. The original-block MoE route currently
-  uses chunked MMVQ; grouped dequantization/BLAS is an eager fallback that needs
-  separate prefill qualification. Dense canonical storage remains available to
-  preserve qualified small-M projection routes.
+  uses chunked MMVQ for unmeasured inputs. At the measured 512-token prefill
+  chunk, the capability registry selects the shipped MMQ operator for
+  IQ3_XXS/IQ2_S/IQ3_S/IQ4_XS gate/up and IQ4_NL/Q2_0 down. Down counts 5120
+  routed input rows. Partial chunks retain MMVQ. Dense canonical storage
+  remains available to preserve qualified small-M projection routes.
 - HC matrices are staged on CPU and only their TP4 packs move to the GPU. When
   HCX already prepared a pack, the storage owner reuses it. Larger batches
   recover local checkpoint rows from that same pack for the ordinary collective
@@ -74,12 +76,45 @@ packed-row official dequantization. These checks do not establish GPU speed or
 full-model correctness.
 
 GPU test cases cover IQ4_NL/IQ4_XS gate/up, raw down across all TP4 ranks, FP16 and Q8_1
-intermediates, M=5/M=20, and changed inputs during CUDA graph replay. Run them
-before admitting the constrained-memory route. Then record C1/C4, target outputs,
+intermediates, M=5/M=20, and changed inputs during CUDA graph replay. Independent
+fused-Q8 gates (30), raw-down gates (32), host-KV collision/rewrite/graph gates
+(20), and storage-accounting gates (13) passed on four NV2-connected V100-SXM2
+16 GiB devices with CUDA 12.8 and Torch 2.10.0+cu128. These operator checks do
+not establish full-model fit, acceptance, or performance. Record C1/C4, target outputs,
 accepted tokens per round, long prefill, repeated-prefix hits, and tool calls.
 Host-KV overhead must be reported separately from the device-KV acceptance
 benchmark. The historical 15.53 ms/round measurement is a reference on 32 GiB
 V100s and is not a measured result for this profile.
+
+### Original-bank prefill qualification
+
+Real TP4 slices from layers 0, 1, 17 and 47 were tested at M=512, top-k=10,
+512 experts, hidden size 2560 and local intermediate size 160. Layer 0 and
+layer 1 also covered all four TP ranks, including Q2_0 boundary padding.
+Each comparison reconstructs official FP32 weights and independently quantizes
+the activation to Q8_1; it retains FP16 projection/activation boundaries.
+Changed activation, expert IDs and routing probabilities produce exactly the
+same output in captured and eager execution. No persistent decoded bank is
+allocated. The table measures a complete single-rank expert layer, excluding
+TP reduction, other model operators and host-KV work.
+
+| Gate/up and down formats | Chunked MMVQ control | Prepared MMQ path |
+| --- | --- | --- |
+| IQ3_XXS / IQ4_NL | 81–84 ms | 19–21 ms |
+| IQ2_S / Q2_0 | 75–87 ms | 19–21 ms |
+| IQ3_S / IQ4_NL | 80–91 ms | 17–19 ms |
+| IQ4_XS / IQ4_NL | 87–89 ms | 17–20 ms |
+
+Across the ten layer/rank checks, maximum relative L2 error against the
+independent reference was 0.00507 and maximum absolute error was 9.06e-6.
+Allocated expert-layer storage and temporaries were 211–341 MiB; allocator
+reservations were at most 646 MiB. Decode and partial-prefill capabilities
+are unchanged; full-model checks are still required.
+
+Rejected candidates are retained as negative evidence: host-sorted grouped
+execution took 330–380 ms per layer. Bounded FP16 down chunks initially failed
+the K=160 eligibility predicate; zero-padding to K=192 made them eligible
+but took 169–183 ms versus 75–88 ms for original MMVQ. Neither is enabled.
 
 ## Startup
 
