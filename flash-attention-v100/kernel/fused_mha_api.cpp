@@ -56,6 +56,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grouped_sparse_page4_plan_fwd",
         &flash_attention_grouped_sparse_page4_plan,
         "Build grouped exact QSA page4 tables over paged KV cache (Volta)");
+  m.def("grouped_sparse_page4_split_fwd",
+        &flash_attention_grouped_sparse_page4_split,
+        "Grouped exact QSA page4 attention split by m-tile and request segment "
+        "(bit-identical to grouped_sparse_page4_fwd; Volta)");
+  m.def("grouped_sparse_page4_split_abi_version",
+        &flash_attention_grouped_sparse_page4_split_abi_version,
+        "Grouped sparse page4 split forward ABI version");
   m.def("decode_paged_wmma_fwd", &flash_attention_decode_paged_wmma,
         "FlashAttention single-query decode through paged-prefill WMMA order "
         "(Volta)");
