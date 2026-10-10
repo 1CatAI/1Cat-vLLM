@@ -21,13 +21,25 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _json_policy_default(value: Any) -> Any:
+    """Resolved policies carry set-valued filters (e.g. tensor-dump layer and
+    shape filters are ``frozenset``); report them as sorted lists."""
+    if isinstance(value, (set, frozenset)):
+        return sorted(value, key=repr)
+    if isinstance(value, (tuple, list)):
+        return list(value)
+    return repr(value)
+
+
 def linear_policy_report(kernel_config) -> dict[str, Any]:
     """Discover migrated policies from KernelConfig, without a parallel registry."""
     return {
         field.name: {
             "scope": "configured_policy",
             "status": "runtime_guarded",
-            "configuration": json.loads(json.dumps(asdict(value))),
+            "configuration": json.loads(
+                json.dumps(asdict(value), default=_json_policy_default)
+            ),
         }
         for field in fields(kernel_config)
         if field.name.startswith("sm70_")
@@ -629,7 +641,9 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         report["linear_kernel_policy"] = {
             "scope": "ct_nvfp4_linear",
             "status": "runtime_guarded",
-            "configuration": json.loads(json.dumps(asdict(policy))),
+            "configuration": json.loads(
+                json.dumps(asdict(policy), default=_json_policy_default)
+            ),
             "qpn2_reason": (
                 "configuration_not_resolved"
                 if not policy.resolved
