@@ -6,6 +6,8 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
 #include <cstdint>
 
@@ -14,6 +16,7 @@ namespace vllm::qsa {
 constexpr int kLexicographicTopKThreads = 1024;
 constexpr int kLexicographicTopKBins = 256;
 constexpr int kLexicographicTopKDecodeCandidateCapacity = 2304;
+constexpr int kLexicographicTopKCompactMinLength = 32768;
 
 __device__ __forceinline__ uint32_t ordered_float_bits(float value) {
   // IEEE -0.0 and +0.0 compare equal, so keep them in the same score bucket
@@ -403,6 +406,179 @@ __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_topk_kernel(
                                     stride, shared);
 }
 
+// A monotone coarse key narrows the candidate set without rounding the scores
+// used for the final selection. Signed zero retains the existing tie contract.
+__device__ __forceinline__ uint32_t compact_coarse_key(float value) {
+  if (value == 0.0f) value = 0.0f;
+  const uint16_t bits = __half_as_ushort(__float2half_rn(value));
+  return static_cast<uint16_t>((bits & 0x8000u) ? ~bits : (bits | 0x8000u)) >>
+         8;
+}
+
+struct CompactTopKShared {
+  uint32_t histogram[kLexicographicTopKBins];
+  int32_t candidates[2][kLexicographicTopKDecodeCandidateCapacity];
+  uint32_t remaining;
+  uint32_t selected_bin;
+  uint32_t count;
+  uint32_t next_count;
+  uint32_t prefix;
+  uint32_t invalid;
+};
+
+__device__ __forceinline__ void compact_choose_bin(CompactTopKShared& shared) {
+  if (threadIdx.x == 0) {
+    for (int bin = kLexicographicTopKBins - 1; bin >= 0; --bin) {
+      const uint32_t count = shared.histogram[bin];
+      if (shared.remaining > count) {
+        shared.remaining -= count;
+      } else {
+        shared.selected_bin = bin;
+        shared.next_count = count;
+        break;
+      }
+    }
+  }
+  __syncthreads();
+}
+
+template <int TopK>
+__device__ bool compact_score_pivot(const float* logits, uint32_t length,
+                                    CompactTopKShared& shared) {
+  const uint32_t tx = threadIdx.x;
+  // Probe 32 contiguous scores at 32 positions before scanning the full row.
+  // A concentrated tile only declines the optimization: selection still
+  // considers every live score, even if the probe is unrepresentative.
+  const uint32_t lane = tx & 31;
+  const float probe = logits[(tx >> 5) * (length >> 5) + lane];
+  const uint32_t probe_key = compact_coarse_key(probe);
+  const bool concentrated = __all_sync(
+      0xffffffffu, probe_key == __shfl_sync(0xffffffffu, probe_key, 0));
+  if (__syncthreads_or(isnan(probe) || concentrated)) return false;
+  if (tx < kLexicographicTopKBins) shared.histogram[tx] = 0;
+  if (tx == 0) {
+    shared.remaining = TopK;
+    shared.prefix = 0;
+    shared.invalid = 0;
+  }
+  __syncthreads();
+  for (uint32_t index = tx; index < length; index += blockDim.x) {
+    const float score = logits[index];
+    if (isnan(score)) atomicExch(&shared.invalid, 1u);
+    atomicAdd(&shared.histogram[compact_coarse_key(score)], 1u);
+  }
+  __syncthreads();
+  if (shared.invalid) return false;
+  compact_choose_bin(shared);
+  // Never truncate a bucket: clustered scores use the original exact selector.
+  if (shared.next_count > kLexicographicTopKDecodeCandidateCapacity)
+    return false;
+  const uint32_t coarse_bin = shared.selected_bin;
+  if (tx == 0) shared.count = 0;
+  __syncthreads();
+  for (uint32_t index = tx; index < length; index += blockDim.x) {
+    if (compact_coarse_key(logits[index]) == coarse_bin) {
+      const uint32_t slot = atomicAdd(&shared.count, 1u);
+      shared.candidates[0][slot] = index;
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for (int pass = 0; pass < 4; ++pass) {
+    const int source = pass & 1;
+    const int shift = 24 - 8 * pass;
+    if (tx < kLexicographicTopKBins) shared.histogram[tx] = 0;
+    __syncthreads();
+    for (uint32_t item = tx; item < shared.count; item += blockDim.x) {
+      const auto key =
+          ordered_float_bits(logits[shared.candidates[source][item]]);
+      atomicAdd(&shared.histogram[(key >> shift) & 255u], 1u);
+    }
+    __syncthreads();
+    compact_choose_bin(shared);
+    if (tx == 0) shared.prefix |= shared.selected_bin << shift;
+    __syncthreads();
+    if (shift == 0) {
+      // An ambiguous cutoff needs the original lower-index tie resolution.
+      return shared.next_count == shared.remaining;
+    }
+    const uint32_t count = shared.count;
+    const uint32_t bin = shared.selected_bin;
+    if (tx == 0) shared.next_count = 0;
+    __syncthreads();
+    for (uint32_t item = tx; item < count; item += blockDim.x) {
+      const int32_t index = shared.candidates[source][item];
+      if (((ordered_float_bits(logits[index]) >> shift) & 255u) == bin) {
+        const uint32_t slot = atomicAdd(&shared.next_count, 1u);
+        shared.candidates[source ^ 1][slot] = index;
+      }
+    }
+    __syncthreads();
+    if (tx == 0) shared.count = shared.next_count;
+    __syncthreads();
+  }
+  return false;
+}
+
+template <int TopK>
+__global__
+__launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_compact_topk_kernel(
+    const float* logits, const int32_t* lengths, int32_t* output, uint32_t rows,
+    uint32_t columns, uint32_t stride, bool decode_batch) {
+  using Sort = cub::BlockRadixSort<uint32_t, kLexicographicTopKThreads, 1>;
+  __shared__ union {
+    CompactTopKShared compact;
+    LexicographicTopKShared<TopK> exact;
+    LexicographicDecodeTopKShared<TopK> decode;
+    typename Sort::TempStorage sort;
+  } shared;
+  const uint32_t row = blockIdx.x, tx = threadIdx.x;
+  const uint32_t length =
+      lengths[row] > 0 ? min(uint32_t(lengths[row]), columns) : 0;
+  const float* scores = logits + static_cast<uint64_t>(row) * stride;
+  int32_t* indices = output + static_cast<uint64_t>(row) * TopK;
+  if (length <= TopK) {
+    if (tx < TopK) indices[tx] = tx < length ? int32_t(tx) : -1;
+    return;
+  }
+  // Capacity can be large while a replay uses short live sequences. Make the
+  // length decision on device and preserve the original per-row short path.
+  const bool compact =
+      length >= kLexicographicTopKCompactMinLength &&
+      compact_score_pivot<TopK>(scores, length, shared.compact);
+  if (!compact) {
+    __syncthreads();
+    if (rows == 1 || (decode_batch && rows <= 16 && rows != 5 && rows != 10)) {
+      qsa_lexicographic_decode_topk_body<TopK>(scores, lengths + row, indices,
+                                               columns, shared.decode);
+    } else {
+      qsa_lexicographic_topk_body<TopK>(logits, lengths, output, rows, columns,
+                                        stride, shared.exact);
+    }
+    return;
+  }
+  const uint32_t pivot = shared.compact.prefix;
+  if (tx == 0) shared.compact.count = 0;
+  __syncthreads();
+  for (uint32_t index = tx; index < length; index += blockDim.x) {
+    if (ordered_float_bits(scores[index]) >= pivot) {
+      const uint32_t slot = atomicAdd(&shared.compact.count, 1u);
+      if (slot < TopK) indices[slot] = index;
+    }
+  }
+  __syncthreads();
+  if (shared.compact.count != TopK) {
+    __syncthreads();
+    qsa_lexicographic_topk_body<TopK>(logits, lengths, output, rows, columns,
+                                      stride, shared.exact);
+    return;
+  }
+  uint32_t keys[1] = {tx < TopK ? uint32_t(indices[tx]) : UINT32_MAX};
+  __syncthreads();
+  Sort(shared.sort).Sort(keys);
+  if (tx < TopK) indices[tx] = keys[0];
+}
+
 template <int TopK>
 __global__
 __launch_bounds__(kLexicographicTopKThreads) void qsa_lexicographic_decode_topk_kernel(
@@ -443,7 +619,11 @@ void launch_qsa_lexicographic_topk(const float* logits, const int32_t* lengths,
                                    uint32_t columns, uint32_t stride,
                                    cudaStream_t stream,
                                    bool decode_batch = false) {
-  if (num_rows == 1) {
+  if (num_rows <= 32 && columns >= kLexicographicTopKCompactMinLength) {
+    qsa_lexicographic_compact_topk_kernel<TopK>
+        <<<num_rows, kLexicographicTopKThreads, 0, stream>>>(
+            logits, lengths, output, num_rows, columns, stride, decode_batch);
+  } else if (num_rows == 1) {
     qsa_lexicographic_decode_topk_kernel<TopK>
         <<<1, kLexicographicTopKThreads, 0, stream>>>(logits, lengths, output,
                                                       columns, stride);
