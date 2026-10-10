@@ -48,6 +48,10 @@ class DraftTokenRing:
         self.host = _shared_zeros(ring_shape(max_reqs, num_spec), torch.int64)
         self._registered = 0
         with torch.accelerator.device_index(device.index):
+            # Device-side header; the round counter never leaves the GPU stream.
+            # Allocating first also makes the device's primary context current.
+            self._staged = torch.zeros(_HEADER, dtype=torch.int64, device=device)
+            self._offsets = torch.arange(-2, 1, dtype=torch.int64, device=device)
             size = self.host.numel() * self.host.element_size()
             status = cuda_driver.cuMemHostRegister(self.host.data_ptr(), size, 3)
             if status[0].value != 0:
@@ -60,9 +64,6 @@ class DraftTokenRing:
             self._header = mapped[:_HEADER]
             self._context = mapped[_HEADER:context_end].view(max_reqs, 3)
             self._drafts = mapped[context_end:].view(max_reqs, num_spec)
-            # Device-side header; the round counter never leaves the GPU stream.
-            self._staged = torch.zeros(_HEADER, dtype=torch.int64, device=device)
-            self._offsets = torch.arange(-2, 1, dtype=torch.int64, device=device)
 
     def validate_registration(self) -> None:
         if self.host.data_ptr() != self._registered or not self.host.is_pinned():
