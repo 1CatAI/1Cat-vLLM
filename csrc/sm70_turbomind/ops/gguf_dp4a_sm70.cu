@@ -359,9 +359,12 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 bool activated, int64_t lanes_per_row,
                                 bool bank_aware) {
   TORCH_CHECK(source_type == 18 || source_type == 20 || source_type == 21 ||
-                  source_type == 22,
+                  source_type == 22 || source_type == 23,
               "Unsupported GGUF lattice dp4a reader");
-  const int block_bytes = source_type == 18 ? 98 : source_type == 21 ? 110 : 82;
+  const int block_bytes = source_type == 18   ? 98
+                          : source_type == 21 ? 110
+                          : source_type == 23 ? 136
+                                              : 82;
   TORCH_CHECK(activation.is_cuda() &&
                   activation.scalar_type() == torch::kUInt8 &&
                   activation.dim() == 3 && activation.size(2) == sizeof(Q8_1) &&
@@ -416,6 +419,8 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
     DISPATCH_LATTICE(20);
   } else if (source_type == 21) {
     DISPATCH_LATTICE(21);
+  } else if (source_type == 23) {
+    DISPATCH_LATTICE(23);
   } else {
     DISPATCH_LATTICE(22);
   }

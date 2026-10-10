@@ -64,7 +64,7 @@ def _original_expert_dp4a(
         up,
         source_type,
         True,
-        4 if quantized_hidden and source_type == 20 else 16,
+        4 if quantized_hidden and source_type in (20, 23) else 16,
         bank_aware,
     )
     torch.ops._C.gguf_dp4a_raw_down_unroute_sm70_out(
@@ -114,6 +114,9 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             config.kernel_config.sm70_gguf.enabled if config is not None else True
         )
         self.small_m_dp4a = bool(config and config.kernel_config.sm70_gguf.small_m_dp4a)
+        self.lut4_expert_dp4a = bool(
+            config and config.kernel_config.sm70_gguf.lut4_expert_dp4a
+        )
         self.q8_intermediate = bool(
             config and config.kernel_config.sm70_gguf.q8_expert_intermediate
         )
@@ -269,7 +272,8 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             and (self.num_experts, self.hidden_size, self.intermediate_size)
             == (512, 2560, 160)
             and self.weight_types["w1"] == self.weight_types["w3"]
-            and self.weight_types["w1"] in (18, 20, 21, 22)
+            and self.weight_types["w1"] in (18, 20, 21, 22, 23)
+            and (self.weight_types["w1"] not in (20, 23) or self.lut4_expert_dp4a)
             and self.weight_types["w2"] in (20, 42)
             and hasattr(torch.ops._C, "gguf_dp4a_raw_down_unroute_sm70_out")
         )

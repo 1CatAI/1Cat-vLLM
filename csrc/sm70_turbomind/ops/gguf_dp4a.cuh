@@ -133,17 +133,34 @@ using IQ3SDot = LatticeDot<21>;
 // canonical reader, without expanding a second expert bank at load time.
 template <int Type>
 struct OriginalIntegerDot {
-  static_assert(Type == 20 || Type == 42);
+  static_assert(Type == 20 || Type == 23 || Type == 42);
   __device__ static float dot(const uint8_t* row, int group, const Q8_1& x) {
-    const uint8_t* b = row + (Type == 20 ? group : group / 2) * 18;
+    const uint8_t* b;
+    const uint8_t* codes;
+    float scale;
+    if constexpr (Type == 23) {
+      b = row + (group / 8) * 136;
+      const int sub = group % 8;
+      const uint16_t high = *reinterpret_cast<const uint16_t*>(b + 2);
+      const int subscale = ((b[4 + sub / 2] >> (4 * (sub % 2))) & 15) |
+                           (((high >> (2 * sub)) & 3) << 4);
+      // Match the canonical LUT reader's expanded FP16 coefficients.
+      scale = __half2float(__float2half_rn(
+          __half2float(*reinterpret_cast<const half*>(b)) * (subscale - 32)));
+      codes = b + 8 + sub * 16;
+    } else {
+      b = row + (Type == 20 ? group : group / 2) * 18;
+      scale = __half2float(*reinterpret_cast<const half*>(b));
+      codes = b + 2;
+    }
     const int* activation = reinterpret_cast<const int*>(x.qs);
     int sum = 0;
 #pragma unroll
     for (int packet = 0; packet < 8; ++packet) {
       uint32_t values = 0;
-      if constexpr (Type == 20) {
+      if constexpr (Type == 20 || Type == 23) {
         const uint32_t bytes =
-            load_u32_2(b + 2 + (packet % 4) * 4) >> ((packet / 4) * 4);
+            load_u32_2(codes + (packet % 4) * 4) >> ((packet / 4) * 4);
         const uint32_t nibbles = (bytes & 15) | ((bytes >> 4) & 0xf0) |
                                  ((bytes >> 8) & 0xf00) |
                                  ((bytes >> 12) & 0xf000);
@@ -158,7 +175,6 @@ struct OriginalIntegerDot {
       }
       sum = __dp4a(static_cast<int>(values), activation[packet], sum);
     }
-    const float scale = __half2float(*reinterpret_cast<const half*>(b));
     return float(sum) * (scale * __low2float(x.ds));
   }
 };
@@ -170,6 +186,16 @@ struct LatticeDot<20, BankAware> {
   __device__ static float dot(const uint8_t* row, int group, const Q8_1& x,
                               const uint32_t*, const uint32_t*) {
     return OriginalIntegerDot<20>::dot(row, group, x);
+  }
+};
+
+template <bool BankAware>
+struct LatticeDot<23, BankAware> {
+  static constexpr int kBookWords = 1;
+  __device__ static void initialize(uint32_t*, uint32_t*) { __syncthreads(); }
+  __device__ static float dot(const uint8_t* row, int group, const Q8_1& x,
+                              const uint32_t*, const uint32_t*) {
+    return OriginalIntegerDot<23>::dot(row, group, x);
   }
 };
 

@@ -56,7 +56,7 @@ def test_q8_1_matches_round_away_oracle_and_graph(m):
 @pytest.mark.parametrize("m", [1, 5, 20])
 @pytest.mark.parametrize("activated", [False, True])
 @pytest.mark.parametrize(
-    "source_type,block_bytes", [(18, 98), (20, 18), (21, 110), (22, 82)]
+    "source_type,block_bytes", [(18, 98), (20, 18), (21, 110), (22, 82), (23, 136)]
 )
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_lattice_dot_matches_official_weight_and_q8_oracle(
@@ -75,15 +75,19 @@ def test_lattice_dot_matches_official_weight_and_q8_oracle(
         data = data.reshape(experts * n, -1)
         packed = (
             data
-            if source_type == 20
+            if source_type in (20, 23)
             else RawGGUFProjection.from_rows(data, source_type).data
         )
         weights.append(torch.from_numpy(packed.reshape(experts, n, -1)).cuda())
-        reference.append(
-            torch.from_numpy(dequantize(data, source_type))
-            .reshape(experts, n, k)
-            .cuda()
-        )
+        if source_type == 23:
+            from vllm.model_executor.layers.quantization.gguf_lut_transcode import (
+                transcode_lut4,
+            )
+
+            decoded = transcode_lut4(data, source_type).dequantize()
+        else:
+            decoded = dequantize(data, source_type)
+        reference.append(torch.from_numpy(decoded).reshape(experts, n, k).cuda())
     torch.manual_seed(970 + m)
     x = (torch.randn((m, k), device="cuda") * 0.125).half()
     ids = torch.stack(
@@ -202,7 +206,9 @@ def test_down_unroute_matches_tp4_official_weights(
 
 
 @pytest.mark.parametrize("m", [5, 20])
-@pytest.mark.parametrize("source_type,size", [(18, 98), (21, 110), (22, 82)])
+@pytest.mark.parametrize(
+    "source_type,size", [(18, 98), (20, 18), (21, 110), (22, 82), (23, 136)]
+)
 @pytest.mark.parametrize("lanes", [4, 8, 16])
 def test_fused_gated_q8_keeps_fp16_boundary_and_changed_graph(
     m, source_type, size, lanes
@@ -211,11 +217,17 @@ def test_fused_gated_q8_keeps_fp16_boundary_and_changed_graph(
     rng = np.random.default_rng(source_type)
     weights = []
     for _ in range(2):
-        raw = rng.integers(0, 256, (experts * n, k // 256, size), dtype=np.uint8)
+        block = 32 if source_type == 20 else 256
+        raw = rng.integers(0, 256, (experts * n, k // block, size), dtype=np.uint8)
         d = rng.uniform(0.0001, 0.001, raw.shape[:2]).astype("<f2")
         raw[:, :, :2] = d[..., None].view(np.uint8)
-        packed = RawGGUFProjection.from_rows(raw.reshape(experts * n, -1), source_type)
-        weights.append(torch.from_numpy(packed.data.reshape(experts, n, -1)).cuda())
+        data = raw.reshape(experts * n, -1)
+        packed = (
+            data
+            if source_type in (20, 23)
+            else RawGGUFProjection.from_rows(data, source_type).data
+        )
+        weights.append(torch.from_numpy(packed.reshape(experts, n, -1)).cuda())
     x = torch.randn((m, k), device="cuda", dtype=torch.float16) * 0.125
     ids = torch.randint(experts, (m, top_k), device="cuda", dtype=torch.int32)
     activation = torch.empty((m, k // 32, 36), device="cuda", dtype=torch.uint8)
