@@ -17,6 +17,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3 CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTORCH_ALLOC_CONF=expandable_segments:True OMP_NUM_THREADS=1 MALLOC_ARENA_MAX=2
 export VLLM_CACHE_ROOT="$CACHE_DIR/vllm" TRITON_CACHE_DIR="$CACHE_DIR/triton"
 export TORCHINDUCTOR_CACHE_DIR="$CACHE_DIR/inductor"
+export TORCH_EXTENSIONS_DIR="$CACHE_DIR/torch_extensions"
 export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 
 # Host history pools are about 14.5 GiB for this geometry. Reserve another 6 GiB
