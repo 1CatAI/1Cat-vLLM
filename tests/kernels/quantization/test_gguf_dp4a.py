@@ -214,6 +214,7 @@ def test_fused_gated_q8_keeps_fp16_boundary_and_changed_graph(
     m, source_type, size, lanes
 ):
     experts, n, k, top_k = 3, 160, 768, 2
+    torch.manual_seed(1167 + m + source_type)
     rng = np.random.default_rng(source_type)
     weights = []
     for _ in range(2):
@@ -253,9 +254,19 @@ def test_fused_gated_q8_keeps_fp16_boundary_and_changed_graph(
             torch.testing.assert_close(ds[..., 0].reshape_as(d), d, rtol=0, atol=0)
             torch.testing.assert_close(ds[..., 1].reshape_as(s), s, rtol=0, atol=0)
         else:
-            scale = out[..., :2].contiguous().view(torch.float16).float()
-            decoded = (out[..., 4:].view(torch.int8).float() * scale).reshape_as(hidden)
-            torch.testing.assert_close(decoded, hidden.float(), rtol=0.01, atol=0.01)
+            # Changing the lane reduction tree can move an FP16 rounding
+            # boundary. Compare against independently quantized FP16 values;
+            # comparing Q8 directly with FP16 confounds this with its expected
+            # half-step error, especially for the wider IQ4_XS dynamic range.
+            actual_q = out[..., 4:].view(torch.int8).reshape_as(q)
+            assert (actual_q.int() - q.int()).abs().max() <= 1
+            ds = out[..., :4].contiguous().view(torch.float16)
+            torch.testing.assert_close(
+                ds[..., 0].reshape_as(d), d, rtol=0.002, atol=1e-6
+            )
+            sum_error = (ds[..., 1].reshape_as(s).float() - s.float()).abs()
+            magnitude = hidden.float().reshape(m * top_k, -1, 32).abs().sum(-1)
+            assert (sum_error <= 0.002 * magnitude + 1e-4).all()
 
     run()
     check()
