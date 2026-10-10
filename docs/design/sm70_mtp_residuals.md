@@ -1,7 +1,11 @@
 # Retained SM70 MTP optimizations
 
-This change is based on main `4e5357b59294edd31c46e66ae8219503a843b2bd`.
-It retains the parts of PR903 that are absent from that revision. Ordinary
+This change is based on main `16628e2f0a70761ba6525bf46e5e844c04b3e66f`.
+The full serving comparison was frozen on main
+`4e5357b59294edd31c46e66ae8219503a843b2bd`; the later rebase replaces an
+equivalent report serializer with upstream PR1160 and updates its tests.
+GPU computation and native source are unchanged by that rebase.
+This change retains the parts of PR903 that are absent from main. Ordinary
 upstream collective, graph, GDN projection, attention and native resource
 owners remain authoritative. Core native sources, CMake and package build
 rules have no residual diff from the base.
@@ -43,10 +47,13 @@ substitutes for the initialized upstream runtime interfaces.
 The bundled FlashQLA extension must expose GDN policy ABI 1, as required by
 the current upstream GDN owner.
 
-An acceleration-report repair serializes initialized diagnostic filter sets
-without changing the policy objects or computation hash. The comparison
-control includes the identical repair because unmodified main fails while
-creating the internal MTP draft configuration after MoE initialization.
+Upstream PR1160 serializes initialized diagnostic filter sets without
+changing policy objects or computation hashes. The frozen comparison used
+the same equivalent local repair in both arms because the earlier main
+failed while creating the internal MTP draft after MoE initialization.
+That duplicate local repair is absent from the final implementation.
+Both arms also preserve explicit Inductor combo settings through SM70
+platform defaults and use identical ordinary deterministic compiler options.
 
 Qualification uses the same FP16/TP4/MTP4 serving configuration, request bytes
 and weights on both arms. Prefill-only and normal generation are measured
@@ -60,7 +67,11 @@ sets. Each arm has a separate ordinary compiler cache. Timing excludes code
 warmup; cache changes during measurement are reported. No loader interception
 or kernel allowlist is introduced.
 
-Results and commands for this exact revision are supplied with PR903 after
-qualification. Earlier measurements are retained as
+The [fixed comparison and final-source equivalence](https://github.com/areslp/1Cat-vLLM/tree/evidence/pr903-e-166-20261010/docs/sm70-e-qualification)
+record exact measured commits, commands, per-case results and limitations.
+All 26 historical C1 inputs improve against the fixed control, with identical
+output and MTP work. Cold prefill and TTFT improve too. Some paths remain
+slower than the older production runtime; those differences are disclosed
+separately from patch-only gains. Earlier measurements are retained as
 [historical evidence](https://github.com/areslp/1Cat-vLLM/tree/b352d3967a166bdc468b21b959ebe98529032d1a/docs/sm70-c73-qualification)
 and do not qualify this revision. AI assistance was used.
