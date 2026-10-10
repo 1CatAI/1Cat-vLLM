@@ -138,6 +138,25 @@ class MTPQPN8Head(nn.Module):
         return None
 
 
+def shard_hot_ids(
+    ranking: torch.Tensor, count: int, world: int, rank: int, rows_per_rank: int
+) -> torch.Tensor:
+    """This rank's share of the ``count`` top-ranked ids, sorted and padded.
+
+    Every rank pads (by repeating its last id) to the largest shard's count,
+    rounded up to 32, so all ranks run the same draft GEMM width.
+    """
+    hot = ranking[:count].long()
+    owner = hot // rows_per_rank
+    largest = int(torch.bincount(owner, minlength=world).max())
+    ids = hot[owner == rank].sort().values
+    width = largest + (-largest) % 32
+    if ids.numel() < width:
+        fill = ids[-1:] if ids.numel() else ids.new_full((1,), rank * rows_per_rank)
+        ids = torch.cat([ids, fill.expand(width - ids.numel())])
+    return ids
+
+
 class MTPGGUFHotHead(nn.Module):
     """FR-Spec draft head for a GGUF (e.g. Q6_K) shared LM head.
 
@@ -146,7 +165,15 @@ class MTPGGUFHotHead(nn.Module):
     target's verification, keeps the original GGUF head.
     """
 
-    def __init__(self, head, count: int, world: int, rank: int, group) -> None:
+    def __init__(
+        self,
+        head,
+        count: int,
+        world: int,
+        rank: int,
+        group,
+        ranking: torch.Tensor | None = None,
+    ) -> None:
         super().__init__()
         from vllm.model_executor.layers.quantization.gguf import (
             dequantize_gguf_rows,
@@ -154,28 +181,41 @@ class MTPGGUFHotHead(nn.Module):
 
         self.head = head
         self.shard_indices = head.shard_indices
-        rows_per_rank = self.shard_indices.org_vocab_end_index - (
-            self.shard_indices.org_vocab_start_index
-        )
+        start = self.shard_indices.org_vocab_start_index
+        rows_per_rank = self.shard_indices.org_vocab_end_index - start
         raw = head.gguf_lm_head_raw
         row_bytes = raw.shape[-1] if raw.ndim == 2 else raw.numel() // rows_per_rank
-        # The hottest ids are the lowest; with contiguous vocabulary shards
-        # they all live on rank 0, which shares just those packed rows.
-        hot_raw = torch.empty((count, row_bytes), dtype=torch.uint8, device=raw.device)
-        if rank == 0:
-            hot_raw.copy_(raw.reshape(-1)[: count * row_bytes].view(count, row_bytes))
-        group.broadcast(hot_raw, src=0)
-        ids = torch.arange(rank, count, world, device=raw.device)
-        pad = (-ids.numel()) % 32
-        if pad:
-            ids = torch.cat([ids, ids[-1:].expand(pad)])
+        if ranking is not None:
+            # Frequency-ranked ids: every rank keeps the hot ids of its own
+            # contiguous shard, padded to the largest shard's count so the
+            # ranks finish together.
+            ids = shard_hot_ids(ranking, count, world, rank, rows_per_rank)
+            ids = ids.to(raw.device)
+            rows = raw.reshape(rows_per_rank, row_bytes)[ids - start]
+        else:
+            # The hottest ids are the lowest; with contiguous vocabulary shards
+            # they all live on rank 0, which shares just those packed rows.
+            hot_raw = torch.empty(
+                (count, row_bytes), dtype=torch.uint8, device=raw.device
+            )
+            if rank == 0:
+                hot_raw.copy_(
+                    raw.reshape(-1)[: count * row_bytes].view(count, row_bytes)
+                )
+            group.broadcast(hot_raw, src=0)
+            ids = torch.arange(rank, count, world, device=raw.device)
+            pad = (-ids.numel()) % 32
+            if pad:
+                ids = torch.cat([ids, ids[-1:].expand(pad)])
+            rows = hot_raw[ids]
+            del hot_raw
         weight = dequantize_gguf_rows(
-            hot_raw[ids].contiguous(),
+            rows.contiguous(),
             int(head.qweight_type.weight_type),
             2560,
             torch.float16,
         )
-        del hot_raw
+        del rows
         codes, scales = prepare_channel_qpn8_weight(weight)
         del weight
         self.register_buffer("hot_codes", codes, persistent=False)
@@ -233,7 +273,17 @@ class MTPGGUFHotHead(nn.Module):
         return None
 
 
-def prepare_mtp_gguf_hot_head(head, hot: int):
+def _load_hot_ranking(path: str) -> torch.Tensor:
+    """Token ids, most frequent first: a .npy array or one id per line."""
+    if path.endswith(".npy"):
+        import numpy as np
+
+        return torch.from_numpy(np.load(path).astype("int64"))
+    with open(path) as f:
+        return torch.tensor([int(line) for line in f if line.strip()])
+
+
+def prepare_mtp_gguf_hot_head(head, hot: int, ranking_path: str = ""):
     """Hot-vocabulary draft head for a GGUF-quantized shared LM head."""
     from vllm.distributed import get_tp_group
 
@@ -263,15 +313,26 @@ def prepare_mtp_gguf_hot_head(head, hot: int):
     if rows * group.world_size != 248320:
         logger.info_once("SM70 GGUF draft hot vocabulary skipped: padded shards.")
         return None
+    if ranking_path:
+        ranking = _load_hot_ranking(ranking_path)
+        ranking = ranking[(ranking >= 0) & (ranking < 248320)]
+        return MTPGGUFHotHead(
+            head,
+            min(hot, ranking.numel()),
+            group.world_size,
+            group.rank_in_group,
+            group,
+            ranking,
+        )
     # Hot ids must lie in rank 0's contiguous shard.
     count = min(hot, rows)
     return MTPGGUFHotHead(head, count, group.world_size, group.rank_in_group, group)
 
 
-def prepare_mtp_qpn8_head(head, hot: int = 0):
+def prepare_mtp_qpn8_head(head, hot: int = 0, ranking_path: str = ""):
     weight = getattr(head, "weight", None)
     if hot > 0 and hasattr(head, "gguf_lm_head_raw"):
-        return prepare_mtp_gguf_hot_head(head, hot)
+        return prepare_mtp_gguf_hot_head(head, hot, ranking_path)
     if not isinstance(weight, torch.Tensor):
         return None
     if (

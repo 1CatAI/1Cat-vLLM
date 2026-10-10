@@ -727,6 +727,11 @@ class KernelConfig:
     order) spread evenly across TP ranks; 0 keeps the full vocabulary. Only
     the draft proposal changes; verification still uses the full head."""
 
+    sm70_draft_hot_vocab_ids: str = ""
+    """Optional file of token ids ranked most frequent first (.npy or one id
+    per line). With ``sm70_draft_hot_vocab`` > 0, the draft keeps the first
+    that many ranked ids, each rank reading its own vocabulary shard."""
+
     sm70_draft_single_graph: bool = False
     """Capture all MTP draft decode steps, including their slot mappings and
     attention metadata, as one CUDA graph instead of one replay per step."""
