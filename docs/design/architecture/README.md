@@ -1,142 +1,123 @@
-# 1Cat-vLLM architecture and layering
+# 1Cat-vLLM architecture and maintenance
 
-This document is the entry point for how 1Cat-vLLM is organised on top of
-upstream vLLM and how new work must be placed. It replaces "add another branch
-where it is needed" with explicit layers, ownership and a ratchet that keeps the
-generic code from absorbing more project specifics.
+This is the current architecture entry point. Component READMEs describe
+maintained contracts; phase reports retain historical decisions and measurements.
+Phase E starts from main `18784e027` (D1–D6 merged). Merged scope is not a claim
+that every model, topology or experiment is qualified. PLE and DDTree follow-up
+remain deferred.
 
-## Why
+## Responsibilities and dependency direction
 
-A 2026-10-08 audit of `main` (#1041) against upstream vLLM found that hardware
-(SM70/V100) support, model families (Qwen3.8 Flash-Next, DFlash2, QUASAR, ...),
-quantisation formats and acceleration paths are written directly into generic
-vLLM modules and into each other:
+```text
+initialization: compatibility inputs -> ordered defaults / validation
+                                    -> engine-owned typed policy
+model adapter: eligibility, weight relationships, state contract
+platform/provider: device, format, layout, dtype and native capability
+assembly: bind existing selector, operations and resource owners
+execution: dynamic inputs -> selected stages -> state commit
+observations: existing checkpoints -> engine-owned diagnostics
+```
 
-| Measure | 1Cat-vLLM | upstream |
-| --- | ---: | ---: |
-| `VLLM_*` environment variables | 981 (688 model/platform specific, 313 default-off) | 296 |
-| `vllm/envs.py` | 18,675 lines | 2,456 |
-| `vllm/v1/worker/gpu_model_runner.py` | 13,163 lines | 7,540 |
-| `mamba/gdn/qwen_gdn_linear_attn.py` | 8,120 lines | 2,059 |
-| `vocab_parallel_embedding.py` | 1,309 lines | 639 |
-| Flash-V100 attention backend | 9,870 lines, 160 KV-dtype branches, 50 route sites | — |
-| Generic modules with model/platform/env coupling | 182 files: 2,325 model, 3,964 platform, 335 raw env references | — |
+Runner V1 and V2 retain their selection and execution order. Models declare
+contracts; providers implement them; runners sequence execution. Shared stages
+receive prepared inputs and explicit bindings, not an entire runner or a callback
+into an old format-specific implementation. Resource owners retain buffers,
+events and workspaces; contexts borrow them without copying ownership. Dynamic
+token counts, request order and prefill/decode decisions stay at their existing
+safe boundaries.
 
-Consequences we have already paid for: a KV page-size change silently disabled
-the DFlash2 split draft attention; `--block-size 2048` silently made the 75T
-prefill route unreachable; E4M3 decode uses a different partition/reduction
-policy than FP16 and is slower than it; every new KV or weight format has to be
-copied into each acceleration path; four parallel SM70 MoE implementations
-(AWQ, NVFP4, FP8, MXFP4) repeat the same structure.
+Maintenance rules:
 
-## Layers
-
-Dependencies point downwards only. A layer never names anything that lives in a
-layer above it.
-
-| Layer | Owns | Lives in |
-| --- | --- | --- |
-| 6. Model adapters | Model families and their fusions (HC, QSA, PLE, MTP heads, DFlash drafts) | `vllm/models/<family>/`, `vllm/model_executor/models/`, spec-decode proposer packages |
-| 5. Engine (generic) | Scheduler, KV manager, runners, sampler, config, distributed state | upstream vLLM modules — kept as close to upstream as possible |
-| 4. Dispatch | Selecting an implementation from (stage, shape, format, platform); capability declarations; route accounting | backend / kernel-selector modules (e.g. `kernels/linear` selectors, attention backend routing) |
-| 3. Operators | Attention, GEMV/GEMM, MoE, collectives, norms — parameterised by format codecs | `vllm/model_executor/kernels/`, attention backends, `csrc/`, `flash-attention-v100/` |
-| 2. Formats | Weight formats (GGUF types, NVFP4, AWQ, FP8) and KV formats (FP16, E4M3, INT8) as codecs: byte layout, scales, read/write | one definition per format, shared by every operator |
-| 1. Platform | SM70 capabilities, policies, profiles, observability | `vllm/config/kernel.py` (`KernelConfig.sm70_*`), `vllm/sm70_profiles/`, platform hooks |
-
-Rules:
-
-1. **Generic modules do not name models or the platform.** They expose a hook
-   (a method on the platform, a field of `KernelConfig`, a registry entry, a
-   model-state class) and the specific code registers itself. `check-layering`
-   enforces this with a per-file ratchet (below).
-2. **Policies are configuration, captured once.** Behaviour is read from a typed
-   `KernelConfig` field resolved at engine construction — never from
-   `os.getenv` at forward/capture time. Legacy `VLLM_*` names are adapters into
-   `KernelConfig` (the existing `check-sm70-linear-policy` pattern). New
-   environment variables are for debugging only.
-3. **Formats are codecs, not branches.** An operator is written once against a
-   codec interface; adding a format means adding a codec, not editing every
-   path. Route names never contain a format.
-4. **Dispatch is declared and loud.** Every implementation declares what it
-   supports. When nothing matches, the fallback is logged and counted — never
-   silent. The "path x format x shape" matrix is generated from the
-   declarations and checked by tests.
-5. **Experiments do not live in `main` forever.** A default-off path either
-   graduates (becomes the default, with data) or is marked deprecated with its
-   negative result linked in the design log. Retain experimental and `_old` /
-   `_fixed` / `_vN` paths for reproducibility; do not delete them.
-6. **One home per concept.** A behaviour is implemented once; variants are
-   template/codec parameters, not copied files.
-
-## The ratchet
-
-`tools/pre_commit/check_layering.py` counts, for every non-owner module under
-`vllm/`, references to model families, to the SM70 platform, and raw
-`VLLM_*` environment reads. The current debt is recorded per file in
-`tools/pre_commit/layering_baseline.json`.
-
-- A change that **adds** coupling to a generic module fails pre-commit. Move the
-  code behind a hook instead.
-- A change that **removes** coupling passes; run
-  `python tools/pre_commit/check_layering.py --update` to lock the reduction in.
-  `--update` refuses to record growth.
-- `python tools/pre_commit/check_layering.py --report` prints the remaining
-  debt, largest first. This is the progress metric of the refactor.
-
-Owner modules (excluded from the model/platform counts) are model packages and
-files whose path names their platform or feature (`*sm70*`, `*turbomind*`,
-`*gguf*`, `*dflash*`, `qwen4_exp`, ...). `vllm/envs.py`, `vllm/envs_metadata.py`
-`vllm/config/kernel.py` and its typed `vllm/config/sm70_moe.py` adapter are
-configuration registries and are excluded
-entirely.
+1. Model qualification belongs in model adapters; hardware/native admission
+   belongs in platform or provider code. Generic modules expose existing
+   extension points. The layering ratchet prevents new debt; old coupling remains
+   visible rather than being declared eliminated.
+2. Capture compatibility inputs during initialization. Explicit typed settings
+   win, subject to preserved safety constraints and validation order. Workers
+   receive resolved policy; execution does not reread legacy settings.
+3. Put parameters in their responsible configuration below. Computation affects
+   effective cache hashes; diagnostics do not. Do not communicate policy through
+   process-environment writes or introduce a second global configuration store.
+4. Reuse codecs and stages while retaining real layout, algorithm and rounding
+   differences. New codecs still need writers/readers, bindings, admission,
+   fallback and tests; registration alone enables no native route.
+5. Reuse existing selectors and declarations. Preserve compatible route labels,
+   including historical format-bearing names. Static declaration and selector
+   prediction are distinct from observed native execution.
+6. Keep one implementation and mutable resource owner per responsibility.
+   Compatibility modules forward to that owner. Default-off experiments remain
+   available; deprecation requires a reason, evidence and replacement.
 
 ## Where things live
 
-| Concept | Home |
+| Responsibility | Maintained entry / extension point |
 | --- | --- |
-| KV-cache storage formats | `vllm/v1/attention/kv_codecs.py` (`KVCodec`: FP16, BF16, FP8-E4M3, FP8-E5M2). Routes admit codecs, never `kv_cache_dtype` strings. |
-| Flash-V100 attention | `vllm/v1/attention/backends/flash_v100/`: `ops` (native operator loading), `routing` (route accounting, decode partition/XQA admission), `kv_layout`, `masks`, `dense_prefill`, `spec/` (feature metadata hooks and device preparation), `metadata` (common metadata), `impl` (initialization/forward with registered feature hooks), `decode`, `prefill`, `verify`, `debug_compare`, `state` (shared flags), `backend`. Modules reach each other through the module object (`_routing._record_route`), so rebound globals and monkeypatches have one owner. `flash_attn_v100.py` is a compatibility module that forwards reads and writes, including wildcard imports. Public package re-exports resolve the owning module dynamically. The original logger name and shared one-shot flags are retained. |
+| KV storage identity and conversion | [KV codecs](../../../vllm/v1/attention/kv_codecs.README.md); independent of weight quantization |
+| Flash-V100 selection and execution | [Attention component](../../../vllm/v1/attention/backends/flash_v100/README.md); assembly, executors and feature-owned metadata |
+| MoE stages, codecs and resources | [SM70 MoE component](../../../vllm/model_executor/layers/fused_moe/sm70/README.md); existing `sm70_moe_router` selector |
+| Linear dispatch and QPN | `vllm/model_executor/kernels/linear/`, including `qpn/`; existing selector and prepared provider state |
+| Native SM70 bindings | `vllm/_sm70/`; `_sm70_ops.py` is a compatibility facade |
+| GDN computation | `vllm/model_executor/layers/fla/ops/`; existing selector produces `GdnExecutionPlan`; model layer adapts projections and stages |
+| GDN metadata and state | `vllm/v1/attention/ops/gdn_state.py`, `GDNSpecDecodeStateContract` and `ModelState`; builders own metadata, model state owns conv/SSM updates |
+| Model defaults and shared weights | `vllm/model_executor/models/runtime_defaults.py`, `shared_weights.py`, and existing `MODELS_CONFIG_MAP` adapters |
+| Platform defaults | `vllm/platforms/runtime_defaults.py` and existing platform hooks |
+| Ordered configuration resolution | `vllm/config/policy_defaults.py`; retain early defaults and late validation checkpoints |
+| Runners and ordinary speculation | `vllm/v1/worker/gpu_model_runner.py`, `vllm/v1/worker/gpu/model_runner.py` and `BaseSpeculator`; ordinary DFlash uses V2 |
+| Warmup and staged input | `vllm/model_executor/warmup/plan.py`, `sm70_runtime.py`, and `vllm/v1/worker/runtime/input_transfer.py` |
+| Graphs, communication and layer providers | Existing graph dispatcher/runner and communicator; `kernels/lm_head/`, `kernels/norm/`, `kernels/linear/`; graph tables and IPC lifetimes retain their owners |
+| Diagnostics and resource binding | `vllm/diagnostics.py`, `vllm/runtime_resources.py`; engine-owned budgets, observations and runtime resources |
 
-The grouped attention family lives in `vllm/v1/attention/ops/sm70_grouped.py`
-(shared codec admission/providers), `sm70_grouped_scalar.py` and
-`sm70_grouped_long.py` (existing native family members). Old paths retain
-compatibility exports/aliases. See the adjacent `sm70_grouped.README.md` for
-contracts and limits.
+## Configuration ownership
 
-A pure move between files keeps every coupling total constant; record it with
-`python tools/pre_commit/check_layering.py --accept-moves`, which refuses to
-run if any total grows.
+| Policy | Canonical configuration |
+| --- | --- |
+| Linear, MoE, GDN and provider computation | `KernelConfig` family fields, `sm70_moe`, `gdn`, `layer_execution`, `sm70_sparse` |
+| Attention algorithms and native resources | `AttentionConfig.flash_v100`; existing shared graph/attention fields remain authoritative |
+| Ordinary speculative sampling / DFlash2 | `SpeculativeConfig.sampling_policy` / `sm70_dflash2` |
+| Graph selection / collectives | `CompilationConfig.runtime` / `ParallelConfig.communication` |
+| Warmup and staged input | `KernelConfig.sm70_runtime` |
+| Trace, compare, dump and timing | `ObservabilityConfig.runtime_trace` and existing diagnostic/profiler fields |
+| PLE placement | `OffloadConfig.ple`; outstanding PLE test adaptation is deferred |
 
-## Refactor roadmap
+Legacy names are initialization adapters. The
+[environment reference](../../configuration/env_var_reference.md) documents their
+metadata; [Phase D](sm70_phase_d.md) records parsing, provenance, effective hashes,
+native ABI and retained process/standalone boundaries.
 
-Every step is behaviour-preserving (bitwise outputs, identical route hits, no
-performance regression), lands as its own PR and can be reverted alone.
+## Inspection and evidence
 
-1. **Guardrails** — this document, the ratchet, the debt report. *(done)*
-2. **Configuration** — finish moving runtime `os.getenv` reads in generic modules
-   into `KernelConfig` / `envs` captured at init; mark default-off
-   experiments deprecated when their negative results are recorded.
-3. **Extract platform and model code from generic modules**, largest first:
-   `gpu_model_runner.py`, `qwen_gdn_linear_attn.py`, `config/vllm.py`,
-   `vocab_parallel_embedding.py`, `gdn_attn.py`, `config/speculative.py`,
-   `v1/core/sched/scheduler.py`. Metric: diff against upstream for these files
-   and the ratchet totals.
-4. **Format codecs and dispatch registries** — KV formats first (FP16, E4M3,
-   then INT8 on the same interface), then weight formats and the SM70 MoE
-   family; split the Flash-V100 backend into routing / metadata / decode /
-   verify / prefill / KV-codec modules. *(KV codecs and the module split done;
-   declarative route table and shared XQA admission introduced;
-   grouped FP16/E4M3 admission and native-family ownership consolidated;
-   shared E4M3/FP16 planning introduced with a native revision gate;
-   next: CUDA codec traits and MoE,
-   metadata and implementation feature hooks plus method composition done;
-   common attention entrypoints contain no family names.)*
-5. **Kernels and build** — consolidate extension modules, mark retired variant files deprecated,
-   split multi-thousand-line kernels by responsibility.
-6. **Process** — PRs state their coverage in the generated matrix; new knobs go
-   into `KernelConfig`; design notes become one overview plus per-component
-   READMEs and decision records, with data files out of `docs/`.
+Run from the repository root with the project environment:
 
-Phase B's current integration map, compatibility rules and delivery boundaries
-are recorded in [SM70 Phase B](sm70_phase_b.md), with a generated
-[B0 parameter/native-path ledger](sm70_phase_b_parameters.md).
+```bash
+.venv/bin/python tools/pre_commit/check_layering.py --report
+.venv/bin/python -m tools.config_inventory --check
+.venv/bin/python -m tools.config_inventory --json
+.venv/bin/python -m tools.sm70.flash_v100_audit
+```
+
+These are source audits. The layering report includes the full parameter
+inventory; avoid repeating that inventory just to collect the same evidence.
+[B](sm70_phase_b.md), [C](sm70_phase_c.md) and [D](sm70_phase_d.md) explain their
+different count scopes. Counts are not per-token reads or observed kernel hits.
+The per-file baseline may only decrease: `--update` records reductions;
+`--accept-moves` allows redistribution only when aggregate counts do not grow.
+Neither permits widening exclusions to conceal new coupling.
+
+## Delivery status and retained work
+
+| Scope | Status / evidence |
+| --- | --- |
+| A3 attention ownership and common stages | Merged; [record](flash_v100_refactor_progress.md) and [limitations](flash_v100_known_issues.md) retain exact baselines |
+| B MoE/linear paths and bindings | Merged; [integration and operator evidence](sm70_phase_b.md) |
+| C model/platform, execution and state | Seven deliveries merged; [protocol/resource accounting](sm70_phase_c.md#phase-c-structural-accounting-and-retained-boundaries) |
+| D configuration lifetime and deprecation | D1–D6 merged; [closure](sm70_phase_d.md), with PLE follow-up deferred and validation limitations retained |
+| E maintained documentation and checks | In progress; [delivery record](sm70_phase_e.md) |
+| DDTree / PLE follow-up | Deferred; no repair or new qualification in E |
+| INT8-G64 | [Design handoff](int8_g64_codec.md) only; not implemented or qualified |
+
+A3's merge does not imply every original A0–A6 proposal was delivered. Native
+codec follow-ups and experimental paths need individual evidence. No model
+throughput, TTFT or 35B speed conclusion follows from B–D operator acceptance.
+The [migration control log](../sm70_v100_migration_control.md) keeps experiments
+at their original links. Use component contracts for current development and
+follow evidence links for the original decision data.
