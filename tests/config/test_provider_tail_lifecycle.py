@@ -101,3 +101,18 @@ def test_output_repair_freezes_errors_and_typed_precedence(monkeypatch):
     assert not typed()
     with pytest.raises(ValueError):
         invalid()
+
+
+def test_retained_gdn_notices_are_diagnostic_snapshots(monkeypatch):
+    from vllm.config.sm70_runtime import RuntimeTraceConfig
+
+    monkeypatch.setenv("VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING", "bad-but-presence-only")
+    monkeypatch.setenv("VLLM_SM70_GDN_EMPTY_CORE_OUT", "1")
+    first = RuntimeTraceConfig()
+    monkeypatch.delenv("VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING")
+    monkeypatch.setenv("VLLM_SM70_GDN_EMPTY_CORE_OUT", "bad")
+    second = RuntimeTraceConfig()
+    assert first.gdn_legacy_fused_notice and first.value("gdn_empty_output_notice")
+    assert not second.gdn_legacy_fused_notice
+    with pytest.raises(ValueError):
+        second.value("gdn_empty_output_notice")

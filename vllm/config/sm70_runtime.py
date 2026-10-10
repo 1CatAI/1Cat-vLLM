@@ -170,6 +170,8 @@ class RuntimeTraceConfig:
     """Shared tensor-diagnostic policy; mutable observations are engine-owned."""
 
     layer_aliases: ClassVar[dict[str, str]] = {
+        "gdn_empty_output_notice": "VLLM_SM70_GDN_EMPTY_CORE_OUT",
+        "gdn_legacy_fused_notice": "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING",
         "require_profile_acceleration": "VLLM_SM70_REQUIRE_PROFILE_ACCELERATION",
         "gdn_route_debug": "VLLM_SM70_GDN_DECODE_FLASHQLA_ROUTE_DEBUG",
         "gdn_mixed_compare": "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV_COMPARE",
@@ -185,6 +187,11 @@ class RuntimeTraceConfig:
         "mtp_load_verbose": "VLLM_DEBUG_MTP_LOAD_VERBOSE",
         "greedy_token_trace": "VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE",
     }
+
+    gdn_empty_output_notice: bool | None = None
+    """Explain the retained paused empty-output experiment; allocation stays zeroed."""
+    gdn_legacy_fused_notice: bool | None = None
+    """Explain the replaced coarse gate when its legacy name was explicitly set."""
 
     require_profile_acceleration: bool | None = None
     """Fail initialization when required profile capabilities are unavailable."""
@@ -261,6 +268,8 @@ class RuntimeTraceConfig:
         from vllm import envs
 
         def read_flag(name):
+            if name == "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING":
+                return name in os.environ
             if name == "VLLM_SM70_DUMP_QWEN_MLP_INTERNALS":
                 return os.getenv(name) == "1"
             try:
@@ -271,6 +280,7 @@ class RuntimeTraceConfig:
                         field
                         for field in (
                             "gdn_route_debug",
+                            "gdn_empty_output_notice",
                             "gdn_mixed_compare",
                             "mtp_load",
                             "mtp_load_verbose",

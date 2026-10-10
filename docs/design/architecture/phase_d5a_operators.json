@@ -1,0 +1,2264 @@
+{
+  "baseline": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+  "contract": {
+    "gpu": "V100 SXM2 32GB, physical GPU 2 on 54633",
+    "driver": "580.173.02",
+    "torch": "2.10.0+cu128",
+    "cuda": "12.8",
+    "tp": 1,
+    "models_loaded": false,
+    "order": [
+      "baseline/candidate",
+      "candidate/baseline",
+      "baseline/candidate"
+    ],
+    "gpu_measurement": "5 event samples of 50 captured replays; TurboQuant prefill uses eager event timings including submission gaps",
+    "host_measurement": "5 synchronized-start enqueue samples of 50 calls; step_host also enters/exits the native owner per call",
+    "temporary_allocation": "peak allocated minus starting allocation after warmup",
+    "selection": "Identical legacy/typed inputs; FP16 tune_max_m=0 in both final arms",
+    "limitations": "Operator and synthetic-state evidence only. Host scope switching adds 25-27 us per boundary and remains a follow-up; no model throughput, TTFT, or multi-GPU claim."
+  },
+  "artifacts": {
+    "remote": "/home/ymzx/arch-ws/phase-d5-20261010/artifacts",
+    "local": "/home/ymzx/arch-ws/tmp/phase-d5",
+    "native_candidate": "495fb442a3bb5e8b502a42648b3aba8ac538acb3",
+    "native_policy_abi": 61,
+    "native_runtime_abi": 1,
+    "baseline_C_sha256": "72a2e4b4617eb2b11496d8d5854c92c742118c4ceee668c8d22a111de547f30f",
+    "baseline_moe_C_sha256": "81ee024b31bb9a97a2706c2232a15affda44d1a2f61a1857fcf6925131d849d4",
+    "candidate_C_sha256": "4d1774f1b072418f65eeca26035a1fbfc00810823097ca8884ba5aa4ac52816e",
+    "candidate_moe_C_sha256": "449f0a88befa04a0153253ce596ce4d2bc79e8dd550345ce83fd018711e354a5",
+    "common_stable_sha256": "81b09261655effa17506d674a82642e76e837595ed6b576b90f262bce8c0ba17",
+    "ld_preload": null
+  },
+  "summaries": [
+    {
+      "name": "qsa_cublas_scorer_M512_K2048",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        20971520
+      ],
+      "gpu_us": {
+        "baseline": 62.52543926239014,
+        "candidate": 62.423038482666016,
+        "delta_percent": -0.16377458668366263
+      },
+      "host_us": {
+        "baseline": 112.91444,
+        "candidate": 118.44378,
+        "delta_percent": 4.896929037596975
+      }
+    },
+    {
+      "name": "mtp_router_M5_N512_K2560",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        5120
+      ],
+      "gpu_us": {
+        "baseline": 6.38975977897644,
+        "candidate": 6.410239934921265,
+        "delta_percent": 0.3205152721422744
+      },
+      "host_us": {
+        "baseline": 34.86666,
+        "candidate": 37.53306,
+        "delta_percent": 7.6474202002715375
+      }
+    },
+    {
+      "name": "triton_fp16_M1_KV64_H8_G4_D128",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        0
+      ],
+      "gpu_us": {
+        "baseline": 19.148800373077393,
+        "candidate": 19.107840061187744,
+        "delta_percent": -0.2139053679166114
+      },
+      "host_us": {
+        "baseline": 135.70438000000001,
+        "candidate": 112.87006,
+        "delta_percent": -16.826516579641726
+      },
+      "step_host_us": {
+        "baseline": 140.34718,
+        "candidate": 113.65146,
+        "delta_percent": -19.021201566002254
+      }
+    },
+    {
+      "name": "triton_fp16_M33_KV64_H8_G4_D128",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        0
+      ],
+      "gpu_us": {
+        "baseline": 19.619840383529663,
+        "candidate": 19.578880071640015,
+        "delta_percent": -0.20876985280692262
+      },
+      "host_us": {
+        "baseline": 134.95195999999999,
+        "candidate": 118.79248,
+        "delta_percent": -11.974246242885233
+      },
+      "step_host_us": {
+        "baseline": 137.15036,
+        "candidate": 114.11129999999999,
+        "delta_percent": -16.798395571108983
+      }
+    },
+    {
+      "name": "turboquant_dense_prefill_M33_H8_G4_D128",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        306176
+      ],
+      "gpu_us": {
+        "baseline": 495.8003234863281,
+        "candidate": 497.9507064819336,
+        "delta_percent": 0.43371956284428137
+      },
+      "host_us": {
+        "baseline": 494.07995999999997,
+        "candidate": 497.40552,
+        "delta_percent": 0.6730813368751143
+      },
+      "step_host_us": {
+        "baseline": 502.49800000000005,
+        "candidate": 506.81546000000003,
+        "delta_percent": 0.859199439599756
+      }
+    },
+    {
+      "name": "f16_M16_N512_K1024",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        16384
+      ],
+      "gpu_us": {
+        "baseline": 70.63551902770996,
+        "candidate": 70.59455871582031,
+        "delta_percent": -0.057988264903352515
+      },
+      "host_us": {
+        "baseline": 22.19448,
+        "candidate": 21.7869,
+        "delta_percent": -1.8364025649620919
+      },
+      "step_host_us": {
+        "baseline": 22.523180000000004,
+        "candidate": 49.2875,
+        "delta_percent": 118.83011191137305
+      }
+    },
+    {
+      "name": "qpn8_M8_N5120_K1536",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        0
+      ],
+      "gpu_us": {
+        "baseline": 12.57472038269043,
+        "candidate": 12.554240226745605,
+        "delta_percent": -0.16286768470029633
+      },
+      "host_us": {
+        "baseline": 20.679520000000004,
+        "candidate": 22.465619999999998,
+        "delta_percent": 8.637047668417797
+      },
+      "step_host_us": {
+        "baseline": 22.129839999999998,
+        "candidate": 48.17254,
+        "delta_percent": 117.68137501220073
+      }
+    },
+    {
+      "name": "qpn8_M17_N5120_K1536",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        0
+      ],
+      "gpu_us": {
+        "baseline": 21.626880168914795,
+        "candidate": 21.626880168914795,
+        "delta_percent": 0.0
+      },
+      "host_us": {
+        "baseline": 20.556060000000002,
+        "candidate": 22.136280000000003,
+        "delta_percent": 7.687368104588144
+      },
+      "step_host_us": {
+        "baseline": 22.32368,
+        "candidate": 47.337759999999996,
+        "delta_percent": 112.05177640962422
+      }
+    },
+    {
+      "name": "qpn8_M32_N5120_K1536",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        98304
+      ],
+      "gpu_us": {
+        "baseline": 18.37056040763855,
+        "candidate": 18.37056040763855,
+        "delta_percent": 0.0
+      },
+      "host_us": {
+        "baseline": 33.2277,
+        "candidate": 32.6539,
+        "delta_percent": -1.7268724588220041
+      },
+      "step_host_us": {
+        "baseline": 35.07582,
+        "candidate": 61.01112,
+        "delta_percent": 73.94068050297898
+      }
+    },
+    {
+      "name": "kda_prefill_M64_H4_K64",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        458752
+      ],
+      "gpu_us": {
+        "baseline": 91.01311683654785,
+        "candidate": 91.11552238464355,
+        "delta_percent": 0.11251735096560189
+      },
+      "host_us": {
+        "baseline": 731.75342,
+        "candidate": 736.51446,
+        "delta_percent": 0.6506344719236168
+      }
+    },
+    {
+      "name": "gdn_prefill_M64_H4_K64",
+      "identical_output_and_state_digests": true,
+      "temporary_bytes": [
+        362496
+      ],
+      "gpu_us": {
+        "baseline": 97.95583724975586,
+        "candidate": 97.95583724975586,
+        "delta_percent": 0.0
+      },
+      "host_us": {
+        "baseline": 696.03512,
+        "candidate": 694.3655,
+        "delta_percent": -0.23987582695540466
+      }
+    }
+  ],
+  "rounds": [
+    {
+      "artifact": "bench-d-a-baseline-1.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "qsa_cublas_scorer_M512_K2048",
+          "sha256": "dbc3f2e50cd6379d91028aceac9d951755d8f501bf2c24143add6ef01fec47c6",
+          "gpu_us": 62.52543926239014,
+          "gpu_samples": [
+            62.99647808074951,
+            62.52543926239014,
+            62.40255832672119,
+            62.36159801483154,
+            62.73024082183838
+          ],
+          "host_us": 110.96502000000001,
+          "host_samples": [
+            119.17612,
+            110.96502000000001,
+            111.93972,
+            109.25848,
+            109.74892
+          ],
+          "temporary_bytes": 20971520
+        },
+        {
+          "name": "mtp_router_M5_N512_K2560",
+          "sha256": "6d24601e1cfca0df55a34e87885e53f0de736e6533e32e93dfafd0e449b7dfe5",
+          "gpu_us": 6.369280219078064,
+          "gpu_samples": [
+            6.73471987247467,
+            6.594560146331787,
+            6.369280219078064,
+            6.34880006313324,
+            6.34880006313324
+          ],
+          "host_us": 32.85578,
+          "host_samples": [
+            34.60146,
+            32.85578,
+            32.73866,
+            32.95466,
+            32.68056
+          ],
+          "temporary_bytes": 5120
+        }
+      ]
+    },
+    {
+      "artifact": "bench-d-a-baseline-2.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "qsa_cublas_scorer_M512_K2048",
+          "sha256": "dbc3f2e50cd6379d91028aceac9d951755d8f501bf2c24143add6ef01fec47c6",
+          "gpu_us": 62.38207817077637,
+          "gpu_samples": [
+            62.753281593322754,
+            62.44351863861084,
+            62.38207817077637,
+            62.34111785888672,
+            62.36159801483154
+          ],
+          "host_us": 112.91444,
+          "host_samples": [
+            121.7109,
+            112.91444,
+            113.16964,
+            112.86716,
+            112.81458
+          ],
+          "temporary_bytes": 20971520
+        },
+        {
+          "name": "mtp_router_M5_N512_K2560",
+          "sha256": "6d24601e1cfca0df55a34e87885e53f0de736e6533e32e93dfafd0e449b7dfe5",
+          "gpu_us": 6.410239934921265,
+          "gpu_samples": [
+            6.773759722709656,
+            6.430720090866089,
+            6.410239934921265,
+            6.410239934921265,
+            6.410239934921265
+          ],
+          "host_us": 34.86666,
+          "host_samples": [
+            39.2262,
+            35.3612,
+            34.81396,
+            34.6138,
+            34.86666
+          ],
+          "temporary_bytes": 5120
+        }
+      ]
+    },
+    {
+      "artifact": "bench-d-a-baseline-3.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "qsa_cublas_scorer_M512_K2048",
+          "sha256": "dbc3f2e50cd6379d91028aceac9d951755d8f501bf2c24143add6ef01fec47c6",
+          "gpu_us": 62.54591941833496,
+          "gpu_samples": [
+            62.951040267944336,
+            62.54591941833496,
+            62.52543926239014,
+            62.64832019805908,
+            62.34111785888672
+          ],
+          "host_us": 114.20216,
+          "host_samples": [
+            123.86792,
+            114.11370000000001,
+            114.22702,
+            114.19744,
+            114.20216
+          ],
+          "temporary_bytes": 20971520
+        },
+        {
+          "name": "mtp_router_M5_N512_K2560",
+          "sha256": "6d24601e1cfca0df55a34e87885e53f0de736e6533e32e93dfafd0e449b7dfe5",
+          "gpu_us": 6.38975977897644,
+          "gpu_samples": [
+            6.737920045852661,
+            6.410239934921265,
+            6.38975977897644,
+            6.38975977897644,
+            6.369280219078064
+          ],
+          "host_us": 39.134859999999996,
+          "host_samples": [
+            41.16828,
+            38.27392,
+            39.134859999999996,
+            40.60262,
+            38.16102
+          ],
+          "temporary_bytes": 5120
+        }
+      ]
+    },
+    {
+      "artifact": "bench-d-a-candidate-d-1.json",
+      "variant": "candidate-d",
+      "source": "e9b9e042a5155526b6730e31834f4605b97c0b18",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "qsa_cublas_scorer_M512_K2048",
+          "sha256": "dbc3f2e50cd6379d91028aceac9d951755d8f501bf2c24143add6ef01fec47c6",
+          "gpu_us": 62.463998794555664,
+          "gpu_samples": [
+            63.16351890563965,
+            62.50495910644531,
+            62.40255832672119,
+            62.463998794555664,
+            62.320637702941895
+          ],
+          "host_us": 117.49804,
+          "host_samples": [
+            125.7386,
+            117.49804,
+            116.77116,
+            118.86648,
+            116.68224000000001
+          ],
+          "temporary_bytes": 20971520
+        },
+        {
+          "name": "mtp_router_M5_N512_K2560",
+          "sha256": "6d24601e1cfca0df55a34e87885e53f0de736e6533e32e93dfafd0e449b7dfe5",
+          "gpu_us": 6.512640118598938,
+          "gpu_samples": [
+            6.766719818115234,
+            6.430720090866089,
+            6.410239934921265,
+            6.512640118598938,
+            6.676480174064636
+          ],
+          "host_us": 35.74332,
+          "host_samples": [
+            37.64098,
+            35.74332,
+            36.29018,
+            35.06144,
+            35.13794
+          ],
+          "temporary_bytes": 5120
+        }
+      ]
+    },
+    {
+      "artifact": "bench-d-a-candidate-d-2.json",
+      "variant": "candidate-d",
+      "source": "e9b9e042a5155526b6730e31834f4605b97c0b18",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "qsa_cublas_scorer_M512_K2048",
+          "sha256": "dbc3f2e50cd6379d91028aceac9d951755d8f501bf2c24143add6ef01fec47c6",
+          "gpu_us": 62.423038482666016,
+          "gpu_samples": [
+            62.707839012145996,
+            62.52543926239014,
+            62.423038482666016,
+            62.36159801483154,
+            62.40255832672119
+          ],
+          "host_us": 118.44378,
+          "host_samples": [
+            127.40454,
+            118.07486,
+            118.44378,
+            118.75316000000001,
+            118.36265999999999
+          ],
+          "temporary_bytes": 20971520
+        },
+        {
+          "name": "mtp_router_M5_N512_K2560",
+          "sha256": "6d24601e1cfca0df55a34e87885e53f0de736e6533e32e93dfafd0e449b7dfe5",
+          "gpu_us": 6.410239934921265,
+          "gpu_samples": [
+            6.765440106391907,
+            6.430720090866089,
+            6.38975977897644,
+            6.369280219078064,
+            6.410239934921265
+          ],
+          "host_us": 39.06736,
+          "host_samples": [
+            41.2149,
+            40.23136,
+            39.06736,
+            38.82592,
+            38.66946
+          ],
+          "temporary_bytes": 5120
+        }
+      ]
+    },
+    {
+      "artifact": "bench-d-a-candidate-d-3.json",
+      "variant": "candidate-d",
+      "source": "e9b9e042a5155526b6730e31834f4605b97c0b18",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "qsa_cublas_scorer_M512_K2048",
+          "sha256": "dbc3f2e50cd6379d91028aceac9d951755d8f501bf2c24143add6ef01fec47c6",
+          "gpu_us": 62.38207817077637,
+          "gpu_samples": [
+            62.86848068237305,
+            62.34111785888672,
+            62.423038482666016,
+            62.38207817077637,
+            62.34111785888672
+          ],
+          "host_us": 123.97578,
+          "host_samples": [
+            134.45888000000002,
+            125.76745999999999,
+            123.97578,
+            123.17396000000001,
+            123.11974000000001
+          ],
+          "temporary_bytes": 20971520
+        },
+        {
+          "name": "mtp_router_M5_N512_K2560",
+          "sha256": "6d24601e1cfca0df55a34e87885e53f0de736e6533e32e93dfafd0e449b7dfe5",
+          "gpu_us": 6.38975977897644,
+          "gpu_samples": [
+            6.804479956626892,
+            6.410239934921265,
+            6.38975977897644,
+            6.369280219078064,
+            6.369280219078064
+          ],
+          "host_us": 37.53306,
+          "host_samples": [
+            42.7989,
+            37.65302,
+            37.53306,
+            37.49318,
+            37.49404
+          ],
+          "temporary_bytes": 5120
+        }
+      ]
+    },
+    {
+      "artifact": "bench-c2-baseline-1.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "triton_fp16_M1_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "70ffbf5ed7bbee5ce938e5659c18b77cd1657efe13d7bfbca126fc744988ceb6",
+          "gpu_us": 19.148800373077393,
+          "gpu_samples": [
+            19.251199960708618,
+            19.169280529022217,
+            19.148800373077393,
+            19.12832021713257,
+            19.148800373077393
+          ],
+          "host_us": 139.2049,
+          "host_samples": [
+            146.16191999999998,
+            139.2049,
+            139.92478,
+            137.04512,
+            136.11882
+          ],
+          "step_host_us": 135.54846,
+          "step_host_samples": [
+            135.54846,
+            146.37086,
+            142.06012,
+            132.1029,
+            132.95860000000002
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "triton_fp16_M33_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "9f38d7177fa72a42cf8f805f642a08a27e8380e4689f55df03c22589b80e69ac",
+          "gpu_us": 19.59936022758484,
+          "gpu_samples": [
+            19.640320539474487,
+            19.619840383529663,
+            19.578880071640015,
+            19.59936022758484,
+            19.578880071640015
+          ],
+          "host_us": 133.6733,
+          "host_samples": [
+            138.96082,
+            139.69791999999998,
+            133.6733,
+            132.9258,
+            131.1458
+          ],
+          "step_host_us": 136.55076,
+          "step_host_samples": [
+            131.95504,
+            132.52392,
+            136.55076,
+            144.89968000000002,
+            146.47585999999998
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "turboquant_dense_prefill_M33_H8_G4_D128",
+          "mode": "eager_cuda_event",
+          "sha256": "383bc573a0ec7a9bad6c5a3d668ec6ec4ebef2bbfa6c4b9d0102d1bb5eafc229",
+          "gpu_us": 495.4316711425781,
+          "gpu_samples": [
+            507.4764633178711,
+            500.2444839477539,
+            492.2367858886719,
+            495.4316711425781,
+            485.84705352783203
+          ],
+          "host_us": 494.07995999999997,
+          "host_samples": [
+            496.71334,
+            501.39042,
+            489.91652,
+            487.95268,
+            494.07995999999997
+          ],
+          "step_host_us": 502.49800000000005,
+          "step_host_samples": [
+            501.96232000000003,
+            502.49800000000005,
+            515.59778,
+            495.43564,
+            523.5612
+          ],
+          "temporary_bytes": 306176
+        }
+      ]
+    },
+    {
+      "artifact": "bench-c2-baseline-2.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "triton_fp16_M1_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "70ffbf5ed7bbee5ce938e5659c18b77cd1657efe13d7bfbca126fc744988ceb6",
+          "gpu_us": 19.189759492874146,
+          "gpu_samples": [
+            19.251199960708618,
+            19.21023964881897,
+            19.189759492874146,
+            19.189759492874146,
+            19.189759492874146
+          ],
+          "host_us": 124.95685999999999,
+          "host_samples": [
+            129.80548000000002,
+            127.68744000000001,
+            124.95685999999999,
+            124.54881999999999,
+            124.90012
+          ],
+          "step_host_us": 143.17134,
+          "step_host_samples": [
+            138.9974,
+            143.71396000000001,
+            141.4891,
+            143.66598,
+            143.17134
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "triton_fp16_M33_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "9f38d7177fa72a42cf8f805f642a08a27e8380e4689f55df03c22589b80e69ac",
+          "gpu_us": 19.640320539474487,
+          "gpu_samples": [
+            19.68127965927124,
+            19.640320539474487,
+            19.640320539474487,
+            19.68127965927124,
+            19.619840383529663
+          ],
+          "host_us": 141.60912,
+          "host_samples": [
+            139.78567999999999,
+            142.76144,
+            141.60912,
+            140.53959999999998,
+            142.07536
+          ],
+          "step_host_us": 140.6586,
+          "step_host_samples": [
+            138.11888000000002,
+            143.1379,
+            138.66755999999998,
+            144.02316000000002,
+            140.6586
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "turboquant_dense_prefill_M33_H8_G4_D128",
+          "mode": "eager_cuda_event",
+          "sha256": "383bc573a0ec7a9bad6c5a3d668ec6ec4ebef2bbfa6c4b9d0102d1bb5eafc229",
+          "gpu_us": 495.8003234863281,
+          "gpu_samples": [
+            502.0499038696289,
+            495.7183837890625,
+            488.98048400878906,
+            495.8003234863281,
+            505.0163269042969
+          ],
+          "host_us": 493.20396,
+          "host_samples": [
+            502.83522,
+            493.20396,
+            487.97202,
+            486.85458,
+            532.51288
+          ],
+          "step_host_us": 506.55949999999996,
+          "step_host_samples": [
+            512.96934,
+            492.3282,
+            509.72888,
+            506.55949999999996,
+            491.97084
+          ],
+          "temporary_bytes": 306176
+        }
+      ]
+    },
+    {
+      "artifact": "bench-c2-baseline-3.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "triton_fp16_M1_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "70ffbf5ed7bbee5ce938e5659c18b77cd1657efe13d7bfbca126fc744988ceb6",
+          "gpu_us": 19.107840061187744,
+          "gpu_samples": [
+            19.169280529022217,
+            19.107840061187744,
+            19.08735990524292,
+            19.107840061187744,
+            19.08735990524292
+          ],
+          "host_us": 135.70438000000001,
+          "host_samples": [
+            131.00992,
+            131.91075999999998,
+            142.48686,
+            135.70438000000001,
+            139.90388000000002
+          ],
+          "step_host_us": 140.34718,
+          "step_host_samples": [
+            144.40538,
+            139.5924,
+            144.34446,
+            139.94034,
+            140.34718
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "triton_fp16_M33_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "9f38d7177fa72a42cf8f805f642a08a27e8380e4689f55df03c22589b80e69ac",
+          "gpu_us": 19.619840383529663,
+          "gpu_samples": [
+            19.640320539474487,
+            19.619840383529663,
+            19.578880071640015,
+            19.578880071640015,
+            19.619840383529663
+          ],
+          "host_us": 134.95195999999999,
+          "host_samples": [
+            134.95195999999999,
+            132.96076,
+            136.73466,
+            131.84124,
+            139.4776
+          ],
+          "step_host_us": 137.15036,
+          "step_host_samples": [
+            137.15036,
+            131.6528,
+            125.93632,
+            137.66558,
+            142.36360000000002
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "turboquant_dense_prefill_M33_H8_G4_D128",
+          "mode": "eager_cuda_event",
+          "sha256": "383bc573a0ec7a9bad6c5a3d668ec6ec4ebef2bbfa6c4b9d0102d1bb5eafc229",
+          "gpu_us": 497.04959869384766,
+          "gpu_samples": [
+            507.33631134033203,
+            497.04959869384766,
+            494.65343475341797,
+            496.98814392089844,
+            498.89278411865234
+          ],
+          "host_us": 504.41052,
+          "host_samples": [
+            503.99674,
+            497.62593999999996,
+            510.54766,
+            504.41052,
+            511.86701999999997
+          ],
+          "step_host_us": 499.64774,
+          "step_host_samples": [
+            499.64774,
+            497.40178,
+            498.15538,
+            500.17858,
+            499.90552
+          ],
+          "temporary_bytes": 306176
+        }
+      ]
+    },
+    {
+      "artifact": "bench-c2-candidate-d-1.json",
+      "variant": "candidate-d",
+      "source": "e9b9e042a5155526b6730e31834f4605b97c0b18",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "triton_fp16_M1_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "70ffbf5ed7bbee5ce938e5659c18b77cd1657efe13d7bfbca126fc744988ceb6",
+          "gpu_us": 19.12832021713257,
+          "gpu_samples": [
+            19.189759492874146,
+            19.148800373077393,
+            19.107840061187744,
+            19.12832021713257,
+            19.107840061187744
+          ],
+          "host_us": 111.61352000000001,
+          "host_samples": [
+            111.61352000000001,
+            107.93638000000001,
+            113.03634,
+            121.33166,
+            108.77516
+          ],
+          "step_host_us": 113.65146,
+          "step_host_samples": [
+            113.65146,
+            109.33864,
+            111.24828,
+            122.44322,
+            116.34466
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "triton_fp16_M33_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "9f38d7177fa72a42cf8f805f642a08a27e8380e4689f55df03c22589b80e69ac",
+          "gpu_us": 19.578880071640015,
+          "gpu_samples": [
+            19.619840383529663,
+            19.578880071640015,
+            19.578880071640015,
+            19.537919759750366,
+            19.537919759750366
+          ],
+          "host_us": 119.2951,
+          "host_samples": [
+            121.62856,
+            119.6785,
+            117.91912,
+            119.2951,
+            115.9259
+          ],
+          "step_host_us": 113.53692,
+          "step_host_samples": [
+            113.53692,
+            109.74396,
+            107.6067,
+            118.5052,
+            121.56052
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "turboquant_dense_prefill_M33_H8_G4_D128",
+          "mode": "eager_cuda_event",
+          "sha256": "383bc573a0ec7a9bad6c5a3d668ec6ec4ebef2bbfa6c4b9d0102d1bb5eafc229",
+          "gpu_us": 497.72544860839844,
+          "gpu_samples": [
+            515.3363037109375,
+            501.55521392822266,
+            493.58848571777344,
+            497.72544860839844,
+            496.5580749511719
+          ],
+          "host_us": 494.60314,
+          "host_samples": [
+            499.50158000000005,
+            491.88559999999995,
+            491.60064,
+            506.97318,
+            494.60314
+          ],
+          "step_host_us": 506.81546000000003,
+          "step_host_samples": [
+            509.09436,
+            507.56074,
+            506.81546000000003,
+            498.08944,
+            494.97622
+          ],
+          "temporary_bytes": 306176
+        }
+      ]
+    },
+    {
+      "artifact": "bench-c2-candidate-d-2.json",
+      "variant": "candidate-d",
+      "source": "e9b9e042a5155526b6730e31834f4605b97c0b18",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "triton_fp16_M1_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "70ffbf5ed7bbee5ce938e5659c18b77cd1657efe13d7bfbca126fc744988ceb6",
+          "gpu_us": 19.107840061187744,
+          "gpu_samples": [
+            19.169280529022217,
+            19.12832021713257,
+            19.107840061187744,
+            19.066879749298096,
+            19.08735990524292
+          ],
+          "host_us": 112.87006,
+          "host_samples": [
+            115.02618000000001,
+            112.54863999999999,
+            114.59443999999999,
+            109.00358,
+            112.87006
+          ],
+          "step_host_us": 112.80638,
+          "step_host_samples": [
+            117.16856,
+            115.17335999999999,
+            111.12858,
+            112.80638,
+            112.25822
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "triton_fp16_M33_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "9f38d7177fa72a42cf8f805f642a08a27e8380e4689f55df03c22589b80e69ac",
+          "gpu_us": 19.537919759750366,
+          "gpu_samples": [
+            19.55839991569519,
+            19.55839991569519,
+            19.537919759750366,
+            19.517439603805542,
+            19.517439603805542
+          ],
+          "host_us": 118.79248,
+          "host_samples": [
+            115.6499,
+            114.87002000000001,
+            118.79248,
+            119.1365,
+            125.2226
+          ],
+          "step_host_us": 114.11129999999999,
+          "step_host_samples": [
+            117.86444,
+            114.11129999999999,
+            112.19018,
+            113.38194,
+            118.08334
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "turboquant_dense_prefill_M33_H8_G4_D128",
+          "mode": "eager_cuda_event",
+          "sha256": "383bc573a0ec7a9bad6c5a3d668ec6ec4ebef2bbfa6c4b9d0102d1bb5eafc229",
+          "gpu_us": 497.9507064819336,
+          "gpu_samples": [
+            504.453125,
+            502.0057678222656,
+            496.6400146484375,
+            497.21343994140625,
+            497.9507064819336
+          ],
+          "host_us": 497.40552,
+          "host_samples": [
+            497.33376,
+            497.40552,
+            494.58922,
+            525.80006,
+            497.81858
+          ],
+          "step_host_us": 506.16578000000004,
+          "step_host_samples": [
+            503.07205999999996,
+            506.16578000000004,
+            530.48534,
+            527.02242,
+            504.5965
+          ],
+          "temporary_bytes": 306176
+        }
+      ]
+    },
+    {
+      "artifact": "bench-c2-candidate-d-3.json",
+      "variant": "candidate-d",
+      "source": "e9b9e042a5155526b6730e31834f4605b97c0b18",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "triton_fp16_M1_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "70ffbf5ed7bbee5ce938e5659c18b77cd1657efe13d7bfbca126fc744988ceb6",
+          "gpu_us": 19.107840061187744,
+          "gpu_samples": [
+            19.189759492874146,
+            19.169280529022217,
+            19.107840061187744,
+            19.08735990524292,
+            19.107840061187744
+          ],
+          "host_us": 113.4983,
+          "host_samples": [
+            122.60438,
+            113.4983,
+            112.88652,
+            117.08866,
+            112.56291999999999
+          ],
+          "step_host_us": 118.21508,
+          "step_host_samples": [
+            118.21508,
+            117.41647999999999,
+            124.94592,
+            121.04766,
+            112.28842
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "triton_fp16_M33_KV64_H8_G4_D128",
+          "mode": "cuda_graph",
+          "sha256": "9f38d7177fa72a42cf8f805f642a08a27e8380e4689f55df03c22589b80e69ac",
+          "gpu_us": 19.660799503326416,
+          "gpu_samples": [
+            19.68127965927124,
+            19.68127965927124,
+            19.660799503326416,
+            19.660799503326416,
+            19.640320539474487
+          ],
+          "host_us": 118.36192,
+          "host_samples": [
+            128.6171,
+            118.87200000000001,
+            118.36192,
+            115.63286,
+            116.3492
+          ],
+          "step_host_us": 118.459,
+          "step_host_samples": [
+            118.459,
+            116.30848,
+            119.43796,
+            128.20074,
+            114.86414
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "turboquant_dense_prefill_M33_H8_G4_D128",
+          "mode": "eager_cuda_event",
+          "sha256": "383bc573a0ec7a9bad6c5a3d668ec6ec4ebef2bbfa6c4b9d0102d1bb5eafc229",
+          "gpu_us": 506.2246322631836,
+          "gpu_samples": [
+            508.9420700073242,
+            511.34464263916016,
+            505.28255462646484,
+            502.1696090698242,
+            506.2246322631836
+          ],
+          "host_us": 502.01304,
+          "host_samples": [
+            501.79146000000003,
+            502.01304,
+            498.97566,
+            523.9558000000001,
+            505.82758
+          ],
+          "step_host_us": 514.19506,
+          "step_host_samples": [
+            509.2757,
+            514.19506,
+            514.6054,
+            516.08168,
+            506.97566
+          ],
+          "temporary_bytes": 306176
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-b-baseline-1.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "f16_M16_N512_K1024",
+          "sha256": "02e9d57b61907179e25d54ed20d7e60258e7910e435de12a3a5f121adc2d2eaf",
+          "gpu_us": 70.63551902770996,
+          "gpu_samples": [
+            71.06368064880371,
+            70.55359840393066,
+            70.63551902770996,
+            70.57407855987549,
+            70.65599918365479
+          ],
+          "host_us": 22.19448,
+          "host_samples": [
+            23.55866,
+            22.19448,
+            22.01852,
+            22.272260000000003,
+            21.8558
+          ],
+          "step_host_us": 23.160059999999998,
+          "step_host_samples": [
+            23.995540000000002,
+            23.34748,
+            23.160059999999998,
+            23.121399999999998,
+            23.09436
+          ],
+          "temporary_bytes": 16384
+        },
+        {
+          "name": "qpn8_M8_N5120_K1536",
+          "sha256": "d03d51acfa79899ad099bf42eeaf931331da7bfbbdc6fa0440eced2177fce82d",
+          "gpu_us": 12.513279914855957,
+          "gpu_samples": [
+            13.578239679336548,
+            12.57472038269043,
+            12.513279914855957,
+            12.492799758911133,
+            12.513279914855957
+          ],
+          "host_us": 20.93132,
+          "host_samples": [
+            21.79326,
+            21.06948,
+            20.93132,
+            20.796239999999997,
+            20.82978
+          ],
+          "step_host_us": 22.7566,
+          "step_host_samples": [
+            23.13746,
+            22.37728,
+            22.324340000000003,
+            22.7566,
+            23.60468
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M17_N5120_K1536",
+          "sha256": "d9e6bb7ea77a3e90169b68470983dcd9ba930ad96ea660c390170df131248fb3",
+          "gpu_us": 21.585919857025146,
+          "gpu_samples": [
+            21.60640001296997,
+            21.585919857025146,
+            21.565439701080322,
+            21.60640001296997,
+            21.585919857025146
+          ],
+          "host_us": 21.18016,
+          "host_samples": [
+            21.80442,
+            21.34202,
+            21.18016,
+            21.02382,
+            20.930419999999998
+          ],
+          "step_host_us": 22.32368,
+          "step_host_samples": [
+            23.270239999999998,
+            22.47544,
+            22.32368,
+            22.32252,
+            22.27676
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M32_N5120_K1536",
+          "sha256": "ed00033098f0f2e7d25edd6cfcbd7b103eb25eb22854fcce3c0f0685fe14f0f6",
+          "gpu_us": 18.3296000957489,
+          "gpu_samples": [
+            18.411519527435303,
+            18.3296000957489,
+            18.288639783859253,
+            18.3296000957489,
+            18.3296000957489
+          ],
+          "host_us": 35.25056,
+          "host_samples": [
+            35.25056,
+            34.40162,
+            34.23246,
+            37.3546,
+            36.04272
+          ],
+          "step_host_us": 35.07582,
+          "step_host_samples": [
+            35.90494,
+            40.118719999999996,
+            35.07582,
+            34.47032,
+            33.83924
+          ],
+          "temporary_bytes": 98304
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-b-baseline-2.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "f16_M16_N512_K1024",
+          "sha256": "02e9d57b61907179e25d54ed20d7e60258e7910e435de12a3a5f121adc2d2eaf",
+          "gpu_us": 70.67647933959961,
+          "gpu_samples": [
+            71.22687816619873,
+            70.73791980743408,
+            70.65599918365479,
+            70.67647933959961,
+            70.65599918365479
+          ],
+          "host_us": 22.702600000000004,
+          "host_samples": [
+            22.84252,
+            21.16022,
+            22.18618,
+            22.7718,
+            22.702600000000004
+          ],
+          "step_host_us": 22.235079999999996,
+          "step_host_samples": [
+            23.05264,
+            22.523159999999997,
+            22.235079999999996,
+            22.124899999999997,
+            22.097800000000003
+          ],
+          "temporary_bytes": 16384
+        },
+        {
+          "name": "qpn8_M8_N5120_K1536",
+          "sha256": "d03d51acfa79899ad099bf42eeaf931331da7bfbbdc6fa0440eced2177fce82d",
+          "gpu_us": 12.57472038269043,
+          "gpu_samples": [
+            13.537280559539795,
+            12.595200538635254,
+            12.57472038269043,
+            12.533760070800781,
+            12.533760070800781
+          ],
+          "host_us": 20.679520000000004,
+          "host_samples": [
+            21.68626,
+            20.679520000000004,
+            20.73656,
+            20.558960000000003,
+            20.60174
+          ],
+          "step_host_us": 22.129839999999998,
+          "step_host_samples": [
+            22.75386,
+            22.0488,
+            22.129839999999998,
+            23.31078,
+            22.10736
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M17_N5120_K1536",
+          "sha256": "d9e6bb7ea77a3e90169b68470983dcd9ba930ad96ea660c390170df131248fb3",
+          "gpu_us": 21.64736032485962,
+          "gpu_samples": [
+            21.667840480804443,
+            21.64736032485962,
+            21.64736032485962,
+            21.585919857025146,
+            21.626880168914795
+          ],
+          "host_us": 20.556060000000002,
+          "host_samples": [
+            21.05862,
+            20.67098,
+            20.556060000000002,
+            20.55218,
+            20.54252
+          ],
+          "step_host_us": 23.108040000000003,
+          "step_host_samples": [
+            23.73652,
+            23.108040000000003,
+            22.96338,
+            23.099140000000002,
+            23.472040000000003
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M32_N5120_K1536",
+          "sha256": "ed00033098f0f2e7d25edd6cfcbd7b103eb25eb22854fcce3c0f0685fe14f0f6",
+          "gpu_us": 18.37056040763855,
+          "gpu_samples": [
+            18.431999683380127,
+            18.431999683380127,
+            18.37056040763855,
+            18.37056040763855,
+            18.37056040763855
+          ],
+          "host_us": 33.2277,
+          "host_samples": [
+            34.2418,
+            33.1133,
+            32.23388,
+            33.2277,
+            33.54114
+          ],
+          "step_host_us": 37.630160000000004,
+          "step_host_samples": [
+            38.34404,
+            36.38664,
+            36.2733,
+            37.630160000000004,
+            39.1275
+          ],
+          "temporary_bytes": 98304
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-b-baseline-3.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "f16_M16_N512_K1024",
+          "sha256": "02e9d57b61907179e25d54ed20d7e60258e7910e435de12a3a5f121adc2d2eaf",
+          "gpu_us": 70.61503887176514,
+          "gpu_samples": [
+            71.18720054626465,
+            70.61503887176514,
+            70.9222412109375,
+            70.53311824798584,
+            70.57407855987549
+          ],
+          "host_us": 20.937040000000003,
+          "host_samples": [
+            22.713359999999998,
+            20.937040000000003,
+            20.953560000000003,
+            19.97092,
+            19.93686
+          ],
+          "step_host_us": 22.523180000000004,
+          "step_host_samples": [
+            22.10736,
+            22.985439999999997,
+            22.523180000000004,
+            23.9465,
+            21.19758
+          ],
+          "temporary_bytes": 16384
+        },
+        {
+          "name": "qpn8_M8_N5120_K1536",
+          "sha256": "d03d51acfa79899ad099bf42eeaf931331da7bfbbdc6fa0440eced2177fce82d",
+          "gpu_us": 12.595200538635254,
+          "gpu_samples": [
+            13.598719835281372,
+            12.615679502487183,
+            12.595200538635254,
+            12.554240226745605,
+            12.513279914855957
+          ],
+          "host_us": 19.5945,
+          "host_samples": [
+            20.41638,
+            19.6154,
+            19.5945,
+            19.49738,
+            19.51678
+          ],
+          "step_host_us": 21.15458,
+          "step_host_samples": [
+            21.55132,
+            21.007060000000003,
+            21.382260000000002,
+            21.15458,
+            20.976080000000003
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M17_N5120_K1536",
+          "sha256": "d9e6bb7ea77a3e90169b68470983dcd9ba930ad96ea660c390170df131248fb3",
+          "gpu_us": 21.626880168914795,
+          "gpu_samples": [
+            21.688320636749268,
+            21.60640001296997,
+            21.626880168914795,
+            21.74976110458374,
+            21.626880168914795
+          ],
+          "host_us": 19.702260000000003,
+          "host_samples": [
+            20.36374,
+            19.702260000000003,
+            19.47248,
+            19.75796,
+            19.43144
+          ],
+          "step_host_us": 20.9711,
+          "step_host_samples": [
+            21.99524,
+            20.982860000000002,
+            20.91628,
+            20.8079,
+            20.9711
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M32_N5120_K1536",
+          "sha256": "ed00033098f0f2e7d25edd6cfcbd7b103eb25eb22854fcce3c0f0685fe14f0f6",
+          "gpu_us": 18.37056040763855,
+          "gpu_samples": [
+            18.45247983932495,
+            18.391040563583374,
+            18.350080251693726,
+            18.37056040763855,
+            18.3296000957489
+          ],
+          "host_us": 31.31178,
+          "host_samples": [
+            32.40688,
+            31.520799999999998,
+            31.298099999999998,
+            31.31178,
+            31.20394
+          ],
+          "step_host_us": 33.98512,
+          "step_host_samples": [
+            36.33348,
+            33.6652,
+            33.87066,
+            34.53878,
+            33.98512
+          ],
+          "temporary_bytes": 98304
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-b-candidate-f-1.json",
+      "variant": "candidate-f",
+      "source": "234c56abb28c2f239ff3e56625f8e11c5afcb448",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "f16_M16_N512_K1024",
+          "sha256": "02e9d57b61907179e25d54ed20d7e60258e7910e435de12a3a5f121adc2d2eaf",
+          "gpu_us": 70.59455871582031,
+          "gpu_samples": [
+            71.05728149414062,
+            70.55359840393066,
+            70.65599918365479,
+            70.55359840393066,
+            70.59455871582031
+          ],
+          "host_us": 21.398780000000002,
+          "host_samples": [
+            22.9193,
+            21.39366,
+            21.414679999999997,
+            21.398780000000002,
+            21.27652
+          ],
+          "step_host_us": 50.70624,
+          "step_host_samples": [
+            50.70624,
+            47.71714,
+            47.704260000000005,
+            51.836040000000004,
+            50.845
+          ],
+          "temporary_bytes": 16384
+        },
+        {
+          "name": "qpn8_M8_N5120_K1536",
+          "sha256": "d03d51acfa79899ad099bf42eeaf931331da7bfbbdc6fa0440eced2177fce82d",
+          "gpu_us": 12.554240226745605,
+          "gpu_samples": [
+            13.63968014717102,
+            12.595200538635254,
+            12.554240226745605,
+            12.554240226745605,
+            12.554240226745605
+          ],
+          "host_us": 22.465619999999998,
+          "host_samples": [
+            22.72942,
+            22.465619999999998,
+            22.52554,
+            21.78978,
+            21.60998
+          ],
+          "step_host_us": 47.705200000000005,
+          "step_host_samples": [
+            50.01824,
+            47.705200000000005,
+            47.5254,
+            47.72268,
+            47.37042
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M17_N5120_K1536",
+          "sha256": "d9e6bb7ea77a3e90169b68470983dcd9ba930ad96ea660c390170df131248fb3",
+          "gpu_us": 21.626880168914795,
+          "gpu_samples": [
+            21.688320636749268,
+            21.626880168914795,
+            21.60640001296997,
+            21.585919857025146,
+            21.626880168914795
+          ],
+          "host_us": 21.5896,
+          "host_samples": [
+            22.444760000000002,
+            22.02984,
+            21.5896,
+            21.517979999999998,
+            21.58522
+          ],
+          "step_host_us": 46.86446,
+          "step_host_samples": [
+            48.497460000000004,
+            46.95698,
+            46.86446,
+            46.609840000000005,
+            46.77482
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M32_N5120_K1536",
+          "sha256": "ed00033098f0f2e7d25edd6cfcbd7b103eb25eb22854fcce3c0f0685fe14f0f6",
+          "gpu_us": 18.37056040763855,
+          "gpu_samples": [
+            18.45247983932495,
+            18.513920307159424,
+            18.350080251693726,
+            18.288639783859253,
+            18.37056040763855
+          ],
+          "host_us": 33.04862,
+          "host_samples": [
+            33.7234,
+            32.7036,
+            33.04862,
+            34.2844,
+            32.384859999999996
+          ],
+          "step_host_us": 60.61724,
+          "step_host_samples": [
+            61.427780000000006,
+            60.12932,
+            60.61724,
+            59.579679999999996,
+            60.86982
+          ],
+          "temporary_bytes": 98304
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-b-candidate-f-2.json",
+      "variant": "candidate-f",
+      "source": "234c56abb28c2f239ff3e56625f8e11c5afcb448",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "f16_M16_N512_K1024",
+          "sha256": "02e9d57b61907179e25d54ed20d7e60258e7910e435de12a3a5f121adc2d2eaf",
+          "gpu_us": 70.53311824798584,
+          "gpu_samples": [
+            71.02911949157715,
+            70.63551902770996,
+            70.53311824798584,
+            70.47167778015137,
+            70.53311824798584
+          ],
+          "host_us": 22.14346,
+          "host_samples": [
+            23.64404,
+            22.249740000000003,
+            22.11252,
+            21.93974,
+            22.14346
+          ],
+          "step_host_us": 48.825,
+          "step_host_samples": [
+            50.0133,
+            49.00948,
+            48.825,
+            48.74116,
+            48.33014
+          ],
+          "temporary_bytes": 16384
+        },
+        {
+          "name": "qpn8_M8_N5120_K1536",
+          "sha256": "d03d51acfa79899ad099bf42eeaf931331da7bfbbdc6fa0440eced2177fce82d",
+          "gpu_us": 12.513279914855957,
+          "gpu_samples": [
+            13.496320247650146,
+            12.513279914855957,
+            12.533760070800781,
+            12.513279914855957,
+            12.513279914855957
+          ],
+          "host_us": 22.0356,
+          "host_samples": [
+            22.773139999999998,
+            22.433980000000002,
+            21.54176,
+            22.0356,
+            21.608980000000003
+          ],
+          "step_host_us": 48.17254,
+          "step_host_samples": [
+            49.492799999999995,
+            49.47526,
+            47.33292,
+            47.39412,
+            48.17254
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M17_N5120_K1536",
+          "sha256": "d9e6bb7ea77a3e90169b68470983dcd9ba930ad96ea660c390170df131248fb3",
+          "gpu_us": 21.565439701080322,
+          "gpu_samples": [
+            21.626880168914795,
+            21.626880168914795,
+            21.544959545135498,
+            21.565439701080322,
+            21.544959545135498
+          ],
+          "host_us": 22.136280000000003,
+          "host_samples": [
+            23.22328,
+            21.606460000000002,
+            22.35174,
+            22.125100000000003,
+            22.136280000000003
+          ],
+          "step_host_us": 48.874939999999995,
+          "step_host_samples": [
+            48.86606,
+            51.57402,
+            50.21206,
+            48.874939999999995,
+            46.92594
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M32_N5120_K1536",
+          "sha256": "ed00033098f0f2e7d25edd6cfcbd7b103eb25eb22854fcce3c0f0685fe14f0f6",
+          "gpu_us": 18.309119939804077,
+          "gpu_samples": [
+            18.37056040763855,
+            18.309119939804077,
+            18.309119939804077,
+            18.288639783859253,
+            18.26815962791443
+          ],
+          "host_us": 32.61978,
+          "host_samples": [
+            33.60226,
+            32.61978,
+            32.69748,
+            32.37112,
+            32.35886
+          ],
+          "step_host_us": 61.01112,
+          "step_host_samples": [
+            62.666019999999996,
+            61.01112,
+            61.359300000000005,
+            60.5265,
+            60.898860000000006
+          ],
+          "temporary_bytes": 98304
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-b-candidate-f-3.json",
+      "variant": "candidate-f",
+      "source": "234c56abb28c2f239ff3e56625f8e11c5afcb448",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "f16_M16_N512_K1024",
+          "sha256": "02e9d57b61907179e25d54ed20d7e60258e7910e435de12a3a5f121adc2d2eaf",
+          "gpu_us": 70.61503887176514,
+          "gpu_samples": [
+            71.1033582687378,
+            70.61503887176514,
+            70.57407855987549,
+            70.53311824798584,
+            70.61503887176514
+          ],
+          "host_us": 21.7869,
+          "host_samples": [
+            23.3612,
+            21.7869,
+            21.86852,
+            21.56818,
+            21.611439999999998
+          ],
+          "step_host_us": 49.2875,
+          "step_host_samples": [
+            49.2875,
+            47.90976,
+            50.50504,
+            49.61674,
+            47.57238
+          ],
+          "temporary_bytes": 16384
+        },
+        {
+          "name": "qpn8_M8_N5120_K1536",
+          "sha256": "d03d51acfa79899ad099bf42eeaf931331da7bfbbdc6fa0440eced2177fce82d",
+          "gpu_us": 12.57472038269043,
+          "gpu_samples": [
+            13.537280559539795,
+            12.595200538635254,
+            12.57472038269043,
+            12.513279914855957,
+            12.533760070800781
+          ],
+          "host_us": 22.90302,
+          "host_samples": [
+            24.18672,
+            23.2172,
+            22.90302,
+            22.38046,
+            22.183960000000003
+          ],
+          "step_host_us": 48.58106,
+          "step_host_samples": [
+            49.141459999999995,
+            48.58106,
+            48.63381999999999,
+            47.35236,
+            47.4086
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M17_N5120_K1536",
+          "sha256": "d9e6bb7ea77a3e90169b68470983dcd9ba930ad96ea660c390170df131248fb3",
+          "gpu_us": 21.626880168914795,
+          "gpu_samples": [
+            21.64736032485962,
+            21.64736032485962,
+            21.626880168914795,
+            21.585919857025146,
+            21.626880168914795
+          ],
+          "host_us": 22.1375,
+          "host_samples": [
+            24.14882,
+            22.319499999999998,
+            22.1375,
+            22.042759999999998,
+            21.968760000000003
+          ],
+          "step_host_us": 47.337759999999996,
+          "step_host_samples": [
+            48.927,
+            47.337759999999996,
+            46.73858,
+            46.85042000000001,
+            47.40196
+          ],
+          "temporary_bytes": 0
+        },
+        {
+          "name": "qpn8_M32_N5120_K1536",
+          "sha256": "ed00033098f0f2e7d25edd6cfcbd7b103eb25eb22854fcce3c0f0685fe14f0f6",
+          "gpu_us": 18.37056040763855,
+          "gpu_samples": [
+            18.431999683380127,
+            18.37056040763855,
+            18.309119939804077,
+            18.3296000957489,
+            18.37056040763855
+          ],
+          "host_us": 32.6539,
+          "host_samples": [
+            33.3751,
+            32.6368,
+            32.6539,
+            32.70048,
+            32.6004
+          ],
+          "step_host_us": 61.13252000000001,
+          "step_host_samples": [
+            61.7834,
+            62.905860000000004,
+            60.33196,
+            60.90282,
+            61.13252000000001
+          ],
+          "temporary_bytes": 98304
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-fla-baseline-1.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "kda_prefill_M64_H4_K64",
+          "sha256": "a854cc2570f99894456d5f9c013caf10a1680864353f0116bc79426ac8874c85",
+          "gpu_us": 92.07807540893555,
+          "gpu_samples": [
+            93.27232360839844,
+            92.09856033325195,
+            92.07807540893555,
+            92.0576000213623,
+            92.0576000213623
+          ],
+          "host_us": 754.6096000000001,
+          "host_samples": [
+            766.2321400000001,
+            770.30894,
+            754.6096000000001,
+            742.23076,
+            735.6928
+          ],
+          "temporary_bytes": 458752
+        },
+        {
+          "name": "gdn_prefill_M64_H4_K64",
+          "sha256": "c22c6ad108cf95395160559a5834dcb7bf745912bbfc0e8fd08534fceaaea691",
+          "gpu_us": 98.2425594329834,
+          "gpu_samples": [
+            132.1292781829834,
+            98.2425594329834,
+            98.2630443572998,
+            98.2425594329834,
+            98.22208404541016
+          ],
+          "host_us": 712.50082,
+          "host_samples": [
+            819.88864,
+            712.18166,
+            718.0095600000001,
+            712.50082,
+            711.3563
+          ],
+          "temporary_bytes": 362496
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-fla-baseline-2.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "kda_prefill_M64_H4_K64",
+          "sha256": "a854cc2570f99894456d5f9c013caf10a1680864353f0116bc79426ac8874c85",
+          "gpu_us": 90.93119621276855,
+          "gpu_samples": [
+            91.19999885559082,
+            90.93119621276855,
+            90.93119621276855,
+            90.93119621276855,
+            90.95168113708496
+          ],
+          "host_us": 731.75342,
+          "host_samples": [
+            726.14088,
+            722.27106,
+            731.75342,
+            783.26872,
+            762.7706
+          ],
+          "temporary_bytes": 458752
+        },
+        {
+          "name": "gdn_prefill_M64_H4_K64",
+          "sha256": "c22c6ad108cf95395160559a5834dcb7bf745912bbfc0e8fd08534fceaaea691",
+          "gpu_us": 97.95583724975586,
+          "gpu_samples": [
+            98.06015968322754,
+            97.97632217407227,
+            97.95583724975586,
+            97.95583724975586,
+            97.95583724975586
+          ],
+          "host_us": 696.03512,
+          "host_samples": [
+            696.03512,
+            693.40898,
+            697.58118,
+            696.6624800000001,
+            693.9675
+          ],
+          "temporary_bytes": 362496
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-fla-baseline-3.json",
+      "variant": "baseline",
+      "source": "b14c2ab0a081fa6ba2ae827de4040073cc030873",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "kda_prefill_M64_H4_K64",
+          "sha256": "a854cc2570f99894456d5f9c013caf10a1680864353f0116bc79426ac8874c85",
+          "gpu_us": 91.01311683654785,
+          "gpu_samples": [
+            91.29216194152832,
+            91.01311683654785,
+            90.99264144897461,
+            91.03360176086426,
+            90.99264144897461
+          ],
+          "host_us": 699.7516400000001,
+          "host_samples": [
+            714.3639200000001,
+            698.32898,
+            703.7869000000001,
+            699.6144400000001,
+            699.7516400000001
+          ],
+          "temporary_bytes": 458752
+        },
+        {
+          "name": "gdn_prefill_M64_H4_K64",
+          "sha256": "c22c6ad108cf95395160559a5834dcb7bf745912bbfc0e8fd08534fceaaea691",
+          "gpu_us": 97.91487693786621,
+          "gpu_samples": [
+            98.01216125488281,
+            97.93536186218262,
+            97.91487693786621,
+            97.91487693786621,
+            97.91487693786621
+          ],
+          "host_us": 680.01742,
+          "host_samples": [
+            705.09068,
+            697.23038,
+            673.66322,
+            678.00294,
+            680.01742
+          ],
+          "temporary_bytes": 362496
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-fla-candidate-f-1.json",
+      "variant": "candidate-f",
+      "source": "234c56abb28c2f239ff3e56625f8e11c5afcb448",
+      "round": 1,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "kda_prefill_M64_H4_K64",
+          "sha256": "a854cc2570f99894456d5f9c013caf10a1680864353f0116bc79426ac8874c85",
+          "gpu_us": 90.95168113708496,
+          "gpu_samples": [
+            91.17952346801758,
+            90.95168113708496,
+            90.95168113708496,
+            90.91072082519531,
+            90.91072082519531
+          ],
+          "host_us": 755.07328,
+          "host_samples": [
+            752.93976,
+            745.00234,
+            755.17716,
+            759.9727800000001,
+            755.07328
+          ],
+          "temporary_bytes": 458752
+        },
+        {
+          "name": "gdn_prefill_M64_H4_K64",
+          "sha256": "c22c6ad108cf95395160559a5834dcb7bf745912bbfc0e8fd08534fceaaea691",
+          "gpu_us": 97.95583724975586,
+          "gpu_samples": [
+            98.01407814025879,
+            98.09920310974121,
+            97.95583724975586,
+            97.95583724975586,
+            97.91487693786621
+          ],
+          "host_us": 716.75136,
+          "host_samples": [
+            716.7230999999999,
+            722.1828,
+            716.75136,
+            714.0225599999999,
+            716.86564
+          ],
+          "temporary_bytes": 362496
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-fla-candidate-f-2.json",
+      "variant": "candidate-f",
+      "source": "234c56abb28c2f239ff3e56625f8e11c5afcb448",
+      "round": 2,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "kda_prefill_M64_H4_K64",
+          "sha256": "a854cc2570f99894456d5f9c013caf10a1680864353f0116bc79426ac8874c85",
+          "gpu_us": 91.11552238464355,
+          "gpu_samples": [
+            91.33760452270508,
+            91.1564826965332,
+            91.11552238464355,
+            91.0745620727539,
+            91.0745620727539
+          ],
+          "host_us": 730.51018,
+          "host_samples": [
+            752.36932,
+            734.40974,
+            730.51018,
+            712.61196,
+            716.90292
+          ],
+          "temporary_bytes": 458752
+        },
+        {
+          "name": "gdn_prefill_M64_H4_K64",
+          "sha256": "c22c6ad108cf95395160559a5834dcb7bf745912bbfc0e8fd08534fceaaea691",
+          "gpu_us": 98.14016342163086,
+          "gpu_samples": [
+            98.22079658508301,
+            98.1606388092041,
+            98.11967849731445,
+            98.11967849731445,
+            98.14016342163086
+          ],
+          "host_us": 694.3655,
+          "host_samples": [
+            690.8961800000001,
+            688.6721799999999,
+            694.3655,
+            695.5046600000001,
+            715.7192600000001
+          ],
+          "temporary_bytes": 362496
+        }
+      ]
+    },
+    {
+      "artifact": "bench-f-fla-candidate-f-3.json",
+      "variant": "candidate-f",
+      "source": "234c56abb28c2f239ff3e56625f8e11c5afcb448",
+      "round": 3,
+      "torch": "2.10.0+cu128",
+      "cuda": "12.8",
+      "gpu": "Tesla V100-SXM2-32GB",
+      "results": [
+        {
+          "name": "kda_prefill_M64_H4_K64",
+          "sha256": "a854cc2570f99894456d5f9c013caf10a1680864353f0116bc79426ac8874c85",
+          "gpu_us": 91.1564826965332,
+          "gpu_samples": [
+            91.38815879821777,
+            91.1564826965332,
+            91.17695808410645,
+            91.09503746032715,
+            91.0745620727539
+          ],
+          "host_us": 736.51446,
+          "host_samples": [
+            740.20622,
+            720.56962,
+            727.93094,
+            736.51446,
+            806.17752
+          ],
+          "temporary_bytes": 458752
+        },
+        {
+          "name": "gdn_prefill_M64_H4_K64",
+          "sha256": "c22c6ad108cf95395160559a5834dcb7bf745912bbfc0e8fd08534fceaaea691",
+          "gpu_us": 97.89440155029297,
+          "gpu_samples": [
+            97.96223640441895,
+            97.89440155029297,
+            97.89440155029297,
+            97.87391662597656,
+            97.85344123840332
+          ],
+          "host_us": 693.1039999999999,
+          "host_samples": [
+            693.1039999999999,
+            686.44092,
+            684.24342,
+            696.59352,
+            706.87406
+          ],
+          "temporary_bytes": 362496
+        }
+      ]
+    }
+  ]
+}

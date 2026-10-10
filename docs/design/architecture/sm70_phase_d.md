@@ -429,161 +429,73 @@ refreshes source timestamps and produces a different baseline artifact. The
 local policy/metadata suite also needs a GPU-capable platform for nine existing
 fixtures; those fixtures pass in the 203-case remote run.
 
-### D5 provider migration (in progress)
+### D5a: provider configuration and resource lifecycle
 
-The first provider change binds nine QSA controls, two GDN projection controls,
-two MTP batch projection controls, four layer provider controls, five
-unquantized MoE controls and two GLM diagnostic controls. The existing configuration
-owners and initialization checkpoints remain authoritative. No algorithm,
-precision mode, shape bound or native schema changes in this part.
+QSA/indexer, GDN/FLA schedules, quantized loaders, MTP projections, ordinary
+sampling, fallback attention, TurboQuant and the remaining HC/PLE provider gates
+now consume their initialized owners. Deferred compatibility inputs travel with
+worker configuration; malformed dormant inputs still raise at their original
+admission checkpoints. Capturing a format does not activate it. Explicit typed
+values take precedence without changing the process environment.
 
-- QSA no longer snapshots computation policy on module import. Its two mutable
-  workspace maps borrow engine storage, retain captured allocations across
-  growth, and keep standalone compatibility storage separate. The QSA library
-  path and grouped ABI capability remain process loading/capability concerns.
-- GDN batch packing and MTP router/shared projection consumers use the same
-  initialized policy as weight preparation. The ordinary top-k20 sampler captures
-  its layer policy at construction; static helper calls retain a standalone
-  compatibility adapter. Invalid dormant settings are recorded at initialization
-  and raised at their original admission checkpoints.
-- Unquantized MoE warmup and execution use one configuration. The temporary
-  legacy-tile warmup override is context-local and restored on exceptions.
-- GLM KDA finite/trace admission uses runtime diagnostics. Seen keys, armed
-  prefixes and token indices belong to the engine diagnostic owner.
-- Online QPN8 workspace pools are engine-local. Its ordinary and fused HC
-  dispatch resolve workspace addresses by layer prefix inside opaque operations,
-  preserving B's export/reload mechanism. Existing native operators are unchanged.
+- QSA's two workspace maps, online-QPN8 address pools, sampler scratch and
+  TurboQuant caches borrow the worker resource map. Captured allocations survive
+  growth; AOT resolves new addresses by the existing layer prefix/owner slot.
+- Native runtime ABI 1 owns TurboMind packing, tuning, scratch and observation
+  counters in both normal extensions. Policy ABI 61 parses scalars and target
+  lists once. Existing custom-op schemas remain compatible. An explicit engine
+  configuration fails initialization against an insufficient binary.
+- Six FLA modules no longer snapshot launch policy on import. GDN and KDA reuse
+  `GdnScheduleConfig`; the model adapter declares the applicable hash fields.
+  Live autotuners belong to worker resources and are omitted from serialization.
+  Independent operator calls retain separate lazy compatibility caches.
+- Diagnostic budgets and buffers use engine owners. The paused empty-output and
+  replaced coarse GDN gates retain their original notices, including presence-only
+  parsing for the latter. No empty-allocation experiment is reactivated.
+- Async queue depth remains in the scheduler. The old output-token repair switch
+  also affects ordinary async runs, so its canonical owner is `sm70_runtime`.
+  Both batch constructors bind it once; request-history repair reads no env.
+- Library paths, capabilities and upstream loading controls remain loading inputs.
+  The six native `SM70_MARLIN_*` launch overrides still need D5b. DDTree remains
+  deferred. D6 must audit the full inventory with one common counter.
 
-Focused CPU evidence is under `/home/ymzx/arch-ws/tmp/phase-d5`. The remote
-baseline is main `b14c2ab0a`; normal `_C` and `_moe_C` builds are owned by
-`/home/ymzx/arch-ws/phase-d5-20261010`. GPU validation and A/B results are pending.
-The next candidate also binds DeepSeek/indexer controls, ordinary sampling
-scratch, long-attention opt-out/manifest selection, top-token/GLM/DFlash diagnostics
-and the remaining QPN8 native selectors. Prepared native policies parse scalar
-and target-list inputs once. Native runtime ABI 1 owns TurboMind scratch, packing,
-tuning and trace state per engine. Existing custom-op schemas remain unchanged;
-new host-only runtime classes and an explicit capability query are built into
-both normal extensions. Stable configuration-owner slots rebind AOT policy inputs
-without embedding engine addresses or diagnostic values in compiled graphs.
+**Validation.** Focused CPU suites cover worker serialization, hash qualification,
+two-engine initialization/execution order, malformed inputs, original golden
+route/call-order snapshots, forbidden getters after initialization and resource
+release. Logs reside under `/home/ymzx/arch-ws/tmp/phase-d5`. Final notice/default
+coverage passes 32 tests. The remote provider suites initially stopped after
+170 and 197 passes on fixture/package failures; all seven corresponding cases
+pass after supplying the unchanged standard extension and using production
+initialization scopes. The fallback-attention suite passes 34 tests. The final
+FLA/GDN/native-owner/async-state suite passes 35 tests (8 unrelated deselections),
+including changed-input/state graph replay and release of one of two owners.
 
-CPU validation, native-header compilation, normal CUDA rebuild, and operator
-A/B evidence are recorded separately. The candidate policy/provider/diagnostic
-regression suite passes 294 tests (3 GPU-dependent skips); native owner isolation
-and retained diagnostic checkpoints pass 55 focused tests. Both the standalone
-C++ policy header and Torch class registration template compile successfully.
-The same layering counter records 147 -> 129 raw environment references,
-3191 -> 3186 platform references and 2114 -> 2111 model references relative to
-the first D5 candidate's ledger. These counts are source references, not a claim
-that all remaining readers execute per token. D6 must compare the full campaign
-with one unchanged counter and classify its remaining consumers. The new native owner is still under
-validation. Other provider/loading boundaries and the full D6 inventory are
-unfinished; this section does not claim completion of D5 or D.
+Normal `_C`, `_moe_C` and `_C_stable_libtorch` components were built from source;
+both arms use the same unchanged FA2/Flash-V100 components. Fresh-process ABI and
+loader checks passed. Artifact hashes, raw samples and workload contracts are in
+[phase_d5a_operators.json](phase_d5a_operators.json).
 
-The next Python-only candidate captures eight Triton fallback-attention schedule
-inputs and four quantized-warmup controls. The schedule is validated once with
-its original deferred error gate; shape-dependent prefill/decode tiles remain
-dynamic. Effective warp choices replace redundant alias inputs in the hash.
-TurboQuant provider choices and comparison policy now share the engine lifecycle:
-comparison/dump budgets use the common diagnostic channels, continuation reserve
-records and Hadamard tensors use engine attention caches, and each layer retains
-its initialized upstream workspace manager. The upstream manager installation
-API remains a separate compatibility boundary.
+| Operator | GPU/event median change | Host median change | Output/state and allocation |
+| --- | --- | --- | --- |
+| QSA M512/K2048 | -0.16% | +4.90% | Exact |
+| MTP router M5/N512/K2560 | +0.32% | +7.65% | Exact |
+| FP16 M16/N512/K1024, fixed selector | -0.06% | -1.84% | Exact |
+| QPN8 M8/M17/M32 | -0.16% / 0% / 0% | +8.64% / +7.69% / -1.73% | Exact |
+| Triton attention M1/M33 | -0.21% / -0.21% | -16.83% / -11.97% | Exact |
+| TurboQuant prefill M33, eager events | +0.43% | +0.67% | Exact |
+| KDA/GDN prefill M64/H4/K64 | +0.11% / 0% | +0.65% / -0.24% | Exact |
 
-The same candidate migrates both runners' greedy admission, the retained
-piecewise/profile graph controls, MTP projection allowlists/weight-sharing rules, shared-expert gates and QSA
-calibration inputs. Calibration destinations are fixed; the existing `COLLECTING`
-marker still changes corpus shards dynamically. The six quantized loader families
-and their remaining provider-selection aliases are still under review.
+All entries use three alternating A/B rounds. GPU differences are small; the
+host overhead is **not** uniformly unchanged. Entering/exiting both native owners
+adds about 25–27 microseconds per host boundary after caching ScriptObject method
+wrappers (previously about 35 microseconds). It is paid at the runner boundary,
+not per captured GPU node. QPN8's eager wrapper costs about 1.6–1.8 microseconds
+and QSA about 5.5 microseconds in these samples. D5b will retain this measurement
+and narrow the owner transition cost. No model-performance conclusion is made.
 
-The focused CPU suite passes 166 tests with three CUDA-only skips and one
-CPU-Triton fixture deselection (`attention-cpu-v6.log`). An additional FP16 Triton
-operator test covers independent schedules and changed-input capture/replay; its
-GPU result is pending. No tensor algorithm or numerical acceptance was broadened.
-The unchanged D5 counter records 129 -> 119 raw environment references,
-3186 -> 3130 platform references and 2111 -> 2111 model references for this
-candidate. Ledger updates accept only total reductions, not additional exclusions.
-
-The next loader candidate freezes deferred AWQ/FP8/NVFP4, all four quantized
-MoE owners and native compatibility inputs before worker transfer. Capturing
-inputs does not activate a format; legacy parser errors remain deferred to their
-original consumer. Existing format fields remain authoritative; shared backend
-selection and integer GPTQ/compressed-tensors/MXFP4 admission belong to
-`layer_execution`. The two AWQMarlin gates that historically used the raw format
-flag retain that behavior. Explicit typed format/backend requests override their
-legacy inputs without changing the environment. Loader snapshots and provenance
-are excluded from the calculation hash.
-
-`loader-cpu-v2.log` records 115 passing lifecycle/policy tests and three CUDA-only
-skips, including worker serialization, alternating engines and forbidden legacy
-getters after initialization. Existing CPU preparation simulations now mock their
-native capture dependency explicitly; they do not pretend to validate the native
-ABI. The original AWQ route snapshot is unchanged. The inventory additionally
-lists native enum-bound consumers separately from native environment reads and
-retains unresolved computed native names.
-
-The normal `_C`/`_moe_C` candidate build completed and passed a fresh-process check
-of policy ABI 61 and runtime ABI 1. Initial GPU suites recorded 170 and 197 passes,
-respectively, before stopping on failures; these are incomplete runs. The first
-suite lacked the unchanged `_C_stable_libtorch` package component containing QSA
-selection and activation registration, and one test still expected the old
-MTP-MoE default despite the C baseline enabling it. The second suite exposed stale
-DFlash test fixtures and a compiled-layer test without an outer engine runtime
-scope. The missing standard component is being built from the same source;
-fixtures now use the production lifecycle. Their targeted reruns and same-criterion
-A/B are pending. No GPU completion or performance claim is made here.
-
-Follow-up CPU verification passes 45 default/hash/native-owner tests
-(`loader-defaults-v1.log`) and 33 FP8 preparation/inventory tests
-(`loader-cpu-v7.log`). The existing AWQ golden selector/call-order snapshot passes
-without changing its expected routes. The common ledger records 119 -> 119 raw
-references, 3130 -> 3121 platform references and 2111 -> 2111 model references;
-the worker-isolation tests, rather than these aggregate counts, establish the
-loader lifecycle change.
-
-The provider-tail candidate captures the existing async queue override in its
-scheduler owner, including deferred integer errors and unchanged no-PP gates.
-HC staging, PLE convolution, shared-expert overlap, QSA scale validation, private
-compressor state, QNorm/KV fusion, static PP transfer and QPN4 loader admission now
-consume their existing typed owners. Legacy aliases cease contributing duplicate
-environment hash inputs once the corresponding owner has captured them.
-
-Focused CPU validation records 53 passes (`providers-e-v6.log`), followed by
-33 passes with real sparse-policy objects (`providers-e-v7.log`). The original
-NVFP4 selector/call-order golden remains unchanged. Five affected queue cases
-pass; unrelated scheduler integration tests require a GPU-resolvable device
-fixture and are not counted as passes. No new hardware topology is claimed.
-
-The FLA follow-up removes six import-time schedule snapshots and shares the
-existing `GdnScheduleConfig` parsers. KDA adds its previously independent launch
-gate to that owner, with the original candidate order. Kimi, GLM, Bailing and
-OLMo initialize tuners before execution; recurrent and chunk helpers receive the
-resolved schedule/tuners. Live tuners now reside in the existing worker resource
-map, so configuration transfer cannot serialize tuning winners or CUDA objects.
-Independent operator calls retain an explicitly separate lazy compatibility
-cache. The model adapter declares which schedule fields affect calculation hashes.
-
-The historical MTP output-token repair rollback also affects ordinary async
-execution. It therefore belongs to `sm70_runtime` input/output lifecycle policy,
-not exclusively to an absent `SpeculativeConfig`. Both old-runner batch
-construction sites bind its deferred value. A standalone batch captures only
-this one legacy input; no repair loop reads the environment. Five CPU async
-history/reordering tests pass, including both repair modes after environment
-mutation (`input-repair-v2.log`). No sampler algorithm is changed.
-
-Three alternating A/B rounds completed for QSA scoring, MTP routing and QPN8.
-Their output digests and temporary allocations agree; GPU median deltas are
--0.16%, +0.32%, and -0.11% to +0.33%, respectively. These are operator results.
-The first native-owner benchmark exposed additional host scope overhead; method
-wrappers are now bound once, and the host measurement will be repeated. The FP16
-baseline's own autotuning produced three output digests across rounds, so that
-case is not counted as deterministic parity. It will be repeated with an
-identical fixed selection policy on both sides. Failed runs remain in the worklog.
-
-The final focused FLA/provider/native-owner CPU suite passes 41 tests
-(`fla-cpu-v6.log`). The import guard runs in a fresh process; it forbids legacy
-FLA schedule reads without re-registering custom ops in the test process.
-A further three-round attention comparison has identical outputs and allocations:
-Triton M1/M33 GPU medians change by -0.21%; host medians change by -16.83% and
--11.97%. TurboQuant prefill uses the same eager CUDA-event measurement on both
-sides (including host submission gaps), changing by +0.43%; host changes +0.67%.
-The original unsupported prefill capture attempt is not represented as a pass.
+Rejected evidence is retained: TurboQuant prefill cannot use the attempted graph
+capture because the original path calls `.item()`; its final A/B uses eager events
+on both sides. FP16's first autotuned baseline changed its own digest across
+rounds, so deterministic parity uses fixed selection on both sides. Initial CPU
+fixtures that inferred a GPU or re-registered custom ops are not counted as
+passes; corrected tests exercise the actual initialized policies.

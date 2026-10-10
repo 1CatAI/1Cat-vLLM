@@ -1702,7 +1702,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "SM70 DFlash2 fused post-convolution Q/K/V packing enabled.",
                 scope="local",
             )
-        if envs.is_set("VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING"):
+        if capture_runtime_trace().gdn_legacy_fused_notice:
             logger.info_once(
                 "VLLM_QWEN3_NEXT_FUSED_SIGMOID_GATING is upstream-split "
                 "into VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE, "
@@ -1710,7 +1710,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 "VLLM_SM70_FUSED_SIGMOID_MIXED_QKV controls.",
                 scope="local",
             )
-        if envs.VLLM_SM70_GDN_EMPTY_CORE_OUT:
+        if capture_runtime_trace().value("gdn_empty_output_notice"):
             logger.info_once(
                 "VLLM_SM70_GDN_EMPTY_CORE_OUT is paused-unsafe; latest keeps "
                 "GDN core_attn_out allocated with torch.zeros until a route-hit "
