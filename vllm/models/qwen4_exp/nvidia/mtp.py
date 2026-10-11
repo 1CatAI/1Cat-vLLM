@@ -277,6 +277,19 @@ def _make_draft_vllm_config(
                 "Lossless MTP storage requires unquantized FP16, SM70, TP4"
             )
         draft_quant_config = MTPLosslessConfig()
+    if draft_vllm_config.kernel_config.sm70_mtp_q8_0_experts:
+        from .mtp_q8_experts import MTPQ80Config
+
+        if (
+            draft_quant_config is not None
+            or draft_vllm_config.model_config.dtype != torch.float16
+            or draft_vllm_config.parallel_config.enable_expert_parallel
+        ):
+            raise ValueError(
+                "Q8_0 MTP experts require an unquantized FP16 draft without EP "
+                "and exclude sm70_mtp_lossless_storage"
+            )
+        draft_quant_config = MTPQ80Config()
     draft_vllm_config.quant_config = draft_quant_config
     return draft_vllm_config
 

@@ -765,6 +765,10 @@ class KernelConfig:
     TP4. Preserve subnormals, signed zero and FP32 accumulation; reject weights
     outside the lossless representation instead of requantizing."""
 
+    sm70_mtp_q8_0_experts: bool = False
+    """Store MTP draft experts as GGUF Q8_0 (about half of FP16). Drafts only
+    propose tokens, so this can change acceptance but never verified output."""
+
     sm70_top1x: bool = False
     """Exchange TP-local greedy (value, id) pairs in two direct-NVLink hops
     instead of an all-gather."""
