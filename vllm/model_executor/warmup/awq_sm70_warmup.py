@@ -103,7 +103,7 @@ def _lut_cache_disabled_for_dynamic_quant_dispatch(
     )
     fp8_dynamic = (
         has_fp8_dense
-        and _native_number("fp8", "fp8_tune_small_shapes", 1)
+        and _native_number("fp8", "fp8_tune_small_shapes", 0)
         and not _native_number("fp8", "fp8_reuse_imported_cache", 0)
     )
     mxfp4_dynamic = (
@@ -260,7 +260,7 @@ def _warmup_fp8_dense_layers_coordinated(
     if not layers:
         return 0
     if not _native_number(
-        "fp8", "fp8_tune_small_shapes", 1
+        "fp8", "fp8_tune_small_shapes", 0
     ) or not capture_runtime_config().value("fp8_coordinated_tuning"):
         return _warmup_fp8_dense_layers(layers, m_values)
 
