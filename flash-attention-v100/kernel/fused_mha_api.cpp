@@ -29,6 +29,38 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.attr("decode_paged_kv_codecs") =
       py::make_tuple("auto", "float16", "fp8", "fp8_e4m3", "fp8_e5m2", "int8",
                      "int8_per_token_head");
+  m.def("paged_kv_to_fp16_kv_fwd", &flash_attention_paged_kv_to_fp16);
+  m.def("paged_kv_to_fp16_kv_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_paged_kv_to_fp16));
+  m.attr("paged_kv_to_fp16_kv_abi") = 1;
+  m.attr("paged_kv_to_fp16_kv_codecs") = m.attr("decode_paged_kv_codecs");
+  m.def("prefill_paged_kv_fwd", &flash_attention_prefill_paged_with_scales);
+  m.def("prefill_paged_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_prefill_paged_with_scales));
+  m.attr("prefill_paged_kv_abi") = 1;
+  m.attr("prefill_paged_kv_codecs") = m.attr("decode_paged_kv_codecs");
+  m.def("prefill_paged_splitkv_kv_fwd",
+        &flash_attention_prefill_paged_splitkv_with_scales);
+  m.def("prefill_paged_splitkv_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_prefill_paged_splitkv_with_scales));
+  m.attr("prefill_paged_splitkv_kv_abi") = 1;
+  m.attr("prefill_paged_splitkv_kv_codecs") = m.attr("decode_paged_kv_codecs");
+  m.def("prefill_paged_bfla_kv_fwd",
+        &flash_attention_prefill_paged_bfla_with_scales);
+  m.def("prefill_paged_bfla_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_prefill_paged_bfla_with_scales));
+  m.attr("prefill_paged_bfla_kv_abi") = 1;
+  m.attr("prefill_paged_bfla_kv_codecs") = m.attr("decode_paged_kv_codecs");
+  m.def("decode_paged_wmma_kv_fwd",
+        &flash_attention_decode_paged_wmma_with_scales);
+  m.def("decode_paged_wmma_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_decode_paged_wmma_with_scales));
+  m.attr("decode_paged_wmma_kv_abi") = 1;
+  m.attr("decode_paged_wmma_kv_codecs") = m.attr("decode_paged_kv_codecs");
   m.def("decode_paged_xqa_fwd", &flash_attention_decode_paged_xqa,
         "FlashAttention XQA decode over paged KV cache (Volta)");
   m.def("decode_paged_xqa_kv_fwd",

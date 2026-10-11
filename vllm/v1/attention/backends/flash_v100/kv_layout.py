@@ -17,6 +17,7 @@ from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
+from vllm.v1.attention.kv_cache_view import KVCacheView
 from vllm.v1.attention.kv_codecs import (
     resolve_kv_codec,
 )
@@ -33,6 +34,8 @@ _prefill_gather_dense_workspaces: dict[
 def split_paged_kv_cache(
     kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if isinstance(kv_cache, KVCacheView):
+        return kv_cache.key, kv_cache.value
     if isinstance(kv_cache, (list, tuple)):
         if len(kv_cache) != 2:
             raise ValueError(
@@ -162,7 +165,10 @@ def extract_contiguous_kv_from_paged_cache(
 
     key_cache, value_cache = split_paged_kv_cache(kv_cache)
 
-    if paged_kv_utils is not None and key_cache.dtype != torch.uint8:
+    if paged_kv_utils is not None and key_cache.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ):
         if hasattr(paged_kv_utils, "paged_kv_to_contiguous"):
             k_cont, v_cont = paged_kv_utils.paged_kv_to_contiguous(
                 key_cache, value_cache, block_table, seq_lens
@@ -179,18 +185,22 @@ def extract_contiguous_kv_from_paged_cache(
         return k_cont[:total_tokens], v_cont[:total_tokens]
 
     # Slow Python fallback.
+    view = kv_cache if isinstance(kv_cache, KVCacheView) else None
+    row_scaled = view is not None and view.codec.per_token_head
+    if key_cache.dtype == torch.int8 and not row_scaled:
+        raise ValueError("Dense KV gather needs the INT8 cache view and scales")
     batch_size = block_table.shape[0]
     if total_tokens is None:
         total_tokens = int(seq_lens.sum().item())
 
     k_cont = torch.empty(
         (total_tokens, num_kv_heads, head_dim),
-        dtype=key_cache.dtype,
+        dtype=torch.float16 if row_scaled else key_cache.dtype,
         device=key_cache.device,
     )
     v_cont = torch.empty(
         (total_tokens, num_kv_heads, head_dim),
-        dtype=value_cache.dtype,
+        dtype=torch.float16 if row_scaled else value_cache.dtype,
         device=value_cache.device,
     )
 
@@ -207,10 +217,21 @@ def extract_contiguous_kv_from_paged_cache(
             end_token = min(start_token + block_size, seq_len)
             n = end_token - start_token
 
-            k_cont[token_offset : token_offset + n] = key_cache[physical_block_idx, :n]
-            v_cont[token_offset : token_offset + n] = value_cache[
-                physical_block_idx, :n
-            ]
+            k, v = (
+                key_cache[physical_block_idx, :n],
+                value_cache[physical_block_idx, :n],
+            )
+            if row_scaled:
+                assert view is not None
+                assert view.key_scale is not None and view.value_scale is not None
+                k = view.codec.dequantize(
+                    k, view.key_scale[physical_block_idx, :n], torch.float16
+                )
+                v = view.codec.dequantize(
+                    v, view.value_scale[physical_block_idx, :n], torch.float16
+                )
+            k_cont[token_offset : token_offset + n] = k
+            v_cont[token_offset : token_offset + n] = v
             token_offset += n
 
     return k_cont, v_cont

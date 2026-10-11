@@ -1,11 +1,11 @@
 #ifndef FUSED_MHA_H
-#define FUSED_MHA_H
+  #define FUSED_MHA_H
 
-#include <cuda_runtime.h>
-#include <stdexcept>
-#include <string>
-#include <torch/extension.h>
-#include <ATen/ATen.h>
+  #include <cuda_runtime.h>
+  #include <stdexcept>
+  #include <string>
+  #include <torch/extension.h>
+  #include <ATen/ATen.h>
 
 std::vector<at::Tensor> flash_attention_forward(
     at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
@@ -211,3 +211,48 @@ at::Tensor flash_attention_dflash2_paged_bmhd(
     const at::Tensor& lengths, const float scale);
 
 #endif
+
+void flash_attention_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out, int64_t codec, float key_scale,
+    float value_scale, const std::optional<at::Tensor>& key_scale_cache,
+    const std::optional<at::Tensor>& value_scale_cache);
+
+at::Tensor flash_attention_prefill_paged_with_scales(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window, const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale);
+
+at::Tensor flash_attention_prefill_paged_splitkv_with_scales(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const int split_kv_tokens,
+    const int max_seq_len_hint, const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale);
+
+at::Tensor flash_attention_prefill_paged_bfla_with_scales(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const at::Tensor& bfla_block_mask,
+    const int bfla_mask_block_n, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale);
+
+at::Tensor flash_attention_decode_paged_wmma_with_scales(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale);

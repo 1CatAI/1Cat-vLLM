@@ -13,6 +13,7 @@ return types. Backend callers import from this owner.
 | FP16 | 1–4 | B1: 2–8; B>1: B×8 | 832 | FP16 | CUDA, D256/GQA6, one KV head, aligned Q/output/cache |
 | E4M3 | 1–16 | B1: 2–8; B>1: B×8 | positive multiple of 16 | uint8 | D256/GQA6, aligned cache; batch requires revision 6 |
 | E4M3 explicit groups | 1–16 | G×8, padded rows allowed | positive multiple of 16 | uint8 | compact group table and device row lengths |
+| Shared codec binding | 1–16 | B1: 2–8; B>1: B×8; explicit padded groups | positive multiple of 16 | codec payload plus explicit row scales | FP16 Q/output, D256/GQA6, one or more KV heads |
 
 All three contracts retain the 266240-token capacity ceiling. The E4M3
 predicate retains its existing CPU descriptor admission for policy tests; the
@@ -27,20 +28,23 @@ sole workspace owner. `sm70_e4m3_grouped.py` retains the E4M3 native loader;
 its predicates re-export the common wrappers. `sm70_grouped_scalar.py` and
 `sm70_grouped_long.py` own the existing specialized family members. Their old
 `sm70_e4m3_{scalar,long}` paths alias the same module objects, preserving mutable
-state, caches and patches; original logger names remain unchanged. Their
-arithmetic, manifests, workspace geometry, launch ABI and route policies have
-not been generalized or numerically changed by this admission refactor.
+state, caches and patches; original logger names remain unchanged. New shared
+bindings query the installed native codec ABI and borrow scale planes from the
+cache view. Legacy entry points retain their signatures and arithmetic. Long
+and compact-tail scratch use the existing engine/stream resource owner; public
+standalone calls retain their standalone owner.
 
 Adding an entry declares admission and a provider; it does not implement a new
-native storage reader or ABI. An unsupported codec fails closed. Native INT8
-support needs its codec/traits and qualified provider before declaration can
-admit it. Scalar/long remain E4M3-only until their implementations support
-another codec.
+native storage reader or ABI. An unsupported codec fails closed. Shared
+grouped/scalar/long instances cover FP16, E4M3, E5M2 and both ordinary INT8
+identities. Python admission requires the corresponding installed binding,
+not the payload byte width. Format-specific conversions remain in codec traits.
 
 CPU tests generate boundary cases from the declarations and compare 2940
 shape/device/revision combinations plus 98 policy/layout cases to frozen
 legacy predicates, including exact FP16 rejection strings. Other checks cover
 legacy module identity, missing revision import behavior, provider dispatch,
-workspace cleanup and hashes of 22 unchanged native/family functions. These
-checks provide structural and dispatch evidence; GPU arithmetic, graph replay
-and timing are unmeasured under the user's no-V100 instruction.
+workspace cleanup and historical hashes of 22 native/family functions. Those
+hashes describe the admission-refactor baseline, not subsequent native changes.
+Current GPU qualification, artifact identity and remaining engine/latency gates
+are recorded in the [codec implementation record](../../../../docs/design/architecture/kv_codec_unification.md).

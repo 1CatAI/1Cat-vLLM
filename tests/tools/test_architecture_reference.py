@@ -55,6 +55,7 @@ def test_reference_is_deterministic_and_links_actual_owners(source_tree):
     }
     assert first["routes"] == sorted(first["routes"], key=lambda r: r["name"])
     int8 = next(row for row in first["codecs"] if row["symbol"] == "INT8")
+    assert int8["native_id"] == 3
     assert (int8["rounding"], int8["layout"], int8["scale_dtype"]) == (
         "nearest_even",
         "planar_scales",

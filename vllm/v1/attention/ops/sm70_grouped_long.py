@@ -13,6 +13,8 @@ import torch
 from vllm.config.execution_policy import flash_v100_options
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.v1.attention.kv_codecs import KVCodec
+from vllm.v1.attention.ops.sm70_workspaces import workspace_cache
 
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_long")
 
@@ -35,7 +37,7 @@ BUILTIN_OP = "sm70_grouped_long_fwd"
 # route was qualified with. The source digest names that layout so a rebuilt
 # kernel cannot silently inherit the workspace identity of a different one.
 BUILTIN_SOURCE_SHA256 = (
-    "e98db3a38dfae231ec164c3e14c9e755f362af9c089dcc36331b32b7b8d8e55f"
+    "234605588803cbb2a728549a72f9df76149cff7e20661632c9ca95974a884442"
 )
 # Every B1 verifier tail width uses the long-context graph contract at this
 # capacity; q1 additionally has the compact scalar tail.
@@ -231,17 +233,87 @@ def _report_unadmitted_page_size(page_size: int) -> None:
     )
 
 
-def wrap_long_attention(fallback):
+def builtin_codec_attention(stem: str, codec: KVCodec):
+    """Require the loaded FA2 binary's explicit codec ABI, not a dtype guess."""
+    if codec.native_id is None:
+        return None
+    # Loading is owned by the same lazy FA2 loader as the legacy entry.
+    builtin_long_attention()
+    native = torch.ops._vllm_fa2_C
+    abi = getattr(native, stem + "_kv_abi", None)
+    supported = getattr(native, stem + "_kv_codecs", None)
+    if (
+        abi is None
+        or abi() != 1
+        or supported is None
+        or codec.native_id not in supported()
+    ):
+        return None
+    return getattr(native, stem + "_kv_fwd", None)
+
+
+def supports_long_batch_graphs(vllm_config) -> bool:
+    """Avoid extra batch captures when the attention operator would fall back."""
+    from vllm.v1.attention.kv_codecs import FP8_E4M3, resolve_kv_codec
+
+    model = getattr(vllm_config, "model_config", None)
+    cache = getattr(vllm_config, "cache_config", None)
+    codec = resolve_kv_codec(getattr(cache, "cache_dtype", None))
+    if (
+        model is None
+        or getattr(model, "dtype", None) != torch.float16
+        or codec is None
+        or (
+            codec is not FP8_E4M3
+            and builtin_codec_attention("sm70_grouped_long", codec) is None
+        )
+    ):
+        return False
+    parallel = vllm_config.parallel_config
+    return model.get_head_size() == 256 and model.get_num_attention_heads(
+        parallel
+    ) == 6 * model.get_num_kv_heads(parallel)
+
+
+def wrap_long_attention(fallback, *, codec: KVCodec | None = None):
     operator, manifest = resolve_long_attention()
     if operator is None:
         return fallback
+    if codec is not None:
+        # Explicit experimental manifests keep their declared legacy ABI.
+        if manifest["module_name"] != "_vllm_fa2_C":
+            return fallback
+        operator = builtin_codec_attention("sm70_grouped_long", codec)
+        if operator is None:
+            return fallback
     capability = long_attention_capability(manifest)
     query_rows = long_attention_query_rows(manifest)
     max_batch_size = long_attention_max_batch_size(manifest)
 
     def run(
-        q, k, v, table, row_lengths, *, out, softmax_scale, k_scale=1.0, v_scale=1.0
+        q,
+        k,
+        v,
+        table,
+        row_lengths,
+        *,
+        out,
+        softmax_scale,
+        k_scale=1.0,
+        v_scale=1.0,
+        kv_cache_dtype=None,
+        k_scale_cache=None,
+        v_scale_cache=None,
     ):
+        binding = {}
+        if codec is not None:
+            if kv_cache_dtype != codec.name:
+                raise ValueError("Grouped long binding does not match the cache codec")
+            binding = {
+                "kv_cache_dtype": kv_cache_dtype,
+                "k_scale_cache": k_scale_cache,
+                "v_scale_cache": v_scale_cache,
+            }
         descriptor = (
             get_forward_context().batch_descriptor
             if is_forward_context_available()
@@ -287,6 +359,7 @@ def wrap_long_attention(fallback):
                 softmax_scale=softmax_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                **binding,
             )
         # Allocate a fixed workspace once for each warmup/capture stream. Graph
         # replay never allocates. Layers reuse it in stream order; different
@@ -302,7 +375,9 @@ def wrap_long_attention(fallback):
             )
         stream = torch.cuda.current_stream(q.device).cuda_stream
         key = (manifest["source_sha256"], bucket, 80, q.device, stream)
-        bank = _WORKSPACES.setdefault(key, [])
+        bank = workspace_cache("grouped_long_workspaces", _WORKSPACES).setdefault(
+            key, []
+        )
         # Full graphs replay in stream order, just like successive layers.
         # Reuse a larger request panel for smaller captures. Keep older panels
         # alive when growing: an earlier graph may still reference them.
@@ -310,12 +385,13 @@ def wrap_long_attention(fallback):
             if partial.shape[0] >= batch_size:
                 break
         else:
-            partial = torch.empty(
-                (batch_size, 80, 8, 6, 256), dtype=torch.float32, device=q.device
-            )
-            lse = torch.empty(
-                (batch_size, 80, 8, 6, 2), dtype=torch.float32, device=q.device
-            )
+            with torch.inference_mode(False):
+                partial = torch.empty(
+                    (batch_size, 80, 8, 6, 256), dtype=torch.float32, device=q.device
+                )
+                lse = torch.empty(
+                    (batch_size, 80, 8, 6, 2), dtype=torch.float32, device=q.device
+                )
             bank.append((partial, lse))
         if batch_size == 1:
             partial, lse = partial[0], lse[0]
@@ -334,12 +410,22 @@ def wrap_long_attention(fallback):
             float(softmax_scale),
             float(k_scale),
             float(v_scale),
+            **(
+                {
+                    "codec": codec.native_id,
+                    "key_scales": k_scale_cache,
+                    "value_scales": v_scale_cache,
+                }
+                if codec is not None
+                else {}
+            ),
         )
 
+    run.__dict__.update(getattr(fallback, "__dict__", {}))
     return run
 
 
-def run_six_head_groups(operator, q, k, v, out, *args):
+def run_six_head_groups(operator, q, k, v, out, *args, **kwargs):
     """Reuse the validated six-head kernel without copying the paged KV cache.
 
     Each group retains the original reduction order. The shared workspace is
@@ -347,7 +433,7 @@ def run_six_head_groups(operator, q, k, v, out, *args):
     query/output buffers used for the individual groups.
     """
     if k.shape[2] == 1:
-        return operator(q, k, v, out, *args)
+        return operator(q, k, v, out, *args, **kwargs)
     for head in range(k.shape[2]):
         group_q = q[:, head * 6 : (head + 1) * 6].contiguous()
         group_out = torch.empty_like(group_q)
@@ -357,6 +443,14 @@ def run_six_head_groups(operator, q, k, v, out, *args):
             v[:, :, head : head + 1],
             group_out,
             *args,
+            **{
+                name: (
+                    value[:, :, head : head + 1]
+                    if name in ("key_scales", "value_scales") and value is not None
+                    else value
+                )
+                for name, value in kwargs.items()
+            },
         )
         out[:, head * 6 : (head + 1) * 6].copy_(group_out)
     return out

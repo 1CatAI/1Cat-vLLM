@@ -26,6 +26,8 @@ def scalar_call(monkeypatch):
         "load_attention_library",
         lambda _: (SimpleNamespace(run=lambda *args: calls.append(args)), manifest),
     )
+    # This is a CPU admission test; the compiled FA2 operator is not present.
+    monkeypatch.setattr(scalar, "resolve_long_attention", lambda: (None, manifest))
     scalar.load_scalar_tail_attention.cache_clear()
     monkeypatch.setattr(scalar, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(

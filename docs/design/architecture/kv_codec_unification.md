@@ -388,3 +388,96 @@ normal component build/install logs, `configured-acceleration.json`,
 mistakenly exposed one GPU for a TP4 configuration check; that failure is
 retained as `harness-one-gpu-config-preflight.log`. Restoring the declared
 four-GPU visibility makes configuration succeed without a source change.
+
+## Engine integration and repeated prefill/decode audit
+
+This next slice is based on `dea7beec35eb1f281864cbd6a03fb6bb0066b061`.
+The audit follows both engine entry → selector → native binding → fallback
+and native FP8 implementation → public wrapper → engine caller. An advertised
+codec, a selected route and an executed kernel are separate evidence. Historical
+FP8 names remain compatibility names, not a complete capability inventory.
+
+The engine borrows one `KVCacheView` for decode, prefill, mixed batches and
+verification. The view supplies the physical payload and scale strides to the
+existing algorithms. Shared grouped, FA2 long-context and compact-tail bindings
+use the same codec visitor as scalar/XQA. Norm/RoPE cache writers use the common
+encoder. No model name, weight format or TP whitelist was added for INT8.
+Prefill partial bindings retain their native capabilities when wrapped with
+engine policy. Both candidate and final scalar fallback check the installed
+binary; a missing INT8 binding cannot silently interpret signed bytes as FP8.
+
+The public package now exposes native codec bindings for ordinary paged prefill,
+BHMD, split-KV, BFLA and WMMA decode. INT8 K row scales are applied after QK;
+V row scales multiply probabilities after the unscaled softmax denominator.
+The original FP8 arithmetic remains unchanged. The existing split-KV merge
+grid also needed its own query tile size: reusing the partial kernel's larger
+tile count left rows unwritten beyond a tile boundary.
+
+The first INT8 prefill candidate converted resident KV to FP16 before the old
+FP16 algorithm. This failed the frozen `atol=0.004, rtol=0.015` output gate:
+maximum errors were about 0.047/0.064, and 0.5–0.7% of elements failed. A paired
+diagnostic reproduced the candidate exactly using the existing FP16 entry;
+early scale multiplication and FP16 rounding were responsible. The failed
+candidate was replaced by native codec reads, without widening the bound.
+Resident INT8's dense bridge remains disabled pending a precision-preserving
+adapter. Its absence is still an acceleration coverage gap, even though native
+paged prefill works. Uncached prefill can use the original dense Q/K/V tensors.
+
+Repeated audit findings and responsibility:
+
+| Family / boundary | This slice | Remaining closure requirement |
+| --- | --- | --- |
+| Ordinary scalar/XQA and mixed decode | Shared payload/scale view, actual ABI admission, XQA before scalar | Measure the engine; inspect native events because an XQA wrapper can launch scalar internally |
+| XQA wave partitions, batch/context, dual CTA, page reuse | Basic codec bindings exist | `flash_decode_paged.cu` and `routing.py` retain E4M3/E5M2 tuning predicates; INT8 lacks parts of those plans. LUT conversion is format-specific; partition/reduction algorithms should be shared |
+| Grouped q2..8 / request-major q8 | Common binding and explicit row lengths | GPU engine/state evidence; legacy E5M2 q16 verifier still needs common binding |
+| Long-context grouped / compact tail | Common FA2 binding, engine-owned scratch, codec-aware V2 graph admission | New artifact GPU evidence, valid range interiors/boundaries and graph replay; scalar stays a fallback |
+| Native paged prefill / split-KV / BHMD / WMMA | Shared codec implementation | Broader engine execution and paired latency; native BFLA all-ones masks do not qualify sparse-mask generation |
+| Resident prefix dense / Split-D / v37 / 79t / splitkv3 | FP8 paths retained; common bounded conversion exists | `dense_prefill.py` plus FA2 dense providers need a numerically qualified row-scale adapter; deleting their FP16 guards is insufficient |
+| BFLA and anchored windows | Existing format restrictions retained | BFLA mask pooling and native mask tile geometry need a common contract; anchored windows were FP16-only for FP8 as well |
+| QSA page4, host history and hot cache | Existing FP16/E4M3 paths preserved | `models/qwen4_exp/nvidia/qsa.py`, host KV and sparse-page4 native entry need representation-aware scales, indexing and transfer validation |
+| MLA / compressed sparse / indexer | Existing latent, RoPE and grouped scale layouts preserved | DeepSeek sparse/indexer writers and readers need their own codec contracts; ordinary token/head INT8 is not interchangeable with their packed G64/exponent-scale representation |
+| Fused Norm/RoPE/KV | Common encoder and address rules | GPU byte compatibility and replay; existing model-side fusion qualification still contains old TP/weight/model gates |
+| Draft/target defaults and global predicates | INT8 included in common quantized-KV and token/head predicates; DDTree implicit draft retains FP16 | Explicit mixed-codec engines and draft acceptance/rollback quality remain unmeasured |
+| CUDA Graph / prefix / sleep / offload / transfer | Data and scales share physical allocation; view rebinding is read-only | End-to-end restore, reorder, slot reuse, transport identity and V1 graph tuning still require execution evidence |
+| Diagnostics | Actual native codec manifests are reported alongside historical names | Configured capability is not observed execution; task latency and quality cannot be inferred from this report |
+
+The second pass found that `utils/torch_utils.py` had omitted new `int8` from
+both quantized-KV predicates although the runner's quantization-mode enum
+included it. This affected common consumers such as post-sleep initialization.
+Both predicates now agree with every declared codec/alias, with a generated
+codec test. The old DDTree implicit draft rule also recognized only FP8;
+row-scaled target caches now retain the same FP16 draft default. Explicit
+draft cache choices are preserved.
+
+Current measured correctness scope: V100-SXM2-32GB GPU 0, driver 580.178.04,
+CUDA 12.8.93, Torch 2.10.0+cu128, normal Flash-V100 wheel build and fresh process.
+Before the candidate, 15 FP16/E4M3/E5M2 public prefill cases passed. The native
+candidate passes **55 GPU checks**: 15 byte-exact conversion/replay cases,
+25 paged/BHMD/split-KV/BFLA/WMMA cases across five codec identities, and 15
+geometry/window/split-merge cases. These include shuffled physical pages,
+changed graph lengths, D64/D128/D256, one/two KV heads, q1/q8/q17/q33,
+noncausal window attention and a 33-query split-KV merge with NaN-initialized
+output. INT8 prefill keeps the frozen output bounds above. These measurements
+do not establish task quality, engine throughput or full sparse-mask support.
+
+Wheel SHA256:
+`6ecd5ac9ba251cde4e76b2975ba00e70ea5bb2693ebfdeb0608ac1c06eeb0648`.
+Evidence under `/home/ymzx/kv-engine-bindings-20261011-123817` on the validation
+host includes `build-public-r5.log`, `gpu-prefill-fp8-baseline-r3.log`,
+`gpu-prefill-r5.log`, the rejected `gpu-prefill-r3.log`, and
+`prefill-r3-numerical-diagnosis.log`. FA2/engine/fused GPU cases are separate
+from these 55 public-package cases and must be recorded after their normal
+main-package build finishes.
+
+CPU checks include 45 acceleration-report cases and 33 targeted codec/default
+cases; 518 route/engine/declaration cases and 28 ownership/size regressions pass.
+A broader DDTree configuration run has four pre-existing failures
+(two missing observability fixture fields, two old async-policy expectations),
+reproduced unchanged on the parent worktree. The historical scalar-tail AST
+snapshot also predates this slice and does not describe the current parent.
+The broader trace/metadata check reproduces eight failures on the parent in
+this CPU environment (Triton stub APIs and the old scalar-first trace). Its
+one new function-size regression was fixed without increasing the ratchet.
+Retain these baseline failures separately from new numerical/state regressions.
+No 27B service timing, representative task-quality gate, latency parity or
+35B AWQ/FP8 decode acceptance is claimed at this checkpoint.

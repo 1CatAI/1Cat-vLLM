@@ -1,5 +1,6 @@
 #include <cuda.h>
 #include <torch/library.h>
+#include "../../../../flash-attention-v100/kernel/kv_cache_view.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -1047,9 +1048,9 @@ __global__ void flash_attention_decode_partition_kernel(
     const float v_scale, const int window_size_left,
     const int window_size_right, const int route_seq_len_begin,
     const int route_seq_len_end, const int route_seq_len_final,
-    const int* __restrict__ anchor_lens, const int anchored_window) {
+    const int* __restrict__ anchor_lens, const int anchored_window,
+    const flash_v100::KVScaleView scales = {}) {
   static_assert(D == 256 && PARTITION_SIZE == 1024 &&
-      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
       SEQ_LEN_ROUTE == 0 && !ANCHORED_SWA &&
       std::is_same_v<PARTIAL_T, float>, "Private scalar six-head contract");
   const int partition_idx = blockIdx.z;
@@ -1063,9 +1064,9 @@ __global__ void flash_attention_decode_partition_kernel(
   const int part_tokens = min(PARTITION_SIZE, seq_len - start_token_idx);
   const int lane = threadIdx.x % kWarpSize;
   const int warp_idx = threadIdx.x / kWarpSize;
-  const float score_scale = softmax_scale * k_scale;
   __shared__ float kv_lut[256];
-  kv_lut[threadIdx.x] = flash_v100::fp8_e4m3fn_to_float(
+  if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3)
+    kv_lut[threadIdx.x] = flash_v100::fp8_e4m3fn_to_float(
       static_cast<uint8_t>(threadIdx.x));
   __shared__ __half q_shared[6][D];
   __shared__ float scores_shared[6][PARTITION_SIZE];
@@ -1097,7 +1098,9 @@ __global__ void flash_attention_decode_partition_kernel(
     // Only independent heads share the decoded K value.
 #pragma unroll
     for (int d = lane; d < D; d += kWarpSize) {
-      const float kv = kv_lut[static_cast<const uint8_t*>(k_cache)[k_index + d]];
+      const float kv = KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
+          ? kv_lut[static_cast<const uint8_t*>(k_cache)[k_index + d]]
+          : flash_v100::KVCodecTraits<KV_DTYPE>::unscaled(k_cache, k_index + d);
 #pragma unroll
       for (int head = 0; head < 6; ++head)
         score[head] = fmaf(__half2float(q_shared[head][d]), kv, score[head]);
@@ -1106,7 +1109,9 @@ __global__ void flash_attention_decode_partition_kernel(
     for (int head = 0; head < 6; ++head) {
       const float reduced = warp_reduce_sum(score[head]);
       if (lane == 0) {
-        const float value = reduced * score_scale;
+        const float value = reduced * flash_v100::KVCodecTraits<KV_DTYPE>::score_scale(
+            softmax_scale, k_scale, scales.key,
+            block_idx_shared[second_page], token_offset, 0);
         scores_shared[head][token_local] = value;
         local_max[head] = fmaxf(local_max[head], value);
       }
@@ -1141,16 +1146,21 @@ __global__ void flash_attention_decode_partition_kernel(
       int64_t v_index = static_cast<int64_t>(block_idx_shared[page]) *
           v_block_stride + (page == 0 ? first_offset * v_token_stride : 0) + d;
       for (int i = begin; i < end; ++i, v_index += v_token_stride) {
-        const float vv =
-            kv_lut[static_cast<const uint8_t*>(v_cache)[v_index]];
+        const float vv = KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
+            ? kv_lut[static_cast<const uint8_t*>(v_cache)[v_index]]
+            : flash_v100::KVCodecTraits<KV_DTYPE>::unscaled(v_cache, v_index);
 #pragma unroll
-        for (int head = 0; head < 6; ++head)
-          acc[head] = fmaf(scores_shared[head][i], vv, acc[head]);
+        for (int head = 0; head < 6; ++head) {
+          const float weight = flash_v100::KVCodecTraits<KV_DTYPE>::value_weight(
+              scores_shared[head][i], scales.value, block_idx_shared[page],
+              page == 0 ? first_offset + i : i - first_page_tokens, 0);
+          acc[head] = fmaf(weight, vv, acc[head]);
+        }
       }
     }
 #pragma unroll
     for (int head = 0; head < 6; ++head) {
-      const float out_scale = inv_sum[head] * v_scale;
+      const float out_scale = flash_v100::KVCodecTraits<KV_DTYPE>::output_scale(inv_sum[head], v_scale);
       const int64_t tmp_out_base = head * tmp_out_stride1 +
           static_cast<int64_t>(partition_idx) * tmp_out_stride2;
       tmp_out[tmp_out_base + d] = acc[head] * out_scale;
@@ -1257,17 +1267,19 @@ __global__ void flash_attention_decode_reduce_kernel(
 }
 
 }  // namespace
+template <int KV_DTYPE>
 at::Tensor scalar_attention_candidate(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     at::Tensor& out, const at::Tensor& table, const at::Tensor& lengths,
     at::Tensor& partial, at::Tensor& maximum, at::Tensor& sums,
-    const at::Tensor& active, float scale, float k_scale, float v_scale) {
+    const at::Tensor& active, float scale, float k_scale, float v_scale,
+    flash_v100::KVScaleView scales = {}) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf &&
               q.sizes() == at::IntArrayRef({1, 6, 256}) && q.is_contiguous(),
               "Private scalar q1 probe requires contiguous FP16 [1,6,256]");
   TORCH_CHECK(k.dim() == 4 && k.size(2) == 1 && k.size(3) == 256 &&
-              k.size(1) > 0 && k.scalar_type() == at::kByte &&
-              v.sizes() == k.sizes() && v.scalar_type() == at::kByte,
+              k.size(1) >= 1024 && k.scalar_type() == flash_v100::kv_storage_type<KV_DTYPE>() &&
+              v.sizes() == k.sizes() && v.scalar_type() == flash_v100::kv_storage_type<KV_DTYPE>(),
               "Private scalar q1 probe requires E4M3 [pages,page,1,256]");
   for (const auto* t : {&k, &v})
     TORCH_CHECK(t->stride(3) == 1, "Head dimension must be contiguous");
@@ -1302,7 +1314,7 @@ at::Tensor scalar_attention_candidate(
   TORCH_CHECK(properties->major == 7 && properties->minor == 0, "SM70 only");
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   flash_attention_decode_partition_kernel<256, 1024,
-      flash_v100::KV_CACHE_DTYPE_FP8_E4M3, 0, false, float>
+      KV_DTYPE, 0, false, float>
       <<<dim3(1, 1, 256), 256, 4096, stream>>>(
       reinterpret_cast<const __half*>(q.data_ptr()), k.data_ptr(), v.data_ptr(),
       partial.data_ptr<float>(), maximum.data_ptr<float>(), sums.data_ptr<float>(),
@@ -1312,7 +1324,7 @@ at::Tensor scalar_attention_candidate(
       maximum.stride(0), maximum.stride(1),
       k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2),
-      scale, k_scale, v_scale, -1, -1, 0, 0, 0, nullptr, 0);
+      scale, k_scale, v_scale, -1, -1, 0, 0, 0, nullptr, 0, scales);
   flash_attention_decode_reduce_kernel<256, 1024, 0, float>
       <<<dim3(1, 6, 1), 256, 2 * 256 * sizeof(float), stream>>>(
       partial.data_ptr<float>(), maximum.data_ptr<float>(), sums.data_ptr<float>(),
@@ -1333,14 +1345,36 @@ at::Tensor sm70_scalar_attention_entry(
     at::Tensor& out, const at::Tensor& table, const at::Tensor& lengths,
     at::Tensor& partial, at::Tensor& maximum, at::Tensor& sums,
     const at::Tensor& active, double scale, double k_scale, double v_scale) {
-  return scalar_attention_candidate(
+  return scalar_attention_candidate<flash_v100::KV_CACHE_DTYPE_FP8_E4M3>(
       q, k, v, out, table, lengths, partial, maximum, sums, active,
       static_cast<float>(scale), static_cast<float>(k_scale),
       static_cast<float>(v_scale));
 }
+at::Tensor sm70_scalar_attention_kv_entry(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, const at::Tensor& table, const at::Tensor& lengths,
+    at::Tensor& partial, at::Tensor& maximum, at::Tensor& sums,
+    const at::Tensor& active, double scale, double k_scale, double v_scale,
+    int64_t codec, const std::optional<at::Tensor>& key_scales,
+    const std::optional<at::Tensor>& value_scales) {
+  const auto scales = flash_v100::bind_scale_view(codec, k, v, key_scales, value_scales);
+  return flash_v100::visit_kv_codec(codec, [&](auto tag) {
+    return scalar_attention_candidate<decltype(tag)::value>(
+        q, k, v, out, table, lengths, partial, maximum, sums, active,
+        float(scale), float(k_scale), float(v_scale), scales);
+  });
+}
 }  // namespace
 
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
+  ops.def("sm70_scalar_attention_kv_abi() -> int", []() -> int64_t { return 1; });
+  ops.def("sm70_scalar_attention_kv_codecs() -> int[]",
+          []() -> std::vector<int64_t> { return {0, 1, 2, 3}; });
+  ops.def(
+      "sm70_scalar_attention_kv_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
+      "Tensor table, Tensor lengths, Tensor(b!) partial, Tensor(c!) maximum, "
+      "Tensor(d!) sums, Tensor active, float scale, float k_scale, float v_scale, "
+      "int codec, Tensor? key_scales, Tensor? value_scales) -> Tensor(a!)");
   ops.def(
       "sm70_scalar_attention_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
       "Tensor table, Tensor lengths, Tensor(a!) partial, Tensor(a!) maximum, "
@@ -1349,4 +1383,5 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
 }
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
   ops.impl("sm70_scalar_attention_fwd", &sm70_scalar_attention_entry);
+  ops.impl("sm70_scalar_attention_kv_fwd", &sm70_scalar_attention_kv_entry);
 }

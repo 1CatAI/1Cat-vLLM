@@ -614,7 +614,12 @@ class FlashV100Options(CapturedFlashOptions):
                 continue
             if (
                 field.startswith("xqa_e4m3_") or field.startswith("e4m3_")
-            ) and self.cache_dtype not in ("fp8", "fp8_e4m3"):
+            ) and self.cache_dtype not in (
+                "fp8",
+                "fp8_e4m3",
+                "int8",
+                "int8_per_token_head",
+            ):
                 continue
             fields[field] = getattr(self, field)
         # Native parser projections can intentionally differ from the Python
@@ -625,7 +630,11 @@ class FlashV100Options(CapturedFlashOptions):
             if "trace" not in field
             and field != "tp2_e4m3_scalar_fast"
             and ("e5m2" not in field or self.cache_dtype == "fp8_e5m2")
-            and ("e4m3" not in field or self.cache_dtype in ("fp8", "fp8_e4m3"))
+            and (
+                "e4m3" not in field
+                or self.cache_dtype
+                in ("fp8", "fp8_e4m3", "int8", "int8_per_token_head")
+            )
         )
         fields["package"] = {
             field: value
@@ -633,7 +642,8 @@ class FlashV100Options(CapturedFlashOptions):
             if field != "share_workspace"
             and (
                 field not in ("scalar_fast", "batch_xqa")
-                or self.cache_dtype in ("fp8", "fp8_e4m3")
+                or self.cache_dtype
+                in ("fp8", "fp8_e4m3", "int8", "int8_per_token_head")
             )
         }
         fields["errors"] = {

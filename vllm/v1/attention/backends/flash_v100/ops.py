@@ -488,3 +488,24 @@ if TYPE_CHECKING:
     _get_sm70_d256_gqa_architecture_q8192_op = get_sm70_d256_gqa_architecture_q8192_op
     _get_flash_grouped_verify_op = get_flash_grouped_verify_op
     _get_flash_ops = get_flash_ops
+
+
+def get_paged_kv_bridge_op():
+    """Load the codec-bound public bridge from the installed native package."""
+    try:
+        from flash_attn_v100 import paged_kv_to_fp16
+    except ImportError:
+        return None
+    return bind_attention_operation(paged_kv_to_fp16)
+
+
+def get_grouped_fp32_op(codec):
+    try:
+        from flash_attn_v100 import flash_attn_grouped_fp32_paged
+    except ImportError:
+        return None
+    from vllm.v1.attention.ops.sm70_grouped_long import wrap_long_attention
+
+    return wrap_long_attention(
+        bind_attention_operation(flash_attn_grouped_fp32_paged), codec=codec
+    )

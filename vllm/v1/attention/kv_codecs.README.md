@@ -37,8 +37,11 @@ do not alias new formats to old ones just because their storage width matches.
 Ordinary native decode prefers XQA when its geometry, semantics and installed
 codec binding admit it. Scalar is the final native fallback; disabling scalar
 must not disable XQA. The public scalar and XQA bindings share scale-argument
-validation and accumulator workspace selection. These operator bindings do not
-by themselves qualify full-backend INT8 prefill or model execution.
+validation and accumulator workspace selection. Engine prefill/grouped/mixed
+verification borrow the same view and actual native codec capabilities.
+Native paged prefill keeps row scales until QK/PV; the resident INT8-to-FP16
+dense adapter is not numerically qualified. These operator bindings do not
+by themselves qualify model execution or latency.
 
 Published aliases and historical counters remain compatible. Add formats here,
 then extend the relevant existing family binding and admission; do not copy

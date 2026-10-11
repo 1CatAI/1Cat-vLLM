@@ -33,6 +33,7 @@ class KVCodec:
     element_dtype: torch.dtype | None = None
     # Whether reading the cache needs scales.
     quantized: bool = False
+    native_id: int | None = None
     encoding_version: int = 1
     scale_granularity: Literal["none", "tensor", "token_head"] = "none"
     scale_dtype: torch.dtype | None = None
@@ -54,6 +55,15 @@ class KVCodec:
             key_cache.dtype == self.storage_dtype
             and value_cache.dtype == self.storage_dtype
         )
+
+    def supported_by(self, operation) -> bool:
+        """Query installed bindings; legacy callables support tensor-scale KV only."""
+        if operation is None:
+            return False
+        formats = getattr(operation, "kv_cache_codecs", None)
+        if formats is None:
+            return self in (FP16, FP8_E4M3, FP8_E5M2)
+        return self.name in formats
 
     def dequantize(
         self,
@@ -108,7 +118,7 @@ class KVCodec:
 
 
 # The unquantized 16-bit cache. Native operators name it "auto".
-FP16 = KVCodec("auto", ("auto", "float16"), torch.float16)
+FP16 = KVCodec("auto", ("auto", "float16"), torch.float16, native_id=0)
 BF16 = KVCodec("bfloat16", ("bfloat16",), torch.bfloat16)
 FP8_E4M3 = KVCodec(
     "fp8_e4m3",
@@ -116,6 +126,7 @@ FP8_E4M3 = KVCodec(
     torch.uint8,
     torch.float8_e4m3fn,
     quantized=True,
+    native_id=1,
     scale_granularity="tensor",
     scale_dtype=torch.float32,
     rounding="nearest_even",
@@ -126,6 +137,7 @@ FP8_E5M2 = KVCodec(
     torch.uint8,
     torch.float8_e5m2,
     quantized=True,
+    native_id=2,
     scale_granularity="tensor",
     scale_dtype=torch.float32,
     rounding="nearest_even",
@@ -136,6 +148,7 @@ INT8 = KVCodec(
     torch.int8,
     torch.int8,
     quantized=True,
+    native_id=3,
     scale_granularity="token_head",
     scale_dtype=torch.float32,
     rounding="nearest_even",
@@ -147,6 +160,7 @@ INT8_PER_TOKEN_HEAD = KVCodec(
     torch.int8,
     torch.int8,
     quantized=True,
+    native_id=3,
     scale_granularity="token_head",
     scale_dtype=torch.float32,
     rounding="truncate",

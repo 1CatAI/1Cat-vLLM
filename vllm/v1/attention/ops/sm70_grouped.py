@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 import torch
@@ -119,7 +119,9 @@ def _cache_layout_valid(contract, q, k, v):
         and t.device == q.device
         and t.stride(-1) == 1
         and t.data_ptr() % 16 == 0
-        and all(s % 8 == 0 for s in t.stride()[:3])
+        and all(
+            s % (4 if contract.codec.per_token_head else 8) == 0 for s in t.stride()[:3]
+        )
         for t in (k, v)
     )
 
@@ -147,6 +149,7 @@ def grouped_fp32_reason(
     partition_size_hint: int | None = None,
     layout: Literal["request_rows", "explicit_groups"] = "request_rows",
     causal: bool = True,
+    shared: bool = False,
 ) -> str | None:
     """Return the first rejected contract, or None for the admitted native route.
 
@@ -157,6 +160,19 @@ def grouped_fp32_reason(
     if codec is None:
         return "codec_unsupported"
     contract = GROUPED_CONTRACTS.get(codec)
+    if shared:
+        operation = getattr(instance, "flash_attn_grouped_fp32_paged", None)
+        if not codec.supported_by(operation):
+            return "operator_codec_missing:grouped_fp32"
+        # The shared numerical kernel implements the same geometry contract;
+        # codec binding supplies payload/scale strides, independent of models.
+        contract = replace(
+            GROUPED_CONTRACTS[FP8_E4M3],
+            codec=codec,
+            operator_attr="flash_attn_grouped_fp32_paged",
+            operator_name="grouped_fp32",
+            batch_revision=None,
+        )
     if contract is None:
         return "codec_unsupported"
     codec = contract.codec

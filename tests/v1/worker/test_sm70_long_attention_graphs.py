@@ -207,6 +207,8 @@ def test_tail_capture_and_dispatch_from_real_initialization(
         (4, 1, 256, "fp8_e4m3", False),
         (6, 1, 256, "auto", False),
         (6, 1, 256, "fp8_e5m2", False),
+        (6, 1, 256, "int8", True),
+        (12, 2, 256, "int8_per_token_head", True),
         (6, 1, 128, "fp8_e4m3", False),
     ],
 )
@@ -215,6 +217,11 @@ def test_batch_long_graph_capture_requires_native_capability(
 ):
     from vllm.v1.attention.ops import sm70_e4m3_long as long
 
+    monkeypatch.setattr(
+        long,
+        "builtin_codec_attention",
+        lambda stem, codec: object() if codec.per_token_head else None,
+    )
     monkeypatch.setenv("VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS", "0")
     monkeypatch.setenv("VLLM_SM70_MTP_SPLIT_DRAFT_CUDAGRAPHS", "0")
     monkeypatch.setattr(long, "long_attention_enabled", lambda policy=None: True)
@@ -271,6 +278,25 @@ def test_batch_long_graph_capture_requires_native_capability(
         if variant is not None:
             assert variant.attention_context_bucket == 131072
             assert variant in manager._capture_descs[CUDAGraphMode.FULL]
+
+
+def test_long_batch_int8_graph_rejects_a_binary_without_the_codec(monkeypatch):
+    from vllm.v1.attention.ops import sm70_e4m3_long as long
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype="int8"),
+        model_config=SimpleNamespace(
+            dtype=torch.float16,
+            get_head_size=lambda: 256,
+            get_num_attention_heads=lambda p: 12,
+            get_num_kv_heads=lambda p: 2,
+        ),
+        parallel_config=SimpleNamespace(),
+    )
+    monkeypatch.setattr(long, "builtin_codec_attention", lambda *args: None)
+    assert not cg._supports_sm70_long_batch_graphs(config)
+    monkeypatch.setattr(long, "builtin_codec_attention", lambda *args: object())
+    assert cg._supports_sm70_long_batch_graphs(config)
 
 
 @pytest.mark.parametrize("native_capacity", [None, 16])

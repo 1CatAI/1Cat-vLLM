@@ -70,6 +70,14 @@ and FP16/FP32 accumulation/reduction boundaries remain binding. Native policy
 and resource ABI probes run at initialization; unsupported explicit policy on an
 old binary must fail rather than be silently ignored.
 
+`DecodeOps`, `PrefillOps` and `VerificationOps` borrow the same `KVCacheView`.
+Native capability attributes survive initialization-time partial bindings.
+The INT8 prefill binding reads the original payload and row scales; converting
+resident INT8 to scaled FP16 before attention failed its numerical gate and
+does not qualify the dense-prefix path. The current bidirectional route audit,
+GPU evidence and open acceleration gaps are in the
+[implementation record](../../../../../docs/design/architecture/kv_codec_unification.md#engine-integration-and-repeated-prefilldecode-audit).
+
 An admission predicate does not prove an operator ran. Missing operators,
 unsupported layout and native attempts that decline retain the existing ordered
 fallback. `ROUTE_SPECS` declares accounting and structural admission; its table

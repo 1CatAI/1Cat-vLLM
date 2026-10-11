@@ -20,6 +20,7 @@ using namespace nvcuda::wmma;
 
 #include "flash_v100_traits.cuh"
 #include "kv_codec_traits.cuh"
+#include "kv_cache_view.h"
 
 #define WMMA_M 16
 #define WMMA_N 16
@@ -38,7 +39,8 @@ using namespace nvcuda::wmma;
 namespace {
 
 int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
-  if (kv_cache_dtype == "auto" || kv_cache_dtype == "bfloat16") {
+  if (kv_cache_dtype == "auto" || kv_cache_dtype == "float16" ||
+      kv_cache_dtype == "bfloat16") {
     return flash_v100::KV_CACHE_DTYPE_FP16;
   }
   if (kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3") {
@@ -46,6 +48,9 @@ int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
   }
   if (kv_cache_dtype == "fp8_e5m2") {
     return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;
+  }
+  if (kv_cache_dtype == "int8" || kv_cache_dtype == "int8_per_token_head") {
+    return flash_v100::KV_CACHE_DTYPE_INT8;
   }
   return -1;
 }
@@ -349,6 +354,27 @@ __device__ __forceinline__ void pipeline_pv_tile(
   store_matrix_sync(sO + tile_d, acc_frag, O_STRIDE, mem_row_major);
 }
 
+template <int CODEC>
+__device__ __forceinline__ float prefill_exp(float score, float maximum) {
+  if constexpr (flash_v100::KVCodecTraits<CODEC>::per_token_head) {
+    if (score <= -1.e20f) return 0.f;
+    if (isnan(score) || isnan(maximum)) return nanf("");
+  }
+  return __expf(fmaxf(score - maximum, -80.0f));
+}
+
+template <int CODEC>
+__device__ __forceinline__ float prefill_value_weight(
+    float weight, flash_v100::KVScaleView scales, const int* pages, int token,
+    int page_size, int head) {
+  if constexpr (flash_v100::KVCodecTraits<CODEC>::per_token_head) {
+    return weight == 0.f ? 0.f
+                         : weight * scales.value.load(pages[token / page_size],
+                                                      token % page_size, head);
+  }
+  return weight;
+}
+
 template <int D, bool LOW_SMEM, bool LOW_SMEM_CONTIG_FAST,
           bool LOW_SMEM_SCALAR_QK, bool LOW_SMEM_BM32, bool SPLIT_KV,
           bool IS_CAUSAL, int KV_DTYPE, bool D256_OUTPUT_STRIDE_268 = false,
@@ -376,7 +402,8 @@ __global__ void __launch_bounds__(
         const int window_size_right, float* __restrict__ split_tmp_out,
         float* __restrict__ split_tmp_row_max,
         float* __restrict__ split_tmp_row_sum, const int split_kv_tiles,
-        const int* __restrict__ anchor_lens, const int anchored_window) {
+        const int* __restrict__ anchor_lens, const int anchored_window,
+        flash_v100::KVScaleView scales = {}) {
   static_assert(!ANCHORED_SWA ||
                     (IS_CAUSAL && KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16),
                 "ANCHORED_SWA requires causal attention and an fp16 KV cache");
@@ -1108,7 +1135,9 @@ __global__ void __launch_bounds__(
               (int64_t)block_offset * k_token_stride +
               (int64_t)kv_head_id * k_head_stride + col;
           sK[row * KV_STRIDE + col] = flash_v100::load_kv_cache_half<KV_DTYPE>(
-              K_cache, physical_offset, k_scale);
+              K_cache, physical_offset,
+              flash_v100::KVCodecTraits<KV_DTYPE>::per_token_head ? 1.f
+                                                                  : k_scale);
         }
       }
       __syncthreads();
@@ -1183,6 +1212,14 @@ __global__ void __launch_bounds__(
                               (global_q_pos - global_n < anchored_window);
           }
 
+          if constexpr (flash_v100::KVCodecTraits<KV_DTYPE>::per_token_head) {
+            if (is_valid && is_causal_valid && is_window_valid &&
+                is_anchor_valid) {
+              acc_frag.x[i] *=
+                  scales.key.load(block_table_seq[global_n / page_block_size],
+                                  global_n % page_block_size, kv_head_id);
+            }
+          }
           acc_frag.x[i] = (is_valid && is_causal_valid && is_window_valid &&
                            is_anchor_valid)
                               ? acc_frag.x[i] * softmax_scale
@@ -1264,7 +1301,9 @@ __global__ void __launch_bounds__(
               (int64_t)block_offset * v_token_stride +
               (int64_t)kv_head_id * v_head_stride + col;
           sV[row * KV_STRIDE + col] = flash_v100::load_kv_cache_half<KV_DTYPE>(
-              V_cache, physical_offset, v_scale);
+              V_cache, physical_offset,
+              flash_v100::KVCodecTraits<KV_DTYPE>::per_token_head ? 1.f
+                                                                  : v_scale);
         }
       }
       __syncthreads();
@@ -1361,12 +1400,28 @@ __global__ void __launch_bounds__(
             if (vc_base < vec_cols) {
               float4 v4 = sS_vec4[vc_base];
 
-              float e0 = __expf(fmaxf(v4.x - new_max, -80.0f));
-              float e1 = __expf(fmaxf(v4.y - new_max, -80.0f));
-              float e2 = __expf(fmaxf(v4.z - new_max, -80.0f));
-              float e3 = __expf(fmaxf(v4.w - new_max, -80.0f));
+              float e0 = prefill_exp<KV_DTYPE>(v4.x, new_max);
+              float e1 = prefill_exp<KV_DTYPE>(v4.y, new_max);
+              float e2 = prefill_exp<KV_DTYPE>(v4.z, new_max);
+              float e3 = prefill_exp<KV_DTYPE>(v4.w, new_max);
 
               thread_sum += (e0 + e1) + (e2 + e3);
+              e0 = prefill_value_weight<KV_DTYPE>(
+                  e0, scales, block_table_seq,
+                  start_col + sub_start + vc_base * 4 + 0, page_block_size,
+                  kv_head_id);
+              e1 = prefill_value_weight<KV_DTYPE>(
+                  e1, scales, block_table_seq,
+                  start_col + sub_start + vc_base * 4 + 1, page_block_size,
+                  kv_head_id);
+              e2 = prefill_value_weight<KV_DTYPE>(
+                  e2, scales, block_table_seq,
+                  start_col + sub_start + vc_base * 4 + 2, page_block_size,
+                  kv_head_id);
+              e3 = prefill_value_weight<KV_DTYPE>(
+                  e3, scales, block_table_seq,
+                  start_col + sub_start + vc_base * 4 + 3, page_block_size,
+                  kv_head_id);
 
               const __half2 p01 = __float22half2_rn(make_float2(e0, e1));
               const __half2 p23 = __float22half2_rn(make_float2(e2, e3));
@@ -1387,8 +1442,11 @@ __global__ void __launch_bounds__(
           for (int c = tail_start + thread_in_row; c < sub_valid_k_rows;
                c += THREADS_PER_ROW) {
             float v = sS_row_f[c];
-            float e = __expf(fmaxf(v - new_max, -80.0f));
+            float e = prefill_exp<KV_DTYPE>(v, new_max);
             thread_sum += e;
+            e = prefill_value_weight<KV_DTYPE>(e, scales, block_table_seq,
+                                               start_col + sub_start + c,
+                                               page_block_size, kv_head_id);
             if constexpr (D256_SW_PIPELINE_PV) {
               sP_row_h[c] = __float2half_rn(e);
             } else {
@@ -1551,12 +1609,28 @@ __global__ void __launch_bounds__(
             if (vc_base < vec_cols) {
               float4 v4 = sS_vec4[vc_base];
 
-              float e0 = __expf(fmaxf(v4.x - new_max, -80.0f));
-              float e1 = __expf(fmaxf(v4.y - new_max, -80.0f));
-              float e2 = __expf(fmaxf(v4.z - new_max, -80.0f));
-              float e3 = __expf(fmaxf(v4.w - new_max, -80.0f));
+              float e0 = prefill_exp<KV_DTYPE>(v4.x, new_max);
+              float e1 = prefill_exp<KV_DTYPE>(v4.y, new_max);
+              float e2 = prefill_exp<KV_DTYPE>(v4.z, new_max);
+              float e3 = prefill_exp<KV_DTYPE>(v4.w, new_max);
 
               thread_sum += (e0 + e1) + (e2 + e3);
+              e0 = prefill_value_weight<KV_DTYPE>(
+                  e0, scales, block_table_seq,
+                  start_col + sub_start + vc_base * 4 + 0, page_block_size,
+                  kv_head_id);
+              e1 = prefill_value_weight<KV_DTYPE>(
+                  e1, scales, block_table_seq,
+                  start_col + sub_start + vc_base * 4 + 1, page_block_size,
+                  kv_head_id);
+              e2 = prefill_value_weight<KV_DTYPE>(
+                  e2, scales, block_table_seq,
+                  start_col + sub_start + vc_base * 4 + 2, page_block_size,
+                  kv_head_id);
+              e3 = prefill_value_weight<KV_DTYPE>(
+                  e3, scales, block_table_seq,
+                  start_col + sub_start + vc_base * 4 + 3, page_block_size,
+                  kv_head_id);
 
               const __half2 p01 = __float22half2_rn(make_float2(e0, e1));
               const __half2 p23 = __float22half2_rn(make_float2(e2, e3));
@@ -1577,8 +1651,11 @@ __global__ void __launch_bounds__(
           for (int c = tail_start + thread_in_row; c < sub_valid_k_rows;
                c += THREADS_PER_ROW) {
             float v = sS_row_f[c];
-            float e = __expf(fmaxf(v - new_max, -80.0f));
+            float e = prefill_exp<KV_DTYPE>(v, new_max);
             thread_sum += e;
+            e = prefill_value_weight<KV_DTYPE>(e, scales, block_table_seq,
+                                               start_col + sub_start + c,
+                                               page_block_size, kv_head_id);
             if constexpr (D256_SW_PIPELINE_PV) {
               sP_row_h[c] = __float2half_rn(e);
             } else {
@@ -1800,7 +1877,7 @@ void launcher_flash_attention_forward_paged_impl(
     int64_t bfla_mask_stride_k, float softmax_scale, bool is_causal,
     float k_scale, float v_scale, int window_size_left, int window_size_right,
     cudaStream_t stream, const int* anchor_lens = nullptr,
-    int anchored_window = 0) {
+    int anchored_window = 0, flash_v100::KVScaleView scales = {}) {
   using Config = KernelConfig<D, LOW_SMEM, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
                               D256_OUTPUT_STRIDE_268, D256_SW_PIPELINE_QK,
                               D256_SW_PIPELINE_PV>;
@@ -1848,7 +1925,7 @@ void launcher_flash_attention_forward_paged_impl(
           k_block_stride, k_token_stride, k_head_stride, v_block_stride,
           v_token_stride, v_head_stride, softmax_scale, k_scale, v_scale,
           window_size_left, window_size_right, nullptr, nullptr, nullptr, 0,
-          anchor_lens, anchored_window);
+          anchor_lens, anchored_window, scales);
       return;
     }
   } else {
@@ -1882,7 +1959,7 @@ void launcher_flash_attention_forward_paged_impl(
         bfla_mask_stride_k, page_block_size, num_kv_heads, k_block_stride,
         k_token_stride, k_head_stride, v_block_stride, v_token_stride,
         v_head_stride, softmax_scale, k_scale, v_scale, window_size_left,
-        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0);
+        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0, scales);
   } else {
     flash_attention_forward_kernel_paged<
         D, LOW_SMEM, LOW_SMEM_CONTIG_FAST, LOW_SMEM_SCALAR_QK, LOW_SMEM_BM32,
@@ -1896,7 +1973,7 @@ void launcher_flash_attention_forward_paged_impl(
         bfla_mask_stride_k, page_block_size, num_kv_heads, k_block_stride,
         k_token_stride, k_head_stride, v_block_stride, v_token_stride,
         v_head_stride, softmax_scale, k_scale, v_scale, window_size_left,
-        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0);
+        window_size_right, nullptr, nullptr, nullptr, 0, nullptr, 0, scales);
   }
 }
 
@@ -1988,7 +2065,8 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
     const torch::Tensor& block_table, const torch::Tensor& seq_lens,
     float softmax_scale, bool is_causal, float k_scale, float v_scale,
     int window_size_left, int window_size_right, int split_kv_tokens,
-    int max_seq_len_hint, cudaStream_t stream) {
+    int max_seq_len_hint, cudaStream_t stream,
+    flash_v100::KVScaleView scales = {}) {
   static_assert(D == 256, "split-KV paged prefill is D=256 only");
   static_assert(LOW_SMEM || !LOW_SMEM_CONTIG_FAST,
                 "contiguous low-smem loads require LOW_SMEM");
@@ -2059,7 +2137,8 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
             softmax_scale, k_scale, v_scale, window_size_left,
             window_size_right, split_tmp_out.data_ptr<float>(),
             split_tmp_row_max.data_ptr<float>(),
-            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0);
+            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0,
+            scales);
   } else {
     flash_attention_forward_kernel_paged<D, LOW_SMEM, LOW_SMEM_CONTIG_FAST,
                                          LOW_SMEM_SCALAR_QK, false, true, false,
@@ -2074,10 +2153,12 @@ void launcher_flash_attention_forward_paged_splitkv_impl(
             softmax_scale, k_scale, v_scale, window_size_left,
             window_size_right, split_tmp_out.data_ptr<float>(),
             split_tmp_row_max.data_ptr<float>(),
-            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0);
+            split_tmp_row_sum.data_ptr<float>(), split_kv_tiles, nullptr, 0,
+            scales);
   }
 
-  const dim3 merge_grid(grid_x, 1, B * H);
+  const dim3 merge_grid((M + BLOCK_M_256_LOW_SMEM - 1) / BLOCK_M_256_LOW_SMEM,
+                        1, B * H);
   const dim3 merge_block(512);
   flash_attention_forward_paged_splitkv_merge_kernel<D>
       <<<merge_grid, merge_block, 0, stream>>>(
@@ -3178,7 +3259,7 @@ void launcher_flash_attention_forward_paged(
     int bfla_mask_block_n = 0, int64_t bfla_mask_stride_b = 0,
     int64_t bfla_mask_stride_h = 0, int64_t bfla_mask_stride_q = 0,
     int64_t bfla_mask_stride_k = 0, const int* anchor_lens = nullptr,
-    int anchored_window = 0) {
+    int anchored_window = 0, flash_v100::KVScaleView scales = {}) {
   if (anchor_lens != nullptr && anchored_window > 0) {
     TORCH_CHECK(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16,
                 "anchored decode window requires an fp16 KV cache");
@@ -3195,7 +3276,7 @@ void launcher_flash_attention_forward_paged(
         bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
         bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
         softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-        window_size_right, stream, anchor_lens, anchored_window);
+        window_size_right, stream, anchor_lens, anchored_window, scales);
     return;
   }
   if constexpr (D == 256 && KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
@@ -3259,7 +3340,7 @@ void launcher_flash_attention_forward_paged(
                 bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
                 bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-                window_size_right, stream);
+                window_size_right, stream, nullptr, 0, scales);
           } else {
             launcher_flash_attention_forward_paged_impl<D, KV_DTYPE, true, true,
                                                         true, false>(
@@ -3267,7 +3348,7 @@ void launcher_flash_attention_forward_paged(
                 bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
                 bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-                window_size_right, stream);
+                window_size_right, stream, nullptr, 0, scales);
           }
         } else {
           if (use_low_smem_bm32) {
@@ -3277,7 +3358,7 @@ void launcher_flash_attention_forward_paged(
                 bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
                 bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-                window_size_right, stream);
+                window_size_right, stream, nullptr, 0, scales);
           } else {
             launcher_flash_attention_forward_paged_impl<D, KV_DTYPE, true, true,
                                                         false, false>(
@@ -3285,7 +3366,7 @@ void launcher_flash_attention_forward_paged(
                 bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
                 bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-                window_size_right, stream);
+                window_size_right, stream, nullptr, 0, scales);
           }
         }
       } else {
@@ -3297,7 +3378,7 @@ void launcher_flash_attention_forward_paged(
                 bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
                 bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-                window_size_right, stream);
+                window_size_right, stream, nullptr, 0, scales);
           } else {
             launcher_flash_attention_forward_paged_impl<D, KV_DTYPE, true,
                                                         false, true, false>(
@@ -3305,7 +3386,7 @@ void launcher_flash_attention_forward_paged(
                 bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
                 bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-                window_size_right, stream);
+                window_size_right, stream, nullptr, 0, scales);
           }
         } else {
           if (use_low_smem_bm32) {
@@ -3315,7 +3396,7 @@ void launcher_flash_attention_forward_paged(
                 bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
                 bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
                 softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-                window_size_right, stream);
+                window_size_right, stream, nullptr, 0, scales);
           } else {
             if (use_low_smem_output_stride_268) {
               if (use_sw_pipeline_qk) {
@@ -3327,7 +3408,7 @@ void launcher_flash_attention_forward_paged(
                       bfla_mask_stride_b, bfla_mask_stride_h,
                       bfla_mask_stride_q, bfla_mask_stride_k, softmax_scale,
                       is_causal, k_scale, v_scale, window_size_left,
-                      window_size_right, stream);
+                      window_size_right, stream, nullptr, 0, scales);
                 } else {
                   launcher_flash_attention_forward_paged_impl<
                       D, KV_DTYPE, true, false, false, false, true, true,
@@ -3336,7 +3417,8 @@ void launcher_flash_attention_forward_paged(
                              bfla_mask_stride_b, bfla_mask_stride_h,
                              bfla_mask_stride_q, bfla_mask_stride_k,
                              softmax_scale, is_causal, k_scale, v_scale,
-                             window_size_left, window_size_right, stream);
+                             window_size_left, window_size_right, stream,
+                             nullptr, 0, scales);
                 }
               } else if (use_sw_pipeline_pv) {
                 launcher_flash_attention_forward_paged_impl<
@@ -3345,7 +3427,8 @@ void launcher_flash_attention_forward_paged(
                     seq_lens, bfla_mask_ptr, bfla_mask_block_n,
                     bfla_mask_stride_b, bfla_mask_stride_h, bfla_mask_stride_q,
                     bfla_mask_stride_k, softmax_scale, is_causal, k_scale,
-                    v_scale, window_size_left, window_size_right, stream);
+                    v_scale, window_size_left, window_size_right, stream,
+                    nullptr, 0, scales);
               } else {
                 launcher_flash_attention_forward_paged_impl<
                     D, KV_DTYPE, true, false, false, false, true>(
@@ -3353,7 +3436,8 @@ void launcher_flash_attention_forward_paged(
                     seq_lens, bfla_mask_ptr, bfla_mask_block_n,
                     bfla_mask_stride_b, bfla_mask_stride_h, bfla_mask_stride_q,
                     bfla_mask_stride_k, softmax_scale, is_causal, k_scale,
-                    v_scale, window_size_left, window_size_right, stream);
+                    v_scale, window_size_left, window_size_right, stream,
+                    nullptr, 0, scales);
               }
             } else {
               launcher_flash_attention_forward_paged_impl<D, KV_DTYPE, true,
@@ -3362,7 +3446,7 @@ void launcher_flash_attention_forward_paged(
                   bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
                   bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
                   softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-                  window_size_right, stream);
+                  window_size_right, stream, nullptr, 0, scales);
             }
           }
         }
@@ -3374,7 +3458,7 @@ void launcher_flash_attention_forward_paged(
           bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
           bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
           softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-          window_size_right, stream);
+          window_size_right, stream, nullptr, 0, scales);
     }
   } else {
     launcher_flash_attention_forward_paged_impl<D, KV_DTYPE, false, false,
@@ -3383,7 +3467,7 @@ void launcher_flash_attention_forward_paged(
         bfla_mask_ptr, bfla_mask_block_n, bfla_mask_stride_b,
         bfla_mask_stride_h, bfla_mask_stride_q, bfla_mask_stride_k,
         softmax_scale, is_causal, k_scale, v_scale, window_size_left,
-        window_size_right, stream);
+        window_size_right, stream, nullptr, 0, scales);
   }
 }
 
@@ -3536,45 +3620,97 @@ at::Tensor flash_attention_prefill_paged_splitkv(
   return out_fp16;
 }
 
-at::Tensor flash_attention_prefill_paged(
+static at::Tensor prefill_paged_with_view(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
     const bool is_causal, const int window_size_left,
     const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
-    const int64_t anchored_window) {
+    const int64_t anchored_window, const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale,
+    const std::optional<at::Tensor>& block_mask = std::nullopt,
+    const int mask_block_n = 0, const int split_tokens = 0,
+    const int max_seq_len_hint = 0) {
   TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");
   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
   TORCH_CHECK(kv_dtype_code >= 0,
               "Unsupported kv_cache_dtype: ", kv_cache_dtype);
-  if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
-    TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
-    TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
-  } else {
-    TORCH_CHECK(k_cache.dtype() == torch::kUInt8,
-                "fp8 k_cache must be stored as uint8");
-    TORCH_CHECK(v_cache.dtype() == torch::kUInt8,
-                "fp8 v_cache must be stored as uint8");
-    TORCH_CHECK(k_scale > 0.f && v_scale > 0.f,
-                "fp8 k/v scales must be positive");
+  TORCH_CHECK(q.dim() == 4 && k_cache.dim() == 4 && v_cache.dim() == 4,
+              "Q must be BHMD and KV must be [page, token, head, dim]");
+  TORCH_CHECK(q.is_cuda(), "Q must be on CUDA");
+  for (const auto& tensor : {k_cache, v_cache, block_table, seq_lens}) {
+    TORCH_CHECK(tensor.device() == q.device(),
+                "All tensors must use Q's device");
   }
-  TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
-              "Tensors must be on CUDA");
-  TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(),
-              "block_table and seq_lens must be CUDA tensors");
-  TORCH_CHECK(
-      q.stride(-1) == 1 && k_cache.stride(-1) == 1 && v_cache.stride(-1) == 1,
-      "Last dim must be contiguous");
-  TORCH_CHECK(k_cache.stride(1) % 8 == 0 && k_cache.stride(2) % 8 == 0 &&
-                  v_cache.stride(1) % 8 == 0 && v_cache.stride(2) % 8 == 0,
-              "Paged KV strides must be divisible by 8 half elements");
+  TORCH_CHECK(q.is_contiguous(), "Q must be contiguous BHMD");
+  TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "KV shapes must match");
+  TORCH_CHECK(k_cache.stride(-1) == 1 && v_cache.stride(-1) == 1,
+              "KV head dimensions must be contiguous");
+  TORCH_CHECK(block_table.dim() == 2 && seq_lens.dim() == 1 &&
+                  block_table.scalar_type() == at::kInt &&
+                  seq_lens.scalar_type() == at::kInt &&
+                  block_table.is_contiguous() && seq_lens.is_contiguous(),
+              "Page tables and lengths must be contiguous int32");
+  flash_v100::visit_kv_codec(kv_dtype_code, [&](auto tag) {
+    constexpr int codec = decltype(tag)::value;
+    TORCH_CHECK(
+        k_cache.scalar_type() == flash_v100::kv_storage_type<codec>() &&
+            v_cache.scalar_type() == flash_v100::kv_storage_type<codec>(),
+        "Cache payload dtype does not match codec");
+    constexpr int alignment =
+        flash_v100::KVCodecTraits<codec>::per_token_head ? 4 : 8;
+    for (const auto& cache : {k_cache, v_cache}) {
+      TORCH_CHECK(cache.stride(0) > 0 && cache.stride(1) > 0 &&
+                      cache.stride(2) > 0 && cache.stride(0) % alignment == 0 &&
+                      cache.stride(1) % alignment == 0 &&
+                      cache.stride(2) % alignment == 0,
+                  "KV row strides must preserve vector alignment");
+    }
+    if constexpr (codec == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
+                  codec == flash_v100::KV_CACHE_DTYPE_FP8_E5M2) {
+      TORCH_CHECK(k_scale > 0.f && v_scale > 0.f,
+                  "FP8 scales must be positive");
+    }
+  });
+  const auto scales = flash_v100::bind_scale_view(
+      kv_dtype_code, k_cache, v_cache, key_scale, value_scale);
 
   const int B = q.size(0);
   const int H = q.size(1);
   const int M = q.size(2);
   const int D = q.size(3);
   const int num_kv_heads = k_cache.size(2);
+
+  TORCH_CHECK(B > 0 && H > 0 && M > 0 && num_kv_heads > 0 &&
+                  k_cache.size(0) > 0 && k_cache.size(1) > 0 &&
+                  k_cache.size(3) == D && block_table.size(0) == B &&
+                  block_table.size(1) > 0 && seq_lens.size(0) == B,
+              "Invalid attention geometry or page table capacity");
+  TORCH_CHECK(block_table.size(1) * k_cache.size(1) <= INT_MAX,
+              "Page capacity exceeds int32 indexing");
+  if (out_) {
+    TORCH_CHECK(out_->device() == q.device() && out_->dtype() == q.dtype() &&
+                    out_->sizes() == q.sizes() && out_->is_contiguous(),
+                "Output must be contiguous BHMD on Q's device");
+  }
+  if (block_mask) {
+    TORCH_CHECK(
+        D == 256 && M > 1 && is_causal && window_size_left == -1 &&
+            window_size_right == -1 && !anchor_lens && split_tokens == 0,
+        "Block sparsity requires causal D256 prefill without other masks");
+    TORCH_CHECK(
+        block_mask->device() == q.device() &&
+            block_mask->scalar_type() == at::kInt && block_mask->dim() == 4 &&
+            mask_block_n > 0 && block_mask->size(0) >= B &&
+            block_mask->size(1) >= num_kv_heads &&
+            block_mask->size(2) >= (M + mask_block_n - 1) / mask_block_n &&
+            block_mask->size(3) >=
+                (block_table.size(1) * k_cache.size(1) + mask_block_n - 1) /
+                    mask_block_n,
+        "Block mask must cover all query and key tiles");
+  }
+  c10::cuda::CUDAGuard guard(q.device());
 
   TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0,
               "D must be even, <=256, multiple of 8");
@@ -3617,29 +3753,54 @@ at::Tensor flash_attention_prefill_paged(
   bool sm70 = props->major == 7 && props->minor == 0;
   TORCH_CHECK(sm70, "Kernel supports only Volta GPUs.");
 
-#define LAUNCH_PAGED_TYPED(HDIM, KV_DTYPE_CODE)                           \
-  launcher_flash_attention_forward_paged<HDIM, KV_DTYPE_CODE>(            \
-      q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens,  \
-      softmax_scale, is_causal, k_scale, v_scale, window_size_left,       \
-      window_size_right, stream, nullptr, 0, 0, 0, 0, 0, anchor_lens_ptr, \
-      static_cast<int>(anchored_window))
+  if (split_tokens > 0) {
+    TORCH_CHECK(D == 256 && M > 1 && !anchor_lens && k_cache.size(1) % 16 == 0,
+                "Split-KV requires D256 prefill and pages divisible by 16");
+    // Preserve the existing low-smem FP16 and E5M2 launch plans.
+    if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16 ||
+        kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2) {
+      return flash_attention_prefill_paged_splitkv(
+          q, k_cache, v_cache, out_, block_table, seq_lens, softmax_scale,
+          kv_cache_dtype, k_scale, v_scale, is_causal, window_size_left,
+          window_size_right, split_tokens, max_seq_len_hint);
+    }
+    const int block_n = KernelConfig<256, false>::BLOCK_N;
+    const int tiles_per_part =
+        std::max(1, (split_tokens + block_n - 1) / block_n);
+    const int hint = max_seq_len_hint > 0
+                         ? max_seq_len_hint
+                         : block_table.size(1) * k_cache.size(1);
+    const int num_tiles = std::max(1, (hint + block_n - 1) / block_n);
+    const int parts = (num_tiles + tiles_per_part - 1) / tiles_per_part;
+    auto options = q.options().dtype(at::kFloat);
+    auto tmp_out = torch::empty({B, H, parts, M, D}, options);
+    auto tmp_max = torch::empty({B, H, parts, M}, options);
+    auto tmp_sum = torch::empty({B, H, parts, M}, options);
+    flash_v100::visit_kv_codec(kv_dtype_code, [&](auto tag) {
+      constexpr int codec = decltype(tag)::value;
+      launcher_flash_attention_forward_paged_splitkv_impl<256, codec, false,
+                                                          false, false>(
+          q, k_cache, v_cache, out_fp16, softmax_lse, tmp_out, tmp_max, tmp_sum,
+          block_table, seq_lens, softmax_scale, is_causal, k_scale, v_scale,
+          window_size_left, window_size_right, split_tokens, hint, stream,
+          scales);
+    });
+    return out_fp16;
+  }
 
-#define LAUNCH_PAGED_BY_KV(HDIM)                                            \
-  do {                                                                      \
-    switch (kv_dtype_code) {                                                \
-      case flash_v100::KV_CACHE_DTYPE_FP16:                                 \
-        LAUNCH_PAGED_TYPED(HDIM, flash_v100::KV_CACHE_DTYPE_FP16);          \
-        break;                                                              \
-      case flash_v100::KV_CACHE_DTYPE_FP8_E4M3:                             \
-        LAUNCH_PAGED_TYPED(HDIM, flash_v100::KV_CACHE_DTYPE_FP8_E4M3);      \
-        break;                                                              \
-      case flash_v100::KV_CACHE_DTYPE_FP8_E5M2:                             \
-        LAUNCH_PAGED_TYPED(HDIM, flash_v100::KV_CACHE_DTYPE_FP8_E5M2);      \
-        break;                                                              \
-      default:                                                              \
-        TORCH_CHECK(false, "Unsupported kv_cache_dtype: ", kv_cache_dtype); \
-    }                                                                       \
-  } while (0)
+#define LAUNCH_PAGED_BY_KV(HDIM)                                           \
+  flash_v100::visit_kv_codec(kv_dtype_code, [&](auto tag) {                \
+    launcher_flash_attention_forward_paged<HDIM, decltype(tag)::value>(    \
+        q, k_cache, v_cache, out_fp16, softmax_lse, block_table, seq_lens, \
+        softmax_scale, is_causal, k_scale, v_scale, window_size_left,      \
+        window_size_right, stream,                                         \
+        block_mask ? block_mask->data_ptr<int>() : nullptr, mask_block_n,  \
+        block_mask ? block_mask->stride(0) : 0,                            \
+        block_mask ? block_mask->stride(1) : 0,                            \
+        block_mask ? block_mask->stride(2) : 0,                            \
+        block_mask ? block_mask->stride(3) : 0, anchor_lens_ptr,           \
+        static_cast<int>(anchored_window), scales);                        \
+  })
 
   switch (D) {
     case 16:
@@ -3662,9 +3823,38 @@ at::Tensor flash_attention_prefill_paged(
   }
 
 #undef LAUNCH_PAGED_BY_KV
-#undef LAUNCH_PAGED_TYPED
 
   return out_fp16;
+}
+
+at::Tensor flash_attention_prefill_paged(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window) {
+  return prefill_paged_with_view(q, k_cache, v_cache, out_, block_table,
+                                 seq_lens, softmax_scale, kv_cache_dtype,
+                                 k_scale, v_scale, is_causal, window_size_left,
+                                 window_size_right, anchor_lens,
+                                 anchored_window, std::nullopt, std::nullopt);
+}
+
+at::Tensor flash_attention_prefill_paged_with_scales(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window, const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale) {
+  return prefill_paged_with_view(
+      q, k_cache, v_cache, out_, block_table, seq_lens, softmax_scale,
+      kv_cache_dtype, k_scale, v_scale, is_causal, window_size_left,
+      window_size_right, anchor_lens, anchored_window, key_scale, value_scale);
 }
 
 std::vector<at::Tensor>
@@ -4144,7 +4334,57 @@ at::Tensor flash_attention_dflash2_paged_bmhd(
       q.size(1), table.size(1) * k.size(1), nullptr, 0, 0, 0, 0, 0, k.size(1),
       k.size(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
       v.stride(1), v.stride(2), scale, 1.f, 1.f, 2047, 2047, nullptr, nullptr,
-      nullptr, 0, nullptr, 0);
+      nullptr, 0, nullptr, 0, {});
   AT_CUDA_CHECK(cudaGetLastError());
   return out;
+}
+
+at::Tensor flash_attention_prefill_paged_splitkv_with_scales(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const int split_kv_tokens,
+    const int max_seq_len_hint, const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale) {
+  return prefill_paged_with_view(
+      q, k_cache, v_cache, out_, block_table, seq_lens, softmax_scale,
+      kv_cache_dtype, k_scale, v_scale, is_causal, window_size_left,
+      window_size_right, std::nullopt, 0, key_scale, value_scale, std::nullopt,
+      0, split_kv_tokens, max_seq_len_hint);
+}
+
+at::Tensor flash_attention_prefill_paged_bfla_with_scales(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const at::Tensor& bfla_block_mask,
+    const int bfla_mask_block_n, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const bool is_causal, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale) {
+  return prefill_paged_with_view(
+      q, k_cache, v_cache, out_, block_table, seq_lens, softmax_scale,
+      kv_cache_dtype, k_scale, v_scale, is_causal, window_size_left,
+      window_size_right, std::nullopt, 0, key_scale, value_scale,
+      bfla_block_mask, bfla_mask_block_n);
+}
+
+at::Tensor flash_attention_decode_paged_wmma_with_scales(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, const float softmax_scale,
+    const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
+    const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale) {
+  TORCH_CHECK(q.dim() == 3, "WMMA decode Q must be BHD");
+  auto q_bhmd = q.unsqueeze(2);
+  std::optional<at::Tensor> out_bhmd =
+      out_ ? std::make_optional(out_->unsqueeze(2)) : std::nullopt;
+  return prefill_paged_with_view(q_bhmd, k_cache, v_cache, out_bhmd,
+                                 block_table, seq_lens, softmax_scale,
+                                 kv_cache_dtype, k_scale, v_scale, false, -1,
+                                 -1, std::nullopt, 0, key_scale, value_scale)
+      .squeeze(2);
 }

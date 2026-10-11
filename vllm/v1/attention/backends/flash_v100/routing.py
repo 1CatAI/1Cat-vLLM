@@ -37,7 +37,9 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 RouteStage = Literal["decode", "verify", "mixed_decode", "prefill", "metadata", "any"]
 _NATIVE_CODECS = frozenset((FP16, FP8_E4M3, FP8_E5M2))
-_ALL_CODECS = _NATIVE_CODECS | {BF16}
+_ROW_CODECS = frozenset((INT8, INT8_PER_TOKEN_HEAD))
+_BOUND_CODECS = _NATIVE_CODECS | _ROW_CODECS
+_ALL_CODECS = _BOUND_CODECS | {BF16}
 
 
 @dataclass(frozen=True)
@@ -144,12 +146,22 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
         (
             "prefill_prefix_decode_rows_xqa",
             "mixed_decode",
-            {"head_dims": (256,), "gqa_ratios": (4, 6, 8), "xqa": True},
+            {
+                "head_dims": (256,),
+                "gqa_ratios": (4, 6, 8),
+                "xqa": True,
+                "codecs": _BOUND_CODECS,
+            },
         ),
         (
             "prefill_smallq_decode_xqa",
             "verify",
-            {"head_dims": (256,), "gqa_ratios": (6, 8), "xqa": True},
+            {
+                "head_dims": (256,),
+                "gqa_ratios": (6, 8),
+                "xqa": True,
+                "codecs": _BOUND_CODECS,
+            },
         ),
         (
             "decode_scalar_paged",
@@ -159,15 +171,27 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
                 "codecs": _NATIVE_CODECS | {INT8, INT8_PER_TOKEN_HEAD},
             },
         ),
-        ("prefill_smallq_decode_scalar", "verify", {"fallback": True}),
-        ("prefill_prefix_decode_rows_scalar", "mixed_decode", {"fallback": True}),
-        ("decode_dense_cache decode_paged_prefill", "decode", {}),
+        (
+            "prefill_smallq_decode_scalar",
+            "verify",
+            {"fallback": True, "codecs": _BOUND_CODECS},
+        ),
+        (
+            "prefill_prefix_decode_rows_scalar",
+            "mixed_decode",
+            {"fallback": True, "codecs": _BOUND_CODECS},
+        ),
+        (
+            "decode_dense_cache decode_paged_prefill",
+            "decode",
+            {"codecs": _BOUND_CODECS},
+        ),
         ("decode_dense_reference", "decode", {"codecs": _ALL_CODECS}),
         (
             "decode_e4m3_compact_scalar_tail",
             "decode",
             {
-                "codecs": frozenset((FP8_E4M3,)),
+                "codecs": _BOUND_CODECS,
                 "head_dims": (256,),
                 "gqa_ratios": (6,),
                 "page_alignment": 16,
@@ -184,7 +208,7 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
             {"codecs": _ALL_CODECS, "fallback": True},
         ),
         ("prefill_triton_safe", "prefill", {"codecs": _ALL_CODECS, "fallback": True}),
-        ("prefill_ddtree_triton", "verify", {"codecs": _ALL_CODECS}),
+        ("prefill_ddtree_triton", "verify", {"codecs": frozenset((FP16,))}),
         (
             (
                 "metadata_none_zero_output prefill_capture_dflash_noncausal_paged "
@@ -224,7 +248,33 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
                 "page_alignment": 16,
             },
         ),
-        ("prefill_smallq_dflash2_grouped_verify prefill_ddtree_dense", "verify", {}),
+        (
+            "prefill_smallq_grouped_fp32",
+            "verify",
+            {
+                "codecs": _BOUND_CODECS,
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "page_alignment": 16,
+            },
+        ),
+        (
+            "prefill_prefix_decode_rows_grouped_fp32",
+            "mixed_decode",
+            {
+                "codecs": _BOUND_CODECS,
+                "head_dims": (256,),
+                "gqa_ratios": (6,),
+                "page_alignment": 16,
+            },
+        ),
+        ("prefill_prefix_kv_bridge", "prefill", {"codecs": _BOUND_CODECS}),
+        (
+            "prefill_smallq_dflash2_grouped_verify",
+            "verify",
+            {"codecs": frozenset((FP8_E5M2,))},
+        ),
+        ("prefill_ddtree_dense", "verify", {"codecs": frozenset((FP16,))}),
         (
             (
                 "prefill_dense_splitd_d256 prefill_prefix_splitd_d256 "
@@ -339,15 +389,21 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
         ),
         (
             (
-                "prefill_no_prefix_dense_flash prefill_no_prefix_paged_cache_flash "
+                "prefill_no_prefix_dense_flash "
                 "prefill_prefix_bfla prefill_prefix_contig_dense "
                 "prefill_prefix_contig_dense_bhmd "
                 "prefill_prefix_contig_dense_fa2_d256 "
-                "prefill_prefix_dflash_noncausal_batch prefill_prefix_flash "
-                "prefill_prefix_paged_anchored prefill_prefix_splitkv"
+                "prefill_prefix_dflash_noncausal_batch "
+                "prefill_prefix_paged_anchored"
             ),
             "prefill",
-            {},
+            {"codecs": frozenset((FP16,))},
+        ),
+        (
+            "prefill_no_prefix_paged_cache_flash prefill_prefix_flash "
+            "prefill_prefix_splitkv",
+            "prefill",
+            {"codecs": _BOUND_CODECS},
         ),
         (
             "flashinfer_sm70_fixed_entry flashinfer_sm70_splitkv3_fast_visible",
@@ -378,7 +434,9 @@ _ROUTE_FAMILIES = (
     ),
     (
         re.compile(r"decode_xqa_p[0-9]+_page[0-9]+"),
-        RouteSpec("decode_xqa_p{partition}_page{page}", "decode", observer=True),
+        RouteSpec(
+            "decode_xqa_p{partition}_page{page}", "decode", _BOUND_CODECS, observer=True
+        ),
     ),
     (
         re.compile(r"fp8_kv_decode(?:_.+)?"),
@@ -501,12 +559,7 @@ def native_codec_supported(operation, codec: KVCodec | None) -> bool:
     must obtain its declaration from the loaded extension, not its signature.
     Engine-bound callables preserve this immutable capability attribute.
     """
-    if operation is None or codec is None:
-        return False
-    formats = getattr(operation, "kv_cache_codecs", None)
-    if formats is None:
-        return codec in _NATIVE_CODECS
-    return codec.name in formats
+    return codec is not None and codec.supported_by(operation)
 
 
 def select_route(
@@ -565,8 +618,6 @@ _fallback_counts: dict[str, int] = {}
 _decode_active_trace_signatures: set[tuple[object, ...]] = set()
 _DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
-_DEFAULT_Q4_XQA_MIN_SEQ_LEN = 32768
-_DEFAULT_FP8_XQA_MIN_SEQ_LEN = 16384
 
 
 def normalize_flash_v100_kv_cache_dtype(kv_cache_dtype: str) -> str:

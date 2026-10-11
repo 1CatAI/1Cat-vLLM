@@ -10,6 +10,7 @@ from vllm.v1.attention.kv_codecs import (
     FP16,
     INT8,
     INT8_PER_TOKEN_HEAD,
+    KV_CODECS,
     canonical_kv_cache_dtype,
     resolve_kv_codec,
 )
@@ -80,6 +81,19 @@ def test_storage_admission_checks_both_tensors():
     assert FP8_E4M3.stores(k, k.clone())
     assert not FP8_E4M3.stores(k, k.to(torch.float16))
     assert not FP16.stores(k, k)
+
+
+@pytest.mark.parametrize("codec", KV_CODECS, ids=lambda c: c.name)
+def test_common_and_runner_format_predicates_agree_with_codec(codec):
+    from vllm.utils import torch_utils
+    from vllm.v1 import kv_cache_interface
+
+    for alias in codec.aliases:
+        for module in (torch_utils, kv_cache_interface):
+            assert module.is_quantized_kv_cache(alias) == codec.quantized
+            assert module.kv_cache_uses_per_token_head_scales(alias) == (
+                codec.per_token_head
+            )
 
 
 @pytest.mark.parametrize("codec", [FP8_E4M3, FP8_E5M2])

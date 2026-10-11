@@ -196,7 +196,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if self.kv_codec is FP16 and current_platform.is_device_capability(70)
             else None
         )
-        self.spec_attention.initialize_scalar_tail(use_e4m3_fp32)
+        self.spec_attention.initialize_scalar_tail(
+            _config.options().value("e4m3_grouped_fp32")
+            and current_platform.is_device_capability(70),
+        )
         if use_e4m3_fp32 and self.flash_attn_grouped_e4m3_fp32_paged is None:
             logger.warning_once(
                 "E4M3 grouped FP32 requires Flash-V100 precision revision 4; "
@@ -207,6 +210,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.spec_attention.initialize_verify_abi(
             _ops._flash_attn_grouped_verify_max_query_tokens,
             _ops._flash_attn_grouped_verify_request_major_abi_version,
+        )
+        self.paged_kv_to_fp16 = _ops.get_paged_kv_bridge_op()
+        self.flash_attn_grouped_fp32_paged = (
+            _ops.get_grouped_fp32_op(self.kv_codec)
+            if _config.options().value("e4m3_grouped_fp32")
+            and current_platform.is_device_capability(70)
+            else None
         )
         self.fp8_e5m2_paged_kv_to_fp16 = _ops.get_fp8_e5m2_paged_kv_bridge_op()
         self.fp8_e4m3_paged_kv_to_fp16 = (
@@ -262,6 +272,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if self.kv_codec is FP8_E4M3
             else self.fp8_e5m2_paged_kv_to_fp16 is not None
         ) and _config.options().value("fp8_prefill_bridge")
+        if self.kv_codec is not None and self.kv_codec.per_token_head:
+            self.use_fp8_prefill_bridge = _routing.native_codec_supported(
+                self.paged_kv_to_fp16, self.kv_codec
+            ) and _config.options().value("fp8_prefill_bridge")
         self.use_flash_v100_prefill_splitkv = (
             self.flash_attn_prefill_paged_splitkv is not None
             and _config.options().value("prefill_split_kv")
@@ -456,8 +470,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> KVCodec | None:
         """The codec when the XQA operator reads this cache natively."""
         codec = self.kv_codec
-        if codec not in (FP16, FP8_E4M3, FP8_E5M2) or not codec.stores(
-            key_cache, value_cache
+        if (
+            codec is None
+            or not _routing.native_codec_supported(
+                self.flash_attn_decode_paged_xqa, codec
+            )
+            or not codec.stores(key_cache, value_cache)
         ):
             return None
         # Feature contracts can require a separate native FP32 verifier route.
@@ -468,6 +486,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
         supported_kv_dtype = self.kv_codec in (FP16, FP8_E4M3, FP8_E5M2)
+        if self.kv_codec is not None and self.kv_codec.per_token_head:
+            supported_kv_dtype = (
+                self.use_flash_v100_decode
+                and _routing.native_codec_supported(
+                    getattr(self, "paged_kv_to_fp16", None), self.kv_codec
+                )
+                and _routing.native_codec_supported(
+                    self.flash_attn_prefill_paged, self.kv_codec
+                )
+            )
         return (
             self.use_flash_v100
             and self.attn_type == AttentionType.DECODER
@@ -522,6 +550,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             draft_debug_log=_debug.draft_graph_debug_log,
             format_debug=_debug.format_tensor_debug,
             scalar_override=vars(self).get("_call_flash_attn_decode_paged"),
+            cache_view=getattr(self, "_kv_cache_view", None),
         )
         workspace = getattr(self, "workspace", None)
         if workspace is None:
@@ -548,6 +577,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         partition_size_hint: int | None = None,
         anchor_lens: torch.Tensor | None = None,
         anchored_window: int = 0,
+        k_scale_cache: torch.Tensor | None = None,
+        v_scale_cache: torch.Tensor | None = None,
     ) -> None:
         return self._new_decode_executor()._call_flash_attn_decode_paged(
             query,
@@ -567,6 +598,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             partition_size_hint=partition_size_hint,
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
         )
 
     def _new_comparison_executor(self):
@@ -611,6 +644,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             for field, legacy_name in _feature.PREFILL_CALLBACK_FIELDS.items()
         }
         ops = _prefill.PrefillDriverOps(
+            cache_view=getattr(self, "_kv_cache_view", None),
             **native,
             supports_anchor=getattr(
                 self, "_flash_prefill_paged_supports_anchor", False
@@ -661,6 +695,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             **limits,
         )
         ops = _verify.VerificationOps(
+            cache_view=getattr(self, "_kv_cache_view", None),
+            shared_grouped=getattr(self, "flash_attn_grouped_fp32_paged", None),
             parent_ids_cpu=_masks.parent_ids_cpu,
             draft_debug_enabled=_debug.draft_graph_debug_enabled,
             metadata_debug_log=_debug.graph_metadata_debug_log,
@@ -750,6 +786,22 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.use_triton_prefill,
         )
 
+    def _unsupported_path_message(self, layer_info) -> str:
+        return (
+            "FLASH_ATTN_V100 cannot run this layer/config because a required "
+            "Flash op is unavailable or the attention features/KV cache dtype "
+            "are unsupported. Select TRITON_ATTN for a full Triton route, or "
+            "set VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for explicit "
+            "diagnostic fallback. "
+            f"Details: layer={layer_info.get('layer_name')!r}, "
+            f"flash_ops_available={self.use_flash_v100}, "
+            f"attn_type={self.attn_type!r}, "
+            f"has_alibi={self.alibi_slopes is not None}, "
+            f"logits_soft_cap={self.logits_soft_cap!r}, "
+            f"has_sinks={self.sinks is not None}, "
+            f"kv_cache_dtype={self.kv_cache_dtype!r}."
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -792,20 +844,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not self._supports_flash_v100_path():
             layer_info = self._layer_debug_info(layer)
             feature_fallback = _feature.fallback_kind(layer_info)
-            message = (
-                "FLASH_ATTN_V100 cannot run this layer/config because a required "
-                "Flash op is unavailable or the attention features/KV cache dtype "
-                "are unsupported. Select TRITON_ATTN for a full Triton route, or "
-                "set VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for explicit "
-                "diagnostic fallback. "
-                f"Details: layer={layer_info.get('layer_name')!r}, "
-                f"flash_ops_available={self.use_flash_v100}, "
-                f"attn_type={self.attn_type!r}, "
-                f"has_alibi={self.alibi_slopes is not None}, "
-                f"logits_soft_cap={self.logits_soft_cap!r}, "
-                f"has_sinks={self.sinks is not None}, "
-                f"kv_cache_dtype={self.kv_cache_dtype!r}."
-            )
+            message = self._unsupported_path_message(layer_info)
             _feature.unsupported(self._policy(), layer_info, message, feature_fallback)
             return super().forward(
                 layer,
@@ -820,6 +859,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
 
         assert output is not None
+        if self.kv_codec is not None and self.kv_codec.per_token_head:
+            self._ensure_scale_caches(kv_cache)
         is_prefill = attn_metadata.max_query_len > 1
         is_capturing = _routing.is_cuda_graph_capturing(query)
         layer_name = self._layer_debug_info(layer).get("layer_name")
