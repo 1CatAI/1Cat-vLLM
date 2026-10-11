@@ -17,7 +17,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cub/block/block_radix_sort.cuh>
 
-#include "fp8_kv_utils.cuh"
+#include "kv_codec_traits.cuh"
+#include "kv_cache_view.h"
 #include "fused_mma.h"
 
 namespace {
@@ -32,6 +33,9 @@ int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
   }
   if (kv_cache_dtype == "fp8_e5m2") {
     return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;
+  }
+  if (kv_cache_dtype == "int8" || kv_cache_dtype == "int8_per_token_head") {
+    return flash_v100::KV_CACHE_DTYPE_INT8;
   }
   return -1;
 }
@@ -628,109 +632,6 @@ __device__ __forceinline__ float block_reduce_max(float val) {
   return result;
 }
 
-__device__ __forceinline__ uint32_t
-fp8_e5m2_pair_to_half2_bits(const uint16_t raw_pair) {
-  return (static_cast<uint32_t>(raw_pair & 0x00ffu) << 8) |
-         (static_cast<uint32_t>(raw_pair & 0xff00u) << 16);
-}
-
-__device__ __forceinline__ uint4 fp8_e5m2_vector_to_half8(const uint64_t raw) {
-  return make_uint4(
-      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw)),
-      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
-      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
-      fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
-}
-
-__device__ __forceinline__ uint16_t fp8_e4m3fn_to_half_bits(const uint8_t raw) {
-  const uint16_t sign = static_cast<uint16_t>(raw & 0x80u) << 8;
-  const uint8_t magnitude = raw & 0x7fu;
-  const uint8_t exponent = magnitude >> 3;
-  const uint8_t mantissa = magnitude & 0x07u;
-  if (magnitude == 0) {
-    return sign;
-  }
-  if (exponent == 0) {
-    // E4M3 subnormals are exact fp16 normals: mantissa * 2^-9.
-    const uint16_t magnitude_bits =
-        mantissa < 2
-            ? 0x1800u
-            : (mantissa < 4
-                   ? static_cast<uint16_t>(0x1c00u | ((mantissa - 2) << 9))
-                   : static_cast<uint16_t>(0x2000u | ((mantissa - 4) << 8)));
-    return sign | magnitude_bits;
-  }
-  if (magnitude == 0x7fu) {
-    return sign | 0x7e00u;
-  }
-  return sign | static_cast<uint16_t>((exponent + 8) << 10) |
-         static_cast<uint16_t>(mantissa << 7);
-}
-
-__device__ __forceinline__ uint32_t
-fp8_e4m3fn_pair_to_half2_bits(const uint16_t raw_pair) {
-  return static_cast<uint32_t>(
-             fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw_pair))) |
-         (static_cast<uint32_t>(
-              fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw_pair >> 8)))
-          << 16);
-}
-
-__device__ __forceinline__ uint32_t
-fp8_e4m3fn_pair_to_half2_bits_fast(const uint16_t raw_pair) {
-  const uint8_t raw0 = static_cast<uint8_t>(raw_pair);
-  const uint8_t raw1 = static_cast<uint8_t>(raw_pair >> 8);
-  if ((raw0 & 0x7fu) == 0x7fu || (raw1 & 0x7fu) == 0x7fu) {
-    return fp8_e4m3fn_pair_to_half2_bits(raw_pair);
-  }
-
-  // Moving a finite E4M3 encoding into the corresponding fp16 sign,
-  // exponent, and mantissa fields represents exactly value / 256. A packed
-  // half2 multiply restores both values without per-byte exponent branches.
-  const uint32_t expanded = (static_cast<uint32_t>(raw_pair & 0x0080u) << 8) |
-                            (static_cast<uint32_t>(raw_pair & 0x007fu) << 7) |
-                            (static_cast<uint32_t>(raw_pair & 0x8000u) << 16) |
-                            (static_cast<uint32_t>(raw_pair & 0x7f00u) << 15);
-  union {
-    uint32_t u;
-    __half2 h2;
-  } converter;
-  converter.u = expanded;
-  converter.h2 = __hmul2(converter.h2, __float2half2_rn(256.0f));
-  return converter.u;
-}
-
-__device__ __forceinline__ uint4
-fp8_e4m3fn_vector_to_half8(const uint64_t raw) {
-  return make_uint4(
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw)),
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
-      fp8_e4m3fn_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
-}
-
-__device__ __forceinline__ uint4
-fp8_e4m3fn_vector_to_half8_fast(const uint64_t raw) {
-  return make_uint4(
-      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw)),
-      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 16)),
-      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 32)),
-      fp8_e4m3fn_pair_to_half2_bits_fast(static_cast<uint16_t>(raw >> 48)));
-}
-
-__device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
-    const uint64_t raw, const uint16_t* __restrict__ lut) {
-  return make_uint4(
-      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw)]) |
-          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 8)]) << 16),
-      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 16)]) |
-          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 24)]) << 16),
-      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 32)]) |
-          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 40)]) << 16),
-      static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 48)]) |
-          (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 56)]) << 16));
-}
-
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP16,
           bool E4M3_SHARED_LUT = false>
@@ -798,27 +699,8 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
                       static_cast<int64_t>(kv_head_idx) * head_stride +
                       panel_offset;
   }
-  if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
-    const uint4* cache_vec = reinterpret_cast<const uint4*>(kv_cache);
-    return __ldg(&cache_vec[physical_offset / 8 + vec_col]);
-  } else {
-    static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
-                      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-                  "XQA only supports fp16, FP8 E4M3, and FP8 E5M2 KV");
-    const uint64_t* cache_vec = reinterpret_cast<const uint64_t*>(kv_cache);
-    const uint64_t raw = __ldg(&cache_vec[physical_offset / 8 + vec_col]);
-    if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
-      if constexpr (E4M3_SHARED_LUT) {
-        return fp8_e4m3fn_vector_to_half8_lut(raw, e4m3_lut);
-      } else {
-        return fp8_e4m3fn_vector_to_half8(raw);
-      }
-    } else {
-      static_assert(!E4M3_SHARED_LUT,
-                    "The E4M3 conversion LUT requires E4M3 KV");
-      return fp8_e5m2_vector_to_half8(raw);
-    }
-  }
+  return flash_v100::KVCodecTraits<KV_DTYPE>::template load_half8<
+      E4M3_SHARED_LUT>(kv_cache, physical_offset, vec_col, e4m3_lut);
 }
 
 template <int BLOCK_SIZE, bool CONTIGUOUS_HKV1_LAYOUT, int NUM_THREADS,
@@ -896,15 +778,13 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
       const uint64_t raw_lo =
           static_cast<uint64_t>(raw.x) | (static_cast<uint64_t>(raw.y) << 32);
       shared_vec[shared_offset] =
-          KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
-              ? fp8_e4m3fn_vector_to_half8_fast(raw_lo)
-              : fp8_e5m2_vector_to_half8(raw_lo);
+          flash_v100::KVCodecTraits<KV_DTYPE>::template half8_from_packed<true>(
+              raw_lo);
       const uint64_t raw_hi =
           static_cast<uint64_t>(raw.z) | (static_cast<uint64_t>(raw.w) << 32);
       shared_vec[shared_offset + 1] =
-          KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
-              ? fp8_e4m3fn_vector_to_half8_fast(raw_hi)
-              : fp8_e5m2_vector_to_half8(raw_hi);
+          flash_v100::KVCodecTraits<KV_DTYPE>::template half8_from_packed<true>(
+              raw_hi);
     }
   } else {
     const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
@@ -1049,7 +929,8 @@ __global__ void flash_attention_decode_partition_kernel(
     const float v_scale, const int window_size_left,
     const int window_size_right, const int route_seq_len_begin,
     const int route_seq_len_end, const int route_seq_len_final,
-    const int* __restrict__ anchor_lens, const int anchored_window) {
+    const int* __restrict__ anchor_lens, const int anchored_window,
+    const flash_v100::KVScaleView scales) {
   // The anchored decode-window mask variant is only generated for the fp16-KV
   // configuration; every other instantiation keeps its original code path.
   static_assert(!ANCHORED_SWA || KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16,
@@ -1105,10 +986,6 @@ __global__ void flash_attention_decode_partition_kernel(
   const int kv_head_idx = head_idx / q_per_kv;
   const int lane = threadIdx.x % kWarpSize;
   const int warp_idx = threadIdx.x / kWarpSize;
-  const float score_scale = KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16
-                                ? softmax_scale
-                                : softmax_scale * k_scale;
-
   const int64_t tmp_out_base =
       static_cast<int64_t>(batch_idx) * tmp_out_stride0 +
       static_cast<int64_t>(head_idx) * tmp_out_stride1 +
@@ -1161,6 +1038,10 @@ __global__ void flash_attention_decode_partition_kernel(
     float score = dot_qk_cache<D, KV_DTYPE, TP2_E4M3_FAST>(q_shared, k_cache,
                                                            k_index, lane);
     if (lane == 0) {
+      const float score_scale =
+          flash_v100::KVCodecTraits<KV_DTYPE>::score_scale(
+              softmax_scale, k_scale, scales.key, physical_block, block_offset,
+              kv_head_idx);
       if constexpr (ANCHORED_SWA) {
         const int token_idx = part_start + token_local;
         if (token_idx >= gap_lo && token_idx < gap_hi) {
@@ -1214,7 +1095,10 @@ __global__ void flash_attention_decode_partition_kernel(
         const float vv =
             flash_v100::load_kv_cache_float_unscaled<KV_DTYPE, true>(v_cache,
                                                                      v_index);
-        acc = fmaf(scores_shared[i], vv, acc);
+        const float weight = flash_v100::KVCodecTraits<KV_DTYPE>::value_weight(
+            scores_shared[i], scales.value, physical_block, block_offset,
+            kv_head_idx);
+        acc = fmaf(weight, vv, acc);
       }
     } else {
       for (int i = 0; i < part_tokens; ++i) {
@@ -1226,12 +1110,14 @@ __global__ void flash_attention_decode_partition_kernel(
             static_cast<int64_t>(kv_head_idx) * v_head_stride + d;
         const float vv = flash_v100::load_kv_cache_float_unscaled<KV_DTYPE>(
             v_cache, v_index);
-        acc = fmaf(scores_shared[i], vv, acc);
+        const float weight = flash_v100::KVCodecTraits<KV_DTYPE>::value_weight(
+            scores_shared[i], scales.value, physical_block, block_offset,
+            kv_head_idx);
+        acc = fmaf(weight, vv, acc);
       }
     }
-    const float out_scale = KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16
-                                ? inv_part_sum
-                                : inv_part_sum * v_scale;
+    const float out_scale = flash_v100::KVCodecTraits<KV_DTYPE>::output_scale(
+        inv_part_sum, v_scale);
     if constexpr (std::is_same_v<PARTIAL_T, float>) {
       tmp_out[tmp_out_base + d] = acc * out_scale;
     } else {
@@ -1372,7 +1258,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
   if constexpr (E4M3_SHARED_LUT) {
     e4m3_lut = reinterpret_cast<uint16_t*>(smem_raw + sizeof(SmemLayout));
     for (int raw = tid; raw < 256; raw += NUM_THREADS) {
-      e4m3_lut[raw] = fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw));
+      e4m3_lut[raw] =
+          flash_v100::fp8_e4m3fn_to_half_bits(static_cast<uint8_t>(raw));
     }
   }
   __half* sQ = smem.q;
@@ -3551,7 +3438,7 @@ void launch_flash_attention_decode_paged(
     cudaStream_t stream, const int route_seq_len_begin = 0,
     const int route_seq_len_end = 0, const int route_seq_len_final = 0,
     const bool launch_reduce = true, const int* anchor_lens = nullptr,
-    const int anchored_window = 0) {
+    const int anchored_window = 0, const flash_v100::KVScaleView scales = {}) {
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
   const int num_heads_kv = k_cache.size(2);
@@ -3588,7 +3475,7 @@ void launch_flash_attention_decode_paged(
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
             softmax_scale, k_scale, v_scale, window_size_left,
             window_size_right, route_seq_len_begin, route_seq_len_end,
-            route_seq_len_final, anchor_lens, anchored_window);
+            route_seq_len_final, anchor_lens, anchored_window, scales);
   };
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
     if (use_anchored) {
@@ -4940,7 +4827,7 @@ at::Tensor flash_attention_grouped_sparse_page4(
   return out;
 }
 
-at::Tensor flash_attention_decode_paged(
+at::Tensor flash_attention_decode_paged_with_scales(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
@@ -4949,7 +4836,8 @@ at::Tensor flash_attention_decode_paged(
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
     const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
-    const int64_t anchored_window) {
+    const int64_t anchored_window, const std::optional<at::Tensor>& key_scales,
+    const std::optional<at::Tensor>& value_scales) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),
               "k/v cache must be on CUDA");
@@ -4966,6 +4854,10 @@ at::Tensor flash_attention_decode_paged(
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
     TORCH_CHECK(k_cache.dtype() == torch::kFloat16, "k_cache must be fp16");
     TORCH_CHECK(v_cache.dtype() == torch::kFloat16, "v_cache must be fp16");
+  } else if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_INT8) {
+    TORCH_CHECK(k_cache.scalar_type() == at::kChar &&
+                    v_cache.scalar_type() == at::kChar,
+                "INT8 KV payload must use signed int8 storage");
   } else {
     TORCH_CHECK(k_cache.dtype() == torch::kUInt8,
                 "fp8 k_cache must be stored as uint8");
@@ -4975,9 +4867,10 @@ at::Tensor flash_attention_decode_paged(
                 "fp8 k/v scales must be positive");
   }
   TORCH_CHECK(tmp_out.dtype() == torch::kFloat16 ||
-                  (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 &&
+                  ((kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
+                    kv_dtype_code == flash_v100::KV_CACHE_DTYPE_INT8) &&
                    tmp_out.dtype() == torch::kFloat32),
-              "tmp_out must be fp16, or fp32 for E4M3 scalar decode");
+              "tmp_out must be fp16, or fp32 for E4M3/INT8 scalar decode");
   TORCH_CHECK(max_logits.dtype() == torch::kFloat32, "max_logits must be fp32");
   TORCH_CHECK(exp_sums.dtype() == torch::kFloat32, "exp_sums must be fp32");
   TORCH_CHECK(block_table.dtype() == torch::kInt32,
@@ -5038,6 +4931,13 @@ at::Tensor flash_attention_decode_paged(
   TORCH_CHECK(window_size_left >= -1 && window_size_right >= -1,
               "window sizes must be >= -1");
 
+  TORCH_CHECK(k_cache.sizes() == v_cache.sizes(),
+              "K/V cache shapes must match");
+  TORCH_CHECK(k_cache.device() == q.device() && v_cache.device() == q.device(),
+              "KV payload and query must use the same device");
+  const auto scales = flash_v100::bind_scale_view(
+      kv_dtype_code, k_cache, v_cache, key_scales, value_scales);
+
   TORCH_CHECK(anchored_window >= 0 && anchored_window <= INT_MAX,
               "anchored_window must fit in a non-negative int32");
   TORCH_CHECK((anchored_window > 0) == anchor_lens.has_value(),
@@ -5076,33 +4976,46 @@ at::Tensor flash_attention_decode_paged(
       q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,   \
       exp_sums, active_num_partitions, softmax_scale, launch_num_partitions,  \
       k_scale, v_scale, window_size_left, window_size_right, stream, 0, 0, 0, \
-      true, anchor_lens_ptr, static_cast<int>(anchored_window))
+      true, anchor_lens_ptr, static_cast<int>(anchored_window), scales)
 
-#define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                   \
-  do {                                                                        \
-    switch (kv_dtype_code) {                                                  \
-      case flash_v100::KV_CACHE_DTYPE_FP16:                                   \
-        LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP16);       \
-        break;                                                                \
-      case flash_v100::KV_CACHE_DTYPE_FP8_E4M3:                               \
-        if (tmp_out.scalar_type() == at::kFloat) {                            \
-          launch_flash_attention_decode_paged<                                \
-              HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,           \
-              kXQARouteAllSeqLens, float>(                                    \
-              q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,       \
-              max_logits, exp_sums, active_num_partitions, softmax_scale,     \
-              launch_num_partitions, k_scale, v_scale, window_size_left,      \
-              window_size_right, stream);                                     \
-        } else {                                                              \
-          LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3); \
-        }                                                                     \
-        break;                                                                \
-      case flash_v100::KV_CACHE_DTYPE_FP8_E5M2:                               \
-        LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E5M2);   \
-        break;                                                                \
-      default:                                                                \
-        TORCH_CHECK(false, "Unsupported kv_cache_dtype: ", kv_cache_dtype);   \
-    }                                                                         \
+#define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                    \
+  do {                                                                         \
+    switch (kv_dtype_code) {                                                   \
+      case flash_v100::KV_CACHE_DTYPE_FP16:                                    \
+        LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP16);        \
+        break;                                                                 \
+      case flash_v100::KV_CACHE_DTYPE_FP8_E4M3:                                \
+        if (tmp_out.scalar_type() == at::kFloat) {                             \
+          launch_flash_attention_decode_paged<                                 \
+              HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3,            \
+              kXQARouteAllSeqLens, float>(                                     \
+              q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,        \
+              max_logits, exp_sums, active_num_partitions, softmax_scale,      \
+              launch_num_partitions, k_scale, v_scale, window_size_left,       \
+              window_size_right, stream);                                      \
+        } else {                                                               \
+          LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E4M3);  \
+        }                                                                      \
+        break;                                                                 \
+      case flash_v100::KV_CACHE_DTYPE_FP8_E5M2:                                \
+        LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_FP8_E5M2);    \
+        break;                                                                 \
+      case flash_v100::KV_CACHE_DTYPE_INT8:                                    \
+        if (tmp_out.scalar_type() == at::kFloat) {                             \
+          launch_flash_attention_decode_paged<HDIM, PARTITION,                 \
+                                              flash_v100::KV_CACHE_DTYPE_INT8, \
+                                              kXQARouteAllSeqLens, float>(     \
+              q, k_cache, v_cache, out, block_table, seq_lens, tmp_out,        \
+              max_logits, exp_sums, active_num_partitions, softmax_scale,      \
+              launch_num_partitions, k_scale, v_scale, window_size_left,       \
+              window_size_right, stream, 0, 0, 0, true, nullptr, 0, scales);   \
+        } else {                                                               \
+          LAUNCH_TYPED(HDIM, PARTITION, flash_v100::KV_CACHE_DTYPE_INT8);      \
+        }                                                                      \
+        break;                                                                 \
+      default:                                                                 \
+        TORCH_CHECK(false, "Unsupported kv_cache_dtype: ", kv_cache_dtype);    \
+    }                                                                          \
   } while (0)
 
 #define LAUNCH_BY_PARTITION(HDIM)                                           \
@@ -5152,6 +5065,26 @@ at::Tensor flash_attention_decode_paged(
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+// Preserve the installed scalar ABI for old Python wrappers. Both entry points
+// execute the same implementation; per-row scale support is an advertised ABI.
+at::Tensor flash_attention_decode_paged(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
+    at::Tensor& exp_sums, const at::Tensor& active_num_partitions,
+    const float softmax_scale, const int partition_size,
+    const int launch_num_partitions, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale, const int window_size_left,
+    const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
+    const int64_t anchored_window) {
+  return flash_attention_decode_paged_with_scales(
+      q, k_cache, v_cache, out_, block_table, seq_lens, tmp_out, max_logits,
+      exp_sums, active_num_partitions, softmax_scale, partition_size,
+      launch_num_partitions, kv_cache_dtype, k_scale, v_scale, window_size_left,
+      window_size_right, anchor_lens, anchored_window, std::nullopt,
+      std::nullopt);
 }
 
 at::Tensor flash_attention_decode_paged_xqa(

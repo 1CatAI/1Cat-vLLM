@@ -26,6 +26,8 @@ from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
     FP8_E5M2,
     FP16,
+    INT8,
+    INT8_PER_TOKEN_HEAD,
     KVCodec,
     canonical_kv_cache_dtype,
     resolve_kv_codec,
@@ -144,7 +146,14 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
             "verify",
             {"head_dims": (256,), "gqa_ratios": (6, 8), "xqa": True},
         ),
-        ("decode_scalar_paged", "decode", {"fallback": True}),
+        (
+            "decode_scalar_paged",
+            "decode",
+            {
+                "fallback": True,
+                "codecs": _NATIVE_CODECS | {INT8, INT8_PER_TOKEN_HEAD},
+            },
+        ),
         ("prefill_smallq_decode_scalar", "verify", {"fallback": True}),
         ("prefill_prefix_decode_rows_scalar", "mixed_decode", {"fallback": True}),
         ("decode_dense_cache decode_paged_prefill", "decode", {}),
@@ -476,8 +485,27 @@ def route_reason(spec: RouteSpec, context: RouteContext) -> str | None:
     return _xqa_reason(spec, context) if spec.xqa else None
 
 
+def native_codec_supported(operation, codec: KVCodec | None) -> bool:
+    """Use the installed callable's advertised formats, with a legacy ceiling.
+
+    Legacy binaries implement tensor-scale FP16/FP8 only. A new Python wrapper
+    must obtain its declaration from the loaded extension, not its signature.
+    Engine-bound callables preserve this immutable capability attribute.
+    """
+    if operation is None or codec is None:
+        return False
+    formats = getattr(operation, "kv_cache_codecs", None)
+    if formats is None:
+        return codec in _NATIVE_CODECS
+    return codec.name in formats
+
+
 def select_route(
-    context: RouteContext, candidates: tuple[str, ...], *, fallback: str | None = None
+    context: RouteContext,
+    candidates: tuple[str, ...],
+    *,
+    fallback: str | None = None,
+    fallback_context: RouteContext | None = None,
 ) -> RouteSpec | None:
     """Select in declared priority order; caller supplies operator availability.
 
@@ -493,7 +521,9 @@ def select_route(
     spec = route_spec(fallback)
     if not spec.fallback:
         raise ValueError(f"Route is not a declared fallback: {fallback}")
-    return spec
+    # A fallback is an implementation with its own capability requirements,
+    # not an escape from admission. Its operator may differ from the candidate.
+    return spec if route_reason(spec, fallback_context or context) is None else None
 
 
 def batch_context_routing_for_graph_variant(

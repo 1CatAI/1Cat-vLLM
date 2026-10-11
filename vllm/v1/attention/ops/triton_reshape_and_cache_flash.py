@@ -10,6 +10,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.attention.ops.kv_codec import encode_kv_per_token_head, kv_token_head_scale
 
 FP8_MIN, FP8_MAX = get_fp8_min_max()
 
@@ -174,6 +175,7 @@ def _reshape_cache_per_token_head(
     HEAD_SIZE_PADDED: tl.constexpr,  # next_power_of_2(max(head_size, head_size_v))
     QUANT_MAX: tl.constexpr = 127.0,
     QUANT_MIN: tl.constexpr = -128.0,
+    ROUND_INT8_EVEN: tl.constexpr = False,
 ):
     tok = tl.program_id(0)
     head = tl.program_id(1)
@@ -195,7 +197,7 @@ def _reshape_cache_per_token_head(
         other=0.0,
     ).to(tl.float32)
 
-    k_scale = tl.maximum(tl.max(tl.abs(k_h)) / QUANT_MAX, 1e-6)
+    k_scale = kv_token_head_scale(k_h, QUANT_MAX, ROUND_INT8_EVEN)
     tl.store(
         k_scale_cache_ptr
         + blk * stride_ks_blk
@@ -204,7 +206,7 @@ def _reshape_cache_per_token_head(
         k_scale,
     )
 
-    k_q = tl.clamp(k_h * (1.0 / k_scale), QUANT_MIN, QUANT_MAX)
+    k_q = encode_kv_per_token_head(k_h, k_scale, QUANT_MIN, QUANT_MAX, ROUND_INT8_EVEN)
     tl.store(
         key_cache_ptr
         + blk * stride_kc_blk
@@ -223,7 +225,7 @@ def _reshape_cache_per_token_head(
         other=0.0,
     ).to(tl.float32)
 
-    v_scale = tl.maximum(tl.max(tl.abs(v_h)) / QUANT_MAX, 1e-6)
+    v_scale = kv_token_head_scale(v_h, QUANT_MAX, ROUND_INT8_EVEN)
     tl.store(
         v_scale_cache_ptr
         + blk * stride_vs_blk
@@ -232,7 +234,7 @@ def _reshape_cache_per_token_head(
         v_scale,
     )
 
-    v_q = tl.clamp(v_h * (1.0 / v_scale), QUANT_MIN, QUANT_MAX)
+    v_q = encode_kv_per_token_head(v_h, v_scale, QUANT_MIN, QUANT_MAX, ROUND_INT8_EVEN)
     tl.store(
         value_cache_ptr
         + blk * stride_vc_blk
@@ -260,6 +262,8 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
     k_scale_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads] float32
     v_scale_cache: torch.Tensor,  # [num_blocks, block_size, num_kv_heads] float32
     slot_mapping: torch.Tensor,  # [num_tokens]
+    *,
+    round_int8_even: bool = False,
 ):
     """Quantize key/value per (token, head) and write to paged cache.
 
@@ -320,6 +324,7 @@ def triton_reshape_and_cache_flash_per_token_head_quant(
         HEAD_SIZE_PADDED=head_size_padded,
         QUANT_MAX=quant_max,
         QUANT_MIN=quant_min,
+        ROUND_INT8_EVEN=round_int8_even,
         num_warps=num_warps,
     )
 

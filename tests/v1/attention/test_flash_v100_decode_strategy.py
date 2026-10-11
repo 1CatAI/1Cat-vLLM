@@ -137,3 +137,44 @@ def test_non_e4_codecs_do_not_require_the_shared_revision(monkeypatch):
             routing.resolve_decode_strategy(codec, object(), enabled=True) == "shared"
         )
     record.assert_not_called()
+
+
+def test_int8_native_abi_requires_real_scale_capability(source_interface):
+    module, native = source_interface
+    q = torch.zeros((1, 4, 128), dtype=torch.float16)
+    k = torch.zeros((2, 16, 1, 128), dtype=torch.int8)
+    table = torch.tensor([[1]], dtype=torch.int32)
+    seq = torch.tensor([16], dtype=torch.int32)
+    scales = torch.ones((2, 16, 1), dtype=torch.float32)
+    kwargs = dict(
+        kv_cache_dtype="int8",
+        k_scale_cache=scales,
+        v_scale_cache=scales,
+        max_seq_len_hint=16,
+        workspace_seq_capacity_hint=16,
+    )
+    with pytest.raises(RuntimeError, match="scale-view ABI"):
+        module.flash_attn_decode_paged(q, k, k, table, seq, **kwargs)
+    native.decode_paged_kv_abi = 1
+    native.decode_paged_kv_codecs = ("int8", "int8_per_token_head")
+    native.decode_paged_kv_fwd = MagicMock()
+    module.flash_attn_decode_paged(q, k, k, table, seq, **kwargs)
+    args = native.decode_paged_kv_fwd.call_args.args
+    assert args[1] is k and args[2] is k
+    assert args[-2] is scales and args[-1] is scales
+    assert args[6].dtype == torch.float32
+    with pytest.raises(ValueError, match="both scale planes"):
+        module.flash_attn_decode_paged(q, k, k, table, seq, kv_cache_dtype="int8")
+
+
+def test_scalar_legacy_native_abi_keeps_its_original_arguments(source_interface):
+    module, native = source_interface
+    native.decode_paged_fwd = MagicMock()
+    q = torch.zeros((1, 4, 128), dtype=torch.float16)
+    k = torch.zeros((2, 16, 1, 128), dtype=torch.float16)
+    table = torch.tensor([[1]], dtype=torch.int32)
+    seq = torch.tensor([16], dtype=torch.int32)
+    module.flash_attn_decode_paged(q, k, k, table, seq, max_seq_len_hint=16)
+    args = native.decode_paged_fwd.call_args.args
+    assert len(args) == 20
+    assert args[6].dtype == torch.float16

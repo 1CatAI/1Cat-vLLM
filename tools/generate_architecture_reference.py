@@ -135,7 +135,18 @@ def source_location(path, node):
 def read_codecs(root):
     tree = ast.parse((root / CODECS).read_text())
     spec = fields(tree, "KVCodec", {})
-    if set(spec) != {"name", "aliases", "storage_dtype", "element_dtype", "quantized"}:
+    if set(spec) != {
+        "name",
+        "aliases",
+        "storage_dtype",
+        "element_dtype",
+        "quantized",
+        "encoding_version",
+        "scale_granularity",
+        "scale_dtype",
+        "rounding",
+        "layout",
+    }:
         raise DeclarationError("KVCodec schema changed; update its reference renderer")
     declared = assignment(tree, "KV_CODECS")
     if not isinstance(declared, (ast.Tuple, ast.List)):
@@ -269,6 +280,17 @@ def collect(root=ROOT):
         evidence="source declarations; no selector or native execution",
         codecs=codecs,
         routes=routes,
+        codec_coverage=[
+            dict(
+                route=route["name"],
+                codec=codec["symbol"],
+                declared=codec["symbol"] in route["codecs"],
+                source=route["source"],
+            )
+            for route in routes
+            if not route["observer"]
+            for codec in codecs
+        ],
         configurations=configurations,
         bindings=sorted(bindings, key=lambda r: (r["family"], r["stage"], r["mode"])),
     )
@@ -312,14 +334,17 @@ def render(report):
         "",
         "A registered storage descriptor does not establish native support.",
         "",
-        "| Symbol | Canonical / aliases | Storage / element | Quantized | Source |",
-        "| --- | --- | --- | --- | --- |",
+        "| Symbol | Canonical / aliases | Storage / element | Version / layout "
+        "| Scales / rounding | Source |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for row in report["codecs"]:
         lines.append(
             f"| {row['symbol']} | {cell(row['name'])} / "
             f"{cell(', '.join(row['aliases']))} | {row['storage_dtype']} / "
-            f"{row['element_dtype']} | {row['quantized']} | {link(row['source'])} |"
+            f"{row['element_dtype']} | {row['encoding_version']} / {row['layout']} "
+            f"| {row['scale_granularity']} ({row['scale_dtype']}) / "
+            f"{row['rounding']} | {link(row['source'])} |"
         )
     lines += [
         "",

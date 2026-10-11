@@ -834,10 +834,7 @@ def unified_attention(
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
 
-    use_per_token_head_scales = kv_quant_mode in (
-        KVQuantMode.INT8_PER_TOKEN_HEAD,
-        KVQuantMode.FP8_PER_TOKEN_HEAD,
-    )
+    use_per_token_head_scales = kv_quant_mode.is_per_token_head
     if use_per_token_head_scales:
         assert k_scale_cache is not None and v_scale_cache is not None, (
             f"{kv_quant_mode.name} requires k_scale_cache / v_scale_cache"

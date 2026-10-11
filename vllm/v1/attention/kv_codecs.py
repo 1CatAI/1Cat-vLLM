@@ -14,6 +14,7 @@ of the acceleration path that reads it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 
@@ -30,8 +31,22 @@ class KVCodec:
     storage_dtype: torch.dtype
     # Element dtype the stored bytes are reinterpreted as, if they are packed.
     element_dtype: torch.dtype | None = None
-    # Whether reading the cache needs per-tensor scales (k_scale/v_scale).
+    # Whether reading the cache needs scales.
     quantized: bool = False
+    encoding_version: int = 1
+    scale_granularity: Literal["none", "tensor", "token_head"] = "none"
+    scale_dtype: torch.dtype | None = None
+    rounding: Literal["none", "nearest_even", "truncate"] = "none"
+    layout: Literal["dense", "inline_scale", "planar_scales"] = "dense"
+
+    @property
+    def cache_identity(self) -> tuple[str, int, str]:
+        """Versioned storage identity; equal byte widths are not compatible."""
+        return (self.name, self.encoding_version, self.layout)
+
+    @property
+    def per_token_head(self) -> bool:
+        return self.scale_granularity == "token_head"
 
     def stores(self, key_cache: torch.Tensor, value_cache: torch.Tensor) -> bool:
         """Whether both cache tensors use this codec's storage dtype."""
@@ -41,13 +56,52 @@ class KVCodec:
         )
 
     def dequantize(
-        self, cache: torch.Tensor, scale: float, out_dtype: torch.dtype
+        self,
+        cache: torch.Tensor,
+        scale: float | torch.Tensor,
+        out_dtype: torch.dtype,
     ) -> torch.Tensor:
         """Reference dequantization of contiguous cache bytes."""
         if not self.quantized:
             return cache
         assert self.element_dtype is not None
+        if self.per_token_head:
+            if not isinstance(scale, torch.Tensor) or scale.shape != cache.shape[:-1]:
+                raise ValueError("Per-token-head decoding needs one scale per row")
+            # Keep the scale multiplication in FP32. Casting a scale or an
+            # unscaled INT8 product to FP16 can overflow for finite inputs.
+            decoded = cache.view(self.element_dtype).float() * scale[..., None]
+            if self.layout == "planar_scales":
+                # Even an FP32 scale rounded from FLT_MAX/127 can reconstruct
+                # just above FLT_MAX. Saturate finite rows at the destination
+                # boundary; preserve the NaN scale used for invalid rows.
+                limit = torch.finfo(out_dtype).max
+                decoded = torch.where(
+                    torch.isfinite(scale[..., None]),
+                    decoded.clamp(-limit, limit),
+                    decoded,
+                )
+            return decoded.to(out_dtype)
         return cache.view(self.element_dtype).to(out_dtype) * scale
+
+    def encode(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reference dynamic INT8 encoder; not used by the execution hot path.
+
+        A non-finite row receives a NaN scale, propagating invalid inputs to
+        its readers instead of silently converting them into finite values.
+        Legacy truncation retains its original multiplication order.
+        """
+        if self.element_dtype != torch.int8 or not self.per_token_head:
+            raise ValueError(f"{self.name} has no dynamic INT8 reference encoder")
+        x = values.float()
+        scale = (x.abs().amax(dim=-1) / 127.0).clamp_min(1e-6)
+        if self.rounding == "nearest_even":
+            finite = torch.isfinite(x).all(dim=-1)
+            scale = torch.where(finite, scale, float("nan"))
+            q = (x / scale[..., None]).round()
+        else:
+            q = (x * scale.reciprocal()[..., None]).trunc()
+        return q.clamp(-128, 127).to(torch.int8), scale
 
     def __repr__(self) -> str:
         return f"KVCodec({self.name})"
@@ -62,12 +116,63 @@ FP8_E4M3 = KVCodec(
     torch.uint8,
     torch.float8_e4m3fn,
     quantized=True,
+    scale_granularity="tensor",
+    scale_dtype=torch.float32,
+    rounding="nearest_even",
 )
 FP8_E5M2 = KVCodec(
-    "fp8_e5m2", ("fp8_e5m2",), torch.uint8, torch.float8_e5m2, quantized=True
+    "fp8_e5m2",
+    ("fp8_e5m2",),
+    torch.uint8,
+    torch.float8_e5m2,
+    quantized=True,
+    scale_granularity="tensor",
+    scale_dtype=torch.float32,
+    rounding="nearest_even",
+)
+INT8 = KVCodec(
+    "int8",
+    ("int8",),
+    torch.int8,
+    torch.int8,
+    quantized=True,
+    scale_granularity="token_head",
+    scale_dtype=torch.float32,
+    rounding="nearest_even",
+    layout="planar_scales",
+)
+INT8_PER_TOKEN_HEAD = KVCodec(
+    "int8_per_token_head",
+    ("int8_per_token_head",),
+    torch.int8,
+    torch.int8,
+    quantized=True,
+    scale_granularity="token_head",
+    scale_dtype=torch.float32,
+    rounding="truncate",
+    layout="inline_scale",
+)
+FP8_PER_TOKEN_HEAD = KVCodec(
+    "fp8_per_token_head",
+    ("fp8_per_token_head",),
+    torch.uint8,
+    torch.float8_e4m3fn,
+    quantized=True,
+    scale_granularity="token_head",
+    scale_dtype=torch.float32,
+    rounding="nearest_even",
+    layout="inline_scale",
 )
 
-KV_CODECS: tuple[KVCodec, ...] = (FP16, BF16, FP8_E4M3, FP8_E5M2)
+KV_CODECS: tuple[KVCodec, ...] = (
+    FP16,
+    BF16,
+    FP8_E4M3,
+    FP8_E5M2,
+    INT8,
+    INT8_PER_TOKEN_HEAD,
+    FP8_PER_TOKEN_HEAD,
+)
 _BY_ALIAS = {alias: codec for codec in KV_CODECS for alias in codec.aliases}
 
 

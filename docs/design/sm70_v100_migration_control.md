@@ -2,6 +2,23 @@
 
 Date: 2026-05-30
 
+## Unified KV codecs and INT8 operator slice, 2026-10-11
+
+The explicit INT8 prototype adds a versioned nearest-even codec, aligned
+in-page payload/scale regions, runner-owned views and shared Triton/native
+scalar access. Legacy inline INT8 and FP8 numerical contracts remain distinct.
+Scalar fallbacks now require actual loaded-binary capability. CPU contracts,
+legacy reader PTX parity and a normal Flash-V100 wheel build/load pass; GPU
+validation is pending the V100 host's driver/library repair. The existing
+grouped AST-fixture failure is recorded separately. There is no speed or
+quality promotion, and no full Flash-V100 INT8 admission yet.
+
+The [implementation and coverage record](architecture/kv_codec_unification.md)
+lists unbound algorithm families and their owners. Continue at XQA and shared
+bindings, then grouped/prefill/fused/representation-specific paths. Preserve
+calibrated FP8 quality and same-condition 35B-A3B AWQ/FP8 pure-decode gates;
+do not reuse the old uncalibrated short FP8 result.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:

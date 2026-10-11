@@ -24,6 +24,7 @@ from vllm.v1.attention.backends.flash_v100.workspace import (
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
+from vllm.v1.attention.kv_cache_view import KVCacheView
 from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
     FP8_E5M2,
@@ -94,6 +95,7 @@ class NativeDecodeRequest:
     anchor_lens: torch.Tensor | None
     anchored_window: int
     selection: _routing.RouteSpec | None
+    cache_view: KVCacheView | None = None
 
 
 @dataclass(frozen=True)
@@ -164,8 +166,15 @@ class DecodeExecutor:
         partition_size_hint: int | None = None,
         anchor_lens: torch.Tensor | None = None,
         anchored_window: int = 0,
+        k_scale_cache: torch.Tensor | None = None,
+        v_scale_cache: torch.Tensor | None = None,
         record: _plan.RecordRoute = _plan.record_legacy,
     ) -> None:
+        codec = resolve_kv_codec(kv_cache_dtype)
+        if not _routing.native_codec_supported(self.ops.paged, codec):
+            raise RuntimeError(
+                f"Loaded paged decode has no binding for {kv_cache_dtype}"
+            )
         scalar_tail = self.ops.scalar_tail
         if scalar_tail is not None and scalar_tail(
             query,
@@ -193,6 +202,12 @@ class DecodeExecutor:
             "k_scale": k_scale,
             "v_scale": v_scale,
         }
+        if codec is not None and codec.per_token_head:
+            if not {"k_scale_cache", "v_scale_cache"} <= self.ops.paged_keywords:
+                raise RuntimeError("Rebuild Flash-V100 for explicit KV scale views")
+            if k_scale_cache is None or v_scale_cache is None:
+                raise ValueError("Per-token KV decode requires both scale planes")
+            kwargs.update(k_scale_cache=k_scale_cache, v_scale_cache=v_scale_cache)
         if "window_size" in self.ops.paged_keywords:
             kwargs["window_size"] = window_size
         elif tuple(window_size) != (-1, -1):
@@ -706,7 +721,17 @@ class DecodeExecutor:
         if query.shape[0] == 0:
             return output
 
-        key_cache, value_cache = _kv_layout.split_paged_kv_cache(kv_cache)
+        codec = self.config.kv_codec
+        cache_view = (
+            KVCacheView.bind(kv_cache, codec, query.shape[-1])
+            if codec is not None and codec.per_token_head
+            else None
+        )
+        key_cache, value_cache = (
+            (cache_view.key, cache_view.value)
+            if cache_view is not None
+            else _kv_layout.split_paged_kv_cache(kv_cache)
+        )
         xqa_codec = self._xqa_kv_codec(key_cache, value_cache, attn_metadata)
 
         # FP8 G4 XQA had no end-to-end gain on 35B-A3B TP4 and has no accepted
@@ -731,7 +756,26 @@ class DecodeExecutor:
             ),
             ("decode_xqa_paged",),
             fallback="decode_scalar_paged",
+            fallback_context=_routing.RouteContext(
+                stage="decode",
+                codec=self.config.kv_codec,
+                shape=_routing.RouteShape(
+                    query.shape[0],
+                    query.shape[1],
+                    key_cache.shape[2],
+                    query.shape[2],
+                    key_cache.shape[1],
+                ),
+                enabled=self.config.policy.use_decode_scalar_paged,
+                available=_routing.native_codec_supported(self.ops.paged, codec),
+            ),
         )
+        if selection is None:
+            raise RuntimeError(
+                "No native decode binding for KV codec "
+                f"{self.config.kv_cache_dtype!r}; "
+                "select TRITON_ATTN or enable an admitted native implementation."
+            )
         request = NativeDecodeRequest(
             layer,
             query,
@@ -745,6 +789,7 @@ class DecodeExecutor:
             anchor_lens,
             anchored_window,
             selection,
+            cache_view,
         )
         return _plan.execute(request, (XqaDecode(self), ScalarDecode(self)))
 
@@ -843,6 +888,7 @@ class DecodeExecutor:
         anchored_window: int,
         *,
         record: _plan.RecordRoute = _plan.record_legacy,
+        cache_view: KVCacheView | None = None,
     ) -> torch.Tensor:
         _routing.log_fp8_kv_cache_route(
             "decode", self.config.kv_cache_dtype, "scalar_paged", record=record
@@ -887,6 +933,14 @@ class DecodeExecutor:
             ),
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
+            **(
+                {
+                    "k_scale_cache": cache_view.key_scale,
+                    "v_scale_cache": cache_view.value_scale,
+                }
+                if cache_view is not None
+                else {}
+            ),
         )
         record(_routing.ROUTE_SPECS["decode_scalar_paged"].name)
         return output
@@ -921,7 +975,13 @@ class ScalarDecode:
         self.executor = executor
 
     def admit(self, request: NativeDecodeRequest) -> bool:
-        return True
+        codec = self.executor.config.kv_codec
+        return (
+            request.selection is _routing.ROUTE_SPECS["decode_scalar_paged"]
+            and codec in _routing.ROUTE_SPECS["decode_scalar_paged"].codecs
+            and codec.stores(request.key_cache, request.value_cache)
+            and _routing.native_codec_supported(self.executor.ops.paged, codec)
+        )
 
     def run(
         self, request: NativeDecodeRequest, record: _plan.RecordRoute
@@ -938,6 +998,7 @@ class ScalarDecode:
             request.anchor_lens,
             request.anchored_window,
             record=record,
+            cache_view=request.cache_view,
         )
 
 
