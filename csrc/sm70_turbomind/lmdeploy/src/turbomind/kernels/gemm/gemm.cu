@@ -419,8 +419,15 @@ std::optional<LaunchSpec> SelectSm70AwqTp2FastSpec(
     if (target.swizzle > selected.kernel->GetMaxSwizzle(shape)) {
       continue;
     }
-    (void)barriers_size;
-    (void)partials_size;
+    // The forced split count must fit the engine's bounded split-K scratch;
+    // otherwise partials and barrier resets overrun into adjacent buffers.
+    if (target.splits > selected.kernel->GetMaxSplits(
+                            shape, target.swizzle, barriers_size,
+                            partials_size)) {
+      MaybeTraceSm70AwqTp2FastSelector(ctx.desc(), "workspace_too_small",
+                                       &selected);
+      continue;
+    }
     selected.splits = target.splits;
     selected.swizzle = target.swizzle;
     MaybeTraceSm70AwqTp2FastSelector(ctx.desc(), "selected", &selected);
