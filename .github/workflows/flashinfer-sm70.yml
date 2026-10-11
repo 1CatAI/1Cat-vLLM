@@ -1,0 +1,36 @@
+name: FlashInfer SM70 independent package
+on:
+  pull_request:
+    paths:
+      - flashinfer-sm70/**
+      - requirements/flashinfer-sm70.txt
+      - setup.py
+      - tests/tools/test_flashinfer_sm70_requirements.py
+      - .github/workflows/flashinfer-sm70.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v7
+      - name: Create isolated package environment
+        run: |
+          uv venv --python 3.12 .venv-fi
+          uv pip install --python .venv-fi/bin/python build setuptools wheel packaging pytest ruff
+          uv pip install --python .venv-fi/bin/python torch==2.10.0+cpu --index-url https://download.pytorch.org/whl/cpu
+      - name: Build sdist and wheel, install without vLLM
+        run: |
+          .venv-fi/bin/python -m build --no-isolation --outdir dist-fi flashinfer-sm70
+          uv pip install --python .venv-fi/bin/python dist-fi/*.whl
+          uv pip check --python .venv-fi/bin/python
+      - name: Check package and SM70 provider metadata
+        run: |
+          .venv-fi/bin/python -m pytest -c flashinfer-sm70/tests/sm70/pytest.ini --confcutdir=flashinfer-sm70/tests/sm70 flashinfer-sm70/tests/sm70 -m 'not gpu'
+          .venv-fi/bin/python -m pytest --confcutdir=tests/tools tests/tools/test_flashinfer_sm70_requirements.py
+          .venv-fi/bin/ruff check flashinfer-sm70/flashinfer/sm70 flashinfer-sm70/tests/sm70 flashinfer-sm70/sm70_build_backend.py

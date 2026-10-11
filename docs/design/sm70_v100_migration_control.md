@@ -2,6 +2,21 @@
 
 Date: 2026-05-30
 
+## Independent FlashInfer operator module, 2026-10-11
+
+The standalone `flashinfer-sm70` source module is pinned to upstream `34bb66e4`.
+Implementation starts on main `be3722bc09`, retaining #1172 over the audited
+`8d4fd940` baseline. The fork keeps `flashinfer-python` / `import flashinfer`,
+with isolated minimal dependencies and SM70 primitive compilation. Engine SM70
+wheel metadata selects its exact fork version instead of conflicting official
+FlashInfer/cubin pins; non-SM70 metadata keeps the existing provider.
+
+GPU validation is deferred at the user's request until a V100 machine is
+provided. Offline builds and CPU installation checks do not close correctness,
+speed or quality gates. No new engine compute route is enabled. Text C1/C4,
+MTP, D72 vision and 27B/35B-A3B AWQ/FP8 regressions remain mandatory. See the
+[module coverage and historical failures](../../flashinfer-sm70/docs/sm70/coverage.md).
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:
