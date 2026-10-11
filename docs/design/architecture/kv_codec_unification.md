@@ -816,3 +816,42 @@ The DeepSeek indexer compressor forwards the same codec to the shared encoder,
 but its fused execution remains unqualified. Representative sparse-engine
 quality, state-lifecycle, latency and a complete normally installed wheel are
 also pending. This stage does not qualify ordinary MLA, QSA or history INT8.
+
+## Shared history codecs, 2026-10-12
+
+History now declares its FP16, legacy dynamic E4M3 and signed RNE INT8
+representations in `KVCodec`. Borrowed views describe the payload and the
+owner's FP32 token/head scale regions. The existing writer, protected hot-page
+resolver, miss gather, request masks, staging and graph workspaces remain
+common. Hot values retain FP16 reconstruction for every codec. The legacy
+E4M3 floor, scale division and conversion order are preserved.
+
+The direct-history Triton reader uses a compile-time codec argument. The
+existing SM70 native partial/merge algorithm now instantiates codec IDs 0, 1
+and 3, shares the public packed reader, and exposes `cache_codecs()` from the
+normal CMake target. An old binary without this probe retains its qualified
+FP16/FP8 behavior and rejects the INT8 native candidate before allocation.
+Existing semantic/geometry and speculative-draft qualification guards remain.
+`KernelConfig.qsa_host_kv_dtype` and its draft counterpart accept explicit
+`int8`, retaining the FP8 target and FP16 draft defaults.
+
+The normally built history component fingerprint is
+`0807e25f7620455aa5f08760a9ce83b2513a51cddd27c0cfe95a5aac035f6028`.
+On V100, 109 host writer/protection/miss/restore/replay cases and 34 direct
+reader/numerical/replay cases passed. An additional profiler case confirms
+actual `device_qsa::partial<3>` execution: **144 GPU component cases** in total.
+The first profiler assertion used a different demangler spelling and failed
+despite recording the correct INT8 kernel; the corrected assertion checks
+CUDA events and both equivalent spellings. No numerical limit was changed.
+
+Six focused history CPU checks cover scale capacity, aliasing, identity,
+round-even reference values and old-binary admission. The ordinary/indexer
+regressions passed. Their generated tests now select codecs by representation
+rather than treating the entire representation registry as indexer formats.
+
+This closes the bounded history encoding/reader component gap, not its full
+engine and lifecycle qualification. Payload and scale owners must both be
+included in offload/sleep/transfer; that remains in L04/L05. Ordinary paged
+QSA, MLA, representative engine quality, latency and a clean complete package
+still require their own evidence. The source/component test overlay is not
+reported as final whole-wheel qualification.

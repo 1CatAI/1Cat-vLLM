@@ -7,7 +7,7 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.v1.attention.kv_cache_view import KVCacheView
-from vllm.v1.attention.kv_codecs import KV_REPRESENTATION_CODECS
+from vllm.v1.attention.kv_codecs import kv_codecs_for_representation
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 7,
@@ -35,7 +35,9 @@ def _reference(source, codec):
     return payload.flatten(-2).view(torch.uint8), scale
 
 
-@pytest.mark.parametrize("codec", KV_REPRESENTATION_CODECS, ids=lambda c: c.name)
+@pytest.mark.parametrize(
+    "codec", kv_codecs_for_representation("indexer"), ids=lambda c: c.name
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("head_size", [128, 256])
 def test_native_writer_uses_group_scales_and_physical_page_strides(
@@ -76,7 +78,7 @@ def test_native_writer_uses_group_scales_and_physical_page_strides(
 
 
 def test_int8_writer_rounds_ties_and_propagates_invalid_groups():
-    codec = next(c for c in KV_REPRESENTATION_CODECS if c.name == "int8")
+    codec = next(c for c in kv_codecs_for_representation("indexer") if c.name == "int8")
     _, cache, view = _cache(codec, 256)
     source = torch.zeros(2, 256, device="cuda", dtype=torch.float32)
     source[0, :7] = torch.tensor([127, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5], device="cuda")
@@ -98,7 +100,9 @@ def test_int8_writer_rounds_ties_and_propagates_invalid_groups():
     assert view.key_scale[0, 1, 1].item() == 1.0
 
 
-@pytest.mark.parametrize("codec", KV_REPRESENTATION_CODECS, ids=lambda c: c.name)
+@pytest.mark.parametrize(
+    "codec", kv_codecs_for_representation("indexer"), ids=lambda c: c.name
+)
 def test_native_writer_replays_with_changed_source_and_slots(codec):
     _, cache, view = _cache(codec, 256)
     source = torch.zeros(2, 256, device="cuda", dtype=torch.float32)
@@ -133,7 +137,7 @@ def test_native_writer_replays_with_changed_source_and_slots(codec):
 
 
 def test_writer_executes_the_native_codec_binding():
-    codec = next(c for c in KV_REPRESENTATION_CODECS if c.name == "int8")
+    codec = next(c for c in kv_codecs_for_representation("indexer") if c.name == "int8")
     _, cache, _ = _cache(codec, 128)
     source = torch.ones(2, 128, device="cuda")
     slots = torch.tensor([0, 1], device="cuda")

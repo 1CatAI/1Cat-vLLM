@@ -33,10 +33,12 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     kpool_compress_and_write_cache,
     kpool_decode_update_and_maybe_write_cache_batched,
 )
-from vllm.v1.attention.kv_codecs import KV_REPRESENTATION_CODECS
+from vllm.v1.attention.kv_codecs import kv_codecs_for_representation
 
 
-@pytest.fixture(autouse=True, params=KV_REPRESENTATION_CODECS, ids=lambda c: c.name)
+@pytest.fixture(
+    autouse=True, params=kv_codecs_for_representation("indexer"), ids=lambda c: c.name
+)
 def cache_codec(request, monkeypatch):
     codec = request.param
     monkeypatch.setitem(globals(), "_CACHE_CODEC", codec.name)

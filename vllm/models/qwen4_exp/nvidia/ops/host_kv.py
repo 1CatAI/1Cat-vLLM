@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pinned, per-vector E4M3 QSA history with a bounded device hot-page cache.
+"""Pinned codec-backed QSA history with a bounded FP16 hot-page cache.
 
 The selector's positions and masks are preserved. Cache contention falls back
 to authoritative host bytes, never spins or drops selected pages. All storage
@@ -9,12 +9,14 @@ and workspaces are allocated before graph capture.
 
 import torch
 
-from vllm.models.deepseek_v4.common.ops.fp8_software import (
-    fp8_e4m3fn_bits_to_fp32_bitcast,
-    fp32_to_fp8_e4m3fn_bits,
-)
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+from vllm.v1.attention.kv_cache_view import KVCacheView
+from vllm.v1.attention.kv_codecs import kv_codecs_for_representation, resolve_kv_codec
+from vllm.v1.attention.ops.kv_codec import (
+    decode_kv_payload,
+    encode_history_cache_rows,
+)
 
 _WORKSPACES: dict[tuple, tuple[torch.Tensor, ...]] = {}
 
@@ -36,7 +38,7 @@ def _write(
     Page: tl.constexpr,
     Dim: tl.constexpr,
     Sets: tl.constexpr,
-    FP8: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     row = tl.program_id(0)
     if row == 0:
@@ -50,12 +52,9 @@ def _write(
             tl.load(K + row * Ks + dims[None, :]),
             tl.load(V + row * Vs + dims[None, :]),
         ).to(tl.float32)
-        if FP8:
-            scales = tl.maximum(tl.div_rn(tl.max(tl.abs(values), 1), 448.0), 2.0**-126)
-            codes = fp32_to_fp8_e4m3fn_bits(tl.div_rn(values, scales[:, None]))
+        codes, scales = encode_history_cache_rows(values, CODEC, 1)
+        if CODEC != 0:
             tl.store(Scales + slot * 2 + kv, scales)
-        else:
-            codes = values.to(tl.float16)
         block, token = slot // Page, slot % Page
         tl.store(
             History + ((block * 2 + kv[:, None]) * Page + token) * Dim + dims[None, :],
@@ -67,8 +66,8 @@ def _write(
         resident = tl.load(PageSlots + page)
         tag = tl.load(Tags + tl.maximum(resident, 0), resident >= 0, other=-1)
         decoded = codes.to(tl.float16)
-        if FP8:
-            decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, None]).to(
+        if CODEC != 0:
+            decoded = (decode_kv_payload(codes, CODEC, True) * scales[:, None]).to(
                 tl.float16
             )
         tl.store(
@@ -78,6 +77,14 @@ def _write(
             decoded,
             (resident >= 0) & (tag == page),
         )
+
+
+_write.__dict__.update(
+    kv_cache_representations=("history",),
+    kv_cache_codecs=tuple(
+        codec.name for codec in kv_codecs_for_representation("history")
+    ),
+)
 
 
 @triton.jit
@@ -175,7 +182,7 @@ def _gather(
     Page: tl.constexpr,
     Dim: tl.constexpr,
     Sets: tl.constexpr,
-    FP8: tl.constexpr,
+    CODEC: tl.constexpr,
     STAGE: tl.constexpr,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
@@ -324,13 +331,13 @@ def _gather(
         (valid & ~token_hits)[:, None, None],
         other=0,
     )
-    if FP8:
+    if CODEC != 0:
         scales = tl.load(
             Scales + tokens[:, None] * 2 + kv[None, :],
             (valid & ~token_hits)[:, None],
             other=0,
         )
-        decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
+        decoded = (decode_kv_payload(codes, CODEC, True) * scales[:, :, None]).to(
             tl.float16
         )
     else:
@@ -396,6 +403,7 @@ class HostQSAKV:
         device_reference: bool = False,
         direct_device: bool | None = None,
         is_speculative_draft: bool = False,
+        cache_dtype: str | None = None,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -406,8 +414,13 @@ class HostQSAKV:
         self.padded = triton.cdiv(width, 4) * 4
         self.sets = hot_tokens // 16
         dtype = history.dtype if history is not None else dtype
-        if dtype not in (torch.uint8, torch.float16):
-            raise ValueError("Host history requires E4M3 bytes or FP16 values")
+        inferred = {torch.uint8: "fp8_e4m3", torch.int8: "int8", torch.float16: "auto"}
+        codec = resolve_kv_codec(
+            cache_dtype or inferred.get(dtype), representation="history"
+        )
+        if codec is None or codec.storage_dtype != dtype:
+            raise ValueError("Host history requires a compatible FP16/FP8/INT8 codec")
+        self.codec = codec
         self.fp8 = dtype == torch.uint8
         self.device_reference = device_reference
         self.is_speculative_draft = is_speculative_draft
@@ -420,7 +433,7 @@ class HostQSAKV:
             not history.is_contiguous()
         ):
             raise ValueError("Host history must use contiguous page-major E4M3 bytes")
-        scale_shape = (blocks * page_size if self.fp8 else 1, 2)
+        scale_shape = (blocks * page_size if self.codec.quantized else 1, 2)
         if device_reference:
             # Preserve the host allocator geometry and byte layout for the
             # placement experiment; only the writer/reader backing changes.
@@ -442,6 +455,7 @@ class HostQSAKV:
                     else get_accelerator_view_from_cpu_tensor(self.host)
                 )
                 self.scales = get_accelerator_view_from_cpu_tensor(self.host_scales)
+        self.view = KVCacheView.bind_history(self.history, self.scales, self.codec)
         self.hot_values = torch.empty(
             (hot_tokens, 2, dim), dtype=torch.float16, device=device
         )
@@ -490,7 +504,17 @@ class HostQSAKV:
         initialize_device_history_attention(self, direct_device)
 
     def write(self, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor):
-        if key.shape[1:] != (1, self.dim) or value.shape != key.shape:
+        if (
+            key.shape[1:] != (1, self.dim)
+            or value.shape != key.shape
+            or key.stride(-1) != 1
+            or value.stride(-1) != 1
+            or slots.ndim != 1
+            or slots.numel() != key.shape[0]
+            or key.device != self.history.device
+            or value.device != key.device
+            or slots.device != key.device
+        ):
             raise ValueError("Host KV writer requires one local KV head")
         if slots.numel():
             _write[(slots.numel(),)](
@@ -509,7 +533,7 @@ class HostQSAKV:
                 self.page_size,
                 self.dim,
                 self.sets,
-                self.fp8,
+                self.codec.native_id,
                 num_warps=4,
             )
 
@@ -581,7 +605,7 @@ class HostQSAKV:
                 self.page_size,
                 self.dim,
                 self.sets,
-                self.fp8,
+                self.codec.native_id,
                 stage,
                 num_warps=4,
             )

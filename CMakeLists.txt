@@ -846,6 +846,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" AND SM70_TURBOMIND_ARCHS)
     ARCHITECTURES "70"
     LIBRARIES "${TORCH_INSTALL_PREFIX}/lib/libtorch_python.so"
     WITH_SOABI)
+  target_include_directories(_sm70_qsa_device_C PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/flash-attention-v100/kernel")
   define_extension_target(
     _sm70_exact_reduce_C DESTINATION vllm LANGUAGE CUDA
     SOURCES "csrc/sm70_turbomind/ops/exact_row_reduce.cu"

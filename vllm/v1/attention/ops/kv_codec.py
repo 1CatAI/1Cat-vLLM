@@ -39,13 +39,16 @@ def encode_fp8_satfinite(value, E5M2: tl.constexpr = False):
 
 @triton.jit
 def kv_token_head_scale(
-    values, QUANT_MAX: tl.constexpr, ROUND_INT8_EVEN: tl.constexpr = False
+    values,
+    QUANT_MAX: tl.constexpr,
+    ROUND_INT8_EVEN: tl.constexpr = False,
+    AXIS: tl.constexpr = None,
 ):
     if ROUND_INT8_EVEN:
-        scale = tl.maximum(tl.div_rn(tl.max(tl.abs(values)), QUANT_MAX), 1e-6)
+        scale = tl.maximum(tl.div_rn(tl.max(tl.abs(values), AXIS), QUANT_MAX), 1e-6)
         invalid = (tl.abs(values) == float("inf")) | (values != values)
-        return tl.where(tl.sum(invalid.to(tl.int32)) == 0, scale, float("nan"))
-    return tl.maximum(tl.max(tl.abs(values)) / QUANT_MAX, 1e-6)
+        return tl.where(tl.sum(invalid.to(tl.int32), AXIS) == 0, scale, float("nan"))
+    return tl.maximum(tl.max(tl.abs(values), AXIS) / QUANT_MAX, 1e-6)
 
 
 @triton.jit
@@ -119,15 +122,37 @@ def fp8_e4m3fn_bits_to_fp32_bitcast(bits):
 
 
 @triton.jit
-def decode_kv_payload(values, CODEC: tl.constexpr):
+def decode_kv_payload(values, CODEC: tl.constexpr, E4M3_BITS: tl.constexpr = False):
     """Unscaled payload conversion shared by compatible algorithm bindings."""
     if CODEC == 1:
+        if E4M3_BITS:
+            return fp8_e4m3fn_bits_to_fp32_bitcast(values)
         return fp8_e4m3fn_bits_to_fp32(values)
     elif CODEC == 3:
         return values.to(tl.uint8).to(tl.int8, bitcast=True).to(tl.float32)
     else:
         tl.static_assert(CODEC == 0, "Missing unscaled KV codec binding")
         return values.to(tl.float32)
+
+
+@triton.jit
+def encode_history_cache_rows(values, CODEC: tl.constexpr, AXIS: tl.constexpr):
+    """History representation: preserve E4M3's row-scale arithmetic order."""
+    if CODEC == 3:
+        scale = kv_token_head_scale(values, 127.0, True, AXIS)
+        encoded = encode_kv_per_token_head(
+            values, tl.expand_dims(scale, AXIS), -128.0, 127.0, True
+        )
+        return encoded.to(tl.int8), scale
+    elif CODEC == 1:
+        scale = tl.maximum(tl.div_rn(tl.max(tl.abs(values), AXIS), 448.0), 2.0**-126)
+        encoded = fp32_to_fp8_e4m3fn_bits(
+            tl.div_rn(values, tl.expand_dims(scale, AXIS))
+        )
+        return encoded, scale
+    else:
+        tl.static_assert(CODEC == 0, "Missing history cache writer binding")
+        return values.to(tl.float16), 1.0
 
 
 @triton.jit

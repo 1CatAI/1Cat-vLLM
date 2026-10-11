@@ -39,6 +39,11 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
             importlib.import_module("vllm._sm70_qsa_device_C")
         except ImportError:
             reason = "native_extension_unavailable"
+        else:
+            probe = getattr(torch.ops.vllm_sm70_qsa_device, "cache_codecs", None)
+            supported = tuple(probe()) if probe is not None else (0, 1)
+            if state.codec.native_id not in supported:
+                reason = "native_codec_binding_unavailable"
     state.device_history_reason = reason
     state.device_history_workspace = None
     if reason is not None:
@@ -204,7 +209,7 @@ def _direct_history_triton(
         HISTORY_POSITIONS=positions,
         HISTORY_LENGTHS=lengths,
         DEVICE_HISTORY=True,
-        HISTORY_E4M3=state.fp8,
+        HISTORY_CODEC=state.codec.native_id,
         num_warps=warps,
         num_stages=2,
     )
