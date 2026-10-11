@@ -1327,18 +1327,23 @@ def flash_attn_grouped_fp32_paged(
     v_scale: float = 1.0,
     k_scale_cache: torch.Tensor | None = None,
     v_scale_cache: torch.Tensor | None = None,
+    one_pass: bool = True,
     _runtime=None,
 ) -> torch.Tensor:
     """GQA6/D256 grouped attention with authoritative per-query lengths.
 
-    Supports q2..8/B1 and request-major q8/B2..16. Zero-length rows produce
+    Supports q2..16/B1 and request-major q8/B2..16 in plan revision 1.
+    Older binaries retain q2..8 and the one-pass schedule. Zero-length rows produce
     zero outputs. Positive lengths and physical page indices must fit the
     table and cache. FP32 partials belong to this algorithm for every codec.
     """
     native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    planned = getattr(native, "grouped_fp32_execution_plan_revision", 0) >= 1
+    if not planned and (q.shape[0] // block_table.shape[0] > 8 or not one_pass):
+        raise RuntimeError("Rebuild Flash-V100 for grouped q16/two-pass plans")
     binding = bind_kv(
         native,
-        "grouped_fp32_paged",
+        "grouped_fp32_plan" if planned else "grouped_fp32_paged",
         kv_cache_dtype,
         k_scale_cache,
         v_scale_cache,
@@ -1350,7 +1355,7 @@ def flash_attn_grouped_fp32_paged(
         partial_dtype=binding.partial_dtype,
         _runtime=_runtime,
     )
-    return binding.operation(
+    args = (
         q,
         k_cache,
         v_cache,
@@ -1365,10 +1370,19 @@ def flash_attn_grouped_fp32_paged(
         float(v_scale),
         *binding.scale_args,
     )
+    return binding.operation(*args, *((bool(one_pass),) if planned else ()))
 
 
 flash_attn_grouped_fp32_paged.kv_cache_codecs = codec_names(  # type: ignore[attr-defined]
-    flash_attn_v100_cuda, "grouped_fp32_paged"
+    flash_attn_v100_cuda,
+    "grouped_fp32_plan"
+    if getattr(flash_attn_v100_cuda, "grouped_fp32_execution_plan_revision", 0)
+    else "grouped_fp32_paged",
+)
+flash_attn_grouped_fp32_paged.max_query_tokens = (  # type: ignore[attr-defined]
+    16
+    if getattr(flash_attn_v100_cuda, "grouped_fp32_execution_plan_revision", 0)
+    else 8
 )
 
 

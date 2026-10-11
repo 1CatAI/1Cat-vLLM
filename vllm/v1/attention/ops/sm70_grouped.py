@@ -36,6 +36,7 @@ class GroupedContract:
     early_query_layout: bool
     early_cache_dtype: bool
     metadata_before_cache_layout: bool
+    max_query_rows: int = GROUP_ROWS
 
 
 GROUPED_CONTRACTS = {
@@ -172,6 +173,7 @@ def grouped_fp32_reason(
             operator_attr="flash_attn_grouped_fp32_paged",
             operator_name="grouped_fp32",
             batch_revision=None,
+            max_query_rows=getattr(operation, "max_query_tokens", GROUP_ROWS),
         )
     if contract is None:
         return "codec_unsupported"
@@ -215,7 +217,7 @@ def grouped_fp32_reason(
     if not 1 <= groups <= contract.max_groups:
         return "request_group_count"
     if not (
-        (groups == 1 and 2 <= rows <= GROUP_ROWS)
+        (groups == 1 and 2 <= rows <= contract.max_query_rows)
         or (groups > 1 and rows == groups * GROUP_ROWS)
     ):
         return "query_rows"

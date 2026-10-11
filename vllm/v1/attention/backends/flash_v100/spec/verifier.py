@@ -376,7 +376,10 @@ class VerificationExecutor:
                 shared=True,
             )
             is None
-            and self.ops.e4m3_grouped is None
+            and (
+                self.ops.e4m3_grouped is None
+                or query.shape[0] // attn_metadata.block_table.shape[0] > 8
+            )
         ):
             shared_op(
                 query,
