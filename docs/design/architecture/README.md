@@ -131,16 +131,18 @@ or model-quality envelope. Native libraries predating this capability remain
 limited to eight rows, even with newer Python.
 
 CPU admission tests cover tile boundaries, invalid metadata and old binaries.
-GPU cases exercise non-aligned score widths, query tails, padded rows, changed
-live lengths and replay, against both the existing scorer and independent native
-tiles. GPU numerical/performance and model-quality qualification remain pending
-until those cases run on an available SM70 environment. The change does not
-establish multi-request or other-head support.
+The 22 CPU cases and 19 distinct GPU cases pass. GPU checks exercise non-aligned
+score widths, query tails, padded rows, changed live lengths and replay, against
+both the existing scorer and independent native tiles. Actual 32K/256K scorer
+and score-to-selection measurements are recorded in the
+[migration control log](../sm70_v100_migration_control.md#shared-path-generalization-qsa-query-tiles-2026-10-11).
+Model task quality, startup parity and model speed remain unqualified. The
+change does not establish multi-request native scoring or other-head support.
 
 ```bash
 .venv/bin/python -m pytest --confcutdir=tests/v1/attention -q \
   tests/v1/attention/test_sm70_qsa_shared_key_admission.py
-# Build/install the packaged _sm70_qsa_indexer_C target, then on SM70:
+# Build/install standard _C, _C_stable_libtorch and _sm70_qsa_indexer_C targets:
 .venv/bin/python -m pytest --confcutdir=tests/kernels -q \
   tests/kernels/test_sm70_qsa_shared_key.py
 ```
@@ -162,6 +164,14 @@ longer prefix:
   --query-rows 8 9 17 33 65 --page-size 204 --pages-per-request 322 \
   --live-length 262144 --layers 12
 ```
+
+The benchmark records `rtol=2e-6, atol=1e-5` for FP32 scores from FP16 inputs.
+An FP64 diagnostic established rounding error in both scorers; unchanged unit
+fixtures still pass their tighter comparison. For changed selection rows, each
+arm must produce the exact Top-K set for its own scores, retain causal tails and
+padding, and confine exchanges to score-rounding uncertainty. Overlap and
+boundary gaps are reported; malformed-tail and non-Top-K negative controls are
+rejected. This operator criterion does not replace model task-quality evidence.
 
 ## Source-derived reference
 

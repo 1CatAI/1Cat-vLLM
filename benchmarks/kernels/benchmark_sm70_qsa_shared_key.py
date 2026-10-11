@@ -12,6 +12,75 @@ import torch
 from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_mqa_paged, qsa_select_paged_tokens
 from vllm.v1.attention.ops.sm70_qsa_shared_key import shared_key_reason
 
+# Both scorers accumulate FP16 inputs in FP32 with different reduction orders.
+# A paired FP64 check at M8/M9 found a 2.28e-6 difference near zero while
+# each scorer was within 1.49e-6 of FP64, with identical top-512 sets. Retain
+# a bounded absolute floor instead of treating the Triton scorer as exact.
+_SCORE_RTOL = 2e-6
+_SCORE_ATOL = 1e-5
+
+
+def check_selection(layers, reference, candidate):
+    """Allow rounded score ties, while checking each selector's exact semantics."""
+    result = dict(
+        changed_rows=0,
+        changed_set_rows=0,
+        minimum_block_overlap=1.0,
+        max_boundary_score_gap=0.0,
+    )
+    for inputs, expected, actual in zip(layers, reference, candidate):
+        changed = torch.nonzero((expected != actual).any(dim=1)).flatten().tolist()
+        if not changed:
+            continue
+        ref_scores, visible = qsa_mqa_paged(*inputs, 4)
+        scores, av = qsa_mqa_paged(*inputs, 4, shared_key_scoring=True)
+        assert torch.equal(av, visible)
+        mask = (
+            torch.arange(scores.shape[1], device=scores.device)[None, :] < av[:, None]
+        )
+        torch.testing.assert_close(
+            scores[mask], ref_scores[mask], rtol=_SCORE_RTOL, atol=_SCORE_ATOL
+        )
+        for row in changed:
+            count = min(int(visible[row]), 512)
+            expanded = count * 4
+            # Open-group tails and padding remain exact regardless of scores.
+            assert torch.equal(actual[row, expanded:], expected[row, expanded:])
+            selected = []
+            for output, logits in ((expected, ref_scores), (actual, scores)):
+                tokens = output[row, :expanded].reshape(count, 4)
+                blocks = tokens[:, 0] // 4
+                offsets = torch.arange(4, device=tokens.device)
+                assert torch.equal(tokens, blocks[:, None] * 4 + offsets)
+                # The selected set must be exact for the scores that arm used,
+                # including logical-index tie breaking. Output order may differ.
+                canonical = torch.argsort(
+                    logits[row, : int(visible[row])], stable=True, descending=True
+                )[:count]
+                assert torch.equal(blocks.sort().values, canonical.sort().values)
+                selected.append(blocks)
+            old, new = selected
+            overlap = int(torch.isin(old, new).sum())
+            result["changed_rows"] += 1
+            result["minimum_block_overlap"] = min(
+                result["minimum_block_overlap"], overlap / max(count, 1)
+            )
+            if overlap == count:
+                continue
+            removed = old[~torch.isin(old, new)]
+            added = new[~torch.isin(new, old)]
+            boundary = ref_scores[row, torch.cat((removed, added))]
+            gap = float(boundary.max() - boundary.min())
+            # Changes are confined to the uncertainty of the two FP32 score
+            # estimates. This is an operator gate, not model-quality evidence.
+            bound = 2 * (_SCORE_ATOL + _SCORE_RTOL * float(boundary.abs().max()))
+            assert gap <= bound, "Selection differs beyond score-rounding bounds"
+            result["changed_set_rows"] += 1
+            result["max_boundary_score_gap"] = max(
+                result["max_boundary_score_gap"], gap
+            )
+    return result
+
 
 def compare_time(a, b, count):
     for _ in range(3):
@@ -140,8 +209,9 @@ def main():
             )
             compared_scores = 0
             max_abs_score_error = None
+            selection_quality = None
             if full_selection:
-                assert all(torch.equal(a, b) for a, b in zip(ref, cand))
+                selection_quality = check_selection(layers, ref, cand)
             else:
                 max_abs_score_error = 0.0
                 assert native_calls == (args.layers if admission_reason is None else 0)
@@ -150,7 +220,10 @@ def main():
                     mask = torch.arange(columns, device="cuda")[None, :] < ev[:, None]
                     actual_scores, expected_scores = actual[mask], expected[mask]
                     torch.testing.assert_close(
-                        actual_scores, expected_scores, rtol=2e-6, atol=2e-6
+                        actual_scores,
+                        expected_scores,
+                        rtol=_SCORE_RTOL,
+                        atol=_SCORE_ATOL,
                     )
                     compared_scores += actual_scores.numel()
                     if actual_scores.numel():
@@ -173,13 +246,17 @@ def main():
                 columns=columns,
                 admission_reason=admission_reason,
                 observed_native_calls=native_calls,
+                score_rtol=None if full_selection else _SCORE_RTOL,
+                score_atol=None if full_selection else _SCORE_ATOL,
                 compared_scores=compared_scores,
                 max_abs_score_error=max_abs_score_error,
+                selection_quality=selection_quality,
                 timing=timing,
             )
             results.append(row)
             print(row, flush=True)
-    args.out.write_text(json.dumps(results, indent=2) + "\n")
+            # Retain completed cases if a later workload fails qualification.
+            args.out.write_text(json.dumps(results, indent=2) + "\n")
 
 
 if __name__ == "__main__":
