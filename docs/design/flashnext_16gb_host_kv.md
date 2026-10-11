@@ -309,3 +309,15 @@ report exposes stream count, partials capacity and actual scratch bytes.
 Isolated Q4_K, Q6_K and IQ4_XS projections passed independent FP32 comparisons
 at M1, M5, M20 and M512, and changed-input graph replay matched eager exactly
 with both budgets. Full startup capacity and acceptance remain pending.
+
+The following startup completed host-history binding and all 8K hot-cache
+initialization. It then failed while warming the default M10 piecewise graph:
+a new TurboMind stream allocation requested 20 MiB with 19.94 MiB available.
+This is distinct from the earlier cache-binding failure.
+
+The single-request MTP4 profile now captures only M5; larger prefills retain
+the compiled fallback. M10 is outside its uniform verifier batch capacity.
+Ordinary dense segment scratch is bounded by the admitted K2560/N4096
+shapes, and shared scratch by K2560/N320 or K160/N2560. Code, coefficient
+and partial storage decreases by 34.5 MiB per device without changing their
+layouts, arithmetic or supported shapes.

@@ -79,5 +79,5 @@ exec "$VLLM_PYTHON" -m vllm.entrypoints.cli.main serve "$MODEL" \
   --max-model-len 262144 --max-num-seqs 1 --max-num-batched-tokens 512 \
   --gpu-memory-utilization "$GPU_UTIL" --enable-prefix-caching --mamba-cache-mode align \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
-  --language-model-only --compilation-config '{"mode":3,"cudagraph_mode":"FULL"}' \
+  --language-model-only --compilation-config '{"mode":3,"cudagraph_mode":"FULL","cudagraph_capture_sizes":[5]}' \
   --kernel-config "$KERNEL_CONFIG" --speculative-config "$SPEC_CONFIG"
