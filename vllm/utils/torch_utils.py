@@ -125,13 +125,13 @@ def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
         kv_cache_dtype.startswith("fp8")
         or kv_cache_dtype.endswith("per_token_head")
-        or kv_cache_dtype == "nvfp4"
+        or kv_cache_dtype in ("int8", "nvfp4")
     )
 
 
 def kv_cache_uses_per_token_head_scales(kv_cache_dtype: str) -> bool:
     """Return True if *kv_cache_dtype* needs per-token-head scales."""
-    return kv_cache_dtype.endswith("per_token_head")
+    return kv_cache_dtype == "int8" or kv_cache_dtype.endswith("per_token_head")
 
 
 def is_strictly_contiguous(t: torch.Tensor) -> bool:

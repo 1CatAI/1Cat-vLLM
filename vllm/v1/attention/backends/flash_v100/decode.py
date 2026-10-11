@@ -78,6 +78,7 @@ class DecodeOps:
     draft_debug_log: Callable[..., None]
     format_debug: Callable[..., str]
     scalar_override: Callable[..., None] | None = None
+    cache_view: KVCacheView | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,16 @@ class DecodeExecutor:
         self.config = config
         self.ops = ops
         self.workspace = workspace
+
+    @property
+    def scale_kwargs(self):
+        codec = self.config.kv_codec
+        if codec is None or not codec.per_token_head:
+            return {}
+        view = self.ops.cache_view
+        if view is None or view.codec is not codec:
+            raise ValueError("Per-token decode requires its bound cache view")
+        return view.scale_kwargs
 
     def forward(self, request: DecodeRequest) -> torch.Tensor:
         return _plan.execute(
@@ -193,6 +204,11 @@ class DecodeExecutor:
             partition_size_hint=partition_size_hint,
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
+            **(
+                {"k_scale_cache": k_scale_cache, "v_scale_cache": v_scale_cache}
+                if codec is not None and codec.per_token_head
+                else {}
+            ),
         ):
             record(_routing.ROUTE_SPECS["decode_e4m3_compact_scalar_tail"].name)
             return
@@ -305,6 +321,7 @@ class DecodeExecutor:
                 k_scale=float(layer._k_scale_float),
                 v_scale=float(layer._v_scale_float),
                 causal=True,
+                **self.scale_kwargs,
             )
         raw_q_bhmd = q_bhmd
         q_out_same_storage = _routing.same_storage(raw_q_bhmd, out_bhmd)
@@ -335,6 +352,7 @@ class DecodeExecutor:
             k_scale=float(layer._k_scale_float),
             v_scale=float(layer._v_scale_float),
             causal=True,
+            **self.scale_kwargs,
         )
         if safe_bmhd is not None:
             assert compare_call_idx is not None
@@ -381,7 +399,9 @@ class DecodeExecutor:
         if query.shape[0] == 0:
             return output
 
-        key_cache, value_cache = _kv_layout.split_paged_kv_cache(kv_cache)
+        key_cache, value_cache = _kv_layout.split_paged_kv_cache(
+            self.ops.cache_view or kv_cache
+        )
 
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
         query_start_loc = (
@@ -448,6 +468,7 @@ class DecodeExecutor:
                         kv_cache_dtype=self.config.kv_cache_dtype,
                         k_scale=float(layer._k_scale_float),
                         v_scale=float(layer._v_scale_float),
+                        **self.scale_kwargs,
                     )
                     return output
                 if (
@@ -481,6 +502,7 @@ class DecodeExecutor:
                     k_scale=float(layer._k_scale_float),
                     v_scale=float(layer._v_scale_float),
                     causal=True,
+                    **self.scale_kwargs,
                 )
                 if first_query_len == 1 and q_bhmd.is_contiguous():
                     self.ops.compare_bhmd(
@@ -517,6 +539,7 @@ class DecodeExecutor:
                 k_scale=float(layer._k_scale_float),
                 v_scale=float(layer._v_scale_float),
                 causal=True,
+                **self.scale_kwargs,
             )
             out_view[start:end].copy_(out_seq.squeeze(0))
 
@@ -538,7 +561,7 @@ class DecodeExecutor:
         avoids full paged-KV gather after the first step, but it is still an
         oracle path rather than the final paged decode kernel.
         """
-        if _routing.uses_fp8_kv_cache(self.config.kv_cache_dtype):
+        if self.config.kv_codec is not None and self.config.kv_codec.quantized:
             if self.config.policy.use_flash_v100_prefill_paged:
                 return self._flash_v100_decode_as_paged_prefill(
                     layer,
@@ -650,7 +673,9 @@ class DecodeExecutor:
         if query.shape[0] == 0:
             return output
 
-        key_cache, value_cache = _kv_layout.split_paged_kv_cache(kv_cache)
+        key_cache, value_cache = _kv_layout.split_paged_kv_cache(
+            self.ops.cache_view or kv_cache
+        )
         block_size = key_cache.shape[1]
         num_kv_heads = key_cache.shape[2]
         head_dim = key_cache.shape[3]
@@ -674,7 +699,7 @@ class DecodeExecutor:
                 continue
             seq_len = int(seq_lens_host[i].item())
             k_cont, v_cont = _kv_layout.extract_contiguous_kv_from_paged_cache(
-                kv_cache=kv_cache,
+                kv_cache=self.ops.cache_view or kv_cache,
                 block_table=attn_metadata.block_table[i : i + 1],
                 seq_lens=attn_metadata.seq_lens[i : i + 1],
                 num_kv_heads=num_kv_heads,
@@ -726,7 +751,7 @@ class DecodeExecutor:
 
         codec = self.config.kv_codec
         cache_view = (
-            KVCacheView.bind(kv_cache, codec, query.shape[-1])
+            self.ops.cache_view or KVCacheView.bind(kv_cache, codec, query.shape[-1])
             if codec is not None and codec.per_token_head
             else None
         )

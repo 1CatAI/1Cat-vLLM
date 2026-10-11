@@ -61,8 +61,12 @@ def configure_prefill(self: Any) -> None:
     ):
         from functools import partial
 
+        operation = self.flash_attn_prefill_paged
         self.flash_attn_prefill_paged = partial(
-            self.flash_attn_prefill_paged, dflash2_window_split=split_enabled
+            operation, dflash2_window_split=split_enabled
+        )
+        self.flash_attn_prefill_paged.__dict__.update(
+            getattr(operation, "__dict__", {})
         )
     logger.info_once(
         "FLASH_ATTN_V100 DFlash single-request window split pages=%s; "

@@ -67,6 +67,7 @@ class AttentionRuntime:
         self.turboquant_decode_workspace_cache = {}
         self.prefill_splitkv3_workspace_cache = {}
         self.grouped_verify_workspace_cache = {}
+        self.prefill_codec_workspace_cache = {}
         self.bindings = {}
 
     def bind(self, operation):
@@ -90,6 +91,7 @@ class AttentionRuntime:
         self.turboquant_decode_workspace_cache.clear()
         self.prefill_splitkv3_workspace_cache.clear()
         self.grouped_verify_workspace_cache.clear()
+        self.prefill_codec_workspace_cache.clear()
         self.bindings.clear()
         self.native.__dict__.clear()
         self.native_policy = None

@@ -87,6 +87,15 @@ class KVCacheView:
     page_size_bytes: int
 
     @property
+    def scale_kwargs(self) -> dict[str, torch.Tensor]:
+        """Explicit native row-scale arguments; tensor-scale codecs use none."""
+        if not self.codec.per_token_head:
+            return {}
+        if self.key_scale is None or self.value_scale is None:
+            raise ValueError("Per-token KV view is missing its scale planes")
+        return {"k_scale_cache": self.key_scale, "v_scale_cache": self.value_scale}
+
+    @property
     def inter_page_gap_bytes(self) -> int:
         """Bytes between this member's pages, including any packed peers."""
         return self.page_stride_bytes - self.page_size_bytes

@@ -6,6 +6,9 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
+from vllm.v1.attention.kv_cache_view import KVCacheView
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
+from vllm.v1.attention.ops.kv_codec import encode_kv_cache_row
 
 
 @triton.jit
@@ -20,6 +23,18 @@ def _norm_rope_cache(
     CACHE_K,
     CACHE_V,
     SLOTS,
+    KScale,
+    VScale,
+    KRowScale,
+    VRowScale,
+    KS_BLOCK: tl.constexpr,
+    KS_TOKEN: tl.constexpr,
+    KS_HEAD: tl.constexpr,
+    VS_BLOCK: tl.constexpr,
+    VS_TOKEN: tl.constexpr,
+    VS_HEAD: tl.constexpr,
+    CODEC: tl.constexpr,
+    ROUND_INT8_EVEN: tl.constexpr,
     QKV_STRIDE: tl.constexpr,
     CK_BLOCK: tl.constexpr,
     CK_TOKEN: tl.constexpr,
@@ -81,17 +96,32 @@ def _norm_rope_cache(
             slot = tl.load(SLOTS + row, row < NUM_SLOTS, other=-1)
             page = slot // PAGE
             token = slot % PAGE
+            encoded_k, ks = encode_kv_cache_row(
+                rotated.to(tl.float16), KScale, CODEC, ROUND_INT8_EVEN
+            )
             tl.store(
                 CACHE_K + page * CK_BLOCK + token * CK_TOKEN + kv_head * CK_HEAD + d,
-                rotated,
+                encoded_k,
                 (slot >= 0) & (slot < CACHE_TOKENS),
             )
             val = tl.load(QKV + row * QKV_STRIDE + 1280 + kv_head * 128 + d)
+            encoded_v, vs = encode_kv_cache_row(val, VScale, CODEC, ROUND_INT8_EVEN)
             tl.store(
                 CACHE_V + page * CV_BLOCK + token * CV_TOKEN + kv_head * CV_HEAD + d,
-                val,
+                encoded_v,
                 (slot >= 0) & (slot < CACHE_TOKENS),
             )
+            if CODEC == 3:
+                tl.store(
+                    KRowScale + page * KS_BLOCK + token * KS_TOKEN + kv_head * KS_HEAD,
+                    ks,
+                    (slot >= 0) & (slot < CACHE_TOKENS),
+                )
+                tl.store(
+                    VRowScale + page * VS_BLOCK + token * VS_TOKEN + kv_head * VS_HEAD,
+                    vs,
+                    (slot >= 0) & (slot < CACHE_TOKENS),
+                )
 
 
 def qk_norm_rope_cache(
@@ -106,10 +136,28 @@ def qk_norm_rope_cache(
     q_out=None,
     k_out=None,
     epsilon=1e-6,
+    *,
+    kv_cache_dtype="auto",
+    k_scale=None,
+    v_scale=None,
+    k_scale_cache=None,
+    v_scale_cache=None,
 ):
     q = q_out if q_out is not None else raw.new_empty((raw.shape[0], 1024))
     k = k_out if k_out is not None else raw.new_empty((raw.shape[0], 256))
     store_cache = key_cache is not None
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec is None or codec.native_id is None:
+        raise ValueError(f"Unsupported fused KV codec: {kv_cache_dtype}")
+    if store_cache:
+        assert codec.stores(key_cache, value_cache)
+        if codec.per_token_head:
+            assert k_scale_cache is not None and v_scale_cache is not None
+            assert k_scale_cache.shape == v_scale_cache.shape == key_cache.shape[:-1]
+            assert k_scale_cache.dtype == v_scale_cache.dtype == torch.float32
+        elif codec.quantized:
+            assert k_scale.numel() == v_scale.numel() == 1
+            assert k_scale.dtype == v_scale.dtype == torch.float32
     _norm_rope_cache[(raw.shape[0], 10)](
         raw,
         q,
@@ -121,6 +169,22 @@ def qk_norm_rope_cache(
         key_cache,
         value_cache,
         slots,
+        k_scale,
+        v_scale,
+        k_scale_cache,
+        v_scale_cache,
+        *(
+            k_scale_cache.stride()
+            if store_cache and codec.per_token_head
+            else (0, 0, 0)
+        ),
+        *(
+            v_scale_cache.stride()
+            if store_cache and codec.per_token_head
+            else (0, 0, 0)
+        ),
+        codec.native_id,
+        codec.rounding == "nearest_even",
         raw.stride(0),
         *(key_cache.stride()[:3] if store_cache else (0, 0, 0)),
         *(value_cache.stride()[:3] if store_cache else (0, 0, 0)),
@@ -149,16 +213,20 @@ def sm70_dflash2_qk_norm_rope_cache(
 ) -> None:
     from vllm.model_executor.layers.attention.attention import get_attention_context
     from vllm.utils.torch_utils import _resolve_layer_name
-    from vllm.v1.attention.backends.flash_v100.kv_layout import (
-        _split_paged_kv_cache,
-    )
 
     _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
     cache_args = {}
-    if slots is not None and kv_cache.numel() > 0:
-        kc, vc = _split_paged_kv_cache(kv_cache)
+    codec = resolve_kv_codec(layer.kv_cache_dtype)
+    if (
+        slots is not None
+        and kv_cache.numel() > 0
+        and codec is not None
+        and codec.native_id is not None
+    ):
+        view = KVCacheView.bind(kv_cache, codec, 128)
+        kc, vc = view.key, view.value
         if (
-            kc.dtype == vc.dtype == torch.float16
+            codec.stores(kc, vc)
             and kc.ndim == vc.ndim == 4
             and kc.shape == vc.shape
             and kc.shape[2:] == (2, 128)
@@ -166,7 +234,15 @@ def sm70_dflash2_qk_norm_rope_cache(
             and slots.ndim == 1
             and slots.dtype == torch.int64
         ):
-            cache_args = dict(key_cache=kc, value_cache=vc, slots=slots)
+            cache_args = dict(
+                key_cache=kc,
+                value_cache=vc,
+                slots=slots,
+                kv_cache_dtype=codec.name,
+                k_scale=layer._k_scale,
+                v_scale=layer._v_scale,
+                **view.scale_kwargs,
+            )
     qk_norm_rope_cache(
         raw,
         qw,

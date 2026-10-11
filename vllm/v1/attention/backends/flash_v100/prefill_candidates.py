@@ -57,6 +57,12 @@ class PrefillOps:
     log_fp8_bridge: Any
     log_splitkv: Any
 
+    cache_view: Any = None
+
+    @property
+    def scale_kwargs(self):
+        return {} if self.cache_view is None else self.cache_view.scale_kwargs
+
     supports_bmhd: bool = False
     split_pages: tuple[int, ...] = ()
     tree_requires_branch: Any = None
@@ -201,6 +207,7 @@ class BflaPrefill(SequenceCandidate):
                 kv_cache_dtype=self.executor.config.kv_cache_dtype,
                 k_scale=float(request.layer._k_scale_float),
                 v_scale=float(request.layer._v_scale_float),
+                **self.executor.ops.scale_kwargs,
                 causal=request.causal,
                 window_size=request.window_size,
             ),
@@ -278,18 +285,20 @@ class Fa2Prefill(SequenceCandidate):
                 cu_k=cu_k,
                 q_len=request.q_len,
                 seq_len=request.seq_len,
-                out_dest=fa2_out_dest: self.executor.ops.try_fa2(
-                    request.q_seq,
-                    fa2_key,
-                    fa2_value,
-                    cu_seqlens_q=cu_q,
-                    cu_seqlens_k=cu_k,
-                    max_seqlen_q=request.q_len,
-                    max_seqlen_k=request.seq_len,
-                    softmax_scale=self.executor.config.scale,
-                    causal=request.causal,
-                    window_size=request.window_size,
-                    out=out_dest,
+                out_dest=fa2_out_dest: (
+                    self.executor.ops.try_fa2(
+                        request.q_seq,
+                        fa2_key,
+                        fa2_value,
+                        cu_seqlens_q=cu_q,
+                        cu_seqlens_k=cu_k,
+                        max_seqlen_q=request.q_len,
+                        max_seqlen_k=request.seq_len,
+                        softmax_scale=self.executor.config.scale,
+                        causal=request.causal,
+                        window_size=request.window_size,
+                        out=out_dest,
+                    )
                 ),
             )
         else:
@@ -309,22 +318,26 @@ class Fa2Prefill(SequenceCandidate):
                 q_len=request.q_len,
                 seq_len=request.seq_len,
                 out_dest=fa2_out_dest,
-                i=request.i: self.executor.ops.try_fa2(
-                    request.q_seq,
-                    request.key_cache,
-                    request.value_cache,
-                    cu_seqlens_q=cu_q,
-                    cu_seqlens_k=None,
-                    max_seqlen_q=request.q_len,
-                    max_seqlen_k=request.seq_len,
-                    softmax_scale=self.executor.config.scale,
-                    causal=request.causal,
-                    window_size=request.window_size,
-                    out=out_dest,
-                    seqused_k=request.attn_metadata.seq_lens[request.i : request.i + 1],
-                    block_table=request.attn_metadata.block_table[
-                        request.i : request.i + 1
-                    ],
+                i=request.i: (
+                    self.executor.ops.try_fa2(
+                        request.q_seq,
+                        request.key_cache,
+                        request.value_cache,
+                        cu_seqlens_q=cu_q,
+                        cu_seqlens_k=None,
+                        max_seqlen_q=request.q_len,
+                        max_seqlen_k=request.seq_len,
+                        softmax_scale=self.executor.config.scale,
+                        causal=request.causal,
+                        window_size=request.window_size,
+                        out=out_dest,
+                        seqused_k=request.attn_metadata.seq_lens[
+                            request.i : request.i + 1
+                        ],
+                        block_table=request.attn_metadata.block_table[
+                            request.i : request.i + 1
+                        ],
+                    )
                 ),
             )
         if fa2_paged_out is None:
@@ -382,15 +395,15 @@ class ContiguousBhmdPrefill(SequenceCandidate):
             heads_kv=request.num_kv_heads,
             head_dim=request.head_dim,
             block_size=request.block_size,
-            fn=lambda q_bhmd=q_bhmd,
-            k_bhmd=k_bhmd,
-            v_bhmd=v_bhmd: self.executor.ops.bhmd(
-                q_bhmd,
-                k_bhmd,
-                v_bhmd,
-                causal=request.causal,
-                softmax_scale=self.executor.config.scale,
-                window_size=request.window_size,
+            fn=lambda q_bhmd=q_bhmd, k_bhmd=k_bhmd, v_bhmd=v_bhmd: (
+                self.executor.ops.bhmd(
+                    q_bhmd,
+                    k_bhmd,
+                    v_bhmd,
+                    causal=request.causal,
+                    softmax_scale=self.executor.config.scale,
+                    window_size=request.window_size,
+                )
             ),
         )
         request.out_view[request.start : request.end].copy_(
@@ -446,18 +459,20 @@ class ContiguousDensePrefill(SequenceCandidate):
                 cu_k=cu_k,
                 q_len=request.q_len,
                 seq_len=request.seq_len,
-                out_dest=fa2_out_dest: self.executor.ops.try_fa2(
-                    request.q_seq,
-                    k_dense,
-                    v_dense,
-                    cu_seqlens_q=cu_q,
-                    cu_seqlens_k=cu_k,
-                    max_seqlen_q=request.q_len,
-                    max_seqlen_k=request.seq_len,
-                    softmax_scale=self.executor.config.scale,
-                    causal=request.causal,
-                    window_size=request.window_size,
-                    out=out_dest,
+                out_dest=fa2_out_dest: (
+                    self.executor.ops.try_fa2(
+                        request.q_seq,
+                        k_dense,
+                        v_dense,
+                        cu_seqlens_q=cu_q,
+                        cu_seqlens_k=cu_k,
+                        max_seqlen_q=request.q_len,
+                        max_seqlen_k=request.seq_len,
+                        softmax_scale=self.executor.config.scale,
+                        causal=request.causal,
+                        window_size=request.window_size,
+                        out=out_dest,
+                    )
                 ),
             )
         if fa2_out is not None:
@@ -475,15 +490,15 @@ class ContiguousDensePrefill(SequenceCandidate):
                 heads_kv=request.num_kv_heads,
                 head_dim=request.head_dim,
                 block_size=request.block_size,
-                fn=lambda q_seq=request.q_seq,
-                k_dense=k_dense,
-                v_dense=v_dense: self.executor.ops.dense(
-                    request.q_seq,
-                    k_dense,
-                    v_dense,
-                    causal=request.causal,
-                    softmax_scale=self.executor.config.scale,
-                    window_size=request.window_size,
+                fn=lambda q_seq=request.q_seq, k_dense=k_dense, v_dense=v_dense: (
+                    self.executor.ops.dense(
+                        request.q_seq,
+                        k_dense,
+                        v_dense,
+                        causal=request.causal,
+                        softmax_scale=self.executor.config.scale,
+                        window_size=request.window_size,
+                    )
                 ),
             )
         return PrefillResult(out_seq, out_is_destination, False)
@@ -516,7 +531,12 @@ class Fp8BridgePrefill(SequenceCandidate):
             record(
                 "prefill_prefix_fp8_e4m3_bridge"
                 if self.executor.config.kv_codec is FP8_E4M3
-                else "prefill_prefix_fp8_e5m2_bridge"
+                else (
+                    "prefill_prefix_kv_bridge"
+                    if self.executor.config.kv_codec is not None
+                    and self.executor.config.kv_codec.per_token_head
+                    else "prefill_prefix_fp8_e5m2_bridge"
+                )
             )
         else:
             out_seq = self.executor.ops.paged(
@@ -529,6 +549,7 @@ class Fp8BridgePrefill(SequenceCandidate):
                 kv_cache_dtype=self.executor.config.kv_cache_dtype,
                 k_scale=float(request.layer._k_scale_float),
                 v_scale=float(request.layer._v_scale_float),
+                **self.executor.ops.scale_kwargs,
                 causal=request.causal,
                 window_size=request.window_size,
             )
@@ -553,22 +574,23 @@ class SplitKvPrefill(SequenceCandidate):
             heads_kv=request.num_kv_heads,
             head_dim=request.head_dim,
             block_size=request.block_size,
-            fn=lambda q_seq=request.q_seq,
-            i=request.i,
-            seq_len=request.seq_len: self.executor.ops.splitkv(
-                request.q_seq,
-                request.key_cache,
-                request.value_cache,
-                request.attn_metadata.block_table[request.i : request.i + 1],
-                request.attn_metadata.seq_lens[request.i : request.i + 1],
-                softmax_scale=self.executor.config.scale,
-                kv_cache_dtype=self.executor.config.kv_cache_dtype,
-                k_scale=float(request.layer._k_scale_float),
-                v_scale=float(request.layer._v_scale_float),
-                causal=request.causal,
-                window_size=request.window_size,
-                split_kv_tokens=self.executor.config.policy.prefill_split_kv_tokens,
-                max_seq_len_hint=request.seq_len,
+            fn=lambda q_seq=request.q_seq, i=request.i, seq_len=request.seq_len: (
+                self.executor.ops.splitkv(
+                    request.q_seq,
+                    request.key_cache,
+                    request.value_cache,
+                    request.attn_metadata.block_table[request.i : request.i + 1],
+                    request.attn_metadata.seq_lens[request.i : request.i + 1],
+                    softmax_scale=self.executor.config.scale,
+                    kv_cache_dtype=self.executor.config.kv_cache_dtype,
+                    k_scale=float(request.layer._k_scale_float),
+                    v_scale=float(request.layer._v_scale_float),
+                    **self.executor.ops.scale_kwargs,
+                    causal=request.causal,
+                    window_size=request.window_size,
+                    split_kv_tokens=self.executor.config.policy.prefill_split_kv_tokens,
+                    max_seq_len_hint=request.seq_len,
+                )
             ),
         )
         return PrefillResult(out_seq, out_is_destination, False)
@@ -600,6 +622,7 @@ class PagedPrefill(SequenceCandidate):
                 kv_cache_dtype=self.executor.config.kv_cache_dtype,
                 k_scale=float(request.layer._k_scale_float),
                 v_scale=float(request.layer._v_scale_float),
+                **self.executor.ops.scale_kwargs,
                 causal=request.causal,
                 window_size=request.window_size,
             ),

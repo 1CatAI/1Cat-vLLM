@@ -141,6 +141,7 @@ def read_codecs(root):
         "storage_dtype",
         "element_dtype",
         "quantized",
+        "native_id",
         "encoding_version",
         "scale_granularity",
         "scale_dtype",
@@ -178,7 +179,7 @@ def read_codecs(root):
 def read_routes(root, codecs):
     tree = ast.parse((root / ROUTES).read_text())
     values = {row["symbol"]: row["symbol"] for row in codecs}
-    for name in ("_NATIVE_CODECS", "_ALL_CODECS"):
+    for name in ("_NATIVE_CODECS", "_ROW_CODECS", "_BOUND_CODECS", "_ALL_CODECS"):
         values[name] = expression(assignment(tree, name), values)
     spec = fields(tree, "RouteSpec", values)
     node = assignment(tree, "ROUTE_SPECS")
@@ -335,8 +336,8 @@ def render(report):
         "A registered storage descriptor does not establish native support.",
         "",
         "| Symbol | Canonical / aliases | Storage / element | Version / layout "
-        "| Scales / rounding | Source |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| Scales / rounding | Native codec ID | Source |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in report["codecs"]:
         lines.append(
@@ -344,7 +345,7 @@ def render(report):
             f"{cell(', '.join(row['aliases']))} | {row['storage_dtype']} / "
             f"{row['element_dtype']} | {row['encoding_version']} / {row['layout']} "
             f"| {row['scale_granularity']} ({row['scale_dtype']}) / "
-            f"{row['rounding']} | {link(row['source'])} |"
+            f"{row['rounding']} | {row['native_id']} | {link(row['source'])} |"
         )
     lines += [
         "",

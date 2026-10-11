@@ -31,6 +31,7 @@ from vllm.v1.attention.kv_codecs import (
 from vllm.v1.attention.ops.sm70_grouped import (
     MAX_GROUPS_PER_CALL,
     grouped_e4m3_fp32_groups_allowed,
+    grouped_fp32_reason,
 )
 
 PrefillConfig = _sequence.PrefillConfig
@@ -93,7 +94,17 @@ def _should_use_fp8_prefill_bridge(
     return (
         self.use_fp8_prefill_bridge
         and self.use_flash_v100_prefill_paged
-        and self.kv_codec in (FP8_E4M3, FP8_E5M2)
+        and self.kv_codec is not None
+        and self.kv_codec.quantized
+        # Qualification is separate from the bridge's byte-copy capability.
+        # Row-scaled INT8 -> FP16 loses QK precision on varying row scales;
+        # use the native reader until a precision-preserving dense adapter is
+        # qualified. Merely installing the converter cannot promote this route.
+        and not self.kv_codec.per_token_head
+        and (
+            self.kv_codec in (FP8_E4M3, FP8_E5M2)
+            or _routing.native_codec_supported(self.paged_kv_to_fp16, self.kv_codec)
+        )
         and self.kv_codec.stores(key_cache, value_cache)
         and key_cache.shape == value_cache.shape
         and head_dim == 256
@@ -145,6 +156,10 @@ def _run_fp8_prefill_bridge(
         if self.kv_codec is FP8_E4M3
         else self.fp8_e5m2_paged_kv_to_fp16
     )
+    bridge_kwargs = {}
+    if self.kv_codec is not None and self.kv_codec.per_token_head:
+        bridge = self.paged_kv_to_fp16
+        bridge_kwargs = {"kv_cache_dtype": self.kv_cache_dtype, **self.scale_kwargs}
     if bridge is None:
         return None
     bridge(
@@ -156,6 +171,7 @@ def _run_fp8_prefill_bridge(
         value_out,
         k_scale,
         v_scale,
+        **bridge_kwargs,
     )
     q_len = int(query.shape[1])
     exact_query = query
@@ -268,7 +284,11 @@ def _should_use_prefill_splitkv(
         return False
     if head_dim != 256:
         return False
-    if key_cache.dtype != torch.float16:
+    if self.kv_codec is None or not self.kv_codec.supported_by(
+        self.flash_attn_prefill_paged_splitkv
+    ):
+        return False
+    if key_cache.dtype != self.kv_codec.storage_dtype:
         return False
     if q_len < self.prefill_split_kv_min_q:
         return False
@@ -435,6 +455,9 @@ def _run_mixed_rows_grouped_e4m3(
     written to ``out_view`` in that case.
     """
     grouped_op = getattr(self, "flash_attn_grouped_e4m3_fp32_paged", None)
+    shared = grouped_op is None
+    if shared:
+        grouped_op = self.flash_attn_grouped_fp32_paged
     if grouped_op is None:
         return False
     table = plan.group_table(attn_metadata.block_table)
@@ -448,16 +471,36 @@ def _run_mixed_rows_grouped_e4m3(
     ]
     for g0, g1 in chunks:
         r0, r1 = g0 * _workspace.MIXED_ROWS_GROUP, g1 * _workspace.MIXED_ROWS_GROUP
-        if not grouped_e4m3_fp32_groups_allowed(
-            self,
-            q_pad[r0:r1],
-            key_cache,
-            value_cache,
-            table[g0:g1],
-            lengths[r0:r1],
-            causal=bool(getattr(attn_metadata, "causal", True)),
-            out=out_pad[r0:r1],
-        ):
+        if shared:
+            reason = grouped_fp32_reason(
+                self.kv_codec,
+                self,
+                q_pad[r0:r1],
+                key_cache,
+                value_cache,
+                table[g0:g1],
+                lengths[r0:r1],
+                layout="explicit_groups",
+                causal=bool(getattr(attn_metadata, "causal", True)),
+                out=out_pad[r0:r1],
+                shared=True,
+            )
+        else:
+            reason = (
+                None
+                if grouped_e4m3_fp32_groups_allowed(
+                    self,
+                    q_pad[r0:r1],
+                    key_cache,
+                    value_cache,
+                    table[g0:g1],
+                    lengths[r0:r1],
+                    causal=bool(getattr(attn_metadata, "causal", True)),
+                    out=out_pad[r0:r1],
+                )
+                else "legacy_grouped_contract"
+            )
+        if reason is not None:
             return False
     q_pad.index_copy_(0, plan.dst_idx, query.index_select(0, plan.src_idx))
     k_scale = float(layer._k_scale_float)
@@ -476,6 +519,11 @@ def _run_mixed_rows_grouped_e4m3(
             softmax_scale=self.scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            **(
+                {"kv_cache_dtype": self.kv_cache_dtype, **self.scale_kwargs}
+                if shared
+                else {}
+            ),
         )
     out_view.index_copy_(0, plan.src_idx, out_pad.index_select(0, plan.dst_idx))
     if not log_once_seen("flash_v100._logged_prefill_prefix_decode_rows_grouped"):
@@ -495,7 +543,9 @@ def _run_mixed_rows_grouped_e4m3(
         )
     _routing.log_fp8_kv_cache_route("decode", self.kv_cache_dtype, "grouped_fp32")
     _routing.record_route(
-        _routing.ROUTE_SPECS["prefill_prefix_decode_rows_e4m3_grouped_fp32"].name
+        _routing.ROUTE_SPECS["prefill_prefix_decode_rows_grouped_fp32"].name
+        if shared
+        else _routing.ROUTE_SPECS["prefill_prefix_decode_rows_e4m3_grouped_fp32"].name
     )
     return True
 
@@ -559,25 +609,23 @@ def _run_prefill_prefix_decode_rows(
                     int(key_cache.shape[1]),
                 ),
                 enabled=self.use_decode_xqa,
-                available=self.flash_attn_decode_paged_xqa is not None,
+                available=_routing.native_codec_supported(
+                    self.flash_attn_decode_paged_xqa, self.kv_codec
+                ),
                 max_seq_len_hint=max_seq_len_hint,
             ),
             ("prefill_prefix_decode_rows_xqa",),
         )
         is not None
     )
-    if (
-        self.kv_codec is FP8_E4M3
-        and not use_xqa
-        and self._run_mixed_rows_grouped_e4m3(
-            layer,
-            query,
-            key_cache,
-            value_cache,
-            attn_metadata,
-            out_view,
-            plan,
-        )
+    if not use_xqa and self._run_mixed_rows_grouped_e4m3(
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        out_view,
+        plan,
     ):
         return set(plan.rows)
 
@@ -613,6 +661,7 @@ def _run_prefill_prefix_decode_rows(
                 kv_cache_dtype=self.kv_cache_dtype,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                **self.scale_kwargs,
                 window_size=window_size,
                 max_seq_len_hint=max_seq_len_hint,
                 partition_size_hint=partition_size_hint,
@@ -637,6 +686,7 @@ def _run_prefill_prefix_decode_rows(
                 kv_cache_dtype=self.kv_cache_dtype,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                **self.scale_kwargs,
                 window_size=window_size,
                 max_seq_len_hint=max_seq_len_hint,
             )
@@ -739,6 +789,8 @@ def _flash_v100_prefill_with_prefix(
 
     num_seqs = len(query_start_loc) - 1
 
+    if self.ops.cache_view is not None:
+        kv_cache = self.ops.cache_view
     key_cache, value_cache = _kv_layout.split_paged_kv_cache(kv_cache)
     block_size = key_cache.shape[1]
     num_kv_heads = key_cache.shape[2]
@@ -817,6 +869,7 @@ def _flash_v100_prefill_with_prefix(
                         kv_cache_dtype=self.kv_cache_dtype,
                         k_scale=float(layer._k_scale_float),
                         v_scale=float(layer._v_scale_float),
+                        **self.scale_kwargs,
                         causal=causal,
                         window_size=window_size,
                         anchor_lens=anchor_lens[i : i + 1],
@@ -881,7 +934,7 @@ def _flash_v100_prefill_with_prefix(
         else:
             seq_len = int(seq_lens[i].item())
             k_cont, v_cont = _kv_layout.extract_contiguous_kv_from_paged_cache(
-                kv_cache=kv_cache,
+                kv_cache=self.ops.cache_view or kv_cache,
                 block_table=attn_metadata.block_table[i : i + 1],
                 seq_lens=attn_metadata.seq_lens[i : i + 1],
                 num_kv_heads=num_kv_heads,
@@ -1056,6 +1109,7 @@ def execute_prefill_sequence(
 def create_prefill_executor(self):
     config = self.settings
     ops = _sequence.PrefillOps(
+        cache_view=self.ops.cache_view,
         bridge=getattr(self, "_run_fp8_prefill_bridge", None),
         run_paged=getattr(self, "_run_prefill_paged_call", None),
         should_bridge=getattr(self, "_should_use_fp8_prefill_bridge", None),
@@ -1402,6 +1456,9 @@ def forward(
 
 @dataclass(frozen=True)
 class PrefillDriverOps:
+    cache_view: Any = None
+    bridge: Any = None
+    grouped: Any = None
     triton_forward: Any = None
     compare_triton: Any = None
     small_query_enabled: Any = None
@@ -1438,6 +1495,8 @@ class PrefillDriverOps:
 # Calculation bodies keep their old local spelling. Each binding below resolves
 # to a bounded native operator/callback rather than an attention implementation.
 OPERATOR_FIELDS = {
+    "paged_kv_to_fp16": "bridge",
+    "flash_attn_grouped_fp32_paged": "grouped",
     "flash_attn_func": "dense",
     "flash_attn_bhmd_func": "bhmd",
     "flash_attn_prefill_paged": "paged",
@@ -1478,6 +1537,15 @@ class PrefillExecutor:
     @property
     def kv_codec(self):
         return self.settings.kv_codec
+
+    @property
+    def scale_kwargs(self):
+        if self.kv_codec is None or not self.kv_codec.per_token_head:
+            return {}
+        view = self.ops.cache_view
+        if view is None or view.codec is not self.kv_codec:
+            raise RuntimeError("Prefill requires an explicitly bound KV cache view")
+        return view.scale_kwargs
 
     def __getattr__(self, name):
         if name in OPERATOR_FIELDS:

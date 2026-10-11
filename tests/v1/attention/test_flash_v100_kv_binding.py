@@ -20,7 +20,16 @@ binding_module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = binding_module
 spec.loader.exec_module(binding_module)
 
-ALGORITHMS = ("decode_paged", "decode_paged_xqa", "grouped_fp32_paged")
+ALGORITHMS = (
+    "decode_paged",
+    "decode_paged_xqa",
+    "grouped_fp32_paged",
+    "paged_kv_to_fp16",
+    "prefill_paged",
+    "prefill_paged_splitkv",
+    "prefill_paged_bfla",
+    "decode_paged_wmma",
+)
 CODECS = ("auto", "fp8_e4m3", "fp8_e5m2", "int8", "int8_per_token_head")
 
 

@@ -24,6 +24,7 @@ from vllm.v1.attention.kv_codecs import (
 from vllm.v1.attention.ops.sm70_grouped import (
     grouped_e4m3_fp32_allowed,
     grouped_fp16_fp32_reason,
+    grouped_fp32_reason,
 )
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
@@ -73,6 +74,8 @@ class VerificationOps:
     tree_trace_event: Any = None
     parent_ids_cpu: Any = None
     draft_debug_enabled: Any = None
+    cache_view: Any = None
+    shared_grouped: Any = None
     metadata_debug_log: Any = None
     format_debug: Any = None
 
@@ -86,6 +89,7 @@ class GroupedAdmission:
     flash_attn_grouped_fp16_fp32_paged: Any
     flash_attn_grouped_e4m3_fp32_paged: Any
     _flash_v100_window_size: Any
+    flash_attn_grouped_fp32_paged: Any = None
 
 
 class VerificationExecutor:
@@ -98,6 +102,7 @@ class VerificationExecutor:
             ops.fp16_grouped,
             ops.e4m3_grouped,
             ops.window_size,
+            ops.shared_grouped,
         )
         self.admit_grouped = (
             self.grouped_verify_allowed
@@ -122,6 +127,15 @@ class VerificationExecutor:
 
     def validate_contract(self, layer, attn_metadata) -> None:
         self.ops.validate_contract(layer, attn_metadata, self.ops.window_size)
+
+    @property
+    def scale_kwargs(self):
+        if self.config.kv_codec is None or not self.config.kv_codec.per_token_head:
+            return {}
+        view = self.ops.cache_view
+        if view is None or view.codec is not self.config.kv_codec:
+            raise RuntimeError("Verifier requires an explicitly bound KV cache view")
+        return view.scale_kwargs
 
     def grouped_verify_allowed(
         self,
@@ -313,7 +327,9 @@ class VerificationExecutor:
                 key_cache.shape[1],
             ),
             enabled=self.config.policy.use_smallq_decode_xqa,
-            available=self.ops.xqa is not None,
+            available=_routing.native_codec_supported(
+                self.ops.xqa, self.config.kv_codec
+            ),
             query=query,
             metadata=attn_metadata,
             seq_rows=seq_lens.shape[0],
@@ -328,6 +344,57 @@ class VerificationExecutor:
             )
             is None
         )
+
+    def call_shared_grouped(
+        self,
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        attn_metadata,
+        *,
+        out,
+        partition_size_hint,
+    ) -> bool:
+        shared_op = self.ops.shared_grouped
+        if (
+            shared_op is not None
+            and grouped_fp32_reason(
+                self.config.kv_codec,
+                self.grouped_admission,
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                attn_metadata,
+                out=out,
+                partition_size_hint=partition_size_hint,
+                shared=True,
+            )
+            is None
+            and self.ops.e4m3_grouped is None
+        ):
+            shared_op(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                seq_lens,
+                out=out,
+                softmax_scale=self.config.scale,
+                kv_cache_dtype=self.config.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                **self.scale_kwargs,
+            )
+            _routing.record_route(
+                _routing.ROUTE_SPECS["prefill_smallq_grouped_fp32"].name
+            )
+            return True
+        return False
 
     def call_smallq_decode_paged(
         self,
@@ -378,6 +445,18 @@ class VerificationExecutor:
             _routing.record_route(
                 _routing.ROUTE_SPECS["prefill_smallq_fp16_grouped_fp32"].name
             )
+            return
+        if self.call_shared_grouped(
+            layer,
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            attn_metadata,
+            out=out,
+            partition_size_hint=partition_size_hint,
+        ):
             return
         grouped_op = self.ops.e4m3_grouped
         if grouped_op is not None and grouped_e4m3_fp32_allowed(
@@ -470,6 +549,7 @@ class VerificationExecutor:
                 kv_cache_dtype=self.config.kv_cache_dtype,
                 k_scale=float(layer._k_scale_float),
                 v_scale=float(layer._v_scale_float),
+                **self.scale_kwargs,
                 window_size=window_size,
                 max_seq_len_hint=max_seq_len_hint,
                 workspace_seq_capacity_hint=workspace_seq_capacity_hint,
@@ -498,6 +578,7 @@ class VerificationExecutor:
             kv_cache_dtype=self.config.kv_cache_dtype,
             k_scale=float(layer._k_scale_float),
             v_scale=float(layer._v_scale_float),
+            **self.scale_kwargs,
             window_size=window_size,
             max_seq_len_hint=max_seq_len_hint,
             workspace_seq_capacity_hint=workspace_seq_capacity_hint,
@@ -534,6 +615,27 @@ class VerificationExecutor:
         return (
             max_query_len <= self.config.policy.smallq_decode_max_query_len
             and model_len_supported
+        )
+
+    def decode_cache_slots(self, layer, key_cache, value_cache, blocks, offsets):
+        key, value = key_cache[blocks, offsets], value_cache[blocks, offsets]
+        codec = self.config.kv_codec
+        if codec is not None and codec.per_token_head:
+            view = self.ops.cache_view
+            if view is None or view.codec is not codec:
+                raise RuntimeError("Tree diagnostics require the bound KV cache view")
+            return (
+                codec.dequantize(key, view.key_scale[blocks, offsets], torch.float16),
+                codec.dequantize(
+                    value, view.value_scale[blocks, offsets], torch.float16
+                ),
+            )
+        return _kv_layout.dequantize_fp8_contiguous_kv(
+            key,
+            value,
+            self.config.kv_cache_dtype,
+            float(layer._k_scale_float),
+            float(layer._v_scale_float),
         )
 
     def tree_prefill(
@@ -757,16 +859,8 @@ class VerificationExecutor:
                             rounding_mode="floor",
                         )
                         slot_offsets = torch.remainder(slot_slice, key_cache.shape[1])
-                        cache_k_by_slot = key_cache[slot_blocks, slot_offsets]
-                        cache_v_by_slot = value_cache[slot_blocks, slot_offsets]
-                        cache_k_by_slot, cache_v_by_slot = (
-                            _kv_layout.dequantize_fp8_contiguous_kv(
-                                cache_k_by_slot,
-                                cache_v_by_slot,
-                                self.config.kv_cache_dtype,
-                                float(layer._k_scale_float),
-                                float(layer._v_scale_float),
-                            )
+                        cache_k_by_slot, cache_v_by_slot = self.decode_cache_slots(
+                            layer, key_cache, value_cache, slot_blocks, slot_offsets
                         )
                         key_diff = (cache_k_by_slot - key[start:end]).abs()
                         value_diff = (cache_v_by_slot - value[start:end]).abs()
@@ -790,7 +884,7 @@ class VerificationExecutor:
                         )
 
             k_cont, v_cont = _kv_layout.extract_contiguous_kv_from_paged_cache(
-                (key_cache, value_cache),
+                self.ops.cache_view or (key_cache, value_cache),
                 attn_metadata.block_table[req_idx : req_idx + 1],
                 attn_metadata.seq_lens[req_idx : req_idx + 1],
                 key_cache.shape[2],

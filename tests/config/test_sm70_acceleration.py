@@ -107,6 +107,39 @@ def test_e5m2_reason(config):
     assert paths["dflash2_verifier"]["enabled"]
 
 
+@pytest.mark.parametrize("dtype", ["fp8_e5m2", "int8", "int8_per_token_head"])
+def test_common_codec_report_uses_installed_bindings(config, monkeypatch, dtype):
+    config.cache_config.cache_dtype = dtype
+    probe = acc._native_capabilities
+    bindings = {
+        name: [dtype] for name in ("grouped_fp32", "long_context", "scalar_tail")
+    }
+    monkeypatch.setattr(
+        acc,
+        "_native_capabilities",
+        lambda page, policy: {**probe(page, policy), "codec_bindings": bindings},
+    )
+    report = acc.build_report(config)
+    assert report["kv_native_bindings"] == bindings
+    for name in bindings:
+        assert report["paths"][name]["enabled"]
+    # The old counter remains specific to its legacy wrapper.
+    assert report["paths"]["e4m3_grouped_fp32"]["reason"] == "kv_dtype"
+    bindings["scalar_tail"] = []
+    assert acc.build_report(config)["paths"]["scalar_tail"]["reason"] == (
+        "operator_codec_missing:scalar_tail"
+    )
+
+
+def test_missing_int8_binding_is_not_inferred_from_fp8(config):
+    config.cache_config.cache_dtype = "int8"
+    report = acc.build_report(config)
+    assert report["paths"]["grouped_fp32"]["reason"] == (
+        "operator_codec_missing:grouped_fp32"
+    )
+    assert not report["paths"]["long_context"]["enabled"]
+
+
 @pytest.mark.parametrize("page", [16, 784, 816, 896, 1024, 2048])
 def test_bm32_report_admits_aligned_pages(config, monkeypatch, page):
     config.cache_config.cache_dtype = "auto"

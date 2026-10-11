@@ -334,7 +334,11 @@ def test_draft_kv_dtype_is_public_and_defaults_to_inherit() -> None:
     assert SpeculativeConfig.kv_cache_dtype is None
 
 
-def test_ddtree_draft_config_combines_sm70_kv_and_non_causal(monkeypatch) -> None:
+@pytest.mark.parametrize("dtype", ["fp8_e5m2", "int8", "int8_per_token_head"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_ddtree_draft_config_combines_sm70_kv_and_non_causal(
+    monkeypatch, dtype, explicit
+) -> None:
     @dataclass(frozen=True)
     class CacheConfig:
         cache_dtype: str
@@ -349,11 +353,13 @@ def test_ddtree_draft_config_combines_sm70_kv_and_non_causal(monkeypatch) -> Non
         attention_config: AttentionConfig
 
     base = DraftConfig(
-        cache_config=CacheConfig(cache_dtype="fp8_e5m2"),
+        cache_config=CacheConfig(cache_dtype=dtype),
         attention_config=AttentionConfig(use_non_causal=False),
     )
     proposer = object.__new__(DFlashProposer)
-    proposer.speculative_config = SimpleNamespace(kv_cache_dtype=None)
+    proposer.speculative_config = SimpleNamespace(
+        kv_cache_dtype=dtype if explicit else None
+    )
     proposer.dflash_causal = False
 
     monkeypatch.setattr(
@@ -371,7 +377,7 @@ def test_ddtree_draft_config_combines_sm70_kv_and_non_causal(monkeypatch) -> Non
 
     draft = DFlashProposer._create_draft_vllm_config(proposer)
 
-    assert draft.cache_config.cache_dtype == "auto"
+    assert draft.cache_config.cache_dtype == (dtype if explicit else "auto")
     assert draft.attention_config.use_non_causal is True
 
 

@@ -30,6 +30,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.ops import sm70_grouped_long as long_attention
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -42,19 +43,7 @@ logger = init_logger(__name__)
 
 
 def _supports_sm70_long_batch_graphs(vllm_config: VllmConfig) -> bool:
-    """Avoid extra batch captures when the attention operator would fall back."""
-    model = getattr(vllm_config, "model_config", None)
-    cache = getattr(vllm_config, "cache_config", None)
-    if (
-        model is None
-        or getattr(model, "dtype", None) != torch.float16
-        or getattr(cache, "cache_dtype", None) not in ("fp8", "fp8_e4m3")
-    ):
-        return False
-    parallel = vllm_config.parallel_config
-    return model.get_head_size() == 256 and model.get_num_attention_heads(
-        parallel
-    ) == 6 * model.get_num_kv_heads(parallel)
+    return long_attention.supports_long_batch_graphs(vllm_config)
 
 
 def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
@@ -513,17 +502,14 @@ class ModelCudaGraphManager(CudaGraphManager):
         self._long_attention_graphs: dict[
             BatchExecutionDescriptor, BatchExecutionDescriptor
         ] = {}
-        from vllm.v1.attention.ops.sm70_grouped_long import (
-            long_attention_enabled,
-            long_attention_graph_contract,
-            long_attention_max_batch_size,
-        )
         from vllm.v1.attention.ops.sm70_grouped_scalar import (
             scalar_tail_attention_available,
         )
 
         if (
-            long_attention_enabled(vllm_config.attention_config.flash_v100.options)
+            long_attention.long_attention_enabled(
+                vllm_config.attention_config.flash_v100.options
+            )
             and current_platform.is_cuda()
             and current_platform.is_device_capability((7, 0))
             and self.dp_size == 1
@@ -534,12 +520,12 @@ class ModelCudaGraphManager(CudaGraphManager):
             # no model config leaves the bound at the declared capability.
             model_config = getattr(vllm_config, "model_config", None)
             served = int(getattr(model_config, "max_model_len", 0) or 0)
-            context_limit, query_rows = long_attention_graph_contract(
+            context_limit, query_rows = long_attention.long_attention_graph_contract(
                 served or None, policy=vllm_config.attention_config.flash_v100.options
             )
             max_batch_size = min(
                 self.max_num_reqs,
-                long_attention_max_batch_size(
+                long_attention.long_attention_max_batch_size(
                     policy=vllm_config.attention_config.flash_v100.options
                 ),
             )

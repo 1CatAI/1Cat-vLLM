@@ -28,11 +28,13 @@ from flash_attn_v100.flash_attn_interface import (
     flash_attn_turboquant_decode_paged_available,
     fp8_e4m3_paged_kv_to_fp16,
     fp8_e5m2_paged_kv_to_fp16,
+    paged_kv_to_fp16,
 )
 
 __all__ = [
     "fp8_e4m3_paged_kv_to_fp16",
     "fp8_e5m2_paged_kv_to_fp16",
+    "paged_kv_to_fp16",
     "flash_attn_decode_qk_scores",
     "flash_attn_decode_paged",
     "flash_attn_decode_paged_xqa",

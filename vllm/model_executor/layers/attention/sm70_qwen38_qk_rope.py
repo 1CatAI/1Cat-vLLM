@@ -6,23 +6,12 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import LayerNameType, direct_register_custom_op
-
-
-@triton.jit
-def _e4m3_satfinite(value):
-    bits = value.to(tl.uint32, bitcast=True)
-    sign = (bits >> 24) & 0x80
-    absolute_bits = bits & 0x7FFFFFFF
-    absolute = absolute_bits.to(tl.float32, bitcast=True)
-    limited = tl.minimum(absolute, 448.0)
-    limited_bits = limited.to(tl.uint32, bitcast=True)
-    # RNE to three fraction bits. The normal exponent bias is 7.
-    normal = (limited_bits - 0x3C000000 + 0x7FFFF + ((limited_bits >> 20) & 1)) >> 20
-    # Adding 2**14 gives an FP32 ULP of 2**-9, the FP8 subnormal step.
-    subnormal = (limited + 16384.0).to(tl.uint32, bitcast=True) - 0x46800000
-    code = tl.where(limited < 0.015625, subnormal, normal)
-    code = tl.where(absolute_bits > 0x7F800000, 0x7F, code)
-    return (code | sign).to(tl.uint8)
+from vllm.v1.attention.kv_cache_view import KVCacheView
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
+from vllm.v1.attention.ops.kv_codec import (
+    encode_fp8_satfinite as _e4m3_satfinite,  # noqa: F401 - compatibility import
+)
+from vllm.v1.attention.ops.kv_codec import encode_kv_cache_row
 
 
 @triton.jit
@@ -41,6 +30,12 @@ def _qk_norm_rope(
     VCache,
     KScale,
     VScale,
+    KRowScale,
+    VRowScale,
+    SCALE_BLOCK: tl.constexpr,
+    SCALE_TOKEN: tl.constexpr,
+    CODEC: tl.constexpr,
+    ROUND_INT8_EVEN: tl.constexpr,
     STORE_CACHE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     CACHE_BLOCK: tl.constexpr,
@@ -48,6 +43,7 @@ def _qk_norm_rope(
     POS_ROW: tl.constexpr,
     POS_COL: tl.constexpr,
     CACHE_ROWS: tl.constexpr,
+    CACHE_TOKENS: tl.constexpr,
     TOKENS: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
     ROW: tl.constexpr,
@@ -102,20 +98,35 @@ def _qk_norm_rope(
     tl.store(destination + col, processed)
     if STORE_CACHE:
         slot = tl.load(Slots + token, mask=token < NUM_SLOTS, other=-1)
-        if slot >= 0:
+        if (slot >= 0) & (slot < CACHE_TOKENS):
             offset = (
                 (slot // BLOCK_SIZE) * CACHE_BLOCK
                 + (slot % BLOCK_SIZE) * CACHE_TOKEN
                 + col
             )
             if head == 6:
-                scaled = tl.div_rn(processed.to(tl.float32), tl.load(KScale))
-                tl.store(KCache + offset, _e4m3_satfinite(scaled))
+                payload, row_scale = encode_kv_cache_row(
+                    processed, KScale, CODEC, ROUND_INT8_EVEN
+                )
+                tl.store(KCache + offset, payload)
+                if CODEC == 3:
+                    scale_offset = (
+                        slot // BLOCK_SIZE * SCALE_BLOCK
+                        + slot % BLOCK_SIZE * SCALE_TOKEN
+                    )
+                    tl.store(KRowScale + scale_offset, row_scale)
             elif head == 0:
                 value = tl.load(QKV + token * ROW + 3328 + col).to(tl.float32)
-                tl.store(
-                    VCache + offset, _e4m3_satfinite(tl.div_rn(value, tl.load(VScale)))
+                payload, row_scale = encode_kv_cache_row(
+                    value, VScale, CODEC, ROUND_INT8_EVEN
                 )
+                tl.store(VCache + offset, payload)
+                if CODEC == 3:
+                    scale_offset = (
+                        slot // BLOCK_SIZE * SCALE_BLOCK
+                        + slot % BLOCK_SIZE * SCALE_TOKEN
+                    )
+                    tl.store(VRowScale + scale_offset, row_scale)
 
 
 def qk_norm_rope(
@@ -133,6 +144,10 @@ def qk_norm_rope(
     q_out=None,
     k_out=None,
     gate_out=None,
+    *,
+    kv_cache_dtype="fp8_e4m3",
+    k_scale_cache=None,
+    v_scale_cache=None,
 ):
     assert qkv.ndim == 2 and qkv.shape[1] == 3584 and qkv.dtype == torch.float16
     tokens = qkv.shape[0]
@@ -144,14 +159,23 @@ def qk_norm_rope(
     assert positions.shape in ((tokens,), (3, tokens))
     assert positions.dtype == torch.int64
     store_cache = key_cache is not None
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec is None or codec.native_id is None:
+        raise ValueError(f"Unsupported fused KV codec: {kv_cache_dtype}")
     if store_cache:
         assert key_cache.shape == value_cache.shape and key_cache.ndim == 4
         assert key_cache.shape[2:] == (1, 256)
         assert key_cache.stride() == value_cache.stride() and key_cache.stride(3) == 1
-        assert key_cache.dtype == value_cache.dtype == torch.uint8
+        assert codec.stores(key_cache, value_cache)
         assert slots.ndim == 1 and slots.dtype == torch.int64
-        assert k_scale.numel() == v_scale.numel() == 1
-        assert k_scale.dtype == v_scale.dtype == torch.float32
+        if codec.per_token_head:
+            assert k_scale_cache is not None and v_scale_cache is not None
+            assert k_scale_cache.shape == v_scale_cache.shape == key_cache.shape[:-1]
+            assert k_scale_cache.stride() == v_scale_cache.stride()
+            assert k_scale_cache.dtype == v_scale_cache.dtype == torch.float32
+        elif codec.quantized:
+            assert k_scale.numel() == v_scale.numel() == 1
+            assert k_scale.dtype == v_scale.dtype == torch.float32
     q = (
         q_out
         if q_out is not None
@@ -179,6 +203,12 @@ def qk_norm_rope(
         value_cache,
         k_scale,
         v_scale,
+        k_scale_cache,
+        v_scale_cache,
+        k_scale_cache.stride(0) if store_cache and codec.per_token_head else 0,
+        k_scale_cache.stride(1) if store_cache and codec.per_token_head else 0,
+        codec.native_id,
+        codec.rounding == "nearest_even",
         store_cache,
         key_cache.shape[1] if store_cache else 0,
         key_cache.stride(0) if store_cache else 0,
@@ -186,6 +216,7 @@ def qk_norm_rope(
         positions.stride(0) if positions.ndim == 2 else 0,
         positions.stride(-1),
         cache.shape[0],
+        key_cache.shape[0] * key_cache.shape[1] if store_cache else 0,
         tokens,
         slots.numel() if store_cache else 0,
         qkv.stride(0),
@@ -213,17 +244,20 @@ def _prepare_with_cache(
 ):
     from vllm.model_executor.layers.attention.attention import get_attention_context
     from vllm.utils.torch_utils import _resolve_layer_name
-    from vllm.v1.attention.backends.flash_v100.kv_layout import (
-        _split_paged_kv_cache,
-    )
 
     _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
     cache_args = {}
-    if slots is not None and kv_cache.numel() > 0:
-        key_cache, value_cache = _split_paged_kv_cache(kv_cache)
+    codec = resolve_kv_codec(layer.kv_cache_dtype)
+    if (
+        slots is not None
+        and kv_cache.numel() > 0
+        and codec is not None
+        and codec.native_id is not None
+    ):
+        view = KVCacheView.bind(kv_cache, codec, 256)
+        key_cache, value_cache = view.key, view.value
         eligible = (
-            layer.kv_cache_dtype in ("fp8", "fp8_e4m3")
-            and key_cache.dtype == value_cache.dtype == torch.uint8
+            codec.stores(key_cache, value_cache)
             and key_cache.ndim == value_cache.ndim == 4
             and key_cache.shape == value_cache.shape
             and key_cache.shape[2:] == (1, 256)
@@ -240,6 +274,8 @@ def _prepare_with_cache(
                 slots=slots,
                 k_scale=layer._k_scale,
                 v_scale=layer._v_scale,
+                kv_cache_dtype=codec.name,
+                **view.scale_kwargs,
             )
     qk_norm_rope(
         qkv,

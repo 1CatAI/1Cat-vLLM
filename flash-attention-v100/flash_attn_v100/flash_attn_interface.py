@@ -28,6 +28,7 @@ _xqa_staged_rescale_workspace_cache = {}
 _turboquant_decode_workspace_cache = {}
 _prefill_splitkv3_workspace_cache = {}
 _grouped_verify_workspace_cache = {}
+_prefill_codec_workspace_cache = {}
 logger = logging.getLogger(__name__)
 
 
@@ -1691,12 +1692,36 @@ def flash_attn_decode_paged_wmma(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     *,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
     _runtime=None,
 ):
     """Single-query decode using the paged-prefill WMMA compute order.
 
     ``q`` has the same [B, H, D] shape as ``flash_attn_decode_paged``.
     """
+    k_cache, v_cache, block_table, kv_cache_dtype, k_scale, v_scale = (
+        _bind_prefill_cache(
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            k_scale_cache,
+            v_scale_cache,
+            algorithm="decode_paged_wmma",
+            _runtime=_runtime,
+        )
+    )
+    binding = bind_kv(
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda,
+        "decode_paged_wmma",
+        kv_cache_dtype,
+        k_scale_cache,
+        v_scale_cache,
+    )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
@@ -1705,9 +1730,7 @@ def flash_attn_decode_paged_wmma(
     seq_lens = maybe_contiguous(seq_lens)
     out = maybe_contiguous(out)
 
-    return (
-        _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    ).decode_paged_wmma_fwd(
+    return binding.operation(
         q,
         k_cache,
         v_cache,
@@ -1718,6 +1741,7 @@ def flash_attn_decode_paged_wmma(
         kv_cache_dtype,
         float(k_scale),
         float(v_scale),
+        *binding.scale_args,
     )
 
 
@@ -1815,6 +1839,92 @@ def flash_attn_turboquant_decode_paged(
     )
 
 
+@torch.inference_mode(False)
+def _prefill_codec_workspace(key, table, *, _runtime=None):
+    """Borrow stream-local conversion storage, retaining prior graph addresses."""
+    cache = (
+        _runtime.prefill_codec_workspace_cache
+        if _runtime is not None
+        else _prefill_codec_workspace_cache
+    )
+    batch, pages = table.shape
+    page, heads, dim = key.shape[1:]
+    signature = (key.device, _workspace_stream_id(key.device), batch, page, heads, dim)
+    bank = cache.setdefault(signature, [])
+    for k, v, linear_table in bank:
+        if linear_table.shape[1] >= pages:
+            return (
+                k[: batch * pages],
+                v[: batch * pages],
+                linear_table.flatten()[: batch * pages].view(batch, pages),
+            )
+    # Initial capture allocations are retained by this runtime until graphs die.
+    k = torch.empty(
+        (batch * pages, page, heads, dim), device=key.device, dtype=torch.float16
+    )
+    v = torch.empty_like(k)
+    linear_table = torch.arange(
+        batch * pages, device=key.device, dtype=torch.int32
+    ).view(batch, pages)
+    bank.append((k, v, linear_table))
+    return k, v, linear_table
+
+
+def _bind_prefill_cache(
+    k,
+    v,
+    table,
+    lengths,
+    codec,
+    k_scale,
+    v_scale,
+    k_scale_cache,
+    v_scale_cache,
+    *,
+    algorithm="prefill_paged",
+    native_codecs=("auto", "float16", "fp8", "fp8_e4m3", "fp8_e5m2"),
+    _runtime=None,
+):
+    """Prefer the shared native codec binding; retain qualified legacy adapters.
+
+    The conversion capacity is the supplied table capacity. Callers trim eager
+    tables to live pages; capture uses its fixed declared capacity. No read
+    outside lengths contributes, and partial tensor-core tiles are zeroed.
+    """
+    native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    if int(getattr(native, f"{algorithm}_kv_abi", 0)) == 1:
+        bind_kv(native, algorithm, codec, k_scale_cache, v_scale_cache)
+        return k, v, table, codec, k_scale, v_scale
+    if codec in ("int8", "int8_per_token_head"):
+        # A rounded FP16 bridge is not a numerically qualified replacement for
+        # native row-scaled attention. Old binaries must fail before capture.
+        bind_kv(native, algorithm, codec, k_scale_cache, v_scale_cache)
+    if codec in native_codecs:
+        if k_scale_cache is not None or v_scale_cache is not None:
+            raise ValueError("Tensor-scale KV cannot consume row scale planes")
+        return k, v, table, codec, k_scale, v_scale
+    native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    # Resolve the binary before allocating scratch. Unknown codecs never enter
+    # a scalar or FP8 reader merely because their payload is one byte wide.
+    bind_kv(native, "paged_kv_to_fp16", codec, k_scale_cache, v_scale_cache)
+    ko, vo, converted_table = _prefill_codec_workspace(k, table, _runtime=_runtime)
+    paged_kv_to_fp16(
+        k,
+        v,
+        table,
+        lengths,
+        ko,
+        vo,
+        k_scale,
+        v_scale,
+        kv_cache_dtype=codec,
+        k_scale_cache=k_scale_cache,
+        v_scale_cache=v_scale_cache,
+        _runtime=_runtime,
+    )
+    return ko, vo, converted_table, "auto", 1.0, 1.0
+
+
 def flash_attn_prefill_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1832,8 +1942,32 @@ def flash_attn_prefill_paged(
     anchored_window: int = 0,
     dflash2_window_split: bool = True,
     *,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
     _runtime=None,
 ):
+    k_cache, v_cache, block_table, kv_cache_dtype, k_scale, v_scale = (
+        _bind_prefill_cache(
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            k_scale_cache,
+            v_scale_cache,
+            algorithm="prefill_paged",
+            _runtime=_runtime,
+        )
+    )
+    binding = bind_kv(
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda,
+        "prefill_paged",
+        kv_cache_dtype,
+        k_scale_cache,
+        v_scale_cache,
+    )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
@@ -1933,9 +2067,7 @@ def flash_attn_prefill_paged(
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
 
-    out_ = (
-        _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    ).prefill_paged_fwd(
+    out_ = binding.operation(
         q_,
         k_cache,
         v_cache,
@@ -1951,6 +2083,7 @@ def flash_attn_prefill_paged(
         int(window_size_right),
         anchor_lens,
         int(anchored_window),
+        *binding.scale_args,
     )
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
@@ -1961,6 +2094,54 @@ flash_attn_prefill_paged._sm70_dflash2_direct_bmhd = hasattr(
     flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd"
 )
 flash_attn_prefill_paged._sm70_dflash2_split_pages = (832, 1024, 1648, 2048)
+
+
+def paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    *,
+    kv_cache_dtype: str = "auto",
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
+    _runtime=None,
+) -> None:
+    """Expand active pages into an owner-provided, bounded FP16 workspace."""
+    native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    binding = bind_kv(
+        native, "paged_kv_to_fp16", kv_cache_dtype, k_scale_cache, v_scale_cache
+    )
+    codec = {
+        "auto": 0,
+        "float16": 0,
+        "fp8": 1,
+        "fp8_e4m3": 1,
+        "fp8_e5m2": 2,
+        "int8": 3,
+        "int8_per_token_head": 3,
+    }[kv_cache_dtype]
+    binding.operation(
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        key_out,
+        value_out,
+        codec,
+        float(k_scale),
+        float(v_scale),
+        *binding.scale_args,
+    )
+
+
+paged_kv_to_fp16.kv_cache_codecs = codec_names(  # type: ignore[attr-defined]
+    flash_attn_v100_cuda, "paged_kv_to_fp16"
+)
 
 
 def fp8_e4m3_paged_kv_to_fp16(
@@ -2035,8 +2216,33 @@ def flash_attn_prefill_paged_bfla(
     causal: bool = True,
     window_size: tuple = (-1, -1),
     *,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
     _runtime=None,
 ):
+    k_cache, v_cache, block_table, kv_cache_dtype, k_scale, v_scale = (
+        _bind_prefill_cache(
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            k_scale_cache,
+            v_scale_cache,
+            native_codecs=("auto", "float16"),
+            algorithm="prefill_paged_bfla",
+            _runtime=_runtime,
+        )
+    )
+    binding = bind_kv(
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda,
+        "prefill_paged_bfla",
+        kv_cache_dtype,
+        k_scale_cache,
+        v_scale_cache,
+    )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
@@ -2053,9 +2259,7 @@ def flash_attn_prefill_paged_bfla(
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
 
-    out_ = (
-        _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    ).prefill_paged_bfla_fwd(
+    out_ = binding.operation(
         q_,
         k_cache,
         v_cache,
@@ -2071,6 +2275,7 @@ def flash_attn_prefill_paged_bfla(
         causal,
         int(window_size_left),
         int(window_size_right),
+        *binding.scale_args,
     )
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
@@ -2091,8 +2296,33 @@ def flash_attn_prefill_paged_splitkv(
     split_kv_tokens: int = 32768,
     max_seq_len_hint: int = 0,
     *,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
     _runtime=None,
 ):
+    k_cache, v_cache, block_table, kv_cache_dtype, k_scale, v_scale = (
+        _bind_prefill_cache(
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            k_scale_cache,
+            v_scale_cache,
+            native_codecs=("auto", "float16", "fp8_e5m2"),
+            algorithm="prefill_paged_splitkv",
+            _runtime=_runtime,
+        )
+    )
+    binding = bind_kv(
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda,
+        "prefill_paged_splitkv",
+        kv_cache_dtype,
+        k_scale_cache,
+        v_scale_cache,
+    )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
@@ -2108,9 +2338,7 @@ def flash_attn_prefill_paged_splitkv(
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
 
-    out_ = (
-        _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    ).prefill_paged_splitkv_fwd(
+    out_ = binding.operation(
         q_,
         k_cache,
         v_cache,
@@ -2126,6 +2354,7 @@ def flash_attn_prefill_paged_splitkv(
         int(window_size_right),
         int(split_kv_tokens),
         int(max_seq_len_hint),
+        *binding.scale_args,
     )
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
@@ -2144,9 +2373,33 @@ def flash_attn_prefill_paged_bhmd(
     causal: bool = True,
     window_size: tuple = (-1, -1),
     *,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
     _runtime=None,
 ):
     """Paged prefill entry for tensors already laid out as [B, H, M, D]."""
+    k_cache, v_cache, block_table, kv_cache_dtype, k_scale, v_scale = (
+        _bind_prefill_cache(
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            kv_cache_dtype,
+            k_scale,
+            v_scale,
+            k_scale_cache,
+            v_scale_cache,
+            algorithm="prefill_paged",
+            _runtime=_runtime,
+        )
+    )
+    binding = bind_kv(
+        _runtime.native if _runtime is not None else flash_attn_v100_cuda,
+        "prefill_paged",
+        kv_cache_dtype,
+        k_scale_cache,
+        v_scale_cache,
+    )
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
@@ -2158,9 +2411,7 @@ def flash_attn_prefill_paged_bhmd(
     if window_size_left < -1 or window_size_right < -1:
         raise ValueError(f"Invalid window_size={window_size}; values must be >= -1")
 
-    return (
-        _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    ).prefill_paged_fwd(
+    return binding.operation(
         q,
         k_cache,
         v_cache,
@@ -2176,6 +2427,7 @@ def flash_attn_prefill_paged_bhmd(
         int(window_size_right),
         None,
         0,
+        *binding.scale_args,
     )
 
 
@@ -2281,3 +2533,15 @@ __all__ = [
     "flash_attn_prefill_paged_splitkv",
     "flash_attn_prefill_paged_bhmd",
 ]
+
+# Binary manifests, not payload byte widths, define native codec support.
+for _operation, _algorithm in (
+    (flash_attn_decode_paged_wmma, "decode_paged_wmma"),
+    (flash_attn_prefill_paged, "prefill_paged"),
+    (flash_attn_prefill_paged_bhmd, "prefill_paged"),
+    (flash_attn_prefill_paged_bfla, "prefill_paged_bfla"),
+    (flash_attn_prefill_paged_splitkv, "prefill_paged_splitkv"),
+):
+    _operation.kv_cache_codecs = codec_names(  # type: ignore[attr-defined]
+        flash_attn_v100_cuda, _algorithm
+    )

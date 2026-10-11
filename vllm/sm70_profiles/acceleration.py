@@ -394,7 +394,7 @@ def _flash_next_batch_report(cfg: VllmConfig) -> dict[str, Any]:
     }
 
 
-def _native_capabilities(page_size: int, policy) -> dict[str, bool]:
+def _native_capabilities(page_size: int, policy) -> dict[str, Any]:
     import torch
 
     # Register FA2 operators before probing availability.
@@ -408,13 +408,16 @@ def _native_capabilities(page_size: int, policy) -> dict[str, bool]:
     from flash_attn_v100 import (  # type: ignore[attr-defined]
         flash_attn_grouped_e4m3_fp32_available,
     )
+    from flash_attn_v100 import flash_attn_interface as public_attention
 
     # isort: split
     from vllm.v1.attention.backends.flash_v100.ops import (
         _get_sm70_d256_gqa_architecture_q8192_op,
     )
+    from vllm.v1.attention.kv_codecs import KV_CODECS
     from vllm.v1.attention.ops.sm70_grouped_long import (
         BUILTIN_MANIFEST,
+        builtin_codec_attention,
         builtin_long_attention,
         long_attention_enabled,
         long_attention_page_supported,
@@ -423,7 +426,35 @@ def _native_capabilities(page_size: int, policy) -> dict[str, bool]:
         scalar_tail_attention_available,
     )
 
+    # Obtain format support from the installed bindings. Keeping the manifest
+    # in the report makes a missing instance visible without claiming that a
+    # configured operation actually ran or passed its numerical/performance gate.
+    codec_bindings = {
+        name: sorted(
+            getattr(getattr(public_attention, symbol, None), "kv_cache_codecs", ())
+        )
+        for name, symbol in (
+            ("grouped_fp32", "flash_attn_grouped_fp32_paged"),
+            ("xqa", "flash_attn_decode_paged_xqa"),
+            ("scalar", "flash_attn_decode_paged"),
+            ("paged_prefill", "flash_attn_prefill_paged"),
+            ("splitkv_prefill", "flash_attn_prefill_paged_splitkv"),
+        )
+    }
+    for name, stem in (
+        ("long_context", "sm70_grouped_long"),
+        ("scalar_tail", "sm70_scalar_attention"),
+    ):
+        codec_bindings[name] = sorted(
+            {
+                codec.name
+                for codec in KV_CODECS
+                if builtin_codec_attention(stem, codec) is not None
+            }
+        )
+
     return {
+        "codec_bindings": codec_bindings,
         "fp16_grouped": hasattr(torch.ops._vllm_fa2_C, "sm70_grouped_fp16_fwd"),
         "fp16_short_splits": hasattr(
             torch.ops._vllm_fa2_C, "sm70_grouped_fp16_short_split_revision"
@@ -826,7 +857,32 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
             )
         },
     )
-    long_reason = grouped_reason or (
+    from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+    codec = resolve_kv_codec(dtype)
+    codec_name = codec.name if codec is not None else dtype
+    bindings = native.get("codec_bindings", {})
+    report["kv_native_bindings"] = bindings
+    common_grouped_reason = (
+        "user_override"
+        if not attention_options.value("e4m3_grouped_fp32")
+        else "operator_codec_missing:grouped_fp32"
+        if codec_name not in bindings.get("grouped_fp32", ())
+        else None
+    )
+    paths["grouped_fp32"] = _row(
+        common_grouped_reason,
+        kv_cache_dtype=codec_name,
+        scope="configured_native_capability",
+        runtime_guards="FP16 Q/output, D=256, GQA6; q2..8 or request-major q8; "
+        "16-aligned pages; row scales required by the codec",
+    )
+    long_binding_reason = (
+        common_grouped_reason
+        if codec_name in bindings.get("long_context", ())
+        else grouped_reason
+    )
+    long_reason = long_binding_reason or (
         "operator_missing:sm70_grouped_long_fwd"
         if not native["long_operator"]
         else (
@@ -838,6 +894,12 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
     paths["long_context"] = _row(long_reason, block_size=page_size)
     paths["scalar_tail"] = _row(
         long_reason
+        or (
+            "operator_codec_missing:scalar_tail"
+            if codec_name != "fp8_e4m3"
+            and codec_name not in bindings.get("scalar_tail", ())
+            else None
+        )
         or (
             "user_override"
             if (

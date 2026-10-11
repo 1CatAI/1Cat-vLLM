@@ -11,11 +11,13 @@ from vllm.logger import init_logger
 from vllm.v1.attention.kv_codecs import FP8_E4M3, resolve_kv_codec
 from vllm.v1.attention.ops.sm70_grouped_long import (
     BUILTIN_MAX_CONTEXT,
+    builtin_codec_attention,
     load_attention_library,
     long_attention_capability,
     resolve_long_attention,
     run_six_head_groups,
 )
+from vllm.v1.attention.ops.sm70_workspaces import workspace_cache
 
 logger = init_logger("vllm.v1.attention.ops.sm70_e4m3_scalar")
 
@@ -37,6 +39,24 @@ BUILTIN_SCALAR_MANIFEST = {
     # long-context contract it is admitted against.
     "max_context": BUILTIN_MAX_CONTEXT,
 }
+_WORKSPACES: dict = {}
+
+
+@torch.inference_mode(False)
+def _scalar_workspace(device, identity):
+    stream = (
+        torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else 0
+    )
+    cache = workspace_cache("grouped_scalar_workspaces", _WORKSPACES)
+    key = (device, stream, identity)
+    if key not in cache:
+        cache[key] = (
+            torch.empty((1, 6, 256, 256), dtype=torch.float32, device=device),
+            torch.empty((1, 6, 256), dtype=torch.float32, device=device),
+            torch.empty((1, 6, 256), dtype=torch.float32, device=device),
+            torch.full((1,), 256, dtype=torch.int32, device=device),
+        )
+    return cache[key]
 
 
 @lru_cache(maxsize=1)
@@ -57,7 +77,6 @@ def scalar_tail_attention_available() -> bool:
     return builtin_scalar_tail_attention() is not None
 
 
-@lru_cache(maxsize=4)
 def load_scalar_tail_attention(manifest_name: str, device: torch.device):
     if manifest_name:
         module, manifest = load_attention_library(manifest_name)
@@ -91,12 +110,8 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
         )
     # Allocate before memory profiling and graph capture. Model layers execute
     # serially on the worker stream; all target graphs retain this same storage.
-    buffers = (
-        torch.empty((1, 6, 256, 256), dtype=torch.float32, device=device),
-        torch.empty((1, 6, 256), dtype=torch.float32, device=device),
-        torch.empty((1, 6, 256), dtype=torch.float32, device=device),
-        torch.full((1,), 256, dtype=torch.int32, device=device),
-    )
+    identity = (manifest["library_sha256"], capability)
+    _scalar_workspace(device, identity)
     logger.info_once(
         "Loaded SM70 compact scalar tail attention: module=%s SHA256=%s; "
         "256 partitions, FP32 numerator/max/sum.",
@@ -122,7 +137,17 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
         partition_size_hint,
         anchor_lens,
         anchored_window,
+        k_scale_cache=None,
+        v_scale_cache=None,
     ) -> bool:
+        codec = resolve_kv_codec(kv_cache_dtype)
+        operator = module.run
+        if codec is not FP8_E4M3:
+            if manifest_name or codec is None:
+                return False
+            operator = builtin_codec_attention("sm70_scalar_attention", codec)
+            if operator is None:
+                return False
         descriptor = (
             get_forward_context().batch_descriptor
             if is_forward_context_available()
@@ -147,9 +172,8 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
             )
             and k.shape[2] * 6 == q.shape[1]
             and k.shape[3] == 256
-            and k.dtype == v.dtype == torch.uint8
+            and codec.stores(k, v)
             and v.shape == k.shape
-            and resolve_kv_codec(kv_cache_dtype) is FP8_E4M3
             and window_size == (-1, -1)
             and anchor_lens is None
             and anchored_window == 0
@@ -159,18 +183,35 @@ def load_scalar_tail_attention(manifest_name: str, device: torch.device):
         ):
             return False
         run_six_head_groups(
-            module.run,
+            operator,
             q,
             k,
             v,
             out,
             table,
             lengths,
-            *buffers,
+            *_scalar_workspace(device, identity),
             float(softmax_scale),
             float(k_scale),
             float(v_scale),
+            **(
+                {
+                    "codec": codec.native_id,
+                    "key_scales": k_scale_cache,
+                    "value_scales": v_scale_cache,
+                }
+                if codec is not FP8_E4M3
+                else {}
+            ),
         )
         return True
 
     return run
+
+
+def _clear_scalar_workspaces():
+    workspace_cache("grouped_scalar_workspaces", _WORKSPACES).clear()
+
+
+# Preserve the old reset hook without caching a closure across engine owners.
+load_scalar_tail_attention.cache_clear = _clear_scalar_workspaces  # type: ignore[attr-defined]
