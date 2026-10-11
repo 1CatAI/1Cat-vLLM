@@ -35,27 +35,42 @@ def _sm70_mhc_sqrsum_staging_kernel(
 
 
 @triton.jit
-def _sm70_mhc_dot_staging_kernel(
+def _sm70_mhc_prenorm_staging_kernel(
     x_ptr,
     fn_ptr,
     out_ptr,
+    sqrsum_ptr,
     x_stride_t,
     fn_stride_n,
     out_stride_s,
     out_stride_t,
+    sqrsum_stride_s,
+    sqrsum_stride_t,
+    N: tl.constexpr,
     K_PER_SPLIT: tl.constexpr,
+    SQRSUM_MULT: tl.constexpr,
+    WRITE_NORM: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     output_idx = tl.program_id(1)
     split_idx = tl.program_id(2)
     offsets = split_idx * K_PER_SPLIT + tl.arange(0, K_PER_SPLIT)
     x = tl.load(x_ptr + token_idx * x_stride_t + offsets).to(tl.float32)
-    weight = tl.load(fn_ptr + output_idx * fn_stride_n + offsets).to(tl.float32)
-    dot = tl.sum(x * weight, axis=0)
-    tl.store(
-        out_ptr + split_idx * out_stride_s + token_idx * out_stride_t + output_idx,
-        dot,
-    )
+    if N != 0:
+        weight = tl.load(fn_ptr + output_idx * fn_stride_n + offsets).to(tl.float32)
+        dot = tl.sum(x * weight, axis=0)
+        tl.store(
+            out_ptr + split_idx * out_stride_s + token_idx * out_stride_t + output_idx,
+            dot,
+        )
+    # One output column owns each norm partial. Keep the original FP32
+    # reductions and split boundaries; only the input load/launch is shared.
+    if WRITE_NORM and output_idx == 0:
+        sqrsum = tl.sum(x * x, axis=0) * SQRSUM_MULT
+        tl.store(
+            sqrsum_ptr + split_idx * sqrsum_stride_s + token_idx * sqrsum_stride_t,
+            sqrsum,
+        )
 
 
 def sm70_mhc_prenorm_staging(
@@ -89,25 +104,36 @@ def sm70_mhc_prenorm_staging(
     if k_per_split & (k_per_split - 1):
         raise ValueError("SM70 mHC prenorm split size must be a power of two")
 
-    _sm70_mhc_sqrsum_staging_kernel[(x.shape[0], n_splits)](
-        x,
-        gemm_out_sqrsum,
-        x.stride(0),
-        gemm_out_sqrsum.stride(0),
-        gemm_out_sqrsum.stride(1),
-        K_PER_SPLIT=k_per_split,
-        SQRSUM_MULT=sqrsum_mult,
-        num_warps=8,
-    )
-    _sm70_mhc_dot_staging_kernel[(x.shape[0], fn.shape[0], n_splits)](
+    # Larger partials lose occupancy when x stays live for both reductions.
+    # Preserve the separate norm launch for those existing split choices.
+    fuse_norm = k_per_split <= 4096
+    if not fuse_norm:
+        _sm70_mhc_sqrsum_staging_kernel[(x.shape[0], n_splits)](
+            x,
+            gemm_out_sqrsum,
+            x.stride(0),
+            gemm_out_sqrsum.stride(0),
+            gemm_out_sqrsum.stride(1),
+            K_PER_SPLIT=k_per_split,
+            SQRSUM_MULT=sqrsum_mult,
+            num_warps=8,
+        )
+    columns = max(1, fn.shape[0]) if fuse_norm else fn.shape[0]
+    _sm70_mhc_prenorm_staging_kernel[(x.shape[0], columns, n_splits)](
         x,
         fn,
         gemm_out_mul,
+        gemm_out_sqrsum,
         x.stride(0),
         fn.stride(0),
         gemm_out_mul.stride(0),
         gemm_out_mul.stride(1),
+        gemm_out_sqrsum.stride(0),
+        gemm_out_sqrsum.stride(1),
+        N=fn.shape[0],
         K_PER_SPLIT=k_per_split,
+        SQRSUM_MULT=sqrsum_mult,
+        WRITE_NORM=fuse_norm,
         num_warps=8,
     )
 
