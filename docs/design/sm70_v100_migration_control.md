@@ -2,6 +2,113 @@
 
 Date: 2026-05-30
 
+## Shared-path generalization: QSA query tiles, 2026-10-11
+
+Base `be3722bc095b9792bf9833068595f0b1ef70ad37` (`onecat/main`);
+native source `6d3c789a1f8370e5c4ba71bbe17d093e20c23810`.
+The first delivery moves QSA shared-key loading/admission to the common
+attention-ops owner and tiles queries across the existing eight-row CUDA kernel.
+The former model import forwards the same functions. Old binaries retain their
+eight-row fallback; FP16/H4/D128, one request and causal metadata remain required.
+`MAX_QUERY_ROWS` is the CUDA launch bound, not a measured performance range.
+The [eight-family queue](architecture/README.md#generalizing-existing-paths)
+separates implementation coverage, layout correctness, quality and tuning.
+
+CPU admission/old-binary checks pass 22 cases. All 19 distinct GPU cases pass:
+14 initial controls, four remaining negative-position/query-tile cases and one
+selector replay retest after installing its missing standard extension. The
+first selector failure was a missing `_C_stable_libtorch` target in the partial
+build, not a scoring error. Do not repeat the completed controls. Added cases
+cover M9/17/32, non-aligned columns, strided tensors, padded rows, invalid pages
+and changing live lengths during Graph replay. Existing unit tolerances remain;
+independent native tiles match exactly as an indexing oracle.
+
+All three normal CMake targets build, install and load from the owned source
+in a fresh process without sidecars, private library overlays or platform
+patches. Environment: one Tesla V100-SXM2-32GB, Python 3.12.13, Torch
+2.10.0+cu128, Triton 3.6.0, CUDA toolkit 12.8.93, NVIDIA 580.178.04. Artifact
+SHA256 values:
+
+- `_sm70_qsa_indexer_C`:
+  `1e8160781fadb3a679ef13018b6f24a18c564e2cd46153dd60c34224bf85068f`
+- `_C`:
+  `37ae3c4d09459a87d98a97375b3e5dd5a862a36a510ffae08d1641df57c4f772`
+- `_C_stable_libtorch`:
+  `5cb29547d7f3d62e6e0d1e9fe2d44a798e20ab4afaead8352416ffd324dd0c26`
+
+### Measured operator range
+
+The same-process ABBA Graph benchmark uses 12 synthetic layers, one request,
+FP16 compressed keys, four heads of width 128 and 204-key pages. Live lengths
+are 32,768/262,144 tokens; allocated capacities are separately recorded as
+33,456/262,752 tokens, compression ratio four. Each of the ten scorer cases
+observes 12 native dispatcher calls outside timed capture. The existing Triton
+scorer is the control; no clock settings were changed by this task.
+
+| Query rows | 32K control / candidate (ms) | Speedup | 256K control / candidate (ms) | Speedup |
+| --- | --- | --- | --- | --- |
+| 8 | 1.0400 / 0.2031 | 5.12x | 7.1105 / 0.8767 | 8.11x |
+| 9 | 1.0493 / 0.2132 | 4.92x | 7.8844 / 1.2821 | 6.15x |
+| 17 | 1.8990 / 0.3072 | 6.18x | 14.5061 / 2.1606 | 6.71x |
+| 33 | 4.1338 / 0.5105 | 8.10x | 27.4684 / 3.9022 | 7.04x |
+| 65 | 7.2345 / 0.8989 | 8.05x | 53.3764 / 7.4229 | 7.19x |
+
+All 116,767,152 compared scores pass `rtol=2e-6, atol=1e-5`; maximum observed
+absolute difference is `9.5367431640625e-6`. These times cover the 12-layer
+synthetic scorer graph, not model token latency. The accepted timing runs
+started after the standard extension build completed, with no second GPU
+workload on the measured device.
+
+At M17, the existing full score-to-selection chain gives:
+
+| Live tokens | Control / candidate (ms) | Speedup | Selection evidence |
+| --- | --- | --- | --- |
+| 32,768 | 2.3442 / 0.7777 | 3.01x | All output index arrays identical |
+| 262,144 | 15.7132 / 3.4242 | 4.59x | One of 204 query rows changes one of 512 selected blocks at a rounding boundary |
+
+Both caller-chain cases observe 12 native scoring calls. The 256K case retains
+511/512 blocks in the affected row; every other row is unchanged. Its two
+boundary candidates differ by approximately `2.90e-7` in FP64 score. This is a
+bounded operator difference, not an identical-output or model-quality claim.
+
+### Numerical decision and retained limits
+
+The first scorer sweep stopped at one of 1,670,904 M8/M9 scores: native and
+Triton differ by `2.2798776626586914e-6`, while their respective FP64 errors at
+that point are `1.4826840482734527e-6` and `7.971936143852387e-7`. Neither
+FP32 scorer is an exact reference. All selected top-512 sets in that diagnostic
+match, and tiled native execution equals independent native tiles.
+
+The benchmark therefore records a bounded absolute floor of `1e-5` while
+retaining `rtol=2e-6`. For changed selection rows it checks both arms against
+exact stable Top-K sets for their own scores, preserves expanded groups, causal
+tails and padding, and permits only boundary exchanges within the two score
+error budgets. It reports the overlap and boundary gap. The observed reference
+boundary gap is `4.76837158203125e-7`. Negative controls with a corrupt tail
+and a non-Top-K group are both rejected. Position-by-position equality alone
+would misclassify the boundary exchange: sorted block IDs shift 488 token slots
+although only one selected block changes. No model-generation equality gate is
+introduced.
+
+The host driver mismatch during compilation was resolved by an observed reboot
+after the other build, wheel packaging and installation completed. The initial
+automated reboot attempt required host administrator authentication. Preserve
+the completed builds and resolved dependency record; no rebuild or platform
+spoofing was needed for driver recovery.
+
+Raw evidence is retained under `runtime-path-generalization-20261011`:
+`qsa-gpu-tests.xml`, `qsa-scorer-remaining-tests.xml`, `qsa-selector-retest.xml`,
+`scorer-32k.json`, `scorer-256k.json`, `selection-32k.json`,
+`selection-256k.json`, both numerical/selection diagnostic JSON files,
+`selection-gate-check.json` and `runtime.json`. The benchmark version used
+before the selection-gate refinement and its hash are also retained.
+
+This qualifies the measured operator/caller range. Model task quality, startup
+parity, pure decode speed and 35B AWQ/FP8 parity remain unmeasured, so retain
+Draft status before wider default promotion. Other head geometries,
+multi-request native scoring and the separate Top-K capacity gap remain in
+the generalization queue; the ten measured points are not a runtime whitelist.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:
