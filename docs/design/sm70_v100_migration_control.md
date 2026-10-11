@@ -2,6 +2,33 @@
 
 Date: 2026-05-30
 
+## KV acceleration framework audit, 2026-10-11
+
+The [framework audit and INT8 plan](architecture/kv_acceleration_audit.md) freezes
+main `be3722bc095b9792bf9833068595f0b1ef70ad37`. This delivery is documentation only.
+It inventories all configured KV format families, Flash-V100's 57 named route
+declarations, fused writers, graph policy, grouped/speculative paths, QSA/host,
+sparse MLA/indexer and cache transfer. Declaration counts are not native hits.
+
+Retain A3's owners and the existing codec/route registries. Reuse the relevant
+parts of Drafts #1048/#1061/#1063 on current main; do not restore their old
+monolithic backend or duplicate their implementation. First close admission and
+physical/numerical codec contracts, then an INT8 token/head vertical slice,
+remaining acceleration families and cache lifecycle. G64 is still a proposal.
+
+Source tracing finds that INT8 can pass the broad Flash-V100 entry check while
+the scalar native fallback accepts only FP16/E4M3/E5M2. This is a source-level
+admission gap, not a new GPU reproduction. CPU checks give 286 passed / 1 failed;
+the failure is a pre-existing grouped-native AST-hash fixture mismatch. No
+fixture was regenerated and no runtime, GPU or default behavior changed.
+
+Do not repeat descriptor-only INT8 admission, per-format execution copies,
+unchecked native fallbacks, or whole-history FP16 conversion advertised as
+INT8 acceleration. Prior short-request RMSE used uncalibrated E4M3 comparison
+scales and establishes neither production accuracy nor speed. Preserve the
+FP16-scale finite-extreme overflow case and the separate same-criterion 35B
+AWQ/FP8 pure-decode acceptance target.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:

@@ -5,6 +5,11 @@ against main `18784e027`; former stacked native-codec dependencies are not
 assumed merged. Python `KV_CODECS` contains FP16, BF16, E4M3 and E5M2, not
 `Int8G64Codec`.
 
+The [2026-10-11 framework audit](kv_acceleration_audit.md) covers the wider
+format, native binding, graph, writer and cache-lifecycle boundaries. It proposes
+a token/head INT8 vertical slice before selecting G64, retains the FP16-scale
+overflow counterexample, and does not admit a new codec or change defaults.
+
 ## Reusable contracts and remaining work
 
 Existing codec admission, metadata and executors are reusable extension points.
