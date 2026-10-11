@@ -30,8 +30,10 @@ The restored V100 host builds and installs both normal CMake targets,
 `1e8160781fadb3a679ef13018b6f24a18c564e2cd46153dd60c34224bf85068f`;
 the core artifact SHA256 is
 `37ae3c4d09459a87d98a97375b3e5dd5a862a36a510ffae08d1641df57c4f772`.
-No sidecar or private native-library overlay is used. The benchmark's source
-import and argument-help smoke passes in a fresh process.
+No sidecar or private native-library overlay is used. Both packaged modules
+load in a fresh process; native capability and legacy/public function identity
+checks pass, with resolved library paths recorded. This loading check disables
+GPU execution. The benchmark's source import and argument-help smoke also pass.
 
 GPU execution is temporarily blocked by a host driver update during compilation:
 unattended upgrades installed NVIDIA 580.178.04 while the kernel still has
@@ -39,9 +41,12 @@ unattended upgrades installed NVIDIA 580.178.04 while the kernel still has
 `UnspecifiedPlatform`; the runner exits at its GPU-ownership check before
 executing QSA tests. A tiny CUDA allocation succeeds, but does not qualify the
 normal runtime route. The user authorized stopping the Studio inference service
-and rebooting after an unrelated active build finishes. Preserve both completed
-native builds; do not rebuild or bypass normal platform detection to address
-this driver mismatch.
+and rebooting after an unrelated active build finishes. That build, wheel
+packaging and installation completed at 15:12 +08:00. The subsequent normal
+reboot attempt failed because the host requires interactive administrator
+authentication; noninteractive sudo also requires a password. Machine-side
+reboot is pending. Preserve both completed native builds; do not rebuild or
+bypass normal platform detection to address this driver mismatch.
 
 After recovery, run the 19-case affected GPU suite, then the existing ABBA
 scorer benchmark at M8/9/17/33/65 with actual 32K and 256K live prefixes. The
