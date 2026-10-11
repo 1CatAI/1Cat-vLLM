@@ -41,6 +41,22 @@ FlashInfer imports. No kernel change was needed. These results do not admit
 performance or close complete QSA/model gates; see the
 [hardware record](../../flashinfer-sm70/docs/sm70/gpu-validation-20261011.md).
 
+The source-release check found that `tests/sm70/pytest.ini` was missing from
+the sdist. Its manifest now includes the standalone test configuration; the
+extracted artifact passes all 9 packaging tests, with the 31 GPU cases explicitly
+skipped on the CPU validation host. The CUDA 12.8 install example pins Torch
+2.10 and TVM-FFI 0.1.10 in its fresh environment. QSA screening also saves each
+completed point before proceeding, retaining earlier results if a later A/A
+check fails or execution is interrupted. These fixes do not change kernels.
+The first normal engine wheel also exposed QuACK's indirect CuTe dependency;
+SM70 metadata now removes QuACK while retaining it for other architectures.
+The engine and companion extensions compiled successfully, but a system driver
+update interrupted GPU availability. Build artifacts are backed up; the approved
+reboot needs interactive authentication before hardware work can resume. The
+hardware record distinguishes the pre-update passing tests from the pending
+performance run; do not repeat the failed capacity screen until the driver is
+consistent.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:

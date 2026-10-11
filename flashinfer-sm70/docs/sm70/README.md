@@ -22,8 +22,11 @@ environment (do not upgrade the engine stack):
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python build setuptools wheel packaging
 .venv/bin/python -m build --outdir dist
-# Use the CUDA 12.8 Torch index and the engine's pinned dependencies on V100.
-uv pip install --python .venv/bin/python dist/flashinfer_python-*.whl
+# Install the validated runtime explicitly in this fresh environment.
+uv pip install --python .venv/bin/python \
+  --index-url https://download.pytorch.org/whl/cu128 'torch==2.10.0'
+uv pip install --python .venv/bin/python \
+  'apache-tvm-ffi==0.1.10' dist/flashinfer_python-*.whl
 uv pip install --python .venv/bin/python pytest
 .venv/bin/python -m pytest -c tests/sm70/pytest.ini --confcutdir=tests/sm70 tests/sm70
 ```
@@ -33,7 +36,9 @@ requires an environment without vLLM. Run GPU tests from the same ordinary
 installed wheel in a fresh process; no source overlay or private library mount.
 The wheel includes the CUDA sources and headers used for JIT. It is currently a
 source/JIT wheel, **not an accepted AOT binary release**. The sdist contains the
-build backend, pinned provenance, licenses and required build sources.
+build backend, pinned provenance, licenses, required build sources and the
+standalone tests with their `pytest.ini` configuration. Run the same test command
+from the extracted sdist when validating a source release.
 
 The base install does not install CuTe DSL, CUDA 13, cuda-tile or EP backends and
 does not execute the upstream installer hooks that modify Torch/NCCL. The

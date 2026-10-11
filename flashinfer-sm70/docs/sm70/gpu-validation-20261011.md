@@ -64,12 +64,39 @@ rather than attributing interpreter startup work to this library. The failed log
 and JUnit record are retained alongside the passing run; no production change
 was needed for this failure.
 
+## Normal engine build and driver interruption
+
+The normal engine wheel from source `b41c0c7aa884` built and installed successfully:
+`1cat_vllm-1.5.2+fi.sm70.b41c0c7-cp312-cp312-linux_x86_64.whl`, SHA256
+`d9a89efa3309fbf710763c2860c0b128713af8c413bfb5438e1541524a7dd898`.
+Its 19 native libraries include the engine, QSA indexer, Flash-V100 and FlashQLA.
+Native `csrc`, the CMake file and the CMake directory are identical to the main
+baseline; no previous task's compiled engine extension is reused. The wheel
+and build/test logs are saved on the validation host and locally.
+
+Dependency validation of this first engine artifact found three missing runtime
+packages (cuDNN frontend, CUDA 12.8.93 compiler and CUDA 12.8.90 CCCL) and an
+unnecessary QuACK requirement. QuACK would reintroduce CuTe DSL transitively;
+the SM70 metadata now omits it, with the non-SM70 requirement preserved and both
+metadata tests passing. Regenerate the normal wheel with this metadata fix and
+install its declared dependencies before engine timing. The standalone operator
+environment is separate and its dependency check already passed.
+
+During engine compilation the host's system package update replaced NVIDIA
+driver libraries with `580.178.04`, while the running kernel still had
+`580.173.02`. NVML reports a driver/library mismatch; the new matching kernel
+module is present on disk. The first capacity-screen attempt stopped at this
+hardware check before executing any GPU benchmark. No timing result exists.
+The user approved reboot after compilation and artifact preservation. Both are
+complete; the desktop reboot request timed out and the system interface requires
+interactive administrator authentication. Hardware validation awaits completion
+of that reboot. Keep the original 40-test record under `pre-driver-update` and
+repeat it after confirming the new driver before measuring any candidate.
+
 ## Performance and remaining gates
 
-No speed claim follows from these correctness tests. A normal engine wheel is
-being built from the owned source for a paired comparison against the existing
-QSA route. Its native `csrc`, CMake file and CMake directory are identical to
-the main baseline; no previous task's compiled engine extension is reused.
+No speed claim follows from correctness or compilation. Paired engine scoring
+and selection measurements have not run successfully.
 
 Score/selection screening, complete QSA, text C1/C4, MTP rollback/acceptance,
 D72 vision, HC/MoE/GDN/PLE/output chains and shared Qwen3.6 regressions remain

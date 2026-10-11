@@ -43,12 +43,16 @@ def test_provider_is_exclusive_and_arch_specific(sm70):
     if sm70:
         version = (ROOT / "flashinfer-sm70/version.txt").read_text().strip()
         assert str(providers[0].specifier) == f"=={version}"
-        assert not {"flashinfer-cubin", "nvidia-cutlass-dsl", "humming-kernels"} & {
-            r.name for r in requirements
-        }
+        assert not {
+            "flashinfer-cubin",
+            "nvidia-cutlass-dsl",
+            "quack-kernels",
+            "humming-kernels",
+        } & {r.name for r in requirements}
         assert [
             str(r.specifier) for r in requirements if r.name == "apache-tvm-ffi"
         ] == ["==0.1.10"]
     else:
         assert str(providers[0].specifier) == "==0.6.11.post2"
         assert "flashinfer-cubin" in {r.name for r in requirements}
+        assert "quack-kernels" in {r.name for r in requirements}

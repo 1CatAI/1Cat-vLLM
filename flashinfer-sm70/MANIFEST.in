@@ -10,7 +10,7 @@ recursive-include 3rdparty/cccl/thrust/thrust *
 recursive-include 3rdparty/cccl/libcudacxx/include *
 recursive-include 3rdparty/spdlog/include *
 include 3rdparty/*/LICENSE*
-recursive-include tests/sm70 *.py
+recursive-include tests/sm70 *.py *.ini
 recursive-include benchmarks/sm70 *.py
 recursive-include docs/sm70 *.md *.json
 global-exclude __pycache__ *.pyc *.so *.o

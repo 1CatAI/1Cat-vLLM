@@ -1281,6 +1281,7 @@ def get_requirements() -> list[str]:
                 "flashinfer-cubin",
                 "apache-tvm-ffi",
                 "nvidia-cutlass-dsl",
+                "quack-kernels",  # CuTe DSL would otherwise return transitively.
                 "humming-kernels",
             )
             requirements = [

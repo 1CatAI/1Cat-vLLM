@@ -154,7 +154,17 @@ def main():
             aa_relative = abs(aa["candidate_ms"] / aa["control_ms"] - 1)
             if aa_relative > 0.02:
                 args.out.write_text(
-                    json.dumps({"status": "unstable_A_A", "m": m, "aa": aa}, indent=2)
+                    json.dumps(
+                        {
+                            "status": "unstable_A_A",
+                            "m": m,
+                            "context": args.context,
+                            "full_selection": full_selection,
+                            "aa": aa,
+                            "completed_results": results,
+                        },
+                        indent=2,
+                    )
                     + "\n"
                 )
                 raise RuntimeError(
@@ -189,8 +199,9 @@ def main():
                 native=scorers[0].plan.provenance() if args.flashinfer else None,
             )
             results.append(row)
+            # Preserve completed points if a later shape fails or is interrupted.
+            args.out.write_text(json.dumps(results, indent=2) + "\n")
             print(row, flush=True)
-    args.out.write_text(json.dumps(results, indent=2) + "\n")
 
 
 if __name__ == "__main__":
