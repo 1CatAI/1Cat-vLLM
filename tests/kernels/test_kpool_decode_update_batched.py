@@ -24,6 +24,7 @@ green here.
 """
 
 import math
+from functools import partial
 
 import pytest
 import torch
@@ -32,6 +33,23 @@ from vllm.models.glm5next.nvidia.ops.kpool_compress import (
     kpool_compress_and_write_cache,
     kpool_decode_update_and_maybe_write_cache_batched,
 )
+from vllm.v1.attention.kv_codecs import KV_REPRESENTATION_CODECS
+
+
+@pytest.fixture(autouse=True, params=KV_REPRESENTATION_CODECS, ids=lambda c: c.name)
+def cache_codec(request, monkeypatch):
+    codec = request.param
+    monkeypatch.setitem(globals(), "_CACHE_CODEC", codec.name)
+    for name in (
+        "kpool_compress_and_write_cache",
+        "kpool_decode_update_and_maybe_write_cache_batched",
+    ):
+        monkeypatch.setitem(
+            globals(), name, partial(globals()[name], cache_dtype=codec.name)
+        )
+
+
+_CACHE_CODEC = "fp8_e4m3"
 
 HEAD_DIM = 128
 POOL_SIZE = 16
@@ -171,14 +189,20 @@ def _torch_reference(
                 acc = (pool_ks * prob).sum(dim=0)
                 x = (acc / denom).to(torch.bfloat16).to(torch.float32)
                 x = _hadamard128_torch(x).to(torch.bfloat16).to(torch.float32)
-                absmax = torch.clamp(x.abs().max(), min=1e-4)
-                if ROUND_SCALE:
-                    scale = torch.exp2(torch.ceil(torch.log2(absmax / FP8_MAX)))
+                if _CACHE_CODEC == "int8":
+                    scale = torch.clamp(x.abs().max() / 127.0, min=1e-6)
+                    quantized = torch.clamp(torch.round(x / scale), -128, 127).to(
+                        torch.int8
+                    )
                 else:
-                    scale = absmax / FP8_MAX
-                quantized = torch.clamp(x / scale, -FP8_MAX, FP8_MAX).to(
-                    torch.float8_e4m3fn
-                )
+                    absmax = torch.clamp(x.abs().max(), min=1e-4)
+                    if ROUND_SCALE:
+                        scale = torch.exp2(torch.ceil(torch.log2(absmax / FP8_MAX)))
+                    else:
+                        scale = absmax / FP8_MAX
+                    quantized = torch.clamp(x / scale, -FP8_MAX, FP8_MAX).to(
+                        torch.float8_e4m3fn
+                    )
                 # write K and scale at the separated-layout offsets
                 loc = cache_loc
                 loc_page_index = loc // PAGE_SIZE

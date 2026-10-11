@@ -128,7 +128,7 @@ W02 是缺原生绑定的事实，不是已经测得 Triton 比 CUDA 慢；接�
 | R03 | host history 写入/保护、FP16 hot cache、miss gather、直接 host/device history attention | history 独立支持动态 E4M3 或 FP16；`self.fp8` / `template<bool FP8>` 选择解码；没有 INT8 history codec。hot cache 的 FP16 数学表示可以保留，INT8 应接入 history 编码、miss 读取和一起搬运的 scales |
 | R04 | DeepSeek sparse MLA：paged、split-K、QK-D split、gathered/BMM prefill；压缩与 SWA | G64/exponent scales 与 FP16 RoPE 专用表示，尚无 INT8；应复用各算法及公共 index/merge，补表示级读写，不套普通 token/head 布局 |
 | R05 | GLM NoPE latent MLA：直接 paged、B1 gather+GEMM、M2..8 batched GEMM、较大行数 paged | **本轮单独补记**。512 维 latent、G64 exponent scale、520-byte slot 契约，现有专门 E4M3 实现；缺 INT8，不能只检查 DeepSeek sparse 就宣布 MLA 全覆盖 |
-| R06 | MLA indexer：paged score、Tensor Core scorer、gather/cuBLAS、KPool 压缩及 quant/cache | 索引缓存直接解析 E4M3 payload + FP32 scale（或独立 FP4 表示），未接 INT8；注意索引缓存与 attention KV 的选择不是一个字段，也不应强制一起变更 |
+| R06 | MLA indexer：paged score、Tensor Core scorer、gather/cuBLAS、KPool 压缩及 quant/cache | 公共 G128 codec/view、CUDA writer、Triton scorer、gather/cuBLAS 和 KPool 已接 E4M3/INT8；122 项 SM70 GPU 组件测试通过。独立 `AttentionConfig.indexer_cache_dtype`，`auto` 保留旧选择；原生 ABI 缺失在写入前拒绝。DeepSeek 融合 compressor 的执行证据、代表性引擎、质量与性能仍开放，不以组件测试关闭全部验收 |
 | R07 | 通用 Triton MLA prefill/decode | 当前 backend 格式声明只有 FP16/BF16/FP8，没有普通 INT8；普通 Triton attention 的 INT8 支持不能代替 MLA 支持 |
 | R08 | TurboQuant store/decode | 旋转、低比特编码与查询变换为独立数学表示；不是一个尚漏 INT8 绑定的 FP8 快路径。可共享资源和准入框架，不能用 INT8 名称抹掉算法区别 |
 

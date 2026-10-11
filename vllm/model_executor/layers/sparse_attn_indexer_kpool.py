@@ -70,6 +70,7 @@ def _kpool_compress_insert(
     kpool: int,
     head_dim: int,
     round_scale: bool,
+    cache_dtype: str = "fp8",
 ) -> None:
     """Pool ``kpool`` consecutive tokens into one fp8 K and write at pool slots.
 
@@ -104,6 +105,7 @@ def _kpool_compress_insert(
         round_scale=round_scale,
         write_cache=True,
         return_compressed=False,
+        cache_dtype=cache_dtype,
     )
 
 
@@ -274,17 +276,18 @@ def sparse_attn_indexer_kpool(
     # path and when the tail cache is disabled.
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    cache_dtype: str = "fp8",
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
-    fp8_dtype = current_platform.fp8_dtype()
+    key_dtype = torch.int8 if cache_dtype == "int8" else current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            total_seq_lens, head_dim, key_dtype, use_fp4_cache
         )
         current_workspace_manager().get_simultaneous(
             values_spec,
@@ -333,6 +336,7 @@ def sparse_attn_indexer_kpool(
             topk_indices_buffer,
             skip_k_cache_insert,
             use_fp4_cache,
+            cache_dtype=cache_dtype,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -347,7 +351,7 @@ def sparse_attn_indexer_kpool(
     if sm70_fp16_indexer:
         assert q_quant.dtype == torch.float16
         assert q_scale is None
-        assert not use_fp4_cache, "SM70 requires the FP8 indexer cache"
+        assert not use_fp4_cache, "SM70 requires a byte indexer cache"
     elif use_fp4_cache:
         assert q_scale is not None, "use_fp4_cache=True requires q_scale"
     else:
@@ -382,6 +386,7 @@ def sparse_attn_indexer_kpool(
                     index_kpool,
                     head_dim,
                     round_scale=(scale_fmt is not None),
+                    cache_dtype=cache_dtype,
                 )
                 # Persist each request's incomplete prefill pool so decode can
                 # finish it, including after PD transfer. Tail slots use
@@ -413,6 +418,7 @@ def sparse_attn_indexer_kpool(
                 slot_mapping,
                 quant_block_size,
                 scale_fmt,
+                cache_dtype=cache_dtype,
             )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
@@ -462,7 +468,7 @@ def sparse_attn_indexer_kpool(
         # scales) based on use_fp4_cache.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            total_seq_lens, head_dim, key_dtype, use_fp4_cache
         )
         k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
             values_spec,
@@ -507,6 +513,7 @@ def sparse_attn_indexer_kpool(
                     k_quant,
                     k_scale,
                     weights[chunk.token_start : chunk.token_end],
+                    cache_dtype=cache_dtype,
                 )
             else:
                 logits = fp8_fp4_mqa_logits(
@@ -704,6 +711,7 @@ def sparse_attn_indexer_kpool(
                     index_kpool,
                     head_dim,
                     round_scale=(scale_fmt is not None),
+                    cache_dtype=cache_dtype,
                 )
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
@@ -767,6 +775,7 @@ def sparse_attn_indexer_kpool(
                 indexer_decode_cublas=get_forward_context()
                 .no_compile_layers[k_cache_prefix]
                 .sm70_sparse.indexer_decode_cublas,
+                cache_dtype=cache_dtype,
             )
         else:
             logits = fp8_fp4_paged_mqa_logits(
@@ -902,6 +911,7 @@ def sparse_attn_indexer_kpool_fake(
     positions: torch.Tensor | None = None,
     tail_kv_cache: torch.Tensor | None = None,
     tail_prefix: str | None = None,
+    cache_dtype: str = "fp8",
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -959,11 +969,16 @@ class SparseAttnIndexerKpool(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if (
-            current_platform.is_cuda()
-            and not _is_exact_sm70_cuda()
-            and not has_deep_gemm()
-        ):
+        config = get_current_vllm_config_or_none()
+        self.cache_dtype = (
+            config.attention_config.resolved_indexer_cache_dtype
+            if config is not None
+            else "fp8"
+        )
+        byte_scorer = _is_exact_sm70_cuda()
+        if self.cache_dtype == "int8" and (use_fp4_cache or not byte_scorer):
+            raise ValueError("INT8 indexer needs a byte-cache scorer on this device")
+        if current_platform.is_cuda() and not byte_scorer and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
@@ -1040,6 +1055,7 @@ class SparseAttnIndexerKpool(CustomOp):
             positions,
             self.tail_cache.kv_cache if self.tail_cache is not None else None,
             self.tail_cache.prefix if self.tail_cache is not None else None,
+            self.cache_dtype,
         )
 
     def forward_hip(

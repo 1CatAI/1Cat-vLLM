@@ -101,6 +101,53 @@ class KVCacheView:
         return self.page_stride_bytes - self.page_size_bytes
 
     @classmethod
+    def bind_indexer(
+        cls, cache: torch.Tensor, codec: KVCodec, head_size: int
+    ) -> "KVCacheView":
+        """Borrow block-major payload/group scales, including padded pages.
+
+        The indexer has one key plane. Its value and scale aliases preserve
+        the public view contract without allocating or duplicating that plane.
+        """
+        if codec.representation != "indexer" or codec.layout != "group_planar":
+            raise ValueError("Indexer binding requires its group representation")
+        if (
+            cache.ndim != 3
+            or cache.dtype not in (torch.uint8, torch.int8)
+            or cache.stride(-1) != 1
+            or head_size <= 0
+            or codec.group_size <= 0
+            or head_size % codec.group_size
+        ):
+            raise ValueError("Expected byte indexer pages with complete groups")
+        pages, tokens, capacity = cache.shape
+        groups = head_size // codec.group_size
+        page_size = tokens * (head_size + groups * 4)
+        page_stride = cache.stride(0)
+        base = cache.storage_offset()
+        if capacity < head_size + groups * 4 or page_stride < page_size:
+            raise ValueError("Indexer carrier does not reserve payload and scales")
+        if base % 4 or page_stride % 4:
+            raise ValueError("Indexer scale addresses require four-byte alignment")
+        if (
+            pages
+            and base + (pages - 1) * page_stride + page_size
+            > cache.untyped_storage().nbytes()
+        ):
+            raise ValueError("Indexer regions exceed the allocation")
+        key = cache.view(codec.storage_dtype).as_strided(
+            (pages, tokens, 1, head_size),
+            (page_stride, head_size, head_size, 1),
+        )
+        scales = torch.empty(0, dtype=torch.float32, device=cache.device).set_(
+            cache.untyped_storage(),
+            (base + tokens * head_size) // 4,
+            (pages, tokens, groups),
+            (page_stride // 4, groups, 1),
+        )
+        return cls(codec, key, key, scales, scales, page_stride, page_size)
+
+    @classmethod
     def bind(cls, cache: torch.Tensor, codec: KVCodec, head_size: int) -> "KVCacheView":
         """Bind a runner-owned ``[page, 2, token, head, storage]`` carrier.
 
@@ -108,6 +155,8 @@ class KVCacheView:
         only this view describes their interpretation. Dense and legacy inline
         layouts use the carrier's actual strides, including HND and page padding.
         """
+        if codec.representation != "ordinary":
+            raise ValueError("Ordinary KV binding requires an ordinary representation")
         if cache.ndim != 5 or cache.shape[1] != 2 or cache.stride(-1) != 1:
             raise ValueError("Expected a paged KV carrier with contiguous head storage")
         if cache.dtype != codec.storage_dtype:

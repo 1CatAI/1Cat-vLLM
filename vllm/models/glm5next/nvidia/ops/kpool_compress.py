@@ -19,6 +19,8 @@ from vllm.models.deepseek_v4.common.ops.fp8_software import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
+from vllm.v1.attention.ops.kv_codec import encode_indexer_cache_group
 
 # The GLM-5.3-Flash indexer head dimension is fixed at 128.
 INDEX_HEAD_DIM = 128
@@ -293,6 +295,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     SOFTWARE_FP8: tl.constexpr,
     MATERIALIZE_FP16: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     """One program per pool. softmax(slot_score+ape)-weighted sum of slot_k ->
     Hadamard-128 -> per-vector fp8 absmax quant -> write to cache at ``loc``."""
@@ -358,19 +361,7 @@ def _kpool_softmax_rotate_write_cache_kernel(
     else:
         x = x.to(tl.bfloat16).to(tl.float32)
 
-    # --- per-vector absmax fp8 quant ---
-    fp8_max = 448.0
-    fp8_max_inv = 1.0 / fp8_max
-    absmax = tl.max(tl.abs(x), axis=0)
-    absmax = tl.maximum(absmax, 1e-4)
-    if ROUND_SCALE:
-        scale = tl.exp2(tl.ceil(tl.log2(absmax * fp8_max_inv)))
-    else:
-        scale = absmax * fp8_max_inv
-    quantized = x / scale
-    quantized = tl.minimum(tl.maximum(quantized, -fp8_max), fp8_max)
-    if SOFTWARE_FP8:
-        quantized = fp32_to_fp8_e4m3fn_bits(quantized)
+    quantized, scale = encode_indexer_cache_group(x, CODEC, ROUND_SCALE, SOFTWARE_FP8)
 
     if WRITE_CACHE:
         loc = tl.load(loc_ptr + row, mask=do_write, other=0)
@@ -410,6 +401,7 @@ def kpool_compress_and_write_cache(
     round_scale: bool = True,
     return_compressed: bool = False,
     write_cache: bool = True,
+    cache_dtype: str = "fp8",
 ):
     """Compress ``pool_size`` tokens into one fp8 K and write at ``loc``.
 
@@ -420,6 +412,9 @@ def kpool_compress_and_write_cache(
         ape: ``[pool_size, head_dim]`` fp32 — per-slot position bias.
         loc: ``[n_pools]`` int64 — flat physical slot per pool.
     """
+    codec = resolve_kv_codec(cache_dtype, representation="indexer")
+    if codec is None:
+        raise ValueError(f"Unsupported indexer cache codec: {cache_dtype}")
     assert slot_k.ndim == 3
     assert slot_score.shape == slot_k.shape
     assert ape.shape == slot_k.shape[1:]
@@ -451,7 +446,7 @@ def kpool_compress_and_write_cache(
             return (
                 torch.empty(
                     (0, head_dim),
-                    dtype=torch.float8_e4m3fn,
+                    dtype=codec.element_dtype,
                     device=slot_k.device,
                 ),
                 torch.empty((0,), dtype=torch.float32, device=slot_k.device),
@@ -459,7 +454,7 @@ def kpool_compress_and_write_cache(
         return None
 
     software_fp8 = _is_exact_sm70_cuda()
-    buf_fp8 = buf if software_fp8 else buf.view(torch.float8_e4m3fn)
+    buf_fp8 = buf.view(torch.uint8)
     buf_fp32 = buf.view(torch.float32)
     # bytes per page (last dim of kv_cache) viewed as uint8
     buf_numel_per_page = buf.stride(0)
@@ -468,7 +463,7 @@ def kpool_compress_and_write_cache(
     if return_compressed:
         compressed_k = torch.empty(
             (slot_k.shape[0], head_dim),
-            dtype=torch.float8_e4m3fn,
+            dtype=codec.element_dtype,
             device=slot_k.device,
         )
         compressed_scale = torch.empty(
@@ -478,11 +473,7 @@ def kpool_compress_and_write_cache(
         compressed_k = buf_fp8
         compressed_scale = buf_fp32
 
-    compressed_k_ptr = (
-        compressed_k.view(torch.uint8)
-        if software_fp8 and compressed_k.dtype == torch.float8_e4m3fn
-        else compressed_k
-    )
+    compressed_k_ptr = compressed_k.view(torch.uint8)
 
     _kpool_softmax_rotate_write_cache_kernel[(slot_k.shape[0],)](
         buf_fp8,
@@ -509,6 +500,7 @@ def kpool_compress_and_write_cache(
         RETURN_COMPRESSED=return_compressed,
         WRITE_CACHE=write_cache,
         SOFTWARE_FP8=software_fp8,
+        CODEC=codec.native_id,
         MATERIALIZE_FP16=slot_k.dtype == torch.float16,
         BLOCK_D=triton.next_power_of_2(head_dim),
     )
@@ -619,6 +611,7 @@ def _kpool_decode_update_batched_kernel(
     SOFTWARE_FP8: tl.constexpr,
     MATERIALIZE_FP16: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     """One program per request; iterates its NEXT_N verify tokens in order.
 
@@ -731,16 +724,9 @@ def _kpool_decode_update_batched_kernel(
             else:
                 x = x.to(tl.bfloat16).to(tl.float32)
 
-            fp8_max = 448.0
-            fp8_max_inv = 1.0 / fp8_max
-            absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
-            if ROUND_SCALE:
-                scale = tl.exp2(tl.ceil(tl.log2(absmax * fp8_max_inv)))
-            else:
-                scale = absmax * fp8_max_inv
-            quantized = tl.minimum(tl.maximum(x / scale, -fp8_max), fp8_max)
-            if SOFTWARE_FP8:
-                quantized = fp32_to_fp8_e4m3fn_bits(quantized)
+            quantized, scale = encode_indexer_cache_group(
+                x, CODEC, ROUND_SCALE, SOFTWARE_FP8
+            )
 
             loc = cache_loc.to(tl.int64)
             loc_page_index = loc // PAGE_SIZE
@@ -787,6 +773,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     pool_size: int,
     head_dim: int = INDEX_HEAD_DIM,
     round_scale: bool = True,
+    cache_dtype: str = "fp8",
 ) -> None:
     """Batched decode-step kpool update for spec verify (``next_n > 1``).
 
@@ -807,6 +794,9 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         ape: ``[pool_size, head_dim]`` fp32.
         slot_mapping / positions: ``[num_requests, next_n]`` int32.
     """
+    codec = resolve_kv_codec(cache_dtype, representation="indexer")
+    if codec is None:
+        raise ValueError(f"Unsupported indexer cache codec: {cache_dtype}")
     num_requests, next_n = key.shape[0], key.shape[1]
     if num_requests == 0 or next_n == 0:
         return
@@ -830,7 +820,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
     page_size = kv_cache.shape[1]
     buf = kv_cache
     software_fp8 = _is_exact_sm70_cuda()
-    buf_fp8 = buf if software_fp8 else buf.view(torch.float8_e4m3fn)
+    buf_fp8 = buf.view(torch.uint8)
     buf_fp32 = buf.view(torch.float32)
 
     # The kernel indexes the int tensors as ``req * next_n + t`` (row-major),
@@ -866,6 +856,7 @@ def kpool_decode_update_and_maybe_write_cache_batched(
         S_OFFSET_NBYTES_IN_PAGE=page_size * head_dim,
         ROUND_SCALE=round_scale,
         SOFTWARE_FP8=software_fp8,
+        CODEC=codec.native_id,
         MATERIALIZE_FP16=key.dtype == torch.float16,
         BLOCK_D=triton.next_power_of_2(head_dim),
     )

@@ -682,16 +682,18 @@ __global__ void concat_and_cache_ds_mla_kernel(
       *reinterpret_cast<const uint64_t*>(result);
 }
 
-template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+template <typename scalar_t, bool INT8>
 __global__ void indexer_k_quant_and_cache_kernel(
     const scalar_t* __restrict__ k,  // [num_tokens, head_dim]
-    cache_t* __restrict__ kv_cache,  // [num_blocks, block_size, cache_stride]
+    uint8_t* __restrict__ kv_cache, float* __restrict__ scales,
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int head_dim,                        // dimension of each head
     const int quant_block_size,                // quantization block size
     const int cache_block_size,                // cache block size
-    const int cache_stride,  // stride for each token in kv_cache
-
+    const int64_t source_stride, const int64_t cache_block_stride,
+    const int64_t cache_token_stride, const int64_t scale_block_stride,
+    const int64_t scale_token_stride, const int64_t scale_group_stride,
+    const int64_t slot_capacity,
     const bool use_ue8m0  // use ue8m0 scale format
 ) {
   constexpr int VEC_SIZE = 4;
@@ -704,16 +706,19 @@ __global__ void indexer_k_quant_and_cache_kernel(
   const int64_t block_offset = slot_idx % cache_block_size;
 
   // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0 || (head_dim_idx >= head_dim)) {
+  if (slot_idx < 0 || slot_idx >= slot_capacity || head_dim_idx >= head_dim) {
     return;
   }
 
-  float2 k_val = (reinterpret_cast<const float2*>(
-      k))[(token_idx * head_dim + head_dim_idx) / VEC_SIZE];
-  scalar_t* k_val_ptr = reinterpret_cast<scalar_t*>(&k_val);
+  float values[VEC_SIZE];
   float amax = 0.0f;
+  bool invalid = false;
+#pragma unroll
   for (int i = 0; i < VEC_SIZE; i++) {
-    amax = fmaxf(amax, fabsf(float(k_val_ptr[i])));
+    values[i] =
+        static_cast<float>(k[token_idx * source_stride + head_dim_idx + i]);
+    amax = fmaxf(amax, fabsf(values[i]));
+    if constexpr (INT8) invalid |= !isfinite(values[i]);
   }
 
   // Reduced amax
@@ -726,23 +731,35 @@ __global__ void indexer_k_quant_and_cache_kernel(
   }
 
   float scale = fmaxf(amax, 1e-4) / kFp8ScaleDivisor;
-
-  if (use_ue8m0) {
+#ifndef USE_ROCM
+  if constexpr (INT8) {
+    invalid = __any_sync(0xffffffffu, invalid);
+    scale = flash_v100::KVInt8RowEncoder<true>::scale(amax, invalid);
+  } else
+#endif
+      if (use_ue8m0) {
     scale = exp2f(ceilf(log2f(scale)));
   }
 
-  const int64_t dst_offset = block_idx * cache_block_size * cache_stride +
-                             block_offset * head_dim + head_dim_idx;
+  const int64_t dst_offset = block_idx * cache_block_stride +
+                             block_offset * cache_token_stride + head_dim_idx;
+#pragma unroll
   for (int i = 0; i < VEC_SIZE; i++) {
-    kv_cache[dst_offset + i] =
-        fp8::scaled_convert<cache_t, scalar_t, kv_dt>(k_val_ptr[i], scale);
+#ifndef USE_ROCM
+    if constexpr (INT8) {
+      kv_cache[dst_offset + i] = static_cast<uint8_t>(
+          flash_v100::KVInt8RowEncoder<true>::encode(values[i], scale));
+    } else
+#endif
+    {
+      kv_cache[dst_offset + i] =
+          fp8::scaled_convert<uint8_t, float, Fp8KVCacheDataType::kFp8E4M3>(
+              values[i], scale);
+    }
   }
   if (threadIdx.x == 0) {
-    const int64_t dst_scale_idx =
-        block_idx * cache_block_size * cache_stride +
-        cache_block_size * head_dim +
-        (block_offset * head_dim + head_dim_idx) * 4 / quant_block_size;
-    reinterpret_cast<float*>(kv_cache)[dst_scale_idx / 4] = scale;
+    scales[block_idx * scale_block_stride + block_offset * scale_token_stride +
+           (head_dim_idx / quant_block_size) * scale_group_stride] = scale;
   }
 }
 
@@ -1695,45 +1712,128 @@ void cp_gather_and_upconvert_fp8_kv_cache(
       dst_entry_stride);
 }
 
-// Macro to dispatch the kernel based on the data type.
-#define CALL_INDEXER_K_QUANT_AND_CACHE(KV_T, CACHE_T, KV_DTYPE)               \
-  vllm::indexer_k_quant_and_cache_kernel<KV_T, CACHE_T, KV_DTYPE>             \
-      <<<grid, block, 0, stream>>>(                                           \
-          reinterpret_cast<KV_T*>(k.data_ptr()),                              \
-          reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                    \
-          slot_mapping.const_data_ptr<int64_t>(), head_dim, quant_block_size, \
-          cache_block_size, cache_stride, use_ue8m0);
-
-void indexer_k_quant_and_cache(
-    torch::stable::Tensor& k,         // [num_tokens, head_dim]
-    torch::stable::Tensor& kv_cache,  // [num_blocks, block_size, cache_stride]
-    torch::stable::Tensor& slot_mapping,  // [num_tokens]
-    int64_t quant_block_size,             // quantization block size
-    const std::string& scale_fmt) {
-  int num_tokens = k.size(0);
-  int head_dim = k.size(1);
-  int cache_block_size = kv_cache.size(1);
-  int cache_stride = kv_cache.size(2);
-  bool use_ue8m0 = scale_fmt == "ue8m0";
-
-  STD_TORCH_CHECK(k.device() == kv_cache.device(),
-                  "k and kv_cache must be on the same device");
-  STD_TORCH_CHECK(k.device() == slot_mapping.device(),
-                  "k and slot_mapping must be on the same device");
-  STD_TORCH_CHECK(head_dim % quant_block_size == 0,
-                  "head_dim must be divisible by quant_block_size");
-
-  constexpr int vec_size = 4;
-  dim3 grid(num_tokens, (head_dim + quant_block_size * vec_size - 1) /
-                            (quant_block_size * vec_size));
-  dim3 block(32, vec_size);
+namespace {
+void launch_indexer_cache_writer(
+    torch::stable::Tensor& k, uint8_t* payload, float* scales,
+    torch::stable::Tensor& slot_mapping, int head_dim, int quant_block_size,
+    int cache_block_size, int64_t payload_block_stride,
+    int64_t payload_token_stride, int64_t scale_block_stride,
+    int64_t scale_token_stride, int64_t scale_group_stride, int64_t slots,
+    bool use_ue8m0, bool int8) {
+  STD_TORCH_CHECK(k.dim() == 2 && k.stride(1) == 1,
+                  "Indexer keys require contiguous head dimensions");
+  STD_TORCH_CHECK(quant_block_size == 128 && head_dim % 128 == 0,
+                  "Indexer writer requires complete 128-element groups");
+  STD_TORCH_CHECK(cache_block_size > 0 && slot_mapping.dim() == 1 &&
+                      slot_mapping.size(0) >= k.size(0),
+                  "Invalid indexer slots or physical page size");
+  STD_TORCH_CHECK(
+      slot_mapping.scalar_type() == torch::headeronly::ScalarType::Long &&
+          slot_mapping.stride(0) == 1 && k.device() == slot_mapping.device(),
+      "Indexer slots must be contiguous device int64 values");
+  if (k.size(0) == 0) return;
+  dim3 grid(k.size(0), (head_dim + 511) / 512);
+  dim3 block(32, 4);
   const torch::stable::accelerator::DeviceGuard device_guard(
       k.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
+#define INDEXER_CODEC(ROW_SCALES)                                             \
+  vllm::indexer_k_quant_and_cache_kernel<scalar_t, ROW_SCALES>                \
+      <<<grid, block, 0, stream>>>(                                           \
+          static_cast<scalar_t*>(k.data_ptr()), payload, scales,              \
+          slot_mapping.const_data_ptr<int64_t>(), head_dim, quant_block_size, \
+          cache_block_size, k.stride(0), payload_block_stride,                \
+          payload_token_stride, scale_block_stride, scale_token_stride,       \
+          scale_group_stride, slots, use_ue8m0)
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(k.scalar_type(), "indexer_cache_writer",
+                                      [&] {
+#ifndef USE_ROCM
+                                        if (int8) {
+                                          INDEXER_CODEC(true);
+                                        } else
+#else
+    STD_TORCH_CHECK(!int8, "INT8 indexer writer is unavailable in this binary");
+#endif
+                                        {
+                                          INDEXER_CODEC(false);
+                                        }
+                                      });
+#undef INDEXER_CODEC
+}
+}  // namespace
 
-  static const std::string kv_cache_dtype = "fp8_e4m3";
-  DISPATCH_BY_KV_CACHE_DTYPE(k.scalar_type(), kv_cache_dtype,
-                             CALL_INDEXER_K_QUANT_AND_CACHE);
+void indexer_k_quant_and_cache(torch::stable::Tensor& k,
+                               torch::stable::Tensor& kv_cache,
+                               torch::stable::Tensor& slot_mapping,
+                               int64_t quant_block_size,
+                               const std::string& scale_fmt) {
+  STD_TORCH_CHECK(
+      kv_cache.dim() == 3 && kv_cache.stride(2) == 1 &&
+          kv_cache.scalar_type() == torch::headeronly::ScalarType::Byte &&
+          kv_cache.device() == k.device(),
+      "Indexer cache must be device byte pages");
+  const int head_dim = k.size(1), page = kv_cache.size(1);
+  const int groups = head_dim / 128;
+  STD_TORCH_CHECK(
+      kv_cache.size(2) >= head_dim + 4 * groups && kv_cache.stride(0) % 4 == 0,
+      "Indexer page cannot hold aligned payload and scales");
+  auto* data = static_cast<uint8_t*>(kv_cache.data_ptr());
+  launch_indexer_cache_writer(
+      k, data, reinterpret_cast<float*>(data + int64_t(page) * head_dim),
+      slot_mapping, head_dim, quant_block_size, page, kv_cache.stride(0),
+      head_dim, kv_cache.stride(0) / 4, groups, 1, kv_cache.size(0) * page,
+      scale_fmt == "ue8m0", false);
+}
+
+void indexer_k_quant_and_cache_kv(torch::stable::Tensor& k,
+                                  torch::stable::Tensor& payload,
+                                  torch::stable::Tensor& scales,
+                                  torch::stable::Tensor& slot_mapping,
+                                  int64_t quant_block_size,
+                                  const std::string& scale_fmt,
+                                  const std::string& kv_cache_dtype) {
+  const bool int8 = kv_cache_dtype == "int8";
+  STD_TORCH_CHECK(int8 || kv_cache_dtype == "fp8_e4m3",
+                  "Unsupported indexer codec");
+  STD_TORCH_CHECK(payload.dim() == 4 && payload.size(2) == 1 &&
+                      payload.size(3) == k.size(1) && payload.stride(3) == 1 &&
+                      payload.device() == k.device(),
+                  "Indexer payload must be [page, token, 1, dimension]");
+  STD_TORCH_CHECK(
+      payload.scalar_type() == (int8 ? torch::headeronly::ScalarType::Char
+                                     : torch::headeronly::ScalarType::Byte),
+      "Indexer payload dtype does not match its codec");
+  const int groups = k.size(1) / 128;
+  STD_TORCH_CHECK(
+      scales.dim() == 3 && scales.size(0) == payload.size(0) &&
+          scales.size(1) == payload.size(1) && scales.size(2) == groups &&
+          scales.stride(2) > 0 && scales.device() == k.device() &&
+          scales.scalar_type() == torch::headeronly::ScalarType::Float,
+      "Indexer scales must be device FP32 [page, token, group]");
+  STD_TORCH_CHECK(
+      payload.stride(0) > 0 && payload.stride(1) >= k.size(1) &&
+          scales.stride(1) >= (groups - 1) * scales.stride(2) + 1 &&
+          scales.stride(0) >= (scales.size(1) - 1) * scales.stride(1) +
+                                  (groups - 1) * scales.stride(2) + 1 &&
+          payload.stride(0) >=
+              (payload.size(1) - 1) * payload.stride(1) + k.size(1),
+      "Indexer view requires valid physical strides");
+  STD_TORCH_CHECK(!int8 || scale_fmt == "float32",
+                  "INT8 indexer uses FP32 dynamic scales");
+  launch_indexer_cache_writer(
+      k, static_cast<uint8_t*>(payload.data_ptr()),
+      static_cast<float*>(scales.data_ptr()), slot_mapping, k.size(1),
+      quant_block_size, payload.size(1), payload.stride(0), payload.stride(1),
+      scales.stride(0), scales.stride(1), scales.stride(2),
+      payload.size(0) * payload.size(1), scale_fmt == "ue8m0", int8);
+}
+
+int64_t indexer_k_quant_codec_abi() {
+#ifdef USE_ROCM
+  return 0;
+#else
+  return 1;
+#endif
 }
 
 // Macro to dispatch the kernel based on the data amount.

@@ -9,11 +9,10 @@ from vllm.config import CUDAGraphMode
 from vllm.config.sm70_sparse import sparse_policy
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
-from vllm.models.deepseek_v4.common.ops.fp8_software import (
-    fp8_e4m3fn_bits_to_fp32,
-)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.kv_codecs import KV_REPRESENTATION_CODECS, resolve_kv_codec
+from vllm.v1.attention.ops.kv_codec import decode_kv_payload
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
@@ -141,13 +140,14 @@ def _dequant_contiguous_index_k_kernel(
     k_stride0,
     out_stride0,
     head_dim: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     row_idx = tl.program_id(0)
     offsets = tl.arange(0, head_dim)
     packed_ptr = k_ptr.to(tl.pointer_type(tl.uint8))
     values = tl.load(packed_ptr + row_idx * k_stride0 + offsets)
     scale = tl.load(scale_ptr + row_idx).to(tl.float32)
-    dequant = fp8_e4m3fn_bits_to_fp32(values) * scale
+    dequant = decode_kv_payload(values, CODEC) * scale
     tl.store(
         out_ptr + row_idx * out_stride0 + offsets,
         dequant.to(out_ptr.type.element_ty),
@@ -168,6 +168,7 @@ def _dequant_paged_index_k_kernel(
     max_seq_len,
     head_dim: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     row_idx = tl.program_id(0)
     key_offsets = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -194,9 +195,9 @@ def _dequant_paged_index_k_kernel(
         mask=valid[:, None],
         other=0,
     )
-    fp8 = fp8_e4m3fn_bits_to_fp32(packed)
+    payload = decode_kv_payload(packed, CODEC)
     scale = tl.load(scale_ptr, mask=valid, other=0.0).to(tl.float32)
-    dequant = fp8 * scale[:, None]
+    dequant = payload * scale[:, None]
     tl.store(
         out_ptr
         + row_idx * out_stride0
@@ -222,6 +223,7 @@ def _gather_paged_index_k_unscaled_kernel(
     head_dim: tl.constexpr,
     MAX_ROWS: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     """Gather one request's live paged keys once for all verifier rows.
 
@@ -266,7 +268,7 @@ def _gather_paged_index_k_unscaled_kernel(
     scales = tl.load(scale_ptr, mask=valid, other=0.0).to(tl.float32)
     tl.store(
         out_k_ptr + key_offsets[:, None] * out_k_stride0 + dim_offsets[None, :],
-        fp8_e4m3fn_bits_to_fp32(packed).to(tl.float16),
+        decode_kv_payload(packed, CODEC).to(tl.float16),
         mask=in_bucket[:, None],
     )
     tl.store(out_scale_ptr + key_offsets, scales, mask=in_bucket)
@@ -287,6 +289,7 @@ def _paged_index_logits_kernel(
     head_dim: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     """Index logits straight out of the paged FP8 cache, no gather buffer.
 
@@ -331,10 +334,10 @@ def _paged_index_logits_kernel(
             mask=valid[:, None],
             other=0,
         )
-        fp8 = fp8_e4m3fn_bits_to_fp32(packed)
+        payload = decode_kv_payload(packed, CODEC)
         scale = tl.load(scale_ptr, mask=valid, other=0.0).to(tl.float32)
         # Per-token scale factors out of the dot product.
-        logits = tl.sum(fp8 * q[None, :], axis=1) * scale
+        logits = tl.sum(payload * q[None, :], axis=1) * scale
         tl.store(out_ptr + row_idx * out_stride0 + key_offsets, logits, mask=valid)
 
 
@@ -356,6 +359,7 @@ def _contiguous_index_logits_relu_kernel(
     head_dim: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     """Prefill index scores, per head, with the relu inside the head sum.
 
@@ -386,7 +390,7 @@ def _contiguous_index_logits_relu_kernel(
         mask=n_valid[:, None],
         other=0,
     )
-    k_t = tl.trans(fp8_e4m3fn_bits_to_fp32(packed).to(tl.float16))
+    k_t = tl.trans(decode_kv_payload(packed, CODEC).to(tl.float16))
     scale = tl.load(k_scale_ptr + offs_n, mask=n_valid, other=0.0).to(tl.float32)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
@@ -428,6 +432,7 @@ def _paged_index_logits_relu_kernel(
     NUM_HEADS: tl.constexpr,
     BLOCK_N: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     """Decode counterpart of `_contiguous_index_logits_relu_kernel`.
 
@@ -476,7 +481,7 @@ def _paged_index_logits_relu_kernel(
             mask=valid[:, None],
             other=0,
         )
-        k_t = tl.trans(fp8_e4m3fn_bits_to_fp32(packed).to(tl.float16))
+        k_t = tl.trans(decode_kv_payload(packed, CODEC).to(tl.float16))
         scale = tl.load(scale_ptr, mask=valid, other=0.0).to(tl.float32)
         # relu(q_h . k) is per head; only then does the weighted head sum
         # collapse it to one logit. The per-key scale is positive, so pulling
@@ -490,7 +495,9 @@ def _combine_index_queries(q: torch.Tensor, weights: torch.Tensor) -> torch.Tens
     assert q.dtype == torch.float16 and q.ndim == 3
     assert q.shape[-1] == _INDEX_HEAD_DIM
     assert weights.shape == q.shape[:2]
-    out = torch.empty((q.shape[0], q.shape[-1]), dtype=torch.float16, device=q.device)
+    # Head-weight cancellation must not be rounded before the key dot. This
+    # computation representation is shared by every cache codec.
+    out = torch.empty((q.shape[0], q.shape[-1]), dtype=torch.float32, device=q.device)
     block_d = 32
     _weighted_query_kernel[(q.shape[0], triton.cdiv(q.shape[-1], block_d))](
         q,
@@ -560,6 +567,7 @@ def _dequant_index_k_unscaled_kernel(
     k_stride0,
     out_stride0,
     head_dim: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     """Widen FP8 index keys to FP16 without applying the per-key scale.
 
@@ -574,11 +582,11 @@ def _dequant_index_k_unscaled_kernel(
     )
     tl.store(
         out_ptr + row_idx * out_stride0 + offsets,
-        fp8_e4m3fn_bits_to_fp32(values).to(tl.float16),
+        decode_kv_payload(values, CODEC).to(tl.float16),
     )
 
 
-def _prefill_logits_cublas(q, k_quant, k_scales, weights):
+def _prefill_logits_cublas(q, k_quant, k_scales, weights, codec_id=1):
     """Prefill index scores through cuBLAS, with the relu inside the head sum.
 
     Triton's `tl.dot` does not reach Volta's tensor cores: on the exact shape
@@ -601,6 +609,7 @@ def _prefill_logits_cublas(q, k_quant, k_scales, weights):
         k_quant.stride(0),
         k_fp16.stride(0),
         head_dim=head_dim,
+        CODEC=codec_id,
         num_warps=4,
     )
 
@@ -642,16 +651,22 @@ def sm70_indexer_prefill_logits(
     k_quant: torch.Tensor,
     k_scale_storage: torch.Tensor,
     weights: torch.Tensor,
+    *,
+    cache_dtype: str = "fp8",
 ) -> torch.Tensor:
     """Compute all prefill index scores; caller supplies causal row bounds."""
     policy = sparse_policy()
-    assert k_quant.dtype == torch.float8_e4m3fn
+    codec = resolve_kv_codec(cache_dtype, representation="indexer")
+    if codec is None:
+        raise ValueError(f"Unsupported indexer cache codec: {cache_dtype}")
+    assert codec.native_id is not None
+    assert k_quant.dtype == codec.element_dtype
     assert k_quant.ndim == 2 and k_quant.shape[1] == _INDEX_HEAD_DIM
     k_scales = k_scale_storage.view(torch.float32).reshape(-1)
     assert k_scales.shape[0] == k_quant.shape[0]
 
     if policy.value("indexer_relu") and policy.value("indexer_prefill_cublas"):
-        return _prefill_logits_cublas(q, k_quant, k_scales, weights)
+        return _prefill_logits_cublas(q, k_quant, k_scales, weights, codec.native_id)
 
     if policy.value("indexer_relu"):
         num_q, num_heads, _ = q.shape
@@ -675,6 +690,7 @@ def sm70_indexer_prefill_logits(
             num_k,
             num_heads,
             head_dim=_INDEX_HEAD_DIM,
+            CODEC=codec.native_id,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=8,
@@ -682,17 +698,20 @@ def sm70_indexer_prefill_logits(
         return out
 
     weighted_q = _combine_index_queries(q, weights)
-    k_fp16 = torch.empty(k_quant.shape, dtype=torch.float16, device=k_quant.device)
+    k_dequant = torch.empty(
+        k_quant.shape, dtype=weighted_q.dtype, device=k_quant.device
+    )
     _dequant_contiguous_index_k_kernel[(k_quant.shape[0],)](
         k_quant.view(torch.uint8),
         k_scales,
-        k_fp16,
+        k_dequant,
         k_quant.stride(0),
-        k_fp16.stride(0),
+        k_dequant.stride(0),
         head_dim=_INDEX_HEAD_DIM,
+        CODEC=codec.native_id,
         num_warps=4,
     )
-    return torch.mm(weighted_q, k_fp16.t(), out_dtype=torch.float32)
+    return torch.mm(weighted_q, k_dequant.t())
 
 
 def _decode_logits_cublas(
@@ -703,6 +722,7 @@ def _decode_logits_cublas(
     block_table: torch.Tensor,
     max_seq_len: int,
     table_rows_per_request: int,
+    codec_id: int = 1,
 ) -> torch.Tensor:
     """Score each request's verifier rows over one shared paged gather.
 
@@ -733,6 +753,7 @@ def _decode_logits_cublas(
             k_scales,
             scores,
             out[first : first + rows],
+            codec_id,
         )
     return out
 
@@ -748,6 +769,7 @@ def _score_request_cublas(
     k_scales: torch.Tensor,
     scores: torch.Tensor,
     out: torch.Tensor,
+    codec_id: int = 1,
 ) -> None:
     total_rows, num_heads, head_dim = q.shape
     block_n = 16
@@ -763,6 +785,7 @@ def _score_request_cublas(
         max_seq_len,
         total_rows,
         head_dim=head_dim,
+        CODEC=codec_id,
         MAX_ROWS=triton.next_power_of_2(total_rows),
         BLOCK_N=block_n,
         num_warps=4,
@@ -869,10 +892,10 @@ def _decode_cublas_blocker(
             <= policy.value("indexer_prefill_tile_mb") * 2**20,
         ),
         (
-            f"a uint8 cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
+            f"a byte cache [blocks, block_size, {_INDEX_CACHE_BYTES}] with "
             "contiguous blocks",
             lambda: cache.ndim == 3
-            and cache.dtype == torch.uint8
+            and cache.dtype in (torch.uint8, torch.int8)
             and cache.shape[1] > 0
             and cache.shape[2] == _INDEX_CACHE_BYTES
             and cache.stride(1) == _INDEX_CACHE_BYTES
@@ -917,6 +940,7 @@ def sm70_indexer_decode_logits(
     table_rows_per_request: int = 1,
     *,
     indexer_decode_cublas: bool,
+    cache_dtype: str = "fp8",
 ) -> torch.Tensor:
     """Gather paged FP8 index keys and compute batched decode scores.
 
@@ -926,7 +950,11 @@ def sm70_indexer_decode_logits(
     `indexer_decode_cublas` is the engine's `KernelConfig.sm70_sparse` setting;
     callers pass it because the forward pass runs outside the config context."""
     policy = sparse_policy()
-    assert cache.dtype == torch.uint8 and cache.ndim == 3
+    codec = resolve_kv_codec(cache_dtype, representation="indexer")
+    if codec is None:
+        raise ValueError(f"Unsupported indexer cache codec: {cache_dtype}")
+    assert codec.native_id is not None
+    assert cache.dtype in (torch.uint8, torch.int8) and cache.ndim == 3
     assert cache.shape[-1] >= _INDEX_CACHE_BYTES
     # The relu path scores per head, so it needs q as [rows, heads, dim]; the
     # factored path collapses the head axis up front.
@@ -970,6 +998,7 @@ def sm70_indexer_decode_logits(
                 block_table,
                 max_seq_len,
                 table_rows_per_request,
+                codec.native_id,
             )
         logger.info_once(
             "SM70 indexer decode: paged Triton kernel on %s, the cuBLAS route "
@@ -1003,6 +1032,7 @@ def sm70_indexer_decode_logits(
             out.stride(0),
             cache.shape[1],
             head_dim=_INDEX_HEAD_DIM,
+            CODEC=codec.native_id,
             NUM_HEADS=q.shape[1],
             BLOCK_N=_RELU_BLOCK_N,
             NUM_SPLITS=splits,
@@ -1030,6 +1060,7 @@ def sm70_indexer_decode_logits(
             out.stride(0),
             cache.shape[1],
             head_dim=_INDEX_HEAD_DIM,
+            CODEC=codec.native_id,
             BLOCK_N=_LOGITS_BLOCK_N,
             NUM_SPLITS=splits,
             num_warps=4,
@@ -1042,7 +1073,7 @@ def sm70_indexer_decode_logits(
     block_n = 16
     gathered_k = torch.empty(
         (total_rows, max_seq_len, _INDEX_HEAD_DIM),
-        dtype=torch.float16,
+        dtype=weighted_q.dtype,
         device=q.device,
     )
     _dequant_paged_index_k_kernel[(total_rows, triton.cdiv(max_seq_len, block_n))](
@@ -1057,11 +1088,22 @@ def sm70_indexer_decode_logits(
         cache.shape[1],
         max_seq_len,
         head_dim=_INDEX_HEAD_DIM,
+        CODEC=codec.native_id,
         BLOCK_N=block_n,
         num_warps=4,
     )
     return torch.bmm(
         weighted_q.unsqueeze(1),
         gathered_k.transpose(1, 2),
-        out_dtype=torch.float32,
     ).squeeze(1)
+
+
+for _operation in (sm70_indexer_prefill_logits, sm70_indexer_decode_logits):
+    _operation.__dict__.update(
+        kv_cache_representations=("indexer",),
+        kv_cache_codecs=tuple(
+            codec.name
+            for codec in KV_REPRESENTATION_CODECS
+            if codec.representation == "indexer" and codec.native_id in (1, 3)
+        ),
+    )
