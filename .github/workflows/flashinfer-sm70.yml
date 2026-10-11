@@ -6,6 +6,10 @@ on:
       - requirements/flashinfer-sm70.txt
       - setup.py
       - tests/tools/test_flashinfer_sm70_requirements.py
+      - tests/tools/test_flashinfer_sm70_adapter.py
+      - vllm/model_executor/kernels/flashinfer_sm70.py
+      - vllm/models/qwen4_exp/nvidia/indexer_qsa.py
+      - vllm/models/qwen4_exp/nvidia/ops/qsa.py
       - .github/workflows/flashinfer-sm70.yml
   workflow_dispatch:
 permissions:
@@ -32,5 +36,5 @@ jobs:
       - name: Check package and SM70 provider metadata
         run: |
           .venv-fi/bin/python -m pytest -c flashinfer-sm70/tests/sm70/pytest.ini --confcutdir=flashinfer-sm70/tests/sm70 flashinfer-sm70/tests/sm70 -m 'not gpu'
-          .venv-fi/bin/python -m pytest --confcutdir=tests/tools tests/tools/test_flashinfer_sm70_requirements.py
+          .venv-fi/bin/python -m pytest --confcutdir=tests/tools tests/tools/test_flashinfer_sm70_requirements.py tests/tools/test_flashinfer_sm70_adapter.py
           .venv-fi/bin/ruff check flashinfer-sm70/flashinfer/sm70 flashinfer-sm70/tests/sm70 flashinfer-sm70/sm70_build_backend.py

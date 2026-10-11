@@ -17,6 +17,16 @@ speed or quality gates. No new engine compute route is enabled. Text C1/C4,
 MTP, D72 vision and 27B/35B-A3B AWQ/FP8 regressions remain mandatory. See the
 [module coverage and historical failures](../../flashinfer-sm70/docs/sm70/coverage.md).
 
+The second, stacked batch adds an independent request-grouped QSA score kernel
+and the engine's `KernelConfig.sm70_flashinfer_qsa` candidate/force adapter.
+It preserves the C1 single-launch Volta MMA route and shares keys across C4×5
+rows using GPU request grouping. The default remains `off`; `force` rejects
+unsupported inputs and bypasses legacy prefill scoring. Exact Top-K, expansion,
+cache updates and sparse attention retain their existing implementations, so
+this batch does not close the full QSA chain. Workspace allocation is bounded
+per indexer and occurs before capture; the scorer never replaces captured
+storage. See [candidate scope and pending GPU matrix](../../flashinfer-sm70/docs/sm70/qsa.md).
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:

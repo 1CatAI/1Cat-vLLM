@@ -1174,6 +1174,7 @@ def qsa_mqa_paged(
     num_columns: int | None = None,
     score_scale: float | None = None,
     shared_key_scoring: bool = False,
+    score_provider=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
 
@@ -1204,6 +1205,20 @@ def qsa_mqa_paged(
     columns = capacity if num_columns is None else num_columns
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
+    if score_provider is not None:
+        result = score_provider.score(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            compress_ratio,
+            columns,
+            score_divisor,
+        )
+        if result is not None:
+            return result
     if shared_key_scoring and 0 < columns <= capacity and q.shape[0]:
         from .qsa_shared_key import maybe_shared_key_scores
 
@@ -1593,6 +1608,7 @@ def qsa_select_paged_tokens(
     out: torch.Tensor | None = None,
     query_start_loc_cpu: torch.Tensor | None = None,
     shared_key_scoring: bool = False,
+    score_provider=None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization."""
 
@@ -1604,18 +1620,29 @@ def qsa_select_paged_tokens(
         raise ValueError("QSA selection output has an invalid shape")
     if not rows:
         return out
-    if query_start_loc_cpu is not None and _qsa_select_by_request(
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
-        token_topk,
-        compress_ratio,
-        out,
-        query_start_loc_cpu,
+    if score_provider is not None:
+        score_provider.validate_force(
+            q, k_cache, page_table, token_to_req, query_positions, sequence_lengths
+        )
+    force_score = score_provider is not None and score_provider.mode == "force"
+    if (
+        not force_score
+        and query_start_loc_cpu is not None
+        and _qsa_select_by_request(
+            q,
+            k_cache,
+            page_table,
+            token_to_req,
+            query_positions,
+            sequence_lengths,
+            token_topk,
+            compress_ratio,
+            out,
+            query_start_loc_cpu,
+        )
     ):
+        if score_provider is not None:
+            score_provider.record_legacy_path("request_segmented_prefill")
         return out
 
     capacity_columns = page_table.shape[1] * k_cache.shape[1]
@@ -1624,7 +1651,7 @@ def qsa_select_paged_tokens(
     contiguous_keys: torch.Tensor | None = None
     key_valid: torch.Tensor | None = None
     all_visible: torch.Tensor | None = None
-    if _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
+    if not force_score and _use_sm70_qsa_indexer_cublas(q, k_cache, page_table):
         all_visible = _qsa_visible_blocks(
             token_to_req,
             query_positions,
@@ -1652,6 +1679,8 @@ def qsa_select_paged_tokens(
             contiguous_keys, key_valid = _qsa_gather_single_request_keys(
                 k_cache, page_table, score_columns
             )
+            if score_provider is not None:
+                score_provider.record_legacy_path("prefill_cublas")
         else:
             score_columns = capacity_columns
             all_visible = None
@@ -1687,6 +1716,7 @@ def qsa_select_paged_tokens(
                 sequence_lengths,
                 compress_ratio,
                 shared_key_scoring=shared_key_scoring,
+                score_provider=score_provider,
             )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
