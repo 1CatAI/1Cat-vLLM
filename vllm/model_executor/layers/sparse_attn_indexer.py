@@ -8,6 +8,7 @@ import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import get_current_vllm_config_or_none
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
@@ -118,17 +119,18 @@ def sparse_attn_indexer(
     topk_indices_buffer: torch.Tensor,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
+    cache_dtype: str = "fp8",
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
-    fp8_dtype = current_platform.fp8_dtype()
+    key_dtype = torch.int8 if cache_dtype == "int8" else current_platform.fp8_dtype()
     k_cache_prefix = _resolve_layer_name(k_cache_prefix)
 
     # assert isinstance(attn_metadata, dict)
     if not isinstance(attn_metadata, dict):
         # Reserve workspace for indexer during profiling run
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            total_seq_lens, head_dim, key_dtype, use_fp4_cache
         )
         current_workspace_manager().get_simultaneous(
             values_spec,
@@ -160,6 +162,7 @@ def sparse_attn_indexer(
             topk_indices_buffer,
             skip_k_cache_insert,
             use_fp4_cache,
+            cache_dtype,
         )
     attn_metadata_narrowed = attn_metadata[k_cache_prefix]
     assert isinstance(attn_metadata_narrowed, DeepseekV32IndexerMetadata)
@@ -174,7 +177,7 @@ def sparse_attn_indexer(
     if sm70_fp16_indexer:
         assert q_quant.dtype == torch.float16
         assert q_scale is None
-        assert not use_fp4_cache, "SM70 requires the FP8 indexer cache"
+        assert not use_fp4_cache, "SM70 requires a byte indexer cache"
     elif use_fp4_cache:
         assert q_scale is not None, "use_fp4_cache=True requires q_scale"
     else:
@@ -197,6 +200,7 @@ def sparse_attn_indexer(
             slot_mapping,
             quant_block_size,
             scale_fmt,
+            cache_dtype=cache_dtype,
         )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
@@ -210,7 +214,7 @@ def sparse_attn_indexer(
         # scales) based on use_fp4_cache.
         workspace_manager = current_workspace_manager()
         values_spec, scales_spec = _gather_workspace_shapes(
-            total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
+            total_seq_lens, head_dim, key_dtype, use_fp4_cache
         )
         k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
             values_spec,
@@ -255,6 +259,7 @@ def sparse_attn_indexer(
                     k_quant,
                     k_scale,
                     weights[chunk.token_start : chunk.token_end],
+                    cache_dtype=cache_dtype,
                 )
             elif current_platform.is_xpu():
                 if q_scale_slice is not None:
@@ -378,6 +383,7 @@ def sparse_attn_indexer(
                 indexer_decode_cublas=get_forward_context()
                 .no_compile_layers[k_cache_prefix]
                 .sm70_sparse.indexer_decode_cublas,
+                cache_dtype=cache_dtype,
             )
         elif current_platform.is_xpu():
             if padded_q_scale is not None:
@@ -464,6 +470,7 @@ def sparse_attn_indexer_fake(
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool,
     use_fp4_cache: bool = False,
+    cache_dtype: str = "fp8",
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -514,11 +521,21 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if (
-            current_platform.is_cuda()
-            and not _is_volta_or_turing_cuda()
-            and not has_deep_gemm()
-        ):
+        config = get_current_vllm_config_or_none()
+        self.cache_dtype = (
+            config.attention_config.resolved_indexer_cache_dtype
+            if config is not None
+            else "fp8"
+        )
+        byte_scorer = _is_volta_or_turing_cuda()
+        if self.cache_dtype == "int8":
+            if use_fp4_cache or not byte_scorer:
+                raise ValueError(
+                    "INT8 indexer needs a byte-cache scorer on this device"
+                )
+            if not skip_k_cache_insert:
+                ops.require_indexer_cache_codec(self.cache_dtype)
+        if current_platform.is_cuda() and not byte_scorer and not has_deep_gemm():
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
@@ -570,6 +587,7 @@ class SparseAttnIndexer(CustomOp):
             self.topk_indices_buffer,
             self.skip_k_cache_insert,
             self.use_fp4_cache,
+            self.cache_dtype,
         )
 
     def forward_xpu(

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
+
 import pytest
 import torch
 
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import AttentionConfig, VllmConfig, set_current_vllm_config
 from vllm.config.sm70_sparse import sparse_policy
 from vllm.models.deepseek_v4.sm70 import indexer as sm70_indexer
 from vllm.models.deepseek_v4.sm70.indexer import (
@@ -12,11 +14,27 @@ from vllm.models.deepseek_v4.sm70.indexer import (
     sm70_indexer_prefill_logits,
 )
 from vllm.utils.torch_utils import current_stream
+from vllm.v1.attention.kv_codecs import KV_REPRESENTATION_CODECS
 
 
-@pytest.fixture(autouse=True)
-def indexer_engine_config():
-    with set_current_vllm_config(VllmConfig()):
+@pytest.fixture(autouse=True, params=KV_REPRESENTATION_CODECS, ids=lambda c: c.name)
+def indexer_engine_config(request, monkeypatch):
+    codec = request.param
+    monkeypatch.setitem(globals(), "_KEY_DTYPE", codec.element_dtype)
+    for name in ("sm70_indexer_prefill_logits", "sm70_indexer_decode_logits"):
+        monkeypatch.setitem(
+            globals(), name, partial(globals()[name], cache_dtype=codec.name)
+        )
+    if codec.name == "int8":
+        values = torch.tensor([0.0, 32.0, 64.0, 96.0, 127.0, -32.0, -64.0, -127.0])
+        monkeypatch.setitem(
+            globals(), "_FP8_BITS", values.to(torch.int8).view(torch.uint8)
+        )
+        monkeypatch.setitem(globals(), "_FP8_VALUES", values)
+    config = VllmConfig(
+        attention_config=AttentionConfig(indexer_cache_dtype=codec.name.split("_")[0])
+    )
+    with set_current_vllm_config(config):
         yield
 
 
@@ -25,6 +43,7 @@ requires_sm70 = pytest.mark.skipif(
     reason="requires a Volta or Turing GPU (SM70/SM75)",
 )
 
+_KEY_DTYPE = torch.float8_e4m3fn
 _HEAD_DIM = 128
 _BLOCK_SIZE = 64
 
@@ -111,9 +130,7 @@ def test_prefill_matches_the_reference_scoring_function(monkeypatch, use_cublas)
     scales = torch.linspace(0.5, 2.0, num_keys, device="cuda", dtype=torch.float32)
     k = values * scales[:, None]
 
-    actual = sm70_indexer_prefill_logits(
-        q, bits.view(torch.float8_e4m3fn), scales, weights
-    )
+    actual = sm70_indexer_prefill_logits(q, bits.view(_KEY_DTYPE), scales, weights)
     expected = _reference_index_logits(q, weights, k)
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
@@ -135,9 +152,7 @@ def test_prefill_relu_off_restores_the_factored_form(monkeypatch):
     bits, values = _random_fp8_keys(num_keys, generator)
     scales = torch.linspace(0.5, 2.0, num_keys, device="cuda", dtype=torch.float32)
 
-    actual = sm70_indexer_prefill_logits(
-        q, bits.view(torch.float8_e4m3fn), scales, weights
-    )
+    actual = sm70_indexer_prefill_logits(q, bits.view(_KEY_DTYPE), scales, weights)
     expected = _reference_factored_logits(q, weights, values * scales[:, None])
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 

@@ -3,7 +3,7 @@
 
 from typing import Any, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from vllm.config.execution_policy import FlashV100Policy
 from vllm.config.sm70_triton_attention import Sm70TritonAttentionPolicy
@@ -60,6 +60,25 @@ class AttentionConfig:
     use_fp4_indexer_cache: bool = False
     """If set, use fp4 indexer cache for dsv32 family model (not support yet)"""
 
+    indexer_cache_dtype: Literal["auto", "fp8", "int8"] = "auto"
+    """Indexer storage, independent of attention KV storage. ``auto`` retains
+    the existing FP8 choice, or FP4 when ``use_fp4_indexer_cache`` is set.
+    Explicit FP8/INT8 conflicts with the legacy FP4 selection."""
+
+    @property
+    def resolved_indexer_cache_dtype(self) -> Literal["fp4", "fp8", "int8"]:
+        if self.use_fp4_indexer_cache:
+            return "fp4"
+        return "fp8" if self.indexer_cache_dtype == "auto" else self.indexer_cache_dtype
+
+    @model_validator(mode="after")
+    def _validate_indexer_cache_dtype(self) -> "AttentionConfig":
+        if self.use_fp4_indexer_cache and self.indexer_cache_dtype != "auto":
+            raise ValueError(
+                "Explicit indexer_cache_dtype conflicts with use_fp4_indexer_cache"
+            )
+        return self
+
     use_non_causal: bool = False
     """Whether to use non-causal (bidirectional) attention."""
 
@@ -102,6 +121,7 @@ class AttentionConfig:
 
         ignored_factors: set[str] = set()
         factors = get_hash_factors(self, ignored_factors)
+        factors["indexer_cache_dtype"] = self.resolved_indexer_cache_dtype
         factors["flash_v100"] = self.flash_v100.compute_hash()
         factors["sm70_triton"] = self.sm70_triton.compute_hash()
         return hash_factors(factors)

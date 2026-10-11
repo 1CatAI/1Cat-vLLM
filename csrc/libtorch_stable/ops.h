@@ -484,6 +484,15 @@ void indexer_k_quant_and_cache(
     int64_t quant_block_size,             // quantization block size
     const std::string& scale_fmt);
 
+void indexer_k_quant_and_cache_kv(torch::stable::Tensor& k,
+                                  torch::stable::Tensor& payload,
+                                  torch::stable::Tensor& scales,
+                                  torch::stable::Tensor& slot_mapping,
+                                  int64_t quant_block_size,
+                                  const std::string& scale_fmt,
+                                  const std::string& kv_cache_dtype);
+int64_t indexer_k_quant_codec_abi();
+
 // Concatenate query nope and rope for MLA/DSA attention
 void concat_mla_q(
     torch::stable::Tensor& ql_nope,  // [num_tokens, num_heads, nope_dim]

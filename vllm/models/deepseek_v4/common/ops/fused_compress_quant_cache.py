@@ -24,6 +24,8 @@ from typing import Any
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
+from vllm.v1.attention.ops.kv_codec import encode_indexer_cache_group
 
 from .cache_utils import needs_software_fp8
 from .fp8_software import fp32_to_fp8_e4m3fn_bits
@@ -197,6 +199,7 @@ def compress_norm_rope_store_triton(
     use_dense_private_state: bool = False,
     ring_size: int = 1,
     private_history_size: int = 1,
+    cache_dtype: str = "fp8",
 ) -> None:
     """Shared triton launcher for the fused compress+norm+RoPE+insert path.
 
@@ -212,6 +215,13 @@ def compress_norm_rope_store_triton(
     else:
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
+
+    codec_kwargs = {}
+    if kernel is _fused_kv_compress_norm_rope_insert_indexer_attn:
+        codec = resolve_kv_codec(cache_dtype, representation="indexer")
+        if codec is None:
+            raise ValueError(f"Unsupported indexer cache codec: {cache_dtype}")
+        codec_kwargs["CODEC"] = codec.native_id
 
     kernel[(num_actual,)](
         # state cache
@@ -260,6 +270,7 @@ def compress_norm_rope_store_triton(
         PRIVATE_HISTORY_SIZE=private_history_size,
         num_warps=num_warps,
         **pdl_kwargs,
+        **codec_kwargs,
     )
 
 
@@ -510,6 +521,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     USE_DENSE_PRIVATE_STATE: tl.constexpr,
     RING_SIZE: tl.constexpr,
     PRIVATE_HISTORY_SIZE: tl.constexpr,
+    CODEC: tl.constexpr = 1,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -620,27 +632,14 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
         TRITON_BLOCK_SIZE == QUANT_BLOCK,
         "Indexer expects one quant block (QUANT_BLOCK == TRITON_BLOCK_SIZE)",
     )
-    INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
-
     result_bf16 = result.to(tl.bfloat16).to(tl.float32)
-    absmax = tl.max(tl.abs(result_bf16), axis=0)  # scalar
-    absmax = tl.maximum(absmax, 1e-4)
-    raw_scale = absmax * INV_FP8_MAX
-    exponent = tl.ceil(tl.log2(raw_scale))
-    inv_scale = tl.exp2(-exponent)
-
-    x_scaled = result_bf16 * inv_scale
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    if USE_SOFTWARE_FP8:
-        x_uint8 = fp32_to_fp8_e4m3fn_bits(x_clamped)
-    else:
-        x_fp8 = x_clamped.to(tl.float8e4nv)
-        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    x_uint8, scale_val = encode_indexer_cache_group(
+        result_bf16, CODEC, True, USE_SOFTWARE_FP8, True
+    )
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 
     # Single float32 scale
-    scale_val = tl.exp2(exponent)
     tl.store(scale_ptr.to(tl.pointer_type(tl.float32)), scale_val)
 
 

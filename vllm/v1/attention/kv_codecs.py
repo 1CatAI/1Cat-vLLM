@@ -13,7 +13,7 @@ of the acceleration path that reads it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
@@ -35,15 +35,29 @@ class KVCodec:
     quantized: bool = False
     native_id: int | None = None
     encoding_version: int = 1
-    scale_granularity: Literal["none", "tensor", "token_head"] = "none"
+    scale_granularity: Literal["none", "tensor", "token_head", "token_group"] = "none"
     scale_dtype: torch.dtype | None = None
     rounding: Literal["none", "nearest_even", "truncate"] = "none"
-    layout: Literal["dense", "inline_scale", "planar_scales"] = "dense"
+    layout: Literal["dense", "inline_scale", "planar_scales", "group_planar"] = "dense"
+    representation: str = "ordinary"
+    group_axis: int | None = None
+    group_size: int = 0
+    scale_encoding: Literal["none", "fp32", "ue8m0"] = "none"
+    unquantized_fields: tuple[str, ...] = ()
 
     @property
-    def cache_identity(self) -> tuple[str, int, str]:
+    def cache_identity(self) -> tuple[object, ...]:
         """Versioned storage identity; equal byte widths are not compatible."""
-        return (self.name, self.encoding_version, self.layout)
+        legacy = (self.name, self.encoding_version, self.layout)
+        if self.representation == "ordinary":
+            return legacy
+        return legacy + (
+            self.representation,
+            self.group_axis,
+            self.group_size,
+            self.scale_encoding,
+            self.unquantized_fields,
+        )
 
     @property
     def per_token_head(self) -> bool:
@@ -60,6 +74,10 @@ class KVCodec:
         """Query installed bindings; legacy callables support tensor-scale KV only."""
         if operation is None:
             return False
+        if self.representation not in getattr(
+            operation, "kv_cache_representations", ("ordinary",)
+        ):
+            return False
         formats = getattr(operation, "kv_cache_codecs", None)
         if formats is None:
             return self in (FP16, FP8_E4M3, FP8_E5M2)
@@ -75,6 +93,19 @@ class KVCodec:
         if not self.quantized:
             return cache
         assert self.element_dtype is not None
+        if self.scale_granularity == "token_group":
+            grouped = self._group_values(cache.view(self.element_dtype).float())
+            if not isinstance(scale, torch.Tensor) or scale.shape != grouped.shape[:-1]:
+                raise ValueError("Grouped decoding needs one scale per token/group")
+            decoded = grouped * scale[..., None]
+            if self.element_dtype == torch.int8:
+                limit = torch.finfo(out_dtype).max
+                decoded = torch.where(
+                    torch.isfinite(scale[..., None]),
+                    decoded.clamp(-limit, limit),
+                    decoded,
+                )
+            return decoded.reshape_as(cache).to(out_dtype)
         if self.per_token_head:
             if not isinstance(scale, torch.Tensor) or scale.shape != cache.shape[:-1]:
                 raise ValueError("Per-token-head decoding needs one scale per row")
@@ -101,9 +132,14 @@ class KVCodec:
         its readers instead of silently converting them into finite values.
         Legacy truncation retains its original multiplication order.
         """
-        if self.element_dtype != torch.int8 or not self.per_token_head:
+        if self.element_dtype != torch.int8 or self.scale_granularity not in (
+            "token_head",
+            "token_group",
+        ):
             raise ValueError(f"{self.name} has no dynamic INT8 reference encoder")
         x = values.float()
+        if self.scale_granularity == "token_group":
+            x = self._group_values(x)
         scale = (x.abs().amax(dim=-1) / 127.0).clamp_min(1e-6)
         if self.rounding == "nearest_even":
             finite = torch.isfinite(x).all(dim=-1)
@@ -111,7 +147,16 @@ class KVCodec:
             q = (x / scale[..., None]).round()
         else:
             q = (x * scale.reciprocal()[..., None]).trunc()
-        return q.clamp(-128, 127).to(torch.int8), scale
+        return q.clamp(-128, 127).to(torch.int8).reshape_as(values), scale
+
+    def _group_values(self, values: torch.Tensor) -> torch.Tensor:
+        if (
+            self.group_axis != -1
+            or self.group_size <= 0
+            or values.shape[-1] % self.group_size
+        ):
+            raise ValueError("Group encoding requires complete groups on the last axis")
+        return values.unflatten(-1, (-1, self.group_size))
 
     def __repr__(self) -> str:
         return f"KVCodec({self.name})"
@@ -129,6 +174,7 @@ FP8_E4M3 = KVCodec(
     native_id=1,
     scale_granularity="tensor",
     scale_dtype=torch.float32,
+    scale_encoding="fp32",
     rounding="nearest_even",
 )
 FP8_E5M2 = KVCodec(
@@ -140,6 +186,7 @@ FP8_E5M2 = KVCodec(
     native_id=2,
     scale_granularity="tensor",
     scale_dtype=torch.float32,
+    scale_encoding="fp32",
     rounding="nearest_even",
 )
 INT8 = KVCodec(
@@ -151,6 +198,7 @@ INT8 = KVCodec(
     native_id=3,
     scale_granularity="token_head",
     scale_dtype=torch.float32,
+    scale_encoding="fp32",
     rounding="nearest_even",
     layout="planar_scales",
 )
@@ -163,6 +211,7 @@ INT8_PER_TOKEN_HEAD = KVCodec(
     native_id=3,
     scale_granularity="token_head",
     scale_dtype=torch.float32,
+    scale_encoding="fp32",
     rounding="truncate",
     layout="inline_scale",
 )
@@ -174,6 +223,7 @@ FP8_PER_TOKEN_HEAD = KVCodec(
     quantized=True,
     scale_granularity="token_head",
     scale_dtype=torch.float32,
+    scale_encoding="fp32",
     rounding="nearest_even",
     layout="inline_scale",
 )
@@ -189,12 +239,44 @@ KV_CODECS: tuple[KVCodec, ...] = (
 )
 _BY_ALIAS = {alias: codec for codec in KV_CODECS for alias in codec.aliases}
 
+# Bind formats to their actual mathematical representation. These descriptors
+# share the format encoders; they do not add another attention backend.
+INDEXER_FP8 = replace(
+    FP8_E4M3,
+    representation="indexer",
+    scale_granularity="token_group",
+    group_axis=-1,
+    group_size=128,
+    layout="group_planar",
+)
+INDEXER_INT8 = replace(
+    INT8,
+    representation="indexer",
+    scale_granularity="token_group",
+    group_axis=-1,
+    group_size=128,
+    layout="group_planar",
+)
+KV_REPRESENTATION_CODECS = (INDEXER_FP8, INDEXER_INT8)
 
-def resolve_kv_codec(kv_cache_dtype: str | None) -> KVCodec | None:
+
+def resolve_kv_codec(
+    kv_cache_dtype: str | None, *, representation: str = "ordinary"
+) -> KVCodec | None:
     """Map a ``kv_cache_dtype`` string to its codec; ``None`` if unknown."""
     if kv_cache_dtype is None:
         return None
-    return _BY_ALIAS.get(kv_cache_dtype)
+    codec = _BY_ALIAS.get(kv_cache_dtype)
+    if representation == "ordinary" or codec is None:
+        return codec
+    return next(
+        (
+            bound
+            for bound in KV_REPRESENTATION_CODECS
+            if bound.representation == representation and bound.name == codec.name
+        ),
+        None,
+    )
 
 
 def canonical_kv_cache_dtype(kv_cache_dtype: str) -> str:

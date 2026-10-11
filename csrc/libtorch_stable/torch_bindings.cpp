@@ -733,6 +733,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "slot_mapping, "
       "int quant_block_size, str kv_cache_dtype) -> ()");
 
+  ops.def(
+      "indexer_k_quant_and_cache_kv(Tensor k, Tensor! payload, Tensor! scales, "
+      "Tensor slot_mapping, int quant_block_size, str scale_fmt, "
+      "str kv_cache_dtype) -> ()");
+  ops.def("indexer_k_quant_codec_abi() -> int");
+
   ops.def("concat_mla_q(Tensor ql_nope, Tensor q_pe, Tensor! q_out) -> ()");
 
   ops.def(
@@ -758,12 +764,15 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("cp_gather_and_upconvert_fp8_kv_cache",
            TORCH_BOX(&cp_gather_and_upconvert_fp8_kv_cache));
   ops.impl("indexer_k_quant_and_cache", TORCH_BOX(&indexer_k_quant_and_cache));
+  ops.impl("indexer_k_quant_and_cache_kv",
+           TORCH_BOX(&indexer_k_quant_and_cache_kv));
   ops.impl("concat_mla_q", TORCH_BOX(&concat_mla_q));
   ops.impl("cp_gather_indexer_k_quant_cache",
            TORCH_BOX(&cp_gather_indexer_k_quant_cache));
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CompositeExplicitAutograd, ops) {
+  ops.impl("indexer_k_quant_codec_abi", TORCH_BOX(&indexer_k_quant_codec_abi));
   ops.impl("reshape_and_cache_flash_kv_abi",
            TORCH_BOX(&reshape_and_cache_flash_kv_abi));
 }

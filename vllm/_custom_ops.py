@@ -3,6 +3,7 @@
 
 import os
 from enum import IntEnum
+from functools import lru_cache
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -2897,13 +2898,61 @@ def concat_mla_q(
     torch.ops._C_cache_ops.concat_mla_q(ql_nope, q_pe, q_out)
 
 
+@lru_cache(maxsize=1)
+def _indexer_kv_writer():
+    from vllm.v1.attention.kv_codecs import KV_REPRESENTATION_CODECS
+
+    native = torch.ops._C_cache_ops
+    probe = getattr(native, "indexer_k_quant_codec_abi", None)
+    operation = getattr(native, "indexer_k_quant_and_cache_kv", None)
+    if operation is None or probe is None or probe() != 1:
+        return None
+    operation.kv_cache_representations = ("indexer",)
+    operation.kv_cache_codecs = tuple(
+        codec.name
+        for codec in KV_REPRESENTATION_CODECS
+        if codec.representation == "indexer" and codec.native_id in (1, 3)
+    )
+    return operation
+
+
+def require_indexer_cache_codec(cache_dtype: str) -> None:
+    """Reject a missing binding at initialization, before writing new bytes."""
+    if cache_dtype == "int8" and _indexer_kv_writer() is None:
+        raise RuntimeError(
+            "INT8 indexer requires native cache writer ABI 1; rebuild vLLM"
+        )
+
+
 def indexer_k_quant_and_cache(
     k: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     quant_block_size: int,
     kv_cache_dtype: str,
+    *,
+    cache_dtype: str = "fp8",
 ) -> None:
+    from vllm.v1.attention.kv_cache_view import KVCacheView
+    from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+    codec = resolve_kv_codec(cache_dtype, representation="indexer")
+    if codec is None:
+        raise ValueError(f"Unsupported indexer codec {cache_dtype}")
+    operation = _indexer_kv_writer()
+    if operation is not None:
+        view = KVCacheView.bind_indexer(kv_cache, codec, k.shape[-1])
+        operation(
+            k,
+            view.key,
+            view.key_scale,
+            slot_mapping,
+            quant_block_size,
+            "float32" if codec.element_dtype == torch.int8 else kv_cache_dtype,
+            codec.name,
+        )
+        return
+    require_indexer_cache_codec(cache_dtype)
     torch.ops._C_cache_ops.indexer_k_quant_and_cache(
         k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype
     )

@@ -52,6 +52,8 @@ def test_reference_is_deterministic_and_links_actual_owners(source_tree):
         "INT8",
         "INT8_PER_TOKEN_HEAD",
         "FP8_PER_TOKEN_HEAD",
+        "INDEXER_FP8",
+        "INDEXER_INT8",
     }
     assert first["routes"] == sorted(first["routes"], key=lambda r: r["name"])
     int8 = next(row for row in first["codecs"] if row["symbol"] == "INT8")
@@ -61,6 +63,13 @@ def test_reference_is_deterministic_and_links_actual_owners(source_tree):
         "planar_scales",
         "torch.float32",
     )
+    indexer = next(row for row in first["codecs"] if row["symbol"] == "INDEXER_INT8")
+    assert (
+        indexer["representation"],
+        indexer["group_axis"],
+        indexer["group_size"],
+    ) == ("indexer", -1, 128)
+    assert indexer["scale_encoding"] == "fp32"
     (source_tree / reference.OUTPUT).write_text(reference.render(first))
     assert reference.check_links(source_tree) == []
 

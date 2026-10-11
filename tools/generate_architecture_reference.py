@@ -48,6 +48,10 @@ def expression(node, values):
     """Read the small expression vocabulary in existing declarations, not Python."""
     if isinstance(node, ast.Constant):
         return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        operand = expression(node.operand, values)
+        if isinstance(operand, (int, float)):
+            return -operand
     if isinstance(node, ast.Name) and node.id in values:
         return values[node.id]
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
@@ -147,27 +151,42 @@ def read_codecs(root):
         "scale_dtype",
         "rounding",
         "layout",
+        "representation",
+        "group_axis",
+        "group_size",
+        "scale_encoding",
+        "unquantized_fields",
     }:
         raise DeclarationError("KVCodec schema changed; update its reference renderer")
-    declared = assignment(tree, "KV_CODECS")
-    if not isinstance(declared, (ast.Tuple, ast.List)):
-        raise DeclarationError("KV_CODECS must list codec symbols")
+    symbols = []
+    for registry in ("KV_CODECS", "KV_REPRESENTATION_CODECS"):
+        declared = assignment(tree, registry)
+        if not isinstance(declared, (ast.Tuple, ast.List)):
+            raise DeclarationError(f"{registry} must list codec symbols")
+        symbols.extend(declared.elts)
     result = []
-    for symbol in declared.elts:
+    known = {}
+    for symbol in symbols:
         if not isinstance(symbol, ast.Name):
             raise DeclarationError("KV_CODECS contains a non-symbol")
         node = assignment(tree, symbol.id)
-        if (
-            not isinstance(node, ast.Call)
-            or not isinstance(node.func, ast.Name)
-            or node.func.id != "KVCodec"
-        ):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
             raise DeclarationError(f"{symbol.id}: expected KVCodec declaration")
-        data = construct(
-            spec,
-            [expression(a, {}) for a in node.args],
-            {k.arg: expression(k.value, {}) for k in node.keywords},
-        )
+        keywords = {k.arg: expression(k.value, {}) for k in node.keywords}
+        if node.func.id == "KVCodec":
+            data = construct(spec, [expression(a, {}) for a in node.args], keywords)
+        elif (
+            node.func.id == "replace"
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in known
+        ):
+            data = construct(spec, [], known[node.args[0].id] | keywords)
+        else:
+            raise DeclarationError(
+                f"{symbol.id}: expected codec or bound representation"
+            )
+        known[symbol.id] = data
         result.append(
             dict(symbol=symbol.id, source=source_location(CODECS, node), **data)
         )
@@ -335,16 +354,20 @@ def render(report):
         "",
         "A registered storage descriptor does not establish native support.",
         "",
-        "| Symbol | Canonical / aliases | Storage / element | Version / layout "
+        "| Symbol | Canonical / aliases | Storage / element | Representation / group "
+        "| Version / layout "
         "| Scales / rounding | Native codec ID | Source |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in report["codecs"]:
         lines.append(
             f"| {row['symbol']} | {cell(row['name'])} / "
             f"{cell(', '.join(row['aliases']))} | {row['storage_dtype']} / "
-            f"{row['element_dtype']} | {row['encoding_version']} / {row['layout']} "
-            f"| {row['scale_granularity']} ({row['scale_dtype']}) / "
+            f"{row['element_dtype']} | {row['representation']} / "
+            f"{row['group_axis']}:{row['group_size']} | "
+            f"{row['encoding_version']} / {row['layout']} "
+            f"| {row['scale_granularity']} ({row['scale_dtype']}, "
+            f"{row['scale_encoding']}) / "
             f"{row['rounding']} | {row['native_id']} | {link(row['source'])} |"
         )
     lines += [

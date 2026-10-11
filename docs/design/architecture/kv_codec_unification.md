@@ -775,3 +775,39 @@ spelling from each spec's declared quantization mode. This does not choose a
 reader codec or change algorithm policy. Mixed target/draft tests now keep the
 spec fixed while varying the outer `auto`, FP8 and INT8 settings, and check
 both runner views and restore behavior.
+
+## Independent grouped indexer codecs (2026-10-12)
+
+`AttentionConfig.indexer_cache_dtype=auto|fp8|int8` controls indexer storage
+independently of attention KV. `auto` preserves FP8 and the explicit legacy
+FP4 option; an explicit FP8/INT8 choice conflicts with that FP4 option. The
+effective choice participates in the attention configuration hash.
+
+Indexer codecs bind the existing E4M3 and RNE INT8 formats to the indexer
+representation, last-axis groups of 128 and FP32 scales. Ordinary and grouped
+cache identities differ. Their borrowed view describes page payload and
+scale regions, actual byte strides and physical padding. One CUDA writer and
+the existing Triton scoring, gather/cuBLAS and KPool algorithms take the codec;
+there is no second INT8 indexer executor. Old FP8 native entry points remain;
+INT8 requires the actual native codec ABI before writing any cache byte.
+
+The SM70 component build passes 16 native-writer cases, 50 scorer/gather/cuBLAS
+cases and 56 KPool cases generated for both compatible codecs. Coverage includes
+128/256-dimensional keys with 128-element groups, FP16/BF16/FP32 inputs,
+non-contiguous row strides, physical padding, independent scales, rounding ties,
+invalid group propagation, changed-input graph replay, non-contiguous pages,
+top-k sets, pool completion and tail state. A CUDA profiler case observes the
+native codec writer kernel. The native component was rebuilt serially after
+rejecting two overlapping build attempts; artifacts from those attempts do not
+qualify this stage.
+
+Three initial INT8 factored-score cases exceeded the existing `atol=0.01,
+rtol=0.01` contract. Rounding the combined weighted query and decoded keys to
+FP16 caused cancellation error. The shared factored computation now retains
+FP32 intermediates for both codecs; all 50 cases pass the unchanged limits.
+The default per-head ReLU algorithm retains its existing computation.
+
+The DeepSeek indexer compressor forwards the same codec to the shared encoder,
+but its fused execution remains unqualified. Representative sparse-engine
+quality, state-lifecycle, latency and a complete normally installed wheel are
+also pending. This stage does not qualify ordinary MLA, QSA or history INT8.
