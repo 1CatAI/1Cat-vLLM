@@ -6,6 +6,80 @@ owner. Use the component contracts for behavior, the
 declarations, and phase reports for historical evidence. Update the primary
 source of each fact and link to it from other documents.
 
+## Runtime acceptance contract
+
+This contract is required for changes to runtime behavior, model integration,
+dispatch, configuration or native loading/builds. Record it in the existing PR
+template and component tests; do not create a second capability registry.
+Documentation-only changes use the checks below. Reviewers must resolve missing
+evidence within the claimed scope before marking a runtime change ready.
+
+1. **Declare coverage before implementation.** Separate the correctness support
+   envelope, accelerated subset and measured cases. Include affected dimensions:
+   device, model/state contract, weight/KV dtype, layout/head geometry, token and
+   request counts, context range, TP/EP/PP, speculation, graph and launch mode.
+   State units: live tokens, compressed score columns, allocated page capacity
+   and graph padding are different. A 32K measurement proves no other length.
+2. **Extend a family path.** New models map their capabilities to existing
+   attention, MoE, linear and GDN providers, stages and resource owners. Identify
+   reusable stages and the missing capability before adding code. Keep algorithm,
+   tiling and fusion specializations behind that family's selector; do not copy a
+   model's complete fast path or introduce another dispatcher/configuration
+   store. A new provider needs an algorithm/layout/numerical reason and explicit
+   bindings. Fewer files or one giant kernel is not a performance acceptance test.
+3. **Separate admission, qualification and tuning.** Hardware/layout constraints
+   determine whether an implementation can execute; model/state evidence
+   determines qualification; measurements choose among eligible implementations.
+   Preserve numerical and state contracts. Never remove a safety/quality guard
+   or change precision merely to widen a fast path. Each exact-shape restriction
+   must identify which constraint it represents and the qualified fallback.
+4. **Define startup equivalence.** For supported entry points with equivalent
+   effective inputs, resolved computation policy, worker policy, computation
+   hashes and numerical/state behavior must agree. Compare values, not command
+   text. Defaults versus explicit values, CLI versus `LLM`, legacy inputs versus
+   typed configuration, process initialization and warm/AOT cache reuse belong in
+   the affected matrix. Graph/eager execution may use different kernels; explain
+   intentional differences. A developer shell, import order or stale native
+   library must not be required for a released path. Follow the configuration
+   and native-binding recipes below for ownership and compatibility checks.
+5. **Make boundaries safe and visible.** Every admitted input must reach a valid
+   implementation. Outside a specialized range, retain a qualified fallback with
+   a diagnosable rejection reason; if no implementation supports the input,
+   reject at the earliest boundary with enough information. Do not silently
+   change precision. Check interval endpoints, an interior case, valid neighbors
+   of each changed threshold, page/tile tails and capacity growth. Explicitly
+   account for gaps between fast ranges; a selector flag is not a native hit.
+6. **Test affected interactions.** Use cheap selector/configuration cases for
+   range coverage, then the smallest GPU cases that exercise changed computation
+   and fallback. Include affected interactions among mixed request lengths,
+   batch/token counts, prefill/decode/verification, graph capture/replay and state
+   reorder/commit. Startup changes need paired fresh-process entry tests; native
+   packaging changes need the supported clean artifact entry. Justify omitted
+   dimensions. Do not require an unrelated Cartesian benchmark sweep or repeat
+   recorded experiments. A regression must remain in the owning test suite.
+7. **Keep evidence distinct.** Report selection, observed native execution,
+   output/state correctness and measured performance separately. Record each
+   source/binary identity; match inputs and effective configuration across the
+   baseline and candidate except for the declared change under comparison.
+   Preserve the component's deterministic comparison or documented numerical
+   tolerance; changing that contract needs separate justification. Performance
+   acceptance includes the affected real execution path, with TTFT/prefill and
+   pure decode reported separately; a faster isolated kernel can add conversion,
+   allocation, synchronization or launch overhead elsewhere. Model-reuse claims
+   need a second compatible model's evidence; structural reuse alone does not
+   qualify that model. Retain the migration's separate 27B and 35B AWQ/FP8 targets.
+8. **Bound incomplete work.** A narrow optimization may be accepted with its
+   exact coverage and correct fallback, but must not be advertised as general
+   acceleration. Record uncovered intervals/interactions, the responsible
+   component and follow-up decision in existing component or migration records.
+   Missing evidence remains unverified; it is not a passing result. Default-on
+   promotion or a broader support claim requires the corresponding evidence.
+
+For example, extending a score-column fast path through `N` requires cases at
+the valid neighbors of `N`, a non-aligned interior length and different live
+lengths sharing padded capacity. Record the expected native branch or fallback
+for each. A token-context label alone cannot establish that coverage.
+
 ## Choose the extension point
 
 The following recipes retain existing selectors, initialization order and

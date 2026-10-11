@@ -127,3 +127,7 @@ change and explain why**.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+- **1Cat runtime, acceleration and model integration**:
+  [`docs/contributing/1cat-development.md`](docs/contributing/1cat-development.md#runtime-acceptance-contract)
+  — Mandatory support/acceleration coverage, startup equivalence, boundary and
+  fallback evidence, and reuse of existing family paths before adding providers.
