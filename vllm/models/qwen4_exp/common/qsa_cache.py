@@ -980,6 +980,7 @@ class QSACompressedKeyCache(_QSAStateCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         _, side_block_size, _ = qsa_dcp_block_geometry(vllm_config, self.prefix)
+        policy = vllm_config.kernel_config
         return MLAAttentionSpec(
             block_size=side_block_size,
             num_kv_heads=1,
@@ -987,6 +988,11 @@ class QSACompressedKeyCache(_QSAStateCache):
             dtype=self.dtype,
             compress_ratio=self.compress_ratio,
             dcp_sharded=False,
+            host_backed=bool(
+                policy.qsa_host_indexer_history
+                and policy.qsa_host_kv_active
+                and not policy.qsa_host_kv_device_reference
+            ),
         )
 
 

@@ -31,6 +31,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import (
     AttentionGroup,
     add_kv_sharing_layers_to_kv_cache_groups,
+    allocate_host_kv_cache_pool,
     bind_kv_cache,
     compressed_kernel_block_size,
     prepare_kernel_block_sizes,
@@ -159,18 +160,11 @@ def init_attn_backend(
 def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
 ):
-    kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+    kv_cache_raw_tensors = allocate_host_kv_cache_pool(kv_cache_config, device)
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         if kv_cache_tensor.host_backed:
-            from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
-
-            with torch.accelerator.device_index(device.index):
-                host = torch.zeros(
-                    kv_cache_tensor.size, dtype=torch.int8, pin_memory=True
-                )
-                tensor = get_accelerator_view_from_cpu_tensor(host)
-        else:
-            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+            continue
+        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
 

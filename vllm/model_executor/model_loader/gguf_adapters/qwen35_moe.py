@@ -92,6 +92,7 @@ class Qwen35MoeAdapter(Qwen35Adapter):
             repack = (
                 int(tensor.tensor_type) == 42
                 and not getattr(self, "canonical_expert_storage", False)
+                and not getattr(self, "preserve_expert_blocks", False)
                 and projection == "down_proj"
                 and int(tensor.shape[0]) % (64 * self.tp_size) != 0
             )

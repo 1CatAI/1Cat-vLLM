@@ -13,18 +13,31 @@ pytestmark = pytest.mark.skipif(
     reason="requires SM70 and sm70_dmv13_out",
 )
 
-BLOCK = {12: 144, 14: 210}
+BLOCK = {8: 34, 12: 144, 13: 176, 14: 210, 20: 18, 23: 136}
+
+
+@pytest.fixture(params=[torch.float32, torch.float16])
+def default_dtype(request):
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(request.param)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
 
 
 def _raw(rng, rows, k, qtype):
     size = BLOCK[qtype]
-    raw = rng.integers(0, 256, (rows, k // 256, size), dtype=np.uint8)
-    d = np.full((rows, k // 256), 0.002, np.float16).view(np.uint8)
-    if qtype == 12:
-        raw[..., 0:2] = d.reshape(rows, k // 256, 2)
-        raw[..., 2:4] = d.reshape(rows, k // 256, 2)
+    block = 32 if qtype in (8, 20) else 256
+    raw = rng.integers(0, 256, (rows, k // block, size), dtype=np.uint8)
+    d = np.full((rows, k // block), 0.002, np.float16).view(np.uint8)
+    if qtype in (12, 13):
+        raw[..., 0:2] = d.reshape(rows, k // block, 2)
+        raw[..., 2:4] = d.reshape(rows, k // block, 2)
+    elif qtype == 14:
+        raw[..., 208:210] = d.reshape(rows, k // block, 2)
     else:
-        raw[..., 208:210] = d.reshape(rows, k // 256, 2)
+        raw[..., :2] = d.reshape(rows, k // block, 2)
     return raw.reshape(rows, -1)
 
 
@@ -38,6 +51,71 @@ class _Shard:
 class _Extra:
     def __init__(self, weight):
         self.weight = weight
+
+
+class _MergedShard:
+    def __init__(self, raws, qtypes):
+        self.qweight = torch.from_numpy(raws[0])
+        self.qweight.data_container = [torch.from_numpy(raw) for raw in raws]
+        self.qweight.shard_id = list(range(len(raws)))
+        self.qweight.shard_id_map = {i: i for i in self.qweight.shard_id}
+        self.qweight_type = type(
+            "T", (), {"shard_weight_type": dict(enumerate(qtypes))}
+        )()
+        self.prefix = "test.merged"
+
+
+@pytest.mark.parametrize(
+    "qtypes", [(12, 14, 23), (12, 14, 13), (8, 12), (8, 13), (8, 14)]
+)
+def test_unsupported_side_formats_declined_before_packing(qtypes, monkeypatch):
+    from vllm.model_executor.layers.quantization import sm70_dmv13_projection
+
+    rng = np.random.default_rng(9216)
+    layer = _MergedShard([_raw(rng, 32, 256, t) for t in qtypes], qtypes)
+
+    def unexpected_decode(*args):
+        pytest.fail("Unsupported formats must be declined before decoding/upload")
+
+    monkeypatch.setattr(sm70_dmv13_projection.dense, "decode", unexpected_decode)
+    assert not sm70_dmv13_projection.attach(layer, None, "sm70_side_projection")
+    assert not hasattr(layer, "sm70_side_projection")
+
+
+@pytest.mark.parametrize(
+    "qtypes,real_shape",
+    [
+        ((12, 14), False),
+        ((8, 23), False),
+        ((20, 23, 20), False),
+        ((23, 14, 14), True),
+        ((23, 23, 14), True),
+        ((13, 14, 13), True),
+        ((13, 14, 14), True),
+        ((14, 14, 14), True),
+    ],
+)
+def test_supported_mixed_side_formats_match_separate(qtypes, real_shape, default_dtype):
+    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
+        Dmv13Projection,
+    )
+
+    rng = np.random.default_rng(16384)
+    k = 2560 if real_shape else 256
+    widths = [3072, 128, 128] if real_shape else [32] * len(qtypes)
+    raws = [_raw(rng, n, k, t) for n, t in zip(widths, qtypes)]
+    fused = Dmv13Projection(_MergedShard(raws, qtypes))
+    controls = [Dmv13Projection(_Shard(raw, t)) for raw, t in zip(raws, qtypes)]
+    assert fused.ready and all(p.ready for p in controls)
+    x = torch.randn(5, k, device="cuda", dtype=torch.float16)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, _ = fused.run(x)
+    for _ in range(3):
+        x.normal_()
+        graph.replay()
+        reference = torch.cat([p.run(x)[0] for p in controls], dim=1)
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
 
 
 class _MergedBf16Extra:
@@ -78,3 +156,85 @@ def test_side_projection_matches_dequant(qtype, tokens, merged_bf16):
     torch.testing.assert_close(
         extra_out.float(), (x.float() @ extra.half().float().T), atol=2e-2, rtol=2e-2
     )
+
+
+@pytest.mark.parametrize("qtype", [8, 12, 13, 14, 20, 23])
+def test_shared_segment_planes_preserve_side_and_m20_graph(qtype, default_dtype):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import (
+        decode,
+        pack,
+    )
+    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
+        Dmv13Projection,
+        _register_banks,
+        share_prepared_banks,
+    )
+
+    n, k = 256, 2560
+    raw = _raw(np.random.default_rng(3000 + qtype), n, k, qtype)
+    fmt, codes, scales, minimum, group = decode(raw, qtype)
+    payload = [
+        torch.from_numpy(t).cuda() for t in pack(fmt, codes, scales, minimum, group)
+    ]
+    p = torch.nn.Module()
+    p.codes, p.segment_high, p.stats = payload
+    p.kernel = SimpleNamespace(config=SimpleNamespace(partition_weight_shape=(k, n)))
+    p.source_output_sizes = (n,)
+    p.segment_format, p.output_padding, p.input_layout_restored = fmt, 0, False
+    layer = torch.nn.Module()
+    layer.gguf_tm_projections = torch.nn.ModuleList([p])
+    extra = (torch.randn(24, k, device="cuda") * 0.02).half()
+    proj = Dmv13Projection(_Shard(raw, qtype), _Extra(extra))
+    assert proj.ready
+    assert proj.workspace.dtype == torch.float32
+    layer.sm70_side_projection = proj
+    _register_banks(layer, "sm70_side_projection", proj)
+    x = torch.randn(5, k, device="cuda", dtype=torch.float16)
+    before = tuple(t.clone() for t in proj.run(x))
+    assert share_prepared_banks(layer) == 1
+    after = proj.run(x)
+    for got, expected in zip(after, before):
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = proj.run(x)
+    for _ in range(3):
+        x.normal_()
+        graph.replay()
+        for got, expected in zip(captured, proj.run(x)):
+            torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    # C4 still reads the same resident planes through the existing M20 route.
+    x20 = torch.randn(20, k, device="cuda", dtype=torch.float16)
+    y20 = torch.empty(20, n, device="cuda", dtype=torch.float16)
+    workspace = torch.empty(8192, device="cuda", dtype=torch.float32)
+    counters = torch.zeros(32, device="cuda", dtype=torch.int32)
+
+    def run20():
+        torch.ops._C.gguf_dense_segments_sm70_out(
+            x20,
+            [p.codes],
+            [p.segment_high],
+            [p.stats],
+            [y20],
+            [fmt],
+            [n],
+            k,
+            1,
+            4,
+            workspace,
+            counters,
+            None,
+        )
+
+    run20()
+    graph20 = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph20):
+        run20()
+    for _ in range(3):
+        x20.normal_()
+        graph20.replay()
+        got = y20.clone()
+        run20()
+        torch.testing.assert_close(got, y20, rtol=0, atol=0)

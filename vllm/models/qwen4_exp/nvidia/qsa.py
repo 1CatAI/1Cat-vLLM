@@ -70,6 +70,15 @@ from .indexer_qsa import QSAIndexer
 logger = init_logger(__name__)
 
 
+def _qsa_rope_cache_length(config, model_config) -> int:
+    """Bound fixed-frequency text RoPE by the engine's position limit."""
+    mm_config = model_config.multimodal_config
+    text_only = mm_config is None or mm_config.language_model_only
+    if text_only and config.rope_parameters.get("rope_type", "default") == "default":
+        return min(config.max_position_embeddings, model_config.max_model_len)
+    return config.max_position_embeddings
+
+
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
     """Flash metadata supporting uniform decode and target-verify graphs."""
 
@@ -572,7 +581,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=_qsa_rope_cache_length(config, model_config),
             rope_parameters=config.rope_parameters,
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -623,6 +632,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         self.host_kv_enabled = vllm_config.kernel_config.qsa_host_kv_active
         self.host_kv_hot_tokens = vllm_config.kernel_config.qsa_host_kv_hot_tokens
+        self.host_kv_staging_rows = vllm_config.kernel_config.qsa_host_kv_staging_rows
         self.host_kv_device_reference = (
             vllm_config.kernel_config.qsa_host_kv_device_reference
         )
@@ -806,6 +816,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.head_dim,
                 kv_cache.device,
                 hot_tokens=self.host_kv_hot_tokens,
+                rows=self.host_kv_staging_rows,
                 history=kv_cache,
                 width=self.indexer.output_width,
                 device_reference=self.host_kv_device_reference,
@@ -829,19 +840,24 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         from .ops.host_kv_attention import host_qsa_attention
 
         state = self.host_kv
-        for start in range(0, query.shape[0], state.rows):
-            stop = min(start + state.rows, query.shape[0])
-            host_qsa_attention(
-                query[start:stop],
-                state,
-                indices[start:stop],
-                table,
-                requests[start:stop],
-                positions[start:stop],
-                lengths,
-                output[start:stop],
-                gate[start:stop] if gate is not None else None,
-            )
+        # Preserve the default 32-row grouping and its arithmetic while
+        # subdividing only the shared host-miss staging allocation.
+        for base in range(0, query.shape[0], 32):
+            end = min(base + 32, query.shape[0])
+            for start in range(base, end, state.rows):
+                stop = min(start + state.rows, end)
+                host_qsa_attention(
+                    query[start:stop],
+                    state,
+                    indices[start:stop],
+                    table,
+                    requests[start:stop],
+                    positions[start:stop],
+                    lengths,
+                    output[start:stop],
+                    gate[start:stop] if gate is not None else None,
+                    launch_rows=end - base,
+                )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size, _, dcp_sharded = qsa_dcp_block_geometry(

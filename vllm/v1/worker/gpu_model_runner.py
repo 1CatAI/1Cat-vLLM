@@ -248,7 +248,10 @@ from vllm.v1.worker.ubatch_utils import (
     maybe_create_ubatch_slices,
     split_attn_metadata,
 )
-from vllm.v1.worker.utils import is_residual_scattered_for_sp
+from vllm.v1.worker.utils import (
+    allocate_host_kv_cache_pool,
+    is_residual_scattered_for_sp,
+)
 from vllm.v1.worker.workspace import lock_workspace
 
 from .utils import (
@@ -12363,20 +12366,13 @@ class GPUModelRunner(
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
-        kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+        kv_cache_raw_tensors = allocate_host_kv_cache_pool(kv_cache_config, self.device)
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             if kv_cache_tensor.host_backed:
-                from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
-
-                with torch.accelerator.device_index(self.device.index):
-                    host = torch.zeros(
-                        kv_cache_tensor.size, dtype=torch.int8, pin_memory=True
-                    )
-                    tensor = get_accelerator_view_from_cpu_tensor(host)
-            else:
-                tensor = torch.zeros(
-                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
-                )
+                continue
+            tensor = torch.zeros(
+                kv_cache_tensor.size, dtype=torch.int8, device=self.device
+            )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor
 

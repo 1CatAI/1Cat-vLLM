@@ -263,6 +263,20 @@ def _make_draft_vllm_config(
             checkpoint_prefixes,
             quantize_unquantized=online_fp8,
         )
+    if draft_vllm_config.kernel_config.sm70_mtp_lossless_storage:
+        from .mtp_lossless_experts import MTPLosslessConfig
+
+        if (
+            draft_quant_config is not None
+            or not is_exact_sm70_cuda_platform()
+            or draft_vllm_config.model_config.dtype != torch.float16
+            or draft_vllm_config.parallel_config.tensor_parallel_size != 4
+            or draft_vllm_config.parallel_config.enable_expert_parallel
+        ):
+            raise ValueError(
+                "Lossless MTP storage requires unquantized FP16, SM70, TP4"
+            )
+        draft_quant_config = MTPLosslessConfig()
     draft_vllm_config.quant_config = draft_quant_config
     return draft_vllm_config
 
@@ -279,7 +293,13 @@ def _make_draft_vllm_config(
 class Qwen4ExpMultiTokenPredictor(nn.Module):
     hf_to_vllm_mapper = _QWEN3_5_WEIGHTS_MAPPER | _HC_WEIGHTS_MAPPER
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+        share_target_embed_tokens: bool = False,
+    ) -> None:
         super().__init__()
 
         model_config = vllm_config.model_config
@@ -294,7 +314,11 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
 
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        self.embed_tokens = (
+            PPMissingLayer()
+            if share_target_embed_tokens
+            else VocabParallelEmbedding(self.vocab_size, self.hidden_size)
+        )
         draft_vllm_config = _make_draft_vllm_config(
             vllm_config,
             self.mtp_start_layer_idx,
@@ -574,13 +598,22 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
 
         super().__init__()
         self.config = config
+        speculative = vllm_config.speculative_config
+        self.share_target_io_weights = bool(
+            speculative is not None
+            and speculative.method == "mtp"
+            and get_pp_group().world_size == 1
+        )
         self.model = Qwen4ExpMultiTokenPredictor(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),
+            share_target_embed_tokens=self.share_target_io_weights,
         )
 
         if get_pp_group().is_last_rank:
-            if config.tie_word_embeddings:
+            if self.share_target_io_weights:
+                self.lm_head = PPMissingLayer()
+            elif config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
                 self.lm_head = ParallelLMHead(
@@ -602,6 +635,13 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
         object.__setattr__(self, "_sm70_decode_graph_model", None)
         self._sm70_draft_head = None
+
+    def prepare_loaded_linear_weights(self) -> None:
+        from .sm70_fp16_hc import prepare_sharded_hc_storage
+
+        prepare_sharded_hc_storage(self, self.vllm_config)
+        if self.vllm_config.kernel_config.hc_weight_storage == "sharded":
+            torch.accelerator.empty_cache()
 
     def prepare_sm70_draft_head(self) -> None:
         # Called after checkpoint loading and target-head sharing, before KV
@@ -684,13 +724,17 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         # The drafter ships inside its target's checkpoint; without this the
         # loader reads the whole target again only for load_weights to drop
         # everything but the MTP tensors.
-        return _remap_mtp_weight_name(name) is None
+        remapped = _remap_mtp_weight_name(name)
+        return remapped is None or (
+            getattr(self, "share_target_io_weights", False)
+            and remapped.startswith(("model.embed_tokens.", "lm_head."))
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
             for name, weight in weights:
                 remapped_name = _remap_mtp_weight_name(name)
-                if remapped_name is not None:
+                if remapped_name is not None and not self.skip_checkpoint_weight(name):
                     yield remapped_name, weight
 
         loader = AutoWeightsLoader(

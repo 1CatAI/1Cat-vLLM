@@ -174,6 +174,43 @@ requires_sm70 = pytest.mark.skipif(
 
 
 @requires_sm70
+def test_long_context_score_budget_keeps_exact_selected_indices(
+    monkeypatch, workspace_init
+):
+    torch.manual_seed(1167)
+    _enable_cublas(monkeypatch)
+    page, columns, rows = 64, 65536, 512
+    cache = torch.randn(
+        columns // page, page, 1, 128, dtype=torch.float16, device="cuda"
+    )
+    query = torch.randn(rows, 4, 128, dtype=torch.float16, device="cuda")
+    table = torch.arange(columns // page, dtype=torch.int32, device="cuda")[None]
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    positions = torch.full((rows,), 262143, dtype=torch.int64, device="cuda")
+    lengths = torch.full((1,), 262144, dtype=torch.int32, device="cuda")
+    chunks = []
+    original = qsa_ops._qsa_mqa_cublas
+
+    def record(q, *args):
+        chunks.append(q.shape[0])
+        return original(q, *args)
+
+    monkeypatch.setattr(qsa_ops, "_qsa_mqa_cublas", record)
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 64)
+    reference = qsa_ops.qsa_select_paged_tokens(
+        query, cache, table, requests, positions, lengths, 2048, 4
+    )
+    assert chunks == [512]
+    chunks.clear()
+    set_qsa_option(monkeypatch, "qsa_score_tile_mb", 8)
+    actual = qsa_ops.qsa_select_paged_tokens(
+        query, cache, table, requests, positions, lengths, 2048, 4
+    )
+    assert chunks == [64] * 8
+    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@requires_sm70
 def test_mixed_batch_selection_matches_each_request_alone(monkeypatch, workspace_init):
     """A long prefill selects the same blocks with or without decode rows."""
 

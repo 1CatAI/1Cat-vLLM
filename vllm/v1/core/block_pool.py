@@ -127,6 +127,48 @@ class BlockHashToBlockMap:
         raise AssertionError(f"Invalid KV cache block type {type(blocks)}")
 
 
+class _PartitionedBlockQueue:
+    """Keep state IDs in a small GPU range; history uses the remaining IDs.
+
+    Blocks retain globally unique IDs and the ordinary hash/refcount lifetime.
+    Each range has its own eviction order, so prefix checkpoints can be evicted
+    without growing GPU state tensors to the host-history capacity.
+    """
+
+    def __init__(self, blocks, state_blocks, state_group_ids):
+        self.state_blocks = state_blocks
+        self.state_group_ids = frozenset(state_group_ids)
+        self.state = FreeKVCacheBlockQueue(blocks[1:state_blocks])
+        self.history = FreeKVCacheBlockQueue(blocks[state_blocks:])
+
+    @property
+    def num_free_blocks(self):
+        return self.state.num_free_blocks + self.history.num_free_blocks
+
+    def for_group(self, group_id):
+        if group_id is None:
+            raise ValueError("Partitioned cache allocation requires a group ID")
+        return self.state if group_id in self.state_group_ids else self.history
+
+    def popleft_n(self, n, group_id=None):
+        return self.for_group(group_id).popleft_n(n)
+
+    def remove(self, block):
+        queue = self.state if block.block_id < self.state_blocks else self.history
+        queue.remove(block)
+
+    def append_n(self, blocks):
+        self.state.append_n([b for b in blocks if b.block_id < self.state_blocks])
+        self.history.append_n([b for b in blocks if b.block_id >= self.state_blocks])
+
+    def prepend_n(self, blocks):
+        self.state.prepend_n([b for b in blocks if b.block_id < self.state_blocks])
+        self.history.prepend_n([b for b in blocks if b.block_id >= self.state_blocks])
+
+    def get_all_free_blocks(self):
+        return self.state.get_all_free_blocks() + self.history.get_all_free_blocks()
+
+
 class BlockPool:
     """BlockPool that manages KVCacheBlocks.
     It provides methods to allocate, free and cache the kv cache blocks. The
@@ -153,6 +195,8 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        device_state_blocks: int = 0,
+        device_state_group_ids: tuple[int, ...] = (),
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -165,7 +209,10 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        initial_queue = FreeKVCacheBlockQueue(self.blocks)
+        self.free_block_queue: FreeKVCacheBlockQueue | _PartitionedBlockQueue = (
+            initial_queue
+        )
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
@@ -173,8 +220,15 @@ class BlockPool:
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
-        self.null_block = self.free_block_queue.popleft()
+        self.null_block = initial_queue.popleft()
         self.null_block.is_null = True
+
+        if device_state_blocks:
+            if not 1 < device_state_blocks < num_gpu_blocks:
+                raise ValueError("State partition must leave history capacity")
+            self.free_block_queue = _PartitionedBlockQueue(
+                self.blocks, device_state_blocks, device_state_group_ids
+            )
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -329,7 +383,9 @@ class BlockPool:
                     )
                 )
 
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    def get_new_blocks(
+        self, num_blocks: int, kv_cache_group_id: int | None = None
+    ) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
 
         Note that we do not check block cache in this function.
@@ -340,10 +396,14 @@ class BlockPool:
         Returns:
             A list of new block.
         """
-        if num_blocks > self.get_num_free_blocks():
+        if num_blocks > self.get_num_free_blocks(kv_cache_group_id):
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
-        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        ret: list[KVCacheBlock] = (
+            self.free_block_queue.popleft_n(num_blocks, kv_cache_group_id)
+            if isinstance(self.free_block_queue, _PartitionedBlockQueue)
+            else self.free_block_queue.popleft_n(num_blocks)
+        )
 
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
@@ -515,13 +575,30 @@ class BlockPool:
 
         return True
 
-    def get_num_free_blocks(self) -> int:
+    def get_num_free_blocks(self, kv_cache_group_id: int | None = None) -> int:
         """Get the number of free blocks in the pool.
 
         Returns:
             The number of free blocks.
         """
+        if kv_cache_group_id is not None and isinstance(
+            self.free_block_queue, _PartitionedBlockQueue
+        ):
+            return self.free_block_queue.for_group(kv_cache_group_id).num_free_blocks
         return self.free_block_queue.num_free_blocks
+
+    def can_allocate_group_blocks(self, demand: dict[int, int]) -> bool:
+        """Check partition quotas; callers still check aggregate free capacity."""
+        if not isinstance(self.free_block_queue, _PartitionedBlockQueue):
+            return True
+        state = sum(
+            n for i, n in demand.items() if i in self.free_block_queue.state_group_ids
+        )
+        history = sum(demand.values()) - state
+        return (
+            state <= self.free_block_queue.state.num_free_blocks
+            and history <= self.free_block_queue.history.num_free_blocks
+        )
 
     def get_usage(self) -> float:
         """Get the KV cache usage.

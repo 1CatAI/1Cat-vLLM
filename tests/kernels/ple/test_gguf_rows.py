@@ -83,3 +83,21 @@ def test_reports_fp16_overflow_without_clipping():
     actual = reader.lookup(np.array([0]), np.float32)
     expected = gguf.quants.dequantize(data, gguf.GGMLQuantizationType.IQ4_NL)
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_packed_row_reader_uses_gather_before_official_dequantization():
+    import torch
+
+    source = iq4_rows(7)
+    calls = []
+
+    class Gather:
+        def apply(self, ids, output):
+            calls.append(ids.tolist())
+            output.copy_(torch.from_numpy(source)[ids])
+
+    reader = PackedGGUFRowReader(source, 20, 160, packed_row_gather=Gather())
+    ids = np.array([[6, 0, 6], [2, 6, 0]], dtype=np.int64)
+    reference = PackedGGUFRowReader(source, 20, 160).lookup(ids)
+    np.testing.assert_array_equal(reader.lookup(ids), reference)
+    assert calls == [[0, 2, 6]]

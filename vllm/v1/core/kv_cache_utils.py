@@ -919,6 +919,27 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    if kv_cache_config.device_state_blocks:
+        state_groups = set(kv_cache_config.device_state_group_ids)
+        state_per_request = 0
+        history_per_request = 0
+        for i, group in enumerate(kv_cache_config.kv_cache_groups):
+            demand = (
+                cdiv(
+                    group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                    group.kv_cache_spec.page_size_bytes,
+                )
+                + 1
+            )
+            if i in state_groups:
+                state_per_request += demand
+            else:
+                history_per_request += demand
+        return min(
+            (kv_cache_config.device_state_blocks - 1) / state_per_request,
+            (kv_cache_config.num_blocks - kv_cache_config.device_state_blocks)
+            / history_per_request,
+        )
     num_blocks_per_request = sum(
         cdiv(
             group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
@@ -1760,6 +1781,11 @@ def _glm5_next_tensor_layout(
     )
 
 
+def _host_kv_state_blocks(vllm_config: VllmConfig) -> int:
+    policy = cast(Any, getattr(vllm_config, "kernel_config", None))
+    return int(getattr(policy, "qsa_host_kv_state_blocks", 0))
+
+
 def _get_kv_cache_config_csa_linear(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1769,9 +1795,59 @@ def _get_kv_cache_config_csa_linear(
     if layout is None:
         return None
 
-    num_blocks = available_memory // layout.bytes_per_block
+    state_blocks = _host_kv_state_blocks(vllm_config)
+    state_groups = tuple(
+        i for i, group in enumerate(kv_cache_groups) if group in layout.mamba_groups
+    )
+    if state_blocks:
+        if not layout.host_main_kv_names or len(layout.host_main_kv_names) != len(
+            layout.main_kv_names
+        ):
+            raise ValueError("A bounded state pool requires all main KV owners on host")
+        if getattr(vllm_config, "kv_transfer_config", None) is not None:
+            raise ValueError("Bounded host-KV state pools do not support KV connectors")
+        requests = vllm_config.scheduler_config.max_num_seqs
+
+        def demand(group):
+            return (
+                cdiv(
+                    group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                    group.kv_cache_spec.page_size_bytes,
+                )
+                + 1
+            )
+
+        active_states = 1 + requests * sum(
+            demand(group)
+            for i, group in enumerate(kv_cache_groups)
+            if i in state_groups
+        )
+        if state_blocks < active_states:
+            raise ValueError(f"State pool needs at least {active_states} blocks")
+        history_blocks = requests * sum(
+            demand(group)
+            for i, group in enumerate(kv_cache_groups)
+            if i not in state_groups
+        )
+        state_bytes = (
+            sum(layout.owner_page_size(i) for i in range(len(layout.main_kv_owners)))
+            * state_blocks
+        )
+        history_page = layout.device_compressed_page_bytes
+        num_blocks = state_blocks + history_blocks
+        required = state_bytes + history_page * num_blocks
+        if required > available_memory:
+            raise ValueError(
+                f"Host-KV fixed pools need {format_gib(required)} GiB device "
+                f"memory; {format_gib(available_memory)} GiB is available"
+            )
+        if vllm_config.cache_config.num_gpu_blocks_override is not None:
+            raise ValueError("A bounded state pool derives its logical block capacity")
+    else:
+        num_blocks = available_memory // layout.bytes_per_block
     if (
         layout.host_main_kv_names
+        and not state_blocks
         and vllm_config.cache_config.num_gpu_blocks_override is None
         and not getattr(vllm_config.cache_config, "enable_prefix_caching", False)
     ):
@@ -1813,15 +1889,17 @@ def _get_kv_cache_config_csa_linear(
         if device_members:
             kv_cache_tensors.append(
                 KVCacheTensor(
-                    size=layout.owner_page_size(index) * num_blocks,
+                    size=layout.owner_page_size(index) * (state_blocks or num_blocks),
                     shared_by=device_members,
                     packed_members=members if len(members) > 1 else None,
+                    physical_num_blocks=state_blocks or None,
                 )
             )
     kv_cache_tensors.extend(
         KVCacheTensor(
             size=layout.compressed_page_sizes[index] * num_blocks,
             shared_by=[compressed_name, layout.compressor_state_names[index]],
+            host_backed=compressed_name in layout.host_compressed_names,
         )
         for index, compressed_name in enumerate(layout.compressed_names)
     )
@@ -1961,10 +2039,22 @@ def get_kv_cache_config_from_groups(
                 KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
             )
 
+    layout = _get_csa_linear_tensor_layout(kv_cache_groups)
+    state_blocks = (
+        _host_kv_state_blocks(vllm_config)
+        if layout is not None and layout.host_main_kv_names
+        else 0
+    )
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        device_state_blocks=state_blocks,
+        device_state_group_ids=tuple(
+            i
+            for i, group in enumerate(kv_cache_groups)
+            if layout is not None and state_blocks and group in layout.mamba_groups
+        ),
     )
 
 
@@ -2122,13 +2212,23 @@ class _CSALinearTensorLayout:
     # Physical main-KV owners, as indices into ``main_kv_names``.
     main_kv_owners: list[list[int]]
     host_main_kv_names: tuple[str, ...] = ()
+    host_compressed_names: tuple[str, ...] = ()
     device_owner_page_sizes: list[int] | None = None
+
+    @property
+    def device_compressed_page_bytes(self) -> int:
+        return sum(
+            size
+            for name, size in zip(self.compressed_names, self.compressed_page_sizes)
+            if name not in self.host_compressed_names
+        )
 
     @property
     def bytes_per_block(self) -> int:
         pages = self.device_owner_page_sizes
-        return sum(pages if pages is not None else self.main_kv_page_sizes) + sum(
-            self.compressed_page_sizes
+        return (
+            sum(pages if pages is not None else self.main_kv_page_sizes)
+            + self.device_compressed_page_bytes
         )
 
     def owner_page_size(self, owner: int) -> int:
@@ -2503,6 +2603,11 @@ def _get_csa_linear_tensor_layout(
             compressed_sparse[name].page_size_bytes for name in compressed_names
         ],
         host_main_kv_names=host_owners,
+        host_compressed_names=tuple(
+            name
+            for name in compressed_names
+            if cast(MLAAttentionSpec, compressed_sparse[name]).host_backed
+        ),
         device_owner_page_sizes=device_pages,
         main_kv_owners=[[i] for i in range(len(main_kv_names))]
         if host_owners
@@ -2832,6 +2937,13 @@ def _max_memory_usage_bytes_from_groups(
             for spec in per_layer_specs.values()
         )
     elif layout := _get_csa_linear_tensor_layout(kv_cache_groups):
+        if layout.host_main_kv_names and _host_kv_state_blocks(vllm_config):
+            allocation = _get_kv_cache_config_csa_linear(
+                vllm_config, kv_cache_groups, 1 << 62
+            )
+            assert allocation is not None
+            _, tensors = allocation
+            return sum(t.size for t in tensors if not t.host_backed)
         blocks_needed = sum(
             cdiv(
                 group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
@@ -3214,6 +3326,8 @@ def get_kv_cache_configs(
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
+            if tensor.physical_num_blocks is not None:
+                continue
             assert tensor.size % num_blocks_old == 0
             tensor.size = tensor.size // num_blocks_old * min_num_blocks
 

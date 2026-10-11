@@ -476,9 +476,11 @@ class GGUFModelLoader(BaseModelLoader):
         self._gguf_prepared_weights_map = gguf_weights_map
         # we can only know if tie word embeddings after mapping weights
         gguf_files = self._get_all_gguf_files(local_model_path)
-        all_extra_names = []
+        all_extra_names = set(gguf_weights_map.values())
         for f in gguf_files:
-            all_extra_names.extend(get_gguf_extra_tensor_names(f, gguf_weights_map))
+            all_extra_names.intersection_update(
+                get_gguf_extra_tensor_names(f, gguf_weights_map)
+            )
         if "lm_head.weight" in all_extra_names:
             model_config.hf_config.update({"tie_word_embeddings": True})
 
@@ -487,6 +489,13 @@ class GGUFModelLoader(BaseModelLoader):
         )
         # filter out unquantized modules to skip
         adapter = getattr(self, "_native_adapter", None)
+        if adapter is not None:
+            adapter.packed_embeddings = (
+                getattr(
+                    vllm_config.kernel_config.sm70_gguf, "embedding_storage", "dense"
+                )
+                == "original"
+            )
         unquant_names = [
             name.removesuffix(".weight")
             for name, weight_type in weight_type_map.items()
@@ -506,11 +515,18 @@ class GGUFModelLoader(BaseModelLoader):
             quant_config.canonical_expert_storage = (
                 quant_config.native_expert_storage
                 and vllm_config.kernel_config.sm70_gguf.enabled
+                and getattr(
+                    vllm_config.kernel_config.sm70_gguf,
+                    "expert_storage",
+                    "canonical",
+                )
+                == "canonical"
                 and model_config.dtype == torch.float16
                 and current_platform.get_device_capability() == (7, 0)
                 and hasattr(torch.ops._C, "gguf_affine_grouped_gemm_sm70_out")
             )
             adapter.canonical_expert_storage = quant_config.canonical_expert_storage
+            adapter.preserve_expert_blocks = quant_config.native_expert_storage
             if "output.weight" not in self._native_tensors:
                 model_config.hf_config.tie_word_embeddings = True
         logger.debug("GGUF unquantized modules: %s", unquant_names)
@@ -532,6 +548,19 @@ class GGUFModelLoader(BaseModelLoader):
                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
                 )
             model._gguf_model_path = local_model_path
+            if (
+                adapter is not None
+                and quant_config.native_expert_storage
+                and not quant_config.canonical_expert_storage
+                and vllm_config.kernel_config.sm70_gguf.expert_arena
+            ):
+                from vllm.model_executor.layers.quantization import (
+                    gguf_expert_storage,
+                )
+
+                gguf_expert_storage.prepare_original_expert_arena(
+                    model, gguf_weights_map, self._native_tensors, target_device
+                )
             self.load_weights(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)

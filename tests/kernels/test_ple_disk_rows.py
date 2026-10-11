@@ -81,3 +81,41 @@ def test_strided_ids_do_not_silently_read_adjacent_storage():
         torch.ops._C.ple_disk_gather_u8(
             ids, pointers, 4, 4, 16, torch.empty((2, 16), dtype=torch.uint8)
         )
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.ops._C, "ple_disk_cached_gather_u8"),
+    reason="requires bounded native cache",
+)
+def test_row_cache_preserves_order_under_collisions_and_reuse():
+    table = (torch.arange(9 * 17) % 256).to(torch.uint8).reshape(9, 17)
+    pointers = torch.tensor([table.data_ptr()], dtype=torch.int64)
+    keys = torch.full((2,), -1, dtype=torch.int64)
+    rows = torch.empty((2, 17), dtype=torch.uint8)
+    for selected in ([0, 2, 0, 1, 3], [2, 3, 3, 2], [8, 2, 0, 8, 1]):
+        ids = torch.tensor(selected)
+        output = torch.empty((len(selected), 17), dtype=torch.uint8)
+        torch.ops._C.ple_disk_cached_gather_u8(
+            ids,
+            pointers,
+            9,
+            9,
+            17,
+            output,
+            keys,
+            rows,
+        )
+        torch.testing.assert_close(output, table[ids], rtol=0, atol=0)
+    output = torch.full((2, 17), 123, dtype=torch.uint8)
+    with pytest.raises(IndexError, match="row id out of range"):
+        torch.ops._C.ple_disk_cached_gather_u8(
+            torch.tensor([1, 9]),
+            pointers,
+            9,
+            9,
+            17,
+            output,
+            keys,
+            rows,
+        )
+    assert torch.all(output == 123)

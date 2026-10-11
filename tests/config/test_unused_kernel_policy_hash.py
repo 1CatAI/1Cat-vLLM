@@ -19,3 +19,14 @@ def test_loaded_policy_keeps_enabled_and_disabled_graphs_distinct(policy):
     setattr(enabled, f"{policy}_applicable", True)
     setattr(disabled, f"{policy}_applicable", True)
     assert enabled.compute_hash() != disabled.compute_hash()
+
+
+@pytest.mark.parametrize("hcx", [False, True])
+def test_native_hcx_schedule_reuses_compiled_model(hcx):
+    reference = KernelConfig(sm70_hcx=hcx, sm70_hcx_local_schedule=False)
+    candidate = KernelConfig(sm70_hcx=hcx, sm70_hcx_local_schedule=True)
+    # The opaque HC op records native dispatch when CUDA graphs are captured;
+    # selecting a schedule must not recompile unrelated model operators.
+    assert reference.compute_hash() == candidate.compute_hash()
+    other_graph = KernelConfig(sm70_hcx=not hcx)
+    assert reference.compute_hash() != other_graph.compute_hash()

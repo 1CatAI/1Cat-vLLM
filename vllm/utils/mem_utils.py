@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import ctypes
 import gc
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field
 from functools import cache
+from typing import Any
 
 import psutil
 import torch
@@ -14,6 +16,63 @@ import torch.types
 from vllm.platforms import current_platform
 
 from .mem_constants import GiB_bytes, KiB_bytes, MiB_bytes
+
+
+def loaded_cuda_model_storage(models: Mapping[str, Any]) -> dict[str, Any]:
+    """Count registered backing storage once across target/draft aliases.
+
+    This is model storage, not allocator usage. Unregistered scratch buffers,
+    graph pools and CUDA library allocations require separate measurements.
+    """
+    storages: dict[tuple[str, int], dict[str, Any]] = {}
+    for owner, model in models.items():
+        if model is None:
+            continue
+        for name, layer in model.named_modules():
+            tensors = list(layer.named_parameters(recurse=False)) + list(
+                layer.named_buffers(recurse=False)
+            )
+            for key, tensor in tensors:
+                if not tensor.is_cuda or not tensor.numel():
+                    continue
+                storage = tensor.untyped_storage()
+                identity = (str(tensor.device), storage.data_ptr())
+                row = storages.setdefault(
+                    identity,
+                    {
+                        "device": str(tensor.device),
+                        "bytes": storage.nbytes(),
+                        "names": [],
+                    },
+                )
+                row["names"].append(
+                    ".".join(part for part in (owner, name, key) if part)
+                )
+    rows = sorted(storages.values(), key=lambda row: row["bytes"], reverse=True)
+    return {
+        "bytes": sum(row["bytes"] for row in rows),
+        "storages": rows,
+        "scope": "registered_cuda_model_backing_excluding_allocator_overhead",
+    }
+
+
+def reclaim_cpu_allocator_pages() -> tuple[int, int]:
+    """Return inactive libc pages after checkpoint conversion, when supported.
+
+    Live tensors and mapped checkpoint data keep their storage. This only
+    returns allocator-owned free pages before allocating pinned history.
+    """
+    gc.collect()
+    process = psutil.Process()
+    before = process.memory_info().rss
+    try:
+        trim = ctypes.CDLL(None).malloc_trim
+    except (AttributeError, OSError):
+        return before, before
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    trim(0)
+    return before, process.memory_info().rss
 
 
 def format_kib(b: int) -> str:
@@ -76,6 +135,7 @@ class MemorySnapshot:
     total_memory: int = 0
     cuda_memory: int = 0
     torch_memory: int = 0
+    torch_allocated_memory: int = 0
     non_torch_memory: int = 0
     timestamp: float = 0.0
 
@@ -121,6 +181,7 @@ class MemorySnapshot:
         # PyTorch gets from cuda (by calling cudaMalloc, etc.)
         # this is used to measure the non-torch memory usage
         self.torch_memory = torch.accelerator.memory_reserved(device)
+        self.torch_allocated_memory = torch.accelerator.memory_allocated(device)
 
         self.non_torch_memory = self.cuda_memory - self.torch_memory
         self.timestamp = time.time()
@@ -138,6 +199,9 @@ class MemorySnapshot:
             total_memory=self.total_memory - other.total_memory,
             cuda_memory=self.cuda_memory - other.cuda_memory,
             torch_memory=self.torch_memory - other.torch_memory,
+            torch_allocated_memory=(
+                self.torch_allocated_memory - other.torch_allocated_memory
+            ),
             non_torch_memory=self.non_torch_memory - other.non_torch_memory,
             timestamp=self.timestamp - other.timestamp,
             device=self.device_,
@@ -151,6 +215,7 @@ class MemorySnapshot:
             f"total_memory={format_gib(self.total_memory)}GiB, "
             f"{current_platform.device_name}_memory={format_gib(self.cuda_memory)}GiB, "
             f"torch_memory={format_gib(self.torch_memory)}GiB, "
+            f"torch_allocated_memory={format_gib(self.torch_allocated_memory)}GiB, "
             f"non_torch_memory={format_gib(self.non_torch_memory)}GiB, "
             f"timestamp={self.timestamp}, "
             f"auto_measure={self.auto_measure}"

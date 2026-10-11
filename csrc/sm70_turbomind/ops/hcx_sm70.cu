@@ -167,6 +167,31 @@ __device__ __forceinline__ void grid_bar(unsigned* bar, unsigned target) {
   __syncthreads();
 }
 
+// A persistent counter avoids the end-of-kernel arrival/reset phase. Signed
+// differences handle uint32 wrap while fewer than 2^31 arrivals are in flight.
+__device__ __forceinline__ void grid_bar_epoch(unsigned* bar, unsigned target) {
+  // CTA synchronization publishes each producer's writes to its leader.
+  // The acquire/release RMW chain and acquire load carry those writes to
+  // every consumer leader; the final CTA barrier distributes visibility.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    unsigned value;
+    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"
+                 : "=r"(value)
+                 : "l"(bar)
+                 : "memory");
+    const auto start = clock64();
+    do {
+      asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+                   : "=r"(value)
+                   : "l"(bar)
+                   : "memory");
+      if (clock64() - start > 4000000000LL) __trap();
+    } while (static_cast<int>(value - target) < 0);
+  }
+  __syncthreads();
+}
+
 __device__ __forceinline__ unsigned long long gtime() {
   unsigned long long v;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(v));
@@ -179,12 +204,13 @@ __device__ __forceinline__ unsigned long long gtime() {
 // pushes to all three peers, no forwarding hop. Sums use the fixed order (v0 +
 // v1) + (v2 + v3) on every rank, the same value the two-hop recursive doubling
 // produces.
-template <bool FULL, int OF>
+template <bool FULL, int OF, bool LOCAL_SCHEDULE = false>
 __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   TS(0);
   const int i = blockIdx.x, t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int M = a.M, rk = a.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
   const unsigned ep = ldv(a.seq), tag = ep + 1;
+  const unsigned base = LOCAL_SCHEDULE ? ldv(a.bar + 3) : 0;
   const int r8 = (lane & 3) + ((lane & 16) ? 4 : 0), quad = (lane >> 2) & 3;
   // ---- 1. all-reduce of the block output for columns [32i, 32i + 32). The
   // partial is loaded and pushed before the weight prefetch is issued, so the
@@ -310,15 +336,37 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       dhi[s] = ldgv(p + 32 + lane);
     }
   }
-  // Up weights: L2 prefetch now (one 128-byte line per lane: 5 warps x 4 s x 1
-  // KB), registers later.
-  if (warp >= 3) {
+  // Up weights use one 128-byte line per lane (5 warps x 4 KB).
+  // The local schedule delays these requests until down weights are ready.
+  if (!LOCAL_SCHEDULE && warp >= 3) {
     const char* p =
         reinterpret_cast<const char*>(a.wu + (i * 5 + warp - 3) * 4 * 64);
     pf_l2(p + lane * 128);
   }
   if (act) {
-    if (FULL) {
+    if constexpr (LOCAL_SCHEDULE) {
+      // Issue the three independent peer loads before checking their tags.
+      unsigned u1, u2, u3, e1, e2, e3;
+      const auto start = clock64();
+      do {
+        asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(u1), "=r"(e1)
+                     : "l"(a.ar[rk] + (p1 * NC + i) * 256 + t));
+        asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(u2), "=r"(e2)
+                     : "l"(a.ar[rk] + (p2 * NC + i) * 256 + t));
+        asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(u3), "=r"(e3)
+                     : "l"(a.ar[rk] + (p3 * NC + i) * 256 + t));
+        if (clock64() - start > 4000000000LL) __trap();
+      } while (e1 != tag || e2 != tag || e3 != tag);
+      const float x1 = __uint_as_float(u1), x2 = __uint_as_float(u2),
+                  x3 = __uint_as_float(u3);
+      // Preserve (rank0 + rank1) + (rank2 + rank3), including operand order.
+      const float near = (rk & 1) ? x1 + v : v + x1;
+      const float far = (rk & 1) ? x3 + x2 : x2 + x3;
+      v = (rk & 2) ? far + near : near + far;
+    } else if (FULL) {
       float x[4];
 #pragma unroll
       for (int s = 0; s < 4; ++s)
@@ -335,7 +383,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   }
   __shared__ __align__(16) half xs[8][128 + 8];
   __shared__ __align__(16) half ls[8][320 + 8];
-  __shared__ float red[6][8][32];
+  __shared__ float red[6][8][LOCAL_SCHEDULE ? 33 : 32];
   __shared__ __align__(16) half tout[8][8];
   __shared__ float rr[8][4];
   TS(1);
@@ -344,6 +392,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   float o[4];
   {
     const float B = __half2float(__float2half_rn(v));
+    float sums[4];
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
       const half h = __float2half_rn(__half2float(resv[b]) + B * g[b]);
@@ -353,13 +402,34 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
           act ? __float2half_rn(o[b] + o[b] * __half2float(nwv[b]))
               : __float2half_rn(0.f);
       float q = act ? o[b] * o[b] : 0.f;
+      if constexpr (LOCAL_SCHEDULE) {
+        sums[b] = q;
+      } else {
 #pragma unroll
-      for (int s = 16; s > 0; s >>= 1) q += __shfl_xor_sync(0xffffffff, q, s);
-      if (lane == 0 && act) a.sq[(i * 8 + row) * 4 + b] = q;
+        for (int s = 16; s > 0; s >>= 1) q += __shfl_xor_sync(0xffffffff, q, s);
+        if (lane == 0 && act) a.sq[(i * 8 + row) * 4 + b] = q;
+      }
+    }
+    if constexpr (LOCAL_SCHEDULE) {
+      // Interleave independent streams while retaining each XOR reduction tree.
+#pragma unroll
+      for (int s = 16; s > 0; s >>= 1) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+          sums[b] += __shfl_xor_sync(0xffffffff, sums[b], s);
+      }
+      if (lane == 0 && act)
+        *reinterpret_cast<float4*>(a.sq + (i * 8 + row) * 4) =
+            make_float4(sums[0], sums[1], sums[2], sums[3]);
     }
   }
   __syncthreads();
   TS(2);
+  if (LOCAL_SCHEDULE && warp >= 3) {
+    const char* p =
+        reinterpret_cast<const char*>(a.wu + (i * 5 + warp - 3) * 4 * 64);
+    pf_l2(p + lane * 128);
+  }
   // ---- 3. per-stream HC down partials over this CTA's 128 K rows (stream b =
   // k_local / 32)
   if (warp < 6) {
@@ -390,7 +460,10 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
   }
   TS(3);
   const unsigned gb = (OF >= 0 && a.gz) ? NC : 0;
-  grid_bar(a.bar, gb + NC);
+  if constexpr (LOCAL_SCHEDULE)
+    grid_bar_epoch(a.bar + 2, base + NC);
+  else
+    grid_bar(a.bar, gb + NC);
   TS(4);
   // The split-K partials of this warp's first output do not depend on rrms:
   // load them now so the two L2 round trips (sq for rrms, dpart for the
@@ -415,14 +488,32 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
                   ? __ldcg(reinterpret_cast<const float4*>(a.sq) +
                            (lane + 32 * j) * 8 + row)
                   : make_float4(0.f, 0.f, 0.f, 0.f);
+    float sums[4];
+    if constexpr (LOCAL_SCHEDULE) {
+      sums[0] = (qs[0].x + qs[1].x) + qs[2].x;
+      sums[1] = (qs[0].y + qs[1].y) + qs[2].y;
+      sums[2] = (qs[0].z + qs[1].z) + qs[2].z;
+      sums[3] = (qs[0].w + qs[1].w) + qs[2].w;
+#pragma unroll
+      for (int s = 16; s > 0; s >>= 1) {
+#pragma unroll
+        for (int b = 0; b < 4; ++b)
+          sums[b] += __shfl_xor_sync(0xffffffff, sums[b], s);
+      }
+    }
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
-      auto comp = [&](const float4& f) {
-        return b == 0 ? f.x : b == 1 ? f.y : b == 2 ? f.z : f.w;
-      };
-      float q = (comp(qs[0]) + comp(qs[1])) + comp(qs[2]);
+      float q;
+      if constexpr (LOCAL_SCHEDULE) {
+        q = sums[b];
+      } else {
+        auto comp = [&](const float4& f) {
+          return b == 0 ? f.x : b == 1 ? f.y : b == 2 ? f.z : f.w;
+        };
+        q = (comp(qs[0]) + comp(qs[1])) + comp(qs[2]);
 #pragma unroll
-      for (int s = 16; s > 0; s >>= 1) q += __shfl_xor_sync(0xffffffff, q, s);
+        for (int s = 16; s > 0; s >>= 1) q += __shfl_xor_sync(0xffffffff, q, s);
+      }
       const float rrms = rsqrtf(q / HD + a.eps);
       if (lane == 0) rr[row][b] = rrms;
       float y = o[b] * rrms;
@@ -490,7 +581,10 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     if (!FULL && ((c >= 80 * p1 && c < 80 * p1 + 80) || (p1 == 3 && c >= 320)))
       st2(a.lora[p2] + pos, w, tag);
   }
-  grid_bar(a.bar, gb + 2 * NC);
+  if constexpr (LOCAL_SCHEDULE)
+    grid_bar_epoch(a.bar + 2, base + 2 * NC);
+  else
+    grid_bar(a.bar, gb + 2 * NC);
   for (int idx = t; idx < M * 320; idx += 256) {
     const int rw = idx / 320, c = idx % 320;
     ls[rw][c] = __ushort_as_half(
@@ -517,42 +611,84 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       mma(acc, x1.z, x1.w, uhi[s].z, uhi[s].w);
     }
 #pragma unroll
-    for (int e = 0; e < 8; ++e) red[uw][e][lane] = acc[e];
-  }
-  __syncthreads();
-  if (warp == 0) {
-#pragma unroll
     for (int e = 0; e < 8; ++e) {
-      float acc = red[0][e][lane];
-#pragma unroll
-      for (int q = 1; q < 5; ++q) acc += red[q][e][lane];
-      const int rw = (e & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-      const int hh = (e & 1) | (((lane >> 1) & 1) << 1) | ((e >> 2) << 2);
-      const int h = 640 * rk + 8 * i + hh;
-      const float sg = sigm(__half2float(__float2half_rn(acc)));
-      const float xv =
-          rw < M ? __half2float(__ldcg(a.xn + rw * KD + quad * HD + h)) : 0.f;
-      float mixed = 0.f;
-#pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        const int src = (lane & ~12) | (b << 2);
-        mixed = fmaf(__shfl_sync(0xffffffff, sg, src),
-                     __shfl_sync(0xffffffff, xv, src), mixed);
+      if constexpr (LOCAL_SCHEDULE) {
+        const int rw = (e & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        const int hh = (e & 1) | (lane & 2) | (e & 4);
+        // The padded row stride avoids bank conflicts for both layouts.
+        red[uw][rw][quad * 8 + hh] = acc[e];
+      } else {
+        red[uw][e][lane] = acc[e];
       }
-      if (quad == 0) tout[rw][hh] = __float2half_rn(divf(mixed, 4.0f));
     }
   }
   __syncthreads();
-  TS(7);
-  // push own 8 hidden columns (two 8-byte LL words per 4 halves) to r^1, r^2
-  // and the local output
-  if (t < 2 * M) {
-    const int rw = t >> 1, h4 = (t & 1) * 4, h = 640 * rk + 8 * i + h4;
-    const uint2 d = *reinterpret_cast<const uint2*>(&tout[rw][h4]);
-    st4(a.hb[p1] + (rw * HD + h) / 2, d.x, d.y, tag);
-    st4(a.hb[p2] + (rw * HD + h) / 2, d.x, d.y, tag);
-    if (FULL) st4(a.hb[p3] + (rw * HD + h) / 2, d.x, d.y, tag);
-    *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
+  if constexpr (LOCAL_SCHEDULE) {
+    // One warp owns a row, including all four streams for each hidden column.
+    // It retains the five-part sum and four-stream FMA order, then sends the
+    // packed output directly without another shared-memory rendezvous.
+    if (warp < M) {
+      const int hh = lane & 7, stream = lane >> 3;
+      float acc = red[0][warp][lane];
+#pragma unroll
+      for (int q = 1; q < 5; ++q) acc += red[q][warp][lane];
+      const int h = 640 * rk + 8 * i + hh;
+      const float sg = sigm(__half2float(__float2half_rn(acc)));
+      const float xv = __half2float(__ldcg(a.xn + warp * KD + stream * HD + h));
+      float mixed = 0.f;
+#pragma unroll
+      for (int b = 0; b < 4; ++b)
+        mixed = fmaf(__shfl_sync(0xffffffff, sg, b * 8 + hh),
+                     __shfl_sync(0xffffffff, xv, b * 8 + hh), mixed);
+      const unsigned bits =
+          __half_as_ushort(__float2half_rn(divf(mixed, 4.0f)));
+      const unsigned packed =
+          bits | (__shfl_down_sync(0xffffffff, bits, 1) << 16);
+      const unsigned upper = __shfl_down_sync(0xffffffff, packed, 2);
+      if (lane < 8 && !(lane & 3)) {
+        st4(a.hb[p1] + (warp * HD + h) / 2, packed, upper, tag);
+        st4(a.hb[p2] + (warp * HD + h) / 2, packed, upper, tag);
+        st4(a.hb[p3] + (warp * HD + h) / 2, packed, upper, tag);
+        *reinterpret_cast<uint2*>(a.blk_out + warp * HD + h) =
+            make_uint2(packed, upper);
+      }
+    }
+    TS(7);
+  } else {
+    if (warp == 0) {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        float acc = red[0][e][lane];
+#pragma unroll
+        for (int q = 1; q < 5; ++q) acc += red[q][e][lane];
+        const int rw = (e & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
+        const int hh = (e & 1) | (((lane >> 1) & 1) << 1) | ((e >> 2) << 2);
+        const int h = 640 * rk + 8 * i + hh;
+        const float sg = sigm(__half2float(__float2half_rn(acc)));
+        const float xv =
+            rw < M ? __half2float(__ldcg(a.xn + rw * KD + quad * HD + h)) : 0.f;
+        float mixed = 0.f;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          const int src = (lane & ~12) | (b << 2);
+          mixed = fmaf(__shfl_sync(0xffffffff, sg, src),
+                       __shfl_sync(0xffffffff, xv, src), mixed);
+        }
+        if (quad == 0) tout[rw][hh] = __float2half_rn(divf(mixed, 4.0f));
+      }
+    }
+    __syncthreads();
+    TS(7);
+    // push own 8 hidden columns (two 8-byte LL words per 4 halves) to r^1, r^2
+    // and the local output
+    if (t < 2 * M) {
+      const int rw = t >> 1, h4 = (t & 1) * 4, h = 640 * rk + 8 * i + h4;
+      const uint2 d = *reinterpret_cast<const uint2*>(&tout[rw][h4]);
+      st4(a.hb[p1] + (rw * HD + h) / 2, d.x, d.y, tag);
+      st4(a.hb[p2] + (rw * HD + h) / 2, d.x, d.y, tag);
+      if (FULL) st4(a.hb[p3] + (rw * HD + h) / 2, d.x, d.y, tag);
+      *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
+    }
   }
   if (FULL) {
     if (t >= 32 && t < 32 + 6 * M) {  // collect the three peer slices
@@ -579,9 +715,18 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
       *reinterpret_cast<uint2*>(a.blk_out + rw * HD + h) = d;
     }
   }
-  __syncthreads();
+  if constexpr (!LOCAL_SCHEDULE) __syncthreads();
   TS(8);
-  if (t == 0) {
+  if constexpr (LOCAL_SCHEDULE) {
+    // All CTAs read ep/base before the first grid barrier completes. The next
+    // same-stream kernel starts after every CTA finishes, so one writer can
+    // publish the next epoch without an arrival counter or final CTA join.
+    // Separate counter words keep interleaved legacy/local calls valid.
+    if (i == 0 && t == 0) {
+      a.bar[3] = base + 2 * NC;
+      a.seq[0] = tag;
+    }
+  } else if (t == 0) {
     __threadfence();
     if (atomicAdd(a.bar + 1, 1u) == NC - 1) {
       a.bar[0] = 0;
@@ -605,7 +750,7 @@ void sm70_hcx_out(
     std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
     int64_t ofmt, std::optional<torch::Tensor> gz,
     std::optional<torch::Tensor> gw, double geps,
-    std::optional<torch::Tensor> gscr) {
+    std::optional<torch::Tensor> gscr, bool local_schedule) {
   const c10::cuda::CUDAGuard guard(p0.device());
   hcx::Args a{};
   a.p0 = reinterpret_cast<const half*>(p0.data_ptr());
@@ -671,7 +816,9 @@ void sm70_hcx_out(
                    (const void*)hcx::hcx_kernel<true, dmvns::Q6K>,
                    (const void*)hcx::hcx_kernel<false, dmvns::Q6K>,
                    (const void*)hcx::hcx_kernel<true, dmvns::Q8>,
-                   (const void*)hcx::hcx_kernel<false, dmvns::Q8>})
+                   (const void*)hcx::hcx_kernel<false, dmvns::Q8>,
+                   (const void*)hcx::hcx_kernel<true, dmvns::Q4K, true>,
+                   (const void*)hcx::hcx_kernel<true, dmvns::Q6K, true>})
       C10_CUDA_CHECK(cudaFuncSetAttribute(
           f, cudaFuncAttributeMaxDynamicSharedMemorySize, 64 * 1024));
     attr_dev[cur_dev] = true;
@@ -683,7 +830,24 @@ void sm70_hcx_out(
   else                \
     HCXO_GO(false, O);
   if (!ox) {
-    HCXO_F(-1)
+    if (full && local_schedule) {
+      TORCH_CHECK(bar.numel() >= 4,
+                  "HCX local schedule needs four counter words");
+      hcx::hcx_kernel<true, -1, true><<<hcx::NC, 256, 0, st>>>(a);
+    } else {
+      HCXO_F(-1)
+    }
+  } else if (full && local_schedule && !gz &&
+             (ofmt == dmvns::Q4K || ofmt == dmvns::Q6K)) {
+    // The producer uses the same eight-warp reduction as the reference path.
+    // Gated normalization has a separate legacy barrier and is not covered by
+    // the two-phase local counter protocol.
+    TORCH_CHECK(bar.numel() >= 4,
+                "HCXO local schedule needs four counter words");
+    if (ofmt == dmvns::Q4K)
+      hcx::hcx_kernel<true, dmvns::Q4K, true><<<hcx::NC, 256, sm, st>>>(a);
+    else
+      hcx::hcx_kernel<true, dmvns::Q6K, true><<<hcx::NC, 256, sm, st>>>(a);
   } else if (ofmt == dmvns::Q4K) {
     HCXO_F(dmvns::Q4K)
   } else if (ofmt == dmvns::Q5K) {

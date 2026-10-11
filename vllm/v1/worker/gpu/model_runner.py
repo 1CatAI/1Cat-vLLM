@@ -57,7 +57,12 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import SupportedTask
 from vllm.utils.math_utils import cdiv
-from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+from vllm.utils.mem_utils import (
+    DeviceMemoryProfiler,
+    format_gib,
+    loaded_cuda_model_storage,
+    reclaim_cpu_allocator_pages,
+)
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -400,7 +405,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
             if self.speculator is not None:
+                # Checkpoint conversion can leave cycles holding replaced tensor
+                # banks. Reclaim them before allocating the independent draft.
+                allocated_before = torch.accelerator.memory_allocated()
+                gc.collect()
+                torch.accelerator.empty_cache()
+                if self.vllm_config.kernel_config.qsa_host_kv_active:
+                    before, after = reclaim_cpu_allocator_pages()
+                    logger.info(
+                        "Checkpoint CPU allocator RSS: %d -> %d bytes", before, after
+                    )
+                logger.info(
+                    "Target loading cleanup: allocated %d -> %d bytes, "
+                    "reserved %d bytes",
+                    allocated_before,
+                    torch.accelerator.memory_allocated(),
+                    torch.accelerator.memory_reserved(),
+                )
+                logger.info(
+                    "Target CUDA storage before speculative loading: %s",
+                    loaded_cuda_model_storage({"target": self.model}),
+                )
                 self.speculator.load_model(self.model)
+                if self.vllm_config.kernel_config.qsa_host_kv_active:
+                    before, after = reclaim_cpu_allocator_pages()
+                    logger.info(
+                        "Draft checkpoint CPU allocator RSS: %d -> %d bytes",
+                        before,
+                        after,
+                    )
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
@@ -576,7 +609,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.init_cudagraph_manager(cudagraph_mode)
         elif self.speculator is not None:
             # Preserve the existing Eagle initialization order.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            self.speculator.init_cudagraph_manager(
+                cudagraph_mode,
+                capture_context=(
+                    self.cudagraph_manager.get_capture_context()
+                    if cudagraph_mode
+                    else None
+                ),
+            )
             # HACK(woosuk)
             self.speculator.set_attn(
                 self.model_state, self.kv_cache_config, self.block_tables
@@ -844,6 +884,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
             )
             if self.speculator is not None:
+                # Target warmup leaves eager allocator blocks outside its graph
+                # pool. Release them before allocating the draft's separate
+                # pool; captured tensors and live workspaces remain owned.
+                torch.accelerator.synchronize()
+                gc.collect()
+                free_before = torch.cuda.mem_get_info()[0]
+                torch.accelerator.empty_cache()
+                logger.info(
+                    "Draft graph capture allocator cleanup: freed=%d "
+                    "driver_free=%d allocated=%d reserved=%d bytes",
+                    torch.cuda.mem_get_info()[0] - free_before,
+                    torch.cuda.mem_get_info()[0],
+                    torch.accelerator.memory_allocated(),
+                    torch.accelerator.memory_reserved(),
+                )
                 if isinstance(self.speculator, DraftModelSpeculator):
                     self.speculator.capture()
                 else:

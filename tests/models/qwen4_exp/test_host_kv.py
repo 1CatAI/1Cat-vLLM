@@ -133,6 +133,62 @@ def test_host_gather_collisions_rejection_and_graph(rows, page, dtype):
     check()
 
 
+@pytest.mark.parametrize("rows", [5, 20])
+def test_bounded_staging_attention_matches_reference_and_changed_graph(rows):
+    from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
+
+    torch.manual_seed(1167)
+    device = torch.device("cuda:0")
+    states = [
+        HostQSAKV(4, 816, 256, device, hot_tokens=64, rows=cap, dtype=torch.float16)
+        for cap in (32, 8)
+    ]
+    key = torch.randn(3264, 1, 256, dtype=torch.float16, device=device)
+    value = torch.randn_like(key)
+    slots = torch.arange(3264, device=device)
+    for state in states:
+        state.write(key, value, slots)
+    table = torch.arange(4, dtype=torch.int32, device=device).view(1, -1)
+    requests = torch.zeros(rows, dtype=torch.int32, device=device)
+    positions = torch.full((rows,), 2049, dtype=torch.int64, device=device)
+    lengths = torch.full((1,), 2050, dtype=torch.int32, device=device)
+    indices = torch.arange(2051, dtype=torch.int32, device=device).repeat(rows, 1)
+    query = torch.randn(rows, 6, 256, dtype=torch.float16, device=device)
+    gate = torch.randn_like(query)
+    outputs = [torch.empty_like(query) for _ in states]
+
+    def run():
+        for state, output in zip(states, outputs):
+            for start in range(0, rows, state.rows):
+                stop = min(start + state.rows, rows)
+                host_qsa_attention(
+                    query[start:stop],
+                    state,
+                    indices[start:stop],
+                    table,
+                    requests[start:stop],
+                    positions[start:stop],
+                    lengths,
+                    output[start:stop],
+                    gate[start:stop],
+                    launch_rows=rows,
+                )
+
+    run()
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    query.normal_()
+    indices[:, :4] = torch.tensor([12, 13, 14, 15], device=device)
+    graph.replay()
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+    captured = outputs[1].clone()
+    run()
+    torch.testing.assert_close(outputs[1], captured, rtol=0, atol=0)
+    assert states[1].staging.numel() * 4 == states[0].staging.numel()
+
+
 def test_host_cache_hot_pages_reused():
     device = torch.device("cuda:0")
     state = HostQSAKV(1, 256, 256, device, hot_tokens=1024, rows=5, width=128)

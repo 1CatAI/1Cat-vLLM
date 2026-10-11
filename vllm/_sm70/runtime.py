@@ -66,6 +66,21 @@ class NativeRuntimeOwner:
         self._contexts = tuple((handle.enter, handle.exit) for handle in self.handles)
         self.closed = False
 
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+        budget = getattr(
+            getattr(config, "kernel_config", None),
+            "sm70_turbomind_workspace_bytes",
+            32 * 1024**2,
+        )
+        if budget != 32 * 1024**2:
+            configure = getattr(torch.ops._C, "sm70_gemm_configure_workspace", None)
+            if configure is None:
+                raise RuntimeError("Bounded TurboMind scratch requires rebuilding _C")
+            with self.activate():
+                configure(budget)
+
     def bind(self, values, token):
         from vllm.config import get_current_vllm_config_or_none
         from vllm.config.sm70_native import NATIVE_FIELDS

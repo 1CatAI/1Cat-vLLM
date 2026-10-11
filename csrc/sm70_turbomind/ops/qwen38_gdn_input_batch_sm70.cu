@@ -151,7 +151,7 @@ __global__ __launch_bounds__(32, 8) void dense_batch_kernel(const half* x,
     }
   }
 }
-template <int Unroll>
+template <int Unroll, bool RowMajor = false>
 __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
                                                                   const half* w,
                                                                   half* out,
@@ -161,10 +161,14 @@ __global__ __launch_bounds__(32, 8) void router_split_quad_kernel(const half* x,
   float acc[8] = {};
 #pragma unroll Unroll
   for (int g = 0; g < 40; ++g) {
-    const half* weights =
-        w + (blockIdx.x * 40 * 64 + g * 64 + split * 8 + r) * 8;
+    const half* weights;
+    if constexpr (RowMajor)
+      weights = w + (blockIdx.x * 8 + r) * 2560 + split * 640 + g * 16;
+    else
+      weights = w + (blockIdx.x * 40 * 64 + g * 64 + split * 8 + r) * 8;
     const uint4 lo = *reinterpret_cast<const uint4*>(weights);
-    const uint4 hi = *reinterpret_cast<const uint4*>(weights + 32 * 8);
+    const uint4 hi =
+        *reinterpret_cast<const uint4*>(weights + (RowMajor ? 8 : 32 * 8));
     uint4 a = {}, b = {};
     if (row < m) {
       const half* input = x + row * 2560 + split * 640 + g * 16;
@@ -357,11 +361,15 @@ void router_batch(torch::Tensor output, torch::Tensor x, torch::Tensor packed) {
                     t.scalar_type() == at::kHalf &&
                     reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0,
                 "Batch router requires aligned contiguous FP16 storage");
-  TORCH_CHECK(packed.sizes() == at::IntArrayRef({64, 40, 2, 4, 8, 8}) &&
-                  output.sizes() == at::IntArrayRef({x.size(0), 512}),
-              "Invalid batch router geometry");
-  router_split_quad_kernel<40><<<dim3(64, (x.size(0) + 7) / 8), 32, 0,
-                                 at::cuda::getCurrentCUDAStream()>>>(
+  const bool row_major = packed.sizes() == at::IntArrayRef({512, 2560});
+  TORCH_CHECK(
+      (row_major || packed.sizes() == at::IntArrayRef({64, 40, 2, 4, 8, 8})) &&
+          output.sizes() == at::IntArrayRef({x.size(0), 512}),
+      "Invalid batch router geometry");
+  const auto kernel = row_major ? router_split_quad_kernel<40, true>
+                                : router_split_quad_kernel<40, false>;
+  kernel<<<dim3(64, (x.size(0) + 7) / 8), 32, 0,
+           at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<const half*>(x.data_ptr()),
       reinterpret_cast<const half*>(packed.data_ptr()),
       reinterpret_cast<half*>(output.data_ptr()), x.size(0));

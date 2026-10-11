@@ -792,6 +792,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         row_bytes = getattr(self, "_storage_dim", self.embedding_dim)
         total_rows = self._meta_weight_shape[0]
         table_bytes = total_rows * row_bytes
+        runtime = get_current_vllm_config_or_none()
+        if runtime and runtime.kernel_config.ple_disk_only:
+            return plan_ple_placement(
+                total_rows=total_rows,
+                row_bytes=row_bytes,
+                host_budget_bytes=row_bytes,
+                vram_budget_bytes=0,
+                disk_allowed=True,
+            )
         explicit_host = ple_host_budget_bytes()
         cascade = ple_cascade_configured()
         from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
@@ -1341,6 +1350,12 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         )
         self._disk_segments = disk_segments
         self._remote_placements = bound
+
+    def needs_weight_prefault(self) -> bool:
+        # Until placements arrive, retain the full CPU-table contract. A bound
+        # empty disk tier only publishes zero rows; resident pinned/device rows
+        # are already owned by the GPU workers and need no second RAM copy.
+        return not self._remote_placements or bool(self._disk_segments)
 
     def _remote_lookup(self, ngram_ids: torch.Tensor, output: torch.Tensor) -> None:
         """Fill the worker's output with the rows the ranks left to it.
@@ -2011,6 +2026,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 row_bytes=self.head_dim,
                 file_backed=bool(self._disk_mapped_paths),
                 enabled=self._disk_row_gather,
+                cache_bytes=getattr(self._kernel_config, "ple_row_cache_mib", 0) << 20,
             )
             if self._kernel_config is not None:
                 self._kernel_config.ple_disk_row_readers[self.layer_name] = (

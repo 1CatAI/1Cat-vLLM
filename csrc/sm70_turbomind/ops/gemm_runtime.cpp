@@ -137,6 +137,7 @@ struct StreamWorkspaceKeyHash {
 };
 
 struct TurboMindRuntime : vllm::sm70::RuntimeResource {
+  size_t partials_size = turbomind::gemm::Gemm::kPartialsSize;
   std::mutex workspace_mutex;
   std::mutex gemm_mutex;
   std::mutex tune_mutex;
@@ -647,8 +648,8 @@ static WorkspaceHolder& get_workspace(int device, cudaStream_t stream) {
 
   holder.barriers = torch::zeros(
       {(long long)turbomind::gemm::Gemm::kBarriersSize}, byte_opts);
-  holder.partials = torch::zeros(
-      {(long long)turbomind::gemm::Gemm::kPartialsSize}, byte_opts);
+  holder.partials =
+      torch::zeros({(long long)runtime().partials_size}, byte_opts);
   // Keep same tensormap size as TurboMind LlamaLinear.
   holder.tensormaps = torch::empty({(long long)(8192 * 128)}, byte_opts);
   holder.flags = torch::zeros({1}, int_opts);
@@ -761,6 +762,33 @@ static Sm70F16WeightCacheEntry prepare_sm70_f16_weight(torch::Tensor weight,
   return {std::move(tm_weight), static_cast<int64_t>(k_desc.ld)};
 }
 
+void configure_gemm_workspace(int64_t bytes) {
+  TORCH_CHECK(vllm::sm70::active_runtime,
+              "TurboMind scratch must be configured under an engine owner");
+  TORCH_CHECK(bytes >= (1 << 20) &&
+                  bytes <= turbomind::gemm::Gemm::kPartialsSize &&
+                  bytes % 256 == 0,
+              "TurboMind scratch must be an aligned 1..32 MiB budget");
+  auto& state = runtime();
+  std::lock_guard<std::mutex> lock(state.workspace_mutex);
+  TORCH_CHECK(
+      state.workspace_cache.empty() || state.partials_size == bytes,
+      "TurboMind scratch cannot change after a stream workspace exists");
+  state.partials_size = bytes;
+}
+
+std::vector<int64_t> gemm_workspace_storage() {
+  auto& state = runtime();
+  std::lock_guard<std::mutex> lock(state.workspace_mutex);
+  int64_t total = 0;
+  for (const auto& [key, holder] : state.workspace_cache) {
+    total += holder.barriers.nbytes() + holder.partials.nbytes() +
+             holder.tensormaps.nbytes() + holder.flags.nbytes();
+  }
+  return {static_cast<int64_t>(state.workspace_cache.size()),
+          static_cast<int64_t>(state.partials_size), total};
+}
+
 Sm70F16WeightCacheEntry get_sm70_f16_cached_weight(torch::Tensor weight,
                                                    cudaStream_t stream) {
   weight = weight.contiguous();
@@ -785,6 +813,13 @@ Sm70F16WeightCacheEntry get_sm70_f16_cached_weight(torch::Tensor weight,
 }
 
 }  // namespace vllm::awq_sm70
+
+TORCH_LIBRARY_FRAGMENT(_C, m) {
+  m.def("sm70_gemm_configure_workspace(int bytes) -> ()",
+        &vllm::awq_sm70::configure_gemm_workspace);
+  m.def("sm70_gemm_workspace_storage() -> int[]",
+        &vllm::awq_sm70::gemm_workspace_storage);
+}
 
 int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
                                const std::string& path) {

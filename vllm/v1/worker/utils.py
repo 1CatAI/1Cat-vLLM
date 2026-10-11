@@ -39,6 +39,41 @@ from vllm.v1.worker.block_table import get_block_table_width
 logger = init_logger(__name__)
 
 
+def allocate_host_kv_cache_pool(
+    kv_cache_config: KVCacheConfig, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """Pack host cache banks into one pinned allocation per worker.
+
+    The pinned allocator rounds each allocation to a power of two. Allocating
+    every layer independently can almost double a long-context history pool.
+    Aligned views retain the mapped pool owner and keep stable graph pointers.
+    """
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    banks = [t for t in kv_cache_config.kv_cache_tensors if t.host_backed]
+    if not banks:
+        return {}
+    aligned_sizes = [(t.size + 255) // 256 * 256 for t in banks]
+    pool_size = sum(aligned_sizes)
+    logger.info(
+        "Host KV pinned pool: payload=%d allocation=%d banks=%d bytes",
+        sum(t.size for t in banks),
+        pool_size,
+        len(banks),
+    )
+    with torch.accelerator.device_index(device.index):
+        host = torch.zeros(pool_size, dtype=torch.int8, device="cpu", pin_memory=True)
+        pool = get_accelerator_view_from_cpu_tensor(host)
+    tensors: dict[str, torch.Tensor] = {}
+    offset = 0
+    for bank, aligned_size in zip(banks, aligned_sizes):
+        view = pool.narrow(0, offset, bank.size)
+        for name in bank.shared_by:
+            tensors[name] = view
+        offset += aligned_size
+    return tensors
+
+
 def _resolve_zeroer_kernel_layout(
     spec: FullAttentionSpec,
     group_kernel_block_size: int,

@@ -545,18 +545,14 @@ def _is_dflash2_spec_config(vllm_config: object) -> bool:
 
 
 def _sm70_current_device_is_volta() -> bool:
-    """Whether this worker builds its layers on a Volta device.
+    """Inspect the worker's active GPU without creating a CUDA context.
 
-    The other SM70 gates in this file ask device 0, which reads the same card
-    from every rank on a mixed node: all devices stay visible to every worker
-    and only ``set_device`` differs. The full-forward wrapper decides what the
-    compiler gets to see, so it has to ask the accelerator that is current.
+    Initialized workers resolve their selected device through the platform.
+    CPU/meta construction uses context-free metadata for the visibility list.
     """
     if not current_platform.is_cuda():
         return False
-    return current_platform.is_device_capability(
-        (7, 0), device_id=torch.accelerator.current_device_index()
-    )
+    return current_platform.is_device_capability((7, 0))
 
 
 def _sm70_qwen_gdn_full_forward_enabled(
@@ -1341,7 +1337,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             group_size=None,
             norm_before_gate=True,
             activation=output_gate_type,
-            device=current_platform.current_device(),
+            device=self.dt_bias.device,
         )
 
         self.out_proj = RowParallelLinear(
@@ -1445,7 +1441,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         self.enable_flashqla_decode = self.gdn_policy.flashqla_decode
         self.flashqla_decode_admission = FlashQlaDecodeAdmission.bind(
-            self.gdn_heads, self.enable_flashqla_decode
+            self.gdn_heads, self.enable_flashqla_decode, device=self.dt_bias.device
         )
         self._flashqla_native_policy = (
             flashqla_prefill_provider.bind_flashqla_native_policy(

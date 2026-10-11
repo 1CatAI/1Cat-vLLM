@@ -629,8 +629,8 @@ class Worker(WorkerBase):
         )
         warmup_torch_residual = max(
             0,
-            profile_result.before_profile.torch_memory
-            - self.init_snapshot.torch_memory
+            profile_result.before_profile.torch_allocated_memory
+            - self.init_snapshot.torch_allocated_memory
             - profile_result.weights_memory,
         )
         profile_result.non_kv_cache_memory = (
@@ -687,6 +687,22 @@ class Worker(WorkerBase):
         logger.info_once(
             "Available KV cache memory: %s GiB",
             format_gib(self.available_kv_cache_memory_bytes),
+        )
+        logger.info(
+            "GPU startup budget bytes: requested=%d weights=%d activation_peak=%d "
+            "warmup_live=%d idle_reserved=%d non_torch=%d graph=%d kv=%d",
+            self.requested_memory,
+            profile_result.weights_memory,
+            profile_result.torch_peak_increase,
+            warmup_torch_residual,
+            max(
+                0,
+                profile_result.before_profile.torch_memory
+                - profile_result.before_profile.torch_allocated_memory,
+            ),
+            profile_result.non_torch_increase,
+            cudagraph_memory_estimate_applied,
+            self.available_kv_cache_memory_bytes,
         )
 
         if cudagraph_memory_estimate > 0:
@@ -831,6 +847,7 @@ class Worker(WorkerBase):
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+        self.cudagraph_memory_bytes = cuda_graph_memory_bytes
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -959,8 +976,11 @@ class Worker(WorkerBase):
     def get_sm70_acceleration_report(self) -> dict:
         """Read local selector decisions without rerunning capability probes."""
         from vllm.sm70_profiles.acceleration import (
+            loaded_cuda_model_storage,
             loaded_gguf_layers,
             loaded_linear_kernels,
+            loaded_native_workspace,
+            loaded_qsa_cache_storage,
             loaded_sm70_preparations,
         )
 
@@ -977,6 +997,8 @@ class Worker(WorkerBase):
             if manager is None
             else manager.cudagraph_mode
         )
+        snapshot = MemorySnapshot(device=self.device)
+        cache = self.model_runner.kv_cache_config
         report = {
             "rank": self.rank,
             "scope": "loaded_layer_selection",
@@ -1003,6 +1025,43 @@ class Worker(WorkerBase):
             ],
             "prepared_linear_kernels": loaded_linear_kernels(self.model_runner.model),
             "prepared_gguf_layers": loaded_gguf_layers(self.model_runner.model),
+            "registered_model_storage": loaded_cuda_model_storage(
+                {
+                    "target": self.model_runner.model,
+                    "draft": getattr(
+                        getattr(self.model_runner, "speculator", None)
+                        or getattr(self.model_runner, "drafter", None),
+                        "model",
+                        None,
+                    ),
+                }
+            ),
+            "memory_accounting": {
+                "torch_allocated_bytes": torch.accelerator.memory_allocated(
+                    self.device
+                ),
+                "torch_reserved_bytes": snapshot.torch_memory,
+                "driver_used_bytes": snapshot.cuda_memory,
+                "driver_non_torch_bytes": snapshot.non_torch_memory,
+                "model_load_delta_bytes": self.model_runner.model_memory_usage,
+                "device_cache_pool_bytes": sum(
+                    t.size for t in cache.kv_cache_tensors if not t.host_backed
+                ),
+                "host_cache_pool_bytes": sum(
+                    t.size for t in cache.kv_cache_tensors if t.host_backed
+                ),
+                "recurrent_state_pool_bytes": sum(
+                    t.size for t in cache.kv_cache_tensors if t.physical_num_blocks
+                ),
+                "graph_capture_delta_bytes": getattr(
+                    self, "cudagraph_memory_bytes", None
+                ),
+                "turbomind_workspace": loaded_native_workspace(self.vllm_config),
+                "qsa": loaded_qsa_cache_storage(
+                    self.compilation_config.static_forward_context
+                ),
+                "scope": "post_warmup; graph_delta_may_overlap_registered_workspaces",
+            },
             "model_input_preparation": {
                 "scope": "model_state_capability",
                 "full_graph_phase": (
