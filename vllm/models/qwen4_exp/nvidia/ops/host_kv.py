@@ -522,6 +522,15 @@ class HostQSAKV:
         self._resolve(indices, block_table, token_to_req, positions, lengths, 2)
         return self.resolved[: indices.shape[0]]
 
+    def resolve_hot(self, indices, block_table, token_to_req, positions, lengths):
+        """Install selected pages in the hot cache without staging values.
+
+        Returns hot token ids (-1: read the authoritative history, -2: not
+        selected) for readers that also address the history directly.
+        """
+        self._resolve(indices, block_table, token_to_req, positions, lengths, 0)
+        return self.resolved[: indices.shape[0]]
+
     def _resolve(self, indices, block_table, token_to_req, positions, lengths, stage):
         rows = indices.shape[0]
         if indices.shape[1] != self.width or rows > self.rows:

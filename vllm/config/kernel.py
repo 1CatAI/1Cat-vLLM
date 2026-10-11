@@ -832,6 +832,10 @@ class KernelConfig:
     """Preserve speculative cache precision independently of target storage."""
     qsa_host_kv_device_reference: bool = False
     """Keep identical encoded history on device for controlled placement A/B."""
+    sm70_qsa_host_native: bool = True
+    """With host-authoritative QSA history, run the native SM70 attention:
+    selected pages resolve into the device hot cache, hot tokens are read on
+    device and the remainder directly from mapped host history."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
     qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)

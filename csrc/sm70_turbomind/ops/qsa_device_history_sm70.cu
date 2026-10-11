@@ -21,11 +21,13 @@ struct Args {
   const int64_t* positions;
   const int* lengths;
   const half* gate;
+  const half* hot;       // [hot_tokens, 2, D] FP16, or null
+  const int* resolved;   // [M, width] hot token, -1 host, -2 invalid
   half* out;
   float* partial;
   float* state;
   int M, blocks, page, width, table_width, num_requests, splits;
-  int64_t qs0, qs1, is0, ts0, os0, os1, gs0, gs1;
+  int64_t qs0, qs1, is0, ts0, os0, os1, gs0, gs1, rs0;
 };
 
 __device__ __forceinline__ float fast_exp2(float x) {
@@ -73,7 +75,28 @@ __device__ __forceinline__ uint4 decode8(const unsigned char* source,
   return result;
 }
 
-template <bool FP8>
+// Read one 8-value chunk of token K (kv=0) or V (kv=1): from the protected
+// hot cache when resolved there, else from the authoritative history, which
+// may be pinned host memory mapped into the device address space (UVA).
+template <bool FP8, bool HOT>
+__device__ __forceinline__ uint4 load_kv(const Args& a, int64_t slot, int hot,
+                                         int kv, int dim) {
+  if (slot < 0) return make_uint4(0, 0, 0, 0);
+  if constexpr (HOT) {
+    if (hot >= 0)
+      return __ldg(reinterpret_cast<const uint4*>(
+          a.hot + (int64_t(hot) * 2 + kv) * D + dim));
+  }
+  const int block = slot / a.page, off = slot % a.page;
+  const int64_t element = ((int64_t(block) * 2 + kv) * a.page + off) * D + dim;
+  if constexpr (FP8)
+    return decode8(a.history + element, __ldg(a.scales + slot * 2 + kv));
+  else
+    return __ldg(reinterpret_cast<const uint4*>(
+        reinterpret_cast<const half*>(a.history) + element));
+}
+
+template <bool FP8, bool HOT>
 __global__ __launch_bounds__(256) void partial(Args a) {
   const int row = blockIdx.y, split = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -81,6 +104,7 @@ __global__ __launch_bounds__(256) void partial(Args a) {
   __shared__ __align__(16) half kv[C][PAD];
   __shared__ float scores[4][8][C];
   __shared__ int64_t slots[C];
+  __shared__ int hots[C];
   const int req = a.requests[row];
   const int64_t position = a.positions[row];
   const int length = req >= 0 && req < a.num_requests ? a.lengths[req] : 0;
@@ -96,6 +120,7 @@ __global__ __launch_bounds__(256) void partial(Args a) {
         slot = int64_t(physical) * a.page + logical % a.page;
     }
     slots[t] = slot;
+    hots[t] = HOT && slot >= 0 ? a.resolved[row * a.rs0 + col] : -1;
   }
   const int head = t / 32, d8 = (t % 32) * 8;
   const uint4 qv = head < H ? __ldg(reinterpret_cast<const uint4*>(
@@ -105,20 +130,8 @@ __global__ __launch_bounds__(256) void partial(Args a) {
   __syncthreads();
   for (int v = t; v < C * 32; v += 256) {
     const int token = v / 32, dim = (v % 32) * 8;
-    const int64_t slot = slots[token];
-    uint4 value = make_uint4(0, 0, 0, 0);
-    if (slot >= 0) {
-      const int block = slot / a.page, off = slot % a.page;
-      const unsigned char* src =
-          a.history + (int64_t(block) * 2 * a.page + off) * D + dim;
-      if constexpr (FP8)
-        value = decode8(src, __ldg(a.scales + slot * 2));
-      else
-        value = __ldg(reinterpret_cast<const uint4*>(
-            reinterpret_cast<const half*>(a.history) +
-            (int64_t(block) * 2 * a.page + off) * D + dim));
-    }
-    *reinterpret_cast<uint4*>(&kv[token][dim]) = value;
+    *reinterpret_cast<uint4*>(&kv[token][dim]) =
+        load_kv<FP8, HOT>(a, slots[token], hots[token], 0, dim);
   }
   __syncthreads();
   const int nt = warp & 1, kw = warp >> 1;
@@ -177,20 +190,8 @@ __global__ __launch_bounds__(256) void partial(Args a) {
   // FP32 probabilities and PV FMAs instead of rounding probabilities to half.
   for (int v = t; v < C * 32; v += 256) {
     const int token = v / 32, dim = (v % 32) * 8;
-    const int64_t slot = slots[token];
-    uint4 value = make_uint4(0, 0, 0, 0);
-    if (slot >= 0) {
-      const int block = slot / a.page, off = slot % a.page;
-      const unsigned char* src =
-          a.history + ((int64_t(block) * 2 + 1) * a.page + off) * D + dim;
-      if constexpr (FP8)
-        value = decode8(src, __ldg(a.scales + slot * 2 + 1));
-      else
-        value = __ldg(reinterpret_cast<const uint4*>(
-            reinterpret_cast<const half*>(a.history) +
-            ((int64_t(block) * 2 + 1) * a.page + off) * D + dim));
-    }
-    *reinterpret_cast<uint4*>(&kv[token][dim]) = value;
+    *reinterpret_cast<uint4*>(&kv[token][dim]) =
+        load_kv<FP8, HOT>(a, slots[token], hots[token], 1, dim);
   }
   __syncthreads();
   if (warp < H) {
@@ -264,7 +265,9 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
                     torch::Tensor table, torch::Tensor requests,
                     torch::Tensor positions, torch::Tensor lengths,
                     torch::Tensor out, std::optional<torch::Tensor> gate,
-                    torch::Tensor partial, torch::Tensor state) {
+                    torch::Tensor partial, torch::Tensor state,
+                    std::optional<torch::Tensor> hot = std::nullopt,
+                    std::optional<torch::Tensor> resolved = std::nullopt) {
   const c10::cuda::CUDAGuard guard(q.device());
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
               q.size(0) > 0 && q.size(0) <= 20 && q.size(1) == 6 &&
@@ -297,6 +300,18 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
                              positions, lengths, out, partial, state})
     TORCH_CHECK(tensor.device() == q.device());
   if (gate) TORCH_CHECK(gate->device() == q.device());
+  TORCH_CHECK(hot.has_value() == resolved.has_value());
+  if (hot) {
+    TORCH_CHECK(hot->is_cuda() && hot->device() == q.device() &&
+                hot->scalar_type() == at::kHalf && hot->dim() == 3 &&
+                hot->size(1) == 2 && hot->size(2) == 256 &&
+                hot->is_contiguous());
+    TORCH_CHECK(resolved->device() == q.device() &&
+                resolved->scalar_type() == at::kInt && resolved->dim() == 2 &&
+                resolved->size(0) >= q.size(0) &&
+                resolved->size(1) >= indices.size(1) &&
+                resolved->stride(1) == 1);
+  }
   TORCH_CHECK(reinterpret_cast<uintptr_t>(q.data_ptr()) % 16 == 0 &&
               q.stride(0) % 8 == 0 && q.stride(1) % 8 == 0);
   auto* prop = at::cuda::getCurrentDeviceProperties();
@@ -311,6 +326,9 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
   a.positions = positions.data_ptr<int64_t>();
   a.lengths = lengths.data_ptr<int>();
   a.gate = gate ? reinterpret_cast<const half*>(gate->data_ptr()) : nullptr;
+  a.hot = hot ? reinterpret_cast<const half*>(hot->data_ptr()) : nullptr;
+  a.resolved = resolved ? resolved->data_ptr<int>() : nullptr;
+  a.rs0 = resolved ? resolved->stride(0) : 0;
   a.out = reinterpret_cast<half*>(out.data_ptr());
   a.partial = partial.data_ptr<float>();
   a.state = state.data_ptr<float>();
@@ -335,10 +353,16 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
   a.gs0 = gate ? gate->stride(0) : 0;
   a.gs1 = gate ? gate->stride(1) : 0;
   const auto stream = at::cuda::getCurrentCUDAStream();
-  if (history.scalar_type() == at::kByte)
-    device_qsa::partial<true><<<dim3(a.splits, a.M), 256, 0, stream>>>(a);
+  const dim3 grid(a.splits, a.M);
+  const bool fp8 = history.scalar_type() == at::kByte;
+  if (fp8 && hot)
+    device_qsa::partial<true, true><<<grid, 256, 0, stream>>>(a);
+  else if (fp8)
+    device_qsa::partial<true, false><<<grid, 256, 0, stream>>>(a);
+  else if (hot)
+    device_qsa::partial<false, true><<<grid, 256, 0, stream>>>(a);
   else
-    device_qsa::partial<false><<<dim3(a.splits, a.M), 256, 0, stream>>>(a);
+    device_qsa::partial<false, false><<<grid, 256, 0, stream>>>(a);
   device_qsa::merge<<<a.M * 6, 256, 0, stream>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -347,7 +371,32 @@ TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
       "run(Tensor q, Tensor history, Tensor scales, Tensor indices, Tensor "
       "table, Tensor requests, Tensor positions, Tensor lengths, Tensor(a!) "
       "out, Tensor? gate, Tensor(b!) partial, Tensor(c!) state) -> ()");
-  m.impl("run", torch::kCUDA, &device_qsa_out);
+  m.impl("run", torch::kCUDA,
+         [](torch::Tensor q, torch::Tensor history, torch::Tensor scales,
+            torch::Tensor indices, torch::Tensor table, torch::Tensor requests,
+            torch::Tensor positions, torch::Tensor lengths, torch::Tensor out,
+            std::optional<torch::Tensor> gate, torch::Tensor partial,
+            torch::Tensor state) {
+           device_qsa_out(q, history, scales, indices, table, requests,
+                          positions, lengths, out, gate, partial, state);
+         });
+  // Host-authoritative history with a protected device hot cache: resolved
+  // tokens read the hot copy, the rest read mapped host history directly.
+  m.def(
+      "run_hot(Tensor q, Tensor history, Tensor scales, Tensor indices, Tensor "
+      "table, Tensor requests, Tensor positions, Tensor lengths, Tensor(a!) "
+      "out, Tensor? gate, Tensor(b!) partial, Tensor(c!) state, Tensor hot, "
+      "Tensor resolved) -> ()");
+  m.impl("run_hot", torch::kCUDA,
+         [](torch::Tensor q, torch::Tensor history, torch::Tensor scales,
+            torch::Tensor indices, torch::Tensor table, torch::Tensor requests,
+            torch::Tensor positions, torch::Tensor lengths, torch::Tensor out,
+            std::optional<torch::Tensor> gate, torch::Tensor partial,
+            torch::Tensor state, torch::Tensor hot, torch::Tensor resolved) {
+           device_qsa_out(q, history, scales, indices, table, requests,
+                          positions, lengths, out, gate, partial, state, hot,
+                          resolved);
+         });
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

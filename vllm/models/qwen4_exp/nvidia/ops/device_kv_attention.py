@@ -28,7 +28,7 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
         cfg and cfg.is_speculative_draft
     ):
         reason = "speculative_draft_unqualified"
-    elif not state.device_reference:
+    elif not state.device_reference and not cfg_allows_host_native(cfg):
         reason = "history_on_host"
     elif not current_platform.is_device_capability(70):
         reason = "requires_SM70"
@@ -39,7 +39,15 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
             importlib.import_module("vllm._sm70_qsa_device_C")
         except ImportError:
             reason = "native_extension_unavailable"
+        else:
+            if not state.device_reference and not hasattr(
+                torch.ops.vllm_sm70_qsa_device, "run_hot"
+            ):
+                reason = "native_hot_cache_unavailable"
     state.device_history_reason = reason
+    # Host-authoritative history: resolve selected pages into the protected
+    # hot cache, then read hot tokens on device and the rest from mapped host.
+    state.device_history_hot = reason is None and not state.device_reference
     state.device_history_workspace = None
     if reason is not None:
         return
@@ -68,11 +76,19 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
     state.device_history_workspace = _WORKSPACES[key]
 
 
+def cfg_allows_host_native(cfg) -> bool:
+    return bool(cfg is None or cfg.kernel_config.sm70_qsa_host_native)
+
+
 def device_history_attention(
     query, state, indices, table, requests, positions, lengths, out, gate
 ):
     workspace = state.device_history_workspace
     if workspace is None:
+        return False
+    hot = getattr(state, "device_history_hot", False)
+    if hot and (query.shape[0] > state.rows or indices.shape[1] != state.width):
+        state.device_history_reason = "host_native_requires_staging_geometry"
         return False
     if not (
         query.dtype == torch.float16
@@ -105,6 +121,29 @@ def device_history_attention(
         state.device_history_reason = "metadata_layout"
         return False
     gate = gate.view_as(query) if gate is not None else None
+    if hot:
+        resolved = state.resolve_hot(indices, table, requests, positions, lengths)
+        torch.ops.vllm_sm70_qsa_device.run_hot(
+            query,
+            state.history,
+            state.scales,
+            indices,
+            table,
+            requests,
+            positions,
+            lengths,
+            out,
+            gate,
+            *workspace,
+            state.hot_values,
+            resolved,
+        )
+        state.device_history_reason = None
+        logger.info_once(
+            "Using SM70 native QSA attention over host history with a device "
+            "hot cache (FP32 PV)"
+        )
+        return True
     torch.ops.vllm_sm70_qsa_device.run(
         query,
         state.history,

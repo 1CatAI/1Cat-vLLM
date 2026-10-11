@@ -853,6 +853,34 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.compilation_config.cudagraph_mode
         )
 
+    def _check_graph_capture_headroom(self, free_bytes: int) -> None:
+        """Fail before compiling capture graphs when the reserve is not free.
+
+        Capture-time compilation, autotuning and graph pools run after the KV
+        cache is allocated. With an explicit VLLM_V2_CUDAGRAPH_MEM_MIB reserve,
+        report the ledger and stop here instead of at a late out-of-memory.
+        """
+        reserve = get_explicit_cudagraph_memory_reserve(
+            self.compilation_config.cudagraph_mode
+        )
+        allocated = torch.accelerator.memory_allocated()
+        reserved = torch.accelerator.memory_reserved()
+        logger.info(
+            "Graph capture headroom: driver_free=%.0f MiB reserve=%.0f MiB "
+            "allocated=%.0f MiB reserved=%.0f MiB",
+            free_bytes / 2**20,
+            reserve / 2**20,
+            allocated / 2**20,
+            reserved / 2**20,
+        )
+        if reserve and free_bytes < reserve:
+            raise RuntimeError(
+                f"CUDA graph capture needs {reserve / 2**20:.0f} MiB "
+                f"(VLLM_V2_CUDAGRAPH_MEM_MIB) but only {free_bytes / 2**20:.0f} "
+                "MiB is free after KV allocation; reduce KV/state pools or "
+                "weights before capture."
+            )
+
     @torch.inference_mode()
     def capture_model(self) -> int:
         assert self.cudagraph_manager is not None
@@ -869,6 +897,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         gc.collect()
         torch.accelerator.empty_cache()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+        self._check_graph_capture_headroom(start_free_gpu_memory)
 
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.signal_dummy_outputs(self.max_num_tokens)
