@@ -776,6 +776,11 @@ reader codec or change algorithm policy. Mixed target/draft tests now keep the
 spec fixed while varying the outer `auto`, FP8 and INT8 settings, and check
 both runner views and restore behavior.
 
+The subsequent exact-page allocation repair and bounded serving/graph-node
+results are recorded in [INT8 engine qualification](kv_int8_e2e_20261012.md).
+The physical-page/compact-draft contract now passes; end-to-end latency remains
+experimental and has not passed the FP8 comparison.
+
 ## Independent grouped indexer codecs (2026-10-12)
 
 `AttentionConfig.indexer_cache_dtype=auto|fp8|int8` controls indexer storage

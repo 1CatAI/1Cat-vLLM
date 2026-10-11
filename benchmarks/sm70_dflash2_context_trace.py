@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 
+from benchmarks.sm70_dflash2_prefill_route_audit import PrefillRouteAuditExtension
+
 
 def is_q8_decode(scheduler_output) -> bool:
     scheduled = scheduler_output.num_scheduled_tokens
@@ -97,9 +99,18 @@ def install_context_trace(root: Path) -> None:
             setattr(owner, method, wrap(getattr(owner, method), label))
 
 
-class ContextCostTraceExtension:
+class ContextCostTraceExtension(PrefillRouteAuditExtension):
     """No route changes; explicitly select the performance installer separately."""
 
 
 if trace_root := os.getenv("VLLM_DFLASH2_CONTEXT_COST_TRACE_DIR"):
     install_context_trace(Path(trace_root))
+
+if prefill_root := os.getenv("VLLM_DFLASH2_PREFILL_COST_TRACE_DIR"):
+    from benchmarks.sm70_dflash2_prefill_trace import install_prefill_trace
+
+    install_prefill_trace(
+        Path(prefill_root),
+        int(os.getenv("VLLM_DFLASH2_PREFILL_COST_TRACE_START", "16384")),
+        int(os.getenv("VLLM_DFLASH2_PREFILL_COST_TRACE_CHUNKS", "2")),
+    )

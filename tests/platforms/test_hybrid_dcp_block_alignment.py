@@ -9,7 +9,7 @@ import torch
 from vllm.model_executor.models import ModelRegistry
 from vllm.platforms.interface import Platform
 from vllm.v1.attention.backend import MultipleOf
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, get_kv_quant_mode
 
 # FP16, one KV head of size 64: 2 * 64 * 2 bytes of K and V per token.
 ATTN_BYTES_PER_TOKEN = 256
@@ -84,3 +84,32 @@ def test_dcp_share_keeps_the_block_alignment(monkeypatch, mamba_tokens, dcp) -> 
     # No larger than the next aligned size: existing geometries do not move.
     assert block_size - KERNEL_BLOCK * dcp < mamba_tokens
     assert config.cache_config.mamba_block_size == block_size
+
+
+@pytest.mark.parametrize("mamba_tokens", [20, 21, 41])
+@pytest.mark.parametrize("cache_dtype", ["auto", "fp8_e4m3", "int8"])
+def test_hybrid_budget_uses_the_whole_physical_page(
+    monkeypatch, mamba_tokens, cache_dtype
+):
+    config, model_cls = _vllm_config(mamba_tokens, 1)
+    config.cache_config.cache_dtype = cache_dtype
+    monkeypatch.setattr(
+        ModelRegistry, "resolve_model_cls", lambda *args, **kwargs: (model_cls, "fake")
+    )
+    Platform._align_hybrid_block_size(config, _LooseBackend)
+    cache = config.cache_config
+    dtype = torch.float16 if cache_dtype == "auto" else torch.uint8
+
+    def page(block):
+        return FullAttentionSpec(
+            block_size=block,
+            num_kv_heads=1,
+            head_size=64,
+            dtype=dtype,
+            kv_quant_mode=get_kv_quant_mode(cache_dtype),
+        ).page_size_bytes
+
+    state_bytes = mamba_tokens * ATTN_BYTES_PER_TOKEN
+    assert page(cache.block_size) >= state_bytes
+    assert page(cache.block_size - KERNEL_BLOCK) < state_bytes
+    assert cache.mamba_page_size_padded in (None, page(cache.block_size))

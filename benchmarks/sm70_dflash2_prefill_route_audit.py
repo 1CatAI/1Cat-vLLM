@@ -65,6 +65,17 @@ class PrefillRouteAuditExtension:
                 "kind": type(group.kv_cache_spec).__name__,
                 "block_tokens": group.kv_cache_spec.block_size,
                 "physical_page_bytes": group.kv_cache_spec.page_size_bytes,
+                "storage_dtypes": [
+                    str(dtype)
+                    for dtype in (
+                        group.kv_cache_spec.dtypes
+                        if hasattr(group.kv_cache_spec, "dtypes")
+                        else (group.kv_cache_spec.dtype,)
+                    )
+                ],
+                "page_size_padded": getattr(
+                    group.kv_cache_spec, "page_size_padded", None
+                ),
                 "layers": list(group.layer_names),
             }
             for group in config.kv_cache_groups
@@ -76,6 +87,10 @@ class PrefillRouteAuditExtension:
                 *(row["block_tokens"] for row in groups)
             ),
             "mamba_cache_mode": self.vllm_config.cache_config.mamba_cache_mode,
+            "mamba_ssm_cache_dtype": (
+                self.vllm_config.cache_config.mamba_ssm_cache_dtype
+            ),
+            "target_cache_dtype": self.vllm_config.cache_config.cache_dtype,
             "scope": "allocation and configuration; does not establish prefix restore",
         }
 
