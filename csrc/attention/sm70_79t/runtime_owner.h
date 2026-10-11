@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 namespace onecat_sm70_prefill {
@@ -38,6 +39,14 @@ class PrefillOwner : public torch::CustomClassHolder {
                    double scale, bool causal);
   at::Tensor q8192(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
                    double scale, bool causal);
+  at::Tensor q8000_kv(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
+                      double scale, bool causal,
+                      std::optional<at::Tensor> key_scale,
+                      std::optional<at::Tensor> value_scale);
+  at::Tensor q8192_kv(at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
+                      double scale, bool causal,
+                      std::optional<at::Tensor> key_scale,
+                      std::optional<at::Tensor> value_scale);
 
   template <typename T, typename Factory>
   std::shared_ptr<T> workspace(CacheSlot slot, int device, Factory factory) {
@@ -61,7 +70,9 @@ class PrefillOwner : public torch::CustomClassHolder {
 
  private:
   at::Tensor run(bool aligned, at::Tensor q, at::Tensor k, at::Tensor v,
-                 at::Tensor out, double scale, bool causal);
+                 at::Tensor out, double scale, bool causal,
+                 std::optional<at::Tensor> key_scale = std::nullopt,
+                 std::optional<at::Tensor> value_scale = std::nullopt);
   const std::vector<int64_t> values_;
   std::recursive_mutex mutex_;
   bool closed_ = false;

@@ -825,7 +825,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 and self.sinks is None
                 and abs(self.scale - 0.0625) <= 1.0e-8
             ):
-                _dense_prefill.profile_sm70_prefill_workspace(query, self.num_kv_heads)
+                _dense_prefill.profile_sm70_prefill_workspace(
+                    query, self.num_kv_heads, self.kv_codec
+                )
             _routing.record_route(
                 _routing.ROUTE_SPECS["metadata_none_zero_output"].name
             )

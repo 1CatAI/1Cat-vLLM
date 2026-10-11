@@ -121,8 +121,8 @@ __global__ void stable_restore_recovered(float const* recovered,
 
 // Each lane reads a pair of adjacent query rows. K tiles stay independent,
 // preserving coalesced loads from the transposed cuBLAS score workspace.
-template <bool Tail, bool Repair = false>
-__global__ void stable_row_max_partials(__half const* scores, float* partials,
+template <bool Tail, bool Repair = false, typename Score = __half>
+__global__ void stable_row_max_partials(Score const* scores, float* partials,
                                         int rows, int width) {
   int row = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
   if (row >= rows) return;
@@ -147,11 +147,19 @@ __global__ void stable_row_max_partials(__half const* scores, float* partials,
   // Tail numerators are stored in FP16, so their shift always uses every key.
   // Prefix PV detects missed peaks while reading all scores; flagged tiles are
   // rescanned completely and recomputed before their output can be merged.
-  constexpr int kStride = (Tail || Repair) ? 1 : 8;
+  // Independent V scales can overflow a weighted half probability before
+  // the old exponent-clipping guard fires. FP32 operands use the complete
+  // maximum once, avoiding both overflow and repeated prefix PV repair.
+  constexpr int kStride =
+      (Tail || Repair || std::is_same_v<Score, float>) ? 1 : 8;
 #pragma unroll 4
   for (int col = int(blockIdx.y) * 8192; col < end; col += kStride) {
-    float2 value = __half22float2(*reinterpret_cast<__half2 const*>(
-        scores + base + int64_t(col) * stride + local_row));
+    auto* pair = scores + base + int64_t(col) * stride + local_row;
+    float2 value;
+    if constexpr (std::is_same_v<Score, float>)
+      value = *reinterpret_cast<float2 const*>(pair);
+    else
+      value = __half22float2(*reinterpret_cast<__half2 const*>(pair));
     maximum.x = fmaxf(maximum.x, value.x);
     maximum.y = fmaxf(maximum.y, value.y);
     if constexpr (Tail) {

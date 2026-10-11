@@ -677,3 +677,67 @@ hybrid alignment: repeated 4096/32768-token requests actually reuse 2048/30720
 tokens. The earlier requests that recomputed all 4096 tokens are excluded from
 prefix-hit evidence. Capacity is still 262144 tokens. These reference runs
 establish the comparison setup, not INT8 task quality or a speedup claim.
+
+## 79t shared row-scale binding (2026-10-12)
+
+This slice starts from `eaa70863f8` (Draft #1186). Q8000 and Q8192
+use the same 79t host schedule, triangular tail tasks, request/head ordering,
+streams, state merge and engine-owned score workspace. Optional FP32 K/V
+planes bind compile-time operand specializations; the old six-argument native
+entries wrap the common implementation with absent planes. The old Half
+arithmetic remains bit-exact in paired GPU checks. A loaded binary must
+advertise late-scale ABI 1 and expose the corresponding entry before row-scale
+operands are admitted. Missing unrelated dense/paged/split-KV capabilities no
+longer hide an otherwise qualified 79t entry.
+
+K scales participate in FP32 QK before mask/softmax, and V scales participate
+in PV without changing the denominator. Row-scale QK scores and partial
+numerators remain FP32. Compensated high/residual probability products share
+one tiled PV traversal. FP32 scores are lazily allocated by the existing
+owner and included in engine memory profiling before KV budgeting; scale-aware
+tail metadata shares the existing immutable capture-lifetime map. No private
+executor, model/weight/TP list or second resource owner was introduced.
+
+Frozen numerical and performance decisions:
+
+- Absolute Half QK scores failed 80 of 6144 checked elements (maximum absolute
+  error 0.07443). A paired Half-score oracle reproduced the failure; storing
+  FP32 QK scores fixed it. `atol=0.004, rtol=0.015` remains unchanged.
+- A finite value-scale adversary exposed a missed prefix peak; row-scale
+  prefix maxima now use the complete FP32 score traversal. Prefix/tail
+  finite-value cases, changed-scale graph replay and all 8192 query rows are
+  checked without relaxing the error bound.
+- Fusing compensated PV and reducing its tile removed a duplicated PV
+  traversal. The retained four-shape microbenchmark still costs approximately
+  **1.58–1.67 times** the original 79t computation over reconstructed Half
+  inputs. This is an isolated algorithm measurement, **not a calibrated FP8
+  comparison or an end-to-end result**; its performance gate remains failed.
+- A later centered-Half score experiment passed numerical checks but increased
+  that ratio to **1.84–1.93**. It was rejected and removed. Choosing v37 instead
+  does not close the missing 79t performance qualification.
+
+GPU validation passes **30 component cases** (19 late-scale and 11 existing
+79t stability cases) and **15 implementation-stage prefix cases** in separate
+fresh processes. They include both INT8 identities, Q8000/Q8192, 8001/8096/8191
+padding, independent strided planes, all query rows, prefix/tail finite-value
+adversaries, engine-owner preparation, release and changed-scale graph replay.
+Both the native scaled QK/tensor-core PV and the bridge/Split-D kernels are
+observed by their profiler cases. A combined-process run passed 44 cases but
+did not observe the bridge event in its second profiler; the same prefix suite
+passed all 15 cases in a fresh process. That observation is retained rather
+than relabeled as a complete combined profiler run.
+
+CPU capability/owner/selection and artifact checks pass (64). The parent and candidate also
+share 16 failures in the broader policy fixture: ten fixtures lack CPU device
+configuration and six retain older scalar/model-selection expectations. They
+are recorded separately from the affected passing checks.
+
+The normal FA2 component was built and installed by its existing CMake target.
+The retained R9 library SHA256 is
+`5e52d9f7e0f53b967688a4460345fcb8b2a2fb9f32f731b11063ace89797c5c1`.
+The public Flash-V100 wheel remains the preceding normal R2 artifact.
+Raw GPU tests, rejected variants and alternating cost samples are retained in
+`/home/ymzx/kv-79t-scales-20261012-031000/`. A complete normally installed
+main-package artifact, all remaining P05 variants, full serving/state, quality
+and latency gates remain required. This Draft stage does not complete P05
+or the full 43-item migration.

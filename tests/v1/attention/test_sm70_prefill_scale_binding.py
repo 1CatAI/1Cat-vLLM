@@ -14,6 +14,71 @@ from vllm.v1.attention.kv_codecs import INT8, INT8_PER_TOKEN_HEAD
 pytestmark = pytest.mark.cpu_test
 
 
+@pytest.mark.parametrize(
+    "available", [(True, False, False), (False, True, False), (False, False, True)]
+)
+def test_exact_prefill_loader_retains_independent_native_capabilities(
+    monkeypatch, available
+):
+    import sys
+    import types
+
+    interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
+    interface.__dict__["ensure_fa2_library_loaded"] = lambda: None
+    monkeypatch.setitem(sys.modules, interface.__name__, interface)
+    names = (
+        "sm70_d256_splitd_n32_dense_fwd",
+        "sm70_d256_splitd_n32_paged_fwd",
+        "sm70_d256_splitd_n32_dense_splitkv3_fwd",
+    )
+    operations = tuple(object() if present else None for present in available)
+    namespace = SimpleNamespace(
+        **{name: operation for name, operation in zip(names, operations) if operation}
+    )
+    monkeypatch.setattr(
+        ops, "torch", SimpleNamespace(ops=SimpleNamespace(_vllm_fa2_C=namespace))
+    )
+    monkeypatch.setattr(ops, "_sm70_splitd_d256_ops_checked", False)
+    monkeypatch.delenv("VLLM_SM70_FA2_D256_LIBRARY", raising=False)
+    assert ops.get_sm70_splitd_d256_ops() == operations
+
+
+@pytest.mark.parametrize("query_length", [8000, 8001, 8192])
+def test_79t_capability_does_not_require_an_unused_exact_kernel(
+    monkeypatch, query_length
+):
+    monkeypatch.setattr(ops, "get_sm70_splitd_d256_ops", lambda: None)
+    monkeypatch.setattr(ops, "get_sm70_d256_gqa_architecture_op", lambda: object())
+    monkeypatch.setattr(
+        ops, "get_sm70_d256_gqa_architecture_q8192_op", lambda: object()
+    )
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_ARCH_128K_EXPERIMENTAL", "1")
+    monkeypatch.setenv("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "0")
+    q = SimpleNamespace(ndim=4, shape=(1, query_length, 6, 256))
+    _, dense = dense_prefill._splitd_admission(q, False, query_length, 8224)
+    _, paged = dense_prefill._splitd_admission(q, True, query_length, 8224)
+    assert dense and not paged
+
+
+@pytest.mark.parametrize("neutral_entry", [False, True])
+def test_79t_loaded_binding_checks_entry_and_abi_together(monkeypatch, neutral_entry):
+    def legacy(*args):
+        raise AssertionError("Admission must not launch")
+
+    def neutral(*args):
+        raise AssertionError("Admission must not launch")
+
+    namespace = SimpleNamespace(sm70_d256_gqa_architecture_late_scale_abi=lambda: 1)
+    if neutral_entry:
+        namespace.sm70_d256_gqa_architecture_kv_fwd = neutral
+    monkeypatch.setattr(
+        ops, "torch", SimpleNamespace(ops=SimpleNamespace(_vllm_fa2_C=namespace))
+    )
+    bound = ops._architecture_operand_entry("sm70_d256_gqa_architecture_fwd", legacy)
+    assert bound is (neutral if neutral_entry else legacy)
+    assert ops.prefill_row_scales_supported(bound) is neutral_entry
+
+
 @pytest.mark.parametrize("abi", [None, 0, 1, 2])
 def test_scale_binding_uses_the_loaded_binary_probe(monkeypatch, abi):
     def operation(*args, key_scale=None, value_scale=None):

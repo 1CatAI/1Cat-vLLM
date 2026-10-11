@@ -89,7 +89,7 @@ template <
         typename SmemIteratorB_::Element, typename IteratorB_::Element,
         IteratorB_::Fragment::kElements>,
     /// Used for partial specialization
-    typename Enable = bool>
+    typename Enable = bool, bool Compensated = false>
 class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
  public:
 #if defined(PREFIX_PV_COMPUTE_SUM)
@@ -128,6 +128,22 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
 
   using TransformA = TransformA_;
   using TransformB = TransformB_;
+
+  struct CompensatedStorage : Base::SharedStorage {
+    using ShapeA = typename Base::SharedStorage::ShapeA;
+    AlignedBuffer<typename SmemIteratorA::Element, ShapeA::kCount> residual_A;
+  };
+  using SharedStorage =
+      typename platform::conditional<Compensated, CompensatedStorage,
+                                     typename Base::SharedStorage>::type;
+
+  CUTLASS_DEVICE static typename Base::TensorRefA residual_ref(
+      SharedStorage& storage) {
+    if constexpr (Compensated)
+      return {storage.residual_A.data(), Base::SharedStorage::LayoutA()};
+    else
+      return storage.operand_A_ref();
+  }
 
   //
   // Dependent types
@@ -169,6 +185,8 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
 
   /// Iterator to write threadblock-scoped tile of A operand to shared memory
   SmemIteratorA smem_iterator_A_;
+  SmemIteratorA smem_iterator_A_residual_;
+  typename Operator::IteratorA warp_tile_iterator_A_residual_;
 
   /// Iterator to write threadblock-scoped tile of B operand to shared memory
   SmemIteratorB smem_iterator_B_;
@@ -185,19 +203,21 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
  public:
   /// Construct from tensor references
   CUTLASS_DEVICE
-  MmaPipelined79T(typename Base::SharedStorage&
-                      shared_storage,  ///< Shared storage needed for internal
-                                       ///< use by threadblock-scoped GEMM
-                  int thread_idx,      ///< ID within the threadblock
-                  int warp_idx,        ///< ID of warp
-                  int lane_idx,        ///< ID of each thread within a warp
-                  TransformA transform_A =
-                      TransformA(),  ///< transformation applied to A fragment
-                  TransformB transform_B =
-                      TransformB()  ///< transformation applied to B fragment
-                  )
+  MmaPipelined79T(
+      SharedStorage& shared_storage,  ///< Shared storage needed for internal
+                                      ///< use by threadblock-scoped GEMM
+      int thread_idx,                 ///< ID within the threadblock
+      int warp_idx,                   ///< ID of warp
+      int lane_idx,                   ///< ID of each thread within a warp
+      TransformA transform_A =
+          TransformA(),  ///< transformation applied to A fragment
+      TransformB transform_B =
+          TransformB()  ///< transformation applied to B fragment
+      )
       : Base(shared_storage, thread_idx, warp_idx, lane_idx),
         smem_iterator_A_(shared_storage.operand_A_ref(), thread_idx),
+        smem_iterator_A_residual_(residual_ref(shared_storage), thread_idx),
+        warp_tile_iterator_A_residual_(residual_ref(shared_storage), lane_idx),
         smem_iterator_B_(shared_storage.operand_B_ref(), thread_idx),
         transform_A_(transform_A),
         transform_B_(transform_B),
@@ -217,6 +237,9 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
     // Add per-warp offsets in units of warp-level tiles
     this->warp_tile_iterator_A_.add_tile_offset(
         {warp_idx_m, Base::kWarpGemmIterations * warp_idx_k});
+    if constexpr (Compensated)
+      warp_tile_iterator_A_residual_.add_tile_offset(
+          {warp_idx_m, Base::kWarpGemmIterations * warp_idx_k});
     this->warp_tile_iterator_B_.add_tile_offset(
         {Base::kWarpGemmIterations * warp_idx_k, warp_idx_n});
   }
@@ -225,12 +248,15 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
   CUTLASS_DEVICE
   void advance_smem_write_stage() {
     ++this->smem_iterator_A_;
+    if constexpr (Compensated) ++smem_iterator_A_residual_;
     ++this->smem_iterator_B_;
 
     // Add negative offsets to return iterators to the 'start' of the circular
     // buffer in shared memory
     if (smem_write_stage_idx == 1) {
       this->smem_iterator_A_.add_tile_offset({0, -Base::kStages});
+      if constexpr (Compensated)
+        smem_iterator_A_residual_.add_tile_offset({0, -Base::kStages});
       this->smem_iterator_B_.add_tile_offset({-Base::kStages, 0});
     }
 
@@ -241,6 +267,7 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
   CUTLASS_DEVICE
   void advance_smem_stages() {
     ++this->smem_iterator_A_;
+    if constexpr (Compensated) ++smem_iterator_A_residual_;
     ++this->smem_iterator_B_;
 
     // Add negative offsets to return iterators to the 'start' of the circular
@@ -248,12 +275,18 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
     if (smem_write_stage_idx == 1) {
       // wrap write stage
       this->smem_iterator_A_.add_tile_offset({0, -Base::kStages});
+      if constexpr (Compensated)
+        smem_iterator_A_residual_.add_tile_offset({0, -Base::kStages});
       this->smem_iterator_B_.add_tile_offset({-Base::kStages, 0});
     } else {
       // wrap read stage
       this->warp_tile_iterator_A_.add_tile_offset(
           {0,
            -Base::kStages * Policy::kPartitionsK * Base::kWarpGemmIterations});
+      if constexpr (Compensated)
+        warp_tile_iterator_A_residual_.add_tile_offset(
+            {0, -Base::kStages * Policy::kPartitionsK *
+                    Base::kWarpGemmIterations});
       this->warp_tile_iterator_B_.add_tile_offset(
           {-Base::kStages * Policy::kPartitionsK * Base::kWarpGemmIterations,
            0});
@@ -289,6 +322,8 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
 
     // Store A and B fragments to shared
     this->smem_iterator_A_.store(transform_A_(tb_frag_A));
+    if constexpr (Compensated)
+      smem_iterator_A_residual_.store(transform_A_.residual_fragment);
     this->smem_iterator_B_.store(transform_B_(tb_frag_B));
 
     // Advance write stage
@@ -316,12 +351,18 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
     // Pair of fragments used to overlap shared memory loads and math
     // instructions
     WarpFragmentA warp_frag_A[2];
+    WarpFragmentA warp_frag_A_residual[2];
     WarpFragmentB warp_frag_B[2];
 
     // Load A fragment from shared A
     this->warp_tile_iterator_A_.set_kgroup_index(0);
     this->warp_tile_iterator_A_.load(warp_frag_A[0]);
     ++this->warp_tile_iterator_A_;
+    if constexpr (Compensated) {
+      warp_tile_iterator_A_residual_.set_kgroup_index(0);
+      warp_tile_iterator_A_residual_.load(warp_frag_A_residual[0]);
+      ++warp_tile_iterator_A_residual_;
+    }
 
     // Load B fragment from shared B
     this->warp_tile_iterator_B_.set_kgroup_index(0);
@@ -362,6 +403,8 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
           set_transform_valid_(transform_A_, gemm_k_iterations > 1, 0);
 #endif
           this->smem_iterator_A_.store(transform_A_(tb_frag_A));
+          if constexpr (Compensated)
+            smem_iterator_A_residual_.store(transform_A_.residual_fragment);
 
           this->smem_iterator_B_.store(transform_B_(tb_frag_B));
 
@@ -378,6 +421,13 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
                                                      Base::kWarpGemmIterations);
 
         this->warp_tile_iterator_A_.load(warp_frag_A[(warp_mma_k + 1) % 2]);
+        if constexpr (Compensated) {
+          warp_tile_iterator_A_residual_.set_kgroup_index(
+              (warp_mma_k + 1) % Base::kWarpGemmIterations);
+          warp_tile_iterator_A_residual_.load(
+              warp_frag_A_residual[(warp_mma_k + 1) % 2]);
+          ++warp_tile_iterator_A_residual_;
+        }
         this->warp_tile_iterator_B_.load(warp_frag_B[(warp_mma_k + 1) % 2]);
 
         ++this->warp_tile_iterator_A_;
@@ -401,6 +451,17 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
 
         warp_mma(accum, warp_frag_A[warp_mma_k % 2],
                  warp_frag_B[warp_mma_k % 2], accum);
+        if constexpr (Compensated) {
+          // Raw byte values divided by 2^11 remain exact FP16. Accumulate
+          // the probability residual directly into the same FP32 partial.
+          WarpFragmentB scaled_B;
+          CUTLASS_PRAGMA_UNROLL
+          for (int e = 0; e < WarpFragmentB::kElements; ++e)
+            scaled_B[e] = typename Operator::ElementB(
+                float(warp_frag_B[warp_mma_k % 2][e]) * (1.0f / 2048.0f));
+          warp_mma(accum, warp_frag_A_residual[warp_mma_k % 2], scaled_B,
+                   accum);
+        }
       }
     }
 
@@ -420,6 +481,7 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
       this->warp_tile_iterator_B_.set_kgroup_index(warp_mma_k);
 
       ++this->warp_tile_iterator_A_;
+      if constexpr (Compensated) ++warp_tile_iterator_A_residual_;
       ++this->warp_tile_iterator_B_;
     }
 
@@ -429,6 +491,10 @@ class MmaPipelined79T : public MmaBase<Shape_, Policy_, 2> {
       this->warp_tile_iterator_A_.add_tile_offset(
           {0,
            -Base::kStages * Policy::kPartitionsK * Base::kWarpGemmIterations});
+      if constexpr (Compensated)
+        warp_tile_iterator_A_residual_.add_tile_offset(
+            {0, -Base::kStages * Policy::kPartitionsK *
+                    Base::kWarpGemmIterations});
       this->warp_tile_iterator_B_.add_tile_offset(
           {-Base::kStages * Policy::kPartitionsK * Base::kWarpGemmIterations,
            0});
