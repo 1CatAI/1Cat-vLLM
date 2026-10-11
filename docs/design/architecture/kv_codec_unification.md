@@ -335,3 +335,56 @@ generic grouped entry is not newly selected by the engine in this slice.
 Full-backend INT8 admission, sparse/tree INT8 bindings, prefill, fused writes,
 transport, task quality and latency gates remain open. No grouped speedup or
 end-to-end engine acceptance is claimed.
+
+## Requested 27B NVFP4 / INT8 / DFlash2 service check
+
+The 2026-10-11 service request uses QUASAR Qwen3.8-27B NVFP4, TP4 on four
+V100-SXM2-32GB GPUs, FP16 compute, planar `int8` target KV, FP16 draft KV,
+DFlash2 with seven probabilistic drafts, prefix caching and CUDA graphs.
+The context capacity is **262144 tokens**, not a requested prompt length.
+The requested first measurements are ordinary 4096/32768-token inputs, cold
+and prefix-hit requests, with prefill and target verification reported
+separately. The retained launch uses 8192 batched tokens, four sequences,
+0.80 memory utilization, 2048-token KV blocks and 8192-token Mamba blocks.
+
+At source `5944c302ff5536c3b6bee41cdae562a57581e758`, this is **not yet a
+runnable full Flash-V100 INT8 service**. The GPU driver is functional
+(580.178.04); the remaining issue is engine integration, not GPU access.
+The earlier 264 passing component checks do not establish model execution.
+
+The first CLI launch exposed the component-only build's missing
+`_C_stable_libtorch` library during DFlash2 architecture inspection
+(`_C.silu_and_mul` was absent). The normal CMake targets
+`_C_stable_libtorch`, `_vllm_fa2_C`, `_moe_C` and `cumem_allocator` were then
+built and installed into the owned source runtime. No private library was
+copied or preloaded. This extends the normal component build; it is still
+not a full main-package release wheel.
+
+With those additional libraries installed, the same 264 GPU component and
+workspace checks pass again, with no skips or failures (24.17 seconds).
+The report and JUnit output are in the `components-recheck` artifact subdirectory.
+
+After installing the engine dependencies, the actual TP4 engine configuration
+constructs successfully and its native capability probe has no load error.
+DFlash2/GDN switches, Q8000 prefill and CUDA graphs are configured, but
+grouped, long-context and compact-tail profile entries still report
+`kv_dtype` for INT8. Those configured switches are not proof of execution.
+Fresh backend initialization loads the native operators and admits FP16,
+E4M3 and E5M2. INT8 has native decode operators but its full-backend admission
+is false; a forward call is explicitly rejected before attention execution.
+The engine grouped binding table still contains only FP16/E4M3, and the
+prefix-prefill bridge still accepts only E4M3/E5M2.
+
+Consequently there are **no model prefill, verifier-round or decode latency
+measurements** from this attempt. Do not promote the codec by deleting the
+backend guard. The next execution prerequisite is to connect the borrowed KV
+view and row scales to the common prefill/verification flows and their native
+bindings, retaining the mask, state and fallback contracts above.
+
+Retained artifacts on the validation host are under
+`/home/ymzx/kv-int8-dflash2-20261011-1157`: `manifest.json`, `server.log`,
+normal component build/install logs, `configured-acceleration.json`,
+`backend-capabilities.json` and their probe scripts/logs. A diagnostic harness
+mistakenly exposed one GPU for a TP4 configuration check; that failure is
+retained as `harness-one-gpu-config-preflight.log`. Restoring the declared
+four-GPU visibility makes configuration succeed without a source change.
