@@ -27,8 +27,9 @@ Version `.3` accumulates the grouped dot product in two 64-element parts before
 combining them in FP32. This fixes three reproduced cancellation cases from the
 128K engine comparison without widening the existing tolerance. C1 with at most
 eight rows retains the original accumulation order. The normal installed `.3`
-library passes the standalone suite; its engine performance matrix must be
-remeasured before using `.2` screening results to make a new selection decision.
+library passes the standalone suite and the engine's complete 8K/32K/128K
+score/selection screen. Its measurements are recorded separately from `.2`;
+complete QSA and model admission remain open.
 
 Supported candidate inputs: FP16 query `[M,4,128]`, M1..32; FP16 cache
 `[pages,page_size,1,128]`; int32 page tables with 1..32 requests; contiguous int32
@@ -108,8 +109,8 @@ Its scopes are only `score` and `score_select_expand`, across 12 synthetic local
 layers. Reports explicitly set `complete_qsa_chain=false` and
 `performance_admitted=false`: even a fast result cannot close full QSA or C1/C4
 emitted-token performance. The [hardware record](gpu-validation-20261011.md)
-records `.2` screening gains, the failed 128K/M20 comparison and the `.3`
-accuracy follow-up separately; no complete-chain admission is claimed.
+records `.2` screening gains, the failed 128K/M20 comparison and the passing `.3`
+accuracy/performance screen separately; no complete-chain admission is claimed.
 
 On the provided V100-SXM2 machine use ordinary installed artifacts with Python
 3.12, Torch 2.10 and CUDA 12.8. Establish the frozen mainline A/A control first.

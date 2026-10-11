@@ -1,8 +1,11 @@
 # QSA candidate validation — 2026-10-11
 
-Status: independent source/install/offline native build checks passed. GPU
-correctness, graph replay, performance, model quality and release admission are
-**pending**, explicitly deferred by the user. No speedup is claimed.
+Historical record of the initial CPU/offline phase, before the user supplied
+machine 54633. The hardware deferral has ended. The current standalone GPU
+results and paired partial-chain measurements are in the
+[hardware validation record](gpu-validation-20261011.md). This initial record
+does not establish acceleration or release admission. Delivery is now
+consolidated in Draft PR #1177; #1175 is closed with its commits retained.
 
 ## Source and review boundary
 

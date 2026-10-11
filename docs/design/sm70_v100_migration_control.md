@@ -61,8 +61,13 @@ samples and exact indices. C1/M5 is near parity. The 128K/M20 score comparison
 stopped on three cancellation cases; never report that point as passing.
 The `.3` grouped kernel splits accumulation into two 64-element parts. Three
 fixed regression fixtures and the full independent suite pass (43 tests), with
-the original tolerances and the C1/M<=8 arithmetic retained. Engine revalidation
-and all complete-chain/model gates remain open. The reserved-capacity probe
+the original tolerances and the C1/M<=8 arithmetic retained. The normal `.3`
+engine artifact then passes all 24 score/selection points at 8K/32K/128K,
+including the formerly failing 128K/M20 point. C4/M20 score/Top-K/expansion time
+falls 41.21%, 64.27% and 73.66%; the largest C1/M5 median regression is 1.07%.
+Paired ABBA blocks and stable A/A controls are retained in the hardware record.
+Complete-chain/model gates remain open; a separate normal main artifact is
+being built for whole-model comparison. The reserved-capacity probe
 saved only 1.94% of scoring time and does not justify another variant.
 
 ## Pre-release packaging and video cancellation fixes, 2026-09-29

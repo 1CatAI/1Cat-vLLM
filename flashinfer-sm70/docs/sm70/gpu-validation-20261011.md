@@ -118,8 +118,64 @@ Loaded `.3` QSA source SHA256 is
 `7bbd0326ea1debb2807bb4c43eab2ad37ac9d53de7cb5055f43c83e56c366770`;
 its operator-environment DSO SHA256 is
 `2db345401c5d82d7c88659f767660b263ade885bf22431080742e279714848e9`.
-Revalidate the long-context engine matrix and timings with `.3`; the small
-fixtures do not close the full 128K integration gate.
+The subsequent normal engine artifact `1.5.2+fi.sm70.acc83350d43c` installs this
+`.3` provider. Its wheel SHA256 is
+`9cc53c6567e1d938d25b894fd26f28d41b14821296c596bbd29050a01f0ca0a1`;
+all 190 declared packages pass dependency validation. The installed engine's
+QSA DSO SHA256 is
+`481b56e295bd16c2fa38310040561108cec5131654ae34ff91e081f9875a1685`.
+The library source hash above is unchanged; its native artifact differs from
+the operator environment because the independent build/cache paths differ.
+
+## Version .3 paired engine screen
+
+All 24 score/selection points pass at 8K/32K/128K, for M1/M4 ordinary decode and
+M5/M20 MTP4 verification. Scores retain `rtol=atol=2e-6`; visible lengths and
+selected/expanded IDs match exactly. Repeated control outputs are bit-exact.
+The matrix uses the same four command invocations and RNG progression as `.2`:
+
+```bash
+python -I benchmarks/kernels/benchmark_sm70_qsa_shared_key.py --flashinfer \
+  --rows 5 20 --context 8192 --out qsa-v3-screen-8192.json
+python -I benchmarks/kernels/benchmark_sm70_qsa_shared_key.py --flashinfer \
+  --rows 1 4 --context 8192 --out qsa-v3-matrix-decode-8192.json
+python -I benchmarks/kernels/benchmark_sm70_qsa_shared_key.py --flashinfer \
+  --rows 1 4 5 20 --context 32768 --out qsa-v3-matrix-32768.json
+python -I benchmarks/kernels/benchmark_sm70_qsa_shared_key.py --flashinfer \
+  --rows 1 4 5 20 --context 131072 --out qsa-v3-matrix-131072.json
+```
+
+Each point executes 12 independent synthetic TP-local layers, FP16 Q/K and FP32
+scores, H4/D128, page size 204, randomized page mapping, seed 902, CUDA graphs,
+on GPU 2 after the driver recovery. Both arms use the same ordinary installed
+engine. Control selects the existing best scorer, including native C1 sharing;
+candidate forces the independently installed library. Five ABBA blocks retain
+ten samples per arm, each of 30 graph replays. The table measures the entire
+**score + exact Top-K + expansion portion**, not a sum of kernel timings.
+Times are milliseconds across all 12 layers. Negative changes mean less time.
+
+| Context | Rows | Control ms | Candidate ms | Median change | Paired block changes | Absolute A/A change |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8192 | 1 | 0.225161 | 0.221884 | -1.46% | -1.95 to -1.33% | 0.10% |
+| 8192 | 4 | 0.477474 | 0.462199 | -3.20% | -4.17 to -2.95% | 0.18% |
+| 8192 | 5 | 0.261598 | 0.264397 | +1.07% | +0.91 to +1.31% | 0.17% |
+| 8192 | 20 | 0.957338 | 0.562790 | -41.21% | -42.02 to -41.09% | 0.02% |
+| 32768 | 1 | 0.652151 | 0.532497 | -18.35% | -18.42 to -18.27% | 0.03% |
+| 32768 | 4 | 0.996267 | 0.764228 | -23.29% | -24.06 to -23.12% | 0.06% |
+| 32768 | 5 | 0.607147 | 0.609075 | +0.32% | +0.24 to +0.48% | 0.16% |
+| 32768 | 20 | 2.703787 | 0.965956 | -64.27% | -64.39 to -64.23% | 0.01% |
+| 131072 | 1 | 1.702963 | 1.177822 | -30.84% | -30.85 to -30.79% | 0.03% |
+| 131072 | 4 | 2.782498 | 1.959578 | -29.57% | -29.71 to -29.52% | 0.00% |
+| 131072 | 5 | 1.350007 | 1.356356 | +0.47% | +0.41 to +0.56% | 0.12% |
+| 131072 | 20 | 9.520759 | 2.507964 | -73.66% | -73.69 to -73.58% | 0.01% |
+
+The previously failing 128K/M20 point now passes before timing. C1/M5 retains
+its original arithmetic, with a largest partial-chain median regression of
+1.07%. The source-complete normal engine, native identity, raw samples, commands,
+GPU records and standalone accuracy results are retained locally and on the
+host in `qsa-v3-screen-evidence.tar.gz` and `qsa-accuracy-standalone.tar.gz`.
+This is not an exact-main whole-model comparison: a separate normal main
+artifact from `be3722bc095b` is being built for that next gate.
 
 ## Performance and remaining gates
 
@@ -137,7 +193,7 @@ A separate `.2` C4/M20 capacity probe (32 versus 20 reserved rows) keeps scores
 bit-exact but saves only 1.94% of scoring time, with A/A difference 0.10%.
 No extra kernel variant is added for this small isolated result.
 
-Score/selection screening, complete QSA, text C1/C4, MTP rollback/acceptance,
+Complete QSA, text C1/C4, MTP rollback/acceptance,
 D72 vision, HC/MoE/GDN/PLE/output chains and shared Qwen3.6 regressions remain
 open. Default selection stays off. Complete-chain and integrated acceptance
 remain at least 5% improvement beyond noise, with at most 2% other-point
