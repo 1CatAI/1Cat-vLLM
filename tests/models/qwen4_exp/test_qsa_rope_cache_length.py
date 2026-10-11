@@ -35,7 +35,7 @@ def test_text_only_mrope_cache_covers_exactly_the_engine_positions():
     assert _qsa_rope_cache_length(config, model) == 262144
 
 
-def test_bounded_mrope_rows_match_the_full_cache():
+def test_bounded_mrope_rows_match_the_full_cache(default_vllm_config):
     def cache(max_position):
         return MRotaryEmbedding(
             256, 64, max_position, 10000000, True, torch.float16,
