@@ -766,3 +766,12 @@ The failed startup is retained in
 `/home/ymzx/kv-79t-scales-20261012-031000/int8-engine-r1/`.
 Successful serving, graph/state interactions and paired end-to-end quality and
 latency remain separate gates; this allocation fix does not close those gates.
+
+The retry passed planning and compilation, then exposed a separate owner
+binding gap: V2 passed the target's `int8` spelling to the FP16 draft carrier
+shape API, adding scale bytes absent from the draft spec. V1 had the same
+shape call. Both runners now derive the compatibility shape/block-dimension
+spelling from each spec's declared quantization mode. This does not choose a
+reader codec or change algorithm policy. Mixed target/draft tests now keep the
+spec fixed while varying the outer `auto`, FP8 and INT8 settings, and check
+both runner views and restore behavior.

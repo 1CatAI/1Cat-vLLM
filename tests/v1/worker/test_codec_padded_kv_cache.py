@@ -34,7 +34,10 @@ def _cpu_engine_config():
 
 @pytest.mark.parametrize("runner_version", [1, 2])
 @pytest.mark.parametrize("layer_name,codec", [("target", INT8), ("draft", FP16)])
-def test_padded_cache_regions_and_restore(runner_version, layer_name, codec):
+@pytest.mark.parametrize("configured_dtype", ["auto", "fp8", "int8"])
+def test_padded_cache_regions_and_restore(
+    runner_version, layer_name, codec, configured_dtype
+):
     specs = unify_kv_cache_spec_page_size(
         {
             "target": FullAttentionSpec(
@@ -65,7 +68,7 @@ def test_padded_cache_regions_and_restore(runner_version, layer_name, codec):
     def bind(storage):
         if runner_version == 2:
             return _reshape_kv_cache(
-                [group], {layer_name: storage}, codec.name, [spec.block_size], {}
+                [group], {layer_name: storage}, configured_dtype, [spec.block_size], {}
             )[layer_name]
         runner = object.__new__(GPUModelRunner)
         runner.kv_cache_config = KVCacheConfig(
@@ -75,7 +78,7 @@ def test_padded_cache_regions_and_restore(runner_version, layer_name, codec):
         )
         runner.attn_groups = [[group]]
         runner.runner_only_attn_layers = set()
-        runner.cache_config = SimpleNamespace(cache_dtype=codec.name)
+        runner.cache_config = SimpleNamespace(cache_dtype=configured_dtype)
         return runner._reshape_kv_cache_tensors(
             {layer_name: storage}, [spec.block_size]
         )[layer_name]
