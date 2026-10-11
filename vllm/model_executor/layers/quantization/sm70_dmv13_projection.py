@@ -121,7 +121,7 @@ class Dmv13Projection:
                 return
             self.extra = weight.contiguous()
         tiles = sum((w + 31) // 32 for w in self.widths)
-        self.workspace = torch.zeros(tiles * 256, device=device)
+        self.workspace = torch.zeros(tiles * 256, device=device, dtype=torch.float32)
         self.counters = torch.zeros(tiles, device=device, dtype=torch.int32)
         self.ready = hasattr(torch.ops._C, "sm70_dmv13_out")
 

@@ -16,6 +16,16 @@ pytestmark = pytest.mark.skipif(
 BLOCK = {8: 34, 12: 144, 13: 176, 14: 210, 20: 18, 23: 136}
 
 
+@pytest.fixture(params=[torch.float32, torch.float16])
+def default_dtype(request):
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(request.param)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(previous)
+
+
 def _raw(rng, rows, k, qtype):
     size = BLOCK[qtype]
     block = 32 if qtype in (8, 20) else 256
@@ -84,7 +94,7 @@ def test_side_projection_matches_dequant(qtype, tokens, merged_bf16):
 
 
 @pytest.mark.parametrize("qtype", [8, 12, 13, 14, 20, 23])
-def test_shared_segment_planes_preserve_side_and_m20_graph(qtype):
+def test_shared_segment_planes_preserve_side_and_m20_graph(qtype, default_dtype):
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.quantization.gguf_dense_hmma_formats import (
@@ -113,6 +123,7 @@ def test_shared_segment_planes_preserve_side_and_m20_graph(qtype):
     extra = (torch.randn(24, k, device="cuda") * 0.02).half()
     proj = Dmv13Projection(_Shard(raw, qtype), _Extra(extra))
     assert proj.ready
+    assert proj.workspace.dtype == torch.float32
     layer.sm70_side_projection = proj
     _register_banks(layer, "sm70_side_projection", proj)
     x = torch.randn(5, k, device="cuda", dtype=torch.float16)

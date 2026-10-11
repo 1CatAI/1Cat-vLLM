@@ -321,3 +321,10 @@ Ordinary dense segment scratch is bounded by the admitted K2560/N4096
 shapes, and shared scratch by K2560/N320 or K160/N2560. Code, coefficient
 and partial storage decreases by 34.5 MiB per device without changing their
 layouts, arithmetic or supported shapes.
+
+The subsequent M5 graph capture reached the fused side projection and failed
+because its FP32 split-K workspace inherited the model loader's FP16 default
+dtype. Allocate that workspace explicitly as FP32. Six formats passed both
+FP16 and FP32 default-dtype tests, shared-bank checks and changed-input M5/M20
+graphs (12 tests). This repairs workspace typing; it does not change weight
+or activation precision. Full-model serving remains pending.
