@@ -609,7 +609,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.speculator.init_cudagraph_manager(cudagraph_mode)
         elif self.speculator is not None:
             # Preserve the existing Eagle initialization order.
-            self.speculator.init_cudagraph_manager(cudagraph_mode)
+            self.speculator.init_cudagraph_manager(
+                cudagraph_mode,
+                capture_context=(
+                    self.cudagraph_manager.get_capture_context()
+                    if cudagraph_mode
+                    else None
+                ),
+            )
             # HACK(woosuk)
             self.speculator.set_attn(
                 self.model_state, self.kv_cache_config, self.block_tables

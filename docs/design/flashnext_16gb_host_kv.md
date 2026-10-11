@@ -350,3 +350,13 @@ pool. Keep all live tensors and graph pools. Two GPU tests at M5/M20 verified
 release of a 128 MiB eager warmup allocation, stable target output addresses,
 and bitwise target/draft output on changed-input graph replays. Full-model
 capacity improvement remains to be measured.
+
+Serial target and Eagle capture routines now share one capture context while
+retaining separate target/draft graph pools. FULL captures explicitly use that
+context's stream, matching warmup instead of introducing PyTorch's additional
+default capture stream. Eagle prefill, decode and multistep managers share the
+context; engines retain distinct contexts. M5/M20 native tests ran four serial
+FP16 and Q4_K graphs with independent pools: native workspace storage decreased
+from 50 MiB to 20 MiB including the unchanged tuning stream. Changed-input
+outputs remained bitwise identical. Four GPU tests passed. This establishes
+stream-workspace savings, not an end-to-end latency or capacity result.
