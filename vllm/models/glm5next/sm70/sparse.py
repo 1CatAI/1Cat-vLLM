@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
+import vllm._sm70_ops as sm70_ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.config.sm70_runtime import capture_runtime_trace, target_trace_min_position
@@ -39,6 +40,19 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _FP8_GEMM_MAX_TOKENS = 8
+# The FP32-softmax decode/verify kernel handles 16 query heads per CTA.
+_SPARSE_MLA_FP8_HEADS_PER_CTA = 16
+_SPARSE_MLA_FP8_KEYS_PER_TILE = 32
+
+
+def _sparse_mla_fp8_num_splits(index_width: int, num_tokens: int) -> int:
+    """Split the selected keys so each 16-head group gets about 64 CTAs.
+
+    Measured on V100 at 16 heads and 2048 keys: 46 us at T=1 with 64 splits
+    (75 us with 16), 87 us at T=4 with 16, 161 us at T=8 with 8.
+    """
+    tiles = -(-index_width // _SPARSE_MLA_FP8_KEYS_PER_TILE)
+    return max(1, min(64 // max(1, num_tokens), tiles))
 
 
 class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
@@ -161,7 +175,36 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((max_tokens, num_heads, self.kv_lora_rank), torch.float16),
         ]
-        if self.use_fp8_cache:
+        # FP8-KV decode/verify keeps scores and softmax in FP32. The GEMM
+        # routes below store raw scores in fp16, which overflows on large
+        # logits; they remain only for head counts the kernel cannot tile.
+        self.use_fp32_sparse_mla = (
+            self.use_fp8_cache and num_heads % _SPARSE_MLA_FP8_HEADS_PER_CTA == 0
+        )
+        if self.use_fp32_sparse_mla:
+            if not hasattr(torch.ops._C, "sm70_glm53_sparse_mla_fp8_out"):
+                raise RuntimeError(
+                    "SM70 GLM-5.3 FP8-KV sparse MLA requires the native "
+                    "sm70_glm53_sparse_mla_fp8_out op. Rebuild vLLM from "
+                    "source with CUDA arch 7.0."
+                )
+            max_rows = max(
+                t * _sparse_mla_fp8_num_splits(self.index_width, t)
+                for t in range(1, self.fp8_gemm_max_tokens + 1)
+            )
+            workspace_specs.extend(
+                (
+                    ((max_rows, num_heads, self.kv_lora_rank), torch.float32),
+                    ((max_rows, num_heads, 2), torch.float32),
+                )
+            )
+        elif self.use_fp8_cache:
+            logger.warning_once(
+                "GLM-5.3 FP32 sparse MLA needs a multiple of %d heads per rank, "
+                "got %d; using the FP16-score GEMM route.",
+                _SPARSE_MLA_FP8_HEADS_PER_CTA,
+                num_heads,
+            )
             workspace_specs.extend(
                 (
                     (
@@ -187,7 +230,9 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             "GLM-5.3-Flash route: SM70 FP16 sparse MLA with %s KV%s.",
             "packed E4M3FN" if self.use_fp8_cache else "FP16",
             (
-                " and B1/M2-M8 dequant + tensor-core GEMM decode"
+                " and FP32-softmax decode/verify"
+                if self.use_fp32_sparse_mla
+                else " and B1/M2-M8 dequant + tensor-core GEMM decode"
                 if self.use_fp8_cache
                 else ""
             ),
@@ -287,6 +332,29 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 )
                 diagnostic_history("glm_sparse_indices")["seen"] = True
         workspace_manager = current_workspace_manager()
+        if self.use_fp32_sparse_mla and num_tokens <= self.fp8_gemm_max_tokens:
+            splits = _sparse_mla_fp8_num_splits(self.index_width, num_tokens)
+            out, o_part, ml = workspace_manager.get_simultaneous(
+                ((num_tokens, self.num_heads, self.kv_lora_rank), torch.float16),
+                (
+                    (num_tokens, self.num_heads, splits, self.kv_lora_rank),
+                    torch.float32,
+                ),
+                ((num_tokens, self.num_heads, splits, 2), torch.float32),
+            )
+            if q.stride(-1) != 1 or q.stride(1) % 8 or q.stride(0) % 8:
+                q = q.contiguous()
+            sm70_ops.sm70_glm53_sparse_mla_fp8_out(
+                out,
+                o_part,
+                ml,
+                q,
+                kv_c_and_k_pe_cache.view(torch.uint8),
+                global_indices.reshape(num_tokens, -1),
+                valid_counts.reshape(-1),
+                self.softmax_scale,
+            )
+            return out, None
         if self.use_fp8_cache:
             if num_tokens == 1:
                 out, gathered_kv, scores, probs = workspace_manager.get_simultaneous(

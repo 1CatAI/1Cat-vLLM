@@ -16,6 +16,7 @@ from vllm._sm70.auxiliary import (
     sm70_f16_lm_head_top20_tc_out,
     sm70_f16_rerank_keys_out,
     sm70_f16_rerank_topk_out,
+    sm70_glm53_sparse_mla_fp8_out,
     sm70_glm_kda_fg_b_out,
     sm70_glm_mhc_post_dot_q8_out,
     sm70_glm_mhc_pre_norm_out,
