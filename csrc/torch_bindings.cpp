@@ -206,6 +206,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("ple_disk_cached_gather_u8", torch::kCPU,
            &ple_disk_cached_gather_u8);
 
+  // Native owner thread for host-mapped PLE requests and packed results.
+  ops.def(
+      "ple_fast_lane_start(Tensor request, int max_reqs, int max_tokens, "
+      "int table_ptr, int row_bytes, int num_rows, int[] multipliers, "
+      "int[] sizes, int[] offsets, int eos, int[] result_ptrs, "
+      "int[] flag_ptrs, int cache_bytes, int idle_spin_us, "
+      "bool clamp_tokens, Tensor? draft_ring, int ring_reqs, "
+      "int ring_spec) -> int");
+  ops.impl("ple_fast_lane_start", torch::kCPU, &ple_fast_lane_start);
+  ops.def("ple_fast_lane_stats(int handle) -> Tensor");
+  ops.impl("ple_fast_lane_stats", &ple_fast_lane_stats);
+  ops.def("ple_fast_lane_stop(int handle) -> ()");
+  ops.impl("ple_fast_lane_stop", &ple_fast_lane_stop);
+
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
 #ifdef VLLM_REGISTER_BASIC_ACTIVATION_IN_C
   // Compatibility path for local builds where _C_stable_libtorch is not

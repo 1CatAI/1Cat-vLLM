@@ -752,6 +752,11 @@ class KernelConfig:
     order) spread evenly across TP ranks; 0 keeps the full vocabulary. Only
     the draft proposal changes; verification still uses the full head."""
 
+    sm70_draft_hot_vocab_ids: str = ""
+    """Optional file of token ids ranked most frequent first (.npy or one id
+    per line). With ``sm70_draft_hot_vocab`` > 0, the draft keeps the first
+    that many ranked ids, each rank reading its own vocabulary shard."""
+
     sm70_draft_single_graph: bool = False
     """Capture all MTP draft decode steps, including their slot mappings and
     attention metadata, as one CUDA graph instead of one replay per step."""
@@ -848,8 +853,6 @@ class KernelConfig:
     """Release file-backed PLE mappings after gathers to reduce resident RAM."""
     ple_disk_row_gather: bool = True
     """Admit byte-preserving native CPU gathers for retained mapped PLE rows."""
-    ple_row_cache_mib: int = Field(default=0, ge=0)
-    """Total native packed-row cache budget in the shared CPU PLE process."""
     ple_disk_only: bool = False
     """Keep PLE tables on disk with only a sentinel row in each rank's staging."""
     ple_disk_row_readers: dict[str, Any] = Field(
@@ -861,6 +864,14 @@ class KernelConfig:
     ple_disk_cascade_reason: str | None = Field(default=None, init=False)
     """Startup reason when the disk cascade cannot serve this configuration."""
 
+    ple_fast_lane: bool = True
+    """Serve eligible CPU PLE requests from a native owner thread."""
+    ple_draft_prefetch: bool = True
+    """Read PLE table pages of drafted tokens into page cache while drafting."""
+    ple_row_cache_mib: int = Field(default=1536, ge=0)
+    """Packed-row cache (MiB) for CPU-owned GGUF PLE: the native fast lane's
+    cache when it serves requests, otherwise the mapped row reader's."""
+
     ple_pinned_decode: bool = True
     """Admit calibrated packed PLE decode rows from rank-local pinned storage."""
     ple_pinned_decode_active: bool = Field(default=False, init=False)
@@ -869,6 +880,13 @@ class KernelConfig:
         default_factory=dict, init=False, repr=False
     )
     """Observed pinned row decoder admission, capacity and fallback reasons."""
+
+    ple_packed_gguf_results: bool = True
+    """Transfer eligible CPU-owned GGUF PLE rows without CPU dequantization."""
+    ple_packed_result_decoders: dict[str, Any] = Field(
+        default_factory=dict, init=False, repr=False
+    )
+    """Observed packed result geometry and decoder fallback reasons."""
 
     ple_result_transport: Literal["auto", "cuda", "mapped"] = "auto"
     """Select CPU PLE result transport by local operator/resource capability."""
@@ -984,11 +1002,14 @@ class KernelConfig:
             "ple_disk_cascade_reason",
             "ple_result_transports",
             "ple_pinned_decoders",
+            "ple_packed_result_decoders",
             "ple_input_prepare",  # Input staging is outside the compiled model.
             "ple_input_preparations",
             "ple_disk_row_gather",  # CPU-only I/O; no compiled model change
+            "ple_row_cache_mib",  # CPU-only reuse of bit-identical rows
+            "ple_draft_prefetch",  # Page-cache readahead; results unchanged
+            "ple_fast_lane",  # Same packed rows through a native owner thread
             "ple_disk_row_readers",
-            "ple_row_cache_mib",  # CPU cache does not change compiled computation.
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",
         }

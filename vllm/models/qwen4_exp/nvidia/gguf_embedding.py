@@ -4,11 +4,13 @@
 
 from typing import cast
 
+import numpy as np
 import torch
 from torch.nn import Parameter
 
 from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization.gguf import (
     GGUFEmbeddingMethod,
@@ -22,6 +24,8 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .ple_layer import Qwen4ExpPinnedHostEmbedding, _advise_random_file_access
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -146,6 +150,20 @@ direct_register_custom_op(
 )
 
 
+def _row_gather_callable(kernel, row_bytes: int):
+    """``data[rows]`` through a native mapped-row gather (sorted int64 rows)."""
+    if kernel is None:
+        return None
+
+    def gather(rows: np.ndarray) -> np.ndarray:
+        output = torch.empty((rows.shape[0], row_bytes), dtype=torch.uint8)
+        ids = np.ascontiguousarray(rows, dtype=np.int64)
+        kernel.apply(torch.from_numpy(ids), output)
+        return output.numpy()
+
+    return gather
+
+
 class Qwen4ExpPLEGGUFEmbeddingMethod(GGUFEmbeddingMethod):
     def embedding(self, layer, input_):
         return layer.embedding_lookup(input_)
@@ -198,7 +216,14 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
         self._cpu_reader = None
         self._cpu_owned = is_offload_process()
         self.layer_name = prefix
-        context = get_current_vllm_config().compilation_config.static_forward_context
+        vllm_config = get_current_vllm_config()
+        # Weight loading may run outside the config context; read it now.
+        cache_mib = getattr(vllm_config.kernel_config, "ple_row_cache_mib", 0)
+        self._row_cache_bytes = int(cache_mib) << 20 if self._cpu_owned else 0
+        self._row_gather = bool(
+            getattr(vllm_config.kernel_config, "ple_disk_row_gather", True)
+        )
+        context = vllm_config.compilation_config.static_forward_context
         if prefix in context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         context[prefix] = self
@@ -244,7 +269,8 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
                 row_bytes=self._storage_dim,
                 file_backed=bool(mapped_path),
                 enabled=policy.ple_disk_row_gather,
-                cache_bytes=policy.ple_row_cache_mib << 20,
+                # The native fast lane keeps its own row cache.
+                cache_bytes=0 if policy.ple_fast_lane else self._row_cache_bytes,
             )
             policy.ple_disk_row_readers[self.layer_name] = admission
             # The parameter and reader retain the mmap owner, with no table copy.
@@ -255,7 +281,7 @@ class Qwen4ExpPackedGGUFEmbedding(Qwen4ExpPinnedHostEmbedding):
                 self._source_type,
                 self.embedding_dim,
                 self.org_vocab_size,
-                packed_row_gather=reader,
+                gather=_row_gather_callable(reader, self._storage_dim),
             )
         else:
             from vllm.model_executor.kernels.ple.gguf_pinned import (

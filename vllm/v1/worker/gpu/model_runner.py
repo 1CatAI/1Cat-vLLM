@@ -331,6 +331,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
         self._ple_offload_connector: Any | None = None
+        self._ple_draft_ring: Any | None = None
         self._sm70_v2_mtp_profile_pending: dict[str, Any] | None = None
 
         # Expert parallelism load balancer.
@@ -382,6 +383,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_source=query_start_loc_source,
             ngram_context_source=ngram_context_source,
         )
+        ring = self._ple_offload_connector.draft_ring
+        if ring is not None and hasattr(self.speculator, "draft_step_listener"):
+            # Set before graph capture so every draft graph publishes.
+            self.speculator.draft_step_listener = ring.publish_draft_step
+            self._ple_draft_ring = ring
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
         time_before_load = time.perf_counter()
@@ -1838,6 +1844,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
             mtp_draft_start = self._step_profiler.start_context(mtp_profile_ctx)
+            if self._ple_draft_ring is not None:
+                # The committed state now ends at each request's bonus token.
+                self._ple_draft_ring.publish_round(
+                    input_batch.idx_mapping,
+                    input_batch.num_reqs,
+                    self.req_states.all_token_ids.gpu,
+                    self.req_states.num_computed_tokens.gpu,
+                    self.model_state.ngram_eos_token_id,
+                )
             draft_tokens = self.speculator.propose(
                 input_batch,
                 attn_metadata,
@@ -1971,6 +1986,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self._ple_offload_connector is not None:
             self._ple_offload_connector.close()
             self._ple_offload_connector = None
+        self._ple_draft_ring = None
+        if getattr(getattr(self, "speculator", None), "draft_step_listener", None):
+            self.speculator.draft_step_listener = None
 
         target_model = getattr(self, "model", None)
         speculator = getattr(self, "speculator", None)

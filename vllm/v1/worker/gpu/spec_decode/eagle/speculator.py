@@ -123,6 +123,11 @@ class EagleSpeculator(TargetSamplingHooks):
             device=device,
         )
         self.current_draft_step = torch.tensor(0, dtype=torch.int64, device=device)
+        # Optional observer of each step's drafts (e.g. PLE row prefetch). It
+        # must only enqueue stream-ordered, graph-capturable device work.
+        self.draft_step_listener: (
+            Callable[[torch.Tensor, torch.Tensor], None] | None
+        ) = None
         self.last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
@@ -467,6 +472,8 @@ class EagleSpeculator(TargetSamplingHooks):
         )
         self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = pos
+        if self.draft_step_listener is not None:
+            self.draft_step_listener(self.draft_tokens, self.current_draft_step)
 
     def multi_step_decode(
         self,
@@ -610,6 +617,8 @@ class EagleSpeculator(TargetSamplingHooks):
             self.max_model_len,
             self.num_speculative_steps,
         )
+        if self.draft_step_listener is not None:
+            self.draft_step_listener(self.draft_tokens, self.current_draft_step)
 
     def _build_draft_attn_metadata(
         self,
