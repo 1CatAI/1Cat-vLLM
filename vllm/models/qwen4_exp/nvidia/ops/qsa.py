@@ -1205,7 +1205,7 @@ def qsa_mqa_paged(
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
     if shared_key_scoring and 0 < columns <= capacity and q.shape[0]:
-        from .qsa_shared_key import maybe_shared_key_scores
+        from vllm.v1.attention.ops.sm70_qsa_shared_key import maybe_shared_key_scores
 
         result = maybe_shared_key_scores(
             q,

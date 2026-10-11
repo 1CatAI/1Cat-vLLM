@@ -612,7 +612,10 @@ def build_report(cfg: VllmConfig) -> dict[str, Any]:
         "enabled": shared_key_reason is None,
         "reason": shared_key_reason,
         "scope": "configured_native_capability",
-        "runtime_guards": "one request; M2..8, H4, D128; FP16 Q and indexer K",
+        "runtime_guards": (
+            "one request; M>=2 within installed native row limit, H4, D128; "
+            "FP16 Q and indexer K; legacy binaries retain M<=8"
+        ),
         "arithmetic": "FP16 MMA inputs; FP32 accumulation and scores",
         "fallback": "paged Triton indexer; multiple requests and other shapes",
     }

@@ -9,7 +9,7 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa import (
     qsa_mqa_paged,
     qsa_select_paged_tokens,
 )
-from vllm.models.qwen4_exp.nvidia.ops.qsa_shared_key import (
+from vllm.v1.attention.ops.sm70_qsa_shared_key import (
     load_operator,
     shared_key_reason,
 )
@@ -74,7 +74,7 @@ def test_c4_falls_back_without_changing_scores():
     pos = torch.full((20,), 1024, device="cuda", dtype=torch.int64)
     lengths = torch.full((4,), 1025, device="cuda", dtype=torch.int32)
     args = (q, cache, table, req, pos, lengths, 4)
-    assert shared_key_reason(*args[:6]) == "requires_M2_8_H4_D128"
+    assert shared_key_reason(*args[:6]) == "multiple_requests"
     expected, ev = qsa_mqa_paged(*args)
     actual, av = qsa_mqa_paged(*args, shared_key_scoring=True)
     assert torch.equal(av, ev)
@@ -147,3 +147,80 @@ def test_negative_positions_match_triton_integer_division():
     _, expected = qsa_mqa_paged(*args)
     _, actual = qsa_mqa_paged(*args, shared_key_scoring=True)
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "rows,columns,strided,position_dtype",
+    [
+        (9, 2497, False, torch.int32),
+        (17, 9217, True, torch.int64),
+        (32, 32769, False, torch.int64),
+    ],
+)
+def test_query_tiles_match_reference_and_independent_tiles_on_replay(
+    rows, columns, strided, position_dtype
+):
+    """Exercise row/column tails, padded rows and growing live lengths together."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 required")
+    assert load_operator(), "Build the packaged QSA indexer extension"
+    torch.manual_seed(8100 + rows)
+    page_size = 16
+    pages = (columns + page_size - 1) // page_size
+    width = 256 if strided else 128
+    query = torch.randn(rows, 4, width, device="cuda", dtype=torch.float16)
+    cache = torch.randn(pages, page_size, 1, width, device="cuda", dtype=torch.float16)
+    if strided:
+        query, cache = query[..., ::2], cache[..., ::2]
+    table = torch.randperm(pages, device="cuda", dtype=torch.int32)[None, :]
+    requests = torch.zeros(rows, device="cuda", dtype=torch.int32)
+    positions = torch.zeros(rows, device="cuda", dtype=position_dtype)
+    lengths = torch.zeros(1, device="cuda", dtype=torch.int32)
+    args = (query, cache, table, requests, positions, lengths, 4)
+    assert shared_key_reason(*args[:6]) is None, "Rebuild for query-tile capability"
+    qsa_mqa_paged(*args, num_columns=columns, shared_key_scoring=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual, visible = qsa_mqa_paged(
+            *args, num_columns=columns, shared_key_scoring=True
+        )
+    for case, live in enumerate((65, columns * 4 - rows, columns * 4)):
+        query.normal_()
+        lengths.fill_(live)
+        positions.copy_(torch.arange(rows, device="cuda") + live - rows)
+        requests.zero_()
+        if case == 1:
+            requests[8] = -1  # First row in a later query tile is padding.
+        if case == 2:
+            positions[-1] = -5
+            table[0, 1] = -1
+        actual.fill_(float("nan"))
+        graph.replay()
+        reference, expected_visible = qsa_mqa_paged(*args, num_columns=columns)
+        assert torch.equal(visible, expected_visible)
+        mask = torch.arange(columns, device="cuda")[None, :] < visible[:, None]
+        torch.testing.assert_close(actual[mask], reference[mask], rtol=2e-6, atol=2e-6)
+        # Launching each tile independently is an indexing oracle. Both paths
+        # execute identical arithmetic, so this check deliberately uses equality.
+        for start in range(0, rows, 8):
+            stop = min(start + 8, rows)
+            tile_scores = torch.empty(
+                (stop - start, columns), device="cuda", dtype=torch.float32
+            )
+            tile_visible = torch.empty(stop - start, device="cuda", dtype=torch.int32)
+            torch.ops.vllm_sm70_qsa_indexer.run(
+                tile_scores,
+                tile_visible,
+                query[start:stop],
+                cache,
+                table,
+                requests[start:stop],
+                positions[start:stop],
+                lengths,
+                query.shape[2] ** 0.5,
+                4,
+            )
+            assert torch.equal(tile_visible, visible[start:stop])
+            assert torch.equal(
+                tile_scores[mask[start:stop]], actual[start:stop][mask[start:stop]]
+            )

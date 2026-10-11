@@ -2,6 +2,37 @@
 
 Date: 2026-05-30
 
+## Shared-path generalization: QSA query tiles, 2026-10-11
+
+Base `be3722bc095b9792bf9833068595f0b1ef70ad37` (`onecat/main`).
+The architecture map now contains the
+[existing-path generalization queue](architecture/README.md#generalizing-existing-paths),
+classifying hardware/layout constraints, implementation coverage, model quality
+and performance tuning instead of treating every narrow guard identically.
+
+The first candidate moves QSA shared-key admission/loading to the common
+attention-ops owner, with a forwarding model import. The existing CUDA scorer
+uses query tiles across rows rather than rejecting M>8. Its installed module
+advertises `MAX_QUERY_ROWS`; older binaries retain their eight-row fallback.
+FP16/H4/D128, single-request, causal metadata and arithmetic contracts remain.
+The maximum grid extent is an implementation bound, not a measured fast range.
+
+CPU admission/old-binary compatibility checks pass 22 cases with Torch
+`2.11.0+cpu`, Python 3.12. A first CPU run exposed a logging fixture's dependency
+on distributed runtime packages; isolating only logging resolved it. GPU cases
+cover M9/17/32, non-aligned widths, valid/padded query tails, invalid pages and
+changing live lengths during replay. They compare the original scorer and
+independently launched native tiles; no new numerical tolerance is introduced.
+
+GPU build/numerical/quality/performance validation is pending: the local NVIDIA
+driver is unavailable and the recorded remote environment closed its connection.
+No GPU process was started. Local CPU Torch and CUDA 12.0 do not provide the
+required matching CUDA Torch build environment. Resume with the packaged
+`_sm70_qsa_indexer_C` target on an available SM70 host, run the affected GPU
+suite, then compare the added row cases with the existing scorer before
+qualifying broader default dispatch. No model-throughput or 35B parity claim
+follows from these CPU checks.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:
