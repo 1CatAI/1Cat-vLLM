@@ -65,9 +65,9 @@ supported.
 | Component | Implemented in this slice | Remaining acceptance / owner |
 | --- | --- | --- |
 | Codec / allocation / views | Identities, planar layout, V1/V2 bindings, actual scale strides | Engine initialization, hybrid cache, prefix/offload and multi-engine GPU state tests / runners |
-| Triton writer / attention | Common encoder and existing unified attention | GPU execution, capture/replay and numerical limits / Triton backend |
-| Native scalar | Same partition kernel and reduction, scale ABI, qualified fallback admission | GPU correctness and latency / Flash-V100 |
-| XQA / long / compact | Common FP16/FP8 reader extracted | Row-scale binding, tuning and execution / Flash-V100 |
+| Triton writer / attention | Common encoder and existing unified attention; component GPU checks pass | Engine-level state and task qualification / Triton backend |
+| Native scalar | Same partition kernel and reduction, scale ABI, qualified fallback admission; component GPU checks pass | Latency and engine-level qualification / Flash-V100 |
+| XQA / long / compact | Standard XQA bound to row scales; component GPU checks pass | Other tuning variants, compact paths and latency / Flash-V100 |
 | Grouped / mixed / MTP / DFlash | Common reader extracted where shared | Row-scale binding, masks, commit/rollback and execution / verifier owners |
 | Prefill / prefix / Split-D / split-KV | FP16/FP8 reader extraction | Native INT8 binding and bounded dense conversion / prefill owners |
 | Norm / RoPE fusion | No new format admitted | Common writer binding and byte compatibility / fused writers |
@@ -92,7 +92,8 @@ cases, the 516-test affected subset passes. The offline tool suite passes 17
 tests, including legacy-reader PTX parity with CUDA 12.0. The actual Triton
 writer compiles for SM70 in both rounding modes (2 tests).
 
-GPU tests are present but have **not run**. They use non-contiguous pages and
+At the foundation commit, GPU tests had not run; the XQA follow-up below records
+their completed component run. They use non-contiguous pages and
 lengths 15/16/17, 255/256/257 and 1023/1024/1025 tokens. Writer graph replay
 changes slots and inputs while preserving untouched bytes. Attention is
 compared with FP64 arithmetic over the independently encoded cache, with
@@ -201,6 +202,23 @@ standard Torch/CUDA dependencies, without private library overrides.
 The task's normal main-package CMake build and final-wheel component suite are
 tracked separately. The initial combined test collection failed because the
 owned main source had no `_C` extension; no private extension was substituted.
+The normal CMake `_C` build and component installation subsequently completed
+on SM70. Installed `_C.abi3.so` SHA256:
+`d7660d3d6d477988a3deebb5fdcac8c9dafe23ade34ffc517690376c9436fe0a`.
+This builds the main native component, not the full main-package release wheel.
+
+The exact committed `test_int8_kv_codec.py` and
+`test_flash_v100_bound_runtime.py` suites now pass **104 tests** on GPU 0,
+using the final Flash-V100 wheel and that normally installed main component.
+The tests cover both INT8 writers at D=32/64/80/128/256; Triton and scalar
+attention at D=128; XQA at D=256; the page/partition boundaries listed above;
+GQA=4/6/8, two KV heads, one/two decode rows and partitions 256/512/1024;
+changed queries/pages/lengths/scales at graph replay; negative write slots;
+invalid-scale/head isolation; and configured FP16/E4M3/E5M2/INT8 calls,
+environment changes and independent workspace/capture owners.
+`gpu-components.log` retains the result. Eight additional native scalar
+comparisons at D=256, GQA=4/6 and 17/257 tokens also pass
+(`scalar-probe.json`). No model or inference service was launched.
 
 CPU evidence: the final 529-test route/binding/executor/lifecycle suite passes,
 including scalar disabled and explicit-scale forwarding. Four legacy-reader
@@ -211,7 +229,17 @@ covered by executable contracts instead of the old implementation hashes.
 Logs are `/tmp/1cat-kv-xqa-{routing,executor,composition,reader-parity}.log`;
 `composition-{base,head}.log` retains the baseline comparison.
 
-No independently calibrated FP8 accuracy comparison, task-quality result,
-latency parity or 35B pure-decode result is claimed here. The broad acceptance
-matrix above remains open until those measurements and remaining native
-bindings are complete.
+An exploratory operator comparison freezes its generated Gaussian inputs and
+independently calibrates FP8 E4M3 K/V tensor scales before candidate execution.
+At GQA6/Hkv2/D256 and 257/4097/32769 tokens, INT8 reconstruction MSE is about
+14.5 times lower on those fixtures; attention arithmetic meets the frozen
+operator bound. This is not representative model-task evidence. Initial FP8
+timing repetitions drift by roughly 9–13% at two lengths, so the observed INT8
+latency advantage is diagnostic only and does not pass the repeatability gate.
+The exact probe, fixture hashes, protocol and raw samples are retained in
+`decode-comparison.py`, `decode-comparison-protocol.json` and
+`decode-comparison.json` in the same task directory.
+
+No representative task-quality result, latency parity or 35B pure-decode result
+is claimed here. The broad acceptance matrix above remains open until those
+measurements and remaining native bindings are complete.
