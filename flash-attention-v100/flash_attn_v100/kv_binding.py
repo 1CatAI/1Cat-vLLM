@@ -25,36 +25,39 @@ def codec_names(native: Any, algorithm: str) -> frozenset[str]:
 
 
 @dataclass(frozen=True)
-class DecodeKVBinding:
+class KVBinding:
     operation: Any
-    scale_args: tuple[torch.Tensor, torch.Tensor] | tuple[()]
+    scale_args: tuple[torch.Tensor | None, torch.Tensor | None] | tuple[()]
     partial_dtype: torch.dtype
 
 
-def bind_decode_kv(
+def bind_kv(
     native: Any,
     algorithm: str,
     codec: str,
     key_scale: torch.Tensor | None,
     value_scale: torch.Tensor | None,
-) -> DecodeKVBinding:
+    *,
+    partial_dtype: torch.dtype | None = None,
+) -> KVBinding:
     # Check the binary before allocating workspaces or entering graph capture.
     if codec not in codec_names(native, algorithm):
         raise RuntimeError(
             f"Rebuild Flash-V100: {algorithm} has no explicit KV binding for {codec}"
         )
     row_scaled = codec in _ROW_SCALE_CODECS
-    scale_args: tuple[torch.Tensor, torch.Tensor] | tuple[()]
     if row_scaled:
         if key_scale is None or value_scale is None:
             raise ValueError("Token/head KV decoding requires both scale planes")
-        scale_args = (key_scale, value_scale)
     else:
         if key_scale is not None or value_scale is not None:
             raise ValueError("This KV codec uses tensor scales, not scale planes")
-        scale_args = ()
-    return DecodeKVBinding(
-        getattr(native, f"{algorithm}_{'kv_' if row_scaled else ''}fwd"),
-        scale_args,
-        torch.float32 if codec in _FP32_PARTIAL_CODECS else torch.float16,
+    explicit = int(getattr(native, f"{algorithm}_kv_abi", 0)) == 1 and callable(
+        getattr(native, f"{algorithm}_kv_fwd", None)
+    )
+    return KVBinding(
+        getattr(native, f"{algorithm}_{'kv_' if explicit else ''}fwd"),
+        (key_scale, value_scale) if explicit else (),
+        partial_dtype
+        or (torch.float32 if codec in _FP32_PARTIAL_CODECS else torch.float16),
     )

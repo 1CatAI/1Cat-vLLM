@@ -43,6 +43,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grouped_e4m3_fp32_paged_fwd", &flash_attention_grouped_e4m3_fp32_paged,
         "Opt-in E4M3 small-query attention with FP32 partials and explicit row "
         "lengths");
+  m.def("grouped_fp32_paged_kv_fwd", &flash_attention_grouped_fp32_paged,
+        "Shared grouped FP32 attention with explicit row lengths and KV views");
+  m.attr("grouped_fp32_paged_kv_abi") = 1;
+  m.attr("grouped_fp32_paged_kv_codecs") = m.attr("decode_paged_kv_codecs");
   m.def("grouped_e4m3_fp32_precision_version",
         &flash_attention_grouped_e4m3_fp32_precision_version,
         "E4M3 grouped FP32 numerical implementation revision");
@@ -132,6 +136,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grouped_e4m3_fp32_paged_fwd_configured",
         flash_v100::policy::with_policy(
             &flash_attention_grouped_e4m3_fp32_paged));
+  m.def("grouped_fp32_paged_kv_fwd_configured",
+        flash_v100::policy::with_policy(&flash_attention_grouped_fp32_paged));
   m.def("tp2_e4m3_scalar_fast_launch_count_configured",
         flash_v100::policy::with_policy(
             &flash_attention_tp2_e4m3_scalar_fast_launch_count));

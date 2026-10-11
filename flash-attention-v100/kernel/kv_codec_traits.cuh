@@ -16,24 +16,28 @@ template <>
 struct KVStorageTraits<KV_CACHE_DTYPE_FP16> {
   using storage_type = __half;
   static constexpr bool quantized = false;
+  static constexpr int vector_alignment = 16;
 };
 
 template <>
 struct KVStorageTraits<KV_CACHE_DTYPE_FP8_E4M3> {
   using storage_type = uint8_t;
   static constexpr bool quantized = true;
+  static constexpr int vector_alignment = 8;
 };
 
 template <>
 struct KVStorageTraits<KV_CACHE_DTYPE_FP8_E5M2> {
   using storage_type = uint8_t;
   static constexpr bool quantized = true;
+  static constexpr int vector_alignment = 8;
 };
 
 template <>
 struct KVStorageTraits<KV_CACHE_DTYPE_INT8> {
   using storage_type = int8_t;
   static constexpr bool quantized = true;
+  static constexpr int vector_alignment = 4;
 };
 
 // Borrowed scale addresses use element strides from the public cache view.

@@ -28,6 +28,18 @@ decltype(auto) visit_kv_codec(int codec, Operation&& operation) {
   }
 }
 
+template <int KV_DTYPE>
+constexpr at::ScalarType kv_storage_type() {
+  using Storage = typename KVStorageTraits<KV_DTYPE>::storage_type;
+  static_assert(std::is_same_v<Storage, __half> ||
+                    std::is_same_v<Storage, uint8_t> ||
+                    std::is_same_v<Storage, int8_t>,
+                "Native KV storage needs an ATen dtype binding");
+  return std::is_same_v<Storage, __half>   ? at::kHalf
+         : std::is_same_v<Storage, int8_t> ? at::kChar
+                                           : at::kByte;
+}
+
 inline KVScalePlane bind_scale_plane(const at::Tensor& scale,
                                      const at::Tensor& payload) {
   TORCH_CHECK(scale.device() == payload.device(),
@@ -46,15 +58,18 @@ inline KVScaleView bind_scale_view(
     int codec, const at::Tensor& key, const at::Tensor& value,
     const std::optional<at::Tensor>& key_scale,
     const std::optional<at::Tensor>& value_scale) {
-  if (codec == KV_CACHE_DTYPE_INT8) {
-    TORCH_CHECK(key_scale.has_value() && value_scale.has_value(),
-                "Token/head KV codecs require both scale planes");
-    return {bind_scale_plane(*key_scale, key),
-            bind_scale_plane(*value_scale, value)};
-  }
-  TORCH_CHECK(!key_scale.has_value() && !value_scale.has_value(),
-              "This KV codec uses tensor scales, not scale planes");
-  return {};
+  return visit_kv_codec(codec, [&](auto tag) -> KVScaleView {
+    if constexpr (KVCodecTraits<decltype(tag)::value>::per_token_head) {
+      TORCH_CHECK(key_scale.has_value() && value_scale.has_value(),
+                  "Token/head KV codecs require both scale planes");
+      return {bind_scale_plane(*key_scale, key),
+              bind_scale_plane(*value_scale, value)};
+    } else {
+      TORCH_CHECK(!key_scale.has_value() && !value_scale.has_value(),
+                  "This KV codec uses tensor scales, not scale planes");
+      return {};
+    }
+  });
 }
 
 }  // namespace flash_v100
