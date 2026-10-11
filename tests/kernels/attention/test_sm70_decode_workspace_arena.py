@@ -48,6 +48,18 @@ def test_rollback_keeps_independent_row_buffers(monkeypatch):
     assert large[0].data_ptr() != small[0].data_ptr()
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_workspace_outlives_inference_mode(dtype):
+    q = torch.empty((8, 6, 32), dtype=torch.float16)
+    with torch.inference_mode():
+        first = workspace(q, 8, partitions=4, dtype=dtype)
+    second = workspace(q, 4, partitions=3, dtype=dtype)
+    for before, after in zip(first, second):
+        assert before.data_ptr() == after.data_ptr()
+        assert not after.is_inference()
+    assert second[3].item() == 3
+
+
 def test_non_captured_growth_releases_old_storage():
     q = torch.empty((8, 6, 32), dtype=torch.float16)
     workspace(q, 2)
@@ -75,7 +87,7 @@ def test_capture_reuse_then_growth_retains_addresses():
     results = [torch.empty((), device="cuda") for _ in range(3)]
     graphs = []
     refs = []
-    with torch.cuda.stream(stream):
+    with torch.inference_mode(), torch.cuda.stream(stream):
         # The first buffer predates capture, but becomes live graph storage.
         workspace(q, 2)
     for index, (rows, partitions) in enumerate([(2, 4), (8, 4), (1, 4)]):

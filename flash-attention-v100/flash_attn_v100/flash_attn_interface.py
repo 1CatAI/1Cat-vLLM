@@ -5,7 +5,7 @@ import logging
 import torch
 
 from . import legacy_policy as _legacy
-from .kv_binding import bind_decode_kv, codec_names
+from .kv_binding import bind_kv, codec_names
 
 try:
     from . import flash_attn_v100_cuda
@@ -133,6 +133,8 @@ def _cuda_graph_capture_active() -> bool:
         return False
 
 
+# Cached scratch can outlive the caller's inference-mode scope.
+@torch.inference_mode(False)
 def _allocate_decode_workspace(
     q: torch.Tensor,
     *,
@@ -1142,13 +1144,13 @@ def flash_attn_decode_paged(
 
     e4m3_fp32 = kv_cache_dtype in ("fp8", "fp8_e4m3")
     native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    binding = bind_decode_kv(
-        native, "decode_paged", kv_cache_dtype, k_scale_cache, v_scale_cache
-    )
     if e4m3_fp32 and not flash_attn_grouped_e4m3_fp32_available():
         raise RuntimeError(
             "Rebuild Flash-V100 for E4M3 FP32 scalar decode (precision revision 4)"
         )
+    binding = bind_kv(
+        native, "decode_paged", kv_cache_dtype, k_scale_cache, v_scale_cache
+    )
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
@@ -1285,6 +1287,65 @@ def flash_attn_grouped_e4m3_fp32_available(min_version: int = 4) -> bool:
     )
 
 
+def flash_attn_grouped_fp32_paged(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    softmax_scale: float,
+    kv_cache_dtype: str = "auto",
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
+    _runtime=None,
+) -> torch.Tensor:
+    """GQA6/D256 grouped attention with authoritative per-query lengths.
+
+    Supports q2..8/B1 and request-major q8/B2..16. Zero-length rows produce
+    zero outputs. Positive lengths and physical page indices must fit the
+    table and cache. FP32 partials belong to this algorithm for every codec.
+    """
+    native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    binding = bind_kv(
+        native,
+        "grouped_fp32_paged",
+        kv_cache_dtype,
+        k_scale_cache,
+        v_scale_cache,
+        partial_dtype=torch.float32,
+    )
+    workspace = _get_grouped_verify_workspace(
+        q,
+        batch_size=block_table.shape[0],
+        partial_dtype=binding.partial_dtype,
+        _runtime=_runtime,
+    )
+    return binding.operation(
+        q,
+        k_cache,
+        v_cache,
+        out,
+        block_table,
+        row_lengths,
+        workspace.partial_out,
+        workspace.partial_lse,
+        float(softmax_scale),
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+        *binding.scale_args,
+    )
+
+
+flash_attn_grouped_fp32_paged.kv_cache_codecs = codec_names(  # type: ignore[attr-defined]
+    flash_attn_v100_cuda, "grouped_fp32_paged"
+)
+
+
 def flash_attn_grouped_e4m3_fp32_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1322,6 +1383,20 @@ def flash_attn_grouped_e4m3_fp32_paged(
     batch_size = block_table.shape[0]
     if batch_size > 1 and not flash_attn_grouped_e4m3_fp32_available(6):
         raise RuntimeError("Rebuild Flash-V100 for request-major E4M3 revision 6")
+    if "fp8_e4m3" in flash_attn_grouped_fp32_paged.kv_cache_codecs:
+        return flash_attn_grouped_fp32_paged(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            row_lengths,
+            out=out,
+            softmax_scale=softmax_scale,
+            kv_cache_dtype="fp8_e4m3",
+            k_scale=k_scale,
+            v_scale=v_scale,
+            _runtime=_runtime,
+        )
     workspace = _get_grouped_verify_workspace(
         q, batch_size=batch_size, partial_dtype=torch.float32, _runtime=_runtime
     )
@@ -1427,7 +1502,7 @@ def flash_attn_decode_paged_xqa(
         softmax_scale = q.shape[-1] ** -0.5
 
     native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    binding = bind_decode_kv(
+    binding = bind_kv(
         native, "decode_paged_xqa", kv_cache_dtype, k_scale_cache, v_scale_cache
     )
 

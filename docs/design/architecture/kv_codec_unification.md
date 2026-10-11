@@ -68,7 +68,7 @@ supported.
 | Triton writer / attention | Common encoder and existing unified attention; component GPU checks pass | Engine-level state and task qualification / Triton backend |
 | Native scalar | Same partition kernel and reduction, scale ABI, qualified fallback admission; component GPU checks pass | Latency and engine-level qualification / Flash-V100 |
 | XQA / long / compact | Standard XQA bound to row scales; component GPU checks pass | Other tuning variants, compact paths and latency / Flash-V100 |
-| Grouped / mixed / MTP / DFlash | Common reader extracted where shared | Row-scale binding, masks, commit/rollback and execution / verifier owners |
+| Grouped / mixed / MTP / DFlash | Ordinary grouped FP32 shares native codec bindings; component GPU checks pass | Engine bindings, tree/sparse masks and commit/rollback / verifier owners |
 | Prefill / prefix / Split-D / split-KV | FP16/FP8 reader extraction | Native INT8 binding and bounded dense conversion / prefill owners |
 | Norm / RoPE fusion | No new format admitted | Common writer binding and byte compatibility / fused writers |
 | QSA / host history / hot cache | No new format admitted | Representation and transport adapters / QSA owners |
@@ -249,3 +249,142 @@ The exact probe, fixture hashes, protocol and raw samples are retained in
 No representative task-quality result, latency parity or 35B pure-decode result
 is claimed here. The broad acceptance matrix above remains open until those
 measurements and remaining native bindings are complete.
+
+## Shared grouped FP32 bindings
+
+The next slice binds FP16, E4M3, E5M2 and both INT8 storage identities to the
+existing compensated grouped attention kernel. It keeps the old E4M3 public
+entry point as a compatibility wrapper around the common implementation.
+There is no INT8-only grouped algorithm, row planner or workspace owner.
+The new public entry is `flash_attn_grouped_fp32_paged`; its native
+`grouped_fp32_paged_kv_abi=1` advertises the actual installed codec bindings.
+
+Grouped attention applies K scales to each key column after QK, and V scales
+to probabilities after accumulating the unscaled softmax sum. The existing
+compensated probability product and FP32 partition merge remain shared.
+V scales are applied only after the causal-row mask, preventing an invalid
+future token from contaminating an earlier row through zero times NaN.
+Invalid K rows keep a live NaN partition rather than being dropped as empty.
+Zero-length rows and unrelated requests/heads retain their exact state contract.
+
+The public binding helper is now `bind_kv`: current native ABIs receive scale
+arguments for every codec, including `None` for tensor-scaled/unquantized
+storage. Only old binaries use the legacy signatures. The scalar, XQA and
+grouped native instances are generated through the same codec visitor.
+Storage dtype, vector alignment and scale granularity come from the codec
+contract; row scaling does not imply signed-byte storage. Grouped FP32
+declares its own FP32 workspace requirement. Runtime owners copy each
+algorithm's versioned capability metadata without another algorithm list.
+
+The implemented ordinary grouped envelope is FP16 Q/output, D=256, GQA6,
+q2..8 for one request or request-major q8 for 2..16 requests, any positive
+local KV-head count, pages in multiples of 16 tokens, and at most **266240
+tokens per request's block-table capacity**. Row lengths are authoritative;
+indices and positive lengths must remain within that capacity. Payload
+vector alignment is 16 bytes for FP16, 8 for FP8, and 4 for signed INT8.
+FP8 explicit-row groups retain the unpaired reader for valid eight-byte
+strides, including an eight-byte-offset head inside a multi-head cache.
+
+Correctness measurements use V100 GPU 0, CUDA 12.8.93 and Torch 2.10.0+cu128:
+the generated codec matrix tests shuffled pages, q2/q5/q8, B1/B2/B16, one/two
+KV heads, page16/page32, 17/129/255/257/1025/4097-token cases and graph replay
+with changed lengths, pages, queries and scales. Each declared codec is also
+checked at the 266240-token boundary and neighboring lengths. Five codec
+instances have observed grouped CUDA kernel events, independently of route
+names. Separate cases cover causal NaN isolation and two runtime owners with
+different codecs, independent captures and release.
+
+The frozen grouped arithmetic limit is the existing relative-L2 bound:
+`1.02 * FP16_output_rounding_floor + 2e-6` against FP64 over the same
+quantized cache. It is not the decode bound or a model-task quality gate.
+The final normal wheel passes 248 component checks: 43 new grouped cases,
+96 existing E4M3/grouped/QSA regressions, 104 writer/Triton/decode/runtime
+cases and five E4M3 scalar cases. A further 16 workspace checks pass, including
+graph address retention and switching between inference and ordinary calls.
+The 22 CPU binding cases and four legacy-reader PTX/source-packaging checks pass.
+Wheel SHA256:
+`ff681b7a369cd7e6ade8a7c931b3cbc7b698616f550a92c87a872d086947c36a`.
+Native SHA256:
+`388aa79c46aae6e3b38377cb680b77ca20fefa36c691e57df14faaf73d5016f5`.
+Fresh-process public-package loading succeeds without private library overrides.
+
+The first combined run exposed cached decode scratch allocated inside inference
+mode and later mutated outside that scope. Allocation now creates ordinary
+tensors regardless of the caller's scope, retaining the same cache keys and
+capture addresses. The retained earlier wheel reproduces the failure for FP16
+and FP32 scratch. The first added regression test mistakenly crossed two
+partition-capacity buckets; correcting it to reuse one bucket needs no runtime
+change. The old E4M3 precision-revision error remains checked before binding.
+
+Retained evidence is in
+`/home/ymzx/kv-grouped-bindings-20261011-084138` on the validation host:
+`test_sm70_grouped_kv_codecs.py`, `gpu-codecs.log`,
+`gpu-grouped-{owners,capacity}.log`, `gpu-legacy-regressions.log`,
+`gpu-bound-runtime.log`, `artifact-check.json` and normal wheel build logs.
+`gpu-final-suite.log` preserves the initial combined failure;
+`gpu-workspace-suite.log` records the final wheel's 248 passing component cases
+and 14 workspace cases before correcting the test's capacity buckets;
+`gpu-workspace-final.log` records all 16 corrected workspace cases passing.
+`workspace-before-reproducer.log` retains the same corrected test failing with
+the previous wheel. `build-workspace.log` records final packaging.
+CPU evidence is `/tmp/1cat-kv-grouped-contracts.log`.
+
+This qualifies component arithmetic/state for the measured cases. The old
+E4M3 engine wrapper uses the shared implementation; FP16/E5M2/INT8's new
+generic grouped entry is not newly selected by the engine in this slice.
+Full-backend INT8 admission, sparse/tree INT8 bindings, prefill, fused writes,
+transport, task quality and latency gates remain open. No grouped speedup or
+end-to-end engine acceptance is claimed.
+
+## Requested 27B NVFP4 / INT8 / DFlash2 service check
+
+The 2026-10-11 service request uses QUASAR Qwen3.8-27B NVFP4, TP4 on four
+V100-SXM2-32GB GPUs, FP16 compute, planar `int8` target KV, FP16 draft KV,
+DFlash2 with seven probabilistic drafts, prefix caching and CUDA graphs.
+The context capacity is **262144 tokens**, not a requested prompt length.
+The requested first measurements are ordinary 4096/32768-token inputs, cold
+and prefix-hit requests, with prefill and target verification reported
+separately. The retained launch uses 8192 batched tokens, four sequences,
+0.80 memory utilization, 2048-token KV blocks and 8192-token Mamba blocks.
+
+At source `5944c302ff5536c3b6bee41cdae562a57581e758`, this is **not yet a
+runnable full Flash-V100 INT8 service**. The GPU driver is functional
+(580.178.04); the remaining issue is engine integration, not GPU access.
+The earlier 264 passing component checks do not establish model execution.
+
+The first CLI launch exposed the component-only build's missing
+`_C_stable_libtorch` library during DFlash2 architecture inspection
+(`_C.silu_and_mul` was absent). The normal CMake targets
+`_C_stable_libtorch`, `_vllm_fa2_C`, `_moe_C` and `cumem_allocator` were then
+built and installed into the owned source runtime. No private library was
+copied or preloaded. This extends the normal component build; it is still
+not a full main-package release wheel.
+
+With those additional libraries installed, the same 264 GPU component and
+workspace checks pass again, with no skips or failures (24.17 seconds).
+The report and JUnit output are in the `components-recheck` artifact subdirectory.
+
+After installing the engine dependencies, the actual TP4 engine configuration
+constructs successfully and its native capability probe has no load error.
+DFlash2/GDN switches, Q8000 prefill and CUDA graphs are configured, but
+grouped, long-context and compact-tail profile entries still report
+`kv_dtype` for INT8. Those configured switches are not proof of execution.
+Fresh backend initialization loads the native operators and admits FP16,
+E4M3 and E5M2. INT8 has native decode operators but its full-backend admission
+is false; a forward call is explicitly rejected before attention execution.
+The engine grouped binding table still contains only FP16/E4M3, and the
+prefix-prefill bridge still accepts only E4M3/E5M2.
+
+Consequently there are **no model prefill, verifier-round or decode latency
+measurements** from this attempt. Do not promote the codec by deleting the
+backend guard. The next execution prerequisite is to connect the borrowed KV
+view and row scales to the common prefill/verification flows and their native
+bindings, retaining the mask, state and fallback contracts above.
+
+Retained artifacts on the validation host are under
+`/home/ymzx/kv-int8-dflash2-20261011-1157`: `manifest.json`, `server.log`,
+normal component build/install logs, `configured-acceleration.json`,
+`backend-capabilities.json` and their probe scripts/logs. A diagnostic harness
+mistakenly exposed one GPU for a TP4 configuration check; that failure is
+retained as `harness-one-gpu-config-preflight.log`. Restoring the declared
+four-GPU visibility makes configuration succeed without a source change.
