@@ -64,6 +64,38 @@ def test_shared_grouped_engine_admits_each_installed_codec(codec):
     )
 
 
+@pytest.mark.parametrize("codec", CODECS, ids=lambda c: c.name)
+@pytest.mark.parametrize("rows", [8, 9, 16, 17])
+@pytest.mark.parametrize("native_max", [8, 16])
+def test_shared_grouped_query_range_comes_from_installed_plan(codec, rows, native_max):
+    cache = view(codec)
+    operation = SimpleNamespace(
+        kv_cache_codecs={codec.name}, max_query_tokens=native_max
+    )
+    instance = SimpleNamespace(
+        kv_cache_dtype=codec.name,
+        use_smallq_decode_xqa=True,
+        flash_attn_grouped_fp32_paged=operation,
+        _flash_v100_window_size=lambda causal: (-1, -1),
+    )
+    q = torch.zeros((rows, 12, 256), dtype=torch.float16)
+    table = torch.tensor([[3, 1]], dtype=torch.int32)
+    lengths = torch.full((rows,), 64, dtype=torch.int32)
+    reason = grouped_fp32_reason(
+        codec,
+        instance,
+        q,
+        cache.key,
+        cache.value,
+        table.expand(rows, -1).contiguous(),
+        lengths,
+        SimpleNamespace(block_table=table, seq_lens=lengths[-1:]),
+        out=torch.empty_like(q),
+        shared=True,
+    )
+    assert reason == (None if rows <= native_max else "query_rows")
+
+
 def test_scalar_workspace_is_owned_by_engine_and_survives_inference_mode():
     from vllm.config import set_current_vllm_config
     from vllm.runtime_resources import release_runtime_resources

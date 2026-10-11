@@ -80,6 +80,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Shared grouped FP32 attention with explicit row lengths and KV views");
   m.attr("grouped_fp32_paged_kv_abi") = 1;
   m.attr("grouped_fp32_paged_kv_codecs") = m.attr("decode_paged_kv_codecs");
+  m.def("grouped_fp32_plan_kv_fwd",
+        &flash_attention_grouped_fp32_paged_with_plan);
+  m.def("grouped_fp32_plan_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_grouped_fp32_paged_with_plan));
+  m.attr("grouped_fp32_plan_kv_abi") = 1;
+  m.attr("grouped_fp32_plan_kv_codecs") = m.attr("decode_paged_kv_codecs");
+  m.attr("grouped_fp32_execution_plan_revision") = 2;
+  m.attr("grouped_fp32_plan_features") =
+      py::make_tuple("q16", "two_pass", "head_groups", "page_id_staging",
+                     "fixed_stride", "paired_reads");
   m.def("grouped_e4m3_fp32_precision_version",
         &flash_attention_grouped_e4m3_fp32_precision_version,
         "E4M3 grouped FP32 numerical implementation revision");

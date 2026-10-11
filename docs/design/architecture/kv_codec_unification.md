@@ -567,3 +567,52 @@ with no pending calculation: the existing hybrid-model guard disables
 **not an independently calibrated precision baseline**. Preserve the guard;
 unit scales or a short request cannot prove INT8 precision improvement.
 A separately qualified calibration/checkpoint control remains required.
+
+## Shared grouped execution plans (2026-10-12)
+
+Owned follow-up to the shared writer/XQA stage (`c24a1ef562`). The existing
+Tensor Core grouped kernel now accepts q9..16 through the codec visitor and
+supports both one-pass and two-pass FP32 plans. Both passes use compensated QK;
+the probability residual retains the established FP32 numerator/max/sum and
+relative-L2 contract. Query packing, masks, partitioning and reduction are shared.
+
+The plan derives fixed-stride page1648/page3296 admission and paired reads
+from payload geometry, with scale addresses kept independent. Split-local page
+IDs are staged with the same capacity fallback for every codec. Valid eight-byte
+views and the legacy inline layout retain their qualified generic reader instead
+of truncating offsets to sixteen-byte boundaries. Original native entry points
+and stale-binary q8 capability remain available; q16/two-pass require the new
+actual plan entry. Public metadata propagates the actual maximum query rows to
+the engine admission, without a model/weight/TP allowlist.
+
+V100/SM70, CUDA 12.8.93, Torch 2.10.0+cu128 and driver 580.178.04 results:
+
+- New grouped schedules: **50 GPU cases passed**, covering five codec identities,
+  one/two-pass, q9/q16, Hkv1/2, B1 and B2 q8, non-contiguous physical pages,
+  zero-length rows and changed-input graph replay. The numerical bound remains
+  `relative L2 <= 1.02 * FP16 rounding floor + 2e-6`.
+- Address/native-execution boundaries: **5 GPU cases passed**, including four
+  byte-codec eight-byte offsets and a profiler-confirmed q16 INT8 native
+  page1648 grouped instance with no decode kernel. The first test invocation
+  omitted required output/scale arguments; the corrected five cases were rerun
+  separately. No kernel or numerical gate changed to fix those test calls.
+- Existing grouped E5M2/E4M3 entry regressions: **94 GPU cases passed**, preserving
+  original bitwise per-request/fixed-layout checks and precision-qualified tests.
+- Codec/max-row admission: **51 CPU cases passed**. The wider verifier subset
+  passes 68 cases and reproduces two inherited policy-reader fixture failures;
+  the historical long-helper AST snapshot remains an inherited failure.
+
+The normal Flash-V100 R2 wheel SHA256 is
+`5c1641aa08802e48ec2cae8c57074fc9ec8d539abadc1347ef84be49f3a8a955`.
+Unchanged main-package native components are installed with their normal CMake
+component install; this development runtime is not final installed-release
+acceptance. Retained artifacts: `gpu-grouped-plans-r2.log`,
+`gpu-grouped-boundaries-r2b.log` and `gpu-grouped-legacy-r2.log`.
+
+**S03 still requires complete engine/state and latency qualification.** These
+component results do not close the resident-prefix dense adapter, QSA/history,
+MLA/indexer or transfer responsibilities. The benchmark-only range collector
+runs on a separate eager FP16 reference, excludes invalid writer slots, exports
+TP-local Q/K/V ranges and never mutates captured scales. Its frozen calibration
+inputs and normally loaded checkpoint scales must qualify the independent FP8
+control before any precision-improvement claim.

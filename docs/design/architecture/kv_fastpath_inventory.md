@@ -94,9 +94,9 @@ bridge 出现约 0.047/0.064 最大误差；配对诊断定位到 scale 提前�
 
 | 编号 | 算法 | 当前覆盖 | 未闭合项 |
 | --- | --- | --- | --- |
-| S01 | compensated grouped FP32 | 公共 FP16/E4M3/E5M2/新旧 INT8；D256/GQA6、B1 q2..8，request-major q8 B2..16、16 对齐页；组件容量上限 266240 token | 已有组件 GPU 证据；当前引擎调用、混合请求顺序、MTP 提交/回滚与接受率仍缺完整证据 |
+| S01 | compensated grouped FP32 | 公共 FP16/E4M3/E5M2/新旧 INT8；新计划支持 D256/GQA6、B1 q2..16，request-major q8 B2..16、16 对齐页；组件容量上限 266240 token | 新旧计划按实际二进制区分；q16 与变输入 replay 的组件证据已补齐。当前引擎调用、混合请求顺序、MTP 提交/回滚与接受率仍缺完整证据 |
 | S02 | FA2 long-context grouped | 同一 80-split/FP32 state 算法，新普通 codec 绑定；B1 q2..8、request-major q8，descriptor 上限受服务窗口及 262144-token native 能力约束 | 代码已接入；INT8 long/tail GPU 和完整图生命周期资格未结束。V2 long-batch 准入已用 native codec 能力，不能推导 V1 其他图策略也已统一 |
-| S03 | 旧 grouped verifier：q8/q16、两/三 head group、one/two-pass、page-ID staging | 原生 E5M2 及有限 E4M3 byte 入口；引擎为保留 FP32 数值要求只选择旧 E5M2 路线 | INT8 缺该优化绑定，尤其 q16；q8 可进入 S01，q16 退逐行 XQA 不计完成。FP16 另有 page832/短 context split 特化，原来不覆盖 FP8 |
+| S03 | grouped verifier：q8/q16、两/三 head group、one/two-pass、page-ID staging | 旧 E5M2/E4M3 入口保留兼容；新公共计划沿用同一 Tensor Core 计算、FP32 状态和归约，按视图启用固定 stride、暂存页索引及成对读取 | 五种 codec 的 q9/q16、单/双遍、Hkv1/2、page1648/3296 和图重放共 50 个用例通过；另 5 个用例验证 8 字节合法偏移及实际 q16 INT8 原生实例。旧入口 94 个回归通过。完整引擎/state/性能资格仍未闭合。FP16 page832/短 context 特化仍单列原有边界 |
 | S04 | mixed decode rows / small-query 行展开 | 公共 grouped → XQA → 合法 scalar，复用 persistent 表和实际 row lengths | 已接 view/scale；未建立所有批次/树 mask/state 的 GPU 覆盖。不能用单请求 q8 推导所有混合验证形状 |
 | S05 | DFlash2 draft noncausal direct BMHD / window-split | D128/GQA4、q8、B1..4、指定页大小；单请求 window split 与并发 WMMA 为不同候选 | 旧优化只支持 FP16 draft KV。用户要求的 INT8 target + FP16 draft 应保留它；显式 INT8 draft 只能走已支持的公共分页候选，不能宣称复用该专用优化 |
 | S06 | DDTree ancestor-mask Triton / dense correction | Triton cache 要求 FP16/BF16；dense correction 有量化 cache gather/reference | 原有量化树快路径缺口；view-aware gather 不等于 INT8 tree 数值与图资格。V1/V2 默认差异见 L02 |

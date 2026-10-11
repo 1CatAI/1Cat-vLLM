@@ -49628,3 +49628,21 @@ with no pending calculation: the existing hybrid-model guard disables
 **not an independently calibrated precision baseline**. Preserve the guard;
 unit scales or a short request cannot prove INT8 precision improvement.
 A separately qualified calibration/checkpoint control remains required.
+
+### 2026-10-12 — shared q16 and one/two-pass grouped plan
+
+Continue from `c24a1ef562` through the common grouped Tensor Core kernel and
+codec visitor. q16/head-group, one/two-pass, fixed-stride page1648/page3296,
+page-ID staging and alignment-qualified paired reads now share a plan. New
+schedules: 50 GPU cases; address/native-instance boundaries: 5 GPU cases; original
+grouped entries: 94 GPU cases. The relative-L2 gate and original FP8 bitwise
+contracts remain unchanged. Two inherited policy-reader fixture failures and
+the historical long-helper AST snapshot remain separate from regressions.
+
+Retain the test-call failure (missing required out/softmax arguments); rerun only
+the five corrected boundary cases. No numerical limits or fallback guards were
+relaxed. q16 still needs full engine/state/cost evidence. P05 must apply INT8
+row scales after QK and within PV; do not re-promote early FP16 dequantization.
+A benchmark-only eager FP16 range collector prepares independent checkpoint
+calibration; live graph scales must not be changed after capture.
+See architecture/kv_codec_unification.md for the exact normal wheel and cases.

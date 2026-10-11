@@ -99,6 +99,14 @@ at::Tensor flash_attention_grouped_fp32_paged(
     float v_scale, const std::optional<at::Tensor>& key_scales,
     const std::optional<at::Tensor>& value_scales);
 
+at::Tensor flash_attention_grouped_fp32_paged_with_plan(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, const at::Tensor& block_table,
+    const at::Tensor& row_lengths, at::Tensor& partial, at::Tensor& lse,
+    float scale, const std::string& kv_cache_dtype, float k_scale,
+    float v_scale, const std::optional<at::Tensor>& key_scales,
+    const std::optional<at::Tensor>& value_scales, bool one_pass);
+
 int64_t flash_attention_grouped_e4m3_fp32_precision_version();
 
 int64_t flash_attention_tp2_e4m3_scalar_fast_version();
