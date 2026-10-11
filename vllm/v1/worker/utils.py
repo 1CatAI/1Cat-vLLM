@@ -157,6 +157,7 @@ def _zero_kv_blocks_kernel(
     seg_addrs_ptr,
     seg_block_strides_ptr,
     seg_page_sizes_ptr,
+    seg_num_blocks_ptr,
     block_ids_ptr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -175,6 +176,11 @@ def _zero_kv_blocks_kernel(
 
     Programs are mapped as (block_index, seg_index, chunk_index). Segment page
     sizes may differ across hybrid cache groups.
+
+    Block IDs carry no cache-group identity. A segment whose tensor holds
+    fewer blocks than the pool (a bounded recurrent-state range) never owns
+    IDs past its own capacity, so those are skipped rather than written past
+    the end of the allocation.
     """
     block_index = tl.program_id(0)
     seg_index = tl.program_id(1)
@@ -184,6 +190,8 @@ def _zero_kv_blocks_kernel(
     if chunk_offset >= page_size_el:
         return
     block_id = tl.load(block_ids_ptr + block_index)
+    if block_id < 0 or block_id >= tl.load(seg_num_blocks_ptr + seg_index):
+        return
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
     block_stride_el = tl.load(seg_block_strides_ptr + seg_index)
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
@@ -238,14 +246,18 @@ class KVBlockZeroer:
         seen_ptrs: dict[int, int] = {}
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
+        # Logical blocks each segment's tensor actually holds.
+        seg_num_blocks: list[int] = []
 
-        def add_segment(address: int, page_size_el: int) -> None:
+        def add_segment(address: int, page_size_el: int, num_blocks: int) -> None:
             if (index := seen_ptrs.get(address)) is not None:
                 seg_page_sizes[index] = max(seg_page_sizes[index], page_size_el)
+                seg_num_blocks[index] = min(seg_num_blocks[index], num_blocks)
                 return
             seen_ptrs[address] = len(seg_addrs)
             seg_addrs.append(address)
             seg_page_sizes.append(page_size_el)
+            seg_num_blocks.append(num_blocks)
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -284,9 +296,10 @@ class KVBlockZeroer:
                         if kv.stride(d) * el > block_stride_bytes
                     ]
                     outer_strides = [kv.stride(d) * el for d in outer_dims]
+                    num_blocks = kv.shape[block_dim] // ratio
                     for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                         off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                        add_segment(dp + off_bytes, cur_page_el)
+                        add_segment(dp + off_bytes, cur_page_el, num_blocks)
                 elif isinstance(spec, MambaSpec):
                     if not isinstance(kv, (list, tuple)) or not kv:
                         continue
@@ -298,7 +311,9 @@ class KVBlockZeroer:
                     page_bytes = spec.page_size_bytes
                     assert page_bytes % 4 == 0
                     cur_page_el = page_bytes // 4
-                    add_segment(dp, cur_page_el)
+                    # A bounded state pool exposes fewer pages than the
+                    # scheduler's block-ID range.
+                    add_segment(dp, cur_page_el, first_state.shape[0])
 
         if not seg_addrs:
             self._meta = None
@@ -334,6 +349,7 @@ class KVBlockZeroer:
             torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
             seg_block_strides,
             torch.tensor(seg_page_sizes, dtype=torch.int64, device=self.device),
+            torch.tensor(seg_num_blocks, dtype=torch.int64, device=self.device),
             (max_page_size_el + blk_size - 1) // blk_size,
             blk_size,
             n_segs,
@@ -347,6 +363,7 @@ class KVBlockZeroer:
             seg_addrs,
             seg_block_strides,
             seg_page_sizes,
+            seg_num_blocks,
             max_chunks,
             blk_size,
             n_segs,
@@ -368,6 +385,7 @@ class KVBlockZeroer:
             seg_addrs,
             seg_block_strides,
             seg_page_sizes,
+            seg_num_blocks,
             idx,
             BLOCK_SIZE=blk_size,
         )
