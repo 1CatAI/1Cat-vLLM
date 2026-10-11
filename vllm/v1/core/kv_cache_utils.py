@@ -1088,8 +1088,30 @@ def _compact_sm70_hybrid_sliding_window_pages(
             type(spec) is not SlidingWindowSpec
             or spec.page_size_padded is not None
             or spec.page_size_bytes <= target_page
-            or spec.page_size_bytes % target_page
         ):
+            continue
+        if spec.page_size_bytes % target_page:
+            # Scale bytes can make the physical ratio non-integral. Preserve
+            # the existing prefix/checkpoint grid by using a divisor of the
+            # logical block and padding its physical page to the common size.
+            grid = math.gcd(
+                *(
+                    other.block_size
+                    for other in specs.values()
+                    if isinstance(other, (AttentionSpec, MambaSpec))
+                )
+            )
+            divisors: set[int] = set()
+            for factor in range(1, math.isqrt(grid) + 1):
+                if grid % factor == 0:
+                    divisors.update((factor, grid // factor))
+            for block_size in sorted(divisors, reverse=True):
+                if block_size >= spec.block_size or block_size % 16:
+                    continue
+                compact = replace(spec, block_size=block_size)
+                if compact.page_size_bytes <= target_page:
+                    result[name] = replace(compact, page_size_padded=target_page)
+                    break
             continue
         ratio = spec.page_size_bytes // target_page
         if spec.block_size % (16 * ratio):
