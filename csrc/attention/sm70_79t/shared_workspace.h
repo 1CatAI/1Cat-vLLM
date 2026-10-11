@@ -23,6 +23,8 @@ std::shared_ptr<ExecutionGate> execution_gate(int device);
 struct ScoreWorkspace {
   const int64_t block_n;
   at::Tensor scores;
+  // Optional FP32 scores share this owner and its cross-engine execution gate.
+  at::Tensor fp32_scores;
   std::shared_ptr<ExecutionGate> gate;
   std::mutex& mutex;
   cudaEvent_t& completion;

@@ -100,28 +100,51 @@ extern "C" cudaError_t onecat_v37_dense_state_float_raw_with_scales(
 // Flags cover 64 query tokens (all six heads); only flagged tiles overwrite
 // normalized FP32 residuals. Logits, statistics and PV accumulation stay FP32;
 // the caller supplies centered/scaled V and restores its output afterwards.
-extern "C" cudaError_t onecat_v37_recover_score_tiles_raw(
-    const void* q, const void* k, const void* v, void* out,
-    const int* recovery_tiles, int query_len, int kv_len, cudaStream_t stream) {
+template <bool RowScales>
+cudaError_t recover_score_tiles_raw_impl(const void* q, const void* k,
+                                         const void* v, void* out,
+                                         const int* recovery_tiles,
+                                         int query_len, int kv_len,
+                                         cudaStream_t stream,
+                                         flash_v100::KVScaleView scales) {
   if (q == nullptr || k == nullptr || v == nullptr || out == nullptr ||
       recovery_tiles == nullptr || query_len <= 0 || query_len % 64 != 0 ||
       kv_len < query_len || kv_len % 32 != 0) {
     return cudaErrorInvalidValue;
   }
   using Traits = Sm70D256SplitDTraits;
-  auto kernel = sm70_d256_splitd_dense_kernel<cutlass::half_t, false, false,
-                                              false, true, false, true>;
+  auto kernel =
+      sm70_d256_splitd_dense_kernel<cutlass::half_t, false, false, false, true,
+                                    false, true, RowScales>;
+  constexpr int smem =
+      Traits::kSmemBytes +
+      (RowScales ? Traits::kPElements * sizeof(cutlass::half_t) : 0);
   cudaError_t result = cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Traits::kSmemBytes);
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   if (result != cudaSuccess) return result;
-  kernel<<<dim3(query_len / 64, 1, 6), Traits::kNThreads, Traits::kSmemBytes,
-           stream>>>(static_cast<const cutlass::half_t*>(q),
-                     static_cast<const cutlass::half_t*>(k),
-                     static_cast<const cutlass::half_t*>(v),
-                     static_cast<float*>(out), query_len * 6 * 256, 6 * 256,
-                     256, kv_len * 256, 256, 256, kv_len * 256, 256, 256,
-                     query_len, kv_len, 6, 1, 0.0625f * float(M_LOG2E), nullptr,
-                     0, 0, nullptr, nullptr, nullptr, recovery_tiles, {});
+  kernel<<<dim3(query_len / 64, 1, 6), Traits::kNThreads, smem, stream>>>(
+      static_cast<const cutlass::half_t*>(q),
+      static_cast<const cutlass::half_t*>(k),
+      static_cast<const cutlass::half_t*>(v), static_cast<float*>(out),
+      query_len * 6 * 256, 6 * 256, 256, kv_len * 256, 256, 256, kv_len * 256,
+      256, 256, query_len, kv_len, 6, 1, 0.0625f * float(M_LOG2E), nullptr, 0,
+      0, nullptr, nullptr, nullptr, recovery_tiles, scales);
   return cudaPeekAtLastError();
+}
+
+extern "C" cudaError_t onecat_v37_recover_score_tiles_raw(
+    const void* q, const void* k, const void* v, void* out,
+    const int* recovery_tiles, int query_len, int kv_len, cudaStream_t stream) {
+  return recover_score_tiles_raw_impl<false>(q, k, v, out, recovery_tiles,
+                                             query_len, kv_len, stream, {});
+}
+
+extern "C" cudaError_t onecat_v37_recover_score_tiles_raw_with_scales(
+    const void* q, const void* k, const void* v, void* out,
+    const int* recovery_tiles, int query_len, int kv_len, cudaStream_t stream,
+    flash_v100::KVScaleView scales) {
+  if (!scales.key.data || !scales.value.data) return cudaErrorInvalidValue;
+  return recover_score_tiles_raw_impl<true>(q, k, v, out, recovery_tiles,
+                                            query_len, kv_len, stream, scales);
 }
 }  // namespace FLASH_NAMESPACE

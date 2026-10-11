@@ -74,6 +74,15 @@ def prefill_row_scales_supported(operation) -> bool:
     return operation is not None and getattr(operation, "kv_scale_abi", 0) == 1
 
 
+def row_scale_prefill_available(query_length: int) -> bool:
+    operations = list(get_sm70_splitd_d256_ops() or ())
+    if _config.options().value("prefill_d256_gqa_arch_128k_experimental"):
+        operations.append(get_sm70_d256_gqa_architecture_op())
+        if query_length > 8000 and not _config.options().value("prefill_d256_gqa_v37"):
+            operations.append(get_sm70_d256_gqa_architecture_q8192_op())
+    return any(prefill_row_scales_supported(operation) for operation in operations)
+
+
 def get_flash_ops():
     """Lazy-load flash_attn_v100 ops if available."""
     global _flash_attn_func, _flash_attn_bhmd_func
@@ -218,7 +227,7 @@ def get_flash_grouped_verify_op():
 
 
 def get_sm70_splitd_d256_ops():
-    """Load the exact SM70 Split-D dense and paged prefill operators."""
+    """Resolve each exact-prefill capability from the installed binary."""
     global _sm70_splitd_d256_ops
     global _sm70_splitd_d256_ops_checked
     if _sm70_splitd_d256_ops_checked:
@@ -257,13 +266,15 @@ def get_sm70_splitd_d256_ops():
                     library_path,
                 )
 
-        dense = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_dense_fwd
-        paged = torch.ops._vllm_fa2_C.sm70_d256_splitd_n32_paged_fwd
+        dense = getattr(torch.ops._vllm_fa2_C, required_ops[0], None)
+        paged = getattr(torch.ops._vllm_fa2_C, required_ops[1], None)
         splitkv3 = getattr(
             torch.ops._vllm_fa2_C,
             "sm70_d256_splitd_n32_dense_splitkv3_fwd",
             None,
         )
+        if all(operation is None for operation in (dense, paged, splitkv3)):
+            raise AttributeError("No SM70 D256 exact-prefill native operator")
         _sm70_splitd_d256_ops = tuple(
             _bind_prefill_scale_capability(op, "sm70_d256_splitd_late_scale_abi")
             for op in (dense, paged, splitkv3)
@@ -296,6 +307,30 @@ def _sm70_gqa_has_fp32_accumulation() -> bool:
 _sm70_gqa_capabilities: dict[str, Callable | None] = {}
 
 
+def _architecture_operand_entry(legacy_name, legacy):
+    probe = getattr(
+        torch.ops._vllm_fa2_C, "sm70_d256_gqa_architecture_late_scale_abi", None
+    )
+    if probe is None or probe() != 1:
+        if callable(legacy):
+            legacy.kv_scale_abi = 0
+        return legacy
+    name = {
+        "sm70_d256_gqa_architecture_fwd": "sm70_d256_gqa_architecture_kv_fwd",
+        "sm70_d256_gqa_architecture_q8192_fwd": (
+            "sm70_d256_gqa_architecture_q8192_kv_fwd"
+        ),
+    }[legacy_name]
+    operation = getattr(torch.ops._vllm_fa2_C, name, None)
+    if operation is None:
+        if callable(legacy):
+            legacy.kv_scale_abi = 0
+        return legacy
+    return _bind_prefill_scale_capability(
+        operation, "sm70_d256_gqa_architecture_late_scale_abi"
+    )
+
+
 def get_sm70_d256_gqa_architecture_op():
     """Select by engine policy; cache only immutable native capabilities."""
     global _sm70_d256_gqa_architecture_op_checked
@@ -315,6 +350,8 @@ def get_sm70_d256_gqa_architecture_op():
             _sm70_gqa_capabilities[op_name] = None
             return None
         operation = getattr(torch.ops._vllm_fa2_C, op_name, None)
+        if not use_v37:
+            operation = _architecture_operand_entry(op_name, operation)
         if operation is None:
             logger.warning_once(
                 "Requested SM70 GQA operator %s is absent; rebuild FA2. "
@@ -329,12 +366,10 @@ def get_sm70_d256_gqa_architecture_op():
                 type(exc).__name__,
                 exc,
             )
-    operation = _bind_prefill_scale_capability(
-        operation,
-        "sm70_d256_gqa_v37_late_scale_abi"
-        if use_v37
-        else "sm70_d256_gqa_architecture_late_scale_abi",
-    )
+    if use_v37:
+        operation = _bind_prefill_scale_capability(
+            operation, "sm70_d256_gqa_v37_late_scale_abi"
+        )
     _sm70_gqa_capabilities[op_name] = operation
     return operation if use_v37 else bind_prefill_operation(operation, 8000)
 
@@ -359,9 +394,8 @@ def get_sm70_d256_gqa_architecture_q8192_op():
             op_name,
             None,
         )
-        _sm70_d256_gqa_architecture_q8192_op = _bind_prefill_scale_capability(
-            _sm70_d256_gqa_architecture_q8192_op,
-            "sm70_d256_gqa_architecture_late_scale_abi",
+        _sm70_d256_gqa_architecture_q8192_op = _architecture_operand_entry(
+            op_name, _sm70_d256_gqa_architecture_q8192_op
         )
     except (AttributeError, ImportError, RuntimeError):
         _sm70_d256_gqa_architecture_q8192_op = None

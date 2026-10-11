@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Initialize the independent attention package from resolved engine owners."""
 
+from functools import partial
+
 from vllm.runtime_resources import current_runtime_resources
 
 
@@ -39,6 +41,20 @@ def bind_attention_operation(operation):
     return runtime.bind(operation)
 
 
+def _call_scale_operands(
+    operation,
+    query,
+    key,
+    value,
+    output,
+    scale,
+    causal,
+    key_scale=None,
+    value_scale=None,
+):
+    return operation(query, key, value, output, scale, causal, key_scale, value_scale)
+
+
 class PrefillRuntime:
     """Engine-owned FA2 buffers; the kernel's physical-device gate stays shared."""
 
@@ -55,7 +71,19 @@ class PrefillRuntime:
             list(options.prefill_native_effective)
         )
         # Resolve bound methods once. No native strings or env parsing in forward.
-        self.operations = {8000: self.owner.q8000, 8192: self.owner.q8192}
+        scale_probe = getattr(native, "sm70_d256_gqa_architecture_late_scale_abi", None)
+        scale_abi = int(scale_probe()) if scale_probe is not None else 0
+        self.operations = {}
+        for length in (8000, 8192):
+            method = (
+                getattr(self.owner, f"q{length}_kv", None) if scale_abi == 1 else None
+            )
+            if method is not None:
+                operation = partial(_call_scale_operands, method)
+                operation.__dict__["kv_scale_abi"] = scale_abi
+            else:
+                operation = getattr(self.owner, f"q{length}")
+            self.operations[length] = operation
 
     def close(self):
         self.owner.close()

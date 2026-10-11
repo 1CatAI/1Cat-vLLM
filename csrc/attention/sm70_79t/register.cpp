@@ -68,16 +68,26 @@ extern "C" int64_t onecat_sm70_q8000_accumulation_bits();
 extern "C" int64_t onecat_sm70_q8192_accumulation_bits();
 
 namespace flash {
+at::Tensor sm70_d256_gqa_architecture_kv_fwd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, double softmax_scale, bool causal,
+    const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale);
 at::Tensor sm70_d256_gqa_architecture_fwd(const at::Tensor& q,
                                           const at::Tensor& k,
                                           const at::Tensor& v, at::Tensor& out,
                                           double softmax_scale, bool causal);
-}
+}  // namespace flash
 namespace onecat_79t_q8192 {
+at::Tensor sm70_d256_gqa_architecture_q8192_kv_fwd(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    at::Tensor& out, double softmax_scale, bool causal,
+    const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale);
 at::Tensor sm70_d256_gqa_architecture_q8192_fwd(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     at::Tensor& out, double softmax_scale, bool causal);
-}
+}  // namespace onecat_79t_q8192
 
 namespace onecat_sm70_prefill {
 namespace {
@@ -130,15 +140,16 @@ std::vector<int64_t> PrefillOwner::observations() {
 }
 at::Tensor PrefillOwner::run(bool aligned, at::Tensor q, at::Tensor k,
                              at::Tensor v, at::Tensor out, double scale,
-                             bool causal) {
+                             bool causal, std::optional<at::Tensor> key_scale,
+                             std::optional<at::Tensor> value_scale) {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
   TORCH_CHECK(!closed_, "SM70 prefill runtime has been closed");
   OwnerScope scope(this);
-  auto result =
-      aligned
-          ? onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd(
-                q, k, v, out, scale, causal)
-          : flash::sm70_d256_gqa_architecture_fwd(q, k, v, out, scale, causal);
+  auto result = aligned
+                    ? onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_kv_fwd(
+                          q, k, v, out, scale, causal, key_scale, value_scale)
+                    : flash::sm70_d256_gqa_architecture_kv_fwd(
+                          q, k, v, out, scale, causal, key_scale, value_scale);
   ++observations_[aligned ? 1 : 0];
   return result;
 }
@@ -149,6 +160,18 @@ at::Tensor PrefillOwner::q8000(at::Tensor q, at::Tensor k, at::Tensor v,
 at::Tensor PrefillOwner::q8192(at::Tensor q, at::Tensor k, at::Tensor v,
                                at::Tensor out, double scale, bool causal) {
   return run(true, q, k, v, out, scale, causal);
+}
+at::Tensor PrefillOwner::q8000_kv(at::Tensor q, at::Tensor k, at::Tensor v,
+                                  at::Tensor out, double scale, bool causal,
+                                  std::optional<at::Tensor> key_scale,
+                                  std::optional<at::Tensor> value_scale) {
+  return run(false, q, k, v, out, scale, causal, key_scale, value_scale);
+}
+at::Tensor PrefillOwner::q8192_kv(at::Tensor q, at::Tensor k, at::Tensor v,
+                                  at::Tensor out, double scale, bool causal,
+                                  std::optional<at::Tensor> key_scale,
+                                  std::optional<at::Tensor> value_scale) {
+  return run(true, q, k, v, out, scale, causal, key_scale, value_scale);
 }
 void PrefillOwner::close() {
   std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -175,10 +198,14 @@ PrefillOwner::~PrefillOwner() {
 
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
   ops.def("sm70_prefill_policy_abi() -> int", []() -> int64_t { return 1; });
+  ops.def("sm70_d256_gqa_architecture_late_scale_abi() -> int",
+          []() -> int64_t { return 1; });
   ops.class_<onecat_sm70_prefill::PrefillOwner>("Sm70PrefillRuntime")
       .def(torch::init<std::vector<int64_t>>())
       .def("q8000", &onecat_sm70_prefill::PrefillOwner::q8000)
       .def("q8192", &onecat_sm70_prefill::PrefillOwner::q8192)
+      .def("q8000_kv", &onecat_sm70_prefill::PrefillOwner::q8000_kv)
+      .def("q8192_kv", &onecat_sm70_prefill::PrefillOwner::q8192_kv)
       .def("values", &onecat_sm70_prefill::PrefillOwner::values)
       .def("observations", &onecat_sm70_prefill::PrefillOwner::observations)
       .def("close", &onecat_sm70_prefill::PrefillOwner::close);
@@ -191,9 +218,23 @@ TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
   ops.def(
       "sm70_d256_gqa_architecture_q8192_fwd(Tensor q, Tensor k, Tensor v, "
       "Tensor(a!) out, float softmax_scale, bool causal) -> Tensor(a!)");
+  ops.def(
+      "sm70_d256_gqa_architecture_kv_fwd(Tensor q, Tensor k, Tensor v, "
+      "Tensor(a!) out, float softmax_scale, bool causal, Tensor? "
+      "key_scale=None, "
+      "Tensor? value_scale=None) -> Tensor(a!)");
+  ops.def(
+      "sm70_d256_gqa_architecture_q8192_kv_fwd(Tensor q, Tensor k, Tensor v, "
+      "Tensor(a!) out, float softmax_scale, bool causal, Tensor? "
+      "key_scale=None, "
+      "Tensor? value_scale=None) -> Tensor(a!)");
 }
 
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
+  ops.impl("sm70_d256_gqa_architecture_kv_fwd",
+           &flash::sm70_d256_gqa_architecture_kv_fwd);
+  ops.impl("sm70_d256_gqa_architecture_q8192_kv_fwd",
+           &onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_kv_fwd);
   ops.impl("sm70_d256_gqa_architecture_q8192_fwd",
            &onecat_79t_q8192::sm70_d256_gqa_architecture_q8192_fwd);
 }

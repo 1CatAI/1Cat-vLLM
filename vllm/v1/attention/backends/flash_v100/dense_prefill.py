@@ -17,6 +17,7 @@ from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
+from vllm.v1.attention.kv_codecs import KVCodec
 from vllm.v1.attention.ops.sm70_grouped import (
     clear_grouped_fp16_workspaces,
 )
@@ -240,10 +241,12 @@ def _should_use_prefill_d256_gqa_architecture(
 
 # Native prefill storage is shared by layers in an engine. Initialize it
 # during memory profiling so the KV allocator does not consume its budget.
-_sm70_prefill_profiled_workspaces: set[tuple[torch.device, int]] = set()
+_sm70_prefill_profiled_workspaces: set[tuple[torch.device, int, bool]] = set()
 
 
-def profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> None:
+def profile_sm70_prefill_workspace(
+    query: torch.Tensor, num_kv_heads: int, codec: KVCodec | None = None
+) -> None:
     if (
         not _config.options().value("prefill_d256_gqa_arch_128k_experimental")
         or not _config.options().value("fa2_d256_prefill")
@@ -263,7 +266,8 @@ def profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> No
         if query.shape[0] == _SM70_79T_CORE_QUERY_LEN
         else _SM70_79T_MAX_QUERY_LEN
     )
-    cache_key = (query.device, q_len)
+    row_scales = codec is not None and codec.per_token_head
+    cache_key = (query.device, q_len, row_scales)
     profiled = workspace_cache("prefill_profiled", _sm70_prefill_profiled_workspaces)
     if cache_key in profiled:
         return
@@ -274,11 +278,21 @@ def profile_sm70_prefill_workspace(query: torch.Tensor, num_kv_heads: int) -> No
     )
     if op is None:
         return
+    if row_scales and not _ops.prefill_row_scales_supported(op):
+        return
     q = torch.zeros((1, q_len, 6, 256), device=query.device, dtype=query.dtype)
     kv = torch.zeros((1, q_len, 1, 256), device=query.device, dtype=query.dtype)
-    op(q, kv, kv, torch.empty_like(q), 0.0625, True)
+    scale_args: tuple[torch.Tensor, ...] = ()
+    if row_scales:
+        scale = torch.ones((1, q_len, 1), device=query.device, dtype=torch.float32)
+        scale_args = (scale, scale)
+    op(q, kv, kv, torch.empty_like(q), 0.0625, True, *scale_args)
     profiled.add(cache_key)
-    logger.info_once("SM70 Q%d prefill workspace included in memory profiling.", q_len)
+    logger.info_once(
+        "SM70 Q%d prefill workspace included in memory profiling (row scales=%s).",
+        q_len,
+        row_scales,
+    )
 
 
 def _run_sm70_gqa_groups(
@@ -715,6 +729,7 @@ def try_sm70_fa2_d256_prefill(
                         )
                 if (
                     splitd_result is None
+                    and dense_op is not None
                     and max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
                     and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
                     and (not scale_args or _ops.prefill_row_scales_supported(dense_op))
@@ -1192,9 +1207,9 @@ def _try_dense_architecture(
     )
     architecture_q8192_op = (
         _ops.get_sm70_d256_gqa_architecture_q8192_op()
-        if architecture_op is not None
-        and not _config.options().value("prefill_d256_gqa_v37")
+        if not _config.options().value("prefill_d256_gqa_v37")
         and max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
+        and _config.options().value("prefill_d256_gqa_arch_128k_experimental")
         else None
     )
     if key_scale is not None:
@@ -1209,11 +1224,12 @@ def _try_dense_architecture(
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,
-        architecture_op=architecture_op,
+        architecture_op=architecture_q8192_op or architecture_op,
     ):
-        assert architecture_op is not None
+        assert architecture_op is not None or architecture_q8192_op is not None
         try:
             if _config.options().value("prefill_d256_gqa_v37"):
+                assert architecture_op is not None
                 splitd_result = _run_sm70_gqa_groups(
                     architecture_op,
                     query,
@@ -1236,10 +1252,12 @@ def _try_dense_architecture(
                     key_scale=key_scale,
                     value_scale=value_scale,
                 )
-            elif (
-                max_seqlen_q == _SM70_79T_CORE_QUERY_LEN
-                or max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
-            ) and (key_scale is None or _ops.prefill_row_scales_supported(dense_op)):
+            elif max_seqlen_q == _SM70_79T_CORE_QUERY_LEN or (
+                dense_op is not None
+                and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+                and (key_scale is None or _ops.prefill_row_scales_supported(dense_op))
+            ):
+                assert architecture_op is not None
                 splitd_result = _run_sm70_d256_gqa_79t_dispatch(
                     query,
                     key,
@@ -1314,7 +1332,7 @@ def _try_dense_architecture(
 
 
 def _splitd_admission(query, paged_kv, max_seqlen_q, max_seqlen_k):
-    splitd_ops = _ops.get_sm70_splitd_d256_ops()
+    splitd_ops = _ops.get_sm70_splitd_d256_ops() or (None, None, None)
     q8000_core_dispatch_eligible = (
         not paged_kv
         and not _config.options().value("prefill_d256_gqa_v37")
@@ -1327,8 +1345,20 @@ def _splitd_admission(query, paged_kv, max_seqlen_q, max_seqlen_k):
         max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
         and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
     )
+    architecture_available = (
+        not paged_kv
+        and _config.options().value("prefill_d256_gqa_arch_128k_experimental")
+        and (
+            _ops.get_sm70_d256_gqa_architecture_op() is not None
+            or (
+                max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
+                and _ops.get_sm70_d256_gqa_architecture_q8192_op() is not None
+            )
+        )
+    )
+    required_native = splitd_ops[1] if paged_kv else splitd_ops[0] or splitd_ops[2]
     splitd_eligible = (
-        splitd_ops is not None
+        (required_native is not None or architecture_available)
         and query.ndim == 4
         and query.shape[1] == max_seqlen_q
         and (architecture_kv_eligible or exact_splitd_shape_eligible)

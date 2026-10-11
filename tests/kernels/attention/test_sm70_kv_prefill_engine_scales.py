@@ -77,7 +77,15 @@ def check(query, out, view, table, kv_len):
 @pytest.mark.parametrize("codec", [INT8, INT8_PER_TOKEN_HEAD], ids=lambda c: c.name)
 @pytest.mark.parametrize(
     "v37,q_len,kv_len",
-    [(True, 384, 3136), (True, 1568, 8192), (True, 1600, 8192), (False, 1024, 3136)],
+    [
+        (True, 384, 3136),
+        (True, 1568, 8192),
+        (True, 1600, 8192),
+        (False, 1024, 3136),
+        (False, 8000, 16416),
+        (False, 8001, 16416),
+        (False, 8192, 16416),
+    ],
 )
 def test_engine_prefix_preserves_row_scales(monkeypatch, codec, v37, q_len, kv_len):
     from vllm import envs
@@ -120,6 +128,7 @@ def test_engine_bridge_executes_the_native_scaled_core(monkeypatch, record_prope
     )
     # Prepare the bounded owner before profiling actual launches.
     assert executor._run_fp8_prefill_bridge(**kwargs)[1]
+    torch.accelerator.synchronize()
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,

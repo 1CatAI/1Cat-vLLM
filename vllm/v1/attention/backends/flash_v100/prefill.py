@@ -102,10 +102,7 @@ def _should_use_fp8_prefill_bridge(
             or (
                 self.kv_codec.name
                 in getattr(self.paged_kv_to_fp16, "unscaled_kv_cache_codecs", ())
-                and any(
-                    _ops.prefill_row_scales_supported(operation)
-                    for operation in (_ops.get_sm70_splitd_d256_ops() or ())
-                )
+                and _ops.row_scale_prefill_available(q_len)
             )
         )
         and (
