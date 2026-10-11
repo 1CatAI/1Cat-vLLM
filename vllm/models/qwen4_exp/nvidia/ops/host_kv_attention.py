@@ -14,7 +14,17 @@ from vllm.triton_utils import triton
 
 
 def host_qsa_attention(
-    query, state, indices, table, requests, positions, lengths, out, gate=None
+    query,
+    state,
+    indices,
+    table,
+    requests,
+    positions,
+    lengths,
+    out,
+    gate=None,
+    *,
+    launch_rows=None,
 ):
     if query.dtype != torch.float16 or query.shape[2] != state.dim:
         raise ValueError("Direct host QSA requires FP16 queries matching D256")
@@ -29,8 +39,11 @@ def host_qsa_attention(
     resolved = state.resolve(indices, table, requests, positions, lengths)
     group = query.shape[1]  # Host admission requires one TP-local KV head.
     block_m = triton.next_power_of_2(group)
-    block_n, target, warps = _qsa_sparse_launch_profile(query.shape[0], block_m, True)
-    if _use_sm70_qsa_two_warp_partial(query.shape[0], group, state.dim):
+    # Smaller staging batches retain the original logical batch's split-K
+    # and warp choices, so the per-row accumulation order does not change.
+    launch_rows = query.shape[0] if launch_rows is None else launch_rows
+    block_n, target, warps = _qsa_sparse_launch_profile(launch_rows, block_m, True)
+    if _use_sm70_qsa_two_warp_partial(launch_rows, group, state.dim):
         warps = 2
     tiles = triton.cdiv(indices.shape[1], block_n)
     splits = min(1 << (tiles.bit_length() - 1), target)

@@ -548,6 +548,19 @@ class GGUFModelLoader(BaseModelLoader):
                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
                 )
             model._gguf_model_path = local_model_path
+            if (
+                adapter is not None
+                and quant_config.native_expert_storage
+                and not quant_config.canonical_expert_storage
+                and vllm_config.kernel_config.sm70_gguf.expert_arena
+            ):
+                from vllm.model_executor.layers.quantization import (
+                    gguf_expert_storage,
+                )
+
+                gguf_expert_storage.prepare_original_expert_arena(
+                    model, gguf_weights_map, self._native_tensors, target_device
+                )
             self.load_weights(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)

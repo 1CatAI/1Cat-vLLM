@@ -513,6 +513,11 @@ class Sm70GgufConfig:
     and covers TP boundaries with original blocks and zero activation padding.
     """
 
+    expert_arena: bool = False
+    """Allocate original expert banks together before transient dense weights.
+    This avoids interleaving permanent expert banks with loading temporaries.
+    """
+
     dense_storage: Literal["canonical", "original"] = "canonical"
     """Keep calibrated canonical projections or dispatch original packed rows."""
 
@@ -813,6 +818,8 @@ class KernelConfig:
     """Keep identical encoded history on device for controlled placement A/B."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
+    """Shared host-miss staging capacity; larger batches use bounded row chunks."""
     qsa_host_indexer_history: bool = False
     """Keep the FP16 compressed indexer history and its co-owned compressor
     state in mapped host storage when QSA host KV is active. Exact score

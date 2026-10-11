@@ -1655,7 +1655,14 @@ def qsa_select_paged_tokens(
         else:
             score_columns = capacity_columns
             all_visible = None
-    rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(score_columns * 4, 1))
+    logits_bytes = _LOGITS_WORKSPACE_BYTES
+    if contiguous_keys is not None:
+        # Keep final logits bounded alongside the per-head cuBLAS score tile.
+        # The default 64 MiB score tile preserves the existing 128 MiB limit.
+        logits_bytes = min(
+            logits_bytes, 2 * sparse_policy().value("qsa_score_tile_mb") * 1024**2
+        )
+    rows_per_chunk = max(1, logits_bytes // max(score_columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device

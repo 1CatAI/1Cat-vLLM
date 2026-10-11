@@ -255,3 +255,35 @@ python -m pip install -c examples/deployment/sm70_flashnext_gguf/constraints-cu1
 ```
 
 The source launcher checks these header packages before loading weights.
+
+### Bounded GPU allocations after host-pool initialization
+
+The shared pinned history pool passed the full four-rank allocation and changed
+input graph gate. The next startup reached attention-cache binding, where the
+32-row shared host-miss staging allocation requested 66 MiB with only about
+8 MiB free and 271 MiB reserved but unallocated. This is a device allocation
+failure; the host pool remained within the protected process budget.
+
+The compact profile now reserves original expert banks in one device allocation
+before loading temporary dense representations. Each projection remains an
+independent contiguous view with its original TP block span and zero safety
+tail. Float experts and the default canonical policy retain their previous
+allocation path. No codes or coefficients change.
+
+`qsa_host_kv_staging_rows=8` reduces shared attention staging by 75%. Larger
+batches subdivide the existing 32-row arithmetic groups while retaining each
+group's split-K and warp choices. Merely choosing the smaller batch's arithmetic
+profile changed M20 outputs by up to 6.10e-5; that variant was rejected.
+
+The existing `sm70_sparse.qsa_score_tile_mb=8` also bounds final prefill logits
+to twice that score budget, versus 128 MiB with the default 64 MiB score tile.
+The bound applies only to the already admitted cuBLAS path; generic paged QSA
+and default policies retain their previous behavior. Twelve isolated CPU/GPU gates passed: TP boundary and zero-tail checks,
+nonzero arena offsets at M5/M20 with changed-input graphs, cache owner policy,
+bitwise M5/M20 host attention with 8-row staging, and identical selected indices
+for a 512-row, 256K cuBLAS score pass with 8 MiB versus 64 MiB tile budgets.
+The real checkpoint metadata also produced 144 expert views in one
+12,679,262,042-byte allocation; Torch reserved 12,687,769,600 bytes, with every
+view aligned and its safety tail zeroed. This allocation-only check does not
+establish full-model fit. Full-model initialization and performance remain
+unqualified.
