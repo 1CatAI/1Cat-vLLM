@@ -20,7 +20,14 @@ logger = init_logger(__name__)
 
 MAX_M = 8
 MAX_SEGMENTS = 4
-_DENSE_TYPES = {8, 12, 13, 14, 20, 23}
+_DENSE_FORMATS = {
+    8: dense.Q8,
+    12: dense.Q4K,
+    13: dense.Q5K,
+    14: dense.Q6K,
+    20: dense.LUT4,
+    23: dense.LUT4,
+}
 _F16_TYPES = {1, 30}  # F16 and BF16 use the existing FP16 dense contract.
 
 
@@ -79,7 +86,18 @@ class Dmv13Projection:
         shards = _raw_shards(layer)
         if not shards or len(shards) > MAX_SEGMENTS:
             return
-        if any(t not in _DENSE_TYPES for _, t in shards):
+        if any(t not in _DENSE_FORMATS for _, t in shards):
+            return
+        formats = {_DENSE_FORMATS[t] for _, t in shards}
+        if len(formats) > 2 or (
+            dense.Q8 in formats and not formats <= {dense.Q8, dense.LUT4}
+        ):
+            logger.info(
+                "SM70 fused side projection %s skipped: unsupported format "
+                "combination %s; retaining separate projections.",
+                self.name,
+                sorted(formats),
+            )
             return
         device = None
         self.codes, self.high, self.scale = [], [], []

@@ -53,6 +53,71 @@ class _Extra:
         self.weight = weight
 
 
+class _MergedShard:
+    def __init__(self, raws, qtypes):
+        self.qweight = torch.from_numpy(raws[0])
+        self.qweight.data_container = [torch.from_numpy(raw) for raw in raws]
+        self.qweight.shard_id = list(range(len(raws)))
+        self.qweight.shard_id_map = {i: i for i in self.qweight.shard_id}
+        self.qweight_type = type(
+            "T", (), {"shard_weight_type": dict(enumerate(qtypes))}
+        )()
+        self.prefix = "test.merged"
+
+
+@pytest.mark.parametrize(
+    "qtypes", [(12, 14, 23), (12, 14, 13), (8, 12), (8, 13), (8, 14)]
+)
+def test_unsupported_side_formats_declined_before_packing(qtypes, monkeypatch):
+    from vllm.model_executor.layers.quantization import sm70_dmv13_projection
+
+    rng = np.random.default_rng(9216)
+    layer = _MergedShard([_raw(rng, 32, 256, t) for t in qtypes], qtypes)
+
+    def unexpected_decode(*args):
+        pytest.fail("Unsupported formats must be declined before decoding/upload")
+
+    monkeypatch.setattr(sm70_dmv13_projection.dense, "decode", unexpected_decode)
+    assert not sm70_dmv13_projection.attach(layer, None, "sm70_side_projection")
+    assert not hasattr(layer, "sm70_side_projection")
+
+
+@pytest.mark.parametrize(
+    "qtypes,real_shape",
+    [
+        ((12, 14), False),
+        ((8, 23), False),
+        ((20, 23, 20), False),
+        ((23, 14, 14), True),
+        ((23, 23, 14), True),
+        ((13, 14, 13), True),
+        ((13, 14, 14), True),
+        ((14, 14, 14), True),
+    ],
+)
+def test_supported_mixed_side_formats_match_separate(qtypes, real_shape, default_dtype):
+    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
+        Dmv13Projection,
+    )
+
+    rng = np.random.default_rng(16384)
+    k = 2560 if real_shape else 256
+    widths = [3072, 128, 128] if real_shape else [32] * len(qtypes)
+    raws = [_raw(rng, n, k, t) for n, t in zip(widths, qtypes)]
+    fused = Dmv13Projection(_MergedShard(raws, qtypes))
+    controls = [Dmv13Projection(_Shard(raw, t)) for raw, t in zip(raws, qtypes)]
+    assert fused.ready and all(p.ready for p in controls)
+    x = torch.randn(5, k, device="cuda", dtype=torch.float16)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out, _ = fused.run(x)
+    for _ in range(3):
+        x.normal_()
+        graph.replay()
+        reference = torch.cat([p.run(x)[0] for p in controls], dim=1)
+        torch.testing.assert_close(out, reference, atol=0, rtol=0)
+
+
 class _MergedBf16Extra:
     def __init__(self, weight):
         pieces = [part.contiguous().view(torch.uint8) for part in weight.chunk(2)]

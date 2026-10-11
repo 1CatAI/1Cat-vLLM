@@ -328,3 +328,9 @@ dtype. Allocate that workspace explicitly as FP32. Six formats passed both
 FP16 and FP32 default-dtype tests, shared-bank checks and changed-input M5/M20
 graphs (12 tests). This repairs workspace typing; it does not change weight
 or activation precision. Full-model serving remains pending.
+
+The next capture passed workspace typing but found a three-format QKV bank
+at layer 11 (Q4_K/Q6_K/Q5_K). The fused native reader supports at most two
+formats and only pairs Q8 with LUT4. Check that capability before decoding
+or uploading banks; unsupported combinations retain separate projections.
+The real checkpoint's other 11 attention layers satisfy this restriction.
