@@ -11,13 +11,14 @@ with isolated minimal dependencies and SM70 primitive compilation. Engine SM70
 wheel metadata selects its exact fork version instead of conflicting official
 FlashInfer/cubin pins; non-SM70 metadata keeps the existing provider.
 
-GPU validation is deferred at the user's request until a V100 machine is
-provided. Offline builds and CPU installation checks do not close correctness,
-speed or quality gates. No new engine compute route is enabled. Text C1/C4,
+The user has provided machine 54633 and authorized releasing the Studio GPUs.
+GPU validation uses independent environments on Python 3.12 / Torch 2.10 /
+CUDA 12.8 / V100-SXM2. Offline builds and CPU installation checks do not close
+correctness, speed or quality gates. Text C1/C4,
 MTP, D72 vision and 27B/35B-A3B AWQ/FP8 regressions remain mandatory. See the
 [module coverage and historical failures](../../flashinfer-sm70/docs/sm70/coverage.md).
 
-The second, stacked batch adds an independent request-grouped QSA score kernel
+The same consolidated PR adds an independent request-grouped QSA score kernel
 and the engine's `KernelConfig.sm70_flashinfer_qsa` candidate/force adapter.
 It preserves the C1 single-launch Volta MMA route and shares keys across C4×5
 rows using GPU request grouping. The default remains `off`; `force` rejects
@@ -26,6 +27,19 @@ cache updates and sparse attention retain their existing implementations, so
 this batch does not close the full QSA chain. Workspace allocation is bounded
 per indexer and occurs before capture; the scorer never replaces captured
 storage. See [candidate scope and pending GPU matrix](../../flashinfer-sm70/docs/sm70/qsa.md).
+
+Delivery is consolidated in Draft PR #1177 directly against `main`, per the
+user's updated request. Foundation PR #1175 is closed and its commits are
+included in #1177. Keep import, library kernels, engine adaptation and evidence
+as distinct commits within this one PR; no separate batch PRs are planned.
+
+The fresh independent wheel now passes 40 tests on V100-SXM2 / CUDA 12.8:
+9 packaging tests, 16 GPU primitive cases and 15 GPU QSA cases, with unchanged
+floating tolerances and exact selected indices. A startup-namespace assertion
+was corrected after proving that CUDA Python's `.pth` creates `cuda` before
+FlashInfer imports. No kernel change was needed. These results do not admit
+performance or close complete QSA/model gates; see the
+[hardware record](../../flashinfer-sm70/docs/sm70/gpu-validation-20261011.md).
 
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 

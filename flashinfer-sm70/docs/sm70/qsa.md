@@ -1,7 +1,8 @@
 # Request-grouped QSA scoring candidate
 
-Status: development, **no GPU correctness or acceleration admission**. The user
-deferred GPU execution until a machine is provided. This batch implements the
+Status: development, **independent GPU correctness passed; acceleration admission pending**.
+The provided V100 passes the 15 standalone QSA cases described in the
+[hardware validation record](gpu-validation-20261011.md). This implementation covers the
 score stage only. Projection, compression/cache update, exact Top-K, index
 expansion, sparse attention and output processing remain open in the
 [complete-chain ledger](coverage.md).
@@ -32,14 +33,14 @@ invalid request IDs have non-positive visibility. Only columns below
 
 The library plan also handles zero rows/columns. Score accumulation and the
 nonnegative head sum preserve the inherited native scorer's floating contract;
-the pending independent oracle uses the existing 2e-6 absolute/relative tolerance
+the independent oracle uses the existing 2e-6 absolute/relative tolerance
 and exact selected IDs, without widening thresholds. `fmaxf(dot, 0)` governs NaNs.
 
 The engine's production implementation stays in its existing build until this
 candidate passes numerical and complete-chain gates. It is a rollback route,
 not a dependency of the new library. After admission, move the production
 selection to the library and remove the redundant native build target in a
-separate reviewed change.
+separate reviewed commit within the consolidated PR.
 
 ## Lifecycle and engine selection
 
@@ -74,14 +75,14 @@ source/compiler identity, **actually loaded** DSO and workspace bytes; later
 source edits cannot relabel an already loaded kernel. Total layer/graph workspace
 and OOM behavior still require model-level validation.
 
-## Prepared validation; do not infer results
+## Validation scope
 
 Independent tests in `tests/sm70/test_qsa.py` cover M1/M5/M20/M32, C1/C4,
 contiguous/strided tensors, real page size 204 and small page boundaries, invalid
 pages, ties, NaN/extremes, negative padding positions, empty rows/columns,
 changing graph metadata, separate captures and cache rebinding. They use a
-library-independent FP64 oracle and exact stable Top-K IDs. They have **not run
-on a GPU**. They do not replace engine exact-selector, state rollback or model
+library-independent FP64 oracle and exact stable Top-K IDs. All 15 cases pass
+on V100-SXM2 / CUDA 12.8. They do not replace engine exact-selector, state rollback or model
 output/acceptance tests.
 
 The existing engine screen accepts the independent forced provider:

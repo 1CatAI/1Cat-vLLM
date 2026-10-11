@@ -15,10 +15,15 @@ from flashinfer.sm70 import _jit
 
 def test_clean_process_import_is_independent_and_lazy():
     code = """
-import importlib.util, sys, flashinfer
+import importlib.util, sys
+# cuda-bindings may create its namespace from a Python startup .pth file.
+# Check what importing this package adds, including any new backend submodules.
+before = set(sys.modules)
+import flashinfer
 assert importlib.util.find_spec('vllm') is None
 assert '1cat.sm70' in flashinfer.__version__
-assert all(x not in sys.modules for x in ('torch','tvm_ffi','cutlass','triton','cuda','vllm'))
+backends = {'torch','tvm_ffi','cutlass','triton','cuda','vllm'}
+assert not any(m.split('.')[0] in backends for m in set(sys.modules) - before)
 from flashinfer import rmsnorm, gemma_rmsnorm, silu_and_mul, apply_rope_pos_ids
 assert all(callable(x) for x in (rmsnorm, gemma_rmsnorm, silu_and_mul, apply_rope_pos_ids))
 assert 'vllm' not in sys.modules

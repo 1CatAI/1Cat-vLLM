@@ -6,9 +6,10 @@ This is an independently installable `flashinfer-python` provider, retaining
 complete upstream snapshot and all four pinned dependency snapshots, including
 their licenses. Local changes follow the separate vendor commit.
 
-**Status: development, no GPU or performance admission.** The user deferred GPU
-validation on 2026-10-11 until a V100 machine is provided. A source wheel and
-offline compilation are not acceleration evidence. No engine backend is enabled
+**Status: development; independent GPU correctness passed, performance admission pending.**
+The supplied V100-SXM2 machine passes 40 standalone tests (31 execute GPU kernels)
+on Python 3.12 / Torch 2.10 / CUDA 12.8. See the
+[hardware validation record](gpu-validation-20261011.md). No engine backend is enabled
 by default. The request-grouped QSA scorer is an explicit candidate described
 in [QSA development and validation](qsa.md).
 
@@ -67,7 +68,7 @@ Torch C++ ABI dependency. Torch custom operators declare mutation and fake
 implementations. Callers own outputs and persistent state. Replaying a captured
 graph uses the captured tensor addresses; changing storage addresses requires
 recapture. Reloading tensor contents in place is supported by the contract and
-covered by pending GPU tests. No derived weight tensor is retained globally.
+covered by the standalone GPU tests. No derived weight tensor is retained globally.
 
 Offline compilation (does not run a GPU kernel):
 

@@ -8,7 +8,8 @@ Canonical dirty checkouts and other worktrees are not development inputs.
 This is a **source audit / implementation ledger**, not a completed execution
 audit. For every row, native registration, loaded artifact identity, actual
 GPU kernel, numeric correctness and complete-chain timing must be closed on the
-target machine. All GPU results below are pending at the user's request.
+target machine. GPU validation is in progress on the supplied V100 machine;
+the earlier user-requested hardware deferral has ended.
 
 Paths below are relative to the engine repository, except `flashinfer.*` APIs.
 Both target and draft traverse the relevant rows. Production baselines exclude
@@ -17,9 +18,9 @@ kernel does not close a row.
 
 | Chain | Engine call / native owner at implementation base | Shape / state constraints | Fork status and upstream design reference |
 | --- | --- | --- | --- |
-| RMS/Gemma norm, residual norm, activation, position-ID RoPE | model layers → `flashinfer` public dispatch → `flashinfer.sm70.ops` → TVM-FFI `basics` | FP16, FP32 reduction, explicit output; no BF16/FP8 Tensor Core or PDL | Independent native implementation / upstream norm and activation reuse; offline build only |
+| RMS/Gemma norm, residual norm, activation, position-ID RoPE | model layers → `flashinfer` public dispatch → `flashinfer.sm70.ops` → TVM-FFI `basics` | FP16, FP32 reduction, explicit output; no BF16/FP8 Tensor Core or PDL | Independent native implementation / upstream norm and activation reuse; 16 GPU cases pass on V100/CUDA 12.8; performance pending |
 | QSA projection, Q/K norm, rotary, compressed/raw-key updates | `nvidia/indexer_qsa.py`, `nvidia/ops/qsa.py` | H4/D128, compression 4, original calibration and ring layout | Pending extraction; upstream `experimental/b12x/attention/qsa` plan/bind/run contracts inform lifecycle, its BF16/CuTe kernels cannot run on SM70 |
-| QSA score | `ops/qsa.py:qsa_mqa_paged` → `model_executor/kernels/flashinfer_sm70.py` → `flashinfer.sm70.QsaScorePlan` → TVM-FFI `qsa_scores` → `group_qsa_rows` / `mqa_multiquery` | Candidate FP16 M1..32 H4/D128; arbitrary request membership, at most 32 requests, int32/int64 positions, existing paged strides | Independent Volta MMA candidate, default off; C1 M1..8 retains one launch, C4×5 shares each request's keys; GPU correctness and complete-chain gates pending. Production still uses the existing owner |
+| QSA score | `ops/qsa.py:qsa_mqa_paged` → `model_executor/kernels/flashinfer_sm70.py` → `flashinfer.sm70.QsaScorePlan` → TVM-FFI `qsa_scores` → `group_qsa_rows` / `mqa_multiquery` | Candidate FP16 M1..32 H4/D128; arbitrary request membership, at most 32 requests, int32/int64 positions, existing paged strides | Independent Volta MMA candidate, default off; C1 M1..8 retains one launch, C4×5 shares each request's keys; 15 standalone GPU cases pass. Engine/complete-chain gates pending; production still uses the existing owner |
 | QSA exact Top-K and expansion | `ops/qsa.py:qsa_select_paged_tokens` → `csrc/qsa_lexicographic_topk.cuh` / Triton expansion | Exact score order, lower logical ID on ties, sorted selected IDs; visible-length mask | Preserve #1171; migration and complete-chain qualification pending |
 | QSA sparse attention / output gate | `nvidia/qsa.py`, `ops/device_kv_attention.py` → `_sm70_qsa_device_C` or existing host/paged route | Main D256; qualified device-history M1..20 H6; target vs draft placement differs | Pending; generic FlashInfer attention is not a substitute for QSA admission |
 | HC mix, norm, projection, combine, TP boundary | `nvidia/hyperconnection.py`, `sm70_hcx.py`, `model_executor/kernels/mhc/triton.py` | HC4, hidden 2560, rank 320; TP4 and topology constraints | Pending; retain #1172 and distinguish M5 from M20; upstream b12x HC is BF16-specific |
@@ -75,7 +76,8 @@ Summed kernel times are not an end-to-end result. Visual tests need real weights
 mixed resolutions/lengths and videos, encoder and overall TTFT, and final outputs.
 
 No automatic admission entries exist. Foundation, QSA, HC/MoE, GDN, PLE/MTP,
-vision and full integration remain separate review/test batches. Retire an
+vision and full integration retain separate test gates within the single
+consolidated PR #1177, as requested by the user. Retire an
 engine-native duplicate only after the new owner passes its equivalence and
 performance gates. The required text/MTP/vision rows must all close before
 announcing “Qwen4 全路径打通”.
