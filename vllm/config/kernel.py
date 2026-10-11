@@ -796,6 +796,13 @@ class KernelConfig:
     whose bucket does not exceed the indexer budget (where QSA selects every
     visible token)."""
 
+    sm70_turbomind_workspace_bytes: int = Field(
+        default=32 * 1024**2, ge=1024**2, le=32 * 1024**2, multiple_of=256
+    )
+    """Per-stream FP32 split-K scratch bound in the engine-owned TurboMind
+    runtime. Candidate selection respects the available scratch capacity.
+    """
+
     qsa_auto_e4m3: bool = True
     """Default eligible calibrated QSA caches to E4M3 without speculation."""
     qsa_auto_e4m3_active: bool = Field(default=False, init=False)

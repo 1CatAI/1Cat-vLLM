@@ -1024,3 +1024,26 @@ def log_and_validate(cfg: VllmConfig) -> dict[str, Any]:
             "SM70 profile acceleration requirement failed: " + "; ".join(failures)
         )
     return report
+
+
+def loaded_native_workspace(config) -> dict | None:
+    """Read scratch allocations under the worker's native resource owner."""
+    import torch
+
+    from vllm._sm70.runtime import bind_native_runtime
+    from vllm.config import set_current_vllm_config
+
+    query = getattr(torch.ops._C, "sm70_gemm_workspace_storage", None)
+    if query is None:
+        return None
+    with set_current_vllm_config(config):
+        owner = bind_native_runtime()
+        if owner is None:
+            return None
+        with owner.activate():
+            streams, partials, total = query()
+    return {
+        "streams": streams,
+        "partials_bytes_per_stream": partials,
+        "total_bytes": total,
+    }

@@ -98,6 +98,28 @@ def test_native_runtime_requires_both_binary_owners(monkeypatch):
         NativeRuntimeOwner()
 
 
+def test_workspace_limit_binds_before_native_execution(fake_handles, monkeypatch):
+    calls = []
+
+    def configure(budget):
+        assert _active_owner.get() is not None
+        assert all(handle.depth == 1 for handle in fake_handles)
+        calls.append(budget)
+
+    monkeypatch.setattr(
+        torch.ops._C, "sm70_gemm_configure_workspace", configure, raising=False
+    )
+    config = SimpleNamespace(
+        kernel_config=KernelConfig(sm70_turbomind_workspace_bytes=8 * 1024**2)
+    )
+    with set_current_vllm_config(config):
+        owner = bind_native_runtime()
+        assert bind_native_runtime() is owner
+    assert calls == [8 * 1024**2]
+    assert all(handle.depth == 0 for handle in fake_handles)
+    release_runtime_resources(config)
+
+
 @pytest.mark.parametrize("shared", [False, True])
 def test_native_owner_probes_shared_tls_without_assuming_loader_behavior(
     monkeypatch, fake_handles, shared

@@ -287,3 +287,25 @@ The real checkpoint metadata also produced 144 expert views in one
 view aligned and its safety tail zeroed. This allocation-only check does not
 establish full-model fit. Full-model initialization and performance remain
 unqualified.
+
+### Per-stream TurboMind scratch
+
+The next complete startup exhausted device capacity during quantized-kernel
+warmup, before host-cache binding. Its last native error was an invalid
+argument in the tuner's L2 flush; device usage reached 16,143 MiB out of
+16,145 MiB. The previous L2 flush ignored allocation failure, so it could
+report a later memset error instead of the allocation failure. Allocation and
+device-query errors now retain their actual CUDA status.
+
+TurboMind allocates a separate scratch bundle for each CUDA stream: 32 MiB
+of FP32 split-K partials, 1 MiB of barriers and 1 MiB of tensor maps. The
+compact launcher sets the engine-owned partials budget to 8 MiB, saving
+24 MiB per active stream. Generic profiles retain 32 MiB. The budget is fixed
+before the first stream workspace exists; cached and new kernel candidates
+must fit it, including imported plans. This changes split-K candidate
+availability rather than weight or activation precision. The worker memory
+report exposes stream count, partials capacity and actual scratch bytes.
+
+Isolated Q4_K, Q6_K and IQ4_XS projections passed independent FP32 comparisons
+at M1, M5, M20 and M512, and changed-input graph replay matched eager exactly
+with both budgets. Full startup capacity and acceptance remain pending.

@@ -979,6 +979,7 @@ class Worker(WorkerBase):
             loaded_cuda_model_storage,
             loaded_gguf_layers,
             loaded_linear_kernels,
+            loaded_native_workspace,
             loaded_qsa_cache_storage,
             loaded_sm70_preparations,
         )
@@ -1055,6 +1056,7 @@ class Worker(WorkerBase):
                 "graph_capture_delta_bytes": getattr(
                     self, "cudagraph_memory_bytes", None
                 ),
+                "turbomind_workspace": loaded_native_workspace(self.vllm_config),
                 "qsa": loaded_qsa_cache_storage(
                     self.compilation_config.static_forward_context
                 ),

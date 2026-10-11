@@ -491,7 +491,8 @@ void MaybeTraceGemmDispatch(const GemmDesc& desc, DispatchPolicy policy,
   }
   auto& logged = vllm::sm70::diagnostic_counter("tm_gemm_dispatch");
   const int limit = GemmTraceLimit();
-  if (limit > 0 && logged.fetch_add(1, std::memory_order_relaxed) >= static_cast<unsigned>(limit)) {
+  if (limit > 0 && logged.fetch_add(1, std::memory_order_relaxed) >=
+                       static_cast<unsigned>(limit)) {
     return;
   }
 
@@ -554,6 +555,13 @@ struct Gemm::Impl {
   LaunchSpec Dispatch(Context& ctx, DispatchPolicy policy, size_t barriers_size,
                       size_t partials_size) {
     const auto& desc = ctx.desc();
+    const auto fits_workspace = [&](const LaunchSpec& spec) {
+      if (!spec.kernel) return false;
+      const auto& actual = ctx.get_desc(*spec.kernel);
+      return spec.splits <= spec.kernel->GetMaxSplits(
+                                {actual.m, actual.n, actual.k, actual.num},
+                                spec.swizzle, barriers_size, partials_size);
+    };
     if (policy & DispatchPolicy::kSm70Nvfp4Prescaled) {
       auto ordinary_policy = static_cast<DispatchPolicy>(
           (int)policy & ~(int)DispatchPolicy::kSm70Nvfp4Prescaled);
@@ -573,7 +581,7 @@ struct Gemm::Impl {
       // the fixed contract separately so they cannot override it, including
       // on the first captured tail or repeated eager calls.
       auto& cached = sm70_dflash_context_specs_[desc.m - 1];
-      if (cached &&
+      if (cached && fits_workspace(*cached) &&
           cached->kernel->is_feasible(ctx.get_desc(*cached->kernel))) {
         return *cached;
       }
@@ -589,7 +597,7 @@ struct Gemm::Impl {
     const bool allow_prescaled =
         policy & DispatchPolicy::kSm70Fp8PrefillPrescaled;
     const auto is_feasible = [&](const LaunchSpec& spec) {
-      return spec.kernel &&
+      return fits_workspace(spec) &&
              (allow_prescaled || spec.kernel->name().find("_sm70_fp8_pscale") ==
                                      std::string::npos) &&
              spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
@@ -607,7 +615,7 @@ struct Gemm::Impl {
         // rewrite cannot also change split-K or reduction order. Other M1
         // roles retain their existing source-selected prescaled tactics.
         const auto is_control_feasible = [&](const LaunchSpec& spec) {
-          return spec.kernel &&
+          return fits_workspace(spec) &&
                  spec.kernel->name().find("_sm70_fp8_pscale") ==
                      std::string::npos &&
                  spec.kernel->is_feasible(ctx.get_desc(*spec.kernel));
@@ -1013,6 +1021,13 @@ int Gemm::Run(const Operation& operation, float alpha, const void* A,
       if (!spec.kernel) {
         return -1;
       }
+    }
+    const auto& actual = context.get_desc(*spec.kernel);
+    if (spec.splits >
+        spec.kernel->GetMaxSplits({actual.m, actual.n, actual.k, actual.num},
+                                  spec.swizzle, workspace.barriers_size,
+                                  workspace.partials_size)) {
+      return -1;
     }
     auto _workspace = workspace;
     return spec.kernel->Launch(operation, alpha, A, Adesc, U, Udesc, B, Bdesc,
