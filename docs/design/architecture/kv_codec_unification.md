@@ -391,6 +391,12 @@ four-GPU visibility makes configuration succeed without a source change.
 
 ## Engine integration and repeated prefill/decode audit
 
+The subsequent [path-by-path inventory](kv_fastpath_inventory.md) pins source
+`19d43870059472a794b86d416c6de73e30003f74` and separates native variants,
+engine reachability, existing FP16-only boundaries and missing INT8 bindings.
+It also records the CUDA cache writer, GLM sparse MLA and V2 implicit draft
+default gaps that are not visible in a top-level Flash-V100 route name.
+
 This next slice is based on `dea7beec35eb1f281864cbd6a03fb6bb0066b061`.
 The audit follows both engine entry → selector → native binding → fallback
 and native FP8 implementation → public wrapper → engine caller. An advertised
@@ -436,8 +442,8 @@ Repeated audit findings and responsibility:
 | BFLA and anchored windows | Existing format restrictions retained | BFLA mask pooling and native mask tile geometry need a common contract; anchored windows were FP16-only for FP8 as well |
 | QSA page4, host history and hot cache | Existing FP16/E4M3 paths preserved | `models/qwen4_exp/nvidia/qsa.py`, host KV and sparse-page4 native entry need representation-aware scales, indexing and transfer validation |
 | MLA / compressed sparse / indexer | Existing latent, RoPE and grouped scale layouts preserved | DeepSeek sparse/indexer writers and readers need their own codec contracts; ordinary token/head INT8 is not interchangeable with their packed G64/exponent-scale representation |
-| Fused Norm/RoPE/KV | Common encoder and address rules | GPU byte compatibility and replay; existing model-side fusion qualification still contains old TP/weight/model gates |
-| Draft/target defaults and global predicates | INT8 included in common quantized-KV and token/head predicates; DDTree implicit draft retains FP16 | Explicit mixed-codec engines and draft acceptance/rollback quality remain unmeasured |
+| Fused Norm/RoPE/KV | Common encoder and address rules; 10 component GPU byte/replay cases pass | Engine execution and existing model-side fusion qualification, which still contains old TP/weight/model gates |
+| Draft/target defaults and global predicates | INT8 included in common quantized-KV and token/head predicates; V1 DFlash/DDTree implicit draft retains FP16 | V2 DFlash implicit default still recognizes only FP8; explicit mixed-codec engines and draft acceptance/rollback quality remain unmeasured |
 | CUDA Graph / prefix / sleep / offload / transfer | Data and scales share physical allocation; view rebinding is read-only | End-to-end restore, reorder, slot reuse, transport identity and V1 graph tuning still require execution evidence |
 | Diagnostics | Actual native codec manifests are reported alongside historical names | Configured capability is not observed execution; task latency and quality cannot be inferred from this report |
 
@@ -465,9 +471,15 @@ Wheel SHA256:
 Evidence under `/home/ymzx/kv-engine-bindings-20261011-123817` on the validation
 host includes `build-public-r5.log`, `gpu-prefill-fp8-baseline-r3.log`,
 `gpu-prefill-r5.log`, the rejected `gpu-prefill-r3.log`, and
-`prefill-r3-numerical-diagnosis.log`. FA2/engine/fused GPU cases are separate
-from these 55 public-package cases and must be recorded after their normal
-main-package build finishes.
+`prefill-r3-numerical-diagnosis.log`. Separately, `gpu-fused-r6.log` records
+**10 passed** for the target partial-RoPE and draft NeoX-RoPE writers across
+five codec identities, including byte compatibility and changed-input graph
+replay. FA2 long/tail and engine GPU qualification remain pending; these fused
+component results do not establish model-side route execution.
+The normal main-package build also finished `_C`, `_C_stable_libtorch`,
+`_vllm_fa2_C`, `_moe_C` and `cumem_allocator` in the owned build directory.
+Build completion is not execution evidence; no model service was started during
+the path-inventory audit.
 
 CPU checks include 45 acceleration-report cases and 33 targeted codec/default
 cases; 518 route/engine/declaration cases and 28 ownership/size regressions pass.
