@@ -15,15 +15,22 @@ from filelock import FileLock
 
 from ..version import __version__
 
-_SOURCES = {"basics": "sm70/basics.cu"}
+_SOURCES = {"basics": "sm70/basics.cu", "qsa": "sm70/qsa.cu"}
 _MODULES = {}
+_LOADED_PROVENANCE = {}
 _FLAGS = ["-O3", "-lineinfo", "-DFLASHINFER_ENABLE_F16", "-DFLASHINFER_SM70_RMS_ONLY"]
 
 
 def source_root():
     package = Path(__file__).resolve().parents[1]
     installed = package / "data"
-    return package.parent if (package.parent / "csrc" / "sm70").is_dir() else installed
+    source = package.parent
+    return (
+        source
+        if (source / "UPSTREAM.lock.json").is_file()
+        and (source / "csrc" / "sm70").is_dir()
+        else installed
+    )
 
 
 def _compiler():
@@ -168,13 +175,26 @@ def prepare(component="basics"):
             )
         import tvm_ffi
 
-        _MODULES[component] = tvm_ffi.load_module(str(build(component)))
+        library = build(component)
+        record = json.loads(library.with_name("manifest.json").read_text())
+        _MODULES[component] = tvm_ffi.load_module(str(library))
+        # Snapshot the artifact we actually loaded. A subsequent source change
+        # or explicit offline build must not relabel a running kernel.
+        _LOADED_PROVENANCE[component] = {
+            **record,
+            "library": str(library),
+            "loaded": True,
+        }
     return _MODULES[component]
 
 
 def provenance(component="basics"):
+    if component in _MODULES:
+        # Return a copy so callers cannot mutate the retained loaded identity.
+        return json.loads(json.dumps(_LOADED_PROVENANCE[component]))
     library = build(component)
     return {
         **json.loads(library.with_name("manifest.json").read_text()),
         "library": str(library),
+        "loaded": False,
     }

@@ -9,7 +9,8 @@ their licenses. Local changes follow the separate vendor commit.
 **Status: development, no GPU or performance admission.** The user deferred GPU
 validation on 2026-10-11 until a V100 machine is provided. A source wheel and
 offline compilation are not acceleration evidence. No engine backend is enabled
-by this foundational change.
+by default. The request-grouped QSA scorer is an explicit candidate described
+in [QSA development and validation](qsa.md).
 
 ## Install and test independently
 

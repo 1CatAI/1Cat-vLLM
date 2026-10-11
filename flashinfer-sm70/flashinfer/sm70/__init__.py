@@ -4,6 +4,8 @@
 from importlib import import_module
 
 _EXPORTS = {
+    "QsaScorePlan": (".qsa", "QsaScorePlan"),
+    "qsa_score_reason": (".qsa", "qsa_score_reason"),
     "prepare": ("._jit", "prepare"),
     "build": ("._jit", "build"),
     "provenance": ("._jit", "provenance"),

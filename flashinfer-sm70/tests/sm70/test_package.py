@@ -50,7 +50,9 @@ def test_source_and_provenance_are_installed():
     for path in (
         "csrc/sm70/basics.cu",
         "csrc/sm70/common.h",
+        "csrc/sm70/qsa.cu",
         "include/flashinfer/sm70/rope.cuh",
+        "include/flashinfer/sm70/qsa.cuh",
         "include/flashinfer/norm.cuh",
     ):
         assert (package / "data" / path).is_file(), path
@@ -122,3 +124,31 @@ def test_sources_and_compiler_change_cache_identity(tmp_path, monkeypatch):
         _jit, "_compiler", lambda: ("nvcc", {"nvcc": "12.9", "cxx": "gcc11"})
     )
     assert _jit._identity("basics")[2] != before_toolchain
+
+
+def test_loaded_identity_survives_source_changes(tmp_path, monkeypatch):
+    import tvm_ffi
+
+    first = tmp_path / "original"
+    first.mkdir()
+    library = first / "kernels.so"
+    record = {"source_sha256": "original", "compiler": {"nvcc": "12.8"}}
+    manifest = first / "manifest.json"
+    manifest.write_text(json.dumps(record))
+    monkeypatch.setattr(_jit, "_MODULES", {})
+    monkeypatch.setattr(_jit, "_LOADED_PROVENANCE", {})
+    monkeypatch.setattr(_jit, "build", lambda component: library)
+    module = object()
+    monkeypatch.setattr(tvm_ffi, "load_module", lambda path: module)
+    assert _jit.prepare("qsa") is module
+    # Rebuilding/editing files must not change the description of the loaded DSO.
+    manifest.write_text('{"source_sha256": "replaced"}')
+
+    def unexpected_build(*args):
+        raise AssertionError("provenance must not compile again after load")
+
+    monkeypatch.setattr(_jit, "build", unexpected_build)
+    loaded = _jit.provenance("qsa")
+    assert loaded["source_sha256"] == "original" and loaded["loaded"] is True
+    loaded["compiler"]["nvcc"] = "changed by caller"
+    assert _jit.provenance("qsa")["compiler"]["nvcc"] == "12.8"
