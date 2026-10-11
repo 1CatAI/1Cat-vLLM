@@ -1133,8 +1133,10 @@ def unify_kv_cache_spec_page_size(
     """
     Unify the page size of the given KVCacheSpec. If the page size of all layers
     are the same, return the original KVCacheSpec. If not same, unify the page
-    size by increasing the block size of layers with smaller page size. Raise
-    NotImplementedError if failed to unify the page size.
+    size by increasing the block size of layers with smaller page size. When
+    page sizes are not integer multiples, use the spec's physical padding
+    contract without changing its logical block size. Raise NotImplementedError
+    for specs that cannot represent the common physical page.
 
     Args:
         kv_cache_spec: The KVCacheSpec of each attention layer in the model
@@ -1158,9 +1160,18 @@ def unify_kv_cache_spec_page_size(
         else:
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:
+                # Payload, scale and state regions need not have an integral
+                # size ratio. Their logical token/checkpoint grids still agree
+                # with the scheduler; padding belongs to the physical page.
+                if isinstance(layer_spec, (AttentionSpec, MambaSpec)):
+                    padded_spec = replace(layer_spec, page_size_padded=max_page_size)
+                    if padded_spec.page_size_bytes == max_page_size:
+                        new_kv_cache_spec[layer_name] = padded_spec
+                        continue
                 raise NotImplementedError(
                     "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
+                    "maximum page size and its spec cannot represent padding. "
+                    "Cannot unify the physical pages."
                 )
             ratio = max_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
