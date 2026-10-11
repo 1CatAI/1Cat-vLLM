@@ -22,19 +22,38 @@ pytestmark = pytest.mark.cpu_test
 
 @pytest.mark.parametrize("codec", ["auto", "int8", "int8_per_token_head"])
 @pytest.mark.parametrize(
-    "use_xqa,use_scalar,expected",
+    "use_xqa,use_scalar",
     [
-        (True, True, "xqa"),
-        (True, False, "xqa"),
-        (False, True, "scalar"),
-        (False, False, "triton"),
+        (True, True),
+        (True, False),
+        (False, True),
+        (False, False),
     ],
 )
+@pytest.mark.parametrize(
+    "available_xqa,available_scalar",
+    [(True, True), (True, False), (False, True), (False, False)],
+)
 def test_decode_executor_runs_with_independent_operators(
-    monkeypatch, codec, use_xqa, use_scalar, expected
+    monkeypatch, codec, use_xqa, use_scalar, available_xqa, available_scalar
 ):
+    expected = (
+        "xqa"
+        if use_xqa and available_xqa
+        else "scalar"
+        if use_scalar and available_scalar
+        else "triton"
+    )
     with cpu_cuda(monkeypatch, False), strict_shim() as legacy:
-        install_ops(monkeypatch, Recorder(), legacy, {})
+        unavailable = [
+            name
+            for name, available in (
+                ("xqa", available_xqa),
+                ("decode", available_scalar),
+            )
+            if not available
+        ]
+        install_ops(monkeypatch, Recorder(), legacy, {"unavailable": unavailable})
         backend = legacy.FlashAttnV100Impl(
             num_heads=6,
             num_kv_heads=1,
@@ -81,8 +100,8 @@ def test_decode_executor_runs_with_independent_operators(
             config,
             DecodeOps(
                 dense=unused,
-                paged=scalar,
-                xqa=xqa,
+                paged=scalar if available_scalar else None,
+                xqa=xqa if available_xqa else None,
                 wmma=unused,
                 prefill=unused,
                 prefill_bhmd=unused,
@@ -148,3 +167,40 @@ def test_decode_executor_runs_with_independent_operators(
                     assert kwargs[name].dtype == torch.float32
                     assert kwargs[name].untyped_storage() == cache.untyped_storage()
         assert torch.all(output == {"xqa": 3, "scalar": 2, "triton": 4}[expected])
+
+
+def test_xqa_import_does_not_require_scalar_or_prefill(monkeypatch):
+    import sys
+
+    from vllm.v1.attention.backends.flash_v100 import ops
+
+    def xqa(*args, **kwargs):
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_attn_v100",
+        SimpleNamespace(flash_attn_decode_paged_xqa=xqa),
+    )
+    for name in (
+        "_flash_attn_func",
+        "_flash_attn_bhmd_func",
+        "_flash_attn_decode_paged",
+        "_flash_attn_decode_paged_xqa",
+        "_flash_attn_decode_paged_wmma",
+        "_flash_attn_prefill_paged",
+        "_flash_attn_prefill_paged_bhmd",
+        "_flash_attn_prefill_paged_bfla",
+        "_flash_attn_prefill_paged_splitkv",
+    ):
+        monkeypatch.setattr(ops, name, None)
+    prepared = []
+    monkeypatch.setattr(ops, "prepare_attention_runtime", lambda: prepared.append(True))
+    monkeypatch.setattr(ops, "bind_attention_operation", lambda operation: operation)
+    monkeypatch.setattr(
+        ops._config, "options", lambda: SimpleNamespace(value=lambda name: False)
+    )
+    loaded = ops.get_flash_ops()
+    assert loaded[3] is xqa
+    assert all(operation is None for i, operation in enumerate(loaded) if i != 3)
+    assert prepared == [True]

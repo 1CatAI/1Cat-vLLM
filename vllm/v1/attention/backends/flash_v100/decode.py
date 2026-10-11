@@ -1028,8 +1028,8 @@ class DecodeUnavailable(DecodeCandidate):
 
     def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
         message = (
-            "FLASH_ATTN_V100 decode cannot run because the paged decode "
-            "op is unavailable. Select TRITON_ATTN for a full Triton "
+            "FLASH_ATTN_V100 decode cannot run because no compatible XQA "
+            "or scalar binding is available. Select TRITON_ATTN for a full Triton "
             "route, or set VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for "
             "explicit diagnostic fallback."
         )

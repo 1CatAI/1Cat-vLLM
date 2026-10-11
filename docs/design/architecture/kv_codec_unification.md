@@ -164,6 +164,12 @@ The requested XQA-first policy removes the default G4, E5M2 and small-query
 length preferences for scalar, including the native E5M2 short-context scalar
 launch. Explicit old threshold overrides remain available. Disabling scalar
 now leaves XQA eligible; fallback is considered only after actual XQA admission.
+Native loading and the initialized decode-availability flag also treat XQA
+independently: a missing or incompatible scalar binding cannot disable a usable
+XQA binding. The CPU matrix exercises enabled/disabled and present/missing
+combinations for both operators, including explicit rejection/fallback when
+neither is usable. These initialization, executor and route checks pass
+**523 tests** (`/tmp/1cat-kv-xqa-availability.log`).
 Existing layout, mask, E4M3 numerical qualification and native-availability
 guards remain. Compact scalar tails are reached only through scalar fallback.
 This policy is a Draft candidate, not a performance-qualified release default.

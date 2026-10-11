@@ -216,7 +216,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # as storage compression only, with K/V dequantized inside FA2 kernels.
         self.supports_quant_query_input = False
         self.use_flash_v100 = self.flash_attn_func is not None
-        self.use_flash_v100_decode = self.flash_attn_decode_paged is not None
+        self.use_flash_v100_decode = any(
+            _routing.native_codec_supported(operation, self.kv_codec)
+            for operation in (
+                self.flash_attn_decode_paged_xqa,
+                self.flash_attn_decode_paged,
+            )
+        )
         self._flash_decode_paged_kwargs = {
             name
             for name in (
@@ -760,9 +766,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         - Prefill: use Flash-V100 by default. Triton prefill is an explicit
           diagnostic fallback only.
-        - Decode: use scalar paged Flash-V100 by default, including CUDA graph
-          capture/replay, so selecting this backend is not a no-op in
-          production decode. Mixed Triton/Flash routes are never silent.
+        - Decode: prefer an admitted XQA binding, including CUDA graph
+          capture/replay, with qualified scalar as the final native fallback.
+          Mixed Triton/Flash routes are never silent.
         """
 
         if attn_metadata is None:
