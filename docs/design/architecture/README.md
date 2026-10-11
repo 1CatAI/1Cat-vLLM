@@ -141,7 +141,26 @@ establish multi-request or other-head support.
 .venv/bin/python -m pytest --confcutdir=tests/v1/attention -q \
   tests/v1/attention/test_sm70_qsa_shared_key_admission.py
 # Build/install the packaged _sm70_qsa_indexer_C target, then on SM70:
-.venv/bin/python -m pytest -q tests/kernels/test_sm70_qsa_shared_key.py
+.venv/bin/python -m pytest --confcutdir=tests/kernels -q \
+  tests/kernels/test_sm70_qsa_shared_key.py
+```
+
+The existing scorer benchmark accepts query rows and live length independently
+of allocated capacity. Its defaults retain the former M5/C1 and M20/C4 workloads.
+It records actual native dispatcher calls outside timed capture, numerical error
+and same-process ABBA CUDA Graph timings. Use the model's 204-key page layout to
+compare actual 32K and 256K prefixes; larger capacity alone does not test a
+longer prefix:
+
+```bash
+.venv/bin/python -m benchmarks.kernels.benchmark_sm70_qsa_shared_key \
+  --out /tmp/qsa-scorer-32k.json --component scorer --requests 1 \
+  --query-rows 8 9 17 33 65 --page-size 204 --pages-per-request 41 \
+  --live-length 32768 --layers 12
+.venv/bin/python -m benchmarks.kernels.benchmark_sm70_qsa_shared_key \
+  --out /tmp/qsa-scorer-256k.json --component scorer --requests 1 \
+  --query-rows 8 9 17 33 65 --page-size 204 --pages-per-request 322 \
+  --live-length 262144 --layers 12
 ```
 
 ## Source-derived reference

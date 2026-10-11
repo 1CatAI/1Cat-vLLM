@@ -24,14 +24,33 @@ cover M9/17/32, non-aligned widths, valid/padded query tails, invalid pages and
 changing live lengths during replay. They compare the original scorer and
 independently launched native tiles; no new numerical tolerance is introduced.
 
-GPU build/numerical/quality/performance validation is pending: the local NVIDIA
-driver is unavailable and the recorded remote environment closed its connection.
-No GPU process was started. Local CPU Torch and CUDA 12.0 do not provide the
-required matching CUDA Torch build environment. Resume with the packaged
-`_sm70_qsa_indexer_C` target on an available SM70 host, run the affected GPU
-suite, then compare the added row cases with the existing scorer before
-qualifying broader default dispatch. No model-throughput or 35B parity claim
-follows from these CPU checks.
+The restored V100 host builds and installs both normal CMake targets,
+`_sm70_qsa_indexer_C` and `_C`, from source in an owned environment with Python
+3.12.13, Torch 2.10.0+cu128 and CUDA 12.8.93. The QSA artifact SHA256 is
+`1e8160781fadb3a679ef13018b6f24a18c564e2cd46153dd60c34224bf85068f`;
+the core artifact SHA256 is
+`37ae3c4d09459a87d98a97375b3e5dd5a862a36a510ffae08d1641df57c4f772`.
+No sidecar or private native-library overlay is used. The benchmark's source
+import and argument-help smoke passes in a fresh process.
+
+GPU execution is temporarily blocked by a host driver update during compilation:
+unattended upgrades installed NVIDIA 580.178.04 while the kernel still has
+580.173.02 loaded. NVML fails and normal vLLM platform detection returns
+`UnspecifiedPlatform`; the runner exits at its GPU-ownership check before
+executing QSA tests. A tiny CUDA allocation succeeds, but does not qualify the
+normal runtime route. The user authorized stopping the Studio inference service
+and rebooting after an unrelated active build finishes. Preserve both completed
+native builds; do not rebuild or bypass normal platform detection to address
+this driver mismatch.
+
+After recovery, run the 19-case affected GPU suite, then the existing ABBA
+scorer benchmark at M8/9/17/33/65 with actual 32K and 256K live prefixes. The
+benchmark now separates query rows, live length and allocated capacity and
+records native dispatcher calls plus score error. Compare the full existing
+score-to-selection chain at M17 for those two lengths after scorer validation.
+These measurements qualify the operator and caller chain, not whole-model task
+quality, startup parity, pure decode speed or 35B AWQ/FP8 migration parity. The
+separate Top-K capacity gap remains in the generalization queue.
 
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
