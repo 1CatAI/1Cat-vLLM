@@ -1,4 +1,4 @@
-# SM70 mHC prenorm staging
+# SM70 mHC projection and output staging
 
 The FP16 mHC provider computes FP32 projection and squared-norm partials
 before the existing mixing, Sinkhorn and normalization stage. The standalone
@@ -35,12 +35,28 @@ records the caller's addresses; replay consumes updated input/weight contents
 and overwrites both partial buffers. Independent callers retain independent
 buffers.
 
+## Output mixing
+
+The existing `sm70_mhc_post` stage uses 256-element hidden-dimension tiles
+for up to eight tokens, increasing independent CTAs for small batches.
+Larger batches retain 512-element tiles. The FP32 operation order, FP16
+saturation at 65504, explicit residual/mix/output strides and optional
+caller-owned output remain unchanged. Input `x` retains its unit hidden
+stride requirement. This reuses the existing kernel and adds no policy or
+workspace.
+
+Tile changes require bitwise validation: a smaller tile can change compiler
+contraction even when the scalar expressions are identical. The regression
+checks compare against the former 512-element launch, including extreme
+values, padding, strided residual/output and independent graph replay.
+
 ## Validation
 
 Run on SM70 with the usual source runtime:
 
 ```console
 python -m pytest --confcutdir=tests/kernels -q tests/kernels/test_mhc_sm70_prenorm_staging.py
+python -m pytest --confcutdir=tests/kernels -q tests/kernels/test_mhc_sm70_post_schedule.py
 ```
 
 The regression oracle retains the former independent reductions because a

@@ -225,7 +225,9 @@ def sm70_mhc_post(
         out = torch.empty_like(residual)
     elif out.shape != residual.shape or out.dtype != residual.dtype:
         raise ValueError("SM70 mHC post output must match the residual")
-    block_h = 512
+    # More independent CTAs help small batches without changing each element's
+    # FP32 arithmetic. Larger batches retain the existing memory-access geometry.
+    block_h = 256 if num_tokens <= 8 else 512
     _sm70_mhc_post_kernel[(num_tokens, triton.cdiv(hidden_size, block_h))](
         x.view(num_tokens, hidden_size),
         residual,
