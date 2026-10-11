@@ -31,6 +31,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                      "int8_per_token_head");
   m.def("decode_paged_xqa_fwd", &flash_attention_decode_paged_xqa,
         "FlashAttention XQA decode over paged KV cache (Volta)");
+  m.def("decode_paged_xqa_kv_fwd",
+        &flash_attention_decode_paged_xqa_with_scales,
+        "Shared XQA decode with explicit KV scale views (Volta)");
+  m.attr("decode_paged_xqa_kv_abi") = 1;
+  m.attr("decode_paged_xqa_kv_codecs") = m.attr("decode_paged_kv_codecs");
   m.def("decode_paged_xqa_staged_fwd", &flash_attention_decode_paged_xqa_staged,
         "Staged FlashAttention XQA decode over paged KV cache (Volta)");
   m.def("grouped_verify_paged_fwd", &flash_attention_grouped_verify_paged,
@@ -116,6 +121,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             &flash_attention_decode_paged_with_scales));
   m.def("decode_paged_xqa_fwd_configured",
         flash_v100::policy::with_policy(&flash_attention_decode_paged_xqa));
+  m.def("decode_paged_xqa_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_decode_paged_xqa_with_scales));
   m.def("decode_paged_xqa_staged_fwd_configured",
         flash_v100::policy::with_policy(
             &flash_attention_decode_paged_xqa_staged));

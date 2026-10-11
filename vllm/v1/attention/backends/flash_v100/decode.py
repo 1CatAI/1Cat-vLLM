@@ -27,7 +27,6 @@ from vllm.v1.attention.backends.triton_attn import (
 from vllm.v1.attention.kv_cache_view import KVCacheView
 from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
-    FP8_E5M2,
     FP16,
     KVCodec,
     resolve_kv_codec,
@@ -138,8 +137,10 @@ class DecodeExecutor:
 
     def _xqa_kv_codec(self, key_cache, value_cache, attn_metadata) -> KVCodec | None:
         codec = self.config.kv_codec
-        if codec not in (FP16, FP8_E4M3, FP8_E5M2) or not codec.stores(
-            key_cache, value_cache
+        if (
+            codec is None
+            or not _routing.native_codec_supported(self.ops.xqa, codec)
+            or not codec.stores(key_cache, value_cache)
         ):
             return None
         if self.ops.reject_xqa(codec, attn_metadata):
@@ -707,6 +708,8 @@ class DecodeExecutor:
         kv_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor,
+        *,
+        unavailable: Callable[[], torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Decode path using Flash V100 directly over paged KV cache."""
         window_size = self._flash_v100_window_size(causal=True)
@@ -734,8 +737,7 @@ class DecodeExecutor:
         )
         xqa_codec = self._xqa_kv_codec(key_cache, value_cache, attn_metadata)
 
-        # FP8 G4 XQA had no end-to-end gain on 35B-A3B TP4 and has no accepted
-        # sampled-quality advantage. Keep that shape on scalar decode.
+        # Prefer XQA whenever its actual binding and semantic contract admit it.
         selection = _routing.select_route(
             _routing.RouteContext(
                 stage="decode",
@@ -748,7 +750,7 @@ class DecodeExecutor:
                     key_cache.shape[1],
                 ),
                 enabled=self.config.policy.use_decode_xqa,
-                available=self.ops.xqa is not None,
+                available=_routing.native_codec_supported(self.ops.xqa, xqa_codec),
                 query=query,
                 metadata=attn_metadata,
                 seq_rows=attn_metadata.seq_lens.shape[0],
@@ -771,6 +773,8 @@ class DecodeExecutor:
             ),
         )
         if selection is None:
+            if unavailable is not None:
+                return unavailable()
             raise RuntimeError(
                 "No native decode binding for KV codec "
                 f"{self.config.kv_cache_dtype!r}; "
@@ -806,6 +810,7 @@ class DecodeExecutor:
         xqa_codec: KVCodec | None,
         *,
         record: _plan.RecordRoute = _plan.record_legacy,
+        cache_view: KVCacheView | None = None,
     ) -> torch.Tensor:
         _routing.log_fp8_kv_cache_route(
             "decode", self.config.kv_cache_dtype, "xqa_paged", record=record
@@ -835,6 +840,12 @@ class DecodeExecutor:
                 record(f"decode_xqa_e4m3_dynamic_page{key_cache.shape[1]}")
             else:
                 record(f"decode_xqa_p{partition_size_hint}_page{key_cache.shape[1]}")
+        scale_args = {}
+        if cache_view is not None:
+            scale_args = {
+                "k_scale_cache": cache_view.key_scale,
+                "v_scale_cache": cache_view.value_scale,
+            }
         self.ops.xqa(
             query,
             key_cache,
@@ -863,6 +874,7 @@ class DecodeExecutor:
                 None,
             ),
             partition_size_hint=partition_size_hint,
+            **scale_args,
             batch_context_routing=bool(
                 getattr(
                     attn_metadata,
@@ -967,6 +979,7 @@ class XqaDecode:
             request.window_size,
             request.xqa_codec,
             record=record,
+            cache_view=request.cache_view,
         )
 
 
@@ -1176,9 +1189,9 @@ class DecodeScalarDisabled(DecodeCandidate):
 
     def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
         message = (
-            "FLASH_ATTN_V100 decode has no enabled Flash route: scalar "
-            "paged decode is disabled and the strict paged-prefill bridge"
-            " is unavailable or CUDA graph capture is active. Re-enable "
+            "FLASH_ATTN_V100 decode has no admitted native route: XQA and "
+            "scalar bindings are unavailable, disabled or incompatible with "
+            "the request. Enable a compatible native route, re-enable "
             "VLLM_FLASH_V100_DECODE_USE_SCALAR_PAGED=1, select "
             "TRITON_ATTN for a full Triton route, or set "
             "VLLM_FLASH_V100_ALLOW_TRITON_FALLBACK=1 for explicit "
@@ -1250,6 +1263,9 @@ class DecodePaged(DecodeCandidate):
             request.kv_cache,
             request.attn_metadata,
             request.output,
+            unavailable=lambda: DecodeScalarDisabled(self.executor).run(
+                request, record
+            ),
         )
         self.executor.ops.compare_triton(
             request.layer,
@@ -1271,6 +1287,5 @@ DECODE_CANDIDATES = (
     DecodePagedPrefill,
     DecodeDenseCache,
     DecodeDenseReference,
-    DecodeScalarDisabled,
     DecodePaged,
 )

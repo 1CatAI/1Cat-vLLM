@@ -83,7 +83,8 @@ address lifetimes and the existing AOT reload/address-resolution contract.
 2. Implement `admit(request)` as a pure predicate and `run(request, record)` as
    execution. A preparation/native attempt that can decline belongs in `run`.
 3. Add it at the intended position of the relevant candidate tuple. Decode
-   priority is paged-prefill, dense-cache, dense-reference, scalar/XQA dispatch;
+   priority is paged-prefill, dense-cache, dense-reference, XQA, then admitted
+   scalar fallback. Disabling scalar must leave XQA eligible;
    per-sequence prefill keeps BFLA, split-D, contiguous BHMD/dense, bridge,
    split-KV and paged fallback order.
 4. Inject its operations from assembly and test the actual executor. Prove

@@ -728,11 +728,17 @@ def test_all_method_bodies_and_static_descriptors_match_parent():
                     ).encode()
                 ).hexdigest()
     # A4b deliberately changes policy capture and the two hint consumers.
-    # Preserve every other calculation body; route planning has its own oracle.
+    # KV migration additionally changes the native scale ABI, rejects unfinished
+    # full-backend INT8 support and puts scalar-disabled fallback after XQA.
+    # Binding/old-binary tests and the executable decode matrix own these new
+    # contracts. Keep the unrelated historical hashes, including stale entries.
     changed_policy = {
         "__init__",
         "_flash_v100_decode",
         "_run_prefill_prefix_decode_rows",
+        "_call_flash_attn_decode_paged",
+        "_supports_flash_v100_path",
+        "forward",
     }
     assert actual.keys() == fixture.keys()
     assert {k: v for k, v in actual.items() if k not in changed_policy} == {

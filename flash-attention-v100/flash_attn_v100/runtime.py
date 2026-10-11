@@ -51,7 +51,12 @@ class AttentionRuntime:
         self.policy = policy
         self.native_policy = extension.PreparedPolicy(native_inputs)
         self.native = SimpleNamespace()
-        for name in ("decode_paged_kv_abi", "decode_paged_kv_codecs"):
+        for name in (
+            "decode_paged_kv_abi",
+            "decode_paged_kv_codecs",
+            "decode_paged_xqa_kv_abi",
+            "decode_paged_xqa_kv_codecs",
+        ):
             if hasattr(extension, name):
                 setattr(self.native, name, getattr(extension, name))
         for name in dir(extension):

@@ -84,7 +84,7 @@ NATIVE_FIELDS = (
         "decode_fp8_xqa_min_seq_len",
         "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN",
         "positive_atoi",
-        16384,
+        1,
     ),
     (
         "xqa_e5m2_g6_dual_cta_trace",
@@ -901,12 +901,12 @@ class FlashV100Options(CapturedFlashOptions):
         "decode_xqa_q4_min_seq_len": (
             "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN",
             "threshold",
-            "32768",
+            "1",
         ),
         "decode_fp8_xqa_min_seq_len": (
             "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN",
             "threshold",
-            "16384",
+            "1",
         ),
         "decode_dynamic_partitions": (
             "VLLM_FLASH_V100_DECODE_DYNAMIC_PARTITIONS",
@@ -917,7 +917,7 @@ class FlashV100Options(CapturedFlashOptions):
         "smallq_decode_xqa_min_seq_len": (
             "VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN",
             "int",
-            "4096",
+            "1",
         ),
         "prefill_d256_gqa_v37": (
             "VLLM_FLASH_V100_PREFILL_D256_GQA_V37",

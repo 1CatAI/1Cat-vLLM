@@ -139,10 +139,12 @@ def test_non_e4_codecs_do_not_require_the_shared_revision(monkeypatch):
     record.assert_not_called()
 
 
-def test_int8_native_abi_requires_real_scale_capability(source_interface):
+@pytest.mark.parametrize("algorithm", ["decode_paged", "decode_paged_xqa"])
+def test_int8_native_abi_requires_real_scale_capability(source_interface, algorithm):
     module, native = source_interface
-    q = torch.zeros((1, 4, 128), dtype=torch.float16)
-    k = torch.zeros((2, 16, 1, 128), dtype=torch.int8)
+    operation = getattr(module, "flash_attn_" + algorithm)
+    q = torch.zeros((1, 4, 256), dtype=torch.float16)
+    k = torch.zeros((2, 16, 1, 256), dtype=torch.int8)
     table = torch.tensor([[1]], dtype=torch.int32)
     seq = torch.tensor([16], dtype=torch.int32)
     scales = torch.ones((2, 16, 1), dtype=torch.float32)
@@ -153,18 +155,19 @@ def test_int8_native_abi_requires_real_scale_capability(source_interface):
         max_seq_len_hint=16,
         workspace_seq_capacity_hint=16,
     )
-    with pytest.raises(RuntimeError, match="scale-view ABI"):
-        module.flash_attn_decode_paged(q, k, k, table, seq, **kwargs)
-    native.decode_paged_kv_abi = 1
-    native.decode_paged_kv_codecs = ("int8", "int8_per_token_head")
-    native.decode_paged_kv_fwd = MagicMock()
-    module.flash_attn_decode_paged(q, k, k, table, seq, **kwargs)
-    args = native.decode_paged_kv_fwd.call_args.args
+    with pytest.raises(RuntimeError, match="no explicit KV binding"):
+        operation(q, k, k, table, seq, **kwargs)
+    setattr(native, algorithm + "_kv_abi", 1)
+    setattr(native, algorithm + "_kv_codecs", ("int8", "int8_per_token_head"))
+    binding = MagicMock()
+    setattr(native, algorithm + "_kv_fwd", binding)
+    operation(q, k, k, table, seq, **kwargs)
+    args = binding.call_args.args
     assert args[1] is k and args[2] is k
     assert args[-2] is scales and args[-1] is scales
     assert args[6].dtype == torch.float32
     with pytest.raises(ValueError, match="both scale planes"):
-        module.flash_attn_decode_paged(q, k, k, table, seq, kv_cache_dtype="int8")
+        operation(q, k, k, table, seq, kv_cache_dtype="int8")
 
 
 def test_scalar_legacy_native_abi_keeps_its_original_arguments(source_interface):
