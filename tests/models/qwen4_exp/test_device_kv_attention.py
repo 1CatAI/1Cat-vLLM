@@ -14,6 +14,49 @@ from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attentio
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+def test_int8_history_executes_the_shared_native_reader():
+    state = HostQSAKV(
+        1,
+        16,
+        256,
+        torch.device("cuda:0"),
+        width=1,
+        hot_tokens=64,
+        device_reference=True,
+        direct_device=True,
+        dtype=torch.int8,
+    )
+    assert state.device_history_workspace is not None, state.device_history_reason
+    source = torch.ones((1, 1, 256), device="cuda", dtype=torch.float16)
+    state.write(source, source, torch.zeros(1, device="cuda", dtype=torch.int64))
+    query = torch.zeros((1, 6, 256), device="cuda", dtype=torch.float16)
+    output = torch.empty_like(query)
+    metadata = (
+        torch.zeros((1, 1), device="cuda", dtype=torch.int32),
+        torch.zeros((1, 1), device="cuda", dtype=torch.int32),
+        torch.zeros(1, device="cuda", dtype=torch.int32),
+        torch.zeros(1, device="cuda", dtype=torch.int64),
+        torch.ones(1, device="cuda", dtype=torch.int32),
+    )
+    host_qsa_attention(query, state, *metadata, output)
+    torch.accelerator.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        host_qsa_attention(query, state, *metadata, output)
+        torch.accelerator.synchronize()
+    names = [
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    assert any(
+        "device_qsa::partial<3>" in name or "device_qsa::partial<(int)3>" in name
+        for name in names
+    ), names
+    assert torch.equal(output, torch.ones_like(output))
+
+
 def test_draft_owner_never_admits_native_history():
     state = HostQSAKV(
         1,
@@ -35,15 +78,15 @@ def test_draft_owner_never_admits_native_history():
 
 
 def decoded_history(state):
-    if not state.fp8:
+    if not state.codec.quantized:
         return state.history.squeeze(3)
-    values = state.history.view(torch.float8_e4m3fn).float().squeeze(3)
+    values = state.history.view(state.codec.element_dtype).float().squeeze(3)
     scales = state.scales.view(state.blocks, state.page_size, 2).transpose(1, 2)
     return (values * scales[..., None]).half()
 
 
 @pytest.mark.parametrize("rows", [1, 5, 20])
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8, torch.float16])
 @pytest.mark.parametrize("strided", [False, True])
 def test_direct_history_matches_protected_arithmetic_and_replay(rows, dtype, strided):
     """Check the actual FP16 probability boundary, not only an FP32 oracle."""
@@ -149,7 +192,8 @@ def test_direct_history_matches_protected_arithmetic_and_replay(rows, dtype, str
 
 
 @pytest.mark.parametrize("scale", [1.0, 0.001, 256.0])
-def test_all_e4m3_codes_single_key_exact_values(scale):
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8])
+def test_all_byte_codes_single_key_exact_values(scale, dtype):
     state = HostQSAKV(
         1,
         256,
@@ -160,12 +204,13 @@ def test_all_e4m3_codes_single_key_exact_values(scale):
         hot_tokens=64,
         device_reference=True,
         direct_device=True,
+        dtype=dtype,
     )
     assert state.device_history_workspace is not None, state.device_history_reason
     state.history[0, 0, 0].zero_()
-    state.history[0, 1, 0, 0] = torch.arange(
-        256, device="cuda", dtype=torch.int32
-    ).byte()
+    state.history[0, 1, 0, 0] = (
+        torch.arange(256, device="cuda", dtype=torch.int32).byte().view(dtype)
+    )
     state.scales.fill_(scale)
     q = torch.zeros(1, 6, 256, dtype=torch.float16, device="cuda")
     out = torch.empty_like(q)
@@ -184,7 +229,7 @@ def test_all_e4m3_codes_single_key_exact_values(scale):
 
 
 @pytest.mark.parametrize("rows", [1, 5, 20])
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8, torch.float16])
 def test_fp32_attention_oracle_aliases_masks_writes_and_graph(rows, dtype):
     torch.manual_seed(53)
     state = HostQSAKV(

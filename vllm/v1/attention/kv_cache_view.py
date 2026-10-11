@@ -101,6 +101,46 @@ class KVCacheView:
         return self.page_stride_bytes - self.page_size_bytes
 
     @classmethod
+    def bind_history(
+        cls, cache: torch.Tensor, scales: torch.Tensor, codec: KVCodec
+    ) -> "KVCacheView":
+        """Borrow history payload and its independently owned FP32 scale plane."""
+        if codec.representation != "history" or codec.layout != "history_planes":
+            raise ValueError("History binding requires the history representation")
+        if (
+            cache.ndim != 5
+            or cache.shape[1] != 2
+            or cache.shape[3] != 1
+            or cache.dtype != codec.storage_dtype
+            or not cache.is_contiguous()
+            or scales.dtype != torch.float32
+            or not scales.is_contiguous()
+            or scales.device != cache.device
+        ):
+            raise ValueError("Invalid history payload or scale layout")
+        pages, _, tokens, _, dim = cache.shape
+        expected = (pages * tokens if codec.quantized else 1, 2)
+        if scales.shape != expected:
+            raise ValueError("History scales must match every physical token")
+        key, value = cache.unbind(1)
+        if codec.quantized:
+            planes = scales.view(pages, tokens, 2)
+            key_scale = planes[..., 0, None]
+            value_scale = planes[..., 1, None]
+        else:
+            key_scale = value_scale = None
+        occupied = 2 * tokens * dim * cache.element_size()
+        return cls(
+            codec,
+            key,
+            value,
+            key_scale,
+            value_scale,
+            cache.stride(0) * cache.element_size(),
+            occupied,
+        )
+
+    @classmethod
     def bind_indexer(
         cls, cache: torch.Tensor, codec: KVCodec, head_size: int
     ) -> "KVCacheView":

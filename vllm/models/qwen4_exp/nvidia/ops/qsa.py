@@ -19,6 +19,7 @@ from vllm.models.deepseek_v4.common.ops.fp8_software import (
 from vllm.models.qwen4_exp.nvidia.ops.host_kv_reader import load_host_kv
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.ops.kv_codec import decode_kv_payload
 from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
 
 logger = init_logger(__name__)
@@ -641,6 +642,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     HISTORY_LENGTHS=None,
     DEVICE_HISTORY: tl.constexpr = False,
     HISTORY_E4M3: tl.constexpr = False,
+    HISTORY_CODEC: tl.constexpr = -1,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -759,14 +761,18 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 mask=valid[:, None],
                 other=0.0,
             )
-        if DEVICE_HISTORY and HISTORY_E4M3:
+        if DEVICE_HISTORY and (HISTORY_E4M3 or HISTORY_CODEC > 0):
             slot = safe_page * PAGE_SIZE + page_offset
             key_scales = tl.load(HISTORY_SCALES + slot * 2, valid, other=1.0)
             value_scales = tl.load(HISTORY_SCALES + slot * 2 + 1, valid, other=1.0)
-            keys = (fp8_e4m3fn_bits_to_fp32(keys) * key_scales[None, :]).to(query.dtype)
-            values = (fp8_e4m3fn_bits_to_fp32(values) * value_scales[:, None]).to(
-                query.dtype
-            )
+            keys = (
+                decode_kv_payload(keys, HISTORY_CODEC if HISTORY_CODEC >= 0 else 1)
+                * key_scales[None, :]
+            ).to(query.dtype)
+            values = (
+                decode_kv_payload(values, HISTORY_CODEC if HISTORY_CODEC >= 0 else 1)
+                * value_scales[:, None]
+            ).to(query.dtype)
         if KV_E4M3:
             keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
             values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)

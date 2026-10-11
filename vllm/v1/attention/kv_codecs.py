@@ -38,7 +38,9 @@ class KVCodec:
     scale_granularity: Literal["none", "tensor", "token_head", "token_group"] = "none"
     scale_dtype: torch.dtype | None = None
     rounding: Literal["none", "nearest_even", "truncate"] = "none"
-    layout: Literal["dense", "inline_scale", "planar_scales", "group_planar"] = "dense"
+    layout: Literal[
+        "dense", "inline_scale", "planar_scales", "group_planar", "history_planes"
+    ] = "dense"
     representation: str = "ordinary"
     group_axis: int | None = None
     group_size: int = 0
@@ -257,7 +259,30 @@ INDEXER_INT8 = replace(
     group_size=128,
     layout="group_planar",
 )
-KV_REPRESENTATION_CODECS = (INDEXER_FP8, INDEXER_INT8)
+HISTORY_FP16 = replace(FP16, representation="history", layout="history_planes")
+HISTORY_FP8 = replace(
+    FP8_E4M3,
+    representation="history",
+    scale_granularity="token_head",
+    scale_dtype=torch.float32,
+    scale_encoding="fp32",
+    rounding="nearest_even",
+    layout="history_planes",
+)
+HISTORY_INT8 = replace(INT8, representation="history", layout="history_planes")
+KV_REPRESENTATION_CODECS = (
+    INDEXER_FP8,
+    INDEXER_INT8,
+    HISTORY_FP16,
+    HISTORY_FP8,
+    HISTORY_INT8,
+)
+
+
+def kv_codecs_for_representation(representation: str) -> tuple[KVCodec, ...]:
+    """Declared formats for an algorithm's representation requirement."""
+    registry = KV_CODECS if representation == "ordinary" else KV_REPRESENTATION_CODECS
+    return tuple(codec for codec in registry if codec.representation == representation)
 
 
 def resolve_kv_codec(

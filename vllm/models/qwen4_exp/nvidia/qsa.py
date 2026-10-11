@@ -57,6 +57,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     KVCacheSpec,
+    KVQuantMode,
     get_kv_quant_mode,
 )
 
@@ -635,16 +636,22 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             if self.host_kv_is_draft
             else vllm_config.kernel_config.qsa_host_kv_dtype
         )
-        if self.kv_cache_dtype not in ("fp8", "fp8_e4m3") and (
-            self.kv_cache_torch_dtype != model_config.dtype
+        if (
+            not self.host_kv_enabled
+            and self.kv_cache_dtype not in ("fp8", "fp8_e4m3")
+            and (self.kv_cache_torch_dtype != model_config.dtype)
         ):
             raise NotImplementedError(
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
             )
         if self.host_kv_enabled:
-            self.kv_cache_torch_dtype = (
-                torch.uint8 if self.host_kv_dtype == "fp8_e4m3" else torch.float16
+            from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+            history_codec = resolve_kv_codec(
+                self.host_kv_dtype, representation="history"
             )
+            assert history_codec is not None
+            self.kv_cache_torch_dtype = history_codec.storage_dtype
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
@@ -811,6 +818,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 device_reference=self.host_kv_device_reference,
                 direct_device=self.host_kv_direct_device,
                 is_speculative_draft=self.host_kv_is_draft,
+                cache_dtype=self.host_kv_dtype,
             )
             logger.info_once(
                 "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
@@ -854,7 +862,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             head_size=self.head_dim,
             head_size_v=self.head_dim,
             dtype=self.kv_cache_torch_dtype,
-            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            kv_quant_mode=(
+                KVQuantMode.NONE
+                if self.host_kv_enabled
+                else get_kv_quant_mode(self.kv_cache_dtype)
+            ),
             dcp_sharded=dcp_sharded,
         )
 

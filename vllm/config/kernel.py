@@ -768,15 +768,15 @@ class KernelConfig:
     """Startup reason when calibrated automatic storage cannot be selected."""
 
     sm70_qsa_device_history: bool = True
-    """Read target device E4M3/FP16 QSA history directly with FP32 PV at
+    """Read target device FP8/INT8/FP16 QSA history directly with FP32 PV at
     M1..20, H6, D256. Speculative draft attention retains its existing path."""
     sm70_qsa_shared_key: bool = True
     """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
-    qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
+    qsa_host_kv_dtype: Literal["fp8_e4m3", "int8", "float16"] = "fp8_e4m3"
     """Authoritative target history format; FP16 isolates placement error."""
-    qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "float16"] = "float16"
+    qsa_host_kv_draft_dtype: Literal["fp8_e4m3", "int8", "float16"] = "float16"
     """Preserve speculative cache precision independently of target storage."""
     qsa_host_kv_device_reference: bool = False
     """Keep identical encoded history on device for controlled placement A/B."""

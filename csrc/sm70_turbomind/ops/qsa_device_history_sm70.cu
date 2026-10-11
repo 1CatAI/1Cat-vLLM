@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-// Direct device E4M3/FP16 history: FP16 QK operands, FP32 QK/PV,
+// Direct device codec-backed history: FP16 QK operands, FP32 QK/PV,
 // probability and merge. No protected-hot ownership or staging is required.
 #include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
 #include <torch/extension.h>
+#include "kv_codec_traits.cuh"
 
 namespace device_qsa {
 constexpr int D = 256, H = 6, C = 64, PAD = 264;
@@ -34,16 +35,6 @@ __device__ __forceinline__ float fast_exp2(float x) {
   return result;
 }
 
-__device__ __forceinline__ float e4m3(unsigned c) {
-  const unsigned sign = (c & 128u) << 24;
-  const unsigned magnitude = c & 127u;
-  if (magnitude == 127u) return __uint_as_float(sign | 0x7fc00000u);
-  const unsigned normal = (magnitude << 20) + (120u << 23);
-  const float subnormal = float(magnitude & 7u) * 0x1p-9f;
-  const unsigned bits = magnitude < 8u ? __float_as_uint(subnormal) : normal;
-  return __uint_as_float(bits | sign);
-}
-
 __device__ __forceinline__ void mma(float (&d)[8], uint32_t a0, uint32_t a1,
                                     uint32_t b0, uint32_t b1) {
   asm volatile(
@@ -55,25 +46,29 @@ __device__ __forceinline__ void mma(float (&d)[8], uint32_t a0, uint32_t a1,
       : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
 }
 
+template <int CODEC>
 __device__ __forceinline__ uint4 decode8(const unsigned char* source,
                                          float scale) {
   const uint2 packed = __ldg(reinterpret_cast<const uint2*>(source));
+  const uint64_t raw = uint64_t(packed.x) | (uint64_t(packed.y) << 32);
+  const uint4 payload =
+      flash_v100::KVCodecTraits<CODEC>::half8_from_packed(raw);
+  const unsigned* unscaled = reinterpret_cast<const unsigned*>(&payload);
   uint4 result;
   unsigned* words = reinterpret_cast<unsigned*>(&result);
 #pragma unroll
   for (int j = 0; j < 4; ++j) {
-    const unsigned p = j < 2 ? packed.x : packed.y;
-    const unsigned code0 = (p >> (16 * (j & 1))) & 255u;
-    const unsigned code1 = (p >> (16 * (j & 1) + 8)) & 255u;
-    const half lo = __float2half_rn(__fmul_rn(e4m3(code0), scale));
-    const half hi = __float2half_rn(__fmul_rn(e4m3(code1), scale));
+    const float code0 = __half2float(__ushort_as_half(unscaled[j] & 65535u));
+    const float code1 = __half2float(__ushort_as_half(unscaled[j] >> 16));
+    const half lo = __float2half_rn(__fmul_rn(code0, scale));
+    const half hi = __float2half_rn(__fmul_rn(code1, scale));
     words[j] =
         unsigned(__half_as_ushort(lo)) | (unsigned(__half_as_ushort(hi)) << 16);
   }
   return result;
 }
 
-template <bool FP8>
+template <int CODEC>
 __global__ __launch_bounds__(256) void partial(Args a) {
   const int row = blockIdx.y, split = blockIdx.x;
   const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -111,8 +106,8 @@ __global__ __launch_bounds__(256) void partial(Args a) {
       const int block = slot / a.page, off = slot % a.page;
       const unsigned char* src =
           a.history + (int64_t(block) * 2 * a.page + off) * D + dim;
-      if constexpr (FP8)
-        value = decode8(src, __ldg(a.scales + slot * 2));
+      if constexpr (CODEC != 0)
+        value = decode8<CODEC>(src, __ldg(a.scales + slot * 2));
       else
         value = __ldg(reinterpret_cast<const uint4*>(
             reinterpret_cast<const half*>(a.history) +
@@ -183,8 +178,8 @@ __global__ __launch_bounds__(256) void partial(Args a) {
       const int block = slot / a.page, off = slot % a.page;
       const unsigned char* src =
           a.history + ((int64_t(block) * 2 + 1) * a.page + off) * D + dim;
-      if constexpr (FP8)
-        value = decode8(src, __ldg(a.scales + slot * 2 + 1));
+      if constexpr (CODEC != 0)
+        value = decode8<CODEC>(src, __ldg(a.scales + slot * 2 + 1));
       else
         value = __ldg(reinterpret_cast<const uint4*>(
             reinterpret_cast<const half*>(a.history) +
@@ -270,12 +265,13 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
               q.size(0) > 0 && q.size(0) <= 20 && q.size(1) == 6 &&
               q.size(2) == 256 && q.stride(2) == 1);
   TORCH_CHECK((history.scalar_type() == at::kByte ||
+               history.scalar_type() == at::kChar ||
                history.scalar_type() == at::kHalf) &&
               history.dim() == 5 && history.size(1) == 2 &&
               history.size(3) == 1 && history.size(4) == 256 &&
               history.is_contiguous());
   TORCH_CHECK(scales.scalar_type() == at::kFloat && scales.is_contiguous() &&
-              scales.numel() == (history.scalar_type() == at::kByte
+              scales.numel() == (history.scalar_type() != at::kHalf
                                      ? history.size(0) * history.size(2) * 2
                                      : 2));
   TORCH_CHECK(indices.scalar_type() == at::kInt && indices.dim() == 2 &&
@@ -336,13 +332,17 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
   a.gs1 = gate ? gate->stride(1) : 0;
   const auto stream = at::cuda::getCurrentCUDAStream();
   if (history.scalar_type() == at::kByte)
-    device_qsa::partial<true><<<dim3(a.splits, a.M), 256, 0, stream>>>(a);
+    device_qsa::partial<1><<<dim3(a.splits, a.M), 256, 0, stream>>>(a);
+  else if (history.scalar_type() == at::kChar)
+    device_qsa::partial<3><<<dim3(a.splits, a.M), 256, 0, stream>>>(a);
   else
-    device_qsa::partial<false><<<dim3(a.splits, a.M), 256, 0, stream>>>(a);
+    device_qsa::partial<0><<<dim3(a.splits, a.M), 256, 0, stream>>>(a);
   device_qsa::merge<<<a.M * 6, 256, 0, stream>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
+  m.def("cache_codecs() -> int[]",
+        []() { return std::vector<int64_t>{0, 1, 3}; });
   m.def(
       "run(Tensor q, Tensor history, Tensor scales, Tensor indices, Tensor "
       "table, Tensor requests, Tensor positions, Tensor lengths, Tensor(a!) "

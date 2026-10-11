@@ -9,7 +9,7 @@ from vllm.v1.attention.kv_cache_view import KVCacheView
 from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
     INT8,
-    KV_REPRESENTATION_CODECS,
+    kv_codecs_for_representation,
     resolve_kv_codec,
 )
 
@@ -35,7 +35,9 @@ def test_indexer_identity_and_rounding_keep_the_group_axis():
     assert torch.equal(restored[:, 128:], 2 * restored[:, :128])
 
 
-@pytest.mark.parametrize("codec", KV_REPRESENTATION_CODECS, ids=lambda c: c.name)
+@pytest.mark.parametrize(
+    "codec", kv_codecs_for_representation("indexer"), ids=lambda c: c.name
+)
 @pytest.mark.parametrize("head_size", [128, 256])
 def test_indexer_view_preserves_padding_scale_bytes_and_restore(codec, head_size):
     block, pages, groups = 64, 3, head_size // 128

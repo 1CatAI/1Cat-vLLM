@@ -9,7 +9,43 @@ from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+def test_int8_history_rounding_invalid_groups_and_changed_slot_replay():
+    state = HostQSAKV(
+        2,
+        16,
+        256,
+        torch.device("cuda:0"),
+        hot_tokens=64,
+        rows=1,
+        width=4,
+        dtype=torch.int8,
+    )
+    source = torch.zeros((3, 1, 256), device="cuda", dtype=torch.float32)
+    source[0, 0, :7] = torch.tensor(
+        [127, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5], device="cuda"
+    )
+    source[2, 0, 2] = float("nan")
+    slots = torch.tensor([0, 17, 31], device="cuda", dtype=torch.int64)
+    state.write(source, source, slots)
+    torch.accelerator.synchronize()
+    assert state.host[0, 0, 0, 0, :7].tolist() == [127, 0, 2, 2, 0, -2, -2]
+    assert state.host_scales[0].tolist() == [1.0, 1.0]
+    assert state.host_scales[17].tolist() == [pytest.approx(1e-6)] * 2
+    assert torch.isnan(state.host_scales[31]).all()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        state.write(source, source, slots)
+    source[2].zero_()
+    source[0].mul_(2)
+    slots.copy_(torch.tensor([16, 1, -1], device="cuda"))
+    graph.replay()
+    torch.accelerator.synchronize()
+    assert state.host[1, 0, 0, 0, :7].tolist() == [127, 0, 2, 2, 0, -2, -2]
+    assert state.host_scales[16].tolist() == [2.0, 2.0]
+    assert torch.isnan(state.host_scales[31]).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8, torch.float16])
 def test_shared_physical_page_rewrite_updates_every_logical_alias(dtype):
     device = torch.device("cuda:0")
     state = HostQSAKV(2, 816, 256, device, hot_tokens=64, rows=2, width=4, dtype=dtype)
@@ -32,9 +68,9 @@ def test_shared_physical_page_rewrite_updates_every_logical_alias(dtype):
         torch.accelerator.synchronize()
         for kind, actual in enumerate((k, v)):
             expected = state.host[0, kind, 4:8, 0]
-            if dtype == torch.uint8:
+            if dtype in (torch.uint8, torch.int8):
                 expected = (
-                    expected.view(torch.float8_e4m3fn).float()
+                    expected.view(state.codec.element_dtype).float()
                     * state.host_scales[4:8, kind, None]
                 ).half()
             torch.testing.assert_close(actual[0, :4, 0].cpu(), expected, rtol=0, atol=0)
@@ -44,7 +80,7 @@ def test_shared_physical_page_rewrite_updates_every_logical_alias(dtype):
 
 @pytest.mark.parametrize("rows", [1, 5, 20])
 @pytest.mark.parametrize("page", [256, 816, 1568])
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8, torch.float16])
 def test_host_gather_collisions_rejection_and_graph(rows, page, dtype):
     torch.manual_seed(17)
     device = torch.device("cuda:0")
@@ -63,9 +99,19 @@ def test_host_gather_collisions_rejection_and_graph(rows, page, dtype):
         if dtype == torch.float16:
             assert torch.equal(state.host[:, kind, :, 0], original.half())
             continue
-        scales = original.double().abs().amax(-1).div(448).float().clamp_min(2.0**-126)
-        expected = (original / scales.unsqueeze(-1)).to(torch.float8_e4m3fn)
-        assert torch.equal(state.host[:, kind, :, 0], expected.view(torch.uint8))
+        if dtype == torch.int8:
+            scales = original.abs().amax(-1).div(127).clamp_min(1e-6)
+            expected = (
+                (original / scales.unsqueeze(-1)).round().clamp(-128, 127).to(dtype)
+            )
+        else:
+            scales = (
+                original.double().abs().amax(-1).div(448).float().clamp_min(2.0**-126)
+            )
+            expected = (
+                (original / scales.unsqueeze(-1)).to(torch.float8_e4m3fn).view(dtype)
+            )
+        assert torch.equal(state.host[:, kind, :, 0], expected)
         assert torch.equal(state.host_scales[:, kind].view(blocks, page), scales)
 
     table = torch.stack((torch.arange(8), torch.arange(24, 32)))
@@ -95,11 +141,11 @@ def test_host_gather_collisions_rejection_and_graph(rows, page, dtype):
         physical = table.cpu()[requests.cpu().long()[:, None], safe // page].long()
         for kind, actual in enumerate((actual_k, actual_v)):
             codes = state.host[physical, kind, safe % page, 0]
-            if dtype == torch.uint8:
+            if dtype in (torch.uint8, torch.int8):
                 scales = state.host_scales[physical * page + safe % page, kind]
-                reference = codes.view(torch.float8_e4m3fn).float() * scales.unsqueeze(
-                    -1
-                )
+                reference = codes.view(
+                    state.codec.element_dtype
+                ).float() * scales.unsqueeze(-1)
             else:
                 reference = codes
             reference = reference.masked_fill(~valid.unsqueeze(-1), 0).half()

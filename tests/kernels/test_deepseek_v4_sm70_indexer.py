@@ -14,10 +14,12 @@ from vllm.models.deepseek_v4.sm70.indexer import (
     sm70_indexer_prefill_logits,
 )
 from vllm.utils.torch_utils import current_stream
-from vllm.v1.attention.kv_codecs import KV_REPRESENTATION_CODECS
+from vllm.v1.attention.kv_codecs import kv_codecs_for_representation
 
 
-@pytest.fixture(autouse=True, params=KV_REPRESENTATION_CODECS, ids=lambda c: c.name)
+@pytest.fixture(
+    autouse=True, params=kv_codecs_for_representation("indexer"), ids=lambda c: c.name
+)
 def indexer_engine_config(request, monkeypatch):
     codec = request.param
     monkeypatch.setitem(globals(), "_KEY_DTYPE", codec.element_dtype)
