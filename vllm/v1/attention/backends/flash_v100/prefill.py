@@ -612,6 +612,9 @@ def _run_prefill_prefix_decode_rows(
                 available=_routing.native_codec_supported(
                     self.flash_attn_decode_paged_xqa, self.kv_codec
                 ),
+                execution_plan_revision=getattr(
+                    self.flash_attn_decode_paged_xqa, "execution_plan_revision", 0
+                ),
                 max_seq_len_hint=max_seq_len_hint,
             ),
             ("prefill_prefix_decode_rows_xqa",),

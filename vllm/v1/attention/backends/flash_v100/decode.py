@@ -776,6 +776,9 @@ class DecodeExecutor:
                 ),
                 enabled=self.config.policy.use_decode_xqa,
                 available=_routing.native_codec_supported(self.ops.xqa, xqa_codec),
+                execution_plan_revision=getattr(
+                    self.ops.xqa, "execution_plan_revision", 0
+                ),
                 query=query,
                 metadata=attn_metadata,
                 seq_rows=attn_metadata.seq_lens.shape[0],

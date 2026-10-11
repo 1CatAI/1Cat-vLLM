@@ -12,9 +12,43 @@ import torch
 
 from vllm.config.kernel import KernelConfig
 from vllm.v1.attention.backends.flash_v100 import routing
-from vllm.v1.attention.kv_codecs import FP8_E4M3, FP8_E5M2, FP16
+from vllm.v1.attention.kv_codecs import FP8_E4M3, FP8_E5M2, FP16, INT8
 
 pytestmark = pytest.mark.cpu_test
+
+
+@pytest.mark.parametrize("codec", [FP8_E4M3, FP8_E5M2, INT8])
+@pytest.mark.parametrize("gqa", [4, 6, 8])
+def test_actual_shared_binary_keeps_xqa_ahead_of_scalar(codec, gqa, monkeypatch):
+    monkeypatch.setenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", "4096")
+    metadata = SimpleNamespace(max_seq_len=16)
+    context = routing.RouteContext(
+        stage="decode",
+        codec=codec,
+        shape=routing.RouteShape(1, gqa, 1, 256, 16),
+        query=torch.zeros((1, gqa, 256)),
+        metadata=metadata,
+        execution_plan_revision=2,
+    )
+    assert (
+        routing.select_route(
+            context, ("decode_xqa_paged",), fallback="decode_scalar_paged"
+        ).name
+        == "decode_xqa_paged"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8])
+@pytest.mark.parametrize("page", [16, 256, 800])
+def test_shared_binary_exposes_geometry_partitions_to_all_byte_payloads(
+    source_interface, dtype, page
+):
+    module, _ = source_interface
+    q = torch.zeros((1, 6, 256), dtype=torch.float16)
+    k = torch.zeros((2, page, 1, 256), dtype=dtype)
+    partitions = module._xqa_partition_sizes(q, k, k, batch_wave=True)
+    assert {64, 128, 256, 512, 1024} <= set(partitions)
+    assert ((896 in partitions) and (1664 in partitions)) == (page >= 256)
 
 
 @pytest.mark.parametrize(

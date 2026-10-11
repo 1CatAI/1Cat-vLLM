@@ -17,6 +17,7 @@ from vllm.model_executor.models.shared_weights import (
     get_target_lm_head as get_target_lm_head,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.sm70.speculative_policy import resolve_dflash_draft_cache_dtype
 
 logger = init_logger(__name__)
 
@@ -42,14 +43,12 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
-    draft_cache_dtype = speculative_config.kv_cache_dtype
-    if (
-        draft_cache_dtype is None
-        and str(vllm_config.cache_config.cache_dtype).startswith("fp8")
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability(70)
-    ):
-        draft_cache_dtype = "auto"
+    draft_cache_dtype = resolve_dflash_draft_cache_dtype(
+        vllm_config.cache_config.cache_dtype,
+        speculative_config.kv_cache_dtype,
+        sm70=current_platform.is_cuda() and current_platform.is_device_capability(70),
+    )
+    if draft_cache_dtype == "auto" and speculative_config.kv_cache_dtype is None:
         logger.info_once(
             "Using FP16 draft KV cache for SM70 DFlash while the target uses %s.",
             vllm_config.cache_config.cache_dtype,

@@ -26,10 +26,21 @@ __device__ inline void vectorize_with_alignment(
                 "VEC_SIZE must be a positive power-of-two");
   constexpr int WIDTH = VEC_SIZE * sizeof(InT);  // eg: 64 B
   uintptr_t addr = reinterpret_cast<uintptr_t>(in);
+  constexpr int OUT_WIDTH = VEC_SIZE * sizeof(OutT);
+  const uintptr_t out_addr = reinterpret_cast<uintptr_t>(out);
+
+  // Aligning the source does not necessarily align a separately laid-out
+  // destination (for example, a cache row followed by an inline FP32 scale).
+  const int source_prefix =
+      ((WIDTH - (addr & (WIDTH - 1))) & (WIDTH - 1)) / sizeof(InT);
+  if ((out_addr + source_prefix * sizeof(OutT)) & (OUT_WIDTH - 1)) {
+    for (int i = tid; i < len; i += stride) {
+      scalar_op(out[i], in[i]);
+    }
+    return;
+  }
 
   // fast path when the whole region is already aligned
-  // Note: currently the output is guaranteed to be same as the input, so we
-  // don't check it here, comments here just for future reference.
   bool can_vec = ((addr & (WIDTH - 1)) == 0) && ((len & (VEC_SIZE - 1)) == 0);
   if (can_vec) {
     int num_vec = len / VEC_SIZE;

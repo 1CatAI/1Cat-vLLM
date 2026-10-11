@@ -11,6 +11,12 @@ XQA、grouped 和分页 prefill 已有公共绑定，但同一个入口内部仍
 调优，resident-prefix dense 转换链尚未通过 INT8 数值资格，稀疏表示及部分
 引擎生命周期也未闭合。本轮只审计并记录，不调整运行策略或放宽数值门槛。
 
+## 2026-10-12 实施进展
+
+此表继续保留 43 项责任清单。新增公共 writer 和 XQA 计划已通过组件检查，
+完整质量、延迟及引擎生命周期仍未验收；未关闭项不会被通用回退抵消。
+具体版本、失败及构建记录见 [统一工作记录](kv_codec_unification.md#shared-native-writer-and-xqa-execution-plans-2026-10-12)。
+
 ## 审计方法与口径
 
 交叉检查引擎入口 → 选择器 → Python 包装 → 原生实例 → 兜底，以及原生
@@ -46,19 +52,19 @@ capture/metadata observer 不重复算作算法。`decode_dense_cache`、
 | 编号 | 实际算法或优化 | FP16 / FP8 现状与主要边界 | INT8 状态及责任位置 |
 | --- | --- | --- | --- |
 | D01 | 基础 XQA，公共 partition 与 reduction | D256、GQA4/6/8，partition 256/512/1024；E4M3 另有 GQA6 和批次资格 | 已绑定。`decode_paged_xqa_kv_fwd` 经同一 codec visitor 实例化；已有组件 GPU 证据，完整引擎/延迟资格未完成 |
-| D02 | padded shared memory、通用 dual-CTA、split reduction、block4/16/784 索引；page784 auto/sawtooth | 原生通用分支按几何和策略组合，不全部属于 E5M2 专用分支 | 源码模板已携带 INT8 scale view；不能笼统说所有 dual-CTA 都未接入。INT8 各组合仍缺执行/成本证据；Python 对齐页规划也未完全统一 |
-| D03 | E4M3 B1 p64/p128，p64→p256，p512/p896/p1664 wave；merged-wave launch/reducer | `KV_DTYPE == FP8_E4M3` 分支；D256/GQA6，页对齐与阈值检查 | 缺接入。公共 INT8 只接受 p256/512/1024。分区及归约应抽成公共计划；E4M3 LUT/位转换留在 codec |
-| D04 | E4M3 batch/context dual-CTA、split reduction、page800/page1568 固定布局 | E4M3 batch policy、uint8 和 stride 条件控制 | 缺接入。不能只把 Python 路由 codec 集合扩大；原生分支、页地址和 FP32 partial 都要同时符合契约 |
-| D05 | E5M2 B1 p256/p1024 动态分区、one/two CTA、partition page-ID 复用、paired load | 原生 E5M2、Hkv1、16 对齐页、未显式覆盖 partition 的分支 | 缺接入。`paired_byte_load` trait 仍只含两种 FP8；INT8 不能直接继承旧 uint8 读取假设 |
-| D06 | E5M2 批次/context 计划和 batch-wide load | B≥4、GQA6、Hkv1、page16 或对齐大页，带 context hint | 缺接入。引擎 `batch_context_routing_cache_dtype_supported`、图计划和 native 三层都有 FP8 gate |
-| D07 | E5M2 MTP5/page1616 dual-CTA | 五行、GQA6、page1616 的旧优化 | 缺接入。应按行数、页布局、资源与数值资格组合，不复制一条 INT8 MTP 路径 |
+| D02 | padded shared memory、通用 dual-CTA、split reduction、block4/16/784 索引；page784 auto/sawtooth | 原生通用分支按几何和策略组合，不全部属于 E5M2 专用分支 | 公共计划及 INT8 scale view 已接入；44 个 XQA GPU 用例覆盖非连续页、页几何和变输入 replay，仍缺主要变体独立延迟及完整引擎证据。 |
+| D03 | E4M3 B1 p64/p128，p64→p256，p512/p896/p1664 wave；merged-wave launch/reducer | `KV_DTYPE == FP8_E4M3` 分支；D256/GQA6，页对齐与阈值检查 | 已接入公共量化 codec 模板：p64/p128、动态 wave 与 merged-wave。四种 byte codec 的阈值相邻点及 replay 通过；未完成同条件性能验收。 |
+| D04 | E4M3 batch/context dual-CTA、split reduction、page800/page1568 固定布局 | E4M3 batch policy、uint8 和 stride 条件控制 | 已改为 byte codec、布局及 FP32 partial 条件，page800 固定布局与 B4 GPU/replay 通过；其他容量和性能范围仍须分别验证。 |
+| D05 | E5M2 B1 p256/p1024 动态分区、one/two CTA、partition page-ID 复用、paired load | 原生 E5M2、Hkv1、16 对齐页、未显式覆盖 partition 的分支 | 动态分区、one/two CTA、页索引及 paired-byte reader 采用公共 codec/实际对齐；非连续页与分区图测试通过。未对齐旧布局使用公共合法读者，不伪装对齐。成本资格未闭合。 |
+| D06 | E5M2 批次/context 计划和 batch-wide load | B≥4、GQA6、Hkv1、page16 或对齐大页，带 context hint | Python/native/graph 计划已接入普通 byte codec；B4/page16 和 page800 组件 GPU/replay 通过，完整引擎及批次成本待验收。 |
+| D07 | E5M2 MTP5/page1616 dual-CTA | 五行、GQA6、page1616 的旧优化 | 原生 MTP5/page1616 已按五行、GQA6、对齐及资源条件公共化；Hkv1 五行及 Hkv2 的五 codec GPU/replay 通过，性能范围继续单列。 |
 | D08 | staged QK/softmax + PV、G6 QK software pipeline | 原来只读 FP16；staged PV 还要求 p256、padded shared memory、dual-CTA | 原有边界。不能算 FP8 已有而 INT8 漏掉；后续可评估公共化 |
-| D09 | scalar paged + partition merge | 一般 head dimension/window 的兜底；E4M3 另有 opt-in scalar fast 变体 | 公共 scalar 已绑定且检查实际 codec 能力；E4M3 专用 fast 变体尚非公共绑定，优先级低于 XQA 闭合 |
+| D09 | scalar paged + partition merge | 一般 head dimension/window 的兜底；E4M3 另有 opt-in scalar fast 变体 | 公共 scalar 兜底保留能力检查；新二进制修复内部 E5M2 scalar 优先分支。scalar fast 实例已公共化，但不用于关闭未通过的 XQA 或性能项。 |
 | D10 | compact scalar tail | q1、D256/GQA6、long-context 图 descriptor，当前原生 page≥1024；p1024、FP32 state | 已有 INT8 绑定，完整 GPU/图资格未完成。它在 scalar 调用内尝试，不能绕过已合格 XQA 的优先选择 |
 
 `decode.py` 当前顺序为先检查可用且语义兼容的 XQA，再检查 scalar 的实际绑定。
-默认短上下文 XQA 门槛已降至 1。原生 E5M2 XQA 包装内仍保留显式阈值覆盖后的
-scalar 节点；默认阈值为 1 时不会启动该短上下文 scalar 分支。D≠256、当前
+新原生执行计划 revision 2 删除了 E5M2 包装内的短上下文 scalar 优先节点；
+旧二进制保留旧能力和策略检查，不继承新覆盖声明。D≠256、当前
 XQA 不支持的 GQA/window 等仍须保留合法兜底。E4M3 DFlash target 的旧数值
 资格拒绝位于 `spec/attention.py:reject_xqa`，需要独立记录，不能因降低 scalar
 优先级而直接删除。
@@ -103,7 +109,7 @@ bridge 出现约 0.047/0.064 最大误差；配对诊断定位到 scale 提前�
 | 编号 | 路径 | 当前判断 |
 | --- | --- | --- |
 | W01 | Triton 普通动态量化写入、统一 attention 读者 | 已接公共 codec/view，新 INT8 RNE planar 与旧 INT8 truncate inline 身份不同；writer/scalar/XQA 组件已有 GPU 证据。不能让二者按相同字节宽度互读 |
-| W02 | `_C_cache_ops.reshape_and_cache_flash` 原生 CUDA 写入 | **仍有缺口**。SM70 FP8 普通写缓存走它；INT8 在 per-token/head 分支提前进入 Triton。旧 CUDA writer 的格式 dispatch 只有 auto/E4M3/E5M2，没有 row-scale 输出 ABI；不能把“INT8 能写缓存”写成“FP8 原生写入链已完整复用” |
+| W02 | `_C_cache_ops.reshape_and_cache_flash` 原生 CUDA 写入 | 已接现有 CUDA writer，可选 FP32 scale-plane ABI 保留旧八参数调用。21 个 GPU 字节/异常/槽位/replay 用例通过；旧 inline misalignment 和历史 truncation 边界均已修复并记录。性能仍待验收。 |
 | W03 | 目标 Norm/partial RoPE/KV、draft Norm/NeoX RoPE/KV 融合 | 两种融合均接公共 encoder/view，五种 codec 共 10 个 GPU 字节兼容及变输入 replay 用例通过；目标 D256/GQA6、draft D128/GQA4 的几何/模型侧资格仍存在，未证明所有模型自动调用 |
 | W04 | paged KV→FP16 bridge、contiguous/gather、尾部填零 | 公共转换已有 15 个组件 GPU 用例；转换字节/读写正确性与 P05 的下游 attention 数值资格分开。旧无 codec 的 `paged_kv_utils` 不得直接读取 planar INT8 |
 | W05 | MLA QNorm/RoPE/插入与 indexer quant/cache | 消费独立 packed FP8、G64/exponent scale、未量化 RoPE 或 index scale，未接 INT8 表示契约；不由普通 W03 自动覆盖 |
@@ -135,12 +141,12 @@ W02 是缺原生绑定的事实，不是已经测得 Triton 比 CUDA 慢；接�
 
 | 编号 | 边界 | 审计结论与责任位置 |
 | --- | --- | --- |
-| L01 | CUDA Graph context buckets / batch-context / wave routing | [SM70 graph policy][graph] 的 `fp8_decode_shape` 及 [routing][routing] 仍按 E4M3/E5M2 选择，INT8 未获得相同计划；V2 long-batch 已改不代表这些 V1 计划已改。静态工作区/地址稳定仍须变输入 replay |
-| L02 | V1/V2 DFlash 隐式 draft KV 默认 | [V1 proposer][dflash-v1] 已将 INT8 target 的隐式 draft 保持为 FP16；[V2 loader][dflash-v2] 仍仅 `startswith("fp8")`。未显式配置 draft dtype 时可产生不同计算策略；用户当前明确 `draft=auto` 的请求不受该隐式差异影响，但框架未对齐 |
+| L01 | CUDA Graph context buckets / batch-context / wave routing | 普通 byte codec 复用图分桶、wave、batch/context 计划及有效策略哈希；组件 replay 通过。模型图状态/容量/生命周期及延迟仍未验收。 |
+| L02 | V1/V2 DFlash 隐式 draft KV 默认 | V1/V2 共用隐式 draft KV 解析函数；显式配置优先。四种 target codec 的默认/显式/非 SM70 CPU 检查通过；引擎边界仍待验证。 |
 | L03 | cold/warm/AOT 与融合资格 | [runtime defaults][defaults] 的旧 NVFP4/TP4/E4M3 条件把 AOT reload 设为关闭，INT8 不继承；[模型侧 Norm/RoPE 接入][qwen-next] 仍有 TP/权重/模型资格。需要分离算子结构准入和已有质量资格，不能机械删除保护 |
 | L04 | prefix 恢复、槽位复用、重排、sleep/offload、MTP commit/rollback、多引擎 | INT8 payload/scale 同物理分配，V1/V2 allocator 已有 view；CPU/offload 有整页 byte-copy 路线，但实际引擎恢复/隔离未验收。`cache_dtype`/编码身份、padding、块拆分都需覆盖 |
 | L05 | KV transfer：相同页复制、异构 TP/块大小、permute | [NIXL worker][nixl] 按连续半页或 head chunk 建描述；planar 页的 payload/scale 区不能靠除以 TP 或 block ratio 推导。当前没有 plane-aware 描述；handshake 有 dtype 字符串及通用 cache layout，但未使用 KVCodec 编码版本/布局身份。普通整页搬运与异构变换分别验收，不能因同分配就宣称 connector 全支持 |
-| L06 | 后端能力、缺二进制与通用兜底 | 普通 decode 的 candidate/fallback 已检查 native codec；但 [impl][impl] 对 row-scale 整个后端还同时要求 converter 与 paged-prefill 能力，即使某次只需原生 decode。能力应按实际算法组合；现有显式拒绝可保安全，却仍有不必要的整体耦合 |
+| L06 | 后端能力、缺二进制与通用兜底 | 已解除整个后端必须同时具备 converter/prefill 的耦合；各算法依实际二进制 codec 能力准入。decode-only 能力缺口用例通过；实际回退/原生/性能范围仍分别验收。 |
 
 `prefill_prefix_kv_bridge` 已在路由表中声明，但 P05 的数值 gate 使 INT8 当前
 不能选中它，这是“声明不等于接入”的具体例子。类似地，BFLA 的已声明 native
@@ -208,10 +214,6 @@ global-format-gates.txt,native-gates-audit.txt,qsa-audit.txt}`。
 [indexer]: ../../../vllm/models/deepseek_v4/sm70/indexer.py
 [kpool]: ../../../vllm/model_executor/layers/sparse_attn_indexer_kpool.py
 [triton-mla]: ../../../vllm/v1/attention/backends/mla/triton_mla.py
-[graph]: ../../../vllm/platforms/sm70/graph_policy.py
-[dflash-v1]: ../../../vllm/v1/spec_decode/dflash.py
-[dflash-v2]: ../../../vllm/v1/worker/gpu/spec_decode/dflash/utils.py
 [defaults]: ../../../vllm/model_executor/models/runtime_defaults.py
 [qwen-next]: ../../../vllm/model_executor/models/qwen3_next.py
 [nixl]: ../../../vllm/distributed/kv_transfer/kv_connector/v1/nixl/worker.py
-[impl]: ../../../vllm/v1/attention/backends/flash_v100/impl.py

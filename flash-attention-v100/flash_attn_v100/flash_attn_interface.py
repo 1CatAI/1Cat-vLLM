@@ -22,6 +22,7 @@ DEFAULT_DECODE_PARTITION_SIZE = 256
 VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 E4M3_XQA_VALID_DECODE_PARTITION_SIZES = (64, 128, 256, 512, 896, 1024, 1664)
 E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES = (64, 128, 256)
+BYTE_XQA_VALID_DECODE_PARTITION_SIZES = E4M3_XQA_VALID_DECODE_PARTITION_SIZES
 _decode_plan_cache = {}
 _decode_workspace_cache = {}
 _xqa_staged_rescale_workspace_cache = {}
@@ -38,6 +39,30 @@ class _DecodePlan:
     actual_num_partitions: int
     launch_num_partitions: int
     workspace_num_partitions: int
+
+
+def _xqa_partition_sizes(q, key, value, *, batch_wave: bool):
+    """Compatible payloads receive the same geometric algorithm candidates.
+
+    Conversion instructions and partial precision belong to the bound codec.
+    This helper describes the revision-2 binary's partition implementations.
+    """
+    if not (
+        q.ndim == 3
+        and key.ndim == 4
+        and value.shape == key.shape
+        and key.shape[2] > 0
+        and q.shape[1:] == (6 * key.shape[2], 256)
+        and key.element_size() == value.element_size() == 1
+    ):
+        return VALID_DECODE_PARTITION_SIZES
+    if q.shape[0] == 1:
+        if key.shape[1] >= 256 and key.shape[1] % 16 == 0:
+            return BYTE_XQA_VALID_DECODE_PARTITION_SIZES
+        return (64, 128, *VALID_DECODE_PARTITION_SIZES)
+    if batch_wave:
+        return (64, 128, *VALID_DECODE_PARTITION_SIZES)
+    return VALID_DECODE_PARTITION_SIZES
 
 
 @dataclass
@@ -1531,33 +1556,46 @@ def flash_attn_decode_paged_xqa(
         active_num_partitions=active_num_partitions,
         partition_size_hint=partition_size_hint,
         valid_partition_sizes=(
-            E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
-            if kv_cache_dtype in ("fp8", "fp8_e4m3")
-            and q.ndim == 3
-            and k_cache.shape[2] > 0
-            and q.shape[1:] == (6 * k_cache.shape[2], 256)
-            and (
-                _runtime.policy.batch_xqa
-                if _runtime is not None
-                else _legacy.batch_xqa()
+            _xqa_partition_sizes(
+                q,
+                k_cache,
+                v_cache,
+                batch_wave=(
+                    _runtime.policy.batch_xqa
+                    if _runtime is not None
+                    else _legacy.batch_xqa()
+                ),
             )
-            and q.shape[0] > 1
-            and k_cache.dtype == torch.uint8
-            and v_cache.dtype == torch.uint8
+            if int(getattr(native, "xqa_execution_plan_revision", 0)) >= 2
             else (
-                E4M3_XQA_VALID_DECODE_PARTITION_SIZES
+                E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
                 if kv_cache_dtype in ("fp8", "fp8_e4m3")
                 and q.ndim == 3
                 and k_cache.shape[2] > 0
-                and q.shape == (1, 6 * k_cache.shape[2], 256)
-                and k_cache.shape[1] >= 256
-                and k_cache.shape[1] % 16 == 0
+                and q.shape[1:] == (6 * k_cache.shape[2], 256)
+                and (
+                    _runtime.policy.batch_xqa
+                    if _runtime is not None
+                    else _legacy.batch_xqa()
+                )
+                and q.shape[0] > 1
                 and k_cache.dtype == torch.uint8
                 and v_cache.dtype == torch.uint8
                 else (
-                    E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
+                    E4M3_XQA_VALID_DECODE_PARTITION_SIZES
                     if kv_cache_dtype in ("fp8", "fp8_e4m3")
-                    else VALID_DECODE_PARTITION_SIZES
+                    and q.ndim == 3
+                    and k_cache.shape[2] > 0
+                    and q.shape == (1, 6 * k_cache.shape[2], 256)
+                    and k_cache.shape[1] >= 256
+                    and k_cache.shape[1] % 16 == 0
+                    and k_cache.dtype == torch.uint8
+                    and v_cache.dtype == torch.uint8
+                    else (
+                        E4M3_XQA_BATCH_VALID_DECODE_PARTITION_SIZES
+                        if kv_cache_dtype in ("fp8", "fp8_e4m3")
+                        else VALID_DECODE_PARTITION_SIZES
+                    )
                 )
             )
         ),
@@ -1672,6 +1710,9 @@ def flash_attn_decode_paged_xqa(
 # Resolve the ABI once; old extensions keep their legacy captured strategy.
 flash_attn_decode_paged_xqa.shared_decode_strategy_revision = int(  # type: ignore[attr-defined]
     getattr(flash_attn_v100_cuda, "xqa_shared_decode_strategy_revision", 0)
+)
+flash_attn_decode_paged_xqa.execution_plan_revision = int(  # type: ignore[attr-defined]
+    getattr(flash_attn_v100_cuda, "xqa_execution_plan_revision", 0)
 )
 
 

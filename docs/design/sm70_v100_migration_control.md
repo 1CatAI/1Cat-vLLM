@@ -49602,3 +49602,29 @@ syntax exit 0. No CUDA driver repair or GPU execution was attempted.
 - See [the Phase D closure](architecture/sm70_phase_d.md), its machine-readable
   counts, exact retained boundaries and operator artifacts. DDTree and full E
   documentation/workflow work remain outside this delivery.
+
+### 2026-10-12 — shared KV writer and native XQA plans
+
+Owned follow-up on Draft #1182 (`9a787d03e6`): the existing CUDA writer now
+binds codec scale planes, and XQA wave/batch/pair-load planning is shared by
+ordinary byte codecs. V1/V2 implicit DFlash draft defaults use one resolver.
+Writer 21 GPU cases, XQA 44 GPU cases and 90 affected backend-component cases
+pass. Route/hash CPU cases: 545 pass; graph/lifecycle cases: 28 pass, 2 GPU
+skips. The whole task is experimental and incomplete; grouped q16, resident
+prefix scale ordering, QSA/history/MLA/indexer and transfer remain open.
+
+Reject writer revision 3 (legacy inline vector misalignment) and revision 4
+(RN division changes historical truncation bytes). Keep revision 5, which
+preserves legacy div.full and separately retains new INT8 RNE. Do not repeat
+those abandoned encoders or loosen the byte compatibility requirement.
+The initial FP8 baseline prefix-reset attempt returned HTTP 404 before model
+execution; restart the owned control with explicit development API and
+read-only diagnostics. No model-speed or quality gate is passed by this slice.
+Detailed cases, artifacts and support boundaries: architecture/kv_codec_unification.md.
+
+The live scale audit found all Q/K/V values at 1.0 on every TP rank,
+with no pending calculation: the existing hybrid-model guard disables
+`calculate_kv_scales` at configuration initialization. This control is
+**not an independently calibrated precision baseline**. Preserve the guard;
+unit scales or a short request cannot prove INT8 precision improvement.
+A separately qualified calibration/checkpoint control remains required.

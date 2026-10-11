@@ -2705,8 +2705,10 @@ def reshape_and_cache_flash(
     kv_cache_dtype: str,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> None:
-    torch.ops._C_cache_ops.reshape_and_cache_flash(
+    args: tuple[object, ...] = (
         key,
         value,
         key_cache,
@@ -2716,6 +2718,9 @@ def reshape_and_cache_flash(
         k_scale,
         v_scale,
     )
+    if k_scale_cache is not None or v_scale_cache is not None:
+        args += (k_scale_cache, v_scale_cache)
+    torch.ops._C_cache_ops.reshape_and_cache_flash(*args)
 
 
 def concat_and_cache_mla(

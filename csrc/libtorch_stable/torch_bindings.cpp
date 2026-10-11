@@ -677,7 +677,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                        Tensor! value_cache,"
       "                        Tensor slot_mapping,"
       "                        str kv_cache_dtype,"
-      "                        Tensor k_scale, Tensor v_scale) -> ()");
+      "                        Tensor k_scale, Tensor v_scale,"
+      "                        Tensor(a!)? k_scale_cache=None,"
+      "                        Tensor(b!)? v_scale_cache=None) -> ()");
+  ops.def("reshape_and_cache_flash_kv_abi() -> int");
 
   // Concat kv_c and k_pe and cache them.
   ops.def(
@@ -758,6 +761,11 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
   ops.impl("concat_mla_q", TORCH_BOX(&concat_mla_q));
   ops.impl("cp_gather_indexer_k_quant_cache",
            TORCH_BOX(&cp_gather_indexer_k_quant_cache));
+}
+
+STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CompositeExplicitAutograd, ops) {
+  ops.impl("reshape_and_cache_flash_kv_abi",
+           TORCH_BOX(&reshape_and_cache_flash_kv_abi));
 }
 
 REGISTER_EXTENSION(_C_stable_libtorch)
