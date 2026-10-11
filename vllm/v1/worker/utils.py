@@ -44,8 +44,8 @@ def allocate_host_kv_cache_pool(
 ) -> dict[str, torch.Tensor]:
     """Pack host cache banks into one pinned allocation per worker.
 
-    The pinned allocator rounds each allocation to a power of two. Allocating
-    every layer independently can almost double a long-context history pool.
+    The caching pinned allocator rounds each allocation to a power of two, so
+    the pool is one exact cudaHostAlloc instead of per-layer pinned tensors.
     Aligned views retain the mapped pool owner and keep stable graph pointers.
     """
     from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -62,8 +62,14 @@ def allocate_host_kv_cache_pool(
         len(banks),
     )
     with torch.accelerator.device_index(device.index):
-        host = torch.zeros(pool_size, dtype=torch.int8, device="cpu", pin_memory=True)
+        # A pageable source makes the view helper cudaHostAlloc exactly
+        # pool_size bytes. The caching pinned allocator would round this one
+        # allocation up to a power of two (2.3 GB -> 4 GiB per worker). The
+        # untouched source pages are never resident; zero the pool on device.
+        host = torch.empty(pool_size, dtype=torch.int8, device="cpu")
         pool = get_accelerator_view_from_cpu_tensor(host)
+        del host
+        pool.zero_()
     tensors: dict[str, torch.Tensor] = {}
     offset = 0
     for bank, aligned_size in zip(banks, aligned_sizes):
