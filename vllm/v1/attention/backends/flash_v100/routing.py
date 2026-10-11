@@ -478,6 +478,7 @@ class RouteContext:
     workspace_seq_capacity_hint: int | None = None
     partition_size_hint: int | None = None
     window_size: tuple[int, int] = (-1, -1)
+    execution_plan_revision: int = 0
 
 
 def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
@@ -492,7 +493,8 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
         return "sequence_rows"
     if smallq and shape.gqa not in (6, 8):
         return "gqa"
-    if not smallq and shape.gqa == 4:
+    shared_plan = context.execution_plan_revision >= 2
+    if not shared_plan and not smallq and shape.gqa == 4:
         if context.stage == "decode":
             assert context.metadata is not None
             if not _decode_xqa_allowed_for_q_per_kv(shape.gqa, context.metadata):
@@ -502,7 +504,7 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
             and int(context.max_seq_len_hint or 0) < _decode_xqa_q4_min_seq_len()
         ):
             return "short_gqa4"
-    if context.codec is FP8_E4M3:
+    if not shared_plan and context.codec is FP8_E4M3:
         if shape.gqa != 6:
             return "e4m3_gqa"
         # The legacy small-Q guard accepts zero rows, whereas uniform and
@@ -522,9 +524,9 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
         minimum = _config.options().value("smallq_decode_xqa_min_seq_len")
         if context.codec is FP8_E5M2:
             minimum = max(minimum, _decode_fp8_xqa_min_seq_len())
-        if minimum > 1 and hint < minimum:
+        if not shared_plan and minimum > 1 and hint < minimum:
             return "short_verify"
-    elif context.codec is FP8_E5M2:
+    elif not shared_plan and context.codec is FP8_E5M2:
         if context.stage == "decode":
             assert context.metadata is not None and context.query is not None
             if not _decode_fp8_xqa_allowed(context.metadata, context.query):
@@ -603,10 +605,14 @@ def batch_context_routing_for_graph_variant(
 def batch_context_routing_cache_dtype_supported(
     cache_dtype: str | None, *, policy=None
 ) -> bool:
-    """Admit the exact FP8 XQA formats implemented by Flash-V100."""
+    """Codec storage eligibility; native bindings are checked by the executor."""
     codec = resolve_kv_codec(cache_dtype)
     policy = policy if policy is not None else graph_policy()
-    return codec is FP8_E5M2 or (codec is FP8_E4M3 and bool(policy.e4m3_batch_xqa))
+    return (
+        codec in _ROW_CODECS
+        or codec is FP8_E5M2
+        or (codec is FP8_E4M3 and bool(policy.e4m3_batch_xqa))
+    )
 
 
 _logged_fp8_kv_prefill = False
@@ -705,7 +711,9 @@ def g6_aligned_page_partition_size_hint(
         # shape while selecting p64/p256 and long wave partitions from device
         # sequence lengths.
         return 64
-    if codec is FP8_E5M2:
+    if codec in _ROW_CODECS and strategy == "legacy":
+        return 64
+    if codec is FP8_E5M2 or codec in _ROW_CODECS:
         # Plan the largest p256 workspace once. The extension selects p256 or
         # p1024 from device seq_lens, so CUDA graph replay keeps one
         # captured shape while short and long contexts use different kernels.

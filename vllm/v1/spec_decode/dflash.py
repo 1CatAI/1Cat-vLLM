@@ -16,8 +16,8 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
+from vllm.platforms.sm70.speculative_policy import resolve_dflash_draft_cache_dtype
 from vllm.triton_utils import triton
-from vllm.utils.torch_utils import kv_cache_uses_per_token_head_scales
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -59,15 +59,13 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
-        if (
-            self.speculative_config.kv_cache_dtype is None
-            and (
-                str(base.cache_config.cache_dtype).startswith("fp8")
-                or kv_cache_uses_per_token_head_scales(base.cache_config.cache_dtype)
-            )
-            and current_platform.is_cuda()
-            and current_platform.is_device_capability(70)
-        ):
+        draft_dtype = resolve_dflash_draft_cache_dtype(
+            base.cache_config.cache_dtype,
+            self.speculative_config.kv_cache_dtype,
+            sm70=current_platform.is_cuda()
+            and current_platform.is_device_capability(70),
+        )
+        if draft_dtype is not None and draft_dtype != base.cache_config.cache_dtype:
             logger.info_once(
                 "Using FP16 draft KV cache for SM70 DFlash DDTree while the "
                 "target uses %s.",
@@ -75,7 +73,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             )
             base = replace(
                 base,
-                cache_config=replace(base.cache_config, cache_dtype="auto"),
+                cache_config=replace(base.cache_config, cache_dtype=draft_dtype),
             )
         return replace(
             base,

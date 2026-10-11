@@ -642,6 +642,14 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        writer_abi = getattr(
+            torch.ops._C_cache_ops, "reshape_and_cache_flash_kv_abi", None
+        )
+        self._native_row_writer = (
+            kv_cache_dtype in ("int8", "int8_per_token_head")
+            and writer_abi is not None
+            and writer_abi() == 1
+        )
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel Xe2/Xe3).  The dead branch
@@ -868,10 +876,27 @@ class TritonAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
         # Reshape the input keys and values and store them in the cache.
+        native_cache_update = _sm70_fp8_kv_needs_cpp_cache_update(
+            self.kv_cache_dtype, key
+        )
         if self._is_per_token_head_quant:
             self._ensure_scale_caches(kv_cache)
             assert self._kv_cache_view is not None
             key_cache, value_cache = self._kv_cache_view.key, self._kv_cache_view.value
+            if self._native_row_writer and native_cache_update:
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                    self._k_scale_cache,
+                    self._v_scale_cache,
+                )
+                return
             if key_cache.dtype == torch.uint8:
                 key_cache = key_cache.view(self.fp8_dtype)
                 value_cache = value_cache.view(self.fp8_dtype)
@@ -890,7 +915,7 @@ class TritonAttentionImpl(AttentionImpl):
             return
         # For decoder and cross-attention, use KV cache as before.
         key_cache, value_cache = kv_cache.unbind(1)
-        if _sm70_fp8_kv_needs_cpp_cache_update(self.kv_cache_dtype, key):
+        if native_cache_update:
             if not _logged_sm70_fp8_kv_cpp_cache_update:
                 logger.info(
                     "SM70 FP8 KV cache C++ reshape_and_cache_flash path enabled "

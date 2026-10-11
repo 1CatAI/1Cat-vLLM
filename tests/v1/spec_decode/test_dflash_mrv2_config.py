@@ -15,6 +15,7 @@ from vllm.config.speculative import (
 )
 from vllm.config.vllm import VllmConfig
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
+from vllm.platforms.sm70.speculative_policy import resolve_dflash_draft_cache_dtype
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
@@ -37,6 +38,20 @@ def _config(method: str, num_speculative_tokens: int = 7) -> SpeculativeConfig:
     config.num_speculative_tokens = num_speculative_tokens
     config.parallel_drafting = True
     return config
+
+
+@pytest.mark.parametrize(
+    "target_dtype", ["fp8", "fp8_e5m2", "int8", "int8_per_token_head"]
+)
+def test_dflash_draft_storage_policy_preserves_explicit_choice(target_dtype):
+    assert resolve_dflash_draft_cache_dtype(target_dtype, None, sm70=True) == "auto"
+    assert resolve_dflash_draft_cache_dtype(target_dtype, None, sm70=False) is None
+    for explicit in ("auto", "fp8_e4m3", "int8"):
+        assert (
+            resolve_dflash_draft_cache_dtype(target_dtype, explicit, sm70=True)
+            == explicit
+        )
+    assert resolve_dflash_draft_cache_dtype("auto", None, sm70=True) is None
 
 
 def test_dflash_and_ddtree_routes_are_disjoint() -> None:

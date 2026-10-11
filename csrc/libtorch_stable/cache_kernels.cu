@@ -6,6 +6,9 @@
 
 #include "quantization/vectorization_utils.cuh"
 #include "concat_mla_q.cuh"
+#ifndef USE_ROCM
+  #include "../../flash-attention-v100/kernel/kv_row_codec.cuh"
+#endif
 
 #ifdef USE_ROCM
   #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"
@@ -246,6 +249,18 @@ struct CopyWithScaleOp {
   }
 };
 
+#ifndef USE_ROCM
+template <typename InT, bool ROUND_EVEN>
+struct CopyRowScaleOp {
+  float scale;
+
+  __device__ __forceinline__ void operator()(int8_t& dst, const InT src) const {
+    dst = flash_v100::KVInt8RowEncoder<ROUND_EVEN>::encode(
+        static_cast<float>(src), scale);
+  }
+};
+#endif
+
 __device__ __forceinline__ uint8_t
 fp16_bits_to_e5m2_satfinite_rn(const uint16_t bits) {
   const uint16_t sign = (bits >> 8) & 0x80u;
@@ -333,7 +348,8 @@ __global__ void reshape_and_cache_kernel(
   }
 }
 
-template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
+          bool ROW_SCALED = false, bool ROUND_EVEN = false>
 __global__ void reshape_and_cache_flash_kernel(
     const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
     const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]
@@ -344,13 +360,23 @@ __global__ void reshape_and_cache_flash_kernel(
     const int64_t head_stride, const int64_t key_stride,
     const int64_t value_stride, const int num_heads, const int head_size,
     const int block_size, const float* k_scale, const float* v_scale,
-    const int kv_scale_stride) {
+    const int kv_scale_stride
+#ifndef USE_ROCM
+    ,
+    flash_v100::KVWritableScalePlane key_rows = {},
+    flash_v100::KVWritableScalePlane value_rows = {},
+    int64_t slot_capacity = INT64_MAX
+#endif
+) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
   // NOTE: slot_idx can be -1 if the token is padded
   if (slot_idx < 0) {
     return;
   }
+#ifndef USE_ROCM
+  if (slot_idx >= slot_capacity) return;
+#endif
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
   const int n_elems = num_heads * head_size;
@@ -368,96 +394,142 @@ __global__ void reshape_and_cache_flash_kernel(
   // this is true for the NHD layout where `head_stride == head_size`
   const bool is_contiguous_heads = (head_stride == head_size);
 
-  constexpr int VEC_SIZE = (sizeof(scalar_t) == 2) ? 8 : 4;
+  // The legacy inline scale permits four-byte, rather than eight-byte,
+  // payload alignment. The planar codec retains the wider vector store.
+  constexpr int VEC_SIZE =
+      ROW_SCALED && !ROUND_EVEN ? 4 : ((sizeof(scalar_t) == 2) ? 8 : 4);
 
-  if (is_contiguous_heads && kv_scale_stride == 0) {
-    // NHD layout and k/v_scales are [1] (i.e. single scale for all heads)
-    // kv cache: [num_blocks, block_size, num_heads, head_size]
-    float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *k_scale;
-    float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *v_scale;
-
-    if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E5M2 &&
-                  std::is_same_v<scalar_t, uint16_t> &&
-                  std::is_same_v<cache_t, uint8_t>) {
-      if (k_scale_val == 1.f) {
-        vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems,
-                                           threadIdx.x, blockDim.x,
-                                           CopyFp16ToE5M2UnitScaleOp{});
-      } else {
-        CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
-        vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems,
-                                           threadIdx.x, blockDim.x, k_op);
+#ifndef USE_ROCM
+  if constexpr (ROW_SCALED) {
+    using Encoder = flash_v100::KVInt8RowEncoder<ROUND_EVEN>;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    for (int head = warp; head < num_heads; head += blockDim.x >> 5) {
+      const scalar_t* k_src = key_src + head * head_size;
+      const scalar_t* v_src = value_src + head * head_size;
+      float k_max = 0.f, v_max = 0.f;
+      bool k_invalid = false, v_invalid = false;
+      for (int d = lane; d < head_size; d += 32) {
+        const float k = static_cast<float>(k_src[d]);
+        const float v = static_cast<float>(v_src[d]);
+        k_max = fmaxf(k_max, fabsf(k));
+        v_max = fmaxf(v_max, fabsf(v));
+        k_invalid |= ROUND_EVEN ? !isfinite(k) : isnan(k);
+        v_invalid |= ROUND_EVEN ? !isfinite(v) : isnan(v);
       }
-      if (v_scale_val == 1.f) {
-        vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
-                                           threadIdx.x, blockDim.x,
-                                           CopyFp16ToE5M2UnitScaleOp{});
-      } else {
-        CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
-        vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
-                                           threadIdx.x, blockDim.x, v_op);
+      k_invalid = __any_sync(0xffffffff, k_invalid);
+      v_invalid = __any_sync(0xffffffff, v_invalid);
+      for (int delta = 16; delta; delta >>= 1) {
+        k_max = fmaxf(k_max, __shfl_xor_sync(0xffffffff, k_max, delta));
+        v_max = fmaxf(v_max, __shfl_xor_sync(0xffffffff, v_max, delta));
       }
-    } else {
-      CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
-      CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
-
-      vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems, threadIdx.x,
-                                         blockDim.x, k_op);
-      vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
-                                         threadIdx.x, blockDim.x, v_op);
+      const float ks = Encoder::scale(k_max, k_invalid);
+      const float vs = Encoder::scale(v_max, v_invalid);
+      if (lane == 0) {
+        key_rows.store(block_idx, block_offset, head, ks);
+        value_rows.store(block_idx, block_offset, head, vs);
+      }
+      vectorize_with_alignment<VEC_SIZE>(
+          k_src, key_dst + head * head_stride, head_size, lane, 32,
+          CopyRowScaleOp<scalar_t, ROUND_EVEN>{ks});
+      vectorize_with_alignment<VEC_SIZE>(
+          v_src, value_dst + head * head_stride, head_size, lane, 32,
+          CopyRowScaleOp<scalar_t, ROUND_EVEN>{vs});
     }
-  } else {
-    // HND layout OR k/v_scales are [num_heads] (i.e. per-attn-head)
-    // HND layout: heads are strided, but each head_size segment is contiguous
-    // kv cache: [num_blocks, num_heads, block_size, head_size]
-    const int lane = threadIdx.x & 31;     // 0..31 within warp
-    const int warp_id = threadIdx.x >> 5;  // warp index within block
-    const int warps_per_block = blockDim.x >> 5;
-
-    for (int head = warp_id; head < num_heads; head += warps_per_block) {
-      const scalar_t* __restrict__ k_src_h = key_src + head * head_size;
-      const scalar_t* __restrict__ v_src_h = value_src + head * head_size;
-
-      cache_t* __restrict__ k_dst_h =
-          key_dst + static_cast<int64_t>(head) * head_stride;
-      cache_t* __restrict__ v_dst_h =
-          value_dst + static_cast<int64_t>(head) * head_stride;
-
-      float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
-                              ? 0.f
-                              : k_scale[head * kv_scale_stride];
-      float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
-                              ? 0.f
-                              : v_scale[head * kv_scale_stride];
+  } else
+#endif
+  {
+    if (is_contiguous_heads && kv_scale_stride == 0) {
+      // NHD layout and k/v_scales are [1] (i.e. single scale for all heads)
+      // kv cache: [num_blocks, block_size, num_heads, head_size]
+      float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *k_scale;
+      float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto) ? 0.f : *v_scale;
 
       if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E5M2 &&
                     std::is_same_v<scalar_t, uint16_t> &&
                     std::is_same_v<cache_t, uint8_t>) {
         if (k_scale_val == 1.f) {
-          vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,
-                                             32, CopyFp16ToE5M2UnitScaleOp{});
+          vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems,
+                                             threadIdx.x, blockDim.x,
+                                             CopyFp16ToE5M2UnitScaleOp{});
         } else {
           CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
-          vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,
-                                             32, k_op);
+          vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems,
+                                             threadIdx.x, blockDim.x, k_op);
         }
         if (v_scale_val == 1.f) {
-          vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane,
-                                             32, CopyFp16ToE5M2UnitScaleOp{});
+          vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
+                                             threadIdx.x, blockDim.x,
+                                             CopyFp16ToE5M2UnitScaleOp{});
         } else {
           CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
-          vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane,
-                                             32, v_op);
+          vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
+                                             threadIdx.x, blockDim.x, v_op);
         }
       } else {
         CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
         CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
 
-        // Within each head, let one warp perform the vector copy.
-        vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,
-                                           32, k_op);
-        vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane,
-                                           32, v_op);
+        vectorize_with_alignment<VEC_SIZE>(key_src, key_dst, n_elems,
+                                           threadIdx.x, blockDim.x, k_op);
+        vectorize_with_alignment<VEC_SIZE>(value_src, value_dst, n_elems,
+                                           threadIdx.x, blockDim.x, v_op);
+      }
+    } else {
+      // HND layout OR k/v_scales are [num_heads] (i.e. per-attn-head)
+      // HND layout: heads are strided, but each head_size segment is contiguous
+      // kv cache: [num_blocks, num_heads, block_size, head_size]
+      const int lane = threadIdx.x & 31;     // 0..31 within warp
+      const int warp_id = threadIdx.x >> 5;  // warp index within block
+      const int warps_per_block = blockDim.x >> 5;
+
+      for (int head = warp_id; head < num_heads; head += warps_per_block) {
+        const scalar_t* __restrict__ k_src_h = key_src + head * head_size;
+        const scalar_t* __restrict__ v_src_h = value_src + head * head_size;
+
+        cache_t* __restrict__ k_dst_h =
+            key_dst + static_cast<int64_t>(head) * head_stride;
+        cache_t* __restrict__ v_dst_h =
+            value_dst + static_cast<int64_t>(head) * head_stride;
+
+        float k_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
+                                ? 0.f
+                                : k_scale[head * kv_scale_stride];
+        float v_scale_val = (kv_dt == Fp8KVCacheDataType::kAuto)
+                                ? 0.f
+                                : v_scale[head * kv_scale_stride];
+
+        if constexpr (kv_dt == Fp8KVCacheDataType::kFp8E5M2 &&
+                      std::is_same_v<scalar_t, uint16_t> &&
+                      std::is_same_v<cache_t, uint8_t>) {
+          if (k_scale_val == 1.f) {
+            vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size,
+                                               lane, 32,
+                                               CopyFp16ToE5M2UnitScaleOp{});
+          } else {
+            CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+            vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size,
+                                               lane, 32, k_op);
+          }
+          if (v_scale_val == 1.f) {
+            vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size,
+                                               lane, 32,
+                                               CopyFp16ToE5M2UnitScaleOp{});
+          } else {
+            CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+            vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size,
+                                               lane, 32, v_op);
+          }
+        } else {
+          CopyWithScaleOp<cache_t, scalar_t, kv_dt> k_op{k_scale_val};
+          CopyWithScaleOp<cache_t, scalar_t, kv_dt> v_op{v_scale_val};
+
+          // Within each head, let one warp perform the vector copy.
+          vectorize_with_alignment<VEC_SIZE>(k_src_h, k_dst_h, head_size, lane,
+                                             32, k_op);
+          vectorize_with_alignment<VEC_SIZE>(v_src_h, v_dst_h, head_size, lane,
+                                             32, v_op);
+        }
       }
     }
   }
@@ -817,8 +889,10 @@ void reshape_and_cache_flash(
         value_cache,  // [num_blocks, block_size, num_heads, head_size]
     torch::stable::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
     const std::string& kv_cache_dtype,
-    torch::stable::Tensor& k_scale,    // [1] or [num_heads]
-    torch::stable::Tensor& v_scale) {  // [1] or [num_heads]
+    torch::stable::Tensor& k_scale,  // [1] or [num_heads]
+    torch::stable::Tensor& v_scale,
+    const std::optional<torch::stable::Tensor>& k_scale_cache,
+    const std::optional<torch::stable::Tensor>& v_scale_cache) {
   // NOTE(woosuk): In vLLM V1, key.size(0) can be different from
   // slot_mapping.size(0) because of padding for CUDA graphs.
   // In vLLM V0, key.size(0) is always equal to slot_mapping.size(0) because
@@ -836,6 +910,74 @@ void reshape_and_cache_flash(
   const torch::stable::accelerator::DeviceGuard device_guard(
       key.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
+
+#ifndef USE_ROCM
+  if (kv_cache_dtype == "int8" || kv_cache_dtype == "int8_per_token_head") {
+    STD_TORCH_CHECK(k_scale_cache.has_value() && v_scale_cache.has_value(),
+                    "INT8 KV writer requires both FP32 scale planes");
+    STD_TORCH_CHECK(
+        key_cache.scalar_type() == torch::headeronly::ScalarType::Char &&
+            value_cache.scalar_type() == key_cache.scalar_type(),
+        "INT8 KV payload must use signed bytes");
+    STD_TORCH_CHECK(key.dim() == 3 && value.sizes().equals(key.sizes()) &&
+                        value.scalar_type() == key.scalar_type() &&
+                        value.device() == key.device() &&
+                        key_cache.device() == key.device() &&
+                        value_cache.device() == key.device() && num_heads > 0 &&
+                        head_size > 0 && key.stride(1) == head_size &&
+                        key.stride(2) == 1 && value.stride(1) == head_size &&
+                        value.stride(2) == 1,
+                    "KV inputs require contiguous heads and dimensions");
+    STD_TORCH_CHECK(
+        slot_mapping.scalar_type() == torch::headeronly::ScalarType::Long &&
+            slot_mapping.dim() == 1 && slot_mapping.stride(0) == 1 &&
+            slot_mapping.device() == key.device() && num_tokens <= key.size(0),
+        "KV slots require a contiguous int64 vector on the input device");
+    STD_TORCH_CHECK(
+        key_cache.dim() == 4 && value_cache.sizes().equals(key_cache.sizes()) &&
+            key_cache.size(2) == num_heads && key_cache.size(3) == head_size &&
+            key_cache.strides().equals(value_cache.strides()) &&
+            key_cache.stride(3) == 1,
+        "KV writer requires matching payload views");
+    auto bind_rows = [&](const torch::stable::Tensor& scales) {
+      STD_TORCH_CHECK(
+          scales.scalar_type() == torch::headeronly::ScalarType::Float &&
+              scales.dim() == 3 && scales.size(0) == key_cache.size(0) &&
+              scales.size(1) == key_cache.size(1) &&
+              scales.size(2) == num_heads &&
+              scales.device() == key_cache.device(),
+          "KV scales require FP32 [page, token, head]");
+      return flash_v100::KVWritableScalePlane{
+          static_cast<float*>(scales.data_ptr()), scales.stride(0),
+          scales.stride(1), scales.stride(2)};
+    };
+    const auto key_rows = bind_rows(*k_scale_cache);
+    const auto value_rows = bind_rows(*v_scale_cache);
+    if (num_tokens == 0) return;
+    const dim3 grid(num_tokens);
+    const dim3 block(std::min(num_heads, 16) * 32);
+    VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+        key.scalar_type(), "kv_cache_writer", [&] {
+          VLLM_STABLE_DISPATCH_BOOL(kv_cache_dtype == "int8", round_even, [&] {
+            vllm::reshape_and_cache_flash_kernel<
+                scalar_t, int8_t, vllm::Fp8KVCacheDataType::kAuto, true,
+                round_even><<<grid, block, 0, stream>>>(
+                static_cast<const scalar_t*>(key.data_ptr()),
+                static_cast<const scalar_t*>(value.data_ptr()),
+                static_cast<int8_t*>(key_cache.data_ptr()),
+                static_cast<int8_t*>(value_cache.data_ptr()),
+                slot_mapping.const_data_ptr<int64_t>(), key_cache.stride(0),
+                key_cache.stride(1), key_cache.stride(2), key.stride(0),
+                value.stride(0), num_heads, head_size, key_cache.size(1),
+                nullptr, nullptr, 0, key_rows, value_rows,
+                key_cache.size(0) * key_cache.size(1));
+          });
+        });
+    return;
+  }
+#endif
+  STD_TORCH_CHECK(!k_scale_cache.has_value() && !v_scale_cache.has_value(),
+                  "Tensor-scale KV codecs do not use row-scale planes");
 
   if (kv_cache_dtype == "nvfp4") {
 #if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
@@ -889,6 +1031,14 @@ void reshape_and_cache_flash(
 
   DISPATCH_BY_KV_CACHE_DTYPE(key.scalar_type(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
+}
+
+int64_t reshape_and_cache_flash_kv_abi() {
+#ifdef USE_ROCM
+  return 0;
+#else
+  return 1;
+#endif
 }
 
 // KV_T is the data type of key and value tensors.

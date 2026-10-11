@@ -590,6 +590,10 @@ class FlashV100Options(CapturedFlashOptions):
         }
 
     def hash_values(self):
+        from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+        codec = resolve_kv_codec(self.cache_dtype)
+        byte_kv = codec is not None and codec.quantized and codec.native_id is not None
         fields = {}
         for field in self.bindings:
             if field in (
@@ -610,16 +614,11 @@ class FlashV100Options(CapturedFlashOptions):
                 continue
             if field.startswith("prefill_split_kv_") and not self.prefill_split_kv:
                 continue
-            if field.startswith("xqa_e5m2_") and self.cache_dtype != "fp8_e5m2":
+            if field.startswith("xqa_e5m2_") and not byte_kv:
                 continue
             if (
                 field.startswith("xqa_e4m3_") or field.startswith("e4m3_")
-            ) and self.cache_dtype not in (
-                "fp8",
-                "fp8_e4m3",
-                "int8",
-                "int8_per_token_head",
-            ):
+            ) and not byte_kv:
                 continue
             fields[field] = getattr(self, field)
         # Native parser projections can intentionally differ from the Python
@@ -629,22 +628,14 @@ class FlashV100Options(CapturedFlashOptions):
             for (field, _, _, _), value in zip(NATIVE_FIELDS, self.native_effective)
             if "trace" not in field
             and field != "tp2_e4m3_scalar_fast"
-            and ("e5m2" not in field or self.cache_dtype == "fp8_e5m2")
-            and (
-                "e4m3" not in field
-                or self.cache_dtype
-                in ("fp8", "fp8_e4m3", "int8", "int8_per_token_head")
-            )
+            and ("e5m2" not in field or byte_kv)
+            and ("e4m3" not in field or byte_kv)
         )
         fields["package"] = {
             field: value
             for field, value in self.python_policy.items()
             if field != "share_workspace"
-            and (
-                field not in ("scalar_fast", "batch_xqa")
-                or self.cache_dtype
-                in ("fp8", "fp8_e4m3", "int8", "int8_per_token_head")
-            )
+            and (field not in ("scalar_fast", "batch_xqa") or byte_kv)
         }
         fields["errors"] = {
             field: error for field, error in self.errors.items() if field in fields

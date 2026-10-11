@@ -13,6 +13,42 @@ from pathlib import Path
 
 
 class PrefillRouteAuditExtension:
+    def kv_scale_snapshot(self):
+        """Read the live scales without changing calibration or captured graphs."""
+        import torch
+
+        rows = []
+        context = self.vllm_config.compilation_config.static_forward_context
+        for name, layer in sorted(context.items()):
+            codec = getattr(layer, "kv_cache_dtype", None)
+            if codec is None:
+                continue
+            scales = {}
+            for field in ("_q_scale", "_k_scale", "_v_scale"):
+                value = getattr(layer, field, None)
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().float().cpu()
+                    scales[field] = {
+                        "values": value.reshape(-1).tolist(),
+                        "finite_positive": bool(torch.isfinite(value).all())
+                        and bool((value > 0).all()),
+                    }
+            rows.append(
+                {
+                    "layer": name,
+                    "codec": codec,
+                    "calculation_pending": bool(
+                        getattr(layer, "calculate_kv_scales", False)
+                    ),
+                    "scales": scales,
+                }
+            )
+        return {
+            "rank": torch.distributed.get_rank(),
+            "layers": rows,
+            "scope": "live scale values; does not establish calibration quality",
+        }
+
     def dflash2_prefill_route_snapshot(self):
         import torch
 

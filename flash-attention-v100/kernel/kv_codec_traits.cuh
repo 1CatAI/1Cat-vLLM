@@ -71,7 +71,7 @@ struct KVCodecTraits : KVStorageTraits<KV_DTYPE>,
       per_token_head || KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3;
   static constexpr bool paired_byte_load =
       KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3 ||
-      KV_DTYPE == KV_CACHE_DTYPE_FP8_E5M2;
+      KV_DTYPE == KV_CACHE_DTYPE_FP8_E5M2 || per_token_head;
 
   __device__ __forceinline__ static float score_scale(float softmax_scale,
                                                       float tensor_scale,

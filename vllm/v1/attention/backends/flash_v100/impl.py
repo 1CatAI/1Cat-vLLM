@@ -31,7 +31,6 @@ from vllm.v1.attention.backends.triton_attn import (
 )
 from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
-    FP8_E5M2,
     FP16,
     KVCodec,
     resolve_kv_codec,
@@ -341,10 +340,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             "decode_dense_reference"
         )
         self.use_decode_dense_cache = _config.options().value("decode_dense_cache")
-        # Classified quality rule: long q=1 scalar paged decode is a Type-B
-        # reduction-order path, not a Type-A layout bug. Keep it as the
-        # production Flash decode default so an explicit FLASH_ATTN_V100
-        # selection does not silently become Triton during CUDA graph capture.
+        # Keep the qualified paged fallback native during graph capture.
+        # Decode selection gives an admitted XQA binding first priority.
         decode_paged_prefill_env = _config.options().value("decode_use_paged_prefill")
         self.use_decode_paged_prefill = decode_paged_prefill_env
         decode_bhmd_out_env = _config.options().value("decode_use_bhmd_out")
@@ -485,17 +482,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
-        supported_kv_dtype = self.kv_codec in (FP16, FP8_E4M3, FP8_E5M2)
-        if self.kv_codec is not None and self.kv_codec.per_token_head:
-            supported_kv_dtype = (
-                self.use_flash_v100_decode
-                and _routing.native_codec_supported(
-                    getattr(self, "paged_kv_to_fp16", None), self.kv_codec
-                )
-                and _routing.native_codec_supported(
-                    self.flash_attn_prefill_paged, self.kv_codec
-                )
-            )
+        # Native candidates check their own binding; every admitted ordinary
+        # codec also has the existing view-aware Triton fallback. A decode-only
+        # layer must not require an unrelated converter/prefill installation.
+        supported_kv_dtype = (
+            self.kv_codec is not None and self.kv_codec.native_id is not None
+        )
         return (
             self.use_flash_v100
             and self.attn_type == AttentionType.DECODER

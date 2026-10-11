@@ -330,6 +330,7 @@ class VerificationExecutor:
             available=_routing.native_codec_supported(
                 self.ops.xqa, self.config.kv_codec
             ),
+            execution_plan_revision=getattr(self.ops.xqa, "execution_plan_revision", 0),
             query=query,
             metadata=attn_metadata,
             seq_rows=seq_lens.shape[0],

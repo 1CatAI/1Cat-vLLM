@@ -493,3 +493,77 @@ one new function-size regression was fixed without increasing the ratchet.
 Retain these baseline failures separately from new numerical/state regressions.
 No 27B service timing, representative task-quality gate, latency parity or
 35B AWQ/FP8 decode acceptance is claimed at this checkpoint.
+
+## Shared native writer and XQA execution plans (2026-10-12)
+
+This follow-up starts from Draft #1182 at `9a787d03e6`. Ordinary CUDA cache
+publication now accepts the codec view's two FP32 scale planes in the existing
+`reshape_and_cache_flash` entry. Its eight-argument compatibility call remains
+valid. ABI capability is checked once per backend instance; an older binary
+uses the existing, qualified Triton row writer. Decode admission no longer
+requires an unrelated converter or paged-prefill binary.
+
+Native and Python XQA planning use common geometry and aligned byte-storage
+requirements. Wave/merged-wave, device-selected partitions, dual CTAs,
+batch/context routing, partition page-ID reuse and paired byte reads admit
+all compatible ordinary byte codecs. FP8 decoding/LUTs and partial types remain
+codec traits. Plan revision 2 removes the native E5M2 short-context scalar
+launch; a qualified XQA request does not enter scalar even with an explicitly
+large historical scalar threshold. Old binary policy checks remain intact.
+V1/V2 now share the implicit DFlash draft-KV resolver; explicit choices win.
+Graph buckets and policy hashing include the common byte-codec tuning inputs.
+
+GPU qualification uses V100/SM70, CUDA 12.8.93, Torch 2.10.0+cu128,
+driver 580.178.04 and the task's own normal CMake components and Flash-V100
+wheel. It does not load sidecar kernels or preloaded DSOs. Results:
+
+- Writer: **21 passed**, including signed INT8, legacy INT8, both FP8 codecs
+  and FP16; D64/80/128/256, multiple heads, non-contiguous source rows,
+  non-contiguous slots, untouched physical bytes, invalid rows and replay.
+- XQA plans: **44 passed**, including GQA4/6/8, B1/2/4/5, Hkv1/2,
+  page16/32/784/800/1616 (including Hkv1 five-row planning), wave and merged-wave threshold neighbors,
+  non-contiguous pages and changed graph inputs. The short INT8 test records
+  the CUDA XQA partition kernel and rejects a scalar partition launch.
+- Affected conversion/grouped/long/tail/engine-component regression:
+  **90 passed**, including graph replay. This is a backend component run,
+  not a complete model-engine or task-quality acceptance.
+- CPU route/admission/hash subset: **545 passed**. Graph/lifecycle/workspace
+  subset: **28 passed, 2 GPU-dependent skipped**. The four shared draft-default
+  cases pass. These do not substitute for the GPU or model gates.
+
+Writer revision 3 initially failed on legacy inline rows with a misaligned
+vector store. Revision 4 fixed addressing but exposed three byte mismatches:
+Triton's historical `div.full`/reciprocal and CUDA RN division differ at
+truncation boundaries. Revision 5 preserves that legacy operation sequence;
+the new codec retains RN division and nearest-even rounding. Both failures
+remain in the task logs; numerical limits were not loosened.
+
+Retained logs are `gpu-writer-r5.log`, `gpu-xqa-only-r3.log` and
+`gpu-engine-regression-r5.log` and `gpu-shared-boundaries-r5.log` in the
+validation task directory. The latter adds the five Hkv1/page1616 codec
+cases and a positive slot-capacity boundary. Flash-V100 R3
+wheel SHA256 is
+`b71dec051db2e87b8e3aaaace64b61942ff12678ba696f8cf54d560014be06a3`.
+The main components compile from source, including `_C`, `_C_stable_libtorch`,
+`_vllm_fa2_C`, `_moe_C` and the allocator. A final normally installed main wheel
+and release-artifact acceptance are still required.
+
+**The full migration remains incomplete and experimental.** Legacy grouped
+q16/two-pass/staging, the independently scaled resident-prefix dense adapter,
+QSA/history, MLA/indexer and plane-aware transfer remain open responsibilities.
+The above GPU evidence closes component correctness cases, not all latency
+or state-semantics gates. The 27B NVFP4/TP4 FP8 control is independently
+initialized with scale calculation, DFlash2 seven drafts, FP16 draft storage,
+prefix caching and graphs, and capacity 262144 tokens. Its latency corpus is
+frozen before candidate model runs. The initial reset-prefix request received
+HTTP 404 because development API routes were disabled; no model request ran.
+The control is restarted with the explicit normal read-only route/scale
+extension and development API. Calibration quality and cold/hot repeatability
+remain unaccepted; no speed or quality improvement is claimed.
+
+The live scale audit found all Q/K/V values at 1.0 on every TP rank,
+with no pending calculation: the existing hybrid-model guard disables
+`calculate_kv_scales` at configuration initialization. This control is
+**not an independently calibrated precision baseline**. Preserve the guard;
+unit scales or a short request cannot prove INT8 precision improvement.
+A separately qualified calibration/checkpoint control remains required.

@@ -51,7 +51,7 @@ def fp8_decode_shape(
     sm70,
     enabled,
     ratios,
-    cache_dtypes=("fp8_e5m2",),
+    cache_dtypes=("fp8", "fp8_e4m3", "fp8_e5m2", "int8", "int8_per_token_head"),
     backends=("FLASH_ATTN_V100", "FLASHINFER_SM70"),
 ):
     return bool(
@@ -60,6 +60,10 @@ def fp8_decode_shape(
         and enabled
         and contract.cache_dtype in cache_dtypes
         and contract.attention_backend in (None, *backends)
+        and (
+            not contract.cache_dtype.startswith("int8")
+            or contract.attention_backend in (None, "FLASH_ATTN_V100")
+        )
         and contract.gqa_shape(ratios)
     )
 
@@ -106,9 +110,8 @@ def resolve_graph_plan(cfg):
         )
     if fp8 and policy.fp8_context_buckets is None:
         logger.info_once(
-            "Auto-enabling the SM70 E5M2 KV short-context decode CUDA graph "
-            "at %d tokens. This keeps the short D256 GQA graph scalar-only while "
-            "the unbounded graph retains the long-context XQA routes. Set %s "
+            "Auto-enabling the SM70 quantized-KV decode CUDA graph "
+            "at %d tokens using the common XQA plan. Set %s "
             "explicitly to override or to an empty value to disable.",
             fp8[0],
             policy.aliases["fp8_context_buckets"],
@@ -123,7 +126,6 @@ def resolve_graph_plan(cfg):
             sm70=sm70,
             enabled=enabled,
             ratios=(6,),
-            cache_dtypes=("fp8", "fp8_e4m3") if e4m3 else ("fp8_e5m2",),
             backends=("FLASH_ATTN_V100",)
             if e4m3
             else ("FLASH_ATTN_V100", "FLASHINFER_SM70"),
@@ -135,9 +137,7 @@ def resolve_graph_plan(cfg):
         compressed,
         fp8,
         batch,
-        bool(
-            batch and e4m3 and policy.e4m3_p64_p256_auto and policy.e4m3_wave_partitions
-        ),
+        bool(batch and policy.e4m3_p64_p256_auto and policy.e4m3_wave_partitions),
         max(
             1,
             int(
