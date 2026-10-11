@@ -741,3 +741,37 @@ Raw GPU tests, rejected variants and alternating cost samples are retained in
 main-package artifact, all remaining P05 variants, full serving/state, quality
 and latency gates remain required. This Draft stage does not complete P05
 or the full 43-item migration.
+
+## Non-integral shared physical pages (2026-10-12)
+
+The first 27B TP4 INT8-target/FP16-draft serving startup from `21442955a6`
+failed in `unify_kv_cache_spec_page_size`, before cache allocation or inference.
+A 2048-token ordinary INT8 page occupies 1064960 bytes including its FP32
+scale planes. The corresponding 1024-token draft page occupies 1048576 bytes.
+Their 65:64 ratio cannot be represented by the previous integer block-size
+multiplier. This is a physical allocation issue, not an algorithm or model
+admission restriction.
+
+The common planner now uses existing attention/state `page_size_padded` for
+non-integral page ratios and retains each logical token/checkpoint block size.
+Integral ratios retain their previous block-size behavior. Specs without an
+effective padding contract still reject before allocating storage. The codec
+view remains the authority for region offsets and byte strides; there is no
+format string or model-specific exception in the new planner rule.
+
+CPU checks cover 65:64 ordinary/draft/state page ratios, immutable input specs,
+idempotent planning, existing rounded FP8 layouts, and V1/V2 runner-owned
+views. Cache restore checks retain payload, scales and untouched page padding.
+The failed startup is retained in
+`/home/ymzx/kv-79t-scales-20261012-031000/int8-engine-r1/`.
+Successful serving, graph/state interactions and paired end-to-end quality and
+latency remain separate gates; this allocation fix does not close those gates.
+
+The retry passed planning and compilation, then exposed a separate owner
+binding gap: V2 passed the target's `int8` spelling to the FP16 draft carrier
+shape API, adding scale bytes absent from the draft spec. V1 had the same
+shape call. Both runners now derive the compatibility shape/block-dimension
+spelling from each spec's declared quantization mode. This does not choose a
+reader codec or change algorithm policy. Mixed target/draft tests now keep the
+spec fixed while varying the outer `auto`, FP8 and INT8 settings, and check
+both runner views and restore behavior.
