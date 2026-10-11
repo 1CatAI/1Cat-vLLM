@@ -1655,13 +1655,14 @@ def qsa_select_paged_tokens(
         else:
             score_columns = capacity_columns
             all_visible = None
-    logits_bytes = _LOGITS_WORKSPACE_BYTES
-    if contiguous_keys is not None:
-        # Keep final logits bounded alongside the per-head cuBLAS score tile.
-        # The default 64 MiB score tile preserves the existing 128 MiB limit.
-        logits_bytes = min(
-            logits_bytes, 2 * sparse_policy().value("qsa_score_tile_mb") * 1024**2
-        )
+    # Bound the per-chunk logits by the configured score tile on both the
+    # cuBLAS and paged paths. Startup profiling skips attention, so this
+    # transient is not in the KV budget; the default 64 MiB tile preserves the
+    # existing 128 MiB limit.
+    logits_bytes = min(
+        _LOGITS_WORKSPACE_BYTES,
+        2 * sparse_policy().value("qsa_score_tile_mb") * 1024**2,
+    )
     rows_per_chunk = max(1, logits_bytes // max(score_columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
     blocks_buffer = torch.empty(
