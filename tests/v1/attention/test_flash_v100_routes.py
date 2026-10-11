@@ -123,13 +123,39 @@ _XQA = {
 
 @pytest.mark.parametrize("stage", _XQA)
 @pytest.mark.parametrize("codec", (FP16, FP8_E4M3, FP8_E5M2, BF16, None))
-def test_xqa_boundary_matrix_matches_frozen_legacy(stage, codec, legacy):
+def test_xqa_boundary_matrix_preserves_legacy_except_e5_g4_preference(
+    stage, codec, legacy
+):
     for ratio, rows, length in itertools.product(
         (4, 6, 8), (0, 1, 2, 32), (0, 4095, 4096, 16383, 16384, 32767, 32768)
     ):
         ctx = context(stage, codec, ratio, rows, length)
         result = r.select_route(ctx, (_XQA[stage],)) is not None
-        assert result == legacy_allowed(ctx, legacy), ctx
+        if codec is FP8_E5M2 and ratio == 4 and stage != "verify":
+            assert not legacy_allowed(ctx, legacy)
+            # The operator already implements G4; preserve explicit context
+            # tuning overrides without retaining its old scalar preference.
+            assert result == (length >= 32768), ctx
+        else:
+            assert result == legacy_allowed(ctx, legacy), ctx
+
+
+@pytest.mark.parametrize("codec", tuple(r.ROUTE_SPECS["decode_xqa_paged"].codecs))
+@pytest.mark.parametrize("length", [None, 1, 16, 256, 16383, 32768])
+def test_default_prefers_xqa_over_scalar_for_every_bound_codec(
+    monkeypatch, codec, length
+):
+    for name in (
+        "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN",
+        "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN",
+        "VLLM_FLASH_V100_SMALLQ_DECODE_XQA_MIN_SEQ_LEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    ctx = context("decode", codec=codec, ratio=6, length=length)
+    selection = r.select_route(
+        ctx, ("decode_xqa_paged",), fallback="decode_scalar_paged"
+    )
+    assert selection is r.ROUTE_SPECS["decode_xqa_paged"]
 
 
 @pytest.mark.parametrize("stage", _XQA)

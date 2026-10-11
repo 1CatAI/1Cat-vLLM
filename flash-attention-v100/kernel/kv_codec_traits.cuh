@@ -63,6 +63,11 @@ struct KVCodecTraits : KVStorageTraits<KV_DTYPE>,
                        KVReader<KV_DTYPE, E4M3_BITS> {
   static constexpr int vector_elements = 8;
   static constexpr bool per_token_head = KV_DTYPE == KV_CACHE_DTYPE_INT8;
+  static constexpr bool fp32_partials =
+      per_token_head || KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3;
+  static constexpr bool paired_byte_load =
+      KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3 ||
+      KV_DTYPE == KV_CACHE_DTYPE_FP8_E5M2;
 
   __device__ __forceinline__ static float score_scale(float softmax_scale,
                                                       float tensor_scale,
@@ -103,5 +108,23 @@ struct KVCodecTraits : KVStorageTraits<KV_DTYPE>,
                     KVReader<KV_DTYPE, E4M3_BITS>::element_bytes,
                 "KV storage type must match reader addressing");
 };
+
+// Apply row scales to an existing score or probability tile. Softmax,
+// masking and reduction remain owned by the attention algorithm.
+template <int KV_DTYPE>
+__device__ __forceinline__ void scale_attention_tile(
+    float* tile, int rows, int columns, int stride, const KVScalePlane& scale,
+    const int* page_ids, int first_token, int block_size, int head) {
+  if constexpr (KVCodecTraits<KV_DTYPE>::per_token_head) {
+    for (int i = threadIdx.x; i < rows * columns; i += blockDim.x) {
+      const int row = i / columns;
+      const int col = i - row * columns;
+      const int token = first_token + col;
+      tile[row * stride + col] = KVCodecTraits<KV_DTYPE>::value_weight(
+          tile[row * stride + col], scale, page_ids[token / block_size],
+          token % block_size, head);
+    }
+  }
+}
 
 }  // namespace flash_v100

@@ -5,6 +5,7 @@ import logging
 import torch
 
 from . import legacy_policy as _legacy
+from .kv_binding import bind_decode_kv, codec_names
 
 try:
     from . import flash_attn_v100_cuda
@@ -1140,19 +1141,10 @@ def flash_attn_decode_paged(
         softmax_scale = q.shape[-1] ** -0.5
 
     e4m3_fp32 = kv_cache_dtype in ("fp8", "fp8_e4m3")
-    row_scaled = kv_cache_dtype in ("int8", "int8_per_token_head")
     native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    if row_scaled:
-        if (
-            int(getattr(native, "decode_paged_kv_abi", 0)) != 1
-            or not hasattr(native, "decode_paged_kv_fwd")
-            or kv_cache_dtype not in getattr(native, "decode_paged_kv_codecs", ())
-        ):
-            raise RuntimeError("Rebuild Flash-V100 for the explicit KV scale-view ABI")
-        if k_scale_cache is None or v_scale_cache is None:
-            raise ValueError("Token/head KV decoding requires both scale planes")
-    elif k_scale_cache is not None or v_scale_cache is not None:
-        raise ValueError("This KV codec uses tensor scales, not scale planes")
+    binding = bind_decode_kv(
+        native, "decode_paged", kv_cache_dtype, k_scale_cache, v_scale_cache
+    )
     if e4m3_fp32 and not flash_attn_grouped_e4m3_fp32_available():
         raise RuntimeError(
             "Rebuild Flash-V100 for E4M3 FP32 scalar decode (precision revision 4)"
@@ -1214,14 +1206,12 @@ def flash_attn_decode_paged(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
-            partial_dtype=torch.float32 if e4m3_fp32 or row_scaled else torch.float16,
+            partial_dtype=binding.partial_dtype,
             _runtime=_runtime,
         )
     )
 
-    operation = native.decode_paged_kv_fwd if row_scaled else native.decode_paged_fwd
-    scale_args = (k_scale_cache, v_scale_cache) if row_scaled else ()
-    return operation(
+    return binding.operation(
         q,
         k_cache,
         v_cache,
@@ -1242,15 +1232,12 @@ def flash_attn_decode_paged(
         int(window_size_right),
         anchor_lens,
         int(anchored_window),
-        *scale_args,
+        *binding.scale_args,
     )
 
 
-flash_attn_decode_paged.kv_cache_codecs = frozenset(  # type: ignore[attr-defined]
-    getattr(flash_attn_v100_cuda, "decode_paged_kv_codecs", ())
-    if int(getattr(flash_attn_v100_cuda, "decode_paged_kv_abi", 0)) == 1
-    and hasattr(flash_attn_v100_cuda, "decode_paged_kv_fwd")
-    else ("auto", "float16", "fp8", "fp8_e4m3", "fp8_e5m2")
+flash_attn_decode_paged.kv_cache_codecs = codec_names(  # type: ignore[attr-defined]
+    flash_attn_v100_cuda, "decode_paged"
 )
 
 
@@ -1430,12 +1417,19 @@ def flash_attn_decode_paged_xqa(
     partition_size_hint: int | None = None,
     batch_context_routing: bool = False,
     *,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
     _runtime=None,
 ):
     if not flash_attn_decode_paged_xqa_available():
         raise RuntimeError("flash_attn_v100 CUDA extension lacks XQA decode")
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
+
+    native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    binding = bind_decode_kv(
+        native, "decode_paged_xqa", kv_cache_dtype, k_scale_cache, v_scale_cache
+    )
 
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
@@ -1506,11 +1500,7 @@ def flash_attn_decode_paged_xqa(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
-            partial_dtype=(
-                torch.float32
-                if kv_cache_dtype in ("fp8", "fp8_e4m3")
-                else torch.float16
-            ),
+            partial_dtype=binding.partial_dtype,
             _runtime=_runtime,
         )
     )
@@ -1579,9 +1569,7 @@ def flash_attn_decode_paged_xqa(
         if batch_context_max_seq_len <= 0:
             batch_context_max_seq_len = plan.launch_num_partitions * plan.partition_size
 
-    return (
-        _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    ).decode_paged_xqa_fwd(
+    return binding.operation(
         q,
         k_cache,
         v_cache,
@@ -1601,12 +1589,18 @@ def flash_attn_decode_paged_xqa(
         int(window_size_left),
         int(window_size_right),
         int(batch_context_max_seq_len),
+        *binding.scale_args,
     )
 
 
 # Resolve the ABI once; old extensions keep their legacy captured strategy.
 flash_attn_decode_paged_xqa.shared_decode_strategy_revision = int(  # type: ignore[attr-defined]
     getattr(flash_attn_v100_cuda, "xqa_shared_decode_strategy_revision", 0)
+)
+
+
+flash_attn_decode_paged_xqa.kv_cache_codecs = codec_names(  # type: ignore[attr-defined]
+    flash_attn_v100_cuda, "decode_paged_xqa"
 )
 
 

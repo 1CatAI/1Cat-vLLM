@@ -4,10 +4,29 @@
 
 #include <ATen/ATen.h>
 #include <optional>
+#include <type_traits>
 
 #include "kv_codec_traits.cuh"
 
 namespace flash_v100 {
+
+// Compatible algorithms instantiate from one catalog. A codec implements its
+// reader/scale traits once; it does not add another algorithm dispatch tree.
+template <typename Operation>
+decltype(auto) visit_kv_codec(int codec, Operation&& operation) {
+  switch (codec) {
+#define BIND_CODEC(ID) \
+  case ID:             \
+    return operation(std::integral_constant<int, ID>{});
+    BIND_CODEC(KV_CACHE_DTYPE_FP16)
+    BIND_CODEC(KV_CACHE_DTYPE_FP8_E4M3)
+    BIND_CODEC(KV_CACHE_DTYPE_FP8_E5M2)
+    BIND_CODEC(KV_CACHE_DTYPE_INT8)
+#undef BIND_CODEC
+    default:
+      TORCH_CHECK(false, "Unregistered native KV codec: ", codec);
+  }
+}
 
 inline KVScalePlane bind_scale_plane(const at::Tensor& scale,
                                      const at::Tensor& payload) {

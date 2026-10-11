@@ -212,7 +212,7 @@ inline int parse(Field field, const std::array<const char*, size>& raw) {
     }
     case Field::xqa_e5m2_scalar_xqa_seq_len: {
       const char* value = raw[14];
-      return value == nullptr ? 16384 : std::max(1, std::atoi(value));
+      return value == nullptr ? 1 : std::max(1, std::atoi(value));
     }
     case Field::xqa_e5m2_g6_dual_cta_trace_enabled: {
       const char* value = raw[15];

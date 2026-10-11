@@ -134,7 +134,12 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
         (
             "decode_xqa_paged",
             "decode",
-            {"head_dims": (256,), "gqa_ratios": (4, 6, 8), "xqa": True},
+            {
+                "head_dims": (256,),
+                "gqa_ratios": (4, 6, 8),
+                "xqa": True,
+                "codecs": _NATIVE_CODECS | {INT8, INT8_PER_TOKEN_HEAD},
+            },
         ),
         (
             "prefill_prefix_decode_rows_xqa",
@@ -434,7 +439,10 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
             assert context.metadata is not None
             if not _decode_xqa_allowed_for_q_per_kv(shape.gqa, context.metadata):
                 return "short_gqa4"
-        elif int(context.max_seq_len_hint or 0) < _decode_xqa_q4_min_seq_len():
+        elif (
+            _decode_xqa_q4_min_seq_len() > 1
+            and int(context.max_seq_len_hint or 0) < _decode_xqa_q4_min_seq_len()
+        ):
             return "short_gqa4"
     if context.codec is FP8_E4M3:
         if shape.gqa != 6:
@@ -456,16 +464,17 @@ def _xqa_reason(spec: RouteSpec, context: RouteContext) -> str | None:
         minimum = _config.options().value("smallq_decode_xqa_min_seq_len")
         if context.codec is FP8_E5M2:
             minimum = max(minimum, _decode_fp8_xqa_min_seq_len())
-        if hint < max(1, minimum):
+        if minimum > 1 and hint < minimum:
             return "short_verify"
     elif context.codec is FP8_E5M2:
-        if shape.gqa == 4:
-            return "e5m2_gqa4"
         if context.stage == "decode":
             assert context.metadata is not None and context.query is not None
             if not _decode_fp8_xqa_allowed(context.metadata, context.query):
                 return "short_e5m2"
-        elif int(context.max_seq_len_hint or 0) < _decode_fp8_xqa_min_seq_len():
+        elif (
+            _decode_fp8_xqa_min_seq_len() > 1
+            and int(context.max_seq_len_hint or 0) < _decode_fp8_xqa_min_seq_len()
+        ):
             return "short_e5m2"
     if context.stage == "decode" and context.window_size != (-1, -1):
         return "window"
@@ -703,6 +712,8 @@ def _decode_fp8_xqa_allowed(
     attn_metadata: TritonAttentionMetadata,
     query: torch.Tensor,
 ) -> bool:
+    if _decode_fp8_xqa_min_seq_len() <= 1:
+        return True
     graph_capture = bool(
         getattr(attn_metadata, "flash_v100_cudagraph_capture", False)
     ) or is_cuda_graph_capturing(query)
@@ -733,6 +744,8 @@ def _decode_xqa_allowed_for_q_per_kv(
         return True
     if q_per_kv != 4:
         return False
+    if _decode_xqa_q4_min_seq_len() <= 1:
+        return True
 
     seq_hint = getattr(
         attn_metadata,

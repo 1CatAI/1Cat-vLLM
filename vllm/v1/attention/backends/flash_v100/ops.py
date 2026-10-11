@@ -71,21 +71,22 @@ def get_flash_ops():
     global _flash_attn_prefill_paged_bfla, _flash_attn_prefill_paged_splitkv
     if (
         _flash_attn_func is None
-        or _flash_attn_decode_paged is None
+        or (_flash_attn_decode_paged is None and _flash_attn_decode_paged_xqa is None)
         or _flash_attn_prefill_paged is None
     ):
         try:
-            from flash_attn_v100 import (
-                flash_attn_bhmd_func,
-                flash_attn_decode_paged,
-                flash_attn_func,
-                flash_attn_prefill_paged,
-            )
+            import flash_attn_v100
 
-            _flash_attn_func = flash_attn_func
-            _flash_attn_bhmd_func = flash_attn_bhmd_func
-            _flash_attn_decode_paged = flash_attn_decode_paged
-            _flash_attn_prefill_paged = flash_attn_prefill_paged
+            _flash_attn_func = getattr(flash_attn_v100, "flash_attn_func", None)
+            _flash_attn_bhmd_func = getattr(
+                flash_attn_v100, "flash_attn_bhmd_func", None
+            )
+            _flash_attn_decode_paged = getattr(
+                flash_attn_v100, "flash_attn_decode_paged", None
+            )
+            _flash_attn_prefill_paged = getattr(
+                flash_attn_v100, "flash_attn_prefill_paged", None
+            )
             try:
                 from flash_attn_v100 import flash_attn_decode_paged_xqa
 
@@ -131,7 +132,15 @@ def get_flash_ops():
             _flash_attn_prefill_paged_bhmd = None
             _flash_attn_prefill_paged_bfla = None
             _flash_attn_prefill_paged_splitkv = None
-    if _flash_attn_func is not None:
+    if any(
+        operation is not None
+        for operation in (
+            _flash_attn_func,
+            _flash_attn_decode_paged_xqa,
+            _flash_attn_decode_paged,
+            _flash_attn_prefill_paged,
+        )
+    ):
         prepare_attention_runtime()
         if (
             _config.options().value("fa2_d256_prefill")

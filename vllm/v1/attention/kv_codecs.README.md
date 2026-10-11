@@ -34,6 +34,12 @@ bridge describes input storage separately from the downstream FP16 arithmetic.
 Unsupported combinations retain explicit rejection or the existing fallback;
 do not alias new formats to old ones just because their storage width matches.
 
+Ordinary native decode prefers XQA when its geometry, semantics and installed
+codec binding admit it. Scalar is the final native fallback; disabling scalar
+must not disable XQA. The public scalar and XQA bindings share scale-argument
+validation and accumulator workspace selection. These operator bindings do not
+by themselves qualify full-backend INT8 prefill or model execution.
+
 Published aliases and historical counters remain compatible. Add formats here,
 then extend the relevant existing family binding and admission; do not copy
 execution flows. The [INT8-G64 handoff](../../../docs/design/architecture/int8_g64_codec.md)

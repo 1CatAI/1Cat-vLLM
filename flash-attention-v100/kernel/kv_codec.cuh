@@ -243,6 +243,13 @@ struct KVReader {
     if constexpr (KV_DTYPE == KV_CACHE_DTYPE_FP16) {
       const uint4* cache_vec = reinterpret_cast<const uint4*>(cache);
       return __ldg(&cache_vec[physical_offset / 8 + vec_col]);
+    } else if constexpr (KV_DTYPE == KV_CACHE_DTYPE_INT8) {
+      const auto* bytes = reinterpret_cast<const uint8_t*>(cache);
+      const auto* words = reinterpret_cast<const uint32_t*>(
+          bytes + physical_offset + static_cast<int64_t>(vec_col) * 8);
+      const uint64_t raw = static_cast<uint64_t>(__ldg(words)) |
+                           (static_cast<uint64_t>(__ldg(words + 1)) << 32);
+      return half8_from_packed(raw);
     } else {
       static_assert(KV_DTYPE == KV_CACHE_DTYPE_FP8_E4M3 || !SHARED_LUT,
                     "The E4M3 conversion LUT requires E4M3 KV");

@@ -558,7 +558,7 @@ if TYPE_CHECKING:
     VLLM_SM70_REQUIRE_PROFILE_ACCELERATION: bool = False
     VLLM_FLASH_V100_PREFILL_PREFIX_DECODE_ROWS: bool = True
     VLLM_FLASH_V100_FP8_PREFILL_BRIDGE: bool = True
-    VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN: int = 16384
+    VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN: int = 1
     VLLM_FLASH_V100_KERNEL_BLOCK_SIZE16: bool = False
     VLLM_FLASH_V100_DENSE_D256_LOW_SMEM: bool = False
     VLLM_FLASH_V100_DENSE_D256_WMMA_QK: bool = True
@@ -631,7 +631,7 @@ if TYPE_CHECKING:
     VLLM_FLASH_V100_DFLASH2_GROUPED_VERIFY_MIN_MODEL_LEN: int = 32768
     VLLM_FLASH_V100_DFLASH2_FIXED_INTERLEAVED: bool = True
     VLLM_FLASH_V100_DFLASH2_STAGE_PAGE_IDS: bool = True
-    VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN: int = 32768
+    VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN: int = 1
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH: bool = True
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_TRACE: bool = False
     VLLM_FLASH_V100_XQA_G6_P1024_SAWTOOTH_P1024_MID_SEQ_LEN: int = 111104
@@ -8854,14 +8854,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN": env_var(
-        lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", "16384")),
+        lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_FP8_XQA_MIN_SEQ_LEN", "1")),
         description=(
             "Flash-V100 attention: decode fp8 xqa min seq len. The consumer "
             "locations and unset defaults are listed below."
         ),
         category="tuning",
-        declared_default="16384",
-        effective_default="16384",
+        declared_default="1",
+        effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
         user_visible=False,
@@ -9900,14 +9900,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         user_visible=False,
     ),
     "VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN": env_var(
-        lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "32768")),
+        lambda: int(os.getenv("VLLM_FLASH_V100_DECODE_XQA_Q4_MIN_SEQ_LEN", "1")),
         description=(
             "Flash-V100 attention: decode xqa q4 min seq len. The consumer "
             "locations and unset defaults are listed below."
         ),
         category="tuning",
-        declared_default="32768",
-        effective_default="32768",
+        declared_default="1",
+        effective_default="1",
         automatic_conditions=(),
         acceleration_paths=("FlashAttentionV100Backend",),
         user_visible=False,
@@ -16483,7 +16483,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         effective_default=("None"),
         automatic_conditions=(
             (
-                "'4096' at vllm/v1/attention/backends/flash_attn_v100.py:_smallq_d"
+                "'1' at vllm/v1/attention/backends/flash_attn_v100.py:_smallq_d"
                 "ecode_xqa_allowed"
             ),
         ),

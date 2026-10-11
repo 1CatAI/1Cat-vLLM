@@ -7,6 +7,8 @@ import torch
 
 from vllm.config.execution_policy import FlashV100Policy, GraphPolicy
 from vllm.config.flash_v100 import NATIVE_FIELDS, FlashV100Diagnostics, native_value
+from vllm.v1.attention.kv_cache_view import KVCacheView
+from vllm.v1.attention.kv_codecs import KV_CODECS, resolve_kv_codec
 
 interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
 runtime_module = pytest.importorskip("flash_attn_v100.runtime")
@@ -126,7 +128,15 @@ def device():
     return torch.device("cuda")
 
 
-@pytest.mark.parametrize("storage", ["fp16", "fp8_e4m3", "fp8_e5m2"])
+@pytest.mark.parametrize(
+    "storage",
+    [
+        "fp16",
+        "fp8_e4m3",
+        "fp8_e5m2",
+        *(codec.name for codec in KV_CODECS if codec.storage_dtype == torch.int8),
+    ],
+)
 @pytest.mark.parametrize("partition", [256, 1024])
 def test_configured_decode_matches_legacy_and_survives_environment_change(
     monkeypatch, device, storage, partition
@@ -137,13 +147,29 @@ def test_configured_decode_matches_legacy_and_survives_environment_change(
     q = torch.randn(1, 6, 256, device=device, dtype=torch.float16)
     k = torch.randn(8, 256, 1, 256, device=device, dtype=torch.float16)
     v = torch.randn_like(k)
-    if storage != "fp16":
+    scale_args = {}
+    codec = resolve_kv_codec(storage)
+    if codec is not None and codec.per_token_head:
+        carrier = torch.empty((8, 2, 256, 1, 260), device=device, dtype=torch.int8)
+        view = KVCacheView.bind(carrier, codec, 256)
+        for source, payload, scales in (
+            (k, view.key, view.key_scale),
+            (v, view.value, view.value_scale),
+        ):
+            encoded, scale = codec.encode(source.cpu())
+            payload.copy_(encoded)
+            scales.copy_(scale)
+        k, v = view.key, view.value
+        scale_args = dict(k_scale_cache=view.key_scale, v_scale_cache=view.value_scale)
+    elif storage != "fp16":
         dtype = torch.float8_e4m3fn if storage == "fp8_e4m3" else torch.float8_e5m2
         k, v = k.to(dtype).view(torch.uint8), v.to(dtype).view(torch.uint8)
     table = torch.arange(8, device=device, dtype=torch.int32).view(1, -1)
     lengths = torch.tensor([1537], device=device, dtype=torch.int32)
     kwargs = dict(
-        kv_cache_dtype="auto" if storage == "fp16" else storage, max_seq_len_hint=1537
+        kv_cache_dtype="auto" if storage == "fp16" else storage,
+        max_seq_len_hint=1537,
+        **scale_args,
     )
     reference = interface.flash_attn_decode_paged_xqa(
         q, k, v, table, lengths, **kwargs

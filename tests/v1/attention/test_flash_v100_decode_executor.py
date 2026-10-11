@@ -13,16 +13,47 @@ from vllm.v1.attention.backends.flash_v100.decode import (
     DecodeConfig,
     DecodeExecutor,
     DecodeOps,
+    DecodeRequest,
 )
 from vllm.v1.attention.backends.flash_v100.workspace import V100Workspace
 
 pytestmark = pytest.mark.cpu_test
 
 
-@pytest.mark.parametrize("use_xqa", [False, True])
-def test_decode_executor_runs_with_independent_operators(monkeypatch, use_xqa):
+@pytest.mark.parametrize("codec", ["auto", "int8", "int8_per_token_head"])
+@pytest.mark.parametrize(
+    "use_xqa,use_scalar",
+    [
+        (True, True),
+        (True, False),
+        (False, True),
+        (False, False),
+    ],
+)
+@pytest.mark.parametrize(
+    "available_xqa,available_scalar",
+    [(True, True), (True, False), (False, True), (False, False)],
+)
+def test_decode_executor_runs_with_independent_operators(
+    monkeypatch, codec, use_xqa, use_scalar, available_xqa, available_scalar
+):
+    expected = (
+        "xqa"
+        if use_xqa and available_xqa
+        else "scalar"
+        if use_scalar and available_scalar
+        else "triton"
+    )
     with cpu_cuda(monkeypatch, False), strict_shim() as legacy:
-        install_ops(monkeypatch, Recorder(), legacy, {})
+        unavailable = [
+            name
+            for name, available in (
+                ("xqa", available_xqa),
+                ("decode", available_scalar),
+            )
+            if not available
+        ]
+        install_ops(monkeypatch, Recorder(), legacy, {"unavailable": unavailable})
         backend = legacy.FlashAttnV100Impl(
             num_heads=6,
             num_kv_heads=1,
@@ -33,9 +64,14 @@ def test_decode_executor_runs_with_independent_operators(monkeypatch, use_xqa):
             kv_cache_dtype="auto",
         )
         config = DecodeConfig(
-            replace(backend.config, use_decode_xqa=use_xqa),
+            replace(
+                backend.config,
+                use_decode_xqa=use_xqa,
+                use_decode_scalar_paged=use_scalar,
+                allow_triton_fallback=True,
+            ),
             backend.scale,
-            backend.kv_cache_dtype,
+            codec,
             backend.attn_type,
             backend.sliding_window,
         )
@@ -49,6 +85,14 @@ def test_decode_executor_runs_with_independent_operators(monkeypatch, use_xqa):
             calls.append(("xqa", kwargs))
             kwargs["out"].fill_(3)
 
+        def triton(*args):
+            calls.append(("triton", {}))
+            args[6].fill_(4)
+            return args[6]
+
+        for operation in (scalar, xqa):
+            operation.kv_cache_codecs = frozenset([codec])  # type: ignore[attr-defined]
+
         def unused(*args, **kwargs):
             raise AssertionError("unexpected diagnostic/native route")
 
@@ -56,21 +100,21 @@ def test_decode_executor_runs_with_independent_operators(monkeypatch, use_xqa):
             config,
             DecodeOps(
                 dense=unused,
-                paged=scalar,
-                xqa=xqa,
+                paged=scalar if available_scalar else None,
+                xqa=xqa if available_xqa else None,
                 wmma=unused,
                 prefill=unused,
                 prefill_bhmd=unused,
-                paged_keywords={"max_seq_len_hint"},
+                paged_keywords={"max_seq_len_hint", "k_scale_cache", "v_scale_cache"},
                 scalar_tail=None,
                 reject_xqa=lambda codec, metadata: False,
                 reserve_bhmd_compare=unused,
                 write_bhmd_compare=unused,
                 compare_bhmd=unused,
-                compare_triton=unused,
-                triton_forward=unused,
-                profile_trace=unused,
-                draft_debug_enabled=unused,
+                compare_triton=lambda *args: None,
+                triton_forward=triton,
+                profile_trace=lambda *args: None,
+                draft_debug_enabled=lambda: False,
                 draft_debug_log=unused,
                 format_debug=unused,
             ),
@@ -82,7 +126,11 @@ def test_decode_executor_runs_with_independent_operators(monkeypatch, use_xqa):
         backend.flash_attn_decode_paged_xqa = unused
         query = torch.zeros((1, 6, 256), dtype=torch.float16)
         output = torch.empty_like(query)
-        cache = torch.zeros((2, 1, 16, 1, 256), dtype=torch.float16)
+        cache = (
+            torch.zeros((2, 1, 16, 1, 256), dtype=torch.float16)
+            if codec == "auto"
+            else torch.zeros((1, 2, 16, 1, 260), dtype=torch.int8)
+        )
         metadata = SimpleNamespace(
             num_actual_tokens=1,
             seq_lens=torch.tensor([16], dtype=torch.int32),
@@ -91,14 +139,68 @@ def test_decode_executor_runs_with_independent_operators(monkeypatch, use_xqa):
         )
         layer = SimpleNamespace(_k_scale_float=1.25, _v_scale_float=0.75)
         assert (
-            executor._flash_v100_decode(
-                layer, query, query, query, cache, metadata, output
+            executor.forward(
+                DecodeRequest(
+                    layer,
+                    query,
+                    query,
+                    query,
+                    cache,
+                    metadata,
+                    output,
+                    None,
+                    None,
+                    False,
+                    "test_layer",
+                )
             )
             is output
         )
         assert len(calls) == 1
         route, kwargs = calls[0]
-        assert route == ("xqa" if use_xqa else "scalar")
-        assert kwargs["max_seq_len_hint"] == 16
-        assert (kwargs["k_scale"], kwargs["v_scale"]) == (1.25, 0.75)
-        assert torch.all(output == (3 if use_xqa else 2))
+        assert route == expected
+        if expected != "triton":
+            assert kwargs["max_seq_len_hint"] == 16
+            assert (kwargs["k_scale"], kwargs["v_scale"]) == (1.25, 0.75)
+            if codec != "auto":
+                for name in ("k_scale_cache", "v_scale_cache"):
+                    assert kwargs[name].dtype == torch.float32
+                    assert kwargs[name].untyped_storage() == cache.untyped_storage()
+        assert torch.all(output == {"xqa": 3, "scalar": 2, "triton": 4}[expected])
+
+
+def test_xqa_import_does_not_require_scalar_or_prefill(monkeypatch):
+    import sys
+
+    from vllm.v1.attention.backends.flash_v100 import ops
+
+    def xqa(*args, **kwargs):
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "flash_attn_v100",
+        SimpleNamespace(flash_attn_decode_paged_xqa=xqa),
+    )
+    for name in (
+        "_flash_attn_func",
+        "_flash_attn_bhmd_func",
+        "_flash_attn_decode_paged",
+        "_flash_attn_decode_paged_xqa",
+        "_flash_attn_decode_paged_wmma",
+        "_flash_attn_prefill_paged",
+        "_flash_attn_prefill_paged_bhmd",
+        "_flash_attn_prefill_paged_bfla",
+        "_flash_attn_prefill_paged_splitkv",
+    ):
+        monkeypatch.setattr(ops, name, None)
+    prepared = []
+    monkeypatch.setattr(ops, "prepare_attention_runtime", lambda: prepared.append(True))
+    monkeypatch.setattr(ops, "bind_attention_operation", lambda operation: operation)
+    monkeypatch.setattr(
+        ops._config, "options", lambda: SimpleNamespace(value=lambda name: False)
+    )
+    loaded = ops.get_flash_ops()
+    assert loaded[3] is xqa
+    assert all(operation is None for i, operation in enumerate(loaded) if i != 3)
+    assert prepared == [True]
