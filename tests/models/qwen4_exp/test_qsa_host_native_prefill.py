@@ -254,3 +254,40 @@ def test_serving_geometry_two_chunks_match_reference(max_model_len, warmup):
                 torch.cuda.synchronize()
                 worst = max(worst, (out.float() - ref.float()).abs().max().item())
     assert worst == 0.0, f"max diff {worst}"
+
+
+def test_native_resolves_wide_prefill_slices_exactly():
+    """Prefill slices wider than the Triton staging rows resolve in one pass."""
+    dev = torch.device("cuda")
+    page, blocks, context, slice_rows = 16, 2 * 51 + 51, 1003, 32
+    g = torch.Generator().manual_seed(32)
+    state = HostQSAKV(blocks, page, 256, dev, hot_tokens=8192, rows=ROWS,
+                      width=WIDTH, dtype=torch.uint8, direct_device=True,
+                      resolve_rows=slice_rows)
+    assert state.resolve_rows == slice_rows and state.rows == ROWS
+    table = torch.arange(blocks, dtype=torch.int32, device=dev)[None]
+    keys = torch.randn(context, 1, 256, generator=g).half().to(dev)
+    values = torch.randn(context, 1, 256, generator=g).half().to(dev)
+    queries = torch.randn(context, 6, 256, generator=g).half().to(dev)
+    lengths = torch.zeros(1, dtype=torch.int32, device=dev)
+    for start, stop in ((0, 512), (512, context)):
+        t = torch.arange(start, stop, device=dev)
+        state.write(keys[start:stop], values[start:stop], t.int())
+        lengths.fill_(stop)
+        torch.cuda.synchronize()
+        hist, scales = state.history.clone(), state.scales.clone()
+        for row in range(start, stop, slice_rows):
+            end = min(row + slice_rows, stop)
+            idx = torch.stack([_selection(p, g) for p in range(row, end)]).to(dev)
+            req = torch.zeros(end - row, dtype=torch.int32, device=dev)
+            pos = torch.arange(row, end, device=dev, dtype=torch.int64)
+            out = torch.empty(end - row, 6, 256, dtype=torch.float16, device=dev)
+            ref = torch.empty_like(out)
+            host_qsa_attention(queries[row:end], state, idx, table, req, pos,
+                               lengths, out, None)
+            torch.ops.vllm_sm70_qsa_device.run(
+                queries[row:end], hist, scales, idx, table, req, pos, lengths,
+                ref, None, *_workspace(end - row, dev))
+            torch.cuda.synchronize()
+            assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), (
+                f"rows {row}:{end} differ")

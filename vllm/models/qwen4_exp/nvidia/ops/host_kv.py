@@ -396,6 +396,7 @@ class HostQSAKV:
         device_reference: bool = False,
         direct_device: bool | None = None,
         is_speculative_draft: bool = False,
+        resolve_rows: int = 32,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -403,6 +404,9 @@ class HostQSAKV:
             raise ValueError("Invalid hot cache or staging capacity")
         self.blocks, self.page_size, self.dim = blocks, page_size, dim
         self.rows, self.width = rows, width
+        # Rows one hot-cache resolve may cover. Staging (``rows``) bounds only
+        # the Triton miss path; direct readers resolve larger prefill slices.
+        self.resolve_rows = max(rows, resolve_rows)
         self.padded = triton.cdiv(width, 4) * 4
         self.sets = hot_tokens // 16
         dtype = history.dtype if history is not None else dtype
@@ -453,24 +457,27 @@ class HostQSAKV:
             (blocks * page_size // 4,), -1, dtype=torch.int32, device=device
         )
         self._stats = torch.zeros(
-            (rows * triton.cdiv(width, 16), 3), dtype=torch.int64, device=device
+            (self.resolve_rows * triton.cdiv(width, 16), 3),
+            dtype=torch.int64,
+            device=device,
         )
         # QSA layers execute serially on the model stream. Share staging across
         # owners while keeping each owner's hot pages and scales persistent.
-        workspace_key = (device.index, rows, width, dim)
+        workspace_key = (device.index, rows, self.resolve_rows, width, dim)
         if workspace_key not in _WORKSPACES:
+            meta = self.resolve_rows
             _WORKSPACES[workspace_key] = (
                 torch.zeros(
                     (rows, 2, self.padded, 1, dim),
                     dtype=torch.float16,
                     device=device,
                 ),
-                torch.empty((rows, width), dtype=torch.int32, device=device),
-                torch.arange(rows, dtype=torch.int32, device=device),
-                torch.full((rows,), width - 1, dtype=torch.int64, device=device),
-                torch.full((rows,), width, dtype=torch.int32, device=device),
-                torch.empty((rows, width), dtype=torch.int32, device=device),
-                torch.empty((rows, width), dtype=torch.int32, device=device),
+                torch.empty((meta, width), dtype=torch.int32, device=device),
+                torch.arange(meta, dtype=torch.int32, device=device),
+                torch.full((meta,), width - 1, dtype=torch.int64, device=device),
+                torch.full((meta,), width, dtype=torch.int32, device=device),
+                torch.empty((meta, width), dtype=torch.int32, device=device),
+                torch.empty((meta, width), dtype=torch.int32, device=device),
             )
         (
             self.staging,
@@ -533,7 +540,8 @@ class HostQSAKV:
 
     def _resolve(self, indices, block_table, token_to_req, positions, lengths, stage):
         rows = indices.shape[0]
-        if indices.shape[1] != self.width or rows > self.rows:
+        capacity = self.rows if stage else self.resolve_rows
+        if indices.shape[1] != self.width or rows > capacity:
             raise ValueError("Host KV selection exceeds fixed staging capacity")
         if block_table.shape[0] != lengths.numel():
             raise ValueError("Host KV request metadata disagrees")

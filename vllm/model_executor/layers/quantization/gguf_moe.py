@@ -14,6 +14,7 @@ from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
     admit_moe_fallback,
     decoder_family,
+    moe_mmq_supported,
     original_moe_prefill_capability,
 )
 from vllm.model_executor.layers.fused_moe import (
@@ -296,6 +297,10 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 self.params_dtype,
                 is_sm70=current_platform.is_device_capability(70),
                 enabled=self.native_enabled,
+                mmq_supported=moe_mmq_supported(
+                    prepared, value, self.params_dtype
+                ),
+                top_k=getattr(layer, "top_k", 10),
             )
             self.prefill_capabilities[shard] = prefill
             self.native_admission["prefill_projections"][shard] = asdict(prefill)

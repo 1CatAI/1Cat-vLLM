@@ -51,14 +51,15 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
     state.device_history_workspace = None
     if reason is not None:
         return
-    key = (state.history.device, state.width)
+    key = (state.history.device, state.width, getattr(state, "resolve_rows", 20))
     if key not in _WORKSPACES:
         # The protected launch policy uses 16-column tiles and up to 64 splits,
         # including at short widths. Bound all admitted M values before capture.
         reference_elements = max(
             rows * 6 * _attention_profile(rows, state.width)[2] for rows in range(1, 21)
         )
-        native_elements = 20 * 6 * ((state.width + 63) // 64)
+        native_rows = max(20, getattr(state, "resolve_rows", 20))
+        native_elements = native_rows * 6 * ((state.width + 63) // 64)
         # Native split states contain both a maximum and a denominator. Keep
         # enough room for the arithmetic-preserving diagnostic reference too.
         _WORKSPACES[key] = (
@@ -87,15 +88,16 @@ def device_history_attention(
     if workspace is None:
         return False
     hot = getattr(state, "device_history_hot", False)
-    if hot and (query.shape[0] > state.rows or indices.shape[1] != state.width):
+    rows_limit = state.resolve_rows if hot else 20
+    if hot and (query.shape[0] > rows_limit or indices.shape[1] != state.width):
         state.device_history_reason = "host_native_requires_staging_geometry"
         return False
     if not (
         query.dtype == torch.float16
-        and 0 < query.shape[0] <= 20
+        and 0 < query.shape[0] <= rows_limit
         and query.shape[1:] == (6, 256)
     ):
-        state.device_history_reason = "requires_M1_20_H6_D256"
+        state.device_history_reason = "requires_M1_resolve_rows_H6_D256"
         return False
     if (
         query.data_ptr() % 16

@@ -846,6 +846,29 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         from .ops.host_kv_attention import host_qsa_attention
 
         state = self.host_kv
+        if (
+            state.device_history_workspace is not None
+            and state.device_history_hot
+            and indices.shape[1] == state.width
+        ):
+            # The native reader needs no staging: one resolve and one launch per
+            # resolve_rows slice. Rows are independent, so slicing does not
+            # change the arithmetic.
+            step = state.resolve_rows
+            for start in range(0, query.shape[0], step):
+                stop = min(start + step, query.shape[0])
+                host_qsa_attention(
+                    query[start:stop],
+                    state,
+                    indices[start:stop],
+                    table,
+                    requests[start:stop],
+                    positions[start:stop],
+                    lengths,
+                    output[start:stop],
+                    gate[start:stop] if gate is not None else None,
+                )
+            return
         # Preserve the default 32-row grouping and its arithmetic while
         # subdividing only the shared host-miss staging allocation.
         for base in range(0, query.shape[0], 32):

@@ -270,7 +270,7 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
                     std::optional<torch::Tensor> resolved = std::nullopt) {
   const c10::cuda::CUDAGuard guard(q.device());
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
-              q.size(0) > 0 && q.size(0) <= 20 && q.size(1) == 6 &&
+              q.size(0) > 0 && q.size(0) <= 64 && q.size(1) == 6 &&
               q.size(2) == 256 && q.stride(2) == 1);
   TORCH_CHECK((history.scalar_type() == at::kByte ||
                history.scalar_type() == at::kHalf) &&

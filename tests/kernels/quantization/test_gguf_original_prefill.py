@@ -17,15 +17,25 @@ def operators(monkeypatch):
 
 @pytest.mark.parametrize(
     "kind,k,n,m",
-    [(kind, 2560, 160, 512) for kind in (18, 21, 22, 23)]
-    + [(20, 160, 2560, 5120), (42, 192, 2560, 5120)],
+    [(kind, 2560, 160, 64) for kind in (18, 21, 22, 23)]
+    + [(20, 160, 2560, 640), (42, 192, 2560, 640)],
 )
-def test_only_calibrated_prefill_inputs_are_admitted(operators, kind, k, n, m):
+def test_prefill_sized_inputs_use_batched_mmq(operators, kind, k, n, m):
+    """Every chunk from 64 tokens up (640 routed down rows), not only 512."""
     cap = original_moe_prefill_capability(kind, k, n, 512, torch.float16, is_sm70=True)
     assert cap.reason is None and cap.graph_safe
-    assert cap.supports_m(m)
-    for other in (1, 5, 8, 20, m - 1, m + 1):
-        assert not cap.supports_m(other)
+    for admitted in (m, m + 1, 304 * m // 64, 512 * m // 64, 8192 * m // 64):
+        assert cap.supports_m(admitted)
+    for decode in (1, 5, 8, 20, m - 1):
+        assert not cap.supports_m(decode)
+
+
+@pytest.mark.parametrize("supported,reason", [(True, None), (False, "mmq_not_supported_for_source_type")])
+def test_installed_mmq_support_decides_source_admission(operators, supported, reason):
+    cap = original_moe_prefill_capability(
+        20, 2560, 160, 512, torch.float16, is_sm70=True, mmq_supported=supported
+    )
+    assert cap.reason == reason
 
 
 @pytest.mark.parametrize(
@@ -60,7 +70,10 @@ def test_missing_prefill_operator_retains_fallback(monkeypatch):
     assert cap.reason == "operator_missing:ggml_moe_mmq"
 
 
-@pytest.mark.parametrize("m,selected", [(20, "mmvq"), (511, "mmvq"), (512, "mmq")])
+@pytest.mark.parametrize(
+    "m,selected",
+    [(20, "mmvq"), (63, "mmvq"), (64, "mmq"), (304, "mmq"), (511, "mmq"), (512, "mmq")],
+)
 def test_projection_dispatch_counts_routed_down_rows(monkeypatch, m, selected):
     from vllm.model_executor.layers.fused_moe import MoEActivation
     from vllm.model_executor.layers.quantization.gguf_moe import GGUFNativeMoEMethod
