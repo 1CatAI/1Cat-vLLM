@@ -135,6 +135,7 @@ Neither permits widening exclusions to conceal new coupling.
 | E maintained documentation and checks | E1–E3 delivered; [validation and retained boundaries](sm70_phase_e.md) |
 | DDTree / PLE follow-up | Deferred; no repair or new qualification in E |
 | INT8-G64 | [Design handoff](int8_g64_codec.md) only; not implemented or qualified |
+| KV formats and acceleration reuse | [Framework audit and INT8 implementation plan](kv_acceleration_audit.md), pinned to `be3722bc09`; design and CPU evidence only |
 
 A3's merge does not imply every original A0–A6 proposal was delivered. Native
 codec follow-ups and experimental paths need individual evidence. No model
