@@ -1,0 +1,132 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of libcu++, the C++ Standard Library for your entire system,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _CUDA_STD_CTIME
+#define _CUDA_STD_CTIME
+
+#include <cuda/std/detail/__config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/std/__host_stdlib/time.h>
+
+#if _CCCL_CUDA_COMPILATION()
+#  include <cuda/__ptx/instructions/get_sreg.h>
+#endif // _CCCL_CUDA_COMPILATION()
+
+#include <cuda/std/__cccl/prologue.h>
+
+#if _CCCL_FREESTANDING()
+#  define TIME_UTC 1
+
+#  if _CCCL_HOSTJIT()
+using clock_t = long long int;
+#  endif // _CCCL_HOSTJIT()
+using time_t = long long int;
+
+struct timespec
+{
+  ::time_t tv_sec;
+  long tv_nsec;
+};
+#endif // _CCCL_FREESTANDING()
+
+_CCCL_BEGIN_NAMESPACE_CUDA_STD
+
+using ::clock_t;
+using ::size_t;
+using ::time_t;
+using ::timespec;
+
+// clock
+
+[[nodiscard]] _CCCL_HOST_DEVICE_API inline clock_t clock() noexcept
+{
+#if _CCCL_HOSTJIT() // host-side `clock` is not supported in freestanding
+  NV_IF_ELSE_TARGET(
+    NV_IS_HOST, (::cuda::std::terminate();), (return static_cast<clock_t>(::cuda::ptx::get_sreg_clock64());))
+#else // ^^^ _CCCL_HOSTJIT() ^^^ / vvv !_CCCL_HOSTJIT() vvv
+  NV_IF_ELSE_TARGET(NV_IS_HOST, (return ::clock();), (return static_cast<clock_t>(::cuda::ptx::get_sreg_clock64());))
+#endif // !_CCCL_HOSTJIT()
+}
+
+// difftime
+
+[[nodiscard]] _CCCL_HOST_DEVICE_API constexpr double difftime(time_t __end, time_t __start) noexcept
+{
+  return static_cast<double>(__end - __start);
+}
+
+// time
+
+#if _CCCL_CUDA_COMPILATION()
+[[nodiscard]] _CCCL_DEVICE_API inline time_t __cccl_time_impl_device(time_t* __v) noexcept
+{
+  const auto __t = static_cast<clock_t>(::cuda::ptx::get_sreg_globaltimer() / 1'000'000'000);
+  if (__v != nullptr)
+  {
+    *__v = __t;
+  }
+  return __t;
+}
+#endif // _CCCL_CUDA_COMPILATION()
+
+_CCCL_HOST_DEVICE_API inline time_t time(time_t* __v) noexcept
+{
+#if _CCCL_HOSTJIT() // host-side `time` is not supported in freestanding
+  NV_IF_ELSE_TARGET(NV_IS_HOST, (::cuda::std::terminate();), (return ::cuda::std::__cccl_time_impl_device(__v);))
+#else // ^^^ _CCCL_HOSTJIT() ^^^ / vvv !_CCCL_HOSTJIT() vvv
+  NV_IF_ELSE_TARGET(NV_IS_HOST, (return ::time(__v);), (return ::cuda::std::__cccl_time_impl_device(__v);))
+#endif // !_CCCL_HOSTJIT()
+}
+
+#if !defined(__ANDROID_API__) || __ANDROID_API__ >= 29
+
+// timespec_get
+
+#  if _CCCL_CUDA_COMPILATION()
+[[nodiscard]] _CCCL_DEVICE_API inline int __cccl_timespec_get_impl_device(timespec* __ts, int __base) noexcept
+{
+  if (__ts == nullptr || __base != TIME_UTC)
+  {
+    return 0;
+  }
+  const auto __t = ::cuda::ptx::get_sreg_globaltimer();
+  __ts->tv_sec   = static_cast<time_t>(__t / 1'000'000'000);
+  __ts->tv_nsec  = static_cast<long>(__t % 1'000'000'000);
+  return __base;
+}
+#  endif // _CCCL_CUDA_COMPILATION()
+
+[[nodiscard]] _CCCL_HOST_DEVICE_API inline int timespec_get(timespec* __ts, int __base) noexcept
+{
+#  if _CCCL_HOSTJIT() // host-side `timespec_get` is not supported in freestanding
+  NV_IF_ELSE_TARGET(
+    NV_IS_HOST, (::cuda::std::terminate();), (return ::cuda::std::__cccl_timespec_get_impl_device(__ts, __base);))
+#  else // ^^^ _CCCL_HOSTJIT() ^^^ / vvv !_CCCL_HOSTJIT() vvv
+  NV_IF_ELSE_TARGET(NV_IS_HOST,
+                    (return ::timespec_get(__ts, __base);),
+                    (return ::cuda::std::__cccl_timespec_get_impl_device(__ts, __base);))
+#  endif // !_CCCL_HOSTJIT()
+}
+
+#endif // !defined(__ANDROID_API__) || __ANDROID_API__ >= 29
+
+_CCCL_END_NAMESPACE_CUDA_STD
+
+#include <cuda/std/__cccl/epilogue.h>
+
+#endif // _CUDA_STD_CTIME

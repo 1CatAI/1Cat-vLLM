@@ -1,0 +1,264 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2024, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+/*! \file
+ *  \brief C++14's
+ *  <a href="https://en.cppreference.com/w/cpp/utility/integer_sequence"><tt>std::index_sequence</tt></a>,
+ *  associated helper aliases, and some related extensions.
+ */
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/std/__utility/integer_sequence.h>
+#include <cuda/std/cstdint>
+
+THRUST_NAMESPACE_BEGIN
+
+/*! \addtogroup utility
+ *  \{
+ */
+
+/*! \addtogroup type_traits Type Traits
+ *  \{
+ */
+
+/*! \brief A compile-time sequence of
+ *  <a href="https://en.cppreference.com/w/cpp/language/constant_expression#Integral_constant_expression"><i>integral
+ * constants</i></a> of type \c T with values <tt>Is...</tt>.
+ *  \deprecated [Since 3.4]
+ *  \see <a
+ * href="https://en.cppreference.com/w/cpp/language/constant_expression#Integral_constant_expression"><i>integral
+ * constants</i></a> \see index_sequence \see make_integer_sequence \see make_reversed_integer_sequence \see
+ * make_index_sequence \see make_reversed_index_sequence \see integer_sequence_push_front \see
+ * integer_sequence_push_back \see <a
+ * href="https://en.cppreference.com/w/cpp/utility/integer_sequence"><tt>std::integer_sequence</tt></a>
+ */
+template <typename T, T... Is>
+using integer_sequence
+  CCCL_DEPRECATED_BECAUSE("Use cuda::std::integer_sequence") = ::cuda::std::integer_sequence<T, Is...>;
+
+///////////////////////////////////////////////////////////////////////////////
+
+/*! \brief A compile-time sequence of type
+ *  <a href="https://en.cppreference.com/w/cpp/types/size_t">std::size_t</a>
+ *  with values <tt>Is...</tt>.
+ *  \deprecated [Since 3.4]
+ *
+ *  \see integer_sequence
+ *  \see make_integer_sequence
+ *  \see make_reversed_integer_sequence
+ *  \see make_index_sequence
+ *  \see make_reversed_index_sequence
+ *  \see integer_sequence_push_front
+ *  \see integer_sequence_push_back
+ *  \see <a href="https://en.cppreference.com/w/cpp/utility/integer_sequence"><tt>std::index_sequence</tt></a>
+ */
+template <::cuda::std::size_t... Is>
+using index_sequence CCCL_DEPRECATED_BECAUSE("Use cuda::std::index_sequence") = ::cuda::std::index_sequence<Is...>;
+
+/*! \brief Create a new \c integer_sequence with elements
+ *  <tt>0, 1, 2, ..., N - 1</tt> of type \c T.
+ *  \deprecated [Since 3.4]
+ *
+ *  \see integer_sequence
+ *  \see index_sequence
+ *  \see make_reversed_integer_sequence
+ *  \see make_index_sequence
+ *  \see make_reversed_index_sequence
+ *  \see <a href="https://en.cppreference.com/w/cpp/utility/integer_sequence"><tt>std::make_integer_sequence</tt></a>
+ */
+template <typename T, ::cuda::std::size_t N>
+using make_integer_sequence
+  CCCL_DEPRECATED_BECAUSE("Use cuda::std::make_integer_sequence") = ::cuda::std::make_integer_sequence<T, N>;
+
+///////////////////////////////////////////////////////////////////////////////
+
+/*! \brief Create a new \c integer_sequence with elements
+ *  <tt>0, 1, 2, ..., N - 1</tt> of type
+ *  <a href="https://en.cppreference.com/w/cpp/types/size_t">std::size_t</a>.
+ *  \deprecated [Since 3.4]
+ *
+ *  \see integer_sequence
+ *  \see index_sequence
+ *  \see make_integer_sequence
+ *  \see make_reversed_integer_sequence
+ *  \see make_reversed_index_sequence
+ *  \see <a href="https://en.cppreference.com/w/cpp/utility/integer_sequence"><tt>std::make_index_sequence</tt></a>
+ */
+template <::cuda::std::size_t N>
+using make_index_sequence
+  CCCL_DEPRECATED_BECAUSE("Use cuda::std::make_index_sequence") = ::cuda::std::make_index_sequence<N>;
+
+///////////////////////////////////////////////////////////////////////////////
+
+/*! \cond
+ */
+
+namespace detail
+{
+/*! \brief Create a new \c integer_sequence containing the elements of \c
+ *  Sequence0 followed by the elements of \c Sequence1. \c Sequence1::size() is
+ *  added to each element from \c Sequence0 in the new sequence.
+ *
+ *  \see make_reversed_integer_sequence
+ *  \see integer_sequence
+ *  \see index_sequence
+ *  \see make_integer_sequence
+ *  \see make_reversed_integer_sequence
+ *  \see make_index_sequence
+ *  \see make_reversed_index_sequence
+ *  \see merge_and_renumber_integer_sequences_impl
+ */
+template <typename Sequence0, typename Sequence1>
+struct merge_and_renumber_reversed_integer_sequences_impl;
+template <typename Sequence0, typename Sequence1>
+using merge_and_renumber_reversed_integer_sequences =
+  typename merge_and_renumber_reversed_integer_sequences_impl<Sequence0, Sequence1>::type;
+
+template <typename T, ::cuda::std::size_t N>
+struct make_reversed_integer_sequence_impl;
+
+template <typename T, T Value, typename Sequence>
+struct integer_sequence_push_front_impl;
+
+template <typename T, T Value, typename Sequence>
+struct integer_sequence_push_back_impl;
+
+template <typename T, T... Is0, T... Is1>
+struct merge_and_renumber_reversed_integer_sequences_impl<::cuda::std::integer_sequence<T, Is0...>,
+                                                          ::cuda::std::integer_sequence<T, Is1...>>
+{
+  using type = ::cuda::std::integer_sequence<T, (sizeof...(Is1) + Is0)..., Is1...>;
+};
+} // namespace detail
+
+/*! \endcond
+ */
+
+///////////////////////////////////////////////////////////////////////////////
+
+/*! \brief Create a new \c integer_sequence with elements
+ *  <tt>N - 1, N - 2, N - 3, ..., 0</tt>.
+ *  \deprecated [Since 3.4]
+ *
+ *  \see integer_sequence
+ *  \see index_sequence
+ *  \see make_integer_sequence
+ *  \see make_index_sequence
+ *  \see make_reversed_index_sequence
+ */
+template <typename T, ::cuda::std::size_t N>
+using make_reversed_integer_sequence
+  CCCL_DEPRECATED_BECAUSE("No replacement. Please consider adopting a meta programming library or fold over the "
+                          "assignment operator") = typename detail::make_reversed_integer_sequence_impl<T, N>::type;
+
+/*! \brief Create a new \c index_sequence with elements
+ *  <tt>N - 1, N - 2, N - 3, ..., 0</tt>.
+ *  \deprecated [Since 3.4]
+ *
+ *  \see integer_sequence
+ *  \see index_sequence
+ *  \see make_integer_sequence
+ *  \see make_reversed_integer_sequence
+ *  \see make_reversed_index_sequence
+ */
+template <::cuda::std::size_t N>
+using make_reversed_index_sequence
+  CCCL_DEPRECATED_BECAUSE("No replacement. Please consider adopting a meta programming library or fold over the "
+                          "assignment operator") =
+    typename detail::make_reversed_integer_sequence_impl<::cuda::std::size_t, N>::type;
+
+/*! \brief Add a new element to the front of an \c integer_sequence.
+ *  \deprecated [Since 3.4]
+ *
+ *  \see integer_sequence
+ *  \see index_sequence
+ *  \see make_integer_sequence
+ *  \see make_index_sequence
+ */
+template <typename T, T Value, typename Sequence>
+using integer_sequence_push_front
+  CCCL_DEPRECATED_BECAUSE("No replacement. Please consider adopting a meta programming library") =
+    typename detail::integer_sequence_push_front_impl<T, Value, Sequence>::type;
+
+/*! \brief Add a new element to the back of an \c integer_sequence.
+ *  \deprecated [Since 3.4]
+ *
+ *  \see integer_sequence
+ *  \see index_sequence
+ *  \see make_integer_sequence
+ *  \see make_index_sequence
+ */
+template <typename T, T Value, typename Sequence>
+using integer_sequence_push_back
+  CCCL_DEPRECATED_BECAUSE("No replacement. Please consider adopting a meta programming library") =
+    typename detail::integer_sequence_push_back_impl<T, Value, Sequence>::type;
+
+///////////////////////////////////////////////////////////////////////////////
+
+/*! \cond
+ */
+
+namespace detail
+{
+template <typename T, ::cuda::std::size_t N>
+struct make_reversed_integer_sequence_impl
+{
+  using type =
+    merge_and_renumber_reversed_integer_sequences<typename make_reversed_integer_sequence_impl<T, N / 2>::type,
+                                                  typename make_reversed_integer_sequence_impl<T, N - N / 2>::type>;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+struct make_reversed_integer_sequence_impl<T, 0>
+{
+  using type = ::cuda::std::integer_sequence<T>;
+};
+
+template <typename T>
+struct make_reversed_integer_sequence_impl<T, 1>
+{
+  using type = ::cuda::std::integer_sequence<T, 0>;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename T, T I0, T... Is>
+struct integer_sequence_push_front_impl<T, I0, ::cuda::std::integer_sequence<T, Is...>>
+{
+  using type = ::cuda::std::integer_sequence<T, I0, Is...>;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename T, T I0, T... Is>
+struct integer_sequence_push_back_impl<T, I0, ::cuda::std::integer_sequence<T, Is...>>
+{
+  using type = ::cuda::std::integer_sequence<T, Is..., I0>;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+} // namespace detail
+
+/*! \endcond
+ */
+
+/*! \} // type traits
+ */
+
+/*! \} // utility
+ */
+
+THRUST_NAMESPACE_END

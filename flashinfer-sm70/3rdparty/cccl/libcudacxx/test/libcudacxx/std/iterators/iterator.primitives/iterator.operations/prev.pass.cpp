@@ -1,0 +1,62 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// <cuda/std/iterator>
+
+// template <InputIterator Iter>
+//   Iter prev(Iter x, Iter::difference_type n = 1);
+
+#include <cuda/std/cassert>
+#include <cuda/std/iterator>
+
+#include "test_iterators.h"
+#include "test_macros.h"
+
+template <class It>
+TEST_FUNC constexpr void check_prev_n(It it, typename cuda::std::iterator_traits<It>::difference_type n, It result)
+{
+#if !_CCCL_TILE_COMPILATION() // error: indirect call is unsupported in tile code
+  static_assert(cuda::std::is_same<decltype(cuda::std::prev(it, n)), It>::value);
+  assert(cuda::std::prev(it, n) == result);
+
+  It (*prev_ptr)(It, typename cuda::std::iterator_traits<It>::difference_type) = cuda::std::prev;
+  assert(prev_ptr(it, n) == result);
+#endif // !_CCCL_TILE_COMPILATION()
+}
+
+template <class It>
+TEST_FUNC constexpr void check_prev_1(It it, It result)
+{
+  static_assert(cuda::std::is_same<decltype(cuda::std::prev(it)), It>::value);
+  assert(cuda::std::prev(it) == result);
+}
+
+TEST_FUNC constexpr bool tests()
+{
+  const char* s = "1234567890";
+  check_prev_n(forward_iterator<const char*>(s), -10, forward_iterator<const char*>(s + 10));
+  check_prev_n(bidirectional_iterator<const char*>(s + 10), 10, bidirectional_iterator<const char*>(s));
+  check_prev_n(bidirectional_iterator<const char*>(s), -10, bidirectional_iterator<const char*>(s + 10));
+  check_prev_n(random_access_iterator<const char*>(s + 10), 10, random_access_iterator<const char*>(s));
+  check_prev_n(random_access_iterator<const char*>(s), -10, random_access_iterator<const char*>(s + 10));
+  check_prev_n(s + 10, 10, s);
+
+  check_prev_1(bidirectional_iterator<const char*>(s + 1), bidirectional_iterator<const char*>(s));
+  check_prev_1(random_access_iterator<const char*>(s + 1), random_access_iterator<const char*>(s));
+  check_prev_1(s + 1, s);
+
+  return true;
+}
+
+int main(int, char**)
+{
+  tests();
+  static_assert(tests());
+  return 0;
+}

@@ -1,0 +1,5 @@
+# Ignore subproject non-tracked files and sub-directories
+subprojects/*
+!subprojects/packagefiles/
+!subprojects/*.wrap
+

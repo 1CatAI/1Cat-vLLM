@@ -1,0 +1,66 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// cuda::std::pod is deprecated in C++20
+// ADDITIONAL_COMPILE_DEFINITIONS: CCCL_IGNORE_DEPRECATED_API
+
+// type_traits
+
+// is_pod
+
+#include <cuda/std/type_traits>
+
+#include "test_macros.h"
+
+template <class T>
+TEST_FUNC void test_is_pod()
+{
+  static_assert(cuda::std::is_pod<T>::value);
+  static_assert(cuda::std::is_pod<const T>::value);
+  static_assert(cuda::std::is_pod<volatile T>::value);
+  static_assert(cuda::std::is_pod<const volatile T>::value);
+  static_assert(cuda::std::is_pod_v<T>);
+  static_assert(cuda::std::is_pod_v<const T>);
+  static_assert(cuda::std::is_pod_v<volatile T>);
+  static_assert(cuda::std::is_pod_v<const volatile T>);
+}
+
+template <class T>
+TEST_FUNC void test_is_not_pod()
+{
+  static_assert(!cuda::std::is_pod<T>::value);
+  static_assert(!cuda::std::is_pod<const T>::value);
+  static_assert(!cuda::std::is_pod<volatile T>::value);
+  static_assert(!cuda::std::is_pod<const volatile T>::value);
+  static_assert(!cuda::std::is_pod_v<T>);
+  static_assert(!cuda::std::is_pod_v<const T>);
+  static_assert(!cuda::std::is_pod_v<volatile T>);
+  static_assert(!cuda::std::is_pod_v<const volatile T>);
+}
+
+class Class
+{
+public:
+  TEST_FUNC ~Class();
+};
+
+int main(int, char**)
+{
+  test_is_not_pod<void>();
+  test_is_not_pod<int&>();
+  test_is_not_pod<Class>();
+
+  test_is_pod<int>();
+  test_is_pod<double>();
+  test_is_pod<int*>();
+  test_is_pod<const int*>();
+  test_is_pod<char[3]>();
+  test_is_pod<char[]>();
+
+  return 0;
+}

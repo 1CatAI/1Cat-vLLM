@@ -1,0 +1,87 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: libcpp-has-no-threads, pre-sm-60
+// UNSUPPORTED: windows && pre-sm-70
+
+// UNSUPPORTED: force-tile
+// error: asm statement is unsupported in tile code
+
+// <cuda/std/atomic>
+
+// constexpr atomic<T>::atomic(T value)
+
+// ADDITIONAL_COMPILE_DEFINITIONS: CCCL_IGNORE_DEPRECATED_API
+
+#include <cuda/atomic>
+#include <cuda/std/atomic>
+#include <cuda/std/cassert>
+#include <cuda/std/type_traits>
+
+#include "atomic_helpers.h"
+#include "cuda_space_selector.h"
+#include "test_macros.h"
+
+struct UserType
+{
+  int i;
+
+  TEST_HOST_DEVICE_FUNC UserType() noexcept {}
+  TEST_HOST_DEVICE_FUNC constexpr explicit UserType(int d) noexcept
+      : i(d)
+  {}
+
+  TEST_HOST_DEVICE_FUNC friend bool operator==(const UserType& x, const UserType& y)
+  {
+    return x.i == y.i;
+  }
+};
+
+template <class Tp, template <typename, typename> class, cuda::thread_scope Scope>
+struct TestFunc
+{
+  TEST_HOST_DEVICE_FUNC void operator()() const
+  {
+    using Atomic = cuda::atomic<Tp, Scope>;
+    static_assert(cuda::std::is_literal_type<Atomic>::value);
+    constexpr Tp t(42);
+    {
+      constexpr Atomic a(t);
+      assert(a == t);
+    }
+    {
+      constexpr Atomic a{t};
+      assert(a == t);
+    }
+#if !_CCCL_COMPILER(GCC) || _CCCL_COMPILER(GCC, >=, 4, 9)
+    // TODO: Figure out why this is failing with GCC 4.8.2 on CentOS 7 only.
+    {
+      constexpr Atomic a = LIBCUDACXX_ATOMIC_VAR_INIT(t);
+      assert(a == t);
+    }
+#endif
+  }
+};
+
+int main(int, char**)
+{
+  NV_DISPATCH_TARGET(
+    NV_IS_HOST,
+    (TestFunc<UserType, local_memory_selector, cuda::thread_scope_system>()();
+     TestEachIntegralType<TestFunc, local_memory_selector, cuda::thread_scope_system>()();),
+    NV_PROVIDES_SM_60,
+    (TestFunc<UserType, local_memory_selector, cuda::thread_scope_system>()();
+     TestEachIntegralType<TestFunc, local_memory_selector, cuda::thread_scope_system>()();))
+
+  TestFunc<UserType, local_memory_selector, cuda::thread_scope_device>()();
+  TestEachIntegralType<TestFunc, local_memory_selector, cuda::thread_scope_device>()();
+  TestFunc<UserType, local_memory_selector, cuda::thread_scope_block>()();
+  TestEachIntegralType<TestFunc, local_memory_selector, cuda::thread_scope_block>()();
+
+  return 0;
+}

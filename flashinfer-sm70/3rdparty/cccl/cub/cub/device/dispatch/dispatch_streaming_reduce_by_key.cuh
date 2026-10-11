@@ -1,0 +1,255 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause
+
+#pragma once
+
+#include <cub/config.cuh>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cub/agent/agent_reduce_by_key.cuh>
+#include <cub/device/dispatch/dispatch_common.cuh>
+#include <cub/device/dispatch/dispatch_reduce_by_key.cuh>
+#include <cub/device/dispatch/tuning/tuning_reduce_by_key.cuh>
+#include <cub/util_device.cuh>
+#include <cub/util_type.cuh>
+
+#include <thrust/iterator/offset_iterator.h>
+#include <thrust/system/cuda/detail/core/triple_chevron_launch.h>
+
+#include <cuda/std/__functional/invoke.h>
+#include <cuda/std/__host_stdlib/sstream>
+#include <cuda/std/__type_traits/conditional.h>
+#include <cuda/std/__type_traits/is_same.h>
+
+CUB_NAMESPACE_BEGIN
+
+namespace detail::reduce_by_key
+{
+template <typename KeysInputIteratorT,
+          typename UniqueOutputIteratorT,
+          typename ValuesInputIteratorT,
+          typename AggregatesOutputIteratorT,
+          typename NumRunsOutputIteratorT,
+          typename EqualityOpT,
+          typename ReductionOpT,
+          typename OffsetT,
+          typename AccumT = ::cuda::std::__accumulator_t<ReductionOpT, it_value_t<ValuesInputIteratorT>>,
+          typename PolicySelector =
+            policy_selector_from_types<ReductionOpT,
+                                       AccumT,
+                                       non_void_value_t<UniqueOutputIteratorT, it_value_t<KeysInputIteratorT>>>>
+#if _CCCL_HAS_CONCEPTS()
+  requires reduce_by_key_policy_selector<PolicySelector>
+#endif
+CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE cudaError_t dispatch_streaming(
+  void* d_temp_storage,
+  size_t& temp_storage_bytes,
+  KeysInputIteratorT d_keys_in,
+  UniqueOutputIteratorT d_unique_out,
+  ValuesInputIteratorT d_values_in,
+  AggregatesOutputIteratorT d_aggregates_out,
+  NumRunsOutputIteratorT d_num_runs_out,
+  EqualityOpT equality_op,
+  ReductionOpT reduction_op,
+  OffsetT num_items,
+  cudaStream_t stream,
+  PolicySelector policy_selector = {})
+{
+  ::cuda::compute_capability cc{};
+  if (const auto error = CubDebug(ptx_compute_cap(cc)))
+  {
+    return error;
+  }
+
+  const ReduceByKeyPolicy policy = policy_selector(cc);
+
+#if _CCCL_HOSTED() && defined(CUB_DEBUG_LOG)
+  NV_IF_TARGET(NV_IS_HOST, ({
+                 ::std::stringstream ss;
+                 ss << policy;
+                 _CubLog("Dispatching streaming reduce by key to compute capability %d.%d with tuning: %s\n",
+                         cc.major_cap(),
+                         cc.minor_cap(),
+                         ss.str().c_str());
+               }))
+#endif // _CCCL_HOSTED() && defined(CUB_DEBUG_LOG)
+
+  using local_offset_t  = ::cuda::std::int32_t;
+  using global_offset_t = OffsetT;
+  static constexpr bool use_streaming_invocation =
+    ::cuda::std::numeric_limits<OffsetT>::max() > ::cuda::std::numeric_limits<local_offset_t>::max();
+  using streaming_context_t = ::cuda::std::
+    conditional_t<use_streaming_invocation, streaming_context<KeysInputIteratorT, AccumT, global_offset_t>, NullType>;
+  using ScanTileStateT                                      = ReduceByKeyScanTileState<AccumT, local_offset_t>;
+  [[maybe_unused]] static constexpr int init_kernel_threads = 128;
+
+  const int threads_per_block = policy.lookback.threads_per_block;
+  const int items_per_thread  = policy.lookback.items_per_thread;
+  const auto tile_size =
+    static_cast<global_offset_t>(threads_per_block) * static_cast<global_offset_t>(items_per_thread);
+
+  auto capped_num_items_per_invocation = num_items;
+  if constexpr (use_streaming_invocation)
+  {
+    capped_num_items_per_invocation = static_cast<global_offset_t>(::cuda::std::numeric_limits<local_offset_t>::max());
+    capped_num_items_per_invocation -= (capped_num_items_per_invocation % tile_size);
+  }
+
+  const auto max_num_items_per_invocation =
+    use_streaming_invocation ? ::cuda::std::min(capped_num_items_per_invocation, num_items) : num_items;
+  auto const num_partitions =
+    (num_items == 0) ? global_offset_t{1} : ::cuda::ceil_div(num_items, capped_num_items_per_invocation);
+
+  const auto max_num_tiles = static_cast<int>(::cuda::ceil_div(max_num_items_per_invocation, tile_size));
+
+  size_t allocation_sizes[3];
+  if (const auto error = CubDebug(ScanTileStateT::AllocationSize(max_num_tiles, allocation_sizes[0])))
+  {
+    return error;
+  }
+  allocation_sizes[1] = num_partitions > 1 ? sizeof(global_offset_t) * 2 : size_t{0};
+  allocation_sizes[2] = num_partitions > 1 ? sizeof(AccumT) * 2 : size_t{0};
+
+  void* allocations[3] = {};
+  if (const auto error =
+        CubDebug(detail::alias_temporaries(d_temp_storage, temp_storage_bytes, allocations, allocation_sizes)))
+  {
+    return error;
+  }
+
+  if (d_temp_storage == nullptr)
+  {
+    return cudaSuccess;
+  }
+
+  for (global_offset_t partition_idx = 0; partition_idx < num_partitions; partition_idx++)
+  {
+    global_offset_t current_partition_offset = partition_idx * capped_num_items_per_invocation;
+    global_offset_t current_num_items =
+      (partition_idx + 1 == num_partitions) ? (num_items - current_partition_offset) : capped_num_items_per_invocation;
+
+    const auto num_current_tiles = static_cast<int>(::cuda::ceil_div(current_num_items, tile_size));
+    ScanTileStateT tile_state;
+    if (const auto error = CubDebug(tile_state.Init(num_current_tiles, allocations[0], allocation_sizes[0])))
+    {
+      return error;
+    }
+
+    const int init_grid_size = ::cuda::std::max(1, ::cuda::ceil_div(num_current_tiles, init_kernel_threads));
+#ifdef CUB_DEBUG_LOG
+    _CubLog("Invoking init_kernel<<<%d, %d, 0, %lld>>>()\n", init_grid_size, init_kernel_threads, (long long) stream);
+#endif
+    if (const auto error = CubDebug(
+          THRUST_NS_QUALIFIER::cuda_cub::detail::triple_chevron(init_grid_size, init_kernel_threads, 0, stream)
+            .doit(&detail::scan::DeviceCompactInitKernel<ScanTileStateT, NumRunsOutputIteratorT>,
+                  tile_state,
+                  num_current_tiles,
+                  d_num_runs_out)))
+    {
+      return error;
+    }
+
+    if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+    {
+      return error;
+    }
+
+    if (num_items == 0)
+    {
+      return cudaSuccess;
+    }
+
+#ifdef CUB_DEBUG_LOG
+    _CubLog("Invoking reduce_by_key_kernel<<<%d, %d, 0, %lld>>>(), %d items per thread\n",
+            num_current_tiles,
+            threads_per_block,
+            (long long) stream,
+            items_per_thread);
+#endif
+    auto reduce_by_key_kernel = DeviceReduceByKeyKernel<
+      PolicySelector,
+      KeysInputIteratorT,
+      UniqueOutputIteratorT,
+      ValuesInputIteratorT,
+      AggregatesOutputIteratorT,
+      NumRunsOutputIteratorT,
+      ScanTileStateT,
+      EqualityOpT,
+      ReductionOpT,
+      local_offset_t,
+      AccumT,
+      streaming_context_t>;
+
+    if constexpr (use_streaming_invocation)
+    {
+      auto tmp_num_uniques          = static_cast<global_offset_t*>(allocations[1]);
+      auto tmp_prefix               = static_cast<AccumT*>(allocations[2]);
+      const bool is_first_partition = (partition_idx == 0);
+      const bool is_last_partition  = (partition_idx + 1 == num_partitions);
+      const int buffer_selector     = partition_idx % 2;
+      streaming_context_t streaming_context{
+        is_first_partition,
+        is_last_partition,
+        is_first_partition ? d_keys_in : d_keys_in + current_partition_offset - 1,
+        &tmp_prefix[buffer_selector],
+        &tmp_prefix[buffer_selector ^ 0x01],
+        &tmp_num_uniques[buffer_selector],
+        &tmp_num_uniques[buffer_selector ^ 0x01]};
+      if (const auto error = CubDebug(
+            THRUST_NS_QUALIFIER::cuda_cub::detail::triple_chevron(num_current_tiles, threads_per_block, 0, stream)
+              .doit(reduce_by_key_kernel,
+                    d_keys_in + current_partition_offset,
+                    d_unique_out,
+                    d_values_in + current_partition_offset,
+                    d_aggregates_out,
+                    d_num_runs_out,
+                    tile_state,
+                    0,
+                    equality_op,
+                    reduction_op,
+                    static_cast<local_offset_t>(current_num_items),
+                    streaming_context,
+                    detail::vsmem_t{nullptr})))
+      {
+        return error;
+      }
+    }
+    else
+    {
+      if (const auto error = CubDebug(
+            THRUST_NS_QUALIFIER::cuda_cub::detail::triple_chevron(num_current_tiles, threads_per_block, 0, stream)
+              .doit(reduce_by_key_kernel,
+                    d_keys_in + current_partition_offset,
+                    d_unique_out,
+                    d_values_in + current_partition_offset,
+                    d_aggregates_out,
+                    d_num_runs_out,
+                    tile_state,
+                    0,
+                    equality_op,
+                    reduction_op,
+                    static_cast<local_offset_t>(current_num_items),
+                    NullType{},
+                    detail::vsmem_t{nullptr})))
+      {
+        return error;
+      }
+    }
+    if (const auto error = CubDebug(detail::DebugSyncStream(stream)))
+    {
+      return error;
+    }
+  }
+
+  return cudaSuccess;
+}
+} // namespace detail::reduce_by_key
+
+CUB_NAMESPACE_END

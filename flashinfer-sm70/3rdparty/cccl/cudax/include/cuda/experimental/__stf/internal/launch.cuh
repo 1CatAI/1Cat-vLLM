@@ -1,0 +1,542 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of CUDASTF in CUDA C++ Core Libraries,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include <cuda/__cccl_config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/experimental/__stf/internal/execution_policy.cuh> // launch_impl() uses execution_policy
+#include <cuda/experimental/__stf/internal/interpreted_execution_policy_impl.cuh>
+#include <cuda/experimental/__stf/internal/task_dep.cuh>
+#include <cuda/experimental/__stf/internal/task_statistics.cuh>
+#include <cuda/experimental/__stf/internal/thread_hierarchy.cuh>
+#include <cuda/experimental/__stf/utility/scope_guard.cuh> // graph_launch_impl() uses SCOPE
+
+namespace cuda::experimental::stf
+{
+// This feature requires a CUDA compiler
+#if !defined(CUDASTF_DISABLE_CODE_GENERATION) && _CCCL_CUDA_COMPILATION()
+
+class stream_ctx;
+template <typename...>
+class stream_task;
+
+namespace reserved
+{
+template <typename Fun, typename Arg>
+__global__ void launch_kernel(Fun f, Arg arg)
+{
+  ::std::apply(mv(f), mv(arg));
+}
+
+template <typename interpreted_spec, typename Fun, typename Stream_t>
+void cuda_launcher(interpreted_spec interpreted_policy, Fun&& f, void** args, Stream_t& stream)
+{
+  const ::std::array<size_t, 3> config     = interpreted_policy.get_config();
+  const ::std::array<size_t, 3> mem_config = interpreted_policy.get_mem_config();
+
+  bool cooperative_kernel = interpreted_policy.need_cooperative_kernel_launch();
+
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id              = cudaLaunchAttributeCooperative;
+  attrs[0].val.cooperative = cooperative_kernel ? 1 : 0;
+
+  cudaLaunchConfig_t lconfig;
+  lconfig.gridDim          = static_cast<int>(config[1]);
+  lconfig.blockDim         = static_cast<int>(config[2]);
+  lconfig.attrs            = attrs;
+  lconfig.numAttrs         = 1;
+  lconfig.dynamicSmemBytes = mem_config[2];
+  lconfig.stream           = stream;
+
+  cuda_try<cudaLaunchKernelExC>(&lconfig, (void*) f, args);
+}
+
+template <typename interpreted_spec, typename Fun>
+void cuda_launcher_graph(interpreted_spec interpreted_policy, Fun&& f, void** args, cudaGraph_t& g, cudaGraphNode_t& n)
+{
+  const ::std::array<size_t, 3> config     = interpreted_policy.get_config();
+  const ::std::array<size_t, 3> mem_config = interpreted_policy.get_mem_config();
+
+  cudaKernelNodeParams kconfig;
+  kconfig.gridDim        = static_cast<int>(config[1]);
+  kconfig.blockDim       = static_cast<int>(config[2]);
+  kconfig.extra          = nullptr;
+  kconfig.func           = (void*) f;
+  kconfig.kernelParams   = args;
+  kconfig.sharedMemBytes = static_cast<int>(mem_config[2]);
+
+  n = cuda_try<cudaGraphAddKernelNode>(g, nullptr, 0, &kconfig);
+
+  // Enable cooperative kernel if necessary by updating the node attributes
+
+  bool cooperative_kernel = interpreted_policy.need_cooperative_kernel_launch();
+
+  cudaKernelNodeAttrValue val;
+  val.cooperative = cooperative_kernel ? 1 : 0;
+  cuda_try<cudaGraphKernelNodeSetAttribute>(n, cudaKernelNodeAttributeCooperative, &val);
+}
+
+template <typename Fun, typename interpreted_spec, typename Arg>
+void launch_impl(interpreted_spec interpreted_policy, exec_place& p, Fun f, Arg arg, cudaStream_t stream, size_t rank)
+{
+  _CCCL_ASSERT(p.size() == 1, "Expected scalar exec_place");
+
+  p->*[&] {
+    auto th = thread_hierarchy(static_cast<int>(rank), interpreted_policy);
+
+    void* th_dev_tmp_ptr = nullptr;
+
+    // Free the temporary device memory on the way out, even if set_device_tmp
+    // or the launch throws. Installed before the malloc so a throw from
+    // set_device_tmp cannot skip the free. cuda_safe_call (not cuda_try)
+    // because SCOPE(exit) is noexcept.
+    SCOPE(exit)
+    {
+      if (th_dev_tmp_ptr)
+      {
+        cuda_safe_call(cudaFreeAsync(th_dev_tmp_ptr, stream));
+      }
+    };
+
+    /* Allocate temporary device memory */
+    auto th_mem_config = interpreted_policy.get_mem_config();
+    if (th_mem_config[0] > 0)
+    {
+      // Lazily initialize system memory if needed
+      void* sys_mem = interpreted_policy.get_system_mem();
+      if (!sys_mem)
+      {
+        sys_mem = allocateManagedMemory(th_mem_config[0]);
+        interpreted_policy.set_system_mem(sys_mem);
+      }
+
+      _CCCL_ASSERT(sys_mem, "System memory allocation failed");
+      th.set_system_tmp(sys_mem);
+    }
+
+    if (th_mem_config[1] > 0)
+    {
+      cuda_try(cudaMallocAsync(&th_dev_tmp_ptr, th_mem_config[1], stream));
+      th.set_device_tmp(th_dev_tmp_ptr);
+    }
+
+    auto kernel_args = tuple_prepend(mv(th), mv(arg));
+    using args_type  = decltype(kernel_args);
+    void* all_args[] = {&f, &kernel_args};
+
+    cuda_launcher(interpreted_policy, reserved::launch_kernel<Fun, args_type>, all_args, stream);
+  };
+}
+
+template <typename task_t, typename Fun, typename interpreted_spec, typename Arg>
+void graph_launch_impl(task_t& t, interpreted_spec interpreted_policy, exec_place& p, Fun f, Arg arg, size_t rank)
+{
+  _CCCL_ASSERT(p.size() == 1, "Expected scalar exec_place");
+
+  auto kernel_args = tuple_prepend(thread_hierarchy(static_cast<int>(rank), interpreted_policy), mv(arg));
+  using args_type  = decltype(kernel_args);
+  void* all_args[] = {&f, &kernel_args};
+
+  p->*[&] {
+    cuda_launcher_graph(
+      interpreted_policy, reserved::launch_kernel<Fun, args_type>, all_args, t.get_ctx_graph(), t.get_node());
+  };
+}
+
+/**
+ * @brief a free-function implementation of the launch mechanism which can be
+ * used multiple times in a task, or possibly outside tasks
+ */
+template <typename spec_t, typename Arg>
+class launch
+{
+public:
+  /**
+   * @brief Constructor to initialize a light-weight launch
+   * @param ctx Execution context.
+   * @param spec The specification of the thread hierarchy.
+   * @param e_place Execution place (e.g., device, host).
+   * @param arg Arguments to be passed to the kernel.
+   */
+  launch(spec_t spec, exec_place e_place, ::std::vector<cudaStream_t> streams, Arg arg)
+      : arg(mv(arg))
+      , e_place(mv(e_place))
+      , spec(mv(spec))
+      , streams(mv(streams))
+  {}
+
+  launch(exec_place e_place, ::std::vector<cudaStream_t> streams, Arg arg)
+      : launch(spec_t(), mv(e_place), mv(streams), mv(arg))
+  {}
+
+  template <typename Fun>
+  void operator->*(Fun&& f)
+  {
+#  if _CCCL_CUDA_COMPILER(NVHPC)
+    // With nvc++, all lambdas can run on host and device.
+    static constexpr bool is_extended_host_device_lambda_closure_type = true,
+                          is_extended_device_lambda_closure_type      = false;
+#  else // ^^^ _CCCL_CUDA_COMPILER(NVHPC) ^^^ / VVV !_CCCL_CUDA_COMPILER(NVHPC) VVV
+    // With nvcpp, dedicated traits tell how a lambda can be executed.
+    static constexpr bool is_extended_host_device_lambda_closure_type =
+                            __nv_is_extended_host_device_lambda_closure_type(Fun),
+                          is_extended_device_lambda_closure_type = __nv_is_extended_device_lambda_closure_type(Fun);
+#  endif // ^^^ !_CCCL_CUDA_COMPILER(NVHPC) ^^^
+
+    static_assert(is_extended_host_device_lambda_closure_type || is_extended_device_lambda_closure_type,
+                  "Cannot run launch() on the host");
+
+    EXPECT(e_place != exec_place::host(), "Attempt to run a launch on the host.");
+
+    const size_t grid_size = e_place.size();
+
+    using th_t     = typename spec_t::thread_hierarchy_t;
+    using arg_type = decltype(tuple_prepend(th_t(), arg));
+
+    auto interpreted_policy = interpreted_execution_policy(spec, e_place, reserved::launch_kernel<Fun, arg_type>);
+
+    SCOPE(exit)
+    {
+      /* If there was managed memory allocated we need to deallocate it */
+      void* sys_mem = interpreted_policy.get_system_mem();
+      if (sys_mem)
+      {
+        auto th_mem_config = interpreted_policy.get_mem_config();
+        deallocateManagedMemory(sys_mem, th_mem_config[0], streams[0]);
+      }
+
+      unsigned char* hostMemoryArrivedList = interpreted_policy.cg_system.get_arrived_list();
+      if (hostMemoryArrivedList)
+      {
+        deallocateManagedMemory(hostMemoryArrivedList, grid_size - 1, streams[0]);
+      }
+    };
+
+    /* Should only be allocated / deallocated if the last level used is system wide. Unnecessary and wasteful
+     * otherwise. */
+    if (grid_size > 1)
+    {
+      if (interpreted_policy.last_level_scope() == hw_scope::device)
+      {
+        const size_t arrived_bytes  = grid_size - 1;
+        auto* hostMemoryArrivedList = static_cast<unsigned char*>(allocateManagedMemory(arrived_bytes));
+        // Own the buffer until cg_system adopts it; if the assignment below
+        // throws, free immediately so we do not leak. cuda_safe_call because
+        // SCOPE(fail) is noexcept (pool insert can throw).
+        SCOPE(fail)
+        {
+          cuda_safe_call(cudaFree(hostMemoryArrivedList));
+        };
+        memset(hostMemoryArrivedList, 0, arrived_bytes);
+        interpreted_policy.cg_system = reserved::cooperative_group_system(hostMemoryArrivedList);
+      }
+    }
+
+    // t.get_stream_grid should return the stream from get_stream if this is not a grid ?
+    for (size_t p_rank = 0; p_rank < e_place.size(); ++p_rank)
+    {
+      auto p = e_place.get_place(p_rank);
+      launch_impl(interpreted_policy, p, f, arg, streams[p_rank], p_rank);
+    }
+  }
+
+private:
+  template <typename Fun>
+  void run_on_host(Fun&& f)
+  {
+    _CCCL_ASSERT(false, "Not yet implemented");
+    abort();
+  }
+
+  Arg arg;
+  exec_place e_place;
+  ::std::string symbol;
+  spec_t spec;
+  ::std::vector<cudaStream_t> streams;
+};
+
+/**
+ * @brief A class template for launching tasks with dependencies and execution context.
+ * @tparam Ctx Type of the execution context.
+ * @tparam Deps Types of dependencies.
+ */
+template <typename Ctx, typename thread_hierarchy_spec_t, typename... Deps>
+class launch_scope
+{
+public:
+  /**
+   * @brief Constructor to initialize a launch_scope.
+   * @param ctx Execution context.
+   * @param spec The specification of the thread hierarchy.
+   * @param e_place Execution place (e.g., device, host).
+   * @param deps Dependencies for the task to be launched.
+   */
+  launch_scope(Ctx& ctx, thread_hierarchy_spec_t spec, exec_place e_place, task_dep<Deps>... deps)
+      : deps(mv(deps)...)
+      , ctx(ctx)
+      , e_place(mv(e_place))
+      , spec(mv(spec))
+  {}
+
+  /// Deleted copy constructor and copy assignment operator.
+  launch_scope(const launch_scope&)            = delete;
+  launch_scope& operator=(const launch_scope&) = delete;
+
+  /// Move constructor
+  launch_scope(launch_scope&&) = default;
+
+  /**
+   * @brief Set the symbol for the task.
+   * @param s The symbol string.
+   * @return Reference to the current object for chaining.
+   */
+  auto& set_symbol(::std::string s)
+  {
+    symbol = mv(s);
+    return *this;
+  }
+
+  /**
+   * @brief Operator to launch the task.
+   * @tparam Fun Type of the function or lambda to be executed.
+   * @param f Function or lambda to be executed.
+   */
+  template <typename Fun>
+  void operator->*(Fun&& f)
+  {
+#  if _CCCL_CUDA_COMPILER(NVHPC)
+    // With nvc++, all lambdas can run on host and device.
+    static constexpr bool is_extended_host_device_lambda_closure_type = true,
+                          is_extended_device_lambda_closure_type      = false;
+#  else // ^^^ _CCCL_CUDA_COMPILER(NVHPC) ^^^ / VVV !_CCCL_CUDA_COMPILER(NVHPC) VVV
+    // With nvcpp, dedicated traits tell how a lambda can be executed.
+    static constexpr bool is_extended_host_device_lambda_closure_type =
+                            __nv_is_extended_host_device_lambda_closure_type(Fun),
+                          is_extended_device_lambda_closure_type = __nv_is_extended_device_lambda_closure_type(Fun);
+#  endif // ^^^ !_CCCL_CUDA_COMPILER(NVHPC) ^^^
+
+    static_assert(is_extended_device_lambda_closure_type || is_extended_host_device_lambda_closure_type,
+                  "Cannot run launch() on the host");
+
+    EXPECT(e_place != exec_place::host(), "Attempt to run a launch on the host.");
+
+    auto& dot        = *ctx.get_dot();
+    auto& statistics = reserved::task_statistics::instance();
+
+    auto t = ctx.task(e_place);
+
+    _CCCL_ASSERT(e_place.affine_data_place() == t.get_affine_data_place(), "Affine data places must match");
+
+    /*
+     * If we have a grid (including 1-element grids), the implicit affine partitioner is the blocked_partition.
+     *
+     * An explicit composite data place is required per data dependency to customize this behaviour.
+     */
+    if (e_place.size() > 1)
+    {
+      // Create a composite data place defined by the grid of places + the partitioning function
+      t.set_affine_data_place(data_place::composite(blocked_partition(), e_place.as_grid()));
+    }
+
+    t.add_deps(deps);
+    if (!symbol.empty())
+    {
+      t.set_symbol(symbol);
+    }
+
+    const bool scheduled = t.schedule_task();
+    // Execution place may have changed during scheduling task
+    e_place                = t.get_exec_place();
+    const bool record_time = scheduled || statistics.is_calibrating_to_file();
+
+    nvtx_range nr(t.get_symbol().c_str());
+
+    int device              = -1;
+    cudaEvent_t start_event = nullptr, end_event = nullptr;
+
+    SCOPE(exit)
+    {
+      if (start_event)
+      {
+        cuda_safe_call(cudaEventDestroy(start_event));
+      }
+      if (end_event)
+      {
+        cuda_safe_call(cudaEventDestroy(end_event));
+      }
+    };
+
+    const size_t grid_size = e_place.size();
+
+    // Build the policy before start(): occupancy queries can throw, and we must
+    // not leave a started task without teardown guards. args_type only needs the
+    // unevaluated return type of data2inst, so get() is not invoked here.
+    using th_t      = typename thread_hierarchy_spec_t::thread_hierarchy_t;
+    using args_type = decltype(tuple_prepend(th_t(), data2inst<decltype(t), Deps...>(t)));
+
+    auto interpreted_policy = interpreted_execution_policy(spec, e_place, reserved::launch_kernel<Fun, args_type>);
+
+    // Free launch-scoped managed temps between end_uncleared and clear on both paths.
+    auto free_launch_temps = [&] {
+      if constexpr (::std::is_same_v<Ctx, stream_ctx>)
+      {
+        void* sys_mem = interpreted_policy.get_system_mem();
+        if (sys_mem)
+        {
+          auto th_mem_config = interpreted_policy.get_mem_config();
+          deallocateManagedMemory(sys_mem, th_mem_config[0], t.get_stream());
+        }
+
+        unsigned char* hostMemoryArrivedList = interpreted_policy.cg_system.get_arrived_list();
+        if (hostMemoryArrivedList)
+        {
+          deallocateManagedMemory(hostMemoryArrivedList, grid_size - 1, t.get_stream());
+        }
+      }
+    };
+
+    t.start();
+
+    // If things go well, end the task with time measurements.
+    SCOPE(success)
+    {
+      t.end_uncleared();
+      free_launch_temps();
+
+      if constexpr (::std::is_same_v<Ctx, stream_ctx>)
+      {
+        if (start_event && end_event)
+        {
+          // Inside the SCOPE body; keep cuda_safe_call so a CUDA error aborts
+          // rather than throwing through a fail/exit guard (std::terminate).
+          cuda_safe_call(cudaEventRecord(end_event, t.get_stream()));
+          cuda_safe_call(cudaEventSynchronize(end_event));
+
+          float milliseconds = 0;
+          cuda_safe_call(cudaEventElapsedTime(&milliseconds, start_event, end_event));
+
+          if (dot.is_tracing())
+          {
+            dot.template add_vertex_timing<stream_task<>>(t, milliseconds, device);
+          }
+
+          if (statistics.is_calibrating())
+          {
+            statistics.log_task_time(t, milliseconds);
+          }
+        }
+      }
+
+      t.clear();
+    };
+
+    // And if they don't, free temps and just end the task.
+    SCOPE(fail)
+    {
+      t.end_uncleared();
+      free_launch_temps();
+      t.clear();
+    };
+
+    // Put all data instances in a tuple (requires a started task).
+    auto args = data2inst<decltype(t), Deps...>(t);
+
+    if constexpr (::std::is_same_v<Ctx, stream_ctx>)
+    {
+      if (record_time)
+      {
+        device = cuda_try<cudaGetDevice>(); // We will use this to force it during the next run
+        // Events must be created here to avoid issues with multi-gpu.
+        // cudaEventCreate is an overload set (cuda_runtime.h adds a flags overload),
+        // so cuda_try<cudaEventCreate> cannot name it; use the non-overloaded
+        // cudaEventCreateWithFlags with the default flags (equivalent to cudaEventCreate).
+        start_event = cuda_try<cudaEventCreateWithFlags>(cudaEventDefault);
+        end_event   = cuda_try<cudaEventCreateWithFlags>(cudaEventDefault);
+        cuda_try<cudaEventRecord>(start_event, t.get_stream());
+      }
+    }
+
+    /* Should only be allocated / deallocated if the last level used is system wide. Unnecessary and wasteful
+     * otherwise. */
+    if (grid_size > 1)
+    {
+      if (interpreted_policy.last_level_scope() == hw_scope::device)
+      {
+        const size_t arrived_bytes  = grid_size - 1;
+        auto* hostMemoryArrivedList = static_cast<unsigned char*>(allocateManagedMemory(arrived_bytes));
+        // Own the buffer until cg_system adopts it; if the assignment below
+        // throws, free immediately so we do not leak. cuda_safe_call because
+        // SCOPE(fail) is noexcept (pool insert can throw).
+        SCOPE(fail)
+        {
+          cuda_safe_call(cudaFree(hostMemoryArrivedList));
+        };
+        memset(hostMemoryArrivedList, 0, arrived_bytes);
+        interpreted_policy.cg_system = reserved::cooperative_group_system(hostMemoryArrivedList);
+      }
+    }
+
+    for (size_t p_rank = 0; p_rank < e_place.size(); ++p_rank)
+    {
+      auto p = e_place.get_place(p_rank);
+      if constexpr (::std::is_same_v<Ctx, stream_ctx>)
+      {
+        reserved::launch_impl(interpreted_policy, p, f, args, t.get_stream(p_rank), p_rank);
+      }
+      else
+      {
+        reserved::graph_launch_impl(t, interpreted_policy, p, f, args, p_rank);
+      }
+    }
+  }
+
+private:
+  /**
+   * @brief Converts a set of slices to a tuple of instances.
+   * @tparam T Type of the task.
+   * @tparam S Type of the slice.
+   * @tparam MoreSlices Types of more slices.
+   * @param t The task object.
+   * @param i Index (used internally for recursion).
+   * @return A tuple containing instances corresponding to slices.
+   */
+  template <typename T, typename S, typename... MoreSlices>
+  auto data2inst(T& t, size_t i = 0)
+  {
+    S s = t.template get<S>(i);
+    if constexpr (sizeof...(MoreSlices) == 0)
+    {
+      return ::std::make_tuple(s);
+    }
+    else
+    {
+      return tuple_prepend(s, data2inst<T, MoreSlices...>(t, i + 1));
+    }
+  }
+
+  task_dep_vector<Deps...> deps;
+  Ctx& ctx;
+  exec_place e_place;
+  ::std::string symbol;
+  thread_hierarchy_spec_t spec;
+};
+} // namespace reserved
+
+#endif // !defined(CUDASTF_DISABLE_CODE_GENERATION) && _CCCL_CUDA_COMPILATION()
+} // end namespace cuda::experimental::stf

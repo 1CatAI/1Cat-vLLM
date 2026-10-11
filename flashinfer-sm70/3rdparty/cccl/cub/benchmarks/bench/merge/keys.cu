@@ -1,0 +1,78 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause
+
+#include <cub/device/device_merge.cuh>
+
+#include <thrust/detail/raw_pointer_cast.h>
+
+#include <cuda/std/utility>
+
+#include <cstdint>
+
+#include <nvbench_helper.cuh>
+
+#include "merge_common.cuh"
+
+// %RANGE% TUNE_TRANSPOSE trp 0:1:1
+// %RANGE% TUNE_LOAD ld 0:3:1
+// %RANGE% TUNE_ITEMS_PER_THREAD ipt 7:24:1
+// %RANGE% TUNE_THREADS_PER_BLOCK_POW2 tpb 6:10:1
+
+template <typename KeyT>
+void keys(nvbench::state& state, nvbench::type_list<KeyT>)
+{
+  using offset_t     = int64_t;
+  using compare_op_t = less_t;
+
+  // Retrieve axis parameters
+  const auto elements       = static_cast<std::size_t>(state.get_int64("Elements{io}"));
+  const bit_entropy entropy = str_to_entropy(state.get_string("Entropy"));
+
+  const auto num_items_lhs  = elements / 2;
+  const auto num_items_rhs  = elements - num_items_lhs;
+  auto [keys_lhs, keys_rhs] = generate_lhs_rhs<KeyT>(num_items_lhs, num_items_rhs, entropy);
+
+  thrust::device_vector<KeyT> keys_out(elements, thrust::no_init);
+  KeyT* d_keys_lhs = thrust::raw_pointer_cast(keys_lhs.data());
+  KeyT* d_keys_rhs = thrust::raw_pointer_cast(keys_rhs.data());
+  KeyT* d_keys_out = thrust::raw_pointer_cast(keys_out.data());
+
+  // Enable throughput calculations and add "Size" column to results.
+  state.add_element_count(elements);
+  state.add_global_memory_reads<KeyT>(elements);
+  state.add_global_memory_writes<KeyT>(elements);
+
+  caching_allocator_t alloc;
+  state.exec(nvbench::exec_tag::gpu | nvbench::exec_tag::no_batch, [&](nvbench::launch& launch) {
+    auto env = cub_bench_env(
+      alloc,
+      launch
+#if !TUNE_BASE
+      ,
+      cuda::execution::tune(bench_policy_selector<key_t>{})
+#endif // !TUNE_BASE
+    );
+    _CCCL_TRY_CUDA_API(
+      cub::DeviceMerge::MergeKeys,
+      "MergePairs failed",
+      d_keys_lhs,
+      static_cast<offset_t>(num_items_lhs),
+      d_keys_rhs,
+      static_cast<offset_t>(num_items_rhs),
+      d_keys_out,
+      compare_op_t{},
+      env);
+  });
+}
+
+#ifdef TUNE_KeyT
+using key_types = nvbench::type_list<TUNE_KeyT>;
+#else // !defined(TUNE_KeyT)
+using key_types = fundamental_types;
+#endif // TUNE_KeyT
+
+NVBENCH_BENCH_TYPES(keys, NVBENCH_TYPE_AXES(key_types))
+  .set_name("base")
+  .set_type_axes_names({"KeyT{ct}"})
+  .add_int64_power_of_two_axis("Elements{io}", nvbench::range(16, 28, 4))
+  .add_string_axis("Entropy", {"1.000", "0.201"});

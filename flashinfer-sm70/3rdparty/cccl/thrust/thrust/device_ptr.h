@@ -1,0 +1,227 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2021, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+/*! \file
+ *  \brief A pointer to an object which resides in memory associated with the
+ *  \c device system.
+ */
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <thrust/memory.h>
+
+#include <cuda/std/__memory/addressof.h>
+#include <cuda/std/__memory/pointer_traits.h>
+
+THRUST_NAMESPACE_BEGIN
+
+/*! \addtogroup memory_management Memory Management
+ *  \{
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+
+template <typename T>
+class device_reference;
+
+/*! \brief \c device_ptr is a pointer-like object which points to an object that
+ *  resides in memory associated with the \ref device system.
+ *
+ *  \c device_ptr has pointer semantics: it may be dereferenced safely from
+ *  anywhere, including the \ref host, and may be manipulated with pointer
+ *  arithmetic.
+ *
+ *  \c device_ptr can be created with \ref device_new, \ref device_malloc,
+ *  \ref device_malloc_allocator, \ref device_allocator, or
+ *  \ref device_pointer_cast, or by explicitly calling its constructor with a
+ *  raw pointer.
+ *
+ *  The raw pointer contained in a \c device_ptr may be obtained via \c get
+ *  member function or the \ref raw_pointer_cast free function.
+ *
+ *  \ref algorithms operating on \c device_ptr types will automatically be
+ *  dispatched to the \ref device system.
+ *
+ *  \note \c device_ptr is not a smart pointer; it is the programmer's
+ *  responsibility to deallocate memory pointed to by \c device_ptr.
+ *
+ *  \see device_new
+ *  \see device_malloc
+ *  \see device_malloc_allocator
+ *  \see device_allocator
+ *  \see device_pointer_cast
+ *  \see raw_pointer_cast
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename T>
+class device_ptr
+    : public thrust::pointer<T, thrust::device_system_tag, thrust::device_reference<T>, thrust::device_ptr<T>>
+{
+private:
+  using super_t = thrust::pointer<T, thrust::device_system_tag, thrust::device_reference<T>, thrust::device_ptr<T>>;
+
+public:
+  _CCCL_HIDE_FROM_ABI device_ptr() = default;
+
+  /*! \brief Construct a null \c device_ptr.
+   *
+   *  This constructor accepts a \c std::nullptr_t value.
+   *
+   *  \post <tt>get() == nullptr</tt>.
+   *
+   *  \verbatim embed:rst:leading-asterisk
+   *     .. versionadded:: 2.2.0
+   *  \endverbatim
+   */
+  _CCCL_HOST_DEVICE device_ptr(std::nullptr_t)
+      : super_t(nullptr)
+  {}
+
+  /*! \brief Construct a \c device_ptr from a raw pointer which is
+   *  convertible to \c T*.
+   *
+   *  \tparam U   A type whose pointer is convertible to \c T*.
+   *  \param  ptr A raw pointer to a \c U in device memory to construct from.
+   *
+   *  \pre <tt>std::is_convertible_v<U*, T*> == true</tt>.
+   *
+   *  \pre \c ptr points to a location in device memory.
+   *
+   *  \post <tt>get() == nullptr</tt>.
+   *
+   *  \verbatim embed:rst:leading-asterisk
+   *     .. versionadded:: 2.2.0
+   *  \endverbatim
+   */
+  template <typename U>
+  _CCCL_HOST_DEVICE explicit device_ptr(U* ptr)
+      : super_t(ptr)
+  {}
+
+  /*! \brief Copy construct a \c device_ptr from another \c device_ptr whose
+   *  pointer type is convertible to \c T*.
+   *
+   *  \tparam U     A type whose pointer is convertible to \c T*.
+   *  \param  other A \c device_ptr to a \c U to construct from.
+   *
+   *  \pre <tt>std::is_convertible_v<U*, T*> == true</tt>.
+   *
+   *  \post <tt>get() == other.get()</tt>.
+   *
+   *  \verbatim embed:rst:leading-asterisk
+   *     .. versionadded:: 2.2.0
+   *  \endverbatim
+   */
+  template <typename U>
+  _CCCL_HOST_DEVICE device_ptr(device_ptr<U> const& other)
+      : super_t(other)
+  {}
+
+  /*! \brief Set this \c device_ptr to point to the same object as another
+   *  \c device_ptr whose pointer type is convertible to \c T*.
+   *
+   *  \tparam U     A type whose pointer is convertible to \c T*.
+   *  \param  other A \c device_ptr to a \c U to assign from.
+   *
+   *  \pre <tt>std::is_convertible_v<U*, T*> == true</tt>.
+   *
+   *  \post <tt>get() == other.get()</tt>.
+   *
+   *  \return \c *this.
+   *
+   *  \verbatim embed:rst:leading-asterisk
+   *     .. versionadded:: 2.2.0
+   *  \endverbatim
+   */
+  template <typename U>
+  _CCCL_HOST_DEVICE device_ptr& operator=(device_ptr<U> const& other)
+  {
+    super_t::operator=(other);
+    return *this;
+  }
+
+  /*! \brief Set this \c device_ptr to null.
+   *
+   *  This operator accepts a \c std::nullptr_t value.
+   *
+   *  \post <tt>get() == nullptr</tt>.
+   *
+   *  \return \c *this.
+   *
+   *  \verbatim embed:rst:leading-asterisk
+   *     .. versionadded:: 2.2.0
+   *  \endverbatim
+   */
+  _CCCL_HOST_DEVICE device_ptr& operator=(std::nullptr_t)
+  {
+    super_t::operator=(nullptr);
+    return *this;
+  }
+};
+
+#ifdef _CCCL_DOXYGEN_INVOKED
+/*! Write the address that a \c device_ptr points to to an output stream.
+ *
+ *  \param os The output stream.
+ *  \param dp The \c device_ptr to output.
+ *
+ *  \return \c os.
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename T, typename CharT, typename Traits>
+_CCCL_HOST std::basic_ostream<CharT, Traits>& operator<<(std::basic_ostream<CharT, Traits>& os, device_ptr<T> const& dp);
+#endif
+
+/*! \brief Create a \c device_ptr from a raw pointer.
+ *
+ *  \tparam T   Any type.
+ *  \param  ptr A raw pointer to a \c T in device memory.
+ *
+ *  \pre \c ptr points to a location in device memory.
+ *
+ *  \return A \c device_ptr<T> pointing to \c ptr.
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename T>
+_CCCL_HOST_DEVICE device_ptr<T> device_pointer_cast(T* ptr);
+
+/*! \brief Create a \c device_ptr from another \c device_ptr.
+ *
+ *  \tparam T    Any type.
+ *  \param  dptr A \c device_ptr to a \c T.
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename T>
+_CCCL_HOST_DEVICE device_ptr<T> device_pointer_cast(device_ptr<T> const& dptr);
+
+/*! \} // memory_management
+ */
+
+THRUST_NAMESPACE_END
+
+#include <thrust/detail/device_ptr.inl>
+#include <thrust/detail/raw_pointer_cast.h>

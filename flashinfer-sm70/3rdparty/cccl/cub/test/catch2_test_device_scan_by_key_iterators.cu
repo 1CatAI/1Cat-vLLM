@@ -1,0 +1,183 @@
+// SPDX-FileCopyrightText: Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3
+
+#include "insert_nested_NVTX_range_guard.h"
+
+#include <cub/device/device_scan.cuh>
+
+#include <cuda/iterator>
+
+#include <cstdint>
+
+#include "catch2_test_device_reduce.cuh"
+#include "catch2_test_device_scan.cuh"
+#include "catch2_test_launch_helper.h"
+#include "cub_test_macros.h"
+#include <c2h/custom_type.h>
+#include <c2h/extended_types.h>
+
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::ExclusiveSumByKey, device_exclusive_sum_by_key);
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::ExclusiveScanByKey, device_exclusive_scan_by_key);
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::InclusiveSumByKey, device_inclusive_sum_by_key);
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::InclusiveScanByKey, device_inclusive_scan_by_key);
+
+// %PARAM% TEST_LAUNCH lid 0:1
+// %PARAM% TEST_TYPES types 0:1:2:3
+
+// List of types to test
+using custom_t =
+  c2h::custom_type_t<c2h::accumulateable_t,
+                     c2h::equal_comparable_t,
+                     c2h::lexicographical_less_comparable_t,
+                     c2h::lexicographical_greater_comparable_t>;
+
+// type_quad's parameters and defaults:
+// type_quad<value_in_t, value_out_t=value_in_t, key_t=int32_t, equality_op_t=cuda::std::equal_to<>>
+#if TEST_TYPES == 0
+using full_type_list = c2h::type_list<type_quad<std::uint8_t, std::int32_t, float>,
+                                      type_quad<std::int8_t, std::int8_t, std::int32_t, Mod2Equality>>;
+#elif TEST_TYPES == 1
+using full_type_list = c2h::type_list<type_quad<std::int32_t>, type_quad<std::uint64_t>>;
+#elif TEST_TYPES == 2
+using full_type_list =
+  c2h::type_list<type_quad<uchar3, uchar3, custom_t>,
+                 type_quad<
+#  if _CCCL_CTK_AT_LEAST(13, 0)
+                   ulonglong4_16a,
+                   ulonglong4_16a
+#  else // _CCCL_CTK_AT_LEAST(13, 0)
+                   ulonglong4,
+                   ulonglong4
+#  endif // _CCCL_CTK_AT_LEAST(13, 0)
+                   ,
+                   std::uint8_t,
+                   Mod2Equality>>;
+#elif TEST_TYPES == 3
+using full_type_list = c2h::type_list<type_quad<custom_t, custom_t, custom_t>>;
+#endif
+
+/**
+ * @brief Input data generation mode
+ */
+enum class gen_data_t : int
+{
+  /// Uniform random data generation
+  GEN_TYPE_RANDOM,
+  /// Constant value as input data
+  GEN_TYPE_CONST
+};
+
+CUB_TEST("Device scan works with fancy iterators", "[by_key][scan][device]", CUB_SMALL, full_type_list)
+{
+  using params   = params_t<TestType>;
+  using key_t    = typename params::type_pair_t::key_t;
+  using value_t  = typename params::item_t;
+  using output_t = typename params::output_t;
+  using offset_t = std::uint32_t;
+  using eq_op_t  = typename params::type_pair_t::eq_op_t;
+
+  constexpr offset_t min_items = 1;
+  constexpr offset_t max_items = 1000000;
+
+  // Generate the input sizes to test for
+  const offset_t num_items = GENERATE_COPY(
+    take(2, random(min_items, max_items)),
+    values({
+      min_items,
+      max_items,
+    }));
+  INFO("Test num_items: " << num_items);
+
+  // Range of segment sizes to generate (a segment is a series of consecutive equal keys)
+  const std::tuple<offset_t, offset_t> seg_size_range =
+    GENERATE_COPY(table<offset_t, offset_t>({{1, 1}, {1, num_items}, {num_items, num_items}}));
+  INFO("Test seg_size_range: [" << std::get<0>(seg_size_range) << ", " << std::get<1>(seg_size_range) << "]");
+
+  // Generate input segments
+  c2h::device_vector<offset_t> segment_offsets = c2h::gen_uniform_offsets<offset_t>(
+    C2H_SEED(1), num_items, std::get<0>(seg_size_range), std::get<1>(seg_size_range));
+
+  // Get array of keys from segment offsets
+  c2h::device_vector<key_t> segment_keys(num_items);
+  c2h::init_key_segments(segment_offsets, segment_keys);
+  auto d_keys_it = segment_keys.begin();
+  c2h::host_vector<key_t> h_segment_keys(segment_keys);
+
+  // Prepare input data
+  value_t default_constant{};
+  init_default_constant(default_constant);
+  auto values_in_it = cuda::constant_iterator(default_constant);
+
+  SECTION("inclusive sum")
+  {
+    using op_t = cuda::std::plus<>;
+
+    // Prepare verification data
+    c2h::host_vector<output_t> expected_result(num_items);
+    compute_inclusive_scan_by_key_reference(
+      values_in_it, h_segment_keys.cbegin(), expected_result.begin(), op_t{}, eq_op_t{}, num_items);
+
+    // Run test
+    c2h::device_vector<output_t> out_values(num_items);
+    device_inclusive_sum_by_key(d_keys_it, values_in_it, out_values.begin(), num_items, eq_op_t{});
+
+    // Verify result
+    REQUIRE(expected_result == out_values);
+  }
+
+  SECTION("exclusive sum")
+  {
+    using op_t = cuda::std::plus<>;
+
+    // Prepare verification data
+    c2h::host_vector<output_t> expected_result(num_items);
+    compute_exclusive_scan_by_key_reference(
+      values_in_it, h_segment_keys.cbegin(), expected_result.begin(), op_t{}, eq_op_t{}, output_t{}, num_items);
+
+    // Run test
+    c2h::device_vector<output_t> out_values(num_items);
+    device_exclusive_sum_by_key(d_keys_it, values_in_it, out_values.begin(), num_items, eq_op_t{});
+
+    // Verify result
+    REQUIRE(expected_result == out_values);
+  }
+
+  SECTION("inclusive scan")
+  {
+    using op_t = cuda::minimum<>;
+
+    // Prepare verification data
+    c2h::host_vector<output_t> expected_result(num_items);
+    compute_inclusive_scan_by_key_reference(
+      values_in_it, h_segment_keys.cbegin(), expected_result.begin(), op_t{}, eq_op_t{}, num_items);
+
+    // Run test
+    c2h::device_vector<output_t> out_values(num_items);
+    device_inclusive_scan_by_key(d_keys_it, values_in_it, out_values.begin(), op_t{}, num_items, eq_op_t{});
+
+    // Verify result
+    REQUIRE(expected_result == out_values);
+  }
+
+  SECTION("exclusive scan")
+  {
+    using op_t = cuda::std::plus<>;
+
+    // Scan operator
+    auto scan_op = op_t{};
+
+    // Prepare verification data
+    c2h::host_vector<output_t> expected_result(num_items);
+    compute_exclusive_scan_by_key_reference(
+      values_in_it, h_segment_keys.cbegin(), expected_result.begin(), scan_op, eq_op_t{}, output_t{}, num_items);
+
+    // Run test
+    c2h::device_vector<output_t> out_values(num_items);
+    using init_value_t = value_t;
+    device_exclusive_scan_by_key(
+      d_keys_it, values_in_it, out_values.begin(), scan_op, init_value_t{}, num_items, eq_op_t{});
+
+    // Verify result
+    REQUIRE(expected_result == out_values);
+  }
+}

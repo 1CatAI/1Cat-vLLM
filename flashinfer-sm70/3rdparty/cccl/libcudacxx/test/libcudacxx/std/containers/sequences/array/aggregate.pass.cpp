@@ -1,0 +1,60 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of libcu++, the C++ Standard Library for your entire system,
+// under the Apache License v2.0 with LLVM Exceptions.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// Make sure cuda::std::array is an aggregate type.
+// We can only check this in C++17 and above, because we don't have the
+// trait before that.
+
+// UNSUPPORTED: gcc-6
+
+#include <cuda/std/array>
+#include <cuda/std/type_traits>
+
+#include "test_macros.h"
+
+template <typename T>
+TEST_FUNC void check_aggregate()
+{
+  static_assert(cuda::std::is_aggregate<cuda::std::array<T, 0>>::value);
+  static_assert(cuda::std::is_aggregate<cuda::std::array<T, 1>>::value);
+  static_assert(cuda::std::is_aggregate<cuda::std::array<T, 2>>::value);
+  static_assert(cuda::std::is_aggregate<cuda::std::array<T, 3>>::value);
+  static_assert(cuda::std::is_aggregate<cuda::std::array<T, 4>>::value);
+}
+
+struct Empty
+{};
+struct Trivial
+{
+  int i;
+  int j;
+};
+struct NonTrivial
+{
+  int i;
+  int j;
+  TEST_FUNC NonTrivial(NonTrivial const&) {}
+};
+
+int main(int, char**)
+{
+  check_aggregate<char>();
+  check_aggregate<int>();
+  check_aggregate<long>();
+  check_aggregate<float>();
+  check_aggregate<double>();
+#if _CCCL_HAS_LONG_DOUBLE()
+  check_aggregate<long double>();
+#endif // _CCCL_HAS_LONG_DOUBLE()
+  check_aggregate<Empty>();
+  check_aggregate<Trivial>();
+  check_aggregate<NonTrivial>();
+
+  return 0;
+}

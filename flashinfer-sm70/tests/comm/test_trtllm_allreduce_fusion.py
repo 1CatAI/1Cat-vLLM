@@ -1,0 +1,736 @@
+import multiprocessing as mp
+import socket
+from typing import Any
+
+import numpy as np
+import pytest
+import torch
+import torch.distributed as dist
+
+import flashinfer.comm as comm
+from flashinfer.utils import get_compute_capability
+
+from flashinfer.comm.mnnvl import TorchDistBackend
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or get_compute_capability(torch.device("cuda:0"))[0] not in (9, 10, 12),
+    reason="trtllm_comm kernels support SM90/SM100/SM12x only",
+)
+
+
+# todo(Yingyi): add benchmark and quant test
+
+# Usage: test var
+kOneShotMaxTokenNum = 128
+MIN_TOKEN_NUM = 1
+MAX_TOKEN_NUM = 2048
+SF_VEC_SIZE = 16
+
+# temp var
+SCALE_FACTOR_RANGE = (-1, 1)
+
+
+def _run_correctness_worker(
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    legacy_api=True,
+    weight_bias=0.0,
+    gpu_offset=0,
+):
+    device = torch.device(f"cuda:{rank + gpu_offset}")
+    torch.cuda.set_device(device)
+    distributed_init_method = f"tcp://localhost:{distributed_init_port}"
+    dist.init_process_group(
+        backend="nccl",
+        init_method=distributed_init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    group = dist.group.WORLD
+
+    try:
+        token_nums = [1, 128, 1024, 2048]
+        pattern_codes = [
+            comm.AllReduceFusionPattern.kAllReduce,
+            comm.AllReduceFusionPattern.kARResidualRMSNorm,
+            comm.AllReduceFusionPattern.kARResidualRMSNormFP8Quant,
+            comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant,
+            comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant,
+            comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant,
+        ]
+        swizzled_layout_codes = [
+            comm.QuantizationSFLayout.LINEAR,
+            comm.QuantizationSFLayout.SWIZZLED_128x4,
+            comm.QuantizationSFLayout.SWIZZLED_8x4,
+        ]
+        launch_with_pdls = [True, False]
+        use_oneshots = [True, False, None]
+        trigger_completion_at_ends = [True, False]
+        fp32_accs = [True, False]
+
+        lamport_use_fp32 = dtype == torch.float32
+
+        # Create workspace - choose between legacy and new API
+        if legacy_api:
+            # Legacy API: create workspace for allreduce fusion with metadata
+            ipc_handles, workspace_tensor, workspace_metadata = (
+                comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                    rank,
+                    world_size,
+                    MAX_TOKEN_NUM,
+                    hidden_dim,
+                    group=group,
+                    use_fp32_lamport=lamport_use_fp32,
+                    create_metadata=True,  # Get metadata for validation
+                )
+            )
+        else:
+            workspace = None
+            # New unified API: create workspace
+            workspace = comm.create_allreduce_fusion_workspace(
+                backend="trtllm",
+                world_size=world_size,
+                rank=rank,
+                max_token_num=MAX_TOKEN_NUM,
+                hidden_dim=hidden_dim,
+                dtype=dtype,
+                comm_backend=TorchDistBackend(),
+            )
+
+        test_loop = 5
+
+        for token_num in token_nums:
+            for pattern_code in pattern_codes:
+                for swizzled_layout_code in swizzled_layout_codes:
+                    for launch_with_pdl in launch_with_pdls:
+                        for use_oneshot in use_oneshots:
+                            for trigger_completion_at_end in trigger_completion_at_ends:
+                                for fp32_acc in fp32_accs:
+                                    if token_num < world_size and not use_oneshot:
+                                        continue
+                                    if dtype == torch.float32 and (
+                                        pattern_code
+                                        == comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant
+                                        or pattern_code
+                                        == comm.AllReduceFusionPattern.kARResidualRMSNormFP4Quant
+                                    ):
+                                        continue
+
+                                    dist.barrier(group=group)
+                                    test_passed = True
+                                    print(
+                                        f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-dtype{dtype}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl}-isOneShot{use_oneshot}-isTriggerCompletionAtEnd{trigger_completion_at_end}-isFP32Acc{fp32_acc} start"
+                                    )
+                                    dist.barrier(group=group)
+                                    torch.cuda.synchronize()
+
+                                    message_size = token_num * hidden_dim
+
+                                    allreduce_in = torch.randn(
+                                        message_size, dtype=dtype, device=device
+                                    )
+                                    allreduce_in_clone = allreduce_in.clone()
+
+                                    all_reduce_out = torch.zeros(
+                                        message_size, dtype=dtype, device=device
+                                    )
+
+                                    residual_in = torch.randn(
+                                        message_size, dtype=dtype, device=device
+                                    )
+                                    residual_in_clone = residual_in.clone()
+
+                                    residual_out = torch.empty_like(residual_in)
+                                    norm_out = torch.empty_like(residual_in)
+                                    quant_out = torch.empty(
+                                        message_size, dtype=dtype, device=device
+                                    )
+
+                                    scale_out = None
+                                    assert hidden_dim % SF_VEC_SIZE == 0, (
+                                        "hidden_dim must be divisible by SF_VEC_SIZE"
+                                    )
+                                    if (
+                                        swizzled_layout_code
+                                        == comm.QuantizationSFLayout.SWIZZLED_128x4
+                                    ):
+                                        # TODO(Yingyi): check this
+                                        padded_message_size = (
+                                            (token_num + 127) // 128 * 128
+                                        ) * ((hidden_dim + 63) // 64 * 4)
+                                        scale_out = torch.empty(
+                                            padded_message_size,
+                                            dtype=dtype,
+                                            device=device,
+                                        )
+                                    else:
+                                        scale_out = torch.empty(
+                                            message_size // SF_VEC_SIZE,
+                                            dtype=dtype,
+                                            device=device,
+                                        )
+
+                                    rms_gamma = torch.randn(
+                                        hidden_dim, dtype=dtype, device=device
+                                    )
+                                    scale_factor = (
+                                        torch.rand(
+                                            1, dtype=torch.float32, device=device
+                                        )
+                                        * (
+                                            SCALE_FACTOR_RANGE[1]
+                                            - SCALE_FACTOR_RANGE[0]
+                                        )
+                                        + SCALE_FACTOR_RANGE[0]
+                                    )
+                                    rms_eps = 1e-3
+
+                                    # warmup
+                                    s = torch.cuda.Stream()
+                                    s.wait_stream(torch.cuda.current_stream())
+                                    with torch.cuda.stream(s):
+                                        for _ in range(test_loop):
+                                            if legacy_api:
+                                                # Legacy API - uses flattened tensors
+                                                comm.trtllm_allreduce_fusion(
+                                                    allreduce_in=allreduce_in,
+                                                    world_size=world_size,
+                                                    world_rank=rank,
+                                                    token_num=token_num,
+                                                    hidden_dim=hidden_dim,
+                                                    workspace_ptrs=workspace_tensor,
+                                                    launch_with_pdl=launch_with_pdl,
+                                                    use_oneshot=use_oneshot,
+                                                    trigger_completion_at_end=trigger_completion_at_end,
+                                                    fp32_acc=fp32_acc,
+                                                    pattern_code=pattern_code,
+                                                    allreduce_out=all_reduce_out,
+                                                    residual_in=residual_in,
+                                                    residual_out=residual_out,
+                                                    norm_out=norm_out,
+                                                    quant_out=quant_out,
+                                                    scale_out=scale_out,
+                                                    rms_gamma=rms_gamma,
+                                                    rms_eps=rms_eps,
+                                                    weight_bias=weight_bias,
+                                                    scale_factor=scale_factor,
+                                                    layout_code=swizzled_layout_code,
+                                                    metadata=workspace_metadata,
+                                                )
+                                            else:
+                                                # New unified API - expects 2D tensors [token_num, hidden_dim]
+                                                comm.allreduce_fusion(
+                                                    input=allreduce_in.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    workspace=workspace,
+                                                    launch_with_pdl=launch_with_pdl,
+                                                    output=all_reduce_out.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    residual_in=residual_in.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    residual_out=residual_out.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    norm_out=norm_out.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    quant_out=quant_out.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    scale_out=scale_out,
+                                                    rms_gamma=rms_gamma,
+                                                    rms_eps=rms_eps,
+                                                    weight_bias=weight_bias,
+                                                    scale_factor=scale_factor,
+                                                    layout_code=swizzled_layout_code,
+                                                    pattern=pattern_code,
+                                                    use_oneshot=use_oneshot,
+                                                    fp32_acc=fp32_acc,
+                                                )
+
+                                    # NOTE: in real case, you dont have to set all optional params. You could set those required by fusion pattern.
+                                    # capture
+                                    g = torch.cuda.CUDAGraph()
+                                    with torch.cuda.graph(g):
+                                        for _ in range(test_loop):
+                                            if legacy_api:
+                                                # Legacy API - uses flattened tensors
+                                                comm.trtllm_allreduce_fusion(
+                                                    allreduce_in=allreduce_in,
+                                                    world_size=world_size,
+                                                    world_rank=rank,
+                                                    token_num=token_num,
+                                                    hidden_dim=hidden_dim,
+                                                    workspace_ptrs=workspace_tensor,
+                                                    launch_with_pdl=launch_with_pdl,
+                                                    use_oneshot=use_oneshot,
+                                                    trigger_completion_at_end=trigger_completion_at_end,
+                                                    fp32_acc=fp32_acc,
+                                                    pattern_code=pattern_code,
+                                                    allreduce_out=all_reduce_out,
+                                                    residual_in=residual_in,
+                                                    residual_out=residual_out,
+                                                    norm_out=norm_out,
+                                                    quant_out=quant_out,
+                                                    scale_out=scale_out,
+                                                    rms_gamma=rms_gamma,
+                                                    rms_eps=rms_eps,
+                                                    weight_bias=weight_bias,
+                                                    scale_factor=scale_factor,
+                                                    layout_code=swizzled_layout_code,
+                                                    metadata=workspace_metadata,
+                                                )
+                                            else:
+                                                # New unified API - expects 2D tensors [token_num, hidden_dim]
+                                                comm.allreduce_fusion(
+                                                    input=allreduce_in.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    workspace=workspace,
+                                                    launch_with_pdl=launch_with_pdl,
+                                                    output=all_reduce_out.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    residual_in=residual_in.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    residual_out=residual_out.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    norm_out=norm_out.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    quant_out=quant_out.view(
+                                                        token_num, hidden_dim
+                                                    ),
+                                                    scale_out=scale_out,
+                                                    rms_gamma=rms_gamma,
+                                                    rms_eps=rms_eps,
+                                                    weight_bias=weight_bias,
+                                                    scale_factor=scale_factor,
+                                                    layout_code=swizzled_layout_code,
+                                                    pattern=pattern_code,
+                                                    use_oneshot=use_oneshot,
+                                                    fp32_acc=fp32_acc,
+                                                )
+                                    # replay
+                                    g.replay()
+                                    torch.cuda.synchronize()
+
+                                    # match shape
+                                    all_reduce_out = all_reduce_out.view(
+                                        token_num, hidden_dim
+                                    )
+                                    residual_out = residual_out.view(
+                                        token_num, hidden_dim
+                                    )
+                                    norm_out = norm_out.view(token_num, hidden_dim)
+
+                                    torch.cuda.synchronize()
+
+                                    # calculate reference
+                                    # allreduce_out
+                                    dist.all_reduce(allreduce_in_clone, group=group)
+                                    ref_allreduce_out = allreduce_in_clone.clone()
+                                    ref_allreduce_out = ref_allreduce_out.view(
+                                        token_num, hidden_dim
+                                    ).to(torch.float32)
+
+                                    # residual_out
+                                    ref_residual_out = (
+                                        ref_allreduce_out
+                                        + residual_in_clone.view(
+                                            token_num, hidden_dim
+                                        ).to(torch.float32)
+                                    )
+
+                                    # norm_out
+                                    variance = (
+                                        ref_residual_out.to(torch.float32)
+                                        .pow(2)
+                                        .mean(dim=-1, keepdim=True)
+                                    )
+                                    hidden_states = ref_residual_out * torch.rsqrt(
+                                        variance + rms_eps
+                                    )
+                                    ref_norm_out = (
+                                        weight_bias + rms_gamma.to(torch.float32)
+                                    ) * hidden_states
+
+                                    # check correctness
+                                    tolerance = 8e-2 if dtype == torch.float16 else 8e-1
+                                    # compare allreduce_out
+                                    if (
+                                        pattern_code
+                                        == comm.AllReduceFusionPattern.kAllReduce
+                                    ):
+                                        torch.testing.assert_close(
+                                            all_reduce_out.to(torch.float32),
+                                            ref_allreduce_out,
+                                            atol=tolerance,
+                                            rtol=1e-2,
+                                        )
+                                    elif (
+                                        pattern_code
+                                        == comm.AllReduceFusionPattern.kARResidualRMSNormOutFP8Quant
+                                        or pattern_code
+                                        == comm.AllReduceFusionPattern.kARResidualRMSNormOutFP4Quant
+                                    ):
+                                        torch.testing.assert_close(
+                                            residual_out.to(torch.float32),
+                                            ref_residual_out,
+                                            atol=tolerance,
+                                            rtol=1e-2,
+                                        )
+
+                                        torch.testing.assert_close(
+                                            norm_out.to(torch.float32),
+                                            ref_norm_out,
+                                            atol=tolerance,
+                                            rtol=1e-2,
+                                        )
+
+                                        # todo(Yingyi): check quant out
+                                    dist.barrier(group=group)
+                                    if test_passed:
+                                        print(
+                                            f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-dtype{dtype}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl}-isOneShot{use_oneshot}-isTriggerCompletionAtEnd{trigger_completion_at_end}-isFP32Acc{fp32_acc} passed"
+                                        )
+                                    else:
+                                        print(
+                                            f"test RANK {rank}: token{token_num}-hidden_dim{hidden_dim}-dtype{dtype}-pattern{pattern_code}-layout{swizzled_layout_code}-pdl{launch_with_pdl}-isOneShot{use_oneshot}-isTriggerCompletionAtEnd{trigger_completion_at_end}-isFP32Acc{fp32_acc} failed"
+                                        )
+    finally:
+        dist.barrier(group=group)
+
+        # Destroy workspace - choose between legacy and new API
+        if legacy_api:
+            comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+                ipc_handles, group=group
+            )
+        elif workspace is not None:
+            # New unified API
+            workspace.destroy()
+
+        dist.destroy_process_group(group=group)
+
+
+def _run_twoshot_growing_grid_worker(
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    small_token_num,
+    large_token_num,
+    gpu_offset=0,
+):
+    # Back-to-back two-shot calls whose grid grows (small -> large token count),
+    # with no host synchronization in between, as in a model forward pass.
+    device = torch.device(f"cuda:{rank + gpu_offset}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{distributed_init_port}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    workspace = None
+    try:
+        workspace = comm.create_allreduce_fusion_workspace(
+            backend="trtllm",
+            world_size=world_size,
+            rank=rank,
+            max_token_num=MAX_TOKEN_NUM,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            comm_backend=TorchDistBackend(),
+        )
+        token_nums = [small_token_num, large_token_num, large_token_num] * 4
+        # Every rank generates every rank's input so it can build the reference.
+        inputs = []
+        for i, token_num in enumerate(token_nums):
+            per_rank = []
+            for r in range(world_size):
+                gen = torch.Generator(device=device).manual_seed(1000 * i + r)
+                per_rank.append(
+                    torch.randn(token_num, hidden_dim, generator=gen, device=device).to(
+                        dtype
+                    )
+                )
+            inputs.append(per_rank)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        outputs = []
+        for i in range(len(token_nums)):
+            out = torch.empty_like(inputs[i][rank])
+            comm.allreduce_fusion(
+                input=inputs[i][rank],
+                workspace=workspace,
+                pattern=comm.AllReduceFusionPattern.kAllReduce,
+                output=out,
+                use_oneshot=False,
+            )
+            outputs.append(out)
+        torch.cuda.synchronize()
+
+        for i, token_num in enumerate(token_nums):
+            ref = torch.stack([x.float() for x in inputs[i]]).sum(0)
+            torch.testing.assert_close(
+                outputs[i].float(),
+                ref,
+                atol=0.1,
+                rtol=3e-2,
+                msg=lambda m, i=i, t=token_num: f"rank {rank} call {i} (T={t}): {m}",
+            )
+    finally:
+        dist.barrier()
+        if workspace is not None:
+            workspace.destroy()
+        dist.destroy_process_group()
+
+
+def get_open_port() -> int:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+    except OSError:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("::1", 0))
+            return s.getsockname()[1]
+
+
+def multi_process_parallel(
+    world_size: int,
+    dtype: torch.dtype,
+    hidden_dim: int,
+    test_target: Any,
+    target_args: tuple = (),
+    gpu_offset: int = 0,
+) -> None:
+    mp.set_start_method("spawn", force=True)
+
+    procs = []
+    distributed_init_port = get_open_port()
+    for i in range(world_size):
+        proc_args = (
+            (
+                world_size,
+                i,
+                dtype,
+                hidden_dim,
+                distributed_init_port,
+            )
+            + target_args
+            + (gpu_offset,)
+        )
+        proc = mp.Process(target=test_target, args=proc_args, name=f"Worker-{i}")
+        proc.start()
+        procs.append(proc)
+
+    for i in range(world_size):
+        procs[i].join()
+        assert procs[i].exitcode == 0, (
+            f"Process {i} failed with exit code {procs[i].exitcode}"
+        )
+
+
+def _run_fp32_twoshot_worker(
+    world_size,
+    rank,
+    dtype,
+    hidden_dim,
+    distributed_init_port,
+    max_token_num,
+    gpu_offset=0,
+):
+    # Two-shot at the workspace's max_token_num: the kernel writes
+    # 2 * token_num * hidden_dim elements into each rank's buffer.
+    device = torch.device(f"cuda:{rank + gpu_offset}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{distributed_init_port}",
+        rank=rank,
+        world_size=world_size,
+        device_id=device,
+    )
+    workspace = None
+    try:
+        workspace = comm.create_allreduce_fusion_workspace(
+            backend="trtllm",
+            world_size=world_size,
+            rank=rank,
+            max_token_num=max_token_num,
+            hidden_dim=hidden_dim,
+            dtype=dtype,
+            comm_backend=TorchDistBackend(),
+        )
+        assert workspace.is_buffer_size_sufficient(
+            world_size, max_token_num, hidden_dim, dtype
+        )
+        inputs = [
+            torch.randn(
+                max_token_num,
+                hidden_dim,
+                generator=torch.Generator(device=device).manual_seed(r),
+                device=device,
+                dtype=dtype,
+            )
+            for r in range(world_size)
+        ]
+        out = torch.empty_like(inputs[rank])
+        comm.allreduce_fusion(
+            input=inputs[rank],
+            workspace=workspace,
+            pattern=comm.AllReduceFusionPattern.kAllReduce,
+            output=out,
+            use_oneshot=False,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out, torch.stack(inputs).sum(0), atol=1e-4, rtol=1e-4
+        )
+    finally:
+        dist.barrier()
+        if workspace is not None:
+            workspace.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_trtllm_allreduce_fusion_fp32_twoshot_max_tokens(world_size):
+    """fp32 two-shot at max_token_num must fit in the workspace (sized per element)."""
+    available_gpus = torch.cuda.device_count()
+    if world_size > available_gpus:
+        pytest.skip(
+            f"world_size {world_size} is greater than available_gpus {available_gpus}"
+        )
+    multi_process_parallel(
+        world_size,
+        torch.float32,
+        4096,
+        _run_fp32_twoshot_worker,
+        target_args=(1024,),
+    )
+
+
+# Run as: python tests/comm/test_trtllm_allreduce_fusion.py
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("hidden_dim", [1024, 2048, 4096, 7168, 8192])
+@pytest.mark.parametrize("legacy_api", [True, False])
+@pytest.mark.parametrize("weight_bias", [0.0, 1.0])
+def test_trtllm_allreduce_fusion(
+    world_size, dtype, hidden_dim, legacy_api, weight_bias
+):
+    # weight_bias=0.0 -> standard RMSNorm; weight_bias=1.0 -> Gemma / Qwen3.5 RMSNorm.
+    np.random.seed(42)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    available_gpus = torch.cuda.device_count()
+    if world_size > available_gpus:
+        pytest.skip(
+            f"world_size {world_size} is greater than available_gpus {available_gpus}"
+        )
+    api_str = "legacy" if legacy_api else "unified"
+    print(
+        f"Running test for world_size={world_size} with {api_str} API, "
+        f"weight_bias={weight_bias}"
+    )
+
+    multi_process_parallel(
+        world_size,
+        dtype,
+        hidden_dim,
+        _run_correctness_worker,
+        target_args=(legacy_api, weight_bias),
+    )
+    print(
+        f"allreduce fusion tp = {world_size} ({api_str} API, "
+        f"weight_bias={weight_bias}): OK"
+    )
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("legacy_api", [True, False])
+def test_trtllm_allreduce_fusion_gpu_offset(world_size, dtype, legacy_api):
+    """Test allreduce fusion when CUDA device index != TP rank (base_gpu_id > 0).
+
+    Simulates sglang colocate mode where inference engines run on non-zero
+    base GPUs (e.g. GPUs 4-7 with TP ranks 0-3).
+    See: https://github.com/flashinfer-ai/flashinfer/pull/2662
+    """
+    np.random.seed(42)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    available_gpus = torch.cuda.device_count()
+    gpu_offset = available_gpus - world_size
+    if gpu_offset <= 0:
+        pytest.skip(
+            f"Need more than {world_size} GPUs to test gpu_offset>0 "
+            f"(have {available_gpus})"
+        )
+    api_str = "legacy" if legacy_api else "unified"
+    print(
+        f"Running gpu_offset test: world_size={world_size}, gpu_offset={gpu_offset}, "
+        f"{api_str} API (GPUs {gpu_offset}..{gpu_offset + world_size - 1})"
+    )
+
+    multi_process_parallel(
+        world_size,
+        dtype,
+        1024,
+        _run_correctness_worker,
+        # weight_bias must be passed positionally so gpu_offset (appended after
+        # target_args) reaches the worker correctly.
+        target_args=(legacy_api, 0.0),
+        gpu_offset=gpu_offset,
+    )
+    print(f"gpu_offset allreduce fusion tp={world_size} ({api_str} API): OK")
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+@pytest.mark.parametrize("hidden_dim", [4096, 7168])
+def test_trtllm_allreduce_fusion_twoshot_growing_grid(world_size, hidden_dim):
+    """Two-shot calls whose grid grows between calls must not pass the barrier early.
+
+    Each block of the barrier also writes the flags of the CTAs that are not
+    launched, so that a later launch with a larger grid sees the current flag.
+    """
+    available_gpus = torch.cuda.device_count()
+    if world_size > available_gpus:
+        pytest.skip(
+            f"world_size {world_size} is greater than available_gpus {available_gpus}"
+        )
+    multi_process_parallel(
+        world_size,
+        torch.bfloat16,
+        hidden_dim,
+        _run_twoshot_growing_grid_worker,
+        target_args=(world_size + 1, 256),
+    )
+
+
+if __name__ == "__main__":
+    # Test both legacy and unified APIs, both standard and Gemma RMSNorm.
+    for wb in (0.0, 1.0):
+        print(f"Testing legacy API (weight_bias={wb})...")
+        test_trtllm_allreduce_fusion(
+            2, torch.float16, 1024, legacy_api=True, weight_bias=wb
+        )
+        print(f"\nTesting unified API (weight_bias={wb})...")
+        test_trtllm_allreduce_fusion(
+            2, torch.float16, 1024, legacy_api=False, weight_bias=wb
+        )

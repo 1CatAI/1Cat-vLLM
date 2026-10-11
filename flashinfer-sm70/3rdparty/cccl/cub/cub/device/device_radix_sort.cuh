@@ -1,0 +1,5272 @@
+// SPDX-FileCopyrightText: Copyright (c) 2011, Duane Merrill. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2011-2026, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3
+
+//! @file
+//! cub::DeviceRadixSort provides device-wide, parallel operations for computing a radix sort across a sequence of data
+//! items residing within device-accessible memory.
+
+#pragma once
+
+#include <cub/config.cuh>
+
+#ifndef CCCL_DISABLE_NVRTC_COMPATIBILITY_CHECK
+#  if _CCCL_COMPILER(NVRTC)
+#    error \
+      "Including <cub/device/device_radix_sort.cuh> is not supported when compiling with NVRTC. Include block-, warp-, or thread-level primitives instead (e.g. <cub/block/block_reduce.cuh>). You can define CCCL_DISABLE_NVRTC_COMPATIBILITY_CHECK to disable this warning."
+#  endif // _CCCL_COMPILER(NVRTC)
+#endif // CCCL_DISABLE_NVRTC_COMPATIBILITY_CHECK
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cub/detail/choose_offset.cuh>
+#include <cub/detail/env_dispatch.cuh>
+#include <cub/device/dispatch/dispatch_radix_sort.cuh>
+
+#include <cuda/__execution/require.h>
+#include <cuda/std/__execution/env.h>
+#include <cuda/std/__functional/operations.h>
+#include <cuda/std/__memory/pointer_traits.h>
+#include <cuda/std/__type_traits/enable_if.h>
+#include <cuda/std/__type_traits/integral_constant.h>
+#include <cuda/std/__type_traits/is_arithmetic.h>
+#include <cuda/std/__type_traits/is_convertible.h>
+#include <cuda/std/__type_traits/is_one_of.h>
+#include <cuda/std/__type_traits/is_same.h>
+#include <cuda/std/__type_traits/remove_cvref.h>
+#include <cuda/std/cstdint>
+
+CUB_NAMESPACE_BEGIN
+
+#ifndef _CCCL_DOXYGEN_INVOKED // Do not document
+template <class _InputIterator, class _BinaryPredicate, class _ValueType = ::cuda::std::iter_value_t<_InputIterator>>
+inline constexpr bool __can_use_radix_sort =
+  (::cuda::std::is_arithmetic_v<_ValueType>
+#  if _CCCL_HAS_NVFP16() && !defined(__CUDA_NO_HALF_OPERATORS__) && !defined(__CUDA_NO_HALF_CONVERSIONS__)
+   || ::cuda::std::is_same_v<_ValueType, __half>
+#  endif // _CCCL_HAS_NVFP16() && !defined(__CUDA_NO_HALF_OPERATORS__) && !defined(__CUDA_NO_HALF_CONVERSIONS__)
+#  if _CCCL_HAS_NVBF16() && !defined(__CUDA_NO_BFLOAT16_CONVERSIONS__) && !defined(__CUDA_NO_BFLOAT16_OPERATORS__)
+   || ::cuda::std::is_same_v<_ValueType, __nv_bfloat16>
+#  endif // _CCCL_HAS_NVBF16() && !defined(__CUDA_NO_BFLOAT16_CONVERSIONS__) &&
+         // !defined(__CUDA_NO_BFLOAT16_OPERATORS__)
+   )
+  && ::cuda::std::__is_one_of_v<::cuda::std::remove_cvref_t<_BinaryPredicate>,
+                                ::cuda::std::less<>,
+                                ::cuda::std::less<_ValueType>,
+                                ::cuda::std::greater<>,
+                                ::cuda::std::greater<_ValueType>>;
+#endif // !_CCCL_DOXYGEN_INVOKED
+
+//! @rst
+//! DeviceRadixSort provides device-wide, parallel operations for
+//! computing a radix sort across a sequence of data items residing
+//! within device-accessible memory.
+//!
+//! .. image:: ../../img/sorting_logo.png
+//!     :align: center
+//!
+//! Overview
+//! --------------------------------------------------
+//!
+//! The `radix sorting method <http://en.wikipedia.org/wiki/Radix_sort>`_
+//! arranges items into ascending (or descending) order. The algorithm relies
+//! upon a positional representation for keys, i.e., each key is comprised of an
+//! ordered sequence of symbols (e.g., digits, characters, etc.) specified from
+//! least-significant to most-significant. For a given input sequence of keys
+//! and a set of rules specifying a total ordering of the symbolic alphabet, the
+//! radix sorting method produces a lexicographic ordering of those keys.
+//!
+//! @rowmajor
+//!
+//! Supported Types
+//! --------------------------------------------------
+//!
+//! DeviceRadixSort can sort all of the built-in C++ numeric primitive types
+//! (``unsigned char``, ``int``, ``double``, etc.) as well as CUDA's ``__half``
+//! and ``__nv_bfloat16`` 16-bit floating-point types. User-defined types are
+//! supported as long as a decomposer object is provided.
+//!
+//! Floating-Point Special Cases
+//! --------------------------------------------------
+//!
+//! - Positive and negative zeros are considered equivalent, and will be treated
+//!   as such in the output.
+//! - No special handling is implemented for NaN values; these are sorted
+//!   according to their bit representations after any transformations.
+//!
+//! Transformations
+//! --------------------------------------------------
+//!
+//! Although the direct radix sorting method can only be applied to unsigned
+//! integral types, DeviceRadixSort is able to sort signed and floating-point
+//! types via simple bit-wise transformations that ensure lexicographic key
+//! ordering. Additional transformations occur for descending sorts. These
+//! transformations must be considered when restricting the
+//! ``[begin_bit, end_bit)`` range, as the bitwise transformations will occur
+//! before the bit-range truncation.
+//!
+//! Any transformations applied to the keys prior to sorting are reversed
+//! while writing to the final output buffer.
+//!
+//! Type Specific Bitwise Transformations
+//! --------------------------------------------------
+//!
+//! To convert the input values into a radix-sortable bitwise representation,
+//! the following transformations take place prior to sorting:
+//!
+//! - For unsigned integral values, the keys are used directly.
+//! - For signed integral values, the sign bit is inverted.
+//! - For positive floating point values, the sign bit is inverted.
+//! - For negative floating point values, the full key is inverted.
+//!
+//! For floating point types, positive and negative zero are a special case and
+//! will be considered equivalent during sorting.
+//!
+//! Descending Sort Bitwise Transformations
+//! --------------------------------------------------
+//!
+//! If descending sort is used, the keys are inverted after performing any
+//! type-specific transformations, and the resulting keys are sorted in ascending
+//! order.
+//!
+//! Stability
+//! --------------------------------------------------
+//!
+//! DeviceRadixSort is stable. For floating-point types, ``-0.0`` and ``+0.0`` are
+//! considered equal and appear in the result in the same order as they appear in
+//! the input.
+//!
+//! Usage Considerations
+//! --------------------------------------------------
+//!
+//! @cdp_class{DeviceRadixSort}
+//!
+//! Performance
+//! --------------------------------------------------
+//!
+//! @linear_performance{radix sort}
+//!
+//! Tuning
+//! +++++++++++++++++++++++++++++++++++++++++++++
+//!
+//! All algorithms in DeviceRadixSort that accept an environment can be tuned by passing a custom
+//! :ref:`policy selector <cub-policy-selectors>` that returns a :cpp:struct:`cub::RadixSortPolicy`, as shown in the
+//! example below:
+//!
+//!  .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+//!      :language: c++
+//!      :dedent:
+//!      :start-after: example-begin radix-sort-keys-policy-selector
+//!      :end-before: example-end radix-sort-keys-policy-selector
+//!
+//!  .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+//!      :language: c++
+//!      :dedent:
+//!      :start-after: example-begin radix-sort-keys-tuning
+//!      :end-before: example-end radix-sort-keys-tuning
+//!
+//! @endrst
+struct DeviceRadixSort
+{
+private:
+  // TODO(bgruber): I would ideally like to have the logic of extracting the policy selector from the tuning environment
+  // inside the dispatch function, but this will not work with CCCL.C, which needs to pass a stateful policy selector.
+  // Refactor this once we have a host code JIT compiler.
+  template <SortOrder Order,
+            typename KeyT,
+            typename ValueT,
+            typename OffsetT,
+            typename DecomposerT = detail::identity_decomposer_t,
+            typename TuningEnvT  = ::cuda::std::execution::env<>>
+  CUB_RUNTIME_FUNCTION static cudaError_t select_tuning_and_dispatch(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    OffsetT num_items,
+    int begin_bit,
+    int end_bit,
+    bool is_overwrite_okay,
+    cudaStream_t stream,
+    DecomposerT decomposer = {},
+    TuningEnvT             = {})
+  {
+    using default_policy_selector_t = detail::radix_sort::policy_selector_from_types<KeyT, ValueT, OffsetT>;
+    using policy_selector_t =
+      ::cuda::std::execution::__query_result_or_t<TuningEnvT, RadixSortPolicy, default_policy_selector_t>;
+    return detail::radix_sort::dispatch<Order>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      num_items,
+      begin_bit,
+      end_bit,
+      is_overwrite_okay,
+      stream,
+      decomposer,
+      policy_selector_t{});
+  }
+
+  template <SortOrder Order,
+            typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename TuningEnvT = ::cuda::std::execution::env<>>
+  CUB_RUNTIME_FUNCTION static cudaError_t radix_sort_with_decomposer(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream,
+    TuningEnvT tuning_env  = {},
+    int begin_bit          = 0,
+    int end_bit            = detail::radix::traits_t<KeyT>::default_end_bit(DecomposerT{}),
+    bool is_overwrite_okay = true)
+  {
+    using offset_t                         = detail::choose_offset_t<NumItemsT>;
+    static constexpr bool decomposer_check = detail::radix::decomposer_check<KeyT, DecomposerT>;
+
+    static_assert(decomposer_check,
+                  "DecomposerT must be a callable object returning a tuple of references to "
+                  "arithmetic types");
+
+    if constexpr (decomposer_check)
+    {
+      return select_tuning_and_dispatch<Order>(
+        d_temp_storage,
+        temp_storage_bytes,
+        d_keys,
+        d_values,
+        static_cast<offset_t>(num_items),
+        begin_bit,
+        end_bit,
+        is_overwrite_okay,
+        stream,
+        decomposer,
+        tuning_env);
+    }
+    _CCCL_UNREACHABLE();
+  }
+
+  template <SortOrder Order,
+            typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename TuningEnvT = ::cuda::std::execution::env<>>
+  CUB_RUNTIME_FUNCTION static cudaError_t radix_sort_with_decomposer(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream,
+    TuningEnvT tuning_env = {},
+    int begin_bit         = 0,
+    int end_bit           = detail::radix::traits_t<KeyT>::default_end_bit(DecomposerT{}))
+  {
+    // We cast away const-ness, but will *not* write to these arrays. ``DispatchRadixSort::Dispatch`` will allocate
+    // temporary storage and create a new double-buffer internally when the ``is_overwrite_ok`` flag is not set.
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    DoubleBuffer<ValueT> d_values(const_cast<ValueT*>(d_values_in), d_values_out);
+    return radix_sort_with_decomposer<Order>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      num_items,
+      decomposer,
+      stream,
+      tuning_env,
+      begin_bit,
+      end_bit,
+      /* is_overwrite_okay */ false);
+  }
+
+  // Name reported for NVTX ranges
+  _CCCL_HOST_DEVICE static constexpr auto GetName() -> const char*
+  {
+    return "cub::DeviceRadixSort";
+  }
+
+public:
+  //! @name KeyT-value pairs
+  //! @{
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   - ``[d_keys_out,   d_keys_out   + num_items)``
+  //!   - ``[d_values_in,  d_values_in  + num_items)``
+  //!   - ``[d_values_out, d_values_out + num_items)``
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageNP For sorting using only ``O(P)`` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the sorting of a device vector of ``int``
+  //! keys with associated vector of ``int`` values.
+  //! @endrst
+  //!
+  //! @code{.cpp}
+  //! #include <cub/cub.cuh>
+  //! // or equivalently <cub/device/device_radix_sort.cuh>
+  //!
+  //! // Declare, allocate, and initialize device-accessible pointers
+  //! // for sorting data
+  //! int  num_items;          // e.g., 7
+  //! int  *d_keys_in;         // e.g., [8, 6, 7, 5, 3, 0, 9]
+  //! int  *d_keys_out;        // e.g., [        ...        ]
+  //! int  *d_values_in;       // e.g., [0, 1, 2, 3, 4, 5, 6]
+  //! int  *d_values_out;      // e.g., [        ...        ]
+  //! ...
+  //!
+  //! // Determine temporary device storage requirements
+  //! void     *d_temp_storage = nullptr;
+  //! size_t   temp_storage_bytes = 0;
+  //! cub::DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes,
+  //!     d_keys_in, d_keys_out, d_values_in, d_values_out, num_items);
+  //!
+  //! // Allocate temporary storage
+  //! cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  //!
+  //! // Run sorting operation
+  //! cub::DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes,
+  //!     d_keys_in, d_keys_out, d_values_in, d_values_out, num_items);
+  //!
+  //! // d_keys_out            <-- [0, 3, 5, 6, 7, 8, 9]
+  //! // d_values_out          <-- [5, 4, 3, 1, 2, 0, 6]
+  //! @endcode
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT, typename ValueT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairs(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    // Unsigned integer type for global offsets.
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    // TODO API that doesn't accept decomposer should also contain a static
+    //      assert that the key type is fundamental.
+
+    // We cast away const-ness, but will *not* write to these arrays.
+    // ``DispatchRadixSort::Dispatch`` will allocate temporary storage and
+    // create a new double-buffer internally when the ``is_overwrite_ok`` flag
+    // is not set.
+    constexpr bool is_overwrite_okay = false;
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    DoubleBuffer<ValueT> d_values(const_cast<ValueT*>(d_values_in), d_values_out);
+
+    return select_tuning_and_dispatch<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      static_cast<OffsetT>(num_items),
+      begin_bit,
+      end_bit,
+      is_overwrite_okay,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   - ``[d_keys_out,   d_keys_out   + num_items)``
+  //!   - ``[d_values_in,  d_values_in  + num_items)``
+  //!   - ``[d_values_out, d_values_out + num_items)``
+  //!
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the env-based sorting of key-value pairs:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-env
+  //!     :end-before: example-end radix-sort-pairs-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type (e.g., `cuda::std::execution::env<...>`)
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!   (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename EnvT                                                        = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<::cuda::std::is_integral_v<NumItemsT>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairs(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    int begin_bit   = 0,
+    int end_bit     = sizeof(KeyT) * 8,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    using offset_t = detail::choose_offset_t<NumItemsT>;
+
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    DoubleBuffer<ValueT> d_values(const_cast<ValueT*>(d_values_in), d_values_out);
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return select_tuning_and_dispatch<SortOrder::Ascending>(
+        storage,
+        bytes,
+        d_keys,
+        d_values,
+        static_cast<offset_t>(num_items),
+        begin_bit,
+        end_bit,
+        false,
+        stream,
+        {},
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! * The contents of the input data are not altered by the sorting operation.
+  //! * Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   * ``[d_keys_out,   d_keys_out   + num_items)``
+  //!   * ``[d_values_in,  d_values_in  + num_items)``
+  //!   * ``[d_values_out, d_values_out + num_items)``
+  //!
+  //! * A bit subrange ``[begin_bit, end_bit)`` is provided to specify
+  //!   differentiating key bits. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! * @devicestorageNP For sorting using only :math:`O(P)` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortPairs``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin pairs-bits
+  //!     :end-before: example-end pairs-bits
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``(sizeof(float) + sizeof(long long int)) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairs(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      d_values_in,
+      d_values_out,
+      num_items,
+      decomposer,
+      stream,
+      {},
+      begin_bit,
+      end_bit);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! - A bit subrange ``[begin_bit, end_bit)`` is provided to specify which
+  //!   key bits are used for sorting.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-decomposer-bits-env
+  //!     :end-before: example-end radix-sort-pairs-decomposer-bits-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairs(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Ascending>(
+        storage,
+        bytes,
+        d_keys_in,
+        d_keys_out,
+        d_values_in,
+        d_values_out,
+        num_items,
+        decomposer,
+        stream,
+        tuning_env,
+        begin_bit,
+        end_bit);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The contents of the input data are not altered by the sorting operation.
+  //! * Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   * ``[d_keys_out,   d_keys_out   + num_items)``
+  //!   * ``[d_values_in,  d_values_in  + num_items)``
+  //!   * ``[d_values_out, d_values_out + num_items)``
+  //!
+  //! * @devicestorageNP For sorting using only :math:`O(P)` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortPairs``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin pairs
+  //!     :end-before: example-end pairs
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairs(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      d_values_in,
+      d_values_out,
+      num_items,
+      decomposer,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-decomposer-env
+  //!     :end-before: example-end radix-sort-pairs-decomposer-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairs(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Ascending>(
+        storage, bytes, d_keys_in, d_keys_out, d_values_in, d_values_out, num_items, decomposer, stream, tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! - The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers.  Each pair is managed by a DoubleBuffer
+  //!   structure that indicates which of the two buffers is "current" (and thus
+  //!   contains the input data to be sorted).
+  //! - The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!   - ``[d_values.Current(),   d_values.Current()   + num_items)``
+  //!   - ``[d_values.Alternate(), d_values.Alternate() + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within each DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageP
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the sorting of a device vector of ``int``
+  //! keys with associated vector of ``int`` values.
+  //! @endrst
+  //!
+  //! @code
+  //! #include <cub/cub.cuh>
+  //! // or equivalently <cub/device/device_radix_sort.cuh>
+  //!
+  //! // Declare, allocate, and initialize device-accessible pointers for
+  //! // sorting data
+  //! int  num_items;          // e.g., 7
+  //! int  *d_key_buf;         // e.g., [8, 6, 7, 5, 3, 0, 9]
+  //! int  *d_key_alt_buf;     // e.g., [        ...        ]
+  //! int  *d_value_buf;       // e.g., [0, 1, 2, 3, 4, 5, 6]
+  //! int  *d_value_alt_buf;   // e.g., [        ...        ]
+  //! ...
+  //!
+  //! // Create a set of DoubleBuffers to wrap pairs of device pointers
+  //! cub::DoubleBuffer<int> d_keys(d_key_buf, d_key_alt_buf);
+  //! cub::DoubleBuffer<int> d_values(d_value_buf, d_value_alt_buf);
+  //!
+  //! // Determine temporary device storage requirements
+  //! void     *d_temp_storage = nullptr;
+  //! size_t   temp_storage_bytes = 0;
+  //! cub::DeviceRadixSort::SortPairs(
+  //!   d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items);
+  //!
+  //! // Allocate temporary storage
+  //! cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  //!
+  //! // Run sorting operation
+  //! cub::DeviceRadixSort::SortPairs(
+  //!   d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items);
+  //!
+  //! // d_keys.Current()      <-- [0, 3, 5, 6, 7, 8, 9]
+  //! // d_values.Current()    <-- [5, 4, 3, 1, 2, 0, 6]
+  //!
+  //! @endcode
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values whose "current" device-accessible buffer
+  //!   contains the unsorted input values and, upon return, is updated to point
+  //!   to the sorted output values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT, typename ValueT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairs(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+
+    // Unsigned integer type for global offsets.
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    constexpr bool is_overwrite_okay = true;
+
+    return select_tuning_and_dispatch<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      static_cast<OffsetT>(num_items),
+      begin_bit,
+      end_bit,
+      is_overwrite_okay,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers. Each pair is managed by a DoubleBuffer
+  //!   structure that indicates which of the two buffers is "current" (and thus
+  //!   contains the input data to be sorted).
+  //! - The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!   - ``[d_values.Current(),   d_values.Current()   + num_items)``
+  //!   - ``[d_values.Alternate(), d_values.Alternate() + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within each DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type (e.g., `cuda::std::execution::env<...>`)
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values whose "current" device-accessible buffer
+  //!   contains the unsorted input values and, upon return, is updated to point
+  //!   to the sorted output values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!   (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename EnvT                                                        = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<::cuda::std::is_integral_v<NumItemsT>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairs(
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    int begin_bit   = 0,
+    int end_bit     = sizeof(KeyT) * 8,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    using offset_t = detail::choose_offset_t<NumItemsT>;
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return select_tuning_and_dispatch<SortOrder::Ascending>(
+        storage,
+        bytes,
+        d_keys,
+        d_values,
+        static_cast<offset_t>(num_items),
+        begin_bit,
+        end_bit,
+        true,
+        stream,
+        {},
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers.  Each pair is managed by a DoubleBuffer
+  //!   structure that indicates which of the two buffers is "current" (and thus
+  //!   contains the input data to be sorted).
+  //! * The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!   - ``[d_values.Current(),   d_values.Current()   + num_items)``
+  //!   - ``[d_values.Alternate(), d_values.Alternate() + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within each DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - @devicestorageP
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortPairs``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin pairs-db
+  //!     :end-before: example-end pairs-db
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values whose "current" device-accessible buffer
+  //!   contains the unsorted input values and, upon return, is updated to point
+  //!   to the sorted output values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairs(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Ascending>(
+      d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items, decomposer, stream);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers. Each pair is managed by a DoubleBuffer
+  //!   structure that indicates which of the two buffers is "current" (and thus
+  //!   contains the input data to be sorted).
+  //! - The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-db-decomposer-env
+  //!     :end-before: example-end radix-sort-pairs-db-decomposer-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairs(
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Ascending>(
+        storage, bytes, d_keys, d_values, num_items, decomposer, stream, tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers.  Each pair is managed by a DoubleBuffer
+  //!   structure that indicates which of the two buffers is "current" (and thus
+  //!   contains the input data to be sorted).
+  //! * The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!   - ``[d_values.Current(),   d_values.Current()   + num_items)``
+  //!   - ``[d_values.Alternate(), d_values.Alternate() + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within each DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageP
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortPairs``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin pairs-bits-db
+  //!     :end-before: example-end pairs-bits-db
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values whose "current" device-accessible buffer
+  //!   contains the unsorted input values and, upon return, is updated to point
+  //!   to the sorted output values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``(sizeof(float) + sizeof(long long int)) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairs(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Ascending>(
+      d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items, decomposer, stream, {}, begin_bit, end_bit);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers. Each pair is managed by a DoubleBuffer
+  //!   structure.
+  //! - The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //! - A bit subrange ``[begin_bit, end_bit)`` is provided to specify which
+  //!   key bits are used for sorting.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-db-decomposer-bits-env
+  //!     :end-before: example-end radix-sort-pairs-db-decomposer-bits-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairs(
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Ascending>(
+        storage, bytes, d_keys, d_values, num_items, decomposer, stream, tuning_env, begin_bit, end_bit);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   - ``[d_keys_out,   d_keys_out   + num_items)``
+  //!   - ``[d_values_in,  d_values_in  + num_items)``
+  //!   - ``[d_values_out, d_values_out + num_items)``
+  //!
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageNP  For sorting using only ``O(P)`` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the sorting of a device vector of ``int``
+  //! keys with associated vector of ``int`` values.
+  //! @endrst
+  //!
+  //! @code{.cpp}
+  //! #include <cub/cub.cuh>
+  //! // or equivalently <cub/device/device_radix_sort.cuh>
+  //!
+  //! // Declare, allocate, and initialize device-accessible pointers
+  //! // for sorting data
+  //! int  num_items;          // e.g., 7
+  //! int  *d_keys_in;         // e.g., [8, 6, 7, 5, 3, 0, 9]
+  //! int  *d_keys_out;        // e.g., [        ...        ]
+  //! int  *d_values_in;       // e.g., [0, 1, 2, 3, 4, 5, 6]
+  //! int  *d_values_out;      // e.g., [        ...        ]
+  //! ...
+  //!
+  //! // Determine temporary device storage requirements
+  //! void     *d_temp_storage = nullptr;
+  //! size_t   temp_storage_bytes = 0;
+  //! cub::DeviceRadixSort::SortPairsDescending(
+  //!     d_temp_storage, temp_storage_bytes,
+  //!     d_keys_in, d_keys_out, d_values_in, d_values_out, num_items);
+  //!
+  //! // Allocate temporary storage
+  //! cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  //!
+  //! // Run sorting operation
+  //! cub::DeviceRadixSort::SortPairsDescending(
+  //!     d_temp_storage, temp_storage_bytes,
+  //!     d_keys_in, d_keys_out, d_values_in, d_values_out, num_items);
+  //!
+  //! // d_keys_out            <-- [9, 8, 7, 6, 5, 3, 0]
+  //! // d_values_out          <-- [6, 0, 2, 1, 3, 4, 5]
+  //! @endcode
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT, typename ValueT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairsDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+
+    // Unsigned integer type for global offsets.
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    // We cast away const-ness, but will *not* write to these arrays.
+    // ``DispatchRadixSort::Dispatch`` will allocate temporary storage and
+    // create a new double-buffer internally when the ``is_overwrite_ok`` flag
+    // is not set.
+    constexpr bool is_overwrite_okay = false;
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    DoubleBuffer<ValueT> d_values(const_cast<ValueT*>(d_values_in), d_values_out);
+
+    return select_tuning_and_dispatch<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      static_cast<OffsetT>(num_items),
+      begin_bit,
+      end_bit,
+      is_overwrite_okay,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   - ``[d_keys_out,   d_keys_out   + num_items)``
+  //!   - ``[d_values_in,  d_values_in  + num_items)``
+  //!   - ``[d_values_out, d_values_out + num_items)``
+  //!
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the env-based descending sort of key-value pairs:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-descending-env
+  //!     :end-before: example-end radix-sort-pairs-descending-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type (e.g., `cuda::std::execution::env<...>`)
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!   (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename EnvT                                                        = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<::cuda::std::is_integral_v<NumItemsT>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairsDescending(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    int begin_bit   = 0,
+    int end_bit     = sizeof(KeyT) * 8,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    using offset_t = detail::choose_offset_t<NumItemsT>;
+
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    DoubleBuffer<ValueT> d_values(const_cast<ValueT*>(d_values_in), d_values_out);
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return select_tuning_and_dispatch<SortOrder::Descending>(
+        storage,
+        bytes,
+        d_keys,
+        d_values,
+        static_cast<offset_t>(num_items),
+        begin_bit,
+        end_bit,
+        false,
+        stream,
+        {},
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! * The contents of the input data are not altered by the sorting operation.
+  //! * Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   * ``[d_keys_out,   d_keys_out   + num_items)``
+  //!   * ``[d_values_in,  d_values_in  + num_items)``
+  //!   * ``[d_values_out, d_values_out + num_items)``
+  //!
+  //! * A bit subrange ``[begin_bit, end_bit)`` is provided to specify
+  //!   differentiating key bits. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! * @devicestorageNP For sorting using only :math:`O(P)` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortPairsDescending``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin pairs-descending-bits
+  //!     :end-before: example-end pairs-descending-bits
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``(sizeof(float) + sizeof(long long int)) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairsDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      d_values_in,
+      d_values_out,
+      num_items,
+      decomposer,
+      stream,
+      {},
+      begin_bit,
+      end_bit);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The contents of the input data are not altered by the sorting operation.
+  //! * Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   * ``[d_keys_out,   d_keys_out   + num_items)``
+  //!   * ``[d_values_in,  d_values_in  + num_items)``
+  //!   * ``[d_values_out, d_values_out + num_items)``
+  //!
+  //! * @devicestorageNP For sorting using only :math:`O(P)` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortPairsDescending``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin pairs-descending
+  //!     :end-before: example-end pairs-descending
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] d_values_in
+  //!   Pointer to the corresponding input sequence of associated value items
+  //!
+  //! @param[out] d_values_out
+  //!   Pointer to the correspondingly-reordered output sequence of associated
+  //!   value items
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairsDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      d_values_in,
+      d_values_out,
+      num_items,
+      decomposer,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! - The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers.  Each pair is managed by a DoubleBuffer
+  //!   structure that indicates which of the two buffers is "current" (and thus
+  //!   contains the input data to be sorted).
+  //! - The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!   - ``[d_values.Current(),   d_values.Current()   + num_items)``
+  //!   - ``[d_values.Alternate(), d_values.Alternate() + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within each DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the number
+  //!   of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageP
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the sorting of a device vector of ``int``
+  //! keys with associated vector of ``int`` values.
+  //! @endrst
+  //!
+  //! @code{.cpp}
+  //! #include <cub/cub.cuh>
+  //! // or equivalently <cub/device/device_radix_sort.cuh>
+  //!
+  //! // Declare, allocate, and initialize device-accessible pointers
+  //! // for sorting data
+  //! int  num_items;          // e.g., 7
+  //! int  *d_key_buf;         // e.g., [8, 6, 7, 5, 3, 0, 9]
+  //! int  *d_key_alt_buf;     // e.g., [        ...        ]
+  //! int  *d_value_buf;       // e.g., [0, 1, 2, 3, 4, 5, 6]
+  //! int  *d_value_alt_buf;   // e.g., [        ...        ]
+  //! ...
+  //!
+  //! // Create a set of DoubleBuffers to wrap pairs of device pointers
+  //! cub::DoubleBuffer<int> d_keys(d_key_buf, d_key_alt_buf);
+  //! cub::DoubleBuffer<int> d_values(d_value_buf, d_value_alt_buf);
+  //!
+  //! // Determine temporary device storage requirements
+  //! void     *d_temp_storage = nullptr;
+  //! size_t   temp_storage_bytes = 0;
+  //! cub::DeviceRadixSort::SortPairsDescending(
+  //!   d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items);
+  //!
+  //! // Allocate temporary storage
+  //! cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  //!
+  //! // Run sorting operation
+  //! cub::DeviceRadixSort::SortPairsDescending(
+  //!   d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items);
+  //!
+  //! // d_keys.Current()      <-- [9, 8, 7, 6, 5, 3, 0]
+  //! // d_values.Current()    <-- [6, 0, 2, 1, 3, 4, 5]
+  //! @endcode
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values whose "current" device-accessible buffer
+  //!   contains the unsorted input values and, upon return, is updated to point
+  //!   to the sorted output values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT, typename ValueT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairsDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+
+    // Unsigned integer type for global offsets.
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    constexpr bool is_overwrite_okay = true;
+
+    return select_tuning_and_dispatch<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      static_cast<OffsetT>(num_items),
+      begin_bit,
+      end_bit,
+      is_overwrite_okay,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers. Each pair is managed by a DoubleBuffer
+  //!   structure that indicates which of the two buffers is "current" (and thus
+  //!   contains the input data to be sorted).
+  //! - The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!   - ``[d_values.Current(),   d_values.Current()   + num_items)``
+  //!   - ``[d_values.Alternate(), d_values.Alternate() + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within each DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type (e.g., `cuda::std::execution::env<...>`)
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values whose "current" device-accessible buffer
+  //!   contains the unsorted input values and, upon return, is updated to point
+  //!   to the sorted output values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!   (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename EnvT                                                        = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<::cuda::std::is_integral_v<NumItemsT>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairsDescending(
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    int begin_bit   = 0,
+    int end_bit     = sizeof(KeyT) * 8,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    using offset_t = detail::choose_offset_t<NumItemsT>;
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return select_tuning_and_dispatch<SortOrder::Descending>(
+        storage,
+        bytes,
+        d_keys,
+        d_values,
+        static_cast<offset_t>(num_items),
+        begin_bit,
+        end_bit,
+        true,
+        stream,
+        {},
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers.  Each pair is managed by a DoubleBuffer
+  //!   structure that indicates which of the two buffers is "current" (and thus
+  //!   contains the input data to be sorted).
+  //! * The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!   - ``[d_values.Current(),   d_values.Current()   + num_items)``
+  //!   - ``[d_values.Alternate(), d_values.Alternate() + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within each DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - @devicestorageP
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortPairsDescending``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin pairs-descending-db
+  //!     :end-before: example-end pairs-descending-db
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values whose "current" device-accessible buffer
+  //!   contains the unsorted input values and, upon return, is updated to point
+  //!   to the sorted output values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairsDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Descending>(
+      d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items, decomposer, stream);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The sorting operation is given a pair of key buffers and a corresponding
+  //!   pair of associated value buffers.  Each pair is managed by a DoubleBuffer
+  //!   structure that indicates which of the two buffers is "current" (and thus
+  //!   contains the input data to be sorted).
+  //! * The contents of both buffers within each pair may be altered by the
+  //!   sorting operation.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!   - ``[d_values.Current(),   d_values.Current()   + num_items)``
+  //!   - ``[d_values.Alternate(), d_values.Alternate() + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within each DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageP
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortPairsDescending``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin pairs-descending-bits-db
+  //!     :end-before: example-end pairs-descending-bits-db
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in,out] d_values
+  //!   Double-buffer of values whose "current" device-accessible buffer
+  //!   contains the unsorted input values and, upon return, is updated to point
+  //!   to the sorted output values
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``(sizeof(float) + sizeof(long long int)) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortPairsDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Descending>(
+      d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items, decomposer, stream, {}, begin_bit, end_bit);
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - A bit subrange ``[begin_bit, end_bit)`` is provided to specify which key bits are used for sorting.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-descending-decomposer-bits-env
+  //!     :end-before: example-end radix-sort-pairs-descending-decomposer-bits-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in] d_keys_in Pointer to input key data
+  //! @param[out] d_keys_out Pointer to sorted output key data
+  //! @param[in] d_values_in Pointer to input value data
+  //! @param[out] d_values_out Pointer to sorted output value data
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] begin_bit Least-significant bit index (inclusive)
+  //! @param[in] end_bit Most-significant bit index (exclusive)
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairsDescending(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Descending>(
+        storage,
+        bytes,
+        d_keys_in,
+        d_keys_out,
+        d_values_in,
+        d_values_out,
+        num_items,
+        decomposer,
+        stream,
+        tuning_env,
+        begin_bit,
+        end_bit);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-descending-decomposer-env
+  //!     :end-before: example-end radix-sort-pairs-descending-decomposer-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in] d_keys_in Pointer to input key data
+  //! @param[out] d_keys_out Pointer to sorted output key data
+  //! @param[in] d_values_in Pointer to input value data
+  //! @param[out] d_values_out Pointer to sorted output value data
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairsDescending(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    const ValueT* d_values_in,
+    ValueT* d_values_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Descending>(
+        storage, bytes, d_keys_in, d_keys_out, d_values_in, d_values_out, num_items, decomposer, stream, tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given key and value buffers managed by DoubleBuffer structures.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-descending-db-decomposer-env
+  //!     :end-before: example-end radix-sort-pairs-descending-db-decomposer-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in,out] d_keys Reference to the double-buffer of keys
+  //! @param[in,out] d_values Reference to the double-buffer of values
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairsDescending(
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Descending>(
+        storage, bytes, d_keys, d_values, num_items, decomposer, stream, tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts key-value pairs into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given key and value buffers managed by DoubleBuffer structures.
+  //! - A bit subrange ``[begin_bit, end_bit)`` is provided to specify which key bits are used for sorting.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-pairs-descending-db-decomposer-bits-env
+  //!     :end-before: example-end radix-sort-pairs-descending-db-decomposer-bits-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam ValueT
+  //!   **[inferred]** ValueT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in,out] d_keys Reference to the double-buffer of keys
+  //! @param[in,out] d_values Reference to the double-buffer of values
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] begin_bit Least-significant bit index (inclusive)
+  //! @param[in] end_bit Most-significant bit index (exclusive)
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename ValueT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortPairsDescending(
+    DoubleBuffer<KeyT>& d_keys,
+    DoubleBuffer<ValueT>& d_values,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Descending>(
+        storage, bytes, d_keys, d_values, num_items, decomposer, stream, tuning_env, begin_bit, end_bit);
+    });
+  }
+
+  //! @}
+  //! @name Keys-only
+  //! @{
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   - ``[d_keys_out,   d_keys_out   + num_items)``
+  //!
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageNP  For sorting using only ``O(P)`` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the sorting of a device vector of
+  //! ``int`` keys.
+  //! @endrst
+  //!
+  //! @code{.cpp}
+  //! #include <cub/cub.cuh>
+  //! // or equivalently <cub/device/device_radix_sort.cuh>
+  //!
+  //! // Declare, allocate, and initialize device-accessible pointers
+  //! // for sorting data
+  //! int  num_items;          // e.g., 7
+  //! int  *d_keys_in;         // e.g., [8, 6, 7, 5, 3, 0, 9]
+  //! int  *d_keys_out;        // e.g., [        ...        ]
+  //! ...
+  //!
+  //! // Determine temporary device storage requirements
+  //! void     *d_temp_storage = nullptr;
+  //! size_t   temp_storage_bytes = 0;
+  //! cub::DeviceRadixSort::SortKeys(
+  //!   d_temp_storage, temp_storage_bytes, d_keys_in, d_keys_out, num_items);
+  //!
+  //! // Allocate temporary storage
+  //! cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  //!
+  //! // Run sorting operation
+  //! cub::DeviceRadixSort::SortKeys(
+  //!   d_temp_storage, temp_storage_bytes, d_keys_in, d_keys_out, num_items);
+  //!
+  //! // d_keys_out            <-- [0, 3, 5, 6, 7, 8, 9]
+  //! @endcode
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeys(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+
+    // Unsigned integer type for global offsets.
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    // We cast away const-ness, but will *not* write to these arrays.
+    // ``DispatchRadixSort::Dispatch`` will allocate temporary storage and
+    // create a new double-buffer internally when the ``is_overwrite_ok`` flag
+    // is not set.
+    constexpr bool is_overwrite_okay = false;
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    // Null value type
+    DoubleBuffer<NullType> d_values;
+
+    return select_tuning_and_dispatch<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      static_cast<OffsetT>(num_items),
+      begin_bit,
+      end_bit,
+      is_overwrite_okay,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys_in,  d_keys_in  + num_items)``
+  //!   - ``[d_keys_out, d_keys_out + num_items)``
+  //!
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the env-based sorting of keys:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-env
+  //!     :end-before: example-end radix-sort-keys-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type (e.g., `cuda::std::execution::env<...>`)
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!   (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename EnvT                                                        = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<::cuda::std::is_integral_v<NumItemsT>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortKeys(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    int begin_bit   = 0,
+    int end_bit     = sizeof(KeyT) * 8,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    using offset_t = detail::choose_offset_t<NumItemsT>;
+
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    DoubleBuffer<NullType> d_values;
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return select_tuning_and_dispatch<SortOrder::Ascending>(
+        storage,
+        bytes,
+        d_keys,
+        d_values,
+        static_cast<offset_t>(num_items),
+        begin_bit,
+        end_bit,
+        false,
+        stream,
+        {},
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The contents of the input data are not altered by the sorting operation.
+  //! * Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys_in,  d_keys_in  + num_items)``
+  //!   * ``[d_keys_out, d_keys_out + num_items)``
+  //!
+  //! * A bit subrange ``[begin_bit, end_bit)`` is provided to specify
+  //!   differentiating key bits. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! * @devicestorageNP For sorting using only :math:`O(P)` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortKeys``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin keys-bits
+  //!     :end-before: example-end keys-bits
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``(sizeof(float) + sizeof(long long int)) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeys(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      static_cast<NullType*>(nullptr),
+      static_cast<NullType*>(nullptr),
+      num_items,
+      decomposer,
+      stream,
+      {},
+      begin_bit,
+      end_bit);
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - A bit subrange ``[begin_bit, end_bit)`` is provided to specify which key bits are used for sorting.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-custom-decomposer
+  //!     :end-before: example-end radix-sort-keys-custom-decomposer
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-decomposer-bits-env
+  //!     :end-before: example-end radix-sort-keys-decomposer-bits-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in] d_keys_in Pointer to input key data
+  //! @param[out] d_keys_out Pointer to sorted output key data
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] begin_bit Least-significant bit index (inclusive)
+  //! @param[in] end_bit Most-significant bit index (exclusive)
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortKeys(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Ascending>(
+        storage,
+        bytes,
+        d_keys_in,
+        d_keys_out,
+        static_cast<NullType*>(nullptr),
+        static_cast<NullType*>(nullptr),
+        num_items,
+        decomposer,
+        stream,
+        tuning_env,
+        begin_bit,
+        end_bit);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The contents of the input data are not altered by the sorting operation.
+  //! * Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys_in,  d_keys_in  + num_items)``
+  //!   * ``[d_keys_out, d_keys_out + num_items)``
+  //!
+  //! * An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! * @devicestorageNP For sorting using only :math:`O(P)` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortKeys``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin keys
+  //!     :end-before: example-end keys
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeys(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      static_cast<NullType*>(nullptr),
+      static_cast<NullType*>(nullptr),
+      num_items,
+      decomposer,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-custom-decomposer
+  //!     :end-before: example-end radix-sort-keys-custom-decomposer
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-decomposer-env
+  //!     :end-before: example-end radix-sort-keys-decomposer-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in] d_keys_in Pointer to input key data
+  //! @param[out] d_keys_out Pointer to sorted output key data
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t
+  SortKeys(const KeyT* d_keys_in, KeyT* d_keys_out, NumItemsT num_items, DecomposerT decomposer, const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Ascending>(
+        storage,
+        bytes,
+        d_keys_in,
+        d_keys_out,
+        static_cast<NullType*>(nullptr),
+        static_cast<NullType*>(nullptr),
+        num_items,
+        decomposer,
+        stream,
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! - The sorting operation is given a pair of key buffers managed by a
+  //!   DoubleBuffer structure that indicates which of the two buffers is
+  //!   "current" (and thus contains the input data to be sorted).
+  //! - The contents of both buffers may be altered by the sorting operation.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within the DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageP
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the sorting of a device vector of
+  //! ``int`` keys.
+  //! @endrst
+  //!
+  //! @code{.cpp}
+  //! #include <cub/cub.cuh>
+  //! // or equivalently <cub/device/device_radix_sort.cuh>
+  //!
+  //! // Declare, allocate, and initialize device-accessible pointers
+  //! // for sorting data
+  //! int  num_items;          // e.g., 7
+  //! int  *d_key_buf;         // e.g., [8, 6, 7, 5, 3, 0, 9]
+  //! int  *d_key_alt_buf;     // e.g., [        ...        ]
+  //! ...
+  //!
+  //! // Create a DoubleBuffer to wrap the pair of device pointers
+  //! cub::DoubleBuffer<int> d_keys(d_key_buf, d_key_alt_buf);
+  //!
+  //! // Determine temporary device storage requirements
+  //! void     *d_temp_storage = nullptr;
+  //! size_t   temp_storage_bytes = 0;
+  //! cub::DeviceRadixSort::SortKeys(
+  //!   d_temp_storage, temp_storage_bytes, d_keys, num_items);
+  //!
+  //! // Allocate temporary storage
+  //! cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  //!
+  //! // Run sorting operation
+  //! cub::DeviceRadixSort::SortKeys(
+  //!   d_temp_storage, temp_storage_bytes, d_keys, num_items);
+  //!
+  //! // d_keys.Current()      <-- [0, 3, 5, 6, 7, 8, 9]
+  //! @endcode
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeys(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+
+    // Unsigned integer type for global offsets.
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    constexpr bool is_overwrite_okay = true;
+
+    // Null value type
+    DoubleBuffer<NullType> d_values;
+
+    return select_tuning_and_dispatch<SortOrder::Ascending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      static_cast<OffsetT>(num_items),
+      begin_bit,
+      end_bit,
+      is_overwrite_okay,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a pair of key buffers managed by a
+  //!   DoubleBuffer structure that indicates which of the two buffers is
+  //!   "current" (and thus contains the input data to be sorted).
+  //! - The contents of both buffers may be altered by the sorting operation.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within the DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the env-based sorting of keys using DoubleBuffer:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-db-env
+  //!     :end-before: example-end radix-sort-keys-db-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type (e.g., `cuda::std::execution::env<...>`)
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer stores the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!   (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename EnvT                                                        = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<::cuda::std::is_integral_v<NumItemsT>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortKeys(
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    int begin_bit   = 0,
+    int end_bit     = sizeof(KeyT) * 8,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    using offset_t = detail::choose_offset_t<NumItemsT>;
+
+    DoubleBuffer<NullType> d_values;
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return select_tuning_and_dispatch<SortOrder::Ascending>(
+        storage,
+        bytes,
+        d_keys,
+        d_values,
+        static_cast<offset_t>(num_items),
+        begin_bit,
+        end_bit,
+        true,
+        stream,
+        {},
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The sorting operation is given a pair of key buffers managed by a
+  //!   DoubleBuffer structure that indicates which of the two buffers is
+  //!   "current" (and thus contains the input data to be sorted).
+  //! * The contents of both buffers may be altered by the sorting operation.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   * ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!
+  //! * Upon completion, the sorting operation will update the "current"
+  //!   indicator within the DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! * @devicestorageP
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortKeys``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin keys-db
+  //!     :end-before: example-end keys-db
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeys(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    DoubleBuffer<NullType> d_values;
+    return radix_sort_with_decomposer<SortOrder::Ascending>(
+      d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items, decomposer, stream);
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a key buffer managed by a DoubleBuffer structure.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-custom-decomposer
+  //!     :end-before: example-end radix-sort-keys-custom-decomposer
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-db-decomposer-env
+  //!     :end-before: example-end radix-sort-keys-db-decomposer-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in,out] d_keys Reference to the double-buffer of keys
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t
+  SortKeys(DoubleBuffer<KeyT>& d_keys, NumItemsT num_items, DecomposerT decomposer, const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      DoubleBuffer<NullType> d_values;
+      return radix_sort_with_decomposer<SortOrder::Ascending>(
+        storage, bytes, d_keys, d_values, num_items, decomposer, stream, tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The sorting operation is given a pair of key buffers managed by a
+  //!   DoubleBuffer structure that indicates which of the two buffers is
+  //!   "current" (and thus contains the input data to be sorted).
+  //! * The contents of both buffers may be altered by the sorting operation.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   * ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!
+  //! * A bit subrange ``[begin_bit, end_bit)`` is provided to specify
+  //!   differentiating key bits. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! * Upon completion, the sorting operation will update the "current"
+  //!   indicator within the DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! * @devicestorageP
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortKeys``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin keys-bits-db
+  //!     :end-before: example-end keys-bits-db
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``(sizeof(float) + sizeof(long long int)) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeys(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    DoubleBuffer<NullType> d_values;
+    return radix_sort_with_decomposer<SortOrder::Ascending>(
+      d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items, decomposer, stream, {}, begin_bit, end_bit);
+  }
+
+  //! @rst
+  //! Sorts keys into ascending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a key buffer managed by a DoubleBuffer structure.
+  //! - A bit subrange ``[begin_bit, end_bit)`` is provided to specify which key bits are used for sorting.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-custom-decomposer
+  //!     :end-before: example-end radix-sort-keys-custom-decomposer
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-db-decomposer-bits-env
+  //!     :end-before: example-end radix-sort-keys-db-decomposer-bits-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in,out] d_keys Reference to the double-buffer of keys
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] begin_bit Least-significant bit index (inclusive)
+  //! @param[in] end_bit Most-significant bit index (exclusive)
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortKeys(
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      DoubleBuffer<NullType> d_values;
+      return radix_sort_with_decomposer<SortOrder::Ascending>(
+        storage, bytes, d_keys, d_values, num_items, decomposer, stream, tuning_env, begin_bit, end_bit);
+    });
+  }
+
+  //! @rst Sorts keys into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys_in,    d_keys_in    + num_items)``
+  //!   - ``[d_keys_out,   d_keys_out   + num_items)``
+  //!
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageNP For sorting using only ``O(P)`` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the sorting of a device vector of
+  //! ``int`` keys.
+  //! @endrst
+  //!
+  //! @code{.cpp}
+  //! #include <cub/cub.cuh>
+  //! // or equivalently <cub/device/device_radix_sort.cuh>
+  //!
+  //! // Declare, allocate, and initialize device-accessible pointers
+  //! // for sorting data
+  //! int  num_items;          // e.g., 7
+  //! int  *d_keys_in;         // e.g., [8, 6, 7, 5, 3, 0, 9]
+  //! int  *d_keys_out;        // e.g., [        ...        ]
+  //! ...
+  //!
+  //! // Create a DoubleBuffer to wrap the pair of device pointers
+  //! cub::DoubleBuffer<int> d_keys(d_key_buf, d_key_alt_buf);
+  //!
+  //! // Determine temporary device storage requirements
+  //! void     *d_temp_storage = nullptr;
+  //! size_t   temp_storage_bytes = 0;
+  //! cub::DeviceRadixSort::SortKeysDescending(
+  //!   d_temp_storage, temp_storage_bytes, d_keys_in, d_keys_out, num_items);
+  //!
+  //! // Allocate temporary storage
+  //! cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  //!
+  //! // Run sorting operation
+  //! cub::DeviceRadixSort::SortKeysDescending(
+  //!   d_temp_storage, temp_storage_bytes, d_keys_in, d_keys_out, num_items);
+  //!
+  //! // d_keys_out            <-- [9, 8, 7, 6, 5, 3, 0]s
+  //! @endcode
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeysDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+
+    // Unsigned integer type for global offsets.
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    // We cast away const-ness, but will *not* write to these arrays.
+    // ``DispatchRadixSort::Dispatch`` will allocate temporary storage and
+    // create a new double-buffer internally when the ``is_overwrite_ok`` flag
+    // is not set.
+    constexpr bool is_overwrite_okay = false;
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    DoubleBuffer<NullType> d_values;
+
+    return select_tuning_and_dispatch<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      static_cast<OffsetT>(num_items),
+      begin_bit,
+      end_bit,
+      is_overwrite_okay,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys_in,  d_keys_in  + num_items)``
+  //!   - ``[d_keys_out, d_keys_out + num_items)``
+  //!
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the env-based descending sort of keys:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-descending-env
+  //!     :end-before: example-end radix-sort-keys-descending-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type (e.g., `cuda::std::execution::env<...>`)
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!   (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename EnvT                                                        = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<::cuda::std::is_integral_v<NumItemsT>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortKeysDescending(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    int begin_bit   = 0,
+    int end_bit     = sizeof(KeyT) * 8,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    using offset_t = detail::choose_offset_t<NumItemsT>;
+
+    DoubleBuffer<KeyT> d_keys(const_cast<KeyT*>(d_keys_in), d_keys_out);
+    DoubleBuffer<NullType> d_values;
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return select_tuning_and_dispatch<SortOrder::Descending>(
+        storage,
+        bytes,
+        d_keys,
+        d_values,
+        static_cast<offset_t>(num_items),
+        begin_bit,
+        end_bit,
+        false,
+        stream,
+        {},
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The contents of the input data are not altered by the sorting operation.
+  //! * Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys_in,  d_keys_in  + num_items)``
+  //!   * ``[d_keys_out, d_keys_out + num_items)``
+  //!
+  //! * An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! * @devicestorageNP For sorting using only :math:`O(P)` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortKeysDescending``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin keys-descending-bits
+  //!     :end-before: example-end keys-descending-bits
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``(sizeof(float) + sizeof(long long int)) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeysDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      static_cast<NullType*>(nullptr),
+      static_cast<NullType*>(nullptr),
+      num_items,
+      decomposer,
+      stream,
+      {},
+      begin_bit,
+      end_bit);
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The contents of the input data are not altered by the sorting operation.
+  //! * Pointers to contiguous memory must be used; iterators are not currently
+  //!   supported.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys_in,  d_keys_in  + num_items)``
+  //!   * ``[d_keys_out, d_keys_out + num_items)``
+  //!
+  //! * @devicestorageNP For sorting using only :math:`O(P)` temporary storage, see
+  //!   the sorting interface using DoubleBuffer wrappers below.
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortKeysDescending``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin keys-descending
+  //!     :end-before: example-end keys-descending
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in] d_keys_in
+  //!   Pointer to the input data of key data to sort
+  //!
+  //! @param[out] d_keys_out
+  //!   Pointer to the sorted output sequence of key data
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeysDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    return radix_sort_with_decomposer<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys_in,
+      d_keys_out,
+      static_cast<NullType*>(nullptr),
+      static_cast<NullType*>(nullptr),
+      num_items,
+      decomposer,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! - The sorting operation is given a pair of key buffers managed by a
+  //!   DoubleBuffer structure that indicates which of the two buffers is
+  //!   "current" (and thus contains the input data to be sorted).
+  //! - The contents of both buffers may be altered by the sorting operation.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within the DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! - @devicestorageP
+  //! - @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the sorting of a device vector of ``int`` keys.
+  //! @endrst
+  //!
+  //! @code{.cpp}
+  //! #include <cub/cub.cuh>
+  //! // or equivalently <cub/device/device_radix_sort.cuh>
+  //!
+  //! // Declare, allocate, and initialize device-accessible pointers
+  //! // for sorting data
+  //! int  num_items;          // e.g., 7
+  //! int  *d_key_buf;         // e.g., [8, 6, 7, 5, 3, 0, 9]
+  //! int  *d_key_alt_buf;     // e.g., [        ...        ]
+  //! ...
+  //!
+  //! // Create a DoubleBuffer to wrap the pair of device pointers
+  //! cub::DoubleBuffer<int> d_keys(d_key_buf, d_key_alt_buf);
+  //!
+  //! // Determine temporary device storage requirements
+  //! void     *d_temp_storage = nullptr;
+  //! size_t   temp_storage_bytes = 0;
+  //! cub::DeviceRadixSort::SortKeysDescending(
+  //!   d_temp_storage, temp_storage_bytes, d_keys, num_items);
+  //!
+  //! // Allocate temporary storage
+  //! cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  //!
+  //! // Run sorting operation
+  //! cub::DeviceRadixSort::SortKeysDescending(
+  //!   d_temp_storage, temp_storage_bytes, d_keys, num_items);
+  //!
+  //! // d_keys.Current()      <-- [9, 8, 7, 6, 5, 3, 0]
+  //! @endcode
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT, typename NumItemsT>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeysDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    int begin_bit       = 0,
+    int end_bit         = sizeof(KeyT) * 8,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+
+    // Unsigned integer type for global offsets.
+    using OffsetT = detail::choose_offset_t<NumItemsT>;
+
+    constexpr bool is_overwrite_okay = true;
+
+    // Null value type
+    DoubleBuffer<NullType> d_values;
+
+    return select_tuning_and_dispatch<SortOrder::Descending>(
+      d_temp_storage,
+      temp_storage_bytes,
+      d_keys,
+      d_values,
+      static_cast<OffsetT>(num_items),
+      begin_bit,
+      end_bit,
+      is_overwrite_okay,
+      stream);
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a pair of key buffers managed by a
+  //!   DoubleBuffer structure that indicates which of the two buffers is
+  //!   "current" (and thus contains the input data to be sorted).
+  //! - The contents of both buffers may be altered by the sorting operation.
+  //! - In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   - ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   - ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!
+  //! - Upon completion, the sorting operation will update the "current"
+  //!   indicator within the DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! - An optional bit subrange ``[begin_bit, end_bit)`` of differentiating key
+  //!   bits can be specified. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! The code snippet below illustrates the env-based descending sort of keys using DoubleBuffer:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-descending-db-env
+  //!     :end-before: example-end radix-sort-keys-descending-db-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type (e.g., `cuda::std::execution::env<...>`)
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer stores the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param[in] begin_bit
+  //!   The least-significant bit index (inclusive) needed for key comparison
+  //!
+  //! @param[in] end_bit
+  //!   The most-significant bit index (exclusive) needed for key comparison
+  //!   (e.g., ``sizeof(unsigned int) * 8``)
+  //!
+  //! @param[in] env
+  //!   **[optional]** Execution environment. Default is ``cuda::std::execution::env{}``.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename EnvT                                                        = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<::cuda::std::is_integral_v<NumItemsT>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortKeysDescending(
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    int begin_bit   = 0,
+    int end_bit     = sizeof(KeyT) * 8,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    using offset_t = detail::choose_offset_t<NumItemsT>;
+
+    DoubleBuffer<NullType> d_values;
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return select_tuning_and_dispatch<SortOrder::Descending>(
+        storage,
+        bytes,
+        d_keys,
+        d_values,
+        static_cast<offset_t>(num_items),
+        begin_bit,
+        end_bit,
+        true,
+        stream,
+        {},
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The sorting operation is given a pair of key buffers managed by a
+  //!   DoubleBuffer structure that indicates which of the two buffers is
+  //!   "current" (and thus contains the input data to be sorted).
+  //! * The contents of both buffers may be altered by the sorting operation.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   * ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!
+  //! * Upon completion, the sorting operation will update the "current"
+  //!   indicator within the DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! * @devicestorageP
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortKeysDescending``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin keys-descending-db
+  //!     :end-before: example-end keys-descending-db
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeysDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    DoubleBuffer<NullType> d_values;
+    return radix_sort_with_decomposer<SortOrder::Descending>(
+      d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items, decomposer, stream);
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 2.2.0
+  //!    First appears in CUDA Toolkit 12.3.
+  //!
+  //! * The sorting operation is given a pair of key buffers managed by a
+  //!   DoubleBuffer structure that indicates which of the two buffers is
+  //!   "current" (and thus contains the input data to be sorted).
+  //! * The contents of both buffers may be altered by the sorting operation.
+  //! * In-place operations are not supported. There must be no overlap between
+  //!   any of the provided ranges:
+  //!
+  //!   * ``[d_keys.Current(),     d_keys.Current()     + num_items)``
+  //!   * ``[d_keys.Alternate(),   d_keys.Alternate()   + num_items)``
+  //!
+  //! * A bit subrange ``[begin_bit, end_bit)`` is provided to specify
+  //!   differentiating key bits. This can reduce overall sorting overhead and
+  //!   yield a corresponding performance improvement.
+  //! * Upon completion, the sorting operation will update the "current"
+  //!   indicator within the DoubleBuffer wrapper to reference which of the two
+  //!   buffers now contains the sorted output sequence (a function of the
+  //!   number of key bits specified and the targeted device architecture).
+  //! * @devicestorageP
+  //! * @devicestorage
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! Let's consider a user-defined ``custom_t`` type below. To sort an array of
+  //! ``custom_t`` objects, we have to tell CUB about relevant members of the
+  //! ``custom_t`` type. We do this by providing a decomposer that returns a
+  //! tuple of references to relevant members of the key.
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin custom-type
+  //!     :end-before: example-end custom-type
+  //!
+  //! The following snippet shows how to sort an array of ``custom_t`` objects
+  //! using ``cub::DeviceRadixSort::SortKeysDescending``:
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_custom.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin keys-descending-bits-db
+  //!     :end-before: example-end keys-descending-bits-db
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //!
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //!
+  //! @tparam DecomposerT
+  //!   **[inferred]** Type of a callable object responsible for decomposing a
+  //!   ``KeyT`` into a tuple of references to its constituent arithmetic types:
+  //!   ``cuda::std::tuple<ArithmeticTs&...> operator()(KeyT &key)``.
+  //!   The leftmost element of the tuple is considered the most significant.
+  //!   The call operator must not modify members of the key.
+  //!
+  //! @param[in] d_temp_storage
+  //!   @devicestorage
+  //!
+  //! @param[in,out] temp_storage_bytes
+  //!   Reference to size in bytes of ``d_temp_storage`` allocation
+  //!
+  //! @param[in,out] d_keys
+  //!   Reference to the double-buffer of keys whose "current" device-accessible
+  //!   buffer contains the unsorted input keys and, upon return, is updated to
+  //!   point to the sorted output keys
+  //!
+  //! @param[in] num_items
+  //!   Number of items to sort
+  //!
+  //! @param decomposer
+  //!   Callable object responsible for decomposing a ``KeyT`` into a tuple of
+  //!   references to its constituent arithmetic types. The leftmost element of
+  //!   the tuple is considered the most significant. The call operator must not
+  //!   modify members of the key.
+  //!
+  //! @param[in] begin_bit
+  //!   **[optional]** The least-significant bit index (inclusive) needed for
+  //!   key comparison
+  //!
+  //! @param[in] end_bit
+  //!   **[optional]** The most-significant bit index (exclusive) needed for key
+  //!   comparison (e.g., ``(sizeof(float) + sizeof(long long int)) * 8``)
+  //!
+  //! @param[in] stream
+  //!   **[optional]** CUDA stream to launch kernels within.
+  //!   Default is stream<sub>0</sub>.
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  CUB_RUNTIME_FUNCTION static cudaError_t SortKeysDescending(
+    void* d_temp_storage,
+    size_t& temp_storage_bytes,
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    cudaStream_t stream = nullptr)
+  {
+    _CCCL_NVTX_RANGE_SCOPE_IF(d_temp_storage, GetName());
+    DoubleBuffer<NullType> d_values;
+    return radix_sort_with_decomposer<SortOrder::Descending>(
+      d_temp_storage, temp_storage_bytes, d_keys, d_values, num_items, decomposer, stream, {}, begin_bit, end_bit);
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //! - A bit subrange ``[begin_bit, end_bit)`` is provided to specify which key bits are used for sorting.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-descending-decomposer-bits-env
+  //!     :end-before: example-end radix-sort-keys-descending-decomposer-bits-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in] d_keys_in Pointer to input key data
+  //! @param[out] d_keys_out Pointer to sorted output key data
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] begin_bit Least-significant bit index (inclusive)
+  //! @param[in] end_bit Most-significant bit index (exclusive)
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortKeysDescending(
+    const KeyT* d_keys_in,
+    KeyT* d_keys_out,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Descending>(
+        storage,
+        bytes,
+        d_keys_in,
+        d_keys_out,
+        static_cast<NullType*>(nullptr),
+        static_cast<NullType*>(nullptr),
+        num_items,
+        decomposer,
+        stream,
+        tuning_env,
+        begin_bit,
+        end_bit);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx 2N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The contents of the input data are not altered by the sorting operation.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-descending-decomposer-env
+  //!     :end-before: example-end radix-sort-keys-descending-decomposer-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in] d_keys_in Pointer to input key data
+  //! @param[out] d_keys_out Pointer to sorted output key data
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortKeysDescending(
+    const KeyT* d_keys_in, KeyT* d_keys_out, NumItemsT num_items, DecomposerT decomposer, const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      return radix_sort_with_decomposer<SortOrder::Descending>(
+        storage,
+        bytes,
+        d_keys_in,
+        d_keys_out,
+        static_cast<NullType*>(nullptr),
+        static_cast<NullType*>(nullptr),
+        num_items,
+        decomposer,
+        stream,
+        tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a key buffer managed by a DoubleBuffer structure.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-descending-db-decomposer-env
+  //!     :end-before: example-end radix-sort-keys-descending-db-decomposer-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in,out] d_keys Reference to the double-buffer of keys
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION static cudaError_t
+  SortKeysDescending(DoubleBuffer<KeyT>& d_keys, NumItemsT num_items, DecomposerT decomposer, const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      DoubleBuffer<NullType> d_values;
+      return radix_sort_with_decomposer<SortOrder::Descending>(
+        storage, bytes, d_keys, d_values, num_items, decomposer, stream, tuning_env);
+    });
+  }
+
+  //! @rst
+  //! Sorts keys into descending order using :math:`\approx N` auxiliary storage.
+  //!
+  //! .. versionadded:: 3.4.0
+  //!    First appears in CUDA Toolkit 13.4.
+  //!
+  //! This is an environment-based API that allows customization of:
+  //!
+  //! - Stream: Query via ``cuda::get_stream``
+  //! - Memory resource: Query via ``cuda::mr::get_memory_resource``
+  //!
+  //! - The sorting operation is given a key buffer managed by a DoubleBuffer structure.
+  //! - A bit subrange ``[begin_bit, end_bit)`` is provided to specify which key bits are used for sorting.
+  //!
+  //! Snippet
+  //! --------------------------------------------------
+  //!
+  //! .. literalinclude:: ../../../cub/test/catch2_test_device_radix_sort_env_api.cu
+  //!     :language: c++
+  //!     :dedent:
+  //!     :start-after: example-begin radix-sort-keys-descending-db-decomposer-bits-env
+  //!     :end-before: example-end radix-sort-keys-descending-db-decomposer-bits-env
+  //!
+  //! @endrst
+  //!
+  //! @tparam KeyT
+  //!   **[inferred]** KeyT type
+  //! @tparam NumItemsT
+  //!   **[inferred]** Type of num_items
+  //! @tparam DecomposerT
+  //!   **[inferred]** Decomposer type
+  //! @tparam EnvT
+  //!   **[inferred]** Environment type
+  //!
+  //! @param[in,out] d_keys Reference to the double-buffer of keys
+  //! @param[in] num_items Number of items to sort
+  //! @param[in] decomposer Decomposer callable
+  //! @param[in] begin_bit Least-significant bit index (inclusive)
+  //! @param[in] end_bit Most-significant bit index (exclusive)
+  //! @param[in] env **[optional]** Execution environment
+  template <typename KeyT,
+            typename NumItemsT,
+            typename DecomposerT,
+            typename EnvT = ::cuda::std::execution::env<>,
+            ::cuda::std::enable_if_t<!::cuda::std::is_convertible_v<DecomposerT, int>, int> = 0>
+  [[nodiscard]] CUB_RUNTIME_FUNCTION _CCCL_FORCEINLINE static cudaError_t SortKeysDescending(
+    DoubleBuffer<KeyT>& d_keys,
+    NumItemsT num_items,
+    DecomposerT decomposer,
+    int begin_bit,
+    int end_bit,
+    const EnvT& env = {})
+  {
+    _CCCL_NVTX_RANGE_SCOPE(GetName());
+
+    return detail::dispatch_with_env(env, [&](auto tuning_env, void* storage, size_t& bytes, auto stream) {
+      DoubleBuffer<NullType> d_values;
+      return radix_sort_with_decomposer<SortOrder::Descending>(
+        storage, bytes, d_keys, d_values, num_items, decomposer, stream, tuning_env, begin_bit, end_bit);
+    });
+  }
+
+  //! @}
+};
+
+CUB_NAMESPACE_END

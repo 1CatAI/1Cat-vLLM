@@ -1,0 +1,440 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// <cuda/std/functional>
+
+// template <class F, class ...Args>
+// result_of_t<F&&(Args&&...)> invoke(F&&, Args&&...);
+
+/// C++14 [func.def] 20.9.0
+/// (1) The following definitions apply to this Clause:
+/// (2) A call signature is the name of a return type followed by a parenthesized
+///     comma-separated list of zero or more argument types.
+/// (3) A callable type is a function object type (20.9) or a pointer to member.
+/// (4) A callable object is an object of a callable type.
+/// (5) A call wrapper type is a type that holds a callable object and supports
+///     a call operation that forwards to that object.
+/// (6) A call wrapper is an object of a call wrapper type.
+/// (7) A target object is the callable object held by a call wrapper.
+
+/// C++14 [func.require] 20.9.1
+///
+/// Define INVOKE (f, t1, t2, ..., tN) as follows:
+///   (1.1) - (t1.*f)(t2, ..., tN) when f is a pointer to a member function of a class T and t1 is an object of
+///   type T or a reference to an object of type T or a reference to an object of a type derived from T;
+///   (1.2) - ((*t1).*f)(t2, ..., tN) when f is a pointer to a member function of a class T and t1 is not one of
+///   the types described in the previous item;
+///   (1.3) - t1.*f when N == 1 and f is a pointer to member data of a class T and t1 is an object of type T or a
+///   reference to an object of type T or a reference to an object of a type derived from T;
+///   (1.4) - (*t1).*f when N == 1 and f is a pointer to member data of a class T and t1 is not one of the types
+///   described in the previous item;
+///   (1.5) - f(t1, t2, ..., tN) in all other cases.
+
+#define _LIBCUDACXX_ENABLE_CXX20_REMOVED_TYPE_TRAITS
+// ADDITIONAL_COMPILE_DEFINITIONS: CCCL_IGNORE_DEPRECATED_API
+
+#include <cuda/std/cassert>
+#include <cuda/std/functional>
+#include <cuda/std/type_traits>
+#include <cuda/std/utility> // for cuda::std::move
+
+#include "test_macros.h"
+
+TEST_NV_DIAG_SUPPRESS(set_but_not_used)
+
+struct NonCopyable
+{
+  TEST_FUNC NonCopyable() {}
+
+private:
+  NonCopyable(NonCopyable const&)            = delete;
+  NonCopyable& operator=(NonCopyable const&) = delete;
+};
+
+struct TestClass
+{
+  TEST_FUNC explicit TestClass(int x)
+      : data(x)
+  {}
+
+  TEST_FUNC int& operator()(NonCopyable&&) &
+  {
+    return data;
+  }
+  TEST_FUNC int const& operator()(NonCopyable&&) const&
+  {
+    return data;
+  }
+  TEST_FUNC int volatile& operator()(NonCopyable&&) volatile&
+  {
+    return data;
+  }
+  TEST_FUNC int const volatile& operator()(NonCopyable&&) const volatile&
+  {
+    return data;
+  }
+
+  TEST_FUNC int&& operator()(NonCopyable&&) &&
+  {
+    return cuda::std::move(data);
+  }
+  TEST_FUNC int const&& operator()(NonCopyable&&) const&&
+  {
+    return cuda::std::move(data);
+  }
+  TEST_FUNC int volatile&& operator()(NonCopyable&&) volatile&&
+  {
+    return cuda::std::move(data);
+  }
+  TEST_FUNC int const volatile&& operator()(NonCopyable&&) const volatile&&
+  {
+    return cuda::std::move(data);
+  }
+
+  int data;
+
+private:
+  TestClass(TestClass const&)            = delete;
+  TestClass& operator=(TestClass const&) = delete;
+};
+
+struct DerivedFromTestClass : public TestClass
+{
+  TEST_FUNC explicit DerivedFromTestClass(int x)
+      : TestClass(x)
+  {}
+};
+
+TEST_FUNC int& foo(NonCopyable&&)
+{
+  static int data = 42;
+  return data;
+}
+
+#if !_CCCL_TILE_COMPILATION() // error: taking address or reference of a function is unsupported in tile mode!
+template <class Signature, class Expect, class Functor>
+TEST_FUNC void test_b12(Functor&& f)
+{
+  // Create the callable object.
+  using ClassFunc    = Signature TestClass::*;
+  ClassFunc func_ptr = &TestClass::operator();
+
+  // Create the dummy arg.
+  NonCopyable arg;
+
+  // Check that the deduced return type of invoke is what is expected.
+  using DeducedReturnType = decltype(cuda::std::invoke(func_ptr, cuda::std::forward<Functor>(f), cuda::std::move(arg)));
+  static_assert((cuda::std::is_same<DeducedReturnType, Expect>::value));
+
+  // Check that result_of_t matches Expect.
+  using ResultOfReturnType = typename cuda::std::result_of<ClassFunc && (Functor&&, NonCopyable&&)>::type;
+  static_assert((cuda::std::is_same<ResultOfReturnType, Expect>::value));
+
+  // Run invoke and check the return value.
+  DeducedReturnType ret = cuda::std::invoke(func_ptr, cuda::std::forward<Functor>(f), cuda::std::move(arg));
+  assert(ret == 42);
+}
+
+template <class Expect, class Functor>
+TEST_FUNC void test_b34(Functor&& f)
+{
+  // Create the callable object.
+  using ClassFunc    = int TestClass::*;
+  ClassFunc func_ptr = &TestClass::data;
+
+  // Check that the deduced return type of invoke is what is expected.
+  using DeducedReturnType = decltype(cuda::std::invoke(func_ptr, cuda::std::forward<Functor>(f)));
+  static_assert((cuda::std::is_same<DeducedReturnType, Expect>::value));
+
+  // Check that result_of_t matches Expect.
+  using ResultOfReturnType = typename cuda::std::result_of<ClassFunc && (Functor&&)>::type;
+  static_assert((cuda::std::is_same<ResultOfReturnType, Expect>::value));
+
+  // Run invoke and check the return value.
+  DeducedReturnType ret = cuda::std::invoke(func_ptr, cuda::std::forward<Functor>(f));
+  assert(ret == 42);
+}
+#endif // !_CCCL_TILE_COMPILATION()
+
+template <class Expect, class Functor>
+TEST_FUNC void test_b5(Functor&& f)
+{
+  NonCopyable arg;
+
+  // Check that the deduced return type of invoke is what is expected.
+  using DeducedReturnType = decltype(cuda::std::invoke(cuda::std::forward<Functor>(f), cuda::std::move(arg)));
+  static_assert((cuda::std::is_same<DeducedReturnType, Expect>::value));
+
+  // Check that result_of_t matches Expect.
+  using ResultOfReturnType = typename cuda::std::result_of<Functor && (NonCopyable&&)>::type;
+  static_assert((cuda::std::is_same<ResultOfReturnType, Expect>::value));
+
+  // Run invoke and check the return value.
+  DeducedReturnType ret = cuda::std::invoke(cuda::std::forward<Functor>(f), cuda::std::move(arg));
+  assert(ret == 42);
+}
+
+#if !_CCCL_TILE_COMPILATION() // error: taking address or reference of a function is unsupported in tile mode!
+TEST_FUNC void bullet_one_two_tests()
+{
+  {
+    TestClass cl(42);
+    test_b12<int&(NonCopyable&&) &, int&>(cl);
+    test_b12<int const&(NonCopyable&&) const&, int const&>(cl);
+    test_b12<int volatile&(NonCopyable&&) volatile&, int volatile&>(cl);
+    test_b12<int const volatile&(NonCopyable&&) const volatile&, int const volatile&>(cl);
+
+    test_b12<int&&(NonCopyable&&) &&, int&&>(cuda::std::move(cl));
+    test_b12<int const && (NonCopyable&&) const&&, int const&&>(cuda::std::move(cl));
+    test_b12<int volatile && (NonCopyable&&) volatile&&, int volatile&&>(cuda::std::move(cl));
+    test_b12<int const volatile && (NonCopyable&&) const volatile&&, int const volatile&&>(cuda::std::move(cl));
+  }
+  {
+    DerivedFromTestClass cl(42);
+    test_b12<int&(NonCopyable&&) &, int&>(cl);
+    test_b12<int const&(NonCopyable&&) const&, int const&>(cl);
+    test_b12<int volatile&(NonCopyable&&) volatile&, int volatile&>(cl);
+    test_b12<int const volatile&(NonCopyable&&) const volatile&, int const volatile&>(cl);
+
+    test_b12<int&&(NonCopyable&&) &&, int&&>(cuda::std::move(cl));
+    test_b12<int const && (NonCopyable&&) const&&, int const&&>(cuda::std::move(cl));
+    test_b12<int volatile && (NonCopyable&&) volatile&&, int volatile&&>(cuda::std::move(cl));
+    test_b12<int const volatile && (NonCopyable&&) const volatile&&, int const volatile&&>(cuda::std::move(cl));
+  }
+  {
+    TestClass cl_obj(42);
+    cuda::std::reference_wrapper<TestClass> cl(cl_obj);
+    test_b12<int&(NonCopyable&&) &, int&>(cl);
+    test_b12<int const&(NonCopyable&&) const&, int const&>(cl);
+    test_b12<int volatile&(NonCopyable&&) volatile&, int volatile&>(cl);
+    test_b12<int const volatile&(NonCopyable&&) const volatile&, int const volatile&>(cl);
+
+    test_b12<int&(NonCopyable&&) &, int&>(cuda::std::move(cl));
+    test_b12<int const&(NonCopyable&&) const&, int const&>(cuda::std::move(cl));
+    test_b12<int volatile&(NonCopyable&&) volatile&, int volatile&>(cuda::std::move(cl));
+    test_b12<int const volatile&(NonCopyable&&) const volatile&, int const volatile&>(cuda::std::move(cl));
+  }
+  {
+    DerivedFromTestClass cl_obj(42);
+    cuda::std::reference_wrapper<DerivedFromTestClass> cl(cl_obj);
+    test_b12<int&(NonCopyable&&) &, int&>(cl);
+    test_b12<int const&(NonCopyable&&) const&, int const&>(cl);
+    test_b12<int volatile&(NonCopyable&&) volatile&, int volatile&>(cl);
+    test_b12<int const volatile&(NonCopyable&&) const volatile&, int const volatile&>(cl);
+
+    test_b12<int&(NonCopyable&&) &, int&>(cuda::std::move(cl));
+    test_b12<int const&(NonCopyable&&) const&, int const&>(cuda::std::move(cl));
+    test_b12<int volatile&(NonCopyable&&) volatile&, int volatile&>(cuda::std::move(cl));
+    test_b12<int const volatile&(NonCopyable&&) const volatile&, int const volatile&>(cuda::std::move(cl));
+  }
+  {
+    TestClass cl_obj(42);
+    TestClass* cl = &cl_obj;
+    test_b12<int&(NonCopyable&&) &, int&>(cl);
+    test_b12<int const&(NonCopyable&&) const&, int const&>(cl);
+    test_b12<int volatile&(NonCopyable&&) volatile&, int volatile&>(cl);
+    test_b12<int const volatile&(NonCopyable&&) const volatile&, int const volatile&>(cl);
+  }
+  {
+    DerivedFromTestClass cl_obj(42);
+    DerivedFromTestClass* cl = &cl_obj;
+    test_b12<int&(NonCopyable&&) &, int&>(cl);
+    test_b12<int const&(NonCopyable&&) const&, int const&>(cl);
+    test_b12<int volatile&(NonCopyable&&) volatile&, int volatile&>(cl);
+    test_b12<int const volatile&(NonCopyable&&) const volatile&, int const volatile&>(cl);
+  }
+}
+
+TEST_FUNC void bullet_three_four_tests()
+{
+  {
+    using Fn = TestClass;
+    Fn cl(42);
+    test_b34<int&>(cl);
+    test_b34<int const&>(static_cast<Fn const&>(cl));
+    test_b34<int volatile&>(static_cast<Fn volatile&>(cl));
+    test_b34<int const volatile&>(static_cast<Fn const volatile&>(cl));
+
+    test_b34<int&&>(static_cast<Fn&&>(cl));
+    test_b34<int const&&>(static_cast<Fn const&&>(cl));
+    test_b34<int volatile&&>(static_cast<Fn volatile&&>(cl));
+    test_b34<int const volatile&&>(static_cast<Fn const volatile&&>(cl));
+  }
+  {
+    using Fn = DerivedFromTestClass;
+    Fn cl(42);
+    test_b34<int&>(cl);
+    test_b34<int const&>(static_cast<Fn const&>(cl));
+    test_b34<int volatile&>(static_cast<Fn volatile&>(cl));
+    test_b34<int const volatile&>(static_cast<Fn const volatile&>(cl));
+
+    test_b34<int&&>(static_cast<Fn&&>(cl));
+    test_b34<int const&&>(static_cast<Fn const&&>(cl));
+    test_b34<int volatile&&>(static_cast<Fn volatile&&>(cl));
+    test_b34<int const volatile&&>(static_cast<Fn const volatile&&>(cl));
+  }
+  {
+    using Fn = TestClass;
+    Fn cl(42);
+    test_b34<int&>(cuda::std::reference_wrapper<Fn>(cl));
+    test_b34<int const&>(cuda::std::reference_wrapper<Fn const>(cl));
+    test_b34<int volatile&>(cuda::std::reference_wrapper<Fn volatile>(cl));
+    test_b34<int const volatile&>(cuda::std::reference_wrapper<Fn const volatile>(cl));
+  }
+  {
+    using Fn = DerivedFromTestClass;
+    Fn cl(42);
+    test_b34<int&>(cuda::std::reference_wrapper<Fn>(cl));
+    test_b34<int const&>(cuda::std::reference_wrapper<Fn const>(cl));
+    test_b34<int volatile&>(cuda::std::reference_wrapper<Fn volatile>(cl));
+    test_b34<int const volatile&>(cuda::std::reference_wrapper<Fn const volatile>(cl));
+  }
+  {
+    using Fn = TestClass;
+    Fn cl_obj(42);
+    Fn* cl = &cl_obj;
+    test_b34<int&>(cl);
+    test_b34<int const&>(static_cast<Fn const*>(cl));
+    test_b34<int volatile&>(static_cast<Fn volatile*>(cl));
+    test_b34<int const volatile&>(static_cast<Fn const volatile*>(cl));
+  }
+  {
+    using Fn = DerivedFromTestClass;
+    Fn cl_obj(42);
+    Fn* cl = &cl_obj;
+    test_b34<int&>(cl);
+    test_b34<int const&>(static_cast<Fn const*>(cl));
+    test_b34<int volatile&>(static_cast<Fn volatile*>(cl));
+    test_b34<int const volatile&>(static_cast<Fn const volatile*>(cl));
+  }
+}
+#endif // !_CCCL_TILE_COMPILATION()
+
+TEST_FUNC void bullet_five_tests()
+{
+#if !_CCCL_TILE_COMPILATION() //  error: taking address or reference of a function is unsupported in tile mode!
+  using FooType = int&(NonCopyable&&);
+  {
+    FooType& fn = foo;
+    test_b5<int&>(fn);
+  }
+#endif // !_CCCL_TILE_COMPILATION()
+#if !_CCCL_TILE_COMPILATION() // error: function-to-pointer decay is unsupported in tile code
+  {
+    FooType* fn = foo;
+    test_b5<int&>(fn);
+  }
+#endif // !_CCCL_TILE_COMPILATION()
+  {
+    using Fn = TestClass;
+    Fn cl(42);
+    test_b5<int&>(cl);
+    test_b5<int const&>(static_cast<Fn const&>(cl));
+    test_b5<int volatile&>(static_cast<Fn volatile&>(cl));
+    test_b5<int const volatile&>(static_cast<Fn const volatile&>(cl));
+
+    test_b5<int&&>(static_cast<Fn&&>(cl));
+    test_b5<int const&&>(static_cast<Fn const&&>(cl));
+    test_b5<int volatile&&>(static_cast<Fn volatile&&>(cl));
+    test_b5<int const volatile&&>(static_cast<Fn const volatile&&>(cl));
+  }
+}
+
+struct CopyThrows
+{
+  TEST_FUNC CopyThrows() {}
+  TEST_FUNC CopyThrows(CopyThrows const&) {}
+  TEST_FUNC CopyThrows(CopyThrows&&) noexcept {}
+};
+
+struct NoThrowCallable
+{
+  TEST_FUNC void operator()() noexcept {}
+  TEST_FUNC void operator()(CopyThrows) noexcept {}
+};
+
+struct ThrowsCallable
+{
+  TEST_FUNC void operator()() {}
+};
+
+struct MemberObj
+{
+  int x;
+};
+
+TEST_FUNC void noexcept_test()
+{
+  {
+    NoThrowCallable obj;
+    unused(obj); // suppress unused warning
+    CopyThrows arg;
+    unused(arg); // suppress unused warning
+    static_assert(noexcept(cuda::std::invoke(obj)));
+#if !TEST_COMPILER(NVHPC)
+    static_assert(!noexcept(cuda::std::invoke(obj, arg)));
+#endif // TEST_COMPILER(NVHPC)
+    static_assert(noexcept(cuda::std::invoke(obj, cuda::std::move(arg))));
+  }
+#if !TEST_COMPILER(NVHPC)
+  {
+    ThrowsCallable obj;
+    unused(obj); // suppress unused warning
+    static_assert(!noexcept(cuda::std::invoke(obj)));
+  }
+#endif // TEST_COMPILER(NVHPC)
+  {
+    MemberObj obj{42};
+    unused(obj); // suppress unused warning.
+    static_assert(noexcept(cuda::std::invoke(&MemberObj::x, obj)));
+  }
+}
+
+// ensure that we allow `__device__` functions too
+struct with_device_op
+{
+  TEST_DEVICE_FUNC constexpr bool operator()(const int) const
+  {
+    return {};
+  }
+};
+
+__global__ void test_kernel()
+{
+  with_device_op op{};
+  assert(cuda::std::invoke(op, 42));
+}
+
+#if _CCCL_TILE_COMPILATION()
+// ensure that we allow `__tile__` functions too
+struct with_tile_op
+{
+  TEST_TILE_FUNC constexpr bool operator()(const int) const
+  {
+    return {};
+  }
+};
+
+__tile_global__ void test_tile_kernel()
+{
+  with_tile_op op{};
+  assert(cuda::std::invoke(op, 42));
+}
+#endif // _CCCL_TILE_COMPILATION()
+
+int main(int, char**)
+{
+#if !_CCCL_TILE_COMPILATION() // error: taking address or reference of a function is unsupported in tile mode!
+  bullet_one_two_tests();
+  bullet_three_four_tests();
+#endif // !_CCCL_TILE_COMPILATION()
+  bullet_five_tests();
+  noexcept_test();
+
+  return 0;
+}

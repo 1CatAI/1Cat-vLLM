@@ -1,0 +1,132 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# shellcheck disable=SC1091
+. "$(dirname "$0")/../.ci/scripts/common.sh"
+
+set -e
+set -x
+ulimit -c unlimited
+
+# Parse commandline arguments with first argument being the install directory.
+INSTALL_DIR=$1
+
+if [ -z "$INSTALL_DIR" ]; then
+    echo "Usage: $0 <install_dir>"
+    exit 1
+fi
+
+ARCH=$(uname -m)
+[ "$ARCH" = "arm64" ] && ARCH="aarch64"
+
+export LD_LIBRARY_PATH=${INSTALL_DIR}/lib:${INSTALL_DIR}/lib/$ARCH-linux-gnu:${INSTALL_DIR}/lib/$ARCH-linux-gnu/plugins:/usr/local/lib:$LD_LIBRARY_PATH
+
+export CPATH=${INSTALL_DIR}/include:$CPATH
+export PATH=${INSTALL_DIR}/bin:$PATH
+export PKG_CONFIG_PATH=${INSTALL_DIR}/lib/pkgconfig:$PKG_CONFIG_PATH
+export NIXL_PLUGIN_DIR=${INSTALL_DIR}/lib/$ARCH-linux-gnu/plugins
+
+echo "==== Show system info ===="
+env
+nvidia-smi topo -m || true
+ibv_devinfo || true
+uname -a || true
+
+echo "==== Running Nixlbench tests ===="
+cd ${INSTALL_DIR}
+
+DEFAULT_NB_PARAMS="--filepath /tmp --total_buffer_size 80000000 --start_block_size 16384 --max_block_size 16384 --start_batch_size 4 --max_batch_size 4"
+
+run_nixlbench_one_worker() {
+    args="$@"
+    ./bin/nixlbench $DEFAULT_NB_PARAMS $args
+}
+
+for op_type in READ WRITE; do
+    run_nixlbench_one_worker --backend POSIX --op_type $op_type --check_consistency
+done
+
+if $HAS_GPU ; then
+    seg_types="VRAM DRAM"
+else
+    seg_types="DRAM"
+    echo "Worker without GPU, skipping VRAM tests"
+fi
+
+get_random_tcp_port() {
+    python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind((\"\", 0))
+print(s.getsockname()[1])
+s.close()
+"
+}
+
+run_nixlbench_two_workers_asio() {
+    args="$@"
+    asio_port=$(get_random_tcp_port)
+    command_line="./bin/nixlbench --runtime_type=ASIO --asio_port=$asio_port $DEFAULT_NB_PARAMS $args"
+    parallel --line-buffer --halt now,fail=1 ::: "$command_line" "sleep 4 ; $command_line"
+}
+
+for op_type in READ WRITE; do
+    for initiator in $seg_types; do
+        for target in $seg_types; do
+            run_nixlbench_two_workers_asio --backend UCX --op_type $op_type --initiator_seg_type $initiator --target_seg_type $target --check_consistency
+        done
+    done
+done
+
+if $HAS_GPU ; then
+    for op_type in READ WRITE; do
+        for initiator in $seg_types; do
+            for target in $seg_types; do
+                run_nixlbench_two_workers_asio --backend UCCL --op_type $op_type --initiator_seg_type $initiator --target_seg_type $target --check_consistency
+            done
+        done
+    done
+fi
+
+run_nixlbench_two_workers_etcd() {
+    args="$@"
+    benchmark_group=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
+    command_line="./bin/nixlbench --etcd_endpoints ${NIXL_ETCD_ENDPOINTS} $DEFAULT_NB_PARAMS --benchmark_group $benchmark_group $args"
+    parallel --line-buffer --halt now,fail=1 ::: "$command_line" "sleep 4 ; $command_line"
+}
+
+start_etcd_server "/nixl/nixlbench_ci"
+
+for op_type in READ WRITE; do
+    for initiator in $seg_types; do
+        for target in $seg_types; do
+            run_nixlbench_two_workers_etcd --backend UCX --op_type $op_type --initiator_seg_type $initiator --target_seg_type $target --check_consistency
+        done
+    done
+done
+
+if $HAS_GPU ; then
+    for op_type in READ WRITE; do
+        for initiator in $seg_types; do
+            for target in $seg_types; do
+                run_nixlbench_two_workers_etcd --backend UCCL --op_type $op_type --initiator_seg_type $initiator --target_seg_type $target --check_consistency
+            done
+        done
+    done
+fi
+
+kill -9 $ETCD_PID 2>/dev/null || true

@@ -1,0 +1,86 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#ifndef NIXL_BENCHMARK_NIXLBENCH_SRC_WORKER_NIXL_NIXL_WORKER_H
+#define NIXL_BENCHMARK_NIXLBENCH_SRC_WORKER_NIXL_NIXL_WORKER_H
+
+#include "config.h"
+#include <iostream>
+#include <string>
+#include <utility>
+#include <variant>
+#include <vector>
+#include <optional>
+#include <memory>
+#include <unistd.h>
+#include <nixl.h>
+#include "utils/utils.h"
+#include "worker/worker.h"
+#include "worker/nixl/nixl_mem_region.h"
+
+// Use shared GusliDeviceConfig and parseGusliDeviceList declared in utils.h
+
+class xferBenchNixlWorker: public xferBenchWorker {
+    private:
+        nixlAgent* agent;
+        nixlBackendH* backend_engine;
+        nixl_mem_t seg_type;
+        std::vector<xferFileState> remote_fds;
+        std::vector<NixlMemRegion> remote_regs_;
+        std::vector<NixlMemRegion> local_regs_;
+        std::vector<GusliDeviceConfig> gusli_devices;
+
+    public:
+        explicit xferBenchNixlWorker(const std::vector<std::string> &devices);
+        ~xferBenchNixlWorker() override;
+
+        // Memory management
+        std::vector<std::vector<xferBenchIOV>> allocateMemory(int num_threads) override;
+        void deallocateMemory(std::vector<std::vector<xferBenchIOV>> &iov_lists) override;
+
+        // Communication and synchronization
+        int exchangeMetadata() override;
+        std::vector<std::vector<xferBenchIOV>>
+        exchangeIOV(const std::vector<std::vector<xferBenchIOV>> &local_iov_lists,
+                    size_t block_size) override;
+        void
+        poll(size_t block_size) override;
+        int
+        synchronizeStart();
+
+        // Data operations
+        std::variant<xferBenchStats, int>
+        transfer(size_t block_size,
+                 const std::vector<std::vector<xferBenchIOV>> &local_iov_lists,
+                 const std::vector<std::vector<xferBenchIOV>> &remote_iov_lists) override;
+
+    private:
+        std::optional<xferBenchIOV>
+        initBasicDescDram(size_t buffer_size, int mem_dev_id);
+        std::optional<xferBenchIOV>
+        initBasicDescVram(size_t buffer_size, int mem_dev_id);
+        std::optional<xferBenchIOV>
+        initBasicDescFile(size_t buffer_size, xferFileState &fstate, int mem_dev_id);
+        std::optional<xferBenchIOV>
+        initBasicDescObj(size_t buffer_size, int mem_dev_id, std::string name);
+        std::optional<xferBenchIOV>
+        initBasicDescBlk(size_t buffer_size, int mem_dev_id, size_t dev_offset);
+        bool
+        ensureFileHasConsistencyData(const GusliDeviceConfig &device, size_t size);
+};
+
+#endif // NIXL_BENCHMARK_NIXLBENCH_SRC_WORKER_NIXL_NIXL_WORKER_H

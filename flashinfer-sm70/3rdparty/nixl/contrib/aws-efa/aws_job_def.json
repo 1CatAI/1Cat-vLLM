@@ -1,0 +1,54 @@
+{
+    "jobDefinitionName": "NIXL-Ubuntu-JD",
+    "type": "container",
+    "parameters": {},
+    "timeout": {
+        "attemptDurationSeconds": 10800
+    },
+    "tags": {
+        "Project": "NIXL",
+        "Environment": "Testing"
+    },
+    "eksProperties": {
+        "podProperties": {
+            "hostNetwork": true,
+            "imagePullSecrets": [],
+            "containers": [
+                {
+                    "image": "nvcr.io/nvidia/cuda-dl-base:25.06-cuda12.9-devel-ubuntu24.04",
+                    "command": [
+                        "/bin/bash",
+                        "-c",
+                        "sleep 1h"
+                    ],
+                    "args": [],
+                    "env": [],
+                    "resources": {
+                        "limits": {
+                            "memory": "167936Mi",
+                            "cpu": "70"
+                        }
+                    },
+                    "volumeMounts": [
+                        {
+                            "name": "efa-volume",
+                            "mountPath": "/dev/infiniband/uverbs0"
+                        }
+                    ],
+                    "securityContext": {
+                        "privileged": true
+                    }
+                }
+            ],
+            "initContainers": [],
+            "volumes": [
+                {
+                    "name": "efa-volume",
+                    "hostPath": {
+                        "path": "/dev/infiniband/uverbs0"
+                    }
+                }
+            ]
+        }
+    }
+}

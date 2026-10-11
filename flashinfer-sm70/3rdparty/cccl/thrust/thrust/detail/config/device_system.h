@@ -1,0 +1,44 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+// Internal config header that is only included through thrust/detail/config/config.h
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+// reserve 0 for undefined
+#define THRUST_DEVICE_SYSTEM_CUDA 1
+#define THRUST_DEVICE_SYSTEM_OMP  2
+#define THRUST_DEVICE_SYSTEM_TBB  3
+#define THRUST_DEVICE_SYSTEM_CPP  4
+
+#ifndef THRUST_DEVICE_SYSTEM
+#  define THRUST_DEVICE_SYSTEM THRUST_DEVICE_SYSTEM_CUDA
+#endif // THRUST_DEVICE_SYSTEM
+
+#ifdef THRUST_DEVICE_BACKEND
+#  error THRUST_DEVICE_BACKEND is no longer supported; use THRUST_DEVICE_SYSTEM instead.
+#endif // THRUST_DEVICE_BACKEND
+
+#if THRUST_DEVICE_SYSTEM == THRUST_DEVICE_SYSTEM_CUDA
+#  define __THRUST_DEVICE_SYSTEM_NAMESPACE cuda
+#elif THRUST_DEVICE_SYSTEM == THRUST_DEVICE_SYSTEM_OMP
+#  define __THRUST_DEVICE_SYSTEM_NAMESPACE omp
+#elif THRUST_DEVICE_SYSTEM == THRUST_DEVICE_SYSTEM_TBB
+#  define __THRUST_DEVICE_SYSTEM_NAMESPACE tbb
+#elif THRUST_DEVICE_SYSTEM == THRUST_DEVICE_SYSTEM_CPP
+#  define __THRUST_DEVICE_SYSTEM_NAMESPACE cpp
+#endif
+
+// clang-format off
+#define __THRUST_DEVICE_SYSTEM_ROOT thrust/system/__THRUST_DEVICE_SYSTEM_NAMESPACE
+#define __THRUST_DEVICE_SYSTEM_ALGORITH_HEADER_INCLUDE(filename) <__THRUST_DEVICE_SYSTEM_ROOT/filename>
+#define __THRUST_DEVICE_SYSTEM_ALGORITH_DETAIL_HEADER_INCLUDE(filename) <__THRUST_DEVICE_SYSTEM_ROOT/detail/filename>
+// clang-format on

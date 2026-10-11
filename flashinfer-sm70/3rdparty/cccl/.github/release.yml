@@ -1,0 +1,18 @@
+changelog:
+  categories:
+    - title: 🚀 Thrust / CUB
+      labels:
+        - "thrust"
+        - "cub"
+    - title: 📚 Libcudacxx
+      labels:
+        - "libcu++"
+    - title: ⚡ cuda.compute
+      labels:
+        - "cuda.compute"
+    - title: 📝 Documentation
+      labels:
+        - "doc"
+    - title: 🔄 Other Changes
+      labels:
+        - "*"

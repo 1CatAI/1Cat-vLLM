@@ -1,0 +1,68 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+#pragma once
+
+#include <cub/config.cuh>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+CUB_NAMESPACE_BEGIN
+
+//! @brief Options for specifying memory aliasing
+enum class MayAlias
+{
+  Yes,
+  No
+};
+
+//! @brief Options for specifying sorting order.
+enum class SortOrder
+{
+  Ascending,
+  Descending
+};
+
+//! @brief Options for specifying the behavior of the stream compaction algorithm.
+enum class SelectImpl
+{
+  //! Stream compaction, discarding rejected items. It's required that memory of input and output are disjoint.
+  Select,
+  //! Stream compaction, discarding rejected items. Memory of the input may be identical to the memory of the output.
+  SelectPotentiallyInPlace,
+  //! Partition, keeping rejected items. It's required that memory of input and output are disjoint.
+  Partition
+};
+
+//! @brief Options for forcing inclusive prefix-scan even when initial value has been provided
+enum class ForceInclusive
+{
+  Yes,
+  No
+};
+
+// Options for specifying selection direction (e.g., for top-k selection).
+namespace detail::topk
+{
+enum class select
+{
+  // Select the elements with the lowest values
+  min,
+  // Select the elements with the highest values
+  max
+};
+} // namespace detail::topk
+
+namespace detail
+{
+struct use_default
+{};
+} // namespace detail
+
+CUB_NAMESPACE_END

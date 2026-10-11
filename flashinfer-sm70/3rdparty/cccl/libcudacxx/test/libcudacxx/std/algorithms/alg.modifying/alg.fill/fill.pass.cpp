@@ -1,0 +1,77 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// <algorithm>
+
+// template<ForwardIterator Iter, class T>
+//   requires OutputIterator<Iter, const T&>
+//   constexpr void      // constexpr after C++17
+//   fill(Iter first, Iter last, const T& value);
+
+#include <cuda/std/algorithm>
+#include <cuda/std/cassert>
+
+#include "test_iterators.h"
+#include "test_macros.h"
+
+_CCCL_EXEC_CHECK_DISABLE
+template <class Iter>
+TEST_FUNC constexpr void test_char()
+{
+  const unsigned n = 4;
+  char ca[n]       = {0};
+  cuda::std::fill(Iter(ca), Iter(ca + n), char(1));
+  assert(ca[0] == 1);
+  assert(ca[1] == 1);
+  assert(ca[2] == 1);
+  assert(ca[3] == 1);
+}
+
+_CCCL_EXEC_CHECK_DISABLE
+template <class Iter>
+TEST_FUNC constexpr void test_int()
+{
+  const unsigned n = 4;
+  int ia[n]        = {0};
+  cuda::std::fill(Iter(ia), Iter(ia + n), 1);
+  assert(ia[0] == 1);
+  assert(ia[1] == 1);
+  assert(ia[2] == 1);
+  assert(ia[3] == 1);
+}
+
+_CCCL_EXEC_CHECK_DISABLE
+TEST_FUNC constexpr bool test()
+{
+  test_char<forward_iterator<char*>>();
+  test_char<bidirectional_iterator<char*>>();
+  test_char<random_access_iterator<char*>>();
+  test_char<char*>();
+
+  test_int<forward_iterator<int*>>();
+  test_int<bidirectional_iterator<int*>>();
+  test_int<random_access_iterator<int*>>();
+  test_int<int*>();
+
+#if !TEST_COMPILER(NVRTC)
+  NV_IF_TARGET(NV_IS_HOST, (test_int<host_only_iterator<int*>>();))
+#endif // !TEST_COMPILER(NVRTC)
+#if TEST_CUDA_COMPILATION() && !defined(CCCL_FORCE_TILE_TESTS)
+  NV_IF_TARGET(NV_IS_DEVICE, (test_int<device_only_iterator<int*>>();))
+#endif // TEST_CUDA_COMPILATION() && !CCCL_FORCE_TILE_TESTS
+
+  return true;
+}
+
+int main(int, char**)
+{
+  test();
+  static_assert(test());
+
+  return 0;
+}

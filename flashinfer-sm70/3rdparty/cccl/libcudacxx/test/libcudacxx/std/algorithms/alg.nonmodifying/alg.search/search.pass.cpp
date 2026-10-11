@@ -1,0 +1,166 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: force-tile
+// error: a return statement inside a loop is not currently supported in a tile function
+
+// <algorithm>
+
+// template<ForwardIterator Iter1, ForwardIterator Iter2>
+//   requires HasEqualTo<Iter1::value_type, Iter2::value_type>
+//   constexpr Iter1     // constexpr after C++17
+//   search(Iter1 first1, Iter1 last1, Iter2 first2, Iter2 last2);
+//
+//   template<class ForwardIterator, class Searcher>
+//   ForwardIterator search(ForwardIterator first, ForwardIterator last,
+//                          const Searcher& searcher); // C++17
+
+#include <cuda/std/algorithm>
+#include <cuda/std/cassert>
+
+#include "test_iterators.h"
+#include "test_macros.h"
+
+TEST_DIAG_SUPPRESS_MSVC(4018) // signed/unsigned mismatch
+TEST_DIAG_SUPPRESS_GCC("-Wsign-compare")
+TEST_DIAG_SUPPRESS_CLANG("-Wsign-compare")
+
+struct MySearcherC
+{
+  template <typename Iterator>
+  TEST_FUNC cuda::std::pair<Iterator, Iterator> constexpr operator()(Iterator b, Iterator e) const
+  {
+    return cuda::std::make_pair(b, e);
+  }
+};
+
+struct MySearcher
+{
+  TEST_FUNC constexpr MySearcher(int& searcher_called) noexcept
+      : searcher_called(searcher_called)
+  {}
+
+  template <typename Iterator>
+  TEST_FUNC cuda::std::pair<Iterator, Iterator> constexpr operator()(Iterator b, Iterator e) const
+  {
+    ++searcher_called;
+    return cuda::std::make_pair(b, e);
+  }
+
+  int& searcher_called;
+};
+
+namespace User
+{
+struct S
+{
+  TEST_FUNC constexpr S(int x)
+      : x_(x)
+  {}
+  TEST_FUNC friend constexpr bool operator==(S lhs, S rhs) noexcept
+  {
+    return lhs.x_ == rhs.x_;
+  }
+  int x_;
+};
+
+template <class T, class U>
+void make_pair(T&&, U&&) = delete;
+} // namespace User
+
+_CCCL_EXEC_CHECK_DISABLE
+template <class Iter1, class Iter2>
+TEST_FUNC constexpr void test()
+{
+  int ia[]          = {0, 1, 2, 3, 4, 5};
+  const unsigned sa = sizeof(ia) / sizeof(ia[0]);
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa), Iter2(ia), Iter2(ia)) == Iter1(ia));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa), Iter2(ia), Iter2(ia + 1)) == Iter1(ia));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa), Iter2(ia + 1), Iter2(ia + 2)) == Iter1(ia + 1));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa), Iter2(ia + 2), Iter2(ia + 2)) == Iter1(ia));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa), Iter2(ia + 2), Iter2(ia + 3)) == Iter1(ia + 2));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa), Iter2(ia + 2), Iter2(ia + 3)) == Iter1(ia + 2));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia), Iter2(ia + 2), Iter2(ia + 3)) == Iter1(ia));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa), Iter2(ia + sa - 1), Iter2(ia + sa)) == Iter1(ia + sa - 1));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa), Iter2(ia + sa - 3), Iter2(ia + sa)) == Iter1(ia + sa - 3));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa), Iter2(ia), Iter2(ia + sa)) == Iter1(ia));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + sa - 1), Iter2(ia), Iter2(ia + sa)) == Iter1(ia + sa - 1));
+  assert(cuda::std::search(Iter1(ia), Iter1(ia + 1), Iter2(ia), Iter2(ia + sa)) == Iter1(ia + 1));
+  int ib[]          = {0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3, 4};
+  const unsigned sb = sizeof(ib) / sizeof(ib[0]);
+  int ic[]          = {1};
+  assert(cuda::std::search(Iter1(ib), Iter1(ib + sb), Iter2(ic), Iter2(ic + 1)) == Iter1(ib + 1));
+  int id[] = {1, 2};
+  assert(cuda::std::search(Iter1(ib), Iter1(ib + sb), Iter2(id), Iter2(id + 2)) == Iter1(ib + 1));
+  int ie[] = {1, 2, 3};
+  assert(cuda::std::search(Iter1(ib), Iter1(ib + sb), Iter2(ie), Iter2(ie + 3)) == Iter1(ib + 4));
+  int ig[] = {1, 2, 3, 4};
+  assert(cuda::std::search(Iter1(ib), Iter1(ib + sb), Iter2(ig), Iter2(ig + 4)) == Iter1(ib + 8));
+  int ih[]          = {0, 1, 1, 1, 1, 2, 3, 0, 1, 2, 3, 4};
+  const unsigned sh = sizeof(ih) / sizeof(ih[0]);
+  int ii[]          = {1, 1, 2};
+  assert(cuda::std::search(Iter1(ih), Iter1(ih + sh), Iter2(ii), Iter2(ii + 3)) == Iter1(ih + 3));
+  int ij[]          = {0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0};
+  const unsigned sj = sizeof(ij) / sizeof(ij[0]);
+  int ik[]          = {0, 0, 0, 0, 1, 1, 1, 1, 0, 0};
+  const unsigned sk = sizeof(ik) / sizeof(ik[0]);
+  assert(cuda::std::search(Iter1(ij), Iter1(ij + sj), Iter2(ik), Iter2(ik + sk)) == Iter1(ij + 6));
+}
+
+_CCCL_EXEC_CHECK_DISABLE
+template <class Iter>
+TEST_FUNC constexpr void adl_test()
+{
+  User::S ua[] = {1};
+  assert(cuda::std::search(Iter(ua), Iter(ua), Iter(ua), Iter(ua)) == Iter(ua));
+}
+
+_CCCL_EXEC_CHECK_DISABLE
+TEST_FUNC constexpr bool test()
+{
+  test<forward_iterator<const int*>, forward_iterator<const int*>>();
+  test<forward_iterator<const int*>, bidirectional_iterator<const int*>>();
+  test<forward_iterator<const int*>, random_access_iterator<const int*>>();
+  test<bidirectional_iterator<const int*>, forward_iterator<const int*>>();
+  test<bidirectional_iterator<const int*>, bidirectional_iterator<const int*>>();
+  test<bidirectional_iterator<const int*>, random_access_iterator<const int*>>();
+  test<random_access_iterator<const int*>, forward_iterator<const int*>>();
+  test<random_access_iterator<const int*>, bidirectional_iterator<const int*>>();
+  test<random_access_iterator<const int*>, random_access_iterator<const int*>>();
+
+#if !TEST_COMPILER(NVRTC)
+  NV_IF_TARGET(NV_IS_HOST, (test<host_only_iterator<const int*>, host_only_iterator<const int*>>();))
+#endif // !TEST_COMPILER(NVRTC)
+#if TEST_CUDA_COMPILATION() && !defined(CCCL_FORCE_TILE_TESTS)
+  NV_IF_TARGET(NV_IS_DEVICE, (test<device_only_iterator<const int*>, device_only_iterator<const int*>>();))
+#endif // TEST_CUDA_COMPILATION() && !CCCL_FORCE_TILE_TESTS
+
+  adl_test<forward_iterator<User::S*>>();
+  adl_test<random_access_iterator<User::S*>>();
+
+  return true;
+}
+
+int main(int, char**)
+{
+  test();
+  static_assert(test());
+
+  {
+    int searcher_called = 0;
+    using RI            = int*;
+    static_assert(
+      (cuda::std::is_same<RI, decltype(cuda::std::search(RI(), RI(), MySearcher{searcher_called}))>::value));
+
+    RI it(nullptr);
+    assert(it == cuda::std::search(it, it, MySearcher{searcher_called}));
+    assert(searcher_called == 1);
+  }
+
+  return 0;
+}

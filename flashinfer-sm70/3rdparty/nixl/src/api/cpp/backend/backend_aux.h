@@ -1,0 +1,210 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef __BACKEND_AUX_H_
+#define __BACKEND_AUX_H_
+
+#include <mutex>
+#include <string>
+#include "common/nixl_log.h"
+#include "nixl_types.h"
+#include "nixl_descriptors.h"
+#include "common/nixl_time.h"
+
+// Might be removed to be decided by backend, or changed to high
+// level direction or so.
+typedef std::vector<std::pair<std::string, std::string>> notif_list_t;
+
+
+struct nixlBackendOptionalArgs {
+    // During postXfer, user might ask for a notification if supported
+    nixl_blob_t notifMsg;
+    bool        hasNotif = false;
+    nixl_blob_t customParam;
+};
+
+using nixl_opt_b_args_t = nixlBackendOptionalArgs;
+
+
+// A base class to point to backend initialization data
+// User doesn't know about fields such as local_agent but can access it
+// after the backend is initialized by agent. If we needed to make it private
+// from the user, we should make nixlBackendEngine/nixlAgent friend classes.
+class nixlBackendInitParams {
+    public:
+        std::string localAgent;
+
+        nixl_backend_t type;
+        nixl_b_params_t *customParams = nullptr;
+
+        bool enableProgTh = false;
+        nixlTime::us_t pthrDelay = 0;
+        nixl_thread_sync_t syncMode;
+        bool enableTelemetry_ = false;
+};
+
+// Pure virtual class to have a common pointer type
+class nixlBackendReqH {
+public:
+    nixlBackendReqH() { }
+    virtual ~nixlBackendReqH() { }
+};
+
+// Pure virtual class to have a common pointer type for different backendMD.
+class nixlBackendMD {
+    protected:
+        bool isPrivateMD;
+
+    public:
+        nixlBackendMD(bool isPrivate){
+            isPrivateMD = isPrivate;
+        }
+
+        virtual ~nixlBackendMD(){
+        }
+};
+
+// Each backend can have different connection requirement
+// This class would include the required information to make
+// a connection to a remote node. Note that local information
+// is passed during the constructor and through BackendInitParams
+class nixlBackendConnMD {
+  public:
+    // And some other details
+    std::string dstIpAddress;
+    uint16_t    dstPort;
+};
+
+// A pointer required to a metadata object for backends next to each BasicDesc
+class nixlMetaDesc : public nixlBasicDesc {
+  public:
+        // To be able to point to any object
+        nixlBackendMD* metadataP;
+
+        // Reuse parent constructor without the metadata pointer
+        using nixlBasicDesc::nixlBasicDesc;
+
+        nixlMetaDesc() : nixlBasicDesc() { metadataP = nullptr; }
+
+        nixlMetaDesc(uintptr_t addr, size_t len, uint64_t dev_id, nixlBackendMD *metadata)
+            : nixlBasicDesc(addr, len, dev_id),
+              metadataP(metadata) {}
+
+        // No serializer or deserializer, using parent not to expose the metadata
+
+        inline friend bool operator==(const nixlMetaDesc &lhs, const nixlMetaDesc &rhs) {
+            return (((nixlBasicDesc)lhs == (nixlBasicDesc)rhs) &&
+                          (lhs.metadataP == rhs.metadataP));
+        }
+
+        inline void print(const std::string &suffix) const {
+            nixlBasicDesc::print(", Backend ptr val: " +
+                                 std::to_string((uintptr_t)metadataP) + suffix);
+        }
+};
+
+struct nixlRemoteMetaDesc : public nixlMetaDesc {
+    std::string remoteAgent;
+
+    using nixlMetaDesc::nixlMetaDesc;
+
+    explicit nixlRemoteMetaDesc(const std::string &remote_agent)
+        : nixlMetaDesc(),
+          remoteAgent(remote_agent) {}
+};
+
+inline bool
+operator==(const nixlRemoteMetaDesc &lhs, const nixlRemoteMetaDesc &rhs) {
+    return (static_cast<const nixlMetaDesc &>(lhs) == static_cast<const nixlMetaDesc &>(rhs)) &&
+        (lhs.remoteAgent == rhs.remoteAgent);
+}
+
+typedef nixlDescList<nixlMetaDesc> nixl_meta_dlist_t;
+using nixl_remote_meta_dlist_t = nixlDescList<nixlRemoteMetaDesc>;
+
+// Compressed descriptor: a run of `count` equal-length blocks starting at
+// flat index `start_idx`, with consecutive blocks spaced `stride` bytes apart.
+class nixlStrideDesc : public nixlMetaDesc {
+public:
+    size_t stride = 0;
+    size_t count = 0;
+    size_t start_idx = 0;
+
+    nixlStrideDesc() = default;
+
+    using nixlMetaDesc::nixlMetaDesc;
+
+    nixlStrideDesc(uintptr_t addr,
+                   size_t len,
+                   uint64_t dev_id,
+                   nixlBackendMD *metadata,
+                   size_t stride_,
+                   size_t count_)
+        : nixlMetaDesc(addr, len, dev_id, metadata),
+          stride(stride_),
+          count(count_),
+          start_idx(0) {}
+
+    [[nodiscard]] nixlMetaDesc
+    getMetaDesc(size_t idx, size_t size) const noexcept {
+        return nixlMetaDesc(
+            addr + static_cast<uintptr_t>(idx - start_idx) * stride, len * size, devId, metadataP);
+    }
+};
+
+class nixlStrideDescList : public nixlDescList<nixlStrideDesc> {
+public:
+    using nixlDescList<nixlStrideDesc>::nixlDescList;
+
+    // Returns the total number of logical blocks across all runs (the decompressed size).
+    [[nodiscard]] size_t
+    flatSize() const {
+        if (descs.empty()) {
+            return 0;
+        }
+        const nixlStrideDesc &last = descs.back();
+        return last.start_idx + last.count;
+    }
+
+    // Returns the run covering the given flat block index, using an educated probe
+    // with a binary-search fallback.
+    const nixlStrideDesc &
+    find(size_t flat_idx, size_t run_size) const noexcept {
+        NIXL_ASSERT(run_size > 0);
+        // Educated first probe: assume uniform runs
+        size_t mid = flat_idx / run_size;
+        if (flat_idx - descs[mid].start_idx < descs[mid].count) [[likely]] {
+            return descs[mid];
+        }
+
+        // Binary search otherwise
+        size_t lo = 0;
+        size_t hi = descs.size() - 1;
+        while (lo < hi) {
+            if (descs[mid].start_idx <= flat_idx) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+            mid = (lo + hi + 1) >> 1;
+        }
+        return descs[lo];
+    }
+};
+
+using nixl_stride_dlist_t = nixlStrideDescList;
+
+#endif

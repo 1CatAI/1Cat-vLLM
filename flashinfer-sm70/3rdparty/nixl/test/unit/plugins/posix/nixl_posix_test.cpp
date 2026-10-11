@@ -1,0 +1,1106 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <filesystem>
+#include <iostream>
+#include <unistd.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <iomanip>
+#include <cassert>
+#include <cstring>
+#include <string>
+#include <absl/strings/str_format.h>
+#include "nixl.h"
+#include "nixl_params.h"
+#include "nixl_descriptors.h"
+#include "common/nixl_time.h"
+#include "file/file_path_mode.h"
+#include "path_mode_common.h"
+#include <stdexcept>
+#include <cstdio>
+#include <getopt.h>
+
+namespace {
+    const size_t page_size = sysconf(_SC_PAGESIZE);
+
+    constexpr int default_num_transfers = 1024;
+    constexpr size_t default_transfer_size = 1 * 512 * 1024; // 512KB
+    constexpr char repost_test_phrase_1[] = "NIXL Storage Test Pattern 2025 POSIX 1111";
+    constexpr char repost_test_phrase_2[] = "NIXL Storage Test Pattern 2025 POSIX 2222";
+    static_assert (sizeof (repost_test_phrase_1) == sizeof (repost_test_phrase_2),
+                   "Test phrases must be the same length");
+    constexpr char read_write_test_phrase[] = "NIXL Storage Test Pattern 2025 POSIX";
+    constexpr char test_file_name[] = "testfile";
+    constexpr mode_t std_file_permissions = 0744;
+
+    constexpr size_t kb_size = 1024;
+    constexpr size_t mb_size = 1024 * 1024;
+    constexpr size_t gb_size = 1024 * 1024 * 1024;
+    constexpr double us_to_s(double us) { return us / 1000000.0; }
+
+    constexpr int line_width = 60;
+    constexpr int progress_bar_width = line_width - 2; // -2 for the brackets
+    const std::string line_str(line_width, '=');
+    int phase_num = 1;
+
+    std::string center_str(const std::string& str) {
+        return std::string((line_width - str.length()) / 2, ' ') + str;
+    }
+
+    bool
+    has_supported_test_queue(bool use_uring) {
+        if (use_uring) {
+#ifdef HAVE_LIBURING
+            return true;
+#else
+            return false;
+#endif
+        }
+
+#if defined(HAVE_LINUXAIO) || defined(HAVE_LIBURING)
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    void
+    print_unsupported_test_queue_error(bool use_uring) {
+        std::cerr << "Unsupported POSIX test queue configuration: ";
+        if (use_uring) {
+            std::cerr << "io_uring was requested, but this build does not include liburing support."
+                      << std::endl;
+        } else {
+            std::cerr << "this build does not include Linux AIO or io_uring support." << std::endl;
+#ifdef HAVE_POSIXAIO
+            std::cerr
+                << "POSIX AIO may be available in the plugin, but this test requires Linux AIO "
+                   "or io_uring."
+                << std::endl;
+#endif
+        }
+    }
+
+    constexpr char default_test_files_dir_path[] = "tmp/testfiles";
+
+    // Custom deleter for posix_memalign allocated memory
+    struct PosixMemalignDeleter {
+        void operator()(void* ptr) const {
+            if (ptr) free(ptr);
+        }
+    };
+
+    // Helper function to fill buffer with repeating pattern
+    void
+    fill_test_pattern (void *buffer, const char *test_phrase, size_t size) {
+        char* buf = (char*)buffer;
+        size_t phrase_len = strlen (test_phrase);
+        size_t offset = 0;
+
+        while (offset < size) {
+            size_t remaining = size - offset;
+            size_t copy_len = (remaining < phrase_len) ? remaining : phrase_len;
+            memcpy(buf + offset, test_phrase, copy_len);
+            offset += copy_len;
+        }
+    }
+
+    void clear_buffer(void* buffer, size_t size) {
+        memset(buffer, 0, size);
+    }
+
+    // Helper function to format duration
+    std::string format_duration(nixlTime::us_t us) {
+        nixlTime::ms_t ms = us/1000.0;
+        if (ms < 1000) {
+            return absl::StrFormat("%.0f ms", ms);
+        }
+        double seconds = ms / 1000.0;
+        return absl::StrFormat("%.3f sec", seconds);
+    }
+
+    // Helper function to generate timestamped filename
+    std::string generate_timestamped_filename(const std::string& base_name) {
+        std::time_t t = std::time(nullptr);
+        char timestamp[100];
+        std::strftime(timestamp, sizeof(timestamp),
+                    "%Y%m%d%H%M%S", std::localtime(&t));
+        return base_name + std::string(timestamp);
+    }
+
+    void printProgress(float progress) {
+        std::cout << "[";
+        int pos = progress_bar_width * progress;
+        for (int i = 0; i < progress_bar_width; ++i) {
+            if (i < pos) std::cout << "=";
+            else if (i == pos) std::cout << ">";
+            else std::cout << " ";
+        }
+        std::cout << absl::StrFormat("] %.1f%% ", progress * 100.0);
+
+        // Add completion indicator
+        if (progress >= 1.0) {
+            std::cout << "DONE!" << std::endl;
+        } else {
+            std::cout << "\r";
+            std::cout.flush();
+        }
+    }
+
+    std::string phase_title(const std::string& title) {
+        return absl::StrFormat("PHASE %d: %s", phase_num++, title);
+    }
+
+    void print_segment_title(const std::string& title) {
+        std::cout << std::endl << line_str << std::endl;
+        std::cout << center_str(title) << std::endl;
+        std::cout << line_str << std::endl;
+    }
+
+    class tempFile {
+    public:
+        int fd;
+        std::string path;
+
+        // Constructor: opens the file and stores the fd and path
+        tempFile(const std::string& filename, int flags, mode_t mode = 0600)
+            : path(filename)
+        {
+            fd = open(filename.c_str(), flags, mode);
+            if (fd == -1) {
+                throw std::runtime_error("Failed to open file: " + filename);
+            }
+        }
+
+        // Deleted copy constructor and assignment to avoid double-close/unlink
+        tempFile(const tempFile&) = delete;
+        tempFile& operator=(const tempFile&) = delete;
+
+        // Move constructor and assignment
+        tempFile(tempFile&& other) noexcept
+            : fd(other.fd), path(std::move(other.path))
+        {
+            other.fd = -1;
+        }
+        tempFile& operator=(tempFile&& other) noexcept {
+            if (this != &other) {
+                close_fd();
+                path = std::move(other.path);
+                fd = other.fd;
+                other.fd = -1;
+            }
+            return *this;
+        }
+
+        // Conversion operator to int (file descriptor)
+        operator int() const { return fd; }
+
+        // Destructor: closes the fd and deletes the file
+        ~tempFile() {
+            close_fd();
+            if (!path.empty()) {
+                unlink(path.c_str());
+            }
+        }
+
+    private:
+        void close_fd() {
+            if (fd != -1) {
+                close(fd);
+                fd = -1;
+            }
+        }
+    };
+}
+
+int
+read_write_test (int num_transfers,
+                 size_t transfer_size,
+                 std::string test_files_dir_path_abs_path,
+                 bool use_direct_io,
+                 bool use_uring) {
+    // If using O_DIRECT, align transfer size to page size
+    if (use_direct_io) {
+        if (transfer_size % page_size != 0) {
+            transfer_size = ((transfer_size + page_size - 1) / page_size) * page_size;
+            std::cout << "Adjusted transfer size to " << transfer_size << " bytes for O_DIRECT alignment" << std::endl;
+        }
+    }
+    // Initialize NIXL components first
+    nixlAgentConfig cfg;
+    cfg.useProgThread = true;
+    nixlAgent agent("POSIXReadWriteTester", cfg);
+
+    // Set up backend parameters
+    nixl_b_params_t params;
+    if (use_uring) {
+        // Explicitly request io_uring
+        params["use_uring"] = "true";
+        params["use_aio"] = "false";
+    } else {
+        // Use the backend's compiled default queue. Startup validation rejects POSIX AIO-only
+        // builds.
+        params["use_uring"] = "false";
+    }
+
+    if (use_direct_io) {
+        params["use_direct_io"] = "true";
+    }
+
+    // Print test configuration information
+    print_segment_title ("NIXL STORAGE WRITE/READ TEST STARTING (POSIX PLUGIN)");
+    std::cout << absl::StrFormat ("Configuration:\n");
+    std::cout << absl::StrFormat ("- Number of transfers: %d\n", num_transfers);
+    std::cout << absl::StrFormat ("- Transfer size: %zu bytes\n", transfer_size);
+    std::cout << absl::StrFormat ("- Total data: %.2f GB\n",
+                                  (float (transfer_size) * num_transfers) / gb_size);
+    std::cout << absl::StrFormat ("- Directory: %s\n", test_files_dir_path_abs_path);
+    std::cout << absl::StrFormat("- Backend: %s\n", use_uring ? "io_uring" : "default");
+    std::cout << absl::StrFormat ("- Direct I/O: %s\n", use_direct_io ? "enabled" : "disabled");
+    std::cout << std::endl;
+    std::cout << line_str << std::endl;
+
+    // Create POSIX backend first - before allocating any resources
+    nixlBackendH* posix = nullptr;
+    nixl_status_t status = agent.createBackend("POSIX", params, posix);
+    if (status != NIXL_SUCCESS) {
+        std::cerr << std::endl << line_str << std::endl;
+        std::cerr << center_str("ERROR: Backend Creation Failed") << std::endl;
+        std::cerr << line_str << std::endl;
+        std::cerr << "Error creating POSIX backend: " << nixlEnumStrings::statusStr(status)
+                  << std::endl;
+        if (use_uring) {
+            std::cerr << "io_uring was requested but may not be available. Try running without -U "
+                         "flag to use the default queue."
+                      << std::endl;
+        }
+        std::cerr << std::endl << line_str << std::endl;
+        return 1;
+    }
+
+    // Only proceed with resource allocation if backend creation succeeded
+    try {
+        print_segment_title(phase_title("Allocating and initializing buffers"));
+
+        // Allocate resources
+        std::vector<std::unique_ptr<void, PosixMemalignDeleter>> dram_addr;
+        dram_addr.reserve(num_transfers);
+
+        std::vector<tempFile> fd;
+        fd.reserve(num_transfers);
+
+        // File open flags
+        int file_open_flags = O_RDWR|O_CREAT;
+        if (use_direct_io) {
+            file_open_flags |= O_DIRECT;
+        }
+        mode_t file_mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;  // rw-r--r--
+
+        // Create descriptor lists
+        nixl_reg_dlist_t dram_for_posix(DRAM_SEG);
+        nixl_reg_dlist_t file_for_posix(FILE_SEG);
+        nixl_xfer_dlist_t dram_for_posix_xfer(DRAM_SEG);
+        nixl_xfer_dlist_t file_for_posix_xfer(FILE_SEG);
+        std::unique_ptr<nixlBlobDesc[]> dram_buf(new nixlBlobDesc[num_transfers]);
+        std::unique_ptr<nixlBlobDesc[]> ftrans(new nixlBlobDesc[num_transfers]);
+        nixlXferReqH* treq = nullptr;
+
+        // Control variables
+        int i = 0;
+        nixlTime::us_t time_start;
+        nixlTime::us_t time_end;
+        nixlTime::us_t time_duration;
+        nixlTime::us_t total_time(0);
+        double total_data_gb(0);
+        double gbps;
+        double seconds;
+        double data_gb;
+
+        // Allocate and initialize DRAM buffer
+        for (i = 0; i < num_transfers; ++i) {
+            void* ptr;
+            if (posix_memalign(&ptr, page_size, transfer_size) != 0) {
+                std::cerr << "DRAM allocation failed" << std::endl;
+                return 1;
+            }
+            dram_addr.emplace_back(ptr);
+            fill_test_pattern (dram_addr.back().get(), read_write_test_phrase, transfer_size);
+
+            // Create test file
+            std::string file_name = generate_timestamped_filename (test_file_name);
+            std::string file_path =
+                test_files_dir_path_abs_path + "/" + test_file_name + "_" + std::to_string (i);
+
+            try {
+                fd.emplace_back (file_path, file_open_flags, file_mode);
+            }
+            catch (const std::exception &e) {
+                std::cerr << "Failed to open file: " << file_path << " - " << e.what() << std::endl;
+                return 1;
+            }
+
+            dram_buf[i].addr   = (uintptr_t)(dram_addr.back().get());
+            dram_buf[i].len    = transfer_size;
+            dram_buf[i].devId  = 0;
+            dram_for_posix.addDesc(dram_buf[i]);
+            dram_for_posix_xfer.addDesc(dram_buf[i]);
+
+            ftrans[i].addr  = 0;
+            ftrans[i].len   = transfer_size;
+            ftrans[i].devId = fd[i];
+            file_for_posix.addDesc(ftrans[i]);
+            file_for_posix_xfer.addDesc(ftrans[i]);
+
+            printProgress(float(i + 1) / num_transfers);
+        }
+
+        print_segment_title(phase_title("Registering memory with NIXL"));
+
+        i = 0;
+        status = agent.registerMem (dram_for_posix);
+        if (status != NIXL_SUCCESS) {
+            std::cerr << "Failed to register DRAM memory with NIXL" << std::endl;
+            return 1;
+        }
+        printProgress(float(++i) / 2);
+
+        status = agent.registerMem (file_for_posix);
+        if (status != NIXL_SUCCESS) {
+            std::cerr << "Failed to register file memory with NIXL" << std::endl;
+            return 1;
+        }
+        printProgress(float(i + 1) / 2);
+
+        print_segment_title(phase_title("Memory to File Transfer (Write Test)"));
+
+        status = agent.createXferReq (
+            NIXL_WRITE, dram_for_posix_xfer, file_for_posix_xfer, "POSIXReadWriteTester", treq);
+        if (status != NIXL_SUCCESS) {
+            std::cerr << "Failed to create write transfer request - status: " << nixlEnumStrings::statusStr(status) << std::endl;
+            return 1;
+        }
+
+        time_start = nixlTime::getUs();
+        status = agent.postXferReq(treq);
+        if (status < 0) {
+            std::cerr << "Failed to post write transfer request - status: "
+                      << nixlEnumStrings::statusStr (status) << std::endl;
+            agent.releaseXferReq (treq);
+            return 1;
+        }
+
+        // Wait for transfer to complete
+        do {
+            status = agent.getXferStatus(treq);
+            if (status < 0) {
+                std::cerr << "Error during write transfer - status: "
+                          << nixlEnumStrings::statusStr (status) << std::endl;
+                agent.releaseXferReq (treq);
+                return 1;
+            }
+        } while (status == NIXL_IN_PROG);
+
+        time_end = nixlTime::getUs();
+        time_duration = time_end - time_start;
+        total_time += time_duration;
+
+        data_gb = (float(transfer_size) * num_transfers) / (gb_size);
+        total_data_gb += data_gb;
+        seconds = us_to_s(time_duration);
+        gbps = data_gb / seconds;
+
+        std::cout << "Write completed with status: " << nixlEnumStrings::statusStr(status) << std::endl;
+        std::cout << "- Time: " << format_duration(time_duration) << std::endl;
+        std::cout << "- Data: " << std::fixed << std::setprecision(2) << data_gb << " GB" << std::endl;
+        std::cout << "- Speed: " << gbps << " GB/s" << std::endl;
+
+        print_segment_title(phase_title("Syncing files"));
+        std::cout << "Syncing files to ensure data is written to disk" << std::endl;
+        // Sync all files to ensure data is written to disk
+        for (i = 0; i < num_transfers; ++i) {
+            if (fsync(fd[i]) < 0) {
+                std::cerr << "Failed to sync file " << i << " - " << strerror(errno) << std::endl;
+                return 1;
+            }
+            printProgress(float(i + 1) / num_transfers);
+        }
+
+        print_segment_title(phase_title("Clearing DRAM buffers"));
+        std::cout << "Clearing DRAM buffers" << std::endl;
+        for (i = 0; i < num_transfers; ++i) {
+            clear_buffer(dram_addr[i].get(), transfer_size);
+            printProgress(float(i + 1) / num_transfers);
+        }
+
+        // Release the write request before reusing treq for the read request;
+        // otherwise the write request handle leaks.
+        agent.releaseXferReq(treq);
+
+        print_segment_title(phase_title("File to Memory Transfer (Read Test)"));
+
+        status = agent.createXferReq (
+            NIXL_READ, dram_for_posix_xfer, file_for_posix_xfer, "POSIXReadWriteTester", treq);
+        if (status != NIXL_SUCCESS) {
+            std::cerr << "Failed to create read transfer request - status: " << nixlEnumStrings::statusStr(status) << std::endl;
+            return 1;
+        }
+
+        // Execute read transfer and measure performance
+        time_start = nixlTime::getUs();
+        status = agent.postXferReq(treq);
+        if (status < 0) {
+            std::cerr << "Failed to post read transfer request - status: " << nixlEnumStrings::statusStr(status) << std::endl;
+            agent.releaseXferReq (treq);
+            return 1;
+        }
+
+        // Wait for transfer to complete
+        do {
+            status = agent.getXferStatus(treq);
+            if (status < 0) {
+                std::cerr << "Error during read transfer - status: " << nixlEnumStrings::statusStr(status) << std::endl;
+                agent.releaseXferReq (treq);
+                return 1;
+            }
+        } while (status == NIXL_IN_PROG);
+
+        time_end = nixlTime::getUs();
+        time_duration = time_end - time_start;
+        total_time += time_duration;
+
+        data_gb = (float(transfer_size) * num_transfers) / (gb_size);
+        total_data_gb += data_gb;
+        seconds = us_to_s(time_duration);
+        gbps = data_gb / seconds;
+
+        std::cout << "Read completed with status: " << nixlEnumStrings::statusStr(status) << std::endl;
+        std::cout << "- Time: " << format_duration(time_duration) << std::endl;
+        std::cout << "- Data: " << std::fixed << std::setprecision(2) << data_gb << " GB" << std::endl;
+        std::cout << "- Speed: " << gbps << " GB/s" << std::endl;
+
+        print_segment_title(phase_title("Validating read data"));
+
+        std::unique_ptr<char[]> expected_buffer = std::make_unique<char[]> (transfer_size);
+        fill_test_pattern (expected_buffer.get(), read_write_test_phrase, transfer_size);
+
+        for (i = 0; i < num_transfers; ++i) {
+            int ret = memcmp(dram_addr[i].get(), expected_buffer.get(), transfer_size);
+            if (ret != 0) {
+                std::cerr << "DRAM buffer " << i << " validation failed with error: " << ret
+                          << std::endl;
+                return 1;
+            }
+            printProgress(float(i + 1) / num_transfers);
+        }
+
+        print_segment_title("Freeing resources");
+
+        if (treq) {
+            agent.releaseXferReq (treq);
+        }
+
+        agent.deregisterMem(file_for_posix);
+        agent.deregisterMem(dram_for_posix);
+
+        print_segment_title("TEST SUMMARY");
+        std::cout << "Total time: " << format_duration(total_time) << std::endl;
+        std::cout << "Total data: " << std::fixed << std::setprecision(2) << total_data_gb << " GB" << std::endl;
+        std::cout << line_str << std::endl;
+
+        return 0;
+    }
+    catch (const std::exception &e) {
+        std::cerr << "Exception during test execution: " << e.what() << std::endl;
+        return 1;
+    }
+}
+
+int
+test_posix_repost (std::string test_files_dir_path_abs_path, bool use_uring) {
+    constexpr int num_transfers = 16;
+    constexpr size_t transfer_size = 128 * 1024; // 128KB
+    // Set up backend parameters
+    nixl_b_params_t params;
+    if (use_uring) {
+        // Explicitly request io_uring
+        params["use_uring"] = "true";
+        params["use_aio"] = "false";
+    } else {
+        // Use the backend's compiled default queue. Startup validation rejects POSIX AIO-only
+        // builds.
+        params["use_uring"] = "false";
+    }
+
+    print_segment_title ("NIXL STORAGE REPOST TEST STARTING (POSIX PLUGIN)");
+
+    // Create POSIX backend first - before allocating any resources
+    nixlBackendH *posix = nullptr;
+    nixlAgentConfig cfg;
+    cfg.useProgThread = true;
+    nixlAgent agent("POSIXRepostTester", cfg);
+    if (agent.createBackend ("POSIX", params, posix) != NIXL_SUCCESS) {
+        std::cerr << "Failed to create POSIX backend" << std::endl;
+        return 1;
+    }
+
+    print_segment_title (phase_title ("Allocating and initializing buffers"));
+    std::unique_ptr<nixlBlobDesc[]> dram_buf (new nixlBlobDesc[num_transfers]);
+    nixl_reg_dlist_t dram_for_posix (DRAM_SEG);
+    nixl_xfer_dlist_t dram_for_posix_xfer (DRAM_SEG);
+
+    std::vector<tempFile> fd;
+    fd.reserve (num_transfers);
+    nixl_reg_dlist_t file_for_posix (FILE_SEG);
+    nixl_xfer_dlist_t file_for_posix_xfer (FILE_SEG);
+    std::unique_ptr<nixlBlobDesc[]> ftrans (new nixlBlobDesc[num_transfers]);
+
+    // Own the posix_memalign buffers so they are freed on every exit path.
+    std::vector<std::unique_ptr<void, PosixMemalignDeleter>> dram_addr;
+    dram_addr.reserve(num_transfers);
+
+    int file_open_flags = O_RDWR | O_CREAT;
+    mode_t file_mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH; // rw-r--r--
+    for (int i = 0; i < num_transfers; ++i) {
+        void *ptr;
+        if (posix_memalign (&ptr, page_size, transfer_size) != 0) {
+            std::cerr << "DRAM allocation failed" << std::endl;
+            return 1;
+        }
+        dram_addr.emplace_back(ptr);
+        fill_test_pattern (ptr, repost_test_phrase_1, transfer_size);
+
+        // Create test file
+        std::string file_name = generate_timestamped_filename (test_file_name);
+        std::string file_path =
+            test_files_dir_path_abs_path + "/" + file_name + "_" + std::to_string (i);
+        try {
+            fd.emplace_back (file_path, file_open_flags, file_mode);
+        }
+        catch (const std::exception &e) {
+            std::cerr << "Failed to open file: " << file_path << " - " << e.what() << std::endl;
+            return 1;
+        }
+
+        dram_buf[i].addr = (uintptr_t)(ptr);
+        dram_buf[i].len = transfer_size;
+        dram_buf[i].devId = 0;
+        dram_for_posix.addDesc (dram_buf[i]);
+        dram_for_posix_xfer.addDesc (dram_buf[i]);
+
+        ftrans[i].addr = 0;
+        ftrans[i].len = transfer_size;
+        ftrans[i].devId = fd[i].fd;
+        file_for_posix.addDesc (ftrans[i]);
+        file_for_posix_xfer.addDesc (ftrans[i]);
+
+        printProgress (float (i + 1) / num_transfers);
+    }
+
+    print_segment_title (phase_title ("Registering memory with NIXL"));
+
+    int i = 0;
+    nixl_status_t ret = agent.registerMem (dram_for_posix);
+    if (ret != NIXL_SUCCESS) {
+        std::cerr << "Failed to register DRAM memory with NIXL" << std::endl;
+        return 1;
+    }
+    printProgress (float (++i) / 2);
+
+    ret = agent.registerMem (file_for_posix);
+    if (ret != NIXL_SUCCESS) {
+        std::cerr << "Failed to register file memory with NIXL" << std::endl;
+        return 1;
+    }
+    printProgress (float (i + 1) / 2);
+
+    print_segment_title (phase_title ("1st Memory to File Transfer"));
+
+    nixlXferReqH *treq_write = nullptr;
+    nixl_status_t status = agent.createXferReq(
+        NIXL_WRITE, dram_for_posix_xfer, file_for_posix_xfer, "POSIXRepostTester", treq_write);
+    if (status != NIXL_SUCCESS) {
+        std::cerr << "Failed to create write transfer request - status: "
+                  << nixlEnumStrings::statusStr (status) << std::endl;
+        return 1;
+    }
+
+    status = agent.postXferReq(treq_write);
+    if (status < 0) {
+        std::cerr << "Failed to post write transfer request - status: "
+                  << nixlEnumStrings::statusStr (status) << std::endl;
+        agent.releaseXferReq(treq_write);
+        return 1;
+    }
+
+    // Wait for transfer to complete
+    do {
+        status = agent.getXferStatus(treq_write);
+        if (status < 0) {
+            std::cerr << "Error during write transfer - status: "
+                      << nixlEnumStrings::statusStr (status) << std::endl;
+            agent.releaseXferReq(treq_write);
+            return 1;
+        }
+    } while (status == NIXL_IN_PROG);
+
+    print_segment_title (phase_title ("Clearing DRAM buffers"));
+    std::cout << "Clearing DRAM buffers" << std::endl;
+    for (i = 0; i < num_transfers; ++i) {
+        clear_buffer ((void *)dram_buf[i].addr, transfer_size);
+        printProgress (float (i + 1) / num_transfers);
+    }
+
+    print_segment_title (phase_title ("1st Read From File to Memory"));
+
+    nixlXferReqH *treq_read = nullptr;
+    status = agent.createXferReq(
+        NIXL_READ, dram_for_posix_xfer, file_for_posix_xfer, "POSIXRepostTester", treq_read);
+    if (status != NIXL_SUCCESS) {
+        std::cerr << "Failed to create read transfer request - status: "
+                  << nixlEnumStrings::statusStr (status) << std::endl;
+        return 1;
+    }
+
+    status = agent.postXferReq(treq_read);
+    if (status < 0) {
+        std::cerr << "Failed to post read transfer request - status: "
+                  << nixlEnumStrings::statusStr (status) << std::endl;
+        agent.releaseXferReq(treq_read);
+        return 1;
+    }
+
+    // Wait for transfer to complete
+    do {
+        status = agent.getXferStatus(treq_read);
+        if (status < 0) {
+            std::cerr << "Error during read transfer - status: "
+                      << nixlEnumStrings::statusStr (status) << std::endl;
+            agent.releaseXferReq(treq_read);
+            return 1;
+        }
+    } while (status == NIXL_IN_PROG);
+
+    print_segment_title (phase_title ("Validating read data"));
+
+    std::unique_ptr<char[]> expected_buffer = std::make_unique<char[]> (transfer_size);
+    fill_test_pattern (expected_buffer.get(), repost_test_phrase_1, transfer_size);
+
+    for (i = 0; i < num_transfers; ++i) {
+        int ret = memcmp ((void *)dram_buf[i].addr, expected_buffer.get(), transfer_size);
+        if (ret != 0) {
+            std::cerr << "DRAM buffer " << i << " validation failed with error: " << ret
+                      << std::endl;
+            return 1;
+        }
+        printProgress (float (i + 1) / num_transfers);
+    }
+
+    print_segment_title (phase_title ("2nd Memory to File Transfer"));
+    for (i = 0; i < num_transfers; ++i) {
+        fill_test_pattern ((void *)dram_buf[i].addr, repost_test_phrase_2, transfer_size);
+    }
+
+    status = agent.postXferReq(treq_write);
+    if (status < 0) {
+        std::cerr << "Failed to post write transfer request - status: "
+                  << nixlEnumStrings::statusStr (status) << std::endl;
+        agent.releaseXferReq(treq_write);
+        return 1;
+    }
+
+    // Wait for transfer to complete
+    do {
+        status = agent.getXferStatus(treq_write);
+        if (status < 0) {
+            std::cerr << "Error during write transfer - status: "
+                      << nixlEnumStrings::statusStr (status) << std::endl;
+            agent.releaseXferReq(treq_write);
+            return 1;
+        }
+    } while (status == NIXL_IN_PROG);
+
+    print_segment_title (phase_title ("2nd Read From File to Memory"));
+
+    status = agent.postXferReq(treq_read);
+    if (status < 0) {
+        std::cerr << "Failed to post read transfer request - status: "
+                  << nixlEnumStrings::statusStr (status) << std::endl;
+        agent.releaseXferReq(treq_read);
+        return 1;
+    }
+
+    // Wait for transfer to complete
+    do {
+        status = agent.getXferStatus(treq_read);
+        if (status < 0) {
+            std::cerr << "Error during read transfer - status: "
+                      << nixlEnumStrings::statusStr (status) << std::endl;
+            agent.releaseXferReq(treq_read);
+            return 1;
+        }
+    } while (status == NIXL_IN_PROG);
+
+    print_segment_title (phase_title ("Validating read data"));
+
+    fill_test_pattern (expected_buffer.get(), repost_test_phrase_2, transfer_size);
+
+    for (i = 0; i < num_transfers; ++i) {
+        int ret = memcmp ((void *)dram_buf[i].addr, expected_buffer.get(), transfer_size);
+        if (ret != 0) {
+            std::cerr << "DRAM buffer " << i << " validation failed with error: " << ret
+                      << std::endl;
+            return 1;
+        }
+        printProgress (float (i + 1) / num_transfers);
+    }
+
+    print_segment_title ("Freeing resources");
+
+    agent.deregisterMem (file_for_posix);
+    agent.deregisterMem (dram_for_posix);
+    agent.releaseXferReq(treq_write);
+    agent.releaseXferReq(treq_read);
+
+    return 0;
+}
+
+// Path-mode parser unit checks (POSIX-only since it owns parsePathMeta tests).
+static void
+checkPathModeParser() {
+    using nixl::parsePathMeta;
+    {
+        const auto s = parsePathMeta("ro:/tmp/x");
+        assert(s && s->path == "/tmp/x" && s->flags == O_RDONLY);
+    }
+    {
+        const auto s = parsePathMeta("rw:/tmp/x");
+        assert(s && s->flags == O_RDWR);
+    }
+    {
+        const auto s = parsePathMeta("rw,direct:/tmp/x");
+        assert(s && s->flags == (O_RDWR | O_DIRECT));
+    }
+    {
+        const auto s = parsePathMeta("ro,direct,sync,noatime:/tmp/x");
+        assert(s && s->flags == (O_RDONLY | O_DIRECT | O_SYNC | O_NOATIME));
+    }
+    {
+        const auto s = parsePathMeta("rw,create:/tmp/x");
+        assert(s && s->flags == (O_RDWR | O_CREAT) && s->mode == 0644);
+    }
+    assert(!parsePathMeta("").has_value());
+    assert(!parsePathMeta("no-colon").has_value());
+    assert(!parsePathMeta("ro:").has_value());
+    assert(!parsePathMeta("xx:/tmp/x").has_value());
+    assert(!parsePathMeta("rw,foo:/tmp/x").has_value());
+    assert(!parsePathMeta("kv-0042.bin").has_value());
+    std::cout << "parsePathMeta: OK" << std::endl;
+}
+
+// `rw,create:` should produce a new file at registerMem.
+static int
+runPathModeCreateCheck() {
+    constexpr const char *kCreateFile = "/tmp/nixl_posix_path_mode_create.bin";
+    std::remove(kCreateFile);
+    nixlAgentConfig cfg;
+    nixlAgent agent("POSIXPathModeCreate", cfg);
+    nixl_b_params_t params;
+    nixlBackendH *be = nullptr;
+    if (agent.createBackend("POSIX", params, be) != NIXL_SUCCESS) {
+        return 1;
+    }
+    nixl_reg_dlist_t d(FILE_SEG);
+    nixlBlobDesc desc;
+    desc.addr = 0;
+    desc.len = 4096;
+    desc.devId = 0;
+    desc.metaInfo = std::string("rw,create:") + kCreateFile;
+    d.addDesc(desc);
+    if (agent.registerMem(d) != NIXL_SUCCESS) {
+        return 1;
+    }
+    if (!std::filesystem::exists(kCreateFile)) {
+        return 1;
+    }
+    agent.deregisterMem(d);
+    std::remove(kCreateFile);
+    std::cout << "O_CREAT path-mode: OK" << std::endl;
+    return 0;
+}
+
+// Path-mode requires a unique devId per file: reused devId rejected, distinct OK (addr differs so
+// the dup-descriptor check is not what rejects).
+static int
+runPathModeUniqueDevIdCheck() {
+    constexpr const char *kFileA = "/tmp/nixl_posix_path_mode_devid_a.bin";
+    constexpr const char *kFileB = "/tmp/nixl_posix_path_mode_devid_b.bin";
+    for (const char *p : {kFileA, kFileB}) {
+        if (auto *f = std::fopen(p, "wb")) {
+            std::fputc(0, f);
+            std::fclose(f);
+        } else {
+            return 1;
+        }
+    }
+    auto cleanup = [&]() {
+        std::remove(kFileA);
+        std::remove(kFileB);
+    };
+
+    nixlAgentConfig cfg;
+    nixlAgent agent("POSIXPathModeDevId", cfg);
+    nixl_b_params_t params;
+    nixlBackendH *be = nullptr;
+    if (agent.createBackend("POSIX", params, be) != NIXL_SUCCESS) {
+        cleanup();
+        return 1;
+    }
+
+    auto pathDesc = [](const char *p, uint64_t devid, uintptr_t addr) {
+        nixlBlobDesc d;
+        d.addr = addr;
+        d.len = 4096;
+        d.devId = devid;
+        d.metaInfo = std::string("rw:") + p;
+        return d;
+    };
+
+    // Two different files sharing one devId within a single list: rejected.
+    {
+        nixl_reg_dlist_t d(FILE_SEG);
+        d.addDesc(pathDesc(kFileA, 0, 0));
+        d.addDesc(pathDesc(kFileB, 0, 4096));
+        if (agent.registerMem(d) == NIXL_SUCCESS) {
+            agent.deregisterMem(d);
+            std::cerr << "path-mode duplicate devId (within list) was not rejected" << std::endl;
+            cleanup();
+            return 1;
+        }
+    }
+
+    // devId reused across registrations: rejected, the first stays valid, and the devId
+    // is reusable for a different file once the first is deregistered.
+    {
+        nixl_reg_dlist_t a(FILE_SEG);
+        a.addDesc(pathDesc(kFileA, 0, 0));
+        if (agent.registerMem(a) != NIXL_SUCCESS) {
+            cleanup();
+            return 1;
+        }
+
+        nixl_reg_dlist_t b(FILE_SEG);
+        b.addDesc(pathDesc(kFileB, 0, 4096));
+        if (agent.registerMem(b) == NIXL_SUCCESS) {
+            agent.deregisterMem(b);
+            agent.deregisterMem(a);
+            std::cerr << "path-mode duplicate devId (across calls) was not rejected" << std::endl;
+            cleanup();
+            return 1;
+        }
+
+        agent.deregisterMem(a);
+        nixl_reg_dlist_t b2(FILE_SEG);
+        b2.addDesc(pathDesc(kFileB, 0, 0));
+        if (agent.registerMem(b2) != NIXL_SUCCESS) {
+            std::cerr << "devId not freed on deregister" << std::endl;
+            cleanup();
+            return 1;
+        }
+        agent.deregisterMem(b2);
+    }
+
+    // Distinct devIds: both files register together.
+    {
+        nixl_reg_dlist_t d(FILE_SEG);
+        d.addDesc(pathDesc(kFileA, 0, 0));
+        d.addDesc(pathDesc(kFileB, 1, 0));
+        if (agent.registerMem(d) != NIXL_SUCCESS) {
+            std::cerr << "distinct devIds rejected" << std::endl;
+            cleanup();
+            return 1;
+        }
+        agent.deregisterMem(d);
+    }
+
+    cleanup();
+    std::cout << "path-mode unique devId: OK" << std::endl;
+    return 0;
+}
+
+// fd-mode (devId is a real fd, metaInfo not path-mode) is NOT subject to the unique-devId
+// rule, so one fd may back several descriptors (e.g. different offsets in the same file).
+static int
+runFdModeReuseCheck() {
+    constexpr const char *kFile = "/tmp/nixl_posix_fd_mode_reuse.bin";
+    const int fd = open(kFile, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        return 1;
+    }
+    auto cleanup = [&]() {
+        close(fd);
+        std::remove(kFile);
+    };
+
+    nixlAgentConfig cfg;
+    nixlAgent agent("POSIXFdModeReuse", cfg);
+    nixl_b_params_t params;
+    nixlBackendH *be = nullptr;
+    if (agent.createBackend("POSIX", params, be) != NIXL_SUCCESS) {
+        cleanup();
+        return 1;
+    }
+
+    auto fdDesc = [&](uintptr_t addr) {
+        nixlBlobDesc d;
+        d.addr = addr;
+        d.len = 4096;
+        d.devId = static_cast<uint64_t>(fd); // fd-mode: devId is the open fd
+        d.metaInfo = ""; // not path-mode
+        return d;
+    };
+
+    // Same fd (devId) under two descriptors at different offsets must register, not be
+    // rejected as a duplicate path-mode devId.
+    nixl_reg_dlist_t d(FILE_SEG);
+    d.addDesc(fdDesc(0));
+    d.addDesc(fdDesc(4096));
+    if (agent.registerMem(d) != NIXL_SUCCESS) {
+        std::cerr << "fd-mode devId reuse was wrongly rejected" << std::endl;
+        cleanup();
+        return 1;
+    }
+    agent.deregisterMem(d);
+
+    cleanup();
+    std::cout << "fd-mode devId reuse: OK" << std::endl;
+    return 0;
+}
+
+int
+main (int argc, char *argv[]) {
+    if (page_size <= 0) {
+        std::cerr << "Invalid page size returned by sysconf" << std::endl;
+        return 1;
+    }
+
+    std::cout << "NIXL POSIX Plugin Test" << std::endl;
+
+    int opt;
+    int num_transfers = default_num_transfers;
+    size_t transfer_size = default_transfer_size;
+    std::string test_files_dir_path = default_test_files_dir_path;
+    bool use_direct_io = false;
+    bool use_uring = false;
+    bool run_path_mode_smoke = true;
+
+    while ((opt = getopt(argc, argv, "n:s:d:DUPh")) != -1) {
+        switch (opt) {
+        case 'n':
+            num_transfers = std::stoi (optarg);
+            break;
+        case 's':
+            transfer_size = std::stoull (optarg);
+            break;
+        case 'd':
+            test_files_dir_path = optarg;
+            break;
+        case 'D':
+            use_direct_io = true;
+            break;
+        case 'U':
+            use_uring = true;
+            break;
+        case 'P':
+            run_path_mode_smoke = false;
+            break;
+        case 'h':
+        default:
+            std::cout << absl::StrFormat("Usage: %s [-n num_transfers] [-s transfer_size] [-d "
+                                         "test_files_dir_path] [-D] [-U] [-P]",
+                                         argv[0])
+                      << std::endl;
+            std::cout << absl::StrFormat (
+                             "  -n num_transfers      Number of transfers (default: %d)",
+                             default_num_transfers)
+                      << std::endl;
+            std::cout
+                << absl::StrFormat (
+                       "  -s transfer_size      Size of each transfer in bytes (default: %zu)",
+                       default_transfer_size)
+                << std::endl;
+            std::cout << absl::StrFormat("  -d test_files_dir_path Directory for test files, "
+                                         "strongly recommended to use nvme device (default: %s)",
+                                         default_test_files_dir_path)
+                      << std::endl;
+            std::cout << absl::StrFormat ("  -D Use O_DIRECT for file I/O") << std::endl;
+            std::cout << absl::StrFormat("  -U Explicitly use the io_uring backend") << std::endl;
+            std::cout << absl::StrFormat("  -P Skip path-mode smoke (enabled by default)")
+                      << std::endl;
+            std::cout << absl::StrFormat ("  -h Show this help message") << std::endl;
+            return (opt == 'h') ? 0 : 1;
+        }
+    }
+
+    if (!has_supported_test_queue(use_uring)) {
+        print_unsupported_test_queue_error(use_uring);
+        return 1;
+    }
+
+    if (run_path_mode_smoke) {
+        checkPathModeParser();
+        if (int rc = runPathModeCreateCheck(); rc != 0) {
+            return rc;
+        }
+        if (int rc = runPathModeUniqueDevIdCheck(); rc != 0) {
+            return rc;
+        }
+        if (int rc = runFdModeReuseCheck(); rc != 0) {
+            return rc;
+        }
+        if (int rc = nixl_test::runPathModeSmoke(
+                "POSIXPathModeSmoke", "POSIX", "/tmp/nixl_posix_path_mode_smoke.bin", 4096);
+            rc != 0) {
+            return rc;
+        }
+    }
+
+    // Convert directory path to absolute path using std::filesystem
+    std::filesystem::path test_files_dir_path_obj (test_files_dir_path);
+    std::filesystem::create_directories (test_files_dir_path_obj);
+    std::string test_files_dir_path_abs_path =
+        std::filesystem::absolute (test_files_dir_path_obj).string();
+
+    int ret = read_write_test (
+        num_transfers, transfer_size, test_files_dir_path_abs_path, use_direct_io, use_uring);
+
+    if (ret != 0) {
+        std::cerr << "Read/Write Test failed" << std::endl;
+        return 1;
+    }
+
+    // Reset phase number for repost test
+    phase_num = 1;
+
+    ret = test_posix_repost (test_files_dir_path_abs_path, use_uring);
+    if (ret != 0) {
+        std::cerr << "Repost Test failed" << std::endl;
+        return 1;
+    }
+
+    return 0;
+}

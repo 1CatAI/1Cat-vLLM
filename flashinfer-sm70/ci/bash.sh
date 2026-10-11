@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+
+if [ "$#" -lt 1 ]; then
+    echo "Usage: ci/bash.sh <CONTAINER_NAME> -e key [value] -v key value [COMMAND]"
+    exit -1
+fi
+
+DOCKER_IMAGE_NAME=("$1")
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="$(pwd)"
+DOCKER_BINARY="docker"
+DOCKER_ENV="-e ENV_USER_ID=$(id -u) -e ENV_GROUP_ID=$(id -g)"
+DOCKER_VOLUMNS="-v ${WORKSPACE}:/workspace -v ${SCRIPT_DIR}:/docker"
+USE_GPU=true
+
+shift 1
+while [[ $# -gt 0 ]]; do
+    cmd="$1"
+    if [[ $cmd == "-e" ]]; then
+        if [[ $# -lt 2 ]]; then
+            echo "ERROR: -e requires an environment variable name"
+            exit -1
+        fi
+        env_key=$2
+        if [[ $# -ge 3 && $3 != -* ]]; then
+            env_value=$3
+            shift 3
+            DOCKER_ENV="${DOCKER_ENV} -e ${env_key}=${env_value}"
+        else
+            shift 2
+            DOCKER_ENV="${DOCKER_ENV} -e ${env_key}"
+        fi
+    elif [[ $cmd == "-v" ]]; then
+        volumn_key=$2
+        volumn_value=$3
+        shift 3
+        DOCKER_VOLUMNS="${DOCKER_VOLUMNS} -v ${volumn_key}:${volumn_value}"
+    elif [[ $cmd == "-j" ]]; then
+        num_threads=$2
+        shift 2
+        DOCKER_ENV="${DOCKER_ENV} -e NUM_THREADS=${num_threads} --cpus ${num_threads}"
+    elif [[ $cmd == "--no-gpu" ]]; then
+        USE_GPU=false
+        shift
+    else
+        break
+    fi
+done
+
+if [ "$#" -eq 0 ]; then
+    COMMAND="bash"
+    if [[ $(uname) == "Darwin" ]]; then
+        # Docker's host networking driver isn't supported on macOS.
+        # Use default bridge network and expose port for jupyter notebook.
+        DOCKER_EXTRA_PARAMS=("-it -p 8888:8888")
+    else
+        DOCKER_EXTRA_PARAMS=("-it --net=host")
+    fi
+else
+    COMMAND=("$@")
+fi
+
+DOCKER_ENV="${DOCKER_ENV} -e PIP_RETRIES=10 -e PIP_DEFAULT_TIMEOUT=60"
+
+# Share pip's downloads with the other jobs that land on this reused runner. In
+# HOME because the workspace is wiped between jobs and /opt needs root.
+# CI_PIP_CACHE_DIR="" opts out.
+: "${CI_PIP_CACHE_DIR=${HOME:-/tmp}/.cache/flashinfer-ci/pip}"
+if [ -n "${CI_PIP_CACHE_DIR}" ] && mkdir -p "${CI_PIP_CACHE_DIR}" 2>/dev/null; then
+    CACHE_MB=$(du -sm "${CI_PIP_CACHE_DIR}" 2>/dev/null | cut -f1)
+    if [ "${CACHE_MB:-0}" -gt "${CI_PIP_CACHE_MAX_MB:-20480}" ]; then
+        echo "Clearing pip cache: ${CACHE_MB} MB exceeds ${CI_PIP_CACHE_MAX_MB:-20480} MB"
+        # Containers write into it as root, so the runner user may need sudo.
+        rm -rf "${CI_PIP_CACHE_DIR:?}" 2>/dev/null \
+            || sudo -n rm -rf "${CI_PIP_CACHE_DIR:?}" 2>/dev/null || true
+        mkdir -p "${CI_PIP_CACHE_DIR}" 2>/dev/null || true
+    fi
+    DOCKER_VOLUMNS="${DOCKER_VOLUMNS} -v ${CI_PIP_CACHE_DIR}:/pip-cache"
+    DOCKER_ENV="${DOCKER_ENV} -e PIP_CACHE_DIR=/pip-cache"
+else
+    echo "Shared pip cache disabled or not writable; downloads will not be reused"
+fi
+
+# Use nvidia-docker if the container is GPU.
+if [[ ${USE_GPU} == "true" ]]; then
+    # An unset host mask should leave the container's GPUs visible. Preserve
+    # explicitly configured masks, including an intentionally empty one.
+    if [[ -v CUDA_VISIBLE_DEVICES ]]; then
+        DOCKER_ENV="${DOCKER_ENV} -e CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+    fi
+    if type nvidia-docker 1> /dev/null 2> /dev/null; then
+        DOCKER_BINARY=nvidia-docker
+    else
+        DOCKER_BINARY=docker
+        DOCKER_ENV="${DOCKER_ENV} --gpus all"
+    fi
+fi
+
+# Print arguments.
+echo "DOCKER_BINARY ${DOCKER_BINARY}"
+echo "WORKSPACE: ${WORKSPACE}"
+echo "IMAGE NAME: ${DOCKER_IMAGE_NAME}"
+echo "ENV VARIABLES: ${DOCKER_ENV}"
+echo "VOLUMES: ${DOCKER_VOLUMNS}"
+echo "COMMANDS: '${COMMAND[@]}'"
+
+# Pull the latest docker image
+echo "Pulling latest image: ${DOCKER_IMAGE_NAME}"
+${DOCKER_BINARY} pull ${DOCKER_IMAGE_NAME}
+
+# By default we cleanup - remove the container once it finish running (--rm)
+# and share the PID namespace (--pid=host) so the process inside does not have
+# pid 1 and SIGKILL is propagated to the process inside (jenkins can kill it).
+
+${DOCKER_BINARY} run --rm --pid=host \
+    -w /workspace \
+    ${DOCKER_VOLUMNS} \
+    ${DOCKER_ENV} \
+    ${DOCKER_EXTRA_PARAMS[@]} \
+    ${DOCKER_IMAGE_NAME} \
+    ${COMMAND[@]}

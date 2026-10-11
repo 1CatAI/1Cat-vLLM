@@ -1,0 +1,32 @@
+{
+  "repository": "https://github.com/flashinfer-ai/flashinfer",
+  "commit": "34bb66e4d0b420b5a03c99b2b6a1c0831dfaa738",
+  "version": "0.7.2",
+  "archive_sha256": "66a6438e796a3c010acd2b37df429df3ae6b182c83f4f996b15e82e21918079f",
+  "dependencies": [
+    {
+      "path": "3rdparty/cccl",
+      "repository": "https://github.com/NVIDIA/cccl",
+      "commit": "16bd510c9b712e82b0ab6cbb630d8e29ba1f7116",
+      "archive_sha256": "8c4a1bebc5dfefaebbd40f21460951c62403f9c1f7c52b151b99cae82a02c844"
+    },
+    {
+      "path": "3rdparty/cutlass",
+      "repository": "https://github.com/NVIDIA/cutlass",
+      "commit": "b46b16d003484063bca4ed365e44095c4c6ed633",
+      "archive_sha256": "eb32d2231412541cdaefedf82827903360b07762a0c8d554ca10a59951b321d0"
+    },
+    {
+      "path": "3rdparty/nixl",
+      "repository": "https://github.com/ai-dynamo/nixl",
+      "commit": "b20f4d0adb95f53c4a1272915ef8d86cec304584",
+      "archive_sha256": "594ab0a2aebff370c72ad95232ed7e9413224005a037a58ac5791de79ebcd1b3"
+    },
+    {
+      "path": "3rdparty/spdlog",
+      "repository": "https://github.com/gabime/spdlog",
+      "commit": "c3aed4b68373955e1cc94307683d44dca1515d2b",
+      "archive_sha256": "206184e0d3be5b4ea56343dca519d38d1fdf567b59dd9913e3e959ed4c6b0f4d"
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: msvc-19.16
+
+// ranges::advance
+// Make sure we're SFINAE-friendly when the template argument constraints are not met.
+
+#include <cuda/std/iterator>
+
+#include "test_macros.h"
+
+class not_incrementable
+{};
+
+TEST_FUNC void proper_constraints()
+{
+  not_incrementable p{};
+  cuda::std::ranges::advance(p, 5); // expected-error {{no matching function for call}}
+  cuda::std::ranges::advance(p, p); // expected-error {{no matching function for call}}
+  cuda::std::ranges::advance(p, 5, p); // expected-error {{no matching function for call}}
+}
+
+int main(int, char**)
+{
+  return 0;
+}

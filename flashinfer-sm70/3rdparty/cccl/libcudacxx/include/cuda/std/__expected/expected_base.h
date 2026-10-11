@@ -1,0 +1,1031 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+#ifndef _CUDA_STD___EXPECTED_EXPECTED_BASE_H
+#define _CUDA_STD___EXPECTED_EXPECTED_BASE_H
+
+#include <cuda/std/detail/__config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/std/__concepts/concept_macros.h>
+#include <cuda/std/__concepts/invocable.h>
+#include <cuda/std/__expected/unexpect.h>
+#include <cuda/std/__memory/addressof.h>
+#include <cuda/std/__memory/construct_at.h>
+#include <cuda/std/__tuple_dir/sfinae_helpers.h>
+#include <cuda/std/__type_traits/is_assignable.h>
+#include <cuda/std/__type_traits/is_constructible.h>
+#include <cuda/std/__type_traits/is_convertible.h>
+#include <cuda/std/__type_traits/is_copy_assignable.h>
+#include <cuda/std/__type_traits/is_copy_constructible.h>
+#include <cuda/std/__type_traits/is_default_constructible.h>
+#include <cuda/std/__type_traits/is_move_assignable.h>
+#include <cuda/std/__type_traits/is_move_constructible.h>
+#include <cuda/std/__type_traits/is_nothrow_constructible.h>
+#include <cuda/std/__type_traits/is_nothrow_copy_assignable.h>
+#include <cuda/std/__type_traits/is_nothrow_copy_constructible.h>
+#include <cuda/std/__type_traits/is_nothrow_default_constructible.h>
+#include <cuda/std/__type_traits/is_nothrow_move_assignable.h>
+#include <cuda/std/__type_traits/is_nothrow_move_constructible.h>
+#include <cuda/std/__type_traits/is_trivially_copy_assignable.h>
+#include <cuda/std/__type_traits/is_trivially_copy_constructible.h>
+#include <cuda/std/__type_traits/is_trivially_destructible.h>
+#include <cuda/std/__type_traits/is_trivially_move_assignable.h>
+#include <cuda/std/__type_traits/is_trivially_move_constructible.h>
+#include <cuda/std/__type_traits/is_void.h>
+#include <cuda/std/__utility/delegate_constructors.h>
+#include <cuda/std/__utility/exception_guard.h>
+#include <cuda/std/__utility/forward.h>
+#include <cuda/std/__utility/in_place.h>
+#include <cuda/std/__utility/move.h>
+
+#include <cuda/std/__cccl/prologue.h>
+
+_CCCL_BEGIN_NAMESPACE_CUDA_STD
+
+struct __expected_construct_from_invoke_tag
+{
+  _CCCL_HIDE_FROM_ABI explicit __expected_construct_from_invoke_tag() = default;
+};
+
+template <class _Tp, class _Err, bool = is_trivially_destructible_v<_Tp> && is_trivially_destructible_v<_Err>>
+union __expected_union_t
+{
+  struct __empty
+  {};
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _Tp2 = _Tp)
+  _CCCL_REQUIRES(is_default_constructible_v<_Tp2>)
+  _CCCL_API constexpr __expected_union_t() noexcept(is_nothrow_default_constructible_v<_Tp2>)
+      : __val_()
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _Tp2 = _Tp)
+  _CCCL_REQUIRES((!is_default_constructible_v<_Tp2>) )
+  _CCCL_API constexpr __expected_union_t() noexcept
+      : __empty_()
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class... _Args>
+  _CCCL_API constexpr __expected_union_t(in_place_t,
+                                         _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, _Args...>)
+      : __val_(::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class... _Args>
+  _CCCL_API constexpr __expected_union_t(unexpect_t,
+                                         _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+      : __unex_(::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_union_t(
+    __expected_construct_from_invoke_tag,
+    in_place_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, invoke_result_t<_Fun, _Args...>>)
+      : __val_(::cuda::std::invoke(::cuda::std::forward<_Fun>(__fun), ::cuda::std::forward<_Args>(__args)...))
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_union_t(
+    __expected_construct_from_invoke_tag,
+    unexpect_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+      : __unex_(::cuda::std::invoke(::cuda::std::forward<_Fun>(__fun), ::cuda::std::forward<_Args>(__args)...))
+  {}
+
+  // the __expected_destruct's destructor handles this
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 ~__expected_union_t() {}
+
+  _CCCL_NO_UNIQUE_ADDRESS __empty __empty_;
+  _CCCL_NO_UNIQUE_ADDRESS _Tp __val_;
+  _CCCL_NO_UNIQUE_ADDRESS _Err __unex_;
+};
+
+template <class _Tp, class _Err>
+union __expected_union_t<_Tp, _Err, true>
+{
+  struct __empty
+  {};
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _Tp2 = _Tp)
+  _CCCL_REQUIRES(is_default_constructible_v<_Tp2>)
+  _CCCL_API constexpr __expected_union_t() noexcept(is_nothrow_default_constructible_v<_Tp2>)
+      : __val_()
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _Tp2 = _Tp)
+  _CCCL_REQUIRES((!is_default_constructible_v<_Tp2>) )
+  _CCCL_API constexpr __expected_union_t() noexcept
+      : __empty_()
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class... _Args>
+  _CCCL_API constexpr __expected_union_t(in_place_t,
+                                         _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, _Args...>)
+      : __val_(::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class... _Args>
+  _CCCL_API constexpr __expected_union_t(unexpect_t,
+                                         _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+      : __unex_(::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_union_t(
+    __expected_construct_from_invoke_tag,
+    in_place_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, invoke_result_t<_Fun, _Args...>>)
+      : __val_(::cuda::std::invoke(::cuda::std::forward<_Fun>(__fun), ::cuda::std::forward<_Args>(__args)...))
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_union_t(
+    __expected_construct_from_invoke_tag,
+    unexpect_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+      : __unex_(::cuda::std::invoke(::cuda::std::forward<_Fun>(__fun), ::cuda::std::forward<_Args>(__args)...))
+  {}
+
+  _CCCL_NO_UNIQUE_ADDRESS __empty __empty_;
+  _CCCL_NO_UNIQUE_ADDRESS _Tp __val_;
+  _CCCL_NO_UNIQUE_ADDRESS _Err __unex_;
+};
+
+template <class _Tp, class _Err, bool = is_trivially_destructible_v<_Tp>, bool = is_trivially_destructible_v<_Err>>
+struct __expected_destruct;
+
+template <class _Tp, class _Err>
+struct __expected_destruct<_Tp, _Err, false, false>
+{
+  _CCCL_NO_UNIQUE_ADDRESS __expected_union_t<_Tp, _Err> __union_{};
+  bool __has_val_{true};
+
+  _CCCL_HIDE_FROM_ABI constexpr __expected_destruct() = default;
+
+  _CCCL_API constexpr __expected_destruct(const bool __has_val) noexcept(is_nothrow_default_constructible_v<_Tp>)
+      : __has_val_(__has_val)
+  {}
+
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(in_place_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, _Args...>)
+      : __union_(in_place_t{}, ::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(unexpect_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+      : __union_(unexpect, ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    in_place_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 in_place_t{},
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    unexpect_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 unexpect,
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 ~__expected_destruct()
+  {
+    if (__has_val_)
+    {
+      __union_.__val_.~_Tp();
+    }
+    else
+    {
+      __union_.__unex_.~_Err();
+    }
+  }
+};
+
+template <class _Tp, class _Err>
+struct __expected_destruct<_Tp, _Err, true, false>
+{
+  _CCCL_NO_UNIQUE_ADDRESS __expected_union_t<_Tp, _Err> __union_{};
+  bool __has_val_{true};
+
+  _CCCL_HIDE_FROM_ABI constexpr __expected_destruct() = default;
+
+  _CCCL_API constexpr __expected_destruct(const bool __has_val) noexcept(is_nothrow_default_constructible_v<_Tp>)
+      : __has_val_(__has_val)
+  {}
+
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(in_place_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, _Args...>)
+      : __union_(in_place_t{}, ::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(unexpect_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+      : __union_(unexpect, ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    in_place_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 in_place_t{},
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    unexpect_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 unexpect,
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 ~__expected_destruct()
+  {
+    if (!__has_val_)
+    {
+      __union_.__unex_.~_Err();
+    }
+  }
+};
+
+template <class _Tp, class _Err>
+struct __expected_destruct<_Tp, _Err, false, true>
+{
+  _CCCL_NO_UNIQUE_ADDRESS __expected_union_t<_Tp, _Err> __union_{};
+  bool __has_val_{true};
+
+  _CCCL_HIDE_FROM_ABI constexpr __expected_destruct() = default;
+
+  _CCCL_API constexpr __expected_destruct(const bool __has_val) noexcept(is_nothrow_default_constructible_v<_Tp>)
+      : __has_val_(__has_val)
+  {}
+
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(in_place_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, _Args...>)
+      : __union_(in_place_t{}, ::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(unexpect_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+      : __union_(unexpect, ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    in_place_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 in_place_t{},
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    unexpect_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 unexpect,
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 ~__expected_destruct()
+  {
+    if (__has_val_)
+    {
+      __union_.__val_.~_Tp();
+    }
+  }
+};
+
+template <class _Tp, class _Err>
+struct __expected_destruct<_Tp, _Err, true, true>
+{
+  // This leads to an ICE with nvcc, see nvbug4103076
+  /* _CCCL_NO_UNIQUE_ADDRESS */ __expected_union_t<_Tp, _Err> __union_{};
+  bool __has_val_{true};
+
+  _CCCL_HIDE_FROM_ABI constexpr __expected_destruct() = default;
+
+  _CCCL_API constexpr __expected_destruct(const bool __has_val) noexcept(is_nothrow_default_constructible_v<_Tp>)
+      : __has_val_(__has_val)
+  {}
+
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(in_place_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, _Args...>)
+      : __union_(in_place_t{}, ::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(unexpect_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+      : __union_(unexpect, ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    in_place_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 in_place_t{},
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+  {}
+
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    unexpect_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 unexpect,
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+};
+
+template <class _Tp, class _Err>
+struct __expected_storage : __expected_destruct<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_storage, __expected_destruct, _Tp, _Err);
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _T1, class _T2, class... _Args)
+  _CCCL_REQUIRES(is_nothrow_constructible_v<_T1, _Args...>)
+  static _CCCL_API inline _CCCL_CONSTEXPR_CXX20 void
+  __reinit_expected(_T1& __newval, _T2& __oldval, _Args&&... __args) noexcept
+  {
+    ::cuda::std::__destroy_at(::cuda::std::addressof(__oldval));
+    ::cuda::std::__construct_at(::cuda::std::addressof(__newval), ::cuda::std::forward<_Args>(__args)...);
+  }
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _T1, class _T2, class... _Args)
+  _CCCL_REQUIRES((!is_nothrow_constructible_v<_T1, _Args...>) _CCCL_AND is_nothrow_move_constructible_v<_T1>)
+  static _CCCL_API inline _CCCL_CONSTEXPR_CXX20 void __reinit_expected(_T1& __newval, _T2& __oldval, _Args&&... __args)
+  {
+    _T1 __tmp(::cuda::std::forward<_Args>(__args)...);
+    ::cuda::std::__destroy_at(::cuda::std::addressof(__oldval));
+    ::cuda::std::__construct_at(::cuda::std::addressof(__newval), ::cuda::std::move(__tmp));
+  }
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _T1, class _T2, class... _Args)
+  _CCCL_REQUIRES((!is_nothrow_constructible_v<_T1, _Args...>) _CCCL_AND(!is_nothrow_move_constructible_v<_T1>))
+  static _CCCL_API inline _CCCL_CONSTEXPR_CXX20 void __reinit_expected(_T1& __newval, _T2& __oldval, _Args&&... __args)
+  {
+    static_assert(
+      is_nothrow_move_constructible_v<_T2>,
+      "To provide strong exception guarantee, T2 has to satisfy `is_nothrow_move_constructible_v` so that it can "
+      "be reverted to the previous state in case an exception is thrown during the assignment.");
+    _T2 __tmp(::cuda::std::move(__oldval));
+    ::cuda::std::__destroy_at(::cuda::std::addressof(__oldval));
+    auto __trans = ::cuda::std::__make_exception_guard([&] {
+      ::cuda::std::__construct_at(::cuda::std::addressof(__oldval), ::cuda::std::move(__tmp));
+    });
+    ::cuda::std::__construct_at(::cuda::std::addressof(__newval), ::cuda::std::forward<_Args>(__args)...);
+    __trans.__complete();
+  }
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _Err2 = _Err)
+  _CCCL_REQUIRES(is_nothrow_move_constructible_v<_Err2>)
+  static _CCCL_API inline _CCCL_CONSTEXPR_CXX20 void
+  __swap_val_unex_impl(__expected_storage<_Tp, _Err2>& __with_val, __expected_storage& __with_err)
+  {
+    _Err __tmp(::cuda::std::move(__with_err.__union_.__unex_));
+    ::cuda::std::__destroy_at(::cuda::std::addressof(__with_err.__union_.__unex_));
+    auto __trans = ::cuda::std::__make_exception_guard([&] {
+      ::cuda::std::__construct_at(::cuda::std::addressof(__with_err.__union_.__unex_), ::cuda::std::move(__tmp));
+    });
+    ::cuda::std::__construct_at(
+      ::cuda::std::addressof(__with_err.__union_.__val_), ::cuda::std::move(__with_val.__union_.__val_));
+    __trans.__complete();
+    ::cuda::std::__destroy_at(::cuda::std::addressof(__with_val.__union_.__val_));
+    ::cuda::std::__construct_at(::cuda::std::addressof(__with_val.__union_.__unex_), ::cuda::std::move(__tmp));
+    __with_val.__has_val_ = false;
+    __with_err.__has_val_ = true;
+  }
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _Err2 = _Err)
+  _CCCL_REQUIRES((!is_nothrow_move_constructible_v<_Err2>) )
+  static _CCCL_API inline _CCCL_CONSTEXPR_CXX20 void
+  __swap_val_unex_impl(__expected_storage<_Tp, _Err2>& __with_val, __expected_storage& __with_err)
+  {
+    static_assert(is_nothrow_move_constructible_v<_Tp>,
+                  "To provide strong exception guarantee, Tp has to satisfy `is_nothrow_move_constructible_v` so "
+                  "that it can be reverted to the previous state in case an exception is thrown during swap.");
+    _Tp __tmp(::cuda::std::move(__with_val.__union_.__val_));
+    ::cuda::std::__destroy_at(::cuda::std::addressof(__with_val.__union_.__val_));
+    auto __trans = ::cuda::std::__make_exception_guard([&] {
+      ::cuda::std::__construct_at(::cuda::std::addressof(__with_val.__union_.__val_), ::cuda::std::move(__tmp));
+    });
+    ::cuda::std::__construct_at(
+      ::cuda::std::addressof(__with_val.__union_.__unex_), ::cuda::std::move(__with_err.__union_.__unex_));
+    __trans.__complete();
+    ::cuda::std::__destroy_at(::cuda::std::addressof(__with_err.__union_.__unex_));
+    ::cuda::std::__construct_at(::cuda::std::addressof(__with_err.__union_.__val_), ::cuda::std::move(__tmp));
+    __with_val.__has_val_ = false;
+    __with_err.__has_val_ = true;
+  }
+};
+
+template <class _Tp, class _Err>
+inline constexpr __smf_availability __expected_can_copy_construct =
+  (is_trivially_copy_constructible_v<_Tp> || is_same_v<_Tp, void>) && is_trivially_copy_constructible_v<_Err>
+    ? __smf_availability::__trivial
+  : (is_copy_constructible_v<_Tp> || is_same_v<_Tp, void>) && is_copy_constructible_v<_Err>
+    ? __smf_availability::__available
+    : __smf_availability::__deleted;
+
+template <class _Tp, class _Err, __smf_availability = __expected_can_copy_construct<_Tp, _Err>>
+struct __expected_copy : __expected_storage<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_copy, __expected_storage, _Tp, _Err);
+};
+
+template <class _Tp, class _Err>
+struct __expected_copy<_Tp, _Err, __smf_availability::__available> : __expected_storage<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_copy, __expected_storage, _Tp, _Err);
+
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 __expected_copy(const __expected_copy& __other) noexcept(
+    is_nothrow_copy_constructible_v<_Tp> && is_nothrow_copy_constructible_v<_Err>)
+      : __base(__other.__has_val_)
+  {
+    if (__other.__has_val_)
+    {
+      ::cuda::std::__construct_at(::cuda::std::addressof(this->__union_.__val_), __other.__union_.__val_);
+    }
+    else
+    {
+      ::cuda::std::__construct_at(::cuda::std::addressof(this->__union_.__unex_), __other.__union_.__unex_);
+    }
+  }
+
+  _CCCL_HIDE_FROM_ABI __expected_copy(__expected_copy&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __expected_copy& operator=(const __expected_copy&) = default;
+  _CCCL_HIDE_FROM_ABI __expected_copy& operator=(__expected_copy&&)      = default;
+};
+
+template <class _Tp, class _Err>
+struct __expected_copy<_Tp, _Err, __smf_availability::__deleted> : __expected_storage<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_copy, __expected_storage, _Tp, _Err);
+
+  __expected_copy(const __expected_copy&)                                = delete;
+  _CCCL_HIDE_FROM_ABI __expected_copy(__expected_copy&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __expected_copy& operator=(const __expected_copy&) = default;
+  _CCCL_HIDE_FROM_ABI __expected_copy& operator=(__expected_copy&&)      = default;
+};
+
+template <class _Tp, class _Err>
+inline constexpr __smf_availability __expected_can_move_construct =
+  (is_trivially_move_constructible_v<_Tp> || is_same_v<_Tp, void>) && is_trivially_move_constructible_v<_Err>
+    ? __smf_availability::__trivial
+  : (is_move_constructible_v<_Tp> || is_same_v<_Tp, void>) && is_move_constructible_v<_Err>
+    ? __smf_availability::__available
+    : __smf_availability::__deleted;
+
+template <class _Tp, class _Err, __smf_availability = __expected_can_move_construct<_Tp, _Err>>
+struct __expected_move : __expected_copy<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_move, __expected_copy, _Tp, _Err);
+};
+
+template <class _Tp, class _Err>
+struct __expected_move<_Tp, _Err, __smf_availability::__available> : __expected_copy<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_move, __expected_copy, _Tp, _Err);
+
+  _CCCL_HIDE_FROM_ABI __expected_move(const __expected_move&) = default;
+
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 __expected_move(__expected_move&& __other) noexcept(
+    is_nothrow_move_constructible_v<_Tp> && is_nothrow_move_constructible_v<_Err>)
+      : __base(__other.__has_val_)
+  {
+    if (__other.__has_val_)
+    {
+      ::cuda::std::__construct_at(
+        ::cuda::std::addressof(this->__union_.__val_), ::cuda::std::move(__other.__union_.__val_));
+    }
+    else
+    {
+      ::cuda::std::__construct_at(
+        ::cuda::std::addressof(this->__union_.__unex_), ::cuda::std::move(__other.__union_.__unex_));
+    }
+  }
+
+  _CCCL_HIDE_FROM_ABI __expected_move& operator=(const __expected_move&) = default;
+  _CCCL_HIDE_FROM_ABI __expected_move& operator=(__expected_move&&)      = default;
+};
+
+template <class _Tp, class _Err>
+struct __expected_move<_Tp, _Err, __smf_availability::__deleted> : __expected_copy<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_move, __expected_copy, _Tp, _Err);
+
+  _CCCL_HIDE_FROM_ABI __expected_move(const __expected_move&)            = default;
+  __expected_move(__expected_move&&)                                     = delete;
+  _CCCL_HIDE_FROM_ABI __expected_move& operator=(const __expected_move&) = default;
+  _CCCL_HIDE_FROM_ABI __expected_move& operator=(__expected_move&&)      = default;
+};
+
+// Need to also check against is_nothrow_move_constructible in the trivial case as that is stupidly in the constraints
+template <class _Tp, class _Err>
+inline constexpr __smf_availability __expected_can_copy_assign =
+  (is_trivially_destructible_v<_Tp> || is_same_v<_Tp, void>) && is_trivially_destructible_v<_Err>
+      && (is_trivially_copy_constructible_v<_Tp> || is_same_v<_Tp, void>) && is_trivially_copy_constructible_v<_Err>
+      && (is_trivially_copy_assignable_v<_Tp> || is_same_v<_Tp, void>) && is_trivially_copy_assignable_v<_Err>
+      && (is_nothrow_move_constructible_v<_Tp> || is_same_v<_Tp, void> || is_nothrow_move_constructible_v<_Err>)
+    ? __smf_availability::__trivial
+  : (is_copy_constructible_v<_Tp> || is_same_v<_Tp, void>) && is_copy_constructible_v<_Err>
+      && (is_copy_assignable_v<_Tp> || is_same_v<_Tp, void>) && is_copy_assignable_v<_Err>
+      && (is_nothrow_move_constructible_v<_Tp> || is_same_v<_Tp, void> || is_nothrow_move_constructible_v<_Err>)
+    ? __smf_availability::__available
+    : __smf_availability::__deleted;
+
+template <class _Tp, class _Err, __smf_availability = __expected_can_copy_assign<_Tp, _Err>>
+struct __expected_copy_assign : __expected_move<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_copy_assign, __expected_move, _Tp, _Err);
+};
+
+template <class _Tp, class _Err>
+struct __expected_copy_assign<_Tp, _Err, __smf_availability::__available> : __expected_move<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_copy_assign, __expected_move, _Tp, _Err);
+
+  _CCCL_HIDE_FROM_ABI __expected_copy_assign(const __expected_copy_assign&) = default;
+  _CCCL_HIDE_FROM_ABI __expected_copy_assign(__expected_copy_assign&&)      = default;
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 __expected_copy_assign&
+  operator=(const __expected_copy_assign& __other) noexcept(
+    is_nothrow_copy_assignable_v<_Tp> && is_nothrow_copy_constructible_v<_Tp> && is_nothrow_copy_assignable_v<_Err>
+    && is_nothrow_copy_constructible_v<_Err>) // strengthened
+  {
+    if (this->__has_val_ && __other.__has_val_)
+    {
+      this->__union_.__val_ = __other.__union_.__val_;
+    }
+    else if (this->__has_val_ && !__other.__has_val_)
+    {
+      this->__reinit_expected(this->__union_.__unex_, this->__union_.__val_, __other.__union_.__unex_);
+      this->__has_val_ = false;
+    }
+    else if (!this->__has_val_ && __other.__has_val_)
+    {
+      this->__reinit_expected(this->__union_.__val_, this->__union_.__unex_, __other.__union_.__val_);
+      this->__has_val_ = true;
+    }
+    else
+    { // !this->__has_val_ && !__other.__has_val_
+      this->__union_.__unex_ = __other.__union_.__unex_;
+    }
+    return *this;
+  }
+
+  _CCCL_HIDE_FROM_ABI __expected_copy_assign& operator=(__expected_copy_assign&&) = default;
+};
+
+template <class _Tp, class _Err>
+struct __expected_copy_assign<_Tp, _Err, __smf_availability::__deleted> : __expected_move<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_copy_assign, __expected_move, _Tp, _Err);
+
+  _CCCL_HIDE_FROM_ABI __expected_copy_assign(const __expected_copy_assign&)       = default;
+  _CCCL_HIDE_FROM_ABI __expected_copy_assign(__expected_copy_assign&&)            = default;
+  __expected_copy_assign& operator=(const __expected_copy_assign&)                = delete;
+  _CCCL_HIDE_FROM_ABI __expected_copy_assign& operator=(__expected_copy_assign&&) = default;
+};
+
+template <class _Tp, class _Err>
+inline constexpr __smf_availability __expected_can_move_assign =
+  (is_trivially_destructible_v<_Tp> || is_same_v<_Tp, void>) && is_trivially_destructible_v<_Err>
+      && (is_trivially_move_constructible_v<_Tp> || is_same_v<_Tp, void>) && is_trivially_move_constructible_v<_Err>
+      && (is_trivially_move_assignable_v<_Tp> || is_same_v<_Tp, void>) && is_trivially_move_assignable_v<_Err>
+    ? __smf_availability::__trivial
+  : (is_move_constructible_v<_Tp> || is_same_v<_Tp, void>) && is_move_constructible_v<_Err>
+      && (is_move_assignable_v<_Tp> || is_same_v<_Tp, void>) && is_move_assignable_v<_Err>
+      && (is_nothrow_move_constructible_v<_Tp> || is_same_v<_Tp, void> || is_nothrow_move_constructible_v<_Err>)
+    ? __smf_availability::__available
+    : __smf_availability::__deleted;
+
+template <class _Tp, class _Err, __smf_availability = __expected_can_move_assign<_Tp, _Err>>
+struct __expected_move_assign : __expected_copy_assign<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_move_assign, __expected_copy_assign, _Tp, _Err);
+};
+
+template <class _Tp, class _Err>
+struct __expected_move_assign<_Tp, _Err, __smf_availability::__available> : __expected_copy_assign<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_move_assign, __expected_copy_assign, _Tp, _Err);
+
+  _CCCL_HIDE_FROM_ABI __expected_move_assign(const __expected_move_assign&)            = default;
+  _CCCL_HIDE_FROM_ABI __expected_move_assign(__expected_move_assign&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __expected_move_assign& operator=(const __expected_move_assign&) = default;
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 __expected_move_assign& operator=(__expected_move_assign&& __other) noexcept(
+    is_nothrow_move_assignable_v<_Tp> && is_nothrow_move_constructible_v<_Tp> && is_nothrow_move_assignable_v<_Err>
+    && is_nothrow_move_constructible_v<_Err>) // strengthened
+  {
+    if (this->__has_val_ && __other.__has_val_)
+    {
+      this->__union_.__val_ = ::cuda::std::move(__other.__union_.__val_);
+    }
+    else if (this->__has_val_ && !__other.__has_val_)
+    {
+      this->__reinit_expected(
+        this->__union_.__unex_, this->__union_.__val_, ::cuda::std::move(__other.__union_.__unex_));
+      this->__has_val_ = false;
+    }
+    else if (!this->__has_val_ && __other.__has_val_)
+    {
+      this->__reinit_expected(this->__union_.__val_, this->__union_.__unex_, ::cuda::std::move(__other.__union_.__val_));
+      this->__has_val_ = true;
+    }
+    else
+    { // !this->__has_val_ && !__other.__has_val_
+      this->__union_.__unex_ = ::cuda::std::move(__other.__union_.__unex_);
+    }
+    return *this;
+  }
+};
+
+template <class _Tp, class _Err>
+struct __expected_move_assign<_Tp, _Err, __smf_availability::__deleted> : __expected_copy_assign<_Tp, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_move_assign, __expected_copy_assign, _Tp, _Err);
+
+  _CCCL_HIDE_FROM_ABI __expected_move_assign(const __expected_move_assign&)            = default;
+  _CCCL_HIDE_FROM_ABI __expected_move_assign(__expected_move_assign&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __expected_move_assign& operator=(const __expected_move_assign&) = default;
+  __expected_move_assign& operator=(__expected_move_assign&&)                          = delete;
+};
+
+// expected<void, E> base classtemplate <class _Tp, class _Err>
+
+template <class _Err>
+struct __expected_destruct<void, _Err, false, false>
+{
+  _CCCL_NO_UNIQUE_ADDRESS union __expected_union_t
+  {
+    struct __empty
+    {};
+
+    _CCCL_API constexpr __expected_union_t() noexcept
+        : __empty_()
+    {}
+
+    _CCCL_EXEC_CHECK_DISABLE
+    template <class... _Args>
+    _CCCL_API constexpr __expected_union_t(unexpect_t,
+                                           _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+        : __unex_(::cuda::std::forward<_Args>(__args)...)
+    {}
+
+    _CCCL_EXEC_CHECK_DISABLE
+    template <class _Fun, class... _Args>
+    _CCCL_API constexpr __expected_union_t(
+      __expected_construct_from_invoke_tag,
+      unexpect_t,
+      _Fun&& __fun,
+      _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+        : __unex_(::cuda::std::invoke(::cuda::std::forward<_Fun>(__fun), ::cuda::std::forward<_Args>(__args)...))
+    {}
+
+    // the __expected_destruct's destructor handles this
+    _CCCL_EXEC_CHECK_DISABLE
+    _CCCL_API inline _CCCL_CONSTEXPR_CXX20 ~__expected_union_t() {}
+
+    _CCCL_NO_UNIQUE_ADDRESS __empty __empty_;
+    _CCCL_NO_UNIQUE_ADDRESS _Err __unex_;
+  } __union_{};
+  bool __has_val_{true};
+
+  _CCCL_HIDE_FROM_ABI constexpr __expected_destruct() = default;
+
+  _CCCL_API constexpr __expected_destruct(const bool __has_val) noexcept
+      : __has_val_(__has_val)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(unexpect_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+      : __union_(unexpect, ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    unexpect_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 unexpect,
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 ~__expected_destruct()
+  {
+    if (!__has_val_)
+    {
+      __union_.__unex_.~_Err();
+    }
+  }
+};
+
+template <class _Err>
+struct __expected_destruct<void, _Err, false, true>
+{
+  // Using `_CCCL_NO_UNIQUE_ADDRESS` here crashes nvcc
+  /* _CCCL_NO_UNIQUE_ADDRESS */ union __expected_union_t
+  {
+    struct __empty
+    {};
+
+    _CCCL_API constexpr __expected_union_t() noexcept
+        : __empty_()
+    {}
+
+    _CCCL_EXEC_CHECK_DISABLE
+    template <class... _Args>
+    _CCCL_API constexpr __expected_union_t(unexpect_t,
+                                           _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+        : __unex_(::cuda::std::forward<_Args>(__args)...)
+    {}
+
+    _CCCL_EXEC_CHECK_DISABLE
+    template <class _Fun, class... _Args>
+    _CCCL_API constexpr __expected_union_t(
+      __expected_construct_from_invoke_tag,
+      unexpect_t,
+      _Fun&& __fun,
+      _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+        : __unex_(::cuda::std::invoke(::cuda::std::forward<_Fun>(__fun), ::cuda::std::forward<_Args>(__args)...))
+    {}
+
+    _CCCL_NO_UNIQUE_ADDRESS __empty __empty_;
+    _CCCL_NO_UNIQUE_ADDRESS _Err __unex_;
+  } __union_{};
+  bool __has_val_{true};
+
+  _CCCL_HIDE_FROM_ABI constexpr __expected_destruct() = default;
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(in_place_t) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+      : __union_()
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class... _Args>
+  _CCCL_API constexpr __expected_destruct(unexpect_t,
+                                          _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, _Args...>)
+      : __union_(unexpect, ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <class _Fun, class... _Args>
+  _CCCL_API constexpr __expected_destruct(
+    __expected_construct_from_invoke_tag,
+    unexpect_t,
+    _Fun&& __fun,
+    _Args&&... __args) noexcept(is_nothrow_constructible_v<_Err, invoke_result_t<_Fun, _Args...>>)
+      : __union_(__expected_construct_from_invoke_tag{},
+                 unexpect,
+                 ::cuda::std::forward<_Fun>(__fun),
+                 ::cuda::std::forward<_Args>(__args)...)
+      , __has_val_(false)
+  {}
+
+  _CCCL_API constexpr __expected_destruct(const bool __has_val) noexcept
+      : __has_val_(__has_val)
+  {}
+};
+
+template <class _Err>
+struct __expected_storage<void, _Err> : __expected_destruct<void, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_storage, __expected_destruct, void, _Err);
+
+  _CCCL_EXEC_CHECK_DISABLE
+  static _CCCL_API inline _CCCL_CONSTEXPR_CXX20 void __swap_val_unex_impl(
+    __expected_storage& __with_val, __expected_storage& __with_err) noexcept(is_nothrow_move_constructible_v<_Err>)
+  {
+    ::cuda::std::__construct_at(
+      ::cuda::std::addressof(__with_val.__union_.__unex_), ::cuda::std::move(__with_err.__union_.__unex_));
+    ::cuda::std::__destroy_at(::cuda::std::addressof(__with_err.__union_.__unex_));
+    __with_val.__has_val_ = false;
+    __with_err.__has_val_ = true;
+  }
+};
+
+template <class _Err>
+struct __expected_copy<void, _Err, __smf_availability::__available> : __expected_storage<void, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_copy, __expected_storage, void, _Err);
+
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20
+  __expected_copy(const __expected_copy& __other) noexcept(is_nothrow_copy_constructible_v<_Err>)
+      : __base(__other.__has_val_)
+  {
+    if (!__other.__has_val_)
+    {
+      ::cuda::std::__construct_at(::cuda::std::addressof(this->__union_.__unex_), __other.__union_.__unex_);
+    }
+  }
+
+  _CCCL_HIDE_FROM_ABI __expected_copy(__expected_copy&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __expected_copy& operator=(const __expected_copy&) = default;
+  _CCCL_HIDE_FROM_ABI __expected_copy& operator=(__expected_copy&&)      = default;
+};
+
+template <class _Err>
+struct __expected_move<void, _Err, __smf_availability::__available> : __expected_copy<void, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_move, __expected_copy, void, _Err);
+
+  _CCCL_HIDE_FROM_ABI __expected_move(const __expected_move&) = default;
+
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20
+  __expected_move(__expected_move&& __other) noexcept(is_nothrow_move_constructible_v<_Err>)
+      : __base(__other.__has_val_)
+  {
+    if (!__other.__has_val_)
+    {
+      ::cuda::std::__construct_at(
+        ::cuda::std::addressof(this->__union_.__unex_), ::cuda::std::move(__other.__union_.__unex_));
+    }
+  }
+
+  _CCCL_HIDE_FROM_ABI __expected_move& operator=(const __expected_move&) = default;
+  _CCCL_HIDE_FROM_ABI __expected_move& operator=(__expected_move&&)      = default;
+};
+
+template <class _Err>
+struct __expected_copy_assign<void, _Err, __smf_availability::__available> : __expected_move<void, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_copy_assign, __expected_move, void, _Err);
+
+  _CCCL_HIDE_FROM_ABI __expected_copy_assign(const __expected_copy_assign&) = default;
+  _CCCL_HIDE_FROM_ABI __expected_copy_assign(__expected_copy_assign&&)      = default;
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 __expected_copy_assign&
+  operator=(const __expected_copy_assign& __other) noexcept(
+    is_nothrow_copy_assignable_v<_Err> && is_nothrow_copy_constructible_v<_Err>) // strengthened
+  {
+    if (this->__has_val_ && __other.__has_val_)
+    {
+      // nothing to do
+    }
+    else if (this->__has_val_ && !__other.__has_val_)
+    {
+      ::cuda::std::__construct_at(::cuda::std::addressof(this->__union_.__unex_), __other.__union_.__unex_);
+      this->__has_val_ = false;
+    }
+    else if (!this->__has_val_ && __other.__has_val_)
+    {
+      ::cuda::std::__destroy_at(::cuda::std::addressof(this->__union_.__unex_));
+      this->__has_val_ = true;
+    }
+    else
+    { // !this->__has_val_ && !__other.__has_val_
+      this->__union_.__unex_ = __other.__union_.__unex_;
+    }
+    return *this;
+  }
+
+  _CCCL_HIDE_FROM_ABI __expected_copy_assign& operator=(__expected_copy_assign&&) = default;
+};
+
+template <class _Err>
+struct __expected_move_assign<void, _Err, __smf_availability::__available> : __expected_copy_assign<void, _Err>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__expected_move_assign, __expected_copy_assign, void, _Err);
+
+  _CCCL_HIDE_FROM_ABI __expected_move_assign(const __expected_move_assign&)            = default;
+  _CCCL_HIDE_FROM_ABI __expected_move_assign(__expected_move_assign&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __expected_move_assign& operator=(const __expected_move_assign&) = default;
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_API inline _CCCL_CONSTEXPR_CXX20 __expected_move_assign& operator=(__expected_move_assign&& __other) noexcept(
+    is_nothrow_move_assignable_v<_Err> && is_nothrow_move_constructible_v<_Err>) // strengthened
+  {
+    if (this->__has_val_ && __other.__has_val_)
+    {
+      // nothing to do
+    }
+    else if (this->__has_val_ && !__other.__has_val_)
+    {
+      ::cuda::std::__construct_at(
+        ::cuda::std::addressof(this->__union_.__unex_), ::cuda::std::move(__other.__union_.__unex_));
+      this->__has_val_ = false;
+    }
+    else if (!this->__has_val_ && __other.__has_val_)
+    {
+      ::cuda::std::__destroy_at(::cuda::std::addressof(this->__union_.__unex_));
+      this->__has_val_ = true;
+    }
+    else
+    { // !this->__has_val_ && !__other.__has_val_
+      this->__union_.__unex_ = ::cuda::std::move(__other.__union_.__unex_);
+    }
+    return *this;
+  }
+};
+
+_CCCL_END_NAMESPACE_CUDA_STD
+
+#include <cuda/std/__cccl/epilogue.h>
+
+#endif // _CUDA_STD___EXPECTED_EXPECTED_BASE_H

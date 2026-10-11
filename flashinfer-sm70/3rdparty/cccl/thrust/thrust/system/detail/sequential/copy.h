@@ -1,0 +1,108 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+/*! \file copy.h
+ *  \brief Sequential implementations of copy algorithms.
+ */
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <thrust/detail/type_traits.h>
+#include <thrust/iterator/iterator_traits.h>
+#include <thrust/system/detail/sequential/execution_policy.h>
+#include <thrust/system/detail/sequential/general_copy.h>
+#include <thrust/system/detail/sequential/trivial_copy.h>
+#include <thrust/type_traits/is_trivially_relocatable.h>
+
+#include <cuda/std/__memory/pointer_traits.h>
+
+THRUST_NAMESPACE_BEGIN
+namespace system::detail::sequential
+{
+namespace copy_detail
+{
+_CCCL_EXEC_CHECK_DISABLE
+template <typename InputIterator, typename OutputIterator>
+_CCCL_HOST_DEVICE OutputIterator
+copy(InputIterator first,
+     InputIterator last,
+     OutputIterator result,
+     thrust::detail::true_type) // is_indirectly_trivially_copyable_to
+{
+  using Size = thrust::detail::it_difference_t<InputIterator>;
+
+  const Size n = last - first;
+  thrust::system::detail::sequential::trivial_copy_n(::cuda::std::to_address(first), n, ::cuda::std::to_address(result));
+  return result + n;
+} // end copy()
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename InputIterator, typename OutputIterator>
+_CCCL_HOST_DEVICE OutputIterator
+copy(InputIterator first,
+     InputIterator last,
+     OutputIterator result,
+     thrust::detail::false_type) // is_indirectly_trivially_copyable_to
+{
+  return thrust::system::detail::sequential::general_copy(first, last, result);
+} // end copy()
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename InputIterator, typename Size, typename OutputIterator>
+_CCCL_HOST_DEVICE OutputIterator copy_n(
+  InputIterator first,
+  Size n,
+  OutputIterator result,
+  thrust::detail::true_type) // is_indirectly_trivially_copyable_to
+{
+  thrust::system::detail::sequential::trivial_copy_n(::cuda::std::to_address(first), n, ::cuda::std::to_address(result));
+  return result + n;
+} // end copy_n()
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename InputIterator, typename Size, typename OutputIterator>
+_CCCL_HOST_DEVICE OutputIterator copy_n(
+  InputIterator first,
+  Size n,
+  OutputIterator result,
+  thrust::detail::false_type) // is_indirectly_trivially_copyable_to
+{
+  return thrust::system::detail::sequential::general_copy_n(first, n, result);
+} // end copy_n()
+} // end namespace copy_detail
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename DerivedPolicy, typename InputIterator, typename OutputIterator>
+_CCCL_HOST_DEVICE OutputIterator
+copy(sequential::execution_policy<DerivedPolicy>&, InputIterator first, InputIterator last, OutputIterator result)
+{
+  return thrust::system::detail::sequential::copy_detail::copy(
+    first,
+    last,
+    result,
+    ::cuda::std::bool_constant<thrust::detail::is_indirectly_trivially_copyable_to_v<InputIterator, OutputIterator>>{});
+} // end copy()
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename DerivedPolicy, typename InputIterator, typename Size, typename OutputIterator>
+_CCCL_HOST_DEVICE OutputIterator
+copy_n(sequential::execution_policy<DerivedPolicy>&, InputIterator first, Size n, OutputIterator result)
+{
+  return thrust::system::detail::sequential::copy_detail::copy_n(
+    first,
+    n,
+    result,
+    ::cuda::std::bool_constant<thrust::detail::is_indirectly_trivially_copyable_to_v<InputIterator, OutputIterator>>{});
+} // end copy_n()
+} // namespace system::detail::sequential
+THRUST_NAMESPACE_END

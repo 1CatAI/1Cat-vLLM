@@ -1,0 +1,80 @@
+// SPDX-FileCopyrightText: Copyright (c) 2018, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+#include <thrust/detail/alignment.h>
+#include <thrust/detail/execute_with_allocator_fwd.h>
+
+#include <cuda/std/__cstddef/types.h>
+#include <cuda/std/__type_traits/enable_if.h>
+#include <cuda/std/__type_traits/is_reference.h>
+#include <cuda/std/__utility/forward.h>
+
+THRUST_NAMESPACE_BEGIN
+
+namespace mr
+{
+template <typename T, class MR>
+class allocator;
+}
+
+namespace detail
+{
+template <template <typename> class ExecutionPolicyCRTPBase>
+struct allocator_aware_execution_policy
+{
+  template <typename MemoryResource>
+  struct execute_with_memory_resource_type
+  {
+    using type = thrust::detail::execute_with_allocator<thrust::mr::allocator<::cuda::std::max_align_t, MemoryResource>,
+                                                        ExecutionPolicyCRTPBase>;
+  };
+
+  template <typename Allocator>
+  struct execute_with_allocator_type
+  {
+    using type = thrust::detail::execute_with_allocator<Allocator, ExecutionPolicyCRTPBase>;
+  };
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <typename MemoryResource>
+  _CCCL_HOST_DEVICE typename execute_with_memory_resource_type<MemoryResource>::type
+  operator()(MemoryResource* mem_res) const
+  {
+    return typename execute_with_memory_resource_type<MemoryResource>::type(mem_res);
+  }
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <typename Allocator>
+  _CCCL_HOST_DEVICE typename execute_with_allocator_type<Allocator&>::type operator()(Allocator& alloc) const
+  {
+    return typename execute_with_allocator_type<Allocator&>::type(alloc);
+  }
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <typename Allocator>
+  _CCCL_HOST_DEVICE typename execute_with_allocator_type<Allocator>::type operator()(const Allocator& alloc) const
+  {
+    return typename execute_with_allocator_type<Allocator>::type(alloc);
+  }
+
+  _CCCL_EXEC_CHECK_DISABLE
+  template <typename Allocator, ::cuda::std::enable_if_t<!::cuda::std::is_lvalue_reference_v<Allocator>>* = nullptr>
+  _CCCL_HOST_DEVICE typename execute_with_allocator_type<Allocator>::type operator()(Allocator&& alloc) const
+  {
+    return typename execute_with_allocator_type<Allocator>::type(::cuda::std::forward<Allocator>(alloc));
+  }
+};
+} // end namespace detail
+
+THRUST_NAMESPACE_END

@@ -1,0 +1,116 @@
+// SPDX-FileCopyrightText: Copyright (c) 2016, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#if _CCCL_CUDA_COMPILATION()
+#  include <thrust/system/cuda/config.h>
+
+#  include <cub/device/device_reduce.cuh>
+#  include <cub/util_math.cuh>
+
+#  include <thrust/detail/alignment.h>
+#  include <thrust/detail/raw_reference_cast.h>
+#  include <thrust/detail/temporary_array.h>
+#  include <thrust/functional.h>
+#  include <thrust/system/cuda/detail/cdp_dispatch.h>
+#  include <thrust/system/cuda/detail/core/agent_launcher.h>
+#  include <thrust/system/cuda/detail/dispatch.h>
+#  include <thrust/system/cuda/detail/execution_policy.h>
+#  include <thrust/system/cuda/detail/get_value.h>
+#  include <thrust/system/cuda/detail/make_unsigned_special.h>
+#  include <thrust/system/cuda/detail/util.h>
+
+#  include <cuda/std/__iterator/distance.h>
+#  include <cuda/std/cstdint>
+
+THRUST_NAMESPACE_BEGIN
+namespace cuda_cub
+{
+namespace detail
+{
+template <typename Derived, typename InputIt, typename Size, typename UnaryOp, typename T, typename BinaryOp>
+THRUST_RUNTIME_FUNCTION T transform_reduce_n_impl(
+  execution_policy<Derived>& policy, InputIt first, Size num_items, UnaryOp unary_op, T init, BinaryOp binary_op)
+{
+  cudaStream_t stream = cuda_cub::stream(policy);
+  cudaError_t status;
+
+  // Determine temporary device storage requirements.
+
+  size_t tmp_size = 0;
+
+  THRUST_INDEX_TYPE_DISPATCH(
+    status,
+    cub::DeviceReduce::TransformReduce,
+    num_items,
+    (nullptr, tmp_size, first, static_cast<T*>(nullptr), num_items_fixed, binary_op, unary_op, init, stream));
+  cuda_cub::throw_on_error(status, "after reduction step 1");
+
+  // Allocate temporary storage.
+
+  thrust::detail::temporary_array<std::uint8_t, Derived> tmp(policy, sizeof(T) + tmp_size);
+
+  // Run reduction.
+
+  // `tmp.begin()` yields a `normal_iterator`, which dereferences to a
+  // `reference`, which has an `operator&` that returns a `pointer`, which
+  // has a `.get` method that returns a raw pointer, which we can (finally)
+  // `static_cast` to `void*`.
+  //
+  // The array was dynamically allocated, so we assume that it's suitably
+  // aligned for any type of data. `malloc`/`cudaMalloc`/`new`/`std::allocator`
+  // make this guarantee.
+  T* ret_ptr    = thrust::detail::aligned_reinterpret_cast<T*>(tmp.data().get());
+  void* tmp_ptr = static_cast<void*>((tmp.data() + sizeof(T)).get());
+  THRUST_INDEX_TYPE_DISPATCH(
+    status,
+    cub::DeviceReduce::TransformReduce,
+    num_items,
+    (tmp_ptr, tmp_size, first, ret_ptr, num_items_fixed, binary_op, unary_op, init, stream));
+  cuda_cub::throw_on_error(status, "after reduction step 2");
+
+  // Synchronize the stream and get the value.
+
+  status = cuda_cub::synchronize(policy);
+  cuda_cub::throw_on_error(status, "reduce failed to synchronize");
+
+  // `tmp.begin()` yields a `normal_iterator`, which dereferences to a
+  // `reference`, which has an `operator&` that returns a `pointer`, which
+  // has a `.get` method that returns a raw pointer, which we can (finally)
+  // `static_cast` to `void*`.
+  //
+  // The array was dynamically allocated, so we assume that it's suitably
+  // aligned for any type of data. `malloc`/`cudaMalloc`/`new`/`std::allocator`
+  // make this guarantee.
+  return thrust::cuda_cub::get_value(policy, thrust::detail::aligned_reinterpret_cast<T*>(tmp.data().get()));
+}
+} // namespace detail
+
+_CCCL_EXEC_CHECK_DISABLE
+template <class Derived, class InputIt, class TransformOp, class T, class ReduceOp>
+T _CCCL_HOST_DEVICE transform_reduce(
+  execution_policy<Derived>& policy, InputIt first, InputIt last, TransformOp transform_op, T init, ReduceOp reduce_op)
+{
+  using size_type           = thrust::detail::it_difference_t<InputIt>;
+  const size_type num_items = static_cast<size_type>(::cuda::std::distance(first, last));
+
+  THRUST_CDP_DISPATCH(
+    (init = thrust::cuda_cub::detail::transform_reduce_n_impl(policy, first, num_items, transform_op, init, reduce_op);),
+    (init = thrust::transform_reduce(
+       cvt_to_seq(derived_cast(policy)), first, first + num_items, transform_op, init, reduce_op);));
+  return init;
+}
+} // namespace cuda_cub
+THRUST_NAMESPACE_END
+#endif // _CCCL_CUDA_COMPILATION()

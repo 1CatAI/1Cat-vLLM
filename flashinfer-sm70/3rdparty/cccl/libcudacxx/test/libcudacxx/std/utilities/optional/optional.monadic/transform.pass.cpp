@@ -1,0 +1,364 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// <cuda/std/optional>
+
+// template<class F> constexpr auto transform(F&&) &;
+// template<class F> constexpr auto transform(F&&) &&;
+// template<class F> constexpr auto transform(F&&) const&;
+// template<class F> constexpr auto transform(F&&) const&&;
+
+#include <cuda/std/cassert>
+#include <cuda/std/optional>
+#include <cuda/std/type_traits>
+
+#include "test_macros.h"
+
+struct LVal
+{
+  TEST_FUNC constexpr int operator()(int&)
+  {
+    return 1;
+  }
+  int operator()(const int&)  = delete;
+  int operator()(int&&)       = delete;
+  int operator()(const int&&) = delete;
+};
+
+struct CLVal
+{
+  int operator()(int&) = delete;
+  TEST_FUNC constexpr int operator()(const int&)
+  {
+    return 1;
+  }
+  int operator()(int&&)       = delete;
+  int operator()(const int&&) = delete;
+};
+
+struct RVal
+{
+  int operator()(int&)       = delete;
+  int operator()(const int&) = delete;
+  TEST_FUNC constexpr int operator()(int&&)
+  {
+    return 1;
+  }
+  int operator()(const int&&) = delete;
+};
+
+struct CRVal
+{
+  int operator()(int&)       = delete;
+  int operator()(const int&) = delete;
+  int operator()(int&&)      = delete;
+  TEST_FUNC constexpr int operator()(const int&&)
+  {
+    return 1;
+  }
+};
+
+struct RefQual
+{
+  TEST_FUNC constexpr int operator()(int) &
+  {
+    return 1;
+  }
+  int operator()(int) const&  = delete;
+  int operator()(int) &&      = delete;
+  int operator()(int) const&& = delete;
+};
+
+struct CRefQual
+{
+  int operator()(int) & = delete;
+  TEST_FUNC constexpr int operator()(int) const&
+  {
+    return 1;
+  }
+  int operator()(int) &&      = delete;
+  int operator()(int) const&& = delete;
+};
+
+struct RVRefQual
+{
+  int operator()(int) &      = delete;
+  int operator()(int) const& = delete;
+  TEST_FUNC constexpr int operator()(int) &&
+  {
+    return 1;
+  }
+  int operator()(int) const&& = delete;
+};
+
+struct RVCRefQual
+{
+  int operator()(int) &      = delete;
+  int operator()(int) const& = delete;
+  int operator()(int) &&     = delete;
+  TEST_FUNC constexpr int operator()(int) const&&
+  {
+    return 1;
+  }
+};
+
+struct NoCopy
+{
+  NoCopy() = default;
+  TEST_FUNC NoCopy(const NoCopy&)
+  {
+    assert(false);
+  }
+  TEST_FUNC int operator()(const NoCopy&&)
+  {
+    return 1;
+  }
+};
+
+struct NoMove
+{
+  NoMove()         = default;
+  NoMove(NoMove&&) = delete;
+  TEST_FUNC NoMove operator()(const NoCopy&&)
+  {
+    return NoMove{};
+  }
+};
+
+struct LValRef
+{
+  TEST_FUNC constexpr int& operator()(int& val)
+  {
+    return val;
+  }
+  int& operator()(const int&)  = delete;
+  int& operator()(int&&)       = delete;
+  int& operator()(const int&&) = delete;
+};
+
+struct RefQualRef
+{
+  TEST_FUNC constexpr int& operator()(int& val) &
+  {
+    return val;
+  }
+  int& operator()(int&) const&  = delete;
+  int& operator()(int&) &&      = delete;
+  int& operator()(int&) const&& = delete;
+};
+
+struct LValRefObj
+{
+  TEST_FUNC constexpr int operator()(int& val)
+  {
+    return val;
+  }
+  int operator()(const int&)  = delete;
+  int operator()(int&&)       = delete;
+  int operator()(const int&&) = delete;
+};
+
+struct RefQualRefObj
+{
+  TEST_FUNC constexpr int operator()(int& val) &
+  {
+    return val;
+  }
+  int operator()(int&) const&  = delete;
+  int operator()(int&) &&      = delete;
+  int operator()(int&) const&& = delete;
+};
+
+TEST_FUNC constexpr void test_val_types()
+{
+  // Test & overload
+  {
+    // Without & qualifier on F's operator()
+    {
+      cuda::std::optional<int> i{0};
+      assert(i.transform(LVal{}) == 1);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(LVal{})), cuda::std::optional<int>>);
+    }
+
+    // With & qualifier on F's operator()
+    {
+      cuda::std::optional<int> i{0};
+      RefQual l{};
+      assert(i.transform(l) == 1);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(l)), cuda::std::optional<int>>);
+    }
+  }
+
+  // Test const& overload
+  {
+    // Without & qualifier on F's operator()
+    {
+      const cuda::std::optional<int> i{0};
+      assert(i.transform(CLVal{}) == 1);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(CLVal{})), cuda::std::optional<int>>);
+    }
+
+    // With & qualifier on F's operator()
+    {
+      const cuda::std::optional<int> i{0};
+      const CRefQual l{};
+      assert(i.transform(l) == 1);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(l)), cuda::std::optional<int>>);
+    }
+  }
+
+  // Test && overload
+  {
+    // Without & qualifier on F's operator()
+    {
+      cuda::std::optional<int> i{0};
+      assert(cuda::std::move(i).transform(RVal{}) == 1);
+      static_assert(cuda::std::is_same_v<decltype(cuda::std::move(i).transform(RVal{})), cuda::std::optional<int>>);
+    }
+
+    // With & qualifier on F's operator()
+    {
+      cuda::std::optional<int> i{0};
+      assert(i.transform(RVRefQual{}) == 1);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(RVRefQual{})), cuda::std::optional<int>>);
+    }
+  }
+
+  // Test const&& overload
+  {
+    // Without & qualifier on F's operator()
+    {
+      const cuda::std::optional<int> i{0};
+      assert(cuda::std::move(i).transform(CRVal{}) == 1);
+      static_assert(cuda::std::is_same_v<decltype(cuda::std::move(i).transform(CRVal{})), cuda::std::optional<int>>);
+    }
+
+    // With & qualifier on F's operator()
+    {
+      const cuda::std::optional<int> i{0};
+      const RVCRefQual l{};
+      assert(i.transform(cuda::std::move(l)) == 1);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(cuda::std::move(l))), cuda::std::optional<int>>);
+    }
+  }
+
+  // Test optional<T&> overload
+  {
+    int value = 42;
+    // Without & qualifier on F's operator()
+    {
+      cuda::std::optional<int&> i{};
+      assert(!i.transform(LValRef{}).has_value());
+
+      i = value;
+      assert(i.transform(LValRef{}) == 42);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(LValRef{})), cuda::std::optional<int&>>);
+    }
+
+    // With & qualifier on F's operator()
+    {
+      cuda::std::optional<int&> i{};
+      RefQualRef l{};
+      assert(!i.transform(l).has_value());
+
+      i = value;
+      assert(i.transform(l) == 42);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(l)), cuda::std::optional<int&>>);
+    }
+
+    // Without & qualifier on F's operator() returning an object type
+    {
+      cuda::std::optional<int&> i{};
+      assert(!i.transform(LValRefObj{}).has_value());
+
+      i = value;
+      assert(i.transform(LValRefObj{}) == 42);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(LValRefObj{})), cuda::std::optional<int>>);
+    }
+
+    // With & qualifier on F's operator() returning an object type
+    {
+      cuda::std::optional<int&> i{};
+      RefQualRefObj l{};
+      assert(!i.transform(l).has_value());
+
+      i = value;
+      assert(i.transform(l) == 42);
+      static_assert(cuda::std::is_same_v<decltype(i.transform(l)), cuda::std::optional<int>>);
+    }
+  }
+}
+
+struct NonConst
+{
+  TEST_FUNC int non_const()
+  {
+    return 1;
+  }
+};
+
+// For a generic lambda, nvrtc appears to not know what to do and claims it needs an annotation (when normal lambdas
+// don't). This is an expanded lambda from the original test.
+struct nvrtc_workaround
+{
+  template <typename T>
+  TEST_FUNC int operator()(T&& t)
+  {
+    return t.non_const();
+  }
+};
+
+// check that the lambda body is not instantiated during overload resolution
+TEST_FUNC constexpr void test_sfinae()
+{
+  cuda::std::optional<NonConst> opt{};
+  auto l = nvrtc_workaround(); // [](auto&& x) { return x.non_const(); };
+  opt.transform(l);
+  cuda::std::move(opt).transform(l);
+}
+
+TEST_FUNC constexpr bool test()
+{
+  test_sfinae();
+  test_val_types();
+  cuda::std::optional<int> opt{};
+  const auto& copt = opt;
+
+  const auto never_called = [](int) {
+    assert(false);
+    return 0;
+  };
+
+  opt.transform(never_called);
+  cuda::std::move(opt).transform(never_called);
+  copt.transform(never_called);
+  cuda::std::move(copt).transform(never_called);
+
+// the code below depends on guaranteed copy/move elision
+#if (!TEST_COMPILER(MSVC) || TEST_STD_VER >= 2020)
+  cuda::std::optional<NoCopy> nc;
+  const auto& cnc = nc;
+  cuda::std::move(nc).transform(NoCopy{});
+  cuda::std::move(cnc).transform(NoCopy{});
+
+  cuda::std::move(nc).transform(NoMove{});
+  cuda::std::move(cnc).transform(NoMove{});
+#endif
+
+  return true;
+}
+
+int main(int, char**)
+{
+  test();
+#if TEST_STD_VER > 2017
+  static_assert(test());
+#endif
+  return 0;
+}

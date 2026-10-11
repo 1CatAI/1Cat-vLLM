@@ -772,6 +772,10 @@ class KernelConfig:
     M1..20, H6, D256. Speculative draft attention retains its existing path."""
     sm70_qsa_shared_key: bool = True
     """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
+    sm70_flashinfer_qsa: Literal["off", "candidate", "force"] = "off"
+    """Use the independent FlashInfer SM70 request-grouped scorer experimentally.
+    Candidate records unsupported shapes and retains their existing routes;
+    force rejects them. No automatic performance admission is implied."""
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
     qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"

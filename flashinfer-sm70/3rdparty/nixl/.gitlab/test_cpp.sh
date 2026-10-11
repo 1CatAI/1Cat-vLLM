@@ -1,0 +1,133 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+# shellcheck disable=SC1091
+. "$(dirname "$0")/../.ci/scripts/common.sh"
+
+set -e
+set -x
+ulimit -c unlimited
+TEXT_YELLOW="\033[1;33m"
+TEXT_CLEAR="\033[0m"
+
+# Parse commandline arguments with first argument being the install directory.
+INSTALL_DIR=$1
+PREVDIR=$(dirname "$(readlink -f "$0")")
+
+if [ -z "$INSTALL_DIR" ]; then
+    echo "Usage: $0 <install_dir>"
+    exit 1
+fi
+
+ARCH=$(uname -m)
+[ "$ARCH" = "arm64" ] && ARCH="aarch64"
+
+export LD_LIBRARY_PATH=${INSTALL_DIR}/lib:${INSTALL_DIR}/lib/$ARCH-linux-gnu:${INSTALL_DIR}/lib/$ARCH-linux-gnu/plugins:/usr/local/lib:$LD_LIBRARY_PATH
+
+export CPATH=${INSTALL_DIR}/include:$CPATH
+export PATH=${INSTALL_DIR}/bin:$PATH
+export PKG_CONFIG_PATH=${INSTALL_DIR}/lib/pkgconfig:$PKG_CONFIG_PATH
+export NIXL_PLUGIN_DIR=${INSTALL_DIR}/lib/$ARCH-linux-gnu/plugins
+
+echo "==== Show system info ===="
+env
+nvidia-smi topo -m || true
+ibv_devinfo || true
+uname -a || true
+cat /sys/devices/virtual/dmi/id/product_name || true
+
+echo "==== NVIDIA Peermem check ===="
+if ! lsmod | grep -q nvidia_peermem; then
+    echo "nvidia_peermem module not loaded"
+fi
+
+if [ -f /sys/kernel/mm/memory_peers/nv_mem/version ]; then
+    cat /sys/kernel/mm/memory_peers/nv_mem/version
+else
+    echo "/sys/kernel/mm/memory_peers/nv_mem/version not found "
+fi
+
+if [ -f /sys/module/nvidia_peermem/version ]; then
+    cat /sys/module/nvidia_peermem/version
+else
+    echo "/sys/module/nvidia_peermem/version not found"
+fi
+
+if [ -f /sys/module/nv_peer_mem/version ]; then
+    cat /sys/module/nv_peer_mem/version
+else
+    echo "/sys/module/nv_peer_mem/version not found"
+fi
+
+start_etcd_server "/nixl/cpp_ci"
+
+echo "==== Running C++ tests ===="
+cd ${INSTALL_DIR}
+./bin/desc_example
+./bin/agent_example
+./bin/nixl_example
+if $TEST_LIBFABRIC ; then
+    ./bin/nixl_example LIBFABRIC
+fi
+./bin/nixl_etcd_example
+./bin/ucx_backend_test
+mkdir -p /tmp/telemetry_test
+NIXL_TELEMETRY_ENABLE=y NIXL_TELEMETRY_DIR=/tmp/telemetry_test ./bin/agent_example &
+sleep 5
+./bin/telemetry_reader /tmp/telemetry_test/Agent001 &
+telePID=$!
+sleep 15
+kill -s INT $telePID
+
+# POSIX test disabled until we solve io_uring and Docker compatibility
+
+./bin/nixl_posix_test -n 128 -s 1048576
+./bin/nixl_gusli_test -n 4 -s 16
+./bin/ucx_backend_multi
+./bin/serdes_test
+# TODO: Enable Mooncake test once data corruption issue is resolved
+# if $HAS_GPU ; then
+#     ./bin/mooncake_backend_test
+# fi
+
+# shellcheck disable=SC2154
+gtest-parallel --workers=1 --serialize_test_cases ./bin/gtest -- --min-tcp-port="$min_gtest_port" --max-tcp-port="$max_gtest_port"
+./bin/test_plugin
+
+# DOCA telemetry exporter tests: present only when built with the DOCA SDK
+# (TELEMETRY_DOCA). Self-contained - each binds a free loopback port via
+# findFreePort(); the DOCA telemetry exporter libs resolve through ldconfig.
+if [ -x ./bin/doca_test ]; then ./bin/doca_test; fi
+if [ -x ./bin/doca_nixl_test ]; then ./bin/doca_nixl_test; fi
+
+# Run NIXL client-server test
+nixl_test_port=$(get_next_tcp_port)
+parallel --line-buffer --halt now,fail=1 ::: "./bin/nixl_test target" "sleep 3 ; ./bin/nixl_test initiator" ::: "127.0.0.1 $nixl_test_port"
+
+echo "${TEXT_YELLOW}==== Disabled tests==="
+echo "./bin/md_streamer disabled"
+echo "./bin/p2p_test disabled"
+echo "./bin/ucx_worker_test disabled"
+echo "${TEXT_CLEAR}"
+
+kill -9 $ETCD_PID 2>/dev/null || true
+
+sleep 5
+
+# Sample test for Azure Blob Plugin - should be changed to their gtest
+cd $PREVDIR
+./test_azure.sh

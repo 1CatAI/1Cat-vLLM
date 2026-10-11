@@ -1,0 +1,139 @@
+/*
+ * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include "../include/moe_gemm_kernels.h"
+#include "cutlass/arch/mma_sm90.h"
+#include "cutlass_extensions/epilogue_helpers.h"
+
+#ifdef ENABLE_FP4
+#include "tensorrt_llm/kernels/cutlass_kernels/fp4_compat.h"
+#endif
+
+namespace tensorrt_llm::kernels::cutlass_kernels {
+
+// Blackwell arch
+template <typename T, typename WeightType,
+          typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
+          TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
+              TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
+constexpr bool isValidSM120MOESpecialisation() {
+  if constexpr (Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION) {
+    return false;
+  }
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)  // TODO Is there a better choice
+#if defined(ENABLE_FP4)
+  return ((cutlass::platform::is_same<T, Fp4Type>::value &&
+           cutlass::platform::is_same<T, WeightType>::value) ||
+          (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
+           cutlass::platform::is_same<WeightType, Fp4Type>::value)) &&
+         cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
+#else
+  return false;
+#endif
+#else
+  return false;  // CUTLASS_ARCH_MMA_SM100_SUPPORTED is set when Blackwell kernels are enabled
+#endif
+}
+
+template <typename T, typename WeightType,
+          typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
+          TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
+              TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
+constexpr bool isValidBlackwellMOESpecialisation() {
+#if defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)  // TODO Is there a better choice
+  if constexpr (Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION) {
+    constexpr bool is_bf16 = cutlass::platform::is_same<T, __nv_bfloat16>::value;
+#if defined(ENABLE_FP8)
+    constexpr bool is_mxfp8 = cutlass::platform::is_same<T, __nv_fp8_e4m3>::value;
+#else
+    constexpr bool is_mxfp8 = false;
+#endif
+    return (is_bf16 || is_mxfp8) && cutlass::platform::is_same<T, WeightType>::value &&
+           cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
+  }
+#if defined(ENABLE_FP4)
+  return (cutlass::platform::is_same<T, WeightType>::value ||
+#if defined(ENABLE_FP4)
+          (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
+           cutlass::platform::is_same<WeightType, Fp4Type>::value)
+#else
+          false
+#endif
+              ) &&
+         cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
+#else
+  return cutlass::platform::is_same<T, WeightType>::value &&
+         cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
+#endif
+#else
+  return false;  // CUTLASS_ARCH_MMA_SM100_SUPPORTED is set when Blackwell kernels are enabled
+#endif
+}
+
+// Hopper arch
+template <typename T, typename WeightType,
+          typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
+          TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
+              TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
+constexpr bool isValidHopperMOESpecialisation() {
+  if constexpr (Fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::ACTIVATION) {
+    return false;
+  }
+#if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
+  return (cutlass::platform::is_same<T, WeightType>::value ||
+          (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value &&
+           cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
+#ifdef ENABLE_FP4
+          || cutlass::platform::is_same<Fp4Type, WeightType>::value
+#endif
+          )
+#ifdef ENABLE_FP4
+         && !cutlass::platform::is_same<T, Fp4Type>::value
+#endif
+         && cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
+#else
+  return false;  // CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED is set when Hopper kernels are
+                 // enabled
+#endif
+}
+
+template <typename T, typename WeightType,
+          typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
+          TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
+              TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
+constexpr bool isValidTmaWarpSpecializedMOESpecialisation() {
+  // Check at least one of the implementations are valid
+  return isValidSM120MOESpecialisation<T, WeightType, EpilogueTag, Fusion>() ||
+         isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag, Fusion>() ||
+         isValidHopperMOESpecialisation<T, WeightType, EpilogueTag, Fusion>();
+}
+
+// Hopper arch
+template <typename T, typename WeightType,
+          typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
+          TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
+              TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
+constexpr bool isValidAmpereMOESpecialisation() {
+#ifdef ENABLE_FP4
+  return !std::is_same_v<T, Fp4Type> && !std::is_same_v<WeightType, Fp4Type>;
+#else
+  return true;  // Default to true
+#endif
+}
+
+}  // namespace tensorrt_llm::kernels::cutlass_kernels

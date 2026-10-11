@@ -1273,6 +1273,21 @@ def get_requirements() -> list[str]:
         requirements = _read_requirements("common.txt")
     elif _is_cuda():
         requirements = _read_requirements("cuda.txt")
+        if _cuda_arch_contains(7, 0):
+            # The independently packaged fork is the sole SM70 provider. The
+            # modern optional backends must not pull CUDA 13 into this stack.
+            optional_providers = (
+                "flashinfer-python",
+                "flashinfer-cubin",
+                "apache-tvm-ffi",
+                "nvidia-cutlass-dsl",
+                "quack-kernels",  # CuTe DSL would otherwise return transitively.
+                "humming-kernels",
+            )
+            requirements = [
+                req for req in requirements if not req.startswith(optional_providers)
+            ]
+            requirements += _read_requirements("flashinfer-sm70.txt")
         cuda_major, cuda_minor = torch.version.cuda.split(".")
         # An SM70 wheel is a CUDA 12.8 release artifact.  Keep its runtime
         # dependency on the matching PyTorch wheel in the wheel metadata so a

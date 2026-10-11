@@ -1,0 +1,90 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// template<class F, class... Args>
+// concept predicate;
+
+#include <cuda/std/concepts>
+#include <cuda/std/type_traits>
+
+#include "test_macros.h"
+
+using cuda::std::predicate;
+
+static_assert(predicate<bool()>);
+static_assert(predicate<bool (*)()>);
+static_assert(predicate<bool (&)()>);
+
+static_assert(!predicate<void()>);
+static_assert(!predicate<void (*)()>);
+static_assert(!predicate<void (&)()>);
+
+struct S
+{};
+
+static_assert(!predicate<S(int), int>);
+static_assert(!predicate<S(double), double>);
+static_assert(predicate<int S::*, S*>);
+static_assert(predicate<int (S::*)(), S*>);
+static_assert(predicate<int (S::*)(), S&>);
+static_assert(!predicate<void (S::*)(), S*>);
+static_assert(!predicate<void (S::*)(), S&>);
+
+static_assert(!predicate<bool(S)>);
+static_assert(!predicate<bool(S)>);
+#if !TEST_COMPILER(MSVC) || TEST_STD_VER > 2017 // unspecified MSVC bug
+static_assert(!predicate<bool(S&), S>);
+#endif // !TEST_COMPILER(MSVC) || TEST_STD_VER > 2017
+static_assert(!predicate<bool(S&), S const&>);
+static_assert(predicate<bool(S&), S&>);
+
+struct Predicate
+{
+  TEST_FUNC bool operator()(int, double, char);
+};
+static_assert(predicate<Predicate, int, double, char>);
+static_assert(predicate<Predicate&, int, double, char>);
+static_assert(!predicate<const Predicate, int, double, char>);
+static_assert(!predicate<const Predicate&, int, double, char>);
+
+#if !TEST_COMPILER(NVRTC)
+template <class Fun>
+TEST_FUNC constexpr bool check_lambda(Fun)
+{
+  return predicate<Fun>;
+}
+
+static_assert(check_lambda([] {
+  return cuda::std::true_type();
+}));
+static_assert(check_lambda([]() -> int* {
+  return nullptr;
+}));
+
+struct boolean
+{
+  TEST_FUNC operator bool() const noexcept;
+};
+static_assert(check_lambda([] {
+  return boolean();
+}));
+
+struct explicit_bool
+{
+  TEST_FUNC explicit operator bool() const noexcept;
+};
+static_assert(!check_lambda([] {
+  return explicit_bool();
+}));
+#endif // !TEST_COMPILER(NVRTC)
+
+int main(int, char**)
+{
+  return 0;
+}

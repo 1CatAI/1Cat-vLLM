@@ -130,6 +130,13 @@ class QSAIndexer(nn.Module):
         # while continuing to update the QSA side cache.
         self.skip_topk = False
         self.shared_key_scoring = vllm_config.kernel_config.sm70_qsa_shared_key
+        self.flashinfer_scorer = None
+        if vllm_config.kernel_config.sm70_flashinfer_qsa != "off":
+            from vllm.model_executor.kernels.flashinfer_sm70 import FlashInferQsaScorer
+
+            self.flashinfer_scorer = FlashInferQsaScorer(
+                vllm_config.kernel_config.sm70_flashinfer_qsa
+            )
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -361,6 +368,7 @@ class QSAIndexer(nn.Module):
             out,
             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
             shared_key_scoring=self.shared_key_scoring,
+            score_provider=self.flashinfer_scorer,
         )
 
 

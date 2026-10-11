@@ -1,0 +1,181 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of libcu++, the C++ Standard Library for your entire system,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: force-tile
+// error: dynamic allocation is not supported in tile mode
+
+// UNSUPPORTED: enable-tile
+// error: assertion failed
+
+// Self assignment post-conditions are tested.
+// ADDITIONAL_COMPILE_OPTIONS_HOST: -Wno-self-move
+
+// <memory>
+
+// unique_ptr
+
+// Test unique_ptr move assignment
+
+// test move assignment.  Should only require a MoveConstructible deleter, or if
+//    deleter is a reference, not even that.
+
+#include <cuda/std/__memory_>
+#include <cuda/std/cassert>
+#include <cuda/std/utility>
+
+#include "deleter_types.h"
+#include "test_macros.h"
+#include "unique_ptr_test_helper.h"
+
+struct GenericDeleter
+{
+  TEST_HOST_DEVICE_FUNC void operator()(void*) const;
+};
+
+template <bool IsArray>
+TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 void test_basic()
+{
+  using VT               = typename cuda::std::conditional<IsArray, A[], A>::type;
+  const int expect_alive = IsArray ? 5 : 1;
+  {
+    cuda::std::unique_ptr<VT> s1(newValue<VT>(expect_alive));
+    A* p = s1.get();
+    cuda::std::unique_ptr<VT> s2(newValue<VT>(expect_alive));
+    if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+    {
+      assert(A_count == (expect_alive * 2));
+    }
+    s2 = cuda::std::move(s1);
+    if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+    {
+      assert(A_count == expect_alive);
+    }
+    assert(s2.get() == p);
+    assert(s1.get() == 0);
+  }
+  if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+  {
+    assert(A_count == 0);
+  }
+  {
+    cuda::std::unique_ptr<VT, Deleter<VT>> s1(newValue<VT>(expect_alive), Deleter<VT>(5));
+    A* p = s1.get();
+    cuda::std::unique_ptr<VT, Deleter<VT>> s2(newValue<VT>(expect_alive));
+    if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+    {
+      assert(A_count == (expect_alive * 2));
+    }
+    s2 = cuda::std::move(s1);
+    assert(s2.get() == p);
+    assert(s1.get() == 0);
+    if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+    {
+      assert(A_count == expect_alive);
+    }
+    assert(s2.get_deleter().state() == 5);
+    assert(s1.get_deleter().state() == 0);
+  }
+  if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+  {
+    assert(A_count == 0);
+  }
+  {
+    CDeleter<VT> d1(5);
+    cuda::std::unique_ptr<VT, CDeleter<VT>&> s1(newValue<VT>(expect_alive), d1);
+    A* p = s1.get();
+    CDeleter<VT> d2(6);
+    cuda::std::unique_ptr<VT, CDeleter<VT>&> s2(newValue<VT>(expect_alive), d2);
+    s2 = cuda::std::move(s1);
+    assert(s2.get() == p);
+    assert(s1.get() == 0);
+    if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+    {
+      assert(A_count == expect_alive);
+    }
+    assert(d1.state() == 5);
+    assert(d2.state() == 5);
+  }
+  if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+  {
+    assert(A_count == 0);
+  }
+  {
+    cuda::std::unique_ptr<VT> s(newValue<VT>(expect_alive));
+    A* p = s.get();
+    s    = cuda::std::move(s);
+    if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+    {
+      assert(A_count == expect_alive);
+    }
+    assert(s.get() == p);
+  }
+  if (!TEST_IS_CONSTANT_EVALUATED_CXX23())
+  {
+    assert(A_count == 0);
+  }
+}
+
+template <bool IsArray>
+TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 void test_sfinae()
+{
+  using VT = typename cuda::std::conditional<IsArray, int[], int>::type;
+  {
+    using U = cuda::std::unique_ptr<VT>;
+    static_assert(!cuda::std::is_assignable<U, U&>::value);
+    static_assert(!cuda::std::is_assignable<U, const U&>::value);
+    static_assert(!cuda::std::is_assignable<U, const U&&>::value);
+    static_assert(cuda::std::is_nothrow_assignable<U, U&&>::value);
+  }
+  {
+    using U = cuda::std::unique_ptr<VT, GenericDeleter>;
+    static_assert(!cuda::std::is_assignable<U, U&>::value);
+    static_assert(!cuda::std::is_assignable<U, const U&>::value);
+    static_assert(!cuda::std::is_assignable<U, const U&&>::value);
+    static_assert(cuda::std::is_nothrow_assignable<U, U&&>::value);
+  }
+  {
+    using U = cuda::std::unique_ptr<VT, NCDeleter<VT>&>;
+    static_assert(!cuda::std::is_assignable<U, U&>::value);
+    static_assert(!cuda::std::is_assignable<U, const U&>::value);
+    static_assert(!cuda::std::is_assignable<U, const U&&>::value);
+    static_assert(cuda::std::is_nothrow_assignable<U, U&&>::value);
+  }
+  {
+    using U = cuda::std::unique_ptr<VT, const NCDeleter<VT>&>;
+    static_assert(!cuda::std::is_assignable<U, U&>::value);
+    static_assert(!cuda::std::is_assignable<U, const U&>::value);
+    static_assert(!cuda::std::is_assignable<U, const U&&>::value);
+    static_assert(cuda::std::is_nothrow_assignable<U, U&&>::value);
+  }
+}
+
+TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 bool test()
+{
+  {
+    test_basic</*IsArray*/ false>();
+    test_sfinae<false>();
+  }
+  {
+    test_basic</*IsArray*/ true>();
+    test_sfinae<true>();
+  }
+
+  return true;
+}
+
+int main(int, char**)
+{
+  test();
+#if TEST_STD_VER >= 2023
+  static_assert(test());
+#endif // TEST_STD_VER >= 2023
+
+  return 0;
+}

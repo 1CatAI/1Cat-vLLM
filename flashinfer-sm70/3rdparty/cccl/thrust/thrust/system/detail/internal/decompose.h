@@ -1,0 +1,102 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+THRUST_NAMESPACE_BEGIN
+namespace system::detail::internal
+{
+template <typename IndexType>
+class index_range
+{
+public:
+  using index_type = IndexType;
+
+  _CCCL_HOST_DEVICE index_range(index_type begin, index_type end)
+      : m_begin(begin)
+      , m_end(end)
+  {}
+
+  _CCCL_HOST_DEVICE index_type begin() const
+  {
+    return m_begin;
+  }
+
+  _CCCL_HOST_DEVICE index_type end() const
+  {
+    return m_end;
+  }
+
+  _CCCL_HOST_DEVICE index_type size() const
+  {
+    return m_end - m_begin;
+  }
+
+private:
+  index_type m_begin;
+  index_type m_end;
+};
+
+template <typename IndexType>
+class uniform_decomposition
+{
+public:
+  using index_type = IndexType;
+  using range_type = index_range<index_type>;
+
+  _CCCL_HOST_DEVICE uniform_decomposition(index_type N, index_type granularity, index_type max_intervals)
+      : m_N(N)
+      , m_intervals((N + granularity - 1) / granularity)
+      , m_threshold(0)
+      , m_small_interval(granularity)
+      , m_large_interval(0)
+  {
+    if (m_intervals > max_intervals)
+    {
+      m_small_interval = granularity * (m_intervals / max_intervals);
+      m_large_interval = m_small_interval + granularity;
+      m_threshold      = m_intervals % max_intervals;
+      m_intervals      = max_intervals;
+    }
+  }
+
+  _CCCL_HOST_DEVICE index_range<index_type> operator[](const index_type& i) const
+  {
+    if (i < m_threshold)
+    {
+      index_type begin = m_large_interval * i;
+      index_type end   = begin + m_large_interval;
+      return range_type(begin, end);
+    }
+    else
+    {
+      index_type begin = m_large_interval * m_threshold + m_small_interval * (i - m_threshold);
+      index_type end   = (begin + m_small_interval < m_N) ? begin + m_small_interval : m_N;
+      return range_type(begin, end);
+    }
+  }
+
+  _CCCL_HOST_DEVICE index_type size() const
+  {
+    return m_intervals;
+  }
+
+private:
+  index_type m_N;
+  index_type m_intervals;
+  index_type m_threshold;
+  index_type m_small_interval;
+  index_type m_large_interval;
+};
+} // namespace system::detail::internal
+THRUST_NAMESPACE_END

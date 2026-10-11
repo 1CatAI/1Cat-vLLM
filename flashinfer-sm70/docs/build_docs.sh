@@ -1,0 +1,17 @@
+#!/bin/bash
+set -eo pipefail
+set -x
+echo "Building FlashInfer documentation..."
+
+# Install flashinfer package first
+echo "Installing FlashInfer package..."
+pip install -e ..
+
+make clean
+make SPHINXOPTS='-T -v' html
+
+# Add RunLLM widget to generated HTML files
+echo "Adding RunLLM widget to documentation..."
+python3 wrap_run_llm.py
+
+echo "Documentation build complete!"

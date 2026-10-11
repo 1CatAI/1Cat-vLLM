@@ -1,0 +1,22 @@
+# Rust
+**/target/
+
+.vscode
+
+# AWS EFA test files
+contrib/aws-efa/aws_vars.json
+
+# CuFile Logs
+cufile.log
+
+# clangd
+.cache/
+
+# Ignore subproject non-tracked files and sub-directories
+subprojects/*
+!subprojects/packagefiles/
+!subprojects/*.wrap
+
+# Local Python environments
+.venv/
+.venv*/

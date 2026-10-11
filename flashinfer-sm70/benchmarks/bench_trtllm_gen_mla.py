@@ -1,0 +1,237 @@
+import numpy as np
+import torch
+
+import flashinfer
+from flashinfer.testing.utils import bench_gpu_time
+
+num_q_heads = 128
+qk_nope_head_dim = 128
+qk_rope_head_dim = 64
+kv_lora_rank = 512
+
+
+def bench_trtllm_mla(
+    batch_size,
+    q_len_per_request,
+    seq_len,
+    page_size,
+    dtype,
+    backend="auto",
+    with_sinks=False,
+):
+    """Benchmark a single (config, backend, sinks?) cell.
+
+    `with_sinks=True` allocates a per-head sinks tensor and passes it via
+    the `sinks=` kwarg.  Currently supported by trtllm-gen and cute-dsl
+    on MLA decode; xqa MLA rejects sinks.  Output line includes the sinks
+    flag so two cells can be diffed cleanly.
+    """
+    torch.manual_seed(42)
+    device = "cuda:0"
+
+    # Initialize tensors
+    query = torch.randn(
+        batch_size,
+        q_len_per_request,
+        num_q_heads,
+        kv_lora_rank + qk_rope_head_dim,
+        device=device,
+    ).to(dtype)
+
+    num_tokens = seq_len * batch_size
+    num_blocks = (num_tokens + page_size - 1) // page_size
+
+    # Sequence lengths and block tables
+    seq_lens = [torch.randint(1, seq_len, (1,)).item() for _ in range(batch_size)]
+    seq_lens[-1] = seq_len
+    max_seq_len = max(seq_lens)
+    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int, device=device)
+
+    blocks_per_seq = (seq_lens_tensor + page_size - 1) // page_size
+    max_num_blocks_per_seq = blocks_per_seq.max().item()
+
+    # Generate random but unique block IDs for all sequences
+    total_blocks_needed = sum(blocks_per_seq)
+    all_block_ids = torch.randperm(
+        total_blocks_needed, device=device
+    )  # Random permutation
+
+    # Generate unique block IDs for all sequences
+    block_id = 0
+    block_tables = torch.zeros(
+        (batch_size, max_num_blocks_per_seq), dtype=torch.int, device=device
+    )
+
+    # Populate block tables and track block assignments
+    block_id = 0
+    for i in range(batch_size):
+        num_blocks_needed = blocks_per_seq[i]
+        block_tables[i, :num_blocks_needed] = all_block_ids[
+            block_id : block_id + num_blocks_needed
+        ]
+        block_id += num_blocks_needed
+
+    # Create interleaved KV cache
+    # Allocate more than needed blocks, block_id is just enough, to mimick real-world cases
+    kv_cache = torch.randn(
+        size=(num_blocks, page_size, kv_lora_rank + qk_rope_head_dim), device=device
+    ).to(dtype)
+    # (num_blocks, 1, page_size, kv_lora_rank + qk_rope_head_dim)
+
+    # Allocate workspace buffer
+    # todo(Yingyi): calculate the actual size of workspace buffer
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    sinks = (
+        torch.randn(num_q_heads, dtype=torch.float32, device=device)
+        if with_sinks
+        else None
+    )
+
+    common_kwargs = dict(
+        query=query,
+        kv_cache=kv_cache.unsqueeze(1),
+        workspace_buffer=workspace_buffer,
+        qk_nope_head_dim=qk_nope_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_tables=block_tables,
+        seq_lens=seq_lens_tensor,
+        max_seq_len=max_seq_len,
+        bmm1_scale=1.0 / ((128 + 64) ** 0.5),
+        bmm2_scale=1.0,
+        sinks=sinks,
+        backend=backend,
+    )
+
+    # Run decode-MLA
+    # warmup
+    flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(**common_kwargs)
+    # benchmark
+    # NOTE: cold_l2_cache=True is requested but silently degrades to warm-L2
+    # because the inputs are captured in the lambda's closure rather than
+    # passed via input_kwargs= (bench_gpu_time only flushes/rotates GPU
+    # tensors it can find by introspecting its own args).  We accept this:
+    # both backends are measured under identical warm-L2 conditions, so
+    # cross-backend comparisons remain fair, only absolute GB/s numbers
+    # are optimistic vs. a real cold-cache serving workload.
+    measurements = bench_gpu_time(
+        lambda: flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            **common_kwargs
+        ),
+        dry_run_iters=5,
+        repeat_iters=30,
+        enable_cupti=False,
+        use_cuda_graph=True,
+        cold_l2_cache=True,
+    )
+    ms = np.median(measurements)
+
+    # Memory bandwidth calculation based on actual bytes accessed
+    elem_size = query.element_size()
+    # Query bytes: batch_size * q_len_per_request * num_heads * head_dim
+    q_mem_bytes = query.numel() * elem_size
+    # KV cache bytes: actual tokens accessed (sum of seq_lens), not full allocation
+    actual_kv_tokens = sum(seq_lens)
+    kv_mem_bytes = actual_kv_tokens * (kv_lora_rank + qk_rope_head_dim) * elem_size
+    # Output bytes: batch_size * q_len_per_request * num_heads * kv_lora_rank
+    o_mem_bytes = (
+        batch_size * q_len_per_request * num_q_heads * kv_lora_rank * elem_size
+    )
+    total_mem_bytes = q_mem_bytes + kv_mem_bytes + o_mem_bytes
+
+    flops = (
+        2
+        * num_q_heads
+        * (2 * kv_lora_rank + qk_rope_head_dim)
+        * actual_kv_tokens
+        * q_len_per_request
+    )
+    print(
+        f"backend={backend}, sinks={with_sinks}, batch_size={batch_size}, q_len_per_request={q_len_per_request}, seq_len={seq_len}, num_q_heads={num_q_heads}, qk_nope_head_dim={qk_nope_head_dim}, qk_rope_head_dim={qk_rope_head_dim}, kv_lora_rank={kv_lora_rank}, page_size={page_size}"
+    )
+    print(f"execution time: {ms:.4f} ms")
+    print(f"memory bandwidth: {total_mem_bytes / ms / 1e6:.2f} GB/s")
+    print(f"FLOPs: {flops / ms / 1e9:.2f} TFLOPs/s")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Benchmark trtllm MLA decode")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        help="Backend to use (auto, trtllm-gen, cute-dsl)",
+    )
+    args = parser.parse_args()
+
+    q_lens = [1, 2, 4, 8, 16]
+
+    # Main perf sweep — without sinks, same shape grid as the original
+    # script.  Doubling every cell with a sinks pass would explode runtime
+    # without adding signal: sinks adds a small per-call overhead that's
+    # uniform across shapes, so a focused sub-sweep below is enough to
+    # characterise it.
+    for dtype in [torch.bfloat16, torch.float8_e4m3fn]:
+        for page_size in [32, 64]:
+            for batch_size in [1, 2, 4, 16, 32, 64, 128, 256, 512, 768, 1024]:
+                for seq_len in [1024, 4096, 8192]:
+                    for q_len_per_request in q_lens:
+                        try:
+                            bench_trtllm_mla(
+                                batch_size,
+                                q_len_per_request,
+                                seq_len,
+                                page_size,
+                                dtype,
+                                backend=args.backend,
+                                with_sinks=False,
+                            )
+                        except ValueError as e:
+                            print(f"SKIPPED: {e}")
+                            print()
+                        except Exception as e:
+                            print(
+                                f"ERROR: batch_size={batch_size}, q_len={q_len_per_request}, "
+                                f"seq_len={seq_len}, page_size={page_size}, dtype={dtype}, "
+                                f"backend={args.backend}: {type(e).__name__}: {e}"
+                            )
+                            print()
+
+    # Focused sinks sub-sweep — small representative grid that exercises
+    # the sinks code path on both backends that support it (trtllm-gen and
+    # cute-dsl; xqa MLA rejects sinks).  Pairs with the no-sinks rows above
+    # at the same shapes so users can read the sinks overhead off the diff.
+    if args.backend != "xqa":
+        print()
+        print("=" * 72)
+        print("Focused sinks sub-sweep (with_sinks=True)")
+        print("=" * 72)
+        for batch_size in [1, 16, 128]:
+            for seq_len in [1024, 8192]:
+                try:
+                    bench_trtllm_mla(
+                        batch_size,
+                        q_len_per_request=1,
+                        seq_len=seq_len,
+                        page_size=64,
+                        dtype=torch.bfloat16,
+                        backend=args.backend,
+                        with_sinks=True,
+                    )
+                except ValueError as e:
+                    # Mirrors the main sweep above: ValueError = "config not
+                    # supported by this backend", logged but not surfaced.
+                    print(f"SKIPPED: {e}")
+                    print()
+                except Exception as e:
+                    # Anything else is unexpected; surface with type name so
+                    # the failure isn't silently swallowed.
+                    print(
+                        f"ERROR: backend={args.backend}, sinks=True, "
+                        f"batch_size={batch_size}, seq_len={seq_len}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    print()

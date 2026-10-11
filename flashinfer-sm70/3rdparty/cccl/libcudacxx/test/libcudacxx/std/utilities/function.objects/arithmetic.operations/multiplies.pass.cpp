@@ -1,0 +1,84 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// <cuda/std/functional>
+
+// multiplies
+
+// ADDITIONAL_COMPILE_DEFINITIONS: CCCL_IGNORE_DEPRECATED_API
+
+#include <cuda/std/cassert>
+#include <cuda/std/functional>
+#include <cuda/std/type_traits>
+
+#include "test_macros.h"
+
+// ensure that we allow `__device__` functions too
+struct with_device_op
+{
+  TEST_DEVICE_FUNC friend constexpr with_device_op operator*(const with_device_op&, const with_device_op&)
+  {
+    return {};
+  }
+  TEST_DEVICE_FUNC constexpr operator bool() const
+  {
+    return true;
+  }
+};
+
+__global__ void test_global_kernel()
+{
+  const cuda::std::multiplies<with_device_op> f;
+  assert(f({}, {}));
+}
+
+#if _CCCL_TILE_COMPILATION()
+// ensure that we allow `__tile__` functions too
+struct with_tile_op
+{
+  TEST_TILE_FUNC friend constexpr with_tile_op operator*(const with_tile_op&, const with_tile_op&)
+  {
+    return {};
+  }
+  TEST_TILE_FUNC constexpr operator bool() const
+  {
+    return true;
+  }
+};
+
+__tile_global__ void test_tile_kernel()
+{
+  const cuda::std::multiplies<with_tile_op> f;
+  assert(f({}, {}));
+}
+#endif // _CCCL_TILE_COMPILATION()
+
+int main(int, char**)
+{
+  using F   = cuda::std::multiplies<int>;
+  const F f = F();
+#if TEST_STD_VER <= 2017
+  static_assert((cuda::std::is_same<int, F::first_argument_type>::value));
+  static_assert((cuda::std::is_same<int, F::second_argument_type>::value));
+  static_assert((cuda::std::is_same<int, F::result_type>::value));
+#endif // TEST_STD_VER <= 2017
+  assert(f(3, 2) == 6);
+
+  using F2    = cuda::std::multiplies<>;
+  const F2 f2 = F2();
+  assert(f2(3, 2) == 6);
+  assert(f2(3.0, 2) == 6);
+  assert(f2(3, 2.5) == 7.5); // exact in binary
+  constexpr int foo = cuda::std::multiplies<int>()(3, 2);
+  static_assert(foo == 6);
+
+  constexpr double bar = cuda::std::multiplies<>()(3.0, 2);
+  static_assert(bar == 6.0);
+
+  return 0;
+}

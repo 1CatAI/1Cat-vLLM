@@ -1,0 +1,205 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+#pragma once
+
+#include <cub/config.cuh>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cub/util_device.cuh>
+
+#include <cuda/__device/compute_capability.h>
+
+#include <cuda.h>
+
+CUB_NAMESPACE_BEGIN
+
+namespace detail
+{
+struct CudaDriverLauncher
+{
+  dim3 grid;
+  dim3 block;
+  unsigned int shared_mem;
+  ::CUstream stream;
+  bool dependent_launch;
+
+  template <typename... Args>
+  _CCCL_HIDE_FROM_ABI ::cudaError_t doit(::CUkernel kernel, Args const&... args) const
+  {
+    void* kernel_args[] = {const_cast<void*>(static_cast<void const*>(&args))...};
+
+    ::CUfunction kernel_fn;
+    auto status = static_cast<::cudaError_t>(::cuKernelGetFunction(&kernel_fn, kernel));
+    if (status != cudaSuccess)
+    {
+      return status;
+    }
+
+#if _CCCL_HAS_PDL()
+    if (dependent_launch)
+    {
+      ::CUlaunchAttribute attribute[1];
+      attribute[0].id = ::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+      attribute[0].value.programmaticStreamSerializationAllowed = 1;
+
+      ::CUlaunchConfig config{};
+      config.gridDimX       = grid.x;
+      config.gridDimY       = grid.y;
+      config.gridDimZ       = grid.z;
+      config.blockDimX      = block.x;
+      config.blockDimY      = block.y;
+      config.blockDimZ      = block.z;
+      config.sharedMemBytes = shared_mem;
+      config.hStream        = stream;
+      config.attrs          = attribute;
+      config.numAttrs       = 1;
+
+      return static_cast<::cudaError_t>(::cuLaunchKernelEx(&config, kernel_fn, kernel_args, 0));
+    }
+    else
+#endif // _CCCL_HAS_PDL()
+    {
+      return static_cast<::cudaError_t>(::cuLaunchKernel(
+        kernel_fn, grid.x, grid.y, grid.z, block.x, block.y, block.z, shared_mem, stream, kernel_args, 0));
+    }
+  }
+};
+
+struct CudaDriverLauncherFactory
+{
+  CUB_RUNTIME_FUNCTION void __assert_pdl_allowed(bool dependent_launch) const
+  {
+    if (dependent_launch)
+    {
+      // note: assumes that cc_ holds the current device's AND the PTX's compute capability
+      _CCCL_ASSERT((::cuda::compute_capability{cc_} >= ::cuda::compute_capability{9, 0}),
+                   "Enabling PDL for a kernel launch requires CC 9.0+ PTX/SASS when running on SM90+");
+    }
+  }
+
+  CudaDriverLauncher
+  operator()(dim3 grid, dim3 block, unsigned int shared_mem, ::CUstream stream, bool dependent_launch = false) const
+  {
+    __assert_pdl_allowed(dependent_launch);
+    return CudaDriverLauncher{grid, block, shared_mem, stream, dependent_launch};
+  }
+
+  ::cudaError_t PtxVersion(int& version) const
+  {
+    version = cc_ * 10;
+    return cudaSuccess;
+  }
+
+  ::cudaError_t PtxComputeCap(::cuda::compute_capability& cc) const
+  {
+    cc = ::cuda::compute_capability{cc_};
+    return ::cudaSuccess;
+  }
+
+  _CCCL_HIDE_FROM_ABI ::cudaError_t MultiProcessorCount(int& sm_count) const
+  {
+    return static_cast<::cudaError_t>(
+      ::cuDeviceGetAttribute(&sm_count, ::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, device_));
+  }
+
+  _CCCL_HIDE_FROM_ABI ::cudaError_t
+  MaxSmOccupancy(int& sm_occupancy, ::CUkernel kernel, int block_size, int dynamic_smem_bytes = 0) const
+  {
+    // Older drivers have issues handling CUkernel in the occupancy queries, get the CUfunction instead.
+    ::CUfunction kernel_fn;
+    auto status = static_cast<::cudaError_t>(::cuKernelGetFunction(&kernel_fn, kernel));
+    if (status != cudaSuccess)
+    {
+      return status;
+    }
+
+    return static_cast<::cudaError_t>(
+      ::cuOccupancyMaxActiveBlocksPerMultiprocessor(&sm_occupancy, kernel_fn, block_size, dynamic_smem_bytes));
+  }
+
+  _CCCL_HIDE_FROM_ABI ::cudaError_t MaxGridDimX(int& max_grid_dim_x) const
+  {
+    return static_cast<::cudaError_t>(
+      ::cuDeviceGetAttribute(&max_grid_dim_x, ::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, device_));
+  }
+
+  _CCCL_HIDE_FROM_ABI ::cudaError_t
+  MemsetAsync(void* dst, unsigned char value, size_t num_bytes, ::CUstream stream) const
+  {
+    return static_cast<::cudaError_t>(
+      ::cuMemsetD8Async(reinterpret_cast<::CUdeviceptr>(dst), value, num_bytes, stream));
+  }
+
+  _CCCL_HIDE_FROM_ABI ::cudaError_t
+  MemcpyAsync(void* dst, const void* src, size_t num_bytes, ::cudaMemcpyKind /*kind*/, ::CUstream stream) const
+  {
+    return static_cast<::cudaError_t>(
+      ::cuMemcpyAsync(reinterpret_cast<::CUdeviceptr>(dst), reinterpret_cast<::CUdeviceptr>(src), num_bytes, stream));
+  }
+
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION cudaError_t MaxSharedMemory(int& max_shared_memory) const
+  {
+    return static_cast<cudaError_t>(
+      cuDeviceGetAttribute(&max_shared_memory, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, device_));
+  }
+
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION ::cudaError_t
+  max_dynamic_smem_size_for(int& max_dynamic_smem_size, ::CUkernel kernel_ptr) const
+  {
+    max_dynamic_smem_size = -1;
+
+    ::CUfunction kernel_fn;
+    auto status = static_cast<::cudaError_t>(::cuKernelGetFunction(&kernel_fn, kernel_ptr));
+    if (status != cudaSuccess)
+    {
+      return status;
+    }
+
+    int static_smem_size = 0;
+    status               = static_cast<::cudaError_t>(
+      ::cuFuncGetAttribute(&static_smem_size, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, kernel_fn));
+    if (status != cudaSuccess)
+    {
+      return status;
+    }
+
+    int max_smem_size_optin = 0;
+    status                  = static_cast<::cudaError_t>(
+      ::cuDeviceGetAttribute(&max_smem_size_optin, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device_));
+    if (status != cudaSuccess)
+    {
+      return status;
+    }
+
+    max_dynamic_smem_size = max_smem_size_optin - static_smem_size;
+    return cudaSuccess;
+  }
+
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION ::cudaError_t
+  set_max_dynamic_smem_size_for(::CUkernel kernel_ptr, int smem_size) const
+  {
+    ::CUfunction kernel_fn;
+    auto status = static_cast<::cudaError_t>(::cuKernelGetFunction(&kernel_fn, kernel_ptr));
+    if (status != cudaSuccess)
+    {
+      return status;
+    }
+
+    return static_cast<::cudaError_t>(
+      ::cuFuncSetAttribute(kernel_fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem_size));
+  }
+
+  CUdevice device_;
+  int cc_;
+};
+} // namespace detail
+
+CUB_NAMESPACE_END

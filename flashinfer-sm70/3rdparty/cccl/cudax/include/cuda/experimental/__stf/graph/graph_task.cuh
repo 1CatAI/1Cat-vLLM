@@ -1,0 +1,873 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of CUDASTF in CUDA C++ Core Libraries,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+/**
+ * @file
+ * @brief Implement tasks in the CUDA graph backend (graph_ctx)
+ *
+ * @see graph_ctx
+ */
+
+#pragma once
+
+#include <cuda/__cccl_config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/experimental/__stf/graph/internal/event_types.cuh>
+#include <cuda/experimental/__stf/internal/backend_ctx.cuh> // graph_task<> has-a backend_ctx_untyped
+#include <cuda/experimental/__stf/internal/frozen_logical_data.cuh>
+#include <cuda/experimental/__stf/internal/logical_data.cuh>
+#include <cuda/experimental/__stf/internal/void_interface.cuh>
+#include <cuda/experimental/__stf/utility/scope_guard.cuh>
+
+#include <mutex>
+
+namespace cuda::experimental::stf
+{
+template <typename... Deps>
+class graph_task;
+
+/** @brief This describes an untyped task within a CUDA graph.
+ *
+ * A graph task is implemented as a child graph in the graph associated to the
+ * context. The body of the task is in the child graph, and CUDASTF introduces
+ * the dependencies from and to that child graph, in addition to extra nodes
+ * intended to implement data transfers, or allocations for example.
+ *
+ * For graph tasks generated automatically by CUDASTF which are only made of a
+ * single CUDA graph node, we may use the graph node directly rather than
+ * embedding it in a child graph.
+ */
+template <>
+class graph_task<> : public task
+{
+public:
+  graph_task(backend_ctx_untyped ctx,
+             cudaGraph_t g,
+             ::std::mutex& graph_mutex,
+             size_t stage,
+             exec_place e_place = exec_place::current_device())
+      : task(mv(e_place))
+      , ctx_graph(EXPECT(g))
+      , graph_mutex(graph_mutex)
+      , stage(stage)
+      , ctx(mv(ctx))
+  {
+    this->ctx.increment_task_count();
+  }
+
+  graph_task(graph_task&&)            = default;
+  graph_task& operator=(graph_task&&) = default;
+
+  // Tasks are move-only
+  graph_task(const graph_task&)            = delete;
+  graph_task& operator=(const graph_task&) = delete;
+
+  graph_task& start()
+  {
+    auto lock = lock_ctx_graph();
+
+    event_list ready_prereqs = acquire(ctx);
+
+    // The CUDA graph API does not like duplicate dependencies
+    ready_prereqs.optimize(ctx);
+
+    // Reserve for better performance
+    ready_dependencies.reserve(ready_prereqs.size());
+
+    for (auto& e : ready_prereqs)
+    {
+      auto ge = reserved::graph_event(e, reserved::use_dynamic_cast);
+      if (ge->stage == stage)
+      {
+        ready_dependencies.push_back(ge->node);
+      }
+    }
+
+    auto& dot = *ctx.get_dot();
+
+    if (is_capture_enabled())
+    {
+      // Select a stream from the pool
+      const cudaStream_t stream = get_exec_place().getStream(ctx.async_resources().get_place_resources(), true).stream;
+#if _CCCL_CTK_AT_LEAST(12, 3)
+      // New path: capture directly into ctx_graph via cudaStreamBeginCaptureToGraph.
+      // ctx_graph is mutated for the full capture interval, so graph_mutex must
+      // stay held across the start()/end_uncleared() boundary; transfer ownership
+      // into the task-owned capture_lock_ member here.
+      begin_capture_into_ctx_graph(stream, ctx_graph, ready_dependencies);
+      capture_lock_ = mv(lock);
+#else // _CCCL_CTK_AT_LEAST(12, 3)
+      // Legacy path (CTK 12.0-12.2): capture into a fresh per-task graph and
+      // embed it as a child-graph node in ctx_graph from end_uncleared(). The
+      // conditional-inside-task case is unreachable on these toolkits anyway
+      // (Warp stubs out conditional graph nodes below 12.4), so we only need to
+      // keep ordinary STF capture working.
+      // Use relaxed capture mode to allow capturing workloads that lazily
+      // initialize resources (e.g., set up memory pools)
+      cuda_try<cudaStreamBeginCapture>(stream, cudaStreamCaptureModeRelaxed);
+#endif // _CCCL_CTK_AT_LEAST(12, 3)
+      // Publish only after BeginCapture succeeds so a non-null capture_stream
+      // means an active capture.
+      capture_stream = stream;
+    }
+
+    // DOT tracing and set_ready_prereqs must not throw after capture has begun,
+    // or the stream would be left capturing. Abort instead.
+    on_throw(::std::abort) << [&] {
+      if (dot.is_tracing())
+      {
+        dot.template add_vertex<task, logical_data_untyped>(*this);
+      }
+
+      set_ready_prereqs(mv(ready_prereqs));
+    };
+
+    return *this;
+  }
+
+  /* End the task, but do not clear its data structures yet */
+  graph_task<>& end_uncleared()
+  {
+#if _CCCL_CTK_AT_LEAST(12, 3)
+    // On the capture path, graph_mutex was acquired in start() and lives in
+    // capture_lock_. Move it into a local unique_lock so RAII releases it at
+    // the end of this function. On the non-capture path, acquire a fresh lock
+    // here just like the legacy code did.
+    ::std::unique_lock<::std::mutex> lock = is_capture_enabled() ? mv(capture_lock_) : lock_ctx_graph();
+#else // _CCCL_CTK_AT_LEAST(12, 3)
+    ::std::scoped_lock<::std::mutex> lock(graph_mutex);
+#endif // _CCCL_CTK_AT_LEAST(12, 3)
+
+    if (is_capture_enabled())
+    {
+#if _CCCL_CTK_AT_LEAST(12, 3)
+      // New path: end capture and emit one explicit empty done node into
+      // ctx_graph. The done_nodes branch below then takes care of wiring it
+      // up as the task's completion event.
+      done_nodes.push_back(end_capture_into_ctx_graph_and_emit_done(capture_stream, ctx_graph));
+#else // _CCCL_CTK_AT_LEAST(12, 3)
+      // Legacy path: end capture into a fresh per-task graph and let the
+      // child-graph embed branch below splice it into ctx_graph.
+      set_child_graph(cuda_try<cudaStreamEndCapture>(capture_stream));
+#endif // _CCCL_CTK_AT_LEAST(12, 3)
+    }
+
+    auto done_prereqs = event_list();
+
+    if (!done_nodes.empty())
+    {
+      // We added CUDA graph nodes by hand, dependencies are already set, except the output nodes which define
+      // done_prereqs
+      for (auto& node : done_nodes)
+      {
+        auto gnp = reserved::graph_event(node, stage, ctx_graph);
+        gnp->set_symbol(ctx, "done " + get_symbol());
+        /* This node is now the output dependency of the task */
+        done_prereqs.add(mv(gnp));
+      }
+    }
+    else
+    {
+      // We either created independent task nodes, a chain of tasks, or a child
+      // graph. We need to inject input dependencies, and make the task
+      // completion depend on task nodes, task chain, or the child graph.
+      if (task_nodes.size() > 0)
+      {
+        for (auto& node : task_nodes)
+        {
+#ifndef NDEBUG
+          // Ensure the node does not have dependencies yet
+          const size_t num_deps =
+#  if _CCCL_CTK_AT_LEAST(13, 0)
+            cuda_try<cudaGraphNodeGetDependencies>(node, nullptr, nullptr);
+#  else // _CCCL_CTK_AT_LEAST(13, 0)
+            cuda_try<cudaGraphNodeGetDependencies>(node, nullptr);
+#  endif // _CCCL_CTK_AT_LEAST(13, 0)
+          assert(num_deps == 0);
+
+          // Ensure there are no output dependencies either (or we could not
+          // add input dependencies later)
+          const size_t num_deps_out =
+#  if _CCCL_CTK_AT_LEAST(13, 0)
+            cuda_try<cudaGraphNodeGetDependentNodes>(node, nullptr, nullptr);
+#  else // _CCCL_CTK_AT_LEAST(13, 0)
+            cuda_try<cudaGraphNodeGetDependentNodes>(node, nullptr);
+#  endif // _CCCL_CTK_AT_LEAST(13, 0)
+          assert(num_deps_out == 0);
+#endif
+
+          // Repeat node as many times as there are input dependencies
+          ::std::vector<cudaGraphNode_t> out_array(ready_dependencies.size(), node);
+#if _CCCL_CTK_AT_LEAST(13, 0)
+          cuda_try<cudaGraphAddDependencies>(
+            ctx_graph, ready_dependencies.data(), out_array.data(), nullptr, ready_dependencies.size());
+#else // _CCCL_CTK_AT_LEAST(13, 0)
+          cuda_try<cudaGraphAddDependencies>(
+            ctx_graph, ready_dependencies.data(), out_array.data(), ready_dependencies.size());
+#endif // _CCCL_CTK_AT_LEAST(13, 0)
+
+          auto gnp = reserved::graph_event(node, stage, ctx_graph);
+          gnp->set_symbol(ctx, "done " + get_symbol());
+          /* This node is now the output dependency of the task */
+          done_prereqs.add(mv(gnp));
+        }
+      }
+      else if (chained_task_nodes.size() > 0)
+      {
+        // First node depends on ready_dependencies
+        ::std::vector<cudaGraphNode_t> out_array(ready_dependencies.size(), chained_task_nodes[0]);
+#if _CCCL_CTK_AT_LEAST(13, 0)
+        cuda_try<cudaGraphAddDependencies>(
+          ctx_graph, ready_dependencies.data(), out_array.data(), nullptr, ready_dependencies.size());
+#else // _CCCL_CTK_AT_LEAST(13, 0)
+        cuda_try<cudaGraphAddDependencies>(
+          ctx_graph, ready_dependencies.data(), out_array.data(), ready_dependencies.size());
+#endif // _CCCL_CTK_AT_LEAST(13, 0)
+
+        // Overall the task depends on the completion of the last node
+        auto gnp = reserved::graph_event(chained_task_nodes.back(), stage, ctx_graph);
+        gnp->set_symbol(ctx, "done " + get_symbol());
+        done_prereqs.add(mv(gnp));
+      }
+      else
+      {
+        // Note that if nothing was done in the task, this will create a child
+        // graph too, which will be useful as a node to synchronize with anyway.
+        const cudaGraph_t childGraph = get_graph();
+
+        const cudaGraphNode_t* deps = ready_dependencies.data();
+
+        assert(ctx_graph);
+        cudaGraphNode_t n;
+#if _CCCL_CTK_AT_LEAST(13, 0)
+        // Move ownership so child graphs with memory alloc/free nodes
+        // (e.g. from cudaMallocAsync during stream capture) are accepted.
+        cudaGraphNodeParams nodeParams = {};
+        nodeParams.type                = cudaGraphNodeTypeGraph;
+        nodeParams.graph.graph         = childGraph;
+        nodeParams.graph.ownership     = cudaGraphChildGraphOwnershipMove;
+        n = cuda_try<cudaGraphAddNode>(ctx_graph, deps, nullptr, ready_dependencies.size(), &nodeParams);
+#else // _CCCL_CTK_AT_LEAST(13, 0)
+        n = cuda_try<cudaGraphAddChildGraphNode>(ctx_graph, deps, ready_dependencies.size(), childGraph);
+        // Destroy the child graph unless we should not
+        if (must_destroy_child_graph)
+        {
+          cuda_try<cudaGraphDestroy>(childGraph);
+        }
+#endif // _CCCL_CTK_AT_LEAST(13, 0)
+
+        auto gnp = reserved::graph_event(n, stage, ctx_graph);
+        gnp->set_symbol(ctx, "done " + get_symbol());
+        /* This node is now the output dependency of the task */
+        done_prereqs.add(mv(gnp));
+      }
+    }
+
+    release(ctx, done_prereqs);
+
+    return *this;
+  }
+
+  graph_task<>& end()
+  {
+    end_uncleared();
+    clear();
+    return *this;
+  }
+
+  void populate_deps_scheduling_info() const
+  {
+    // Error checking copied from acquire() in acquire_release()
+
+    int index        = 0;
+    const auto& deps = get_task_deps();
+    for (const auto& dep : deps)
+    {
+      if (!dep.get_data().is_initialized())
+      {
+        fprintf(stderr, "Error: dependency number %d is an uninitialized logical data.\n", index);
+        abort();
+      }
+      dep.set_symbol(dep.get_data().get_symbol());
+      dep.set_data_footprint(dep.get_data().get_data_interface().data_footprint());
+      index++;
+    }
+  }
+
+  /**
+   * @brief Use the scheduler to assign a device to this task
+   *
+   * @return returns true if the task's time needs to be recorded
+   */
+  bool schedule_task()
+  {
+    auto& dot        = *ctx.get_dot();
+    auto& statistics = reserved::task_statistics::instance();
+
+    const bool is_auto = get_exec_place().affine_data_place() == data_place::device_auto();
+    bool calibrate     = false;
+
+    // We need to know the data footprint if scheduling or calibrating tasks
+    if (is_auto || statistics.is_calibrating())
+    {
+      populate_deps_scheduling_info();
+    }
+
+    if (is_auto)
+    {
+      auto [place, needs_calibration] = ctx.schedule_task(*this);
+      set_exec_place(place);
+      calibrate = needs_calibration;
+    }
+
+    return dot.is_timing() || (calibrate && statistics.is_calibrating());
+  }
+
+  // Only valid if we have defined a capture stream
+  cudaStream_t get_stream() const
+  {
+    return capture_stream;
+  }
+
+  /**
+   * @brief Invokes a lambda that takes either a `cudaStream_t` or a `cudaGraph_t`. Dependencies must be
+   * set with `add_deps` manually before this call.
+   *
+   * @tparam Fun Type of lambda to call, must accept either a `cudaStream_t` or a `cudaGraph_t` as sole argument
+   * @param f lambda function to call
+   */
+  template <typename Fun>
+  void operator->*(Fun&& f)
+  {
+    auto& dot        = *ctx.get_dot();
+    auto& statistics = reserved::task_statistics::instance();
+
+    // cudaEvent_t start_event, end_event;
+
+    const bool record_time = schedule_task() || statistics.is_calibrating_to_file();
+
+    start();
+
+    if (record_time)
+    {
+      // Events must be created here to avoid issues with multi-gpu
+      // cuda_safe_call(cudaEventCreate(&start_event));
+      // cuda_safe_call(cudaEventCreate(&end_event));
+      // cuda_safe_call(cudaEventRecord(start_event));
+    }
+
+    SCOPE(exit)
+    {
+      end_uncleared();
+      if (record_time)
+      {
+        // cuda_safe_call(cudaEventRecord(end_event));
+        // cuda_safe_call(cudaEventSynchronize(end_event));
+
+        float milliseconds = 0;
+        // cuda_safe_call(cudaEventElapsedTime(&milliseconds, start_event, end_event));
+
+        if (dot.is_tracing())
+        {
+          dot.template add_vertex_timing<task>(*this, milliseconds);
+        }
+
+        if (statistics.is_calibrating())
+        {
+          statistics.log_task_time(*this, milliseconds);
+        }
+      }
+      clear();
+    };
+
+    // Default for the first argument is a `cudaStream_t`.
+    if constexpr (::std::is_invocable_v<Fun, cudaStream_t>)
+    {
+      //
+      // CAPTURE the lambda
+      //
+
+      // Get a stream from the pool associated to the execution place
+      capture_stream = get_exec_place().getStream(ctx.async_resources().get_place_resources(), true).stream;
+
+#if _CCCL_CTK_AT_LEAST(12, 3)
+      // New path: capture directly into ctx_graph. ctx_graph is mutated for
+      // the full capture interval, so graph_mutex must be held throughout.
+      auto lock = lock_ctx_graph();
+      begin_capture_into_ctx_graph(capture_stream, ctx_graph, ready_dependencies);
+      // If the user lambda throws, end the capture so the stream is not left
+      // capturing. EndCapture returns ctx_graph here — do not destroy it.
+      SCOPE(fail)
+      {
+        cudaGraph_t discarded = nullptr;
+        cuda_safe_call(cudaStreamEndCapture(capture_stream, &discarded));
+      };
+
+      // Launch the user provided function
+      f(capture_stream);
+
+      done_nodes.push_back(end_capture_into_ctx_graph_and_emit_done(capture_stream, ctx_graph));
+#else // _CCCL_CTK_AT_LEAST(12, 3)
+      // Legacy path (CTK 12.0-12.2): capture into a fresh per-task graph and
+      // embed it as a child-graph node in ctx_graph from end_uncleared().
+      cudaGraph_t childGraph = nullptr;
+      // Use relaxed capture mode to allow capturing workloads that lazily
+      // initialize resources (e.g., set up memory pools)
+      cuda_try<cudaStreamBeginCapture>(capture_stream, cudaStreamCaptureModeRelaxed);
+      SCOPE(fail)
+      {
+        cudaGraph_t discarded = nullptr;
+        cuda_safe_call(cudaStreamEndCapture(capture_stream, &discarded));
+        if (discarded)
+        {
+          cuda_safe_call(cudaGraphDestroy(discarded));
+        }
+      };
+
+      // Launch the user provided function
+      f(capture_stream);
+
+      childGraph = cuda_try<cudaStreamEndCapture>(capture_stream);
+
+      // This implements the child graph of the `graph_task<>`, we will later
+      // insert the proper dependencies around it
+      set_child_graph(childGraph);
+#endif // _CCCL_CTK_AT_LEAST(12, 3)
+    }
+    else
+    {
+      //
+      // Give the lambda a child graph
+      //
+
+      // Create a child graph in the `graph_task<>`
+      cudaGraph_t childGraph = get_graph();
+
+      // Launch the user provided function
+      f(childGraph);
+    }
+  }
+
+  // Return the child graph, and create it if it does not exist yet
+  cudaGraph_t& get_graph()
+  {
+    // We either use a child graph or task nodes, not both
+    _CCCL_ASSERT(task_nodes.empty(), "cannot use both get_graph() and get_node()");
+    _CCCL_ASSERT(chained_task_nodes.empty(), "cannot use both get_graph() and get_node_chain()");
+    // The explicit-graph path is mutually exclusive with stream capture: with
+    // capture enabled, end_uncleared() takes the done_nodes path and never
+    // embeds this child graph, so nodes added here would be silently dropped.
+    _CCCL_VERIFY(!is_capture_enabled(), "cannot use both get_graph() and enable_capture()");
+
+    // Lazy creation
+    if (child_graph == nullptr)
+    {
+      child_graph              = cuda_try<cudaGraphCreate>(0u);
+      must_destroy_child_graph = true;
+    }
+
+    return child_graph;
+  }
+
+  // Create a node in the graph
+  cudaGraphNode_t& get_node()
+  {
+    _CCCL_ASSERT(!child_graph, "cannot use both get_node() and get_graph()");
+    _CCCL_ASSERT(chained_task_nodes.empty(), "cannot use both get_node() and get_node_chain()");
+
+    // Create a new entry and return it
+    task_nodes.emplace_back();
+    return task_nodes.back();
+  }
+
+  // Create a node in the graph
+  ::std::vector<cudaGraphNode_t>& get_node_chain()
+  {
+    _CCCL_ASSERT(!child_graph, "cannot use both get_node_chain() and get_graph()");
+    _CCCL_ASSERT(task_nodes.empty(), "cannot use both get_node_chain() and get_node()");
+
+    return chained_task_nodes;
+  }
+
+  void add_done_node(cudaGraphNode_t n)
+  {
+    done_nodes.push_back(n);
+  }
+
+  // Get the graph associated to the whole context (not the task)
+  cudaGraph_t& get_ctx_graph()
+  {
+    return ctx_graph;
+  }
+
+  [[nodiscard]] ::std::unique_lock<::std::mutex> lock_ctx_graph()
+  {
+    return ::std::unique_lock<::std::mutex>(graph_mutex);
+  }
+
+  /**
+   * @brief Activate a sub-place within the task's execution place grid
+   *
+   * Returns an exec_place_scope RAII guard. The sub-place is automatically
+   * deactivated when the guard is destroyed.
+   *
+   * @param p The position within the grid
+   * @return An exec_place_scope guard managing the activation lifetime
+   */
+  exec_place_scope activate_place(pos4 p)
+  {
+    return get_exec_place().activate(get_exec_place().get_dims().get_index(p));
+  }
+
+  /**
+   * @brief Activate a sub-place within the task's execution place grid
+   *
+   * @param idx The linear index within the grid
+   * @return An exec_place_scope guard managing the activation lifetime
+   */
+  exec_place_scope activate_place(size_t idx)
+  {
+    return get_exec_place().activate(idx);
+  }
+
+private:
+  // So that graph_ctx can access set_child_graph
+  template <typename... Deps>
+  friend class graph_task;
+
+  // If the child graph was created using a capture mechanism, for example
+  void set_child_graph(cudaGraph_t explicit_g)
+  {
+    child_graph              = explicit_g;
+    must_destroy_child_graph = false;
+  }
+
+#if _CCCL_CTK_AT_LEAST(12, 3)
+  // New capture path (CTK 12.3+): capture directly into ctx_graph via
+  // cudaStreamBeginCaptureToGraph. This lets conditional graph nodes inserted
+  // inside a task body (e.g. wp.capture_while in CTK 12.4+) land at the top
+  // level of ctx_graph rather than inside a per-task wrapper that CUDA would
+  // refuse to embed. Because the shared ctx_graph is being mutated for the
+  // entire capture interval, the helpers must be called while graph_mutex is
+  // held by the caller.
+  static void
+  begin_capture_into_ctx_graph(cudaStream_t s, cudaGraph_t ctx_graph, const ::std::vector<cudaGraphNode_t>& deps)
+  {
+    // Use relaxed capture mode to allow capturing workloads that lazily
+    // initialize resources (e.g., set up memory pools).
+    cuda_try<cudaStreamBeginCaptureToGraph>(
+      s, ctx_graph, deps.data(), nullptr, deps.size(), cudaStreamCaptureModeRelaxed);
+  }
+
+  // Snapshots the capture frontier, ends capture, and emits exactly one empty
+  // no-op done node in ctx_graph depending on that frontier. Always emitting
+  // one done node keeps the invariant `done_nodes.size() == captures` simple
+  // and avoids fragile empty/single-tail detection (cudaStreamGetCaptureInfo_v2
+  // can return inherited input deps as the frontier when no work was actually
+  // captured, so we can't safely treat its output as "captured tails" only).
+  [[nodiscard]] static cudaGraphNode_t end_capture_into_ctx_graph_and_emit_done(cudaStream_t s, cudaGraph_t ctx_graph)
+  {
+    // Snapshot the frontier first: the deps_out pointer is invalidated by
+    // any subsequent stream-capture call, so we copy before EndCapture.
+    cudaStreamCaptureStatus status  = cudaStreamCaptureStatusNone;
+    const cudaGraphNode_t* deps_out = nullptr;
+    size_t ndeps                    = 0;
+#  if _CCCL_CTK_AT_LEAST(13, 0)
+    // CTK 13 dropped the _v2 suffix and added an `edgeData_out` parameter
+    // between the dependency-array and dependency-count outputs; we don't
+    // need edge metadata here, so pass nullptr.
+    // Multiple outputs — keep the runtime-status form of cuda_try.
+    cuda_try(cudaStreamGetCaptureInfo(s, &status, nullptr, nullptr, &deps_out, nullptr, &ndeps));
+#  else // _CCCL_CTK_AT_LEAST(13, 0)
+    cuda_try(cudaStreamGetCaptureInfo_v2(s, &status, nullptr, nullptr, &deps_out, &ndeps));
+#  endif // _CCCL_CTK_AT_LEAST(13, 0)
+    ::std::vector<cudaGraphNode_t> frontier(deps_out, deps_out + ndeps);
+
+    // Ignore the returned graph handle: with BeginCaptureToGraph it is the
+    // caller-supplied ctx_graph; do not make correctness depend on identity.
+    [[maybe_unused]] cudaGraph_t captured = cuda_try<cudaStreamEndCapture>(s);
+
+    cudaGraphNode_t done_node = nullptr;
+#  if _CCCL_CTK_AT_LEAST(13, 0)
+    cudaGraphNodeParams params = {};
+    params.type                = cudaGraphNodeTypeEmpty;
+    done_node = cuda_try<cudaGraphAddNode>(ctx_graph, frontier.data(), nullptr, frontier.size(), &params);
+#  else // _CCCL_CTK_AT_LEAST(13, 0)
+    done_node = cuda_try<cudaGraphAddEmptyNode>(ctx_graph, frontier.data(), frontier.size());
+#  endif // _CCCL_CTK_AT_LEAST(13, 0)
+    return done_node;
+  }
+#endif // _CCCL_CTK_AT_LEAST(12, 3)
+
+  /* The child graph associated to that `graph_task<>`, this was either created
+   * explicitly, or by the means of a capture mechanism. */
+  cudaGraph_t child_graph       = nullptr;
+  bool must_destroy_child_graph = false;
+
+  cudaStream_t capture_stream = nullptr;
+
+  /* If the task corresponds to independent graph nodes, we do not use a
+   * child graph, but add nodes directly */
+  ::std::vector<cudaGraphNode_t> task_nodes;
+
+  ::std::vector<cudaGraphNode_t> chained_task_nodes;
+
+  /* This is the support graph associated to the entire context */
+  cudaGraph_t ctx_graph = nullptr;
+
+  // This protects ctx_graph : it's ok to store a reference to it because the
+  // context and this mutex will outlive the moment when this mutex is needed
+  // (and most likely the graph_task object)
+  // Note that we use a reference_wrapper instead of a mere reference to ensure
+  // the graph_task class remains move assignable.
+  ::std::reference_wrapper<::std::mutex> graph_mutex;
+
+  size_t stage = 0;
+
+  // same as ready_prereqs converted to a vector of cudaGraphNode_t
+  ::std::vector<cudaGraphNode_t> ready_dependencies;
+
+  // If we are building our graph by hand
+  ::std::vector<cudaGraphNode_t> done_nodes;
+
+#if _CCCL_CTK_AT_LEAST(12, 3)
+  // On the CTK 12.3+ capture path, ctx_graph is mutated for the full capture
+  // interval (BeginCaptureToGraph .. user work .. GetCaptureInfo .. EndCapture
+  // .. AddEmptyNode), which spans the start()/end_uncleared() method boundary.
+  // We hand ownership of graph_mutex from start() into this member, then move
+  // it back into a local scope-bound lock in end_uncleared() so RAII releases
+  // the mutex even if user code throws between start() and end_uncleared().
+  // unique_lock is move-only — that is why graph_task<> is move-only too.
+  ::std::unique_lock<::std::mutex> capture_lock_;
+#endif // _CCCL_CTK_AT_LEAST(12, 3)
+
+  backend_ctx_untyped ctx;
+};
+
+/**
+ * @brief Provides a graph scope object within which functions invoked are
+ * either captured in a graph or passed to a subgraph, depending on the
+ * function type.  Invocation is carried by means of operator->*. Dependencies
+ * are typed appropriately.
+ */
+template <typename... Deps>
+class graph_task
+// Hide recursive base from Doxygen — it cannot handle self-referential inheritance.
+#ifndef _CCCL_DOXYGEN_INVOKED
+    : public graph_task<>
+#endif
+{
+public:
+  graph_task(backend_ctx_untyped ctx,
+             cudaGraph_t g,
+             ::std::mutex& graph_mutex,
+             size_t stage,
+             exec_place e_place,
+             task_dep<Deps>... deps)
+      : graph_task<>(mv(ctx), g, graph_mutex, stage, mv(e_place))
+  {
+    static_assert(sizeof(*this) == sizeof(graph_task<>), "Cannot add state - it would be lost by slicing.");
+    add_deps(mv(deps)...);
+  }
+
+  /**
+   * @brief Set the symbol object
+   *
+   * @param s
+   * @return graph_task&
+   */
+  graph_task& set_symbol(::std::string s) &
+  {
+    graph_task<>::set_symbol(mv(s));
+    return *this;
+  }
+
+  graph_task&& set_symbol(::std::string s) &&
+  {
+    graph_task<>::set_symbol(mv(s));
+    return mv(*this);
+  }
+
+#if _CCCL_COMPILER(MSVC)
+  // TODO (miscco): figure out why MSVC is complaining about unreachable code here
+  _CCCL_DIAG_PUSH
+  _CCCL_DIAG_SUPPRESS_MSVC(4702) // unreachable code
+#endif // _CCCL_COMPILER(MSVC)
+
+  template <typename Fun>
+  void operator->*(Fun&& f)
+  {
+    auto& dot        = *ctx.get_dot();
+    auto& statistics = reserved::task_statistics::instance();
+
+    // cudaEvent_t start_event, end_event;
+
+    const bool record_time = schedule_task() || statistics.is_calibrating_to_file();
+
+    start();
+
+    if (record_time)
+    {
+      // Events must be created here to avoid issues with multi-gpu
+      // cuda_safe_call(cudaEventCreate(&start_event));
+      // cuda_safe_call(cudaEventCreate(&end_event));
+      // cuda_safe_call(cudaEventRecord(start_event));
+    }
+
+    SCOPE(exit)
+    {
+      end_uncleared();
+      if (record_time)
+      {
+        // cuda_safe_call(cudaEventRecord(end_event));
+        // cuda_safe_call(cudaEventSynchronize(end_event));
+
+        float milliseconds = 0;
+        // cuda_safe_call(cudaEventElapsedTime(&milliseconds, start_event, end_event));
+
+        if (dot.is_tracing())
+        {
+          dot.template add_vertex_timing<task>(*this, milliseconds);
+        }
+
+        if (statistics.is_calibrating())
+        {
+          statistics.log_task_time(*this, milliseconds);
+        }
+      }
+      clear();
+    };
+
+    constexpr bool fun_invocable_stream_deps = ::std::is_invocable_v<Fun, cudaStream_t, Deps...>;
+    constexpr bool fun_invocable_stream_non_void_deps =
+      reserved::is_applicable_v<Fun, reserved::remove_void_interface_from_pack_t<cudaStream_t, Deps...>>;
+
+    // Default for the first argument is a `cudaStream_t`.
+    if constexpr (fun_invocable_stream_deps || fun_invocable_stream_non_void_deps)
+    {
+      //
+      // CAPTURE the lambda
+      //
+
+      // To ensure the same CUDA stream is not used in multiple threads, we
+      // ensure there can't be multiple threads capturing at the same time.
+      // On CTK 12.3+, this lock additionally protects ctx_graph itself, which
+      // is being mutated for the full capture interval.
+      //
+      // TODO : provide a per-thread CUDA stream dedicated for capture on that
+      // execution place.
+      auto lock = lock_ctx_graph();
+
+      // Get a stream from the pool associated to the execution place
+      cudaStream_t capture_stream =
+        get_exec_place().getStream(ctx.async_resources().get_place_resources(), true).stream;
+
+#if _CCCL_CTK_AT_LEAST(12, 3)
+      // New path: capture directly into ctx_graph.
+      begin_capture_into_ctx_graph(capture_stream, ctx_graph, ready_dependencies);
+      // If the user lambda throws, end the capture so the stream is not left
+      // capturing. EndCapture returns ctx_graph here — do not destroy it.
+      SCOPE(fail)
+      {
+        cudaGraph_t discarded = nullptr;
+        cuda_safe_call(cudaStreamEndCapture(capture_stream, &discarded));
+      };
+
+      // Launch the user provided function
+      if constexpr (fun_invocable_stream_deps)
+      {
+        ::std::apply(f, tuple_prepend(mv(capture_stream), typed_deps()));
+      }
+      else if constexpr (fun_invocable_stream_non_void_deps)
+      {
+        // Remove void arguments
+        ::std::apply(::std::forward<Fun>(f),
+                     tuple_prepend(mv(capture_stream), reserved::remove_void_interface(typed_deps())));
+      }
+
+      done_nodes.push_back(end_capture_into_ctx_graph_and_emit_done(capture_stream, ctx_graph));
+#else // _CCCL_CTK_AT_LEAST(12, 3)
+      // Legacy path (CTK 12.0-12.2): capture into a fresh per-task graph and
+      // let end_uncleared() splice it into ctx_graph as a child-graph node.
+      cudaGraph_t childGraph = nullptr;
+      // Use relaxed capture mode to allow capturing workloads that lazily initialize
+      // resources (e.g., set up memory pools)
+      cuda_try<cudaStreamBeginCapture>(capture_stream, cudaStreamCaptureModeRelaxed);
+      SCOPE(fail)
+      {
+        cudaGraph_t discarded = nullptr;
+        cuda_safe_call(cudaStreamEndCapture(capture_stream, &discarded));
+        if (discarded)
+        {
+          cuda_safe_call(cudaGraphDestroy(discarded));
+        }
+      };
+
+      // Launch the user provided function
+      if constexpr (fun_invocable_stream_deps)
+      {
+        ::std::apply(f, tuple_prepend(mv(capture_stream), typed_deps()));
+      }
+      else if constexpr (fun_invocable_stream_non_void_deps)
+      {
+        // Remove void arguments
+        ::std::apply(::std::forward<Fun>(f),
+                     tuple_prepend(mv(capture_stream), reserved::remove_void_interface(typed_deps())));
+      }
+
+      childGraph = cuda_try<cudaStreamEndCapture>(capture_stream);
+
+      // Save this child graph as the implementation of the
+      // graph_task<>. CUDASTF will then add all necessary
+      // dependencies, or data transfers, allocations etc.
+      // Since this was captured, we will not destroy that graph (should we ?)
+      set_child_graph(childGraph);
+#endif // _CCCL_CTK_AT_LEAST(12, 3)
+    }
+    else
+    {
+      constexpr bool fun_invocable_graph_deps = ::std::is_invocable_v<Fun, cudaGraph_t, Deps...>;
+      constexpr bool fun_invocable_graph_non_void_deps =
+        reserved::is_applicable_v<Fun, reserved::remove_void_interface_from_pack_t<cudaGraph_t, Deps...>>;
+
+      static_assert(fun_invocable_graph_deps || fun_invocable_graph_non_void_deps,
+                    "Incorrect lambda function signature.");
+      //
+      // Give the lambda a child graph
+      //
+
+      // This lazily creates a childGraph which will be destroyed when the task ends
+      cudaGraph_t childGraph = get_graph();
+
+      // Launch the user provided function
+      ::std::apply(f, tuple_prepend(mv(childGraph), typed_deps()));
+    }
+  }
+#if _CCCL_COMPILER(MSVC)
+  _CCCL_DIAG_POP
+#endif // _CCCL_COMPILER(MSVC)
+
+private:
+  auto typed_deps()
+  {
+    return make_tuple_indexwise<sizeof...(Deps)>([&](auto i) {
+      return this->get<::std::tuple_element_t<i, ::std::tuple<Deps...>>>(i);
+    });
+  }
+};
+} // namespace cuda::experimental::stf

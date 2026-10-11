@@ -1,0 +1,4 @@
+# Install the matching wheel built from ./flashinfer-sm70 before the SM70 engine.
+# There must be exactly one provider of the flashinfer Python package.
+flashinfer-python==0.7.2+1cat.sm70.3
+apache-tvm-ffi==0.1.10

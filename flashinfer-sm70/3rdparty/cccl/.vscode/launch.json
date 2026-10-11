@@ -1,0 +1,16 @@
+{
+  "configurations": [
+    {
+      "cwd": "${workspaceFolder}",
+      "initCommands": [
+        "set cuda api_failures stop"
+      ],
+      "name": "(cuda-gdb) Launch",
+      "program": "${command:cmake.launchTargetPath}",
+      "request": "launch",
+      "stopAtEntry": true,
+      "type": "cuda-gdb"
+    }
+  ],
+  "version": "0.2.0"
+}

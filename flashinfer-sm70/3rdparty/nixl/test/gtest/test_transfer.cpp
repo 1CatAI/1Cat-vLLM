@@ -1,0 +1,876 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "common.h"
+#include "gtest/gtest.h"
+
+#include "nixl.h"
+#include "nixl_types.h"
+#include "plugin_manager.h"
+
+#include <absl/strings/str_format.h>
+#include <absl/time/clock.h>
+#include <gtest/gtest.h>
+#include <cstdlib>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
+#include <chrono>
+#include <thread>
+#include <vector>
+#include <thread>
+#include <mutex>
+
+#ifdef HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+constexpr auto min_chrono_time = std::chrono::steady_clock::time_point::min();
+
+namespace gtest {
+
+class MemBuffer : std::shared_ptr<void> {
+public:
+    MemBuffer(size_t size, nixl_mem_t mem_type = DRAM_SEG) :
+        std::shared_ptr<void>(allocate(size, mem_type),
+                              [mem_type](void *ptr) {
+                                  release(ptr, mem_type);
+                              }),
+        size(size)
+    {
+    }
+
+    operator uintptr_t() const
+    {
+        return reinterpret_cast<uintptr_t>(get());
+    }
+
+    size_t getSize() const
+    {
+        return size;
+    }
+
+private:
+    static void *allocate(size_t size, nixl_mem_t mem_type)
+    {
+        switch (mem_type) {
+        case DRAM_SEG:
+            return malloc(size);
+#ifdef HAVE_CUDA
+        case VRAM_SEG:
+            void *ptr;
+            return cudaSuccess == cudaMalloc(&ptr, size)? ptr : nullptr;
+#endif
+        default:
+            return nullptr; // TODO
+        }
+    }
+
+    static void release(void *ptr, nixl_mem_t mem_type)
+    {
+        switch (mem_type) {
+        case DRAM_SEG:
+            free(ptr);
+            break;
+#ifdef HAVE_CUDA
+        case VRAM_SEG:
+            cudaFree(ptr);
+            break;
+#endif
+        default:
+            return; // TODO
+        }
+    }
+
+    const size_t size;
+};
+
+class TestTransfer : public nixl_test_t {
+protected:
+    nixlAgentConfig
+    getConfig(int listen_port, bool capture_telemetry) {
+        nixlAgentConfig cfg;
+        cfg.useProgThread = isProgressThreadEnabled();
+        cfg.useListenThread = (listen_port > 0);
+        cfg.listenPort = listen_port;
+        cfg.syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW;
+        cfg.captureTelemetry = capture_telemetry;
+        return cfg;
+    }
+
+    uint16_t
+    getPort(int i) const {
+        return ports.at(i);
+    }
+
+    nixl_b_params_t getBackendParams()
+    {
+        nixl_b_params_t params;
+
+        if (getBackendName() == "UCX") {
+            params["num_workers"] = std::to_string(getNumWorkers());
+            params["num_threads"] = std::to_string(getNumThreads());
+            params["split_batch_size"] = "32";
+        }
+
+        params["engine_config"] = GetParam().engineConfig;
+        return params;
+    }
+
+    void
+    addAgent(unsigned int agent_num, bool capture_telemetry = false) {
+        ports.push_back(PortAllocator::next_tcp_port());
+        agents.emplace_back(std::make_unique<nixlAgent>(
+            getAgentName(agent_num), getConfig(getPort(agent_num), capture_telemetry)));
+        nixlBackendH *backend_handle = nullptr;
+        nixl_status_t status =
+            agents.back()->createBackend(getBackendName(), getBackendParams(), backend_handle);
+        ASSERT_EQ(status, NIXL_SUCCESS);
+        EXPECT_NE(backend_handle, nullptr);
+        backend_handles.push_back(backend_handle);
+    }
+
+    void SetUp() override
+    {
+#ifdef HAVE_CUDA
+        m_cuda_device = (cudaSetDevice(0) == cudaSuccess);
+#endif
+
+        // Disabling Telemetry until the corresponding test
+        env.addVar("NIXL_TELEMETRY_ENABLE", "n");
+
+        // Create two agents
+        for (size_t i = 0; i < 2; i++) {
+            addAgent(i);
+        }
+    }
+
+    void TearDown() override
+    {
+        agents.clear();
+    }
+
+    std::string getBackendName() const
+    {
+        return GetParam().backendName;
+    }
+
+    bool
+    isProgressThreadEnabled() const {
+        return GetParam().progressThreadEnabled;
+    }
+
+    size_t
+    getNumWorkers() const {
+        return GetParam().numWorkers;
+    }
+
+    size_t
+    getNumThreads() const {
+        return GetParam().numThreads;
+    }
+
+    nixl_opt_args_t
+    extra_params_ip(int remote) {
+        nixl_opt_args_t extra_params;
+
+        extra_params.ipAddr = "127.0.0.1";
+        extra_params.port   = getPort(remote);
+        return extra_params;
+    }
+
+    nixl_status_t fetchRemoteMD(int local = 0, int remote = 1)
+    {
+        auto extra_params = extra_params_ip(remote);
+
+        return agents[local]->fetchRemoteMD(getAgentName(remote),
+                                            &extra_params);
+    }
+
+    nixl_status_t checkRemoteMD(int local = 0, int remote = 1)
+    {
+        nixl_xfer_dlist_t descs(DRAM_SEG);
+        return agents[local]->checkRemoteMD(getAgentName(remote), descs);
+    }
+
+    template<typename Desc>
+    nixlDescList<Desc>
+    makeDescList(const std::vector<MemBuffer> &buffers, nixl_mem_t mem_type) const {
+        nixlDescList<Desc> desc_list(mem_type);
+        for (const auto &buffer : buffers) {
+            desc_list.addDesc(Desc(buffer, buffer.getSize(), DEV_ID));
+        }
+        return desc_list;
+    }
+
+    void registerMem(nixlAgent &agent, const std::vector<MemBuffer> &buffers,
+                     nixl_mem_t mem_type)
+    {
+        std::optional<gtest::LogIgnoreGuard> lig_efa_warn;
+
+        if (getBackendName() == "UCX") {
+            // Ignore EFA hardware mismatch warning
+            lig_efa_warn.emplace(
+                "Amazon EFA\\(s\\) were detected, but the UCX backend was configured");
+        }
+
+        auto reg_list = makeDescList<nixlBlobDesc>(buffers, mem_type);
+        agent.registerMem(reg_list);
+    }
+
+    static bool wait_until_true(std::function<bool()> func, int retries = 500) {
+        bool result;
+
+        while (!(result = func()) && retries-- > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        return result;
+    }
+
+    void
+    exchangeMDIP(size_t start, size_t end) {
+        // Exchange metadata for the agents in the specified range using their IP
+        for (size_t i = start; i <= end; i++) {
+            for (size_t j = start; j <= end; j++) {
+                if (i == j) {
+                    continue;
+                }
+
+                auto status = fetchRemoteMD(i, j);
+                ASSERT_EQ(NIXL_SUCCESS, status);
+                ASSERT_TRUE(wait_until_true(
+                    [&]() { return checkRemoteMD(i, j) == NIXL_SUCCESS; }));
+            }
+        }
+    }
+
+    void
+    exchangeMD(size_t start, size_t end) {
+        // Exchange metadata for the agents in the specified range
+        for (size_t i = start; i <= end; i++) {
+            nixl_blob_t md;
+            nixl_status_t status = agents[i]->getLocalMD(md);
+            ASSERT_EQ(status, NIXL_SUCCESS);
+
+            for (size_t j = start; j <= end; j++) {
+                if (i == j)
+                    continue;
+                std::string remote_agent_name;
+                status = agents[j]->loadRemoteMD(md, remote_agent_name);
+                ASSERT_EQ(status, NIXL_SUCCESS);
+                EXPECT_EQ(remote_agent_name, getAgentName(i));
+            }
+        }
+    }
+
+    void
+    invalidateMD(size_t start, size_t end) {
+        // Invalidate each other's metadata for the agents in the specified range
+        for (size_t i = start; i <= end; i++) {
+            for (size_t j = start; j < end; j++) {
+                if (i == j)
+                    continue;
+                nixl_status_t status = agents[j]->invalidateRemoteMD(
+                        getAgentName(i));
+                ASSERT_EQ(status, NIXL_SUCCESS);
+            }
+        }
+    }
+
+    void createRegisteredMem(nixlAgent& agent,
+                             size_t size, size_t count,
+                             nixl_mem_t mem_type,
+                             std::vector<MemBuffer>& out)
+    {
+        while (count-- != 0) {
+            out.emplace_back(size, mem_type);
+        }
+
+        registerMem(agent, out, mem_type);
+    }
+
+    void
+    deregisterMem(nixlAgent &agent,
+                  const std::vector<MemBuffer> &buffers,
+                  nixl_mem_t mem_type) const {
+        const auto desc_list = makeDescList<nixlBlobDesc>(buffers, mem_type);
+        agent.deregisterMem(desc_list);
+    }
+
+    void
+    verifyNotifs(nixlAgent &agent,
+                 const std::string &from_name,
+                 size_t expected_count,
+                 const std::string &expected_notif,
+                 nixl_notifs_t notif_map = {}) {
+        for (int i = 0; i < retry_count; i++) {
+            nixl_status_t status = agent.getNotifs(notif_map);
+            ASSERT_EQ(status, NIXL_SUCCESS);
+
+            if (notif_map[from_name].size() >= expected_count) {
+                break;
+            }
+            std::this_thread::sleep_for(retry_timeout);
+        }
+
+        auto& notif_list = notif_map[from_name];
+        EXPECT_EQ(notif_list.size(), expected_count);
+
+        for (const auto& notif : notif_list) {
+            EXPECT_EQ(notif, expected_notif);
+        }
+    }
+
+    void
+    doNotificationTest(nixlAgent &from,
+                       const std::string &from_name,
+                       nixlAgent &to,
+                       const std::string &to_name,
+                       size_t repeat,
+                       size_t num_threads,
+                       const std::string &notif_msg = NOTIF_MSG) {
+        const size_t total_notifs = repeat * num_threads;
+
+        exchangeMD(0, 1);
+
+        std::vector<std::thread> threads;
+        nixl_notifs_t notif_map;
+        for (size_t thread = 0; thread < num_threads; ++thread) {
+            threads.emplace_back([&]() {
+                for (size_t i = 0; i < repeat; ++i) {
+                    nixl_status_t status = from.genNotif(to_name, notif_msg);
+                    ASSERT_EQ(status, NIXL_SUCCESS);
+
+                    if (!isProgressThreadEnabled()) {
+                        ASSERT_EQ(NIXL_SUCCESS, from.getNotifs(notif_map));
+                        ASSERT_EQ(NIXL_SUCCESS, to.getNotifs(notif_map));
+                    }
+                }
+            });
+        }
+
+        for (auto &thread : threads) {
+            thread.join();
+        }
+
+        verifyNotifs(to, from_name, total_notifs, notif_msg, std::move(notif_map));
+        invalidateMD(0, 1);
+    }
+
+    void
+    doTransfer(nixlAgent &from,
+               const std::string &from_name,
+               nixlAgent &to,
+               const std::string &to_name,
+               size_t size,
+               size_t count,
+               size_t repeat,
+               size_t num_threads,
+               nixl_mem_t src_mem_type,
+               std::vector<MemBuffer> src_buffers,
+               nixl_mem_t dst_mem_type,
+               std::vector<MemBuffer> dst_buffers,
+               nixl_status_t expected_telem_status = NIXL_ERR_NO_TELEMETRY,
+               const std::string &notif_msg = NOTIF_MSG) {
+        std::mutex logger_mutex;
+        std::vector<std::thread> threads;
+        nixl_notifs_t notif_map;
+        for (size_t thread = 0; thread < num_threads; ++thread) {
+            threads.emplace_back([&, thread]() {
+                nixl_opt_args_t extra_params;
+                extra_params.notif = notif_msg;
+
+                nixlXferReqH *xfer_req = nullptr;
+                nixl_status_t status = from.createXferReq(
+                        NIXL_WRITE,
+                        makeDescList<nixlBasicDesc>(src_buffers, src_mem_type),
+                        makeDescList<nixlBasicDesc>(dst_buffers, dst_mem_type), to_name,
+                        xfer_req, &extra_params);
+                ASSERT_EQ(status, NIXL_SUCCESS);
+                EXPECT_NE(xfer_req, nullptr);
+
+                auto start_time = absl::Now();
+
+                for (size_t i = 0; i < repeat; i++) {
+                    status = from.postXferReq(xfer_req);
+                    ASSERT_TRUE((status == NIXL_SUCCESS) || (status == NIXL_IN_PROG));
+
+                    for (int i = 0; i < retry_count; i++) {
+                        status = from.getXferStatus(xfer_req);
+                        EXPECT_TRUE((status == NIXL_SUCCESS) || (status == NIXL_IN_PROG));
+                        if (status == NIXL_SUCCESS) {
+                            break;
+                        }
+                        if (!isProgressThreadEnabled()) {
+                            ASSERT_EQ(NIXL_SUCCESS, to.getNotifs(notif_map));
+                        }
+                        std::this_thread::sleep_for(retry_timeout);
+                    }
+                    EXPECT_TRUE(status == NIXL_SUCCESS);
+                }
+
+                auto total_time = absl::ToDoubleSeconds(absl::Now() - start_time);
+                auto total_size = size * count * repeat;
+                auto bandwidth  = total_size / total_time / (1024 * 1024 * 1024);
+                {
+                    const std::lock_guard<std::mutex> lock(logger_mutex);
+                    Logger() << "Thread " << thread << ": " << size << "x" << count << "x" << repeat
+                             << "=" << total_size << " bytes in " << total_time << " seconds "
+                             << "(" << bandwidth << " GB/s)";
+                }
+
+                nixl_xfer_telem_t telemetry;
+                if (expected_telem_status == NIXL_ERR_NO_TELEMETRY) {
+                    const LogIgnoreGuard lig("cannot return values when telemetry is not enabled");
+                    status = from.getXferTelemetry(xfer_req, telemetry);
+                    EXPECT_EQ(status, expected_telem_status);
+                } else {
+                    status = from.getXferTelemetry(xfer_req, telemetry);
+                    EXPECT_EQ(status, expected_telem_status);
+                    if (expected_telem_status == NIXL_SUCCESS) {
+                        EXPECT_TRUE(telemetry.startTime > min_chrono_time);
+                        EXPECT_TRUE(telemetry.postDuration > chrono_period_us_t(0));
+                        EXPECT_TRUE(telemetry.xferDuration > chrono_period_us_t(0));
+                        EXPECT_TRUE(telemetry.xferDuration >= telemetry.postDuration);
+                    }
+                }
+
+                status = from.releaseXferReq(xfer_req);
+                EXPECT_EQ(status, NIXL_SUCCESS);
+            });
+        }
+
+        for (auto& thread : threads) {
+            thread.join();
+        }
+
+        verifyNotifs(to, from_name, repeat * num_threads, notif_msg, std::move(notif_map));
+    }
+
+    nixlAgent &getAgent(size_t idx)
+    {
+        return *agents[idx];
+    }
+
+    std::string getAgentName(size_t idx)
+    {
+        return absl::StrFormat("agent_%d", idx);
+    }
+
+    bool m_cuda_device = false;
+    gtest::ScopedEnv env;
+    std::vector<nixlBackendH *> backend_handles;
+
+private:
+    static constexpr uint64_t DEV_ID = 0;
+    static const std::string NOTIF_MSG;
+    // TODO: with error handling enabled by default we get poor performance with UCX1.18.
+    // Before we upgrade to UCX1.19, we need to temporarily increase the retry count,
+    // in order to pass threadpool tests.
+    // TODO: revert this to 1000 once we upgrade to UCX1.19.
+    static constexpr int retry_count{10000};
+    static constexpr std::chrono::milliseconds retry_timeout{10};
+
+    std::vector<std::unique_ptr<nixlAgent>> agents;
+    std::vector<uint16_t> ports;
+};
+
+class TestTransferTelemetry : public TestTransfer {
+protected:
+    void
+    SetUp() override {
+        // Do not create agents here, the test will create them with custom parameters
+    }
+
+    void
+    runTelemetryTransferTest(size_t size,
+                             nixl_status_t expected_telem_status,
+                             bool capture_telemetry) {
+        constexpr size_t count = 1;
+        constexpr size_t repeat = 1;
+        constexpr size_t num_threads = 1;
+
+        addAgent(0, capture_telemetry);
+        addAgent(1, capture_telemetry);
+
+        std::vector<MemBuffer> src_buffers, dst_buffers;
+        createRegisteredMem(getAgent(0), size, count, DRAM_SEG, src_buffers);
+        createRegisteredMem(getAgent(1), size, count, DRAM_SEG, dst_buffers);
+
+        exchangeMD(0, 1);
+        doTransfer(getAgent(0),
+                   getAgentName(0),
+                   getAgent(1),
+                   getAgentName(1),
+                   size,
+                   count,
+                   repeat,
+                   num_threads,
+                   DRAM_SEG,
+                   src_buffers,
+                   DRAM_SEG,
+                   dst_buffers,
+                   expected_telem_status);
+
+        invalidateMD(0, 1);
+        deregisterMem(getAgent(0), src_buffers, DRAM_SEG);
+        deregisterMem(getAgent(1), dst_buffers, DRAM_SEG);
+    }
+};
+
+const std::string TestTransfer::NOTIF_MSG = "notification";
+
+TEST_P(TestTransfer, RandomSizes)
+{
+    // Tuple fields are: size, count, repeat, num_threads
+    constexpr std::array<std::tuple<size_t, size_t, size_t, size_t>, 4> test_cases = {
+        {{4096, 8, 3, 1},
+         {32768, 64, 3, 2},
+         {1000000, 100, 3, 4},
+         {40, 1000, 1, 4}}
+    };
+    constexpr nixl_mem_t mem_type = DRAM_SEG;
+
+    for (const auto &[size, count, repeat, num_threads] : test_cases) {
+        std::vector<MemBuffer> src_buffers, dst_buffers;
+
+        createRegisteredMem(getAgent(0), size, count, mem_type, src_buffers);
+        createRegisteredMem(getAgent(1), size, count, mem_type, dst_buffers);
+
+        exchangeMD(0, 1);
+        doTransfer(getAgent(0),
+                   getAgentName(0),
+                   getAgent(1),
+                   getAgentName(1),
+                   size,
+                   count,
+                   repeat,
+                   num_threads,
+                   mem_type,
+                   src_buffers,
+                   mem_type,
+                   dst_buffers);
+        invalidateMD(0, 1);
+        deregisterMem(getAgent(0), src_buffers, mem_type);
+        deregisterMem(getAgent(1), dst_buffers, mem_type);
+    }
+}
+
+TEST_P(TestTransfer, remoteMDFromSocket)
+{
+    std::vector<MemBuffer> src_buffers, dst_buffers;
+    constexpr size_t size = 16 * 1024;
+    constexpr size_t count = 4;
+    nixl_mem_t mem_type = m_cuda_device? VRAM_SEG : DRAM_SEG;
+
+    createRegisteredMem(getAgent(0), size, count, mem_type, src_buffers);
+    createRegisteredMem(getAgent(1), size, count, mem_type, dst_buffers);
+
+    exchangeMDIP(0, 1);
+    doTransfer(getAgent(0), getAgentName(0), getAgent(1), getAgentName(1),
+               size, count, 1, 1,
+               mem_type, src_buffers,
+               mem_type, dst_buffers);
+
+    invalidateMD(0, 1);
+    deregisterMem(getAgent(0), src_buffers, mem_type);
+    deregisterMem(getAgent(1), dst_buffers, mem_type);
+}
+
+TEST_P(TestTransfer, NotificationOnly) {
+    constexpr size_t repeat = 100;
+    constexpr size_t num_threads = 4;
+    doNotificationTest(
+            getAgent(0), getAgentName(0), getAgent(1), getAgentName(1), repeat, num_threads);
+}
+
+TEST_P(TestTransfer, SelfNotification) {
+    constexpr size_t repeat = 100;
+    constexpr size_t num_threads = 4;
+    doNotificationTest(
+            getAgent(0), getAgentName(0), getAgent(0), getAgentName(0), repeat, num_threads);
+}
+
+TEST_P(TestTransfer, EmptyNotificationPayload) {
+    constexpr size_t repeat = 16;
+    constexpr size_t num_threads = 2;
+    doNotificationTest(
+        getAgent(0), getAgentName(0), getAgent(1), getAgentName(1), repeat, num_threads, "");
+}
+
+TEST_P(TestTransfer, ListenerCommSize) {
+    std::vector<MemBuffer> buffers;
+    createRegisteredMem(getAgent(1), 64, 10000, DRAM_SEG, buffers);
+    auto status = fetchRemoteMD(0, 1);
+    ASSERT_EQ(NIXL_SUCCESS, status);
+    ASSERT_TRUE(
+        wait_until_true([&]() { return checkRemoteMD(0, 1) == NIXL_SUCCESS; }));
+    deregisterMem(getAgent(1), buffers, DRAM_SEG);
+}
+
+TEST_P(TestTransferTelemetry, GetXferTelemetryFile) {
+    env.addVar("NIXL_TELEMETRY_ENABLE", "y");
+    env.addVar("NIXL_TELEMETRY_DIR", "/tmp/");
+    runTelemetryTransferTest(1024, NIXL_SUCCESS, false);
+}
+
+TEST_P(TestTransferTelemetry, GetXferTelemetryAPI) {
+    // Telemetry explicitly enabled via NIXL_TELEMETRY_ENABLE=y but with no sink
+    // (no NIXL_TELEMETRY_DIR/EXPORTER) collects in-process via the collect-only
+    // NOP fallback, so getXferTelemetry() still works.
+    env.addVar("NIXL_TELEMETRY_ENABLE", "y");
+    runTelemetryTransferTest(1024, NIXL_SUCCESS, false);
+}
+
+TEST_P(TestTransferTelemetry, GetXferTelemetryCaptureNoSink) {
+    // Telemetry requested only via capture_telemetry=true (no
+    // NIXL_TELEMETRY_ENABLE, no sink): the in-process NOP fallback keeps
+    // getXferTelemetry() working.
+    runTelemetryTransferTest(1024, NIXL_SUCCESS, true);
+}
+
+TEST_P(TestTransferTelemetry, GetXferTelemetryAPICfg) {
+    // An explicit disabled environment variable overrides agent config telemetry.
+    env.addVar("NIXL_TELEMETRY_ENABLE", "n");
+
+    const LogIgnoreGuard lig("ignoring telemetry requested through agent config");
+
+    runTelemetryTransferTest(1024, NIXL_ERR_NO_TELEMETRY, true);
+
+    EXPECT_EQ(lig.getIgnoredCount(), 2);
+}
+
+TEST_P(TestTransferTelemetry, GetXferTelemetryDisabled) {
+    env.addVar("NIXL_TELEMETRY_ENABLE", "n");
+    const LogIgnoreGuard lig("cannot return values when telemetry is not enabled");
+    runTelemetryTransferTest(512, NIXL_ERR_NO_TELEMETRY, false);
+    EXPECT_LE(lig.getIgnoredCount(), 1);
+}
+
+NIXL_INSTANTIATE_TEST(ucx, TestTransfer, "UCX", true, 2, 0, "");
+NIXL_INSTANTIATE_TEST(ucx_no_pt, TestTransfer, "UCX", false, 2, 0, "");
+NIXL_INSTANTIATE_TEST(ucx_threadpool, TestTransfer, "UCX", true, 6, 4, "");
+NIXL_INSTANTIATE_TEST(ucx_threadpool_no_pt, TestTransfer, "UCX", false, 6, 4, "");
+
+NIXL_INSTANTIATE_TEST(ucx_telemetry, TestTransferTelemetry, "UCX", true, 2, 0, "");
+NIXL_INSTANTIATE_TEST(ucx_telemetry_no_pt, TestTransferTelemetry, "UCX", false, 2, 0, "");
+NIXL_INSTANTIATE_TEST(ucx_telemetry_threadpool, TestTransferTelemetry, "UCX", true, 6, 4, "");
+NIXL_INSTANTIATE_TEST(ucx_telemetry_threadpool_no_pt,
+                      TestTransferTelemetry,
+                      "UCX",
+                      false,
+                      6,
+                      4,
+                      "");
+
+// End-to-end test with real agents and the NVTX trace backend active. It passes
+// standalone (NVTX ranges are no-op stubs with no profiler attached) and is also
+// the binary profiled under nsys to capture the NVTX timeline as an artifact.
+class TestTransferTracing : public TestTransfer {
+protected:
+    // False when this build did not produce libtrace_backend_nvtx.so.
+    static bool nvtxPluginAvailable_;
+
+    // The NVTX backend is an on-demand plugin (libtrace_backend_nvtx.so); point
+    // the manager at its build-tree location once for the whole suite. Guarded so
+    // a build without the NVTX plugin doesn't log a missing-directory error, and
+    // added a single time so re-entry across instantiations doesn't warn about a
+    // duplicate directory.
+    static void
+    SetUpTestSuite() {
+        static bool added = false;
+        if (added) {
+            nvtxPluginAvailable_ = true;
+            return;
+        }
+        const std::string nvtx_plugin_dir = std::string(BUILD_DIR) + "/src/plugins/tracing/nvtx";
+        if (std::filesystem::exists(nvtx_plugin_dir)) {
+            nixlPluginManager::getInstance().addPluginDirectory(nvtx_plugin_dir);
+            added = true;
+            nvtxPluginAvailable_ = true;
+        } else {
+            nvtxPluginAvailable_ = false;
+        }
+    }
+
+    void
+    SetUp() override {
+        // Nothing to validate without the plugin -- skip instead of running blind.
+        if (!nvtxPluginAvailable_) {
+            GTEST_SKIP() << "NVTX trace plugin (libtrace_backend_nvtx.so) was not built";
+        }
+        // Activate NVTX tracing before the agents are created (the constructor
+        // reads NIXL_TRACE_BACKENDS). Keep telemetry off.
+        env.addVar("NIXL_TELEMETRY_ENABLE", "n");
+        env.addVar("NIXL_TRACE_BACKENDS", "nvtx");
+        for (size_t i = 0; i < 2; i++) {
+            addAgent(i);
+        }
+    }
+
+    void
+    runTracingTransferTest() {
+        constexpr size_t size = 4096;
+        constexpr size_t count = 4;
+        // A few iterations so the captured NVTX timeline shows repeated ranges.
+        constexpr size_t repeat = 8;
+        constexpr size_t num_threads = 1;
+
+        std::vector<MemBuffer> src_buffers, dst_buffers;
+        createRegisteredMem(getAgent(0), size, count, DRAM_SEG, src_buffers);
+        createRegisteredMem(getAgent(1), size, count, DRAM_SEG, dst_buffers);
+
+        exchangeMD(0, 1);
+        doTransfer(getAgent(0),
+                   getAgentName(0),
+                   getAgent(1),
+                   getAgentName(1),
+                   size,
+                   count,
+                   repeat,
+                   num_threads,
+                   DRAM_SEG,
+                   src_buffers,
+                   DRAM_SEG,
+                   dst_buffers);
+        invalidateMD(0, 1);
+        deregisterMem(getAgent(0), src_buffers, DRAM_SEG);
+        deregisterMem(getAgent(1), dst_buffers, DRAM_SEG);
+    }
+};
+
+bool TestTransferTracing::nvtxPluginAvailable_ = false;
+
+TEST_P(TestTransferTracing, NvtxTransferLoop) {
+    runTracingTransferTest();
+}
+
+// Exercises the genNotif/getNotifs trace call sites under active NVTX.
+TEST_P(TestTransferTracing, NvtxNotifications) {
+    doNotificationTest(getAgent(0),
+                       getAgentName(0),
+                       getAgent(1),
+                       getAgentName(1),
+                       /*repeat=*/4,
+                       /*num_threads=*/1);
+}
+
+// Exercises loadRemoteMD via direct metadata blob exchange (exchangeMD path).
+TEST_P(TestTransferTracing, NvtxMetadataExchange) {
+    constexpr size_t size = 4096;
+    constexpr size_t count = 1;
+
+    std::vector<MemBuffer> src_buffers, dst_buffers;
+    createRegisteredMem(getAgent(0), size, count, DRAM_SEG, src_buffers);
+    createRegisteredMem(getAgent(1), size, count, DRAM_SEG, dst_buffers);
+
+    exchangeMD(0, 1);
+
+    invalidateMD(0, 1);
+    deregisterMem(getAgent(0), src_buffers, DRAM_SEG);
+    deregisterMem(getAgent(1), dst_buffers, DRAM_SEG);
+}
+
+// Single clean pass through every traced agent op in lifecycle order, so the
+// nsys capture is an easy-to-narrate demo timeline (see the demo plan in
+// docs/proposals/shared-tracing-api-plan.md). makeConnection is invoked
+// explicitly: the loop/notif tests connect implicitly via exchangeMD, so the
+// Connection span would otherwise never appear on the timeline.
+TEST_P(TestTransferTracing, NvtxDemoWalkthrough) {
+    constexpr size_t size = 4096;
+    constexpr size_t count = 1;
+
+    std::vector<MemBuffer> src_buffers, dst_buffers;
+    createRegisteredMem(getAgent(0), size, count, DRAM_SEG, src_buffers);
+    createRegisteredMem(getAgent(1), size, count, DRAM_SEG, dst_buffers);
+
+    exchangeMD(0, 1);
+
+    ASSERT_EQ(getAgent(0).makeConnection(getAgentName(1)), NIXL_SUCCESS);
+
+    doTransfer(getAgent(0),
+               getAgentName(0),
+               getAgent(1),
+               getAgentName(1),
+               size,
+               count,
+               /*repeat=*/1,
+               /*num_threads=*/1,
+               DRAM_SEG,
+               src_buffers,
+               DRAM_SEG,
+               dst_buffers);
+
+    ASSERT_EQ(getAgent(0).genNotif(getAgentName(1), "nixl::demo"), NIXL_SUCCESS);
+    // Drain the notification until it is actually delivered, so no UCX active
+    // message is left in flight at teardown (a canceled AM logs a warning).
+    constexpr int max_drain_polls = 1000;
+    constexpr std::chrono::milliseconds drain_poll_interval{10};
+    nixl_notifs_t notif_map;
+    for (int i = 0; i < max_drain_polls; ++i) {
+        ASSERT_EQ(getAgent(0).getNotifs(notif_map), NIXL_SUCCESS);
+        ASSERT_EQ(getAgent(1).getNotifs(notif_map), NIXL_SUCCESS);
+        if (!notif_map[getAgentName(0)].empty()) {
+            break;
+        }
+        std::this_thread::sleep_for(drain_poll_interval);
+    }
+    ASSERT_FALSE(notif_map[getAgentName(0)].empty());
+
+    invalidateMD(0, 1);
+    deregisterMem(getAgent(0), src_buffers, DRAM_SEG);
+    deregisterMem(getAgent(1), dst_buffers, DRAM_SEG);
+}
+
+NIXL_INSTANTIATE_TEST(ucx_tracing, TestTransferTracing, "UCX", true, 2, 0, "");
+NIXL_INSTANTIATE_TEST(ucx_tracing_no_pt, TestTransferTracing, "UCX", false, 2, 0, "");
+
+// Auto-enable path (NIX-1576): with NIXL_TRACE_BACKENDS unset, a process running
+// under Nsight Systems (nsys injects NVTX_INJECTION64_PATH) must activate the
+// NVTX backend on its own. Reuses TestTransferTracing's plugin-dir registration
+// and transfer body; only the environment differs.
+class TestTransferTracingNsysAuto : public TestTransferTracing {
+protected:
+    void
+    SetUp() override {
+        if (!nvtxPluginAvailable_) {
+            GTEST_SKIP() << "NVTX trace plugin (libtrace_backend_nvtx.so) was not built";
+        }
+        env.addVar("NIXL_TELEMETRY_ENABLE", "n");
+        // Leave NIXL_TRACE_BACKENDS unset so the NVTX backend can only come from
+        // nsys auto-enable. Under a real nsys run NVTX_INJECTION64_PATH is already
+        // set (real injection library) -- don't clobber it. Otherwise simulate an
+        // nsys process; the path need not exist, as the NVTX runtime falls back to
+        // no-op ranges when injection is absent.
+        if (std::getenv("NVTX_INJECTION64_PATH") == nullptr) {
+            env.addVar("NVTX_INJECTION64_PATH", "/nonexistent/libInjectionNvtx64.so");
+        }
+        for (size_t i = 0; i < 2; i++) {
+            addAgent(i);
+        }
+    }
+};
+
+TEST_P(TestTransferTracingNsysAuto, AutoEnabledTransferLoop) {
+    runTracingTransferTest();
+}
+
+NIXL_INSTANTIATE_TEST(ucx_tracing_nsys_auto, TestTransferTracingNsysAuto, "UCX", true, 2, 0, "");
+
+} // namespace gtest

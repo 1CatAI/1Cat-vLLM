@@ -1,0 +1,85 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the libcu++ Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+// UNSUPPORTED: pre-sm-70
+
+// UNSUPPORTED: force-tile
+// error: accessing gridDim/blockDim/blockIdx/threadIdx/warpSize is unsupported in tile code
+
+#include <cuda/std/array>
+#include <cuda/std/cassert>
+#include <cuda/std/cstdint>
+#include <cuda/std/type_traits>
+#include <cuda/warp>
+
+#include "test_macros.h"
+
+template <typename T>
+TEST_DEVICE_FUNC void test_types(T valueA = T{}, T valueB = T{1})
+{
+  for (int i = 1; i < 32; ++i)
+  {
+    auto mask = cuda::device::lane_mask{(1u << i) - 1};
+    assert(cuda::device::warp_match_all(valueA, mask));
+    if (i > 1)
+    {
+      [[maybe_unused]] auto value = threadIdx.x == 0 ? valueA : valueB;
+      assert(!cuda::device::warp_match_all(value, mask));
+    }
+  }
+}
+
+TEST_DEVICE_FUNC uint32_t make_low_mask(unsigned count)
+{
+  return count == 32 ? 0xFFFFFFFF : ((1u << count) - 1);
+}
+
+TEST_DEVICE_FUNC void test_bool()
+{
+  for (unsigned i = 1; i <= 32; ++i)
+  {
+    auto mask = cuda::device::lane_mask{make_low_mask(i)};
+    if (threadIdx.x < i)
+    {
+      assert(cuda::device::warp_match_all(false, mask));
+      assert(cuda::device::warp_match_all(true, mask));
+      auto value = threadIdx.x == 0;
+      assert(cuda::device::warp_match_all(value, mask) == (i == 1));
+    }
+  }
+}
+
+struct WithPadding
+{
+  int a;
+  char b;
+};
+
+__global__ void test_kernel()
+{
+  test_bool();
+  test_types<uint8_t>();
+  test_types<uint16_t>();
+  test_types<uint32_t>();
+  test_types<uint64_t>();
+#if _CCCL_HAS_INT128()
+  test_types<__uint128_t>();
+#endif
+  test_types(char3{0, 0, 0}, char3{1, 1, 1});
+  using array_t = cuda::std::array<char, 6>;
+  test_types(array_t{0, 0, 0, 0, 0, 0}, array_t{1, 1, 1, 1, 1, 1});
+#if defined(_CCCL_BUILTIN_BUILTIN_CLEAR_PADDING)
+  test_types<WithPadding>();
+#endif
+}
+
+int main(int, char**)
+{
+  NV_IF_TARGET(NV_IS_HOST, (test_kernel<<<1, 32>>>();))
+  return 0;
+}

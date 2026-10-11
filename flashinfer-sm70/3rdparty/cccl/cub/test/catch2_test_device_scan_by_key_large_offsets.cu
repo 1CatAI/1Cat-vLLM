@@ -1,0 +1,132 @@
+// SPDX-FileCopyrightText: Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3
+
+#include "insert_nested_NVTX_range_guard.h"
+
+#include <cub/device/device_scan.cuh>
+
+#include <cuda/iterator>
+
+#include <cstdint>
+
+#include "catch2_large_problem_helper.cuh"
+#include "catch2_test_launch_helper.h"
+#include "cub_test_macros.h"
+
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::ExclusiveScanByKey, device_exclusive_scan_by_key);
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::InclusiveScanByKey, device_inclusive_scan_by_key);
+
+// %PARAM% TEST_LAUNCH lid 0:1:2
+
+// List of offset types to be used for testing large number of items
+// using offset_types = c2h::type_list<std::uint32_t, std::uint64_t>;
+using offset_types = c2h::type_list<std::uint64_t>;
+
+template <typename ItemT, bool IsExclusive>
+struct expected_sum_op
+{
+  uint64_t segment_size;
+  ItemT init_value;
+
+  __host__ __device__ __forceinline__ ItemT operator()(const uint64_t index) const
+  {
+    uint64_t index_within_segment = index % segment_size;
+    uint64_t full_segments        = index / segment_size;
+
+    uint64_t sum_within_partial_segment{};
+    if (IsExclusive)
+    {
+      sum_within_partial_segment = (index_within_segment * (index_within_segment - 1)) / 2;
+    }
+    else
+    {
+      sum_within_partial_segment = (index_within_segment * (index_within_segment + 1)) / 2;
+    }
+    return index_within_segment == 0
+           ? (IsExclusive ? init_value : static_cast<ItemT>(init_value + full_segments))
+           : static_cast<ItemT>(sum_within_partial_segment + full_segments) + init_value;
+  }
+};
+
+template <typename ItemT>
+struct mod_op
+{
+  uint64_t segment_size;
+
+  __host__ __device__ __forceinline__ uint64_t operator()(const uint64_t index) const
+  {
+    auto mod = static_cast<ItemT>(index % segment_size);
+    auto div = static_cast<ItemT>(index / segment_size);
+    return mod == 0 ? div : mod;
+  }
+};
+
+template <typename KeyT>
+struct div_op
+{
+  uint64_t segment_size;
+
+  __host__ __device__ __forceinline__ KeyT operator()(const uint64_t index) const
+  {
+    return static_cast<KeyT>(index / segment_size);
+  }
+};
+
+CUB_TEST("DeviceScan::ScanByKey works for very large number of items", "[by_key][scan][device]", CUB_LARGE, offset_types)
+try
+{
+  using op_t     = cuda::std::plus<>;
+  using item_t   = std::uint32_t;
+  using key_t    = std::uint64_t;
+  using index_t  = std::uint64_t;
+  using offset_t = typename c2h::get<0, TestType>;
+
+  const offset_t num_items_max = detail::make_large_offset<offset_t>();
+  const offset_t num_items_min = num_items_max > 10000 ? num_items_max - 10000ULL : offset_t{0};
+  const offset_t num_items     = GENERATE_COPY(
+    values(
+      {num_items_max, static_cast<offset_t>(num_items_max - 1), static_cast<offset_t>(1), static_cast<offset_t>(3)}),
+    take(2, random(num_items_min, num_items_max)));
+
+  // Prepare input (generate a series of: 0, 1, 2, ..., <segment_size-1>,  1, 1, 2, ..., <segment_size-1>, 2, 1, ...)
+  const index_t segment_size = GENERATE_COPY(values({offset_t{1000}, offset_t{1}}));
+  auto index_it              = cuda::counting_iterator(index_t{});
+  auto keys_it               = cuda::transform_iterator(index_it, div_op<key_t>{segment_size});
+  auto items_it              = cuda::transform_iterator(index_it, mod_op<item_t>{segment_size});
+
+  // Output memory allocation
+  c2h::device_vector<item_t> d_items_out(num_items);
+  auto d_items_out_it = thrust::raw_pointer_cast(d_items_out.data());
+
+  // Run test
+  SECTION("ExclusiveScanByKey")
+  {
+    [[maybe_unused]] constexpr bool is_exclusive = true;
+    auto initial_value                           = item_t{42};
+    device_exclusive_scan_by_key(
+      keys_it, items_it, d_items_out_it, op_t{}, initial_value, num_items, cuda::std::equal_to<>{});
+
+    // Ensure that we created the correct output
+    auto expected_out_it = cuda::transform_iterator(
+      index_it, expected_sum_op<item_t, is_exclusive>{static_cast<index_t>(segment_size), initial_value});
+    bool all_results_correct = thrust::equal(d_items_out.cbegin(), d_items_out.cend(), expected_out_it);
+    REQUIRE(all_results_correct == true);
+  }
+  SECTION("InclusiveScanByKey")
+  {
+    [[maybe_unused]] constexpr bool is_exclusive = false;
+    auto initial_value                           = item_t{0};
+    device_inclusive_scan_by_key(keys_it, items_it, d_items_out_it, op_t{}, num_items, cuda::std::equal_to<>{});
+
+    // Ensure that we created the correct output
+    auto expected_out_it = cuda::transform_iterator(
+      index_it, expected_sum_op<item_t, is_exclusive>{static_cast<index_t>(segment_size), initial_value});
+    bool all_results_correct = thrust::equal(d_items_out.cbegin(), d_items_out.cend(), expected_out_it);
+    REQUIRE(all_results_correct == true);
+  }
+}
+catch (std::bad_alloc&)
+{
+  // Exceeding memory is not a failure.
+  SUCCEED("exceeding memory is not a failure");
+}

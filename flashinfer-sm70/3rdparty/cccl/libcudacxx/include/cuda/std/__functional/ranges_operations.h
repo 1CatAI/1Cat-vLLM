@@ -1,0 +1,113 @@
+// -*- C++ -*-
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _CUDA_STD___FUNCTIONAL_RANGES_OPERATIONS_H
+#define _CUDA_STD___FUNCTIONAL_RANGES_OPERATIONS_H
+
+#include <cuda/std/detail/__config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/std/__concepts/equality_comparable.h>
+#include <cuda/std/__concepts/totally_ordered.h>
+#include <cuda/std/__utility/forward.h>
+
+#include <cuda/std/__cccl/prologue.h>
+
+_CCCL_BEGIN_NAMESPACE_CUDA_STD_RANGES
+
+struct equal_to
+{
+  _CCCL_TEMPLATE(class _Tp, class _Up)
+  _CCCL_REQUIRES(equality_comparable_with<_Tp, _Up>)
+  [[nodiscard]] _CCCL_API constexpr bool _CCCL_STATIC_CALL_OPERATOR(_Tp&& __t, _Up&& __u) noexcept(
+    noexcept(bool(::cuda::std::forward<_Tp>(__t) == ::cuda::std::forward<_Up>(__u))))
+  {
+    return ::cuda::std::forward<_Tp>(__t) == ::cuda::std::forward<_Up>(__u);
+  }
+
+  using is_transparent = void;
+};
+
+struct not_equal_to
+{
+  _CCCL_TEMPLATE(class _Tp, class _Up)
+  _CCCL_REQUIRES(equality_comparable_with<_Tp, _Up>)
+  [[nodiscard]] _CCCL_API constexpr bool _CCCL_STATIC_CALL_OPERATOR(_Tp&& __t, _Up&& __u) noexcept(
+    noexcept(bool(!(::cuda::std::forward<_Tp>(__t) == ::cuda::std::forward<_Up>(__u)))))
+  {
+    return !(::cuda::std::forward<_Tp>(__t) == ::cuda::std::forward<_Up>(__u));
+  }
+
+  using is_transparent = void;
+};
+
+struct less
+{
+  _CCCL_TEMPLATE(class _Tp, class _Up)
+  _CCCL_REQUIRES(totally_ordered_with<_Tp, _Up>)
+  [[nodiscard]] _CCCL_API constexpr bool _CCCL_STATIC_CALL_OPERATOR(_Tp&& __t, _Up&& __u) noexcept(
+    noexcept(bool(::cuda::std::forward<_Tp>(__t) < ::cuda::std::forward<_Up>(__u))))
+  {
+    return ::cuda::std::forward<_Tp>(__t) < ::cuda::std::forward<_Up>(__u);
+  }
+
+  using is_transparent = void;
+};
+
+struct less_equal
+{
+  _CCCL_TEMPLATE(class _Tp, class _Up)
+  _CCCL_REQUIRES(totally_ordered_with<_Tp, _Up>)
+  [[nodiscard]] _CCCL_API constexpr bool _CCCL_STATIC_CALL_OPERATOR(_Tp&& __t, _Up&& __u) noexcept(
+    noexcept(bool(!(::cuda::std::forward<_Up>(__u) < ::cuda::std::forward<_Tp>(__t)))))
+  {
+    return !(::cuda::std::forward<_Up>(__u) < ::cuda::std::forward<_Tp>(__t));
+  }
+
+  using is_transparent = void;
+};
+
+struct greater
+{
+  _CCCL_TEMPLATE(class _Tp, class _Up)
+  _CCCL_REQUIRES(totally_ordered_with<_Tp, _Up>)
+  [[nodiscard]] _CCCL_API constexpr bool _CCCL_STATIC_CALL_OPERATOR(_Tp&& __t, _Up&& __u) noexcept(
+    noexcept(bool(::cuda::std::forward<_Up>(__u) < ::cuda::std::forward<_Tp>(__t))))
+  {
+    return ::cuda::std::forward<_Up>(__u) < ::cuda::std::forward<_Tp>(__t);
+  }
+
+  using is_transparent = void;
+};
+
+struct greater_equal
+{
+  _CCCL_TEMPLATE(class _Tp, class _Up)
+  _CCCL_REQUIRES(totally_ordered_with<_Tp, _Up>)
+  [[nodiscard]] _CCCL_API constexpr bool _CCCL_STATIC_CALL_OPERATOR(_Tp&& __t, _Up&& __u) noexcept(
+    noexcept(bool(!(::cuda::std::forward<_Tp>(__t) < ::cuda::std::forward<_Up>(__u)))))
+  {
+    return !(::cuda::std::forward<_Tp>(__t) < ::cuda::std::forward<_Up>(__u));
+  }
+
+  using is_transparent = void;
+};
+
+_CCCL_END_NAMESPACE_CUDA_STD_RANGES
+
+#include <cuda/std/__cccl/epilogue.h>
+
+#endif // _CUDA_STD___FUNCTIONAL_RANGES_OPERATIONS_H

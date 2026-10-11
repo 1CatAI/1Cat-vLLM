@@ -1,0 +1,66 @@
+// -*- C++ -*-
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _CUDA_STD___CSTDLIB_ALIGNED_ALLOC_H
+#define _CUDA_STD___CSTDLIB_ALIGNED_ALLOC_H
+
+#include <cuda/std/detail/__config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/std/__cstddef/types.h>
+#include <cuda/std/__cstdlib/malloc.h>
+#include <cuda/std/cstring>
+
+#if _CCCL_HOSTED()
+#  include <cstdlib>
+#endif // _CCCL_HOSTED()
+
+#include <nv/target>
+
+#include <cuda/std/__cccl/prologue.h>
+
+#if _CCCL_CUDA_COMPILATION()
+extern "C" _CCCL_DEVICE void* __cuda_syscall_aligned_malloc(size_t __nbytes, size_t __align);
+#endif // _CCCL_CUDA_COMPILATION()
+
+_CCCL_BEGIN_NAMESPACE_CUDA_STD
+
+#if !_CCCL_COMPILER(NVRTC)
+[[nodiscard]] _CCCL_HOST_API inline void*
+__aligned_alloc_host([[maybe_unused]] size_t __align, [[maybe_unused]] size_t __nbytes) noexcept
+{
+#  if _CCCL_OS(WINDOWS)
+  _CCCL_ASSERT(false, "Use of aligned_alloc in host code is not supported on WIndows");
+  return nullptr;
+#  else // ^^^ _CCCL_COMPILER(MSVC) ^^^ / vvv !_CCCL_COMPILER(MSVC) vvv
+  return ::aligned_alloc(__align, __nbytes);
+#  endif // ^^^ !_CCCL_COMPILER(MSVC) ^^^
+}
+#endif // !_CCCL_COMPILER(NVRTC)
+
+[[nodiscard]] _CCCL_HOST_DEVICE_API inline void* aligned_alloc(size_t __align, size_t __nbytes) noexcept
+{
+  NV_IF_ELSE_TARGET(NV_IS_HOST,
+                    (return ::cuda::std::__aligned_alloc_host(__align, __nbytes);),
+                    (return ::__cuda_syscall_aligned_malloc(__nbytes, __align);))
+}
+
+_CCCL_END_NAMESPACE_CUDA_STD
+
+#include <cuda/std/__cccl/epilogue.h>
+
+#endif // _CUDA_STD___CSTDLIB_ALIGNED_ALLOC_H

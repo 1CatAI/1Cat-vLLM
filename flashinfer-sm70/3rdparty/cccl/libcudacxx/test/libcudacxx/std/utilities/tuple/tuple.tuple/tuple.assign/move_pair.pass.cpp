@@ -1,0 +1,36 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// <cuda/std/tuple>
+
+// template <class... Types> class tuple;
+
+// template <class U1, class U2>
+//   tuple& operator=(pair<U1, U2>&& u);
+
+#include <cuda/std/cassert>
+#include <cuda/std/tuple>
+#include <cuda/std/utility>
+
+#include "MoveOnly.h"
+#include "test_macros.h"
+
+int main(int, char**)
+{
+  {
+    using T0 = cuda::std::pair<long, MoveOnly>;
+    using T1 = cuda::std::tuple<long long, MoveOnly>;
+    T0 t0(2, MoveOnly(3));
+    T1 t1;
+    t1 = cuda::std::move(t0);
+    assert(cuda::std::get<0>(t1) == 2);
+    assert(cuda::std::get<1>(t1).get() == 3);
+  }
+
+  return 0;
+}

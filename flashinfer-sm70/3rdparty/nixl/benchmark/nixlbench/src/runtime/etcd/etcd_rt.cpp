@@ -1,0 +1,581 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <thread>
+#include <chrono>
+#include <sstream>
+#include <algorithm>
+#include <iomanip>
+#include <cstring>
+#include <etcd/SyncClient.hpp>
+#include <etcd/KeepAlive.hpp>
+#include <etcd/Response.hpp>
+#include "etcd_rt.h"
+
+#define ETCD_EP_DEFAULT "http://localhost:2379"
+
+namespace {
+// Lease TTL in seconds: rank key auto-expires this long after the last keepalive.
+constexpr int lease_ttl_s = 30;
+} // namespace
+
+// ETCD Runtime implementation
+xferBenchEtcdRT::xferBenchEtcdRT(const std::string &benchmark_group,
+                                 const std::string &etcd_endpoints,
+                                 const int size,
+                                 std::atomic<int> *terminate_input) {
+    // Store parameters for later use in setup
+    stored_etcd_endpoints = etcd_endpoints.empty() ? ETCD_EP_DEFAULT : etcd_endpoints;
+    global_size = size;
+    terminate = terminate_input;
+
+    // Initialize other members
+    namespace_prefix = "xferbench/" + benchmark_group + "/"; // Namespace for XFER benchmark
+    barrier_gen = 0;
+    my_rank = -1; // Will be set in setup()
+
+    // Client will be initialized in setup()
+}
+
+int
+xferBenchEtcdRT::setup() {
+    // Connect to ETCD
+    try {
+        std::cout << "Connecting to ETCD at " << stored_etcd_endpoints << std::endl;
+        client = std::make_unique<etcd::SyncClient>(stored_etcd_endpoints);
+    }
+    catch (const std::exception &e) {
+        std::cerr << "Failed to connect to ETCD: " << e.what() << std::endl;
+        return -1;
+    }
+
+    // Registration process - get a unique rank
+    std::string lock_key = makeKey("lock");
+
+    // Try to acquire a lock for registration
+    auto lock_response = client->lock(lock_key);
+    if (lock_response.error_code() != 0) {
+        std::cerr << "Failed to acquire lock: " << lock_response.error_message() << std::endl;
+        return -1;
+    }
+
+    // Get the current size - number of processes that have registered
+    auto size_response = client->get(makeKey("size"));
+    if (size_response.error_code() == 0) {
+        my_rank = std::stoi(size_response.value().as_string());
+    } else {
+        my_rank = 0;
+    }
+
+    // Register the rank key with a lease before bumping "size"; a crash before
+    // registration leaves size unchanged.
+    try {
+        // Reuse client's gRPC channel to avoid slow channel creation under load.
+        keepalive = std::make_unique<etcd::KeepAlive>(*client, lease_ttl_s);
+    }
+    catch (const std::exception &e) {
+        client->unlock(lock_response.lock_key());
+        std::cerr << "Failed to start etcd keepalive: " << e.what() << std::endl;
+        return -1;
+    }
+
+    const auto rank_response = client->put(makeKey("rank", my_rank), "active", keepalive->Lease());
+    if (!rank_response.is_ok()) {
+        client->unlock(lock_response.lock_key());
+        keepalive->Cancel();
+        keepalive.reset();
+        std::cerr << "Failed to register rank key: " << rank_response.error_message() << std::endl;
+        return -1;
+    }
+
+    // Bump the non-leased "size" counter only after the rank key is successfully
+    // registered with a lease.
+    client->put(makeKey("size"), std::to_string(my_rank + 1));
+
+    // Release the lock
+    client->unlock(lock_response.lock_key());
+
+    // Set the parent class rank and size
+    setRank(my_rank);
+    setSize(global_size);
+
+    if (my_rank >= global_size) {
+        std::cerr << "Rank " << my_rank << " is greater than or equal to global size "
+                  << global_size << std::endl;
+        client->rmdir(makeKey(""), true);
+        return -1;
+    }
+    std::cout << "ETCD Runtime: Registered as rank " << my_rank << " item " << my_rank + 1 << " of "
+              << global_size << std::endl;
+
+    return 0;
+}
+
+xferBenchEtcdRT::~xferBenchEtcdRT() {
+    // Stop lease keepalive before cleanup so the rank key is removed by rmdir
+    // rather than expiring after the TTL
+    if (keepalive) {
+        keepalive->Cancel();
+        keepalive.reset();
+    }
+    // All ranks delete, as some could be missing if ETCD state is confused
+    if (client) {
+        client->rmdir(makeKey(""), true);
+    }
+}
+
+void
+xferBenchEtcdRT::cleanupForExit() {
+    // Cancel keepalive first so the gRPC stream closes before we touch etcd.
+    if (keepalive) {
+        keepalive->Cancel();
+        keepalive.reset();
+    }
+    // Remove the whole namespace so non-leased keys (e.g. "size") don't
+    // linger and poison the next run in the same benchmark_group.
+    if (client) {
+        client->rmdir(makeKey(""), true);
+    }
+}
+
+bool
+xferBenchEtcdRT::checkKeepAlive() {
+    if (keepalive) {
+        try {
+            keepalive->Check();
+        }
+        catch (const std::exception &e) {
+            std::cerr << "nixlbench: keepalive Check() returns a failure detected in the past: "
+                      << e.what() << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+bool
+xferBenchEtcdRT::areAllPeersAlive() {
+    for (int r = 0; r < global_size; r++) {
+        if (r == my_rank) continue;
+        auto resp = client->get(makeKey("rank", r));
+        // For a single-key get(), is_ok() reflects gRPC success, NOT key existence:
+        // a missing key returns is_ok()=true with an empty value().key().
+        // resp.value().key() is non-empty only when the key actually exists in etcd.
+        if (!resp.is_ok() || resp.value().key().empty()) {
+            std::cerr << "nixlbench: peer rank " << r
+                      << " key missing (or etcd error) -- peer may have died" << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+int
+xferBenchEtcdRT::getRank() const {
+    return my_rank;
+}
+
+int xferBenchEtcdRT::getSize() const {
+    return global_size;
+}
+
+std::string xferBenchEtcdRT::makeTypedKey(const std::string& operation, int src,
+                                          int dst, xferBenchEtcdMsgType type) {
+    std::stringstream ss;
+    ss << namespace_prefix << operation << "+"
+       << (type == XFER_BENCH_ETCD_MSG_TYPE_INT ? "int_data" : "char_data") << "/"
+       << "src=" << src << "/"
+       << "dst=" << dst;
+    return ss.str();
+}
+
+int xferBenchEtcdRT::sendInt(int* buffer, int dest_rank) {
+    try {
+        // Create the message key
+        std::string msg_key = makeTypedKey("msg", my_rank, dest_rank, XFER_BENCH_ETCD_MSG_TYPE_INT);
+        std::string ack_key = msg_key + "/ack";
+
+        // Store the integer value directly as a string
+        std::string value_str = std::to_string(*buffer);
+        client->put(msg_key, value_str);
+
+        int retries = 0;
+        bool ack_received = false;
+
+        while (!ack_received && should_retry(retries)) {
+            auto ack_response = client->get(ack_key);
+            if (ack_response.error_code() == 0 && ack_response.value().as_string() == "received") {
+                ack_received = true;
+                // Clean up the acknowledgment
+                client->rm(ack_key);
+            } else {
+                // Wait and retry
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                retries++;
+            }
+        }
+
+        if (!ack_received) {
+            std::cerr << "Timeout waiting for int data acknowledgment from rank " << dest_rank << std::endl;
+            return -1;
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error sending int data: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
+int xferBenchEtcdRT::recvInt(int* buffer, int src_rank) {
+    // Create the message key
+    std::string msg_key = makeTypedKey("msg", src_rank, my_rank, XFER_BENCH_ETCD_MSG_TYPE_INT);
+    std::string ack_key = msg_key + "/ack";
+
+    // Poll until the data is available (blocking)
+    int retries = 0;
+    bool data_received = false;
+
+    while (!data_received && should_retry(retries)) {
+        auto response = client->get(msg_key);
+        if (response.error_code() == 0) {
+            // Get the value directly as a string
+            std::string value_str = response.value().as_string();
+
+            try {
+                // Convert string to integer
+                *buffer = std::stoi(value_str);
+
+                // Send acknowledgment
+                client->put(ack_key, "received");
+                data_received = true;
+
+                // Delete the message after we've acknowledged it
+                std::this_thread::sleep_for(std::chrono::seconds(1)); // Brief delay
+                client->rm(msg_key);
+
+                return 0;
+            }
+            catch (const std::exception &e) {
+                std::cerr << "Error converting value to integer: " << e.what() << std::endl;
+                return -1;
+            }
+        } else {
+            // Wait and retry
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            retries++;
+        }
+    }
+
+    if (!data_received) {
+        std::cerr << "Timeout waiting for int data from rank " << src_rank << std::endl;
+        return -1;
+    }
+
+    return 0;
+}
+
+
+int xferBenchEtcdRT::sendChar(char* buffer, size_t count, int dest_rank) {
+    try {
+        // Create the message key and data key
+        std::string msg_key = makeTypedKey("msg", my_rank, dest_rank, XFER_BENCH_ETCD_MSG_TYPE_CHAR);
+        std::string data_key = msg_key + "/data";
+        std::string ack_key = msg_key + "/ack";
+
+        // Store raw character data directly
+        std::string data_str(buffer, buffer + count);
+        client->put(data_key, data_str);
+
+        // Store metadata
+        std::string meta =
+            std::to_string(my_rank) + ":" + std::to_string(dest_rank) + ":" + std::to_string(count);
+        client->put(msg_key, meta);
+
+        int retries = 0;
+        bool ack_received = false;
+
+        while (!ack_received && should_retry(retries)) {
+            auto ack_response = client->get(ack_key);
+            if (ack_response.error_code() == 0 && ack_response.value().as_string() == "received") {
+                ack_received = true;
+                // Clean up the acknowledgment
+                client->rm(ack_key);
+            } else {
+                // Wait and retry
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+                retries++;
+            }
+        }
+
+        if (!ack_received) {
+            std::cerr << "Timeout waiting for char data acknowledgment from rank " << dest_rank << std::endl;
+            return -1;
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error sending char data: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
+int xferBenchEtcdRT::recvChar(char* buffer, size_t count, int src_rank) {
+    // Create the message keys
+    std::string msg_key = makeTypedKey("msg", src_rank, my_rank, XFER_BENCH_ETCD_MSG_TYPE_CHAR);
+    std::string data_key = msg_key + "/data";
+    std::string ack_key = msg_key + "/ack";
+
+    // Poll until the data is available (blocking)
+    int retries = 0;
+    bool data_received = false;
+
+    while (!data_received && should_retry(retries)) {
+        // First check if metadata exists
+        auto meta_response = client->get(msg_key);
+        if (meta_response.error_code() == 0) {
+            // Now get the actual data
+            auto data_response = client->get(data_key);
+            if (data_response.error_code() == 0) {
+                // Get the raw character data
+                std::string data_str = data_response.value().as_string();
+
+                // Copy to the buffer
+                size_t copy_size = std::min(data_str.size(), count);
+                std::copy(data_str.begin(), data_str.begin() + copy_size, buffer);
+
+                // Send acknowledgment
+                client->put(ack_key, "received");
+                data_received = true;
+
+                // Delete the message after we've acknowledged it
+                std::this_thread::sleep_for(std::chrono::seconds(1)); // Brief delay
+                client->rm(data_key);
+                client->rm(msg_key);
+
+                return 0;
+            }
+        }
+
+        // Wait and retry
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        retries++;
+    }
+
+    if (!data_received) {
+        std::cerr << "Timeout waiting for char data from rank " << src_rank << std::endl;
+        return -1;
+    }
+
+    return 0;
+}
+
+int xferBenchEtcdRT::reduceSumDouble(double *local_value, double *global_value, int dest_rank) {
+    try {
+        // Use a deterministic key based on dest_rank to avoid collisions
+        std::string reduce_key = makeKey("reduce/dest-" + std::to_string(dest_rank));
+        std::string value_key = reduce_key + "/rank-" + std::to_string(my_rank);
+
+        // Contribute our value directly as a string
+        std::stringstream ss;
+        ss << std::fixed << std::setprecision(16) << *local_value;
+        client->put(value_key, ss.str());
+
+        // If we are the destination rank, collect and reduce
+        if (my_rank == dest_rank) {
+            // Initialize the global value with our value
+            *global_value = *local_value;
+
+            // Wait for all contributions
+            int received = 0;
+            int expected;
+            // For pairwise scheme with multiple devices, only initiator processes contribute
+            // In pairwise scheme: global_size = num_initiator_dev + num_target_dev
+            // Only initiators participate in reduction, so we expect (num_initiator_dev - 1)
+            // contributions
+            if (global_size > 2) {
+                // Assume pairwise scheme with equal initiators and targets
+                expected = (global_size / 2) - 1; // Only other initiators
+            } else {
+                expected = global_size - 1; // Fallback for simple 2-process case
+            }
+            int retries = 0;
+
+            while (received < expected && should_retry(retries, 30)) {
+                auto response = client->ls(reduce_key);
+                if (response.error_code() == 0) {
+                    for (const auto &kv : response.keys()) {
+                        // Skip our own contribution
+                        std::string key = kv;
+                        if (key == value_key) {
+                            continue;
+                        }
+
+                        // Get the contribution data as a string
+                        auto get_response = client->get(key);
+                        if (get_response.error_code() == 0) {
+                            // Convert string directly to double
+                            std::string value_str = get_response.value().as_string();
+                            double contrib_value = std::stod(value_str);
+
+                            // Add to the global value
+                            *global_value += contrib_value;
+
+                            // Remove this contribution
+                            client->rm(key);
+                            received++;
+                        }
+                    }
+                }
+
+                if (received < expected) {
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                    retries++;
+                }
+            }
+
+            // Clean up
+            client->rmdir(reduce_key, true);
+
+            if (received < expected) {
+                std::cerr << "Timeout waiting for reduction contributions (got " << received << "/"
+                          << expected << " contributions)" << std::endl;
+                return -1;
+            }
+        } else {
+            // Non-destination ranks just wait a bit to ensure their contribution is processed
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error in reduce operation: " << e.what() << std::endl;
+        return -1;
+    }
+}
+
+int xferBenchEtcdRT::barrier(const std::string& barrier_id) {
+    int count = 0;
+    std::string barrier_suffix = "barrier/" + barrier_id + "/" + std::to_string(barrier_gen);
+    std::string barrier_key = namespace_prefix + barrier_suffix + "/";
+    barrier_gen++; // In case same barrier is reused too quickly
+
+    try {
+        auto resp = client->put(barrier_key + std::to_string(my_rank), "1");
+        if (!resp.is_ok()) {
+            throw std::runtime_error("put");
+        }
+
+        for (auto retries = 0; should_retry(retries); ++retries) {
+            auto resp = client->ls(barrier_key);
+            if (resp.error_code()) {
+                break;
+            }
+
+            count = resp.keys().size();
+            if (count == 0 || // rank 0 observed completion and deleted the barrier
+                count == (int)global_size) {
+                if (my_rank == 0) {
+                    // Only one of them needs to cleanup
+                    client->rmdir(barrier_key, true);
+                }
+                return 0;
+            }
+
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+
+        throw std::runtime_error("wait");
+    }
+    catch (const std::exception &e) {
+        std::cerr << "Error in barrier " << e.what() << " " << barrier_key
+            << " rank " << my_rank << " completed "
+            << count << "/" << global_size << " ranks)" << std::endl;
+        // Clean up after failure, otherwise next runs may be affected
+        client->rmdir(barrier_key, true);
+    }
+
+    return -1;
+}
+
+int xferBenchEtcdRT::broadcastInt(int* buffer, size_t count, int root_rank) {
+    try {
+        // Create a unique key for this broadcast operation
+        std::string bcast_key  = makeKey("bcast/int", root_rank);
+        std::string barrier_id = "bcast_int_" + std::to_string(root_rank);
+
+        // First phase: root process puts the value in etcd
+        if (my_rank == root_rank) {
+            // Serialize array of integers using binary representation
+            std::string value_str(reinterpret_cast<char *>(buffer), count * sizeof(int));
+            client->put(bcast_key, value_str);
+        }
+
+        // Synchronize to ensure the value is written before non-root processes try to read it
+        barrier(barrier_id + "_write");
+
+        // Second phase: non-root processes read the value
+        if (my_rank != root_rank) {
+            int retries = 0;
+            bool data_received = false;
+
+            while (!data_received && should_retry(retries, 10)) {
+                auto response = client->get(bcast_key);
+                if (response.error_code() == 0) {
+                    std::string value_str = response.value().as_string();
+                    try {
+                        // Deserialize binary data directly into the buffer
+                        if (value_str.size() >= count * sizeof(int)) {
+                            std::memcpy(buffer, value_str.data(), count * sizeof(int));
+                            data_received = true;
+                        } else {
+                            std::cerr << "Received data size (" << value_str.size()
+                                      << ") is smaller than expected (" << count * sizeof(int) << ")" << std::endl;
+                            retries++;
+                        }
+                    }
+                    catch (const std::exception &e) {
+                        std::cerr << "Error deserializing broadcast data: " << e.what() << std::endl;
+                        return -1;
+                    }
+                } else {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    retries++;
+                }
+            }
+
+            if (!data_received) {
+                std::cerr << "Failed to read broadcast data from rank "
+                          << root_rank << std::endl;
+                return -1;
+            }
+        }
+
+        // Synchronize to ensure all processes have read the value before cleaning up
+        barrier(barrier_id + "_read");
+
+        // Clean up
+        if (my_rank == root_rank) {
+            client->rm(bcast_key);
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "Error in broadcast operation: " << e.what() << std::endl;
+        return -1;
+    }
+}

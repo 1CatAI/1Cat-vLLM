@@ -1,0 +1,637 @@
+// SPDX-FileCopyrightText: Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3
+
+#include "insert_nested_NVTX_range_guard.h"
+
+#include <cub/detail/prefetch.cuh>
+#include <cub/device/device_select.cuh>
+#include <cub/device/dispatch/tuning/tuning_select_if.cuh>
+
+#include <thrust/count.h>
+#include <thrust/partition.h>
+#include <thrust/reverse.h>
+
+#include <cuda/devices>
+#include <cuda/iterator>
+#include <cuda/std/execution>
+
+#include <algorithm>
+
+#include "catch2_test_device_select_common.cuh"
+#include "catch2_test_launch_helper.h"
+#include "cub_test_macros.h"
+
+template <class T, class FlagT>
+static c2h::host_vector<T> get_reference(const c2h::device_vector<T>& in, const c2h::device_vector<FlagT>& flags)
+{
+  struct selector
+  {
+    const T* ref_begin      = nullptr;
+    const FlagT* flag_begin = nullptr;
+
+    constexpr selector(const T* ref, const FlagT* flag) noexcept
+        : ref_begin(ref)
+        , flag_begin(flag)
+    {}
+
+    bool operator()(const T& val) const
+    {
+      const auto pos = &val - ref_begin;
+      return static_cast<bool>(flag_begin[pos]);
+    }
+  };
+
+  c2h::host_vector<T> reference   = in;
+  c2h::host_vector<FlagT> h_flags = flags;
+
+  const selector pred{thrust::raw_pointer_cast(reference.data()), thrust::raw_pointer_cast(h_flags.data())};
+  const auto boundary = std::stable_partition(reference.begin(), reference.end(), pred);
+  reference.erase(boundary, reference.end());
+  return reference;
+}
+
+DECLARE_LAUNCH_WRAPPER(cub::DeviceSelect::Flagged, select_flagged);
+
+// %PARAM% TEST_LAUNCH lid 0:1:2
+
+using all_types =
+  c2h::type_list<std::uint8_t,
+                 std::uint16_t,
+                 std::uint32_t,
+                 std::uint64_t,
+                 ulonglong2,
+// WAR bug in vec type handling in NVCC 12.0 + GCC 11.4 + C++20
+#if !(_CCCL_CUDA_COMPILER(NVCC, ==, 12, 0) && _CCCL_COMPILER(GCC, ==, 11, 4) && _CCCL_STD_VER == 2020)
+#  if _CCCL_CTK_AT_LEAST(13, 0)
+                 ulonglong4_16a,
+#  else // _CCCL_CTK_AT_LEAST(13, 0)
+                 ulonglong4,
+#  endif // _CCCL_CTK_AT_LEAST(13, 0)
+#endif // !(NVCC 12.0 and GCC 11.4 and C++20)
+                 int,
+                 long2,
+                 c2h::custom_type_t<c2h::equal_comparable_t>>;
+
+using types =
+  c2h::type_list<std::uint8_t,
+                 std::uint32_t,
+// WAR bug in vec type handling in NVCC 12.0 + GCC 11.4 + C++20
+#if !(_CCCL_CUDA_COMPILER(NVCC, ==, 12, 0) && _CCCL_COMPILER(GCC, ==, 11, 4) && _CCCL_STD_VER == 2020)
+#  if _CCCL_CTK_AT_LEAST(13, 0)
+                 ulonglong4_16a,
+#  else // _CCCL_CTK_AT_LEAST(13, 0)
+                 ulonglong4,
+#  endif // _CCCL_CTK_AT_LEAST(13, 0)
+#endif // !(NVCC 12.0 and GCC 11.4 and C++20)
+                 c2h::custom_type_t<c2h::equal_comparable_t>>;
+
+CUB_TEST("DeviceSelect::Flagged can run with empty input", "[device][select_flagged]", CUB_SMALL, types)
+{
+  using type = typename c2h::get<0, TestType>;
+
+  constexpr int num_items = 0;
+  c2h::device_vector<type> in(num_items);
+  c2h::device_vector<type> out(num_items);
+  c2h::device_vector<int> flags(num_items);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 42);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(in.begin(), flags.begin(), out.begin(), d_num_selected_out, num_items);
+
+  REQUIRE(num_selected_out[0] == 0);
+}
+
+CUB_TEST("DeviceSelect::Flagged handles all matched", "[device][select_flagged]", CUB_SMALL, types)
+{
+  using type = typename c2h::get<0, TestType>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items);
+  c2h::device_vector<type> out(num_items);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items, 1);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(in.begin(), flags.begin(), out.begin(), d_num_selected_out, num_items);
+
+  REQUIRE(num_selected_out[0] == num_items);
+  REQUIRE(out == in);
+}
+
+CUB_TEST("DeviceSelect::Flagged handles no matched", "[device][select_flagged]", CUB_SMALL, types)
+{
+  using type = typename c2h::get<0, TestType>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items);
+  c2h::device_vector<type> out(0);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items, 0);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(in.begin(), flags.begin(), out.begin(), d_num_selected_out, num_items);
+
+  REQUIRE(num_selected_out[0] == 0);
+}
+
+CUB_TEST("DeviceSelect::Flagged does not change input", "[device][select_flagged]", CUB_SMALL, types)
+{
+  using type = typename c2h::get<0, TestType>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items);
+  c2h::device_vector<type> out(num_items);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items);
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  // copy input first
+  c2h::device_vector<type> reference = in;
+
+  select_flagged(in.begin(), flags.begin(), out.begin(), d_num_selected_out, num_items);
+
+  REQUIRE(num_selected == num_selected_out[0]);
+  REQUIRE(reference == in);
+}
+
+CUB_TEST("DeviceSelect::Flagged is stable",
+         "[device][select_flagged]",
+         CUB_SMALL,
+         c2h::type_list<c2h::custom_type_t<c2h::equal_comparable_t>>)
+{
+  using type = typename c2h::get<0, TestType>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items);
+  c2h::device_vector<type> out(num_items);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items);
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+  const c2h::host_vector<type> reference = get_reference(in, flags);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(in.begin(), flags.begin(), out.begin(), d_num_selected_out, num_items);
+
+  out.resize(num_selected_out[0]);
+  REQUIRE(num_selected == num_selected_out[0]);
+  REQUIRE(reference == out);
+}
+
+#if TEST_LAUNCH == 0
+CUB_TEST("DeviceSelect::Flagged works with user provided memory and environment",
+         "[device][select_flagged]",
+         CUB_SMALL,
+         all_types)
+{
+  using type = typename c2h::get<0, TestType>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items, thrust::default_init);
+  c2h::device_vector<type> out(num_items, thrust::default_init);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items, thrust::no_init);
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+  const c2h::host_vector<type> reference = get_reference(in, flags);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  size_t expected_allocation_size = 0;
+  auto error                      = cub::DeviceSelect::Flagged(
+    static_cast<void*>(nullptr),
+    expected_allocation_size,
+    in.data(),
+    flags.begin(),
+    out.data(),
+    d_num_selected_out,
+    num_items);
+  REQUIRE(error == cudaSuccess);
+  REQUIRE(cudaSuccess == cudaPeekAtLastError());
+  REQUIRE(cudaSuccess == cudaDeviceSynchronize());
+
+  auto d_temp        = c2h::device_vector<uint8_t>(expected_allocation_size, thrust::no_init);
+  void* temp_storage = thrust::raw_pointer_cast(d_temp.data());
+
+  auto test_flagged = [&](const auto& env) {
+    size_t num_bytes = 0;
+    error            = cub::DeviceSelect::Flagged(
+      static_cast<void*>(nullptr), num_bytes, in.data(), flags.begin(), out.data(), d_num_selected_out, num_items, env);
+    REQUIRE(error == cudaSuccess);
+    REQUIRE(cudaSuccess == cudaPeekAtLastError());
+    REQUIRE(cudaSuccess == cudaDeviceSynchronize());
+    REQUIRE(expected_allocation_size == num_bytes);
+
+    error = cub::DeviceSelect::Flagged(
+      temp_storage, num_bytes, in.data(), flags.begin(), out.data(), d_num_selected_out, num_items, env);
+    REQUIRE(error == cudaSuccess);
+    REQUIRE(cudaSuccess == cudaPeekAtLastError());
+    REQUIRE(cudaSuccess == cudaDeviceSynchronize());
+
+    out.resize(num_selected_out[0]);
+    REQUIRE(num_selected == num_selected_out[0]);
+    REQUIRE(reference == out);
+  };
+
+  int current_device;
+  error = cudaGetDevice(&current_device);
+  REQUIRE(error == cudaSuccess);
+
+  SECTION("DeviceSelect::Flagged works with cudaStream_t")
+  {
+    cuda::stream stream{cuda::devices[current_device]};
+    test_flagged(stream.get());
+  }
+
+  SECTION("DeviceSelect::Flagged works with cuda::stream")
+  {
+    cuda::stream stream{cuda::devices[current_device]};
+    test_flagged(stream);
+  }
+
+  SECTION("DeviceSelect::Flagged works with cuda::stream_ref")
+  {
+    cuda::stream stream{cuda::devices[current_device]};
+    cuda::stream_ref stream_ref{stream};
+    test_flagged(stream_ref);
+  }
+
+  SECTION("DeviceSelect::Flagged works with cuda::std::execution::env")
+  {
+    cuda::std::execution::env env{};
+    test_flagged(env);
+  }
+
+  SECTION("DeviceSelect::Flagged works with cuda::execution::gpu")
+  {
+    const auto policy = cuda::execution::gpu;
+    test_flagged(policy);
+  }
+
+  SECTION("DeviceSelect::Flagged works with cuda::execution::gpu with stream")
+  {
+    cuda::stream stream{cuda::devices[current_device]};
+    const auto policy = cuda::execution::gpu.with(cuda::get_stream, stream);
+    test_flagged(policy);
+  }
+}
+#endif // TEST_LAUNCH == 0
+
+#if TEST_LAUNCH == 0
+template <cub::detail::LoadPrefetch Prefetch, cub::SelectImpl SelectionOpt>
+struct flagged_prefetch_policy_selector
+{
+  [[nodiscard]] _CCCL_HOST_DEVICE_API constexpr auto operator()(cuda::compute_capability cc) const -> cub::SelectPolicy
+  {
+    auto policy = cub::detail::select::policy_selector_from_types<int*, int*, int*, int, SelectionOpt>{}(cc);
+    policy.lookback._load_prefetch = Prefetch;
+    return policy;
+  }
+};
+
+using prefetch_policies =
+  c2h::enum_type_list<cub::detail::LoadPrefetch, cub::detail::LoadPrefetch::l2, cub::detail::LoadPrefetch::bulk_l2>;
+
+using selection_policies =
+  c2h::enum_type_list<cub::SelectImpl, cub::SelectImpl::Select, cub::SelectImpl::SelectPotentiallyInPlace>;
+
+CUB_TEST("DeviceSelect::Flagged works with explicit prefetch policies",
+         "[device][select_flagged][prefetch]",
+         CUB_SMALL,
+         prefetch_policies,
+         selection_policies)
+{
+  constexpr auto prefetch     = c2h::get<0, TestType>::value;
+  constexpr auto selection_op = c2h::get<1, TestType>::value;
+  constexpr int num_items     = 100003;
+
+  c2h::device_vector<int> in(num_items);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items);
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+  const c2h::host_vector<int> reference = get_reference(in, flags);
+
+  c2h::device_vector<int> num_selected_out(1, 0);
+
+  int* const d_in               = thrust::raw_pointer_cast(in.data());
+  int* const d_flags            = thrust::raw_pointer_cast(flags.data());
+  int* const d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+  const auto tuned_execution    = cuda::execution::tune(flagged_prefetch_policy_selector<prefetch, selection_op>{});
+
+  if constexpr (selection_op == cub::SelectImpl::SelectPotentiallyInPlace)
+  {
+    REQUIRE(cudaSuccess == cub::DeviceSelect::Flagged(d_in, d_flags, d_num_selected_out, num_items, tuned_execution));
+    REQUIRE(cudaSuccess == cudaDeviceSynchronize());
+
+    in.resize(num_selected_out[0]);
+    REQUIRE(num_selected == num_selected_out[0]);
+    REQUIRE(reference == in);
+  }
+  else
+  {
+    c2h::device_vector<int> out(num_items);
+    int* const d_out = thrust::raw_pointer_cast(out.data());
+
+    REQUIRE(
+      cudaSuccess == cub::DeviceSelect::Flagged(d_in, d_flags, d_out, d_num_selected_out, num_items, tuned_execution));
+    REQUIRE(cudaSuccess == cudaDeviceSynchronize());
+
+    out.resize(num_selected_out[0]);
+    REQUIRE(num_selected == num_selected_out[0]);
+    REQUIRE(reference == out);
+  }
+}
+#endif // TEST_LAUNCH == 0
+
+CUB_TEST("DeviceSelect::Flagged works with iterators", "[device][select_flagged]", CUB_SMALL, all_types)
+{
+  using type = typename c2h::get<0, TestType>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items);
+  c2h::device_vector<type> out(num_items);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items);
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+  const c2h::host_vector<type> reference = get_reference(in, flags);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(in.data(), flags.begin(), out.data(), d_num_selected_out, num_items);
+
+  out.resize(num_selected_out[0]);
+  REQUIRE(num_selected == num_selected_out[0]);
+  REQUIRE(reference == out);
+}
+
+CUB_TEST("DeviceSelect::Flagged works with pointers", "[device][select_flagged]", CUB_SMALL, types)
+{
+  using type = typename c2h::get<0, TestType>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items);
+  c2h::device_vector<type> out(num_items);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items);
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+  const c2h::host_vector<type> reference = get_reference(in, flags);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(thrust::raw_pointer_cast(in.data()),
+                 thrust::raw_pointer_cast(flags.data()),
+                 thrust::raw_pointer_cast(out.data()),
+                 d_num_selected_out,
+                 num_items);
+
+  out.resize(num_selected_out[0]);
+  REQUIRE(num_selected == num_selected_out[0]);
+  REQUIRE(reference == out);
+}
+
+struct convertible_to_bool
+{
+  int val_;
+
+  convertible_to_bool() = default;
+  __host__ __device__ convertible_to_bool(const int val) noexcept
+      : val_(val)
+  {}
+
+  __host__ __device__ operator bool() const noexcept
+  {
+    return static_cast<bool>(val_);
+  }
+  __host__ __device__ friend bool operator==(const convertible_to_bool& lhs, const int& rhs) noexcept
+  {
+    return lhs.val_ == rhs;
+  }
+  __host__ __device__ friend bool operator==(const int& lhs, const convertible_to_bool& rhs) noexcept
+  {
+    return lhs == rhs.val_;
+  }
+};
+
+CUB_TEST("DeviceSelect::Flagged works with flags that are convertible to bool", "[device][select_flagged]", CUB_SMALL)
+{
+  using type = c2h::custom_type_t<c2h::equal_comparable_t>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items);
+  c2h::device_vector<type> out(num_items);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> iflags(num_items);
+  c2h::gen(C2H_SEED(1), iflags, 0, 1);
+
+  c2h::device_vector<convertible_to_bool> flags = iflags;
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+  const c2h::host_vector<type> reference = get_reference(in, flags);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(in.begin(), flags.begin(), out.begin(), d_num_selected_out, num_items);
+
+  out.resize(num_selected_out[0]);
+  REQUIRE(num_selected == num_selected_out[0]);
+  REQUIRE(reference == out);
+}
+
+CUB_TEST("DeviceSelect::Flagged works with flags that alias input", "[device][select_flagged]", CUB_SMALL)
+{
+  using type = int;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> out(num_items);
+
+  c2h::device_vector<int> flags(num_items);
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+  const c2h::host_vector<type> reference = get_reference(flags, flags);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(flags.begin(), flags.begin(), out.begin(), d_num_selected_out, num_items);
+
+  out.resize(num_selected_out[0]);
+  REQUIRE(num_selected == num_selected_out[0]);
+  REQUIRE(reference == out);
+}
+
+CUB_TEST("DeviceSelect::Flagged works in place", "[device][select_flagged]", CUB_SMALL, types)
+{
+  using type = typename c2h::get<0, TestType>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items);
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+
+  const c2h::host_vector<type> reference = get_reference(in, flags);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(in.begin(), flags.begin(), d_num_selected_out, num_items);
+
+  in.resize(num_selected_out[0]);
+  REQUIRE(reference == in);
+}
+
+CUB_TEST("DeviceSelect::Flagged works in place with flags that alias input", "[device][select_flagged]", CUB_SMALL)
+{
+  using type = int;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<int> flags(num_items);
+
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+  const c2h::host_vector<type> reference = get_reference(flags, flags);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(flags.begin(), flags.begin(), d_num_selected_out, num_items);
+
+  flags.resize(num_selected_out[0]);
+  REQUIRE(num_selected == num_selected_out[0]);
+  REQUIRE(reference == flags);
+}
+
+template <class T>
+struct convertible_from_T
+{
+  T val_;
+
+  convertible_from_T() = default;
+  __host__ __device__ convertible_from_T(const T& val) noexcept
+      : val_(val)
+  {}
+  __host__ __device__ convertible_from_T& operator=(const T& val) noexcept
+  {
+    val_ = val;
+  }
+  // Converting back to T helps satisfy all the machinery that T supports
+  __host__ __device__ operator T() const noexcept
+  {
+    return val_;
+  }
+};
+
+CUB_TEST("DeviceSelect::Flagged works with a different output type", "[device][select_flagged]", CUB_SMALL)
+{
+  using type = c2h::custom_type_t<c2h::equal_comparable_t>;
+
+  const int num_items = GENERATE_COPY(take(2, random(1, 1000000)));
+  c2h::device_vector<type> in(num_items);
+  c2h::device_vector<convertible_from_T<type>> out(num_items);
+  c2h::gen(C2H_SEED(2), in);
+
+  c2h::device_vector<int> flags(num_items);
+  c2h::gen(C2H_SEED(1), flags, 0, 1);
+
+  const int num_selected = static_cast<int>(thrust::count(c2h::device_policy, flags.begin(), flags.end(), 1));
+  const c2h::host_vector<type> reference = get_reference(in, flags);
+
+  // Needs to be device accessible
+  c2h::device_vector<int> num_selected_out(1, 0);
+  int* d_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  select_flagged(in.data(), flags.begin(), out.data(), d_num_selected_out, num_items);
+
+  out.resize(num_selected_out[0]);
+  REQUIRE(num_selected == num_selected_out[0]);
+  REQUIRE(reference == out);
+}
+
+CUB_TEST("DeviceSelect::Flagged works for very large number of items",
+         "[device][select_flagged][skip-cs-initcheck][skip-cs-racecheck][skip-cs-synccheck]",
+         CUB_SMALL)
+try
+{
+  using type     = std::int64_t;
+  using offset_t = std::int64_t;
+
+  // The partition size (the maximum number of items processed by a single kernel invocation) is an important boundary
+  constexpr auto max_partition_size = static_cast<offset_t>(cuda::std::numeric_limits<std::int32_t>::max());
+
+  offset_t num_items = GENERATE_COPY(
+    values({
+      offset_t{2} * max_partition_size + offset_t{20000000}, // 3 partitions
+      offset_t{2} * max_partition_size, // 2 partitions
+      max_partition_size + offset_t{1}, // 2 partitions
+      max_partition_size, // 1 partitions
+      max_partition_size - offset_t{1} // 1 partitions
+    }),
+    take(2, random(max_partition_size - offset_t{1000000}, max_partition_size + offset_t{1000000})));
+
+  // Input
+  constexpr offset_t match_every_nth = 1000000;
+  auto in                            = cuda::counting_iterator(static_cast<type>(0));
+  auto flags_in = cuda::transform_iterator(in, mod_n<offset_t>{static_cast<offset_t>(match_every_nth)});
+
+  // Needs to be device accessible
+  c2h::device_vector<offset_t> num_selected_out(1, 0);
+  offset_t* d_first_num_selected_out = thrust::raw_pointer_cast(num_selected_out.data());
+
+  // Run test
+  offset_t expected_num_copied = (num_items + match_every_nth - offset_t{1}) / match_every_nth;
+  c2h::device_vector<type> out(expected_num_copied);
+  select_flagged(in, flags_in, out.begin(), d_first_num_selected_out, num_items);
+
+  // Ensure that we created the correct output
+  REQUIRE(num_selected_out[0] == expected_num_copied);
+  auto expected_out_it     = cuda::transform_iterator(in, multiply_n<offset_t>{static_cast<offset_t>(match_every_nth)});
+  bool all_results_correct = thrust::equal(out.cbegin(), out.cend(), expected_out_it);
+  REQUIRE(all_results_correct == true);
+}
+catch (std::bad_alloc&)
+{
+  // Exceeding memory is not a failure.
+  SUCCEED("exceeding memory is not a failure");
+}

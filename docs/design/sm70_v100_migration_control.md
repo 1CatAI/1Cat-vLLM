@@ -2,6 +2,74 @@
 
 Date: 2026-05-30
 
+## Independent FlashInfer operator module, 2026-10-11
+
+The standalone `flashinfer-sm70` source module is pinned to upstream `34bb66e4`.
+Implementation starts on main `be3722bc09`, retaining #1172 over the audited
+`8d4fd940` baseline. The fork keeps `flashinfer-python` / `import flashinfer`,
+with isolated minimal dependencies and SM70 primitive compilation. Engine SM70
+wheel metadata selects its exact fork version instead of conflicting official
+FlashInfer/cubin pins; non-SM70 metadata keeps the existing provider.
+
+The user has provided machine 54633 and authorized releasing the Studio GPUs.
+GPU validation uses independent environments on Python 3.12 / Torch 2.10 /
+CUDA 12.8 / V100-SXM2. Offline builds and CPU installation checks do not close
+correctness, speed or quality gates. Text C1/C4,
+MTP, D72 vision and 27B/35B-A3B AWQ/FP8 regressions remain mandatory. See the
+[module coverage and historical failures](../../flashinfer-sm70/docs/sm70/coverage.md).
+
+The same consolidated PR adds an independent request-grouped QSA score kernel
+and the engine's `KernelConfig.sm70_flashinfer_qsa` candidate/force adapter.
+It preserves the C1 single-launch Volta MMA route and shares keys across C4×5
+rows using GPU request grouping. The default remains `off`; `force` rejects
+unsupported inputs and bypasses legacy prefill scoring. Exact Top-K, expansion,
+cache updates and sparse attention retain their existing implementations, so
+this batch does not close the full QSA chain. Workspace allocation is bounded
+per indexer and occurs before capture; the scorer never replaces captured
+storage. See [candidate scope and pending GPU matrix](../../flashinfer-sm70/docs/sm70/qsa.md).
+
+Delivery is consolidated in Draft PR #1177 directly against `main`, per the
+user's updated request. Foundation PR #1175 is closed and its commits are
+included in #1177. Keep import, library kernels, engine adaptation and evidence
+as distinct commits within this one PR; no separate batch PRs are planned.
+
+The fresh independent wheel now passes 40 tests on V100-SXM2 / CUDA 12.8:
+9 packaging tests, 16 GPU primitive cases and 15 GPU QSA cases, with unchanged
+floating tolerances and exact selected indices. A startup-namespace assertion
+was corrected after proving that CUDA Python's `.pth` creates `cuda` before
+FlashInfer imports. No kernel change was needed. These results do not admit
+performance or close complete QSA/model gates; see the
+[hardware record](../../flashinfer-sm70/docs/sm70/gpu-validation-20261011.md).
+
+The source-release check found that `tests/sm70/pytest.ini` was missing from
+the sdist. Its manifest now includes the standalone test configuration; the
+extracted artifact passes all 9 packaging tests, with the 31 GPU cases explicitly
+skipped on the CPU validation host. The CUDA 12.8 install example pins Torch
+2.10 and TVM-FFI 0.1.10 in its fresh environment. QSA screening also saves each
+completed point before proceeding, retaining earlier results if a later A/A
+check fails or execution is interrupted. These fixes do not change kernels.
+The first normal engine wheel also exposed QuACK's indirect CuTe dependency;
+SM70 metadata now removes QuACK while retaining it for other architectures.
+The engine and companion extensions compiled successfully. A system driver
+update interrupted GPU availability; the approved reboot has now completed and
+all four V100s use driver 580.178.04. The independent `.2` suite passed again
+(40 tests), and the corrected normal engine wheel passes its dependency check.
+
+The `.2` partial QSA chain (12 synthetic layers of score/Top-K/expansion) is
+41.32% faster at C4/M20/8K and 64.45% faster at C4/M20/32K, with stable paired
+samples and exact indices. C1/M5 is near parity. The 128K/M20 score comparison
+stopped on three cancellation cases; never report that point as passing.
+The `.3` grouped kernel splits accumulation into two 64-element parts. Three
+fixed regression fixtures and the full independent suite pass (43 tests), with
+the original tolerances and the C1/M<=8 arithmetic retained. The normal `.3`
+engine artifact then passes all 24 score/selection points at 8K/32K/128K,
+including the formerly failing 128K/M20 point. C4/M20 score/Top-K/expansion time
+falls 41.21%, 64.27% and 73.66%; the largest C1/M5 median regression is 1.07%.
+Paired ABBA blocks and stable A/A controls are retained in the hardware record.
+Complete-chain/model gates remain open; a separate normal main artifact is
+being built for whole-model comparison. The reserved-capacity probe
+saved only 1.94% of scoring time and does not justify another variant.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:

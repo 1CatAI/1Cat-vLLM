@@ -1,0 +1,156 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# Common functions for CI scripts
+#
+
+#
+# Set initial port number for client/server applications to be updated with
+# function below
+#
+tcp_port_range=1000
+min_port_number=10500
+max_port_number=65535
+
+# GITLAB CI
+if [ -n "$CI_CONCURRENT_ID" ]; then
+    nixl_concurrent_id=$CI_CONCURRENT_ID
+# Jenkins CI
+elif [ -n "$EXECUTOR_NUMBER" ]; then
+    nixl_concurrent_id=$EXECUTOR_NUMBER
+else
+    # Fallback to random number if both CI_CONCURRENT_ID and EXECUTOR_NUMBER are not set
+    nixl_concurrent_id=$((RANDOM % $(((max_port_number - min_port_number) / tcp_port_range))))
+fi
+
+echo nixl_concurrent_id="$nixl_concurrent_id"
+
+# First half of the port range is used for shell script tests
+tcp_port_min=$((min_port_number + nixl_concurrent_id * tcp_port_range))
+tcp_port_max=$((tcp_port_min + tcp_port_range / 2))
+
+get_next_tcp_port() {
+    local port_file="/tmp/nixl_tcp_port_${nixl_concurrent_id}"
+
+    if [ ! -f "$port_file" ]; then
+        echo "$tcp_port_min" > "$port_file"
+    fi
+
+    local current_port
+    current_port=$(cat "$port_file")
+    local next_port=$((current_port + 1))
+
+    # Check if the port is already in use
+    while ss -tuln | grep -q :$next_port; do
+        next_port=$((next_port + 1))
+    done
+
+    if [ "$next_port" -ge "$tcp_port_max" ]; then
+        next_port="$tcp_port_min"
+    fi
+
+    echo "$next_port" > "$port_file"
+
+    echo "$next_port"
+}
+
+# Second half of the port range is used for gtest
+gtest_offset=$((tcp_port_range / 2))
+# shellcheck disable=SC2034
+min_gtest_port=$((tcp_port_min + gtest_offset))
+# shellcheck disable=SC2034
+max_gtest_port=$((tcp_port_max + gtest_offset))
+
+# Check if a GPU is present
+if [ -z "${HAS_GPU}" ]; then
+    nvidia-smi -L | grep -q '^GPU' && HAS_GPU=true || HAS_GPU=false
+fi
+
+# Ensure CUDA_HOME is set if CUDA is installed (cuda-dl-base images don't set it by default)
+if [ -d "/usr/local/cuda" ] && [ -z "$CUDA_HOME" ]; then
+    export CUDA_HOME=/usr/local/cuda
+fi
+
+if $HAS_GPU && test -d "$CUDA_HOME"
+then
+    UCX_CUDA_BUILD_ARGS="--with-cuda=${CUDA_HOME}"
+else
+    UCX_CUDA_BUILD_ARGS=""
+    # This sequence ensures that we can link and load the binaries in all CI environments, even if a GPU is not present
+    export LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:/usr/local/cuda/compat:/usr/local/cuda/compat/lib.real:$LD_LIBRARY_PATH
+fi
+
+# Default to false, unless TEST_LIBFABRIC is set. AWS EFA tests must set it to true.
+export TEST_LIBFABRIC=${TEST_LIBFABRIC:-false}
+
+# Set default parallelism for make/ninja (can be overridden by NPROC env var)
+if [ -z "$NPROC" ]; then
+    # In containers, calculate based on memory limits to avoid OOM
+    if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "${KUBERNETES_SERVICE_HOST}" ]; then
+        if [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+            limit=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+        elif [ -f /sys/fs/cgroup/memory.max ]; then
+            limit=$(cat /sys/fs/cgroup/memory.max)
+            [ "$limit" = "max" ] && limit=$((4 * 1024 * 1024 * 1024))
+        else
+            limit=$((4 * 1024 * 1024 * 1024))
+        fi
+        # Use 1 process per GB of memory, max 16
+        nproc=$((limit / (1024 * 1024 * 1024)))
+        nproc=$((nproc > 16 ? 16 : nproc))
+        nproc=$((nproc < 1 ? 1 : nproc))
+    else
+        nproc=$(nproc --all)
+    fi
+    export NPROC=$nproc
+fi
+
+wait_for_etcd() {
+    local timeout=30
+    echo "Waiting for etcd to be ready (timeout: ${timeout}s)..."
+    while ! curl -s "${NIXL_ETCD_ENDPOINTS}/health" | grep -q 'true'; do
+        timeout=$((timeout - 1))
+        if [ $timeout -eq 0 ]; then
+            echo "Etcd failed to start"
+            exit 1
+        fi
+        sleep 1
+    done
+    echo "Etcd is ready"
+}
+
+start_etcd_server() {
+    local namespace_prefix=$1
+    if [ -z "${namespace_prefix}" ]; then
+        echo "Usage: start_etcd_server <namespace_prefix>"
+        exit 1
+    fi
+
+    echo "==== Running ETCD server ===="
+    etcd_port=$(get_next_tcp_port)
+    etcd_peer_port=$(get_next_tcp_port)
+    export NIXL_ETCD_ENDPOINTS="http://127.0.0.1:${etcd_port}"
+    export NIXL_ETCD_PEER_URLS="http://127.0.0.1:${etcd_peer_port}"
+    export NIXL_ETCD_NAMESPACE="${namespace_prefix}/${etcd_port}"
+
+    etcd --listen-client-urls "${NIXL_ETCD_ENDPOINTS}" --advertise-client-urls "${NIXL_ETCD_ENDPOINTS}" \
+         --listen-peer-urls "${NIXL_ETCD_PEER_URLS}" --initial-advertise-peer-urls "${NIXL_ETCD_PEER_URLS}" \
+         --initial-cluster "default=${NIXL_ETCD_PEER_URLS}" &
+    ETCD_PID=$!
+
+    wait_for_etcd
+}
