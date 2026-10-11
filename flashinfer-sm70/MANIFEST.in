@@ -1,0 +1,16 @@
+include version.txt UPSTREAM.lock.json requirements*.txt build_utils.py
+include build_backend.py sm70_build_backend.py
+recursive-include include *
+recursive-include csrc *
+recursive-include licenses *
+recursive-include 3rdparty/cutlass/include *
+recursive-include 3rdparty/cutlass/tools/util/include *
+recursive-include 3rdparty/cccl/cub/cub *
+recursive-include 3rdparty/cccl/thrust/thrust *
+recursive-include 3rdparty/cccl/libcudacxx/include *
+recursive-include 3rdparty/spdlog/include *
+include 3rdparty/*/LICENSE*
+recursive-include tests/sm70 *.py
+recursive-include benchmarks/sm70 *.py
+recursive-include docs/sm70 *.md *.json
+global-exclude __pycache__ *.pyc *.so *.o

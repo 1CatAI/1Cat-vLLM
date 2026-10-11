@@ -575,6 +575,13 @@ def apply_rope_pos_ids_inplace(
     --------
     apply_rope_pos_ids
     """
+    from .sm70._dispatch import is_sm70
+
+    if is_sm70(q):
+        from .sm70 import ops
+
+        return ops.apply_rope_pos_ids_inplace(q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta)
+
     if rotary_dim is None:
         rotary_dim = q.size(-1)
     _apply_rope_pos_ids(
@@ -940,6 +947,13 @@ def apply_rope_pos_ids(
     --------
     apply_rope_inplace
     """
+    from .sm70._dispatch import is_sm70
+
+    if is_sm70(q):
+        from .sm70 import ops
+
+        return ops.apply_rope_pos_ids(q, k, pos_ids, rotary_dim, interleave, rope_scale, rope_theta)
+
     q_rope = torch.empty_like(q)
     k_rope = torch.empty_like(k)
     if rotary_dim is None:

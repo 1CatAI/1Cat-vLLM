@@ -22,9 +22,12 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda"]
+license-files = ["LICENSE", "LICENSE*.txt", "NOTICE", "licenses/*", "3rdparty/*/LICENSE*"]
 
 [project.optional-dependencies]
+# Upstream accelerators remain opt-in; the SM70 base never installs them.
+upstream = ["apache-tvm-ffi>=0.1.11,<0.2", "click", "cuda-python>=12.0", "cuda-tile>=1.4.0", "einops", "nccl-extensions>=0.1.0", "nccl4py>=0.4.1", "ninja", "numpy", "nvidia-cudnn-frontend>=1.31.0", "nvidia-cutlass-dsl>=4.6.2a0", "nvidia-ml-py", "packaging>=24.2", "requests", "tabulate", "torch", "tqdm"]
+
 b12x = ["torch>=2.12.0", "nvidia-cutlass-dsl==4.7.1", "nvidia-cutlass-dsl-libs-base==4.7.1", "nvidia-cutlass-dsl-libs-core==4.7.1", "nvidia-cutlass-dsl-libs-cu12==4.7.1", "nvidia-cutlass-dsl-libs-cu13==4.7.1", "rich>=13", "safetensors>=0.6"]
 # Static SM103a KDA PTX uses ISA 9.2 and embedded-cubin TVM FFI shims.
 ptx = ["nvidia-cuda-nvcc>=13.2", "apache-tvm-ffi>=0.1.12,<0.2"]
@@ -47,8 +50,8 @@ nvep = []
 flashinfer = "flashinfer.__main__:cli"
 
 [build-system]
-requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.11,<0.2"]
-build-backend = "build_backend"
+requires = ["setuptools>=77", "packaging>=24"]
+build-backend = "sm70_build_backend"
 backend-path = ["."]
 
 [tool.codespell]
@@ -57,11 +60,11 @@ skip = ["build", "3rdparty", "dist", ".venv"]
 
 [tool.setuptools]
 include-package-data = false
-py-modules = ["build_backend", "build_utils"]
+py-modules = ["build_backend", "build_utils", "sm70_build_backend"]
 
 [tool.setuptools.dynamic]
 version = { attr = "flashinfer._build_meta.__version__" }
-dependencies = { file = ["requirements.txt"] }
+dependencies = { file = ["requirements-sm70.txt"] }
 
 [tool.setuptools.packages.find]
 where = [".", "flashinfer/experimental/b12x/_compat"]
@@ -86,7 +89,7 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimenta
 "flashinfer.experimental.cake_dsa_indexer" = ["csrc/**"]
 # Route catalog of the experimental SM120 paged MQA-logits export, read at runtime next to its module.
 "flashinfer.experimental.deepgemm_sm120_paged_mqa_logits" = ["*.json"]
-"flashinfer" = ["_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
+"flashinfer" = ["UPSTREAM.lock.json", "_build_meta.py", "mla_kv_pack_fp8_workloads.json"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
 "flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe" = ["*.md"]
 "flashinfer.prims_ts.moe" = ["prims_ts_moe_configs.json"]

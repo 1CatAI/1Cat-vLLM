@@ -14,203 +14,208 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import ctypes
-import functools
-import os
+from importlib import import_module as _import_module
 
-# Re-export
-from . import cubin_loader
-from . import env as env
-from .activation import gen_act_and_mul_module as gen_act_and_mul_module
-from .activation import get_act_and_mul_cu_str as get_act_and_mul_cu_str
-from .attention import gen_cudnn_fmha_module as gen_cudnn_fmha_module
-from .attention import gen_batch_attention_module as gen_batch_attention_module
-from .attention import gen_batch_decode_module as gen_batch_decode_module
-from .attention import gen_batch_mla_module as gen_batch_mla_module
-from .attention import gen_batch_prefill_module as gen_batch_prefill_module
-from .attention import (
-    gen_customize_batch_decode_module as gen_customize_batch_decode_module,
-)
-from .attention import (
-    gen_customize_batch_prefill_module as gen_customize_batch_prefill_module,
-)
-from .attention import (
-    gen_customize_single_decode_module as gen_customize_single_decode_module,
-)
-from .attention import (
-    gen_customize_single_prefill_module as gen_customize_single_prefill_module,
-)
-from .attention import gen_fmha_cutlass_sm100a_module as gen_fmha_cutlass_sm100a_module
-from .attention import gen_batch_pod_module as gen_batch_pod_module
-from .attention import gen_pod_module as gen_pod_module
-from .attention import gen_single_decode_module as gen_single_decode_module
-from .attention import gen_single_prefill_module as gen_single_prefill_module
-from .attention import get_batch_attention_uri as get_batch_attention_uri
-from .attention import get_batch_decode_uri as get_batch_decode_uri
-from .attention import get_batch_mla_uri as get_batch_mla_uri
-from .attention import get_batch_prefill_uri as get_batch_prefill_uri
-from .attention import get_pod_uri as get_pod_uri
-from .attention import get_single_decode_uri as get_single_decode_uri
-from .attention import get_single_prefill_uri as get_single_prefill_uri
-from .attention import gen_trtllm_gen_fmha_module as gen_trtllm_gen_fmha_module
-from .attention import gen_fmha_v2_module as gen_fmha_v2_module
-from .attention import (
-    gen_trtllm_fmha_v2_sm120_module as gen_trtllm_fmha_v2_sm120_module,
-)
-from .core import JitSpec as JitSpec
-from .core import JitSpecNvcc as JitSpecNvcc
-from .cute_dsl_core import JitSpecCuteDsl as JitSpecCuteDsl
-from .core import JitSpecStatus as JitSpecStatus
-from .core import JitSpecRegistry as JitSpecRegistry
-from .core import jit_spec_registry as jit_spec_registry
-from .core import build_jit_specs as build_jit_specs
-from .core import clear_cache_dir as clear_cache_dir
-from .core import gen_jit_spec as gen_jit_spec
-from .core import MissingJITCacheError as MissingJITCacheError
-from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
-from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
-from .core import sm100f_nvcc_flags as sm100f_nvcc_flags
-from .core import sm103a_nvcc_flags as sm103a_nvcc_flags
-from .core import sm107a_nvcc_flags as sm107a_nvcc_flags
-from .core import sm110a_nvcc_flags as sm110a_nvcc_flags
-from .core import sm120a_nvcc_flags as sm120a_nvcc_flags
-from .core import sm120f_nvcc_flags as sm120f_nvcc_flags
-from .core import sm121a_nvcc_flags as sm121a_nvcc_flags
-from .core import current_compilation_context as current_compilation_context
-from .cubin_loader import setup_cubin_loader
-from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
-from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
-from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
-from .comm import gen_vllm_comm_module as gen_vllm_comm_module
-from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
-from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
-from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
-from .dsv3_optimizations import (
-    gen_dsv3_router_gemm_module as gen_dsv3_router_gemm_module,
-)
-from .dsv3_optimizations import (
-    gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
-)
-from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
-from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
-from .cake_megamoe_topk_reduce import (
-    gen_cake_megamoe_topk_reduce_module as gen_cake_megamoe_topk_reduce_module,
-)
-from .cake_sampling import gen_cake_sampling_module as gen_cake_sampling_module
-from .cake_sampling import get_cake_sampling_uri as get_cake_sampling_uri
-from .cake_sampling import load_cake_sampling_module as load_cake_sampling_module
-from .cake_megamoe_topk_reduce import (
-    get_cake_megamoe_topk_reduce_module as get_cake_megamoe_topk_reduce_module,
-)
-from .cake_megamoe_topk_reduce import (
-    get_cake_megamoe_topk_reduce_uri as get_cake_megamoe_topk_reduce_uri,
-)
-from .cake_megamoe_topk_reduce import (
-    load_cake_megamoe_topk_reduce_module as load_cake_megamoe_topk_reduce_module,
-)
-from .cake_megamoe_topk_reduce import (
-    is_cake_megamoe_topk_reduce_module_loaded as is_cake_megamoe_topk_reduce_module_loaded,
-)
-from .cake_megamoe_topk_reduce import (
-    run_cake_megamoe_topk_reduce as run_cake_megamoe_topk_reduce,
-)
-from .fused_moe import gen_alphamoe_sm100_module as gen_alphamoe_sm100_module
-from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
-from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
-from .q_token_kv_block_sparse_metadata import (
-    gen_prims_ts_q_token_kv_block_sparse_metadata_module as gen_prims_ts_q_token_kv_block_sparse_metadata_module,
-)
-from .fp4_kv_dequantization import (
-    gen_fp4_kv_dequantization_module as gen_fp4_kv_dequantization_module,
-)
-from .fp4_kv_quantization import (
-    gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
-)
-from .cake_kda import (
-    cake_kda_affine_is_available as cake_kda_affine_is_available,
-)
-from .cake_kda import (
-    gen_cake_kda_affine_module as gen_cake_kda_affine_module,
-)
-from .cake_kda import (
-    gen_cake_kda_m128_unbounded_softplus_module as gen_cake_kda_m128_unbounded_softplus_module,
-)
-from .cake_kda import (
-    get_cake_kda_affine_module as get_cake_kda_affine_module,
-)
-from .cake_kda import (
-    get_cake_kda_prefill_module as get_cake_kda_prefill_module,
-)
-from .cake_kda import (
-    load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
-)
-from .cake_fused_moe_warp_decode import (
-    CakeWarpDecodeTarget as CakeWarpDecodeTarget,
-)
-from .cake_fused_moe_warp_decode import (
-    gen_cake_fused_moe_warp_decode_module as gen_cake_fused_moe_warp_decode_module,
-)
-from .cake_fused_moe_warp_decode import (
-    get_cake_fused_moe_warp_decode_module as get_cake_fused_moe_warp_decode_module,
-)
-from .cake_fused_moe_warp_decode import (
-    get_cake_fused_moe_warp_decode_uri as get_cake_fused_moe_warp_decode_uri,
-)
-from .cake_fused_moe_warp_decode import (
-    load_cake_fused_moe_warp_decode_module as load_cake_fused_moe_warp_decode_module,
-)
-from .flash_kda import (
-    gen_flash_kda_m64_module as gen_flash_kda_m64_module,
-)
-from .flash_kda import (
-    gen_flash_kda_m128_module as gen_flash_kda_m128_module,
-)
-from .flash_kda import (
-    gen_flash_kda_m128_n16_module as gen_flash_kda_m128_n16_module,
-)
-from .flash_kda import (
-    get_flash_kda_prefill_module as get_flash_kda_prefill_module,
-)
-from .flash_kda import (
-    load_flash_kda_m64_module as load_flash_kda_m64_module,
-)
-from .flash_kda import (
-    load_flash_kda_m128_module as load_flash_kda_m128_module,
-)
-from .flash_kda import (
-    load_flash_kda_m128_n16_module as load_flash_kda_m128_n16_module,
-)
-from .blackwell_msa import BLACKWELL_MSA_VARIANTS as BLACKWELL_MSA_VARIANTS
-from .blackwell_msa import (
-    BLACKWELL_MSA_VARIANTS_BY_TARGET as BLACKWELL_MSA_VARIANTS_BY_TARGET,
-)
-from .blackwell_msa import gen_blackwell_msa_module as gen_blackwell_msa_module
-from .blackwell_msa import get_blackwell_msa_module as get_blackwell_msa_module
-from .blackwell_msa import get_blackwell_msa_uri as get_blackwell_msa_uri
-from .blackwell_msa import load_blackwell_msa_module as load_blackwell_msa_module
-from .nvfp4_attention_sm120 import (
-    gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
-)
-from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
-from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
-from .cake_bgmv_moe import (
-    gen_cake_bgmv_moe_module as gen_cake_bgmv_moe_module,
-)
-from .cake_bgmv_moe import (
-    load_cake_bgmv_moe_module as load_cake_bgmv_moe_module,
-)
-from .monomoe import gen_monomoe_module as gen_monomoe_module
-from .monomoe import load_monomoe_module as load_monomoe_module
-from .fused_moe import (
-    gen_alphamoe_fused_router_module as gen_alphamoe_fused_router_module,
-)
-from .fused_moe import (
-    gen_alphamoe_nvfp4_sm100_module as gen_alphamoe_nvfp4_sm100_module,
-)
+_LAZY_EXPORTS = {
+    "BLACKWELL_MSA_VARIANTS": (".blackwell_msa", "BLACKWELL_MSA_VARIANTS"),
+    "BLACKWELL_MSA_VARIANTS_BY_TARGET": (
+        ".blackwell_msa",
+        "BLACKWELL_MSA_VARIANTS_BY_TARGET",
+    ),
+    "CakeWarpDecodeTarget": (".cake_fused_moe_warp_decode", "CakeWarpDecodeTarget"),
+    "JitSpec": (".core", "JitSpec"),
+    "JitSpecCuteDsl": (".cute_dsl_core", "JitSpecCuteDsl"),
+    "JitSpecNvcc": (".core", "JitSpecNvcc"),
+    "JitSpecRegistry": (".core", "JitSpecRegistry"),
+    "JitSpecStatus": (".core", "JitSpecStatus"),
+    "MissingJITCacheError": (".core", "MissingJITCacheError"),
+    "build_jit_specs": (".core", "build_jit_specs"),
+    "cake_kda_affine_is_available": (".cake_kda", "cake_kda_affine_is_available"),
+    "clear_cache_dir": (".core", "clear_cache_dir"),
+    "cubin_loader": (".cubin_loader", None),
+    "current_compilation_context": (".core", "current_compilation_context"),
+    "env": (".env", None),
+    "gen_act_and_mul_module": (".activation", "gen_act_and_mul_module"),
+    "gen_alphamoe_fused_router_module": (
+        ".fused_moe",
+        "gen_alphamoe_fused_router_module",
+    ),
+    "gen_alphamoe_nvfp4_sm100_module": (
+        ".fused_moe",
+        "gen_alphamoe_nvfp4_sm100_module",
+    ),
+    "gen_alphamoe_sm100_module": (".fused_moe", "gen_alphamoe_sm100_module"),
+    "gen_batch_attention_module": (".attention", "gen_batch_attention_module"),
+    "gen_batch_decode_module": (".attention", "gen_batch_decode_module"),
+    "gen_batch_mla_module": (".attention", "gen_batch_mla_module"),
+    "gen_batch_pod_module": (".attention", "gen_batch_pod_module"),
+    "gen_batch_prefill_module": (".attention", "gen_batch_prefill_module"),
+    "gen_bgmv_moe_module": (".bgmv_moe", "gen_bgmv_moe_module"),
+    "gen_blackwell_msa_module": (".blackwell_msa", "gen_blackwell_msa_module"),
+    "gen_cake_bgmv_moe_module": (".cake_bgmv_moe", "gen_cake_bgmv_moe_module"),
+    "gen_cake_fused_moe_warp_decode_module": (
+        ".cake_fused_moe_warp_decode",
+        "gen_cake_fused_moe_warp_decode_module",
+    ),
+    "gen_cake_kda_affine_module": (".cake_kda", "gen_cake_kda_affine_module"),
+    "gen_cake_kda_m128_unbounded_softplus_module": (
+        ".cake_kda",
+        "gen_cake_kda_m128_unbounded_softplus_module",
+    ),
+    "gen_cake_megamoe_topk_reduce_module": (
+        ".cake_megamoe_topk_reduce",
+        "gen_cake_megamoe_topk_reduce_module",
+    ),
+    "gen_cake_sampling_module": (".cake_sampling", "gen_cake_sampling_module"),
+    "gen_comm_alltoall_module": (".comm", "gen_comm_alltoall_module"),
+    "gen_cudnn_fmha_module": (".attention", "gen_cudnn_fmha_module"),
+    "gen_customize_batch_decode_module": (
+        ".attention",
+        "gen_customize_batch_decode_module",
+    ),
+    "gen_customize_batch_prefill_module": (
+        ".attention",
+        "gen_customize_batch_prefill_module",
+    ),
+    "gen_customize_single_decode_module": (
+        ".attention",
+        "gen_customize_single_decode_module",
+    ),
+    "gen_customize_single_prefill_module": (
+        ".attention",
+        "gen_customize_single_prefill_module",
+    ),
+    "gen_dcp_alltoall_module": (".comm", "gen_dcp_alltoall_module"),
+    "gen_dsv3_fused_routing_module": (
+        ".dsv3_optimizations",
+        "gen_dsv3_fused_routing_module",
+    ),
+    "gen_dsv3_router_gemm_module": (
+        ".dsv3_optimizations",
+        "gen_dsv3_router_gemm_module",
+    ),
+    "gen_flash_kda_m128_module": (".flash_kda", "gen_flash_kda_m128_module"),
+    "gen_flash_kda_m128_n16_module": (".flash_kda", "gen_flash_kda_m128_n16_module"),
+    "gen_flash_kda_m64_module": (".flash_kda", "gen_flash_kda_m64_module"),
+    "gen_fmha_cutlass_sm100a_module": (".attention", "gen_fmha_cutlass_sm100a_module"),
+    "gen_fmha_v2_module": (".attention", "gen_fmha_v2_module"),
+    "gen_fp4_kv_dequantization_module": (
+        ".fp4_kv_dequantization",
+        "gen_fp4_kv_dequantization_module",
+    ),
+    "gen_fp4_kv_quantization_module": (
+        ".fp4_kv_quantization",
+        "gen_fp4_kv_quantization_module",
+    ),
+    "gen_hash_topk_module": (".hash_topk", "gen_hash_topk_module"),
+    "gen_jit_spec": (".core", "gen_jit_spec"),
+    "gen_moe_alltoall_module": (".comm", "gen_moe_alltoall_module"),
+    "gen_moe_utils_module": (".moe_utils", "gen_moe_utils_module"),
+    "gen_monomoe_module": (".monomoe", "gen_monomoe_module"),
+    "gen_nvfp4_attention_sm120_module": (
+        ".nvfp4_attention_sm120",
+        "gen_nvfp4_attention_sm120_module",
+    ),
+    "gen_pcie_ipc_comm_module": (".comm", "gen_pcie_ipc_comm_module"),
+    "gen_pod_module": (".attention", "gen_pod_module"),
+    "gen_prims_ts_q_token_kv_block_sparse_metadata_module": (
+        ".q_token_kv_block_sparse_metadata",
+        "gen_prims_ts_q_token_kv_block_sparse_metadata_module",
+    ),
+    "gen_single_decode_module": (".attention", "gen_single_decode_module"),
+    "gen_single_prefill_module": (".attention", "gen_single_prefill_module"),
+    "gen_tinygemm2_module": (".tinygemm2", "gen_tinygemm2_module"),
+    "gen_tinygemm2_sm100_module": (".tinygemm2", "gen_tinygemm2_sm100_module"),
+    "gen_trtllm_comm_module": (".comm", "gen_trtllm_comm_module"),
+    "gen_trtllm_fmha_v2_sm120_module": (
+        ".attention",
+        "gen_trtllm_fmha_v2_sm120_module",
+    ),
+    "gen_trtllm_gen_fmha_module": (".attention", "gen_trtllm_gen_fmha_module"),
+    "gen_trtllm_mnnvl_comm_module": (".comm", "gen_trtllm_mnnvl_comm_module"),
+    "gen_vllm_comm_module": (".comm", "gen_vllm_comm_module"),
+    "get_act_and_mul_cu_str": (".activation", "get_act_and_mul_cu_str"),
+    "get_batch_attention_uri": (".attention", "get_batch_attention_uri"),
+    "get_batch_decode_uri": (".attention", "get_batch_decode_uri"),
+    "get_batch_mla_uri": (".attention", "get_batch_mla_uri"),
+    "get_batch_prefill_uri": (".attention", "get_batch_prefill_uri"),
+    "get_blackwell_msa_module": (".blackwell_msa", "get_blackwell_msa_module"),
+    "get_blackwell_msa_uri": (".blackwell_msa", "get_blackwell_msa_uri"),
+    "get_cake_fused_moe_warp_decode_module": (
+        ".cake_fused_moe_warp_decode",
+        "get_cake_fused_moe_warp_decode_module",
+    ),
+    "get_cake_fused_moe_warp_decode_uri": (
+        ".cake_fused_moe_warp_decode",
+        "get_cake_fused_moe_warp_decode_uri",
+    ),
+    "get_cake_kda_affine_module": (".cake_kda", "get_cake_kda_affine_module"),
+    "get_cake_kda_prefill_module": (".cake_kda", "get_cake_kda_prefill_module"),
+    "get_cake_megamoe_topk_reduce_module": (
+        ".cake_megamoe_topk_reduce",
+        "get_cake_megamoe_topk_reduce_module",
+    ),
+    "get_cake_megamoe_topk_reduce_uri": (
+        ".cake_megamoe_topk_reduce",
+        "get_cake_megamoe_topk_reduce_uri",
+    ),
+    "get_cake_sampling_uri": (".cake_sampling", "get_cake_sampling_uri"),
+    "get_flash_kda_prefill_module": (".flash_kda", "get_flash_kda_prefill_module"),
+    "get_pod_uri": (".attention", "get_pod_uri"),
+    "get_single_decode_uri": (".attention", "get_single_decode_uri"),
+    "get_single_prefill_uri": (".attention", "get_single_prefill_uri"),
+    "is_cake_megamoe_topk_reduce_module_loaded": (
+        ".cake_megamoe_topk_reduce",
+        "is_cake_megamoe_topk_reduce_module_loaded",
+    ),
+    "jit_spec_registry": (".core", "jit_spec_registry"),
+    "load_bgmv_moe_module": (".bgmv_moe", "load_bgmv_moe_module"),
+    "load_blackwell_msa_module": (".blackwell_msa", "load_blackwell_msa_module"),
+    "load_cake_bgmv_moe_module": (".cake_bgmv_moe", "load_cake_bgmv_moe_module"),
+    "load_cake_fused_moe_warp_decode_module": (
+        ".cake_fused_moe_warp_decode",
+        "load_cake_fused_moe_warp_decode_module",
+    ),
+    "load_cake_kda_m128_unbounded_softplus_module": (
+        ".cake_kda",
+        "load_cake_kda_m128_unbounded_softplus_module",
+    ),
+    "load_cake_megamoe_topk_reduce_module": (
+        ".cake_megamoe_topk_reduce",
+        "load_cake_megamoe_topk_reduce_module",
+    ),
+    "load_cake_sampling_module": (".cake_sampling", "load_cake_sampling_module"),
+    "load_flash_kda_m128_module": (".flash_kda", "load_flash_kda_m128_module"),
+    "load_flash_kda_m128_n16_module": (".flash_kda", "load_flash_kda_m128_n16_module"),
+    "load_flash_kda_m64_module": (".flash_kda", "load_flash_kda_m64_module"),
+    "load_monomoe_module": (".monomoe", "load_monomoe_module"),
+    "run_cake_megamoe_topk_reduce": (
+        ".cake_megamoe_topk_reduce",
+        "run_cake_megamoe_topk_reduce",
+    ),
+    "setup_cubin_loader": (".cubin_loader", "setup_cubin_loader"),
+    "sm100a_nvcc_flags": (".core", "sm100a_nvcc_flags"),
+    "sm100f_nvcc_flags": (".core", "sm100f_nvcc_flags"),
+    "sm103a_nvcc_flags": (".core", "sm103a_nvcc_flags"),
+    "sm107a_nvcc_flags": (".core", "sm107a_nvcc_flags"),
+    "sm110a_nvcc_flags": (".core", "sm110a_nvcc_flags"),
+    "sm120a_nvcc_flags": (".core", "sm120a_nvcc_flags"),
+    "sm120f_nvcc_flags": (".core", "sm120f_nvcc_flags"),
+    "sm121a_nvcc_flags": (".core", "sm121a_nvcc_flags"),
+    "sm90a_nvcc_flags": (".core", "sm90a_nvcc_flags"),
+}
 
 
-cuda_lib_path = os.environ.get(
-    "CUDA_LIB_PATH", "/usr/local/cuda/targets/x86_64-linux/lib/"
-)
-if os.path.exists(f"{cuda_lib_path}/libcudart.so.12"):
-    ctypes.CDLL(f"{cuda_lib_path}/libcudart.so.12", mode=ctypes.RTLD_GLOBAL)
+def __getattr__(name):
+    try:
+        module, attr = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    imported = _import_module(module, __name__)
+    value = getattr(imported, attr) if attr else imported
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))

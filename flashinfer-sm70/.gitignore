@@ -212,3 +212,6 @@ flashinfer/moe_ep/backends/split/comm/nixl_ep/_vendored/
 .sqsh_build_logs/
 *.sqsh
 .fi_workspace/
+
+# Generated from the single authoritative root provenance lock.
+flashinfer/UPSTREAM.lock.json

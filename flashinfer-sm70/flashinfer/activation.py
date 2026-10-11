@@ -112,6 +112,13 @@ def silu_and_mul(
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
+    from .sm70._dispatch import is_sm70
+
+    if is_sm70(input):
+        from .sm70 import ops
+
+        return ops.silu_and_mul(input, out, enable_pdl)
+
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
     _check_act_and_mul_input(input)
@@ -156,6 +163,13 @@ def gelu_tanh_and_mul(
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
+    from .sm70._dispatch import is_sm70
+
+    if is_sm70(input):
+        from .sm70 import ops
+
+        return ops.gelu_tanh_and_mul(input, out, enable_pdl)
+
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
     _check_act_and_mul_input(input)
@@ -196,6 +210,13 @@ def gelu_and_mul(
     output: torch.Tensor
         Output tensor, shape (..., hidden_size).
     """
+    from .sm70._dispatch import is_sm70
+
+    if is_sm70(input):
+        from .sm70 import ops
+
+        return ops.gelu_and_mul(input, out, enable_pdl)
+
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
     _check_act_and_mul_input(input)

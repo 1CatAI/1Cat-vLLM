@@ -16,12 +16,15 @@
 #ifndef FLASHINFER_NORM_CUH_
 #define FLASHINFER_NORM_CUH_
 
+#include <cfloat>
 #include <cstdint>
 #include <numeric>
 
+#ifndef FLASHINFER_SM70_RMS_ONLY
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
 #include "flashinfer/trtllm/common/cudaUtils.h"
 #include "flashinfer/trtllm/common/reduceKernelUtils.cuh"
+#endif
 #include "flashinfer/utils.cuh"
 #include "math.cuh"
 #include "utils.cuh"
@@ -31,7 +34,9 @@ namespace flashinfer {
 
 namespace norm {
 
+#ifndef FLASHINFER_SM70_RMS_ONLY
 using namespace tensorrt_llm::common;
+#endif
 
 template <typename T>
 struct QuantTypeStaticVals;
@@ -885,6 +890,7 @@ cudaError_t GemmaFusedAddRMSNorm(T* input, T* residual, T* weight, uint32_t batc
   return cudaSuccess;
 }
 
+#ifndef FLASHINFER_SM70_RMS_ONLY
 template <typename Tf, typename T>
 __inline__ __device__ Tf compute_layernorm(Tf val, float s_mean, float s_variance, T const* gemma,
                                            T const* beta, int i) {
@@ -1175,6 +1181,8 @@ cudaError_t LayerNormQuant(T* input, Tw* gemma, Tw* beta, QuantT* out_quant, flo
   return cudaGetLastError();
 }
 #endif  // ENABLE_FP8
+
+#endif  // FLASHINFER_SM70_RMS_ONLY
 
 }  // namespace norm
 

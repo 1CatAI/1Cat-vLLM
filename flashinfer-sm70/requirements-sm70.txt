@@ -1,0 +1,9 @@
+# Minimal runtime. The engine release pins the validation stack separately.
+torch>=2.10
+apache-tvm-ffi>=0.1.10,<0.2
+filelock
+jinja2
+ninja
+numpy
+packaging>=24.2
+nvidia-ml-py

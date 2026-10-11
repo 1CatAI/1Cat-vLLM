@@ -59,19 +59,27 @@ from ..jit.norm import gen_norm_module
 # Also fallback to CUDA JIT if nvidia-cutlass-dsl is not installed
 _USE_CUDA_NORM = os.environ.get("FLASHINFER_USE_CUDA_NORM", "0") == "1"
 
-if not _USE_CUDA_NORM:
+rmsnorm_cute = qk_rmsnorm_cute = rmsnorm_quant_cute = None
+fused_add_rmsnorm_cute = fused_add_rmsnorm_quant_cute = layernorm_cute = None
+
+
+@functools.cache
+def _load_cute_norm():
+    # Import optional kernels only after an operation selects a modern device.
     try:
-        from .kernels import (
-            rmsnorm_cute,
-            qk_rmsnorm_cute,
-            rmsnorm_quant_cute,
-            fused_add_rmsnorm_cute,
-            fused_add_rmsnorm_quant_cute,
-            layernorm_cute,
-        )
+        from . import kernels
     except (ImportError, AttributeError):
-        # nvidia-cutlass-dsl not installed or incompatible version
-        _USE_CUDA_NORM = True
+        return False
+    for name in (
+        "rmsnorm_cute",
+        "qk_rmsnorm_cute",
+        "rmsnorm_quant_cute",
+        "fused_add_rmsnorm_cute",
+        "fused_add_rmsnorm_quant_cute",
+        "layernorm_cute",
+    ):
+        globals()[name] = getattr(kernels, name)
+    return True
 
 
 @functools.cache
@@ -96,9 +104,10 @@ def _use_cuda_norm(device: torch.device) -> bool:
     ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started).
     The CUDA JIT kernels are functionally equivalent, so norm falls back
     instead of raising like the DSL-only kernels do."""
-    if _USE_CUDA_NORM:
+    capability = torch.cuda.get_device_capability(device)
+    if _USE_CUDA_NORM or capability == (7, 0) or not _load_cute_norm():
         return True
-    return not _cute_dsl_supports_arch(*torch.cuda.get_device_capability(device))
+    return not _cute_dsl_supports_arch(*capability)
 
 
 @functools.cache
@@ -169,6 +178,13 @@ def rmsnorm(
     output: torch.Tensor
         Normalized tensor, 2D shape (batch_size, hidden_size) or 3D shape (batch_size, num_heads, hidden_size).
     """
+    from ..sm70._dispatch import is_sm70
+
+    if is_sm70(input):
+        from ..sm70 import ops
+
+        return ops.rmsnorm(input, weight, eps, out, enable_pdl)
+
     if out is None:
         out = torch.empty_like(input)
     _rmsnorm_impl(out, input, weight, eps, enable_pdl)
@@ -295,6 +311,13 @@ def fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
+    from ..sm70._dispatch import is_sm70
+
+    if is_sm70(input):
+        from ..sm70 import ops
+
+        return ops.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):
@@ -490,6 +513,13 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
+    from ..sm70._dispatch import is_sm70
+
+    if is_sm70(input):
+        from ..sm70 import ops
+
+        return ops.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
+
     if out is None:
         out = torch.empty_like(input)
     _gemma_rmsnorm_impl(out, input, weight, eps, enable_pdl)
@@ -563,6 +593,13 @@ def gemma_fused_add_rmsnorm(
         Whether to enable `programmatic dependent launch
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
     """
+    from ..sm70._dispatch import is_sm70
+
+    if is_sm70(input):
+        from ..sm70 import ops
+
+        return ops.gemma_fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+
     if enable_pdl is None or enable_pdl:
         enable_pdl = device_support_pdl(input.device)
     if _use_cuda_norm(input.device):

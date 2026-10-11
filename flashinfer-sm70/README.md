@@ -1,3 +1,5 @@
+> 1Cat SM70 fork: see [independent module build, ownership and validation status](docs/sm70/README.md). Upstream provenance is pinned in `UPSTREAM.lock.json`. No Qwen4 acceleration admission is claimed.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://github.com/flashinfer-ai/web-data/blob/main/logo/FlashInfer-black-background.png?raw=true">

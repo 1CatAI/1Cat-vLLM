@@ -14,360 +14,436 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import contextlib
-import importlib.util
+from importlib import import_module as _import_module
 
-from .version import __version__ as __version__
-from .version import __git_commit__ as __git_commit__
-from .version import __git_version__ as __git_version__  # backward compat
+from .version import __version__, __git_commit__, __git_version__
 
-from . import jit as jit
-from .activation import gelu_and_mul as gelu_and_mul
-from .activation import gelu_tanh_and_mul as gelu_tanh_and_mul
-from .activation import silu_and_mul as silu_and_mul
-from .activation import (
-    silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
-)
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize as silu_and_mul_mxfp8_quantize,
-)
-from .gated_act_mxfp8 import (
-    silu_and_mul_mxfp8_quantize_backward as silu_and_mul_mxfp8_quantize_backward,
-)
-from .attention import BatchAttention as BatchAttention
-from .attention import (
-    BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
-    BatchPrefillWithCausalBidirectionalRangesWrapper as BatchPrefillWithCausalBidirectionalRangesWrapper,
-)
-from .autotune_cache import MeasurementPolicy as MeasurementPolicy
-from .autotune_cache import autotune_v2 as autotune_v2
-from .autotune_cache import autotune_v2_reload as autotune_v2_reload
-from .autotuner import autotune as autotune
-from .cascade import (
-    BatchDecodeWithSharedPrefixPagedKVCacheWrapper as BatchDecodeWithSharedPrefixPagedKVCacheWrapper,
-)
-from .cascade import (
-    BatchPrefillWithSharedPrefixPagedKVCacheWrapper as BatchPrefillWithSharedPrefixPagedKVCacheWrapper,
-)
-from .cascade import (
-    MultiLevelCascadeAttentionWrapper as MultiLevelCascadeAttentionWrapper,
-)
-from .cascade import merge_state as merge_state
-from .cascade import merge_state_in_place as merge_state_in_place
-from .cascade import merge_states as merge_states
-from .cake_fmha import (
-    cake_batch_context_with_kv_cache as cake_batch_context_with_kv_cache,
-)
-from .cake_fmha import (
-    cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
-)
-from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
-from .cake_sampling import (
-    top_k_top_p_sampling_from_probs as cake_top_k_top_p_sampling_from_probs,
-)
-from .cake_fmha import (
-    CakeFmhaRequestOrderedDecodePlan as CakeFmhaRequestOrderedDecodePlan,
-)
-from .cake_fmha import (
-    plan_cake_fmha_request_ordered_paged_decode as plan_cake_fmha_request_ordered_paged_decode,
-)
-from .decode import (
-    BatchDecodeWithPagedKVCacheWrapper as BatchDecodeWithPagedKVCacheWrapper,
-)
-from .decode import (
-    CUDAGraphBatchDecodeWithPagedKVCacheWrapper as CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
-)
-from .decode import (
-    fast_decode_plan as fast_decode_plan,
-)
-from .decode import (
-    launch_sm110_gqa_decode_prepared as launch_sm110_gqa_decode_prepared,
-)
-from .decode import (
-    prepare_balanced_batch_decode_with_kv_cache as prepare_balanced_batch_decode_with_kv_cache,
-)
-from .decode import prepare_sm110_gqa_decode as prepare_sm110_gqa_decode
-from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
-from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
-from .decode import sm110_gqa_decode as sm110_gqa_decode
-from .cake_dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
-from .cake_dcp import (
-    get_dcp_spec_workspace_size_bytes as get_dcp_spec_workspace_size_bytes,
-)
-from .quantization.fp4_quantization import (
-    block_scale_interleave,
-    nvfp4_block_scale_interleave,
-    e2m1_and_ufp8sf_scale_to_float,
-    fp4_quantize,
-    mxfp4_dequantize_host,
-    mxfp4_dequantize,
-    mxfp4_quantize,
-    nvfp4_quantize,
-    nvfp4_quantize_paged_kv_cache,
-    nvfp4_batched_quantize,
-    shuffle_matrix_a,
-    shuffle_matrix_sf_a,
-    scaled_fp4_grouped_quantize,
-    silu_and_mul_nvfp4_quantize,
-    get_fp4_quantization_module,
-    nvfp4_kv_dequantize,
-    nvfp4_kv_dequantize_paged,
-    nvfp4_kv_quantize,
-)
-from .quantization.nvfp4_quantization_utils import (
-    NVFP44Over6Config,
-    NVFP44Over6ErrMode,
-    make_nvfp4_global_scale,
-    resolve_nvfp4_4over6,
-)
-from .quantization.fp8_quantization import (
-    mxfp8_dequantize_host,
-    mxfp8_grouped_quantize,
-    mxfp8_quantize,
-)
-from .attn_scores import min_block_table_width as min_block_table_width
-from .attn_scores import padded_seq_len as padded_seq_len
-from .attn_scores import (
-    compute_paged_mqa_logits_schedule as compute_paged_mqa_logits_schedule,
-)
-from .attn_scores import fp4_paged_mqa_logits as fp4_paged_mqa_logits
-from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
-from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
-from .fused_moe import (
-    cutlass_fused_moe,
-    cudnn_frost_grouped_gemm1_swiglu,
-    cudnn_frost_grouped_gemm1_swiglu_workspace_size,
-    reorder_rows_for_gated_act_gemm,
-    trtllm_bf16_moe,
-    trtllm_bf16_routed_moe,
-    trtllm_fp4_block_scale_moe,
-    trtllm_fp4_block_scale_routed_moe,
-    trtllm_fp8_block_scale_moe,
-    trtllm_fp8_block_scale_routed_moe,
-    trtllm_fp8_per_tensor_scale_moe,
-    trtllm_fp8_per_tensor_scale_routed_moe,
-)
-
-_PRIMS_TS_LAZY_EXPORTS = frozenset(
-    {
-        "prims_ts_bf16_moe",
-        "prims_ts_bf16_routed_moe",
-        "prims_ts_fp4_block_scale_moe",
+_LAZY_EXPORTS = {
+    "ActivationType": (".tllm_enums", "ActivationType"),
+    "B12xMoEWrapper": (".fused_moe", "B12xMoEWrapper"),
+    "BatchAttention": (".attention", "BatchAttention"),
+    "BatchAttentionWithAttentionSinkWrapper": (
+        ".attention",
+        "BatchAttentionWithAttentionSinkWrapper",
+    ),
+    "BatchDecodeWithPagedKVCacheWrapper": (
+        ".decode",
+        "BatchDecodeWithPagedKVCacheWrapper",
+    ),
+    "BatchDecodeWithSharedPrefixPagedKVCacheWrapper": (
+        ".cascade",
+        "BatchDecodeWithSharedPrefixPagedKVCacheWrapper",
+    ),
+    "BatchMLAPagedAttentionWrapper": (".mla", "BatchMLAPagedAttentionWrapper"),
+    "BatchPODWithPagedKVCacheWrapper": (".pod", "BatchPODWithPagedKVCacheWrapper"),
+    "BatchPrefillWithCausalBidirectionalRangesWrapper": (
+        ".attention",
+        "BatchPrefillWithCausalBidirectionalRangesWrapper",
+    ),
+    "BatchPrefillWithPagedKVCacheWrapper": (
+        ".prefill",
+        "BatchPrefillWithPagedKVCacheWrapper",
+    ),
+    "BatchPrefillWithRaggedKVCacheWrapper": (
+        ".prefill",
+        "BatchPrefillWithRaggedKVCacheWrapper",
+    ),
+    "BatchPrefillWithSharedPrefixPagedKVCacheWrapper": (
+        ".cascade",
+        "BatchPrefillWithSharedPrefixPagedKVCacheWrapper",
+    ),
+    "BlockSparseAttentionWrapper": (".sparse", "BlockSparseAttentionWrapper"),
+    "CUDAGraphBatchDecodeWithPagedKVCacheWrapper": (
+        ".decode",
+        "CUDAGraphBatchDecodeWithPagedKVCacheWrapper",
+    ),
+    "CakeFmhaRequestOrderedDecodePlan": (
+        ".cake_fmha",
+        "CakeFmhaRequestOrderedDecodePlan",
+    ),
+    "CakeRMSNormFunction": (".cake_rmsnorm_train", "CakeRMSNormFunction"),
+    "CuteDslBf16MoEWrapper": (".fused_moe", "CuteDslBf16MoEWrapper"),
+    "CuteDslMoEWrapper": (".fused_moe", "CuteDslMoEWrapper"),
+    "CuteDslMxfp8Mxfp4MoEWrapper": (".fused_moe", "CuteDslMxfp8Mxfp4MoEWrapper"),
+    "KDAPrefillPlanCache": (".kda_prefill", "KDAPrefillPlanCache"),
+    "MeasurementPolicy": (".autotune_cache", "MeasurementPolicy"),
+    "MiniMaxH3Mxfp8PreAttention": (".cake_minimax_h3", "MiniMaxH3Mxfp8PreAttention"),
+    "MiniMaxH3Nvfp4PreAttention": (".cake_minimax_h3", "MiniMaxH3Nvfp4PreAttention"),
+    "MiniMaxH3QkvQuantizePack": (".cake_minimax_h3", "MiniMaxH3QkvQuantizePack"),
+    "MultiLevelCascadeAttentionWrapper": (
+        ".cascade",
+        "MultiLevelCascadeAttentionWrapper",
+    ),
+    "NVFP44Over6Config": (
+        ".quantization.nvfp4_quantization_utils",
+        "NVFP44Over6Config",
+    ),
+    "NVFP44Over6ErrMode": (
+        ".quantization.nvfp4_quantization_utils",
+        "NVFP44Over6ErrMode",
+    ),
+    "PODWithPagedKVCacheWrapper": (".pod", "PODWithPagedKVCacheWrapper"),
+    "RecurrentKDAPrefillWorkspace": (".kda_prefill", "RecurrentKDAPrefillWorkspace"),
+    "RecurrentKDAPrefillWrapper": (".kda", "RecurrentKDAPrefillWrapper"),
+    "RoutingMethodType": (".tllm_enums", "RoutingMethodType"),
+    "SegmentGEMMWrapper": (".gemm", "SegmentGEMMWrapper"),
+    "SfLayout": (".tllm_enums", "SfLayout"),
+    "TopKTieBreak": (".topk", "TopKTieBreak"),
+    "VariableBlockSparseAttentionWrapper": (
+        ".sparse",
+        "VariableBlockSparseAttentionWrapper",
+    ),
+    "add_rmsnorm_fp4quant": (".norm", "add_rmsnorm_fp4quant"),
+    "append_paged_kv_cache": (".page", "append_paged_kv_cache"),
+    "append_paged_mla_kv_cache": (".page", "append_paged_mla_kv_cache"),
+    "apply_llama31_rope": (".rope", "apply_llama31_rope"),
+    "apply_llama31_rope_inplace": (".rope", "apply_llama31_rope_inplace"),
+    "apply_llama31_rope_pos_ids": (".rope", "apply_llama31_rope_pos_ids"),
+    "apply_llama31_rope_pos_ids_inplace": (
+        ".rope",
+        "apply_llama31_rope_pos_ids_inplace",
+    ),
+    "apply_rope": (".rope", "apply_rope"),
+    "apply_rope_inplace": (".rope", "apply_rope_inplace"),
+    "apply_rope_pos_ids": (".rope", "apply_rope_pos_ids"),
+    "apply_rope_pos_ids_inplace": (".rope", "apply_rope_pos_ids_inplace"),
+    "apply_rope_with_cos_sin_cache": (".rope", "apply_rope_with_cos_sin_cache"),
+    "apply_rope_with_cos_sin_cache_inplace": (
+        ".rope",
+        "apply_rope_with_cos_sin_cache_inplace",
+    ),
+    "autotune": (".autotuner", "autotune"),
+    "autotune_v2": (".autotune_cache", "autotune_v2"),
+    "autotune_v2_reload": (".autotune_cache", "autotune_v2_reload"),
+    "b12x_fused_moe": (".fused_moe", "b12x_fused_moe"),
+    "block_scale_interleave": (
+        ".quantization.fp4_quantization",
+        "block_scale_interleave",
+    ),
+    "bmm_bf16": (".gemm", "bmm_bf16"),
+    "bmm_fp8": (".gemm", "bmm_fp8"),
+    "bmm_mxfp8": (".gemm", "bmm_mxfp8"),
+    "cake_batch_context_with_kv_cache": (
+        ".cake_fmha",
+        "cake_batch_context_with_kv_cache",
+    ),
+    "cake_batch_decode_with_kv_cache": (
+        ".cake_fmha",
+        "cake_batch_decode_with_kv_cache",
+    ),
+    "cake_fmha_manifest": (".cake_fmha", "cake_fmha_manifest"),
+    "cake_rmsnorm": (".cake_rmsnorm_train", "cake_rmsnorm"),
+    "cake_rmsnorm_train_backward": (
+        ".cake_rmsnorm_train",
+        "cake_rmsnorm_train_backward",
+    ),
+    "cake_rmsnorm_train_backward_workspace_bytes": (
+        ".cake_rmsnorm_train",
+        "cake_rmsnorm_train_backward_workspace_bytes",
+    ),
+    "cake_rmsnorm_train_forward": (".cake_rmsnorm_train", "cake_rmsnorm_train_forward"),
+    "cake_top_k_top_p_sampling_from_probs": (
+        ".cake_sampling",
+        "top_k_top_p_sampling_from_probs",
+    ),
+    "chain_speculative_sampling": (".sampling", "chain_speculative_sampling"),
+    "chunk_gated_delta_product": (".gdp_prefill", "chunk_gated_delta_product"),
+    "chunk_gated_delta_rule": (".gdn_prefill", "chunk_gated_delta_rule"),
+    "chunk_gated_delta_rule2": (".gdn2_prefill", "chunk_gated_delta_rule2"),
+    "compute_paged_mqa_logits_schedule": (
+        ".attn_scores",
+        "compute_paged_mqa_logits_schedule",
+    ),
+    "concat_mla_kv_quant_fp8": (".mla_kv_pack", "concat_mla_kv_quant_fp8"),
+    "cudnn_batch_decode_with_kv_cache": (".decode", "cudnn_batch_decode_with_kv_cache"),
+    "cudnn_frost_grouped_gemm1_swiglu": (
+        ".fused_moe",
+        "cudnn_frost_grouped_gemm1_swiglu",
+    ),
+    "cudnn_frost_grouped_gemm1_swiglu_workspace_size": (
+        ".fused_moe",
+        "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
+    ),
+    "cute_dsl_fused_moe": (".fused_moe", "cute_dsl_fused_moe"),
+    "cute_dsl_fused_moe_bf16": (".fused_moe", "cute_dsl_fused_moe_bf16"),
+    "cute_dsl_fused_moe_mxfp8_mxfp4": (".fused_moe", "cute_dsl_fused_moe_mxfp8_mxfp4"),
+    "cute_dsl_fused_moe_nvfp4": (".fused_moe", "cute_dsl_fused_moe_nvfp4"),
+    "cutlass_fused_moe": (".fused_moe", "cutlass_fused_moe"),
+    "e2m1_and_ufp8sf_scale_to_float": (
+        ".quantization.fp4_quantization",
+        "e2m1_and_ufp8sf_scale_to_float",
+    ),
+    "fast_decode_plan": (".decode", "fast_decode_plan"),
+    "fi_trace": (".fi_trace", "fi_trace"),
+    "fp4_paged_mqa_logits": (".attn_scores", "fp4_paged_mqa_logits"),
+    "fp4_quantize": (".quantization.fp4_quantization", "fp4_quantize"),
+    "fp8_paged_mqa_logits": (".attn_scores", "fp8_paged_mqa_logits"),
+    "fused_add_rmsnorm": (".norm", "fused_add_rmsnorm"),
+    "fused_add_rmsnorm_fp8_block_quant": (".norm", "fused_add_rmsnorm_fp8_block_quant"),
+    "fused_add_rmsnorm_quant": (".norm", "fused_add_rmsnorm_quant"),
+    "fused_dit_gate_residual_layernorm_gamma_beta": (
+        ".norm",
+        "fused_dit_gate_residual_layernorm_gamma_beta",
+    ),
+    "fused_dit_gate_residual_layernorm_scale_shift": (
+        ".norm",
+        "fused_dit_gate_residual_layernorm_scale_shift",
+    ),
+    "fused_dit_residual_layernorm_scale_shift": (
+        ".norm",
+        "fused_dit_residual_layernorm_scale_shift",
+    ),
+    "fused_kda_decode": (".kda_decode", "fused_kda_decode"),
+    "fused_qk_rmsnorm_rope": (".norm", "fused_qk_rmsnorm_rope"),
+    "fused_rmsnorm_silu": (".norm", "fused_rmsnorm_silu"),
+    "gdn_fused_decode_step": (".gdn_kernels.experimental", "gdn_fused_decode_step"),
+    "gdn_fused_decode_step_supported": (
+        ".gdn_kernels.experimental",
+        "gdn_fused_decode_step_supported",
+    ),
+    "gelu_and_mul": (".activation", "gelu_and_mul"),
+    "gelu_tanh_and_mul": (".activation", "gelu_tanh_and_mul"),
+    "gemma_fused_add_rmsnorm": (".norm", "gemma_fused_add_rmsnorm"),
+    "gemma_rmsnorm": (".norm", "gemma_rmsnorm"),
+    "get_batch_indices_positions": (".page", "get_batch_indices_positions"),
+    "get_dcp_spec_counter_bytes": (".cake_dcp", "get_dcp_spec_counter_bytes"),
+    "get_dcp_spec_workspace_size_bytes": (
+        ".cake_dcp",
+        "get_dcp_spec_workspace_size_bytes",
+    ),
+    "get_fp4_quantization_module": (
+        ".quantization.fp4_quantization",
+        "get_fp4_quantization_module",
+    ),
+    "get_seq_lens": (".page", "get_seq_lens"),
+    "grouped_mm_bf16": (".grouped_mm", "grouped_mm_bf16"),
+    "grouped_mm_fp4": (".grouped_mm", "grouped_mm_fp4"),
+    "grouped_mm_fp8": (".grouped_mm", "grouped_mm_fp8"),
+    "grouped_mm_mxfp8": (".grouped_mm", "grouped_mm_mxfp8"),
+    "is_gated_activation": (".tllm_enums", "is_gated_activation"),
+    "jit": (".jit", None),
+    "kda_prefill_supports_fp32_checkpoints": (
+        ".kda_prefill",
+        "kda_prefill_supports_fp32_checkpoints",
+    ),
+    "launch_sm110_gqa_decode_prepared": (".decode", "launch_sm110_gqa_decode_prepared"),
+    "layernorm": (".norm", "layernorm"),
+    "layernorm_quant": (".norm", "layernorm_quant"),
+    "make_nvfp4_global_scale": (
+        ".quantization.nvfp4_quantization_utils",
+        "make_nvfp4_global_scale",
+    ),
+    "mamba": (".mamba", None),
+    "merge_state": (".cascade", "merge_state"),
+    "merge_state_in_place": (".cascade", "merge_state_in_place"),
+    "merge_states": (".cascade", "merge_states"),
+    "mhc": (".mhc", None),
+    "min_block_table_width": (".attn_scores", "min_block_table_width"),
+    "min_p_sampling_from_probs": (".sampling", "min_p_sampling_from_probs"),
+    "mm_bf16": (".gemm", "mm_bf16"),
+    "mm_bf16_fp4": (".gemm", "mm_bf16_fp4"),
+    "mm_fp4": (".gemm", "mm_fp4"),
+    "mm_fp8": (".gemm", "mm_fp8"),
+    "mm_mxfp8": (".gemm", "mm_mxfp8"),
+    "mm_nvfp4_svdquant": (".gemm", "mm_nvfp4_svdquant"),
+    "msa_ops": (".msa_ops", None),
+    "mxfp4_dequantize": (".quantization.fp4_quantization", "mxfp4_dequantize"),
+    "mxfp4_dequantize_host": (
+        ".quantization.fp4_quantization",
+        "mxfp4_dequantize_host",
+    ),
+    "mxfp4_quantize": (".quantization.fp4_quantization", "mxfp4_quantize"),
+    "mxfp8_dequantize_host": (
+        ".quantization.fp8_quantization",
+        "mxfp8_dequantize_host",
+    ),
+    "mxfp8_grouped_quantize": (
+        ".quantization.fp8_quantization",
+        "mxfp8_grouped_quantize",
+    ),
+    "mxfp8_quantize": (".quantization.fp8_quantization", "mxfp8_quantize"),
+    "next_positive_power_of_2": (".utils", "next_positive_power_of_2"),
+    "nvfp4_attention_sm120": (".nvfp4_attention_sm120", None),
+    "nvfp4_attention_sm120_fwd": (
+        ".nvfp4_attention_sm120",
+        "nvfp4_attention_sm120_fwd",
+    ),
+    "nvfp4_attention_sm120_quantize_qkv": (
+        ".nvfp4_attention_sm120",
+        "nvfp4_attention_sm120_quantize_qkv",
+    ),
+    "nvfp4_batched_quantize": (
+        ".quantization.fp4_quantization",
+        "nvfp4_batched_quantize",
+    ),
+    "nvfp4_block_scale_interleave": (
+        ".quantization.fp4_quantization",
+        "nvfp4_block_scale_interleave",
+    ),
+    "nvfp4_kv_dequantize": (".quantization.fp4_quantization", "nvfp4_kv_dequantize"),
+    "nvfp4_kv_dequantize_paged": (
+        ".quantization.fp4_quantization",
+        "nvfp4_kv_dequantize_paged",
+    ),
+    "nvfp4_kv_quantize": (".quantization.fp4_quantization", "nvfp4_kv_quantize"),
+    "nvfp4_quantize": (".quantization.fp4_quantization", "nvfp4_quantize"),
+    "nvfp4_quantize_append_paged_kv_cache": (
+        ".page",
+        "nvfp4_quantize_append_paged_kv_cache",
+    ),
+    "nvfp4_quantize_append_paged_kv_cache_with_slot_mapping": (
+        ".page",
+        "nvfp4_quantize_append_paged_kv_cache_with_slot_mapping",
+    ),
+    "nvfp4_quantize_append_paged_mla_kv_cache": (
+        ".page",
+        "nvfp4_quantize_append_paged_mla_kv_cache",
+    ),
+    "nvfp4_quantize_paged_kv_cache": (
+        ".quantization.fp4_quantization",
+        "nvfp4_quantize_paged_kv_cache",
+    ),
+    "nvfp4_quantize_smooth": (".gemm", "nvfp4_quantize_smooth"),
+    "packbits": (".quantization", "packbits"),
+    "packed_fused_kda_decode": (".kda_decode", "packed_fused_kda_decode"),
+    "packed_kda_decode": (".kda_decode", "packed_kda_decode"),
+    "padded_seq_len": (".attn_scores", "padded_seq_len"),
+    "plan_cake_fmha_request_ordered_paged_decode": (
+        ".cake_fmha",
+        "plan_cake_fmha_request_ordered_paged_decode",
+    ),
+    "precompile_paged_mqa_logits": (".attn_scores", "precompile_paged_mqa_logits"),
+    "prepare_balanced_batch_decode_with_kv_cache": (
+        ".decode",
+        "prepare_balanced_batch_decode_with_kv_cache",
+    ),
+    "prepare_bf16_fp4_weights": (".gemm", "prepare_bf16_fp4_weights"),
+    "prepare_bf16_kda_prefill": (".kda_prefill", "prepare_bf16_kda_prefill"),
+    "prepare_low_latency_gemm_weights": (
+        ".trtllm_low_latency_gemm",
+        "prepare_low_latency_gemm_weights",
+    ),
+    "prepare_sm110_gqa_decode": (".decode", "prepare_sm110_gqa_decode"),
+    "prepare_tf32_kda_prefill": (".kda_prefill", "prepare_tf32_kda_prefill"),
+    "prims_ts_bf16_moe": (".fused_moe", "prims_ts_bf16_moe"),
+    "prims_ts_bf16_routed_moe": (".fused_moe", "prims_ts_bf16_routed_moe"),
+    "prims_ts_fp4_block_scale_moe": (".fused_moe", "prims_ts_fp4_block_scale_moe"),
+    "prims_ts_fp4_block_scale_routed_moe": (
+        ".fused_moe",
         "prims_ts_fp4_block_scale_routed_moe",
-        "prims_ts_fp8_block_scale_moe",
+    ),
+    "prims_ts_fp8_block_scale_moe": (".fused_moe", "prims_ts_fp8_block_scale_moe"),
+    "prims_ts_fp8_block_scale_routed_moe": (
+        ".fused_moe",
         "prims_ts_fp8_block_scale_routed_moe",
+    ),
+    "prims_ts_fp8_per_tensor_scale_moe": (
+        ".fused_moe",
         "prims_ts_fp8_per_tensor_scale_moe",
-    }
-)
+    ),
+    "recurrent_kda": (".kda", "recurrent_kda"),
+    "reorder_rows_for_gated_act_gemm": (
+        ".fused_moe",
+        "reorder_rows_for_gated_act_gemm",
+    ),
+    "resolve_nvfp4_4over6": (
+        ".quantization.nvfp4_quantization_utils",
+        "resolve_nvfp4_4over6",
+    ),
+    "rmsnorm": (".norm", "rmsnorm"),
+    "rmsnorm_fp4quant": (".norm", "rmsnorm_fp4quant"),
+    "rmsnorm_quant": (".norm", "rmsnorm_quant"),
+    "sampling_from_logits": (".sampling", "sampling_from_logits"),
+    "sampling_from_probs": (".sampling", "sampling_from_probs"),
+    "scaled_fp4_grouped_quantize": (
+        ".quantization.fp4_quantization",
+        "scaled_fp4_grouped_quantize",
+    ),
+    "segment_packbits": (".quantization", "segment_packbits"),
+    "shuffle_matrix_a": (".quantization.fp4_quantization", "shuffle_matrix_a"),
+    "shuffle_matrix_sf_a": (".quantization.fp4_quantization", "shuffle_matrix_sf_a"),
+    "silu_and_mul": (".activation", "silu_and_mul"),
+    "silu_and_mul_mxfp8_quantize": (".gated_act_mxfp8", "silu_and_mul_mxfp8_quantize"),
+    "silu_and_mul_mxfp8_quantize_backward": (
+        ".gated_act_mxfp8",
+        "silu_and_mul_mxfp8_quantize_backward",
+    ),
+    "silu_and_mul_nvfp4_quantize": (
+        ".quantization.fp4_quantization",
+        "silu_and_mul_nvfp4_quantize",
+    ),
+    "silu_and_mul_scaled_nvfp4_experts_quantize": (
+        ".activation",
+        "silu_and_mul_scaled_nvfp4_experts_quantize",
+    ),
+    "single_decode_with_kv_cache": (".decode", "single_decode_with_kv_cache"),
+    "single_prefill_with_kv_cache": (".prefill", "single_prefill_with_kv_cache"),
+    "single_prefill_with_kv_cache_return_lse": (
+        ".prefill",
+        "single_prefill_with_kv_cache_return_lse",
+    ),
+    "sm110_gqa_decode": (".decode", "sm110_gqa_decode"),
+    "sm70": (".sm70", None),
+    "softmax": (".sampling", "softmax"),
+    "svdquant_linear": (".gemm", "svdquant_linear"),
+    "tgv_gemm_sm100": (".gemm", "tgv_gemm_sm100"),
+    "top_k": (".topk", "top_k"),
+    "top_k_mask_logits": (".sampling", "top_k_mask_logits"),
+    "top_k_page_table_transform": (".topk", "top_k_page_table_transform"),
+    "top_k_ragged_transform": (".topk", "top_k_ragged_transform"),
+    "top_k_renorm_probs": (".sampling", "top_k_renorm_probs"),
+    "top_k_sampling_from_probs": (".sampling", "top_k_sampling_from_probs"),
+    "top_k_top_p_sampling_from_logits": (
+        ".sampling",
+        "top_k_top_p_sampling_from_logits",
+    ),
+    "top_k_top_p_sampling_from_probs": (".sampling", "top_k_top_p_sampling_from_probs"),
+    "top_k_varlen": (".topk_varlen.topk_varlen", "top_k_varlen"),
+    "top_p_renorm_probs": (".sampling", "top_p_renorm_probs"),
+    "top_p_sampling_from_probs": (".sampling", "top_p_sampling_from_probs"),
+    "topk": (".topk", None),
+    "trace_apply": (".trace_apply", None),
+    "trtllm_bf16_moe": (".fused_moe", "trtllm_bf16_moe"),
+    "trtllm_bf16_routed_moe": (".fused_moe", "trtllm_bf16_routed_moe"),
+    "trtllm_fmha_v2_prefill": (".prefill", "trtllm_fmha_v2_prefill"),
+    "trtllm_fp4_block_scale_moe": (".fused_moe", "trtllm_fp4_block_scale_moe"),
+    "trtllm_fp4_block_scale_routed_moe": (
+        ".fused_moe",
+        "trtllm_fp4_block_scale_routed_moe",
+    ),
+    "trtllm_fp8_block_scale_moe": (".fused_moe", "trtllm_fp8_block_scale_moe"),
+    "trtllm_fp8_block_scale_routed_moe": (
+        ".fused_moe",
+        "trtllm_fp8_block_scale_routed_moe",
+    ),
+    "trtllm_fp8_per_tensor_scale_moe": (
+        ".fused_moe",
+        "trtllm_fp8_per_tensor_scale_moe",
+    ),
+    "trtllm_fp8_per_tensor_scale_routed_moe": (
+        ".fused_moe",
+        "trtllm_fp8_per_tensor_scale_routed_moe",
+    ),
+    "trtllm_sage_attention_quantize": (".prefill", "trtllm_sage_attention_quantize"),
+    "xqa": (".xqa", "xqa"),
+    "xqa_mla": (".xqa", "xqa_mla"),
+}
 
 
-def __getattr__(name: str):
-    if name not in _PRIMS_TS_LAZY_EXPORTS:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    from . import fused_moe as _fused_moe
-
-    value = getattr(_fused_moe, name)
+def __getattr__(name):
+    try:
+        module, attr = _LAZY_EXPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    imported = _import_module(module, __name__)
+    value = getattr(imported, attr) if attr else imported
     globals()[name] = value
     return value
 
 
-def __dir__() -> list[str]:
-    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
-
-# CuteDSL high-level APIs (conditionally if cute_dsl available)
-with contextlib.suppress(ImportError):
-    from .fused_moe import (
-        cute_dsl_fused_moe as cute_dsl_fused_moe,
-        cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
-        cute_dsl_fused_moe_mxfp8_mxfp4 as cute_dsl_fused_moe_mxfp8_mxfp4,
-        CuteDslMxfp8Mxfp4MoEWrapper as CuteDslMxfp8Mxfp4MoEWrapper,
-        CuteDslMoEWrapper as CuteDslMoEWrapper,
-        b12x_fused_moe as b12x_fused_moe,
-        B12xMoEWrapper as B12xMoEWrapper,
-        cute_dsl_fused_moe_bf16 as cute_dsl_fused_moe_bf16,
-        CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
-    )
-    from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
-from .gdn2_prefill import chunk_gated_delta_rule2 as chunk_gated_delta_rule2
-from .gdp_prefill import chunk_gated_delta_product as chunk_gated_delta_product
-
-
-# The fused GDN decode step is surfaced here like the other GDN APIs; the
-# code lives under flashinfer/gdn_kernels/experimental/ (see its README),
-# but "experimental" describes the file location, not the import path.
-# Unconditional on purpose: the module imports torch and nothing else, and a
-# consumer's capability check is `getattr(flashinfer, "gdn_fused_decode_step",
-# None)` — it must be present whenever the library is new enough, and absent
-# on an older one, with no third "present but broken" state.  Everything
-# heavy (the registry, the kernels, the JIT and CuTe-DSL dependencies) is
-# imported lazily on the first probe or call.
-from .gdn_kernels.experimental import (
-    gdn_fused_decode_step as gdn_fused_decode_step,
-    gdn_fused_decode_step_supported as gdn_fused_decode_step_supported,
-)
-from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
-from .gemm import bmm_bf16 as bmm_bf16
-from .gemm import bmm_fp8 as bmm_fp8
-from .gemm import bmm_mxfp8 as bmm_mxfp8
-from .gemm import mm_bf16 as mm_bf16
-from .gemm import mm_fp4 as mm_fp4
-from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
-from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
-from .gemm import svdquant_linear as svdquant_linear
-from .gemm import mm_bf16_fp4 as mm_bf16_fp4
-from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
-from .gemm import mm_fp8 as mm_fp8
-from .gemm import mm_mxfp8 as mm_mxfp8
-from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
-from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
-from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
-from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
-from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
-from .kda_prefill import (
-    RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
-)
-from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
-from .kda import recurrent_kda as recurrent_kda
-from .kda_decode import fused_kda_decode as fused_kda_decode
-from .kda_decode import packed_kda_decode as packed_kda_decode
-from .kda_decode import packed_fused_kda_decode
-from .cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention as MiniMaxH3Mxfp8PreAttention
-from .cake_minimax_h3 import MiniMaxH3Nvfp4PreAttention as MiniMaxH3Nvfp4PreAttention
-from .cake_minimax_h3 import MiniMaxH3QkvQuantizePack as MiniMaxH3QkvQuantizePack
-from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
-from . import mhc as mhc
-from . import msa_ops as msa_ops
-from .norm import fused_add_rmsnorm as fused_add_rmsnorm
-from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
-from .norm import (
-    fused_add_rmsnorm_fp8_block_quant as fused_add_rmsnorm_fp8_block_quant,
-)
-from .norm import layernorm as layernorm
-from .norm import layernorm_quant as layernorm_quant
-from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm
-from .norm import gemma_rmsnorm as gemma_rmsnorm
-from .norm import rmsnorm as rmsnorm
-from .norm import rmsnorm_quant as rmsnorm_quant
-from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
-from .norm import fused_qk_rmsnorm_rope as fused_qk_rmsnorm_rope
-from .cake_rmsnorm_train import CakeRMSNormFunction as CakeRMSNormFunction
-from .cake_rmsnorm_train import cake_rmsnorm as cake_rmsnorm
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward as cake_rmsnorm_train_backward,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_backward_workspace_bytes as cake_rmsnorm_train_backward_workspace_bytes,
-)
-from .cake_rmsnorm_train import (
-    cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
-)
-from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
-from .nvfp4_attention_sm120 import (
-    nvfp4_attention_sm120_fwd as nvfp4_attention_sm120_fwd,
-)
-from .nvfp4_attention_sm120 import (
-    nvfp4_attention_sm120_quantize_qkv as nvfp4_attention_sm120_quantize_qkv,
-)
-from .norm import (
-    fused_dit_residual_layernorm_scale_shift as fused_dit_residual_layernorm_scale_shift,
-)
-from .norm import (
-    fused_dit_gate_residual_layernorm_scale_shift as fused_dit_gate_residual_layernorm_scale_shift,
-)
-from .norm import (
-    fused_dit_gate_residual_layernorm_gamma_beta as fused_dit_gate_residual_layernorm_gamma_beta,
-)
-
-try:
-    from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
-    from .norm import add_rmsnorm_fp4quant as add_rmsnorm_fp4quant
-except (ImportError, AttributeError):
-    pass  # nvidia-cutlass-dsl not installed
-from .page import append_paged_kv_cache as append_paged_kv_cache
-from .page import append_paged_mla_kv_cache as append_paged_mla_kv_cache
-from .page import get_batch_indices_positions as get_batch_indices_positions
-from .page import get_seq_lens as get_seq_lens
-from .page import (
-    nvfp4_quantize_append_paged_kv_cache as nvfp4_quantize_append_paged_kv_cache,
-)
-from .page import (
-    nvfp4_quantize_append_paged_kv_cache_with_slot_mapping as nvfp4_quantize_append_paged_kv_cache_with_slot_mapping,
-)
-from .page import (
-    nvfp4_quantize_append_paged_mla_kv_cache as nvfp4_quantize_append_paged_mla_kv_cache,
-)
-from .pod import PODWithPagedKVCacheWrapper as PODWithPagedKVCacheWrapper
-from .pod import BatchPODWithPagedKVCacheWrapper as BatchPODWithPagedKVCacheWrapper
-from .prefill import (
-    BatchPrefillWithPagedKVCacheWrapper as BatchPrefillWithPagedKVCacheWrapper,
-)
-from .prefill import (
-    BatchPrefillWithRaggedKVCacheWrapper as BatchPrefillWithRaggedKVCacheWrapper,
-)
-from .prefill import single_prefill_with_kv_cache as single_prefill_with_kv_cache
-from .prefill import (
-    single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
-)
-from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
-from .prefill import (
-    trtllm_sage_attention_quantize as trtllm_sage_attention_quantize,
-)
-from .quantization import packbits as packbits
-from .quantization import segment_packbits as segment_packbits
-from .rope import apply_llama31_rope as apply_llama31_rope
-from .rope import apply_llama31_rope_inplace as apply_llama31_rope_inplace
-from .rope import apply_llama31_rope_pos_ids as apply_llama31_rope_pos_ids
-from .rope import (
-    apply_llama31_rope_pos_ids_inplace as apply_llama31_rope_pos_ids_inplace,
-)
-from .rope import apply_rope as apply_rope
-from .rope import apply_rope_inplace as apply_rope_inplace
-from .rope import apply_rope_pos_ids as apply_rope_pos_ids
-from .rope import apply_rope_pos_ids_inplace as apply_rope_pos_ids_inplace
-from .rope import apply_rope_with_cos_sin_cache as apply_rope_with_cos_sin_cache
-from .rope import (
-    apply_rope_with_cos_sin_cache_inplace as apply_rope_with_cos_sin_cache_inplace,
-)
-from .sampling import chain_speculative_sampling as chain_speculative_sampling
-from .sampling import min_p_sampling_from_probs as min_p_sampling_from_probs
-from .sampling import sampling_from_logits as sampling_from_logits
-from .sampling import sampling_from_probs as sampling_from_probs
-from .sampling import softmax as softmax
-from .sampling import top_k_mask_logits as top_k_mask_logits
-from .sampling import top_k_renorm_probs as top_k_renorm_probs
-from .sampling import top_k_sampling_from_probs as top_k_sampling_from_probs
-from .sampling import (
-    top_k_top_p_sampling_from_logits as top_k_top_p_sampling_from_logits,
-)
-from .sampling import top_k_top_p_sampling_from_probs as top_k_top_p_sampling_from_probs
-from .sampling import top_p_renorm_probs as top_p_renorm_probs
-from .sampling import top_p_sampling_from_probs as top_p_sampling_from_probs
-from .tllm_enums import (
-    SfLayout,
-    ActivationType,
-    RoutingMethodType,
-    is_gated_activation as is_gated_activation,
-)
-from . import topk as topk
-from .topk import top_k as top_k
-from .topk import top_k_page_table_transform as top_k_page_table_transform
-from .topk import top_k_ragged_transform as top_k_ragged_transform
-from .topk import TopKTieBreak as TopKTieBreak
-from .topk_varlen.topk_varlen import top_k_varlen as top_k_varlen
-from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
-from .sparse import (
-    VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
-)
-from .trtllm_low_latency_gemm import (
-    prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
-)
-from .utils import next_positive_power_of_2 as next_positive_power_of_2
-from .mla_kv_pack import concat_mla_kv_quant_fp8 as concat_mla_kv_quant_fp8
-from .xqa import xqa as xqa
-from .xqa import xqa_mla as xqa_mla
-from . import mamba as mamba
-from .fi_trace import fi_trace as fi_trace
 
 # ---------------------------------------------------------------------------
 # Trace Apply (opt-in): zero-code kernel substitution from the FlashInfer Trace.
@@ -435,10 +511,3 @@ def _log_import_version() -> None:
 
 _log_import_version()
 del _log_import_version
-
-from .kda_prefill import prepare_tf32_kda_prefill as prepare_tf32_kda_prefill
-from .kda_prefill import prepare_bf16_kda_prefill as prepare_bf16_kda_prefill
-from .kda_prefill import KDAPrefillPlanCache as KDAPrefillPlanCache
-from .kda_prefill import (
-    kda_prefill_supports_fp32_checkpoints as kda_prefill_supports_fp32_checkpoints,
-)
