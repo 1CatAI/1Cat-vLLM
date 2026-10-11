@@ -14,71 +14,73 @@ template and component tests; do not create a second capability registry.
 Documentation-only changes use the checks below. Reviewers must resolve missing
 evidence within the claimed scope before marking a runtime change ready.
 
-1. **Declare coverage before implementation.** Separate the correctness support
-   envelope, accelerated subset and measured cases. Include affected dimensions:
-   device, model/state contract, weight/KV dtype, layout/head geometry, token and
-   request counts, context range, TP/EP/PP, speculation, graph and launch mode.
-   State units: live tokens, compressed score columns, allocated page capacity
-   and graph padding are different. A 32K measurement proves no other length.
-2. **Extend a family path.** New models map their capabilities to existing
-   attention, MoE, linear and GDN providers, stages and resource owners. Identify
-   reusable stages and the missing capability before adding code. Keep algorithm,
-   tiling and fusion specializations behind that family's selector; do not copy a
-   model's complete fast path or introduce another dispatcher/configuration
-   store. A new provider needs an algorithm/layout/numerical reason and explicit
-   bindings. Fewer files or one giant kernel is not a performance acceptance test.
-3. **Separate admission, qualification and tuning.** Hardware/layout constraints
-   determine whether an implementation can execute; model/state evidence
-   determines qualification; measurements choose among eligible implementations.
-   Preserve numerical and state contracts. Never remove a safety/quality guard
-   or change precision merely to widen a fast path. Each exact-shape restriction
-   must identify which constraint it represents and the qualified fallback.
-4. **Define startup equivalence.** For supported entry points with equivalent
-   effective inputs, resolved computation policy, worker policy, computation
-   hashes and numerical/state behavior must agree. Compare values, not command
-   text. Defaults versus explicit values, CLI versus `LLM`, legacy inputs versus
-   typed configuration, process initialization and warm/AOT cache reuse belong in
-   the affected matrix. Graph/eager execution may use different kernels; explain
-   intentional differences. A developer shell, import order or stale native
-   library must not be required for a released path. Follow the configuration
-   and native-binding recipes below for ownership and compatibility checks.
-5. **Make boundaries safe and visible.** Every admitted input must reach a valid
-   implementation. Outside a specialized range, retain a qualified fallback with
-   a diagnosable rejection reason; if no implementation supports the input,
-   reject at the earliest boundary with enough information. Do not silently
-   change precision. Check interval endpoints, an interior case, valid neighbors
-   of each changed threshold, page/tile tails and capacity growth. Explicitly
-   account for gaps between fast ranges; a selector flag is not a native hit.
-6. **Test affected interactions.** Use cheap selector/configuration cases for
-   range coverage, then the smallest GPU cases that exercise changed computation
-   and fallback. Include affected interactions among mixed request lengths,
-   batch/token counts, prefill/decode/verification, graph capture/replay and state
-   reorder/commit. Startup changes need paired fresh-process entry tests; native
-   packaging changes need the supported clean artifact entry. Justify omitted
-   dimensions. Do not require an unrelated Cartesian benchmark sweep or repeat
-   recorded experiments. A regression must remain in the owning test suite.
-7. **Keep evidence distinct.** Report selection, observed native execution,
-   output/state correctness and measured performance separately. Record each
-   source/binary identity; match inputs and effective configuration across the
-   baseline and candidate except for the declared change under comparison.
-   Preserve the component's deterministic comparison or documented numerical
-   tolerance; changing that contract needs separate justification. Performance
-   acceptance includes the affected real execution path, with TTFT/prefill and
-   pure decode reported separately; a faster isolated kernel can add conversion,
-   allocation, synchronization or launch overhead elsewhere. Model-reuse claims
-   need a second compatible model's evidence; structural reuse alone does not
-   qualify that model. Retain the migration's separate 27B and 35B AWQ/FP8 targets.
-8. **Bound incomplete work.** A narrow optimization may be accepted with its
-   exact coverage and correct fallback, but must not be advertised as general
-   acceleration. Record uncovered intervals/interactions, the responsible
-   component and follow-up decision in existing component or migration records.
-   Missing evidence remains unverified; it is not a passing result. Default-on
-   promotion or a broader support claim requires the corresponding evidence.
-
-For example, extending a score-column fast path through `N` requires cases at
-the valid neighbors of `N`, a non-aligned interior length and different live
-lengths sharing padded capacity. Record the expected native branch or fallback
-for each. A token-context label alone cannot establish that coverage.
+1. **Find the cause that determines the next change.** Reuse the reproducer and
+   existing profile; rank likely causes and critical-path benefit before tuning.
+   Each new experiment must distinguish hypotheses or decide implement, reject
+   or promote. Prefer the cheapest useful measurement, fix and rerun the failing
+   case. Stop disproven or immaterial candidates; broaden only for remaining
+   uncertainty. Record the conclusion in the existing worklog to avoid repeats.
+2. **Declare coverage.** Separate correctness support, accelerated subsets and
+   measured cases. Name affected device/model, dtype/layout, shape/context,
+   TP/EP/PP, speculation, graph and launch conditions. Distinguish live tokens,
+   compressed score columns, page capacity and graph padding; a 32K measurement
+   proves no other length.
+3. **Extend a family path.** Map new models to existing attention, MoE, linear
+   and GDN stages, providers and resource owners. Identify the missing capability
+   before adding code. Keep tiling/fusion behind the family selector; a new
+   provider needs an algorithm/layout/numerical reason and explicit bindings.
+   Do not copy a model's complete fast path or add another dispatcher/policy
+   store. Fewer files or one giant kernel does not establish a performance gain.
+4. **Separate admission, qualification and tuning.** Hardware/layout decides
+   executability, model/state evidence decides qualification, and measurements
+   choose among eligible implementations. Explain each shape restriction and
+   its fallback. Changed arithmetic/precision needs an explicit numerical and
+   quality contract under item 5, rather than a blanket exact-output veto.
+5. **Admit bounded numerical differences.** Bitwise tensor, logit or generated
+   token equality is not the default gate for floating-point changes. Choose
+   operation/dtype-aware error metrics and limits before candidate runs, plus a
+   paired task-quality allowance relative to a trusted baseline and its normal
+   variation. Bounded error with no material quality regression can qualify,
+   including documented precision changes. Keep memory/index/mask validity,
+   request isolation and state commit/rollback semantics strict. Check non-finite
+   values and recurrent/long-output drift; numerical state values use tolerances.
+   Use affected representative tasks to check correctness, instruction/format
+   adherence and repetition/EOS health. Fluency alone is insufficient; different
+   wording/tokens alone is not failure. Expand inconclusive comparisons only
+   enough to decide. Do not move limits after failure merely to pass; explicit
+   bit-exact API/storage contracts remain exact and numerical tests must state
+   their rationale. Update affected contracts/tests together when qualifying a
+   new arithmetic policy; historical bitwise-only rejection is not a quality test.
+6. **Define startup equivalence.** Equivalent effective inputs must resolve the
+   same computation/worker policy and hashes, with outputs/state satisfying the
+   same quality contract. Check affected defaults/overrides, CLI/`LLM`, legacy/
+   typed inputs, process initialization and warm/AOT reuse. Graph/eager may use
+   different kernels. Developer shells, import order or stale libraries must not
+   be hidden requirements; follow the configuration/native recipes below.
+7. **Make boundaries safe and visible.** Admitted inputs need a valid path;
+   outside specialization retain a qualified fallback and rejection reason, or
+   reject unsupported inputs at the earliest informed boundary. Never silently
+   change precision. Check endpoints, an interior case, valid threshold
+   neighbors, page/tile tails and capacity growth, including different live
+   lengths sharing padded capacity. Account for gaps between fast ranges.
+8. **Test affected interactions.** Start with cheap selector/config cases, then
+   minimal GPU computation/fallback cases. Cover affected mixed lengths, batch,
+   prefill/decode/verification, replay and state interactions. Startup changes
+   need paired fresh-process entries; packaging changes need the clean artifact.
+   Reuse still-applicable evidence. After the reproducer and affected regression
+   pass, stop unless changes, failures or unresolved risks justify more testing.
+   Keep regressions in their owning suite; avoid unrelated Cartesian sweeps.
+9. **Keep evidence distinct.** Separate selection, native execution, correctness
+   and performance. Record source/binary identities and match baseline/candidate
+   inputs/configuration except for the declared change. Measure the real path,
+   including conversion, allocation, synchronization and launch costs; separate
+   TTFT/prefill from pure decode. Model-reuse claims need a second compatible
+   model's evidence. Retain the separate 27B and 35B AWQ/FP8 migration targets.
+10. **Bound incomplete work.** Narrow optimizations may qualify with explicit
+    coverage and correct fallback. Record gaps, responsible component and next
+    decision in existing component/migration records. Missing evidence remains
+    unverified; default promotion or broader support claims need matching
+    evidence. Broad quality sweeps belong to qualification, not every edit.
 
 ## Choose the extension point
 
@@ -101,7 +103,8 @@ DDTree work is deferred; INT8-G64 is a design proposal, not a supported codec.
    do not duplicate an entire attention executor or MoE `apply`.
 4. Regenerate the architecture reference. Run the component's minimal tests,
    then writer/reader and capture/replay tests on the supported hardware for an
-   actual implementation. Compare deterministic outputs and state exactly.
+   actual implementation. Check encoded bytes/metadata against their contract;
+   qualify floating-point outputs/state under the acceptance contract above.
 
 ```bash
 .venv/bin/python -m pytest -q tests/v1/attention/test_kv_codecs.py \

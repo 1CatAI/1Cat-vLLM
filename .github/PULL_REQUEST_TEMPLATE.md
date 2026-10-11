@@ -5,6 +5,10 @@ PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTT
 
 ## Test Plan
 
+For runtime investigations, name the leading cause/bottleneck, the smallest
+experiment that distinguishes it, and the implement/reject/stop decision it
+supports. Reuse applicable evidence; expand only for a stated unresolved risk.
+
 ## Path coverage
 
 For documentation-only changes, write **N/A — documentation/offline tooling only**
@@ -27,7 +31,9 @@ Use N/A with a reason for unaffected dimensions; missing evidence is unverified.
 - Existing family path/stages reused; missing capability and reason for any new provider:
 - Admission versus model qualification versus tuning restrictions; fallback/rejection reason:
 - Equivalent startup inputs and resolved policy; affected paired entry, process, cache or artifact checks:
-- Boundary and interaction tests; output/state contract; justified omissions:
+- Boundary/interaction tests and remaining uncertainty; stopping condition:
+- Exact semantic invariants versus floating-point error metrics/limits; rationale for any bitwise requirement:
+- Paired task-quality cases, baseline variation and allowed regression; changed arithmetic/precision and justified omissions:
 - Coverage gaps, responsible component and linked follow-up decision; evidence for any broader model/default-on claim:
 
 ## Acceleration and benchmark contract (required for performance changes)
