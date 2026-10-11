@@ -334,3 +334,10 @@ at layer 11 (Q4_K/Q6_K/Q5_K). The fused native reader supports at most two
 formats and only pairs Q8 with LUT4. Check that capability before decoding
 or uploading banks; unsupported combinations retain separate projections.
 The real checkpoint's other 11 attention layers satisfy this restriction.
+
+The subsequent graph failed in the HC shard fallback: advanced indexing with
+a Python rank list creates a host index and an implicit device transfer while
+capturing. Identity rank order now retains the existing tensor; non-identity
+order concatenates device views. The complete HCX-packed fallback passed
+bitwise output and changed-input graph checks at M5/M20/M512 for both identity
+and reordered ranks (7 GPU tests). Arithmetic and communication are unchanged.

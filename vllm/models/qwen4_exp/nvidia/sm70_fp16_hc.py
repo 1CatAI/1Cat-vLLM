@@ -828,6 +828,13 @@ def _unpack_hc_storage(down: torch.Tensor, up: torch.Tensor):
     )
 
 
+def _logical_hc_rank_rows(value: torch.Tensor, order: tuple[int, ...]) -> torch.Tensor:
+    """Restore logical ranks without creating a host index during capture."""
+    if order == (0, 1, 2, 3):
+        return value
+    return torch.cat([value[:, rank : rank + 1] for rank in order], dim=1)
+
+
 def _sharded_hc_project(
     x: torch.Tensor, down: torch.Tensor, up: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -846,12 +853,12 @@ def _sharded_hc_project(
     local_down, local_up = _unpack_hc_storage(down, up)
     local = torch.mm(x, local_down.T)
     packet = group.all_gather(local, dim=-1).reshape(x.shape[0], 4, 88)
-    packet = packet[:, list(communicator.order)]
+    packet = _logical_hc_rank_rows(packet, communicator.order)
     lora = hc_silu(packet[:, :, :80].reshape(x.shape[0], 320), 4)
     injection = packet[:, 3, 80:84].contiguous()
     local_gate = torch.mm(lora, local_up.T)
     gate = group.all_gather(local_gate, dim=-1).reshape(x.shape[0], 4, 4, 640)
-    gate = gate[:, list(communicator.order)]
+    gate = _logical_hc_rank_rows(gate, communicator.order)
     gate = gate.permute(0, 2, 1, 3).reshape(x.shape[0], 10240)
     return hc_gate_mix(x, gate, 4), injection
 
