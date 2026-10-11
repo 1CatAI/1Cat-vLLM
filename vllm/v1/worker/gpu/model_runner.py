@@ -444,6 +444,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
         time_after_load = time.perf_counter()
+        # Pinned expert staging is only needed while converting checkpoints.
+        from vllm.model_executor.layers.quantization.gguf_turbomind_moe import (
+            release_staging_pool,
+        )
+
+        released = release_staging_pool()
+        if released:
+            logger.info("Released %.2f GiB of pinned loading staging", released / 2**30)
 
         self.model_memory_usage = m.consumed_memory
         logger.info(

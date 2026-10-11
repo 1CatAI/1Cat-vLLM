@@ -520,6 +520,16 @@ def _release_staging(buf: torch.Tensor) -> None:
     _STAGING_POOL.append(buf)
 
 
+def release_staging_pool() -> int:
+    """Return pinned staging chunks to the OS once loading has finished."""
+    freed = sum(buf.numel() for buf in _STAGING_POOL)
+    _STAGING_POOL.clear()
+    empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+    if empty_host_cache is not None:
+        empty_host_cache()
+    return freed
+
+
 def _tp_rows(source, weight_type, rank, size, axis):
     """This rank's packed rows as a view, or None when slicing cuts a block."""
     if size <= 0 or not 0 <= rank < size or axis not in (0, 1):
