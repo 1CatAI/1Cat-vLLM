@@ -1,0 +1,4 @@
+include LICENSE
+include README.md
+recursive-include kernel *.cu *.cuh *.h
+recursive-include include *.h

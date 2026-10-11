@@ -49,8 +49,17 @@ def test_reference_is_deterministic_and_links_actual_owners(source_tree):
         "BF16",
         "FP8_E4M3",
         "FP8_E5M2",
+        "INT8",
+        "INT8_PER_TOKEN_HEAD",
+        "FP8_PER_TOKEN_HEAD",
     }
     assert first["routes"] == sorted(first["routes"], key=lambda r: r["name"])
+    int8 = next(row for row in first["codecs"] if row["symbol"] == "INT8")
+    assert (int8["rounding"], int8["layout"], int8["scale_dtype"]) == (
+        "nearest_even",
+        "planar_scales",
+        "torch.float32",
+    )
     (source_tree / reference.OUTPUT).write_text(reference.render(first))
     assert reference.check_links(source_tree) == []
 

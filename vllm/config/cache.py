@@ -29,6 +29,7 @@ CacheDType = Literal[
     "turboquant_4bit_nc",
     "turboquant_k3v4_nc",
     "turboquant_3bit_nc",
+    "int8",
     "int8_per_token_head",
     "fp8_per_token_head",
     "nvfp4",
@@ -89,6 +90,10 @@ class CacheConfig:
     Some models (namely DeepSeekV3.2) default to fp8, set to bfloat16 to use
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
+    ``int8`` explicitly selects symmetric dynamic per-token/head INT8 with
+    nearest-even rounding and FP32 scales in aligned page regions. The older
+    ``int8_per_token_head`` retains truncation and its inline-scale layout;
+    their cache bytes are not interchangeable.
     """
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
@@ -229,6 +234,10 @@ class CacheConfig:
         from vllm.config.utils import get_hash_factors, hash_factors
 
         factors = get_hash_factors(self, ignored_factors)
+        if self.cache_dtype == "int8":
+            from vllm.v1.attention.kv_codecs import INT8
+
+            factors["kv_codec_identity"] = INT8.cache_identity
         return hash_factors(factors)
 
     def metrics_info(self):

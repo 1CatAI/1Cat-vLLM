@@ -227,6 +227,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "partition_size_hint",
                 "anchor_lens",
                 "anchored_window",
+                "k_scale_cache",
+                "v_scale_cache",
             )
             if self.flash_attn_decode_paged is not None
             and _ops.callable_accepts_keyword(self.flash_attn_decode_paged, name)
@@ -459,9 +461,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
-        supported_kv_dtype = not _routing.uses_fp8_kv_cache(
-            self.kv_cache_dtype
-        ) or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+        supported_kv_dtype = self.kv_codec in (FP16, FP8_E4M3, FP8_E5M2)
         return (
             self.use_flash_v100
             and self.attn_type == AttentionType.DECODER

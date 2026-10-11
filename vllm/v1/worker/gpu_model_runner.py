@@ -163,6 +163,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVQuantMode,
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -12433,6 +12434,31 @@ class GPUModelRunner(
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
+                    if (
+                        kv_cache_spec.kv_quant_mode
+                        == KVQuantMode.INT8_PER_TOKEN_HEAD_RNE
+                    ):
+                        from vllm.v1.attention.kv_cache_view import bind_planar_kv_cache
+
+                        if (
+                            getattr(
+                                kv_cache_spec, "head_size_v", kv_cache_spec.head_size
+                            )
+                            != kv_cache_spec.head_size
+                        ):
+                            raise ValueError(
+                                "Planar KV binding requires equal K/V head dimensions"
+                            )
+                        kv_caches[layer_name] = bind_planar_kv_cache(
+                            raw_tensor,
+                            num_blocks=num_blocks,
+                            scheduler_block_size=kv_cache_spec.storage_block_size,
+                            kernel_block_size=kernel_block_size,
+                            num_heads=kv_cache_spec.num_kv_heads,
+                            head_size=kv_cache_spec.head_size,
+                            page_size_bytes=kv_cache_spec.page_size_bytes,
+                        )
+                        continue
                     # Compressed MLA is split into physical pool pages instead
                     # of the scheduler's attention-kernel blocks.
                     if kv_cache_spec.storage_block_size != kv_cache_spec.block_size:

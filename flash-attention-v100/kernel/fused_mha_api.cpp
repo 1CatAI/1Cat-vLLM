@@ -23,6 +23,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "FlashAttention-2 Backward Pass (Volta)");
   m.def("decode_paged_fwd", &flash_attention_decode_paged,
         "FlashAttention decode over paged KV cache (Volta)");
+  m.def("decode_paged_kv_fwd", &flash_attention_decode_paged_with_scales,
+        "Shared paged decode with explicit KV scale views (Volta)");
+  m.attr("decode_paged_kv_abi") = 1;
+  m.attr("decode_paged_kv_codecs") =
+      py::make_tuple("auto", "float16", "fp8", "fp8_e4m3", "fp8_e5m2", "int8",
+                     "int8_per_token_head");
   m.def("decode_paged_xqa_fwd", &flash_attention_decode_paged_xqa,
         "FlashAttention XQA decode over paged KV cache (Volta)");
   m.def("decode_paged_xqa_staged_fwd", &flash_attention_decode_paged_xqa_staged,
@@ -105,6 +111,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         flash_v100::policy::with_policy(&flash_attention_backward));
   m.def("decode_paged_fwd_configured",
         flash_v100::policy::with_policy(&flash_attention_decode_paged));
+  m.def("decode_paged_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_decode_paged_with_scales));
   m.def("decode_paged_xqa_fwd_configured",
         flash_v100::policy::with_policy(&flash_attention_decode_paged_xqa));
   m.def("decode_paged_xqa_staged_fwd_configured",

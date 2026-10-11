@@ -8,10 +8,18 @@ cache/workspace resources. `resolve_kv_codec` resolves aliases;
 ## Storage and numerical semantics
 
 `KV_CODECS` declares FP16 (`auto`, `float16`), BF16, E4M3 (`fp8`, `fp8_e4m3`)
-and E5M2. FP8 payload tensors use `uint8` storage reinterpreted as the declared
+and E5M2, new planar INT8, and legacy inline INT8/FP8 token/head formats.
+FP8 tensor-scale payloads use `uint8` storage reinterpreted as the declared
 FP8 element type; reference conversion casts then applies a scalar scale.
 Callers supply independent K/V scales. Unquantized reference conversion returns
 the original cache.
+
+The new `int8` codec declares nearest-even rounding, FP32 token/head scales,
+an encoding version and a planar page layout. `KVCacheView` borrows payload
+and scale addresses from the existing allocation; `KVPageLayout` accounts for
+the aligned regions. Legacy `int8_per_token_head` retains truncation and inline
+scale bytes. See the [implementation and qualification record](../../../docs/design/architecture/kv_codec_unification.md)
+for the current supported bindings and outstanding GPU gates.
 
 The descriptor is immutable. Cache allocation, page/stride contracts, persistent
 metadata, capture addresses and workspace lifetime belong to the cache manager,

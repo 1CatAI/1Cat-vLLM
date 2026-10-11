@@ -41,6 +41,7 @@ class KVQuantMode(IntEnum):
     INT8_PER_TOKEN_HEAD = 2  # per-token-head dynamic scales for int8
     FP8_PER_TOKEN_HEAD = 3  # per-token-head dynamic scales for fp8
     NVFP4 = 4  # packed fp4 data + fp8 block scales
+    INT8_PER_TOKEN_HEAD_RNE = 5  # aligned planar data/scales, nearest-even
 
     @property
     def is_per_token_head(self) -> bool:
@@ -48,6 +49,7 @@ class KVQuantMode(IntEnum):
         return self in (
             KVQuantMode.INT8_PER_TOKEN_HEAD,
             KVQuantMode.FP8_PER_TOKEN_HEAD,
+            KVQuantMode.INT8_PER_TOKEN_HEAD_RNE,
         )
 
     @property
@@ -58,6 +60,8 @@ class KVQuantMode(IntEnum):
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
+    if kv_cache_dtype == "int8":
+        return KVQuantMode.INT8_PER_TOKEN_HEAD_RNE
     if kv_cache_dtype == "int8_per_token_head":
         return KVQuantMode.INT8_PER_TOKEN_HEAD
     if kv_cache_dtype == "fp8_per_token_head":
@@ -170,6 +174,16 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def page_size_bytes(self) -> int:
+        if self.kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD_RNE:
+            from vllm.v1.attention.kv_cache_view import KVPageLayout
+
+            return KVPageLayout(
+                self.storage_block_size,
+                self.num_kv_heads,
+                self.head_size,
+                getattr(self, "head_size_v", self.head_size),
+                get_dtype_size(self.dtype),
+            ).scheduler_page_stride(self.page_size_padded)
         real_page_size = self.real_page_size_bytes
         # Per-token-head scales are stored in separate tensors managed
         # by the attention backend, but the memory is carved from the

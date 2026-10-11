@@ -287,9 +287,53 @@ def test_undeclared_routes_and_implicit_fallbacks_are_rejected():
         r.select_route(
             context("decode", BF16), ("decode_xqa_paged",), fallback="decode_xqa_paged"
         )
-    assert r.select_route(
-        context("decode", BF16), ("decode_xqa_paged",), fallback="decode_scalar_paged"
-    ).fallback
+    assert (
+        r.select_route(
+            context("decode", BF16),
+            ("decode_xqa_paged",),
+            fallback="decode_scalar_paged",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("codec", KV_CODECS, ids=lambda c: c.name)
+def test_fallback_checks_codec_and_its_own_native_availability(codec):
+    candidate = replace(context("decode", codec), enabled=False, available=False)
+    fallback = context("decode", codec)
+    selected = r.select_route(
+        candidate,
+        ("decode_xqa_paged",),
+        fallback="decode_scalar_paged",
+        fallback_context=fallback,
+    )
+    assert (selected is not None) == (
+        codec in r.ROUTE_SPECS["decode_scalar_paged"].codecs
+    )
+    assert (
+        r.select_route(
+            candidate,
+            (),
+            fallback="decode_scalar_paged",
+            fallback_context=replace(fallback, available=False),
+        )
+        is None
+    )
+
+
+def test_python_signature_does_not_advertise_missing_native_codec(monkeypatch):
+    from functools import partial
+
+    from vllm.v1.attention.kv_codecs import INT8
+
+    def legacy(*args, **kwargs):
+        raise AssertionError("Capability inspection must not execute an operator")
+
+    assert not r.native_codec_supported(legacy, INT8)
+    assert not r.native_codec_supported(partial(legacy), INT8)
+    assert r.native_codec_supported(legacy, FP8_E4M3)
+    monkeypatch.setattr(legacy, "kv_cache_codecs", frozenset(("int8",)), raising=False)
+    assert r.native_codec_supported(legacy, INT8)
 
 
 def test_fallback_accounting_preserves_legacy_route_summary(monkeypatch):

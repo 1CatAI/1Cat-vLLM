@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    KVQuantMode,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -245,6 +246,28 @@ def _reshape_kv_cache(
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
+                if kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD_RNE:
+                    from vllm.v1.attention.kv_cache_view import bind_planar_kv_cache
+
+                    if (
+                        getattr(kv_cache_spec, "head_size_v", kv_cache_spec.head_size)
+                        != kv_cache_spec.head_size
+                    ):
+                        raise ValueError(
+                            "Planar KV binding requires equal K/V head dimensions"
+                        )
+                    kv_caches[layer_name] = bind_planar_kv_cache(
+                        kv_raw_tensor,
+                        num_blocks=num_blocks,
+                        scheduler_block_size=kv_cache_spec.storage_block_size,
+                        kernel_block_size=kernel_block_size,
+                        num_heads=kv_cache_spec.num_kv_heads,
+                        head_size=kv_cache_spec.head_size,
+                        page_size_bytes=kv_cache_spec.page_size_bytes,
+                        member_index=member_index,
+                        member_count=member_count,
+                    )
+                    continue
                 num_blocks_per_kv_block = (
                     kv_cache_spec.storage_block_size // kernel_block_size
                 )

@@ -9,7 +9,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 
-#include "fp8_kv_utils.cuh"
+#include "kv_codec_traits.cuh"
 
 namespace {
 

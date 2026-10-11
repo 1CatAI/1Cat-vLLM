@@ -1132,12 +1132,27 @@ def flash_attn_decode_paged(
     anchor_lens: torch.Tensor | None = None,
     anchored_window: int = 0,
     *,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
     _runtime=None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
     e4m3_fp32 = kv_cache_dtype in ("fp8", "fp8_e4m3")
+    row_scaled = kv_cache_dtype in ("int8", "int8_per_token_head")
+    native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
+    if row_scaled:
+        if (
+            int(getattr(native, "decode_paged_kv_abi", 0)) != 1
+            or not hasattr(native, "decode_paged_kv_fwd")
+            or kv_cache_dtype not in getattr(native, "decode_paged_kv_codecs", ())
+        ):
+            raise RuntimeError("Rebuild Flash-V100 for the explicit KV scale-view ABI")
+        if k_scale_cache is None or v_scale_cache is None:
+            raise ValueError("Token/head KV decoding requires both scale planes")
+    elif k_scale_cache is not None or v_scale_cache is not None:
+        raise ValueError("This KV codec uses tensor scales, not scale planes")
     if e4m3_fp32 and not flash_attn_grouped_e4m3_fp32_available():
         raise RuntimeError(
             "Rebuild Flash-V100 for E4M3 FP32 scalar decode (precision revision 4)"
@@ -1199,14 +1214,14 @@ def flash_attn_decode_paged(
             head_dim=head_dim,
             plan=plan,
             active_num_partitions=active_num_partitions,
-            partial_dtype=torch.float32 if e4m3_fp32 else torch.float16,
+            partial_dtype=torch.float32 if e4m3_fp32 or row_scaled else torch.float16,
             _runtime=_runtime,
         )
     )
 
-    return (
-        _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    ).decode_paged_fwd(
+    operation = native.decode_paged_kv_fwd if row_scaled else native.decode_paged_fwd
+    scale_args = (k_scale_cache, v_scale_cache) if row_scaled else ()
+    return operation(
         q,
         k_cache,
         v_cache,
@@ -1227,7 +1242,16 @@ def flash_attn_decode_paged(
         int(window_size_right),
         anchor_lens,
         int(anchored_window),
+        *scale_args,
     )
+
+
+flash_attn_decode_paged.kv_cache_codecs = frozenset(  # type: ignore[attr-defined]
+    getattr(flash_attn_v100_cuda, "decode_paged_kv_codecs", ())
+    if int(getattr(flash_attn_v100_cuda, "decode_paged_kv_abi", 0)) == 1
+    and hasattr(flash_attn_v100_cuda, "decode_paged_kv_fwd")
+    else ("auto", "float16", "fp8", "fp8_e4m3", "fp8_e5m2")
+)
 
 
 def flash_attn_decode_paged_xqa_available() -> bool:

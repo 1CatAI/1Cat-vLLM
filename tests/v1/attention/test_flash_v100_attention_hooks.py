@@ -54,6 +54,15 @@ def test_registration_matches_mechanically_inlined_callbacks():
         assert "dflash" not in text and "ddtree" not in text
 
 
+@pytest.mark.parametrize(
+    "dtype", ["int8", "int8_per_token_head", "fp8_per_token_head", "unknown"]
+)
+def test_unbound_kv_formats_do_not_enter_native_fallback(dtype):
+    instance = _instance()
+    instance.kv_cache_dtype = dtype
+    assert not instance._supports_flash_v100_path()
+
+
 @pytest.mark.parametrize("draft,allow", [(False, False), (False, True), (True, False)])
 def test_forward_fallback_keeps_admission_route_and_base_call(
     monkeypatch, draft, allow
