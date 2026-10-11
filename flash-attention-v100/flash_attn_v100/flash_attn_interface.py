@@ -2164,13 +2164,18 @@ def paged_kv_to_fp16(
     kv_cache_dtype: str = "auto",
     k_scale_cache: torch.Tensor | None = None,
     v_scale_cache: torch.Tensor | None = None,
+    key_scale_out: torch.Tensor | None = None,
+    value_scale_out: torch.Tensor | None = None,
     _runtime=None,
 ) -> None:
     """Expand active pages into an owner-provided, bounded FP16 workspace."""
     native = _runtime.native if _runtime is not None else flash_attn_v100_cuda
-    binding = bind_kv(
-        native, "paged_kv_to_fp16", kv_cache_dtype, k_scale_cache, v_scale_cache
+    if (key_scale_out is None) != (value_scale_out is None):
+        raise ValueError("Unscaled KV expansion requires both output scale planes")
+    algorithm = (
+        "paged_kv_to_fp16_unscaled" if key_scale_out is not None else "paged_kv_to_fp16"
     )
+    binding = bind_kv(native, algorithm, kv_cache_dtype, k_scale_cache, v_scale_cache)
     codec = {
         "auto": 0,
         "float16": 0,
@@ -2191,11 +2196,17 @@ def paged_kv_to_fp16(
         float(k_scale),
         float(v_scale),
         *binding.scale_args,
+        *((key_scale_out, value_scale_out) if key_scale_out is not None else ()),
     )
 
 
 paged_kv_to_fp16.kv_cache_codecs = codec_names(  # type: ignore[attr-defined]
     flash_attn_v100_cuda, "paged_kv_to_fp16"
+)
+
+
+paged_kv_to_fp16.unscaled_kv_cache_codecs = codec_names(  # type: ignore[attr-defined]
+    flash_attn_v100_cuda, "paged_kv_to_fp16_unscaled"
 )
 
 

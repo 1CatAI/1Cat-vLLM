@@ -52,7 +52,7 @@ class AttentionRuntime:
         self.native_policy = extension.PreparedPolicy(native_inputs)
         self.native = SimpleNamespace()
         for name in dir(extension):
-            if name.endswith(("_kv_abi", "_kv_codecs", "_revision")):
+            if name.endswith(("_kv_abi", "_kv_codecs", "_revision", "_features")):
                 setattr(self.native, name, getattr(extension, name))
         for name in dir(extension):
             if name.endswith("_configured"):

@@ -36,8 +36,7 @@ _SM70_79T_EXACT_QUERY_ALIGNMENT = 64
 _SM70_79T_KV_ALIGNMENT = 32
 _SM70_SPLITD_KV_ALIGNMENT = 32
 _fp8_prefill_bridge_workspaces: dict[
-    tuple[int, int, int, int],
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[int, int, int, int], tuple[torch.Tensor, ...]
 ] = {}
 _fp8_prefill_bridge_tail_workspaces: dict[
     tuple[int, int, torch.dtype, int, int],
@@ -290,14 +289,25 @@ def _run_sm70_gqa_groups(
     out: torch.Tensor,
     softmax_scale: float,
     causal: bool,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply the native GQA6 core independently to each local KV head."""
+    assert (key_scale is None) == (value_scale is None)
     if query.shape[0] == 1 and key.shape[2] == 1:
-        return op(query, key, value, out, softmax_scale, causal)
+        scale_args = (key_scale, value_scale) if key_scale is not None else ()
+        return op(query, key, value, out, softmax_scale, causal, *scale_args)
     for batch in range(query.shape[0]):
         for head in range(key.shape[2]):
             group_q = query[batch : batch + 1, :, head * 6 : (head + 1) * 6]
             group_out = torch.empty_like(group_q, memory_format=torch.contiguous_format)
+            scale_args = ()
+            if key_scale is not None:
+                assert value_scale is not None
+                scale_args = (
+                    key_scale[batch : batch + 1, :, head : head + 1],
+                    value_scale[batch : batch + 1, :, head : head + 1],
+                )
             op(
                 group_q.contiguous(),
                 key[batch : batch + 1, :, head : head + 1].contiguous(),
@@ -305,6 +315,7 @@ def _run_sm70_gqa_groups(
                 group_out,
                 softmax_scale,
                 causal,
+                *scale_args,
             )
             out[batch : batch + 1, :, head * 6 : (head + 1) * 6].copy_(group_out)
     return out
@@ -319,6 +330,8 @@ def _run_sm70_d256_gqa_79t_dispatch(
     softmax_scale: float,
     architecture_op: Callable[..., torch.Tensor],
     dense_op: Callable[..., torch.Tensor],
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run Q8000 directly and preserve it as the core of Q8001..Q8192.
 
@@ -341,6 +354,8 @@ def _run_sm70_d256_gqa_79t_dispatch(
             out,
             softmax_scale,
             True,
+            key_scale,
+            value_scale,
         )
 
     core_query = query[:, fringe_len:]
@@ -353,6 +368,8 @@ def _run_sm70_d256_gqa_79t_dispatch(
         core_out,
         softmax_scale,
         True,
+        key_scale,
+        value_scale,
     )
 
     fringe_kv_len = int(key.shape[1]) - _SM70_79T_CORE_QUERY_LEN
@@ -381,6 +398,11 @@ def _run_sm70_d256_gqa_79t_dispatch(
         fringe_out,
         softmax_scale,
         True,
+        *(
+            (key_scale[:, :fringe_kv_len], value_scale[:, :fringe_kv_len])
+            if key_scale is not None and value_scale is not None
+            else ()
+        ),
     )
     if fringe_prefix:
         out[:, :fringe_len].copy_(fringe_out[:, fringe_prefix:])
@@ -430,6 +452,8 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
     *,
     softmax_scale: float,
     architecture_q8192_op: Callable[..., torch.Tensor],
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run Q8001..Q8192 through the native Q8192 specialization."""
     query_len = int(query.shape[1])
@@ -444,6 +468,8 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
             out,
             softmax_scale,
             True,
+            key_scale,
+            value_scale,
         )
 
     padded_query, padded_out = _get_sm70_79t_q8192_padding_workspace(query)
@@ -456,6 +482,14 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
     if kv_padding:
         key = torch.nn.functional.pad(key, (0, 0, 0, 0, 0, kv_padding))
         value = torch.nn.functional.pad(value, (0, 0, 0, 0, 0, kv_padding))
+        if key_scale is not None:
+            assert value_scale is not None
+            key_scale = torch.nn.functional.pad(
+                key_scale, (0, 0, 0, kv_padding), value=1.0
+            )
+            value_scale = torch.nn.functional.pad(
+                value_scale, (0, 0, 0, kv_padding), value=1.0
+            )
         leading_padding -= kv_padding
     padded_query.zero_()
     padded_query[:, leading_padding : leading_padding + query_len].copy_(query)
@@ -467,6 +501,8 @@ def _run_sm70_d256_gqa_79t_q8192_dispatch(
         padded_out,
         softmax_scale,
         True,
+        key_scale,
+        value_scale,
     )
     out.copy_(padded_out[:, leading_padding : leading_padding + query_len])
     return out
@@ -487,10 +523,26 @@ def try_sm70_fa2_d256_prefill(
     out: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
     block_table: torch.Tensor | None = None,
+    key_scale: torch.Tensor | None = None,
+    value_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     int32_max = torch.iinfo(torch.int32).max
     if not _config.options().value("fa2_d256_prefill"):
         return None
+    if (key_scale is None) != (value_scale is None):
+        return None
+    scale_args: tuple[torch.Tensor, ...] = ()
+    if key_scale is not None:
+        assert value_scale is not None
+        if any(
+            scale.dtype != torch.float32
+            or scale.device != payload.device
+            or scale.shape != payload.shape[:3]
+            or any(stride <= 0 for stride in scale.stride())
+            for scale, payload in ((key_scale, key), (value_scale, value))
+        ):
+            return None
+        scale_args = (key_scale, value_scale)
     if (
         query.device.type != "cuda"
         or query.dtype != torch.float16
@@ -577,6 +629,8 @@ def try_sm70_fa2_d256_prefill(
                 and max_seqlen_k <= block_table.shape[1] * key.shape[1]
             )
             if splitd_eligible:
+                if scale_args and not _ops.prefill_row_scales_supported(paged_op):
+                    return None
                 splitd_out = out if out is not None else torch.empty_like(query)
                 splitd_result = paged_op(
                     query,
@@ -587,6 +641,7 @@ def try_sm70_fa2_d256_prefill(
                     max_seqlen_k,
                     softmax_scale,
                     True,
+                    *scale_args,
                 )
         else:
             splitd_eligible = (
@@ -606,14 +661,22 @@ def try_sm70_fa2_d256_prefill(
                     max_seqlen_k,
                     softmax_scale,
                     dense_op,
+                    key_scale,
+                    value_scale,
                 )
 
-                if splitd_result is None and _should_use_prefill_dense_splitkv3(
-                    query,
-                    key,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    splitkv3_op=splitkv3_op,
+                if (
+                    splitd_result is None
+                    and (
+                        not scale_args or _ops.prefill_row_scales_supported(splitkv3_op)
+                    )
+                    and _should_use_prefill_dense_splitkv3(
+                        query,
+                        key,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        splitkv3_op=splitkv3_op,
+                    )
                 ):
                     workspace = _get_prefill_dense_splitkv3_workspace(query)
                     if workspace is not None:
@@ -628,6 +691,7 @@ def try_sm70_fa2_d256_prefill(
                             splitd_out,
                             softmax_scale,
                             True,
+                            *scale_args,
                         )
 
                         if not log_once_seen(
@@ -653,9 +717,10 @@ def try_sm70_fa2_d256_prefill(
                     splitd_result is None
                     and max_seqlen_q % _SM70_79T_EXACT_QUERY_ALIGNMENT == 0
                     and max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
+                    and (not scale_args or _ops.prefill_row_scales_supported(dense_op))
                 ):
                     splitd_result = dense_op(
-                        query, key, value, splitd_out, softmax_scale, True
+                        query, key, value, splitd_out, softmax_scale, True, *scale_args
                     )
         if splitd_result is not None:
             result = splitd_result.reshape(query.shape)
@@ -668,7 +733,9 @@ def try_sm70_fa2_d256_prefill(
 def get_fp8_prefill_bridge_workspace(
     key_cache: torch.Tensor,
     required_blocks: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    *,
+    preserve_scales: bool = False,
+) -> tuple[torch.Tensor, ...] | None:
     cache = workspace_cache(
         "fp8_prefill_bridge_workspaces", _fp8_prefill_bridge_workspaces
     )
@@ -689,18 +756,41 @@ def get_fp8_prefill_bridge_workspace(
         int(key_cache.shape[3]),
     )
     workspace = cache.get(cache_key)
-    if workspace is not None and workspace[0].shape[0] >= required_blocks:
-        retain_for_capture(cache, workspace, key_cache)
-        return (
-            workspace[0][:required_blocks],
-            workspace[1][:required_blocks],
-            workspace[2][:, :required_blocks],
+
+    def _view(buffers: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+        result: tuple[torch.Tensor, ...] = (
+            buffers[0][:required_blocks],
+            buffers[1][:required_blocks],
+            buffers[2][:, :required_blocks],
         )
+        if preserve_scales:
+            result += (buffers[3][:required_blocks], buffers[4][:required_blocks])
+        return result
+
+    if workspace is not None and workspace[0].shape[0] >= required_blocks:
+        if preserve_scales and len(workspace) == 3:
+            if _routing.is_cuda_graph_capturing(key_cache):
+                return None
+            shape = workspace[0].shape[:-1]
+            scales = _workspace.allocate_growing_workspace(
+                lambda: (
+                    torch.empty(shape, dtype=torch.float32, device=key_cache.device),
+                    torch.empty(shape, dtype=torch.float32, device=key_cache.device),
+                ),
+                on_cuda=key_cache.is_cuda,
+            )
+            if scales is None:
+                return None
+            workspace += scales
+            cache[cache_key] = workspace
+        retain_for_capture(cache, workspace, key_cache)
+        return _view(workspace)
 
     if _routing.is_cuda_graph_capturing(key_cache):
         return None
 
     previous_capacity = workspace[0].shape[0] if workspace is not None else 0
+    keep_scales = preserve_scales or (workspace is not None and len(workspace) == 5)
     capacity = max(required_blocks, previous_capacity * 2)
     shape = (
         capacity,
@@ -713,35 +803,27 @@ def get_fp8_prefill_bridge_workspace(
         key_out = torch.empty(shape, dtype=torch.float16, device=key_cache.device)
         value_out = torch.empty_like(key_out)
         block_table = torch.arange(
-            capacity,
-            dtype=torch.int32,
-            device=key_cache.device,
+            capacity, dtype=torch.int32, device=key_cache.device
         ).unsqueeze(0)
-        return key_out, value_out, block_table
+        buffers: tuple[torch.Tensor, ...] = (key_out, value_out, block_table)
+        if keep_scales:
+            buffers += (
+                torch.empty(shape[:-1], dtype=torch.float32, device=key_cache.device),
+                torch.empty(shape[:-1], dtype=torch.float32, device=key_cache.device),
+            )
+        return buffers
 
-    # Drop the old buffers before allocating the grown ones; see
-    # _allocate_growing_workspace. The stale entry is not restored on failure
-    # so that a later, smaller request re-allocates from scratch instead of
-    # inheriting a doubled capacity that already failed once.
+    # Payload and scales share the existing owner, capacity, growth and graph
+    # retention rules. An old format can reuse the same payload workspace.
     workspace = None
     cache.pop(cache_key, None)
     allocated = _workspace.allocate_growing_workspace(
-        _allocate,
-        on_cuda=key_cache.is_cuda,
+        _allocate, on_cuda=key_cache.is_cuda
     )
     if allocated is None:
         return None
-    key_out, value_out, block_table = allocated
-    cache[cache_key] = (
-        key_out,
-        value_out,
-        block_table,
-    )
-    return (
-        key_out[:required_blocks],
-        value_out[:required_blocks],
-        block_table[:, :required_blocks],
-    )
+    cache[cache_key] = allocated
+    return _view(allocated)
 
 
 def get_fp8_prefill_bridge_tail_workspace(
@@ -1091,7 +1173,16 @@ LEGACY_ALIASES = {
 
 
 def _try_dense_architecture(
-    query, key, value, splitd_out, max_seqlen_q, max_seqlen_k, softmax_scale, dense_op
+    query,
+    key,
+    value,
+    splitd_out,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale,
+    dense_op,
+    key_scale=None,
+    value_scale=None,
 ):
     splitd_result = None
     architecture_op = (
@@ -1106,6 +1197,11 @@ def _try_dense_architecture(
         and max_seqlen_q > _SM70_79T_CORE_QUERY_LEN
         else None
     )
+    if key_scale is not None:
+        if not _ops.prefill_row_scales_supported(architecture_op):
+            architecture_op = None
+        if not _ops.prefill_row_scales_supported(architecture_q8192_op):
+            architecture_q8192_op = None
     if _should_use_prefill_d256_gqa_architecture(
         query,
         key,
@@ -1126,6 +1222,8 @@ def _try_dense_architecture(
                     splitd_out,
                     softmax_scale,
                     True,
+                    key_scale,
+                    value_scale,
                 )
             elif architecture_q8192_op is not None:
                 splitd_result = _run_sm70_d256_gqa_79t_q8192_dispatch(
@@ -1135,11 +1233,13 @@ def _try_dense_architecture(
                     splitd_out,
                     softmax_scale=softmax_scale,
                     architecture_q8192_op=architecture_q8192_op,
+                    key_scale=key_scale,
+                    value_scale=value_scale,
                 )
             elif (
                 max_seqlen_q == _SM70_79T_CORE_QUERY_LEN
                 or max_seqlen_k % _SM70_SPLITD_KV_ALIGNMENT == 0
-            ):
+            ) and (key_scale is None or _ops.prefill_row_scales_supported(dense_op)):
                 splitd_result = _run_sm70_d256_gqa_79t_dispatch(
                     query,
                     key,
@@ -1148,6 +1248,8 @@ def _try_dense_architecture(
                     softmax_scale=softmax_scale,
                     architecture_op=architecture_op,
                     dense_op=dense_op,
+                    key_scale=key_scale,
+                    value_scale=value_scale,
                 )
         except torch.OutOfMemoryError:
             if not log_once_seen(

@@ -145,6 +145,43 @@ def test_attention_observations_are_owned_by_each_engine():
     assert second.histories.get("flash_v100_routes", {}) == {}
 
 
+def test_prefill_audit_reads_resolved_engine_owner_without_mutation(monkeypatch):
+    from benchmarks.sm70_dflash2_prefill_route_audit import prefill_observations
+
+    engines = []
+    for v37 in (False, True):
+        policy, _, trace = prepare(
+            FlashV100Options(prefill_d256_gqa_v37=v37),
+            trace=FlashV100Diagnostics(route_summary=True),
+        )
+        config = SimpleNamespace(
+            attention_config=SimpleNamespace(flash_v100=policy),
+            observability_config=SimpleNamespace(
+                runtime_trace=RuntimeTraceConfig(flash_v100=trace)
+            ),
+        )
+        owner = diagnostics_for(config)
+        owner.histories["flash_v100_routes"] = {"prefill": int(v37) + 7}
+        engines.append((config, owner))
+    # Neither changed ambient flags nor the legacy global can replace the
+    # worker's selected policy and counters outside a forward context.
+    monkeypatch.setattr("os.getenv", lambda *a: pytest.fail("audit read environment"))
+    for config, owner in engines:
+        before = {name: dict(counts) for name, counts in owner.histories.items()}
+        snapshot = prefill_observations(config)
+        assert snapshot["routes"] == owner.histories["flash_v100_routes"]
+        assert snapshot["route_counting_enabled"]
+        assert snapshot["flags"]["VLLM_FLASH_V100_PREFILL_D256_GQA_V37"] == str(
+            int(config.attention_config.flash_v100.options.prefill_d256_gqa_v37)
+        )
+        snapshot["routes"]["prefill"] = -1
+        assert owner.histories == before
+    config, owner = engines[0]
+    owner.histories.clear()
+    assert prefill_observations(config)["routes"] == {}
+    assert owner.histories == {}
+
+
 def test_bound_report_never_evaluates_legacy_getters(monkeypatch):
     policy, _, _ = prepare()
     expected = policy.explain()
@@ -207,6 +244,78 @@ def test_attention_workspace_shutdown_keeps_other_engine_and_legacy(monkeypatch)
         assert reused[0].data_ptr() == b[0].data_ptr()
         assert workspace_cache("grouped_fp16", legacy) is bank
     assert legacy == {}
+
+
+def test_bridge_scale_planes_share_payload_capacity_and_engine_owner():
+    import torch
+
+    from vllm.config import set_current_vllm_config
+    from vllm.runtime_resources import release_runtime_resources
+    from vllm.v1.attention.backends.flash_v100 import dense_prefill
+
+    first, second = SimpleNamespace(), SimpleNamespace()
+    key = torch.zeros((1, 256, 2, 8), dtype=torch.uint8)
+    with set_current_vllm_config(first):
+        payload = dense_prefill.get_fp8_prefill_bridge_workspace(key, 2)
+        scaled = dense_prefill.get_fp8_prefill_bridge_workspace(
+            key.to(torch.int8), 2, preserve_scales=True
+        )
+        assert len(payload) == 3 and len(scaled) == 5
+        assert payload[0].data_ptr() == scaled[0].data_ptr()
+        assert all(t.dtype == torch.float32 for t in scaled[3:])
+        assert all(t.shape == scaled[0].shape[:-1] for t in scaled[3:])
+        scaled[3].fill_(0.125)
+        reused = dense_prefill.get_fp8_prefill_bridge_workspace(
+            key, 1, preserve_scales=True
+        )
+        assert reused[3].data_ptr() == scaled[3].data_ptr()
+        assert torch.equal(reused[3], torch.full_like(reused[3], 0.125))
+        grown = dense_prefill.get_fp8_prefill_bridge_workspace(
+            key, 3, preserve_scales=True
+        )
+        assert all(t.shape[0] == 3 for t in (grown[0], *grown[3:]))
+    with set_current_vllm_config(second):
+        other = dense_prefill.get_fp8_prefill_bridge_workspace(
+            key, 1, preserve_scales=True
+        )
+        assert other[3].data_ptr() != grown[3].data_ptr()
+    release_runtime_resources(first)
+    with set_current_vllm_config(second):
+        reused = dense_prefill.get_fp8_prefill_bridge_workspace(
+            key, 1, preserve_scales=True
+        )
+        assert reused[3].data_ptr() == other[3].data_ptr()
+    release_runtime_resources(second)
+
+
+def test_bridge_scale_allocation_failure_or_capture_keeps_existing_payload(monkeypatch):
+    import torch
+
+    from vllm.config import set_current_vllm_config
+    from vllm.runtime_resources import release_runtime_resources
+    from vllm.v1.attention.backends.flash_v100 import dense_prefill
+
+    owner = SimpleNamespace()
+    key = torch.zeros((1, 256, 1, 8), dtype=torch.uint8)
+    with set_current_vllm_config(owner):
+        payload = dense_prefill.get_fp8_prefill_bridge_workspace(key, 1)
+        monkeypatch.setattr(
+            dense_prefill._workspace, "allocate_growing_workspace", lambda *a, **k: None
+        )
+        assert (
+            dense_prefill.get_fp8_prefill_bridge_workspace(key, 1, preserve_scales=True)
+            is None
+        )
+        monkeypatch.setattr(
+            dense_prefill._routing, "is_cuda_graph_capturing", lambda t: True
+        )
+        assert (
+            dense_prefill.get_fp8_prefill_bridge_workspace(key, 1, preserve_scales=True)
+            is None
+        )
+        reused = dense_prefill.get_fp8_prefill_bridge_workspace(key, 1)
+        assert payload[0].data_ptr() == reused[0].data_ptr()
+    release_runtime_resources(owner)
 
 
 def test_attention_diagnostic_budgets_and_output_do_not_cross_engines(tmp_path):

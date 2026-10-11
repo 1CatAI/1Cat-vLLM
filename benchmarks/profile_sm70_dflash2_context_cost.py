@@ -46,11 +46,17 @@ def metrics(base: str) -> dict:
         return result
 
 
-def request(base: str, prompt: list[int], output_limit: int, seed: int) -> dict:
+def request(
+    base: str,
+    prompt: list[int],
+    output_limit: int,
+    seed: int,
+    model: str = "quasar-baseline",
+) -> dict:
     if len(prompt) + output_limit > 262144:
         raise ValueError("The complete request exceeds the 256K capacity")
     payload = {
-        "model": "quasar-baseline",
+        "model": model,
         "prompt": prompt,
         "max_tokens": output_limit,
         "temperature": 1.0,
@@ -135,12 +141,14 @@ def main() -> None:
     parser.add_argument("--corpus", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--base", default="http://127.0.0.1:18215")
+    parser.add_argument("--model", default="quasar-baseline")
     parser.add_argument("--lengths", type=int, nargs="+", required=True)
     parser.add_argument("--output-tokens", type=int, default=256)
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--trace-dir", type=Path)
     parser.add_argument("--reset-prefix-cache-before-length", action="store_true")
     parser.add_argument("--require-native-prefill", action="store_true")
+    parser.add_argument("--require-prefix-hits", action="store_true")
     parser.add_argument("--require-original-gdn-prefill", action="store_true")
     args = parser.parse_args()
     if args.require_original_gdn_prefill and not args.require_native_prefill:
@@ -161,9 +169,11 @@ def main() -> None:
     report = {
         "scope": "Bounded latency diagnostic, not natural-output quality scoring",
         "context_capacity": 262144,
+        "served_model": args.model,
         "profiler": args.trace_dir is not None,
         "reset_prefix_cache_before_length": args.reset_prefix_cache_before_length,
         "require_native_prefill": args.require_native_prefill,
+        "require_prefix_hits": args.require_prefix_hits,
         "require_original_gdn_prefill": args.require_original_gdn_prefill,
         "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "seed": 0},
         "corpus_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
@@ -186,6 +196,10 @@ def main() -> None:
             rows = json.load(response)["results"]
         assert sorted(row["rank"] for row in rows) == list(range(4)), rows
         assert all(row["native_prefill_available"] for row in rows), rows
+        assert all(row["route_counting_enabled"] for row in rows), (
+            "Native route evidence requires the engine's resolved route counters",
+            rows,
+        )
         if args.require_original_gdn_prefill:
             assert all(row["gdn_prefill"]["original_tilelang"] for row in rows), rows
         return sorted(rows, key=lambda row: row["rank"])
@@ -206,13 +220,18 @@ def main() -> None:
         for repeat in range(-1, args.repeats):
             if args.trace_dir and repeat == 0:
                 (args.trace_dir / "arm").touch()
-            row = request(args.base, prompt, args.output_tokens, 0)
+            row = request(args.base, prompt, args.output_tokens, 0, args.model)
             row.update(warmup=repeat < 0, repeat=repeat)
             report["cases"].append(row)
             save()
             if args.reset_prefix_cache_before_length and repeat < 0:
                 # The HTTP reset response alone does not prove cache eviction.
                 assert row["prefill_computed_tokens"] == length, row
+            if args.require_prefix_hits and repeat >= 0:
+                assert row["prefill_computed_tokens"] < length, (
+                    "A repeated request did not reuse a cached prefix",
+                    row,
+                )
             if args.require_native_prefill and repeat < 0:
                 row["routes_before"] = routes_before
                 row["routes_after"] = route_snapshot()

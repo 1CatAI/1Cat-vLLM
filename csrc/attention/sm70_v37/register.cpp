@@ -6,14 +6,19 @@
 namespace onecat_v37 {
 at::Tensor sm70_d256_gqa_v37_fwd(const at::Tensor& q, const at::Tensor& k,
                                  const at::Tensor& v, at::Tensor& out,
-                                 double scale, bool causal);
+                                 double scale, bool causal,
+                                 const std::optional<at::Tensor>& key_scale,
+                                 const std::optional<at::Tensor>& value_scale);
 }
 
 // Separate symbol: a stale legacy FA2 library must never masquerade as v37.
 TORCH_LIBRARY_FRAGMENT(_vllm_fa2_C, ops) {
+  ops.def("sm70_d256_gqa_v37_late_scale_abi() -> int",
+          []() -> int64_t { return 1; });
   ops.def(
       "sm70_d256_gqa_v37_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, "
-      "float softmax_scale, bool causal) -> Tensor(a!)");
+      "float softmax_scale, bool causal, Tensor? key_scale=None, "
+      "Tensor? value_scale=None) -> Tensor(a!)");
 }
 TORCH_LIBRARY_IMPL(_vllm_fa2_C, CUDA, ops) {
   ops.impl("sm70_d256_gqa_v37_fwd", &onecat_v37::sm70_d256_gqa_v37_fwd);

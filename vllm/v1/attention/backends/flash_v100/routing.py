@@ -370,7 +370,10 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
                 "prefill_prefix_fp8_bridge_exact_dense_d256_tailpad"
             ),
             "prefill",
-            {"codecs": frozenset((FP8_E4M3, FP8_E5M2)), "head_dims": (256,)},
+            {
+                "codecs": frozenset((FP8_E4M3, FP8_E5M2)) | _ROW_CODECS,
+                "head_dims": (256,),
+            },
         ),
         (
             "prefill_prefix_fp8_e4m3_bridge",
