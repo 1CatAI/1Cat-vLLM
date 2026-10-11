@@ -1,0 +1,100 @@
+# Build Matrix Configuration for NixL CI Pipeline
+#
+# This file defines the build matrix configuration for the NixL CI pipeline in Jenkins.
+# It specifies the build environment, resources, and test matrix for continuous integration.
+#
+# Key Components:
+# - Job Configuration: Defines timeout, failure behavior, and Kubernetes resources
+# - Docker Images: Specifies the container images used for different build stages
+#   - Build/test images: cuda-dl-base 25.06-cuda12.9 (Ubuntu 24.04), the PyTorch
+#     NGC container 26.06-py3 (CUDA 13.3, Ubuntu 24.04), and nvidia/cuda 13.0.1 (Ubuntu 22.04)
+#   - Podman image for container builds
+# - Matrix Axes: Defines build variations (currently x86_64 architecture)
+# - Build Steps: Sequential steps for building, testing, and container creation
+#
+# When Modified:
+# - Adding/removing Docker images: Affects available build environments
+# - Modifying matrix axes: Changes build variations (e.g., adding architectures)
+# - Adjusting resource limits: Impacts build performance and resource allocation
+# - Adding/removing steps: Changes the build pipeline sequence
+#
+# Note: Changes to this file are tested as part of the PR CI flow no need to test them manually.
+
+---
+job: nixl-ci-non-gpu
+
+registry_host: artifactory.nvidia.com
+registry_auth: svc-nixl-new-artifactory-token
+registry_path: /sw-nbu-swx-nixl-docker-local/ci
+
+# Fail job if one of the steps fails or continue
+failFast: false
+
+timeout_minutes: 240
+
+kubernetes:
+  cloud: il-ipp-blossom-prod
+  namespace: nbu-swx-nixl
+  imagePullSecrets: "['artifactory-pull-secret']"
+  limits: "{memory: 16Gi, cpu: 16000m}"
+  requests: "{memory: 8Gi, cpu: 8000m}"
+
+env:
+  NIXL_CI_NON_GPU: 1
+  NIXL_INSTALL_DIR: /opt/nixl
+  TEST_TIMEOUT: 30
+  UCX_TLS: "^shm"
+  STORAGE_DRIVER: 'overlay'
+  CI_IMAGE_TAG: "20260707-1"
+
+runs_on_dockers:
+  - {
+     file: '.ci/dockerfiles/Dockerfile.base', name: "nixl-base-25.06-cuda12.9-ubuntu24.04", tag: "${CI_IMAGE_TAG}",
+     build_args: '--build-arg BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base:25.06-cuda12.9-devel-ubuntu24.04 --build-arg NIXL_INSTALL_DIR=${NIXL_INSTALL_DIR} --build-arg ARCH=${arch} --pull --no-cache --build-arg PRE_INSTALLED_NIXL_ENV=true'
+    }
+  - {
+     file: '.ci/dockerfiles/Dockerfile.base', name: "nixl-base-pytorch26.06-cuda13.3-ubuntu24.04", tag: "${CI_IMAGE_TAG}",
+     build_args: '--build-arg BASE_IMAGE=nvcr.io/nvidia/pytorch:26.06-py3 --build-arg NIXL_INSTALL_DIR=${NIXL_INSTALL_DIR} --build-arg ARCH=${arch} --pull --no-cache --build-arg PRE_INSTALLED_NIXL_ENV=true'
+    }
+  - {
+     file: '.ci/dockerfiles/Dockerfile.base', name: "nixl-base-13.0.1-ubuntu22.04", tag: "${CI_IMAGE_TAG}",
+     build_args: '--build-arg BASE_IMAGE=dockerhub.nvidia.com/nvidia/cuda:13.0.1-devel-ubuntu22.04 --build-arg NIXL_INSTALL_DIR=${NIXL_INSTALL_DIR} --build-arg ARCH=${arch} --pull --no-cache --build-arg PRE_INSTALLED_NIXL_ENV=true'
+    }
+
+matrix:
+  axes:
+    arch:
+      - x86_64
+      - aarch64
+
+steps:
+  - name: Build
+    parallel: false
+    run: |
+      export PRE_INSTALLED_ENV="true"
+      export PRE_INSTALLED_UCX_ENV="true"
+      .gitlab/build.sh ${NIXL_INSTALL_DIR}
+
+  - name: Test CPP
+    parallel: false
+    timeout: "${TEST_TIMEOUT}"
+    run: |
+      .gitlab/test_cpp.sh ${NIXL_INSTALL_DIR}
+
+  - name: Test Python
+    parallel: false
+    timeout: "${TEST_TIMEOUT}"
+    run: |
+      .gitlab/test_python.sh ${NIXL_INSTALL_DIR}
+
+  - name: Test Nixlbench
+    parallel: false
+    timeout: "${TEST_TIMEOUT}"
+    run: |
+      .gitlab/test_nixlbench.sh ${NIXL_INSTALL_DIR}
+
+  - name: Test Rust
+    parallel: false
+    timeout: "${TEST_TIMEOUT}"
+    run: |
+      .gitlab/test_rust.sh ${NIXL_INSTALL_DIR}

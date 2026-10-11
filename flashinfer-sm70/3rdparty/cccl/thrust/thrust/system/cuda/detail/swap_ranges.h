@@ -1,0 +1,76 @@
+// SPDX-FileCopyrightText: Copyright (c) 2016, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3-Clause
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#if _CCCL_CUDA_COMPILATION()
+
+#  include <thrust/iterator/zip_iterator.h>
+#  include <thrust/system/cuda/detail/parallel_for.h>
+#  include <thrust/system/cuda/detail/transform.h>
+#  include <thrust/type_traits/is_trivially_relocatable.h>
+
+#  include <cuda/__functional/address_stability.h>
+#  include <cuda/std/__iterator/distance.h>
+#  include <cuda/std/__iterator/iter_swap.h>
+#  include <cuda/std/__utility/swap.h>
+
+THRUST_NAMESPACE_BEGIN
+namespace cuda_cub
+{
+struct __swap_f
+{
+  template <typename T, typename U>
+  _CCCL_HOST_DEVICE auto operator()(T t, U u) const -> ::cuda::std::tuple<T, U>
+  {
+    using ::cuda::std::swap;
+    swap(t, u);
+    return ::cuda::std::tuple{t, u};
+  }
+};
+
+template <class ItemsIt1, class ItemsIt2>
+struct __swap_fallback_f
+{
+  ItemsIt1 items1;
+  ItemsIt2 items2;
+
+  template <class Size>
+  _CCCL_HOST_DEVICE void operator()(Size idx) const
+  {
+    ::cuda::std::iter_swap(items1 + idx, items2 + idx);
+  }
+};
+
+template <class Derived, class ItemsIt1, class ItemsIt2>
+_CCCL_HOST_DEVICE ItemsIt2
+swap_ranges(execution_policy<Derived>& policy, ItemsIt1 first1, ItemsIt1 last1, ItemsIt2 first2)
+{
+  if constexpr (thrust::detail::is_indirectly_trivially_copyable_to_v<ItemsIt1, ItemsIt2>
+                && thrust::detail::is_indirectly_trivially_copyable_to_v<ItemsIt2, ItemsIt1>)
+  {
+    return ::cuda::std::get<1>(
+      cuda_cub::transform(
+        policy, first1, last1, first2, zip_iterator{first1, first2}, ::cuda::proclaim_copyable_arguments(__swap_f{}))
+        .get_iterator_tuple());
+  }
+  else
+  {
+    const auto num_items = ::cuda::std::distance(first1, last1);
+    cuda_cub::parallel_for(policy, __swap_fallback_f<ItemsIt1, ItemsIt2>{first1, first2}, num_items);
+    return first2 + num_items;
+  }
+}
+} // namespace cuda_cub
+THRUST_NAMESPACE_END
+#endif // _CCCL_CUDA_COMPILATION()

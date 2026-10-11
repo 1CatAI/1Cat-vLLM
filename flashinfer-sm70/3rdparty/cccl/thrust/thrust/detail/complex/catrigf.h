@@ -1,0 +1,576 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation
+// SPDX-FileCopyrightText: Copyright (c) 2013, Filipe RNC Maia
+// SPDX-License-Identifier: Apache-2.0
+
+/*-
+ * Copyright (c) 2012 Stephen Montgomery-Smith <stephen@FreeBSD.ORG>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+/*
+ * Adapted from FreeBSD by Filipe Maia <filipe.c.maia@gmail.com>:
+ *    freebsd/lib/msun/src/catrig.c
+ */
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#include <thrust/complex.h>
+#include <thrust/detail/complex/math_private.h>
+
+#include <cuda/std/__cmath/abs.h>
+#include <cuda/std/__cmath/copysign.h>
+#include <cuda/std/__cmath/hypot.h>
+#include <cuda/std/__cmath/inverse_hyperbolic_functions.h>
+#include <cuda/std/__cmath/inverse_trigonometric_functions.h>
+#include <cuda/std/__cmath/isinf.h>
+#include <cuda/std/__cmath/isnan.h>
+#include <cuda/std/__cmath/logarithms.h>
+#include <cuda/std/__cmath/roots.h>
+#include <cuda/std/__cmath/signbit.h>
+#include <cuda/std/limits>
+#include <cuda/std/numbers>
+
+THRUST_NAMESPACE_BEGIN
+namespace detail::complex
+{
+using thrust::complex;
+
+_CCCL_HOST_DEVICE inline complex<float> clog_for_large_values(complex<float> z);
+
+/*
+ * The algorithm is very close to that in "Implementing the complex arcsine
+ * and arccosine functions using exception handling" by T. E. Hull, Thomas F.
+ * Fairgrieve, and Ping Tak Peter Tang, published in ACM Transactions on
+ * Mathematical Software, Volume 23 Issue 3, 1997, Pages 299-335,
+ * http://dl.acm.org/citation.cfm?id=275324.
+ *
+ * See catrig.c for complete comments.
+ *
+ * XXX comments were removed automatically, and even short ones on the right
+ * of statements were removed (all of them), contrary to normal style.  Only
+ * a few comments on the right of declarations remain.
+ */
+
+_CCCL_HOST_DEVICE inline float f(float a, float b, float hypot_a_b)
+{
+  if (b < 0.0f)
+  {
+    return ((hypot_a_b - b) / 2.0f);
+  }
+  if (b == 0.0f)
+  {
+    return (a / 2.0f);
+  }
+  return (a * a / (hypot_a_b + b) / 2.0f);
+}
+
+/*
+ * All the hard work is contained in this function.
+ * x and y are assumed positive or zero, and less than RECIP_EPSILON.
+ * Upon return:
+ * rx = Re(casinh(z)) = -Im(cacos(y + I*x)).
+ * B_is_usable is set to 1 if the value of B is usable.
+ * If B_is_usable is set to 0, sqrt_A2my2 = sqrt(A*A - y*y), and new_y = y.
+ * If returning sqrt_A2my2 has potential to result in an underflow, it is
+ * rescaled, and new_y is similarly rescaled.
+ */
+_CCCL_HOST_DEVICE inline void
+do_hard_work(float x, float y, float* rx, int* B_is_usable, float* B, float* sqrt_A2my2, float* new_y)
+{
+  float R, S, A; /* A, B, R, and S are as in Hull et al. */
+  float Am1, Amy; /* A-1, A-y. */
+  const float A_crossover   = 10; /* Hull et al suggest 1.5, but 10 works better */
+  const float FOUR_SQRT_MIN = 4.336808689942017736029811e-19f;
+  ; /* =0x1p-61; >= 4 * sqrt(FLT_MIN) */
+  const float B_crossover = 0.6417f; /* suggested by Hull et al */
+  R                       = ::cuda::std::hypotf(x, y + 1);
+  S                       = ::cuda::std::hypotf(x, y - 1);
+
+  A = (R + S) / 2;
+  if (A < 1)
+  {
+    A = 1;
+  }
+
+  if (A < A_crossover)
+  {
+    if (y == 1 && x < FLT_EPSILON * FLT_EPSILON / 128)
+    {
+      *rx = ::cuda::std::sqrtf(x);
+    }
+    else if (x >= FLT_EPSILON * ::cuda::std::fabsf(y - 1))
+    {
+      Am1 = f(x, 1 + y, R) + f(x, 1 - y, S);
+      *rx = ::cuda::std::log1pf(Am1 + ::cuda::std::sqrtf(Am1 * (A + 1)));
+    }
+    else if (y < 1)
+    {
+      *rx = x / ::cuda::std::sqrtf((1 - y) * (1 + y));
+    }
+    else
+    {
+      *rx = ::cuda::std::log1pf((y - 1) + ::cuda::std::sqrtf((y - 1) * (y + 1)));
+    }
+  }
+  else
+  {
+    *rx = ::cuda::std::logf(A + ::cuda::std::sqrtf(A * A - 1));
+  }
+
+  *new_y = y;
+
+  if (y < FOUR_SQRT_MIN)
+  {
+    *B_is_usable = 0;
+    *sqrt_A2my2  = A * (2 / FLT_EPSILON);
+    *new_y       = y * (2 / FLT_EPSILON);
+    return;
+  }
+
+  *B           = y / A;
+  *B_is_usable = 1;
+
+  if (*B > B_crossover)
+  {
+    *B_is_usable = 0;
+    if (y == 1 && x < FLT_EPSILON / 128)
+    {
+      *sqrt_A2my2 = ::cuda::std::sqrtf(x) * ::cuda::std::sqrtf((A + y) / 2);
+    }
+    else if (x >= FLT_EPSILON * ::cuda::std::fabsf(y - 1))
+    {
+      Amy         = f(x, y + 1, R) + f(x, y - 1, S);
+      *sqrt_A2my2 = ::cuda::std::sqrtf(Amy * (A + y));
+    }
+    else if (y > 1)
+    {
+      *sqrt_A2my2 = x * (4 / FLT_EPSILON / FLT_EPSILON) * y / ::cuda::std::sqrtf((y + 1) * (y - 1));
+      *new_y      = y * (4 / FLT_EPSILON / FLT_EPSILON);
+    }
+    else
+    {
+      *sqrt_A2my2 = ::cuda::std::sqrtf((1 - y) * (1 + y));
+    }
+  }
+}
+
+_CCCL_HOST_DEVICE inline complex<float> casinhf(complex<float> z)
+{
+  float x, y, ax, ay, rx, ry, B, sqrt_A2my2, new_y;
+  int B_is_usable;
+  complex<float> w;
+  const float RECIP_EPSILON = 1.0f / FLT_EPSILON;
+  x                         = z.real();
+  y                         = z.imag();
+  ax                        = ::cuda::std::fabsf(x);
+  ay                        = ::cuda::std::fabsf(y);
+
+  if (::cuda::std::isnan(x) || ::cuda::std::isnan(y))
+  {
+    if (::cuda::std::isinf(x))
+    {
+      return (complex<float>(x, y + y));
+    }
+    if (::cuda::std::isinf(y))
+    {
+      return (complex<float>(y, x + x));
+    }
+    if (y == 0)
+    {
+      return (complex<float>(x + x, y));
+    }
+    return (complex<float>(x + 0.0f + (y + 0), x + 0.0f + (y + 0)));
+  }
+
+  if (ax > RECIP_EPSILON || ay > RECIP_EPSILON)
+  {
+    if (::cuda::std::signbit(x) == 0)
+    {
+      w = clog_for_large_values(z) + ::cuda::std::__numbers<float>::__ln2();
+    }
+    else
+    {
+      w = clog_for_large_values(-z) + ::cuda::std::__numbers<float>::__ln2();
+    }
+    return (complex<float>(::cuda::std::copysignf(w.real(), x), ::cuda::std::copysignf(w.imag(), y)));
+  }
+
+  if (x == 0 && y == 0)
+  {
+    return (z);
+  }
+
+  raise_inexact();
+
+  const float SQRT_6_EPSILON = 8.4572793338e-4f; /*  0xddb3d7.0p-34 */
+  if (ax < SQRT_6_EPSILON / 4 && ay < SQRT_6_EPSILON / 4)
+  {
+    return (z);
+  }
+
+  do_hard_work(ax, ay, &rx, &B_is_usable, &B, &sqrt_A2my2, &new_y);
+  if (B_is_usable)
+  {
+    ry = ::cuda::std::asinf(B);
+  }
+  else
+  {
+    ry = ::cuda::std::atan2f(new_y, sqrt_A2my2);
+  }
+  return (complex<float>(::cuda::std::copysignf(rx, x), ::cuda::std::copysignf(ry, y)));
+}
+
+_CCCL_HOST_DEVICE inline complex<float> casinf(complex<float> z)
+{
+  complex<float> w = casinhf(complex<float>(z.imag(), z.real()));
+
+  return (complex<float>(w.imag(), w.real()));
+}
+
+_CCCL_HOST_DEVICE inline complex<float> cacosf(complex<float> z)
+{
+  float x, y, ax, ay, rx, ry, B, sqrt_A2mx2, new_x;
+  int sx, sy;
+  int B_is_usable;
+  complex<float> w;
+  const float pio2_hi          = 1.5707963267948966e0f; /*  0x1921fb54442d18.0p-52 */
+  const volatile float pio2_lo = 6.1232339957367659e-17f; /*  0x11a62633145c07.0p-106 */
+
+  x  = z.real();
+  y  = z.imag();
+  sx = ::cuda::std::signbit(x);
+  sy = ::cuda::std::signbit(y);
+  ax = ::cuda::std::fabsf(x);
+  ay = ::cuda::std::fabsf(y);
+
+  if (::cuda::std::isnan(x) || ::cuda::std::isnan(y))
+  {
+    if (::cuda::std::isinf(x))
+    {
+      return (complex<float>(y + y, -::cuda::std::numeric_limits<float>::infinity()));
+    }
+    if (::cuda::std::isinf(y))
+    {
+      return (complex<float>(x + x, -y));
+    }
+    if (x == 0)
+    {
+      return (complex<float>(pio2_hi + pio2_lo, y + y));
+    }
+    return (complex<float>(x + 0.0f + (y + 0), x + 0.0f + (y + 0)));
+  }
+
+  const float RECIP_EPSILON = 1.0f / FLT_EPSILON;
+  if (ax > RECIP_EPSILON || ay > RECIP_EPSILON)
+  {
+    w  = clog_for_large_values(z);
+    rx = ::cuda::std::fabsf(w.imag());
+    ry = w.real() + ::cuda::std::__numbers<float>::__ln2();
+    if (sy == 0)
+    {
+      ry = -ry;
+    }
+    return (complex<float>(rx, ry));
+  }
+
+  if (x == 1 && y == 0)
+  {
+    return (complex<float>(0, -y));
+  }
+
+  raise_inexact();
+
+  const float SQRT_6_EPSILON = 8.4572793338e-4f; /*  0xddb3d7.0p-34 */
+  if (ax < SQRT_6_EPSILON / 4 && ay < SQRT_6_EPSILON / 4)
+  {
+    return (complex<float>(pio2_hi - (x - pio2_lo), -y));
+  }
+
+  do_hard_work(ay, ax, &ry, &B_is_usable, &B, &sqrt_A2mx2, &new_x);
+  if (B_is_usable)
+  {
+    if (sx == 0)
+    {
+      rx = ::cuda::std::acosf(B);
+    }
+    else
+    {
+      rx = ::cuda::std::acosf(-B);
+    }
+  }
+  else
+  {
+    if (sx == 0)
+    {
+      rx = ::cuda::std::atan2f(sqrt_A2mx2, new_x);
+    }
+    else
+    {
+      rx = ::cuda::std::atan2f(sqrt_A2mx2, -new_x);
+    }
+  }
+  if (sy == 0)
+  {
+    ry = -ry;
+  }
+  return (complex<float>(rx, ry));
+}
+
+_CCCL_HOST_DEVICE inline complex<float> cacoshf(complex<float> z)
+{
+  complex<float> w;
+  float rx, ry;
+
+  w  = cacosf(z);
+  rx = w.real();
+  ry = w.imag();
+  /* cacosh(NaN + I*NaN) = NaN + I*NaN */
+  if (::cuda::std::isnan(rx) && ::cuda::std::isnan(ry))
+  {
+    return (complex<float>(ry, rx));
+  }
+  /* cacosh(NaN + I*+-Inf) = +Inf + I*NaN */
+  /* cacosh(+-Inf + I*NaN) = +Inf + I*NaN */
+  if (::cuda::std::isnan(rx))
+  {
+    return (complex<float>(::cuda::std::fabsf(ry), rx));
+  }
+  /* cacosh(0 + I*NaN) = NaN + I*NaN */
+  if (::cuda::std::isnan(ry))
+  {
+    return (complex<float>(ry, ry));
+  }
+  return (complex<float>(::cuda::std::fabsf(ry), ::cuda::std::copysignf(rx, z.imag())));
+}
+
+/*
+ * Optimized version of clog() for |z| finite and larger than ~RECIP_EPSILON.
+ */
+_CCCL_HOST_DEVICE inline complex<float> clog_for_large_values(complex<float> z)
+{
+  float x, y;
+  float ax, ay, t;
+  constexpr auto m_e = ::cuda::std::__numbers<float>::__e();
+
+  x  = z.real();
+  y  = z.imag();
+  ax = ::cuda::std::fabsf(x);
+  ay = ::cuda::std::fabsf(y);
+  if (ax < ay)
+  {
+    t  = ax;
+    ax = ay;
+    ay = t;
+  }
+
+  if (ax > FLT_MAX / 2)
+  {
+    return (complex<float>(::cuda::std::logf(::cuda::std::hypotf(x / m_e, y / m_e)) + 1, ::cuda::std::atan2f(y, x)));
+  }
+
+  const float QUARTER_SQRT_MAX = 2.3058430092136939520000000e+18f; /* = 0x1p61; <= sqrt(FLT_MAX) / 4 */
+  const float SQRT_MIN         = 1.084202172485504434007453e-19f; /* 0x1p-63; >= sqrt(FLT_MIN) */
+  if (ax > QUARTER_SQRT_MAX || ay < SQRT_MIN)
+  {
+    return (complex<float>(::cuda::std::logf(::cuda::std::hypotf(x, y)), ::cuda::std::atan2f(y, x)));
+  }
+
+  return (complex<float>(::cuda::std::logf(ax * ax + ay * ay) / 2, ::cuda::std::atan2f(y, x)));
+}
+
+/*
+ *				=================
+ *				| catanh, catan |
+ *				=================
+ */
+
+/*
+ * sum_squares(x,y) = x*x + y*y (or just x*x if y*y would underflow).
+ * Assumes x*x and y*y will not overflow.
+ * Assumes x and y are finite.
+ * Assumes y is non-negative.
+ * Assumes fabsf(x) >= FLT_EPSILON.
+ */
+_CCCL_HOST_DEVICE inline float sum_squares(float x, float y)
+{
+  const float SQRT_MIN = 1.084202172485504434007453e-19f; /* 0x1p-63; >= sqrt(FLT_MIN) */
+  /* Avoid underflow when y is small. */
+  if (y < SQRT_MIN)
+  {
+    return (x * x);
+  }
+
+  return (x * x + y * y);
+}
+
+_CCCL_HOST_DEVICE inline float real_part_reciprocal(float x, float y)
+{
+  float scale;
+  uint32_t hx, hy;
+  int32_t ix, iy;
+
+  get_float_word(hx, x);
+  ix = static_cast<int32_t>(hx & 0x7f800000);
+  get_float_word(hy, y);
+  iy = static_cast<int32_t>(hy & 0x7f800000);
+  // #define	BIAS	(FLT_MAX_EXP - 1)
+  const int BIAS = FLT_MAX_EXP - 1;
+  // #define	CUTOFF	(FLT_MANT_DIG / 2 + 1)
+  const int CUTOFF = (FLT_MANT_DIG / 2 + 1);
+  if (ix - iy >= CUTOFF << 23 || ::cuda::std::isinf(x))
+  {
+    return (1 / x);
+  }
+  if (iy - ix >= CUTOFF << 23)
+  {
+    return (x / y / y);
+  }
+  if (ix <= (BIAS + FLT_MAX_EXP / 2 - CUTOFF) << 23)
+  {
+    return (x / (x * x + y * y));
+  }
+  set_float_word(scale, 0x7f800000 - ix);
+  x *= scale;
+  y *= scale;
+  return (x / (x * x + y * y) * scale);
+}
+
+_CCCL_HOST_DEVICE inline complex<float> catanhf(complex<float> z)
+{
+  float x, y, ax, ay, rx, ry;
+  const volatile float pio2_lo = 6.1232339957367659e-17f; /*  0x11a62633145c07.0p-106 */
+  const float pio2_hi          = 1.5707963267948966e0f; /*  0x1921fb54442d18.0p-52 */
+
+  x  = z.real();
+  y  = z.imag();
+  ax = ::cuda::std::fabsf(x);
+  ay = ::cuda::std::fabsf(y);
+
+  if (y == 0 && ax <= 1)
+  {
+    return (complex<float>(::cuda::std::atanhf(x), y));
+  }
+
+  if (x == 0)
+  {
+    return (complex<float>(x, ::cuda::std::atanf(y)));
+  }
+
+  if (::cuda::std::isnan(x) || ::cuda::std::isnan(y))
+  {
+    if (::cuda::std::isinf(x))
+    {
+      return (complex<float>(::cuda::std::copysignf(0, x), y + y));
+    }
+    if (::cuda::std::isinf(y))
+    {
+      return (complex<float>(::cuda::std::copysignf(0, x), ::cuda::std::copysignf(pio2_hi + pio2_lo, y)));
+    }
+    return (complex<float>(x + 0.0f + (y + 0.0f), x + 0.0f + (y + 0.0f)));
+  }
+
+  const float RECIP_EPSILON = 1.0f / FLT_EPSILON;
+  if (ax > RECIP_EPSILON || ay > RECIP_EPSILON)
+  {
+    return (complex<float>(real_part_reciprocal(x, y), ::cuda::std::copysignf(pio2_hi + pio2_lo, y)));
+  }
+
+  const float SQRT_3_EPSILON = 5.9801995673e-4f; /*  0x9cc471.0p-34 */
+  if (ax < SQRT_3_EPSILON / 2 && ay < SQRT_3_EPSILON / 2)
+  {
+    raise_inexact();
+    return (z);
+  }
+
+  if (ax == 1 && ay < FLT_EPSILON)
+  {
+    rx = (::cuda::std::__numbers<float>::__ln2() - ::cuda::std::logf(ay)) / 2;
+  }
+  else
+  {
+    rx = ::cuda::std::log1pf(4 * ax / sum_squares(ax - 1, ay)) / 4;
+  }
+
+  if (ax == 1)
+  {
+    ry = ::cuda::std::atan2f(2, -ay) / 2;
+  }
+  else if (ay < FLT_EPSILON)
+  {
+    ry = ::cuda::std::atan2f(2 * ay, (1 - ax) * (1 + ax)) / 2;
+  }
+  else
+  {
+    ry = ::cuda::std::atan2f(2 * ay, (1 - ax) * (1 + ax) - ay * ay) / 2;
+  }
+
+  return (complex<float>(::cuda::std::copysignf(rx, x), ::cuda::std::copysignf(ry, y)));
+}
+
+_CCCL_HOST_DEVICE inline complex<float> catanf(complex<float> z)
+{
+  complex<float> w = catanhf(complex<float>(z.imag(), z.real()));
+  return (complex<float>(w.imag(), w.real()));
+}
+} // namespace detail::complex
+
+template <>
+_CCCL_HOST_DEVICE inline complex<float> acos(const complex<float>& z)
+{
+  return detail::complex::cacosf(z);
+}
+
+template <>
+_CCCL_HOST_DEVICE inline complex<float> asin(const complex<float>& z)
+{
+  return detail::complex::casinf(z);
+}
+
+template <>
+_CCCL_HOST_DEVICE inline complex<float> atan(const complex<float>& z)
+{
+  return detail::complex::catanf(z);
+}
+
+template <>
+_CCCL_HOST_DEVICE inline complex<float> acosh(const complex<float>& z)
+{
+  return detail::complex::cacoshf(z);
+}
+
+template <>
+_CCCL_HOST_DEVICE inline complex<float> asinh(const complex<float>& z)
+{
+  return detail::complex::casinhf(z);
+}
+
+template <>
+_CCCL_HOST_DEVICE inline complex<float> atanh(const complex<float>& z)
+{
+  return detail::complex::catanhf(z);
+}
+
+THRUST_NAMESPACE_END

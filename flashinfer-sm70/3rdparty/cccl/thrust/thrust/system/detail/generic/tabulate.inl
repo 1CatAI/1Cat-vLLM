@@ -1,0 +1,41 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/iterator_traits.h>
+#include <thrust/system/detail/generic/tabulate.h>
+#include <thrust/transform.h>
+
+#include <cuda/std/__iterator/distance.h>
+
+THRUST_NAMESPACE_BEGIN
+namespace system::detail::generic
+{
+template <typename DerivedPolicy, typename ForwardIterator, typename UnaryOperation>
+_CCCL_HOST_DEVICE void tabulate(
+  thrust::execution_policy<DerivedPolicy>& exec, ForwardIterator first, ForwardIterator last, UnaryOperation unary_op)
+{
+  using difference_type = thrust::detail::it_difference_t<ForwardIterator>;
+
+  // by default, counting_iterator uses a 64b difference_type on 32b platforms to avoid overflowing its counter.
+  // this causes problems when a zip_iterator is created in transform's implementation -- ForwardIterator is
+  // incremented by a 64b difference_type and some compilers warn
+  // to avoid this, specify the counting_iterator's difference_type to be the same as ForwardIterator's.
+  thrust::counting_iterator<difference_type, thrust::use_default, thrust::use_default, difference_type> iter(0);
+
+  thrust::transform(exec, iter, iter + ::cuda::std::distance(first, last), first, unary_op);
+} // end tabulate()
+} // namespace system::detail::generic
+THRUST_NAMESPACE_END

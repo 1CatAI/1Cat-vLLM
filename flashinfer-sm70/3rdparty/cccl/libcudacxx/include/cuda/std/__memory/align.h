@@ -1,0 +1,67 @@
+// -*- C++ -*-
+//===----------------------------------------------------------------------===//
+//
+// Part of libcu++, the C++ Standard Library for your entire system,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _CUDA_STD___MEMORY_ALIGN_H
+#define _CUDA_STD___MEMORY_ALIGN_H
+
+#include <cuda/std/detail/__config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/__memory/is_valid_alignment.h>
+#include <cuda/std/__memory/assume_aligned.h>
+#include <cuda/std/__memory/runtime_assume_aligned.h>
+#include <cuda/std/cstddef>
+#include <cuda/std/cstdint>
+
+#include <cuda/std/__cccl/prologue.h>
+
+_CCCL_DIAG_PUSH
+_CCCL_DIAG_SUPPRESS_MSVC(4146) // unary minus operator applied to unsigned type, result still unsigned
+
+_CCCL_BEGIN_NAMESPACE_CUDA_STD
+
+_CCCL_HOST_DEVICE_API inline void* align(size_t __alignment, size_t __size, void*& __ptr, size_t& __space)
+{
+  _CCCL_ASSERT(::cuda::__is_valid_alignment(__alignment), "cuda::std::align: invalid alignment");
+  if (__space < __size)
+  {
+    return nullptr;
+  }
+
+  char* __char_ptr    = static_cast<char*>(__ptr);
+  char* __aligned_ptr = reinterpret_cast<char*>( // NOLINT(performance-no-int-to-ptr)
+    reinterpret_cast<uintptr_t>(__char_ptr + (__alignment - 1)) & -__alignment);
+  const size_t __diff = static_cast<size_t>(__aligned_ptr - __char_ptr);
+  if (__diff > (__space - __size))
+  {
+    return nullptr;
+  }
+
+  //! We need to avoid using __aligned_ptr here, as nvcc looses track of the execution space otherwise
+  __ptr = reinterpret_cast<void*>(__char_ptr + __diff);
+  __space -= __diff;
+  return ::cuda::std::__runtime_assume_aligned(__ptr, __alignment);
+}
+
+_CCCL_END_NAMESPACE_CUDA_STD
+
+_CCCL_DIAG_POP
+
+#include <cuda/std/__cccl/epilogue.h>
+
+#endif // _CUDA_STD___MEMORY_ALIGN_H

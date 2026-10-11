@@ -1,0 +1,47 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _CUDA_STD___TYPE_TRAITS_RESULT_OF_H
+#define _CUDA_STD___TYPE_TRAITS_RESULT_OF_H
+
+#include <cuda/std/detail/__config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/std/__functional/invoke.h>
+
+#include <cuda/std/__cccl/prologue.h>
+
+_CCCL_BEGIN_NAMESPACE_CUDA_STD
+
+// result_of
+
+#if _CCCL_STD_VER <= 2017 || defined(_LIBCUDACXX_ENABLE_CXX20_REMOVED_TYPE_TRAITS)
+template <class _Callable>
+class result_of;
+
+template <class _Fp, class... _Args>
+class CCCL_DEPRECATED _CCCL_TYPE_VISIBILITY_DEFAULT result_of<_Fp(_Args...)> : public invoke_result<_Fp, _Args...>
+{};
+
+template <class _Tp>
+using result_of_t CCCL_DEPRECATED = typename result_of<_Tp>::type;
+#endif // _CCCL_STD_VER <= 2017 || defined(_LIBCUDACXX_ENABLE_CXX20_REMOVED_TYPE_TRAITS)
+
+_CCCL_END_NAMESPACE_CUDA_STD
+
+#include <cuda/std/__cccl/epilogue.h>
+
+#endif // _CUDA_STD___TYPE_TRAITS_RESULT_OF_H

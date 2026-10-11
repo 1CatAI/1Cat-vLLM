@@ -1,0 +1,15 @@
+#include <thrust/version.h>
+
+#include <iostream>
+
+int main()
+{
+  int major    = THRUST_MAJOR_VERSION;
+  int minor    = THRUST_MINOR_VERSION;
+  int subminor = THRUST_SUBMINOR_VERSION;
+  int patch    = THRUST_PATCH_NUMBER;
+
+  std::cout << "Thrust v" << major << "." << minor << "." << subminor << "-" << patch << '\n';
+
+  return 0;
+}

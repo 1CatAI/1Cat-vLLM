@@ -1,0 +1,322 @@
+// SPDX-FileCopyrightText: Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3
+
+#include "insert_nested_NVTX_range_guard.h"
+
+#include <cub/device/device_scan.cuh>
+
+#include <cuda/buffer>
+#include <cuda/devices>
+#include <cuda/iterator>
+#include <cuda/std/limits>
+
+#include <cstdint>
+
+#include "catch2_test_device_reduce.cuh"
+#include "catch2_test_device_scan.cuh"
+#include "catch2_test_launch_helper.h"
+#include "cub_test_macros.h"
+#include <c2h/custom_type.h>
+#include <c2h/extended_types.h>
+
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::ExclusiveSum, device_exclusive_sum);
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::ExclusiveScan, device_exclusive_scan);
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::InclusiveSum, device_inclusive_sum);
+DECLARE_LAUNCH_WRAPPER(cub::DeviceScan::InclusiveScan, device_inclusive_scan);
+
+// %PARAM% TEST_LAUNCH lid 0:1
+
+// List of types to test
+using custom_t =
+  c2h::custom_type_t<c2h::accumulateable_t,
+                     c2h::equal_comparable_t,
+                     c2h::lexicographical_less_comparable_t,
+                     c2h::lexicographical_greater_comparable_t>;
+
+using iterator_type_list = c2h::type_list<type_pair<std::int8_t>, type_pair<custom_t>, type_pair<uchar3>>;
+
+CUB_TEST("Device scan works with iterators", "[scan][device]", CUB_SMALL, iterator_type_list)
+{
+  using params   = params_t<TestType>;
+  using input_t  = typename params::item_t;
+  using output_t = typename params::output_t;
+  using offset_t = int32_t;
+
+  constexpr offset_t min_items = 1;
+  constexpr offset_t max_items = 1000000;
+
+  // Generate the input sizes to test for
+  const offset_t num_items = GENERATE_COPY(
+    take(3, random(min_items, max_items)),
+    values({
+      min_items,
+      max_items,
+    }));
+
+  // Prepare input iterator
+  input_t default_constant{};
+  init_default_constant(default_constant);
+  auto in_it = cuda::constant_iterator(default_constant);
+
+  SECTION("inclusive sum")
+  {
+    using op_t    = cuda::std::plus<>;
+    using accum_t = cuda::std::__accumulator_t<op_t, input_t, input_t>;
+
+    // Prepare verification data
+    c2h::host_vector<output_t> expected_result(num_items);
+    compute_inclusive_scan_reference(in_it, in_it + num_items, expected_result.begin(), op_t{}, accum_t{});
+
+    // Run test
+    c2h::device_vector<output_t> out_result(num_items);
+    auto d_out_it = thrust::raw_pointer_cast(out_result.data());
+    device_inclusive_sum(in_it, d_out_it, num_items);
+
+    // Verify result
+    REQUIRE(expected_result == out_result);
+  }
+
+  SECTION("exclusive sum")
+  {
+    using op_t    = cuda::std::plus<>;
+    using accum_t = cuda::std::__accumulator_t<op_t, input_t, input_t>;
+
+    // Prepare verification data
+    c2h::host_vector<output_t> expected_result(num_items);
+    compute_exclusive_scan_reference(in_it, in_it + num_items, expected_result.begin(), accum_t{}, op_t{});
+
+    // Run test
+    c2h::device_vector<output_t> out_result(num_items);
+    auto d_out_it = thrust::raw_pointer_cast(out_result.data());
+    device_exclusive_sum(in_it, d_out_it, num_items);
+
+    // Verify result
+    REQUIRE(expected_result == out_result);
+  }
+
+  SECTION("inclusive scan")
+  {
+    using op_t    = cuda::minimum<>;
+    using accum_t = cuda::std::__accumulator_t<op_t, input_t, input_t>;
+
+    // Prepare verification data
+    c2h::host_vector<output_t> expected_result(num_items);
+    compute_inclusive_scan_reference(
+      in_it, in_it + num_items, expected_result.begin(), op_t{}, cuda::std::numeric_limits<accum_t>::max());
+
+    // Run test
+    c2h::device_vector<output_t> out_result(num_items);
+    auto d_out_it = thrust::raw_pointer_cast(out_result.data());
+    device_inclusive_scan(in_it, d_out_it, op_t{}, num_items);
+
+    // Verify result
+    REQUIRE(expected_result == out_result);
+  }
+
+  SECTION("exclusive scan")
+  {
+    using op_t    = cuda::std::plus<>;
+    using accum_t = cuda::std::__accumulator_t<op_t, input_t, input_t>;
+
+    // Prepare verification data
+    c2h::host_vector<output_t> expected_result(num_items);
+    compute_exclusive_scan_reference(in_it, in_it + num_items, expected_result.begin(), accum_t{}, op_t{});
+
+    // Run test
+    c2h::device_vector<output_t> out_result(num_items);
+    auto d_out_it = thrust::raw_pointer_cast(out_result.data());
+    device_exclusive_scan(in_it, d_out_it, op_t{}, input_t{}, num_items);
+
+    // Verify result
+    REQUIRE(expected_result == out_result);
+  }
+
+  SECTION("exclusive scan with future-init value")
+  {
+    using op_t    = cuda::std::plus<>;
+    using accum_t = cuda::std::__accumulator_t<op_t, input_t, input_t>;
+
+    // Prepare verification data
+    accum_t init_value{};
+    init_default_constant(init_value);
+    c2h::host_vector<output_t> expected_result(num_items);
+    compute_exclusive_scan_reference(in_it, in_it + num_items, expected_result.begin(), init_value, op_t{});
+
+    // Run test
+    c2h::device_vector<output_t> out_result(num_items);
+    auto d_out_it      = thrust::raw_pointer_cast(out_result.data());
+    using init_value_t = cub::detail::it_value_t<decltype(unwrap_it(d_out_it))>;
+    c2h::device_vector<init_value_t> d_initial_value(1);
+    d_initial_value[0]     = static_cast<init_value_t>(init_value);
+    auto future_init_value = cub::FutureValue<init_value_t>(thrust::raw_pointer_cast(d_initial_value.data()));
+    device_exclusive_scan(in_it, d_out_it, op_t{}, future_init_value, num_items);
+
+    // Verify result
+    REQUIRE(expected_result == out_result);
+  }
+
+  SECTION("exclusive scan with future-init value, non-pointer iterator")
+  {
+    // cuda::buffer currently does not handle types with size of exactly 3 in the value
+    // constructor. See https://github.com/NVIDIA/cccl/pull/9776
+    if constexpr (sizeof(input_t) != 3)
+    {
+      using op_t    = cuda::std::plus<>;
+      using accum_t = cuda::std::__accumulator_t<op_t, input_t, input_t>;
+
+      // Prepare verification data
+      accum_t init_value{};
+      init_default_constant(init_value);
+      c2h::host_vector<output_t> expected_result(num_items);
+      compute_exclusive_scan_reference(in_it, in_it + num_items, expected_result.begin(), init_value, op_t{});
+
+      // Run test
+      c2h::device_vector<output_t> out_result(num_items);
+      auto d_out_it      = thrust::raw_pointer_cast(out_result.data());
+      using init_value_t = cub::detail::it_value_t<decltype(unwrap_it(d_out_it))>;
+      // Note using device buffer here because dereferencing the iterator will return a raw
+      // device reference and cause a segfault if the detail::InputValue is convert-constructed
+      // from the future value below.
+      auto d_initial_value = cuda::make_device_buffer<init_value_t>(
+        cuda::stream_ref{cudaStream_t{}}, cuda::devices[0], /*__size=*/1, static_cast<init_value_t>(init_value));
+
+      using device_buffer_t = decltype(d_initial_value);
+      using future_t = cub::FutureValue<typename device_buffer_t::value_type, typename device_buffer_t::iterator>;
+
+      auto future_init_value = future_t{d_initial_value.begin()};
+
+      device_exclusive_scan(in_it, d_out_it, op_t{}, future_init_value, num_items);
+
+      // Verify result
+      REQUIRE(expected_result == out_result);
+    }
+  }
+}
+
+class custom_input_t
+{
+  char m_val{};
+
+public:
+  __host__ __device__ explicit custom_input_t(char val)
+      : m_val(val)
+  {}
+
+  __host__ __device__ int get() const
+  {
+    return static_cast<int>(m_val);
+  }
+};
+
+class custom_accumulator_t
+{
+  int m_val{0};
+  int m_magic_value{42};
+
+  __host__ __device__ custom_accumulator_t(int val)
+      : m_val(val)
+  {}
+
+public:
+  custom_accumulator_t() = default;
+
+  __host__ __device__ custom_accumulator_t(const custom_accumulator_t& in)
+      : m_val(in.is_valid() * in.get())
+      , m_magic_value(in.is_valid() * 42)
+  {}
+
+  __host__ __device__ custom_accumulator_t(const custom_input_t& in)
+      : m_val(in.get())
+  {}
+
+  __host__ __device__ void operator=(const custom_input_t& in)
+  {
+    if (this->is_valid())
+    {
+      m_val = in.get();
+    }
+  }
+
+  __host__ __device__ void operator=(const custom_accumulator_t& in)
+  {
+    if (this->is_valid() && in.is_valid())
+    {
+      m_val = in.get();
+    }
+  }
+
+  __host__ __device__ custom_accumulator_t operator+(const custom_input_t& in) const
+  {
+    const int multiplier = this->is_valid();
+    return {(m_val + in.get()) * multiplier};
+  }
+
+  __host__ __device__ custom_accumulator_t operator+(const custom_accumulator_t& in) const
+  {
+    const int multiplier = this->is_valid() && in.is_valid();
+    return {(m_val + in.get()) * multiplier};
+  }
+
+  __host__ __device__ int get() const
+  {
+    return m_val;
+  }
+
+  __host__ __device__ bool is_valid() const
+  {
+    return m_magic_value == 42;
+  }
+};
+
+class custom_output_t
+{
+  int* m_d_ok_count{};
+  int m_expected{};
+
+public:
+  __host__ __device__ custom_output_t(int* d_ok_count, int expected)
+      : m_d_ok_count(d_ok_count)
+      , m_expected(expected)
+  {}
+
+  __device__ void operator=(const custom_accumulator_t& accum) const
+  {
+    const int ok = accum.is_valid() && (accum.get() == m_expected);
+    atomicAdd(m_d_ok_count, ok);
+  }
+};
+
+struct index_to_custom_output_op
+{
+  int* d_ok_count;
+
+  __host__ __device__ __forceinline__ custom_output_t operator()(int index)
+  {
+    return custom_output_t{d_ok_count, index};
+  }
+};
+
+CUB_TEST("Device scan works complex accumulator types", "[scan][device]", CUB_SMALL)
+{
+  constexpr int num_items = 2 * 1024 * 1024;
+
+  custom_accumulator_t init{};
+
+  c2h::device_vector<custom_input_t> d_input(static_cast<size_t>(num_items), custom_input_t{1});
+  c2h::device_vector<custom_output_t> d_output{static_cast<size_t>(num_items), custom_output_t{nullptr, 0}};
+  c2h::device_vector<int> d_ok_count(1);
+
+  auto index_it = cuda::counting_iterator(0);
+  thrust::transform(
+    c2h::device_policy,
+    index_it,
+    index_it + num_items,
+    d_output.begin(),
+    index_to_custom_output_op{thrust::raw_pointer_cast(d_ok_count.data())});
+
+  auto d_in_it  = thrust::raw_pointer_cast(d_input.data());
+  auto d_out_it = thrust::raw_pointer_cast(d_output.data());
+  device_exclusive_scan(d_in_it, d_out_it, cuda::std::plus<>{}, init, num_items);
+
+  REQUIRE(d_ok_count[0] == num_items);
+}

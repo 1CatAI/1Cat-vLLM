@@ -1,0 +1,83 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+#include <thrust/detail/nvtx_policy.h>
+#include <thrust/for_each.h>
+#include <thrust/iterator/iterator_traits.h>
+#include <thrust/system/detail/generic/select_system.h>
+
+// Include all active backend system implementations (generic, sequential, host and device)
+#include <thrust/system/detail/generic/for_each.h>
+#include <thrust/system/detail/sequential/for_each.h>
+#include __THRUST_HOST_SYSTEM_ALGORITH_DETAIL_HEADER_INCLUDE(for_each.h)
+#include __THRUST_DEVICE_SYSTEM_ALGORITH_DETAIL_HEADER_INCLUDE(for_each.h)
+
+// Some build systems need a hint to know which files we could include
+#if 0
+#  include <thrust/system/cpp/detail/for_each.h>
+#  include <thrust/system/cuda/detail/for_each.h>
+#  include <thrust/system/omp/detail/for_each.h>
+#  include <thrust/system/tbb/detail/for_each.h>
+#endif
+
+THRUST_NAMESPACE_BEGIN
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename DerivedPolicy, typename InputIterator, typename UnaryFunction>
+_CCCL_HOST_DEVICE InputIterator for_each(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec,
+  InputIterator first,
+  InputIterator last,
+  UnaryFunction f)
+{
+  _CCCL_NVTX_RANGE_SCOPE_IF(detail::should_enable_nvtx_for_policy<DerivedPolicy>(), "thrust::for_each");
+  using thrust::system::detail::generic::for_each;
+
+  return for_each(thrust::detail::derived_cast(thrust::detail::strip_const(exec)), first, last, f);
+}
+
+template <typename InputIterator, typename UnaryFunction>
+InputIterator for_each(InputIterator first, InputIterator last, UnaryFunction f)
+{
+  using System = typename thrust::iterator_system<InputIterator>::type;
+  _CCCL_NVTX_RANGE_SCOPE_IF(detail::should_enable_nvtx_for_policy<System>(), "thrust::for_each");
+  using thrust::system::detail::generic::select_system;
+
+  System system;
+  return thrust::for_each(select_system(system), first, last, f);
+} // end for_each()
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename DerivedPolicy, typename InputIterator, typename Size, typename UnaryFunction>
+_CCCL_HOST_DEVICE InputIterator for_each_n(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec, InputIterator first, Size n, UnaryFunction f)
+{
+  _CCCL_NVTX_RANGE_SCOPE_IF(detail::should_enable_nvtx_for_policy<DerivedPolicy>(), "thrust::for_each_n");
+  using thrust::system::detail::generic::for_each_n;
+
+  return for_each_n(thrust::detail::derived_cast(thrust::detail::strip_const(exec)), first, n, f);
+} // end for_each_n()
+
+template <typename InputIterator, typename Size, typename UnaryFunction>
+InputIterator for_each_n(InputIterator first, Size n, UnaryFunction f)
+{
+  using System = typename thrust::iterator_system<InputIterator>::type;
+  _CCCL_NVTX_RANGE_SCOPE_IF(detail::should_enable_nvtx_for_policy<System>(), "thrust::for_each_n");
+  using thrust::system::detail::generic::select_system;
+
+  System system;
+  return thrust::for_each_n(select_system(system), first, n, f);
+} // end for_each_n()
+
+THRUST_NAMESPACE_END

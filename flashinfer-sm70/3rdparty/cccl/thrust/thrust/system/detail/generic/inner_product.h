@@ -1,0 +1,45 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+#include <thrust/system/detail/generic/tag.h>
+
+THRUST_NAMESPACE_BEGIN
+namespace system::detail::generic
+{
+template <typename DerivedPolicy, typename InputIterator1, typename InputIterator2, typename OutputType>
+_CCCL_HOST_DEVICE OutputType inner_product(
+  thrust::execution_policy<DerivedPolicy>& exec,
+  InputIterator1 first1,
+  InputIterator1 last1,
+  InputIterator2 first2,
+  OutputType init);
+
+template <typename DerivedPolicy,
+          typename InputIterator1,
+          typename InputIterator2,
+          typename OutputType,
+          typename BinaryFunction1,
+          typename BinaryFunction2>
+_CCCL_HOST_DEVICE OutputType inner_product(
+  thrust::execution_policy<DerivedPolicy>& exec,
+  InputIterator1 first1,
+  InputIterator1 last1,
+  InputIterator2 first2,
+  OutputType init,
+  BinaryFunction1 binary_op1,
+  BinaryFunction2 binary_op2);
+} // namespace system::detail::generic
+THRUST_NAMESPACE_END
+
+#include <thrust/system/detail/generic/inner_product.inl>

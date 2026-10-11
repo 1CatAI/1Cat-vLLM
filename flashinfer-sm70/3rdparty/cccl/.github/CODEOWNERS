@@ -1,0 +1,47 @@
+# Libraries
+thrust/ @nvidia/cccl-thrust-codeowners
+cub/ @nvidia/cccl-cub-codeowners
+libcudacxx/ @nvidia/cccl-libcudacxx-codeowners
+cudax/ @nvidia/cccl-cudax-codeowners
+c/ @nvidia/cccl-c-codeowners
+python/ @nvidia/cccl-python-codeowners
+cudax/include/cuda/experimental/__cuco @nvidia/cccl-cuco-codeowners
+# STF C and Python bindings are maintained by the cudax/STF team
+c/experimental/stf/ @nvidia/cccl-cudax-codeowners
+python/cuda_stf/ @nvidia/cccl-cudax-codeowners
+
+# Infrastructure
+.github/ @nvidia/cccl-infra-codeowners
+.coderabbit.yaml @nvidia/cccl-infra-codeowners
+ci/ @nvidia/cccl-infra-codeowners
+.devcontainer/ @nvidia/cccl-infra-codeowners
+.pre-commit-config.yaml @nvidia/cccl-infra-codeowners
+.clang-format @nvidia/cccl-infra-codeowners
+.clangd @nvidia/cccl-infra-codeowners
+c2h/ @nvidia/cccl-infra-codeowners
+nvbench_helper/ @nvidia/cccl-infra-codeowners
+.vscode @nvidia/cccl-infra-codeowners
+
+# cmake
+**/CMakeLists.txt @nvidia/cccl-cmake-codeowners
+**/cmake/ @nvidia/cccl-cmake-codeowners
+# make an exception for the cudax test cmake file
+cudax/test/CMakeLists.txt @nvidia/cccl-cudax-codeowners
+# make an exception for STF test cmake files
+cudax/test/stf/CMakeLists.txt @nvidia/cccl-cudax-codeowners
+cudax/test/stf/static_error_checks/CMakeLists.txt @nvidia/cccl-cudax-codeowners
+# make an exception for places cmake files
+cudax/test/places/CMakeLists.txt @nvidia/cccl-cudax-codeowners
+cudax/examples/places/CMakeLists.txt @nvidia/cccl-cudax-codeowners
+# make an exception for STF C and Python binding cmake files
+c/experimental/stf/**/CMakeLists.txt @nvidia/cccl-cudax-codeowners
+python/cuda_stf/**/CMakeLists.txt @nvidia/cccl-cudax-codeowners
+
+# benchmarks
+benchmarks/ @nvidia/cccl-benchmark-codeowners
+**/benchmarks @nvidia/cccl-benchmark-codeowners
+
+# docs
+README.md @nvidia/cccl-codeowners
+docs/ @nvidia/cccl-codeowners
+examples/ @nvidia/cccl-codeowners

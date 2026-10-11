@@ -1,0 +1,206 @@
+# Note that we don't specify the language in this file because some files are
+# detected as Cpp, but others are detected as ObjC and we want this formatting
+# to apply to all types of files.
+BasedOnStyle: LLVM
+AccessModifierOffset: -2
+AlignAfterOpenBracket: Align
+AlignConsecutiveAssignments: Consecutive
+AlignConsecutiveBitFields: Consecutive
+AlignConsecutiveMacros: Consecutive
+AlignEscapedNewlines: Left
+AlignOperands: AlignAfterOperator
+AllowAllArgumentsOnNextLine: true
+AlignTrailingComments:
+  Kind: Never
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowAllConstructorInitializersOnNextLine: true
+AllowShortBlocksOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: Empty
+AllowShortLoopsOnASingleLine: false
+AlwaysBreakAfterReturnType: None
+AlwaysBreakTemplateDeclarations: Yes
+AttributeMacros: [
+                  '_CCCL_ALIGNAS_TYPE',
+                  '_CCCL_ALIGNAS',
+                  '_CCCL_CONSTEXPR_CXX20',
+                  '_CCCL_CONSTEXPR_CXX23',
+                  '_CCCL_DECLSPEC_EMPTY_BASES',
+                  '_CCCL_DEVICE',
+                  '_CCCL_FORCEINLINE',
+                  '_CCCL_HIDE_FROM_ABI',
+                  '_CCCL_HOST_DEVICE',
+                  '_CCCL_DEDUCTION_GUIDE_ATTRIBUTES',
+                  '_CCCL_HOST',
+                  '_CCCL_KERNEL_ATTRIBUTES',
+                  '_CCCL_NO_UNIQUE_ADDRESS',
+                  '_CCCL_TYPE_VISIBILITY_DEFAULT',
+                  '_CCCL_TYPE_VISIBILITY_HIDDEN',
+                  '_CCCL_VISIBILITY_HIDDEN',
+                  '_CCCL_LAUNCH_BOUNDS',
+                  '_CCCL_LAUNCH_BOUNDS_CLUSTER',
+                  '_CCCL_BLOCK_SIZE',
+                  'CUB_RUNTIME_FUNCTION',
+                  'THRUST_RUNTIME_FUNCTION',
+                  'CCCL_DEPRECATED',
+                  'CCCL_DEPRECATED_BECAUSE',
+                  '_CCCL_DEPRECATED_IN_CXX20',
+                  '_CCCL_DEPRECATED_IN_CXX23',
+                  '_CCCL_API',
+                  '_CCCL_HOST_API',
+                  '_CCCL_DEVICE_API',
+                  '_CCCL_NODEBUG_API',
+                  '_CCCL_NODEBUG_HOST_API',
+                  '_CCCL_NODEBUG_DEVICE_API',
+                  '_CCCL_TRIVIAL_API',
+                  '_CCCL_TRIVIAL_HOST_API',
+                  '_CCCL_TRIVIAL_DEVICE_API',
+                  '_CCCL_PUBLIC_API',
+                  '_CCCL_PUBLIC_HOST_API',
+                  '_CCCL_PUBLIC_DEVICE_API',
+                 ]
+BinPackArguments: false
+BinPackParameters: false
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterCaseLabel: false
+  AfterClass: true
+  AfterControlStatement: true
+  AfterEnum: true
+  AfterFunction: true
+  AfterNamespace: true
+  AfterStruct: true
+  AfterUnion: true
+  BeforeCatch: true
+  BeforeElse: true
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+BreakBeforeConceptDeclarations: true
+BreakBeforeBinaryOperators: NonAssignment
+BreakBeforeTernaryOperators: true
+BreakConstructorInitializers: BeforeComma
+BreakInheritanceList: BeforeComma
+ColumnLimit: 120
+CompactNamespaces: false
+ContinuationIndentWidth: 2
+EmptyLineAfterAccessModifier: Never
+EmptyLineBeforeAccessModifier: Always
+FixNamespaceComments: true
+IfMacros: [
+  '_CUB_WEAKEN_IF_CONSTEXPR_IF_COMPILED_FOR_CCCL_C',
+  '_CCCL_CATCH'
+]
+IndentWrappedFunctionNames: false
+IncludeBlocks:   Regroup
+IncludeCategories:
+  - Regex:           '^<cuda/std/__cccl/prologue.h>'
+    Priority:            0x7FFFFFFF
+    SortPriority:        0x7FFFFFFF
+  - Regex:           '^<cuda/std/__cccl/epilogue.h>'
+    Priority:            -0x7FFFFFFF
+    SortPriority:        -0x7FFFFFFF
+  - Regex:           '^<cuda/experimental/__execution/prologue.cuh>'
+    Priority:            0x7FFFFFFF
+    SortPriority:        0x7FFFFFFF
+  - Regex:           '^"insert_nested_NVTX_range_guard.h"'
+    Priority:            -1
+    SortPriority:        -1
+  - Regex:           '^<(cuda/std/detail/__config|cub/config.cuh|thrust/detail/config.h|thrust/system/cuda/config.h)'
+    Priority:            0
+    SortPriority:        0
+  - Regex:           '^<cub/'
+    Priority:            2
+    SortPriority:        1
+  - Regex:           '^<thrust/'
+    Priority:            3
+    SortPriority:        2
+  - Regex:           '^<cuda/experimental'
+    Priority:            5
+    SortPriority:        4
+  - Regex:           '^<cuda/'
+    Priority:            4
+    SortPriority:        3
+  - Regex:           '^<nv/'
+    Priority:            6
+    SortPriority:        5
+  - Regex:           '^<[a-z_]*>$'
+    Priority:            7
+    SortPriority:        6
+  - Regex:           '^<[a-z_]*\.[a-z]+>$'
+    Priority:            8
+    SortPriority:        7
+  - Regex:           '^<cuda'
+    Priority:            0
+    SortPriority:        0
+InsertBraces: true
+IndentCaseLabels: true
+InsertNewlineAtEOF: true
+InsertTrailingCommas: Wrapped
+IndentRequires: true
+IndentPPDirectives: AfterHash
+IndentWidth: 2
+KeepEmptyLines:
+  AtEndOfFile: true
+  AtStartOfBlock: false
+  AtStartOfFile: false
+MaxEmptyLinesToKeep: 1
+Macros:
+- _CCCL_TEMPLATE(...)=template<...>
+- _CCCL_REQUIRES(...)=requires (...)
+- _CUDAX_SEMI_PRIVATE=private
+NamespaceIndentation: None
+PackConstructorInitializers: Never
+PenaltyBreakAssignment: 30
+PenaltyBreakBeforeFirstCallParameter: 50
+PenaltyBreakComment: 0
+PenaltyBreakFirstLessLess: 0
+PenaltyBreakString: 70
+PenaltyBreakTemplateDeclaration: 0
+PenaltyExcessCharacter: 100
+PenaltyReturnTypeOnItsOwnLine: 90
+PenaltyIndentedWhitespace: 2
+PointerAlignment: Left
+ReflowComments: true
+RemoveSemicolon: false
+SortIncludes: CaseInsensitive
+SpaceAfterCStyleCast: true
+SpaceAfterLogicalNot: false
+SpaceAfterTemplateKeyword: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCpp11BracedList: false
+SpaceBeforeCtorInitializerColon: true
+SpaceBeforeInheritanceColon: true
+SpaceBeforeParens: ControlStatements
+SpaceBeforeRangeBasedForLoopColon: true
+SpaceInEmptyParentheses: false
+SpacesBeforeTrailingComments: 1
+SpacesInAngles: Never
+SpacesInCStyleCastParentheses: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+Standard: c++20
+StatementMacros: [
+  '_CCCL_EXEC_CHECK_DISABLE',
+  'CUB_NAMESPACE_BEGIN',
+  'CUB_NAMESPACE_END',
+  'THRUST_NAMESPACE_BEGIN',
+  'THRUST_NAMESPACE_END',
+  '_CCCL_BEGIN_NAMESPACE_CUDA_STD',
+  '_CCCL_END_NAMESPACE_CUDA_STD',
+  '_CCCL_BEGIN_NAMESPACE_CUDA_STD_NOVERSION',
+  '_CCCL_END_NAMESPACE_CUDA_STD_NOVERSION',
+  '_CCCL_BEGIN_NAMESPACE_CUDA_STD_RANGES',
+  '_CCCL_END_NAMESPACE_CUDA_STD_RANGES',
+  '_CCCL_BEGIN_NAMESPACE_CUDA_STD_RANGES_ABI',
+  '_CCCL_END_NAMESPACE_CUDA_STD_RANGES_ABI',
+  '_CCCL_BEGIN_NAMESPACE_CUDA_STD_VIEWS',
+  '_CCCL_END_NAMESPACE_CUDA_STD_VIEWS',
+  '_CCCL_BEGIN_NAMESPACE_CPO',
+  '_CCCL_END_NAMESPACE_CPO',
+]
+TabWidth: 2
+UseTab: Never
+WrapNamespaceBodyWithEmptyLines: Never

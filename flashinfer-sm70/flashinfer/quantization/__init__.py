@@ -1,0 +1,130 @@
+"""
+FlashInfer Quantization Module
+==============================
+
+This module provides quantization functions for various formats:
+- FP4 (NVFP4, MXFP4)
+- FP8 (MXFP8)
+- Packbits utilities
+
+Copyright (c) 2025 by FlashInfer team.
+Licensed under the Apache License, Version 2.0.
+"""
+
+# Re-export packbits functions
+from .packbits import packbits, segment_packbits
+
+# Re-export JIT module generator (used by tests and AOT compilation)
+from ..jit.quantization import gen_quantization_module
+
+# Re-export FP8 quantization
+from .fp8_quantization import (
+    mxfp8_quantize,
+    mxfp8_grouped_quantize,
+    mxfp8_dequantize_host,
+    per_token_group_quant_8bit,
+)
+
+# Re-export FP4 quantization (all public symbols)
+from .fp4_quantization import (
+    SfLayout,
+    block_scale_interleave,
+    nvfp4_block_scale_interleave,
+    e2m1_and_ufp8sf_scale_to_float,
+    fp4_quantize,
+    mxfp4_dequantize_host,
+    mxfp4_dequantize,
+    mxfp4_quantize,
+    nvfp4_quantize,
+    nvfp4_batched_quantize,
+    nvfp4_quantize_paged_kv_cache,
+    nvfp4_kv_quantize,
+    nvfp4_kv_dequantize,
+    nvfp4_kv_dequantize_paged,
+    shuffle_matrix_a,
+    shuffle_matrix_sf_a,
+    scaled_fp4_grouped_quantize,
+    silu_and_mul_nvfp4_quantize,
+    get_fp4_quantization_module,  # Used by activation.py
+)
+
+# Re-export the NVFP4 4over6 recipe types and helpers.  These spell the
+# ``nvfp4_4over6=`` parameter of the quantization APIs, replacing the
+# process-wide FLASHINFER_NVFP4_4OVER6* environment variables.
+from .nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    NVFP44Over6ErrMode,
+    make_nvfp4_global_scale,
+    nvfp4_4over6_code,
+    nvfp4_4over6_from_code,
+    nvfp4_e4m3_max,
+    resolve_nvfp4_4over6,
+)
+
+# CuTe-DSL kernels (conditionally exported, EXPERIMENTAL)
+# Warning: These are experimental APIs and may change without notice.
+# Import is guarded to handle environments where cutlass is not installed.
+_cute_dsl_available = False
+try:
+    from ..cute_dsl import is_cute_dsl_available
+
+    if is_cute_dsl_available():
+        from .kernels.mxfp8_quantize import mxfp8_quantize_cute_dsl
+        from .kernels.mxfp4_quantize import mxfp4_quantize_cute_dsl
+        from .kernels.nvfp4_quantize import (
+            nvfp4_quantize_cute_dsl,
+            nvfp4_quantize_per_token_cute_dsl,
+        )
+
+        _cute_dsl_available = True
+except ImportError:
+    pass
+
+__all__ = [
+    # Packbits
+    "packbits",
+    "segment_packbits",
+    # JIT module generator
+    "gen_quantization_module",
+    # FP8
+    "mxfp8_quantize",
+    "mxfp8_grouped_quantize",
+    "mxfp8_dequantize_host",
+    "per_token_group_quant_8bit",
+    # FP4
+    "SfLayout",
+    "block_scale_interleave",
+    "nvfp4_block_scale_interleave",
+    "e2m1_and_ufp8sf_scale_to_float",
+    "fp4_quantize",
+    "mxfp4_dequantize_host",
+    "mxfp4_dequantize",
+    "mxfp4_quantize",
+    "nvfp4_quantize",
+    "nvfp4_batched_quantize",
+    "nvfp4_quantize_paged_kv_cache",
+    "nvfp4_kv_quantize",
+    "nvfp4_kv_dequantize",
+    "nvfp4_kv_dequantize_paged",
+    "shuffle_matrix_a",
+    "shuffle_matrix_sf_a",
+    "scaled_fp4_grouped_quantize",
+    "silu_and_mul_nvfp4_quantize",
+    "get_fp4_quantization_module",
+    # NVFP4 4over6 recipe
+    "NVFP44Over6Config",
+    "NVFP44Over6ErrMode",
+    "make_nvfp4_global_scale",
+    "nvfp4_4over6_code",
+    "nvfp4_4over6_from_code",
+    "nvfp4_e4m3_max",
+    "resolve_nvfp4_4over6",
+]
+
+if _cute_dsl_available:
+    __all__ += [
+        "mxfp8_quantize_cute_dsl",
+        "mxfp4_quantize_cute_dsl",
+        "nvfp4_quantize_cute_dsl",
+        "nvfp4_quantize_per_token_cute_dsl",
+    ]

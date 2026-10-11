@@ -1,0 +1,2173 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the CUDA Toolkit, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _CUDA_STD_INPLACE_VECTOR
+#define _CUDA_STD_INPLACE_VECTOR
+
+#include <cuda/std/detail/__config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/std/__algorithm/copy.h>
+#include <cuda/std/__algorithm/equal.h>
+#include <cuda/std/__algorithm/fill.h>
+#include <cuda/std/__algorithm/lexicographical_compare.h>
+#include <cuda/std/__algorithm/move.h>
+#include <cuda/std/__algorithm/move_backward.h>
+#include <cuda/std/__algorithm/remove.h>
+#include <cuda/std/__algorithm/remove_if.h>
+#include <cuda/std/__algorithm/rotate.h>
+#include <cuda/std/__algorithm/swap_ranges.h>
+#include <cuda/std/__exception/exception_macros.h>
+#include <cuda/std/__exception/terminate.h>
+#include <cuda/std/__fwd/inplace_vector.h>
+#include <cuda/std/__host_stdlib/new>
+#include <cuda/std/__host_stdlib/stdexcept>
+#include <cuda/std/__iterator/advance.h>
+#include <cuda/std/__iterator/concepts.h>
+#include <cuda/std/__iterator/distance.h>
+#include <cuda/std/__iterator/iter_move.h>
+#include <cuda/std/__iterator/next.h>
+#include <cuda/std/__iterator/reverse_iterator.h>
+#include <cuda/std/__memory/construct_at.h>
+#include <cuda/std/__memory/uninitialized_algorithms.h>
+#include <cuda/std/__new/device_new.h>
+#include <cuda/std/__new/launder.h>
+#include <cuda/std/__optional/optional_ref.h>
+#include <cuda/std/__ranges/access.h>
+#include <cuda/std/__ranges/concepts.h>
+#include <cuda/std/__ranges/from_range.h>
+#include <cuda/std/__ranges/size.h>
+#include <cuda/std/__ranges/unwrap_end.h>
+#include <cuda/std/__type_traits/conditional.h>
+#include <cuda/std/__type_traits/is_nothrow_constructible.h>
+#include <cuda/std/__type_traits/is_nothrow_copy_assignable.h>
+#include <cuda/std/__type_traits/is_nothrow_copy_constructible.h>
+#include <cuda/std/__type_traits/is_nothrow_default_constructible.h>
+#include <cuda/std/__type_traits/is_nothrow_move_assignable.h>
+#include <cuda/std/__type_traits/is_nothrow_move_constructible.h>
+#include <cuda/std/__type_traits/is_swappable.h>
+#include <cuda/std/__type_traits/is_trivial.h>
+#include <cuda/std/__type_traits/is_trivially_copy_assignable.h>
+#include <cuda/std/__type_traits/is_trivially_copy_constructible.h>
+#include <cuda/std/__type_traits/is_trivially_destructible.h>
+#include <cuda/std/__type_traits/is_trivially_move_assignable.h>
+#include <cuda/std/__type_traits/is_trivially_move_constructible.h>
+#include <cuda/std/__utility/delegate_constructors.h>
+#include <cuda/std/__utility/forward.h>
+#include <cuda/std/__utility/move.h>
+#include <cuda/std/cstdint>
+#include <cuda/std/initializer_list>
+#include <cuda/std/limits>
+
+#include <cuda/std/__cccl/prologue.h>
+
+_CCCL_BEGIN_NAMESPACE_CUDA_STD
+
+template <size_t _Capacity>
+using __inplace_vector_size_type =
+  _If<_Capacity <= numeric_limits<uint8_t>::max(),
+      uint8_t,
+      _If<_Capacity <= numeric_limits<uint16_t>::max(),
+          uint16_t,
+          _If<_Capacity <= numeric_limits<uint32_t>::max(), uint32_t, uint64_t>>>;
+
+enum class __inplace_vector_specialization
+{
+  __empty,
+  __trivial,
+  __default,
+};
+
+template <class _Tp, size_t _Capacity>
+[[nodiscard]] _CCCL_API constexpr __inplace_vector_specialization __select_inplace_vector_specialization()
+{
+  if (_Capacity == 0)
+  {
+    return __inplace_vector_specialization::__empty;
+  }
+  else if (is_trivial_v<_Tp>)
+  {
+    return __inplace_vector_specialization::__trivial;
+  }
+  else
+  {
+    return __inplace_vector_specialization::__default;
+  }
+}
+
+template <class _Base>
+struct _Rollback_change_size
+{
+  using iterator = typename _Base::iterator;
+  _Base* __obj_;
+  iterator& __first_;
+  iterator __current_;
+
+  _CCCL_API constexpr _Rollback_change_size(_Base* __obj, iterator& __first, iterator& __current) noexcept
+      : __obj_(__obj)
+      , __first_(__first)
+      , __current_(__current)
+  {}
+
+  _CCCL_API inline void operator()() const noexcept
+  {
+    __obj_->__size_ += static_cast<typename _Base::__size_type>(__current_ - __first_);
+  }
+};
+
+template <class _Tp, size_t _Capacity, bool = is_trivially_destructible_v<_Tp>>
+struct __inplace_vector_destruct_base
+{
+  using size_type   = size_t;
+  using __size_type = __inplace_vector_size_type<_Capacity>;
+
+  alignas(_Tp) unsigned char __elems_[_Capacity * sizeof(_Tp)] = {};
+  __size_type __size_{0};
+
+  // [containers.sequences.inplace.vector.cons], construct/copy/destroy
+  _CCCL_HIDE_FROM_ABI __inplace_vector_destruct_base() = default;
+  _CCCL_API inline ~__inplace_vector_destruct_base() noexcept
+  {
+    _Tp* __begin = ::cuda::std::launder(reinterpret_cast<_Tp*>(__elems_));
+    ::cuda::std::__destroy(__begin, __begin + __size_);
+  }
+};
+
+template <class _Tp, size_t _Capacity>
+struct __inplace_vector_destruct_base<_Tp, _Capacity, true>
+{
+  using size_type   = size_t;
+  using __size_type = __inplace_vector_size_type<_Capacity>;
+
+  alignas(_Tp) unsigned char __elems_[_Capacity * sizeof(_Tp)] = {};
+  __size_type __size_{0};
+
+  // [containers.sequences.inplace.vector.cons], construct/copy/destroy
+  _CCCL_HIDE_FROM_ABI constexpr __inplace_vector_destruct_base() = default;
+};
+
+template <class _Tp, size_t _Capacity>
+struct __inplace_vector_storage : public __inplace_vector_destruct_base<_Tp, _Capacity>
+{
+  using size_type      = size_t;
+  using __size_type    = __inplace_vector_size_type<_Capacity>;
+  using reference      = _Tp&;
+  using iterator       = _Tp*;
+  using const_iterator = const _Tp*;
+
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_storage, __inplace_vector_destruct_base, _Tp, _Capacity);
+
+  // [containers.sequences.inplace.vector.members] size/capacity
+  [[nodiscard]] _CCCL_API constexpr size_type size() const noexcept
+  {
+    return static_cast<size_type>(this->__size_);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr bool empty() const noexcept
+  {
+    return this->__size_ == 0;
+  }
+
+  // [containers.sequences.inplace.vector.data], data access
+  [[nodiscard]] _CCCL_API inline _Tp* data() noexcept
+  {
+    return ::cuda::std::launder(reinterpret_cast<_Tp*>(this->__elems_));
+  }
+
+  [[nodiscard]] _CCCL_API inline const _Tp* data() const noexcept
+  {
+    return ::cuda::std::launder(reinterpret_cast<const _Tp*>(this->__elems_));
+  }
+
+  // [containers.sequences.inplace.vector.itertators] iterators
+  [[nodiscard]] _CCCL_API inline iterator begin() noexcept
+  {
+    return ::cuda::std::launder(reinterpret_cast<_Tp*>(this->__elems_));
+  }
+
+  [[nodiscard]] _CCCL_API inline const_iterator begin() const noexcept
+  {
+    return ::cuda::std::launder(reinterpret_cast<const _Tp*>(this->__elems_));
+  }
+
+  [[nodiscard]] _CCCL_API inline iterator end() noexcept
+  {
+    return ::cuda::std::launder(reinterpret_cast<_Tp*>(this->__elems_) + this->__size_);
+  }
+
+  [[nodiscard]] _CCCL_API inline const_iterator end() const noexcept
+  {
+    return ::cuda::std::launder(reinterpret_cast<const _Tp*>(this->__elems_) + this->__size_);
+  }
+
+  // [containers.sequences.inplace.vector.modifiers], modifiers
+  template <class... _Args>
+  _CCCL_API constexpr reference
+  unchecked_emplace_back(_Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, _Args...>)
+  {
+    auto __final = ::cuda::std::__construct_at(end(), ::cuda::std::forward<_Args>(__args)...);
+    ++this->__size_;
+    return *__final;
+  }
+
+protected:
+  _CCCL_API inline void __destroy(iterator __first, iterator __last) noexcept
+  {
+    ::cuda::std::__destroy(__first, __last);
+    this->__size_ -= static_cast<__size_type>(__last - __first);
+  }
+
+  _CCCL_TEMPLATE(bool _IsNothrow = is_nothrow_default_constructible_v<_Tp>)
+  _CCCL_REQUIRES(_IsNothrow)
+  _CCCL_API inline void __uninitialized_value_construct(iterator __first, iterator __last) noexcept
+  {
+    iterator __idx = __first;
+    for (; __idx != __last; ++__idx)
+    {
+      ::new (::cuda::std::__voidify(*__idx)) _Tp();
+    }
+    this->__size_ += static_cast<__size_type>(__last - __first);
+  }
+
+  _CCCL_TEMPLATE(bool _IsNothrow = is_nothrow_default_constructible_v<_Tp>)
+  _CCCL_REQUIRES((!_IsNothrow))
+  _CCCL_API inline void __uninitialized_value_construct(iterator __first, iterator __last)
+  {
+    iterator __idx = __first;
+    auto __guard   = __make_exception_guard(_Rollback_change_size<__inplace_vector_storage>{this, __first, __idx});
+    for (; __idx != __last; ++__idx)
+    {
+      ::new (::cuda::std::__voidify(*__idx)) _Tp();
+    }
+    __guard.__complete();
+    this->__size_ += static_cast<__size_type>(__last - __first);
+  }
+
+  _CCCL_TEMPLATE(bool _IsNothrow = is_nothrow_copy_constructible_v<_Tp>)
+  _CCCL_REQUIRES(_IsNothrow)
+  _CCCL_API inline void __uninitialized_fill(iterator __first, iterator __last, const _Tp& __value) noexcept
+  {
+    iterator __idx = __first;
+    for (; __idx != __last; ++__idx)
+    {
+      ::new (::cuda::std::__voidify(*__idx)) _Tp(__value);
+    }
+    this->__size_ += static_cast<__size_type>(__last - __first);
+  }
+
+  _CCCL_TEMPLATE(bool _IsNothrow = is_nothrow_copy_constructible_v<_Tp>)
+  _CCCL_REQUIRES((!_IsNothrow))
+  _CCCL_API inline void __uninitialized_fill(iterator __first, iterator __last, const _Tp& __value)
+  {
+    iterator __idx = __first;
+    auto __guard   = __make_exception_guard(_Rollback_change_size<__inplace_vector_storage>{this, __first, __idx});
+    for (; __idx != __last; ++__idx)
+    {
+      ::new (::cuda::std::__voidify(*__idx)) _Tp(__value);
+    }
+    __guard.__complete();
+    this->__size_ += static_cast<__size_type>(__last - __first);
+  }
+
+  _CCCL_TEMPLATE(class _Iter, bool _IsNothrow = is_nothrow_copy_constructible_v<_Tp>)
+  _CCCL_REQUIRES(_IsNothrow)
+  _CCCL_API inline void __uninitialized_copy(_Iter __first, _Iter __last, iterator __dest) noexcept
+  {
+    iterator __curr = __dest;
+    for (; __first != __last; ++__curr, (void) ++__first)
+    {
+      ::new (::cuda::std::__voidify(*__curr)) _Tp(*__first);
+    }
+    this->__size_ += static_cast<__size_type>(__curr - __dest);
+  }
+
+  _CCCL_TEMPLATE(class _Iter, bool _IsNothrow = is_nothrow_copy_constructible_v<_Tp>)
+  _CCCL_REQUIRES((!_IsNothrow))
+  _CCCL_API inline void __uninitialized_copy(_Iter __first, _Iter __last, iterator __dest)
+  {
+    iterator __curr = __dest;
+    auto __guard    = __make_exception_guard(_Rollback_change_size<__inplace_vector_storage>{this, __dest, __curr});
+    for (; __first != __last; ++__curr, (void) ++__first)
+    {
+      ::new (::cuda::std::__voidify(*__curr)) _Tp(*__first);
+    }
+    __guard.__complete();
+    this->__size_ += static_cast<__size_type>(__curr - __dest);
+  }
+
+  _CCCL_TEMPLATE(class _Iter, bool _IsNothrow = is_nothrow_move_constructible_v<_Tp>)
+  _CCCL_REQUIRES(_IsNothrow)
+  _CCCL_API inline void __uninitialized_move(_Iter __first, _Iter __last, iterator __dest) noexcept
+  {
+    iterator __curr = __dest;
+    for (; __first != __last; ++__curr, (void) ++__first)
+    {
+      ::new (::cuda::std::__voidify(*__curr)) _Tp(::cuda::std::ranges::iter_move(__first));
+    }
+    this->__size_ += static_cast<__size_type>(__curr - __dest);
+  }
+
+  _CCCL_TEMPLATE(class _Iter, bool _IsNothrow = is_nothrow_move_constructible_v<_Tp>)
+  _CCCL_REQUIRES((!_IsNothrow))
+  _CCCL_API inline void __uninitialized_move(_Iter __first, _Iter __last, iterator __dest)
+  {
+    iterator __curr = __dest;
+    auto __guard    = __make_exception_guard(_Rollback_change_size<__inplace_vector_storage>{this, __dest, __curr});
+    for (; __first != __last; ++__curr, (void) ++__first)
+    {
+      ::new (::cuda::std::__voidify(*__curr)) _Tp(::cuda::std::ranges::iter_move(__first));
+    }
+    __guard.__complete();
+    this->__size_ += static_cast<__size_type>(__curr - __dest);
+  }
+};
+
+// * If is_trivially_copy_constructible_v<T> is true, then IV has a trivial copy constructor.
+template <class _Tp, size_t _Capacity, bool = is_trivially_copy_constructible_v<_Tp>>
+struct __inplace_vector_copy : __inplace_vector_storage<_Tp, _Capacity>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_copy, __inplace_vector_storage, _Tp, _Capacity);
+
+  _CCCL_API inline __inplace_vector_copy(const __inplace_vector_copy& __other) noexcept(
+    is_nothrow_copy_constructible_v<_Tp>)
+      : __base()
+  {
+    this->__uninitialized_copy(__other.begin(), __other.end(), this->begin());
+  }
+
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy(__inplace_vector_copy&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy& operator=(const __inplace_vector_copy&) = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy& operator=(__inplace_vector_copy&&)      = default;
+};
+
+template <class _Tp, size_t _Capacity>
+struct __inplace_vector_copy<_Tp, _Capacity, true> : __inplace_vector_storage<_Tp, _Capacity>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_copy, __inplace_vector_storage, _Tp, _Capacity);
+
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy(const __inplace_vector_copy&)            = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy(__inplace_vector_copy&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy& operator=(const __inplace_vector_copy&) = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy& operator=(__inplace_vector_copy&&)      = default;
+};
+
+// * If is_trivially_move_constructible_v<T> is true, then IV has a trivial move constructor.
+template <class _Tp, size_t _Capacity, bool = is_trivially_move_constructible_v<_Tp>>
+struct __inplace_vector_move : __inplace_vector_copy<_Tp, _Capacity>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_move, __inplace_vector_copy, _Tp, _Capacity);
+
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move(const __inplace_vector_move&) = default;
+
+  _CCCL_API inline __inplace_vector_move(__inplace_vector_move&& __other) noexcept(is_nothrow_move_constructible_v<_Tp>)
+      : __base()
+  {
+    this->__uninitialized_move(__other.begin(), __other.end(), this->begin());
+  }
+
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move& operator=(const __inplace_vector_move&) = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move& operator=(__inplace_vector_move&&)      = default;
+};
+
+template <class _Tp, size_t _Capacity>
+struct __inplace_vector_move<_Tp, _Capacity, true> : __inplace_vector_copy<_Tp, _Capacity>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_move, __inplace_vector_copy, _Tp, _Capacity);
+
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move(const __inplace_vector_move&)            = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move(__inplace_vector_move&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move& operator=(const __inplace_vector_move&) = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move& operator=(__inplace_vector_move&&)      = default;
+};
+
+// * if is_trivially_copy_constructible_v<T> && is_trivially_copy_assignable_v<T> is true, then IV has a trivial copy
+// assignment operator
+template <class _Tp,
+          size_t _Capacity,
+          bool = is_trivially_copy_constructible_v<_Tp> && is_trivially_copy_assignable_v<_Tp>>
+struct __inplace_vector_copy_assign : __inplace_vector_move<_Tp, _Capacity>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_copy_assign, __inplace_vector_move, _Tp, _Capacity);
+
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy_assign(const __inplace_vector_copy_assign&) = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy_assign(__inplace_vector_copy_assign&&)      = default;
+
+  _CCCL_API inline __inplace_vector_copy_assign& operator=(const __inplace_vector_copy_assign& __other) noexcept(
+    is_nothrow_copy_constructible_v<_Tp> && is_nothrow_copy_assignable_v<_Tp>)
+  {
+    if (__other.size() < this->size())
+    {
+      const auto __new_end = ::cuda::std::copy(__other.begin(), __other.end(), this->begin());
+      this->__destroy(__new_end, this->end());
+    }
+    else
+    {
+      ::cuda::std::copy(__other.begin(), __other.begin() + this->size(), this->begin());
+      this->__uninitialized_copy(__other.begin() + this->size(), __other.end(), this->end());
+    }
+    return *this;
+  }
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy_assign& operator=(__inplace_vector_copy_assign&&) = default;
+};
+
+template <class _Tp, size_t _Capacity>
+struct __inplace_vector_copy_assign<_Tp, _Capacity, true> : __inplace_vector_move<_Tp, _Capacity>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_copy_assign, __inplace_vector_move, _Tp, _Capacity);
+
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy_assign(const __inplace_vector_copy_assign&)            = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy_assign(__inplace_vector_copy_assign&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy_assign& operator=(const __inplace_vector_copy_assign&) = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_copy_assign& operator=(__inplace_vector_copy_assign&&)      = default;
+};
+
+// * if is_trivially_move_constructible_v<T> && is_trivially_move_assignable_v<T> is true, then IV has a trivial move
+// assignment operator
+template <class _Tp,
+          size_t _Capacity,
+          bool = is_trivially_move_constructible_v<_Tp> && is_trivially_move_assignable_v<_Tp>>
+struct __inplace_vector_move_assign : __inplace_vector_copy_assign<_Tp, _Capacity>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_move_assign, __inplace_vector_copy_assign, _Tp, _Capacity);
+
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move_assign(const __inplace_vector_move_assign&)            = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move_assign(__inplace_vector_move_assign&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move_assign& operator=(const __inplace_vector_move_assign&) = default;
+
+  _CCCL_API inline __inplace_vector_move_assign& operator=(__inplace_vector_move_assign&& __other) noexcept(
+    is_nothrow_move_constructible_v<_Tp> && is_nothrow_move_assignable_v<_Tp>)
+  {
+    if (__other.size() < this->size())
+    {
+      const auto __new_end = ::cuda::std::move(__other.begin(), __other.end(), this->begin());
+      this->__destroy(__new_end, this->end());
+    }
+    else
+    {
+      ::cuda::std::move(__other.begin(), __other.begin() + this->size(), this->begin());
+      this->__uninitialized_move(__other.begin() + this->size(), __other.end(), this->end());
+    }
+    return *this;
+  }
+};
+
+template <class _Tp, size_t _Capacity>
+struct __inplace_vector_move_assign<_Tp, _Capacity, true> : __inplace_vector_copy_assign<_Tp, _Capacity>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_move_assign, __inplace_vector_copy_assign, _Tp, _Capacity);
+
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move_assign(const __inplace_vector_move_assign&)            = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move_assign(__inplace_vector_move_assign&&)                 = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move_assign& operator=(const __inplace_vector_move_assign&) = default;
+  _CCCL_HIDE_FROM_ABI __inplace_vector_move_assign& operator=(__inplace_vector_move_assign&&)      = default;
+};
+
+// Specialization for non-trivial types. Nothing in here can be constexpr
+template <class _Tp,
+          size_t _Capacity,
+          __inplace_vector_specialization _Spec = __select_inplace_vector_specialization<_Tp, _Capacity>()>
+struct __inplace_vector_base : __inplace_vector_move_assign<_Tp, _Capacity>
+{
+  _CCCL_DELEGATE_CONSTRUCTORS(__inplace_vector_base, __inplace_vector_move_assign, _Tp, _Capacity);
+};
+
+template <class _Tp, size_t _Capacity>
+struct __inplace_vector_base<_Tp, _Capacity, __inplace_vector_specialization::__trivial>
+{
+  using size_type      = size_t;
+  using __size_type    = __inplace_vector_size_type<_Capacity>;
+  using reference      = _Tp&;
+  using iterator       = _Tp*;
+  using const_iterator = const _Tp*;
+
+  _Tp __elems_[_Capacity] = {};
+  __size_type __size_{0};
+
+  // [containers.sequences.inplace.vector.cons], construct/copy/destroy
+  _CCCL_HIDE_FROM_ABI constexpr __inplace_vector_base()                                        = default;
+  _CCCL_HIDE_FROM_ABI constexpr __inplace_vector_base(const __inplace_vector_base&)            = default;
+  _CCCL_HIDE_FROM_ABI constexpr __inplace_vector_base(__inplace_vector_base&&)                 = default;
+  _CCCL_HIDE_FROM_ABI constexpr __inplace_vector_base& operator=(const __inplace_vector_base&) = default;
+  _CCCL_HIDE_FROM_ABI constexpr __inplace_vector_base& operator=(__inplace_vector_base&&)      = default;
+
+  // [containers.sequences.inplace.vector.members] size/capacity
+  [[nodiscard]] _CCCL_API constexpr size_type size() const noexcept
+  {
+    return static_cast<size_type>(__size_);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr bool empty() const noexcept
+  {
+    return __size_ == 0;
+  }
+
+  // [containers.sequences.inplace.vector.data], data access
+  [[nodiscard]] _CCCL_API constexpr _Tp* data() noexcept
+  {
+    return __elems_;
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const _Tp* data() const noexcept
+  {
+    return __elems_;
+  }
+
+  // [containers.sequences.inplace.vector.itertators] iterators
+  [[nodiscard]] _CCCL_API constexpr iterator begin() noexcept
+  {
+    return __elems_;
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_iterator begin() const noexcept
+  {
+    return __elems_;
+  }
+
+  [[nodiscard]] _CCCL_API constexpr iterator end() noexcept
+  {
+    return __elems_ + __size_;
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_iterator end() const noexcept
+  {
+    return __elems_ + __size_;
+  }
+
+  // [containers.sequences.inplace.vector.modifiers], modifiers
+  template <class... _Args>
+  _CCCL_API constexpr reference
+  unchecked_emplace_back(_Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, _Args...>)
+  {
+    _Tp* __final = __elems_ + __size_;
+    *__final     = _Tp(::cuda::std::forward<_Args>(__args)...);
+    ++__size_;
+    return *__final;
+  }
+
+protected:
+  _CCCL_API constexpr void __destroy(iterator __first, iterator __last) noexcept
+  {
+    __size_ -= static_cast<__size_type>(__last - __first);
+  }
+
+  _CCCL_API constexpr void __uninitialized_value_construct(iterator __first, iterator __last) noexcept
+  {
+    ::cuda::std::fill(__first, __last, _Tp());
+    __size_ += static_cast<__size_type>(__last - __first);
+  }
+
+  _CCCL_API constexpr void __uninitialized_fill(iterator __first, iterator __last, const _Tp& __value) noexcept
+  {
+    ::cuda::std::fill(__first, __last, __value);
+    __size_ += static_cast<__size_type>(__last - __first);
+  }
+
+  template <class _Iter>
+  _CCCL_API constexpr void __uninitialized_copy(_Iter __first, _Iter __last, iterator __dest) noexcept
+  {
+    ::cuda::std::copy(__first, __last, __dest);
+    __size_ += static_cast<__size_type>(::cuda::std::ranges::distance(__first, __last));
+  }
+
+  template <class _Iter>
+  _CCCL_API constexpr void __uninitialized_move(_Iter __first, _Iter __last, iterator __dest) noexcept
+  {
+    ::cuda::std::copy(__first, __last, __dest);
+    __size_ += static_cast<__size_type>(::cuda::std::ranges::distance(__first, __last));
+  }
+};
+
+// We need to specialize inplace_vector for zero capacity as in that case it is required to be empty and trivial
+template <class _Tp>
+struct __inplace_vector_base<_Tp, 0, __inplace_vector_specialization::__empty>
+{
+  using size_type      = size_t;
+  using __size_type    = __inplace_vector_size_type<0>;
+  using reference      = _Tp&;
+  using iterator       = _Tp*;
+  using const_iterator = const _Tp*;
+
+  // [containers.sequences.inplace.vector.cons], construct/copy/destroy
+  _CCCL_HIDE_FROM_ABI constexpr __inplace_vector_base() = default;
+
+  // [containers.sequences.inplace.vector.members] size/capacity
+  [[nodiscard]] _CCCL_API constexpr size_type size() const noexcept
+  {
+    return 0;
+  }
+
+  [[nodiscard]] _CCCL_API constexpr bool empty() const noexcept
+  {
+    return true;
+  }
+
+  // [containers.sequences.inplace.vector.data], data access
+  [[nodiscard]] _CCCL_API constexpr _Tp* data() noexcept
+  {
+    return nullptr;
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const _Tp* data() const noexcept
+  {
+    return nullptr;
+  }
+
+  // [containers.sequences.inplace.vector.itertators] iterators
+  [[nodiscard]] _CCCL_API constexpr iterator begin() noexcept
+  {
+    return nullptr;
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_iterator begin() const noexcept
+  {
+    return nullptr;
+  }
+
+  [[nodiscard]] _CCCL_API constexpr iterator end() noexcept
+  {
+    return nullptr;
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_iterator end() const noexcept
+  {
+    return nullptr;
+  }
+
+  // [containers.sequences.inplace.vector.modifiers], modifiers
+  template <class... _Args>
+  _CCCL_API constexpr _Tp& unchecked_emplace_back(_Args&&...) noexcept
+  {
+    _CCCL_UNREACHABLE();
+#if _CCCL_COMPILER(MSVC)
+    return *begin();
+#endif // _CCCL_COMPILER(MSVC)
+  }
+
+protected:
+  _CCCL_API constexpr void __destroy(iterator, iterator) noexcept
+  {
+    _CCCL_UNREACHABLE();
+  }
+  _CCCL_API constexpr void __uninitialized_value_construct(iterator, iterator) noexcept
+  {
+    _CCCL_UNREACHABLE();
+  }
+  _CCCL_API constexpr void __uninitialized_fill(iterator, iterator, const _Tp&) noexcept
+  {
+    _CCCL_UNREACHABLE();
+  }
+  template <class _Iter>
+  _CCCL_API constexpr void __uninitialized_copy(_Iter, _Iter, iterator) noexcept
+  {
+    _CCCL_UNREACHABLE();
+  }
+  template <class _Iter>
+  _CCCL_API constexpr void __uninitialized_move(_Iter, _Iter, iterator) noexcept
+  {
+    _CCCL_UNREACHABLE();
+  }
+};
+
+template <class _Tp, size_t _Capacity>
+class inplace_vector : __inplace_vector_base<_Tp, _Capacity>
+{
+private:
+  using __base = __inplace_vector_base<_Tp, _Capacity>;
+
+public:
+  using value_type      = _Tp;
+  using size_type       = size_t;
+  using difference_type = ptrdiff_t;
+  using pointer         = _Tp*;
+  using const_pointer   = const _Tp*;
+  using reference       = _Tp&;
+  using const_reference = const _Tp&;
+
+  using iterator       = pointer;
+  using const_iterator = const_pointer;
+
+  using reverse_iterator       = ::cuda::std::reverse_iterator<iterator>;
+  using const_reverse_iterator = ::cuda::std::reverse_iterator<const_iterator>;
+
+  // [containers.sequences.inplace.vector.cons], construct/copy/destroy
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector() noexcept                        = default;
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector(const inplace_vector&)            = default;
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector(inplace_vector&&)                 = default;
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector& operator=(const inplace_vector&) = default;
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector& operator=(inplace_vector&&)      = default;
+
+  _CCCL_API constexpr explicit inplace_vector(const size_type __count)
+      : __base()
+  {
+    if (__count > 0)
+    {
+      if (_Capacity < __count)
+      {
+        _CCCL_THROW(::std::bad_alloc);
+      }
+
+      iterator __begin = this->begin();
+      this->__uninitialized_value_construct(__begin, __begin + __count);
+    }
+  }
+
+  _CCCL_API constexpr inplace_vector(const size_type __count, const _Tp& __value)
+      : __base()
+  {
+    if (__count > 0)
+    {
+      if (_Capacity < __count)
+      {
+        _CCCL_THROW(::std::bad_alloc);
+      }
+
+      iterator __begin = this->begin();
+      this->__uninitialized_fill(__begin, __begin + __count, __value);
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Iter)
+  _CCCL_REQUIRES(__has_input_traversal<_Iter> _CCCL_AND(!__has_forward_traversal<_Iter>))
+  _CCCL_API constexpr inplace_vector(_Iter __first, _Iter __last)
+      : __base()
+  {
+    for (; __first != __last; ++__first)
+    {
+      emplace_back(*__first);
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Iter)
+  _CCCL_REQUIRES(__has_forward_traversal<_Iter>)
+  _CCCL_API constexpr inplace_vector(_Iter __first, _Iter __last)
+      : __base()
+  {
+    if (__first != __last)
+    {
+      const auto __size = static_cast<size_t>(::cuda::std::distance(__first, __last));
+      if (_Capacity < __size)
+      {
+        _CCCL_THROW(::std::bad_alloc);
+      }
+
+      this->__uninitialized_copy(__first, __last, this->begin());
+    }
+  }
+
+  _CCCL_API constexpr inplace_vector(initializer_list<_Tp> __ilist)
+      : __base()
+  {
+    if (__ilist.size() != 0)
+    {
+      if (_Capacity < __ilist.size())
+      {
+        _CCCL_THROW(::std::bad_alloc);
+      }
+
+      this->__uninitialized_copy(__ilist.begin(), __ilist.end(), this->begin());
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND(
+    !::cuda::std::ranges::forward_range<_Range>))
+  _CCCL_API constexpr inplace_vector(from_range_t, _Range&& __range)
+      : __base()
+  {
+    auto __first      = ::cuda::std::ranges::begin(__range);
+    const auto __last = ::cuda::std::ranges::end(__range);
+    for (; __first != __last; ++__first)
+    {
+      emplace_back(::cuda::std::ranges::iter_move(__first));
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(
+    ::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND ::cuda::std::ranges::forward_range<_Range>
+      _CCCL_AND ::cuda::std::ranges::sized_range<_Range>)
+  _CCCL_API constexpr inplace_vector(from_range_t, _Range&& __range)
+      : __base()
+  {
+    const auto __size = ::cuda::std::ranges::size(__range);
+    if (__size > 0)
+    {
+      if (_Capacity < __size)
+      {
+        _CCCL_THROW(::std::bad_alloc);
+      }
+
+      this->__uninitialized_move(
+        ::cuda::std::ranges::begin(__range), ::cuda::std::ranges::__unwrap_end(__range), this->begin());
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(
+    ::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND ::cuda::std::ranges::forward_range<_Range>
+      _CCCL_AND(!::cuda::std::ranges::sized_range<_Range>))
+  _CCCL_API constexpr inplace_vector(from_range_t, _Range&& __range)
+      : __base()
+  {
+    const auto __count = static_cast<size_t>(
+      ::cuda::std::ranges::distance(::cuda::std::ranges::begin(__range), ::cuda::std::ranges::end(__range)));
+    if (__count > 0)
+    {
+      if (_Capacity < __count)
+      {
+        _CCCL_THROW(::std::bad_alloc);
+      }
+
+      this->__uninitialized_move(
+        ::cuda::std::ranges::begin(__range), ::cuda::std::ranges::__unwrap_end(__range), this->begin());
+    }
+  }
+
+  _CCCL_API constexpr inplace_vector& operator=(initializer_list<_Tp> __ilist)
+  {
+    const auto __count = __ilist.size();
+    if (_Capacity < __count)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+
+    const auto __size = this->size();
+    if (__count < __size)
+    {
+      const iterator __new_end = ::cuda::std::copy(__ilist.begin(), __ilist.end(), this->begin());
+      this->__destroy(__new_end, this->end());
+    }
+    else
+    {
+      ::cuda::std::copy(__ilist.begin(), __ilist.begin() + __size, this->begin());
+      this->__uninitialized_copy(__ilist.begin() + __size, __ilist.end(), this->end());
+    }
+    return *this;
+  }
+
+  // inplace_vector.assign
+  _CCCL_API constexpr void assign(const size_type __count, const _Tp& __value)
+  {
+    if (_Capacity < __count)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+
+    const iterator __begin = this->begin();
+    const iterator __end   = this->end();
+    if (__count < this->size())
+    {
+      ::cuda::std::fill(__begin, __begin + __count, __value);
+      this->__destroy(__begin + __count, __end);
+    }
+    else
+    {
+      ::cuda::std::fill(__begin, __end, __value);
+      this->__uninitialized_fill(__end, __begin + __count, __value);
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Iter)
+  _CCCL_REQUIRES(__has_input_traversal<_Iter> _CCCL_AND(!__has_forward_traversal<_Iter>))
+  _CCCL_API constexpr void assign(_Iter __first, _Iter __last)
+  {
+    iterator __end = this->end();
+    for (iterator __current = this->begin(); __current != __end; ++__current, (void) ++__first)
+    {
+      if (__first == __last)
+      {
+        this->__destroy(__current, __end);
+        return;
+      }
+      *__current = *__first;
+    }
+
+    for (; __first != __last; ++__first)
+    {
+      emplace_back(*__first);
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Iter)
+  _CCCL_REQUIRES(__has_forward_traversal<_Iter>)
+  _CCCL_API constexpr void assign(_Iter __first, _Iter __last)
+  {
+    const auto __count = static_cast<size_type>(::cuda::std::distance(__first, __last));
+    if (_Capacity < __count)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+
+    if (__count < this->size())
+    {
+      const iterator __new_end = ::cuda::std::copy(__first, __last, this->begin());
+      this->__destroy(__new_end, this->end());
+    }
+    else
+    {
+      _Iter __middle = ::cuda::std::next(__first, this->size());
+      ::cuda::std::copy(__first, __middle, this->begin());
+      this->__uninitialized_copy(__middle, __last, this->end());
+    }
+  }
+
+  _CCCL_API constexpr void assign(initializer_list<_Tp> __ilist)
+  {
+    const auto __count = static_cast<size_type>(__ilist.size());
+    if (_Capacity < __count)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+
+    if (__count < this->size())
+    {
+      const iterator __new_end = ::cuda::std::copy(__ilist.begin(), __ilist.end(), this->begin());
+      this->__destroy(__new_end, this->end());
+    }
+    else
+    {
+      ::cuda::std::copy(__ilist.begin(), __ilist.begin() + this->size(), this->begin());
+      this->__uninitialized_copy(__ilist.begin() + this->size(), __ilist.end(), this->end());
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND(
+    !::cuda::std::ranges::forward_range<_Range>))
+  _CCCL_API constexpr void assign_range(_Range&& __range)
+  {
+    auto __first      = ::cuda::std::ranges::begin(__range);
+    const auto __last = ::cuda::std::ranges::end(__range);
+    iterator __end    = this->end();
+    for (iterator __current = this->begin(); __current != __end; ++__current, (void) ++__first)
+    {
+      if (__first == __last)
+      {
+        this->__destroy(__current, __end);
+        return;
+      }
+      *__current = *__first;
+    }
+
+    for (; __first != __last; ++__first)
+    {
+      emplace_back(*__first);
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(
+    ::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND ::cuda::std::ranges::forward_range<_Range>
+      _CCCL_AND ::cuda::std::ranges::sized_range<_Range>)
+  _CCCL_API constexpr void assign_range(_Range&& __range)
+  {
+    const auto __size = ::cuda::std::ranges::size(__range);
+    if (_Capacity < __size)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+
+    const auto __first = ::cuda::std::ranges::begin(__range);
+    const auto __last  = ::cuda::std::ranges::__unwrap_end(__range);
+    if (static_cast<size_type>(__size) < this->size())
+    {
+      const iterator __new_end = ::cuda::std::copy(__first, __last, this->begin());
+      this->__destroy(__new_end, this->end());
+    }
+    else
+    {
+      const auto __middle = ::cuda::std::next(__first, this->size());
+      ::cuda::std::copy(__first, __middle, this->begin());
+      this->__uninitialized_copy(__middle, __last, this->end());
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(
+    ::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND ::cuda::std::ranges::forward_range<_Range>
+      _CCCL_AND(!::cuda::std::ranges::sized_range<_Range>))
+  _CCCL_API constexpr void assign_range(_Range&& __range)
+  {
+    const auto __first = ::cuda::std::ranges::begin(__range);
+    const auto __last  = ::cuda::std::ranges::__unwrap_end(__range);
+    const auto __size  = static_cast<size_type>(::cuda::std::ranges::distance(__first, __last));
+    if (_Capacity < __size)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+
+    if (__size < this->size())
+    {
+      const iterator __new_end = ::cuda::std::copy(__first, __last, this->begin());
+      this->__destroy(__new_end, this->end());
+    }
+    else
+    {
+      const auto __middle = ::cuda::std::next(__first, this->size());
+      ::cuda::std::copy(__first, __middle, this->begin());
+      this->__uninitialized_copy(__middle, __last, this->end());
+    }
+  }
+
+  // [containers.sequences.inplace.vector.access], element access
+  [[nodiscard]] _CCCL_API constexpr reference at(const size_type __pos)
+  {
+    if (__pos >= this->size())
+    {
+      _CCCL_THROW(::std::out_of_range, "inplace_vector::at");
+    }
+    return *(this->begin() + __pos);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reference at(const size_type __pos) const
+  {
+    if (__pos >= this->size())
+    {
+      _CCCL_THROW(::std::out_of_range, "inplace_vector::at");
+    }
+    return *(this->begin() + __pos);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr reference operator[](const size_type __pos) noexcept
+  {
+    return *(this->begin() + __pos);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reference operator[](const size_type __pos) const noexcept
+  {
+    return *(this->begin() + __pos);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr reference front() noexcept
+  {
+    return *this->begin();
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reference front() const noexcept
+  {
+    return *this->begin();
+  }
+
+  [[nodiscard]] _CCCL_API constexpr reference back() noexcept
+  {
+    return *(this->end() - 1);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reference back() const noexcept
+  {
+    return *(this->end() - 1);
+  }
+
+  using __base::data;
+
+  // inplace_vector.iterators
+  using __base::begin;
+  using __base::end;
+
+  [[nodiscard]] _CCCL_API constexpr reverse_iterator rbegin() noexcept
+  {
+    return reverse_iterator{this->end()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reverse_iterator rbegin() const noexcept
+  {
+    return const_reverse_iterator{this->end()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr reverse_iterator rend() noexcept
+  {
+    return reverse_iterator{this->begin()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reverse_iterator rend() const noexcept
+  {
+    return const_reverse_iterator{this->begin()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_iterator cbegin() const noexcept
+  {
+    return this->begin();
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_iterator cend() const noexcept
+  {
+    return this->end();
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reverse_iterator crbegin() const noexcept
+  {
+    return const_reverse_iterator{this->end()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reverse_iterator crend() const noexcept
+  {
+    return const_reverse_iterator{this->begin()};
+  }
+
+  // [containers.sequences.inplace.vector.members] size/capacity
+  [[nodiscard]] _CCCL_API constexpr bool empty() const noexcept
+  {
+    return __base::empty();
+  }
+
+  [[nodiscard]] _CCCL_API constexpr size_type size() const noexcept
+  {
+    return __base::size();
+  }
+
+  [[nodiscard]] static _CCCL_API constexpr size_type max_size() noexcept
+  {
+    return _Capacity;
+  }
+
+  [[nodiscard]] static _CCCL_API constexpr size_type capacity() noexcept
+  {
+    return _Capacity;
+  }
+
+  // [containers.sequences.inplace.vector.modifiers], modifiers
+  _CCCL_API constexpr iterator insert(const_iterator __cpos, const _Tp& __value)
+  {
+    return emplace(__cpos, __value);
+  }
+
+  _CCCL_API constexpr iterator insert(const_iterator __cpos, _Tp&& __value)
+  {
+    return emplace(__cpos, ::cuda::std::move(__value));
+  }
+
+  _CCCL_API constexpr iterator insert(const_iterator __cpos, const size_type __count, const _Tp& __value)
+  {
+    const auto __pos = static_cast<size_type>(__cpos - this->cbegin());
+    if (__count > _Capacity - this->size())
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    else if (__pos > this->size())
+    {
+      _CCCL_THROW(::std::out_of_range, "inplace_vector::insert(const_iterator, size_type, T)");
+    }
+
+    const iterator __first = this->begin() + __pos;
+    if (__count == 0)
+    {
+      return __first;
+    }
+
+    const iterator __end = this->end();
+    if (__pos == this->size())
+    {
+      this->__uninitialized_fill(__end, __end + __count, __value);
+      return __first;
+    }
+
+    const iterator __middle = __first + __count;
+    if (__end <= __middle)
+    { // all existing elements are pushed into uninitialized storage
+      this->__uninitialized_fill(__end, __middle, __value);
+      this->__uninitialized_move(__first, __end, __middle);
+      ::cuda::std::fill(__first, __end, __value);
+    }
+    else
+    { // some elements get copied into existing storage
+      this->__uninitialized_move(__end - __count, __end, __end);
+      ::cuda::std::move_backward(__first, __end - __count, __end);
+      ::cuda::std::fill(__first, __middle, __value);
+    }
+
+    return __first;
+  }
+
+  _CCCL_TEMPLATE(class _Iter)
+  _CCCL_REQUIRES(__has_input_traversal<_Iter> _CCCL_AND(!__has_forward_traversal<_Iter>))
+  _CCCL_API constexpr iterator insert(const_iterator __cpos, _Iter __first, _Iter __last)
+  {
+    // add all new elements to the back then rotate
+    const iterator __old_end = this->end();
+    for (; __first != __last; ++__first)
+    {
+      emplace_back(*__first);
+    }
+
+    const iterator __res = this->begin() + (__cpos - this->cbegin());
+    ::cuda::std::rotate(__res, __old_end, this->end());
+    return __res;
+  }
+
+  _CCCL_TEMPLATE(class _Iter)
+  _CCCL_REQUIRES(__has_forward_traversal<_Iter>)
+  _CCCL_API constexpr iterator insert(const_iterator __cpos, _Iter __first, _Iter __last)
+  {
+    const auto __pos   = static_cast<size_type>(__cpos - this->cbegin());
+    const auto __count = static_cast<size_type>(::cuda::std::distance(__first, __last));
+    if (__count > _Capacity - this->size())
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    else if (__pos > this->size())
+    {
+      _CCCL_THROW(::std::out_of_range, "inplace_vector::insert(const_iterator, Iter, Iter)");
+    }
+
+    const iterator __res = this->begin() + __pos;
+    if (__count == 0)
+    {
+      return __res;
+    }
+
+    const iterator __end = this->end();
+    if (__pos == this->size())
+    {
+      this->__uninitialized_copy(__first, __last, __end);
+      return __res;
+    }
+
+    const iterator __middle = __res + __count;
+    if (__end <= __middle)
+    { // all existing elements are pushed into uninitialized storage
+      _Iter __imiddle = ::cuda::std::next(__first, this->size() - __pos);
+      this->__uninitialized_copy(__imiddle, __last, __end);
+      this->__uninitialized_move(__res, __end, __middle);
+      ::cuda::std::copy(__first, __imiddle, __res);
+    }
+    else
+    { // all new elements get copied into existing storage
+      this->__uninitialized_move(__end - __count, __end, __end);
+      ::cuda::std::move_backward(__res, __end - __count, __end);
+      ::cuda::std::copy(__first, __last, __res);
+    }
+
+    return __res;
+  }
+
+  _CCCL_API constexpr iterator insert(const_iterator __cpos, initializer_list<_Tp> __ilist)
+  {
+    const auto __pos   = static_cast<size_type>(__cpos - this->cbegin());
+    const auto __count = __ilist.size();
+    if (__count > _Capacity - this->size())
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    else if (__pos > this->size())
+    {
+      _CCCL_THROW(::std::out_of_range, "inplace_vector::insert(const_iterator, initializer_list)");
+    }
+
+    const iterator __res = this->begin() + __pos;
+    if (__count == 0)
+    {
+      return __res;
+    }
+
+    const iterator __end = this->end();
+    if (__pos == this->size())
+    {
+      this->__uninitialized_copy(__ilist.begin(), __ilist.end(), __end);
+      return __res;
+    }
+
+    const iterator __middle = __res + __count;
+    if (__end <= __middle)
+    { // all existing elements are pushed into uninitialized storage
+      auto __imiddel = __ilist.begin() + this->size() - __pos;
+      this->__uninitialized_copy(__imiddel, __ilist.end(), __end);
+      this->__uninitialized_move(__res, __end, __middle);
+      ::cuda::std::copy(__ilist.begin(), __imiddel, __res);
+    }
+    else
+    { // all new elements get copied into existing storage
+      this->__uninitialized_move(__end - __count, __end, __end);
+      ::cuda::std::move_backward(__res, __end - __count, __end);
+      ::cuda::std::copy(__ilist.begin(), __ilist.end(), __res);
+    }
+
+    return __res;
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND(
+    !::cuda::std::ranges::forward_range<_Range>))
+  _CCCL_API constexpr iterator insert_range(const_iterator __cpos, _Range&& __range)
+  {
+    // add all new elements to the back then rotate
+    auto __first             = ::cuda::std::ranges::begin(__range);
+    const auto __last        = ::cuda::std::ranges::end(__range);
+    const iterator __old_end = this->end();
+    for (; __first != __last; ++__first)
+    {
+      emplace_back(*__first);
+    }
+
+    const auto __pos = this->begin() + static_cast<size_type>(__cpos - this->cbegin());
+    ::cuda::std::rotate(__pos, __old_end, this->end());
+    return __pos;
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(
+    ::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND ::cuda::std::ranges::forward_range<_Range>)
+  _CCCL_API constexpr iterator insert_range(const_iterator __cpos, _Range&& __range)
+  {
+    const auto __first = ::cuda::std::ranges::begin(__range);
+    return insert(__cpos, __first, ::cuda::std::ranges::__unwrap_end(__range));
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND(
+    !::cuda::std::ranges::forward_range<_Range>))
+  _CCCL_API constexpr void append_range(_Range&& __range)
+  {
+    auto __first      = ::cuda::std::ranges::begin(__range);
+    const auto __last = ::cuda::std::ranges::end(__range);
+    for (; __first != __last; ++__first)
+    {
+      emplace_back(*__first);
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(
+    ::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND ::cuda::std::ranges::forward_range<_Range>)
+  _CCCL_API constexpr void append_range(_Range&& __range)
+  {
+    const auto __first = ::cuda::std::ranges::begin(__range);
+    insert(this->end(), __first, ::cuda::std::ranges::__unwrap_end(__range));
+  }
+
+  template <class... _Args>
+  _CCCL_API constexpr iterator emplace(const_iterator __cpos, _Args&&... __args)
+  {
+    const auto __pos = static_cast<size_type>(__cpos - this->cbegin());
+    if (this->size() == _Capacity)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    else if (__pos > this->size())
+    {
+      _CCCL_THROW(::std::out_of_range, "inplace_vector::emplace(const_iterator, Args...)");
+    }
+
+    const iterator __res = this->begin() + __pos;
+    if (__pos == this->size())
+    {
+      this->unchecked_emplace_back(::cuda::std::forward<_Args>(__args)...);
+      return __res;
+    }
+
+    const iterator __end = this->end();
+    _Tp __temp{::cuda::std::forward<_Args>(__args)...};
+    this->unchecked_emplace_back(::cuda::std::move(*(__end - 1)));
+    ::cuda::std::move_backward(__res, __end - 1, __end);
+    *__res = ::cuda::std::move(__temp);
+
+    return __res;
+  }
+
+  template <class... _Args>
+  _CCCL_API constexpr reference emplace_back(_Args&&... __args)
+  {
+    if (this->size() == _Capacity)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+
+    return this->unchecked_emplace_back(::cuda::std::forward<_Args>(__args)...);
+  }
+
+  _CCCL_API constexpr reference push_back(const _Tp& __value)
+  {
+    if (this->size() == _Capacity)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+
+    return this->unchecked_emplace_back(__value);
+  }
+
+  _CCCL_API constexpr reference push_back(_Tp&& __value)
+  {
+    if (this->size() == _Capacity)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+
+    return this->unchecked_emplace_back(::cuda::std::move(__value));
+  }
+
+  template <class... _Args>
+  _CCCL_API constexpr optional<reference>
+  try_emplace_back(_Args&&... __args) noexcept(is_nothrow_constructible_v<_Tp, _Args...>)
+  {
+    if (this->size() == _Capacity)
+    {
+      return {};
+    }
+    return optional<reference>{in_place, this->unchecked_emplace_back(::cuda::std::forward<_Args>(__args)...)};
+  }
+
+  _CCCL_API constexpr optional<reference>
+  try_push_back(const _Tp& __value) noexcept(is_nothrow_copy_constructible_v<_Tp>)
+  {
+    if (this->size() == _Capacity)
+    {
+      return {};
+    }
+    return optional<reference>{in_place, this->unchecked_emplace_back(__value)};
+  }
+
+  _CCCL_API constexpr optional<reference> try_push_back(_Tp&& __value) noexcept(is_nothrow_move_constructible_v<_Tp>)
+  {
+    if (this->size() == _Capacity)
+    {
+      return {};
+    }
+    return optional<reference>{in_place, this->unchecked_emplace_back(::cuda::std::move(__value))};
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND(
+    !::cuda::std::ranges::forward_range<_Range>))
+  _CCCL_API constexpr ::cuda::std::ranges::iterator_t<_Range>
+  try_append_range(_Range&& __range) noexcept(is_nothrow_move_constructible_v<_Tp>)
+  {
+    auto __first      = ::cuda::std::ranges::begin(__range);
+    const auto __last = ::cuda::std::ranges::end(__range);
+    for (; this->size() != _Capacity && __first != __last; ++__first)
+    {
+      emplace_back(*__first);
+    }
+    return __first;
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(
+    ::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND ::cuda::std::ranges::forward_range<_Range>
+      _CCCL_AND ::cuda::std::ranges::sized_range<_Range>)
+  _CCCL_API constexpr ::cuda::std::ranges::iterator_t<_Range>
+  try_append_range(_Range&& __range) noexcept(is_nothrow_move_constructible_v<_Tp>)
+  {
+    const auto __capacity = _Capacity - this->size();
+    const auto __size     = ::cuda::std::ranges::size(__range);
+    const auto __diff     = __size < __capacity ? __size : __capacity;
+
+    const auto __first  = ::cuda::std::ranges::begin(__range);
+    const auto __middle = ::cuda::std::ranges::next(__first, __diff);
+    this->__uninitialized_move(__first, __middle, this->end());
+    return __middle;
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(
+    ::cuda::std::ranges::__container_compatible_range<_Range, _Tp> _CCCL_AND ::cuda::std::ranges::forward_range<_Range>
+      _CCCL_AND(!::cuda::std::ranges::sized_range<_Range>))
+  _CCCL_API constexpr ::cuda::std::ranges::iterator_t<_Range>
+  try_append_range(_Range&& __range) noexcept(is_nothrow_move_constructible_v<_Tp>)
+  {
+    const auto __capacity = static_cast<ptrdiff_t>(_Capacity - this->size());
+    const auto __first    = ::cuda::std::ranges::begin(__range);
+    const auto __size =
+      static_cast<ptrdiff_t>(::cuda::std::ranges::distance(__first, ::cuda::std::ranges::__unwrap_end(__range)));
+    const ptrdiff_t __diff = __size < __capacity ? __size : __capacity;
+
+    const auto __middle = ::cuda::std::ranges::next(__first, __diff);
+    this->__uninitialized_move(__first, __middle, this->end());
+    return __middle;
+  }
+
+  using __base::unchecked_emplace_back;
+
+  _CCCL_API constexpr reference unchecked_push_back(const _Tp& __value) noexcept(is_nothrow_copy_constructible_v<_Tp>)
+  {
+    return this->unchecked_emplace_back(__value);
+  }
+
+  _CCCL_API constexpr reference unchecked_push_back(_Tp&& __value) noexcept(is_nothrow_move_constructible_v<_Tp>)
+  {
+    return this->unchecked_emplace_back(::cuda::std::move(__value));
+  }
+
+  _CCCL_API constexpr void pop_back() noexcept
+  {
+    const auto __end = this->end();
+    this->__destroy(__end - 1, __end);
+  }
+
+  _CCCL_API constexpr iterator erase(const_iterator __cpos) noexcept(is_nothrow_move_assignable_v<_Tp>)
+  {
+    const auto __pos = static_cast<size_type>(__cpos - this->cbegin());
+    if (__pos > this->size())
+    {
+      ::cuda::std::terminate();
+    }
+
+    const iterator __res = this->begin() + __pos;
+    if (__pos == this->size())
+    {
+      return __res;
+    }
+
+    const iterator __end = this->end();
+    ::cuda::std::move(__res + 1, __end, __res);
+    this->__destroy(__end - 1, __end);
+    return __res;
+  }
+
+  _CCCL_API constexpr iterator
+  erase(const_iterator __cfirst, const_iterator __clast) noexcept(is_nothrow_move_assignable_v<_Tp>)
+  {
+    const iterator __first = this->begin() + (__cfirst - this->begin());
+    const iterator __last  = this->begin() + (__clast - this->begin());
+    const iterator __end   = this->end();
+    if (__first == __last)
+    {
+      return __last;
+    }
+
+    if (__first < this->begin() || __end < __last)
+    {
+      ::cuda::std::terminate();
+    }
+
+    const auto __new_end = ::cuda::std::move(__last, __end, __first);
+    this->__destroy(__new_end, __end);
+    return __first;
+  }
+
+  _CCCL_API constexpr void clear() noexcept
+  {
+    this->__destroy(this->begin(), this->end());
+  }
+
+  _CCCL_API constexpr void resize(const size_type __count)
+  {
+    const auto __diff = static_cast<ptrdiff_t>(__count) - static_cast<ptrdiff_t>(this->size());
+    if (__diff == 0)
+    {
+      return;
+    }
+    else if (__diff < 0)
+    {
+      this->__destroy(this->begin() + __count, this->end());
+    }
+    else
+    {
+      if (_Capacity < __count)
+      {
+        _CCCL_THROW(::std::bad_alloc);
+      }
+
+      const iterator __end = this->end();
+      this->__uninitialized_value_construct(__end, __end + __diff);
+    }
+  }
+
+  _CCCL_API constexpr void resize(const size_type __count, const _Tp& __value)
+  {
+    const auto __diff = static_cast<ptrdiff_t>(__count) - static_cast<ptrdiff_t>(this->size());
+    if (__diff == 0)
+    {
+      return;
+    }
+    else if (__diff < 0)
+    {
+      this->__destroy(this->begin() + __count, this->end());
+    }
+    else
+    {
+      if (_Capacity < __count)
+      {
+        _CCCL_THROW(::std::bad_alloc);
+      }
+
+      const iterator __end = this->end();
+      this->__uninitialized_fill(__end, __end + __diff, __value);
+    }
+  }
+
+  _CCCL_API static constexpr void reserve(const size_type __count)
+  {
+    if (_Capacity < __count)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+  _CCCL_API static constexpr void shrink_to_fit() noexcept {}
+
+  _CCCL_TEMPLATE(class _Tp2 = _Tp)
+  _CCCL_REQUIRES(is_swappable_v<_Tp2> _CCCL_AND is_move_constructible_v<_Tp2>)
+  _CCCL_API constexpr void
+  swap(inplace_vector& __other) noexcept(is_nothrow_swappable_v<_Tp2> && is_nothrow_move_constructible_v<_Tp2>)
+  {
+    if (this->size() < __other.size())
+    {
+      const auto __new_mid = ::cuda::std::swap_ranges(this->begin(), this->end(), __other.begin());
+      this->__uninitialized_move(__new_mid, __other.end(), this->end());
+      __other.__destroy(__new_mid, __other.end());
+    }
+    else
+    {
+      const auto __new_mid = ::cuda::std::swap_ranges(__other.begin(), __other.end(), this->begin());
+      __other.__uninitialized_move(__new_mid, this->end(), __other.end());
+      this->__destroy(__new_mid, this->end());
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Tp2 = _Tp)
+  _CCCL_REQUIRES(is_swappable_v<_Tp2> _CCCL_AND is_move_constructible_v<_Tp2>)
+  _CCCL_API friend constexpr void swap(inplace_vector& __lhs, inplace_vector& __rhs) noexcept(
+    _Capacity == 0 || (is_nothrow_swappable_v<_Tp2> && is_nothrow_move_constructible_v<_Tp2>) )
+  {
+    __lhs.swap(__rhs);
+  }
+
+  // inplace_vector.comparison
+  [[nodiscard]] _CCCL_API friend constexpr bool
+  operator==(const inplace_vector& __lhs, const inplace_vector& __rhs) noexcept(
+    noexcept(::cuda::std::equal(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end())))
+  {
+    return ::cuda::std::equal(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end());
+  }
+#if _CCCL_STD_VER <= 2017
+  [[nodiscard]]
+  _CCCL_API friend constexpr bool operator!=(const inplace_vector& __lhs, const inplace_vector& __rhs) noexcept(
+    noexcept(::cuda::std::equal(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end())))
+  {
+    return !::cuda::std::equal(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end());
+  }
+#endif // _CCCL_STD_VER <= 2017
+
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  [[nodiscard]] _CCCL_API friend constexpr __synth_three_way_result_t<_Tp>
+  operator<=>(const inplace_vector& __lhs, const inplace_vector& __rhs) noexcept(
+    noexcept(::cuda::std::lexicographical_compare_three_way(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end())))
+  {
+    return ::cuda::std::lexicographical_compare_three_way(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end());
+  }
+#else // ^^^ _LIBCUDACXX_HAS_SPACESHIP_OPERATOR() ^^^ / vvv !_LIBCUDACXX_HAS_SPACESHIP_OPERATOR() vvv
+  [[nodiscard]]
+  _CCCL_API friend constexpr bool operator<(const inplace_vector& __lhs, const inplace_vector& __rhs) noexcept(
+    noexcept(::cuda::std::lexicographical_compare(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end())))
+  {
+    return ::cuda::std::lexicographical_compare(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end());
+  }
+  [[nodiscard]] _CCCL_API friend constexpr bool
+  operator>(const inplace_vector& __lhs, const inplace_vector& __rhs) noexcept(
+    noexcept(::cuda::std::lexicographical_compare(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end())))
+  {
+    return __rhs < __lhs;
+  }
+  [[nodiscard]] _CCCL_API friend constexpr bool
+  operator<=(const inplace_vector& __lhs, const inplace_vector& __rhs) noexcept(
+    noexcept(::cuda::std::lexicographical_compare(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end())))
+  {
+    return !(__rhs < __lhs);
+  }
+  [[nodiscard]] _CCCL_API friend constexpr bool
+  operator>=(const inplace_vector& __lhs, const inplace_vector& __rhs) noexcept(
+    noexcept(::cuda::std::lexicographical_compare(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end())))
+  {
+    return !(__lhs < __rhs);
+  }
+#endif // !_LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+
+  // [containers.sequences.inplace.vector.erasure]
+  _CCCL_API constexpr size_type __erase(const _Tp& __value) noexcept(is_nothrow_move_assignable_v<_Tp>)
+  {
+    const iterator __old_end = this->end();
+    const iterator __new_end = ::cuda::std::remove(this->begin(), __old_end, __value);
+    this->__destroy(__new_end, __old_end);
+    return static_cast<size_type>(__old_end - __new_end);
+  }
+
+  template <class _Pred>
+  _CCCL_API constexpr size_type __erase_if(_Pred __pred) noexcept(is_nothrow_move_assignable_v<_Tp>)
+  {
+    const iterator __old_end = this->end();
+    const iterator __new_end = ::cuda::std::remove_if(this->begin(), __old_end, ::cuda::std::move(__pred));
+    this->__destroy(__new_end, __old_end);
+    return static_cast<size_type>(__old_end - __new_end);
+  }
+};
+
+template <class _Tp>
+class inplace_vector<_Tp, 0> : __inplace_vector_base<_Tp, 0>
+{
+private:
+  using __base = __inplace_vector_base<_Tp, 0>;
+
+public:
+  using value_type      = _Tp;
+  using size_type       = size_t;
+  using difference_type = ptrdiff_t;
+  using pointer         = _Tp*;
+  using const_pointer   = const _Tp*;
+  using reference       = _Tp&;
+  using const_reference = const _Tp&;
+
+  using iterator       = pointer;
+  using const_iterator = const_pointer;
+
+  using reverse_iterator       = ::cuda::std::reverse_iterator<iterator>;
+  using const_reverse_iterator = ::cuda::std::reverse_iterator<const_iterator>;
+
+  // [containers.sequences.inplace.vector.cons], construct/copy/destroy
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector() noexcept                        = default;
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector(const inplace_vector&)            = default;
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector(inplace_vector&&)                 = default;
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector& operator=(const inplace_vector&) = default;
+  _CCCL_HIDE_FROM_ABI constexpr inplace_vector& operator=(inplace_vector&&)      = default;
+
+  _CCCL_API constexpr explicit inplace_vector(const size_type __count)
+      : __base()
+  {
+    if (__count > 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+
+  _CCCL_API constexpr inplace_vector(const size_type __count, const _Tp&)
+      : __base()
+  {
+    if (__count > 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Iter)
+  _CCCL_REQUIRES(__has_input_traversal<_Iter>)
+  _CCCL_API constexpr inplace_vector(_Iter __first, _Iter __last)
+      : __base()
+  {
+    if (__first != __last)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+
+  _CCCL_API constexpr inplace_vector(initializer_list<_Tp> __ilist)
+      : __base()
+  {
+    if (__ilist.size() != 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp>)
+  _CCCL_API constexpr inplace_vector(from_range_t, _Range&& __range)
+      : __base()
+  {
+    if (::cuda::std::ranges::begin(__range) != ::cuda::std::ranges::end(__range))
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+
+  _CCCL_API constexpr inplace_vector& operator=(initializer_list<_Tp> __ilist)
+  {
+    if (__ilist.size() != 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    return *this;
+  }
+
+  // inplace_vector.assign
+  _CCCL_API constexpr void assign(const size_type __count, const _Tp&)
+  {
+    if (__count != 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    return;
+  }
+
+  _CCCL_TEMPLATE(class _Iter)
+  _CCCL_REQUIRES(__has_input_traversal<_Iter>)
+  _CCCL_API constexpr void assign(_Iter __first, _Iter __last)
+  {
+    if (__first != __last)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    return;
+  }
+
+  _CCCL_API constexpr void assign(initializer_list<_Tp> __ilist)
+  {
+    if (__ilist.size() != 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    return;
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp>)
+  _CCCL_API constexpr void assign_range(_Range&& __range)
+  {
+    if (::cuda::std::ranges::begin(__range) != ::cuda::std::ranges::end(__range))
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    return;
+  }
+
+  // [containers.sequences.inplace.vector.access], element access
+  [[nodiscard]] _CCCL_API constexpr reference at(const size_type __pos)
+  {
+    _CCCL_THROW(::std::out_of_range, "inplace_vector::at");
+    return *(this->begin() + __pos);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reference at(const size_type __pos) const
+  {
+    _CCCL_THROW(::std::out_of_range, "inplace_vector::at");
+    return *(this->begin() + __pos);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr reference operator[](const size_type __pos) noexcept
+  {
+    return *(this->begin() + __pos);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reference operator[](const size_type __pos) const noexcept
+  {
+    return *(this->begin() + __pos);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr reference front() noexcept
+  {
+    return *this->begin();
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reference front() const noexcept
+  {
+    return *this->begin();
+  }
+
+  [[nodiscard]] _CCCL_API constexpr reference back() noexcept
+  {
+    return *(this->end() - 1);
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reference back() const noexcept
+  {
+    return *(this->end() - 1);
+  }
+
+  using __base::data;
+
+  // inplace_vector.iterators
+  using __base::begin;
+  using __base::end;
+
+  [[nodiscard]] _CCCL_API constexpr reverse_iterator rbegin() noexcept
+  {
+    return reverse_iterator{this->end()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reverse_iterator rbegin() const noexcept
+  {
+    return const_reverse_iterator{this->end()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr reverse_iterator rend() noexcept
+  {
+    return reverse_iterator{this->begin()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reverse_iterator rend() const noexcept
+  {
+    return const_reverse_iterator{this->begin()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_iterator cbegin() const noexcept
+  {
+    return this->begin();
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_iterator cend() const noexcept
+  {
+    return this->end();
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reverse_iterator crbegin() const noexcept
+  {
+    return const_reverse_iterator{this->end()};
+  }
+
+  [[nodiscard]] _CCCL_API constexpr const_reverse_iterator crend() const noexcept
+  {
+    return const_reverse_iterator{this->begin()};
+  }
+
+  // [containers.sequences.inplace.vector.members] size/capacity
+  using __base::empty;
+  using __base::size;
+
+  [[nodiscard]] static _CCCL_API constexpr size_type max_size() noexcept
+  {
+    return 0;
+  }
+
+  [[nodiscard]] static _CCCL_API constexpr size_type capacity() noexcept
+  {
+    return 0;
+  }
+
+  // [containers.sequences.inplace.vector.modifiers], modifiers
+  _CCCL_API constexpr iterator insert(const_iterator __cpos, const _Tp& __value)
+  {
+    _CCCL_THROW(::std::bad_alloc);
+    return emplace(__cpos, __value);
+  }
+
+  _CCCL_API constexpr iterator insert(const_iterator __cpos, _Tp&& __value)
+  {
+    _CCCL_THROW(::std::bad_alloc);
+    return emplace(__cpos, ::cuda::std::move(__value));
+  }
+
+  _CCCL_API constexpr iterator insert(const_iterator, const size_type __count, const _Tp&)
+  {
+    if (__count != 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    return nullptr;
+  }
+
+  _CCCL_TEMPLATE(class _Iter)
+  _CCCL_REQUIRES(__has_input_traversal<_Iter>)
+  _CCCL_API constexpr iterator insert(const_iterator, _Iter __first, _Iter __last)
+  {
+    if (__first != __last)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    return nullptr;
+  }
+
+  _CCCL_API constexpr iterator insert(const_iterator, initializer_list<_Tp> __ilist)
+  {
+    if (__ilist.size() != 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    return nullptr;
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp>)
+  _CCCL_API constexpr iterator insert_range(const_iterator, _Range&& __range)
+  {
+    if (::cuda::std::ranges::begin(__range) != ::cuda::std::ranges::end(__range))
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+    return nullptr;
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp>)
+  _CCCL_API constexpr void append_range(_Range&& __range)
+  {
+    if (::cuda::std::ranges::begin(__range) != ::cuda::std::ranges::end(__range))
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+
+  template <class... _Args>
+  _CCCL_API constexpr iterator emplace(const_iterator, _Args&&...)
+  {
+    _CCCL_THROW(::std::bad_alloc);
+  }
+
+  template <class... _Args>
+  _CCCL_API constexpr reference emplace_back(_Args&&...)
+  {
+    _CCCL_THROW(::std::bad_alloc);
+  }
+
+  _CCCL_API constexpr reference push_back(const _Tp&)
+  {
+    _CCCL_THROW(::std::bad_alloc);
+  }
+
+  _CCCL_API constexpr reference push_back(_Tp&&)
+  {
+    _CCCL_THROW(::std::bad_alloc);
+  }
+
+  template <class... _Args>
+  _CCCL_API constexpr optional<reference> try_emplace_back(_Args&&...) noexcept
+  {
+    return {};
+  }
+
+  _CCCL_API constexpr optional<reference> try_push_back(const _Tp&) noexcept
+  {
+    return {};
+  }
+
+  _CCCL_API constexpr optional<reference> try_push_back(_Tp&&) noexcept
+  {
+    return {};
+  }
+
+  _CCCL_TEMPLATE(class _Range)
+  _CCCL_REQUIRES(::cuda::std::ranges::__container_compatible_range<_Range, _Tp>)
+  _CCCL_API constexpr ::cuda::std::ranges::iterator_t<_Range> try_append_range(_Range&& __range) noexcept
+  {
+    return ::cuda::std::ranges::begin(__range);
+  }
+
+  using __base::unchecked_emplace_back;
+
+  _CCCL_API constexpr reference unchecked_push_back(const _Tp&) noexcept
+  {
+    ::cuda::std::terminate();
+  }
+
+  _CCCL_API constexpr reference unchecked_push_back(_Tp&&) noexcept
+  {
+    ::cuda::std::terminate();
+  }
+
+  _CCCL_API constexpr void pop_back() noexcept
+  {
+    ::cuda::std::terminate();
+  }
+
+  _CCCL_API constexpr iterator erase(const_iterator) noexcept
+  {
+    ::cuda::std::terminate();
+  }
+
+  _CCCL_API constexpr iterator erase(const_iterator __cfirst, const_iterator __clast) noexcept
+  {
+    if (__cfirst != __clast)
+    {
+      ::cuda::std::terminate();
+    }
+    return nullptr;
+  }
+
+  _CCCL_API constexpr void clear() noexcept {}
+
+  _CCCL_API constexpr void resize(const size_type __count)
+  {
+    if (__count != 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+
+  _CCCL_API constexpr void resize(const size_type __count, const _Tp&)
+  {
+    if (__count != 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+
+  _CCCL_API static constexpr void reserve(const size_type __count)
+  {
+    if (__count != 0)
+    {
+      _CCCL_THROW(::std::bad_alloc);
+    }
+  }
+  _CCCL_API static constexpr void shrink_to_fit() noexcept {}
+  _CCCL_API constexpr void swap(inplace_vector&) noexcept {}
+  _CCCL_API friend constexpr void swap(inplace_vector&, inplace_vector&) noexcept {}
+
+  // inplace_vector.comparison
+  [[nodiscard]] _CCCL_API friend constexpr bool operator==(const inplace_vector&, const inplace_vector&) noexcept
+  {
+    return true;
+  }
+#if _CCCL_STD_VER <= 2017
+  [[nodiscard]] _CCCL_API friend constexpr bool operator!=(const inplace_vector&, const inplace_vector&) noexcept
+  {
+    return false;
+  }
+#endif // _CCCL_STD_VER <= 2017
+
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  [[nodiscard]] _CCCL_API friend constexpr __synth_three_way_result_t<_Tp>
+  operator<=>(const inplace_vector& __lhs, const inplace_vector& __rhs) noexcept(
+    noexcept(::cuda::std::lexicographical_compare_three_way(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end())))
+  {
+    return ::cuda::std::lexicographical_compare_three_way(__lhs.begin(), __lhs.end(), __rhs.begin(), __rhs.end());
+  }
+#else // ^^^ _LIBCUDACXX_HAS_SPACESHIP_OPERATOR() ^^^ / vvv !_LIBCUDACXX_HAS_SPACESHIP_OPERATOR() vvv
+  [[nodiscard]] _CCCL_API friend constexpr bool operator<(const inplace_vector&, const inplace_vector&) noexcept
+  {
+    return false;
+  }
+  [[nodiscard]] _CCCL_API friend constexpr bool operator>(const inplace_vector&, const inplace_vector&) noexcept
+  {
+    return false;
+  }
+  [[nodiscard]] _CCCL_API friend constexpr bool operator<=(const inplace_vector&, const inplace_vector&) noexcept
+  {
+    return true;
+  }
+  [[nodiscard]] _CCCL_API friend constexpr bool operator>=(const inplace_vector&, const inplace_vector&) noexcept
+  {
+    return true;
+  }
+#endif // !_LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+
+  // [containers.sequences.inplace.vector.erasure]
+  _CCCL_API constexpr size_type __erase(const _Tp&) noexcept
+  {
+    return 0;
+  }
+
+  template <class _Pred>
+  _CCCL_API constexpr size_type __erase_if(_Pred) noexcept
+  {
+    return 0;
+  }
+};
+
+// [containers.sequences.inplace.vector.erasure]
+template <class _Tp, size_t _Capacity>
+_CCCL_API constexpr size_t
+erase(inplace_vector<_Tp, _Capacity>& __cont, const _Tp& __value) noexcept(is_nothrow_move_assignable_v<_Tp>)
+{
+  return __cont.__erase(__value);
+}
+
+template <class _Tp, size_t _Capacity, class _Pred>
+_CCCL_API constexpr size_t
+erase_if(inplace_vector<_Tp, _Capacity>& __cont, _Pred __pred) noexcept(is_nothrow_move_assignable_v<_Tp>)
+{
+  return __cont.__erase_if(__pred);
+}
+
+_CCCL_END_NAMESPACE_CUDA_STD
+
+#include <cuda/std/__cccl/epilogue.h>
+
+#endif // _CUDA_STD_INPLACE_VECTOR

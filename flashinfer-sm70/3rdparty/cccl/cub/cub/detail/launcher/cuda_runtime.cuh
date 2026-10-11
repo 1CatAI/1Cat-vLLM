@@ -1,0 +1,153 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+#pragma once
+
+#include <cub/config.cuh>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cub/util_device.cuh>
+
+#include <thrust/system/cuda/detail/core/triple_chevron_launch.h>
+
+#include <cuda/__device/compute_capability.h>
+
+CUB_NAMESPACE_BEGIN
+
+namespace detail
+{
+struct TripleChevronFactory
+{
+  CUB_RUNTIME_FUNCTION void __assert_pdl_allowed(bool dependent_launch) const
+  {
+    if (dependent_launch)
+    {
+      [[maybe_unused]] int sm_version = 0;
+      _CCCL_ASSERT(SmVersion(sm_version) == cudaSuccess, "Failed to query SM compute capability");
+      if (sm_version >= 900)
+      {
+        [[maybe_unused]] ::cuda::compute_capability cc;
+        _CCCL_ASSERT(PtxComputeCap(cc) == cudaSuccess, "Failed to query PTX compute capability");
+        _CCCL_ASSERT((cc >= ::cuda::compute_capability{9, 0}),
+                     "Enabling PDL for a kernel launch requires CC 9.0+ PTX/SASS when running on SM90+");
+      }
+    }
+  }
+
+  CUB_RUNTIME_FUNCTION THRUST_NS_QUALIFIER::cuda_cub::detail::triple_chevron operator()(
+    dim3 grid,
+    dim3 block,
+    ::cuda::std::size_t shared_mem,
+    ::cudaStream_t stream,
+    bool dependent_launch = false,
+    dim3 cluster_dim      = dim3{0, 0, 0}) const
+  {
+    __assert_pdl_allowed(dependent_launch);
+    return THRUST_NS_QUALIFIER::cuda_cub::detail::triple_chevron(
+      grid, block, shared_mem, stream, dependent_launch, cluster_dim);
+  }
+
+  template <class T = void>
+  CUB_RUNTIME_FUNCTION ::cudaError_t PtxVersion(int& version)
+  {
+    return cub::PtxVersion<T>(version);
+  }
+
+  template <class T = void>
+  CUB_RUNTIME_FUNCTION ::cudaError_t PtxComputeCap(::cuda::compute_capability& cc) const
+  {
+    return ptx_compute_cap<T>(cc);
+  }
+
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION ::cudaError_t MultiProcessorCount(int& sm_count) const
+  {
+    int device_ordinal;
+    ::cudaError_t error = CubDebug(::cudaGetDevice(&device_ordinal));
+    if (::cudaSuccess != error)
+    {
+      return error;
+    }
+
+    // Get SM count
+    return ::cudaDeviceGetAttribute(&sm_count, ::cudaDevAttrMultiProcessorCount, device_ordinal);
+  }
+
+  template <typename Kernel>
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION ::cudaError_t
+  MaxSmOccupancy(int& sm_occupancy, Kernel kernel_ptr, int block_size, int dynamic_smem_bytes = 0)
+  {
+    return ::cudaOccupancyMaxActiveBlocksPerMultiprocessor(&sm_occupancy, kernel_ptr, block_size, dynamic_smem_bytes);
+  }
+
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION ::cudaError_t MaxGridDimX(int& max_grid_dim_x) const
+  {
+    int device_ordinal;
+    ::cudaError_t error = CubDebug(::cudaGetDevice(&device_ordinal));
+    if (::cudaSuccess != error)
+    {
+      return error;
+    }
+
+    // Get max grid dimension
+    return ::cudaDeviceGetAttribute(&max_grid_dim_x, ::cudaDevAttrMaxGridDimX, device_ordinal);
+  }
+
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION ::cudaError_t
+  MemsetAsync(void* dst, unsigned char value, size_t num_bytes, ::cudaStream_t stream) const
+  {
+    return ::cudaMemsetAsync(dst, value, num_bytes, stream);
+  }
+
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION ::cudaError_t
+  MemcpyAsync(void* dst, const void* src, size_t num_bytes, ::cudaMemcpyKind kind, ::cudaStream_t stream) const
+  {
+    return ::cudaMemcpyAsync(dst, src, num_bytes, kind, stream);
+  }
+
+  // TODO(bgruber): this is very similar to thrust::cuda_cub::core::get_max_shared_memory_per_block. We should unify
+  // this.
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION cudaError_t MaxSharedMemory(int& max_shared_memory) const
+  {
+    int device = 0;
+    auto error = CubDebug(cudaGetDevice(&device));
+    if (error != cudaSuccess)
+    {
+      return error;
+    }
+
+    return cudaDeviceGetAttribute(&max_shared_memory, cudaDevAttrMaxSharedMemoryPerBlock, device);
+  }
+
+  template <typename Kernel>
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION ::cudaError_t
+  max_dynamic_smem_size_for(int& max_dynamic_smem_size, [[maybe_unused]] Kernel kernel_ptr)
+  {
+    NV_IF_ELSE_TARGET(NV_IS_HOST, //
+                      ({ return MaxPotentialDynamicSmemBytes(max_dynamic_smem_size, kernel_ptr); }),
+                      ({
+                        ::cudaFuncAttributes func_attrs{};
+                        if (const auto error = CubDebug(::cudaFuncGetAttributes(&func_attrs, kernel_ptr)))
+                        {
+                          return error;
+                        }
+                        max_dynamic_smem_size = func_attrs.maxDynamicSharedSizeBytes;
+                        return cudaSuccess;
+                      }))
+  }
+
+  template <typename Kernel>
+  _CCCL_HIDE_FROM_ABI CUB_RUNTIME_FUNCTION ::cudaError_t set_max_dynamic_smem_size_for(Kernel kernel_ptr, int smem_size)
+  {
+    return CubDebug(::cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+  }
+};
+} // namespace detail
+
+CUB_NAMESPACE_END

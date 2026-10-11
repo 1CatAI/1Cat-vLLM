@@ -1,0 +1,167 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// <utility>
+
+// template<class T, class U>
+//   constexpr bool cmp_equal(T t, U u) noexcept;
+
+// template<class T, class U>
+//   constexpr bool cmp_not_equal(T t, U u) noexcept;
+
+// template<class T, class U>
+//   constexpr bool cmp_less(T t, U u) noexcept;
+
+// template<class T, class U>
+//   constexpr bool cmp_less_equal(T t, U u) noexcept;
+
+// template<class T, class U>
+//   constexpr bool cmp_greater(T t, U u) noexcept;
+
+// template<class T, class U>
+//   constexpr bool cmp_greater_equal(T t, U u) noexcept;
+
+// template<class R, class T>
+//   constexpr bool in_range(T t) noexcept;
+
+#include <cuda/std/cstddef>
+#include <cuda/std/utility>
+
+#include "test_macros.h"
+
+struct NonEmptyT
+{
+  int val;
+  TEST_FUNC NonEmptyT()
+      : val(0)
+  {}
+  TEST_FUNC NonEmptyT(int val)
+      : val(val)
+  {}
+  TEST_FUNC operator int&()
+  {
+    return val;
+  }
+  TEST_FUNC operator int() const
+  {
+    return val;
+  }
+};
+
+enum ColorT
+{
+  red,
+  green,
+  blue
+};
+
+struct EmptyT
+{};
+
+template <class T>
+TEST_FUNC constexpr void test()
+{
+  cuda::std::cmp_equal(T(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_equal'}}
+  cuda::std::cmp_equal(T(), int()); // expected-error 10-11 {{no matching function for call to 'cmp_equal'}}
+  cuda::std::cmp_equal(int(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_equal'}}
+  cuda::std::cmp_not_equal(T(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_not_equal'}}
+  cuda::std::cmp_not_equal(T(), int()); // expected-error 10-11 {{no matching function for call to 'cmp_not_equal'}}
+  cuda::std::cmp_not_equal(int(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_not_equal'}}
+  cuda::std::cmp_less(T(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_less'}}
+  cuda::std::cmp_less(T(), int()); // expected-error 10-11 {{no matching function for call to 'cmp_less'}}
+  cuda::std::cmp_less(int(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_less'}}
+  cuda::std::cmp_less_equal(T(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_less_equal'}}
+  cuda::std::cmp_less_equal(T(), int()); // expected-error 10-11 {{no matching function for call to 'cmp_less_equal'}}
+  cuda::std::cmp_less_equal(int(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_less_equal'}}
+  cuda::std::cmp_greater(T(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_greater'}}
+  cuda::std::cmp_greater(T(), int()); // expected-error 10-11 {{no matching function for call to 'cmp_greater'}}
+  cuda::std::cmp_greater(int(), T()); // expected-error 10-11 {{no matching function for call to 'cmp_greater'}}
+  cuda::std::cmp_greater_equal(T(), T()); // expected-error 10-11 {{no matching function for call to
+                                          // 'cmp_greater_equal'}}
+  cuda::std::cmp_greater_equal(T(), int()); // expected-error 10-11 {{no matching function for call to
+                                            // 'cmp_greater_equal'}}
+  cuda::std::cmp_greater_equal(int(), T()); // expected-error 10-11 {{no matching function for call to
+                                            // 'cmp_greater_equal'}}
+  cuda::std::in_range<T>(int()); // expected-error 10-11 {{no matching function for call to 'in_range'}}
+  cuda::std::in_range<int>(T()); // expected-error 10-11 {{no matching function for call to 'in_range'}}
+}
+#if _CCCL_HAS_CHAR8_T()
+template <class T>
+TEST_FUNC constexpr void test_char8t()
+{
+  cuda::std::cmp_equal(T(), T()); // expected-error 1 {{no matching function for call to 'cmp_equal'}}
+  cuda::std::cmp_equal(T(), int()); // expected-error 1 {{no matching function for call to 'cmp_equal'}}
+  cuda::std::cmp_equal(int(), T()); // expected-error 1 {{no matching function for call to 'cmp_equal'}}
+  cuda::std::cmp_not_equal(T(), T()); // expected-error 1 {{no matching function for call to 'cmp_not_equal'}}
+  cuda::std::cmp_not_equal(T(), int()); // expected-error 1 {{no matching function for call to 'cmp_not_equal'}}
+  cuda::std::cmp_not_equal(int(), T()); // expected-error 1 {{no matching function for call to 'cmp_not_equal'}}
+  cuda::std::cmp_less(T(), T()); // expected-error 1 {{no matching function for call to 'cmp_less'}}
+  cuda::std::cmp_less(T(), int()); // expected-error 1 {{no matching function for call to 'cmp_less'}}
+  cuda::std::cmp_less(int(), T()); // expected-error 1 {{no matching function for call to 'cmp_less'}}
+  cuda::std::cmp_less_equal(T(), T()); // expected-error 1 {{no matching function for call to 'cmp_less_equal'}}
+  cuda::std::cmp_less_equal(T(), int()); // expected-error 1 {{no matching function for call to 'cmp_less_equal'}}
+  cuda::std::cmp_less_equal(int(), T()); // expected-error 1 {{no matching function for call to 'cmp_less_equal'}}
+  cuda::std::cmp_greater(T(), T()); // expected-error 1 {{no matching function for call to 'cmp_greater'}}
+  cuda::std::cmp_greater(T(), int()); // expected-error 1 {{no matching function for call to 'cmp_greater'}}
+  cuda::std::cmp_greater(int(), T()); // expected-error 1 {{no matching function for call to 'cmp_greater'}}
+  cuda::std::cmp_greater_equal(T(), T()); // expected-error 1 {{no matching function for call to 'cmp_greater_equal'}}
+  cuda::std::cmp_greater_equal(T(), int()); // expected-error 1 {{no matching function for call to 'cmp_greater_equal'}}
+  cuda::std::cmp_greater_equal(int(), T()); // expected-error 1 {{no matching function for call to 'cmp_greater_equal'}}
+  cuda::std::in_range<T>(int()); // expected-error 1 {{no matching function for call to 'in_range'}}
+  cuda::std::in_range<int>(T()); // expected-error 1 {{no matching function for call to 'in_range'}}
+}
+#endif // _CCCL_HAS_CHAR8_T()
+
+template <class T>
+TEST_FUNC constexpr void test_uchars()
+{
+  cuda::std::cmp_equal(T(), T()); // expected-error 2 {{no matching function for call to 'cmp_equal'}}
+  cuda::std::cmp_equal(T(), int()); // expected-error 2 {{no matching function for call to 'cmp_equal'}}
+  cuda::std::cmp_equal(int(), T()); // expected-error 2 {{no matching function for call to 'cmp_equal'}}
+  cuda::std::cmp_not_equal(T(), T()); // expected-error 2 {{no matching function for call to 'cmp_not_equal'}}
+  cuda::std::cmp_not_equal(T(), int()); // expected-error 2 {{no matching function for call to 'cmp_not_equal'}}
+  cuda::std::cmp_not_equal(int(), T()); // expected-error 2 {{no matching function for call to 'cmp_not_equal'}}
+  cuda::std::cmp_less(T(), T()); // expected-error 2 {{no matching function for call to 'cmp_less'}}
+  cuda::std::cmp_less(T(), int()); // expected-error 2 {{no matching function for call to 'cmp_less'}}
+  cuda::std::cmp_less(int(), T()); // expected-error 2 {{no matching function for call to 'cmp_less'}}
+  cuda::std::cmp_less_equal(T(), T()); // expected-error 2 {{no matching function for call to 'cmp_less_equal'}}
+  cuda::std::cmp_less_equal(T(), int()); // expected-error 2 {{no matching function for call to 'cmp_less_equal'}}
+  cuda::std::cmp_less_equal(int(), T()); // expected-error 2 {{no matching function for call to 'cmp_less_equal'}}
+  cuda::std::cmp_greater(T(), T()); // expected-error 2 {{no matching function for call to 'cmp_greater'}}
+  cuda::std::cmp_greater(T(), int()); // expected-error 2 {{no matching function for call to 'cmp_greater'}}
+  cuda::std::cmp_greater(int(), T()); // expected-error 2 {{no matching function for call to 'cmp_greater'}}
+  cuda::std::cmp_greater_equal(T(), T()); // expected-error 2 {{no matching function for call to 'cmp_greater_equal'}}
+  cuda::std::cmp_greater_equal(T(), int()); // expected-error 2 {{no matching function for call to 'cmp_greater_equal'}}
+  cuda::std::cmp_greater_equal(int(), T()); // expected-error 2 {{no matching function for call to 'cmp_greater_equal'}}
+  cuda::std::in_range<T>(int()); // expected-error 2 {{no matching function for call to 'in_range'}}
+  cuda::std::in_range<int>(T()); // expected-error 2 {{no matching function for call to 'in_range'}}
+}
+
+int main(int, char**)
+{
+  test<bool>();
+  test<char>();
+  test<wchar_t>();
+  test<float>();
+  test<double>();
+  test<long double>();
+  test<cuda::std::byte>();
+  test<NonEmptyT>();
+  test<ColorT>();
+  test<cuda::std::nullptr_t>();
+  test<EmptyT>();
+
+#if _CCCL_HAS_CHAR8_T()
+  test_char8t<char8_t>();
+#endif // _CCCL_HAS_CHAR8_T()
+
+  test_uchars<char16_t>();
+  test_uchars<char32_t>();
+
+  return 0;
+}

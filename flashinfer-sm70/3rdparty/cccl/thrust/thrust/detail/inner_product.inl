@@ -1,0 +1,117 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+#include <thrust/inner_product.h>
+#include <thrust/iterator/iterator_traits.h>
+#include <thrust/system/detail/generic/select_system.h>
+
+// Include all active backend system implementations (generic, sequential, host and device)
+#include <thrust/system/detail/generic/inner_product.h>
+#include <thrust/system/detail/sequential/inner_product.h>
+#include __THRUST_HOST_SYSTEM_ALGORITH_DETAIL_HEADER_INCLUDE(inner_product.h)
+#include __THRUST_DEVICE_SYSTEM_ALGORITH_DETAIL_HEADER_INCLUDE(inner_product.h)
+
+// Some build systems need a hint to know which files we could include
+#if 0
+#  include <thrust/system/cpp/detail/inner_product.h>
+#  include <thrust/system/cuda/detail/inner_product.h>
+#  include <thrust/system/omp/detail/inner_product.h>
+#  include <thrust/system/tbb/detail/inner_product.h>
+#endif
+
+THRUST_NAMESPACE_BEGIN
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename DerivedPolicy, typename InputIterator1, typename InputIterator2, typename OutputType>
+_CCCL_HOST_DEVICE OutputType inner_product(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec,
+  InputIterator1 first1,
+  InputIterator1 last1,
+  InputIterator2 first2,
+  OutputType init)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::inner_product");
+  using thrust::system::detail::generic::inner_product;
+  return inner_product(thrust::detail::derived_cast(thrust::detail::strip_const(exec)), first1, last1, first2, init);
+} // end inner_product()
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename DerivedPolicy,
+          typename InputIterator1,
+          typename InputIterator2,
+          typename OutputType,
+          typename BinaryFunction1,
+          typename BinaryFunction2>
+_CCCL_HOST_DEVICE OutputType inner_product(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec,
+  InputIterator1 first1,
+  InputIterator1 last1,
+  InputIterator2 first2,
+  OutputType init,
+  BinaryFunction1 binary_op1,
+  BinaryFunction2 binary_op2)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::inner_product");
+  using thrust::system::detail::generic::inner_product;
+  return inner_product(
+    thrust::detail::derived_cast(thrust::detail::strip_const(exec)),
+    first1,
+    last1,
+    first2,
+    init,
+    binary_op1,
+    binary_op2);
+} // end inner_product()
+
+template <typename InputIterator1, typename InputIterator2, typename OutputType>
+OutputType inner_product(InputIterator1 first1, InputIterator1 last1, InputIterator2 first2, OutputType init)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::inner_product");
+  using thrust::system::detail::generic::select_system;
+
+  using System1 = typename thrust::iterator_system<InputIterator1>::type;
+  using System2 = typename thrust::iterator_system<InputIterator2>::type;
+
+  System1 system1;
+  System2 system2;
+
+  return thrust::inner_product(select_system(system1, system2), first1, last1, first2, init);
+} // end inner_product()
+
+template <typename InputIterator1,
+          typename InputIterator2,
+          typename OutputType,
+          typename BinaryFunction1,
+          typename BinaryFunction2>
+OutputType inner_product(
+  InputIterator1 first1,
+  InputIterator1 last1,
+  InputIterator2 first2,
+  OutputType init,
+  BinaryFunction1 binary_op1,
+  BinaryFunction2 binary_op2)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::inner_product");
+  using thrust::system::detail::generic::select_system;
+
+  using System1 = typename thrust::iterator_system<InputIterator1>::type;
+  using System2 = typename thrust::iterator_system<InputIterator2>::type;
+
+  System1 system1;
+  System2 system2;
+
+  return thrust::inner_product(select_system(system1, system2), first1, last1, first2, init, binary_op1, binary_op2);
+} // end inner_product()
+
+THRUST_NAMESPACE_END

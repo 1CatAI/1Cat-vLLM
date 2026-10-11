@@ -1,0 +1,692 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+/*! \file extrema.h
+ *  \brief Functions for computing computing extremal values
+ */
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+#include <thrust/detail/execution_policy.h>
+
+#include <cuda/std/__algorithm/max.h>
+#include <cuda/std/__algorithm/min.h>
+#include <cuda/std/__utility/pair.h>
+
+THRUST_NAMESPACE_BEGIN
+
+using ::cuda::std::max;
+using ::cuda::std::min;
+
+/*! \addtogroup reductions
+ *  \{
+ *  \addtogroup extrema
+ *  \ingroup reductions
+ *  \{
+ */
+
+/*! \p min_element finds the smallest element in the range <tt>[first, last)</tt>.
+ *  It returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that no other iterator in <tt>[first, last)</tt> points to a value smaller
+ *  than \c *i. The return value is \p last if and only if <tt>[first, last)</tt> is an
+ *  empty range.
+ *
+ *  The two versions of \p min_element differ in how they define whether one element is
+ *  less than another. This version compares objects using \c operator<. Specifically,
+ *  this version of \p min_element returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that, for every iterator \c j in <tt>[first, last)</tt>, <tt>*j < *i</tt> is
+ *  \c false.
+ *
+ *  The algorithm's execution is parallelized as determined by \p exec.
+ *
+ *  \param exec The execution policy to use for parallelization.
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \return An iterator pointing to the smallest element of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \c ForwardIterator's \c value_type is a model of <a
+ * href="https://en.cppreference.com/w/cpp/named_req/LessThanComparable">LessThan Comparable</a>.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  #include <thrust/execution_policy.h>
+ *  ...
+ *  int data[6] = {1, 0, 2, 2, 1, 3};
+ *  int *result = thrust::min_element(thrust::host, data, data + 6);
+ *
+ *  // result is data + 1
+ *  // *result is 0
+ *  \endcode
+ *
+ *  \see https://en.cppreference.com/w/cpp/algorithm/min_element
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename DerivedPolicy, typename ForwardIterator>
+_CCCL_HOST_DEVICE ForwardIterator min_element(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec, ForwardIterator first, ForwardIterator last);
+
+/*! \p min_element finds the smallest element in the range <tt>[first, last)</tt>.
+ *  It returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that no other iterator in <tt>[first, last)</tt> points to a value smaller
+ *  than \c *i. The return value is \p last if and only if <tt>[first, last)</tt> is an
+ *  empty range.
+ *
+ *  The two versions of \p min_element differ in how they define whether one element is
+ *  less than another. This version compares objects using \c operator<. Specifically,
+ *  this version of \p min_element returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that, for every iterator \c j in <tt>[first, last)</tt>, <tt>*j < *i</tt> is
+ *  \c false.
+ *
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \return An iterator pointing to the smallest element of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \c ForwardIterator's \c value_type is a model of <a
+ * href="https://en.cppreference.com/w/cpp/named_req/LessThanComparable">LessThan Comparable</a>.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  ...
+ *  int data[6] = {1, 0, 2, 2, 1, 3};
+ *  int *result = thrust::min_element(data, data + 6);
+ *
+ *  // result is data + 1
+ *  // *result is 0
+ *  \endcode
+ *
+ *  \see https://en.cppreference.com/w/cpp/algorithm/min_element
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename ForwardIterator>
+ForwardIterator min_element(ForwardIterator first, ForwardIterator last);
+
+/*! \p min_element finds the smallest element in the range <tt>[first, last)</tt>.
+ *  It returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that no other iterator in <tt>[first, last)</tt> points to a value smaller
+ *  than \c *i. The return value is \p last if and only if <tt>[first, last)</tt> is an
+ *  empty range.
+ *
+ *  The two versions of \p min_element differ in how they define whether one element is
+ *  less than another. This version compares objects using a function object \p comp.
+ *  Specifically, this version of \p min_element returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that, for every iterator \c j in <tt>[first, last)</tt>, <tt>comp(*j, *i)</tt> is
+ *  \c false.
+ *
+ *  The algorithm's execution is parallelized as determined by \p exec.
+ *
+ *  \param exec The execution policy to use for parallelization.
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \param comp A binary predicate used for comparison.
+ *  \return An iterator pointing to the smallest element of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam DerivedPolicy The name of the derived execution policy.
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \p ForwardIterator's \c value_type is convertible to both \p comp's first and second argument type.
+ *  \tparam BinaryPredicate is a model of <a
+ * href="https://en.cppreference.com/w/cpp/named_req/BinaryPredicate">Binary Predicate</a>.
+ *
+ *  The following code snippet demonstrates how to use \p min_element to find the smallest element
+ *  of a collection of key-value pairs using the \p thrust::host execution policy for parallelization:
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  #include <thrust/execution_policy.h>
+ *  ...
+ *
+ *  struct key_value
+ *  {
+ *    int key;
+ *    int value;
+ *  };
+ *
+ *  struct compare_key_value
+ *  {
+ *    __host__ __device__
+ *    bool operator()(key_value lhs, key_value rhs)
+ *    {
+ *      return lhs.key < rhs.key;
+ *    }
+ *  };
+ *
+ *  ...
+ *  key_value data[4] = { {4,5}, {0,7}, {2,3}, {6,1} };
+ *
+ *  key_value *smallest = thrust::min_element(thrust::host, data, data + 4, compare_key_value());
+ *
+ *  // smallest == data + 1
+ *  // *smallest == {0,7}
+ *  \endcode
+ *
+ *  \see https://en.cppreference.com/w/cpp/algorithm/min_element
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename DerivedPolicy, typename ForwardIterator, typename BinaryPredicate>
+_CCCL_HOST_DEVICE ForwardIterator min_element(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec,
+  ForwardIterator first,
+  ForwardIterator last,
+  BinaryPredicate comp);
+
+/*! \p min_element finds the smallest element in the range <tt>[first, last)</tt>.
+ *  It returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that no other iterator in <tt>[first, last)</tt> points to a value smaller
+ *  than \c *i. The return value is \p last if and only if <tt>[first, last)</tt> is an
+ *  empty range.
+ *
+ *  The two versions of \p min_element differ in how they define whether one element is
+ *  less than another. This version compares objects using a function object \p comp.
+ *  Specifically, this version of \p min_element returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that, for every iterator \c j in <tt>[first, last)</tt>, <tt>comp(*j, *i)</tt> is
+ *  \c false.
+ *
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \param comp A binary predicate used for comparison.
+ *  \return An iterator pointing to the smallest element of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \p ForwardIterator's \c value_type is convertible to both \p comp's first and second argument type.
+ *  \tparam BinaryPredicate is a model of <a href="https://en.cppreference.com/w/cpp/named_req/BinaryPredicate">Binary
+ * Predicate</a>.
+ *
+ *  The following code snippet demonstrates how to use \p min_element to find the smallest element
+ *  of a collection of key-value pairs.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *
+ *  struct key_value
+ *  {
+ *    int key;
+ *    int value;
+ *  };
+ *
+ *  struct compare_key_value
+ *  {
+ *    __host__ __device__
+ *    bool operator()(key_value lhs, key_value rhs)
+ *    {
+ *      return lhs.key < rhs.key;
+ *    }
+ *  };
+ *
+ *  ...
+ *  key_value data[4] = { {4,5}, {0,7}, {2,3}, {6,1} };
+ *
+ *  key_value *smallest = thrust::min_element(data, data + 4, compare_key_value());
+ *
+ *  // smallest == data + 1
+ *  // *smallest == {0,7}
+ *  \endcode
+ *
+ *  \see https://en.cppreference.com/w/cpp/algorithm/min_element
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename ForwardIterator, typename BinaryPredicate>
+ForwardIterator min_element(ForwardIterator first, ForwardIterator last, BinaryPredicate comp);
+
+/*! \p max_element finds the largest element in the range <tt>[first, last)</tt>.
+ *  It returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that no other iterator in <tt>[first, last)</tt> points to a value larger
+ *  than \c *i. The return value is \p last if and only if <tt>[first, last)</tt> is an
+ *  empty range.
+ *
+ *  The two versions of \p max_element differ in how they define whether one element is
+ *  greater than another. This version compares objects using \c operator<. Specifically,
+ *  this version of \p max_element returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that, for every iterator \c j in <tt>[first, last)</tt>, <tt>*i < *j</tt> is
+ *  \c false.
+ *
+ *  The algorithm's execution is parallelized as determined by \p exec.
+ *
+ *  \param exec The execution policy to use for parallelization.
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \return An iterator pointing to the largest element of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam A Thrust backend system.
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \c ForwardIterator's \c value_type is a model of <a
+ * href="https://en.cppreference.com/w/cpp/named_req/LessThanComparable">LessThan Comparable</a>.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  #include <thrust/execution_policy.h>
+ *  ...
+ *  int data[6] = {1, 0, 2, 2, 1, 3};
+ *  int *result = thrust::max_element(thrust::host, data, data + 6);
+ *
+ *  // *result == 3
+ *  \endcode
+ *
+ *  \see https://en.cppreference.com/w/cpp/algorithm/max_element
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename DerivedPolicy, typename ForwardIterator>
+_CCCL_HOST_DEVICE ForwardIterator max_element(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec, ForwardIterator first, ForwardIterator last);
+
+/*! \p max_element finds the largest element in the range <tt>[first, last)</tt>.
+ *  It returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that no other iterator in <tt>[first, last)</tt> points to a value larger
+ *  than \c *i. The return value is \p last if and only if <tt>[first, last)</tt> is an
+ *  empty range.
+ *
+ *  The two versions of \p max_element differ in how they define whether one element is
+ *  greater than another. This version compares objects using \c operator<. Specifically,
+ *  this version of \p max_element returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that, for every iterator \c j in <tt>[first, last)</tt>, <tt>*i < *j</tt> is
+ *  \c false.
+ *
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \return An iterator pointing to the largest element of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \c ForwardIterator's \c value_type is a model of <a
+ * href="https://en.cppreference.com/w/cpp/named_req/LessThanComparable">LessThan Comparable</a>.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  ...
+ *  int data[6] = {1, 0, 2, 2, 1, 3};
+ *  int *result = thrust::max_element(data, data + 6);
+ *
+ *  // *result == 3
+ *  \endcode
+ *
+ *  \see https://en.cppreference.com/w/cpp/algorithm/max_element
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename ForwardIterator>
+ForwardIterator max_element(ForwardIterator first, ForwardIterator last);
+
+/*! \p max_element finds the largest element in the range <tt>[first, last)</tt>.
+ *  It returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that no other iterator in <tt>[first, last)</tt> points to a value larger
+ *  than \c *i. The return value is \p last if and only if <tt>[first, last)</tt> is an
+ *  empty range.
+ *
+ *  The two versions of \p max_element differ in how they define whether one element is
+ *  less than another. This version compares objects using a function object \p comp.
+ *  Specifically, this version of \p max_element returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that, for every iterator \c j in <tt>[first, last)</tt>, <tt>comp(*i, *j)</tt> is
+ *  \c false.
+ *
+ *  The algorithm's execution is parallelized as determined by \p exec.
+ *
+ *  \param exec The execution policy to use for parallelization.
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \param comp A binary predicate used for comparison.
+ *  \return An iterator pointing to the largest element of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam DerivedPolicy The name of the derived execution policy.
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \p ForwardIterator's \c value_type is convertible to both \p comp's first and second argument type.
+ *  \tparam BinaryPredicate is a model of <a href="https://en.cppreference.com/w/cpp/named_req/BinaryPredicate">Binary
+ * Predicate</a>.
+ *
+ *  The following code snippet demonstrates how to use \p max_element to find the largest element
+ *  of a collection of key-value pairs using the \p thrust::host execution policy for parallelization.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  #include <thrust/execution_policy.h>
+ *  ...
+ *
+ *  struct key_value
+ *  {
+ *    int key;
+ *    int value;
+ *  };
+ *
+ *  struct compare_key_value
+ *  {
+ *    __host__ __device__
+ *    bool operator()(key_value lhs, key_value rhs)
+ *    {
+ *      return lhs.key < rhs.key;
+ *    }
+ *  };
+ *
+ *  ...
+ *  key_value data[4] = { {4,5}, {0,7}, {2,3}, {6,1} };
+ *
+ *  key_value *largest = thrust::max_element(thrust::host, data, data + 4, compare_key_value());
+ *
+ *  // largest == data + 3
+ *  // *largest == {6,1}
+ *  \endcode
+ *
+ *  \see https://en.cppreference.com/w/cpp/algorithm/max_element
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename DerivedPolicy, typename ForwardIterator, typename BinaryPredicate>
+_CCCL_HOST_DEVICE ForwardIterator max_element(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec,
+  ForwardIterator first,
+  ForwardIterator last,
+  BinaryPredicate comp);
+
+/*! \p max_element finds the largest element in the range <tt>[first, last)</tt>.
+ *  It returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that no other iterator in <tt>[first, last)</tt> points to a value larger
+ *  than \c *i. The return value is \p last if and only if <tt>[first, last)</tt> is an
+ *  empty range.
+ *
+ *  The two versions of \p max_element differ in how they define whether one element is
+ *  less than another. This version compares objects using a function object \p comp.
+ *  Specifically, this version of \p max_element returns the first iterator \c i in <tt>[first, last)</tt>
+ *  such that, for every iterator \c j in <tt>[first, last)</tt>, <tt>comp(*i, *j)</tt> is
+ *  \c false.
+ *
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \param comp A binary predicate used for comparison.
+ *  \return An iterator pointing to the largest element of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \p ForwardIterator's \c value_type is convertible to both \p comp's first and second argument type.
+ *  \tparam BinaryPredicate is a model of <a href="https://en.cppreference.com/w/cpp/named_req/BinaryPredicate">Binary
+ * Predicate</a>.
+ *
+ *  The following code snippet demonstrates how to use \p max_element to find the largest element
+ *  of a collection of key-value pairs.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *
+ *  struct key_value
+ *  {
+ *    int key;
+ *    int value;
+ *  };
+ *
+ *  struct compare_key_value
+ *  {
+ *    __host__ __device__
+ *    bool operator()(key_value lhs, key_value rhs)
+ *    {
+ *      return lhs.key < rhs.key;
+ *    }
+ *  };
+ *
+ *  ...
+ *  key_value data[4] = { {4,5}, {0,7}, {2,3}, {6,1} };
+ *
+ *  key_value *largest = thrust::max_element(data, data + 4, compare_key_value());
+ *
+ *  // largest == data + 3
+ *  // *largest == {6,1}
+ *  \endcode
+ *
+ *  \see https://en.cppreference.com/w/cpp/algorithm/max_element
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename ForwardIterator, typename BinaryPredicate>
+ForwardIterator max_element(ForwardIterator first, ForwardIterator last, BinaryPredicate comp);
+
+/*! \p minmax_element finds the smallest and largest elements in the range <tt>[first, last)</tt>.
+ *  It returns a pair of iterators <tt>(imin, imax)</tt> where \c imin is the same iterator
+ *  returned by \p min_element and \c imax is the same iterator returned by \p max_element.
+ *  This function is potentially more efficient than separate calls to \p min_element and \p max_element.
+ *
+ *  The algorithm's execution is parallelized as determined by \p exec.
+ *
+ *  \param exec The execution policy to use for parallelization.
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \return A pair of iterator pointing to the smallest and largest elements of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam DerivedPolicy The name of the derived execution policy.
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \c ForwardIterator's \c value_type is a model of <a
+ * href="https://en.cppreference.com/w/cpp/named_req/LessThanComparable">LessThan Comparable</a>.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  #include <thrust/execution_policy.h>
+ *  ...
+ *  int data[6] = {1, 0, 2, 2, 1, 3};
+ *  cuda::std::pair<int *, int *> result = thrust::minmax_element(thrust::host, data, data + 6);
+ *
+ *  // result.first is data + 1
+ *  // result.second is data + 5
+ *  // *result.first is 0
+ *  // *result.second is 3
+ *  \endcode
+ *
+ *  \see min_element
+ *  \see max_element
+ *  \see http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2005/n1840.pdf
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename DerivedPolicy, typename ForwardIterator>
+_CCCL_HOST_DEVICE ::cuda::std::pair<ForwardIterator, ForwardIterator> minmax_element(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec, ForwardIterator first, ForwardIterator last);
+
+/*! \p minmax_element finds the smallest and largest elements in the range <tt>[first, last)</tt>.
+ *  It returns a pair of iterators <tt>(imin, imax)</tt> where \c imin is the same iterator
+ *  returned by \p min_element and \c imax is the same iterator returned by \p max_element.
+ *  This function is potentially more efficient than separate calls to \p min_element and \p max_element.
+ *
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \return A pair of iterator pointing to the smallest and largest elements of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \c ForwardIterator's \c value_type is a model of <a
+ * href="https://en.cppreference.com/w/cpp/named_req/LessThanComparable">LessThan Comparable</a>.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  ...
+ *  int data[6] = {1, 0, 2, 2, 1, 3};
+ *  cuda::std::pair<int *, int *> result = thrust::minmax_element(data, data + 6);
+ *
+ *  // result.first is data + 1
+ *  // result.second is data + 5
+ *  // *result.first is 0
+ *  // *result.second is 3
+ *  \endcode
+ *
+ *  \see min_element
+ *  \see max_element
+ *  \see http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2005/n1840.pdf
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename ForwardIterator>
+::cuda::std::pair<ForwardIterator, ForwardIterator> minmax_element(ForwardIterator first, ForwardIterator last);
+
+/*! \p minmax_element finds the smallest and largest elements in the range <tt>[first, last)</tt>.
+ *  It returns a pair of iterators <tt>(imin, imax)</tt> where \c imin is the same iterator
+ *  returned by \p min_element and \c imax is the same iterator returned by \p max_element.
+ *  This function is potentially more efficient than separate calls to \p min_element and \p max_element.
+ *
+ *  The algorithm's execution is parallelized as determined by \p exec.
+ *
+ *  \param exec The execution policy to use for parallelization.
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \param comp A binary predicate used for comparison.
+ *  \return A pair of iterator pointing to the smallest and largest elements of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam DerivedPolicy The name of the derived execution policy.
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \p ForwardIterator's \c value_type is convertible to both \p comp's first and second argument type.
+ *  \tparam BinaryPredicate is a model of <a href="https://en.cppreference.com/w/cpp/named_req/BinaryPredicate">Binary
+ * Predicate</a>.
+ *
+ *  The following code snippet demonstrates how to use \p minmax_element to find the smallest and largest elements
+ *  of a collection of key-value pairs using the \p thrust::host execution policy for parallelization:
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  #include <cuda/std/__utility/pair.h>
+ *  #include <thrust/execution_policy.h>
+ *  ...
+ *
+ *  struct key_value
+ *  {
+ *    int key;
+ *    int value;
+ *  };
+ *
+ *  struct compare_key_value
+ *  {
+ *    __host__ __device__
+ *    bool operator()(key_value lhs, key_value rhs)
+ *    {
+ *      return lhs.key < rhs.key;
+ *    }
+ *  };
+ *
+ *  ...
+ *  key_value data[4] = { {4,5}, {0,7}, {2,3}, {6,1} };
+ *
+ *  cuda::std::pair<key_value*,key_value*> extrema = thrust::minmax_element(thrust::host, data, data + 4,
+ * compare_key_value());
+ *
+ *  // extrema.first   == data + 1
+ *  // *extrema.first  == {0,7}
+ *  // extrema.second  == data + 3
+ *  // *extrema.second == {6,1}
+ *  \endcode
+ *
+ *  \see min_element
+ *  \see max_element
+ *  \see http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2005/n1840.pdf
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename DerivedPolicy, typename ForwardIterator, typename BinaryPredicate>
+_CCCL_HOST_DEVICE ::cuda::std::pair<ForwardIterator, ForwardIterator> minmax_element(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec,
+  ForwardIterator first,
+  ForwardIterator last,
+  BinaryPredicate comp);
+
+/*! \p minmax_element finds the smallest and largest elements in the range <tt>[first, last)</tt>.
+ *  It returns a pair of iterators <tt>(imin, imax)</tt> where \c imin is the same iterator
+ *  returned by \p min_element and \c imax is the same iterator returned by \p max_element.
+ *  This function is potentially more efficient than separate calls to \p min_element and \p max_element.
+ *
+ *  \param first The beginning of the sequence.
+ *  \param last  The end of the sequence.
+ *  \param comp A binary predicate used for comparison.
+ *  \return A pair of iterator pointing to the smallest and largest elements of the range <tt>[first, last)</tt>,
+ *          if it is not an empty range; \p last, otherwise.
+ *
+ *  \tparam ForwardIterator is a model of <a href="https://en.cppreference.com/w/cpp/iterator/forward_iterator">Forward
+ * Iterator</a>, and \p ForwardIterator's \c value_type is convertible to both \p comp's first and second argument type.
+ *  \tparam BinaryPredicate is a model of <a href="https://en.cppreference.com/w/cpp/named_req/BinaryPredicate">Binary
+ * Predicate</a>.
+ *
+ *  The following code snippet demonstrates how to use \p minmax_element to find the smallest and largest elements
+ *  of a collection of key-value pairs.
+ *
+ *  \code
+ *  #include <thrust/extrema.h>
+ *  #include <cuda/std/__utility/pair.h>
+ *
+ *  struct key_value
+ *  {
+ *    int key;
+ *    int value;
+ *  };
+ *
+ *  struct compare_key_value
+ *  {
+ *    __host__ __device__
+ *    bool operator()(key_value lhs, key_value rhs)
+ *    {
+ *      return lhs.key < rhs.key;
+ *    }
+ *  };
+ *
+ *  ...
+ *  key_value data[4] = { {4,5}, {0,7}, {2,3}, {6,1} };
+ *
+ *  cuda::std::pair<key_value*,key_value*> extrema = thrust::minmax_element(data, data + 4, compare_key_value());
+ *
+ *  // extrema.first   == data + 1
+ *  // *extrema.first  == {0,7}
+ *  // extrema.second  == data + 3
+ *  // *extrema.second == {6,1}
+ *  \endcode
+ *
+ *  \see min_element
+ *  \see max_element
+ *  \see http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2005/n1840.pdf
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename ForwardIterator, typename BinaryPredicate>
+::cuda::std::pair<ForwardIterator, ForwardIterator>
+minmax_element(ForwardIterator first, ForwardIterator last, BinaryPredicate comp);
+
+/*! \} // end extrema
+ *  \} // end reductions
+ */
+
+THRUST_NAMESPACE_END
+
+#include <thrust/detail/extrema.inl>

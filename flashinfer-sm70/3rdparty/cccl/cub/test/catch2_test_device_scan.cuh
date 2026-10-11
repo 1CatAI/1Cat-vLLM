@@ -1,0 +1,232 @@
+// SPDX-FileCopyrightText: Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3
+
+#pragma once
+
+#include <cub/detail/type_traits.cuh>
+#include <cub/thread/thread_operators.cuh>
+
+#include <c2h/catch2_test_helper.h>
+
+/**
+ * @brief Helper class template to facilitate specifying input/output type pairs along with the key
+ * type for *-by-key algorithms, and an equality operator type.
+ */
+template <typename InputT,
+          typename OutputT     = InputT,
+          typename KeyT        = std::int32_t,
+          typename EqualityOpT = ::cuda::std::equal_to<>>
+struct type_quad
+{
+  using input_t  = InputT;
+  using output_t = OutputT;
+  using key_t    = KeyT;
+  using eq_op_t  = EqualityOpT;
+};
+
+/**
+ * @brief Mod2Equality (used for integral keys, making keys more likely to equal each other)
+ */
+struct Mod2Equality
+{
+  template <typename T>
+  __host__ __device__ __forceinline__ T operator()(const T& a, const T& b) const
+  {
+    return (a % 2) == (b % 2);
+  }
+};
+
+template <typename InputIt, typename OutputIt, typename InitValueT, typename BinaryOp>
+void compute_exclusive_scan_reference(InputIt first, InputIt last, OutputIt result, InitValueT init, BinaryOp op)
+{
+  using value_t  = cub::detail::it_value_t<InputIt>;
+  using accum_t  = ::cuda::std::__accumulator_t<BinaryOp, value_t, InitValueT>;
+  using output_t = cub::detail::it_value_t<OutputIt>;
+  accum_t acc    = static_cast<accum_t>(init);
+  for (; first != last; ++first)
+  {
+    auto v    = *first;
+    *result++ = static_cast<output_t>(acc);
+    acc       = op(acc, v);
+  }
+}
+
+template <typename InputIt, typename OutputIt, typename BinaryOp, typename InitValueT>
+void compute_inclusive_scan_reference(InputIt first, InputIt last, OutputIt result, BinaryOp op, InitValueT init)
+{
+  using value_t  = cub::detail::it_value_t<InputIt>;
+  using accum_t  = ::cuda::std::__accumulator_t<BinaryOp, value_t, InitValueT>;
+  using output_t = cub::detail::it_value_t<OutputIt>;
+  accum_t acc    = static_cast<accum_t>(init);
+  for (; first != last; ++first)
+  {
+    acc       = op(acc, *first);
+    *result++ = static_cast<output_t>(acc);
+  }
+}
+
+template <typename ValueInItT,
+          typename KeyInItT,
+          typename ValuesOutItT,
+          typename ScanOpT,
+          typename EqualityOpT,
+          typename InitValueT>
+void compute_exclusive_scan_by_key_reference(
+  ValueInItT h_values_it,
+  KeyInItT h_keys_it,
+  ValuesOutItT result_out_it,
+  ScanOpT scan_op,
+  EqualityOpT equality_op,
+  InitValueT init,
+  std::size_t num_items)
+{
+  using value_t  = cub::detail::it_value_t<ValueInItT>;
+  using accum_t  = ::cuda::std::__accumulator_t<ScanOpT, value_t, InitValueT>;
+  using output_t = cub::detail::it_value_t<ValuesOutItT>;
+
+  if (num_items > 0)
+  {
+    for (std::size_t i = 0; i < num_items;)
+    {
+      accum_t val       = static_cast<accum_t>(h_values_it[i]);
+      result_out_it[i]  = init;
+      accum_t inclusive = static_cast<accum_t>(scan_op(init, val));
+
+      ++i;
+
+      for (; i < num_items && equality_op(h_keys_it[i - 1], h_keys_it[i]); ++i)
+      {
+        val              = static_cast<accum_t>(h_values_it[i]);
+        result_out_it[i] = static_cast<output_t>(inclusive);
+        inclusive        = static_cast<accum_t>(scan_op(inclusive, val));
+      }
+    }
+  }
+}
+
+template <typename ValueT, typename KeyT, typename ValuesOutItT, typename ScanOpT, typename EqualityOpT, typename InitValueT>
+void compute_exclusive_scan_by_key_reference(
+  const c2h::device_vector<ValueT>& d_values,
+  const c2h::device_vector<KeyT>& d_keys,
+  ValuesOutItT result_out_it,
+  ScanOpT scan_op,
+  EqualityOpT equality_op,
+  InitValueT init)
+{
+  c2h::host_vector<ValueT> host_values(d_values);
+  c2h::host_vector<KeyT> host_keys(d_keys);
+
+  std::size_t num_items = host_values.size();
+
+  compute_exclusive_scan_by_key_reference(
+    host_values.cbegin(), host_keys.cbegin(), result_out_it, scan_op, equality_op, init, num_items);
+}
+
+template <typename ValueInItT, typename KeyInItT, typename ValuesOutItT, typename ScanOpT, typename EqualityOpT>
+void compute_inclusive_scan_by_key_reference(
+  ValueInItT h_values_it,
+  KeyInItT h_keys_it,
+  ValuesOutItT result_out_it,
+  ScanOpT scan_op,
+  EqualityOpT equality_op,
+  std::size_t num_items)
+{
+  using value_t  = cub::detail::it_value_t<ValueInItT>;
+  using accum_t  = ::cuda::std::__accumulator_t<ScanOpT, value_t, value_t>;
+  using output_t = cub::detail::it_value_t<ValuesOutItT>;
+
+  for (std::size_t i = 0; i < num_items;)
+  {
+    accum_t inclusive = h_values_it[i];
+    result_out_it[i]  = static_cast<output_t>(inclusive);
+
+    ++i;
+
+    for (; i < num_items && equality_op(h_keys_it[i - 1], h_keys_it[i]); ++i)
+    {
+      accum_t val      = h_values_it[i];
+      inclusive        = static_cast<accum_t>(scan_op(inclusive, val));
+      result_out_it[i] = static_cast<output_t>(inclusive);
+    }
+  }
+}
+
+template <typename ValueT, typename KeyT, typename ValuesOutItT, typename ScanOpT, typename EqualityOpT>
+void compute_inclusive_scan_by_key_reference(
+  const c2h::device_vector<ValueT>& d_values,
+  const c2h::device_vector<KeyT>& d_keys,
+  ValuesOutItT result_out_it,
+  ScanOpT scan_op,
+  EqualityOpT equality_op)
+{
+  c2h::host_vector<ValueT> host_values(d_values);
+  c2h::host_vector<KeyT> host_keys(d_keys);
+
+  std::size_t num_items = host_values.size();
+
+  compute_inclusive_scan_by_key_reference(
+    host_values.cbegin(), host_keys.cbegin(), result_out_it, scan_op, equality_op, num_items);
+}
+
+struct block_size_recording_constant_iterator
+{
+  using value_type        = int;
+  using reference         = int;
+  using pointer           = int*;
+  using difference_type   = ptrdiff_t;
+  using iterator_category = ::cuda::std::random_access_iterator_tag;
+
+  int value;
+  int* block_size_ptr;
+  difference_type offset;
+
+  __host__ __device__ block_size_recording_constant_iterator(int val, int* bs_ptr, difference_type off = 0)
+      : value(val)
+      , block_size_ptr(bs_ptr)
+      , offset(off)
+  {}
+
+  __device__ reference operator[](difference_type) const
+  {
+    if (threadIdx.x == 0)
+    {
+      *block_size_ptr = static_cast<int>(blockDim.x);
+    }
+    return value;
+  }
+
+  __device__ reference operator*() const
+  {
+    if (threadIdx.x == 0)
+    {
+      *block_size_ptr = static_cast<int>(blockDim.x);
+    }
+    return value;
+  }
+
+  __host__ __device__ block_size_recording_constant_iterator operator+(difference_type n) const
+  {
+    return {value, block_size_ptr, offset + n};
+  }
+
+  __host__ __device__ block_size_recording_constant_iterator& operator+=(difference_type n)
+  {
+    offset += n;
+    return *this;
+  }
+
+  __host__ __device__ difference_type operator-(const block_size_recording_constant_iterator& other) const
+  {
+    return offset - other.offset;
+  }
+
+  __host__ __device__ bool operator==(const block_size_recording_constant_iterator& other) const
+  {
+    return offset == other.offset;
+  }
+
+  __host__ __device__ bool operator!=(const block_size_recording_constant_iterator& other) const
+  {
+    return offset != other.offset;
+  }
+};

@@ -1,0 +1,108 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+#include <thrust/iterator/iterator_traits.h>
+#include <thrust/sequence.h>
+#include <thrust/system/detail/generic/select_system.h>
+
+// Include all active backend system implementations (generic, sequential, host and device)
+#include <thrust/system/detail/generic/sequence.h>
+#include <thrust/system/detail/sequential/sequence.h>
+#include __THRUST_HOST_SYSTEM_ALGORITH_DETAIL_HEADER_INCLUDE(sequence.h)
+#include __THRUST_DEVICE_SYSTEM_ALGORITH_DETAIL_HEADER_INCLUDE(sequence.h)
+
+// Some build systems need a hint to know which files we could include
+#if 0
+#  include <thrust/system/cpp/detail/sequence.h>
+#  include <thrust/system/cuda/detail/sequence.h>
+#  include <thrust/system/omp/detail/sequence.h>
+#  include <thrust/system/tbb/detail/sequence.h>
+#endif
+
+THRUST_NAMESPACE_BEGIN
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename DerivedPolicy, typename ForwardIterator>
+_CCCL_HOST_DEVICE void
+sequence(const thrust::detail::execution_policy_base<DerivedPolicy>& exec, ForwardIterator first, ForwardIterator last)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::sequence");
+  using thrust::system::detail::generic::sequence;
+  return sequence(thrust::detail::derived_cast(thrust::detail::strip_const(exec)), first, last);
+} // end sequence()
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename DerivedPolicy, typename ForwardIterator, typename T>
+_CCCL_HOST_DEVICE void sequence(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec, ForwardIterator first, ForwardIterator last, T init)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::sequence");
+  using thrust::system::detail::generic::sequence;
+  return sequence(thrust::detail::derived_cast(thrust::detail::strip_const(exec)), first, last, init);
+} // end sequence()
+
+_CCCL_EXEC_CHECK_DISABLE
+template <typename DerivedPolicy, typename ForwardIterator, typename T>
+_CCCL_HOST_DEVICE void sequence(
+  const thrust::detail::execution_policy_base<DerivedPolicy>& exec,
+  ForwardIterator first,
+  ForwardIterator last,
+  T init,
+  T step)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::sequence");
+  using thrust::system::detail::generic::sequence;
+  return sequence(thrust::detail::derived_cast(thrust::detail::strip_const(exec)), first, last, init, step);
+} // end sequence()
+
+template <typename ForwardIterator>
+void sequence(ForwardIterator first, ForwardIterator last)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::sequence");
+  using thrust::system::detail::generic::select_system;
+
+  using System = typename thrust::iterator_system<ForwardIterator>::type;
+
+  System system;
+
+  return thrust::sequence(select_system(system), first, last);
+} // end sequence()
+
+template <typename ForwardIterator, typename T>
+void sequence(ForwardIterator first, ForwardIterator last, T init)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::sequence");
+  using thrust::system::detail::generic::select_system;
+
+  using System = typename thrust::iterator_system<ForwardIterator>::type;
+
+  System system;
+
+  return thrust::sequence(select_system(system), first, last, init);
+} // end sequence()
+
+template <typename ForwardIterator, typename T>
+void sequence(ForwardIterator first, ForwardIterator last, T init, T step)
+{
+  _CCCL_NVTX_RANGE_SCOPE("thrust::sequence");
+  using thrust::system::detail::generic::select_system;
+
+  using System = typename thrust::iterator_system<ForwardIterator>::type;
+
+  System system;
+
+  return thrust::sequence(select_system(system), first, last, init, step);
+} // end sequence()
+
+THRUST_NAMESPACE_END

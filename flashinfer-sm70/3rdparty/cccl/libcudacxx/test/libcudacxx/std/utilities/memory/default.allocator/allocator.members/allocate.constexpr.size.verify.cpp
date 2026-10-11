@@ -1,0 +1,48 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of libcu++, the C++ Standard Library for your entire system,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// <memory>
+
+// allocator:
+// constexpr T* allocate(size_type n);
+
+// UNSUPPORTED: c++17
+
+#include <cuda/std/__memory_>
+#include <cuda/std/cstddef>
+
+#include "test_macros.h"
+
+template <typename T>
+TEST_FUNC constexpr bool test()
+{
+  using A  = cuda::std::allocator<T>;
+  using AT = cuda::std::allocator_traits<A>;
+  A a;
+  TEST_IGNORE_NODISCARD a.allocate(AT::max_size(a) + 1); // just barely too large
+  TEST_IGNORE_NODISCARD a.allocate(AT::max_size(a) * 2); // significantly too large
+  TEST_IGNORE_NODISCARD a.allocate(((cuda::std::size_t) -1) / sizeof(T) + 1); // multiply will overflow
+  TEST_IGNORE_NODISCARD a.allocate((cuda::std::size_t) -1); // way too large
+
+  return true;
+}
+
+TEST_FUNC void f()
+{
+  static_assert(test<double>()); // expected-error-re {{{{(static_assert|static assertion)}} expression is not an
+                                 // integral constant expression}}
+  static_assert(test<const double>()); // expected-error-re {{{{(static_assert|static assertion)}} expression is
+                                       // not an integral constant expression}}
+}
+
+int main(int, char**)
+{
+  return 0;
+}

@@ -1,0 +1,3870 @@
+"""
+Copyright (c) 2024 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import os
+from unittest.mock import patch
+
+import pytest
+import torch
+
+import flashinfer
+import flashinfer.utils as flashinfer_utils
+from flashinfer.topk import can_implement_filtered_topk
+from flashinfer.utils import get_compute_capability
+from tests.test_helpers.parametrize import parametrize_product
+
+
+@pytest.fixture
+def set_topk_algo():
+    """Fixture to set and reset FLASHINFER_TOPK_ALGO environment variable."""
+    original_value = os.environ.get("FLASHINFER_TOPK_ALGO", None)
+
+    def _set_algo(algo: str):
+        if algo == "auto":
+            os.environ.pop("FLASHINFER_TOPK_ALGO", None)
+        else:
+            os.environ["FLASHINFER_TOPK_ALGO"] = algo
+
+    yield _set_algo
+
+    # Restore original value
+    if original_value is None:
+        os.environ.pop("FLASHINFER_TOPK_ALGO", None)
+    else:
+        os.environ["FLASHINFER_TOPK_ALGO"] = original_value
+
+
+def compute_topk_accuracy(test_indices, ref_indices, batch_size, k):
+    """Compute accuracy as intersection ratio between test and reference top-k indices."""
+    total_intersection = 0
+    for i in range(batch_size):
+        ref_set = set(ref_indices[i].cpu().numpy())
+        test_set = set(test_indices[i].cpu().numpy())
+        assert len(ref_set) == len(test_set)
+        total_intersection += len(ref_set & test_set)
+    return total_intersection / (batch_size * k)
+
+
+def _require_sm80_for_bf16():
+    major, _ = get_compute_capability(torch.device("cuda"))
+    if major < 8:
+        pytest.skip("BF16 requires SM80+")
+
+
+def _require_cub_tie_break_support():
+    """CUB tie-break requirement configs need SM90+ on any tier."""
+    if get_compute_capability(torch.device("cuda"))[0] < 9:
+        pytest.skip("requires SM90+ (CUB tie-break requirement configs)")
+
+
+def verify_topk_correctness(logits, values, indices, k):
+    """Verify that all returned values are truly in the top-k.
+
+    Returns True if all values are >= the k-th largest value in each row.
+    This is a more robust check than comparing indices, since tie-breaking
+    can differ between implementations.
+    """
+    batch_size = logits.size(0)
+    for i in range(batch_size):
+        # Get the k-th largest value (ground truth threshold)
+        kth_largest = torch.kthvalue(-logits[i], k).values.item() * -1
+        # All returned values should be >= this threshold
+        if values[i].min().item() < kth_largest - 1e-6:
+            return False
+    return True
+
+
+def _get_cached_topk_row_states_buffer(device: torch.device):
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = (f"radix_topk_row_states_{device}", device)
+    return flashinfer_utils._cache_buf.get(key)
+
+
+def _clear_cached_topk_row_states_buffer(device: torch.device):
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    key = (f"radix_topk_row_states_{device}", device)
+    flashinfer_utils._cache_buf.pop(key, None)
+
+
+def _build_strictly_descending_logits(
+    num_rows: int, vocab_size: int, device: torch.device
+) -> torch.Tensor:
+    base = torch.arange(vocab_size, 0, -1, device=device, dtype=torch.float32)
+    return base.unsqueeze(0).repeat(num_rows, 1).contiguous()
+
+
+def _top_k_case_id(case):
+    batch_size, vocab_size, k, dtype, tie_break = case
+    dtype_name = str(dtype).removeprefix("torch.")
+    return f"b{batch_size}-v{vocab_size}-k{k}-{dtype_name}-{tie_break.name.lower()}"
+
+
+@parametrize_product(
+    {
+        "batch_size": [1, 16, 64],
+        "vocab_size": [32000, 65536, 128512],
+        "k": [256, 512, 1024],
+        "dtype": [torch.float32, torch.float16, torch.bfloat16],
+        "tie_break": [
+            flashinfer.TopKTieBreak.NONE,
+            flashinfer.TopKTieBreak.SMALL,
+            flashinfer.TopKTieBreak.LARGE,
+        ],
+    },
+    regular=[
+        (1, 32000, 256, torch.float32, flashinfer.TopKTieBreak.NONE),
+        (1, 65536, 512, torch.bfloat16, flashinfer.TopKTieBreak.NONE),
+        (1, 128512, 1024, torch.float16, flashinfer.TopKTieBreak.NONE),
+        (16, 32000, 512, torch.float16, flashinfer.TopKTieBreak.NONE),
+        (16, 65536, 1024, torch.float32, flashinfer.TopKTieBreak.NONE),
+        (16, 128512, 256, torch.bfloat16, flashinfer.TopKTieBreak.NONE),
+        (64, 32000, 1024, torch.bfloat16, flashinfer.TopKTieBreak.NONE),
+        (64, 65536, 256, torch.float16, flashinfer.TopKTieBreak.NONE),
+        (64, 128512, 512, torch.float32, flashinfer.TopKTieBreak.NONE),
+        (1, 32000, 256, torch.float32, flashinfer.TopKTieBreak.SMALL),
+        (16, 65536, 512, torch.float16, flashinfer.TopKTieBreak.SMALL),
+        (64, 128512, 1024, torch.bfloat16, flashinfer.TopKTieBreak.SMALL),
+        (1, 128512, 1024, torch.bfloat16, flashinfer.TopKTieBreak.LARGE),
+        (16, 65536, 512, torch.float16, flashinfer.TopKTieBreak.LARGE),
+        (64, 32000, 256, torch.float32, flashinfer.TopKTieBreak.LARGE),
+    ],
+    ids=_top_k_case_id,
+)
+def test_top_k(batch_size, vocab_size, k, dtype, tie_break):
+    """Test top_k returns correct values and indices."""
+    if tie_break != flashinfer.TopKTieBreak.NONE and not can_implement_filtered_topk():
+        pytest.skip("Tie-break modes require filtered top-k support on this device")
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
+
+    # flashinfer top_k
+    values, indices = flashinfer.top_k(logits, k, tie_break=tie_break)
+
+    # Reference: torch.topk
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    # Check output shapes
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Check dtypes
+    assert values.dtype == dtype
+    assert indices.dtype == torch.int64
+
+    # Verify values match the gathered indices
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    torch.testing.assert_close(values, gathered_values)
+
+    # Check accuracy of indices
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    # Accuracy depends on vocab size, k, and data distribution
+    # Random Gaussian data can have many values close to each other at boundaries
+    min_accuracy = 0.97
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("vocab_size", [32000, 65536])
+@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize(
+    "tie_break",
+    [
+        flashinfer.TopKTieBreak.NONE,
+        flashinfer.TopKTieBreak.SMALL,
+        flashinfer.TopKTieBreak.LARGE,
+    ],
+)
+def test_top_k_sorted(batch_size, vocab_size, k, dtype, tie_break):
+    """Test top_k with sorted=True returns sorted values."""
+    if tie_break != flashinfer.TopKTieBreak.NONE and not can_implement_filtered_topk():
+        pytest.skip("Tie-break modes require filtered top-k support on this device")
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
+
+    # flashinfer top_k with sorted=True
+    values, indices = flashinfer.top_k(logits, k, sorted=True, tie_break=tie_break)
+
+    # Reference: torch.topk with sorted=True
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1, sorted=True)
+
+    # Check output shapes
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Verify values are sorted in descending order
+    for i in range(batch_size):
+        row_values = values[i]
+        assert torch.all(row_values[:-1] >= row_values[1:]), (
+            f"Row {i} values not sorted in descending order"
+        )
+
+    # Verify values match the gathered indices
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    torch.testing.assert_close(values, gathered_values)
+
+    # Check accuracy of indices
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    min_accuracy = 0.90
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
+@pytest.mark.parametrize("vocab_size", [32000, 65536])
+@pytest.mark.parametrize("k", [256])
+@pytest.mark.parametrize(
+    "tie_break",
+    [
+        flashinfer.TopKTieBreak.NONE,
+        flashinfer.TopKTieBreak.SMALL,
+        flashinfer.TopKTieBreak.LARGE,
+    ],
+)
+def test_top_k_single_batch(vocab_size, k, tie_break):
+    """Test top_k with batch_size=1 (common inference case)."""
+    if tie_break != flashinfer.TopKTieBreak.NONE and not can_implement_filtered_topk():
+        pytest.skip("Tie-break modes require filtered top-k support on this device")
+    torch.manual_seed(42)
+    logits = torch.randn(1, vocab_size, device="cuda", dtype=torch.float32)
+
+    # flashinfer top_k
+    values, indices = flashinfer.top_k(logits, k, tie_break=tie_break)
+
+    # Reference: torch.topk
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    # Check output shape
+    assert values.shape == (1, k)
+    assert indices.shape == (1, k)
+
+    # Check accuracy
+    accuracy = compute_topk_accuracy(indices, ref_indices, 1, k)
+    assert accuracy >= 0.99, f"Accuracy {accuracy:.4f} < 0.99"
+
+
+@pytest.mark.parametrize("batch_size", [64, 128])
+@pytest.mark.parametrize("vocab_size", [65536, 128512])
+@pytest.mark.parametrize("k", [256])
+@pytest.mark.parametrize("det", [True, False])
+@pytest.mark.parametrize(
+    "tie_break",
+    [
+        flashinfer.TopKTieBreak.NONE,
+        flashinfer.TopKTieBreak.SMALL,
+        flashinfer.TopKTieBreak.LARGE,
+    ],
+)
+def test_top_k_large_batch(batch_size, vocab_size, k, det, tie_break):
+    """Test top_k with large batch sizes (multi-CTA path)."""
+    if tie_break != flashinfer.TopKTieBreak.NONE and not can_implement_filtered_topk():
+        pytest.skip("Tie-break modes require filtered top-k support on this device")
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float32)
+
+    # flashinfer top_k (should use multi-CTA path for large vocab)
+    values, indices = flashinfer.top_k(
+        logits, k, deterministic=det, tie_break=tie_break
+    )
+
+    # Reference: torch.topk
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    # Check output shape
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Check accuracy
+    accuracy = compute_topk_accuracy(indices, ref_indices, batch_size, k)
+    assert accuracy >= 0.98, f"Accuracy {accuracy:.4f} < 0.98"
+
+
+@pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
+@pytest.mark.parametrize(
+    ("first_deterministic", "second_deterministic"),
+    [(False, True), (True, False)],
+)
+def test_multi_cta_reuses_dirty_cached_row_states_buffer_across_mode_transitions(
+    api_kind, set_topk_algo, first_deterministic, second_deterministic
+):
+    set_topk_algo("multi_cta")
+    device = torch.device("cuda")
+    _clear_cached_topk_row_states_buffer(device)
+
+    batch_size = 4
+    vocab_size = 131072
+    k = 512
+    logits = _build_strictly_descending_logits(batch_size, vocab_size, device)
+
+    if api_kind == "top_k":
+        expected_values = logits[:, :k]
+        expected_indices = (
+            torch.arange(k, device=device, dtype=torch.int64)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
+
+        values_a, indices_a = flashinfer.top_k(
+            logits, k, sorted=True, deterministic=first_deterministic
+        )
+        torch.testing.assert_close(values_a, expected_values)
+        assert torch.equal(indices_a, expected_indices)
+        buf_a = _get_cached_topk_row_states_buffer(device)
+        assert buf_a is not None
+
+        values_b, indices_b = flashinfer.top_k(
+            logits, k, sorted=True, deterministic=second_deterministic
+        )
+        torch.testing.assert_close(values_b, expected_values)
+        assert torch.equal(indices_b, expected_indices)
+    else:
+        lengths = torch.full(
+            (batch_size,), vocab_size, device=device, dtype=torch.int32
+        )
+        expected = torch.arange(k, device=device, dtype=torch.int32).unsqueeze(0)
+        expected = expected.expand(batch_size, -1)
+        src_page_table = None
+        offsets = None
+
+        if api_kind == "ragged":
+            offsets = torch.arange(
+                0, batch_size * vocab_size, vocab_size, device=device, dtype=torch.int32
+            )
+            expected = offsets.unsqueeze(1) + expected
+
+        output_a = _run_transform(
+            logits,
+            k,
+            api_kind,
+            lengths=lengths,
+            deterministic=first_deterministic,
+            src_page_table=src_page_table,
+            offsets=offsets,
+        )
+        _assert_unordered_indices_match(output_a, expected)
+        buf_a = _get_cached_topk_row_states_buffer(device)
+        assert buf_a is not None
+
+        output_b = _run_transform(
+            logits,
+            k,
+            api_kind,
+            lengths=lengths,
+            deterministic=second_deterministic,
+            src_page_table=src_page_table,
+            offsets=offsets,
+        )
+        _assert_unordered_indices_match(output_b, expected)
+
+    buf_b = _get_cached_topk_row_states_buffer(device)
+    assert buf_b is buf_a
+
+
+@pytest.mark.parametrize("k", [256, 1024, 2048])
+def test_top_k_large_k(k):
+    """Test top_k with larger k values."""
+    batch_size = 4
+    vocab_size = 32000
+
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float32)
+
+    # flashinfer top_k
+    values, indices = flashinfer.top_k(logits, k)
+
+    # Reference: torch.topk
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    # Check output shape
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Check accuracy
+    accuracy = compute_topk_accuracy(indices, ref_indices, batch_size, k)
+    assert accuracy >= 0.98, f"Accuracy {accuracy:.4f} < 0.98"
+
+
+def test_top_k_vs_torch_topk_compatibility():
+    """Test that flashinfer.top_k can be used as a drop-in replacement for torch.topk."""
+    batch_size = 4
+    vocab_size = 32000
+    k = 256
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float32)
+
+    # flashinfer top_k
+    fi_values, fi_indices = flashinfer.top_k(logits, k, sorted=True)
+
+    # torch.topk
+    torch_values, torch_indices = torch.topk(logits, k, dim=-1, sorted=True)
+
+    # Check shapes match
+    assert fi_values.shape == torch_values.shape
+    assert fi_indices.shape == torch_indices.shape
+
+    # Check dtypes
+    assert fi_values.dtype == torch_values.dtype
+    # Note: flashinfer returns int64, torch returns int64
+    assert fi_indices.dtype == torch_indices.dtype
+
+    # Check that the selected values are the same (may be in different order for unsorted)
+    # For sorted case, the order should match for identical values
+    accuracy = compute_topk_accuracy(
+        fi_indices.int(), torch_indices.int(), batch_size, k
+    )
+    assert accuracy >= 0.98
+
+
+# ===================== Fused TopK Transform Tests =====================
+
+
+def reference_page_table_transform(
+    scores: torch.Tensor,
+    src_page_table: torch.Tensor,
+    lengths: torch.Tensor,
+    k: int,
+    row_to_batch: torch.Tensor = None,
+    row_starts: torch.Tensor = None,
+    page_table_row_starts: torch.Tensor = None,
+    page_size: int = 1,
+    out_raw_indices: torch.Tensor = None,
+) -> torch.Tensor:
+    """Reference implementation for page table transform using torch.topk."""
+    num_rows = scores.size(0)
+    device = scores.device
+
+    output = torch.full((num_rows, k), -1, dtype=torch.int32, device=device)
+    if out_raw_indices is not None:
+        out_raw_indices.fill_(-1)
+
+    for i in range(num_rows):
+        length = lengths[i].item()
+        if length <= 0:
+            continue
+        row_start = row_starts[i].item() if row_starts is not None else 0
+        page_table_row_start = (
+            page_table_row_starts[i].item()
+            if page_table_row_starts is not None
+            else row_start
+        )
+        batch_idx = row_to_batch[i].item() if row_to_batch is not None else i
+
+        if length <= k:
+            topk_indices = torch.arange(length, device=device, dtype=torch.int32)
+        else:
+            # Get top-k indices
+            row_scores = scores[i, row_start : row_start + length]
+            _, topk_indices = torch.topk(row_scores.float(), k)
+            topk_indices = topk_indices.to(torch.int32)
+
+        num_selected = min(length, k)
+        topk_indices = topk_indices[:num_selected]
+        physical_pages = src_page_table[
+            batch_idx,
+            page_table_row_start + topk_indices.long() // page_size,
+        ]
+        output[i, :num_selected] = physical_pages * page_size + topk_indices % page_size
+        if out_raw_indices is not None:
+            out_raw_indices[i, :num_selected] = topk_indices
+
+    return output
+
+
+def reference_ragged_transform(
+    scores: torch.Tensor,
+    offsets: torch.Tensor,
+    lengths: torch.Tensor,
+    k: int,
+    row_starts: torch.Tensor = None,
+) -> torch.Tensor:
+    """Reference implementation for ragged transform using torch.topk."""
+    num_rows = scores.size(0)
+    device = scores.device
+
+    output = torch.full((num_rows, k), -1, dtype=torch.int32, device=device)
+
+    for i in range(num_rows):
+        length = lengths[i].item()
+        row_start = row_starts[i].item() if row_starts is not None else 0
+        offset = offsets[i].item()
+
+        if length <= k:
+            # Trivial case: indices are [offset, offset+1, ..., offset+length-1]
+            output[i, :length] = torch.arange(
+                offset, offset + length, dtype=torch.int32, device=device
+            )
+        else:
+            # Get top-k indices
+            row_scores = scores[i, row_start : row_start + length]
+            _, topk_indices = torch.topk(row_scores.float(), k)
+            # Add offset
+            output[i] = topk_indices.int() + offset
+
+    return output
+
+
+def compute_transform_accuracy(test_output, ref_output, num_rows, k):
+    """Compute accuracy for transform outputs, handling -1 padding correctly."""
+    total_matches = 0
+    total_valid = 0
+
+    for i in range(num_rows):
+        # Get valid entries (not -1)
+        test_valid_mask = test_output[i] != -1
+        ref_valid_mask = ref_output[i] != -1
+
+        # Both should have same number of valid entries
+        test_set = set(test_output[i][test_valid_mask].cpu().numpy())
+        ref_set = set(ref_output[i][ref_valid_mask].cpu().numpy())
+
+        # Count intersection
+        total_matches += len(test_set & ref_set)
+        total_valid += len(ref_set)
+
+    return total_matches / total_valid if total_valid > 0 else 1.0
+
+
+@pytest.mark.parametrize("num_rows", [1, 8, 32])
+@pytest.mark.parametrize("max_len", [1024, 4096, 8192])
+@pytest.mark.parametrize("k", [64, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_page_table_transform(num_rows, max_len, k, dtype):
+    """Test top_k_page_table_transform returns correct page table entries."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate random page table (values 0 to 10000)
+    src_page_table = torch.randint(
+        0, 10000, (num_rows, max_len), device=device, dtype=torch.int32
+    )
+
+    # All rows have full length
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
+
+    # Reference implementation
+    ref_output = reference_page_table_transform(scores, src_page_table, lengths, k)
+
+    # Check output shape
+    assert output.shape == (num_rows, k), (
+        f"Expected shape {(num_rows, k)}, got {output.shape}"
+    )
+    assert output.dtype == torch.int32
+
+    # Check accuracy
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
+@pytest.mark.parametrize("max_len,k", [(16384, 128), (65536, 128), (16384, 4096)])
+@pytest.mark.parametrize("return_raw_indices", [False, True])
+def test_top_k_page_table_transform_graph_safe_fallback(
+    max_len, k, return_raw_indices, set_topk_algo
+):
+    """Graph-safe auto dispatch must not require unsupported FilteredTopK (#5058)."""
+    if get_compute_capability(torch.device("cuda"))[0] < 9:
+        pytest.skip("Long-row CUB top-k requires SM90+")
+    if k <= 2048 and can_implement_filtered_topk():
+        pytest.skip("This case requires a device without FilteredTopK support")
+    set_topk_algo("auto")
+    torch.manual_seed(5058)
+    num_rows, page_size = 8, 64
+    # Unique FP32 scores avoid dependence on unspecified boundary tie-breaking.
+    scores = torch.stack(
+        [torch.randperm(max_len, device="cuda") for _ in range(num_rows)]
+    ).float()
+    lengths = torch.tensor(
+        [max_len, max_len - 1, max_len // 2, k + 1, k, k - 1, 1, 0],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    page_table = torch.arange(
+        num_rows * (max_len // page_size), device="cuda", dtype=torch.int32
+    ).reshape(num_rows, -1)
+    out = torch.empty((num_rows, k), device="cuda", dtype=torch.int32)
+    raw = torch.empty_like(out) if return_raw_indices else None
+
+    def run(graph_safe=True):
+        return flashinfer.top_k_page_table_transform(
+            scores,
+            page_table,
+            lengths,
+            k,
+            dsa_graph_safe=graph_safe,
+            page_size=page_size,
+            out=out,
+            out_raw_indices=raw,
+        )
+
+    def check():
+        valid = torch.arange(max_len, device="cuda")[None, :] < lengths[:, None]
+        ref_raw = scores.masked_fill(~valid, -float("inf")).topk(k).indices
+        selected = torch.arange(k, device="cuda")[None, :] < lengths[:, None]
+        ref_out = page_table.gather(1, ref_raw // page_size) * page_size
+        ref_out += ref_raw % page_size
+        ref_out.masked_fill_(~selected, -1)
+        torch.testing.assert_close(
+            out.sort().values.long(), ref_out.sort().values.long(), rtol=0, atol=0
+        )
+        if raw is not None:
+            ref_raw.masked_fill_(~selected, -1)
+            torch.testing.assert_close(
+                raw.sort().values.long(), ref_raw.sort().values, rtol=0, atol=0
+            )
+            mapped = page_table.gather(1, raw.long().clamp_min(0) // page_size)
+            mapped = mapped * page_size + raw.clamp_min(0) % page_size
+            mapped.masked_fill_(raw < 0, -1)
+            torch.testing.assert_close(out, mapped, rtol=0, atol=0)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(False)
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    assert result.data_ptr() == out.data_ptr()
+    for _ in range(2):
+        # Replay must read updated lengths/scores/page IDs, including short rows.
+        lengths.copy_(lengths.flip(0))
+        scores.copy_(scores.roll(17, dims=1))
+        page_table.add_(19)
+        out.fill_(-99)
+        if raw is not None:
+            raw.fill_(-99)
+        graph.replay()
+        check()
+
+
+@pytest.mark.parametrize(
+    "api_name,num_rows,max_len",
+    [
+        ("top_k", 128, 16384),
+        ("top_k_ragged_transform", 8, 16384),
+        ("top_k_ragged_transform", 512, 32768),
+    ],
+)
+@pytest.mark.parametrize("k", [128, 4096])
+def test_top_k_siblings_graph_safe_fallback(
+    api_name, num_rows, max_len, k, set_topk_algo
+):
+    """Cover heuristic-declined plain/ragged calls in eager and graph modes."""
+    if get_compute_capability(torch.device("cuda"))[0] < 9:
+        pytest.skip("Long-row CUB top-k requires SM90+")
+    if k <= 2048 and can_implement_filtered_topk():
+        pytest.skip("This case requires a device without FilteredTopK support")
+    set_topk_algo("auto")
+    torch.manual_seed(5058)
+    scores = torch.stack(
+        [torch.randperm(max_len, device="cuda") for _ in range(num_rows)]
+    ).float()
+    lengths = torch.tensor(
+        [max_len, max_len - 1, max_len // 2, k + 1, k, k - 1, 1, 0],
+        device="cuda",
+        dtype=torch.int32,
+    ).repeat(num_rows // 8)
+    offsets = torch.arange(num_rows, device="cuda", dtype=torch.int32) * max_len
+
+    def run():
+        if api_name == "top_k":
+            return flashinfer.top_k(scores, k, dsa_graph_safe=True)
+        return flashinfer.top_k_ragged_transform(
+            scores, offsets, lengths, k, dsa_graph_safe=True
+        )
+
+    def check(result):
+        if api_name == "top_k":
+            values, indices = result
+            ref_values, ref_indices = scores.topk(k)
+            torch.testing.assert_close(
+                values.sort().values, ref_values.sort().values, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                indices.sort().values, ref_indices.sort().values, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                values, scores.gather(1, indices), rtol=0, atol=0
+            )
+        else:
+            valid = torch.arange(max_len, device="cuda")[None, :] < lengths[:, None]
+            ref = scores.masked_fill(~valid, -float("inf")).topk(k).indices
+            ref += offsets[:, None]
+            ref.masked_fill_(
+                torch.arange(k, device="cuda")[None, :] >= lengths[:, None], -1
+            )
+            torch.testing.assert_close(
+                result.sort().values.long(), ref.sort().values, rtol=0, atol=0
+            )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        result = run()
+    torch.cuda.current_stream().wait_stream(stream)
+    check(result)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    for _ in range(2):
+        scores.copy_(scores.roll(17, dims=1))
+        lengths.copy_(lengths.flip(0))
+        offsets.add_(19)
+        graph.replay()
+        check(result)
+
+
+@pytest.mark.parametrize(
+    "api_name", ["top_k", "top_k_page_table_transform", "top_k_ragged_transform"]
+)
+@pytest.mark.parametrize("k", [128, 4096])
+@pytest.mark.parametrize(
+    "algo,deterministic",
+    [("auto", True), ("default", False), ("filtered", False), ("multi_cta", False)],
+)
+def test_top_k_graph_safe_unsupported(api_name, k, algo, deterministic, set_topk_algo):
+    if k <= 2048 and can_implement_filtered_topk():
+        pytest.skip("Requires a device without FilteredTopK support")
+    set_topk_algo(algo)
+    scores = torch.zeros((1, 16384), device="cuda")
+    page_table = torch.zeros_like(scores, dtype=torch.int32)
+    lengths = torch.tensor([16384], device="cuda", dtype=torch.int32)
+    kwargs = dict(deterministic=deterministic, dsa_graph_safe=True)
+    with pytest.raises(
+        NotImplementedError, match=f"{api_name} with dsa_graph_safe=True.*FilteredTopK"
+    ):
+        if api_name == "top_k":
+            flashinfer.top_k(scores, k, **kwargs)
+        elif api_name == "top_k_page_table_transform":
+            flashinfer.top_k_page_table_transform(
+                scores, page_table, lengths, k, **kwargs
+            )
+        else:
+            offsets = torch.zeros_like(lengths)
+            flashinfer.top_k_ragged_transform(scores, offsets, lengths, k, **kwargs)
+
+
+@pytest.mark.parametrize("k", [128, 4096])
+def test_top_k_graph_safe_sorted_unsupported(k, set_topk_algo):
+    """CUB fallback must not silently drop the sorted-output requirement."""
+    if k <= 2048 and can_implement_filtered_topk():
+        pytest.skip("Requires a device without FilteredTopK support")
+    set_topk_algo("auto")
+    scores = torch.zeros((128, 16384), device="cuda")
+    with pytest.raises(NotImplementedError, match="top_k.*sorted output"):
+        flashinfer.top_k(scores, k, sorted=True, dsa_graph_safe=True)
+
+
+@pytest.mark.parametrize("algo", ["multi_cta", "filtered"])
+@pytest.mark.parametrize("page_size", [64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "num_rows,max_len,k",
+    [
+        (2, 128 * 1024, 2048),
+        (1, 256 * 1024, 1024),
+        (74, 16 * 1024, 512),
+    ],
+)
+def test_top_k_page_table_transform_misaligned_scores_without_row_starts(
+    algo, page_size, dtype, num_rows, max_len, k, set_topk_algo
+):
+    """Vectorized paths should reduce their width for a misaligned score base."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    device = "cuda"
+    score_padding = 16
+    score_storage = torch.empty(
+        (num_rows, max_len + score_padding), device=device, dtype=dtype
+    )
+    scores = score_storage[:, 1 : max_len + 1]
+    scores.zero_()
+    scores[:, :k] = 1
+    assert scores.stride() == (max_len + score_padding, 1)
+    assert scores.data_ptr() % 16 != 0
+
+    row_ids = torch.arange(num_rows, device=device, dtype=torch.int32)
+    lengths = k + 73 + (row_ids % 4) * (k // 2)
+    page_table_width = (max_len + page_size - 1) // page_size
+    src_page_table = 100 + torch.arange(
+        num_rows * page_table_width, device=device, dtype=torch.int32
+    ).reshape(num_rows, page_table_width)
+    out = torch.empty((num_rows, k), device=device, dtype=torch.int32)
+    out_raw_indices = torch.empty_like(out)
+
+    result = flashinfer.top_k_page_table_transform(
+        scores,
+        src_page_table,
+        lengths,
+        k,
+        page_size=page_size,
+        out=out,
+        out_raw_indices=out_raw_indices,
+    )
+    assert result.data_ptr() == out.data_ptr()
+
+    ref_raw_indices = torch.empty_like(out)
+    ref = reference_page_table_transform(
+        scores,
+        src_page_table,
+        lengths,
+        k,
+        page_size=page_size,
+        out_raw_indices=ref_raw_indices,
+    )
+    assert torch.equal(torch.sort(out, dim=-1).values, torch.sort(ref, dim=-1).values)
+    assert torch.equal(
+        torch.sort(out_raw_indices, dim=-1).values,
+        torch.sort(ref_raw_indices, dim=-1).values,
+    )
+
+
+@pytest.mark.parametrize("page_size", [64])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "num_rows,max_len,k",
+    [
+        (2, 128 * 1024, 2048),
+        (1, 256 * 1024, 1024),
+        (74, 16 * 1024, 512),
+    ],
+)
+def test_top_k_page_table_transform_compact_pages_cuda_graph_replay(
+    page_size, dtype, num_rows, max_len, k
+):
+    """Graph replay should consume updated inputs and reuse both output buffers."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    device = torch.device("cuda")
+    score_padding = 16
+    score_storage = torch.empty(
+        (num_rows, max_len + score_padding), device=device, dtype=dtype
+    )
+    scores = score_storage[:, :max_len]
+    page_table_width = (max_len + page_size - 1) // page_size
+    src_page_table = torch.arange(
+        num_rows * page_table_width, device=device, dtype=torch.int32
+    ).reshape(num_rows, page_table_width)
+    row_ids = torch.arange(num_rows, device=device, dtype=torch.int32)
+    lengths = torch.where(
+        row_ids % 4 == 0,
+        max_len,
+        torch.where(
+            row_ids % 4 == 1,
+            k - 1,
+            torch.where(row_ids % 4 == 2, 0, k + 73),
+        ),
+    ).to(torch.int32)
+
+    def set_selected_scores(use_prefix: bool) -> None:
+        scores.zero_()
+        for row, length in enumerate(lengths.tolist()):
+            num_selected = min(length, k)
+            if num_selected == 0:
+                continue
+            start = 0 if use_prefix else length - num_selected
+            scores[row, start : start + num_selected] = 1
+
+    set_selected_scores(use_prefix=False)
+    out = torch.empty((num_rows, k), device=device, dtype=torch.int32)
+    out_raw_indices = torch.empty_like(out)
+
+    kwargs = dict(
+        deterministic=True,
+        dsa_graph_safe=True,
+        page_size=page_size,
+        out=out,
+        out_raw_indices=out_raw_indices,
+    )
+    flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k, **kwargs)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = flashinfer.top_k_page_table_transform(
+            scores, src_page_table, lengths, k, **kwargs
+        )
+    assert result.data_ptr() == out.data_ptr()
+
+    src_page_table.add_(100)
+    updated_lengths = torch.where(
+        row_ids % 4 == 0,
+        k + 73,
+        torch.where(
+            row_ids % 4 == 1,
+            max_len,
+            torch.where(row_ids % 4 == 2, 0, k),
+        ),
+    ).to(torch.int32)
+    lengths.copy_(updated_lengths)
+    set_selected_scores(use_prefix=True)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    ref_raw_indices = torch.empty_like(out)
+    ref = reference_page_table_transform(
+        scores,
+        src_page_table,
+        lengths,
+        k,
+        page_size=page_size,
+        out_raw_indices=ref_raw_indices,
+    )
+    assert torch.equal(torch.sort(out, dim=-1).values, torch.sort(ref, dim=-1).values)
+    assert torch.equal(
+        torch.sort(out_raw_indices, dim=-1).values,
+        torch.sort(ref_raw_indices, dim=-1).values,
+    )
+    for row in range(num_rows):
+        num_selected = min(lengths[row].item(), k)
+        assert torch.all(out_raw_indices[row, :num_selected] >= 0)
+        assert torch.all(out_raw_indices[row, num_selected:] == -1)
+        raw = out_raw_indices[row, :num_selected].long()
+        expected = src_page_table[row, raw // page_size] * page_size + raw % page_size
+        assert torch.equal(out[row, :num_selected], expected)
+
+
+@pytest.mark.parametrize("num_rows", [1, 8, 32])
+@pytest.mark.parametrize("max_len", [1024, 4096, 8192])
+@pytest.mark.parametrize("k", [64, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_ragged_transform(num_rows, max_len, k, dtype):
+    """Test top_k_ragged_transform returns correct indices with offsets."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate offsets (cumulative sum style)
+    offsets = torch.arange(
+        0, num_rows * max_len, max_len, device=device, dtype=torch.int32
+    )
+
+    # All rows have full length
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    # Reference implementation
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+
+    # Check output shape
+    assert output.shape == (num_rows, k), (
+        f"Expected shape {(num_rows, k)}, got {output.shape}"
+    )
+    assert output.dtype == torch.int32
+
+    # Check accuracy
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
+@pytest.mark.parametrize("algo", ["multi_cta", "filtered"])
+@pytest.mark.parametrize("dsa_graph_safe", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize(
+    (
+        "page_size",
+        "separate_page_table_row_starts",
+        "with_raw_output",
+    ),
+    [
+        pytest.param(1, False, False, id="page_size_1_shared_starts"),
+        pytest.param(1, True, False, id="page_size_1_separate_starts"),
+        pytest.param(1, True, True, id="page_size_1_raw_output"),
+        pytest.param(64, True, False, id="compact_pages"),
+        pytest.param(64, True, True, id="compact_pages_raw_output"),
+    ],
+)
+@pytest.mark.parametrize(
+    "num_rows,max_len,k",
+    [
+        (2, 128 * 1024, 2048),
+        (1, 256 * 1024, 1024),
+        (74, 16 * 1024, 512),
+    ],
+)
+def test_top_k_transform_with_row_starts(
+    algo,
+    dsa_graph_safe,
+    deterministic,
+    page_size,
+    separate_page_table_row_starts,
+    with_raw_output,
+    num_rows,
+    max_len,
+    k,
+    set_topk_algo,
+):
+    """Transform APIs should honor score windows and page-table layout options."""
+    if (algo == "filtered" or dsa_graph_safe) and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    device = "cuda"
+
+    base = -torch.arange(max_len, device=device, dtype=torch.float32)
+    scores = base.unsqueeze(0).repeat(num_rows, 1).contiguous()
+    page_scores = scores
+    if page_size > 1:
+        score_padding = 16
+        score_storage = torch.empty(
+            (num_rows, max_len + score_padding), device=device, dtype=torch.float32
+        )
+        page_scores = score_storage[:, 1 : max_len + 1]
+        page_scores.copy_(scores)
+        assert page_scores.stride() == (max_len + score_padding, 1)
+        if num_rows > 1:
+            assert not page_scores.is_contiguous()
+        assert page_scores.data_ptr() % 16 != 0
+
+    row_ids = torch.arange(num_rows, device=device, dtype=torch.int32)
+    max_start = max_len - (k + 1)
+    start_stride = max(1, max_start // max(1, num_rows - 1))
+    row_starts = (row_ids * start_stride).clamp(max=max_start)
+    max_windows = max_len - row_starts
+    lengths = torch.minimum(
+        max_windows,
+        k + 1 + (row_ids % 4),
+    )
+    page_table_row_starts = None
+    if separate_page_table_row_starts:
+        lengths = torch.where(
+            row_ids % 2 == 0,
+            torch.full_like(lengths, k - 1),
+            lengths,
+        )
+        candidate_starts = 7 + 17 * row_ids
+        page_table_row_starts = torch.minimum(candidate_starts, max_len - lengths)
+    offsets = row_ids * 100
+    row_to_batch = torch.arange(num_rows - 1, -1, -1, device=device, dtype=torch.int32)
+
+    src_page_table = (
+        torch.arange(max_len, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .repeat(num_rows, 1)
+    )
+    src_page_table = (
+        src_page_table
+        + 1000 * torch.arange(num_rows, device=device, dtype=torch.int32).unsqueeze(1)
+    ).contiguous()
+
+    output_buffer = (
+        torch.empty((num_rows, k), device=device, dtype=torch.int32)
+        if page_size > 1
+        else None
+    )
+    output_raw_indices = (
+        torch.empty((num_rows, k), device=device, dtype=torch.int32)
+        if with_raw_output
+        else None
+    )
+    output_page = flashinfer.top_k_page_table_transform(
+        page_scores,
+        src_page_table,
+        lengths,
+        k,
+        row_to_batch=row_to_batch,
+        row_starts=row_starts,
+        page_table_row_starts=page_table_row_starts,
+        deterministic=deterministic,
+        dsa_graph_safe=dsa_graph_safe,
+        page_size=page_size,
+        out=output_buffer,
+        out_raw_indices=output_raw_indices,
+    )
+    if output_buffer is not None:
+        assert output_page.data_ptr() == output_buffer.data_ptr()
+    output_ragged = flashinfer.top_k_ragged_transform(
+        scores,
+        offsets,
+        lengths,
+        k,
+        row_starts=row_starts,
+        deterministic=deterministic,
+        dsa_graph_safe=dsa_graph_safe,
+    )
+    ref_raw_indices = torch.empty_like(output_page) if with_raw_output else None
+    ref_page = reference_page_table_transform(
+        page_scores,
+        src_page_table,
+        lengths,
+        k,
+        row_to_batch=row_to_batch,
+        row_starts=row_starts,
+        page_table_row_starts=page_table_row_starts,
+        page_size=page_size,
+        out_raw_indices=ref_raw_indices,
+    )
+    ref_ragged = reference_ragged_transform(
+        scores, offsets, lengths, k, row_starts=row_starts
+    )
+    output_page_sorted, _ = torch.sort(output_page, dim=-1)
+    ref_page_sorted, _ = torch.sort(ref_page, dim=-1)
+    assert torch.equal(output_page_sorted, ref_page_sorted)
+
+    if output_raw_indices is not None:
+        assert ref_raw_indices is not None
+        assert page_table_row_starts is not None
+        assert torch.equal(
+            torch.sort(output_raw_indices, dim=-1).values,
+            torch.sort(ref_raw_indices, dim=-1).values,
+        )
+        for row in range(num_rows):
+            num_selected = min(lengths[row].item(), k)
+            assert torch.all(output_raw_indices[row, :num_selected] >= 0)
+            assert torch.all(output_raw_indices[row, num_selected:] == -1)
+            raw = output_raw_indices[row, :num_selected].long()
+            batch = row_to_batch[row].item()
+            page_start = page_table_row_starts[row].item()
+            expected = (
+                src_page_table[batch, page_start + raw // page_size] * page_size
+                + raw % page_size
+            )
+            assert torch.equal(output_page[row, :num_selected], expected)
+
+    output_ragged_sorted, _ = torch.sort(output_ragged, dim=-1)
+    ref_ragged_sorted, _ = torch.sort(ref_ragged, dim=-1)
+    assert torch.equal(output_ragged_sorted, ref_ragged_sorted)
+
+
+@pytest.mark.parametrize("num_rows", [1, 8, 32])
+@pytest.mark.parametrize("max_len", [1024, 4096, 8192])
+@pytest.mark.parametrize("k", [64, 256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_ragged_transform_out_of_length(num_rows, max_len, k, dtype):
+    """Test top_k_ragged_transform returns correct indices with offsets."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate naive offsets (cumulative sum style)
+    offsets = torch.zeros(num_rows, device=device, dtype=torch.int32)
+
+    # Random in [1, max_len]
+    lengths = torch.randint(
+        1, max_len + 1, (num_rows,), device=device, dtype=torch.int32
+    )
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    # Reference implementation
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+
+    # Check output shape
+    assert output.shape == (num_rows, k), (
+        f"Expected shape {(num_rows, k)}, got {output.shape}"
+    )
+    assert output.dtype == torch.int32
+
+    # Check accuracy
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+    # Check out of length
+    valid_min = offsets
+    valid_max = offsets + lengths
+    output = output.clamp_min(0)
+    assert torch.all((output >= valid_min[:, None]) & (output < valid_max[:, None])), (
+        f"Out of length Error. {valid_min=}, {valid_max=}, {output.max(dim=1).values=}, {output.min(dim=1).values=}"
+    )
+
+
+@pytest.mark.parametrize("num_rows", [4, 16])
+@pytest.mark.parametrize("max_len", [2048])
+@pytest.mark.parametrize("k", [256, 512])
+def test_page_table_transform_trivial_case(num_rows, max_len, k):
+    """Test page table transform when length <= k (trivial copy case)."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate random page table
+    src_page_table = torch.randint(
+        0, 10000, (num_rows, max_len), device=device, dtype=torch.int32
+    )
+
+    # Set lengths less than or equal to k
+    lengths = torch.randint(1, k + 1, (num_rows,), device=device, dtype=torch.int32)
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
+
+    # Verify manually
+    for i in range(num_rows):
+        length = lengths[i].item()
+        # First `length` entries should match page table
+        expected = src_page_table[i, :length]
+        actual_valid = output[i, :length]
+        assert torch.equal(expected, actual_valid), (
+            f"Row {i}: expected {expected}, got {actual_valid}"
+        )
+        # Remaining should be -1
+        if length < k:
+            remaining = output[i, length:]
+            assert torch.all(remaining == -1), f"Row {i}: padding should be -1"
+
+
+@pytest.mark.parametrize("num_rows", [4, 16])
+@pytest.mark.parametrize("max_len", [2048])
+@pytest.mark.parametrize("k", [256, 512])
+def test_ragged_transform_trivial_case(num_rows, max_len, k):
+    """Test ragged transform when length <= k (trivial sequential indices case)."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate offsets
+    offsets = torch.arange(0, num_rows * 1000, 1000, device=device, dtype=torch.int32)
+
+    # Set lengths less than or equal to k
+    lengths = torch.randint(1, k + 1, (num_rows,), device=device, dtype=torch.int32)
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    # Verify manually
+    for i in range(num_rows):
+        length = lengths[i].item()
+        offset = offsets[i].item()
+        # First `length` entries should be [offset, offset+1, ..., offset+length-1]
+        expected = torch.arange(
+            offset, offset + length, dtype=torch.int32, device=device
+        )
+        actual_valid = output[i, :length]
+        assert torch.equal(expected, actual_valid), (
+            f"Row {i}: expected {expected}, got {actual_valid}"
+        )
+        # Remaining should be -1
+        if length < k:
+            remaining = output[i, length:]
+            assert torch.all(remaining == -1), f"Row {i}: padding should be -1"
+
+
+@pytest.mark.parametrize("num_rows", [8])
+@pytest.mark.parametrize("max_len", [4096])
+@pytest.mark.parametrize("k", [256])
+def test_page_table_transform_with_row_to_batch(num_rows, max_len, k):
+    """Test page table transform with row_to_batch mapping."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+
+    # Batch size is smaller than num_rows (multiple rows per batch)
+    batch_size = num_rows // 2
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate random page table for batch_size
+    src_page_table = torch.randint(
+        0, 10000, (batch_size, max_len), device=device, dtype=torch.int32
+    )
+
+    # Map rows to batches (2 rows per batch)
+    row_to_batch = torch.arange(
+        batch_size, device=device, dtype=torch.int32
+    ).repeat_interleave(2)
+
+    # All rows have full length
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_page_table_transform(
+        scores, src_page_table, lengths, k, row_to_batch
+    )
+
+    # Reference implementation
+    ref_output = reference_page_table_transform(
+        scores, src_page_table, lengths, k, row_to_batch
+    )
+
+    # Check output shape
+    assert output.shape == (num_rows, k)
+
+    # Check accuracy
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
+@pytest.mark.parametrize("num_rows", [4, 16])
+@pytest.mark.parametrize("max_len", [4096, 131072])
+@pytest.mark.parametrize("k", [256])
+def test_page_table_transform_variable_lengths(num_rows, max_len, k):
+    """Test page table transform with variable sequence lengths."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate random page table
+    src_page_table = torch.randint(
+        0, 10000, (num_rows, max_len), device=device, dtype=torch.int32
+    )
+
+    # Variable lengths - some trivial (< k), some large (> k)
+    lengths = torch.tensor(
+        [k // 2, max_len, k, max_len // 2, k * 2] * (num_rows // 5 + 1),
+        device=device,
+        dtype=torch.int32,
+    )[:num_rows]
+    lengths = lengths.clamp(max=max_len)
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
+
+    # Reference implementation
+    ref_output = reference_page_table_transform(scores, src_page_table, lengths, k)
+
+    # Check accuracy
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
+@pytest.mark.parametrize("num_rows", [4, 16])
+@pytest.mark.parametrize("max_len", [4096])
+@pytest.mark.parametrize("k", [256])
+def test_ragged_transform_variable_lengths(num_rows, max_len, k):
+    """Test ragged transform with variable sequence lengths."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate variable offsets
+    offsets = torch.tensor(
+        [i * 5000 for i in range(num_rows)], device=device, dtype=torch.int32
+    )
+
+    # Variable lengths - some trivial (< k), some large (> k)
+    lengths = torch.tensor(
+        [k // 2, max_len, k, max_len // 2, k * 2] * (num_rows // 5 + 1),
+        device=device,
+        dtype=torch.int32,
+    )[:num_rows]
+    lengths = lengths.clamp(max=max_len)
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    # Reference implementation
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+
+    # Check accuracy
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
+@pytest.mark.parametrize("num_rows", [64, 128])
+@pytest.mark.parametrize("max_len", [8192, 16384])
+@pytest.mark.parametrize("k", [256, 512])
+def test_page_table_transform_large_scale(num_rows, max_len, k):
+    """Test page table transform with large inputs (multi-CTA path)."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float16
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate random page table
+    src_page_table = torch.randint(
+        0, 10000, (num_rows, max_len), device=device, dtype=torch.int32
+    )
+
+    # All rows have full length
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
+
+    # Reference implementation
+    ref_output = reference_page_table_transform(scores, src_page_table, lengths, k)
+
+    # Check output shape
+    assert output.shape == (num_rows, k)
+
+    # Check accuracy
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
+@pytest.mark.parametrize("num_rows", [64, 128])
+@pytest.mark.parametrize("max_len", [8192, 16384])
+@pytest.mark.parametrize("k", [256, 512])
+def test_ragged_transform_large_scale(num_rows, max_len, k):
+    """Test ragged transform with large inputs (multi-CTA path)."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float16
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate offsets
+    offsets = torch.arange(
+        0, num_rows * max_len, max_len, device=device, dtype=torch.int32
+    )
+
+    # All rows have full length
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    # Test flashinfer implementation
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    # Reference implementation
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+
+    # Check output shape
+    assert output.shape == (num_rows, k)
+
+    # Check accuracy
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+
+def test_page_table_transform_single_row():
+    """Test page table transform with single row (batch_size=1)."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+    max_len = 4096
+    k = 256
+
+    scores = torch.randn(1, max_len, device=device, dtype=dtype)
+    src_page_table = torch.randint(
+        0, 10000, (1, max_len), device=device, dtype=torch.int32
+    )
+    lengths = torch.tensor([max_len], device=device, dtype=torch.int32)
+
+    output = flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
+
+    ref_output = reference_page_table_transform(scores, src_page_table, lengths, k)
+
+    accuracy = compute_transform_accuracy(output, ref_output, 1, k)
+    assert accuracy >= 0.98, f"Accuracy {accuracy:.4f} < 0.98"
+
+
+def test_ragged_transform_single_row():
+    """Test ragged transform with single row (batch_size=1)."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+    max_len = 4096
+    k = 256
+
+    scores = torch.randn(1, max_len, device=device, dtype=dtype)
+    offsets = torch.tensor([0], device=device, dtype=torch.int32)
+    lengths = torch.tensor([max_len], device=device, dtype=torch.int32)
+
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+
+    accuracy = compute_transform_accuracy(output, ref_output, 1, k)
+    assert accuracy >= 0.98, f"Accuracy {accuracy:.4f} < 0.98"
+
+
+def test_page_table_transform_correctness_exact():
+    """Test that page table transform produces values that exist in the page table."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+    num_rows = 8
+    max_len = 2048
+    k = 256
+
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+    # Use unique page table values for easy verification
+    src_page_table = torch.arange(
+        num_rows * max_len, device=device, dtype=torch.int32
+    ).reshape(num_rows, max_len)
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
+
+    # Verify all output values exist in the corresponding page table row
+    for i in range(num_rows):
+        page_values = set(src_page_table[i].cpu().numpy())
+        output_values = output[i][output[i] != -1].cpu().numpy()
+        for val in output_values:
+            assert val in page_values, f"Row {i}: output value {val} not in page table"
+
+
+def test_ragged_transform_offset_correctness():
+    """Test that ragged transform correctly applies offsets."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+    num_rows = 8
+    max_len = 2048
+    k = 256
+
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+    offsets = torch.tensor(
+        [i * 10000 for i in range(num_rows)], device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    # Verify all output values are in the correct range [offset, offset + length)
+    for i in range(num_rows):
+        offset = offsets[i].item()
+        length = lengths[i].item()
+        output_values = output[i][output[i] != -1].cpu().numpy()
+        for val in output_values:
+            assert offset <= val < offset + length, (
+                f"Row {i}: output value {val} not in range [{offset}, {offset + length})"
+            )
+
+
+# ===================== SGLang-style Reference Implementation =====================
+
+
+def sglang_style_topk_page_table_transform(
+    scores: torch.Tensor,
+    src_page_table: torch.Tensor,
+    lengths: torch.Tensor,
+    k: int,
+    cu_seqlens_q: torch.Tensor = None,
+) -> torch.Tensor:
+    """
+    Reference implementation mimicking SGLang's topk_transform_prefill logic.
+
+    SGLang uses a radix-based top-k selection followed by page table gather.
+    This PyTorch implementation follows the same semantic behavior.
+
+    For prefill mode with cu_seqlens_q:
+      - scores shape: [expanded_bs, max_len]
+      - src_page_table shape: [prefill_bs, max_len]
+      - Need to map expanded rows to prefill batch indices via cu_seqlens_q
+    """
+    num_rows = scores.size(0)
+    scores.size(1)
+    device = scores.device
+
+    output = torch.full((num_rows, k), -1, dtype=torch.int32, device=device)
+
+    if cu_seqlens_q is not None:
+        # Prefill mode: map expanded rows back to prefill batch
+        prefill_bs = cu_seqlens_q.size(0) - 1
+        cu_seqlens = cu_seqlens_q.cpu().numpy()
+
+        for i in range(num_rows):
+            length = lengths[i].item()
+            # Find which prefill batch this row belongs to
+            batch_idx = 0
+            for b in range(prefill_bs):
+                if cu_seqlens[b] <= i < cu_seqlens[b + 1]:
+                    batch_idx = b
+                    break
+
+            if length <= k:
+                output[i, :length] = src_page_table[batch_idx, :length]
+            else:
+                row_scores = scores[i, :length].float()
+                _, topk_indices = torch.topk(row_scores, k)
+                output[i] = src_page_table[batch_idx, topk_indices.long()]
+    else:
+        # Decode mode: 1:1 mapping
+        for i in range(num_rows):
+            length = lengths[i].item()
+            if length <= k:
+                output[i, :length] = src_page_table[i, :length]
+            else:
+                row_scores = scores[i, :length].float()
+                _, topk_indices = torch.topk(row_scores, k)
+                output[i] = src_page_table[i, topk_indices.long()]
+
+    return output
+
+
+def sglang_style_topk_ragged_transform(
+    scores: torch.Tensor,
+    offsets: torch.Tensor,
+    lengths: torch.Tensor,
+    k: int,
+) -> torch.Tensor:
+    """
+    Reference implementation mimicking SGLang's topk_transform_prefill_ragged logic.
+
+    For each row:
+      output[i] = topk_indices[i] + offsets[i]
+    """
+    num_rows = scores.size(0)
+    device = scores.device
+
+    output = torch.full((num_rows, k), -1, dtype=torch.int32, device=device)
+
+    for i in range(num_rows):
+        length = lengths[i].item()
+        offset = offsets[i].item()
+
+        if length <= k:
+            output[i, :length] = torch.arange(
+                offset, offset + length, dtype=torch.int32, device=device
+            )
+        else:
+            row_scores = scores[i, :length].float()
+            _, topk_indices = torch.topk(row_scores, k)
+            output[i] = topk_indices.int() + offset
+
+    return output
+
+
+@pytest.mark.parametrize("num_rows", [8, 32])
+@pytest.mark.parametrize("max_len", [4096, 8192])
+@pytest.mark.parametrize("k", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_compare_with_sglang_style_page_table(num_rows, max_len, k, dtype):
+    """Compare flashinfer's page table transform with SGLang-style reference."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate random page table
+    src_page_table = torch.randint(
+        0, 10000, (num_rows, max_len), device=device, dtype=torch.int32
+    )
+
+    # All rows have full length
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    # FlashInfer implementation
+    fi_output = flashinfer.top_k_page_table_transform(
+        scores, src_page_table, lengths, k
+    )
+
+    # SGLang-style reference
+    sgl_output = sglang_style_topk_page_table_transform(
+        scores, src_page_table, lengths, k
+    )
+
+    # Compare results
+    accuracy = compute_transform_accuracy(fi_output, sgl_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, (
+        f"FlashInfer vs SGLang-style accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("num_rows", [8, 32])
+@pytest.mark.parametrize("max_len", [4096, 8192])
+@pytest.mark.parametrize("k", [256, 512, 1024, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_compare_with_sglang_style_ragged(num_rows, max_len, k, dtype):
+    """Compare flashinfer's ragged transform with SGLang-style reference."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    # Generate random scores
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+
+    # Generate offsets
+    offsets = torch.arange(
+        0, num_rows * max_len, max_len, device=device, dtype=torch.int32
+    )
+
+    # All rows have full length
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    # FlashInfer implementation
+    fi_output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    # SGLang-style reference
+    sgl_output = sglang_style_topk_ragged_transform(scores, offsets, lengths, k)
+
+    # Compare results
+    accuracy = compute_transform_accuracy(fi_output, sgl_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, (
+        f"FlashInfer vs SGLang-style accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("num_rows", [8])
+@pytest.mark.parametrize("max_len", [4096])
+@pytest.mark.parametrize("k", [256, 512])
+def test_compare_with_sglang_style_prefill_mode(num_rows, max_len, k):
+    """Compare with SGLang-style in prefill mode with cu_seqlens_q mapping."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.float32
+
+    # Expanded batch: multiple query heads per prefill batch
+    prefill_bs = num_rows // 2
+    expanded_bs = num_rows
+
+    # Generate random scores for expanded batch
+    scores = torch.randn(expanded_bs, max_len, device=device, dtype=dtype)
+
+    # Page table is per prefill batch
+    src_page_table = torch.randint(
+        0, 10000, (prefill_bs, max_len), device=device, dtype=torch.int32
+    )
+
+    # cu_seqlens_q: maps expanded rows to prefill batch
+    # Each prefill batch has 2 rows in expanded batch
+    cu_seqlens_q = torch.arange(0, expanded_bs + 1, 2, device=device, dtype=torch.int32)
+
+    # Lengths for all rows
+    lengths = torch.full((expanded_bs,), max_len, device=device, dtype=torch.int32)
+
+    # FlashInfer: use row_to_batch mapping
+    row_to_batch = torch.arange(
+        prefill_bs, device=device, dtype=torch.int32
+    ).repeat_interleave(2)
+    fi_output = flashinfer.top_k_page_table_transform(
+        scores, src_page_table, lengths, k, row_to_batch
+    )
+
+    # SGLang-style reference with cu_seqlens_q
+    sgl_output = sglang_style_topk_page_table_transform(
+        scores, src_page_table, lengths, k, cu_seqlens_q
+    )
+
+    # Compare results
+    accuracy = compute_transform_accuracy(fi_output, sgl_output, expanded_bs, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, (
+        f"FlashInfer vs SGLang-style prefill mode accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+# ===================== Algorithm-specific Tests =====================
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered", "cub"])
+@pytest.mark.parametrize("batch_size", [1, 8])
+@pytest.mark.parametrize("vocab_size", [4096, 32000])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_top_k_algorithms(algo, batch_size, vocab_size, k, dtype, set_topk_algo):
+    """Test top_k with different algorithms (auto, multi_cta, filtered, cub)."""
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    set_topk_algo(algo)
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=dtype)
+
+    # flashinfer top_k with specified algorithm
+    values, indices = flashinfer.top_k(logits, k)
+
+    # Reference: torch.topk
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    # Check output shapes
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Check dtypes
+    assert values.dtype == dtype
+    assert indices.dtype == torch.int64
+
+    # Verify values match the gathered indices
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    torch.testing.assert_close(values, gathered_values)
+
+    # Check accuracy
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    min_accuracy = 0.98
+    assert accuracy >= min_accuracy, (
+        f"Algorithm {algo}: Accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered", "cub"])
+@pytest.mark.parametrize("num_rows", [1, 8])
+@pytest.mark.parametrize("max_len", [4096, 8192])
+@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_page_table_transform_algorithms(
+    algo, num_rows, max_len, k, dtype, set_topk_algo
+):
+    """Test page table transform with different algorithms."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    set_topk_algo(algo)
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+    src_page_table = torch.randint(
+        0, 10000, (num_rows, max_len), device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.top_k_page_table_transform(scores, src_page_table, lengths, k)
+    ref_output = reference_page_table_transform(scores, src_page_table, lengths, k)
+
+    assert output.shape == (num_rows, k)
+    assert output.dtype == torch.int32
+
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, (
+        f"Algorithm {algo}: Accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered", "cub"])
+@pytest.mark.parametrize("num_rows", [1, 8])
+@pytest.mark.parametrize("max_len", [4096, 8192])
+@pytest.mark.parametrize("k", [256, 512])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_ragged_transform_algorithms(algo, num_rows, max_len, k, dtype, set_topk_algo):
+    """Test ragged transform with different algorithms."""
+    if k > max_len:
+        pytest.skip("k should be less than max_len")
+
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    set_topk_algo(algo)
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+    offsets = torch.arange(
+        0, num_rows * max_len, max_len, device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+
+    assert output.shape == (num_rows, k)
+    assert output.dtype == torch.int32
+
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    min_accuracy = 0.95
+    assert accuracy >= min_accuracy, (
+        f"Algorithm {algo}: Accuracy {accuracy:.4f} < {min_accuracy}"
+    )
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+def test_algorithms_produce_same_topk_set(algo, set_topk_algo):
+    """Test that all algorithms produce valid top-k sets."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    torch.manual_seed(42)
+    batch_size = 4
+    vocab_size = 32000
+    k = 256
+    dtype = torch.float32
+    device = "cuda"
+
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
+
+    set_topk_algo(algo)
+    values, indices = flashinfer.top_k(logits, k)
+
+    # Verify all returned values are truly top-k
+    for i in range(batch_size):
+        kth_largest = torch.kthvalue(-logits[i], k).values.item() * -1
+        assert values[i].min().item() >= kth_largest - 1e-6, (
+            f"Algorithm {algo}, row {i}: min value {values[i].min().item()} < "
+            f"kth largest {kth_largest}"
+        )
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+def test_algorithms_with_large_k(algo, set_topk_algo):
+    """Test algorithms with large k values (stress test)."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    torch.manual_seed(42)
+    batch_size = 2
+    vocab_size = 4096
+    k = 2048  # 50% of vocab_size
+    dtype = torch.float32
+    device = "cuda"
+
+    set_topk_algo(algo)
+
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=dtype)
+    values, indices = flashinfer.top_k(logits, k)
+
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    assert values.shape == (batch_size, k)
+    accuracy = compute_topk_accuracy(indices.int(), ref_indices.int(), batch_size, k)
+    assert accuracy >= 0.98, f"Algorithm {algo}: Accuracy {accuracy:.4f} < 0.98"
+
+
+@pytest.mark.parametrize("num_rows", [4, 8])
+@pytest.mark.parametrize("top_k", [256, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_ragged_transform_multi_cta_short_rows(num_rows, top_k, dtype):
+    """Regression test for uint32 underflow in multi-CTA chunk_size calculation."""
+    torch.manual_seed(42)
+    device = "cuda"
+
+    max_len = 131072
+
+    # Force multi_cta path so the test exercises the vulnerable code path
+    # regardless of the heuristic.
+    old_algo = os.environ.get("FLASHINFER_TOPK_ALGO", None)
+    os.environ["FLASHINFER_TOPK_ALGO"] = "multi_cta"
+
+    try:
+        scores = torch.randn(num_rows, max_len, device=device, dtype=dtype)
+        offsets = torch.zeros(num_rows, device=device, dtype=torch.int32)
+
+        # Mix short and long rows. Short rows (4K-8K) are well below chunk_size
+        # on any GPU, so CTAs beyond the first will have chunk_start > length.
+        lengths_list = []
+        for i in range(num_rows):
+            if i % 2 == 0:
+                lengths_list.append(max_len)
+            else:
+                lengths_list.append(torch.randint(4000, 8000, (1,)).item())
+        lengths = torch.tensor(lengths_list, device=device, dtype=torch.int32)
+
+        output = flashinfer.top_k_ragged_transform(scores, offsets, lengths, top_k)
+        ref_output = reference_ragged_transform(scores, offsets, lengths, top_k)
+
+        assert output.shape == (num_rows, top_k)
+        assert output.dtype == torch.int32
+
+        accuracy = compute_transform_accuracy(output, ref_output, num_rows, top_k)
+        min_accuracy = 0.90
+        assert accuracy >= min_accuracy, f"Accuracy {accuracy:.4f} < {min_accuracy}"
+
+        # Verify indices stay within [offset, offset + length) for each row
+        for i in range(num_rows):
+            length = lengths[i].item()
+            row_out = output[i]
+            valid = row_out[row_out >= 0]
+            assert torch.all(valid < length), (
+                f"Row {i}: index out of bounds (max={valid.max().item()}, length={length})"
+            )
+    finally:
+        if old_algo is None:
+            os.environ.pop("FLASHINFER_TOPK_ALGO", None)
+        else:
+            os.environ["FLASHINFER_TOPK_ALGO"] = old_algo
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta", "filtered"])
+def test_bf16_long_seq_regression_across_algorithms(algo, set_topk_algo):
+    """Regression for bf16 long-seq topk across algorithm overrides."""
+    _require_sm80_for_bf16()
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    set_topk_algo(algo)
+
+    logits, _, _, _, _, k, _ = _build_bf16_long_seq_bucket_inputs()
+
+    values, indices = flashinfer.top_k(logits, k, sorted=True)
+    ref_values, _ = torch.topk(logits, k, dim=-1, sorted=True)
+
+    # Value set must match torch.topk; ties make index order non-unique.
+    torch.testing.assert_close(values, ref_values)
+    gathered_values = torch.gather(logits, dim=-1, index=indices)
+    torch.testing.assert_close(values, gathered_values)
+
+
+def _build_bf16_long_seq_bucket_inputs():
+    """Construct a tie-heavy bf16 workload used by long-sequence regression tests."""
+    batch_size = 4
+    vocab_size = 65536
+    k = 1024
+    device = "cuda"
+
+    logits = (
+        ((torch.arange(vocab_size, device=device, dtype=torch.float32) % 64) / 64.0)
+        .unsqueeze(0)
+        .repeat(batch_size, 1)
+        .to(torch.bfloat16)
+    )
+    lengths = torch.full((batch_size,), vocab_size, device=device, dtype=torch.int32)
+    expected = (
+        torch.arange(63, vocab_size, 64, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .repeat(batch_size, 1)
+    )
+    return logits, lengths, expected, batch_size, vocab_size, k, device
+
+
+def _build_fp32_long_seq_overflow_inputs():
+    """Construct a float32 case that overflows FilteredTopK refine candidate buffer.
+
+    Values are crafted so that all elements share the same coarse/first-refine bucket,
+    while the true top-k elements are concentrated in the tail. This triggers candidate
+    truncation if overflow fallback is missing in multi-round refine.
+    """
+    batch_size = 1
+    vocab_size = 65536
+    k = 1024
+    device = "cuda"
+
+    idx = torch.arange(vocab_size, device=device, dtype=torch.int32)
+    bits = torch.full((vocab_size,), 0x3F800000, device=device, dtype=torch.int32) + idx
+    logits = bits.view(torch.float32).unsqueeze(0).contiguous()
+    return logits, batch_size, vocab_size, k
+
+
+def _build_fp32_long_seq_pivot_mismatch_inputs():
+    """Construct a float32 case that exposes pivot reconstruction mismatch.
+
+    This bit pattern keeps a dense coarse bucket while making the coarse threshold
+    byte differ from the first FP32 ordered-byte threshold. If pivot reconstruction
+    incorrectly mixes the coarse bin into high 8 bits, filtered top-k output drifts
+    from torch.topk.
+    """
+    batch_size = 1
+    vocab_size = 65536
+    k = 1024
+    device = "cuda"
+
+    base = 0x3805ED27
+    idx = torch.arange(vocab_size, device=device, dtype=torch.int64)
+    bits = (
+        (torch.tensor(base, device=device, dtype=torch.int64) + idx) & 0xFFFFFFFF
+    ).to(torch.int32)
+    logits = bits.view(torch.float32).unsqueeze(0).contiguous()
+    return logits, batch_size, vocab_size, k
+
+
+def _assert_unordered_indices_match(output, expected):
+    """Compare index sets row-wise while ignoring order under ties."""
+    output_sorted = torch.sort(output, dim=-1).values.to(torch.long)
+    expected_sorted = torch.sort(expected, dim=-1).values.to(torch.long)
+    assert torch.equal(
+        output_sorted,
+        expected_sorted,
+    )
+
+
+def _assert_top_k_matches_torch(
+    logits: torch.Tensor, k: int, *, deterministic: bool = False, sorted: bool = True
+):
+    """Assert FlashInfer top_k matches torch.topk for exact-order cases."""
+    values, indices = flashinfer.top_k(
+        logits, k, deterministic=deterministic, sorted=sorted
+    )
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1, sorted=sorted)
+
+    assert values.shape == ref_values.shape
+    assert indices.shape == ref_indices.shape
+    torch.testing.assert_close(values, ref_values)
+    assert torch.equal(indices, ref_indices)
+
+
+def _run_transform(
+    logits,
+    k,
+    transform_mode,
+    *,
+    lengths: torch.Tensor | None = None,
+    deterministic: bool = False,
+    src_page_table: torch.Tensor | None = None,
+    offsets: torch.Tensor | None = None,
+):
+    """Run a transform API with either explicit or default identity metadata."""
+    batch_size, vocab_size = logits.shape
+    device = logits.device
+    if lengths is None:
+        lengths = torch.full(
+            (batch_size,), vocab_size, device=device, dtype=torch.int32
+        )
+
+    if transform_mode == "page_table":
+        if src_page_table is None:
+            src_page_table = (
+                torch.arange(vocab_size, device=device, dtype=torch.int32)
+                .unsqueeze(0)
+                .repeat(batch_size, 1)
+                .contiguous()
+            )
+        return flashinfer.top_k_page_table_transform(
+            logits, src_page_table, lengths, k, deterministic=deterministic
+        )
+
+    if offsets is None:
+        offsets = torch.zeros((batch_size,), device=device, dtype=torch.int32)
+    return flashinfer.top_k_ragged_transform(
+        logits, offsets, lengths, k, deterministic=deterministic
+    )
+
+
+def _run_transform_with_identity_mapping(
+    logits, k, transform_mode, deterministic: bool = False
+):
+    """Run transform API with identity mapping so output equals selected indices."""
+    return _run_transform(logits, k, transform_mode, deterministic=deterministic)
+
+
+def _assert_transform_identity_matches_torch(
+    logits, k, transform_mode, deterministic: bool = False
+):
+    """Assert transform output matches torch.topk indices under identity mapping."""
+    output = _run_transform_with_identity_mapping(
+        logits, k, transform_mode, deterministic=deterministic
+    )
+    ref_indices = torch.topk(logits, k, dim=-1, sorted=True).indices.to(torch.int32)
+    _assert_unordered_indices_match(output, ref_indices)
+
+
+def _assert_repeatable_transform_output(
+    logits,
+    k,
+    transform_mode,
+    *,
+    num_runs: int,
+    deterministic: bool = True,
+    lengths: torch.Tensor | None = None,
+    src_page_table: torch.Tensor | None = None,
+    offsets: torch.Tensor | None = None,
+):
+    """Assert a transform API produces bitwise-identical output across repeated runs."""
+    ref = _run_transform(
+        logits,
+        k,
+        transform_mode,
+        lengths=lengths,
+        deterministic=deterministic,
+        src_page_table=src_page_table,
+        offsets=offsets,
+    )
+    for _ in range(num_runs - 1):
+        out = _run_transform(
+            logits,
+            k,
+            transform_mode,
+            lengths=lengths,
+            deterministic=deterministic,
+            src_page_table=src_page_table,
+            offsets=offsets,
+        )
+        assert torch.equal(out, ref)
+    return ref
+
+
+def _assert_repeatable_valid_identity_transform_selection(
+    output_a: torch.Tensor,
+    output_b: torch.Tensor,
+    vocab_size: int,
+    k: int,
+    gt_count: int = 0,
+):
+    """Assert deterministic transform outputs are repeatable and form a valid top-k set."""
+    assert torch.equal(output_a, output_b)
+    output = output_a[0]
+    assert output.numel() == k
+    assert torch.unique(output).numel() == k
+    assert torch.all((output >= 0) & (output < vocab_size))
+
+    if gt_count > 0:
+        gt_indices = torch.arange(
+            vocab_size - gt_count,
+            vocab_size,
+            device=output.device,
+            dtype=torch.int32,
+        )
+        gt_mask = torch.isin(output, gt_indices)
+        assert gt_mask.sum().item() == gt_count
+        assert torch.all(torch.isin(gt_indices, output))
+        tie_selected = output[~gt_mask]
+        assert tie_selected.numel() == k - gt_count
+        assert torch.all(tie_selected < vocab_size - gt_count)
+
+
+def _assert_repeatable_valid_topk_selection(
+    logits: torch.Tensor,
+    values_a: torch.Tensor,
+    indices_a: torch.Tensor,
+    values_b: torch.Tensor,
+    indices_b: torch.Tensor,
+    k: int,
+    gt_count: int = 0,
+):
+    """Assert deterministic top-k outputs are repeatable and form a valid selected set."""
+    assert torch.equal(values_a, values_b)
+    assert torch.equal(indices_a, indices_b)
+
+    gathered_values = torch.gather(logits, 1, indices_a)
+    torch.testing.assert_close(values_a, gathered_values)
+
+    vocab_size = logits.size(1)
+    for output in indices_a:
+        assert output.numel() == k
+        assert torch.unique(output).numel() == k
+        assert torch.all((output >= 0) & (output < vocab_size))
+
+        if gt_count > 0:
+            gt_indices = torch.arange(
+                vocab_size - gt_count,
+                vocab_size,
+                device=output.device,
+                dtype=output.dtype,
+            )
+            gt_mask = torch.isin(output, gt_indices)
+            assert gt_mask.sum().item() == gt_count
+            assert torch.all(torch.isin(gt_indices, output))
+            tie_selected = output[~gt_mask]
+            assert tie_selected.numel() == k - gt_count
+            assert torch.all(tie_selected < vocab_size - gt_count)
+
+
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_bf16_long_seq_transform_regression_filtered(transform_mode, set_topk_algo):
+    """Regression for bf16 long-seq transform APIs under filtered algorithm."""
+    _require_sm80_for_bf16()
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo("filtered")
+
+    logits, lengths, expected, batch_size, vocab_size, k, device = (
+        _build_bf16_long_seq_bucket_inputs()
+    )
+
+    if transform_mode == "page_table":
+        # Identity page table: output should match selected local indices.
+        src_page_table = (
+            torch.arange(vocab_size, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+            .contiguous()
+        )
+        output = flashinfer.top_k_page_table_transform(
+            logits, src_page_table, lengths, k
+        )
+    else:
+        offsets = torch.zeros((batch_size,), device=device, dtype=torch.int32)
+        output = flashinfer.top_k_ragged_transform(logits, offsets, lengths, k)
+
+    _assert_unordered_indices_match(output, expected)
+
+
+@pytest.mark.parametrize(
+    ("builder", "algo"),
+    [
+        (_build_fp32_long_seq_overflow_inputs, "auto"),
+        (_build_fp32_long_seq_overflow_inputs, "multi_cta"),
+        (_build_fp32_long_seq_overflow_inputs, "filtered"),
+        (_build_fp32_long_seq_pivot_mismatch_inputs, "filtered"),
+    ],
+    ids=[
+        "refine_overflow-auto",
+        "refine_overflow-multi_cta",
+        "refine_overflow-filtered",
+        "pivot_rebuild-filtered",
+    ],
+)
+@pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
+def test_fp32_long_seq_regression_matrix(builder, algo, api_kind, set_topk_algo):
+    """Long-sequence fp32 regressions should remain exact across supported APIs."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    logits, _, _, k = builder()
+    if api_kind == "top_k":
+        _assert_top_k_matches_torch(logits, k, sorted=True)
+    else:
+        _assert_transform_identity_matches_torch(logits, k, api_kind)
+
+
+@pytest.mark.parametrize(
+    ("builder", "case_name"),
+    [
+        (_build_fp32_long_seq_overflow_inputs, "refine_overflow"),
+        (_build_fp32_long_seq_pivot_mismatch_inputs, "pivot_rebuild"),
+    ],
+)
+@pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
+def test_fp32_long_seq_filtered_deterministic_regression_matrix(
+    builder, case_name, api_kind, set_topk_algo
+):
+    """Filtered deterministic long-sequence fallback paths should remain exact."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo("filtered")
+    logits, _, _, k = builder()
+    if api_kind == "top_k":
+        _assert_top_k_matches_torch(logits, k, deterministic=True, sorted=True)
+    else:
+        _assert_transform_identity_matches_torch(
+            logits, k, api_kind, deterministic=True
+        )
+
+
+def test_top_k_deterministic_across_streams():
+    """deterministic=True should be repeatable across CUDA streams.
+
+    This runs the same deterministic top-k on two non-default streams (sequentially)
+    and checks for bitwise-identical results.
+    """
+    batch_size = 4
+    vocab_size = 16384
+    k = 256
+    device = "cuda"
+
+    torch.manual_seed(0)
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=torch.float32)
+
+    s1 = torch.cuda.Stream()
+    s2 = torch.cuda.Stream()
+
+    with torch.cuda.stream(s1):
+        values_a, indices_a = flashinfer.top_k(
+            logits, k, deterministic=True, sorted=False
+        )
+    s1.synchronize()
+
+    with torch.cuda.stream(s2):
+        values_b, indices_b = flashinfer.top_k(
+            logits, k, deterministic=True, sorted=False
+        )
+    s2.synchronize()
+
+    assert torch.equal(values_a, values_b)
+    assert torch.equal(indices_a, indices_b)
+
+
+@pytest.mark.parametrize(
+    ("algo", "batch_size", "vocab_size", "k", "dtype", "pattern_mod"),
+    [
+        ("auto", 4, 16384, 256, torch.float32, 32),
+        # A 4096-wide fp32 row keeps ctas_per_group == 1 even under the multi_cta
+        # override, so this still exercises the radix single-CTA branch.
+        ("multi_cta", 4, 4096, 256, torch.float32, 32),
+        ("multi_cta", 1, 131072, 1024, torch.bfloat16, 64),
+        ("filtered", 4, 16384, 256, torch.float32, 32),
+    ],
+)
+def test_top_k_deterministic_repeatability_matrix(
+    algo, batch_size, vocab_size, k, dtype, pattern_mod, set_topk_algo
+):
+    """deterministic=True should be bitwise identical across routing modes."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+    if dtype == torch.bfloat16:
+        _require_sm80_for_bf16()
+
+    set_topk_algo(algo)
+
+    num_runs = 20
+    device = "cuda"
+    pattern = (
+        torch.arange(vocab_size, device=device, dtype=torch.float32) % pattern_mod
+    ) / float(pattern_mod)
+    logits = pattern.unsqueeze(0).repeat(batch_size, 1).to(dtype).contiguous()
+
+    ref_values, ref_indices = flashinfer.top_k(
+        logits, k, deterministic=True, sorted=False
+    )
+    for _ in range(num_runs - 1):
+        values, indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+        assert torch.equal(values, ref_values)
+        assert torch.equal(indices, ref_indices)
+
+
+@pytest.mark.parametrize(
+    ("algo", "batch_size", "vocab_size", "k"),
+    [
+        ("auto", 4, 16384, 256),
+        # A 4096-wide fp32 row keeps ctas_per_group == 1 even under the multi_cta
+        # override, so this still exercises the radix single-CTA branch.
+        ("multi_cta", 4, 4096, 256),
+        ("multi_cta", 1, 131072, 1024),
+        ("filtered", 4, 16384, 256),
+    ],
+)
+def test_top_k_deterministic_sorted_matches_stable_sort(
+    algo, batch_size, vocab_size, k, set_topk_algo
+):
+    """sorted=True should be repeatable, valid, and descending."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    device = "cuda"
+    pattern = (torch.arange(vocab_size, device=device, dtype=torch.float32) % 32) / 32.0
+    logits = pattern.unsqueeze(0).repeat(batch_size, 1).contiguous()
+
+    sorted_values_a, sorted_indices_a = flashinfer.top_k(
+        logits, k, deterministic=True, sorted=True
+    )
+    sorted_values_b, sorted_indices_b = flashinfer.top_k(
+        logits, k, deterministic=True, sorted=True
+    )
+
+    _assert_repeatable_valid_topk_selection(
+        logits, sorted_values_a, sorted_indices_a, sorted_values_b, sorted_indices_b, k
+    )
+    assert torch.all(sorted_values_a[:, :-1] >= sorted_values_a[:, 1:])
+
+
+@pytest.mark.parametrize(
+    ("algo", "vocab_size"),
+    [
+        ("auto", 16384),
+        # A 4096-wide fp32 row keeps ctas_per_group == 1 even under the multi_cta
+        # override, so this still exercises the radix single-CTA branch.
+        ("multi_cta", 4096),
+        ("multi_cta", 131072),
+        ("filtered", 16384),
+    ],
+)
+@pytest.mark.parametrize(("pattern", "k"), [("all_equal", 8), ("pivot_tie", 6)])
+def test_top_k_deterministic_sorted_repeatable_valid_selection_under_ties(
+    algo, vocab_size, pattern, k, set_topk_algo
+):
+    """Deterministic sorted top-k should remain repeatable under tie pressure."""
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    device = "cuda"
+    logits = torch.ones((1, vocab_size), device=device, dtype=torch.float16)
+    gt_count = 0
+
+    if pattern == "all_equal":
+        expected_values = torch.ones((1, k), device=device, dtype=torch.float16)
+    else:
+        gt_count = 2
+        logits[:, vocab_size - gt_count :] = 2.0
+        expected_values = torch.cat(
+            [
+                torch.full((1, gt_count), 2.0, device=device, dtype=torch.float16),
+                torch.ones((1, k - gt_count), device=device, dtype=torch.float16),
+            ],
+            dim=-1,
+        )
+
+    values_a, indices_a = flashinfer.top_k(logits, k, deterministic=True, sorted=True)
+    values_b, indices_b = flashinfer.top_k(logits, k, deterministic=True, sorted=True)
+
+    torch.testing.assert_close(values_a, expected_values)
+    _assert_repeatable_valid_topk_selection(
+        logits, values_a, indices_a, values_b, indices_b, k, gt_count=gt_count
+    )
+
+
+def _make_tie_break_test_case(num_rows, width, k, dtype, pattern):
+    """Build exact SMALL/LARGE expectations for shared tie-break API tests."""
+    device = "cuda"
+    if pattern == "all_equal":
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
+        scores = (
+            torch.randn((num_rows, 1), device=device, dtype=dtype, generator=generator)
+            .expand(num_rows, width)
+            .contiguous()
+        )
+        expected_small = torch.arange(k, device=device, dtype=torch.int64)
+        expected_large = torch.arange(
+            width - k, width, device=device, dtype=torch.int64
+        )
+    elif pattern == "boundary_tie":
+        ties = 8
+        if k < 2 or width < k + ties:
+            raise ValueError("boundary_tie requires k >= 2 and room for the tied group")
+        scores = torch.zeros((num_rows, width), device=device, dtype=dtype)
+        scores[:, : k - 1] = torch.linspace(
+            100.0, 50.0, k - 1, device=device, dtype=dtype
+        )
+        tie_start = min(max(k, width // 2), width - ties)
+        tie_positions = torch.arange(
+            tie_start, tie_start + ties, device=device, dtype=torch.int64
+        )
+        scores[:, tie_positions] = 10.0
+        always_selected = torch.arange(k - 1, device=device, dtype=torch.int64)
+        expected_small = torch.cat((always_selected, tie_positions[:1]))
+        expected_large = torch.cat((always_selected, tie_positions[-1:]))
+    else:
+        raise ValueError(f"unknown tie-break test pattern: {pattern}")
+
+    return (
+        scores,
+        expected_small.unsqueeze(0).expand(num_rows, -1),
+        expected_large.unsqueeze(0).expand(num_rows, -1),
+    )
+
+
+# "clusters" pins a backend that declines tie-break: the dispatcher must ignore the
+# override and fall back to the native radix path with identical results.
+@pytest.mark.parametrize("algo", ["filtered", "cub", "clusters"])
+@pytest.mark.parametrize(
+    ("batch_size", "vocab_size", "k"),
+    [
+        (2, 128 * 1024, 2048),
+        (1, 1024 * 1024, 1024),
+        (74, 16 * 1024, 512),
+    ],
+    ids=[
+        "rows2_l128k_k2048",
+        "rows1_l1m_k1024",
+        "rows74_l16k_k512",
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("pattern", ["all_equal", "boundary_tie"])
+def test_top_k_tie_break_modes(
+    algo, batch_size, vocab_size, k, dtype, pattern, set_topk_algo
+):
+    """tie_break=1|2 should select row-global smallest/largest pivot indices."""
+    if algo == "cub":
+        _require_cub_tie_break_support()
+    elif not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    logits, expected_small, expected_large = _make_tie_break_test_case(
+        batch_size, vocab_size, k, dtype, pattern
+    )
+
+    values_small, indices_small = flashinfer.top_k(logits, k, tie_break=1)
+    values_large, indices_large = flashinfer.top_k(logits, k, tie_break=2)
+
+    torch.testing.assert_close(values_small, torch.gather(logits, 1, indices_small))
+    torch.testing.assert_close(values_large, torch.gather(logits, 1, indices_large))
+    _assert_unordered_indices_match(indices_small, expected_small)
+    _assert_unordered_indices_match(indices_large, expected_large)
+
+
+# "clusters" pins a backend that declines tie-break: the dispatcher must ignore the
+# override and fall back to the native radix path with identical results.
+@pytest.mark.parametrize("algo", ["filtered", "cub", "clusters"])
+@pytest.mark.parametrize(
+    ("num_rows", "max_len", "k"),
+    [
+        (2, 128 * 1024, 2048),
+        (1, 1024 * 1024, 1024),
+        (74, 16 * 1024, 512),
+    ],
+    ids=[
+        "rows2_l128k_k2048",
+        "rows1_l1m_k1024",
+        "rows74_l16k_k512",
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize(
+    "page_size",
+    [1, 64],
+    ids=["wide", "compact"],
+)
+@pytest.mark.parametrize("pattern", ["all_equal", "boundary_tie"])
+def test_top_k_tie_break_modes_transform_apis(
+    algo, num_rows, max_len, k, dtype, page_size, pattern, set_topk_algo
+):
+    """Transform APIs should honor tie_break selection before remapping outputs."""
+    if algo == "cub":
+        _require_cub_tie_break_support()
+    elif not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    device = "cuda"
+
+    scores, local_small, local_large = _make_tie_break_test_case(
+        num_rows, max_len, k, dtype, pattern
+    )
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+    row_ids = torch.arange(num_rows, device=device, dtype=torch.int32)
+    page_table_width = (max_len + page_size - 1) // page_size
+    page_bases = (row_ids + 1) * (page_table_width + 17)
+    logical_pages = torch.arange(page_table_width, device=device, dtype=torch.int32)
+    if page_size > 1:
+        logical_pages = torch.flip(logical_pages, dims=(0,))
+    src_page_table = (page_bases.unsqueeze(1) + logical_pages.unsqueeze(0)).contiguous()
+
+    page_small_out = (
+        torch.empty((num_rows, k), device=device, dtype=torch.int32)
+        if page_size > 1
+        else None
+    )
+    page_large_out = (
+        torch.empty_like(page_small_out) if page_small_out is not None else None
+    )
+    raw_small = torch.empty_like(page_small_out) if page_small_out is not None else None
+    raw_large = torch.empty_like(page_small_out) if page_small_out is not None else None
+
+    page_small = flashinfer.top_k_page_table_transform(
+        scores,
+        src_page_table,
+        lengths,
+        k,
+        tie_break=1,
+        page_size=page_size,
+        out=page_small_out,
+        out_raw_indices=raw_small,
+    )
+    page_large = flashinfer.top_k_page_table_transform(
+        scores,
+        src_page_table,
+        lengths,
+        k,
+        tie_break=2,
+        page_size=page_size,
+        out=page_large_out,
+        out_raw_indices=raw_large,
+    )
+    if page_size == 1:
+        offsets = (row_ids + 1) * (max_len + 17)
+        ragged_small = flashinfer.top_k_ragged_transform(
+            scores, offsets, lengths, k, tie_break=1
+        )
+        ragged_large = flashinfer.top_k_ragged_transform(
+            scores, offsets, lengths, k, tie_break=2
+        )
+
+    def translate(local_indices):
+        physical_pages = torch.gather(
+            src_page_table,
+            1,
+            (local_indices // page_size).long(),
+        )
+        return physical_pages * page_size + local_indices % page_size
+
+    expected_page_small = translate(local_small)
+    expected_page_large = translate(local_large)
+
+    _assert_unordered_indices_match(page_small, expected_page_small)
+    _assert_unordered_indices_match(page_large, expected_page_large)
+    if page_size == 1:
+        expected_ragged_small = offsets.unsqueeze(1) + local_small
+        expected_ragged_large = offsets.unsqueeze(1) + local_large
+        _assert_unordered_indices_match(ragged_small, expected_ragged_small)
+        _assert_unordered_indices_match(ragged_large, expected_ragged_large)
+    if raw_small is not None:
+        assert page_small_out is not None
+        assert page_large_out is not None
+        assert raw_large is not None
+        assert page_small.data_ptr() == page_small_out.data_ptr()
+        assert page_large.data_ptr() == page_large_out.data_ptr()
+        _assert_unordered_indices_match(raw_small, local_small)
+        _assert_unordered_indices_match(raw_large, local_large)
+        assert torch.equal(page_small, translate(raw_small))
+        assert torch.equal(page_large, translate(raw_large))
+
+
+@pytest.mark.parametrize(
+    "tie_break",
+    [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE],
+)
+@pytest.mark.parametrize(
+    ("algo", "batch_size", "vocab_size", "k"),
+    [
+        ("filtered", 2, 128 * 1024, 2048),
+        ("filtered", 1, 1024 * 1024, 1024),
+        ("filtered", 74, 16 * 1024, 512),
+    ],
+    ids=[
+        "filtered_b2_l128k_k2048",
+        "filtered_b1_l1m_k1024",
+        "filtered_b74_l16k_k512",
+    ],
+)
+def test_top_k_tie_break_explicit_deterministic_order(
+    tie_break, algo, batch_size, vocab_size, k, set_topk_algo
+):
+    """Explicit deterministic mode should retain canonical tie-break output order."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    device = "cuda"
+    scores = torch.ones((batch_size, vocab_size), device=device, dtype=torch.float32)
+
+    values_a, indices_a = flashinfer.top_k(
+        scores, k, deterministic=True, tie_break=tie_break
+    )
+    values_b, indices_b = flashinfer.top_k(
+        scores, k, deterministic=True, tie_break=tie_break
+    )
+
+    start = 0 if tie_break == flashinfer.TopKTieBreak.SMALL else vocab_size - k
+    expected_indices = (
+        torch.arange(start, start + k, device=device, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+    torch.testing.assert_close(values_a, torch.ones_like(values_a))
+    assert torch.equal(values_a, values_b)
+    assert torch.equal(indices_a, expected_indices)
+    assert torch.equal(indices_a, indices_b)
+
+
+@pytest.mark.parametrize(
+    "tie_break",
+    [flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE],
+)
+@pytest.mark.parametrize(
+    ("algo", "num_rows", "max_len", "k", "page_size"),
+    [
+        ("filtered", 2, 128 * 1024, 2048, 1),
+        ("filtered", 1, 1024 * 1024, 1024, 1),
+        ("filtered", 74, 16 * 1024, 512, 1),
+        ("filtered", 2, 128 * 1024, 2048, 64),
+        ("filtered", 1, 256 * 1024, 1024, 64),
+        ("filtered", 74, 16 * 1024, 512, 64),
+    ],
+    ids=[
+        "filtered_rows2_l128k_k2048",
+        "filtered_rows1_l1m_k1024",
+        "filtered_rows74_l16k_k512",
+        "filtered_compact_rows2_l128k_k2048",
+        "filtered_compact_rows1_l256k_k1024",
+        "filtered_compact_rows74_l16k_k512",
+    ],
+)
+def test_top_k_tie_break_explicit_deterministic_transform_order(
+    tie_break, algo, num_rows, max_len, k, page_size, set_topk_algo
+):
+    """Deterministic transform APIs should sort local indices before remapping."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    device = "cuda"
+    scores = torch.ones((num_rows, max_len), device=device, dtype=torch.float32)
+    row_ids = torch.arange(num_rows, device=device, dtype=torch.int32)
+    row_starts = 7 + 13 * row_ids
+    page_table_row_starts = 23 + 17 * row_ids
+    length = max_len - (23 + 17 * (num_rows - 1))
+    lengths = torch.full((num_rows,), length, device=device, dtype=torch.int32)
+    row_to_batch = torch.arange(num_rows - 1, -1, -1, device=device, dtype=torch.int32)
+    page_table_width = (
+        page_table_row_starts.max().item() + (length + page_size - 1) // page_size
+    )
+    logical_pages = torch.arange(page_table_width, device=device, dtype=torch.int32)
+    if page_size > 1:
+        logical_pages = torch.flip(logical_pages, dims=(0,))
+    src_page_table = (
+        logical_pages.unsqueeze(0) + 100_000 * (row_ids + 1).unsqueeze(1)
+    ).contiguous()
+    page_out = (
+        torch.empty((num_rows, k), device=device, dtype=torch.int32)
+        if page_size > 1
+        else None
+    )
+    raw_indices = torch.empty_like(page_out) if page_out is not None else None
+
+    page_output = flashinfer.top_k_page_table_transform(
+        scores,
+        src_page_table,
+        lengths,
+        k,
+        row_to_batch=row_to_batch,
+        deterministic=True,
+        tie_break=tie_break,
+        row_starts=row_starts,
+        page_table_row_starts=page_table_row_starts,
+        page_size=page_size,
+        out=page_out,
+        out_raw_indices=raw_indices,
+    )
+    if page_size == 1:
+        offsets = 300_000 + 100_000 * row_ids
+        ragged_output = flashinfer.top_k_ragged_transform(
+            scores,
+            offsets,
+            lengths,
+            k,
+            deterministic=True,
+            tie_break=tie_break,
+            row_starts=row_starts,
+        )
+
+    start = 0 if tie_break == flashinfer.TopKTieBreak.SMALL else length - k
+    local_indices = (
+        torch.arange(start, start + k, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(num_rows, -1)
+    )
+    physical_pages = torch.gather(
+        src_page_table[row_to_batch],
+        1,
+        (page_table_row_starts.unsqueeze(1) + local_indices // page_size).long(),
+    )
+    expected_page = physical_pages * page_size + local_indices % page_size
+    assert torch.equal(page_output, expected_page)
+    if page_size == 1:
+        expected_ragged = offsets.unsqueeze(1) + local_indices
+        assert torch.equal(ragged_output, expected_ragged)
+    if raw_indices is not None:
+        assert page_out is not None
+        assert page_output.data_ptr() == page_out.data_ptr()
+        assert torch.equal(raw_indices, local_indices)
+        translated_raw = torch.gather(
+            src_page_table[row_to_batch],
+            1,
+            (page_table_row_starts.unsqueeze(1) + raw_indices // page_size).long(),
+        )
+        translated_raw = translated_raw * page_size + raw_indices % page_size
+        assert torch.equal(page_output, translated_raw)
+
+
+@pytest.mark.parametrize(
+    ("algo", "vocab_size", "k"),
+    [
+        ("auto", 131072, 4096),
+        ("multi_cta", 131072, 4096),
+        # Keep one filtered-specific large-k coverage row that still satisfies
+        # FILTERED_TOPK_MAX_K and therefore actually routes to FilteredTopK.
+        ("filtered", 131072, 2048),
+    ],
+    ids=[
+        "auto_k4096",
+        "multi_cta_k4096",
+        "filtered_k2048",
+    ],
+)
+def test_top_k_deterministic_sorted_large_k_matches_torch_by_algo(
+    algo, vocab_size, k, set_topk_algo
+):
+    """Deterministic sorted output should match torch.topk across routed large-k cases."""
+    set_topk_algo(algo)
+
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("GPU does not support filtered topk (requires 128KB shared memory)")
+
+    batch_size = 1
+    device = "cuda"
+
+    torch.manual_seed(0)
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=torch.float32)
+
+    values, indices = flashinfer.top_k(logits, k, deterministic=True, sorted=True)
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1, sorted=True)
+
+    torch.testing.assert_close(values, ref_values)
+    assert torch.equal(indices, ref_indices)
+
+
+@pytest.mark.parametrize("algo", ["auto", "multi_cta"])
+def test_top_k_deterministic_trivial_k_equals_length_by_algo(algo, set_topk_algo):
+    """Deterministic k==length fast paths should remain exact across auto/radix routing."""
+    set_topk_algo(algo)
+
+    batch_size = 2
+    vocab_size = 131072
+    k = vocab_size
+    device = "cuda"
+
+    torch.manual_seed(0)
+    logits = torch.randn(batch_size, vocab_size, device=device, dtype=torch.float16)
+
+    values, indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+    expected_indices = (
+        torch.arange(vocab_size, device=device, dtype=torch.int64)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+
+    assert torch.equal(indices, expected_indices)
+    torch.testing.assert_close(values, logits)
+
+
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_top_k_transform_multi_cta_deterministic_trivial_lengths(
+    transform_mode, set_topk_algo
+):
+    """Deterministic radix transform should handle length == k and length < k fast paths."""
+    set_topk_algo("multi_cta")
+
+    num_rows = 2
+    max_len = 131072
+    k = 256
+    device = "cuda"
+
+    torch.manual_seed(0)
+    scores = torch.randn(num_rows, max_len, device=device, dtype=torch.float16)
+    lengths = torch.tensor([k, k // 2], device=device, dtype=torch.int32)
+
+    if transform_mode == "page_table":
+        src_page_table = (
+            torch.arange(max_len, device=device, dtype=torch.int32)
+            .mul(3)
+            .add(7)
+            .unsqueeze(0)
+            .repeat(num_rows, 1)
+            .contiguous()
+        )
+        output = flashinfer.top_k_page_table_transform(
+            scores, src_page_table, lengths, k, deterministic=True
+        )
+        expected = torch.full((num_rows, k), -1, device=device, dtype=torch.int32)
+        expected[0] = src_page_table[0, :k]
+        expected[1, : k // 2] = src_page_table[1, : k // 2]
+    else:
+        offsets = torch.tensor([0, 1000], device=device, dtype=torch.int32)
+        output = flashinfer.top_k_ragged_transform(
+            scores, offsets, lengths, k, deterministic=True
+        )
+        expected = torch.full((num_rows, k), -1, device=device, dtype=torch.int32)
+        expected[0] = torch.arange(k, device=device, dtype=torch.int32)
+        expected[1, : k // 2] = offsets[1] + torch.arange(
+            k // 2, device=device, dtype=torch.int32
+        )
+
+    assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+@pytest.mark.parametrize(("pattern", "k"), [("all_equal", 8), ("pivot_tie", 6)])
+def test_top_k_transform_filtered_deterministic_valid_selection_under_ties(
+    transform_mode, pattern, k, set_topk_algo
+):
+    """Filtered deterministic transform APIs should be repeatable and select a valid top-k set."""
+    if not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo("filtered")
+    device = "cuda"
+    vocab_size = 16384
+    logits = torch.ones((1, vocab_size), device=device, dtype=torch.float16)
+    gt_count = 0
+
+    if pattern == "all_equal":
+        pass
+    else:
+        gt_count = 2
+        logits[:, vocab_size - gt_count :] = 2.0
+
+    output_a = _run_transform_with_identity_mapping(
+        logits, k, transform_mode, deterministic=True
+    )
+    output_b = _run_transform_with_identity_mapping(
+        logits, k, transform_mode, deterministic=True
+    )
+    _assert_repeatable_valid_identity_transform_selection(
+        output_a, output_b, vocab_size, k, gt_count=gt_count
+    )
+
+
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_top_k_transform_deterministic_repeatability_multi_cta_all_equal(
+    transform_mode, set_topk_algo
+):
+    """Force radix multi-CTA all-equal transform path where later CTAs take zero eq quota."""
+    set_topk_algo("multi_cta")
+
+    device = "cuda"
+    vocab_size = 131072
+    k = 256
+    logits = torch.ones((1, vocab_size), device=device, dtype=torch.float16)
+
+    output_a = _run_transform_with_identity_mapping(
+        logits, k, transform_mode, deterministic=True
+    )
+    output_b = _run_transform_with_identity_mapping(
+        logits, k, transform_mode, deterministic=True
+    )
+    _assert_repeatable_valid_identity_transform_selection(
+        output_a, output_b, vocab_size, k
+    )
+
+
+@pytest.mark.parametrize("algo", ["auto", "filtered", "multi_cta"])
+@pytest.mark.parametrize("pattern", ["tie_heavy", "pivot_tie"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_top_k_deterministic_repeatability_tie_cases_by_algo(
+    algo, pattern, dtype, set_topk_algo
+):
+    """Deterministic top-k should be repeatable and valid under tie pressure."""
+    if dtype == torch.bfloat16:
+        _require_sm80_for_bf16()
+
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    batch_size = 4
+    vocab_size = 16384
+    k = 256
+    num_runs = 20
+    device = "cuda"
+    gt_count = 0
+
+    if pattern == "tie_heavy":
+        base = (
+            torch.arange(vocab_size, device=device, dtype=torch.float32) % 32
+        ) / 32.0
+        logits = base.unsqueeze(0).repeat(batch_size, 1).to(dtype).contiguous()
+    else:  # pivot_tie
+        logits = torch.ones(batch_size, vocab_size, device=device, dtype=dtype)
+        gt_count = max(1, min(k // 4, vocab_size // 8))
+        logits[:, vocab_size - gt_count :] = 2.0
+
+    ref_values, ref_indices = flashinfer.top_k(
+        logits, k, deterministic=True, sorted=False
+    )
+    for _ in range(num_runs - 1):
+        values, indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+        _assert_repeatable_valid_topk_selection(
+            logits, ref_values, ref_indices, values, indices, k, gt_count=gt_count
+        )
+
+
+@pytest.mark.parametrize("algo", ["filtered", "multi_cta"])
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_top_k_transform_deterministic_repeatability_tie_heavy_by_algo(
+    algo, transform_mode, set_topk_algo
+):
+    """Deterministic transform APIs should be repeatable under tie-heavy input."""
+    _require_sm80_for_bf16()
+
+    if algo == "filtered" and not can_implement_filtered_topk():
+        pytest.skip("Filtered top-k not supported on this device")
+
+    set_topk_algo(algo)
+    num_rows = 4
+    max_len = 16384
+    k = 256
+    num_runs = 20
+    device = "cuda"
+
+    base = (torch.arange(max_len, device=device, dtype=torch.float32) % 32) / 32.0
+    scores = base.unsqueeze(0).repeat(num_rows, 1).to(torch.bfloat16).contiguous()
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+    offsets = None
+    if transform_mode == "ragged":
+        offsets = torch.arange(
+            0, num_rows * max_len, max_len, device=device, dtype=torch.int32
+        )
+
+    _assert_repeatable_transform_output(
+        scores,
+        k,
+        transform_mode,
+        num_runs=num_runs,
+        deterministic=True,
+        lengths=lengths,
+        offsets=offsets,
+    )
+
+
+def test_top_k_deterministic_bitwise_repeatability():
+    """Deterministic top-k should be bitwise identical across repeated runs."""
+    batch_size = 8
+    vocab_size = 32768
+    k = 512
+    num_runs = 50
+    device = "cuda"
+
+    # Tie-heavy logits: repeated value buckets to stress tie handling.
+    pattern = (torch.arange(vocab_size, device=device, dtype=torch.float32) % 64) / 64.0
+    logits = pattern.unsqueeze(0).repeat(batch_size, 1).contiguous()
+
+    ref_values, ref_indices = flashinfer.top_k(
+        logits, k, deterministic=True, sorted=False
+    )
+    for _ in range(num_runs - 1):
+        values, indices = flashinfer.top_k(logits, k, deterministic=True, sorted=False)
+        assert torch.equal(values, ref_values)
+        assert torch.equal(indices, ref_indices)
+
+
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_top_k_transform_deterministic_repeatability(transform_mode):
+    """Deterministic transform APIs should be bitwise identical across runs."""
+    num_rows = 8
+    max_len = 8192
+    k = 512
+    num_runs = 30
+    device = "cuda"
+
+    pattern = (torch.arange(max_len, device=device, dtype=torch.float32) % 32) / 32.0
+    scores = pattern.unsqueeze(0).repeat(num_rows, 1).contiguous()
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+    src_page_table = None
+    offsets = None
+    if transform_mode == "ragged":
+        offsets = torch.arange(
+            0, num_rows * max_len, max_len, device=device, dtype=torch.int32
+        )
+
+    _assert_repeatable_transform_output(
+        scores,
+        k,
+        transform_mode,
+        num_runs=num_runs,
+        deterministic=True,
+        lengths=lengths,
+        src_page_table=src_page_table,
+        offsets=offsets,
+    )
+
+
+@pytest.mark.parametrize("transform_mode", ["page_table", "ragged"])
+def test_top_k_transform_deterministic_k1_remap(transform_mode):
+    """Deterministic transform APIs must remap local top-1 positions correctly."""
+    num_rows = 4
+    max_len = 257
+    device = "cuda"
+
+    torch.manual_seed(0)
+    scores = torch.randn(num_rows, max_len, device=device, dtype=torch.float32)
+    lengths = torch.full((num_rows,), max_len, device=device, dtype=torch.int32)
+    ref_idx = torch.topk(scores, 1, dim=-1).indices.to(torch.int32)
+    src_page_table = None
+    offsets = None
+
+    if transform_mode == "page_table":
+        src_page_table = (
+            torch.arange(max_len, device=device, dtype=torch.int32)
+            .unsqueeze(0)
+            .repeat(num_rows, 1)
+            .mul(3)
+            .add(7)
+            .contiguous()
+        )
+        ref = torch.gather(src_page_table, 1, ref_idx)
+    else:
+        offsets = torch.tensor([5, 1000, 2000, 3000], device=device, dtype=torch.int32)
+        ref = ref_idx + offsets.unsqueeze(1)
+
+    out = _run_transform(
+        scores,
+        1,
+        transform_mode,
+        lengths=lengths,
+        deterministic=True,
+        src_page_table=src_page_table,
+        offsets=offsets,
+    )
+    assert torch.equal(out, ref)
+
+
+def test_top_k_uint32_pointer_overflow():
+    """Test top_k with batch*vocab > 2^32 bytes"""
+    batch_size = 32769
+    vocab_size = 131072
+    k = 256
+
+    required_bytes = batch_size * vocab_size * 2  # fp16
+    free_mem = torch.cuda.mem_get_info("cuda")[0]
+    if free_mem < int(required_bytes * 1.15):
+        pytest.skip(
+            f"Insufficient GPU memory: {free_mem / 1e9:.1f}GB free, "
+            f"need ~{required_bytes / 1e9:.1f}GB"
+        )
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda", dtype=torch.float16)
+
+    values, indices = flashinfer.top_k(logits, k)
+
+    assert values.shape == (batch_size, k)
+    assert indices.shape == (batch_size, k)
+
+    # Only check the last row: its element offset (row_idx * vocab_size)
+    # exceeds 2^32, so a uint32 overflow bug would corrupt this region.
+    row_idx = batch_size - 1
+    gathered = torch.gather(
+        logits[row_idx : row_idx + 1], -1, indices[row_idx : row_idx + 1]
+    )
+    torch.testing.assert_close(values[row_idx : row_idx + 1], gathered)
+
+    _, ref_indices = torch.topk(logits[row_idx : row_idx + 1], k, dim=-1)
+    accuracy = compute_topk_accuracy(
+        indices[row_idx : row_idx + 1].int(), ref_indices.int(), 1, k
+    )
+    assert accuracy >= 0.98, f"Last row accuracy {accuracy:.4f} < 0.98"
+
+
+# ===================== topk_clusters_exact Tests =====================
+
+
+def _require_sm100_or_sm103():
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if cc not in [100, 103, 107]:
+        pytest.skip("topk_clusters_exact requires SM100, SM103 or SM107")
+
+
+@pytest.mark.parametrize("batch_size", [1, 16, 64])
+@pytest.mark.parametrize("seq_len", [4096, 16384, 65536])
+@pytest.mark.parametrize("k", [256, 1024, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("output_values", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.int32, torch.int64])
+def test_topk_clusters_exact_correctness(
+    batch_size, seq_len, k, dtype, output_values, out_dtype
+):
+    """Test topk_clusters_exact returns indices (and optionally values) matching torch.topk."""
+    _require_sm100_or_sm103()
+    if k > seq_len:
+        pytest.skip("k should be less than seq_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    logits = torch.randn(batch_size, seq_len, device=device, dtype=dtype)
+
+    indices, values = flashinfer.topk.topk_clusters_exact(
+        logits, k, output_values=output_values, out_dtype=out_dtype
+    )
+
+    assert indices.shape == (batch_size, k)
+    assert indices.dtype == out_dtype
+
+    ref_values, ref_indices = torch.topk(logits, k, dim=-1)
+
+    if output_values:
+        assert values is not None
+        assert values.shape == (batch_size, k)
+        assert values.dtype == dtype
+
+        abs_err = 0.125 if dtype == torch.bfloat16 else 1e-5
+        rel_err = 0.1 if dtype == torch.bfloat16 else 1e-5
+        torch.testing.assert_close(
+            values.min(dim=-1).values,
+            ref_values.min(dim=-1).values,
+            rtol=rel_err,
+            atol=abs_err,
+        )
+        torch.testing.assert_close(
+            values.max(dim=-1).values,
+            ref_values.max(dim=-1).values,
+            rtol=rel_err,
+            atol=abs_err,
+        )
+    else:
+        assert values is None
+
+    accuracy = compute_topk_accuracy(indices, ref_indices.int(), batch_size, k)
+    acc = 0.95 if dtype == torch.bfloat16 else 0.99
+    assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("seq_len", [4096, 16384])
+@pytest.mark.parametrize("k", [256, 2048])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_topk_clusters_exact_variable_seq_lens(batch_size, seq_len, k, dtype):
+    """Test topk_clusters_ragged_transform respects per-row variable seq_lens."""
+    _require_sm100_or_sm103()
+    if k > seq_len // 2:
+        pytest.skip("k should be well below seq_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+    logits = torch.randn(batch_size, seq_len, device=device, dtype=dtype)
+    # Variable lengths: half rows get seq_len, half get seq_len // 2
+    lengths_list = [seq_len if i % 2 == 0 else seq_len // 2 for i in range(batch_size)]
+    seq_lens = torch.tensor(lengths_list, device=device, dtype=torch.int32)
+    # Zero offsets: output indices are positions within each row
+    offsets = torch.zeros(batch_size, device=device, dtype=torch.int32)
+
+    indices = flashinfer.topk.topk_clusters_ragged_transform(
+        logits, seq_lens, offsets, k
+    )
+
+    assert indices.shape == (batch_size, k)
+    assert indices.dtype == torch.int32
+
+    # Verify all indices are within [0, row_len) for each row
+    for i in range(batch_size):
+        row_len = lengths_list[i]
+        assert torch.all(indices[i] >= 0) and torch.all(indices[i] < row_len), (
+            f"Row {i}: indices out of [0, {row_len})"
+        )
+
+    # Verify accuracy per row
+    for i in range(batch_size):
+        row_len = lengths_list[i]
+        ref = torch.topk(logits[i, :row_len], k).indices
+        test_set = set(indices[i].cpu().numpy())
+        ref_set = set(ref.cpu().numpy())
+        row_accuracy = len(test_set & ref_set) / k
+        acc = 0.95 if dtype == torch.bfloat16 else 0.99
+        assert row_accuracy >= acc, f"Row {i} accuracy {row_accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize("num_rows", [1, 16, 64])
+@pytest.mark.parametrize("seq_len", [4096, 16384])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_topk_clusters_page_table_transform(num_rows, seq_len, k, dtype):
+    """Test topk_clusters_page_table_transform returns correct page table entries."""
+    _require_sm100_or_sm103()
+    if k > seq_len:
+        pytest.skip("k should be less than seq_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    scores = torch.randn(num_rows, seq_len, device=device, dtype=dtype)
+    src_page_table = torch.randint(
+        0, 10000, (num_rows, seq_len), device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), seq_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.topk.topk_clusters_page_table_transform(
+        scores, lengths, src_page_table, k
+    )
+
+    assert output.shape == (num_rows, k)
+    assert output.dtype == torch.int32
+
+    ref_output = reference_page_table_transform(scores, src_page_table, lengths, k)
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+
+    acc = 0.95 if dtype == torch.bfloat16 else 0.99
+    assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
+
+
+@pytest.mark.parametrize("num_rows", [1, 16, 64])
+@pytest.mark.parametrize("seq_len", [4096, 16384])
+@pytest.mark.parametrize("k", [256, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_topk_clusters_ragged_transform(num_rows, seq_len, k, dtype):
+    """Test topk_clusters_ragged_transform returns correct indices with offsets."""
+    _require_sm100_or_sm103()
+    if k > seq_len:
+        pytest.skip("k should be less than seq_len")
+
+    torch.manual_seed(42)
+    device = "cuda"
+
+    scores = torch.randn(num_rows, seq_len, device=device, dtype=dtype)
+    offsets = torch.arange(
+        0, num_rows * seq_len, seq_len, device=device, dtype=torch.int32
+    )
+    lengths = torch.full((num_rows,), seq_len, device=device, dtype=torch.int32)
+
+    output = flashinfer.topk.topk_clusters_ragged_transform(scores, lengths, offsets, k)
+
+    assert output.shape == (num_rows, k)
+    assert output.dtype == torch.int32
+
+    ref_output = reference_ragged_transform(scores, offsets, lengths, k)
+    accuracy = compute_transform_accuracy(output, ref_output, num_rows, k)
+    acc = 0.95 if dtype == torch.bfloat16 else 0.99
+    assert accuracy >= acc, f"Accuracy {accuracy:.4f} < {acc}"
+
+
+# ===================== CUB DeviceBatchedTopK backend Tests =====================
+# The CUB backend serves top_k_page_table_transform through the dispatcher, so the general
+# transform test grid above already exercises it (and the "cub" entries in the algorithm
+# parametrizations force it explicitly). The tests here cover CUB's physical-width and
+# logical-length boundaries, graph replay, and binding-level workspace contract.
+
+
+@pytest.mark.parametrize("api", ["page_table", "ragged"])
+@pytest.mark.parametrize("algo", ["auto", "cub"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "width,k",
+    [(64, 2048), (65, 4096), (65, 8193), (64, 64), (32768, 2048)],
+    ids=["short", "odd_width", "above_cub_bound", "equal_width", "logical_short"],
+)
+def test_cub_topk_physical_width(api, algo, dtype, width, k, set_topk_algo):
+    """Preserve fused output width through CUB, including when k exceeds d."""
+    _require_cub_tie_break_support()
+    set_topk_algo(algo)
+    num_rows, page_size = 4, 64
+    if width > k:
+        scores, expected_small, expected_large = _make_tie_break_test_case(
+            num_rows, width, k, dtype, "boundary_tie"
+        )
+    else:
+        scores = (
+            (torch.arange(width, device="cuda") % 7 - 3).to(dtype).repeat(num_rows, 1)
+        )
+        # Every real position must survive, including values equal to a possible
+        # padding sentinel. LARGE must not select synthetic padded positions.
+        scores[:, 0] = float("-inf")
+        scores[:, -1] = float("inf")
+    storage = torch.empty((num_rows, width + 2), device="cuda", dtype=dtype)
+    storage[:, 1 : width + 1].copy_(scores)
+    scores = storage[:, 1 : width + 1]
+    lengths = torch.tensor([width, 17, 0, width], device="cuda", dtype=torch.int32)
+    offsets = torch.arange(1, num_rows + 1, device="cuda", dtype=torch.int32) * 100000
+    page_width = (width + page_size - 1) // page_size
+    pages = (
+        torch.arange(num_rows * page_width, device="cuda", dtype=torch.int32)
+        .flip(0)
+        .reshape(num_rows, page_width)
+        + 100
+    )
+    out = torch.empty((num_rows, k), device="cuda", dtype=torch.int32)
+    raw = torch.empty_like(out)
+    module = flashinfer.topk.get_topk_module()
+    entry = {
+        "page_table": "cub_topk_page_table_transform",
+        "ragged": "cub_topk_ragged_transform",
+    }[api]
+
+    for tie_break in (flashinfer.TopKTieBreak.SMALL, flashinfer.TopKTieBreak.LARGE):
+        kwargs = dict(tie_break=tie_break, dsa_graph_safe=True)
+        out.fill_(777)
+        raw.fill_(777)
+        with patch.object(module, entry, wraps=getattr(module, entry)) as cub_call:
+            if api == "page_table":
+                indices = flashinfer.top_k_page_table_transform(
+                    scores,
+                    pages,
+                    lengths,
+                    k,
+                    page_size=page_size,
+                    out=out,
+                    out_raw_indices=raw,
+                    **kwargs,
+                )
+                assert indices.data_ptr() == out.data_ptr()
+            elif api == "ragged":
+                indices = flashinfer.top_k_ragged_transform(
+                    scores, offsets, lengths, k, **kwargs
+                )
+            else:
+                raise AssertionError(f"Unexpected API: {api}")
+            if algo == "cub":
+                assert cub_call.call_count == 1
+
+        assert indices.shape == (num_rows, k)
+        assert indices.dtype == torch.int32
+        for row in range(num_rows):
+            length = int(lengths[row])
+            valid = min(length, k)
+            if length > k:
+                expected = (
+                    expected_small[row]
+                    if tie_break == flashinfer.TopKTieBreak.SMALL
+                    else expected_large[row]
+                )
+            else:
+                expected = torch.arange(valid, device="cuda")
+            selected = indices[row]
+            if api == "page_table":
+                selected = raw[row]
+                local = selected[:valid].long()
+                assert torch.equal(
+                    indices[row, :valid],
+                    pages[row, local // page_size] * page_size + local % page_size,
+                )
+                assert torch.all(indices[row, valid:] == -1)
+            elif api == "ragged":
+                expected = expected + offsets[row]
+            else:
+                raise AssertionError(f"Unexpected API: {api}")
+            _assert_unordered_indices_match(selected[:valid], expected)
+            assert torch.all(selected[valid:] == -1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "api,width,k,capture_length",
+    [
+        pytest.param(api, width, k, capture_length, id=f"{api}-{name}")
+        for api in ("page_table", "ragged")
+        for width, k, capture_length, name in [
+            (65, 4096, "short", "physical_short"),
+            (8192, 2048, "short", "capture_short_replay_long"),
+            (8192, 2048, "long", "capture_long_replay_short"),
+            (32768, 2048, "short", "cluster_capture_short_replay_long"),
+            (32768, 2048, "long", "cluster_capture_long_replay_short"),
+        ]
+    ],
+)
+def test_cub_topk_graph_replay(api, dtype, width, k, capture_length, set_topk_algo):
+    """Replay fixed-capacity graphs; fused API lengths cross k in both directions."""
+    _require_cub_tie_break_support()
+    set_topk_algo("cub")
+    num_rows, page_size = 4, 64
+    scores = (torch.arange(width, device="cuda") % 7).to(dtype).repeat(num_rows, 1)
+    window_start = 5
+    max_length = width - window_start
+    row_starts = torch.full((num_rows,), window_start, device="cuda", dtype=torch.int32)
+    page_table_row_starts = torch.zeros_like(row_starts)
+    short_lengths = [min(64, max_length), 17, 1, 0]
+    long_lengths = [max_length] * num_rows
+    capture_lengths = short_lengths if capture_length == "short" else long_lengths
+    if capture_length == "short":
+        assert max(capture_lengths) < k
+    elif capture_length == "long":
+        assert min(capture_lengths) > k
+    lengths = torch.tensor(capture_lengths, device="cuda", dtype=torch.int32)
+    offsets = torch.tensor([100, 500, 1000, 2000], device="cuda", dtype=torch.int32)
+    page_width = (width + page_size - 1) // page_size
+    pages = torch.arange(
+        100, 100 + num_rows * page_width, device="cuda", dtype=torch.int32
+    ).reshape(num_rows, page_width)
+    out = torch.empty((num_rows, k), device="cuda", dtype=torch.int32)
+    raw = torch.empty_like(out)
+
+    def run():
+        kwargs = dict(tie_break=flashinfer.TopKTieBreak.LARGE, dsa_graph_safe=True)
+        if api == "page_table":
+            return flashinfer.top_k_page_table_transform(
+                scores,
+                pages,
+                lengths,
+                k,
+                page_size=page_size,
+                row_starts=row_starts,
+                page_table_row_starts=page_table_row_starts,
+                out=out,
+                out_raw_indices=raw,
+                **kwargs,
+            )
+        elif api == "ragged":
+            return flashinfer.top_k_ragged_transform(
+                scores, offsets, lengths, k, row_starts=row_starts, **kwargs
+            )
+        raise AssertionError(f"Unexpected API: {api}")
+
+    def check(result):
+        for row in range(num_rows):
+            length = int(lengths[row])
+            valid = min(length, k)
+            # Reverse before a stable sort to prefer LARGE indices at ties.
+            expected = (
+                length
+                - 1
+                - torch.argsort(
+                    scores[row, window_start : window_start + length].flip(0),
+                    descending=True,
+                    stable=True,
+                )[:valid]
+            )
+            if api == "page_table":
+                selected = raw[row]
+                local = selected[:valid].long()
+                assert result.data_ptr() == out.data_ptr()
+                assert torch.equal(
+                    result[row, :valid],
+                    pages[row, local // page_size] * page_size + local % page_size,
+                )
+                assert torch.all(result[row, valid:] == -1)
+            elif api == "ragged":
+                selected = result[row]
+                expected = expected + offsets[row]
+            else:
+                raise AssertionError(f"Unexpected API: {api}")
+            _assert_unordered_indices_match(selected[:valid], expected)
+            assert torch.all(selected[valid:] == -1)
+
+    check(run())
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    opposite_lengths = long_lengths if capture_length == "short" else short_lengths
+    boundary_lengths = [0] + [min(max_length, n) for n in (k - 1, k, k + 1)]
+    replay_lengths = [
+        capture_lengths,
+        opposite_lengths,
+        capture_lengths,
+        boundary_lengths,
+    ]
+    for new_lengths in replay_lengths:
+        lengths.copy_(torch.tensor(new_lengths, device="cuda", dtype=torch.int32))
+        pages.add_(20)
+        offsets.add_(333)
+        scores.copy_(scores.roll(1, dims=1) + 100)
+        result.fill_(777)
+        raw.fill_(777)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(result)
+
+
+@pytest.mark.parametrize(
+    ("transform_mode", "page_size"),
+    [("page_table", 1), ("page_table", 64), ("ragged", 1)],
+    ids=["page_table_wide", "page_table_compact", "ragged"],
+)
+def test_cub_transform_nonpositive_lengths(transform_mode, page_size, set_topk_algo):
+    """lengths[i] <= 0 is a valid empty row for the CUB backend (all -1 outputs).
+
+    The lengths bounds declared to CUB span the full int32 range, so zero and negative
+    values clamp to an empty segment instead of being undefined behavior. Forced to the
+    CUB backend: negative lengths are UB for the native kernels, so there is no native
+    reference to compare against. Both transform entries share the CUB lengths machinery;
+    only the output mapping differs.
+    """
+    set_topk_algo("cub")
+    torch.manual_seed(3)
+    num_rows, d, k = 6, 4096, 256
+    scores = torch.randn(num_rows, d, device="cuda")
+    lengths = torch.tensor(
+        [d, 0, 100, -1, -(2**31), 1], dtype=torch.int32, device="cuda"
+    )
+
+    out_raw_indices = None
+    if transform_mode == "page_table":
+        pt = torch.randint(
+            0,
+            100000,
+            (num_rows, d // page_size),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        out_raw_indices = torch.empty((num_rows, k), dtype=torch.int32, device="cuda")
+
+        def run_transform():
+            return flashinfer.top_k_page_table_transform(
+                scores,
+                pt,
+                lengths,
+                k,
+                page_size=page_size,
+                out_raw_indices=out_raw_indices,
+            )
+
+    else:
+        offsets = torch.arange(0, num_rows * d, d, device="cuda", dtype=torch.int32)
+
+        def run_transform():
+            return flashinfer.top_k_ragged_transform(scores, offsets, lengths, k)
+
+    out = run_transform()
+    torch.cuda.synchronize()
+
+    def check_output():
+        for i, length in enumerate(lengths.tolist()):
+            valid = min(k, max(length, 0))
+            assert torch.all(out[i, valid:] == -1), (
+                f"row {i} (length={length}): bad -1 padding"
+            )
+            if out_raw_indices is not None:
+                assert torch.all(out_raw_indices[i, valid:] == -1), (
+                    f"row {i} (length={length}): bad raw-index -1 padding"
+                )
+            if valid > 0:
+                _, ref_idx = torch.topk(scores[i, :length], valid)
+                if transform_mode == "page_table":
+                    ref = pt[i][ref_idx // page_size] * page_size + ref_idx % page_size
+                    assert sorted(out_raw_indices[i, :valid].tolist()) == sorted(
+                        ref_idx.int().tolist()
+                    )
+                else:
+                    ref = ref_idx.int() + offsets[i]
+                assert sorted(out[i, :valid].tolist()) == sorted(ref.tolist())
+
+    check_output()
+
+    # Capture with full rows so every slot contains a valid result, then replay after
+    # shrinking rows to short, zero, and negative lengths. This catches stale tails when
+    # the padding implementation changes while preserving graph-dynamic lengths.
+    replay_lengths = lengths.clone()
+    lengths.fill_(d)
+    run_transform()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run_transform()
+    lengths.copy_(replay_lengths)
+    graph.replay()
+    torch.cuda.synchronize()
+    check_output()
+
+
+@pytest.mark.parametrize(
+    "transform_mode,d,k",
+    [
+        ("page_table", 4096, 256),
+        ("ragged", 4096, 256),
+        ("top_k", 4096, 256),
+        ("page_table", 65, 8193),
+        ("ragged", 65, 8193),
+    ],
+)
+def test_cub_transform_workspace_paths(transform_mode, d, k):
+    """No workspace falls back to internal allocation; a too-small one raises.
+
+    Deliberately binding-level: the dispatcher always passes the cached workspace, so
+    nothing else exercises the launcher's cudaMallocAsync fallback or its workspace-size
+    ICHECK. Parametrized over all CUB entries, which share the workspace machinery.
+    """
+    from flashinfer.jit.topk import gen_topk_module
+
+    module = gen_topk_module().build_and_load()
+    torch.manual_seed(9)
+    num_rows = 8
+    scores = torch.randn(num_rows, d, device="cuda")
+    lengths = torch.full((num_rows,), d, dtype=torch.int32, device="cuda")
+    out = torch.full((num_rows, k), 777, dtype=torch.int32, device="cuda")
+
+    if transform_mode == "page_table":
+        pt = torch.randint(0, 100000, (num_rows, d), dtype=torch.int32, device="cuda")
+
+        def run(workspace):
+            module.cub_topk_page_table_transform(
+                scores, out, pt, lengths, None, workspace, k, 0, 1, None, None, None
+            )
+
+        def expected_row(i, ref_idx):
+            return pt[i][ref_idx].tolist()
+
+        needed = int(
+            module.cub_topk_page_table_transform_workspace_size(
+                scores, lengths, k, 0, False, False
+            )
+        )
+    elif transform_mode == "ragged":
+        offsets = torch.arange(0, num_rows * d, d, device="cuda", dtype=torch.int32)
+
+        def run(workspace):
+            module.cub_topk_ragged_transform(
+                scores, out, offsets, lengths, workspace, k, 0, None
+            )
+
+        def expected_row(i, ref_idx):
+            return (ref_idx.int() + offsets[i]).tolist()
+
+        needed = int(
+            module.cub_topk_ragged_transform_workspace_size(
+                scores, lengths, k, 0, False
+            )
+        )
+    else:
+        out = torch.full((num_rows, k), 777, dtype=torch.int64, device="cuda")
+        out_values = torch.empty(num_rows, k, dtype=scores.dtype, device="cuda")
+
+        def run(workspace):
+            module.cub_topk(scores, out, out_values, workspace, k, 0)
+
+        def expected_row(i, ref_idx):
+            return ref_idx.tolist()
+
+        needed = int(module.cub_topk_workspace_size(scores, k, 0))
+
+    # workspace=None -> the launcher allocates internally (cudaMallocAsync path).
+    run(None)
+    torch.cuda.synchronize()
+    valid = min(d, k)
+    _, ref_idx = torch.topk(scores, valid)
+    for i in range(num_rows):
+        assert sorted(out[i, :valid].tolist()) == sorted(expected_row(i, ref_idx[i]))
+        assert torch.all(out[i, valid:] == -1)
+    if transform_mode == "top_k":
+        # The plain entry also returns the scores; they must match the indices.
+        gathered = torch.gather(scores, dim=-1, index=out[:, :valid])
+        torch.testing.assert_close(out_values[:, :valid], gathered)
+        assert torch.all(out_values[:, valid:] == 0)
+
+    # A too-small workspace must raise, not corrupt.
+    if needed > 1:
+        tiny = torch.empty(1, dtype=torch.uint8, device="cuda")
+        with pytest.raises(RuntimeError, match="workspace too small"):
+            run(tiny)
+
+
+if __name__ == "__main__":
+    # Basic tests
+    test_top_k(4, 32000, 256, torch.float32, flashinfer.TopKTieBreak.NONE)
+    test_top_k_sorted(4, 32000, 256, torch.float32, flashinfer.TopKTieBreak.NONE)
+    test_top_k_large_batch(64, 128512, 256, False, flashinfer.TopKTieBreak.NONE)
+
+    # Fused transform tests
+    print("Testing page table transform...")
+    test_top_k_page_table_transform(8, 4096, 256, torch.float32)
+    test_top_k_page_table_transform(8, 4096, 256, torch.float16)
+    print("Testing ragged transform...")
+    test_top_k_ragged_transform(8, 4096, 256, torch.float32)
+    test_top_k_ragged_transform(8, 4096, 256, torch.float16)
+    print("Testing trivial cases...")
+    test_page_table_transform_trivial_case(8, 2048, 256)
+    test_ragged_transform_trivial_case(8, 2048, 256)
+    print("Testing variable lengths...")
+    test_page_table_transform_variable_lengths(8, 4096, 256)
+    test_ragged_transform_variable_lengths(8, 4096, 256)
+    print("Testing large scale...")
+    test_page_table_transform_large_scale(64, 8192, 256)
+    test_ragged_transform_large_scale(64, 8192, 256)
+
+    # SGLang-style comparison tests
+    print("\nTesting SGLang-style comparisons...")
+    test_compare_with_sglang_style_page_table(8, 4096, 256, torch.float32)
+    test_compare_with_sglang_style_ragged(8, 4096, 256, torch.float32)
+    test_compare_with_sglang_style_prefill_mode(8, 4096, 256)
+
+    print("\nAll tests passed!")

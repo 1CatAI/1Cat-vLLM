@@ -1,0 +1,95 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of libcu++, the C++ Standard Library for your entire system,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: force-tile
+// error: dynamic allocation is not supported in tile mode
+
+// UNSUPPORTED: enable-tile
+// error: invalid host device tile execution space deduction
+
+// <memory>
+
+// unique_ptr
+
+// test get_deleter()
+
+#include <cuda/std/__memory_>
+#include <cuda/std/cassert>
+#include <cuda/std/type_traits>
+
+#include "test_macros.h"
+
+struct Deleter
+{
+  TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 Deleter() {}
+
+  TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 void operator()(void*) const {}
+
+  TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 int test()
+  {
+    return 5;
+  }
+  TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 int test() const
+  {
+    return 6;
+  }
+};
+
+template <bool IsArray>
+TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 void test_basic()
+{
+  using VT = typename cuda::std::conditional<IsArray, int[], int>::type;
+  {
+    cuda::std::unique_ptr<int, Deleter> p;
+    assert(p.get_deleter().test() == 5);
+  }
+  {
+    const cuda::std::unique_ptr<VT, Deleter> p;
+    assert(p.get_deleter().test() == 6);
+  }
+  {
+    using UPtr = cuda::std::unique_ptr<VT, const Deleter&>;
+    const Deleter d;
+    UPtr p(nullptr, d);
+    const UPtr& cp = p;
+    static_assert(cuda::std::is_same_v<decltype(p.get_deleter()), const Deleter&>);
+    static_assert(cuda::std::is_same_v<decltype(cp.get_deleter()), const Deleter&>);
+    assert(p.get_deleter().test() == 6);
+    assert(cp.get_deleter().test() == 6);
+  }
+  {
+    using UPtr = cuda::std::unique_ptr<VT, Deleter&>;
+    Deleter d;
+    UPtr p(nullptr, d);
+    const UPtr& cp = p;
+    static_assert(cuda::std::is_same_v<decltype(p.get_deleter()), Deleter&>);
+    static_assert(cuda::std::is_same_v<decltype(cp.get_deleter()), Deleter&>);
+    assert(p.get_deleter().test() == 5);
+    assert(cp.get_deleter().test() == 5);
+  }
+}
+
+TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 bool test()
+{
+  test_basic</*IsArray*/ false>();
+  test_basic<true>();
+
+  return true;
+}
+
+int main(int, char**)
+{
+  test();
+#if TEST_STD_VER >= 2023
+  static_assert(test());
+#endif // TEST_STD_VER >= 2023
+
+  return 0;
+}

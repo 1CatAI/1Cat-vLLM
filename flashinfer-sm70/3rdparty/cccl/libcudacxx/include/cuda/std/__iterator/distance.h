@@ -1,0 +1,128 @@
+// -*- C++ -*-
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2023-24 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef _CUDA_STD___ITERATOR_DISTANCE_H
+#define _CUDA_STD___ITERATOR_DISTANCE_H
+
+#include <cuda/std/detail/__config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/std/__iterator/concepts.h>
+#include <cuda/std/__iterator/incrementable_traits.h>
+#include <cuda/std/__iterator/iterator_traits.h>
+#include <cuda/std/__ranges/access.h>
+#include <cuda/std/__ranges/concepts.h>
+#include <cuda/std/__ranges/size.h>
+#include <cuda/std/__type_traits/decay.h>
+#include <cuda/std/__type_traits/remove_cvref.h>
+
+#include <cuda/std/__cccl/prologue.h>
+
+_CCCL_BEGIN_NAMESPACE_CUDA_STD
+
+_CCCL_EXEC_CHECK_DISABLE
+template <class _InputIter>
+[[nodiscard]] _CCCL_API constexpr typename iterator_traits<_InputIter>::difference_type
+distance(_InputIter __first, _InputIter __last)
+{
+  // Must clone branches because sized_sentinel_for may require the type to be complete
+  // NOLINTBEGIN(bugprone-branch-clone)
+  if constexpr (__has_random_access_traversal<_InputIter>) // To support pointers to incomplete types
+  {
+    return __last - __first;
+  }
+  else if constexpr (sized_sentinel_for<_InputIter, _InputIter>)
+  {
+    return __last - __first;
+  }
+  else
+  {
+    typename iterator_traits<_InputIter>::difference_type __r(0);
+    for (; __first != __last; ++__first)
+    {
+      ++__r;
+    }
+    return __r;
+  }
+  // NOLINTEND(bugprone-branch-clone)
+}
+
+_CCCL_END_NAMESPACE_CUDA_STD
+
+// [range.iter.op.distance]
+
+_CCCL_BEGIN_NAMESPACE_CUDA_STD_RANGES
+
+_CCCL_BEGIN_NAMESPACE_CPO(__distance)
+struct __fn
+{
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _Ip, class _Sp)
+  _CCCL_REQUIRES((sentinel_for<_Sp, _Ip> && !sized_sentinel_for<_Sp, _Ip>) )
+  [[nodiscard]] _CCCL_API constexpr iter_difference_t<_Ip> _CCCL_STATIC_CALL_OPERATOR(_Ip __first, _Sp __last)
+  {
+    iter_difference_t<_Ip> __n = 0;
+    while (__first != __last)
+    {
+      ++__first;
+      ++__n;
+    }
+    return __n;
+  }
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _Ip, class _Sp)
+  _CCCL_REQUIRES((sized_sentinel_for<_Sp, decay_t<_Ip>>) )
+  [[nodiscard]] _CCCL_API constexpr iter_difference_t<_Ip> _CCCL_STATIC_CALL_OPERATOR(_Ip&& __first, _Sp __last)
+  {
+    if constexpr (sized_sentinel_for<_Sp, remove_cvref_t<_Ip>>)
+    {
+      return __last - __first;
+    }
+    else
+    {
+      return __last - decay_t<_Ip>(__first);
+    }
+  }
+
+  _CCCL_EXEC_CHECK_DISABLE
+  _CCCL_TEMPLATE(class _Rp)
+  _CCCL_REQUIRES((range<_Rp>) )
+  [[nodiscard]] _CCCL_API constexpr range_difference_t<_Rp> _CCCL_STATIC_CALL_OPERATOR(_Rp&& __r)
+  {
+    if constexpr (sized_range<_Rp>)
+    {
+      return static_cast<range_difference_t<_Rp>>(::cuda::std::ranges::size(__r));
+    }
+    else
+    {
+      return __fn{}(::cuda::std::ranges::begin(__r), ::cuda::std::ranges::end(__r));
+    }
+  }
+};
+_CCCL_END_NAMESPACE_CPO
+
+inline namespace __cpo
+{
+_CCCL_GLOBAL_CONSTANT auto distance = __distance::__fn{};
+} // namespace __cpo
+
+_CCCL_END_NAMESPACE_CUDA_STD_RANGES
+
+#include <cuda/std/__cccl/epilogue.h>
+
+#endif // _CUDA_STD___ITERATOR_DISTANCE_H

@@ -1,0 +1,73 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// <cuda/std/optional>
+
+// ~optional();
+
+#include <cuda/std/cassert>
+#include <cuda/std/optional>
+#include <cuda/std/type_traits>
+
+#include "test_macros.h"
+
+using cuda::std::optional;
+
+struct PODType
+{
+  int value;
+  int value2;
+};
+
+class X
+{
+public:
+  STATIC_MEMBER_VAR(dtor_called, bool)
+  X() = default;
+  TEST_FUNC ~X()
+  {
+    dtor_called() = true;
+  }
+};
+
+int main(int, char**)
+{
+  {
+    using T = int;
+    static_assert(cuda::std::is_trivially_destructible<T>::value);
+    static_assert(cuda::std::is_trivially_destructible<optional<T>>::value);
+    static_assert(cuda::std::is_trivially_destructible<optional<T&>>::value);
+  }
+  {
+    using T = double;
+    static_assert(cuda::std::is_trivially_destructible<T>::value);
+    static_assert(cuda::std::is_trivially_destructible<optional<T>>::value);
+    static_assert(cuda::std::is_trivially_destructible<optional<T&>>::value);
+  }
+  {
+    using T = PODType;
+    static_assert(cuda::std::is_trivially_destructible<T>::value);
+    static_assert(cuda::std::is_trivially_destructible<optional<T>>::value);
+    static_assert(cuda::std::is_trivially_destructible<optional<T&>>::value);
+  }
+  {
+    using T = X;
+    static_assert(!cuda::std::is_trivially_destructible<T>::value);
+    static_assert(!cuda::std::is_trivially_destructible<optional<T>>::value);
+    static_assert(cuda::std::is_trivially_destructible<optional<T&>>::value);
+    {
+      X x;
+      optional<X> opt{x};
+      assert(X::dtor_called() == false);
+    }
+    assert(X::dtor_called() == true);
+  }
+
+  return 0;
+}

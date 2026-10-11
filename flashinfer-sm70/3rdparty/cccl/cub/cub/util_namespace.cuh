@@ -1,0 +1,172 @@
+// SPDX-FileCopyrightText: Copyright (c) 2011, Duane Merrill. All rights reserved.
+// SPDX-FileCopyrightText: Copyright (c) 2011-2021, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3
+
+/**
+ * \file util_namespace.cuh
+ * \brief Utilities that allow `cub::` to be placed inside an
+ * application-specific namespace.
+ */
+
+#pragma once
+
+// This is not used by this file; this is a hack so that we can detect the
+// CUB version from Thrust on older versions of CUB that did not have
+// version.cuh.
+#include <cub/version.cuh>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cub/detail/detect_cuda_runtime.cuh>
+
+// Prior to 1.13.1, only the PREFIX/POSTFIX macros were used. Notify users
+// that they must now define the qualifier macro, too.
+#if (defined(CUB_NS_PREFIX) || defined(CUB_NS_POSTFIX)) && !defined(CUB_NS_QUALIFIER)
+#  error CUB requires a definition of CUB_NS_QUALIFIER when CUB_NS_PREFIX/POSTFIX are defined.
+#endif
+
+#ifdef _CCCL_DOXYGEN_INVOKED
+#  define THRUST_CUB_WRAPPED_NAMESPACE
+#endif
+
+/**
+ * \def THRUST_CUB_WRAPPED_NAMESPACE
+ * If defined, this value will be used as the name of a namespace that wraps the
+ * `thrust::` and `cub::` namespaces.
+ * This macro should not be used with any other CUB namespace macros.
+ */
+#ifdef THRUST_CUB_WRAPPED_NAMESPACE
+#  define CUB_WRAPPED_NAMESPACE THRUST_CUB_WRAPPED_NAMESPACE
+#endif
+
+#ifdef _CCCL_DOXYGEN_INVOKED
+#  define CUB_WRAPPED_NAMESPACE
+#endif
+
+/**
+ * \def CUB_WRAPPED_NAMESPACE
+ * If defined, this value will be used as the name of a namespace that wraps the
+ * `cub::` namespace.
+ * If THRUST_CUB_WRAPPED_NAMESPACE is set, this will inherit that macro's value.
+ * This macro should not be used with any other CUB namespace macros.
+ */
+#ifdef CUB_WRAPPED_NAMESPACE
+#  define CUB_NS_PREFIX             \
+    namespace CUB_WRAPPED_NAMESPACE \
+    {
+#  define CUB_NS_POSTFIX }
+
+#  define CUB_NS_QUALIFIER ::CUB_WRAPPED_NAMESPACE::cub
+#endif
+
+#ifdef _CCCL_DOXYGEN_INVOKED
+#  define CUB_NS_PREFIX
+#endif
+
+/**
+ * \def CUB_NS_PREFIX
+ * This macro is inserted prior to all `namespace cub { ... }` blocks. It is
+ * derived from CUB_WRAPPED_NAMESPACE, if set, and will be empty otherwise.
+ * It may be defined by users, in which case CUB_NS_PREFIX,
+ * CUB_NS_POSTFIX, and CUB_NS_QUALIFIER must all be set consistently.
+ */
+#ifndef CUB_NS_PREFIX
+#  define CUB_NS_PREFIX
+#endif
+
+#ifdef _CCCL_DOXYGEN_INVOKED
+#  define CUB_NS_POSTFIX
+#endif
+
+/**
+ * \def CUB_NS_POSTFIX
+ * This macro is inserted following the closing braces of all
+ * `namespace cub { ... }` block. It is defined appropriately when
+ * CUB_WRAPPED_NAMESPACE is set, and will be empty otherwise. It may be
+ * defined by users, in which case CUB_NS_PREFIX, CUB_NS_POSTFIX, and
+ * CUB_NS_QUALIFIER must all be set consistently.
+ */
+#ifndef CUB_NS_POSTFIX
+#  define CUB_NS_POSTFIX
+#endif
+
+#ifdef _CCCL_DOXYGEN_INVOKED
+#  define CUB_NS_QUALIFIER
+#endif
+
+/**
+ * \def CUB_NS_QUALIFIER
+ * This macro is used to qualify members of cub:: when accessing them from
+ * outside of their namespace. By default, this is just `::cub`, and will be
+ * set appropriately when CUB_WRAPPED_NAMESPACE is defined. This macro may be
+ * defined by users, in which case CUB_NS_PREFIX, CUB_NS_POSTFIX, and
+ * CUB_NS_QUALIFIER must all be set consistently.
+ */
+#ifndef CUB_NS_QUALIFIER
+#  define CUB_NS_QUALIFIER ::cub
+#endif
+
+#if defined(CUB_DISABLE_NAMESPACE_MAGIC) || defined(CUB_WRAPPED_NAMESPACE)
+#  if !defined(CUB_WRAPPED_NAMESPACE)
+#    if !defined(CUB_IGNORE_NAMESPACE_MAGIC_ERROR)
+#      error "Disabling namespace magic is unsafe without wrapping namespace"
+#    endif // !defined(CUB_IGNORE_NAMESPACE_MAGIC_ERROR)
+#  endif // !defined(CUB_WRAPPED_NAMESPACE)
+#  define CUB_DETAIL_MAGIC_NS_BEGIN
+#  define CUB_DETAIL_MAGIC_NS_END
+#else // not defined(CUB_DISABLE_NAMESPACE_MAGIC)
+#  if defined(_NVHPC_CUDA)
+#    define CUB_DETAIL_MAGIC_NS_BEGIN                                                                                  \
+      inline namespace _CCCL_PP_CAT(                                                                                   \
+        _CCCL_PP_CAT(_CCCL_PP_CAT(_V_, CUB_VERSION), _CCCL_PP_SPLICE_WITH(_, _SM, NV_TARGET_SM_INTEGER_LIST)), _NVHPC) \
+      {
+#    define CUB_DETAIL_MAGIC_NS_END }
+#  else // not defined(_NVHPC_CUDA)
+#    define CUB_DETAIL_MAGIC_NS_BEGIN                                                                                 \
+      inline namespace _CCCL_PP_CAT(_CCCL_PP_CAT(_V_, CUB_VERSION), _CCCL_PP_SPLICE_WITH(_, _SM, __CUDA_ARCH_LIST__)) \
+      {
+#    define CUB_DETAIL_MAGIC_NS_END }
+#  endif // not defined(_NVHPC_CUDA)
+#endif // not defined(CUB_DISABLE_NAMESPACE_MAGIC)
+
+/**
+ * \def CUB_NAMESPACE_BEGIN
+ * This macro is used to open a `cub::` namespace block, along with any
+ * enclosing namespaces requested by CUB_WRAPPED_NAMESPACE, etc.
+ * This macro is defined by CUB and may not be overridden.
+ */
+#define CUB_NAMESPACE_BEGIN \
+  CUB_NS_PREFIX             \
+  namespace cub             \
+  {                         \
+  CUB_DETAIL_MAGIC_NS_BEGIN
+
+/**
+ * \def CUB_NAMESPACE_END
+ * This macro is used to close a `cub::` namespace block, along with any
+ * enclosing namespaces requested by CUB_WRAPPED_NAMESPACE, etc.
+ * This macro is defined by CUB and may not be overridden.
+ */
+#define CUB_NAMESPACE_END   \
+  CUB_DETAIL_MAGIC_NS_END   \
+  } /* end namespace cub */ \
+  CUB_NS_POSTFIX
+
+// Declare these namespaces here for the purpose of Doxygenating them
+CUB_NS_PREFIX
+
+/*! \namespace cub
+ *  \brief \p cub is the top-level namespace which contains all CUB
+ *         functions and types.
+ */
+namespace cub
+{
+}
+
+CUB_NS_POSTFIX

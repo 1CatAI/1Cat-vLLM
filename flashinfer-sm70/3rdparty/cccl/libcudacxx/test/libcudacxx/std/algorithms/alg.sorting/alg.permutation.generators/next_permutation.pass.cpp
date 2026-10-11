@@ -1,0 +1,92 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of libcu++, the C++ Standard Library for your entire system,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// <algorithm>
+
+// template<BidirectionalIterator Iter>
+//   requires ShuffleIterator<Iter>
+//         && LessThanComparable<Iter::value_type>
+//   constexpr bool  // constexpr in C++20
+//   next_permutation(Iter first, Iter last);
+
+#include <cuda/std/algorithm>
+#include <cuda/std/cassert>
+
+#include "test_iterators.h"
+#include "test_macros.h"
+
+TEST_FUNC constexpr int factorial(int x)
+{
+  int r = 1;
+  for (; x; --x)
+  {
+    r *= x;
+  }
+  return r;
+}
+
+_CCCL_EXEC_CHECK_DISABLE
+template <class Iter>
+TEST_FUNC constexpr void test()
+{
+  int ia[]     = {1, 2, 3, 4, 5, 6};
+  const int sa = sizeof(ia) / sizeof(ia[0]);
+  int prev[sa] = {};
+  for (int e = 0; e <= sa; ++e)
+  {
+    int count = 0;
+    bool x    = false;
+    do
+    {
+      cuda::std::copy(ia, ia + e, prev);
+      x = cuda::std::next_permutation(Iter(ia), Iter(ia + e));
+      if (e > 1)
+      {
+        if (x)
+        {
+          assert(cuda::std::lexicographical_compare(prev, prev + e, ia, ia + e));
+        }
+        else
+        {
+          assert(cuda::std::lexicographical_compare(ia, ia + e, prev, prev + e));
+        }
+      }
+      ++count;
+    } while (x);
+    assert(count == factorial(e));
+  }
+}
+
+_CCCL_EXEC_CHECK_DISABLE
+TEST_FUNC constexpr bool test()
+{
+  test<bidirectional_iterator<int*>>();
+  test<random_access_iterator<int*>>();
+  test<int*>();
+
+#if !TEST_COMPILER(NVRTC)
+  NV_IF_TARGET(NV_IS_HOST, (test<host_only_iterator<int*>>();))
+#endif // !TEST_COMPILER(NVRTC)
+#if TEST_CUDA_COMPILATION() && !defined(CCCL_FORCE_TILE_TESTS)
+  NV_IF_TARGET(NV_IS_DEVICE, (test<device_only_iterator<int*>>();))
+#endif // TEST_CUDA_COMPILATION() && !CCCL_FORCE_TILE_TESTS
+
+  return true;
+}
+
+int main(int, char**)
+{
+  test();
+#if defined(_CCCL_BUILTIN_IS_CONSTANT_EVALUATED)
+  static_assert(test());
+#endif // _CCCL_BUILTIN_IS_CONSTANT_EVALUATED
+
+  return 0;
+}

@@ -1,0 +1,27 @@
+name: Clang Format Check
+
+on: [pull_request]
+
+jobs:
+  clang-format:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 2
+    - name: Install clang-format-19
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-format-19
+    - name: Check clang-format on changed lines
+      run: |
+        FILE_PATTERN='\.(cpp|h|cc|c|cxx|hpp|cu|cuh)$'
+
+        echo "### Modified C/C++ files:"
+        FILES=$(git diff --name-only HEAD^1 HEAD -- . ':(exclude)examples/device/ep' | grep -E "$FILE_PATTERN") || true
+        [ -z "$FILES" ] && echo "(none)" || echo "$FILES"
+
+        echo "### clang format errors:"
+        [ -z "$FILES" ] && echo "(no matching files)" || \
+          git diff -U0 HEAD^1 HEAD -- $FILES | \
+          clang-format-diff-19 -p1 -style=file -v -iregex ".*${FILE_PATTERN}"

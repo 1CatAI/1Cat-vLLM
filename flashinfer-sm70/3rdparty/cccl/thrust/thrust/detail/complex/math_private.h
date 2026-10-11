@@ -1,0 +1,117 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation
+// SPDX-FileCopyrightText: Copyright (c) 2013, Filipe RNC Maia
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+ * ====================================================
+ * Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+ *
+ * Developed at SunPro, a Sun Microsystems, Inc. business.
+ * Permission to use, copy, modify, and distribute this
+ * software is freely granted, provided that this notice
+ * is preserved.
+ * ====================================================
+ */
+
+/* adapted from FreeBSD:
+ *    lib/msun/src/math_private.h
+ */
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#include <thrust/complex.h>
+
+#include <cuda/std/cstdint>
+
+THRUST_NAMESPACE_BEGIN
+namespace detail::complex
+{
+using thrust::complex;
+
+using ieee_float_shape_type = union
+{
+  float value;
+  uint32_t word;
+};
+
+_CCCL_HOST_DEVICE inline void get_float_word(uint32_t& i, float d)
+{
+  ieee_float_shape_type gf_u;
+  gf_u.value = (d);
+  (i)        = gf_u.word;
+}
+
+_CCCL_HOST_DEVICE inline void get_float_word(int32_t& i, float d)
+{
+  ieee_float_shape_type gf_u;
+  gf_u.value = (d);
+  (i)        = static_cast<int32_t>(gf_u.word);
+}
+
+_CCCL_HOST_DEVICE inline void set_float_word(float& d, uint32_t i)
+{
+  ieee_float_shape_type sf_u;
+  sf_u.word = (i);
+  (d)       = sf_u.value;
+}
+
+// Assumes little endian ordering
+using ieee_double_shape_type = union
+{
+  double value;
+  struct
+  {
+    uint32_t lsw;
+    uint32_t msw;
+  } parts;
+  struct
+  {
+    uint64_t w;
+  } xparts;
+};
+
+_CCCL_HOST_DEVICE inline void get_high_word(uint32_t& i, double d)
+{
+  ieee_double_shape_type gh_u;
+  gh_u.value = (d);
+  (i)        = gh_u.parts.msw;
+}
+
+/* Set the more significant 32 bits of a double from an int.  */
+_CCCL_HOST_DEVICE inline void set_high_word(double& d, uint32_t v)
+{
+  ieee_double_shape_type sh_u;
+  sh_u.value     = (d);
+  sh_u.parts.msw = (v);
+  (d)            = sh_u.value;
+}
+
+_CCCL_HOST_DEVICE inline void insert_words(double& d, uint32_t ix0, uint32_t ix1)
+{
+  ieee_double_shape_type iw_u;
+  iw_u.parts.msw = (ix0);
+  iw_u.parts.lsw = (ix1);
+  (d)            = iw_u.value;
+}
+
+/* Get two 32 bit ints from a double.  */
+_CCCL_HOST_DEVICE inline void extract_words(uint32_t& ix0, uint32_t& ix1, double d)
+{
+  ieee_double_shape_type ew_u;
+  ew_u.value = (d);
+  (ix0)      = ew_u.parts.msw;
+  (ix1)      = ew_u.parts.lsw;
+}
+
+/* Get two 32 bit ints from a double.  */
+_CCCL_HOST_DEVICE inline void extract_words(int32_t& ix0, int32_t& ix1, double d)
+{
+  ieee_double_shape_type ew_u;
+  ew_u.value = (d);
+  (ix0)      = static_cast<int32_t>(ew_u.parts.msw);
+  (ix1)      = static_cast<int32_t>(ew_u.parts.lsw);
+}
+} // namespace detail::complex
+
+THRUST_NAMESPACE_END

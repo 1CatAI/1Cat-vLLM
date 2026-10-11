@@ -1,0 +1,67 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+/*! \file thrust/iterator/retag.h
+ *  \brief Functionality for altering an iterator's associated system.
+ */
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+#include <thrust/iterator/detail/retag.h>
+
+THRUST_NAMESPACE_BEGIN
+
+//! \addtogroup iterators
+//! \addtogroup iterator_tag_utilities Iterator Tag Utilities
+//! \ingroup iterators
+//! \{
+
+#if _CCCL_DOXYGEN_INVOKED
+/*! \p reinterpret_tag returns a copy of an iterator and changes the type of the result's system tag.
+ *  \tparam Tag Any system tag.
+ *  \tparam Iterator Any iterator type.
+ *  \param iter The iterator of interest.
+ *  \return An iterator of unspecified type whose system tag is \p Tag and whose behavior is otherwise
+ *          equivalent to \p iter.
+ *  \note Unlike \p retag, \p reinterpret_tag does not enforce that the converted-to system tag be
+ *        related to the converted-from system tag.
+ *  \see retag
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename Tag, typename Iterator>
+_CCCL_HOST_DEVICE unspecified_iterator_type reinterpret_tag(Iterator iter);
+
+/*! \p retag returns a copy of an iterator and changes the type of the result's system tag.
+ *  \tparam Tag \p Tag shall be convertible to <tt>thrust::iterator_system<Iterator>::type</tt>,
+ *              or <tt>thrust::iterator_system<Iterator>::type</tt> is a base type of \p Tag.
+ *  \tparam Iterator Any iterator type.
+ *  \param iter The iterator of interest.
+ *  \return An iterator of unspecified type whose system tag is \p Tag and whose behavior is
+ *          otherwise equivalent to \p iter.
+ *  \note Unlike \p reinterpret_tag, \p retag enforces that the converted-to system tag be
+ *        related to the converted-from system tag.
+ *  \see reinterpret_tag
+ *
+ *  \verbatim embed:rst:leading-asterisk
+ *     .. versionadded:: 2.2.0
+ *  \endverbatim
+ */
+template <typename Tag, typename Iterator>
+_CCCL_HOST_DEVICE unspecified_iterator_type retag(Iterator iter);
+#endif
+
+//! \} // iterator_tag_utilities
+
+THRUST_NAMESPACE_END

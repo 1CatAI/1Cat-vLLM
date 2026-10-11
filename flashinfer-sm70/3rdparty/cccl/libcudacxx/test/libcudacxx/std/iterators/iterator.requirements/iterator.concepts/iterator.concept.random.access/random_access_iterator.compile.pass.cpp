@@ -1,0 +1,466 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// template<class T>
+// concept random_access_iterator;
+
+#include <cuda/std/iterator>
+
+#include "test_iterators.h"
+#include "test_macros.h"
+
+static_assert(!cuda::std::random_access_iterator<cpp17_input_iterator<int*>>);
+static_assert(!cuda::std::random_access_iterator<cpp20_input_iterator<int*>>);
+static_assert(!cuda::std::random_access_iterator<forward_iterator<int*>>);
+static_assert(!cuda::std::random_access_iterator<bidirectional_iterator<int*>>);
+static_assert(cuda::std::random_access_iterator<random_access_iterator<int*>>);
+static_assert(cuda::std::random_access_iterator<contiguous_iterator<int*>>);
+
+static_assert(cuda::std::random_access_iterator<int*>);
+static_assert(cuda::std::random_access_iterator<int const*>);
+static_assert(cuda::std::random_access_iterator<int volatile*>);
+static_assert(cuda::std::random_access_iterator<int const volatile*>);
+
+struct wrong_iterator_category
+{
+  using iterator_category = cuda::std::bidirectional_iterator_tag;
+  using value_type        = int;
+  using difference_type   = cuda::std::ptrdiff_t;
+  using pointer           = int*;
+  using reference         = int&;
+  using self              = wrong_iterator_category;
+
+  TEST_FUNC reference operator*() const;
+  TEST_FUNC pointer operator->() const;
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const self&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const self&, const self&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const self&, const self&)
+  {
+    return true;
+  };
+#endif
+
+  TEST_FUNC self& operator++();
+  TEST_FUNC self operator++(int);
+
+  TEST_FUNC self& operator--();
+  TEST_FUNC self operator--(int);
+
+  TEST_FUNC self& operator+=(difference_type n);
+  TEST_FUNC self operator+(difference_type n) const;
+  TEST_FUNC friend self operator+(difference_type n, self x);
+
+  TEST_FUNC self& operator-=(difference_type n);
+  TEST_FUNC self operator-(difference_type n) const;
+  TEST_FUNC difference_type operator-(const self&) const;
+
+  TEST_FUNC reference operator[](difference_type n) const;
+};
+static_assert(cuda::std::bidirectional_iterator<wrong_iterator_category>);
+static_assert(!cuda::std::random_access_iterator<wrong_iterator_category>);
+
+template <class Child>
+struct common_base
+{
+  using iterator_category = cuda::std::random_access_iterator_tag;
+  using value_type        = int;
+  using difference_type   = cuda::std::ptrdiff_t;
+  using pointer           = int*;
+  using reference         = int&;
+  using self              = Child;
+
+  TEST_FUNC reference operator*() const;
+  TEST_FUNC pointer operator->() const;
+  TEST_FUNC self& operator++();
+  TEST_FUNC self operator++(int);
+  TEST_FUNC self& operator--();
+  TEST_FUNC self operator--(int);
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const common_base&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const common_base&, const common_base&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const common_base&, const common_base&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const common_base&, const common_base&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const common_base&, const common_base&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const common_base&, const common_base&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const common_base&, const common_base&)
+  {
+    return true;
+  };
+#endif
+};
+
+struct simple_random_access_iterator : common_base<simple_random_access_iterator>
+{
+  TEST_FUNC self& operator+=(difference_type n);
+  TEST_FUNC self operator+(difference_type n) const;
+  TEST_FUNC friend self operator+(difference_type n, self x);
+  TEST_FUNC self& operator-=(difference_type n);
+  TEST_FUNC self operator-(difference_type n) const;
+  TEST_FUNC difference_type operator-(const self&) const;
+  TEST_FUNC reference operator[](difference_type n) const;
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const self&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const self&, const self&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const self&, const self&)
+  {
+    return true;
+  };
+#endif
+};
+static_assert(cuda::std::bidirectional_iterator<simple_random_access_iterator>);
+static_assert(cuda::std::random_access_iterator<simple_random_access_iterator>);
+
+struct no_plus_equals : common_base<no_plus_equals>
+{
+  /*  TEST_FUNC self& operator+=(difference_type n); */
+  TEST_FUNC self operator+(difference_type n) const;
+  TEST_FUNC friend self operator+(difference_type n, self x);
+  TEST_FUNC self& operator-=(difference_type n);
+  TEST_FUNC self operator-(difference_type n) const;
+  TEST_FUNC difference_type operator-(const self&) const;
+  TEST_FUNC reference operator[](difference_type n) const;
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const self&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const self&, const self&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const self&, const self&)
+  {
+    return true;
+  };
+#endif
+};
+static_assert(cuda::std::bidirectional_iterator<no_plus_equals>);
+static_assert(!cuda::std::random_access_iterator<no_plus_equals>);
+
+struct no_plus_difference_type : common_base<no_plus_difference_type>
+{
+  TEST_FUNC self& operator+=(difference_type n);
+  /*  TEST_FUNC self operator+(difference_type n) const; */
+  TEST_FUNC friend self operator+(difference_type n, self x);
+  TEST_FUNC self& operator-=(difference_type n);
+  TEST_FUNC self operator-(difference_type n) const;
+  TEST_FUNC difference_type operator-(const self&) const;
+  TEST_FUNC reference operator[](difference_type n) const;
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const self&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const self&, const self&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const self&, const self&)
+  {
+    return true;
+  };
+#endif
+};
+static_assert(cuda::std::bidirectional_iterator<no_plus_difference_type>);
+static_assert(!cuda::std::random_access_iterator<no_plus_difference_type>);
+
+struct difference_type_no_plus : common_base<difference_type_no_plus>
+{
+  TEST_FUNC self& operator+=(difference_type n);
+  TEST_FUNC self operator+(difference_type n) const;
+  /*  TEST_FUNC friend self operator+(difference_type n, self x); */
+  TEST_FUNC self& operator-=(difference_type n);
+  TEST_FUNC self operator-(difference_type n) const;
+  TEST_FUNC difference_type operator-(const self&) const;
+  TEST_FUNC reference operator[](difference_type n) const;
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const self&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const self&, const self&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const self&, const self&)
+  {
+    return true;
+  };
+#endif
+};
+static_assert(cuda::std::bidirectional_iterator<difference_type_no_plus>);
+static_assert(!cuda::std::random_access_iterator<difference_type_no_plus>);
+
+struct no_minus_equals : common_base<no_minus_equals>
+{
+  TEST_FUNC self& operator+=(difference_type n);
+  TEST_FUNC self operator+(difference_type n) const;
+  TEST_FUNC friend self operator+(difference_type n, self x);
+  /*  TEST_FUNC self& operator-=(difference_type n); */
+  TEST_FUNC self operator-(difference_type n) const;
+  TEST_FUNC difference_type operator-(const self&) const;
+  TEST_FUNC reference operator[](difference_type n) const;
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const self&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const self&, const self&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const self&, const self&)
+  {
+    return true;
+  };
+#endif
+};
+static_assert(cuda::std::bidirectional_iterator<no_minus_equals>);
+static_assert(!cuda::std::random_access_iterator<no_minus_equals>);
+
+struct no_minus : common_base<no_minus>
+{
+  TEST_FUNC self& operator+=(difference_type n);
+  TEST_FUNC self operator+(difference_type n) const;
+  TEST_FUNC friend self operator+(difference_type n, self x);
+  TEST_FUNC self& operator-=(difference_type n);
+  /*  TEST_FUNC self operator-(difference_type n) const; */
+  TEST_FUNC difference_type operator-(const self&) const;
+  TEST_FUNC reference operator[](difference_type n) const;
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const self&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const self&, const self&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const self&, const self&)
+  {
+    return true;
+  };
+#endif
+};
+static_assert(cuda::std::bidirectional_iterator<no_minus>);
+static_assert(!cuda::std::random_access_iterator<no_minus>);
+
+struct not_sized_sentinel : common_base<not_sized_sentinel>
+{
+  TEST_FUNC self& operator+=(difference_type n);
+  TEST_FUNC self operator+(difference_type n) const;
+  TEST_FUNC friend self operator+(difference_type n, self x);
+  TEST_FUNC self& operator-=(difference_type n);
+  TEST_FUNC self operator-(difference_type n) const;
+  /*  TEST_FUNC difference_type operator-(const self&) const; */
+  TEST_FUNC reference operator[](difference_type n) const;
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const self&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const self&, const self&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const self&, const self&)
+  {
+    return true;
+  };
+#endif
+};
+static_assert(cuda::std::bidirectional_iterator<not_sized_sentinel>);
+static_assert(!cuda::std::random_access_iterator<not_sized_sentinel>);
+
+struct no_subscript : common_base<no_subscript>
+{
+  TEST_FUNC self& operator+=(difference_type n);
+  TEST_FUNC self operator+(difference_type n) const;
+  TEST_FUNC friend self operator+(difference_type n, self x);
+  TEST_FUNC self& operator-=(difference_type n);
+  TEST_FUNC self operator-(difference_type n) const;
+  TEST_FUNC difference_type operator-(const self&) const;
+  /* TEST_FUNC reference operator[](difference_type n) const; */
+#if _LIBCUDACXX_HAS_SPACESHIP_OPERATOR()
+  auto operator<=>(const self&) const = default;
+#else
+  TEST_FUNC friend bool operator==(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator!=(const self&, const self&)
+  {
+    return false;
+  };
+  TEST_FUNC friend bool operator<(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator<=(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>(const self&, const self&)
+  {
+    return true;
+  };
+  TEST_FUNC friend bool operator>=(const self&, const self&)
+  {
+    return true;
+  };
+#endif
+};
+static_assert(cuda::std::bidirectional_iterator<no_subscript>);
+static_assert(!cuda::std::random_access_iterator<no_subscript>);
+
+int main(int, char**)
+{
+  return 0;
+}

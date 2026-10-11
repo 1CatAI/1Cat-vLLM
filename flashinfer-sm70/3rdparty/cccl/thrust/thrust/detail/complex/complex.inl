@@ -1,0 +1,258 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2024, NVIDIA Corporation
+// SPDX-FileCopyrightText: Copyright (c) 2013, Filipe RNC Maia
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#include <thrust/complex.h>
+#include <thrust/type_traits/is_trivially_relocatable.h>
+
+THRUST_NAMESPACE_BEGIN
+
+/* --- Constructors --- */
+
+template <typename T>
+_CCCL_HOST_DEVICE complex<T>::complex(const T& re)
+    // Initialize the storage in the member initializer list using C++ unicorn
+    // initialization. This allows `complex<T const>` to work.
+    : data{re, T()}
+{}
+
+template <typename T>
+_CCCL_HOST_DEVICE complex<T>::complex(const T& re, const T& im)
+    // Initialize the storage in the member initializer list using C++ unicorn
+    // initialization. This allows `complex<T const>` to work.
+    : data{re, im}
+{}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>::complex(const complex<U>& z)
+    // Initialize the storage in the member initializer list using C++ unicorn
+    // initialization. This allows `complex<T const>` to work.
+    // We do a functional-style cast here to suppress conversion warnings.
+    : data{T(z.real()), T(z.imag())}
+{}
+
+#if _CCCL_HOSTED()
+template <typename T>
+_CCCL_HOST THRUST_STD_COMPLEX_DEVICE complex<T>::complex(const ::std::complex<T>& z)
+    // Initialize the storage in the member initializer list using C++ unicorn
+    // initialization. This allows `complex<T const>` to work.
+    : data{THRUST_STD_COMPLEX_REAL(z), THRUST_STD_COMPLEX_IMAG(z)}
+{}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST THRUST_STD_COMPLEX_DEVICE complex<T>::complex(const ::std::complex<U>& z)
+    // Initialize the storage in the member initializer list using C++ unicorn
+    // initialization. This allows `complex<T const>` to work.
+    // We do a functional-style cast here to suppress conversion warnings.
+    : data{T(THRUST_STD_COMPLEX_REAL(z)), T(THRUST_STD_COMPLEX_IMAG(z))}
+{}
+#endif // _CCCL_HOSTED()
+
+/* --- Assignment Operators --- */
+
+template <typename T>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator=(const T& re)
+{
+  real(re);
+  imag(T());
+  return *this;
+}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator=(const complex<U>& z)
+{
+  real(T(z.real()));
+  imag(T(z.imag()));
+  return *this;
+}
+
+#if _CCCL_HOSTED()
+template <typename T>
+_CCCL_HOST THRUST_STD_COMPLEX_DEVICE complex<T>& complex<T>::operator=(const ::std::complex<T>& z)
+{
+  real(THRUST_STD_COMPLEX_REAL(z));
+  imag(THRUST_STD_COMPLEX_IMAG(z));
+  return *this;
+}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST THRUST_STD_COMPLEX_DEVICE complex<T>& complex<T>::operator=(const ::std::complex<U>& z)
+{
+  real(T(THRUST_STD_COMPLEX_REAL(z)));
+  imag(T(THRUST_STD_COMPLEX_IMAG(z)));
+  return *this;
+}
+#endif // _CCCL_HOSTED()
+
+/* --- Compound Assignment Operators --- */
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator+=(const complex<U>& z)
+{
+  *this = *this + z;
+  return *this;
+}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator-=(const complex<U>& z)
+{
+  *this = *this - z;
+  return *this;
+}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator*=(const complex<U>& z)
+{
+  *this = *this * z;
+  return *this;
+}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator/=(const complex<U>& z)
+{
+  *this = *this / z;
+  return *this;
+}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator+=(const U& z)
+{
+  *this = *this + z;
+  return *this;
+}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator-=(const U& z)
+{
+  *this = *this - z;
+  return *this;
+}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator*=(const U& z)
+{
+  *this = *this * z;
+  return *this;
+}
+
+template <typename T>
+template <typename U>
+_CCCL_HOST_DEVICE complex<T>& complex<T>::operator/=(const U& z)
+{
+  *this = *this / z;
+  return *this;
+}
+
+/* --- Equality Operators --- */
+
+template <typename T0, typename T1>
+_CCCL_HOST_DEVICE bool operator==(const complex<T0>& x, const complex<T1>& y)
+{
+  return x.real() == y.real() && x.imag() == y.imag();
+}
+
+#if _CCCL_HOSTED()
+template <typename T0, typename T1>
+_CCCL_HOST THRUST_STD_COMPLEX_DEVICE bool operator==(const complex<T0>& x, const ::std::complex<T1>& y)
+{
+  return x.real() == THRUST_STD_COMPLEX_REAL(y) && x.imag() == THRUST_STD_COMPLEX_IMAG(y);
+}
+
+template <typename T0, typename T1>
+_CCCL_HOST THRUST_STD_COMPLEX_DEVICE bool operator==(const ::std::complex<T0>& x, const complex<T1>& y)
+{
+  return THRUST_STD_COMPLEX_REAL(x) == y.real() && THRUST_STD_COMPLEX_IMAG(x) == y.imag();
+}
+#endif // _CCCL_HOSTED()
+
+template <typename T0, typename T1>
+_CCCL_HOST_DEVICE bool operator==(const T0& x, const complex<T1>& y)
+{
+  return x == y.real() && y.imag() == T1();
+}
+
+template <typename T0, typename T1>
+_CCCL_HOST_DEVICE bool operator==(const complex<T0>& x, const T1& y)
+{
+  return x.real() == y && x.imag() == T1();
+}
+
+template <typename T0, typename T1>
+_CCCL_HOST_DEVICE bool operator!=(const complex<T0>& x, const complex<T1>& y)
+{
+  return !(x == y);
+}
+
+#if _CCCL_HOSTED()
+template <typename T0, typename T1>
+_CCCL_HOST THRUST_STD_COMPLEX_DEVICE bool operator!=(const complex<T0>& x, const ::std::complex<T1>& y)
+{
+  return !(x == y);
+}
+
+template <typename T0, typename T1>
+_CCCL_HOST THRUST_STD_COMPLEX_DEVICE bool operator!=(const ::std::complex<T0>& x, const complex<T1>& y)
+{
+  return !(x == y);
+}
+#endif // _CCCL_HOSTED()
+
+template <typename T0, typename T1>
+_CCCL_HOST_DEVICE bool operator!=(const T0& x, const complex<T1>& y)
+{
+  return !(x == y);
+}
+
+template <typename T0, typename T1>
+_CCCL_HOST_DEVICE bool operator!=(const complex<T0>& x, const T1& y)
+{
+  return !(x == y);
+}
+
+_CCCL_SUPPRESS_DEPRECATED_PUSH
+_CCCL_SUPPRESS_DEPRECATED_NVRTC_DIAG
+template <typename T>
+struct proclaim_trivially_relocatable<complex<T>> : thrust::true_type
+{};
+_CCCL_SUPPRESS_DEPRECATED_POP
+
+THRUST_NAMESPACE_END
+
+_CCCL_BEGIN_NAMESPACE_CUDA
+template <typename T>
+inline constexpr bool is_trivially_copyable_v<THRUST_NS_QUALIFIER::complex<T>> = true;
+_CCCL_END_NAMESPACE_CUDA
+
+#include <thrust/detail/complex/arithmetic.h>
+#include <thrust/detail/complex/catrig.h>
+#include <thrust/detail/complex/catrigf.h>
+#include <thrust/detail/complex/ccosh.h>
+#include <thrust/detail/complex/ccoshf.h>
+#include <thrust/detail/complex/cexp.h>
+#include <thrust/detail/complex/cexpf.h>
+#include <thrust/detail/complex/clog.h>
+#include <thrust/detail/complex/clogf.h>
+#include <thrust/detail/complex/cpow.h>
+#include <thrust/detail/complex/cproj.h>
+#include <thrust/detail/complex/csinh.h>
+#include <thrust/detail/complex/csinhf.h>
+#include <thrust/detail/complex/csqrt.h>
+#include <thrust/detail/complex/csqrtf.h>
+#include <thrust/detail/complex/ctanh.h>
+#include <thrust/detail/complex/ctanhf.h>
+#include <thrust/detail/complex/stream.h>

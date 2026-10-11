@@ -1,0 +1,72 @@
+.. FlashInfer documentation master file, created by
+   sphinx-quickstart on Sat Jan 20 12:31:26 2024.
+   You can adapt this file completely to your liking, but it should at least
+   contain the root `toctree` directive.
+
+Welcome to FlashInfer's documentation!
+======================================
+
+`Blog <https://flashinfer.ai/>`_ | `Discussion Forum <https://github.com/orgs/flashinfer-ai/discussions>`_ | `GitHub <https://github.com/flashinfer-ai/flashinfer/>`_
+
+FlashInfer is a library and kernel generator for Large Language Models that provides high-performance implementation of LLM GPU kernels such as FlashAttention, PageAttention and LoRA. FlashInfer focus on LLM serving and inference, and delivers state-of-the-art performance across diverse scenarios.
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Get Started
+
+   installation
+   cli
+   logging
+   fi_trace
+   trace_apply
+   autotuning
+   experimental
+
+.. toctree::
+   :maxdepth: 2
+   :caption: Tutorials
+
+   tutorials/recursive_attention
+   tutorials/kv_layout
+   tutorials/generated/jax_tvm_ffi/index
+
+.. toctree::
+   :maxdepth: 2
+   :caption: PyTorch API Reference
+
+   api/attention
+   api/attn_scores
+   api/cake_fmha
+   api/cake_moe_grouped_gemm
+   api/cake_mxfp4_situ_moe
+   api/cake_sampling
+   api/gemm
+   api/grouped_mm
+   api/fused_moe
+   api/cascade
+   api/comm
+   api/sparse
+   api/pod
+   api/cudnn
+   api/cute_dsl
+   api/concat_ops
+   api/diffusion_ops
+   api/page
+   api/sampling
+   api/topk
+   api/logits_processor
+   api/norm
+   api/rope
+   api/activation
+   api/gdn_decode
+   api/gdn_fused_decode
+   api/gdn_prefill
+   api/gdn2_prefill
+   api/gdp_prefill
+   api/kda
+   api/mamba
+   api/mhc
+   api/quantization
+   api/green_ctx
+   api/fp4_quantization
+   api/testing

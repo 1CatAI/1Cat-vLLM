@@ -1,0 +1,150 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// <tuple>
+
+// template <class... Types> class tuple;
+
+// tuple& operator=(tuple&& u);
+
+#include <cuda/std/__memory_>
+#include <cuda/std/cassert>
+#include <cuda/std/tuple>
+#include <cuda/std/utility>
+
+#include "MoveOnly.h"
+#include "test_macros.h"
+
+struct NonAssignable
+{
+  NonAssignable& operator=(NonAssignable const&) = delete;
+  NonAssignable& operator=(NonAssignable&&)      = delete;
+};
+struct CopyAssignable
+{
+  CopyAssignable& operator=(CopyAssignable const&) = default;
+  CopyAssignable& operator=(CopyAssignable&&)      = delete;
+};
+static_assert(cuda::std::is_copy_assignable<CopyAssignable>::value);
+struct MoveAssignable
+{
+  MoveAssignable& operator=(MoveAssignable const&) = delete;
+  MoveAssignable& operator=(MoveAssignable&&)      = default;
+};
+
+[[maybe_unused]] TEST_GLOBAL_VARIABLE int copied = 0;
+[[maybe_unused]] TEST_GLOBAL_VARIABLE int moved  = 0;
+
+struct CountAssign
+{
+  TEST_FUNC static void reset()
+  {
+#if !_CCCL_TILE_COMPILATION() // error: a non-__tile__ variable cannot be used in tile code
+    copied = moved = 0;
+#endif // !_CCCL_TILE_COMPILATION()
+  }
+  CountAssign() = default;
+  TEST_FUNC CountAssign& operator=(CountAssign const&)
+  {
+#if !_CCCL_TILE_COMPILATION() // error: a non-__tile__ variable cannot be used in tile code
+    ++copied;
+#endif // !_CCCL_TILE_COMPILATION()
+    return *this;
+  }
+  TEST_FUNC CountAssign& operator=(CountAssign&&)
+  {
+#if !_CCCL_TILE_COMPILATION() // error: a non-__tile__ variable cannot be used in tile code
+    ++moved;
+#endif // !_CCCL_TILE_COMPILATION()
+    return *this;
+  }
+};
+
+int main(int, char**)
+{
+  {
+    using T = cuda::std::tuple<>;
+    T t0;
+    T t;
+    t = cuda::std::move(t0);
+    unused(t);
+  }
+  {
+    using T = cuda::std::tuple<MoveOnly>;
+    T t0(MoveOnly(0));
+    T t;
+    t = cuda::std::move(t0);
+    assert(cuda::std::get<0>(t) == 0);
+  }
+  {
+    using T = cuda::std::tuple<MoveOnly, MoveOnly>;
+    T t0(MoveOnly(0), MoveOnly(1));
+    T t;
+    t = cuda::std::move(t0);
+    assert(cuda::std::get<0>(t) == 0);
+    assert(cuda::std::get<1>(t) == 1);
+  }
+  {
+    using T = cuda::std::tuple<MoveOnly, MoveOnly, MoveOnly>;
+    T t0(MoveOnly(0), MoveOnly(1), MoveOnly(2));
+    T t;
+    t = cuda::std::move(t0);
+    assert(cuda::std::get<0>(t) == 0);
+    assert(cuda::std::get<1>(t) == 1);
+    assert(cuda::std::get<2>(t) == 2);
+  }
+  {
+    // test reference assignment.
+    using T = cuda::std::tuple<int&, int&&>;
+    int x   = 42;
+    int y   = 100;
+    int x2  = -1;
+    int y2  = 500;
+    T t(x, cuda::std::move(y));
+    T t2(x2, cuda::std::move(y2));
+    t = cuda::std::move(t2);
+    assert(cuda::std::get<0>(t) == x2);
+    assert(&cuda::std::get<0>(t) == &x);
+    assert(cuda::std::get<1>(t) == y2);
+    assert(&cuda::std::get<1>(t) == &y);
+  }
+
+  {
+    // test that the implicitly generated move assignment operator
+    // is properly deleted
+    using T = cuda::std::tuple<cuda::std::unique_ptr<int>>;
+    static_assert(cuda::std::is_move_assignable<T>::value);
+    static_assert(!cuda::std::is_copy_assignable<T>::value);
+  }
+
+  {
+    using T = cuda::std::tuple<int, NonAssignable>;
+    static_assert(!cuda::std::is_move_assignable<T>::value);
+  }
+  {
+    using T = cuda::std::tuple<int, MoveAssignable>;
+    static_assert(cuda::std::is_move_assignable<T>::value);
+  }
+  {
+    // The move should decay to a copy.
+    CountAssign::reset();
+    using T = cuda::std::tuple<CountAssign, CopyAssignable>;
+    static_assert(cuda::std::is_move_assignable<T>::value);
+    T t1;
+    T t2;
+    t1 = cuda::std::move(t2);
+#if !_CCCL_TILE_COMPILATION() // error: a non-__tile__ variable cannot be used in tile code
+    assert(copied == 1);
+    assert(moved == 0);
+#endif // !_CCCL_TILE_COMPILATION()
+  }
+
+  static_assert(cuda::std::is_trivially_move_assignable_v<cuda::std::tuple<>>);
+
+  return 0;
+}

@@ -1,0 +1,919 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of CUDASTF in CUDA C++ Core Libraries,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+/**
+ * @file
+ * @brief Implement tasks in the CUDA stream backend (stream_ctx)
+ *
+ * @see stream_ctx
+ */
+
+#pragma once
+
+#include <cuda/__cccl_config>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <cuda/experimental/__stf/internal/frozen_logical_data.cuh>
+#include <cuda/experimental/__stf/internal/logical_data.cuh>
+#include <cuda/experimental/__stf/internal/void_interface.cuh>
+#include <cuda/experimental/__stf/stream/internal/event_types.cuh>
+#include <cuda/experimental/__stf/utility/scope_guard.cuh>
+
+#include <deque>
+
+namespace cuda::experimental::stf
+{
+class stream_ctx;
+
+template <typename... Data>
+class stream_task;
+
+/**
+ * @brief Task with dynamic dependencies that uses CUDA streams (and events) to synchronize between the different tasks.
+ *
+ * `stream_task<>` automatically selects a stream from an internal pool if needed, or take a user-provided stream
+ * (by calling `set_stream`). All operations in a task are expected to be executed asynchronously with respect to
+ * that task's stream.
+ *
+ * This task type accepts dynamic dependencies, i.e. dependencies can be added at runtime by calling `add_deps()` or
+ * `add_deps()` prior to starting the task with `start()`. In turn, the added dependencies have dynamic types. It is the
+ * caller's responsibility to access the correct types for each dependency by calling `get<T>(index)`.
+ */
+template <>
+class stream_task<> : public task
+{
+public:
+  stream_task(backend_ctx_untyped ctx_, exec_place e_place = exec_place::current_device())
+      : task(mv(e_place))
+      , ctx(mv(ctx_))
+  {
+    ctx.increment_task_count();
+  }
+
+  // Tasks are move-only: a task wrapper owns per-instance in-flight state
+  // (capture stream, frontier, done nodes, held mutex during stream capture)
+  // on top of the pimpl `task` base, so copying it has no meaningful semantics.
+  // Contexts (`stream_ctx`, `graph_ctx`, `context`) are pimpl handles and
+  // remain copyable.
+  stream_task(const stream_task&)              = delete;
+  stream_task<>& operator=(const stream_task&) = delete;
+  stream_task(stream_task&&)                   = default;
+  stream_task<>& operator=(stream_task&&)      = default;
+  ~stream_task()                               = default;
+
+  // Returns the stream associated to that task : any asynchronous operation
+  // in the task body should be performed asynchronously with respect to that
+  // CUDA stream
+  cudaStream_t get_stream() const
+  {
+    const auto& e_place = get_exec_place();
+    if (e_place.size() > 1)
+    {
+      // For grids, use get_stream(idx) to specify which place's stream.
+      // Without an index, return the main task stream.
+      return dstream.stream;
+    }
+
+    return dstream.stream;
+  }
+
+  cudaStream_t get_stream(size_t pos) const
+  {
+    const auto& e_place = get_exec_place();
+
+    if (e_place.size() > 1)
+    {
+      return stream_grid[pos].stream;
+    }
+
+    return dstream.stream;
+  }
+
+  stream_task<>& set_stream(cudaStream_t s)
+  {
+    // We don't need to find a stream from the pool in this case
+    automatic_stream = false;
+    // -1 identifies streams which are not from our internal pool
+    dstream = augmented_stream(s);
+    return *this;
+  }
+
+  stream_task<>& start()
+  {
+    auto& e_place = get_exec_place();
+
+    event_list ready_prereqs = acquire(ctx);
+
+    /* Select the stream(s) */
+    if (e_place.size() > 1)
+    {
+      // We have currently no way to pass an array of per-place streams
+      _CCCL_ASSERT(automatic_stream, "automatic stream is not enabled");
+
+      // Get stream for each place in the grid
+      auto& place_res = ctx.async_resources().get_place_resources();
+      for (size_t i = 0; i < e_place.size(); ++i)
+      {
+        stream_grid.push_back(e_place.get_place(i).getStream(place_res, true));
+      }
+
+      EXPECT(stream_grid.size() > 0UL);
+    }
+    else
+    {
+      if (automatic_stream)
+      {
+        bool found      = false;
+        auto& place_res = ctx.async_resources().get_place_resources();
+        auto& pool      = e_place.get_stream_pool(true, place_res);
+
+        // To avoid creating inter stream dependencies when this is not
+        // necessary, we try to reuse streams which belong to the pool,
+        // and which are used by events with no outbound dependency. An
+        // event with an existing outbound dependencies means multiple
+        // operations might depend on it so it might be worth using
+        // multiple streams.
+        if (!getenv("CUDASTF_DO_NOT_REUSE_STREAMS"))
+        {
+          for (auto& e : ready_prereqs)
+          {
+            // fprintf(stderr, "outbounds %d (%s)\n", e->outbound_deps.load(), e->get_symbol().c_str());
+            if (e->outbound_deps == 0)
+            {
+              auto se                    = reserved::handle<stream_and_event>(e, reserved::use_static_cast);
+              augmented_stream candidate = se->get_augmented_stream();
+
+              if (candidate.id != k_no_stream_id)
+              {
+                for (const augmented_stream& pool_s : pool)
+                {
+                  if (candidate.id == pool_s.id)
+                  {
+                    found   = true;
+                    dstream = candidate;
+                    // fprintf(stderr, "REUSING stream ID %ld\n", dstream.id);
+                    break;
+                  }
+                }
+              }
+
+              if (found)
+              {
+                break;
+              }
+            }
+          }
+        }
+
+        if (!found)
+        {
+          dstream = e_place.getStream(place_res, true);
+          //    fprintf(stderr, "COULD NOT REUSE ... selected stream ID %ld\n", dstream.id);
+        }
+      }
+    }
+
+    // Select one stream to sync with all prereqs
+    auto& s0 = (e_place.size() > 1) ? stream_grid[0] : dstream;
+
+    /* Ensure that stream depend(s) on prereqs */
+    submitted_events = stream_async_op(ctx, s0, ready_prereqs);
+    if (ctx.generate_event_symbols())
+    {
+      submitted_events.set_symbol("Submitted" + get_symbol());
+    }
+
+    /* If this is a multi-place grid, all other streams must wait on s0 too */
+    if (e_place.size() > 1)
+    {
+      insert_dependencies(stream_grid);
+    }
+
+    auto& dot = ctx.get_dot();
+    // DOT tracing and set_ready_prereqs must not leave the task half-started;
+    // abort instead of letting an exception escape.
+    on_throw(::std::abort) << [&] {
+      if (dot->is_tracing())
+      {
+        dot->template add_vertex<task, logical_data_untyped>(*this);
+      }
+
+      set_ready_prereqs(mv(ready_prereqs));
+    };
+
+    return *this;
+  }
+
+  /**
+   * @brief Activate a sub-place within the task's execution place grid
+   *
+   * Returns an exec_place_scope RAII guard. The sub-place is automatically
+   * deactivated when the guard is destroyed.
+   *
+   * @param p The position within the grid
+   * @return An exec_place_scope guard managing the activation lifetime
+   */
+  exec_place_scope activate_place(pos4 p)
+  {
+    return get_exec_place().activate(get_exec_place().get_dims().get_index(p));
+  }
+
+  /**
+   * @brief Activate a sub-place within the task's execution place grid
+   *
+   * @param idx The linear index within the grid
+   * @return An exec_place_scope guard managing the activation lifetime
+   */
+  exec_place_scope activate_place(size_t idx)
+  {
+    return get_exec_place().activate(idx);
+  }
+
+  /* End the task, but do not clear its data structures yet */
+  stream_task<>& end_uncleared()
+  {
+    assert(get_task_phase() == task::phase::running);
+
+    event_list end_list;
+
+    const auto& e_place = get_exec_place();
+
+    if (e_place.size() > 1)
+    {
+      // s0 depends on all other streams
+      for (size_t i = 1; i < stream_grid.size(); i++)
+      {
+        stream_and_event::insert_dependency(stream_grid[0].stream, stream_grid[i].stream);
+      }
+    }
+
+    auto se = submitted_events.end_as_event(ctx);
+    end_list.add(se);
+
+    release(ctx, end_list);
+
+    return *this;
+  }
+
+  stream_task<>& end()
+  {
+    end_uncleared();
+    clear();
+    return *this;
+  }
+
+  /**
+   * @brief Run lambda function on the specified device
+   *
+   * @tparam Fun Type of lambda
+   * @param fun Lambda function taking either a `stream_task<>` or a `cudaStream_t` as the only argument
+   *
+   * The lambda must accept exactly one argument. If the type of the lambda's argument is one of
+   * `stream_task<>`, `stream_task<>&`, `auto`, `auto&`, or `auto&&`, then `*this` is passed to the
+   * lambda. Otherwise, `this->get_stream()` is passed to the lambda. Dependencies would need to be accessed
+   * separately.
+   */
+  template <typename Fun>
+  void operator->*(Fun&& fun)
+  {
+    cudaEvent_t start_event = nullptr, end_event = nullptr;
+
+    SCOPE(exit)
+    {
+      if (start_event)
+      {
+        cuda_safe_call(cudaEventDestroy(start_event));
+      }
+      if (end_event)
+      {
+        cuda_safe_call(cudaEventDestroy(end_event));
+      }
+    };
+
+    // Apply function to the stream (in the first position) and the data tuple
+    nvtx_range nr(get_symbol().c_str());
+    auto& dot              = ctx.get_dot();
+    const bool record_time = reserved::dot::instance().is_timing();
+
+    start();
+
+    // If things go well, end the task with time measuremments,
+    SCOPE(success)
+    {
+      end_uncleared();
+
+      if (start_event && end_event)
+      {
+        cuda_safe_call(cudaEventRecord(end_event, get_stream()));
+        cuda_safe_call(cudaEventSynchronize(end_event));
+
+        float milliseconds = 0;
+        cuda_safe_call(cudaEventElapsedTime(&milliseconds, start_event, end_event));
+
+        if (dot->is_tracing())
+        {
+          dot->template add_vertex_timing<task>(*this, milliseconds);
+        }
+      }
+
+      clear();
+    };
+
+    // And if they don't, just end the task.
+    SCOPE(fail)
+    {
+      end();
+    };
+
+    if (record_time)
+    {
+      // Events must be created here to avoid issues with multi-gpu.
+      // cudaEventCreate is an overload set, so use the non-overloaded
+      // cudaEventCreateWithFlags with the default flags.
+      start_event = cuda_try<cudaEventCreateWithFlags>(cudaEventDefault);
+      end_event   = cuda_try<cudaEventCreateWithFlags>(cudaEventDefault);
+      cuda_try<cudaEventRecord>(start_event, get_stream());
+    }
+
+    // Default for the first argument is a `cudaStream_t`.
+    if constexpr (::std::is_invocable_v<Fun, cudaStream_t>)
+    {
+      ::std::forward<Fun>(fun)(get_stream());
+    }
+    else
+    {
+      ::std::forward<Fun>(fun)(*this);
+    }
+  }
+
+  void populate_deps_scheduling_info() const
+  {
+    // Error checking copied from acquire() in acquire_release()
+
+    int index        = 0;
+    const auto& deps = get_task_deps();
+    for (const auto& dep : deps)
+    {
+      if (!dep.get_data().is_initialized())
+      {
+        fprintf(stderr, "Error: dependency number %d is an uninitialized logical data.\n", index);
+        abort();
+      }
+      dep.set_symbol(dep.get_data().get_symbol());
+      dep.set_data_footprint(dep.get_data().get_data_interface().data_footprint());
+      index++;
+    }
+  }
+
+  /**
+   * @brief Use the scheduler to assign a device to this task
+   *
+   * @return returns true if the task's time needs to be recorded
+   */
+  bool schedule_task()
+  {
+    reserved::dot& dot = reserved::dot::instance();
+    auto& statistics   = reserved::task_statistics::instance();
+
+    const bool is_auto = get_exec_place().affine_data_place().is_device_auto();
+    bool calibrate     = false;
+
+    // We need to know the data footprint if scheduling or calibrating tasks
+    if (is_auto || statistics.is_calibrating())
+    {
+      populate_deps_scheduling_info();
+    }
+
+    if (is_auto)
+    {
+      auto [place, needs_calibration] = ctx.schedule_task(*this);
+      set_exec_place(place);
+      calibrate = needs_calibration;
+    }
+
+    return dot.is_timing() || (calibrate && statistics.is_calibrating());
+  }
+
+private:
+  // Make all streams depend on streams[0]
+  static void insert_dependencies(::std::vector<augmented_stream>& streams)
+  {
+    if (streams.size() < 2)
+    {
+      // No synchronization needed
+      return;
+    }
+
+    // event and stream must be on the same device
+    // if the stream does not belong to the current device, we
+    // therefore have to find in which device the stream was created,
+    // record the event, and restore the current device to its original
+    // value.
+
+    const int s0_dev = streams[0].dev_id == -1 ? get_device_from_stream(streams[0].stream) : streams[0].dev_id;
+
+    exec_place::device(s0_dev)->*[&] {
+      // Disable timing to avoid implicit barriers.
+      const cudaEvent_t sync_event = cuda_try<cudaEventCreateWithFlags>(cudaEventDisableTiming);
+      SCOPE(exit)
+      {
+        // Asynchronously destroy the event to avoid a memory leak.
+        cuda_safe_call(cudaEventDestroy(sync_event));
+      };
+
+      cuda_try<cudaEventRecord>(sync_event, streams[0].stream);
+
+      // According to documentation, the event may be from a different device than the stream.
+      for (const auto& stream : streams)
+      {
+        cuda_try<cudaStreamWaitEvent>(stream.stream, sync_event, 0);
+      }
+    };
+  }
+
+  bool automatic_stream = true; // `true` if the stream is automatically fetched from the internal pool
+
+  // Stream and their unique id (if applicable)
+  augmented_stream dstream;
+  ::std::vector<augmented_stream> stream_grid;
+
+  // TODO rename to submitted_ops
+  stream_async_op submitted_events;
+
+protected:
+  backend_ctx_untyped ctx;
+};
+
+/**
+ * @brief Task running on stream with fixed, typed dependencies.
+ *
+ * @tparam Data A list of data that this task depends on
+ *
+ * This type models tasks that have known dependencies in arity and type. Dependencies are set statically at
+ * construction and must be statically-typed (i.e., must have type `task_dep<T>` as opposed to `task_dep_untyped`).
+ * Therefore, the choice between `stream_task` and `stream_task<>` is made depending on the nature of the task's
+ * dependencies.
+ *
+ * Most of the time a `stream_task` object is created for the sake of using its `->*` method that effects execution. The
+ * execution place can be set in the constructor and also dynamically. An invocation of `->*` takes place on the last
+ * set execution place.
+ *
+ * It is possible to move this task into a `stream_task<>` by implicit conversion (copying is disabled because
+ * `stream_task<>` is move-only). Subsequently, the obtained object can be used with dynamic dependencies.
+ */
+template <typename... Data>
+class stream_task
+// Hide recursive base from Doxygen — it cannot handle self-referential inheritance.
+#ifndef _CCCL_DOXYGEN_INVOKED
+    : public stream_task<>
+#endif
+{
+public:
+  /**
+   * @brief Construct with an execution place and dependencies
+   *
+   * @param ctx The backend context
+   * @param e_place Place where execution will be carried
+   * @param deps A list of `task_dep` objects that this task depends on
+   */
+  stream_task(backend_ctx_untyped ctx, exec_place e_place, task_dep<Data>... deps)
+      : stream_task<>(mv(ctx), mv(e_place))
+  {
+    static_assert(sizeof(*this) == sizeof(stream_task<>), "Cannot add state - it would be lost by slicing.");
+    add_deps(mv(deps)...);
+  }
+
+  /**
+   * @brief Construct with given dependencies, will execute on the current device
+   *
+   * @param ctx The stream context
+   * @param deps A list of `task_dep` objects that this task depends on
+   */
+  stream_task(stream_ctx* ctx, task_dep<Data>... deps)
+      : stream_task(exec_place::host(), ctx, mv(deps)...)
+  {}
+
+  /**
+   * @brief Set the symbol object
+   *
+   * @param s
+   * @return stream_task&
+   */
+  stream_task& set_symbol(::std::string s) &
+  {
+    stream_task<>::set_symbol(mv(s));
+    return *this;
+  }
+
+  stream_task&& set_symbol(::std::string s) &&
+  {
+    stream_task<>::set_symbol(mv(s));
+    return mv(*this);
+  }
+
+  /**
+   * @brief Run lambda function on the specified device, automatically passing it the dependencies
+   *
+   * @tparam Fun Type of lambda
+   * @param fun Lambda function
+   *
+   * If `fun`'s first parameter has is declared as one of `stream_task<Data...>`, `stream_task<Data...>&`, `auto`,
+   * `auto&`, or `auto&&`, then `*this` is passed as `fun`'s first argument. Otherwise, `this->get_stream()` is passed
+   * as `fun`'s first argument. In either case, the first argument is followed by `slice` objects that the task
+   * depends on. The framework automatically binds dependencies to slices and `fun` may invoke a kernel passing it the
+   * slices.
+   */
+  template <typename Fun>
+  auto operator->*(Fun&& fun)
+  {
+    cudaEvent_t start_event = nullptr, end_event = nullptr;
+
+    SCOPE(exit)
+    {
+      if (start_event)
+      {
+        cuda_safe_call(cudaEventDestroy(start_event));
+      }
+      if (end_event)
+      {
+        cuda_safe_call(cudaEventDestroy(end_event));
+      }
+    };
+
+    // Apply function to the stream (in the first position) and the data tuple
+    auto& dot        = ctx.get_dot();
+    auto& statistics = reserved::task_statistics::instance();
+
+    const bool record_time = schedule_task() || statistics.is_calibrating_to_file();
+
+    nvtx_range nr(get_symbol().c_str());
+    start();
+
+    // If things go well, end the task with time measurements,
+    SCOPE(success)
+    {
+      end_uncleared();
+
+      if (start_event && end_event)
+      {
+        cuda_safe_call(cudaEventRecord(end_event, get_stream()));
+        cuda_safe_call(cudaEventSynchronize(end_event));
+
+        float milliseconds = 0;
+        cuda_safe_call(cudaEventElapsedTime(&milliseconds, start_event, end_event));
+
+        if (dot->is_tracing())
+        {
+          dot->template add_vertex_timing<task>(*this, milliseconds);
+        }
+
+        if (statistics.is_calibrating())
+        {
+          statistics.log_task_time(*this, milliseconds);
+        }
+      }
+
+      clear();
+    };
+
+    // And if they don't, just end the task.
+    SCOPE(fail)
+    {
+      end();
+    };
+
+    if (record_time)
+    {
+      // Events must be created here to avoid issues with multi-gpu.
+      // cudaEventCreate is an overload set, so use the non-overloaded
+      // cudaEventCreateWithFlags with the default flags.
+      start_event = cuda_try<cudaEventCreateWithFlags>(cudaEventDefault);
+      end_event   = cuda_try<cudaEventCreateWithFlags>(cudaEventDefault);
+      cuda_try<cudaEventRecord>(start_event, get_stream());
+    }
+
+    if constexpr (::std::is_invocable_v<Fun, cudaStream_t, Data...>)
+    {
+      // Invoke passing this task's stream as the first argument, followed by the slices
+      auto t = tuple_prepend(get_stream(), typed_deps());
+      return ::std::apply(::std::forward<Fun>(fun), t);
+    }
+    else if constexpr (reserved::is_applicable_v<Fun, reserved::remove_void_interface_from_pack_t<cudaStream_t, Data...>>)
+    {
+      // Use the filtered tuple
+      auto t = tuple_prepend(get_stream(), reserved::remove_void_interface(typed_deps()));
+      return ::std::apply(::std::forward<Fun>(fun), t);
+    }
+    else
+    {
+      constexpr bool fun_invocable_task_deps = ::std::is_invocable_v<Fun, decltype(*this), Data...>;
+      constexpr bool fun_invocable_task_non_void_deps =
+        reserved::is_applicable_v<Fun, reserved::remove_void_interface_from_pack_t<decltype(*this), Data...>>;
+
+      // Invoke passing `*this` as the first argument, followed by the slices
+      static_assert(fun_invocable_task_deps || fun_invocable_task_non_void_deps,
+                    "Incorrect lambda function signature.");
+
+      if constexpr (fun_invocable_task_deps)
+      {
+        return ::std::apply(::std::forward<Fun>(fun), tuple_prepend(*this, typed_deps()));
+      }
+      else if constexpr (fun_invocable_task_non_void_deps)
+      {
+        return ::std::apply(::std::forward<Fun>(fun),
+                            tuple_prepend(*this, reserved::remove_void_interface(typed_deps())));
+      }
+    }
+  }
+
+private:
+  auto typed_deps()
+  {
+    return make_tuple_indexwise<sizeof...(Data)>([&](auto i) {
+      return this->get<::std::tuple_element_t<i, ::std::tuple<Data...>>>(i);
+    });
+  }
+};
+
+/*
+ * @brief Deferred tasks are tasks that are not executed immediately, but rather upon `ctx.submit()`.
+ */
+template <typename... Data>
+class deferred_stream_task;
+
+#ifndef _CCCL_DOXYGEN_INVOKED // doxygen has issues with this code
+/*
+ * Base of all deferred tasks. Stores the needed information for typed deferred tasks to run (see below).
+ */
+template <>
+class deferred_stream_task<>
+{
+protected:
+  // Type stored
+  struct payload_t
+  {
+    virtual ~payload_t()                                         = default;
+    virtual void set_symbol(::std::string s)                     = 0;
+    virtual const ::std::string& get_symbol() const              = 0;
+    virtual int get_mapping_id() const                           = 0;
+    virtual void run()                                           = 0;
+    virtual void populate_deps_scheduling_info()                 = 0;
+    virtual const task_dep_vector_untyped& get_task_deps() const = 0;
+    virtual void set_exec_place(exec_place e_place)              = 0;
+
+    void add_successor(int succ)
+    {
+      successors.insert(succ);
+    }
+    void add_predecessor(int pred)
+    {
+      predecessors.insert(pred);
+    }
+
+    const ::std::unordered_set<int>& get_successors() const
+    {
+      return successors;
+    }
+    const ::std::unordered_set<int>& get_predecessors() const
+    {
+      return predecessors;
+    }
+
+    virtual void set_cost(double c)
+    {
+      assert(c >= 0.0);
+      cost = c;
+    }
+    virtual double get_cost() const
+    {
+      assert(cost >= 0.0);
+      return cost;
+    }
+
+  private:
+    // Sets of mapping ids
+    ::std::unordered_set<int> predecessors;
+    ::std::unordered_set<int> successors;
+    double cost = -1.0;
+  };
+
+  ::std::shared_ptr<payload_t> payload;
+
+  deferred_stream_task(::std::shared_ptr<payload_t> payload)
+      : payload(mv(payload))
+  {}
+
+public:
+  void run()
+  {
+    assert(payload);
+    payload->run();
+  }
+
+  const task_dep_vector_untyped& get_task_deps() const
+  {
+    assert(payload);
+    return payload->get_task_deps();
+  }
+
+  void add_successor(int succ)
+  {
+    assert(payload);
+    payload->add_successor(succ);
+  }
+
+  void add_predecessor(int pred)
+  {
+    assert(payload);
+    payload->add_predecessor(pred);
+  }
+
+  const ::std::unordered_set<int>& get_successors() const
+  {
+    assert(payload);
+    return payload->get_successors();
+  }
+
+  const ::std::unordered_set<int>& get_predecessors() const
+  {
+    assert(payload);
+    return payload->get_predecessors();
+  }
+
+  const ::std::string& get_symbol() const
+  {
+    assert(payload);
+    return payload->get_symbol();
+  }
+
+  void set_symbol(::std::string s) const
+  {
+    return payload->set_symbol(mv(s));
+  }
+
+  int get_mapping_id() const
+  {
+    assert(payload);
+    return payload->get_mapping_id();
+  }
+
+  double get_cost() const
+  {
+    assert(payload);
+    return payload->get_cost();
+  }
+
+  void set_cost(double cost)
+  {
+    assert(payload);
+    payload->set_cost(cost);
+  }
+
+  auto get_reorderer_payload() const
+  {
+    assert(payload);
+    payload->populate_deps_scheduling_info();
+    return reserved::reorderer_payload(
+      payload->get_symbol(),
+      payload->get_mapping_id(),
+      payload->get_successors(),
+      payload->get_predecessors(),
+      payload->get_task_deps());
+  }
+
+  void set_exec_place(exec_place e_place)
+  {
+    assert(payload);
+    payload->set_exec_place(e_place);
+  }
+};
+
+/**
+ * @brief Deferred tasks are tasks that are not executed immediately, but rather upon `ctx.submit()`. This allows
+ * the library to perform optimizations on the task graph before it is executed.
+ *
+ * @tparam Data The dependencies of the task
+ */
+template <typename... Data>
+class deferred_stream_task : public deferred_stream_task<>
+{
+  struct payload_t : public deferred_stream_task<>::payload_t
+  {
+    template <typename... Deps>
+    payload_t(backend_ctx_untyped ctx, exec_place e_place, task_dep<Deps>... deps)
+        : task(mv(ctx), mv(e_place))
+    {
+      task.add_deps(mv(deps)...);
+    }
+
+    // Untyped task information. Will be needed later for launching the task.
+    stream_task<> task;
+    // Function that launches the task.
+    ::std::function<void(stream_task<>&)> todo;
+    // More data could go here
+
+    void set_symbol(::std::string s) override
+    {
+      task.set_symbol(mv(s));
+    }
+
+    const ::std::string& get_symbol() const override
+    {
+      return task.get_symbol();
+    }
+
+    int get_mapping_id() const override
+    {
+      return task.get_mapping_id();
+    }
+
+    void run() override
+    {
+      todo(task);
+    }
+
+    void populate_deps_scheduling_info() override
+    {
+      task.populate_deps_scheduling_info();
+    }
+
+    const task_dep_vector_untyped& get_task_deps() const override
+    {
+      return task.get_task_deps();
+    }
+
+    void set_exec_place(exec_place e_place) override
+    {
+      task.set_exec_place(e_place);
+    }
+  };
+
+  payload_t& my_payload() const
+  {
+    // Safe to do the cast because we've set the pointer earlier ourselves
+    return *static_cast<payload_t*>(payload.get());
+  }
+
+public:
+  /**
+   * @brief Construct a new deferred stream task object from a context, execution place, and dependencies.
+   *
+   * @param ctx the parent context
+   * @param e_place the place where the task will execute
+   * @param deps task dependencies
+   */
+  deferred_stream_task(backend_ctx_untyped ctx, exec_place e_place, task_dep<Data>... deps)
+      : deferred_stream_task<>(::std::make_shared<payload_t>(mv(ctx), mv(e_place), mv(deps)...))
+  {}
+
+  ///@{
+  /**
+   * @name Set the symbol of the task. This is used for profiling and debugging.
+   *
+   * @param s
+   * @return deferred_stream_task&
+   */
+  deferred_stream_task& set_symbol(::std::string s) &
+  {
+    payload->set_symbol(mv(s));
+    return *this;
+  }
+
+  deferred_stream_task&& set_symbol(::std::string s) &&
+  {
+    set_symbol(mv(s));
+    return mv(*this);
+  }
+  ///@}
+
+  void populate_deps_scheduling_info()
+  {
+    payload->populate_deps_scheduling_info();
+  }
+
+  template <typename Fun>
+  void operator->*(Fun fun)
+  {
+    my_payload().todo = [f = mv(fun)](stream_task<>& untyped_task) {
+      // Here we have full type info; we can downcast to typed stream_task
+      auto& task = static_cast<stream_task<Data...>&>(untyped_task);
+      task.operator->*(f);
+    };
+  }
+};
+#endif // _CCCL_DOXYGEN_INVOKED
+} // namespace cuda::experimental::stf

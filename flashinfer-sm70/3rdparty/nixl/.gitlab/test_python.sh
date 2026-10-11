@@ -1,0 +1,147 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# shellcheck disable=SC1091
+. "$(dirname "$0")/../.ci/scripts/common.sh"
+
+set -e
+set -x
+ulimit -c unlimited
+
+# Parse commandline arguments with first argument being the install directory.
+INSTALL_DIR=$1
+
+if [ -n "$VIRTUAL_ENV" ] && grep -q '^uv =' "$VIRTUAL_ENV/pyvenv.cfg" 2>/dev/null; then
+    pip3="uv pip"
+else
+    pip3="python3 -m pip"
+fi
+
+if [ -n "$INSTALL_DIR" ]
+then
+    ARCH=$(uname -m)
+    [ "$ARCH" = "arm64" ] && ARCH="aarch64"
+
+    export LD_LIBRARY_PATH=${INSTALL_DIR}/lib:${INSTALL_DIR}/lib/$ARCH-linux-gnu:${INSTALL_DIR}/lib/$ARCH-linux-gnu/plugins:/usr/local/lib:$LD_LIBRARY_PATH
+    export CPATH=${INSTALL_DIR}/include::$CPATH
+    export PATH=${INSTALL_DIR}/bin:$PATH
+    export PKG_CONFIG_PATH=${INSTALL_DIR}/lib/pkgconfig:$PKG_CONFIG_PATH
+    export NIXL_PLUGIN_DIR=${INSTALL_DIR}/lib/$ARCH-linux-gnu/plugins
+    export NIXL_PREFIX=${INSTALL_DIR}
+    # Raise exceptions for logging errors
+    export NIXL_DEBUG_LOGGING=yes
+
+    # Install build dependencies
+    if [ -n "$VIRTUAL_ENV" ] ; then
+        # Install full build dependencies in venv
+        $pip3 install --break-system-packages meson meson-python pybind11 patchelf pyYAML click tabulate auditwheel tomlkit 'setuptools>=80.9.0'
+    else
+        # Install minimal build dependencies in system python
+        $pip3 install --break-system-packages tomlkit
+    fi
+    # Set the correct wheel name based on the CUDA version
+    cuda_major=$(nvcc --version | grep -oP 'release \K[0-9]+')
+    case "$cuda_major" in
+        12|13) echo "CUDA $cuda_major detected" ;;
+        *) echo "Error: Unsupported CUDA version $cuda_major"; exit 1 ;;
+    esac
+    ./contrib/tomlutil.py --wheel-name "nixl-cu${cuda_major}" pyproject.toml
+    # Control ninja parallelism during pip build to prevent OOM (NPROC from common.sh)
+    $pip3 install --break-system-packages --config-settings=compile-args="-j${NPROC}" .
+    $pip3 install --break-system-packages dist/nixl-*none-any.whl
+fi
+
+# Install test dependencies
+$pip3 install --break-system-packages pytest
+$pip3 install --break-system-packages pytest-timeout
+$pip3 install --break-system-packages zmq
+
+start_etcd_server "/nixl/python_ci"
+
+echo "==== Running python tests ===="
+pytest -s test/python
+
+if $TEST_LIBFABRIC ; then
+    cat /sys/devices/virtual/dmi/id/product_name
+    echo "Product Name: $(cat /sys/devices/virtual/dmi/id/product_name)"
+    echo "Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id)"
+    # To collect libfabric debug logs, uncomment the following lines
+    #export FI_LOG_LEVEL=debug
+    #export FI_LOG_PROV=efa
+    #export NIXL_LOG_LEVEL=TRACE
+    pytest -s test/python --backend LIBFABRIC
+fi
+
+python3 test/python/prep_xfer_perf.py list
+python3 test/python/prep_xfer_perf.py array
+
+echo "==== Running python examples ===="
+cd examples/python
+python3 partial_md_example.py --init-port "$(get_next_tcp_port)" --target-port "$(get_next_tcp_port)"
+python3 partial_md_example.py --etcd
+python3 query_mem_example.py
+
+# Run a two-peers example: starts a target on an OS-assigned port,
+# reads the port from the target's NIXL_INFO log line on stderr,
+# then launches the initiator against it.
+# Extra arguments are passed as env vars to the initiator.
+# Usage: run_two_peers <script> [ENV=val ...]
+run_two_peers() {
+    local script=$1
+    shift
+
+    local target_log
+    target_log=$(mktemp)
+    trap "rm -f '$target_log'" EXIT
+
+    NIXL_LOG_LEVEL=INFO \
+        python3 "$script" --mode="target" --ip=127.0.0.1 --port=0 \
+        2> "$target_log" &
+    local target_pid=$!
+
+    # Look for the listening port in the target's log
+    local port=""
+    for _ in $(seq 30); do
+        port=$(awk '/MD listener is listening on port/ { print $NF; exit }' "$target_log")
+        [[ -n "$port" ]] && break
+        sleep 1
+    done
+
+    if [[ -z "$port" ]]; then
+        echo "Target (pid=$target_pid) failed to report port within 30s"
+        kill "$target_pid" 2>/dev/null
+        exit 1
+    fi
+
+    env "$@" python3 "$script" --mode="initiator" --ip=127.0.0.1 --port="$port"
+}
+
+run_two_peers basic_two_peers.py
+
+# Running telemetry for the last test
+mkdir -p /tmp/telemetry_test
+
+run_two_peers expanded_two_peers.py \
+    NIXL_TELEMETRY_ENABLE=y NIXL_TELEMETRY_DIR=/tmp/telemetry_test
+
+python3 telemetry_reader.py --telemetry_path /tmp/telemetry_test/initiator &
+telePID=$!
+sleep 15
+kill -s INT $telePID
+
+kill -9 $ETCD_PID 2>/dev/null || true
+
+echo "==== Python tests done ===="

@@ -1,0 +1,74 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// <algorithm>
+
+// template<ForwardIterator Iter, Callable Generator>
+//   requires OutputIterator<Iter, Generator::result_type>
+//         && CopyConstructible<Generator>
+//   constexpr void      // constexpr after c++17
+//   generate(Iter first, Iter last, Generator gen);
+
+#include <cuda/std/algorithm>
+#include <cuda/std/cassert>
+
+#include "test_iterators.h"
+#include "test_macros.h"
+
+struct gen_test
+{
+  constexpr TEST_FUNC int operator()() const noexcept
+  {
+    return 1;
+  }
+};
+
+_CCCL_EXEC_CHECK_DISABLE
+template <class Iter>
+constexpr TEST_FUNC void test()
+{
+  constexpr int N = 5;
+  int ia[N + 1]   = {0};
+  cuda::std::generate(Iter(ia), Iter(ia + N), gen_test());
+  for (int i = 0; i < N; ++i)
+  {
+    assert(ia[i] == 1);
+  }
+
+  for (int i = N; i < N + 1; ++i)
+  {
+    assert(ia[i] == 0);
+  }
+}
+
+_CCCL_EXEC_CHECK_DISABLE
+TEST_FUNC constexpr bool test()
+{
+  test<cpp17_input_iterator<int*>>();
+  test<forward_iterator<int*>>();
+  test<bidirectional_iterator<int*>>();
+  test<random_access_iterator<int*>>();
+  test<int*>();
+
+#if !TEST_COMPILER(NVRTC)
+  NV_IF_TARGET(NV_IS_HOST, (test<host_only_iterator<int*>>();))
+#endif // !TEST_COMPILER(NVRTC)
+#if TEST_CUDA_COMPILATION() && !defined(CCCL_FORCE_TILE_TESTS)
+  NV_IF_TARGET(NV_IS_DEVICE, (test<device_only_iterator<int*>>();))
+#endif // TEST_CUDA_COMPILATION() && !CCCL_FORCE_TILE_TESTS
+
+  return true;
+}
+
+int main(int, char**)
+{
+  test();
+  static_assert(test());
+
+  return 0;
+}

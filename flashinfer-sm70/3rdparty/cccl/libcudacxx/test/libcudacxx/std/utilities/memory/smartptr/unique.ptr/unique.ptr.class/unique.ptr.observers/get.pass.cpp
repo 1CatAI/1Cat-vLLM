@@ -1,0 +1,69 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of libcu++, the C++ Standard Library for your entire system,
+// under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+// SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+//
+//===----------------------------------------------------------------------===//
+
+// UNSUPPORTED: force-tile
+// error: dynamic allocation is not supported in tile mode
+
+// <memory>
+
+// unique_ptr
+
+// test get
+
+#include <cuda/std/__memory_>
+#include <cuda/std/cassert>
+
+#include "test_macros.h"
+#include "unique_ptr_test_helper.h"
+
+template <bool IsArray>
+TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 void test_basic()
+{
+  using VT  = typename cuda::std::conditional<IsArray, int[], int>::type;
+  using CVT = const VT;
+  {
+    using U = cuda::std::unique_ptr<VT>;
+    int* p  = newValue<VT>(1);
+    U s(p);
+    U const& sc = s;
+    static_assert(cuda::std::is_same_v<decltype(s.get()), int*>);
+    static_assert(cuda::std::is_same_v<decltype(sc.get()), int*>);
+    assert(s.get() == p);
+    assert(sc.get() == s.get());
+  }
+  {
+    using U      = cuda::std::unique_ptr<CVT>;
+    const int* p = newValue<VT>(1);
+    U s(p);
+    U const& sc = s;
+    static_assert(cuda::std::is_same_v<decltype(s.get()), const int*>);
+    static_assert(cuda::std::is_same_v<decltype(sc.get()), const int*>);
+    assert(s.get() == p);
+    assert(sc.get() == s.get());
+  }
+}
+
+TEST_HOST_DEVICE_FUNC TEST_CONSTEXPR_CXX23 bool test()
+{
+  test_basic</*IsArray*/ false>();
+  test_basic<true>();
+
+  return true;
+}
+
+int main(int, char**)
+{
+  test();
+#if TEST_STD_VER >= 2023
+  static_assert(test());
+#endif // TEST_STD_VER >= 2023
+
+  return 0;
+}

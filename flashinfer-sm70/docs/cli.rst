@@ -1,0 +1,223 @@
+.. _cli:
+
+Command Line Interface
+======================
+
+FlashInfer provides a command-line interface for managing modules, artifacts, and development tools.
+
+Quick Reference
+---------------
+
+View all available commands:
+
+.. code-block:: bash
+
+   flashinfer --help
+
+Export Compile Commands
+------------------------
+
+**For developers:** Generate a ``compile_commands.json`` file for IDE integration with language servers like clangd or ccls:
+
+.. code-block:: bash
+
+   # Export to default location (compile_commands.json)
+   flashinfer export-compile-commands
+
+   # Export to a specific path
+   flashinfer export-compile-commands my_compile_commands.json
+
+   # Or use the --output option
+   flashinfer export-compile-commands --output /path/to/output.json
+
+This compilation database enables:
+
+- Code completion and navigation in IDEs
+- Static analysis tools integration
+- Better development experience with CUDA/C++ code
+
+Module Management
+-----------------
+
+List and inspect compilation modules:
+
+.. code-block:: bash
+
+   # List all available modules
+   flashinfer list-modules
+
+   # Show details for a specific module
+   flashinfer list-modules module_name
+
+   # Show compilation status for all modules
+   flashinfer module-status
+
+   # Show detailed status with filters
+   flashinfer module-status --detailed
+   flashinfer module-status --filter compiled
+   flashinfer module-status --filter not-compiled
+
+Configuration and Status
+-------------------------
+
+Display FlashInfer configuration and installation status:
+
+.. code-block:: bash
+
+   flashinfer show-config
+
+This displays:
+
+- FlashInfer version and installed packages
+- PyTorch and CUDA version information
+- Environment variables and artifact paths
+- Downloaded cubin status and module compilation status
+
+Artifact Management
+-------------------
+
+Manage pre-compiled CUDA binaries:
+
+.. code-block:: bash
+
+   # Download raw pre-compiled cubin artifacts to the local cache
+   flashinfer download-cubin
+
+   # List downloaded cubins
+   flashinfer list-cubins
+
+   # Clear downloaded cubins
+   flashinfer clear-cubin
+
+Install Cubin Wheel
+-------------------
+
+Install the matching ``flashinfer-cubin`` wheel for the current FlashInfer
+environment:
+
+.. code-block:: bash
+
+   # Detect the FlashInfer version automatically
+   flashinfer install-cubin-wheel
+
+   # Use the nightly wheel index
+   flashinfer install-cubin-wheel --nightly
+
+   # Show the pip command without running it
+   flashinfer install-cubin-wheel --dry-run
+
+This command installs from the flat FlashInfer wheel index.
+
+Wheel installs prefer ``uv pip`` when ``pyvenv.cfg`` identifies a uv-created
+environment, or when pip is unavailable, provided uv is on ``PATH``. Otherwise,
+they use ``python -m pip``. Both target the interpreter running FlashInfer;
+uv receives an explicit ``--python`` argument.
+
+Install JIT Cache Wheel
+-----------------------
+
+Install the matching ``flashinfer-jit-cache`` wheel for the current FlashInfer
+and CUDA environment:
+
+.. code-block:: bash
+
+   # Detect FlashInfer and CUDA versions automatically
+   flashinfer install-jit-cache-wheel
+
+   # Override CUDA version detection
+   flashinfer install-jit-cache-wheel --cuda-version 12.9
+
+   # Install only the providers for the visible GPUs
+   flashinfer install-jit-cache-wheel --mode minimal
+
+   # Install only the provider compatible with SM90a (implies --mode minimal)
+   flashinfer install-jit-cache-wheel --sm sm90a
+
+   # Use the nightly wheel index
+   flashinfer install-jit-cache-wheel --nightly
+
+   # Show the pip command without running it
+   flashinfer install-jit-cache-wheel --dry-run
+
+This command installs from the FlashInfer wheel index instead of PyPI because
+``flashinfer-jit-cache`` wheels are too large for PyPI hosting.
+Automatic CUDA detection uses the CUDA runtime version reported by PyTorch
+(``torch.version.cuda``), falling back to toolkit detection only if PyTorch does
+not report a CUDA version.
+If the detected CUDA minor version is newer than the latest available
+``flashinfer-jit-cache`` wheel in the same major version, the command uses the
+newest compatible wheel label. For example, CUDA 13.3 resolves to ``cu130``
+and CUDA 13.5 resolves to ``cu134``.
+
+By default, the command installs the shim together with every
+architecture-specific provider it declares. ``--mode minimal`` installs the shim
+and only the best compatible provider for each visible GPU. ``--sm`` selects the
+target architectures explicitly, implies ``--mode minimal``, and may be repeated
+for heterogeneous targets or for building an image on a machine without the
+target GPU.
+
+Download Kernels
+----------------
+
+Install both optional kernel wheels for the current FlashInfer and CUDA
+environment. This combines ``install-cubin-wheel`` and
+``install-jit-cache-wheel``.
+
+.. code-block:: bash
+
+   # Install flashinfer-cubin and flashinfer-jit-cache
+   flashinfer download-kernels
+
+   # Override CUDA version detection for the jit-cache wheel
+   flashinfer download-kernels --cuda-version 12.9
+
+   # Install only the jit-cache provider compatible with SM90a
+   flashinfer download-kernels --sm sm90a
+
+   # Use nightly wheel indexes
+   flashinfer download-kernels --nightly
+
+   # Show both pip commands without running them
+   flashinfer download-kernels --dry-run
+
+``flashinfer-cubin`` is installed from the flat FlashInfer wheel index, while
+``flashinfer-jit-cache`` is installed from the CUDA-specific wheel index.
+Passing ``--sm`` installs the shim and only the best compatible jit-cache
+provider for that architecture; it may be repeated for heterogeneous targets.
+The ``flashinfer-cubin`` wheel is a shared multi-architecture package and is
+still installed unchanged.
+If one wheel install fails, the command still attempts the other install and
+reports any failures at the end.
+
+The kernel wheels must match the installed ``flashinfer-python`` version, so
+run ``flashinfer download-kernels`` again after upgrading FlashInfer. Until
+then, FlashInfer logs a warning at import and ignores the mismatched wheels:
+cubins are downloaded on demand and kernels are JIT-compiled, as if the
+wheels were not installed. Set ``FLASHINFER_DISABLE_VERSION_CHECK=1`` to use
+mismatched wheels anyway.
+
+Cache Management
+----------------
+
+Clear JIT compilation cache:
+
+.. code-block:: bash
+
+   flashinfer clear-cache
+
+Replay Recorded Calls
+---------------------
+
+Replay API dumps captured by the Level 10 "Flight Recorder" logging mode:
+
+.. code-block:: bash
+
+   # Replay all recorded calls in a dump session
+   flashinfer replay --dir ./flashinfer_dumps
+
+   # Replay a single recorded call
+   flashinfer replay --dir ./flashinfer_dumps/<dump_directory>
+
+The ``replay`` command accepts either the root dump directory or a single dump
+subdirectory. For the full dump/replay workflow and Level 10 logging
+configuration, see :ref:`logging`.

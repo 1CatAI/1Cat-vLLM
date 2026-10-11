@@ -1,0 +1,50 @@
+// SPDX-FileCopyrightText: Copyright (c) 2011-2024, NVIDIA CORPORATION. All rights reserved.
+// SPDX-License-Identifier: BSD-3
+
+#include <thrust/detail/execution_policy.h>
+#include <thrust/execution_policy.h>
+
+#include <algorithm>
+#include <new> // std::bad_alloc
+
+#include "cub_test_macros.h"
+
+std::size_t get_alloc_bytes()
+{
+  std::size_t free_bytes{};
+  std::size_t total_bytes{};
+  cudaError_t status = cudaMemGetInfo(&free_bytes, &total_bytes);
+  REQUIRE(status == cudaSuccess);
+
+  // Find a size that's > free but < total, preferring to return more than total if the values are
+  // too close.
+  constexpr std::size_t one_MiB = 1024 * 1024;
+  const std::size_t alloc_bytes = ::std::max(total_bytes - one_MiB, free_bytes + one_MiB);
+  CAPTURE(free_bytes, total_bytes, alloc_bytes);
+  return alloc_bytes;
+}
+
+CUB_TEST("c2h::device_vector throws when requested allocations exceed free device memory",
+         "[c2h][checked_cuda_allocator][device_vector]",
+         CUB_SMALL)
+{
+  c2h::device_vector<char> vec;
+
+  const std::size_t alloc_bytes = get_alloc_bytes();
+  REQUIRE_THROWS_AS(vec.resize(alloc_bytes), std::bad_alloc);
+}
+
+CUB_TEST("c2h::device_policy throws when requested allocations exceed free device memory",
+         "[c2h][checked_cuda_allocator][device_policy]",
+         CUB_SMALL)
+{
+  cuda::std::pair<char*, std::ptrdiff_t> buffer{nullptr, 0};
+  auto policy = thrust::detail::derived_cast(thrust::detail::strip_const(c2h::device_policy));
+
+  const std::size_t alloc_bytes = get_alloc_bytes();
+  REQUIRE_THROWS_AS(
+    buffer = thrust::detail::get_temporary_buffer<char>(policy, static_cast<std::ptrdiff_t>(alloc_bytes)),
+    std::bad_alloc);
+
+  thrust::detail::return_temporary_buffer(policy, buffer.first, buffer.second);
+}

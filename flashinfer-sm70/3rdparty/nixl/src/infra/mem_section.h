@@ -1,0 +1,227 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#ifndef NIXL_SRC_INFRA_MEM_SECTION_H
+#define NIXL_SRC_INFRA_MEM_SECTION_H
+
+#include <vector>
+#include <unordered_map>
+#include <map>
+#include <array>
+#include <string>
+#include <set>
+#include <cassert>
+
+#include "nixl_descriptors.h"
+#include "nixl.h"
+#include "backend/backend_engine.h"
+
+using section_key_t = std::pair<nixl_mem_t, nixlBackendEngine*>;
+using backend_set_t = std::set<nixlBackendEngine*>;
+
+struct nixlEngineDeleter {
+    void
+    operator()(nixlBackendEngine *) const noexcept;
+};
+
+using backend_ptr_t = std::unique_ptr<nixlBackendEngine, nixlEngineDeleter>;
+using backend_map_t = std::unordered_map<nixl_backend_t, backend_ptr_t>;
+
+/**
+ * @brief Section descriptor for nixl
+ *
+ * This class is used to store a section descriptor for nixl.
+ * It is derived from nixlMetaDesc and contains the meta blob for the section.
+ */
+class nixlSectionDesc : public nixlMetaDesc {
+public:
+    nixl_blob_t metaBlob;
+
+    using nixlMetaDesc::nixlMetaDesc;
+
+    nixl_blob_t serialize() const {
+        // Serialize only the meta blob. metadataP is private so we don't include it.
+        // The other side will deserialize it as nixlBlobDesc.
+        return nixlBasicDesc::serialize() + metaBlob;
+    }
+
+    inline friend bool operator==(const nixlSectionDesc &lhs, const nixlSectionDesc &rhs) {
+        return static_cast<const nixlMetaDesc &>(lhs) == static_cast<const nixlMetaDesc &>(rhs);
+    }
+
+    inline void print(const std::string &suffix) const {
+        nixlMetaDesc::print(", meta blob: " + metaBlob + suffix);
+    }
+};
+
+class nixlSecDescList : public nixlDescList<nixlSectionDesc> {
+public:
+    enum class order : bool { UNSORTED, SORTED };
+
+    explicit nixlSecDescList(const nixl_mem_t &type) : nixlDescList<nixlSectionDesc>(type, 0) {}
+
+    using nixlDescList<nixlSectionDesc>::operator[]; // bring in const overload
+
+    void
+    addDesc(const nixlSectionDesc &desc) override;
+
+    void
+    addDesc(nixlSectionDesc &&desc);
+
+    void
+    addDescs(std::vector<nixlSectionDesc> batch, order ord = order::UNSORTED);
+
+    void
+    addDescs(nixlSecDescList &&other);
+
+    void
+    remDescs(std::vector<size_t> indices, order ord = order::UNSORTED);
+
+    template<class... Args>
+    nixlSectionDesc &
+    emplace(Args &&...args) = delete;
+
+    // Shadow the parent's non-const operator[] to return a const ref,
+    // this prevents mutation of descriptor fields after insertion
+    const nixlSectionDesc &
+    operator[](size_t index) {
+        return descs[index];
+    }
+
+    int
+    getIndex(const nixlBasicDesc &query) const override;
+
+    int
+    getCoveringIndex(const nixlBasicDesc &query) const;
+
+    void
+    resize(const size_t &count) override;
+
+    // Disable parent's convenience constructors that allow pre-sizing
+    nixlSecDescList(const nixlSecDescList &) = default;
+    nixlSecDescList &
+    operator=(const nixlSecDescList &) = default;
+    nixlSecDescList(nixlSecDescList &&) = default;
+    nixlSecDescList &
+    operator=(nixlSecDescList &&) = default;
+
+private:
+    void
+    addSortedDescs(std::vector<nixlSectionDesc> batch);
+};
+
+using nixl_sec_dlist_t = nixlSecDescList;
+using section_map_t = std::map<section_key_t, nixlSecDescList>;
+
+/**
+ * @brief Normalize a section descriptor for file-like segments.
+ *
+ * For BLK_SEG, OBJ_SEG, and FILE_SEG, a zero-length registration is stored
+ * internally with len = SIZE_MAX (unlimited range).
+ */
+inline nixlBasicDesc
+normalizeSecDesc(const nixlBasicDesc &desc, nixl_mem_t type) {
+    if ((type == BLK_SEG || type == OBJ_SEG || type == FILE_SEG) && desc.len == 0) {
+        return nixlBasicDesc(desc.addr, SIZE_MAX, desc.devId);
+    }
+    return desc;
+}
+
+class nixlMemSection {
+    protected:
+        std::array<backend_set_t, FILE_SEG+1>         memToBackend;
+        section_map_t                                 sectionMap;
+
+        ~nixlMemSection() = default;
+
+        [[nodiscard]] nixlSecDescList &
+        emplace(nixl_mem_t nixl_mem, nixlBackendEngine *backend);
+
+    public:
+        nixlMemSection() = default;
+
+        backend_set_t *
+        queryBackends(nixl_mem_t mem) noexcept;
+        const backend_set_t *
+        queryBackends(nixl_mem_t mem) const noexcept;
+
+        nixl_status_t populate (const nixl_xfer_dlist_t &query,
+                                nixlBackendEngine* backend,
+                                nixl_meta_dlist_t &resp) const;
+
+        nixl_status_t
+        populate(const nixl_xfer_dlist_t &query,
+                 nixlBackendEngine *backend,
+                 nixl_stride_dlist_t &resp) const;
+
+        [[nodiscard]] nixl_status_t
+        addElement(const nixlRemoteDesc &query,
+                   nixlBackendEngine *backend,
+                   nixl_remote_meta_dlist_t &resp) const;
+};
+
+
+class nixlLocalSection : public nixlMemSection {
+    public:
+        nixl_status_t
+        addDescList(const nixl_reg_dlist_t &mem_elms,
+                    nixlBackendEngine *backend,
+                    nixlSecDescList &remote_self);
+
+        // Each nixlBasicDesc should be same as original registration region
+        nixl_status_t remDescList (const nixl_reg_dlist_t &mem_elms,
+                                   nixlBackendEngine* backend);
+
+        nixl_status_t serialize(nixlSerDes* serializer) const;
+
+        nixl_status_t serializePartial(nixlSerDes* serializer,
+                                       const backend_set_t &backends,
+                                       const nixl_reg_dlist_t &mem_elms) const;
+
+        ~nixlLocalSection();
+};
+
+
+class nixlRemoteSection : public nixlMemSection {
+    private:
+        std::string agentName;
+        // Per-connection id: a peer may reconnect under the same agentName, so
+        // invalidation matches this generation to avoid tearing down a newer connection.
+        uint64_t generation_;
+
+        nixl_status_t addDescList (
+                           const nixl_reg_dlist_t &mem_elms,
+                           nixlBackendEngine *backend);
+    public:
+        explicit nixlRemoteSection(std::string agent_name) noexcept;
+
+        [[nodiscard]] uint64_t
+        getGeneration() const noexcept {
+            return generation_;
+        }
+
+        nixl_status_t loadRemoteData (nixlSerDes* deserializer,
+                                      backend_map_t &backendToEngineMap);
+
+        // When adding self as a remote agent for local operations
+        nixl_status_t
+        loadLocalData(nixlSecDescList mem_elms, nixlBackendEngine *backend);
+        void
+        removeLocalData(const nixl_reg_dlist_t &mem_elms, nixlBackendEngine &backend);
+        ~nixlRemoteSection();
+};
+
+#endif

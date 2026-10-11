@@ -1,0 +1,134 @@
+// SPDX-FileCopyrightText: Copyright (c) 2008-2013, NVIDIA Corporation. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+/*
+ * Copyright Jens Maurer 2000-2001
+ * Distributed under the Boost Software License, Version 1.0. (See
+ * accompanying file LICENSE_1_0.txt or copy at
+ * http://www.boost.org/LICENSE_1_0.txt)
+ */
+
+#pragma once
+
+#include <thrust/detail/config.h>
+
+#if defined(_CCCL_IMPLICIT_SYSTEM_HEADER_GCC)
+#  pragma GCC system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_CLANG)
+#  pragma clang system_header
+#elif defined(_CCCL_IMPLICIT_SYSTEM_HEADER_MSVC)
+#  pragma system_header
+#endif // no system header
+
+#include <thrust/random/detail/urng_traits.h>
+#include <thrust/random/uniform_real_distribution.h>
+
+#include <cuda/std/__cmath/logarithms.h>
+#include <cuda/std/__cmath/roots.h>
+#include <cuda/std/__cmath/trigonometric_functions.h>
+#include <cuda/std/limits>
+#include <cuda/std/numbers>
+
+THRUST_NAMESPACE_BEGIN
+namespace random::detail
+{
+// this version samples the normal distribution directly
+// and uses the non-standard math function erfcinv
+template <typename RealType>
+class normal_distribution_nvcc
+{
+protected:
+  template <typename UniformRandomNumberGenerator>
+  _CCCL_HOST_DEVICE RealType sample(UniformRandomNumberGenerator& urng, const RealType mean, const RealType stddev)
+  {
+    using uint_type                = typename UniformRandomNumberGenerator::result_type;
+    using traits                   = thrust::random::detail::urng_traits<UniformRandomNumberGenerator>;
+    constexpr uint_type urng_range = (traits::max) () - (traits::min) ();
+
+    // Constants for conversion
+    constexpr RealType S1 = static_cast<RealType>(1. / static_cast<double>(urng_range));
+    constexpr RealType S2 = S1 / 2;
+
+    auto S3 = -::cuda::std::__numbers<RealType>::__sqrt2();
+
+    // Get the integer value
+    uint_type u = urng() - (traits::min) ();
+
+    // Ensure the conversion to float will give a value in the range [0,0.5)
+    if (u > (urng_range / 2))
+    {
+      u  = urng_range - u;
+      S3 = -S3;
+    }
+
+    // Convert to floating point in [0,0.5)
+    RealType p = u * S1 + S2;
+
+    // Apply inverse error function
+    return mean + stddev * S3 * erfcinv(2 * p);
+  }
+
+  // no-op
+  _CCCL_HOST_DEVICE void reset() {}
+};
+
+// this version samples the normal distribution using
+// Marsaglia's "polar method"
+template <typename RealType>
+class normal_distribution_portable
+{
+protected:
+  void reset()
+  {
+    m_valid = false;
+  }
+
+  // note that we promise to call this member function with the same mean and stddev
+  template <typename UniformRandomNumberGenerator>
+  _CCCL_HOST_DEVICE RealType sample(UniformRandomNumberGenerator& urng, const RealType mean, const RealType stddev)
+  {
+    // implementation from Boost
+    // allow for Koenig lookup
+    using ::cuda::std::cos;
+    using ::cuda::std::log;
+    using ::cuda::std::sin;
+    using ::cuda::std::sqrt;
+
+    if (!m_valid)
+    {
+      uniform_real_distribution<RealType> u01;
+      m_r1         = u01(urng);
+      m_r2         = u01(urng);
+      m_cached_rho = sqrt(-RealType(2) * log(RealType(1) - m_r2));
+
+      m_valid = true;
+    }
+    else
+    {
+      m_valid = false;
+    }
+
+    constexpr auto pi = ::cuda::std::__numbers<RealType>::__pi();
+
+    RealType result = m_cached_rho * (m_valid ? cos(RealType(2) * pi * m_r1) : sin(RealType(2) * pi * m_r1));
+
+    return mean + stddev * result;
+  }
+
+private:
+  RealType m_r1{}, m_r2{}, m_cached_rho{};
+  bool m_valid{false};
+};
+
+template <typename RealType>
+struct normal_distribution_base
+{
+#if _CCCL_CUDA_COMPILATION() && !_CCCL_CUDA_COMPILER(NVHPC)
+  using type = normal_distribution_nvcc<RealType>;
+#else // ^^^ _CCCL_CUDA_COMPILATION() && !_CCCL_CUDA_COMPILER(NVHPC) ^^^ /
+      // vvv !_CCCL_CUDA_COMPILATION() || _CCCL_CUDA_COMPILER(NVHPC) vvv
+  using type = normal_distribution_portable<RealType>;
+#endif // ^^^ !_CCCL_CUDA_COMPILATION() || _CCCL_CUDA_COMPILER(NVHPC) ^^^
+};
+} // namespace random::detail
+THRUST_NAMESPACE_END

@@ -1,0 +1,83 @@
+//===----------------------------------------------------------------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+// <cuda/std/functional>
+
+// negate
+
+// ADDITIONAL_COMPILE_DEFINITIONS: CCCL_IGNORE_DEPRECATED_API
+
+#include <cuda/std/cassert>
+#include <cuda/std/functional>
+#include <cuda/std/type_traits>
+
+#include "test_macros.h"
+
+// ensure that we allow `__device__` functions too
+struct with_device_op
+{
+  TEST_DEVICE_FUNC friend constexpr with_device_op operator-(const with_device_op&)
+  {
+    return {};
+  }
+  TEST_DEVICE_FUNC constexpr operator bool() const
+  {
+    return true;
+  }
+};
+
+__global__ void test_global_kernel()
+{
+  const cuda::std::negate<with_device_op> f;
+  assert(f({}));
+}
+
+#if _CCCL_TILE_COMPILATION()
+// ensure that we allow `__tile__` functions too
+struct with_tile_op
+{
+  TEST_TILE_FUNC friend constexpr with_tile_op operator-(const with_tile_op&)
+  {
+    return {};
+  }
+  TEST_TILE_FUNC constexpr operator bool() const
+  {
+    return true;
+  }
+};
+
+__tile_global__ void test_tile_kernel()
+{
+  const cuda::std::negate<with_tile_op> f;
+  assert(f({}));
+}
+#endif // _CCCL_TILE_COMPILATION()
+
+int main(int, char**)
+{
+  using F   = cuda::std::negate<int>;
+  const F f = F();
+#if TEST_STD_VER <= 2017
+  static_assert((cuda::std::is_same<F::argument_type, int>::value));
+  static_assert((cuda::std::is_same<F::result_type, int>::value));
+#endif // TEST_STD_VER <= 2017
+  assert(f(36) == -36);
+
+  using F2    = cuda::std::negate<>;
+  const F2 f2 = F2();
+  assert(f2(36) == -36);
+  assert(f2(36L) == -36);
+  assert(f2(36.0) == -36);
+  constexpr int foo = cuda::std::negate<int>()(3);
+  static_assert(foo == -3);
+
+  constexpr double bar = cuda::std::negate<>()(3.0);
+  static_assert(bar == -3.0);
+
+  return 0;
+}
