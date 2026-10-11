@@ -62,6 +62,18 @@ def callable_accepts_keyword(fn: object, name: str) -> bool:
     )
 
 
+def _bind_prefill_scale_capability(operation, probe_name):
+    """Bind the loaded binary's operand contract, separately from geometry."""
+    if callable(operation):
+        probe = getattr(torch.ops._vllm_fa2_C, probe_name, None)
+        operation.kv_scale_abi = int(probe()) if probe is not None else 0
+    return operation
+
+
+def prefill_row_scales_supported(operation) -> bool:
+    return operation is not None and getattr(operation, "kv_scale_abi", 0) == 1
+
+
 def get_flash_ops():
     """Lazy-load flash_attn_v100 ops if available."""
     global _flash_attn_func, _flash_attn_bhmd_func
@@ -252,7 +264,10 @@ def get_sm70_splitd_d256_ops():
             "sm70_d256_splitd_n32_dense_splitkv3_fwd",
             None,
         )
-        _sm70_splitd_d256_ops = (dense, paged, splitkv3)
+        _sm70_splitd_d256_ops = tuple(
+            _bind_prefill_scale_capability(op, "sm70_d256_splitd_late_scale_abi")
+            for op in (dense, paged, splitkv3)
+        )
     except (AttributeError, ImportError, OSError, RuntimeError) as exc:
         _sm70_splitd_d256_ops = None
         logger.warning_once(
@@ -314,6 +329,12 @@ def get_sm70_d256_gqa_architecture_op():
                 type(exc).__name__,
                 exc,
             )
+    operation = _bind_prefill_scale_capability(
+        operation,
+        "sm70_d256_gqa_v37_late_scale_abi"
+        if use_v37
+        else "sm70_d256_gqa_architecture_late_scale_abi",
+    )
     _sm70_gqa_capabilities[op_name] = operation
     return operation if use_v37 else bind_prefill_operation(operation, 8000)
 
@@ -337,6 +358,10 @@ def get_sm70_d256_gqa_architecture_q8192_op():
             torch.ops._vllm_fa2_C,
             op_name,
             None,
+        )
+        _sm70_d256_gqa_architecture_q8192_op = _bind_prefill_scale_capability(
+            _sm70_d256_gqa_architecture_q8192_op,
+            "sm70_d256_gqa_architecture_late_scale_abi",
         )
     except (AttributeError, ImportError, RuntimeError):
         _sm70_d256_gqa_architecture_q8192_op = None

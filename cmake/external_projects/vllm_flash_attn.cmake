@@ -70,6 +70,9 @@ elseif(VLLM_FLASH_ATTN_SM70)
           COMMAND
             ${PATCH_EXECUTABLE} --batch --forward -p1 -l
             -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_d256_gqa_arch.patch
+          COMMAND
+            ${PATCH_EXECUTABLE} --batch --forward -p1 -l
+            -i ${CMAKE_CURRENT_LIST_DIR}/../patches/sm70_flash_attn_late_scales.patch
           BINARY_DIR ${CMAKE_BINARY_DIR}/vllm-flash-attn
   )
 else()
@@ -101,6 +104,11 @@ if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
   set(SM70_V37_DIR "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention/sm70_v37")
   target_include_directories(_vllm_fa2_C PRIVATE
     "${vllm-flash-attn_SOURCE_DIR}/csrc/cutlass/examples/35_gemm_softmax")
+  set_property(SOURCE
+    "${vllm-flash-attn_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_d256_splitd_sm70.cu"
+    TARGET_DIRECTORY _vllm_fa2_C APPEND PROPERTY INCLUDE_DIRECTORIES
+    "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention"
+    "${CMAKE_CURRENT_LIST_DIR}/../../flash-attention-v100/kernel")
   set(SM70_V37_CUDA_SRCS
     "${SM70_V37_DIR}/prefill.cu"
     "${SM70_V37_DIR}/tail.cu"

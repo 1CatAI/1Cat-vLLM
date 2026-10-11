@@ -12,7 +12,73 @@ import os
 from pathlib import Path
 
 
+def prefill_observations(config):
+    """Read resolved policy and initialized owners, without creating counters."""
+    options = config.attention_config.flash_v100.options
+    resources = getattr(config, "_runtime_resources", {})
+    owner = resources.get("diagnostics")
+    flags = {
+        legacy: str(int(options.value(field)))
+        for legacy, field in (
+            ("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "fp8_prefill_bridge"),
+            ("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "prefill_d256_gqa_v37"),
+            ("VLLM_FLASH_V100_FA2_D256_PREFILL", "fa2_d256_prefill"),
+        )
+    }
+    architecture = (
+        ("sm70_d256_gqa_v37_fwd",)
+        if options.value("prefill_d256_gqa_v37")
+        else (
+            "sm70_d256_gqa_architecture_fwd",
+            "sm70_d256_gqa_architecture_q8192_fwd",
+        )
+    )
+    required = (
+        "sm70_d256_splitd_n32_dense_fwd",
+        "sm70_d256_splitd_n32_paged_fwd",
+        *architecture,
+    )
+    prefill_owner = resources.get("sm70_prefill")
+    return {
+        "flags": flags,
+        "required_operators": required,
+        "routes": dict(owner.histories.get("flash_v100_routes", {}))
+        if owner is not None
+        else {},
+        "route_counting_enabled": owner is not None
+        and owner.trace.flash_v100.value("route_summary"),
+        "prefill_owner": prefill_owner.explain() if prefill_owner is not None else None,
+        "observation_scope": "host dispatches: capture included; graph replay excluded",
+    }
+
+
 class PrefillRouteAuditExtension:
+    def cache_layout_snapshot(self):
+        """Report actual scheduler-block geometry, without reading cache data."""
+        import math
+
+        import torch
+
+        config = self.model_runner.kv_cache_config
+        groups = [
+            {
+                "kind": type(group.kv_cache_spec).__name__,
+                "block_tokens": group.kv_cache_spec.block_size,
+                "physical_page_bytes": group.kv_cache_spec.page_size_bytes,
+                "layers": list(group.layer_names),
+            }
+            for group in config.kv_cache_groups
+        ]
+        return {
+            "rank": torch.distributed.get_rank(),
+            "groups": groups,
+            "block_alignment_tokens": math.lcm(
+                *(row["block_tokens"] for row in groups)
+            ),
+            "mamba_cache_mode": self.vllm_config.cache_config.mamba_cache_mode,
+            "scope": "allocation and configuration; does not establish prefix restore",
+        }
+
     def kv_scale_snapshot(self):
         """Read the live scales without changing calibration or captured graphs."""
         import torch
@@ -52,24 +118,20 @@ class PrefillRouteAuditExtension:
     def dflash2_prefill_route_snapshot(self):
         import torch
 
+        from vllm.config import set_current_vllm_config
         from vllm.model_executor.layers.mamba.gdn import qwen_gdn_linear_attn as gdn
-        from vllm.v1.attention.backends import flash_attn_v100 as backend
 
-        required = (
-            "sm70_d256_splitd_n32_dense_fwd",
-            "sm70_d256_splitd_n32_paged_fwd",
-            "sm70_d256_gqa_v37_fwd",
-            "sm70_v37_e4m3_bridge",
-        )
+        observations = prefill_observations(self.vllm_config)
+        required = observations["required_operators"]
         available = {name: hasattr(torch.ops._vllm_fa2_C, name) for name in required}
-        flags = {
-            name: os.getenv(name, default)
-            for name, default in (
-                ("VLLM_FLASH_V100_FP8_PREFILL_BRIDGE", "1"),
-                ("VLLM_FLASH_V100_PREFILL_D256_GQA_V37", "1"),
-                ("VLLM_FLASH_V100_FA2_D256_PREFILL", "1"),
-            )
-        }
+        flags = observations["flags"]
+        with set_current_vllm_config(self.vllm_config):
+            gdn_prefill = {
+                "original_tilelang": gdn._sm70_flashqla_original_prefill_enabled(),
+                "indexed_state": gdn._sm70_flashqla_indexed_prefill_enabled(),
+                "direct_output": gdn._sm70_flashqla_direct_output_enabled(),
+                "configuration_only_verify_actual_hit_in_worker_log": True,
+            }
         libraries = {}
         for line in Path("/proc/self/maps").read_text().splitlines():
             fields = line.split(maxsplit=5)
@@ -81,25 +143,14 @@ class PrefillRouteAuditExtension:
             "rank": torch.distributed.get_rank(),
             "pid": os.getpid(),
             "operators": available,
-            "flags": flags,
+            **observations,
             "libraries": libraries,
             "native_prefill_available": (
                 all(available.values())
-                and all(value == "1" for value in flags.values())
+                and flags["VLLM_FLASH_V100_FP8_PREFILL_BRIDGE"] == "1"
+                and flags["VLLM_FLASH_V100_FA2_D256_PREFILL"] == "1"
                 and bool(libraries)
             ),
-            "routes": dict(backend._route_counts),
-            "gdn_prefill": {
-                "original_tilelang": gdn._sm70_flashqla_original_prefill_enabled(),
-                "indexed_state": gdn._sm70_flashqla_indexed_prefill_enabled(),
-                "direct_output": gdn._sm70_flashqla_direct_output_enabled(),
-                "explicit_original_flag": os.getenv(
-                    "VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL"
-                ),
-                "legacy_original_flag": os.getenv(
-                    "FLASH_QLA_SM70_USE_ORIGINAL_TILELANG"
-                ),
-                "configuration_only_verify_actual_hit_in_worker_log": True,
-            },
+            "gdn_prefill": gdn_prefill,
             "graph_route_counts_are_capture_counts": True,
         }

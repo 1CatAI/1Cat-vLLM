@@ -227,6 +227,14 @@ void flash_attention_paged_kv_to_fp16(
     float value_scale, const std::optional<at::Tensor>& key_scale_cache,
     const std::optional<at::Tensor>& value_scale_cache);
 
+void flash_attention_paged_kv_to_fp16_unscaled(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out, int64_t codec, float key_scale,
+    float value_scale, const std::optional<at::Tensor>& key_scale_cache,
+    const std::optional<at::Tensor>& value_scale_cache,
+    const at::Tensor& key_scale_out, const at::Tensor& value_scale_out);
+
 at::Tensor flash_attention_prefill_paged_with_scales(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,

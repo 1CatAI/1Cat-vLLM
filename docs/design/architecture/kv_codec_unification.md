@@ -616,3 +616,64 @@ runs on a separate eager FP16 reference, excludes invalid writer slots, exports
 TP-local Q/K/V ranges and never mutates captured scales. Its frozen calibration
 inputs and normally loaded checkpoint scales must qualify the independent FP8
 control before any precision-improvement claim.
+
+## Resident-prefix payloads and late scale operands
+
+This slice starts from `adc90287802d8fc8dcfb87888dba01121f2fab62`.
+The ordinary INT8 adapter expands signed bytes exactly to Half payloads and
+retains K/V scales in independent FP32 views. It does not reconstruct scaled
+Half KV before attention. The existing bridge workspace owns both planes;
+its capacity growth, capture preparation and allocation-failure behavior remain
+shared with FP8. Existing FP8 consumers retain their original arithmetic order.
+
+Dense, paged and split-KV3 Split-D now include one source core. Their row-scale
+specialization applies K scales to FP32 QK before masking and softmax, and V
+scales to the numerator while preserving the unscaled denominator. v37 uses
+the same operand contract, tail core and workspace owner. Original six-argument
+native entries remain valid; optional planes require the loaded binary's ABI 1
+probe. Missing capabilities cannot send raw payloads to an old Half consumer.
+This is an operand binding, not another INT8 executor.
+
+A single rounded Half probability product failed the frozen attention gate:
+five of 589824 checked elements failed in a 384-query INT8 case, with maximum
+absolute error 0.00838. The candidate was rejected. The admitted specialization
+retains compensated high/residual probability products and FP32 partials;
+the `atol=0.004, rtol=0.015` gate was not loosened. Legacy no-plane arithmetic
+is unchanged.
+
+Component evidence on the same V100 software stack:
+
+- **97 GPU cases passed**: 46 shared dense/paged/split-KV3 cases, 26 v37
+  late-scale cases and 25 existing v37 regressions. Five codec identities,
+  strided planes, shuffled pages, boundary padding and changed-scale graph
+  replay are included. Small-query checks cover every output row; larger
+  geometries check selected rows and every output for non-finite values.
+- **9 GPU implementation-stage cases passed** for both INT8 identities,
+  including 1568-query tail padding and generic Split-D. The profiler observes
+  the native unscaled bridge and Split-D CUDA kernel, separately from the
+  selected route. These tests instantiate the attention implementation without
+  loading a model; they are not complete serving or quality acceptance.
+- **613 existing CPU checks passed**, plus **14 new capability/fallback checks**.
+  The scale contract is read from an actual binary probe rather than inferred
+  from a Python signature. If both qualified consumers decline, the bridge
+  returns to the original cache view without invoking an old Half consumer.
+- The public R2 normal wheel has SHA256
+  `9f56c552a68bcb16d4d64a5e30dccf9130681e96f146ae719a6beab5e77a9679`.
+  FA2 is built and installed through its normal component target with the
+  tracked dependency patch. A complete normally installed main-package artifact
+  remains required for final acceptance.
+
+**P05 remains open for 79t and the remaining FP8 conversion-reachable optimized
+variants**, followed by full serving/state, task-quality and latency gates.
+Its generic fallback does not close a missing 79t binding. Other audit families
+retain their separate closure requirements above.
+
+The latency observer now reads the transferred engine policy and initialized
+diagnostics owner without mutating it or reparsing ambient defaults. Route
+counts describe host dispatch/capture, not graph replay. The calibrated FP8
+control verifies all 192 Q/K/V scale values after capture against its independent
+checkpoint before comparison. Its prefix protocol explicitly uses a 2048-token
+hybrid alignment: repeated 4096/32768-token requests actually reuse 2048/30720
+tokens. The earlier requests that recomputed all 4096 tokens are excluded from
+prefix-hit evidence. Capacity is still 262144 tokens. These reference runs
+establish the comparison setup, not INT8 task quality or a speedup claim.

@@ -35,6 +35,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         flash_v100::policy::with_policy(&flash_attention_paged_kv_to_fp16));
   m.attr("paged_kv_to_fp16_kv_abi") = 1;
   m.attr("paged_kv_to_fp16_kv_codecs") = m.attr("decode_paged_kv_codecs");
+  m.def("paged_kv_to_fp16_unscaled_kv_fwd",
+        &flash_attention_paged_kv_to_fp16_unscaled);
+  m.def("paged_kv_to_fp16_unscaled_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_paged_kv_to_fp16_unscaled));
+  m.attr("paged_kv_to_fp16_unscaled_kv_abi") = 1;
+  m.attr("paged_kv_to_fp16_unscaled_kv_codecs") =
+      m.attr("decode_paged_kv_codecs");
   m.def("prefill_paged_kv_fwd", &flash_attention_prefill_paged_with_scales);
   m.def("prefill_paged_kv_fwd_configured",
         flash_v100::policy::with_policy(

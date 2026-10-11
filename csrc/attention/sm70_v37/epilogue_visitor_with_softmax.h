@@ -49,6 +49,7 @@
 #include "cutlass/arch/memory_sm75.h"
 #include "cutlass/numeric_conversion.h"
 #include "cutlass/fast_math.h"
+#include "../../../flash-attention-v100/kernel/kv_codec_traits.cuh"
 
 namespace cutlass {
 namespace epilogue {
@@ -58,7 +59,7 @@ template <typename ThreadblockShape_, int ThreadCount,
           typename OutputTileIterator_, typename ElementAccumulator_,
           typename ElementNorm_, typename ElementSum_,
           typename ElementSoftmaxCompute_, typename ElementwiseFunctor_,
-          bool UseMasking_ = false>
+          bool UseMasking_ = false, bool RowScales = false>
 class EpilogueVisitorSoftmaxV37 {
  public:
   using ThreadblockShape = ThreadblockShape_;
@@ -96,6 +97,8 @@ class EpilogueVisitorSoftmaxV37 {
     int64_t batch_stride_D;
     int64_t batch_stride_Max;
     int64_t batch_stride_Sum;
+    flash_v100::KVScaleView scales{};
+    ElementOutput* residual = nullptr;
 
     //
     // Methods
@@ -115,12 +118,16 @@ class EpilogueVisitorSoftmaxV37 {
 
     Arguments(typename ElementwiseFunctor::Params elementwise_,
               int64_t batch_stride_C_, int64_t batch_stride_D_,
-              int64_t batch_stride_Max_, int64_t batch_stride_Sum_)
+              int64_t batch_stride_Max_, int64_t batch_stride_Sum_,
+              flash_v100::KVScaleView scales_ = {},
+              ElementOutput* residual_ = nullptr)
         : elementwise(elementwise_),
           batch_stride_C(batch_stride_C_),
           batch_stride_D(batch_stride_D_),
           batch_stride_Max(batch_stride_Max_),
-          batch_stride_Sum(batch_stride_Sum_) {}
+          batch_stride_Sum(batch_stride_Sum_),
+          scales(scales_),
+          residual(residual_) {}
   };
 
   struct Params {
@@ -129,6 +136,8 @@ class EpilogueVisitorSoftmaxV37 {
     int64_t batch_stride_D;
     int64_t batch_stride_Max;
     int64_t batch_stride_Sum;
+    flash_v100::KVScaleView scales{};
+    ElementOutput* residual = nullptr;
     //
     // Methods
     //
@@ -141,7 +150,9 @@ class EpilogueVisitorSoftmaxV37 {
           batch_stride_C(args.batch_stride_C),
           batch_stride_D(args.batch_stride_D),
           batch_stride_Max(args.batch_stride_Max),
-          batch_stride_Sum(args.batch_stride_Sum) {}
+          batch_stride_Sum(args.batch_stride_Sum),
+          scales(args.scales),
+          residual(args.residual) {}
   };
 
   /// Shared storage
@@ -156,8 +167,10 @@ class EpilogueVisitorSoftmaxV37 {
 
   OutputTileIterator iterator_C_;
   OutputTileIterator iterator_D_;
+  OutputTileIterator iterator_R_;
   typename OutputTileIterator::Fragment fragment_C_;
   typename OutputTileIterator::Fragment fragment_D_;
+  typename OutputTileIterator::Fragment fragment_R_;
 
   ElementAccumulator alpha_;
   ElementAccumulator beta_;
@@ -202,6 +215,8 @@ class EpilogueVisitorSoftmaxV37 {
                     threadblock_offset),
         iterator_D_(params_D, ptr_D, problem_size, thread_idx,
                     threadblock_offset),
+        iterator_R_(params_D, params.residual, problem_size, thread_idx,
+                    threadblock_offset),
         ptr_Max_(ptr_Max),
         ptr_Sum_(ptr_Sum),
         column_offset_(column_offset),
@@ -230,6 +245,8 @@ class EpilogueVisitorSoftmaxV37 {
   void set_batch_index(int batch_idx) {
     iterator_C_.add_pointer_offset(batch_idx * params_.batch_stride_C);
     iterator_D_.add_pointer_offset(batch_idx * params_.batch_stride_D);
+    if constexpr (RowScales)
+      iterator_R_.add_pointer_offset(batch_idx * params_.batch_stride_D);
   }
 
   /// Called at the start of the epilogue just before iterating over accumulator
@@ -241,6 +258,7 @@ class EpilogueVisitorSoftmaxV37 {
   CUTLASS_DEVICE
   void begin_step(int step_idx) {
     fragment_D_.clear();
+    if constexpr (RowScales) fragment_R_.clear();
     fragment_C_.clear();
 
     if (elementwise_.kScale !=
@@ -284,11 +302,18 @@ class EpilogueVisitorSoftmaxV37 {
         result[i] += ElementSoftmaxCompute(source_vector[i]) *
                      ElementSoftmaxCompute(beta_);
     }
-    if (!column_idx) first_row_fragment_ = frag_idx;
-    if (kHasMultiStepsInRow) row_logits_[column_idx] = result;
-
     thread_offset_ = iterator_D_.thread_start() +
                      OutputTileIterator::ThreadMap::iteration_offset(frag_idx);
+    if constexpr (RowScales) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int e = 0; e < kElementsPerAccess; ++e) {
+        int column = thread_offset_.column() + e;
+        if (column < extent_.column())
+          result[e] *= params_.scales.key.load(blockIdx.z, column, 0);
+      }
+    }
+    if (!column_idx) first_row_fragment_ = frag_idx;
+    if (kHasMultiStepsInRow || RowScales) row_logits_[column_idx] = result;
 
     bool column_guard = (thread_offset_.column() < extent_.column());
 
@@ -366,41 +391,72 @@ class EpilogueVisitorSoftmaxV37 {
     bool is_first_thread_in_tile = ((threadIdx.x % kThreadsPerRow) == 0);
     bool row_guard = thread_offset_.row() < extent_.row();
     bool is_write_thread = row_guard && is_first_thread_in_tile;
-    if (kHasMultiStepsInRow) {
-      NumericArrayConverter<ElementOutput, ElementSoftmaxCompute,
-                            kElementsPerAccess>
-          convert;
+    if constexpr (RowScales) {
+      // Statistics use the unweighted FP32 probability mass. V scales affect
+      // only PV; a half high/residual pair preserves its weighted operand.
+      ElementSoftmaxCompute mass = 0;
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < OutputTileIterator::ThreadMap::Iterations::kColumn;
            ++c) {
-        SoftmaxFragment values;
+        int fragment = first_row_fragment_ + c;
+        int column =
+            iterator_D_.thread_start().column() +
+            OutputTileIterator::ThreadMap::iteration_offset(fragment).column();
+        auto& high = reinterpret_cast<OutputVector*>(&fragment_D_)[fragment];
+        auto& low = reinterpret_cast<OutputVector*>(&fragment_R_)[fragment];
         CUTLASS_PRAGMA_UNROLL
         for (int e = 0; e < kElementsPerAccess; ++e) {
-          ElementSoftmaxCompute centered = row_logits_[c][e] - accum_max_;
-          values[e] = fast_exp(centered);
+          float probability = column + e < extent_.column()
+                                  ? fast_exp(row_logits_[c][e] - accum_max_)
+                                  : 0.0f;
+          mass += probability;
+          float weight = column + e < extent_.column()
+                             ? probability * params_.scales.value.load(
+                                                 blockIdx.z, column + e, 0)
+                             : 0.0f;
+          high[e] = ElementOutput(weight);
+          low[e] = ElementOutput((weight - float(high[e])) * 2048.0f);
         }
-        reinterpret_cast<OutputVector*>(&fragment_D_)[first_row_fragment_ + c] =
-            convert(values);
       }
-    }
-    // Match the mass of the probabilities actually consumed by PV. This
-    // counterfactual is admitted only if it improves the PyTorch oracle error.
-    ElementSoftmaxCompute rounded_sum = ElementSoftmaxCompute(0);
-    CUTLASS_PRAGMA_UNROLL
-    for (int c = 0; c < OutputTileIterator::ThreadMap::Iterations::kColumn;
-         ++c) {
-      int fragment = first_row_fragment_ + c;
-      int column =
-          iterator_D_.thread_start().column() +
-          OutputTileIterator::ThreadMap::iteration_offset(fragment).column();
-      OutputVector const& probabilities =
-          reinterpret_cast<OutputVector const*>(&fragment_D_)[fragment];
+      accum_sum_ = warp_reduce_sum_(mass);
+    } else {
+      if (kHasMultiStepsInRow) {
+        NumericArrayConverter<ElementOutput, ElementSoftmaxCompute,
+                              kElementsPerAccess>
+            convert;
+        CUTLASS_PRAGMA_UNROLL
+        for (int c = 0; c < OutputTileIterator::ThreadMap::Iterations::kColumn;
+             ++c) {
+          SoftmaxFragment values;
+          CUTLASS_PRAGMA_UNROLL
+          for (int e = 0; e < kElementsPerAccess; ++e) {
+            ElementSoftmaxCompute centered = row_logits_[c][e] - accum_max_;
+            values[e] = fast_exp(centered);
+          }
+          reinterpret_cast<OutputVector*>(
+              &fragment_D_)[first_row_fragment_ + c] = convert(values);
+        }
+      }
+      // Match the mass of the probabilities actually consumed by PV. This
+      // counterfactual is admitted only if it improves the PyTorch oracle
+      // error.
+      ElementSoftmaxCompute rounded_sum = ElementSoftmaxCompute(0);
       CUTLASS_PRAGMA_UNROLL
-      for (int e = 0; e < kElementsPerAccess; ++e)
-        if (column + e < extent_.column())
-          rounded_sum += ElementSoftmaxCompute(probabilities[e]);
+      for (int c = 0; c < OutputTileIterator::ThreadMap::Iterations::kColumn;
+           ++c) {
+        int fragment = first_row_fragment_ + c;
+        int column =
+            iterator_D_.thread_start().column() +
+            OutputTileIterator::ThreadMap::iteration_offset(fragment).column();
+        OutputVector const& probabilities =
+            reinterpret_cast<OutputVector const*>(&fragment_D_)[fragment];
+        CUTLASS_PRAGMA_UNROLL
+        for (int e = 0; e < kElementsPerAccess; ++e)
+          if (column + e < extent_.column())
+            rounded_sum += ElementSoftmaxCompute(probabilities[e]);
+      }
+      accum_sum_ = warp_reduce_sum_(rounded_sum);
     }
-    accum_sum_ = warp_reduce_sum_(rounded_sum);
     // The final reduction overwrites tile zero with the block maximum.
     // Preserve that one tile's FP32 maximum in an extra row slab.
     static_assert(
@@ -436,6 +492,10 @@ class EpilogueVisitorSoftmaxV37 {
   void end_step(int step_idx) {
     iterator_D_.store(fragment_D_);
     ++iterator_D_;
+    if constexpr (RowScales) {
+      iterator_R_.store(fragment_R_);
+      ++iterator_R_;
+    }
   }
 
   /// Called after all steps have been completed

@@ -42,22 +42,36 @@ struct KVStorageTraits<KV_CACHE_DTYPE_INT8> {
 
 // Borrowed scale addresses use element strides from the public cache view.
 // No algorithm infers an inline/planar layout from a payload dtype.
-struct KVScalePlane {
-  const float* data = nullptr;
+template <typename Scalar>
+struct KVScalePlaneT {
+  Scalar* data = nullptr;
   int64_t block_stride = 0;
   int64_t token_stride = 0;
   int64_t head_stride = 0;
 
+  __device__ __forceinline__ int64_t offset(int block, int token,
+                                            int head) const {
+    return static_cast<int64_t>(block) * block_stride +
+           static_cast<int64_t>(token) * token_stride +
+           static_cast<int64_t>(head) * head_stride;
+  }
+
   __device__ __forceinline__ float load(int block, int token, int head) const {
-    return data[static_cast<int64_t>(block) * block_stride +
-                static_cast<int64_t>(token) * token_stride +
-                static_cast<int64_t>(head) * head_stride];
+    return data[offset(block, token, head)];
   }
 };
+
+using KVScalePlane = KVScalePlaneT<const float>;
+using KVScaleOutputPlane = KVScalePlaneT<float>;
 
 struct KVScaleView {
   KVScalePlane key;
   KVScalePlane value;
+};
+
+struct KVScaleOutputView {
+  KVScaleOutputPlane key;
+  KVScaleOutputPlane value;
 };
 
 // One format contract supplies scalar and packed-vector readers to every

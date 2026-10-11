@@ -40,6 +40,7 @@
 #include "cutlass/layout/matrix.h"
 #include "cutlass/numeric_conversion.h"
 #include "gemm_with_softmax.h"
+#include "../../../flash-attention-v100/kernel/kv_cache_view.h"
 
 namespace FLASH_NAMESPACE {
 namespace {
@@ -63,12 +64,13 @@ struct QKOutputOp : QKLinearOutputOp {
   CUTLASS_HOST_DEVICE
   explicit QKOutputOp(Params const& params) : QKLinearOutputOp(params) {}
 };
-using QKGemm =
-    cutlass::GemmSoftmaxV37<Element, QKLayoutA, Element, QKLayoutB, Element,
-                            QKAccumulator, cutlass::arch::OpClassTensorOp,
-                            cutlass::arch::Sm70, QKThreadblockShape,
-                            QKWarpShape, QKInstructionShape, QKOutputOp, 2,
-                            cutlass::MatrixShape<1, 1024>>;
+template <bool RowScales>
+using QKGemmFor = cutlass::GemmSoftmaxV37<
+    Element, QKLayoutA, Element, QKLayoutB, Element, QKAccumulator,
+    cutlass::arch::OpClassTensorOp, cutlass::arch::Sm70, QKThreadblockShape,
+    QKWarpShape, QKInstructionShape, QKOutputOp, 2,
+    cutlass::MatrixShape<1, 1024>, 8, 8, 8, float, float, Element, RowScales>;
+using QKGemm = QKGemmFor<false>;
 
 using PVLayout = cutlass::layout::RowMajor;
 using PVAccumulator = float;
@@ -139,6 +141,45 @@ struct PVOutputOp : PVLinearOutputOp {
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < kCount; ++i) result[i] = accum[i] * b;
     return result;
+  }
+};
+
+// The compensated operand uses the same GEMM geometry and accumulation.
+// Its second PV adds only the residual; the online old-state scale is applied
+// once, by the main PV epilogue.
+struct PVResidualOutputOp : PVLinearOutputOp {
+  using Base = PVLinearOutputOp;
+  struct Params : Base::Params {
+    float const* block_scales;
+    CUTLASS_HOST_DEVICE
+    Params() : Base::Params(1.0f, 1.0f), block_scales(nullptr) {}
+    CUTLASS_HOST_DEVICE
+    Params(float const*, float const* next, bool)
+        : Base::Params(1.0f, 1.0f), block_scales(next) {}
+  };
+  float const* block_scales;
+  mutable int sequence = 0;
+  CUTLASS_HOST_DEVICE
+  explicit PVResidualOutputOp(Params const& params)
+      : Base(params), block_scales(params.block_scales) {}
+  CUTLASS_HOST_DEVICE
+  bool is_source_needed() const { return true; }
+  CUTLASS_DEVICE
+  FragmentOutput operator()(FragmentAccumulator const& accum,
+                            FragmentSource const& source) const {
+    int row = pv_output_row(sequence++);
+    float scale = row < g_rows ? block_scales[row] * (1.0f / 2048.0f) : 0.0f;
+    FragmentOutput result;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < kCount; ++i)
+      result[i] = fmaf(accum[i], scale, source[i]);
+    return result;
+  }
+  CUTLASS_DEVICE
+  FragmentOutput operator()(FragmentAccumulator const& accum) const {
+    FragmentSource zero;
+    zero.clear();
+    return (*this)(accum, zero);
   }
 };
 
@@ -272,13 +313,41 @@ using PVKernel =
     cutlass::gemm::kernel::Gemm<PVMma, typename PVDefaultKernel::Epilogue,
                                 PVSwizzle, false>;
 
+using PVScaledKernel = PVDefaultKernel;
+using PVResidualDefaultKernel = typename cutlass::gemm::kernel::DefaultGemm<
+    Element, PVLayout, kPVAlignment, Element, PVLayout, kPVAlignment, PVOutput,
+    PVLayout, PVAccumulator, cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm70, PVThreadblockShape, PVWarpShape, PVInstructionShape,
+    PVResidualOutputOp, PVSwizzle, 2, false,
+    cutlass::arch::OpMultiplyAdd>::GemmKernel;
+
+// Rebase both halves together after the common block-max reduction. Rounding
+// the high operand again in the legacy PV input transform would discard its
+// correction. Old FP8 inputs keep that transform and its numerical order.
+__global__ void rebase_compensated_probabilities(Element* high, Element* low,
+                                                 float const* tile_max,
+                                                 int rows, int width) {
+  int64_t index = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= int64_t(rows) * width) return;
+  int row = int(index / width), column = int(index % width);
+  int tile = column / QKThreadblockShape::kN;
+  int stored_tile = tile == 0 ? 8192 / QKThreadblockShape::kN : tile;
+  float scale = exp2f((tile_max[stored_tile * rows + row] - tile_max[row]) *
+                      1.4426950408889634f);
+  float weight = (float(high[index]) + float(low[index]) / 2048.0f) * scale;
+  Element rounded(weight);
+  high[index] = rounded;
+  low[index] = Element((weight - float(rounded)) * 2048.0f);
+}
+
 void check(cudaError_t result, char const* operation) {
   TORCH_CHECK(result == cudaSuccess, operation, ": ",
               cudaGetErrorString(result));
 }
 
+template <typename Kernel = PVKernel, typename OutputOp = PVOutputOp>
 struct PVLauncher {
-  typename PVKernel::Params params;
+  typename Kernel::Params params;
   dim3 grid;
   dim3 block;
   int smem_bytes;
@@ -293,16 +362,16 @@ struct PVLauncher {
                                 {PVThreadblockShape::kM, PVThreadblockShape::kN,
                                  PVThreadblockShape::kK},
                                 1);
-    params = typename PVKernel::Params(
+    params = typename Kernel::Params(
         problem, tiled_shape, {scores, PVLayout(k)}, {value, PVLayout(256)},
         {output, PVLayout(256)}, {output, PVLayout(256)},
-        typename PVOutputOp::Params(old_scales, block_scales, initialize),
+        typename OutputOp::Params(old_scales, block_scales, initialize),
         nullptr);
     grid = swizzle.get_grid_shape(tiled_shape);
-    block = dim3(PVKernel::kThreadCount, 1, 1);
-    smem_bytes = int(sizeof(typename PVKernel::SharedStorage));
+    block = dim3(Kernel::kThreadCount, 1, 1);
+    smem_bytes = int(sizeof(typename Kernel::SharedStorage));
     if (smem_bytes >= 48 * 1024) {
-      check(cudaFuncSetAttribute(cutlass::Kernel<PVKernel>,
+      check(cudaFuncSetAttribute(cutlass::Kernel<Kernel>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  smem_bytes),
             "set PV dynamic shared memory");
@@ -310,7 +379,7 @@ struct PVLauncher {
   }
 
   void launch(cudaStream_t stream) const {
-    cutlass::Kernel<PVKernel><<<grid, block, smem_bytes, stream>>>(params);
+    cutlass::Kernel<Kernel><<<grid, block, smem_bytes, stream>>>(params);
   }
 };
 
@@ -365,9 +434,9 @@ __global__ void merge_prefix_accumulator_tail(
   output[element] = __float2half_rn(numerator * masses[2]);
 }
 
+template <bool RowScales>
 struct BlockOperators {
-  QKGemm qk;
-  std::unique_ptr<PVLauncher> pv;
+  QKGemmFor<RowScales> qk;
 };
 
 }  // namespace
@@ -376,11 +445,15 @@ struct BlockOperators {
 extern "C" cudaError_t onecat_v37_dense_state_float_raw(
     const void*, const void*, const void*, float*, float*, void*, int, int, int,
     int, float, int, cudaStream_t);
+extern "C" cudaError_t onecat_v37_dense_state_float_raw_with_scales(
+    const void*, const void*, const void*, float*, float*, void*, int, int, int,
+    int, float, int, cudaStream_t, flash_v100::KVScaleView);
 
 namespace FLASH_NAMESPACE {
 
 struct Sm70GqaScoreWorkspace {
   at::Tensor scores;
+  at::Tensor residual;
   cudaEvent_t completion = nullptr;
   cudaStream_t tail_stream = nullptr;
   cudaEvent_t tail_input_ready = nullptr;
@@ -448,9 +521,11 @@ Sm70GqaScoreWorkspacePtr find_sm70_gqa_score_workspace(int device) {
   return found == cache.end() ? nullptr : found->second;
 }
 
-at::Tensor sm70_d256_gqa_v37_fwd(const at::Tensor& q, const at::Tensor& k,
-                                 const at::Tensor& v, at::Tensor& out,
-                                 double softmax_scale, bool causal) {
+template <bool RowScales>
+at::Tensor sm70_d256_gqa_v37_impl(const at::Tensor& q, const at::Tensor& k,
+                                  const at::Tensor& v, at::Tensor& out,
+                                  double softmax_scale, bool causal,
+                                  flash_v100::KVScaleView scales) {
   constexpr int kMaxQuery = 8192;
   constexpr int kMaxRows = kMaxQuery * 6;
   constexpr int kHeadDim = 256;
@@ -561,6 +636,20 @@ at::Tensor sm70_d256_gqa_v37_fwd(const at::Tensor& q, const at::Tensor& k,
   if (score_workspace->completion_recorded) {
     C10_CUDA_CHECK(cudaStreamWaitEvent(stream, score_workspace->completion, 0));
   }
+  if constexpr (RowScales) {
+    if (!score_workspace->residual.defined()) {
+      constexpr size_t kResidualBytes =
+          size_t(kMaxRows) * kBlockN * sizeof(Element);
+      size_t free_bytes = 0, total_bytes = 0;
+      C10_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+      TORCH_CHECK_WITH(
+          OutOfMemoryError,
+          free_bytes >= kResidualBytes + scratch_bytes + 128 * 1024 * 1024,
+          "v37 compensated workspace requires bounded residual storage and "
+          "headroom");
+      score_workspace->residual = at::empty({kMaxRows, kBlockN}, q.options());
+    }
+  }
   at::Tensor scratch = at::empty({static_cast<int64_t>(scratch_bytes)},
                                  q.options().dtype(at::ScalarType::Byte));
   auto* scratch_base = scratch.data_ptr<uint8_t>();
@@ -578,6 +667,10 @@ at::Tensor sm70_d256_gqa_v37_fwd(const at::Tensor& q, const at::Tensor& k,
   auto* value = reinterpret_cast<Element*>(v.data_ptr<at::Half>());
   auto* score_ptr =
       reinterpret_cast<Element*>(score_workspace->scores.data_ptr<at::Half>());
+  Element* residual_ptr = nullptr;
+  if constexpr (RowScales)
+    residual_ptr = reinterpret_cast<Element*>(
+        score_workspace->residual.data_ptr<at::Half>());
   float* prefix_accumulator_ptr =
       reinterpret_cast<float*>(scratch_base + prefix_accumulator_offset);
   auto* tail_output_ptr =
@@ -619,25 +712,44 @@ at::Tensor sm70_d256_gqa_v37_fwd(const at::Tensor& q, const at::Tensor& k,
   C10_CUDA_CHECK(cudaStreamWaitEvent(score_workspace->tail_stream,
                                      score_workspace->tail_input_ready, 0));
   cudaStream_t tail_stream = score_workspace->tail_stream;
-  C10_CUDA_CHECK(onecat_v37_dense_state_float_raw(
-      query, key + size_t(prefix) * kHeadDim, value + size_t(prefix) * kHeadDim,
-      tail_max_ptr, tail_sum_ptr, tail_output_ptr, kTail, kTail, kHeadsQ,
-      kHeadsKV, static_cast<float>(softmax_scale), 1, tail_stream));
+  if constexpr (RowScales) {
+    auto tail_scales = scales;
+    tail_scales.key.data += int64_t(prefix) * tail_scales.key.token_stride;
+    tail_scales.value.data += int64_t(prefix) * tail_scales.value.token_stride;
+    C10_CUDA_CHECK(onecat_v37_dense_state_float_raw_with_scales(
+        query, key + size_t(prefix) * kHeadDim,
+        value + size_t(prefix) * kHeadDim, tail_max_ptr, tail_sum_ptr,
+        tail_output_ptr, kTail, kTail, kHeadsQ, kHeadsKV,
+        static_cast<float>(softmax_scale), 1, tail_stream, tail_scales));
+  } else {
+    C10_CUDA_CHECK(onecat_v37_dense_state_float_raw(
+        query, key + size_t(prefix) * kHeadDim,
+        value + size_t(prefix) * kHeadDim, tail_max_ptr, tail_sum_ptr,
+        tail_output_ptr, kTail, kTail, kHeadsQ, kHeadsKV,
+        static_cast<float>(softmax_scale), 1, tail_stream));
+  }
   C10_CUDA_CHECK(cudaEventRecord(score_workspace->tail_complete, tail_stream));
 
   for (int block = 0; block < blocks; ++block) {
     int begin = block * kBlockN;
     int width = std::min(kBlockN, prefix - begin);
-    BlockOperators operation;
-    typename QKGemm::Arguments arguments(
+    using QK = QKGemmFor<RowScales>;
+    BlockOperators<RowScales> operation;
+    auto block_scales = scales;
+    if constexpr (RowScales) {
+      block_scales.key.data += int64_t(begin) * scales.key.token_stride;
+      block_scales.value.data += int64_t(begin) * scales.value.token_stride;
+    }
+    typename QK::Arguments arguments(
         {kRows, width, kHeadDim}, 1, {query, QKLayoutA(kHeadDim)},
         {key + size_t(begin) * kHeadDim, QKLayoutB(kHeadDim)},
-        {score_ptr, typename QKGemm::LayoutC(width)},
-        {score_ptr, typename QKGemm::LayoutC(width)},
+        {score_ptr, typename QK::LayoutC(width)},
+        {score_ptr, typename QK::LayoutC(width)},
         {Element(static_cast<float>(softmax_scale)), Element(0.0f)},
-        {qk_norm_ptr, typename QKGemm::LayoutN(kRows)},
-        {qk_sum_ptr, typename QKGemm::LayoutS(kRows)},
-        {score_ptr, typename QKGemm::LayoutSoft(width)});
+        {qk_norm_ptr, typename QK::LayoutN(kRows)},
+        {qk_sum_ptr, typename QK::LayoutS(kRows)},
+        {score_ptr, typename QK::LayoutSoft(width)}, 0, 0, 0, 0, 0, 0, 0,
+        block_scales, residual_ptr);
     TORCH_CHECK(operation.qk.initialize(arguments) == cutlass::Status::kSuccess,
                 "initialize SM70 GQA QK block ", block, " failed");
     TORCH_CHECK(operation.qk(stream) == cutlass::Status::kSuccess,
@@ -645,10 +757,25 @@ at::Tensor sm70_d256_gqa_v37_fwd(const at::Tensor& q, const at::Tensor& k,
     prepare_prefix_update<<<(kRows + 255) / 256, 256, 0, stream>>>(
         qk_norm_ptr, qk_sum_ptr, prefix_max_ptr, prefix_sum_ptr, old_scale_ptr,
         block_scale_ptr, kRows, block == 0);
-    operation.pv = std::make_unique<PVLauncher>(
-        score_ptr, value + size_t(begin) * kHeadDim, prefix_accumulator_ptr,
-        kRows, width, old_scale_ptr, block_scale_ptr, block == 0);
-    operation.pv->launch(stream);
+    if constexpr (RowScales) {
+      rebase_compensated_probabilities<<<(int64_t(kRows) * width + 255) / 256,
+                                         256, 0, stream>>>(
+          score_ptr, residual_ptr, qk_norm_ptr, kRows, width);
+      PVLauncher<PVScaledKernel> main_pv(
+          score_ptr, value + size_t(begin) * kHeadDim, prefix_accumulator_ptr,
+          kRows, width, old_scale_ptr, block_scale_ptr, block == 0);
+      main_pv.launch(stream);
+      PVLauncher<PVResidualDefaultKernel, PVResidualOutputOp> residual_pv(
+          residual_ptr, value + size_t(begin) * kHeadDim,
+          prefix_accumulator_ptr, kRows, width, nullptr, block_scale_ptr,
+          false);
+      residual_pv.launch(stream);
+    } else {
+      PVLauncher<> pv(score_ptr, value + size_t(begin) * kHeadDim,
+                      prefix_accumulator_ptr, kRows, width, old_scale_ptr,
+                      block_scale_ptr, block == 0);
+      pv.launch(stream);
+    }
   }
   C10_CUDA_CHECK(
       cudaStreamWaitEvent(stream, score_workspace->tail_complete, 0));
@@ -661,6 +788,18 @@ at::Tensor sm70_d256_gqa_v37_fwd(const at::Tensor& q, const at::Tensor& k,
   score_workspace->completion_recorded = true;
   failed_launch.release();
   return out;
+}
+
+at::Tensor sm70_d256_gqa_v37_fwd(const at::Tensor& q, const at::Tensor& k,
+                                 const at::Tensor& v, at::Tensor& out,
+                                 double softmax_scale, bool causal,
+                                 const std::optional<at::Tensor>& key_scale,
+                                 const std::optional<at::Tensor>& value_scale) {
+  auto scales = flash_v100::bind_dense_scale_view(k, v, key_scale, value_scale);
+  return key_scale ? sm70_d256_gqa_v37_impl<true>(q, k, v, out, softmax_scale,
+                                                  causal, scales)
+                   : sm70_d256_gqa_v37_impl<false>(q, k, v, out, softmax_scale,
+                                                   causal, scales);
 }
 
 }  // namespace FLASH_NAMESPACE

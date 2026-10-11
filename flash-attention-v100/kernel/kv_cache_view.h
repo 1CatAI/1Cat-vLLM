@@ -72,4 +72,24 @@ inline KVScaleView bind_scale_view(
   });
 }
 
+inline KVScaleOutputPlane bind_scale_output_plane(const at::Tensor& scale,
+                                                  const at::Tensor& payload) {
+  const auto plane = bind_scale_plane(scale, payload);
+  return {scale.data_ptr<float>(), plane.block_stride, plane.token_stride,
+          plane.head_stride};
+}
+
+// Dense inputs may be exact, unscaled codec expansions. The same address
+// contract applies to [batch, token, head] scales without a page table.
+inline KVScaleView bind_dense_scale_view(
+    const at::Tensor& key, const at::Tensor& value,
+    const std::optional<at::Tensor>& key_scale,
+    const std::optional<at::Tensor>& value_scale) {
+  TORCH_CHECK(key_scale.has_value() == value_scale.has_value(),
+              "Dense KV requires both scale planes or neither");
+  return key_scale ? KVScaleView{bind_scale_plane(*key_scale, key),
+                                 bind_scale_plane(*value_scale, value)}
+                   : KVScaleView{};
+}
+
 }  // namespace flash_v100

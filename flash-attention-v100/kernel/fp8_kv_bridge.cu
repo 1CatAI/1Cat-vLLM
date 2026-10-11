@@ -34,7 +34,8 @@ __device__ __forceinline__ __half2 load_bridge_half2(const void* cache,
   }
 }
 
-template <int KV_DTYPE, bool UNIT_SCALE, int PAIRS = 1>
+template <int KV_DTYPE, bool UNIT_SCALE, int PAIRS = 1,
+          bool PRESERVE_SCALES = false>
 __global__ void fp8_paged_kv_to_fp16_kernel(
     const void* __restrict__ key_cache, const void* __restrict__ value_cache,
     const int* __restrict__ block_table, const int* __restrict__ seq_lens,
@@ -47,7 +48,8 @@ __global__ void fp8_paged_kv_to_fp16_kernel(
     int64_t key_out_block_stride, int64_t key_out_token_stride,
     int64_t key_out_head_stride, int64_t value_out_block_stride,
     int64_t value_out_token_stride, int64_t value_out_head_stride,
-    float key_scale, float value_scale, flash_v100::KVScaleView scales) {
+    float key_scale, float value_scale, flash_v100::KVScaleView scales,
+    flash_v100::KVScaleOutputView scale_out = {}) {
   const int batch_idx = blockIdx.y;
   if (batch_idx >= batch_size) {
     return;
@@ -159,6 +161,16 @@ __global__ void fp8_paged_kv_to_fp16_kernel(
       static_cast<int64_t>(output_block) * value_out_block_stride +
       static_cast<int64_t>(output_token_offset) * value_out_token_stride +
       static_cast<int64_t>(head_idx) * value_out_head_stride + element_idx;
+  if constexpr (PRESERVE_SCALES) {
+    if (element_idx == 0) {
+      scale_out.key.data[scale_out.key.offset(output_block, output_token_offset,
+                                              head_idx)] =
+          token_idx < seq_len ? key_scale : 1.0f;
+      scale_out.value.data[scale_out.value.offset(
+          output_block, output_token_offset, head_idx)] =
+          token_idx < seq_len ? value_scale : 1.0f;
+    }
+  }
   if constexpr (PAIRS == 4) {
     union Packed {
       uint4 u;
@@ -180,12 +192,13 @@ __global__ void fp8_paged_kv_to_fp16_kernel(
 
 }  // namespace
 
-template <int KV_DTYPE, int PAIRS = 1>
+template <int KV_DTYPE, int PAIRS = 1, bool PRESERVE_SCALES = false>
 void flash_attention_fp8_paged_kv_to_fp16(
     const at::Tensor& key_cache, const at::Tensor& value_cache,
     const at::Tensor& block_table, const at::Tensor& seq_lens,
     at::Tensor& key_out, at::Tensor& value_out, const float key_scale,
-    const float value_scale, flash_v100::KVScaleView scales = {}) {
+    const float value_scale, flash_v100::KVScaleView scales = {},
+    flash_v100::KVScaleOutputView scale_out = {}) {
   TORCH_CHECK(key_cache.is_cuda() && value_cache.is_cuda() &&
                   key_out.is_cuda() && value_out.is_cuda(),
               "FP8 KV bridge tensors must be CUDA tensors");
@@ -287,7 +300,7 @@ void flash_attention_fp8_paged_kv_to_fp16(
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
 
 #define LAUNCH_FP8_BRIDGE(UNIT_SCALE)                                          \
-  fp8_paged_kv_to_fp16_kernel<KV_DTYPE, UNIT_SCALE, PAIRS>                     \
+  fp8_paged_kv_to_fp16_kernel<KV_DTYPE, UNIT_SCALE, PAIRS, PRESERVE_SCALES>    \
       <<<grid, kThreads, 0, stream>>>(                                         \
           key_cache.data_ptr(), value_cache.data_ptr(),                        \
           block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),               \
@@ -299,10 +312,12 @@ void flash_attention_fp8_paged_kv_to_fp16(
           value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
           key_out.stride(0), key_out.stride(1), key_out.stride(2),             \
           value_out.stride(0), value_out.stride(1), value_out.stride(2),       \
-          key_scale, value_scale, scales)
+          key_scale, value_scale, scales, scale_out)
 
-  if (!flash_v100::KVCodecTraits<KV_DTYPE>::per_token_head &&
-      key_scale == 1.f && value_scale == 1.f) {
+  if constexpr (PRESERVE_SCALES) {
+    LAUNCH_FP8_BRIDGE(true);
+  } else if (!flash_v100::KVCodecTraits<KV_DTYPE>::per_token_head &&
+             key_scale == 1.f && value_scale == 1.f) {
     LAUNCH_FP8_BRIDGE(true);
   } else {
     LAUNCH_FP8_BRIDGE(false);
@@ -345,5 +360,28 @@ void flash_attention_paged_kv_to_fp16(
     flash_attention_fp8_paged_kv_to_fp16<decltype(tag)::value, 4>(
         key_cache, value_cache, block_table, seq_lens, key_out, value_out,
         key_scale, value_scale, scales);
+  });
+}
+
+// Preserve exact codec expansions and separate FP32 scales for algorithms
+// that apply K scales after QK and V scales inside the weighted sum.
+void flash_attention_paged_kv_to_fp16_unscaled(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out, int64_t codec, float key_scale,
+    float value_scale, const std::optional<at::Tensor>& key_scale_cache,
+    const std::optional<at::Tensor>& value_scale_cache,
+    const at::Tensor& key_scale_out, const at::Tensor& value_scale_out) {
+  const auto scales = flash_v100::bind_scale_view(
+      codec, key_cache, value_cache, key_scale_cache, value_scale_cache);
+  const flash_v100::KVScaleOutputView output_scales{
+      flash_v100::bind_scale_output_plane(key_scale_out, key_out),
+      flash_v100::bind_scale_output_plane(value_scale_out, value_out)};
+  flash_v100::visit_kv_codec(codec, [&](auto tag) {
+    using Codec = flash_v100::KVCodecTraits<decltype(tag)::value>;
+    flash_attention_fp8_paged_kv_to_fp16<decltype(tag)::value, 4, true>(
+        key_cache, value_cache, block_table, seq_lens, key_out, value_out,
+        Codec::quantized ? key_scale : 1.0f,
+        Codec::quantized ? value_scale : 1.0f, scales, output_scales);
   });
 }

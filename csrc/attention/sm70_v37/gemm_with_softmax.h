@@ -286,7 +286,7 @@ template <typename ElementA_, typename LayoutA_, typename ElementB_,
           int AlignmentB_ = 128 / cutlass::sizeof_bits<ElementB_>::value,
           int AlignmentSoftmax_ = 128 / cutlass::sizeof_bits<ElementC_>::value,
           typename ElementNorm_ = float, typename ElementSum_ = float,
-          typename ElementSoftmax_ = ElementC_>
+          typename ElementSoftmax_ = ElementC_, bool RowScales = false>
 class GemmSoftmaxV37 {
  public:
   ///////////////////////////////////////////////////////////////////////////////////////////////
@@ -360,7 +360,7 @@ class GemmSoftmaxV37 {
           ThreadblockShape, DefaultGemmKernel::kThreadCount,
           typename DefaultGemmKernel::Epilogue::OutputTileIterator,
           ElementCompute, ElementNorm, ElementSum, ElementSoftmaxCompute,
-          EpilogueFunctorOp>;
+          EpilogueFunctorOp, false, RowScales>;
 
   /// Epilogue
   using Epilogue = typename cutlass::epilogue::threadblock::
@@ -403,13 +403,15 @@ class GemmSoftmaxV37 {
               TensorRefSoft ref_Softmax_, int64_t batch_stride_A_ = 0,
               int64_t batch_stride_B_ = 0, int64_t batch_stride_C_ = 0,
               int64_t batch_stride_D_ = 0, int64_t batch_stride_Max_ = 0,
-              int64_t batch_stride_Sum_ = 0, int64_t batch_stride_Softmax_ = 0)
+              int64_t batch_stride_Sum_ = 0, int64_t batch_stride_Softmax_ = 0,
+              flash_v100::KVScaleView scales_ = {},
+              ElementC* residual_ = nullptr)
         : gemm(cutlass::gemm::GemmUniversalMode::kBatched, problem_size,
                batch_count_, ref_A_, ref_B_, ref_C_, ref_D_, ref_N_.data(),
                ref_S_.data(), batch_stride_A_, batch_stride_B_,
                typename EpilogueVisitor::Arguments(
                    linear_scaling, batch_stride_C_, batch_stride_D_,
-                   batch_stride_Max_, batch_stride_Sum_)),
+                   batch_stride_Max_, batch_stride_Sum_, scales_, residual_)),
           reduction(problem_size, ref_N_.data(), ref_S_.data(),
                     batch_stride_Max_, batch_stride_Sum_),
           softmax(MatrixCoord(problem_size.m(), problem_size.n()), batch_count_,

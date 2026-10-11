@@ -15,6 +15,7 @@ from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import dense_prefill as _dense_prefill
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
+from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import prefill_candidates as _sequence
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100 import workspace as _workspace
@@ -96,11 +97,17 @@ def _should_use_fp8_prefill_bridge(
         and self.use_flash_v100_prefill_paged
         and self.kv_codec is not None
         and self.kv_codec.quantized
-        # Qualification is separate from the bridge's byte-copy capability.
-        # Row-scaled INT8 -> FP16 loses QK precision on varying row scales;
-        # use the native reader until a precision-preserving dense adapter is
-        # qualified. Merely installing the converter cannot promote this route.
-        and not self.kv_codec.per_token_head
+        and (
+            not self.kv_codec.per_token_head
+            or (
+                self.kv_codec.name
+                in getattr(self.paged_kv_to_fp16, "unscaled_kv_cache_codecs", ())
+                and any(
+                    _ops.prefill_row_scales_supported(operation)
+                    for operation in (_ops.get_sm70_splitd_d256_ops() or ())
+                )
+            )
+        )
         and (
             self.kv_codec in (FP8_E4M3, FP8_E5M2)
             or _routing.native_codec_supported(self.paged_kv_to_fp16, self.kv_codec)
@@ -144,22 +151,37 @@ def _run_fp8_prefill_bridge(
         input_capacity,
         _dense_prefill._FP8_PREFILL_BRIDGE_PAGE_SIZE,
     )
+    preserve_scales = self.kv_codec is not None and self.kv_codec.per_token_head
     workspace = _dense_prefill.get_fp8_prefill_bridge_workspace(
         key_cache,
         required_blocks,
+        **({"preserve_scales": True} if preserve_scales else {}),
     )
     if workspace is None:
         return None
-    key_out, value_out, output_block_table = workspace
+    key_out, value_out, output_block_table = workspace[:3]
+    dense_scale_kwargs = {}
+    paged_scale_kwargs = {}
     bridge = (
         self.fp8_e4m3_paged_kv_to_fp16
         if self.kv_codec is FP8_E4M3
         else self.fp8_e5m2_paged_kv_to_fp16
     )
     bridge_kwargs = {}
-    if self.kv_codec is not None and self.kv_codec.per_token_head:
+    if preserve_scales:
         bridge = self.paged_kv_to_fp16
-        bridge_kwargs = {"kv_cache_dtype": self.kv_cache_dtype, **self.scale_kwargs}
+        key_scales, value_scales = workspace[3:]
+        bridge_kwargs = {
+            "kv_cache_dtype": self.kv_cache_dtype,
+            **self.scale_kwargs,
+            "key_scale_out": key_scales,
+            "value_scale_out": value_scales,
+        }
+        dense_scale_kwargs = {
+            "key_scale": key_scales.flatten(0, 1)[:seq_len].unsqueeze(0),
+            "value_scale": value_scales.flatten(0, 1)[:seq_len].unsqueeze(0),
+        }
+        paged_scale_kwargs = {"key_scale": key_scales, "value_scale": value_scales}
     if bridge is None:
         return None
     bridge(
@@ -209,6 +231,7 @@ def _run_fp8_prefill_bridge(
         causal=causal,
         window_size=window_size,
         out=exact_out,
+        **dense_scale_kwargs,
     )
     if exact_result is not None:
         if tail_prefix:
@@ -237,6 +260,7 @@ def _run_fp8_prefill_bridge(
         out=exact_out,
         seqused_k=seq_lens,
         block_table=output_block_table,
+        **paged_scale_kwargs,
     )
     if exact_result is not None:
         if tail_prefix:
@@ -251,6 +275,10 @@ def _run_fp8_prefill_bridge(
             _routing.ROUTE_SPECS["prefill_prefix_fp8_bridge_exact_d256"].name
         )
         return exact_result, True
+    if preserve_scales:
+        # Unscaled payloads cannot enter a consumer of reconstructed FP16 KV.
+        # The caller retains the original codec view for its qualified fallback.
+        return None
     paged_result = self.flash_attn_prefill_paged(
         query,
         key_out,
