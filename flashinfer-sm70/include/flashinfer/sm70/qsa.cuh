@@ -80,6 +80,7 @@ __global__ void mqa_multiquery(const half* q, const half* cache, const int* tabl
   const bool key_valid = col < end && page >= 0 && page < pages;
   const int qhead = quad * 8 + r, qrow = qhead / 4;
   float acc[8] = {};
+  float acc_tail[8] = {};
 #pragma unroll
   for (int g = 0; g < 8; ++g) {
     // General strides include transposed paged storage and sliced Q views.
@@ -115,10 +116,17 @@ __global__ void mqa_multiquery(const half* q, const half* cache, const int* tabl
         }
       }
     }
-    QSA_MMA(acc, a.x, a.y, lo.x, lo.y);
-    QSA_MMA(acc, a.z, a.w, lo.z, lo.w);
-    QSA_MMA(acc, b.x, b.y, hi.x, hi.y);
-    QSA_MMA(acc, b.z, b.w, hi.z, hi.w);
+    // Bound cancellation error in grouped scoring without changing the
+    // single-request arithmetic inherited from the engine's shared-key route.
+    float* partial = Grouped && g >= 4 ? acc_tail : acc;
+    QSA_MMA(partial, a.x, a.y, lo.x, lo.y);
+    QSA_MMA(partial, a.z, a.w, lo.z, lo.w);
+    QSA_MMA(partial, b.x, b.y, hi.x, hi.y);
+    QSA_MMA(partial, b.z, b.w, hi.z, hi.w);
+  }
+  if constexpr (Grouped) {
+#pragma unroll
+    for (int i = 0; i < 8; ++i) acc[i] = __fadd_rn(acc[i], acc_tail[i]);
   }
 #pragma unroll
   for (int p = 0; p < 2; ++p) {

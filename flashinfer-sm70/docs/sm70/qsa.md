@@ -1,7 +1,7 @@
 # Request-grouped QSA scoring candidate
 
 Status: development, **independent GPU correctness passed; acceleration admission pending**.
-The provided V100 passes the 15 standalone QSA cases described in the
+The provided V100 passes the 18 standalone QSA cases described in the
 [hardware validation record](gpu-validation-20261011.md). This implementation covers the
 score stage only. Projection, compression/cache update, exact Top-K, index
 expansion, sparse attention and output processing remain open in the
@@ -22,6 +22,13 @@ tile across up to eight query rows from the same request. C4 with five rows per
 request is covered, including interleaved row mappings. No host inspection of
 request IDs or sequence lengths, host synchronization, `ldmatrix`, `cp.async`,
 TMA, BF16 or FP8 Tensor Cores are involved.
+
+Version `.3` accumulates the grouped dot product in two 64-element parts before
+combining them in FP32. This fixes three reproduced cancellation cases from the
+128K engine comparison without widening the existing tolerance. C1 with at most
+eight rows retains the original accumulation order. The normal installed `.3`
+library passes the standalone suite; its engine performance matrix must be
+remeasured before using `.2` screening results to make a new selection decision.
 
 Supported candidate inputs: FP16 query `[M,4,128]`, M1..32; FP16 cache
 `[pages,page_size,1,128]`; int32 page tables with 1..32 requests; contiguous int32
@@ -81,7 +88,8 @@ Independent tests in `tests/sm70/test_qsa.py` cover M1/M5/M20/M32, C1/C4,
 contiguous/strided tensors, real page size 204 and small page boundaries, invalid
 pages, ties, NaN/extremes, negative padding positions, empty rows/columns,
 changing graph metadata, separate captures and cache rebinding. They use a
-library-independent FP64 oracle and exact stable Top-K IDs. All 15 cases pass
+library-independent FP64 oracle and exact stable Top-K IDs. Together with three
+fixed cancellation fixtures, all 18 cases pass
 on V100-SXM2 / CUDA 12.8. They do not replace engine exact-selector, state rollback or model
 output/acceptance tests.
 
@@ -99,7 +107,9 @@ timing with retained samples. An A/A median difference above 2% aborts it.
 Its scopes are only `score` and `score_select_expand`, across 12 synthetic local
 layers. Reports explicitly set `complete_qsa_chain=false` and
 `performance_admitted=false`: even a fast result cannot close full QSA or C1/C4
-emitted-token performance. No benchmark numbers are claimed in this batch.
+emitted-token performance. The [hardware record](gpu-validation-20261011.md)
+records `.2` screening gains, the failed 128K/M20 comparison and the `.3`
+accuracy follow-up separately; no complete-chain admission is claimed.
 
 On the provided V100-SXM2 machine use ordinary installed artifacts with Python
 3.12, Torch 2.10 and CUDA 12.8. Establish the frozen mainline A/A control first.

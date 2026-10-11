@@ -7,7 +7,7 @@ complete upstream snapshot and all four pinned dependency snapshots, including
 their licenses. Local changes follow the separate vendor commit.
 
 **Status: development; independent GPU correctness passed, performance admission pending.**
-The supplied V100-SXM2 machine passes 40 standalone tests (31 execute GPU kernels)
+The supplied V100-SXM2 machine passes 43 standalone tests (34 execute GPU kernels)
 on Python 3.12 / Torch 2.10 / CUDA 12.8. See the
 [hardware validation record](gpu-validation-20261011.md). No engine backend is enabled
 by default. The request-grouped QSA scorer is an explicit candidate described

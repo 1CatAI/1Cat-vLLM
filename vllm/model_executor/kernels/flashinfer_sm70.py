@@ -8,7 +8,7 @@ import math
 from typing import Any
 
 logger = logging.getLogger(__name__)
-_REQUIRED_VERSION = "0.7.2+1cat.sm70.2"
+_REQUIRED_VERSION = "0.7.2+1cat.sm70.3"
 _DEFAULT_DIVISOR = math.sqrt(128)
 
 

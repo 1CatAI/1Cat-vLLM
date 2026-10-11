@@ -50,12 +50,20 @@ completed point before proceeding, retaining earlier results if a later A/A
 check fails or execution is interrupted. These fixes do not change kernels.
 The first normal engine wheel also exposed QuACK's indirect CuTe dependency;
 SM70 metadata now removes QuACK while retaining it for other architectures.
-The engine and companion extensions compiled successfully, but a system driver
-update interrupted GPU availability. Build artifacts are backed up; the approved
-reboot needs interactive authentication before hardware work can resume. The
-hardware record distinguishes the pre-update passing tests from the pending
-performance run; do not repeat the failed capacity screen until the driver is
-consistent.
+The engine and companion extensions compiled successfully. A system driver
+update interrupted GPU availability; the approved reboot has now completed and
+all four V100s use driver 580.178.04. The independent `.2` suite passed again
+(40 tests), and the corrected normal engine wheel passes its dependency check.
+
+The `.2` partial QSA chain (12 synthetic layers of score/Top-K/expansion) is
+41.32% faster at C4/M20/8K and 64.45% faster at C4/M20/32K, with stable paired
+samples and exact indices. C1/M5 is near parity. The 128K/M20 score comparison
+stopped on three cancellation cases; never report that point as passing.
+The `.3` grouped kernel splits accumulation into two 64-element parts. Three
+fixed regression fixtures and the full independent suite pass (43 tests), with
+the original tolerances and the C1/M<=8 arithmetic retained. Engine revalidation
+and all complete-chain/model gates remain open. The reserved-capacity probe
+saved only 1.94% of scoring time and does not justify another variant.
 
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
