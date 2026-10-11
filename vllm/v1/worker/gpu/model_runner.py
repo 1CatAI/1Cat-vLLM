@@ -877,6 +877,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
             )
             if self.speculator is not None:
+                # Target warmup leaves eager allocator blocks outside its graph
+                # pool. Release them before allocating the draft's separate
+                # pool; captured tensors and live workspaces remain owned.
+                torch.accelerator.synchronize()
+                gc.collect()
+                free_before = torch.cuda.mem_get_info()[0]
+                torch.accelerator.empty_cache()
+                logger.info(
+                    "Draft graph capture allocator cleanup: freed=%d "
+                    "driver_free=%d allocated=%d reserved=%d bytes",
+                    torch.cuda.mem_get_info()[0] - free_before,
+                    torch.cuda.mem_get_info()[0],
+                    torch.accelerator.memory_allocated(),
+                    torch.accelerator.memory_reserved(),
+                )
                 if isinstance(self.speculator, DraftModelSpeculator):
                     self.speculator.capture()
                 else:

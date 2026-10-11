@@ -341,3 +341,12 @@ capturing. Identity rank order now retains the existing tensor; non-identity
 order concatenates device views. The complete HCX-packed fallback passed
 bitwise output and changed-input graph checks at M5/M20/M512 for both identity
 and reordered ranks (7 GPU tests). Arithmetic and communication are unchanged.
+
+The target M5 graph then completed, but draft prefill warmup ran out of device
+memory at its 2560-to-640 FP16 projection: a new 20 MiB allocator segment was
+requested with 7.94 MiB driver memory free. Release unused eager allocator
+blocks after target capture and before allocating the separate draft graph
+pool. Keep all live tensors and graph pools. Two GPU tests at M5/M20 verified
+release of a 128 MiB eager warmup allocation, stable target output addresses,
+and bitwise target/draft output on changed-input graph replays. Full-model
+capacity improvement remains to be measured.
