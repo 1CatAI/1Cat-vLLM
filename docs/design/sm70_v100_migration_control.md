@@ -49646,3 +49646,18 @@ row scales after QK and within PV; do not re-promote early FP16 dequantization.
 A benchmark-only eager FP16 range collector prepares independent checkpoint
 calibration; live graph scales must not be changed after capture.
 See architecture/kv_codec_unification.md for the exact normal wheel and cases.
+
+### 2026-10-12 — shared concatenated MLA codec bindings
+
+Continue the owned Draft stack from `b4b6c47992`. Reuse the existing Triton
+MLA provider, normal native writer/gather and RoPE fusion; do not add an INT8
+executor or a model/weight whitelist. The parent common entry misinterprets
+INT8 as FP8, while a standalone FP8 Triton parent reproducer cannot compile
+its native FP8 pointer on SM70. Preserve both failures as bounded evidence.
+
+68 new component GPU cases and 71 CPU cases pass with unchanged numerical
+limits. Reject R2's CUDA-only registration of the no-tensor capability probe;
+its normal CompositeExplicitAutograd registration is exercised in R3.
+Keep DCP and D320/576 gather restrictions explicit. Whole-wheel, representative
+engine, quality, state and latency are not qualified by this component slice.
+See architecture/kv_triton_mla_20261012.md.

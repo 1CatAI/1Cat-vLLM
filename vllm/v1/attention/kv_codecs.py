@@ -39,7 +39,12 @@ class KVCodec:
     scale_dtype: torch.dtype | None = None
     rounding: Literal["none", "nearest_even", "truncate"] = "none"
     layout: Literal[
-        "dense", "inline_scale", "planar_scales", "group_planar", "history_planes"
+        "dense",
+        "inline_scale",
+        "planar_scales",
+        "group_planar",
+        "history_planes",
+        "mla_row_planar",
     ] = "dense"
     representation: str = "ordinary"
     group_axis: int | None = None
@@ -313,6 +318,10 @@ MLA_MIXED_INT8 = replace(
     representation="mla_mixed",
     unquantized_fields=("rope",),
 )
+MLA_CONCAT_FP16 = replace(FP16, representation="mla_concat")
+MLA_CONCAT_BF16 = replace(BF16, representation="mla_concat", native_id=0)
+MLA_CONCAT_FP8 = replace(FP8_E4M3, representation="mla_concat")
+MLA_CONCAT_INT8 = replace(INT8, representation="mla_concat", layout="mla_row_planar")
 KV_REPRESENTATION_CODECS = (
     INDEXER_FP8,
     INDEXER_INT8,
@@ -323,6 +332,10 @@ KV_REPRESENTATION_CODECS = (
     MLA_LATENT_INT8,
     MLA_MIXED_FP8,
     MLA_MIXED_INT8,
+    MLA_CONCAT_FP16,
+    MLA_CONCAT_BF16,
+    MLA_CONCAT_FP8,
+    MLA_CONCAT_INT8,
 )
 
 

@@ -2732,9 +2732,22 @@ def concat_and_cache_mla(
     kv_cache_dtype: str,
     scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.concat_and_cache_mla(
-        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-    )
+    args = [kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale]
+    if kv_cache_dtype == "int8":
+        from vllm.v1.attention.kv_cache_view import KVCacheView
+        from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+        abi = getattr(torch.ops._C_cache_ops, "mla_row_kv_abi", None)
+        if abi is None or abi() not in (1, 2):
+            raise RuntimeError("Installed MLA writer lacks its INT8 row-scale binding")
+        codec = resolve_kv_codec(kv_cache_dtype, representation="mla_concat")
+        assert codec is not None
+        view = KVCacheView.bind_mla_concat(
+            kv_cache, codec, kv_c.shape[1] + k_pe.shape[1], scale
+        )
+        args[2] = view.key.squeeze(2)
+        args.append(view.key_scale)
+    torch.ops._C_cache_ops.concat_and_cache_mla(*args)
 
 
 def concat_and_cache_mla_rope_fused(
@@ -2749,7 +2762,7 @@ def concat_and_cache_mla_rope_fused(
     kv_cache_dtype: str,
     kv_cache_scale: torch.Tensor,
 ) -> None:
-    torch.ops._C_cache_ops.concat_and_cache_mla_rope_fused(
+    args = [
         positions,
         q_pe,
         k_pe,
@@ -2760,7 +2773,22 @@ def concat_and_cache_mla_rope_fused(
         kv_cache,
         kv_cache_dtype,
         kv_cache_scale,
-    )
+    ]
+    if kv_cache_dtype == "int8":
+        from vllm.v1.attention.kv_cache_view import KVCacheView
+        from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+        abi = getattr(torch.ops._C_cache_ops, "mla_row_kv_abi", None)
+        if abi is None or abi() != 2:
+            raise RuntimeError("Installed MLA fused writer lacks its INT8 binding")
+        codec = resolve_kv_codec(kv_cache_dtype, representation="mla_concat")
+        assert codec is not None
+        view = KVCacheView.bind_mla_concat(
+            kv_cache, codec, kv_c.shape[1] + k_pe.shape[1], kv_cache_scale
+        )
+        args[7] = view.key.squeeze(2)
+        args.append(view.key_scale)
+    torch.ops._C_cache_ops.concat_and_cache_mla_rope_fused(*args)
 
 
 def swap_blocks(
@@ -2834,7 +2862,7 @@ def gather_and_maybe_dequant_cache(
     scale: torch.Tensor,
     seq_starts: torch.Tensor | None = None,
 ) -> None:
-    torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(
+    args = [
         src_cache,
         dst,
         block_table,
@@ -2844,7 +2872,20 @@ def gather_and_maybe_dequant_cache(
         kv_cache_dtype,
         scale,
         seq_starts,
-    )
+    ]
+    if kv_cache_dtype == "int8":
+        from vllm.v1.attention.kv_cache_view import KVCacheView
+        from vllm.v1.attention.kv_codecs import resolve_kv_codec
+
+        abi = getattr(torch.ops._C_cache_ops, "mla_row_kv_abi", None)
+        if abi is None or abi() not in (1, 2):
+            raise RuntimeError("Installed MLA gather lacks its INT8 row-scale binding")
+        codec = resolve_kv_codec(kv_cache_dtype, representation="mla_concat")
+        assert codec is not None
+        view = KVCacheView.bind_mla_concat(src_cache, codec, dst.shape[-1], scale)
+        args[0] = view.key.squeeze(2)
+        args.append(view.key_scale)
+    torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(*args)
 
 
 def cp_gather_cache(

@@ -423,12 +423,13 @@ void reshape_and_cache_flash(
 
 int64_t reshape_and_cache_flash_kv_abi();
 
-void concat_and_cache_mla(torch::stable::Tensor& kv_c,
-                          torch::stable::Tensor& k_pe,
-                          torch::stable::Tensor& kv_cache,
-                          torch::stable::Tensor& slot_mapping,
-                          const std::string& kv_cache_dtype,
-                          torch::stable::Tensor& scale);
+void concat_and_cache_mla(
+    torch::stable::Tensor& kv_c, torch::stable::Tensor& k_pe,
+    torch::stable::Tensor& kv_cache, torch::stable::Tensor& slot_mapping,
+    const std::string& kv_cache_dtype, torch::stable::Tensor& scale,
+    const std::optional<torch::stable::Tensor>& row_scales = std::nullopt);
+
+int64_t mla_row_kv_abi();
 
 // NOTE: k_pe and kv_c order is flipped compared to concat_and_cache_mla
 void concat_and_cache_mla_rope_fused(
@@ -437,7 +438,8 @@ void concat_and_cache_mla_rope_fused(
     torch::stable::Tensor& rope_cos_sin_cache, bool rope_is_neox,
     torch::stable::Tensor& slot_mapping, torch::stable::Tensor& kv_cache,
     const std::string& kv_cache_dtype,
-    torch::stable::Tensor& kv_cache_quant_scale);
+    torch::stable::Tensor& kv_cache_quant_scale,
+    const std::optional<torch::stable::Tensor>& row_scales = std::nullopt);
 
 // Just for unittest
 void convert_fp8(torch::stable::Tensor& dst_cache,
@@ -453,7 +455,8 @@ void gather_and_maybe_dequant_cache(
     torch::stable::Tensor const& token_to_seq,  // [MAX_TOKEN_ACROSS_CHUNKS]
     int64_t num_tokens, const std::string& kv_cache_dtype,
     torch::stable::Tensor const& scale,
-    std::optional<torch::stable::Tensor> seq_starts = std::nullopt);
+    std::optional<torch::stable::Tensor> seq_starts = std::nullopt,
+    const std::optional<torch::stable::Tensor>& row_scales = std::nullopt);
 
 // TODO(hc): cp_gather_cache need support scaled kvcahe in the future.
 void cp_gather_cache(

@@ -129,7 +129,7 @@ W02 是缺原生绑定的事实，不是已经测得 Triton 比 CUDA 慢；接�
 | R04 | DeepSeek sparse MLA：paged、split-K、QK-D split、gathered/BMM prefill；压缩与 SWA | 448 latent／64 BF16 RoPE 的公共 G64 view 已接原有执行器、融合 writer、压缩和 SWA 分配。FP8 584-byte/UE8M0，INT8 608-byte/FP32 scales；40 项新增 GPU 读写/算法及 10 项融合检查通过。完整安装、代表性引擎质量、状态生命周期和性能仍开放，见 [mixed MLA 记录](kv_mla_mixed_20261012.md) |
 | R05 | GLM NoPE latent MLA：直接 paged、B1 gather+GEMM、M2..8 batched GEMM、较大行数 paged | 公共 G64 view/encoder 已接入同一执行器；FP8 保留 520-byte/UE8M0，INT8 为 544-byte/FP32 scales。24 项新增 GPU 检查及既有 FP8 回归通过；模型质量、完整安装和延迟待验收，见 [GLM MLA 记录](kv_mla_latent_20261012.md) |
 | R06 | MLA indexer：paged score、Tensor Core scorer、gather/cuBLAS、KPool 压缩及 quant/cache | 公共 G128 codec/view、CUDA writer、Triton scorer、gather/cuBLAS 和 KPool 已接 E4M3/INT8；122 项 SM70 GPU 组件测试通过。DeepSeek C4/C128 融合 compressor 另有 4 项 GPU 检查。独立 `AttentionConfig.indexer_cache_dtype`，`auto` 保留旧选择；原生 ABI 缺失在写入前拒绝。代表性引擎、质量与性能仍开放，不以组件测试关闭全部验收 |
-| R07 | 通用 Triton MLA prefill/decode | 当前 backend 格式声明只有 FP16/BF16/FP8，没有普通 INT8；普通 Triton attention 的 INT8 支持不能代替 MLA 支持 |
+| R07 | 通用 Triton MLA prefill/decode | 公共 concat view、原生 writer/gather、RoPE 融合与既有 Triton decode 已接 FP16/BF16/E4M3/INT8；68 项新增 GPU 组件检查通过。INT8 保留一行一个 FP32 scale，修复公共入口误按 FP8 重解释。前缀 gather 保留 D320/576 几何，D288 仅有 decode 证据；完整引擎、生命周期、质量和延迟仍开放，见 [Triton MLA 记录](kv_triton_mla_20261012.md) |
 | R08 | TurboQuant store/decode | 旋转、低比特编码与查询变换为独立数学表示；不是一个尚漏 INT8 绑定的 FP8 快路径。可共享资源和准入框架，不能用 INT8 名称抹掉算法区别 |
 
 来源：[QSA backend][qsa]、[QSA kernels/planner][qsa-ops]、[host history][host]、

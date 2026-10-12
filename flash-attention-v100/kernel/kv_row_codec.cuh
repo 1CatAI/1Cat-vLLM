@@ -23,6 +23,47 @@ struct KVWritableScalePlane {
 
 template <bool ROUND_EVEN>
 struct KVInt8RowEncoder {
+  template <typename T>
+  __device__ __forceinline__ static float reduce_scale(const T* first,
+                                                       int first_width,
+                                                       const T* second,
+                                                       int second_width) {
+    // Whole-row writers use a CTA; per-head writers retain their warp owner.
+    __shared__ float warp_max[32];
+    __shared__ int warp_bad[32];
+    __shared__ float result;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    float amax = 0.f;
+    bool invalid = false;
+    for (int dim = threadIdx.x; dim < first_width + second_width;
+         dim += blockDim.x) {
+      const float value = dim < first_width
+                              ? static_cast<float>(first[dim])
+                              : static_cast<float>(second[dim - first_width]);
+      amax = fmaxf(amax, fabsf(value));
+      invalid |= !isfinite(value);
+    }
+    for (int delta = 16; delta; delta >>= 1)
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, delta));
+    invalid = __any_sync(0xffffffffu, invalid);
+    if (lane == 0) {
+      warp_max[warp] = amax;
+      warp_bad[warp] = invalid;
+    }
+    __syncthreads();
+    if (warp == 0) {
+      amax = lane < blockDim.x / 32 ? warp_max[lane] : 0.f;
+      invalid = lane < blockDim.x / 32 ? warp_bad[lane] : false;
+      for (int delta = 16; delta; delta >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, delta));
+      invalid = __any_sync(0xffffffffu, invalid);
+      if (lane == 0) result = scale(amax, invalid);
+    }
+    __syncthreads();
+    return result;
+  }
+
   __device__ __forceinline__ static float legacy_divide(float x, float y) {
     // Preserve Triton's legacy div.full operation before the truncating cast.
     // RN division/reciprocal can change the byte at an integer boundary.

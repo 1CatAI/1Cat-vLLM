@@ -2,6 +2,9 @@
 #include "dispatch_utils.h"
 
 #include "../cuda_compat.h"
+#ifndef USE_ROCM
+  #include "../../flash-attention-v100/kernel/kv_row_codec.cuh"
+#endif
 
 #include "../quantization/w8a8/fp8/common.cuh"
 #ifdef USE_ROCM
@@ -20,7 +23,8 @@ namespace vllm {
 // NOTE Be EXTRA careful with raw_kv_scalar_t, for __half and __nv_bfloat16 it's
 // using u16 as the backing type.
 template <typename qk_t, typename cos_sin_t, bool IS_NEOX,
-          typename raw_kv_scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+          typename raw_kv_scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
+          bool ROW_SCALED = false>
 __global__ void concat_and_cache_mla_rope_fused_kernel(
     const int64_t* __restrict__ positions,  // [num_tokens]
     qk_t* __restrict__ q_pe,        // [num_tokens, num_q_heads, rot_dim]
@@ -35,12 +39,13 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
                                      // rot_dim)]
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int block_stride, const int entry_stride, const int kv_lora_rank,
-    const int block_size, const float* kv_cache_quant_scale) {
+    const int block_size, const float* kv_cache_quant_scale, float* row_scales,
+    int64_t scale_block_stride, int64_t scale_token_stride, int64_t capacity) {
   // Each thread block is responsible for one token.
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
   // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0) {
+  if (slot_idx < 0 || slot_idx >= capacity) {
     return;
   }
   const int64_t pos = positions[token_idx];
@@ -129,7 +134,9 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
                             entry_idx * entry_stride + kv_lora_rank;
 
     // MLA Cache Store
-    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+    if constexpr (ROW_SCALED) {
+      // Quantize the complete row after all RoPE pairs have been stored.
+    } else if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
       kv_cache_ptr[pair_idx_x] = raw_x_value;
       kv_cache_ptr[pair_idx_y] = raw_y_value;
     } else {
@@ -142,73 +149,103 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
     }
   }
 
-  // NOPE
-  for (int i = threadIdx.x; i < kv_lora_rank; i += blockDim.x) {
-    const qk_t* src_ptr = kv_c + token_idx * kv_c_stride + i;
-    const raw_kv_scalar_t src_value =
-        *reinterpret_cast<const raw_kv_scalar_t*>(src_ptr);
-
-    cache_t* kv_cache_ptr =
+#ifndef USE_ROCM
+  if constexpr (ROW_SCALED) {
+    __syncthreads();
+    const qk_t* latent = kv_c + token_idx * kv_c_stride;
+    const qk_t* rope = k_pe + token_idx * k_pe_stride;
+    using Encoder = flash_v100::KVInt8RowEncoder<true>;
+    const float scale =
+        Encoder::reduce_scale(latent, kv_lora_rank, rope, rot_dim);
+    if (threadIdx.x == 0)
+      row_scales[block_idx * scale_block_stride +
+                 entry_idx * scale_token_stride] = scale;
+    cache_t* dest =
         kv_cache + block_idx * block_stride + entry_idx * entry_stride;
+    for (int dim = threadIdx.x; dim < kv_lora_rank + rot_dim;
+         dim += blockDim.x) {
+      const float value = dim < kv_lora_rank
+                              ? static_cast<float>(latent[dim])
+                              : static_cast<float>(rope[dim - kv_lora_rank]);
+      dest[dim] = Encoder::encode(value, scale);
+    }
+  } else
+#endif
+  {
+    // NOPE
+    for (int i = threadIdx.x; i < kv_lora_rank; i += blockDim.x) {
+      const qk_t* src_ptr = kv_c + token_idx * kv_c_stride + i;
+      const raw_kv_scalar_t src_value =
+          *reinterpret_cast<const raw_kv_scalar_t*>(src_ptr);
 
-    if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-      kv_cache_ptr[i] = src_value;
-    } else {
-      kv_cache_ptr[i] = fp8::scaled_convert<cache_t, raw_kv_scalar_t, kv_dt>(
-          src_value, *kv_cache_quant_scale);
+      cache_t* kv_cache_ptr =
+          kv_cache + block_idx * block_stride + entry_idx * entry_stride;
+
+      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+        kv_cache_ptr[i] = src_value;
+      } else {
+        kv_cache_ptr[i] = fp8::scaled_convert<cache_t, raw_kv_scalar_t, kv_dt>(
+            src_value, *kv_cache_quant_scale);
+      }
     }
   }
 }
 
 }  // namespace vllm
 
-#define CALL_CONCAT_AND_CACHE_MLA_ROPE_FUSED(RAW_KV_T, CACHE_T, KV_DTYPE)  \
-  do {                                                                     \
-    VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                   \
-        q_pe.scalar_type(), "qk_scalar_type", [&] {                        \
-          using qk_t = scalar_t;                                           \
-          VLLM_STABLE_DISPATCH_FLOATING_TYPES(                             \
-              rope_cos_sin_cache.scalar_type(),                            \
-              "rope_cos_sin_cache_scalar_type", [&] {                      \
-                using cos_sin_t = scalar_t;                                \
-                if (rope_is_neox) {                                        \
-                  vllm::concat_and_cache_mla_rope_fused_kernel<            \
-                      qk_t, cos_sin_t, true, RAW_KV_T, CACHE_T, KV_DTYPE>  \
-                      <<<grid, block, 0, stream>>>(                        \
-                          positions.const_data_ptr<int64_t>(),             \
-                          q_pe.mutable_data_ptr<qk_t>(),                   \
-                          k_pe.mutable_data_ptr<qk_t>(),                   \
-                          kv_c.const_data_ptr<qk_t>(),                     \
-                          rope_cos_sin_cache.const_data_ptr<cos_sin_t>(),  \
-                          rot_dim, q_pe_stride_token, q_pe_stride_head,    \
-                          k_pe_stride, kv_c_stride, num_q_heads,           \
-                          reinterpret_cast<CACHE_T*>(                      \
-                              kv_cache.mutable_data_ptr()),                \
-                          slot_mapping.const_data_ptr<int64_t>(),          \
-                          block_stride, entry_stride, kv_lora_rank,        \
-                          block_size,                                      \
-                          kv_cache_quant_scale.const_data_ptr<float>());   \
-                } else {                                                   \
-                  vllm::concat_and_cache_mla_rope_fused_kernel<            \
-                      qk_t, cos_sin_t, false, RAW_KV_T, CACHE_T, KV_DTYPE> \
-                      <<<grid, block, 0, stream>>>(                        \
-                          positions.const_data_ptr<int64_t>(),             \
-                          q_pe.mutable_data_ptr<qk_t>(),                   \
-                          k_pe.mutable_data_ptr<qk_t>(),                   \
-                          kv_c.const_data_ptr<qk_t>(),                     \
-                          rope_cos_sin_cache.const_data_ptr<cos_sin_t>(),  \
-                          rot_dim, q_pe_stride_token, q_pe_stride_head,    \
-                          k_pe_stride, kv_c_stride, num_q_heads,           \
-                          reinterpret_cast<CACHE_T*>(                      \
-                              kv_cache.mutable_data_ptr()),                \
-                          slot_mapping.const_data_ptr<int64_t>(),          \
-                          block_stride, entry_stride, kv_lora_rank,        \
-                          block_size,                                      \
-                          kv_cache_quant_scale.const_data_ptr<float>());   \
-                }                                                          \
-              });                                                          \
-        });                                                                \
+#define CALL_CONCAT_AND_CACHE_MLA_ROPE_FUSED_IMPL(RAW_KV_T, CACHE_T, KV_DTYPE, \
+                                                  ROW)                         \
+  do {                                                                         \
+    VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                       \
+        q_pe.scalar_type(), "qk_scalar_type", [&] {                            \
+          using qk_t = scalar_t;                                               \
+          VLLM_STABLE_DISPATCH_FLOATING_TYPES(                                 \
+              rope_cos_sin_cache.scalar_type(),                                \
+              "rope_cos_sin_cache_scalar_type", [&] {                          \
+                using cos_sin_t = scalar_t;                                    \
+                if (rope_is_neox) {                                            \
+                  vllm::concat_and_cache_mla_rope_fused_kernel<                \
+                      qk_t, cos_sin_t, true, RAW_KV_T, CACHE_T, KV_DTYPE, ROW> \
+                      <<<grid, block, 0, stream>>>(                            \
+                          positions.const_data_ptr<int64_t>(),                 \
+                          q_pe.mutable_data_ptr<qk_t>(),                       \
+                          k_pe.mutable_data_ptr<qk_t>(),                       \
+                          kv_c.const_data_ptr<qk_t>(),                         \
+                          rope_cos_sin_cache.const_data_ptr<cos_sin_t>(),      \
+                          rot_dim, q_pe_stride_token, q_pe_stride_head,        \
+                          k_pe_stride, kv_c_stride, num_q_heads,               \
+                          reinterpret_cast<CACHE_T*>(                          \
+                              kv_cache.mutable_data_ptr()),                    \
+                          slot_mapping.const_data_ptr<int64_t>(),              \
+                          block_stride, entry_stride, kv_lora_rank,            \
+                          block_size,                                          \
+                          kv_cache_quant_scale.const_data_ptr<float>(),        \
+                          row_scale_ptr, scale_block_stride,                   \
+                          scale_token_stride, capacity);                       \
+                } else {                                                       \
+                  vllm::concat_and_cache_mla_rope_fused_kernel<                \
+                      qk_t, cos_sin_t, false, RAW_KV_T, CACHE_T, KV_DTYPE,     \
+                      ROW><<<grid, block, 0, stream>>>(                        \
+                      positions.const_data_ptr<int64_t>(),                     \
+                      q_pe.mutable_data_ptr<qk_t>(),                           \
+                      k_pe.mutable_data_ptr<qk_t>(),                           \
+                      kv_c.const_data_ptr<qk_t>(),                             \
+                      rope_cos_sin_cache.const_data_ptr<cos_sin_t>(), rot_dim, \
+                      q_pe_stride_token, q_pe_stride_head, k_pe_stride,        \
+                      kv_c_stride, num_q_heads,                                \
+                      reinterpret_cast<CACHE_T*>(kv_cache.mutable_data_ptr()), \
+                      slot_mapping.const_data_ptr<int64_t>(), block_stride,    \
+                      entry_stride, kv_lora_rank, block_size,                  \
+                      kv_cache_quant_scale.const_data_ptr<float>(),            \
+                      row_scale_ptr, scale_block_stride, scale_token_stride,   \
+                      capacity);                                               \
+                }                                                              \
+              });                                                              \
+        });                                                                    \
   } while (false)
+
+#define CALL_CONCAT_AND_CACHE_MLA_ROPE_FUSED(RAW_KV_T, CACHE_T, KV_DTYPE) \
+  CALL_CONCAT_AND_CACHE_MLA_ROPE_FUSED_IMPL(RAW_KV_T, CACHE_T, KV_DTYPE, false)
 
 // Executes RoPE on q_pe and k_pe, then writes k_pe and kv_c in the kv cache.
 // q_pe and k_pe are modified in place.
@@ -225,7 +262,8 @@ void concat_and_cache_mla_rope_fused(
     torch::stable::Tensor&
         kv_cache,  // [num_blocks, block_size, (kv_lora_rank + rot_dim)]
     const std::string& kv_cache_dtype,
-    torch::stable::Tensor& kv_cache_quant_scale) {
+    torch::stable::Tensor& kv_cache_quant_scale,
+    const std::optional<torch::stable::Tensor>& row_scales) {
   // NOTE(woosuk): In vLLM V1, query/key/position.size(0) can be different from
   // slot_mapping.size(0) because of padding for CUDA graphs.
   // In vLLM V0, key.size(0) is always equal to slot_mapping.size(0)
@@ -238,6 +276,7 @@ void concat_and_cache_mla_rope_fused(
   // For compatibility with both cases, we use slot_mapping.size(0) as
   // the number of tokens.
   const int64_t num_tokens = slot_mapping.size(0);
+  if (num_tokens == 0) return;
   const int64_t num_padded_tokens = q_pe.size(0);
   STD_TORCH_CHECK(num_padded_tokens >= num_tokens);
 
@@ -290,10 +329,48 @@ void concat_and_cache_mla_rope_fused(
   int block_stride = kv_cache.stride(0);
   int entry_stride = kv_cache.stride(1);
 
+  const bool row_scaled = kv_cache_dtype == "int8";
+  float* row_scale_ptr = nullptr;
+  int64_t scale_block_stride = 0;
+  int64_t scale_token_stride = 0;
+  const int64_t capacity = kv_cache.size(0) * block_size;
+  STD_TORCH_CHECK(!row_scales.has_value() || row_scaled,
+                  "Row scales require the INT8 MLA codec");
+  if (row_scaled) {
+    STD_TORCH_CHECK(row_scales.has_value(), "INT8 MLA requires row scales");
+    const auto& scales = *row_scales;
+    STD_TORCH_CHECK(
+        kv_cache.scalar_type() == torch::headeronly::ScalarType::Char &&
+            kv_cache.stride(2) == 1 &&
+            kv_cache.stride(1) >= kv_lora_rank + rot_dim &&
+            kv_cache.stride(0) >=
+                (block_size - 1) * kv_cache.stride(1) + kv_lora_rank + rot_dim,
+        "Invalid INT8 MLA payload view");
+    STD_TORCH_CHECK(
+        scales.dim() == 3 && scales.size(0) == kv_cache.size(0) &&
+            scales.size(1) == block_size && scales.size(2) == 1 &&
+            scales.scalar_type() == torch::headeronly::ScalarType::Float &&
+            scales.device() == kv_cache.device() && scales.stride(1) > 0 &&
+            scales.stride(0) >= (block_size - 1) * scales.stride(1) + 1,
+        "Invalid INT8 MLA scale view");
+    STD_TORCH_CHECK(kv_cache.device() == q_pe.device() &&
+                        k_pe.device() == q_pe.device() &&
+                        kv_c.device() == q_pe.device() &&
+                        positions.device() == q_pe.device() &&
+                        slot_mapping.device() == q_pe.device() &&
+                        rope_cos_sin_cache.device() == q_pe.device(),
+                    "MLA fused operands must share a device");
+    row_scale_ptr = static_cast<float*>(scales.data_ptr());
+    scale_block_stride = scales.stride(0);
+    scale_token_stride = scales.stride(1);
+  }
+
   int rope_block_size = std::min(num_q_heads * rot_dim / 2, 512);
   int mla_block_size = kv_lora_rank;
   int thread_block_size =
       std::min(std::max(rope_block_size, mla_block_size), 512);
+
+  if (row_scaled) thread_block_size = ((thread_block_size + 31) / 32) * 32;
 
   dim3 grid(num_tokens, 1, 1);
   dim3 block(thread_block_size, 1, 1);
@@ -302,6 +379,15 @@ void concat_and_cache_mla_rope_fused(
       positions.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
 
-  DISPATCH_BY_KV_CACHE_DTYPE(kv_c.scalar_type(), kv_cache_dtype,
-                             CALL_CONCAT_AND_CACHE_MLA_ROPE_FUSED);
+  if (row_scaled) {
+#ifndef USE_ROCM
+    CALL_CONCAT_AND_CACHE_MLA_ROPE_FUSED_IMPL(
+        int8_t, int8_t, vllm::Fp8KVCacheDataType::kAuto, true);
+#else
+    STD_TORCH_CHECK(false, "INT8 MLA fused writer is unavailable on ROCm");
+#endif
+  } else {
+    DISPATCH_BY_KV_CACHE_DTYPE(kv_c.scalar_type(), kv_cache_dtype,
+                               CALL_CONCAT_AND_CACHE_MLA_ROPE_FUSED);
+  }
 }

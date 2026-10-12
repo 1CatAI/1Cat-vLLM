@@ -918,3 +918,18 @@ reproduced on the parent. Numerical limits remain unchanged. The QK-D reader
 now indexes scale groups correctly for supported tile32/128 as well as tile64.
 Full-engine, package, quality, lifecycle and latency gates remain separate in
 [mixed MLA evidence](kv_mla_mixed_20261012.md); generic Triton MLA R07 is open.
+
+## Shared concatenated Triton MLA, 2026-10-12
+
+The existing Triton MLA executor, normal native concat/gather and RoPE fusion
+now share representation/view bindings for FP16/BF16/E4M3/INT8. INT8 keeps
+one FP32 scale per complete row; grouped/mixed MLA representations remain
+separate. The common entry no longer reinterprets INT8 as FP8 or quantizes
+its query to FP8. Existing DCP and prefix-gather geometry boundaries remain.
+
+68 distinct GPU component cases and 71 focused CPU cases pass. Parent cache
+misinterpretation and unsupported SM70 FP8 pointer compilation are reproduced;
+the first candidate ABI-dispatch failure is fixed and retained in the evidence.
+Normal CMake component identity, exact byte/graph checks and open whole-engine,
+package, quality and performance gates are in
+[concatenated MLA qualification](kv_triton_mla_20261012.md).

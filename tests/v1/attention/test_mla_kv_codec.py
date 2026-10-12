@@ -189,3 +189,165 @@ def test_mixed_mla_engine_specs_share_declared_layout(monkeypatch, cache_dtype, 
         ) == (3, 512 // ratio, size)
     layer.compress_ratio = 1
     assert layer.get_kv_cache_spec(config) is None
+
+
+@pytest.mark.parametrize("head", [288, 320, 576])
+def test_concat_mla_row_layout_has_one_scale_and_retains_page_padding(head):
+    from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
+
+    codec = resolve_kv_codec("int8", representation="mla_concat")
+    layout = TritonMLABackend.get_kv_cache_layout(head, "int8")
+    assert layout.groups == layout.scale_slots == 1
+    assert layout.slot_bytes == head + 4
+    page, stride = 16, layout.page_size_bytes(16) + 128
+    owner = torch.full((3 * stride,), 43, dtype=torch.int8)
+    cache = owner.as_strided(
+        (3, page, layout.slot_bytes), (stride, layout.slot_bytes, 1)
+    )
+    view = KVCacheView.bind_mla_concat(cache, codec, head, torch.ones(()))
+    assert view.key.stride(1) == head
+    assert view.key_scale.stride(1) == 1
+    view.key.fill_(2)
+    view.key_scale.fill_(3)
+    for block in range(3):
+        assert torch.all(
+            owner[block * stride + page * (head + 4) : (block + 1) * stride] == 43
+        )
+    spec = MLAAttentionSpec(
+        block_size=page,
+        head_size=head,
+        num_kv_heads=1,
+        dtype=torch.int8,
+        cache_dtype_str="int8",
+        kv_cache_layout=layout,
+    )
+    assert spec.page_size_bytes == page * (head + 4)
+    assert spec.layout_cache_dtype("fp8") == "int8"
+    assert TritonMLABackend.get_kv_cache_shape(3, page, 1, head, "int8") == cache.shape
+
+
+@pytest.mark.parametrize("cache_dtype", ["auto", "bfloat16", "fp8_e4m3", "int8"])
+def test_common_mla_forward_keeps_int8_encoding_and_unquantized_queries(cache_dtype):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from vllm.model_executor.layers.attention.mla_attention import MLAAttention
+
+    layer = object.__new__(MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.kv_cache_dtype, layer.num_heads, layer.v_head_dim = cache_dtype, 2, 2
+    layer.qk_nope_head_dim, layer.qk_rope_head_dim, layer.q_pad_num_heads = 4, 2, None
+    layer.is_aiter_triton_fp4_bmm_enabled = layer.is_aiter_triton_fp8_bmm_enabled = (
+        False
+    )
+    layer.W_UK_T = torch.ones((2, 4, 8), dtype=torch.float16)
+    layer.attn_backend = SimpleNamespace(get_name=lambda: "TRITON_MLA")
+    layer.impl = SimpleNamespace(
+        dcp_world_size=1,
+        supports_quant_query_input=False,
+        forward_mqa=MagicMock(return_value=(torch.zeros((1, 2, 8)), None)),
+    )
+    layer._v_up_proj = MagicMock(side_effect=lambda value, *, out: out.zero_())
+    dtype = {
+        "auto": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "fp8_e4m3": torch.uint8,
+        "int8": torch.int8,
+    }[cache_dtype]
+    cache = torch.empty((3, 16, 10), dtype=dtype)
+    query = torch.ones((1, 2, 6), dtype=torch.float16)
+    metadata = SimpleNamespace(
+        num_actual_tokens=1,
+        num_decodes=1,
+        num_prefills=0,
+        num_decode_tokens=1,
+        decode=SimpleNamespace(),
+    )
+    output = torch.empty((1, 4), dtype=torch.float16)
+    layer.forward_impl(
+        query, torch.empty((1, 8)), torch.empty((1, 1, 2)), cache, metadata, output
+    )
+    passed_query, passed_cache, _, _ = layer.impl.forward_mqa.call_args.args
+    assert isinstance(passed_query, tuple)
+    assert all(part.dtype == torch.float16 for part in passed_query)
+    expected_dtype = torch.float8_e4m3fn if cache_dtype.startswith("fp8") else dtype
+    assert passed_cache.dtype == expected_dtype
+    assert passed_cache.data_ptr() == cache.data_ptr()
+
+
+@pytest.mark.parametrize("cache_dtype,expected_fp8", [("fp8", True), ("int8", False)])
+def test_prefill_query_encoding_does_not_reinterpret_int8_cache(
+    monkeypatch, cache_dtype, expected_fp8
+):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.attention import mla_attention
+
+    monkeypatch.setattr(
+        mla_attention, "backend_supports_prefill_query_quantization", lambda: True
+    )
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+        attention_config=SimpleNamespace(use_prefill_query_quantization=True),
+    )
+    dtype = mla_attention.MLACommonMetadataBuilder.determine_prefill_query_data_type(
+        config, torch.float16
+    )
+    assert dtype == (
+        mla_attention.current_platform.fp8_dtype() if expected_fp8 else torch.float16
+    )
+
+
+@pytest.mark.parametrize("abi", [0, 1, 2])
+@pytest.mark.parametrize("fused", [False, True])
+def test_native_mla_capability_checked_before_fused_mutation(monkeypatch, abi, fused):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from vllm import _custom_ops as ops
+
+    native = MagicMock()
+    namespace = SimpleNamespace(
+        mla_row_kv_abi=lambda: abi,
+        concat_and_cache_mla=native,
+        concat_and_cache_mla_rope_fused=native,
+    )
+    monkeypatch.setattr(torch.ops, "_C_cache_ops", namespace)
+    latent, rope = torch.ones((2, 256)), torch.ones((2, 64))
+    query = torch.ones((2, 4, 64))
+    cache = torch.zeros((3, 16, 324), dtype=torch.int8)
+    slots, scale = torch.tensor([1, 18]), torch.ones(())
+
+    def run():
+        if fused:
+            ops.concat_and_cache_mla_rope_fused(
+                torch.tensor([0, 1]),
+                query,
+                rope,
+                latent,
+                torch.ones((2, 64)),
+                True,
+                slots,
+                cache,
+                "int8",
+                scale,
+            )
+        else:
+            ops.concat_and_cache_mla(latent, rope, cache, slots, "int8", scale)
+
+    supported = abi == 2 if fused else abi in (1, 2)
+    if supported:
+        run()
+        args = native.call_args.args
+        payload = args[7 if fused else 2]
+        scales = args[-1]
+        assert payload.shape == (3, 16, 320)
+        assert scales.shape == (3, 16, 1)
+        assert payload.untyped_storage().data_ptr() == cache.data_ptr()
+        assert scales.untyped_storage().data_ptr() == cache.data_ptr()
+    else:
+        with pytest.raises(RuntimeError, match="INT8"):
+            run()
+        native.assert_not_called()
+        assert torch.all(query == 1) and torch.all(rope == 1)
+        assert torch.count_nonzero(cache) == 0

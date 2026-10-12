@@ -535,7 +535,8 @@ __global__ void reshape_and_cache_flash_kernel(
   }
 }
 
-template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
+template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
+          bool ROW_SCALED = false>
 __global__ void concat_and_cache_mla_kernel(
     const scalar_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
     const scalar_t* __restrict__ k_pe,  // [num_tokens, pe_dim]
@@ -549,34 +550,60 @@ __global__ void concat_and_cache_mla_kernel(
     const int kv_lora_rank,                    //
     const int pe_dim,                          //
     const int block_size,                      //
-    const float* scale                         //
+    const float* scale, float* row_scales = nullptr,
+    int64_t scale_block_stride = 0, int64_t scale_token_stride = 0,
+    int64_t slot_capacity = INT64_MAX  //
 ) {
   const int64_t token_idx = blockIdx.x;
   const int64_t slot_idx = slot_mapping[token_idx];
   // NOTE: slot_idx can be -1 if the token is padded
-  if (slot_idx < 0) {
+  if (slot_idx < 0 || slot_idx >= slot_capacity) {
     return;
   }
   const int64_t block_idx = slot_idx / block_size;
   const int64_t block_offset = slot_idx % block_size;
 
-  auto copy = [&](const scalar_t* __restrict__ src, cache_t* __restrict__ dst,
-                  int src_stride, int dst_stride, int size, int offset) {
-    for (int i = threadIdx.x; i < size; i += blockDim.x) {
-      const int64_t src_idx = token_idx * src_stride + i;
-      const int64_t dst_idx =
-          block_idx * block_stride + block_offset * entry_stride + i + offset;
-      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        dst[dst_idx] = src[src_idx];
-      } else {
-        dst[dst_idx] =
-            fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], *scale);
-      }
+#ifndef USE_ROCM
+  if constexpr (ROW_SCALED) {
+    using Encoder = flash_v100::KVInt8RowEncoder<true>;
+    const int64_t dst_idx_start =
+        block_idx * block_stride + block_offset * entry_stride;
+    const int width = kv_lora_rank + pe_dim;
+    const float row_scale =
+        Encoder::reduce_scale(kv_c + token_idx * kv_c_stride, kv_lora_rank,
+                              k_pe + token_idx * k_pe_stride, pe_dim);
+    if (threadIdx.x == 0)
+      row_scales[block_idx * scale_block_stride +
+                 block_offset * scale_token_stride] = row_scale;
+    for (int dim = threadIdx.x; dim < width; dim += blockDim.x) {
+      const float value =
+          dim < kv_lora_rank
+              ? static_cast<float>(kv_c[token_idx * kv_c_stride + dim])
+              : static_cast<float>(
+                    k_pe[token_idx * k_pe_stride + dim - kv_lora_rank]);
+      kv_cache[dst_idx_start + dim] = Encoder::encode(value, row_scale);
     }
-  };
+  } else
+#endif
+  {
+    auto copy = [&](const scalar_t* __restrict__ src, cache_t* __restrict__ dst,
+                    int src_stride, int dst_stride, int size, int offset) {
+      for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        const int64_t src_idx = token_idx * src_stride + i;
+        const int64_t dst_idx =
+            block_idx * block_stride + block_offset * entry_stride + i + offset;
+        if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+          dst[dst_idx] = src[src_idx];
+        } else {
+          dst[dst_idx] = fp8::scaled_convert<cache_t, scalar_t, kv_dt>(
+              src[src_idx], *scale);
+        }
+      }
+    };
 
-  copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);
-  copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);
+    copy(kv_c, kv_cache, kv_c_stride, block_stride, kv_lora_rank, 0);
+    copy(k_pe, kv_cache, k_pe_stride, block_stride, pe_dim, kv_lora_rank);
+  }
 }
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
@@ -1069,7 +1096,8 @@ int64_t reshape_and_cache_flash_kv_abi() {
           reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),                    \
           slot_mapping.const_data_ptr<int64_t>(), block_stride, entry_stride, \
           kv_c_stride, k_pe_stride, kv_lora_rank, pe_dim, block_size,         \
-          reinterpret_cast<const float*>(scale.data_ptr()));
+          reinterpret_cast<const float*>(scale.data_ptr()), nullptr, 0, 0,    \
+          kv_cache.size(0) * block_size);
 
 // KV_T is the data type of key and value tensors.
 // CACHE_T is the stored data type of kv-cache.
@@ -1089,7 +1117,8 @@ void concat_and_cache_mla(
     torch::stable::Tensor& kv_cache,  // [num_blocks, block_size, (kv_lora_rank
                                       // + pe_dim)]
     torch::stable::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
-    const std::string& kv_cache_dtype, torch::stable::Tensor& scale) {
+    const std::string& kv_cache_dtype, torch::stable::Tensor& scale,
+    const std::optional<torch::stable::Tensor>& row_scales) {
   // NOTE(woosuk): In vLLM V1, key.size(0) can be different from
   // slot_mapping.size(0) because of padding for CUDA graphs.
   // In vLLM V0, key.size(0) is always equal to slot_mapping.size(0) because
@@ -1104,6 +1133,54 @@ void concat_and_cache_mla(
   int kv_lora_rank = kv_c.size(1);
   int pe_dim = k_pe.size(1);
   int block_size = kv_cache.size(1);
+
+  if (kv_cache_dtype == "int8") {
+#ifndef USE_ROCM
+    STD_TORCH_CHECK(row_scales.has_value(),
+                    "INT8 MLA requires FP32 row scales");
+    const auto& rows = *row_scales;
+    STD_TORCH_CHECK(
+        kv_cache.scalar_type() == torch::headeronly::ScalarType::Char &&
+            kv_cache.dim() == 3 && kv_cache.size(2) == kv_lora_rank + pe_dim &&
+            kv_cache.stride(2) == 1 && rows.dim() == 3 && rows.size(2) == 1 &&
+            rows.size(0) == kv_cache.size(0) && rows.size(1) == block_size &&
+            rows.scalar_type() == torch::headeronly::ScalarType::Float &&
+            rows.device() == kv_cache.device() &&
+            kv_cache.device() == kv_c.device() &&
+            k_pe.device() == kv_c.device() &&
+            k_pe.scalar_type() == kv_c.scalar_type() && kv_c.stride(1) == 1 &&
+            k_pe.stride(1) == 1 && num_tokens <= kv_c.size(0) &&
+            num_tokens <= k_pe.size(0) && slot_mapping.dim() == 1 &&
+            slot_mapping.scalar_type() == torch::headeronly::ScalarType::Long &&
+            slot_mapping.stride(0) == 1 &&
+            slot_mapping.device() == kv_c.device(),
+        "INT8 MLA requires matching payload, slot and FP32 scale views");
+    if (num_tokens == 0) return;
+    const torch::stable::accelerator::DeviceGuard guard(
+        kv_c.get_device_index());
+    const cudaStream_t stream = get_current_cuda_stream();
+    VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+        kv_c.scalar_type(), "mla_row_writer", [&] {
+          vllm::concat_and_cache_mla_kernel<
+              scalar_t, int8_t, vllm::Fp8KVCacheDataType::kAuto, true>
+              <<<dim3(num_tokens), dim3(128), 0, stream>>>(
+                  static_cast<const scalar_t*>(kv_c.data_ptr()),
+                  static_cast<const scalar_t*>(k_pe.data_ptr()),
+                  static_cast<int8_t*>(kv_cache.data_ptr()),
+                  slot_mapping.const_data_ptr<int64_t>(), kv_cache.stride(0),
+                  kv_cache.stride(1), kv_c.stride(0), k_pe.stride(0),
+                  kv_lora_rank, pe_dim, block_size, nullptr,
+                  static_cast<float*>(rows.data_ptr()), rows.stride(0),
+                  rows.stride(1), kv_cache.size(0) * block_size);
+        });
+    return;
+#else
+    STD_TORCH_CHECK(false, "INT8 MLA writer has no ROCm binding");
+#endif
+  }
+  STD_TORCH_CHECK(!row_scales.has_value(),
+                  "Tensor-scaled MLA does not use row scale planes");
+  if (num_tokens == 0) return;
 
   if (kv_cache_dtype == "fp8_ds_mla") {
     STD_TORCH_CHECK(kv_lora_rank == 512,
@@ -1251,7 +1328,7 @@ namespace vllm {
 
 // grid is launched with dimensions (batch, num_splits)
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt,
-          int ENTRY_SIZE, int CTA_SIZE>
+          int ENTRY_SIZE, int CTA_SIZE, bool ROW_SCALED = false>
 __global__ void gather_and_maybe_dequant_cache(
     const cache_t* __restrict__ src_cache,     // [NUM_BLOCKS, BLOCK_SIZE,
                                                // ENTRIES...]
@@ -1262,9 +1339,11 @@ __global__ void gather_and_maybe_dequant_cache(
     const int32_t num_tokens, const int32_t block_size,
     const int64_t block_table_stride, const int64_t cache_block_stride,
     const int64_t cache_entry_stride, const int64_t dst_entry_stride,
-    const float* __restrict__ scale,
-    const int32_t* __restrict__ seq_starts) {  // Optional: starting offsets per
-                                               // batch
+    const float* __restrict__ scale, const int32_t* __restrict__ seq_starts,
+    const float* row_scales = nullptr, int64_t scale_block_stride = 0,
+    int64_t scale_token_stride = 0,
+    int64_t num_blocks = INT64_MAX) {  // Optional: starting offsets per
+                                       // batch
   constexpr int vec_size = sizeof(float4) / sizeof(scalar_t);
   using ltype = vllm::vec_n_t<cache_t, vec_size>;
   using stype = vllm::vec_n_t<scalar_t, vec_size>;
@@ -1296,29 +1375,52 @@ __global__ void gather_and_maybe_dequant_cache(
     scalar_t* dst_ = dst + token_id * dst_entry_stride;
     cache_t* src_ = const_cast<cache_t*>(src_cache) + cache_offset;
 
+    const bool valid = !ROW_SCALED || (block_id >= 0 && block_id < num_blocks);
+    float row_scale = 0.f;
+    if constexpr (ROW_SCALED) {
+      if (valid)
+        row_scale = row_scales[block_id * scale_block_stride +
+                               slot_id * scale_token_stride];
+    }
+    constexpr float limit =
+        std::is_same_v<scalar_t, c10::Half>
+            ? 65504.f
+            : (std::is_same_v<scalar_t, c10::BFloat16> ? 3.3895313892515355e38f
+                                                       : FLT_MAX);
+    // Every codec shares the vector loads/stores and token/page traversal.
 #pragma unroll
     for (int idx = threadIdx.x; idx < vec_iter_cnt; idx += CTA_SIZE) {
-      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+      if constexpr (!ROW_SCALED && kv_dt == Fp8KVCacheDataType::kAuto) {
         reinterpret_cast<stype*>(dst_)[idx] =
             static_cast<stype>(reinterpret_cast<ltype*>(src_)[idx]);
       } else {
-        ltype loaded_val = reinterpret_cast<ltype*>(src_)[idx];
-        stype store_val;
+        const ltype loaded =
+            valid ? reinterpret_cast<ltype*>(src_)[idx] : ltype{};
+        stype output;
 #pragma unroll
         for (int j = 0; j < vec_size; ++j) {
-          store_val.val[j] = fp8::scaled_convert<scalar_t, cache_t, kv_dt>(
-              loaded_val.val[j], *scale);
+          if constexpr (ROW_SCALED) {
+            float value = static_cast<float>(loaded.val[j]) * row_scale;
+            if (isfinite(row_scale)) value = fminf(fmaxf(value, -limit), limit);
+            output.val[j] = static_cast<scalar_t>(value);
+          } else {
+            output.val[j] = fp8::scaled_convert<scalar_t, cache_t, kv_dt>(
+                loaded.val[j], *scale);
+          }
         }
-        reinterpret_cast<stype*>(dst_)[idx] = store_val;
+        reinterpret_cast<stype*>(dst_)[idx] = output;
       }
     }
-    // process tail
     constexpr int32_t tail_cnt = ENTRY_SIZE % vec_size;
-    dst_ = dst_ + ENTRY_SIZE - tail_cnt;
-    src_ = src_ + ENTRY_SIZE - tail_cnt;
+    dst_ += ENTRY_SIZE - tail_cnt;
+    src_ += ENTRY_SIZE - tail_cnt;
 #pragma unroll
     for (int idx = threadIdx.x; idx < tail_cnt; idx += CTA_SIZE) {
-      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
+      if constexpr (ROW_SCALED) {
+        float value = valid ? static_cast<float>(src_[idx]) * row_scale : 0.f;
+        if (isfinite(row_scale)) value = fminf(fmaxf(value, -limit), limit);
+        dst_[idx] = static_cast<scalar_t>(value);
+      } else if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
         dst_[idx] = static_cast<scalar_t>(src_[idx]);
       } else {
         dst_[idx] =
@@ -1368,7 +1470,8 @@ void gather_and_maybe_dequant_cache(
     torch::stable::Tensor const& token_to_seq,  // [MAX_TOKEN_ACROSS_CHUNKS]
     int64_t num_tokens, const std::string& kv_cache_dtype,
     torch::stable::Tensor const& scale,
-    std::optional<torch::stable::Tensor> seq_starts = std::nullopt) {
+    std::optional<torch::stable::Tensor> seq_starts,
+    const std::optional<torch::stable::Tensor>& row_scales) {
   torch::stable::accelerator::DeviceGuard device_guard(
       src_cache.get_device_index());
   const cudaStream_t stream = get_current_cuda_stream();
@@ -1415,6 +1518,57 @@ void gather_and_maybe_dequant_cache(
   const int32_t* seq_starts_ptr =
       seq_starts.has_value() ? seq_starts.value().const_data_ptr<int32_t>()
                              : nullptr;
+
+  if (kv_cache_dtype == "int8") {
+#ifndef USE_ROCM
+    STD_TORCH_CHECK(row_scales.has_value(),
+                    "INT8 MLA gather requires FP32 row scales");
+    const auto& rows = *row_scales;
+    STD_TORCH_CHECK(
+        src_cache.scalar_type() == torch::headeronly::ScalarType::Char &&
+            src_cache.dim() == 3 && src_cache.size(2) == head_dim &&
+            src_cache.stride(2) == 1 &&
+            rows.scalar_type() == torch::headeronly::ScalarType::Float &&
+            rows.dim() == 3 && rows.size(0) == src_cache.size(0) &&
+            rows.size(1) == block_size && rows.size(2) == 1 &&
+            rows.device() == src_cache.device() && dst.stride(-1) == 1 &&
+            token_to_seq.scalar_type() == torch::headeronly::ScalarType::Int &&
+            token_to_seq.device() == src_cache.device() &&
+            token_to_seq.stride(0) == 1 && num_tokens >= 0 &&
+            num_tokens <= dst.size(0) && num_tokens <= token_to_seq.numel(),
+        "INT8 MLA gather requires matching payload, indexes and FP32 scale "
+        "views");
+    if (num_tokens == 0) return;
+    VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+        dst.scalar_type(), "mla_row_gather", [&] {
+          const auto launch = [&](auto entry_size) {
+            vllm::gather_and_maybe_dequant_cache<
+                scalar_t, int8_t, vllm::Fp8KVCacheDataType::kAuto,
+                decltype(entry_size)::value, thread_block_size, true>
+                <<<grid, block, 0, stream>>>(
+                    static_cast<const int8_t*>(src_cache.data_ptr()),
+                    static_cast<scalar_t*>(dst.data_ptr()),
+                    block_table.const_data_ptr<int32_t>(),
+                    cu_seq_lens.const_data_ptr<int32_t>(),
+                    token_to_seq.const_data_ptr<int32_t>(), num_tokens,
+                    block_size, block_table_stride, cache_block_stride,
+                    cache_entry_stride, dst_entry_stride, nullptr,
+                    seq_starts_ptr, rows.const_data_ptr<float>(),
+                    rows.stride(0), rows.stride(1), src_cache.size(0));
+          };
+          if (head_dim == 576)
+            launch(std::integral_constant<int, 576>{});
+          else
+            launch(std::integral_constant<int, 320>{});
+        });
+    return;
+#else
+    STD_TORCH_CHECK(false, "INT8 MLA gather has no ROCm binding");
+#endif
+  }
+  STD_TORCH_CHECK(!row_scales.has_value(),
+                  "Tensor-scaled MLA gather does not use row scale planes");
+  if (num_tokens == 0) return;
 
   if (head_dim == 576) {
     DISPATCH_BY_KV_CACHE_DTYPE(dst.scalar_type(), kv_cache_dtype,
@@ -1941,4 +2095,12 @@ void concat_mla_q(
         q_out.stride(1), ql_nope.stride(0), ql_nope.stride(1), q_pe.stride(0),
         q_pe.stride(1));
   });
+}
+
+int64_t mla_row_kv_abi() {
+#ifdef USE_ROCM
+  return 0;
+#else
+  return 2;
+#endif
 }
