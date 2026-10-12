@@ -933,3 +933,18 @@ the first candidate ABI-dispatch failure is fixed and retained in the evidence.
 Normal CMake component identity, exact byte/graph checks and open whole-engine,
 package, quality and performance gates are in
 [concatenated MLA qualification](kv_triton_mla_20261012.md).
+
+## Shared MLA weighted tails and complete-round protocol, 2026-10-12
+
+An additional 8192-token single-partition case passes dense/E4M3 controls but
+fails INT8's weighted Half cast at the unchanged MLA limit. Exact binary
+rescaling in the same compiled row-scale branch repairs lost tail mass;
+eight new edge cases and nine affected regressions pass, including finite
+range neighbors and changed-input graphs. See
+[weighted-partial evidence](kv_mla_weighted_tail_20261012.md).
+
+The reusable normal-API C1 harness preserves complete-round, accepted-draft
+and emitted-token units separately, with six metric-contract checks. Its
+retained fixture and the unrecovered Oct8 fingerprint are explicit in
+[baseline clarification](kv_round_baseline_20261012.md). Current weights stay
+fixed; the normal complete-wheel build and engine latency/quality remain open.

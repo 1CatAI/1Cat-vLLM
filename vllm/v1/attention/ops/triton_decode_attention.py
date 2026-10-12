@@ -489,9 +489,20 @@ def _fwd_grouped_kernel_stage1(
             acc *= re_scale[:, None]
             if CODEC == 3:
                 pv = p * row_scale[None, :]
+                # Preserve small weighted tail mass through the MMA input cast.
+                # A binary scale is exact in FP32; bounded rows avoid overflowing
+                # the input dtype for finite, large cache values.
+                if v.dtype == tl.float16:
+                    input_limit = 65504.0
+                else:
+                    input_limit = 3.3895313892515355e38
+                factor = tl.where(
+                    tl.max(tl.abs(pv), 1) <= input_limit / 2048.0, 2048.0, 1.0
+                )
+                pv *= factor[:, None]
                 hi = pv.to(v.dtype)
                 lo = (pv - hi.to(tl.float32)).to(v.dtype)
-                acc += tl.dot(hi, v) + tl.dot(lo, v)
+                acc += (tl.dot(hi, v) + tl.dot(lo, v)) / factor[:, None]
             else:
                 acc += tl.dot(p.to(v.dtype), v)
 

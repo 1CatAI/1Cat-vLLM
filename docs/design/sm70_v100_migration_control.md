@@ -49661,3 +49661,19 @@ its normal CompositeExplicitAutograd registration is exercised in R3.
 Keep DCP and D320/576 gather restrictions explicit. Whole-wheel, representative
 engine, quality, state and latency are not qualified by this component slice.
 See architecture/kv_triton_mla_20261012.md.
+
+### 2026-10-12 — shared MLA weighted-tail range and C1 protocol
+
+The additional single-partition 8K input reproduces a parent INT8 failure
+(maximum absolute 0.0096364, relative 0.05330) while dense/BF16/E4M3 controls
+pass. Retain the failed `atol=0.004, rtol=0.03` limit. Exact binary rescaling
+inside the existing row-scale partial repairs underflow; eight new boundary
+cases and nine affected graph/decode regressions pass. Bound the factor to
+avoid finite-value overflow. See architecture/kv_mla_weighted_tail_20261012.md.
+
+Normal-wheel compilation uses fixed Git mirrors after upstream download
+failed before compilation, retaining the normal pin/reset/patch sequence.
+Its final source must include the weighted-tail follow-up. The C1 helper uses
+public endpoints, the retained Oct5 fixture, and explicit distinct round/token
+units; the exact Oct8 input fingerprint remains unconfirmed. This does not
+qualify engine quality/performance or close P05 and lifecycle coverage.
