@@ -261,6 +261,9 @@ class DeepseekCompressor(nn.Module):
         self.k_cache_prefix = k_cache_prefix
         self.validity_cache_prefix = validity_cache_prefix
         self.use_fp4_cache = use_fp4_cache
+        self.attention_cache_dtype = (
+            vllm_config.cache_config.cache_dtype if head_dim == 512 else None
+        )
         self.indexer_cache_dtype = (
             vllm_config.attention_config.resolved_indexer_cache_dtype
         )
@@ -520,6 +523,8 @@ class DeepseekCompressor(nn.Module):
         if compress_norm_rope_store_fn is compress_norm_rope_store_triton:
             if self.head_dim == 128:
                 compress_kwargs["cache_dtype"] = self.indexer_cache_dtype
+            else:
+                compress_kwargs["cache_dtype"] = self.attention_cache_dtype
             compress_kwargs.update(
                 current_kv=kv,
                 current_score=score,

@@ -652,6 +652,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1
     model_version: str | None = None
+    kv_cache_layout: MLAPageLayout | None = None
 
     def __post_init__(self):
         _apply_alignment_padding(self)
@@ -660,8 +661,17 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
     def storage_block_size(self) -> int:
         return self.block_size // self.compress_ratio
 
+    def layout_cache_dtype(self, configured_dtype: str) -> str:
+        if self.kv_cache_layout is not None:
+            if self.cache_dtype_str is None:
+                raise ValueError("Grouped MLA layout requires its storage codec")
+            return self.cache_dtype_str
+        return super().layout_cache_dtype(configured_dtype)
+
     @property
     def real_page_size_bytes(self) -> int:
+        if self.kv_cache_layout is not None:
+            return self.kv_cache_layout.page_size_bytes(self.storage_block_size)
         if self.model_version == "deepseek_v4":
             # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
             return self.storage_block_size * 584
@@ -686,11 +696,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
+        layout_set = {spec.kv_cache_layout for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
+            and len(layout_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, compress ratio, model version and sliding "
@@ -702,11 +714,14 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
+            kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             sliding_window=sliding_window_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            alignment=specs[0].alignment,
+            kv_cache_layout=layout_set.pop(),
         )
 
 

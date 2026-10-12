@@ -13,7 +13,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
+from vllm.config import CacheConfig, DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.config.kernel import Sm70SparseConfig
 from vllm.config.vllm import get_current_vllm_config
 
@@ -45,7 +45,7 @@ def test_indexer_caches_keep_the_engine_policy():
     from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
     from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
 
-    config = VllmConfig()
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     config.kernel_config.sm70_sparse.indexer_decode_cublas = False
     with set_current_vllm_config(config):
         caches = [

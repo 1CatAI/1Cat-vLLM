@@ -23,12 +23,16 @@ from typing import Any
 
 import torch
 
+from vllm.models.deepseek_v4.common.ops.cache_utils import mixed_mla_cache_view
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.kv_cache_view import KVCacheView
 from vllm.v1.attention.kv_codecs import resolve_kv_codec
-from vllm.v1.attention.ops.kv_codec import encode_indexer_cache_group
+from vllm.v1.attention.ops.kv_codec import (
+    encode_indexer_cache_group,
+    encode_mla_cache_group,
+)
 
 from .cache_utils import needs_software_fp8
-from .fp8_software import fp32_to_fp8_e4m3fn_bits
 from .fused_indexer_q import _fp32x2_to_fp4x2
 
 
@@ -216,12 +220,31 @@ def compress_norm_rope_store_triton(
         kernel = _fused_kv_compress_norm_rope_insert_indexer_attn
         num_warps = 1
 
-    codec_kwargs = {}
+    codec_kwargs: dict[str, Any] = {}
     if kernel is _fused_kv_compress_norm_rope_insert_indexer_attn:
         codec = resolve_kv_codec(cache_dtype, representation="indexer")
         if codec is None:
             raise ValueError(f"Unsupported indexer cache codec: {cache_dtype}")
         codec_kwargs["CODEC"] = codec.native_id
+        view = KVCacheView.bind_indexer(kv_cache, codec, head_dim)
+        assert view.key_scale is not None
+        codec_kwargs.update(
+            scales_ptr=view.key_scale,
+            scales_stride_block=view.key_scale.stride(0),
+            scales_stride_token=view.key_scale.stride(1),
+            NUM_CACHE_SLOTS=view.key.shape[0] * view.key.shape[1],
+        )
+
+    if kernel is _fused_kv_compress_norm_rope_insert_sparse_attn:
+        view = mixed_mla_cache_view(kv_cache, cache_dtype)
+        assert view.key_scale is not None
+        codec_kwargs.update(
+            CODEC=view.codec.native_id,
+            scales_ptr=view.key_scale,
+            scales_stride_block=view.key_scale.stride(0),
+            scales_stride_token=view.key_scale.stride(1),
+            NUM_CACHE_SLOTS=view.key.shape[0] * view.key.shape[1],
+        )
 
     kernel[(num_actual,)](
         # state cache
@@ -324,6 +347,11 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     USE_DENSE_PRIVATE_STATE: tl.constexpr,
     RING_SIZE: tl.constexpr,
     PRIVATE_HISTORY_SIZE: tl.constexpr,
+    CODEC: tl.constexpr,
+    scales_ptr,
+    scales_stride_block,
+    scales_stride_token,
+    NUM_CACHE_SLOTS: tl.constexpr,
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -390,7 +418,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
 
     # ── KV cache pointers ────────────────────────────────────────────
     kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
-    if kv_slot_idx < 0:
+    if kv_slot_idx < 0 or kv_slot_idx >= NUM_CACHE_SLOTS:
         return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
@@ -398,9 +426,9 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
     scale_ptr = (
-        cache_block_ptr
-        + kv_cache_block_size * TOKEN_STRIDE
-        + kv_pos_in_block * SCALE_DIM
+        scales_ptr
+        + kv_block_idx.to(tl.int64) * scales_stride_block
+        + kv_pos_in_block * scales_stride_token
     )
 
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM  # 448
@@ -409,39 +437,17 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     # FP8 UE8M0 quant: cast fp32 → bf16 → fp32 before quant to match reference.
     N_QUANT_BLOCKS: tl.constexpr = TRITON_BLOCK_SIZE // QUANT_BLOCK
     N_NOPE_BLOCKS: tl.constexpr = NOPE_HEAD_DIM // QUANT_BLOCK  # 7
-    INV_FP8_MAX: tl.constexpr = 1.0 / FP8_MAX
-
     quant_input = normed.to(tl.bfloat16).to(tl.float32)
     quant_2d = tl.reshape(quant_input, (N_QUANT_BLOCKS, QUANT_BLOCK))
-    abs_2d = tl.abs(quant_2d)
-    block_absmax = tl.max(abs_2d, axis=1)  # [N_QUANT_BLOCKS] fp32
-    block_absmax = tl.maximum(block_absmax, 1e-4)
-
-    raw_scales = block_absmax * INV_FP8_MAX
-    exponents = tl.ceil(tl.log2(raw_scales))
-    inv_scales = tl.exp2(-exponents)
-    inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
-    x_scaled = quant_2d * inv_scales_col
-    x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    if USE_SOFTWARE_FP8:
-        x_uint8 = fp32_to_fp8_e4m3fn_bits(x_clamped)
-    else:
-        x_fp8 = x_clamped.to(tl.float8e4nv)
-        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
-
-    nope_mask = block < NOPE_HEAD_DIM
-    tl.store(fp8_ptr + block, x_uint8_flat, mask=nope_mask)
-
-    scale_idx = tl.arange(0, N_QUANT_BLOCKS)
-    encoded = exponents + 127.0
-    encoded = tl.maximum(tl.minimum(encoded, 255.0), 0.0)
-    tl.store(
-        scale_ptr + scale_idx,
-        encoded.to(tl.uint8),
-        mask=scale_idx < N_NOPE_BLOCKS,
+    packed, encoded = encode_mla_cache_group(
+        quant_2d, CODEC, 1, USE_SOFTWARE_FP8, True, True
     )
-    tl.store(scale_ptr + N_NOPE_BLOCKS, tl.zeros((), dtype=tl.uint8))
+    packed_flat = tl.reshape(packed, (TRITON_BLOCK_SIZE,))
+    nope_mask = block < NOPE_HEAD_DIM
+    tl.store(fp8_ptr + block, packed_flat, mask=nope_mask)
+    scale_idx = tl.arange(0, N_QUANT_BLOCKS)
+    tl.store(scale_ptr + scale_idx, encoded, mask=scale_idx < N_NOPE_BLOCKS)
+    tl.store(scale_ptr + N_NOPE_BLOCKS, 0)
 
     # Register-based GPT-J RoPE in fp32.
     NUM_PAIRS: tl.constexpr = TRITON_BLOCK_SIZE // 2
@@ -521,7 +527,11 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     USE_DENSE_PRIVATE_STATE: tl.constexpr,
     RING_SIZE: tl.constexpr,
     PRIVATE_HISTORY_SIZE: tl.constexpr,
-    CODEC: tl.constexpr = 1,
+    CODEC: tl.constexpr,
+    scales_ptr,
+    scales_stride_block,
+    scales_stride_token,
+    NUM_CACHE_SLOTS: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -590,7 +600,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     # ── KV cache pointers ────────────────────────────────────────────
     kv_slot_idx = tl.load(kv_slot_mapping_ptr + token_idx)
-    if kv_slot_idx < 0:
+    if kv_slot_idx < 0 or kv_slot_idx >= NUM_CACHE_SLOTS:
         return
     kv_block_idx = kv_slot_idx // kv_cache_block_size
     kv_pos_in_block = kv_slot_idx % kv_cache_block_size
@@ -598,9 +608,9 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     cache_block_ptr = k_cache_ptr + kv_block_idx.to(tl.int64) * KV_BLOCK_STRIDE
     fp8_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE
     scale_ptr = (
-        cache_block_ptr
-        + kv_cache_block_size * TOKEN_STRIDE
-        + kv_pos_in_block * SCALE_DIM
+        scales_ptr
+        + kv_block_idx.to(tl.int64) * scales_stride_block
+        + kv_pos_in_block * scales_stride_token
     )
 
     NOPE_HEAD_DIM: tl.constexpr = HEAD_SIZE - ROPE_HEAD_DIM

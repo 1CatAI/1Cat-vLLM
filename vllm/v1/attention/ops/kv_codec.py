@@ -231,7 +231,14 @@ def encode_indexer_cache_group(
 
 
 @triton.jit
-def encode_mla_cache_group(values, CODEC: tl.constexpr, AXIS: tl.constexpr = -1):
+def encode_mla_cache_group(
+    values,
+    CODEC: tl.constexpr,
+    AXIS: tl.constexpr = -1,
+    SOFTWARE_FP8: tl.constexpr = True,
+    FP8_SCALE_RECIPROCAL: tl.constexpr = False,
+    FP8_VALUE_RECIPROCAL: tl.constexpr = False,
+):
     """G64 latent encoder; FP8 retains its UE8M0 division and rounding order."""
     values = values.to(tl.float32)
     if CODEC == 3:
@@ -247,30 +254,60 @@ def encode_mla_cache_group(values, CODEC: tl.constexpr, AXIS: tl.constexpr = -1)
     else:
         tl.static_assert(CODEC == 1, "Missing MLA grouped encoder binding")
         absolute = tl.maximum(tl.max(tl.abs(values), AXIS), 1e-4)
-        exponent = tl.ceil(tl.log2(absolute / 448.0))
-        normalized = tl.clamp(
-            values / tl.expand_dims(tl.exp2(exponent), AXIS), -448.0, 448.0
-        )
-        encoded = fp32_to_fp8_e4m3fn_bits(normalized)
+        if FP8_SCALE_RECIPROCAL:
+            raw_scale = absolute * (1.0 / 448.0)
+        else:
+            raw_scale = absolute / 448.0
+        exponent = tl.ceil(tl.log2(raw_scale))
+        if FP8_VALUE_RECIPROCAL:
+            normalized = values * tl.expand_dims(tl.exp2(-exponent), AXIS)
+        else:
+            normalized = values / tl.expand_dims(tl.exp2(exponent), AXIS)
+        normalized = tl.clamp(normalized, -448.0, 448.0)
+        if SOFTWARE_FP8:
+            encoded = fp32_to_fp8_e4m3fn_bits(normalized)
+        else:
+            encoded = normalized.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
         scale = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.uint8)
         return encoded, scale
 
 
 @triton.jit
 def decode_mla_cache_group(
-    payload, encoded_scale, CODEC: tl.constexpr, E4M3_BITS: tl.constexpr = False
+    payload,
+    encoded_scale,
+    CODEC: tl.constexpr,
+    E4M3_BITS: tl.constexpr = False,
+    OUTPUT_DTYPE: tl.constexpr = None,
+    FP16_SCALE_FIRST: tl.constexpr = True,
+    SOFTWARE_FP8: tl.constexpr = True,
 ):
     """Decode a latent group; unquantized representation fields stay separate."""
-    raw = decode_kv_payload(payload, CODEC, E4M3_BITS)
+    result_dtype: tl.constexpr = tl.float16 if OUTPUT_DTYPE is None else OUTPUT_DTYPE
+    if CODEC == 1 and not SOFTWARE_FP8:
+        raw = payload.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    else:
+        raw = decode_kv_payload(payload, CODEC, E4M3_BITS)
     if CODEC == 3:
         value = raw.to(tl.float32) * encoded_scale.to(tl.float32)
         finite_scale = (encoded_scale == encoded_scale) & (
             tl.abs(encoded_scale) != float("inf")
         )
-        value = tl.where(finite_scale, tl.clamp(value, -65504.0, 65504.0), value)
-        return value.to(tl.float16)
+        limit: tl.constexpr = (
+            65504.0
+            if tl.float16 == result_dtype
+            else (
+                3.3895313892515355e38
+                if tl.bfloat16 == result_dtype
+                else 3.4028234663852886e38
+            )
+        )
+        value = tl.where(finite_scale, tl.clamp(value, -limit, limit), value)
+        return value.to(result_dtype)
     else:
         tl.static_assert(CODEC == 1, "Missing MLA grouped decoder binding")
         # Preserve the existing FP8 reader's FP16 multiply by exponent scale.
-        scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0).to(tl.float16)
-        return raw.to(tl.float16) * scale
+        scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+        if FP16_SCALE_FIRST:
+            return (raw.to(tl.float16) * scale.to(tl.float16)).to(result_dtype)
+        return (raw.to(tl.float32) * scale).to(result_dtype)

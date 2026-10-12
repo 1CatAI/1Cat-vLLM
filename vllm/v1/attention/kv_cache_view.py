@@ -174,6 +174,8 @@ class KVCacheView:
         latent_dim: int,
         rope_dim: int = 0,
         rope_dtype: torch.dtype = torch.bfloat16,
+        *,
+        page_tokens: int | None = None,
     ) -> "KVCacheView":
         """Borrow grouped latent data, scale plane and optional unquantized RoPE.
 
@@ -192,13 +194,6 @@ class KVCacheView:
             or codec.unquantized_fields != (("rope",) if rope_dim else ())
         ):
             raise ValueError("Invalid MLA grouped representation")
-        if (
-            cache.ndim != 3
-            or cache.dtype != codec.storage_dtype
-            or cache.stride(-1) != 1
-            or cache.stride(1) != cache.shape[2]
-        ):
-            raise ValueError("MLA carrier requires block-major byte pages")
         if (codec.scale_encoding, codec.scale_dtype) not in (
             ("fp32", torch.float32),
             ("ue8m0", torch.uint8),
@@ -210,6 +205,23 @@ class KVCacheView:
             codec.group_size,
             4 if codec.scale_encoding == "fp32" else 1,
         )
+        if cache.ndim == 2:
+            if page_tokens is None or page_tokens <= 0 or cache.stride(1) != 1:
+                raise ValueError("Flattened MLA pages need an explicit token capacity")
+            if cache.shape[1] < layout.page_size_bytes(page_tokens):
+                raise ValueError("Flattened MLA page does not reserve payload/scales")
+            cache = cache.as_strided(
+                (cache.shape[0], page_tokens, layout.slot_bytes),
+                (cache.stride(0), layout.slot_bytes, 1),
+            )
+        if (
+            cache.ndim != 3
+            or cache.dtype != codec.storage_dtype
+            or cache.stride(-1) != 1
+            or cache.stride(1) != cache.shape[2]
+            or (page_tokens is not None and page_tokens != cache.shape[1])
+        ):
+            raise ValueError("MLA carrier requires block-major byte pages")
         pages, tokens, capacity = cache.shape
         groups, scale_slots = layout.groups, layout.scale_slots
         scale_bytes, row_bytes = layout.scale_bytes, layout.data_row_bytes

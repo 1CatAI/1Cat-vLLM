@@ -31,7 +31,10 @@ budgets; `KVCacheView.bind_mla` borrows these fields without allocating another
 cache. G64 E4M3 retains UE8M0 scales and its numerical order. Grouped INT8 uses
 FP32 scales and nearest-even encoding. Neither representation changes ordinary
 INT8's token/head scale axis. The GLM NoPE paged, gather/GEMM and batched GEMM
-algorithms now share these bindings; other MLA execution remains separately
+algorithms now share these bindings. Existing SM70 mixed MLA paged, split-K,
+QK-D split, gather/BMM and fused writers use the same G64 view with separate
+unquantized BF16 RoPE. Main and sliding-window specs account for the declared
+layout, including compressed pages. Other MLA execution remains separately
 qualified in the [coverage inventory](../../../docs/design/architecture/kv_fastpath_inventory.md).
 
 ## Admission, execution and fallback

@@ -19,8 +19,21 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_cutedsl
+from vllm.v1.attention.kv_cache_view import KVCacheView
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
+from vllm.v1.attention.ops.kv_codec import (
+    decode_mla_cache_group,
+    encode_mla_cache_group,
+)
 
-from .fp8_software import fp8_e4m3fn_bits_to_fp32, fp32_to_fp8_e4m3fn_bits
+
+def mixed_mla_cache_view(
+    cache: torch.Tensor, cache_dtype: str = "fp8_ds_mla", page_tokens: int | None = None
+) -> KVCacheView:
+    codec = resolve_kv_codec(cache_dtype, representation="mla_mixed")
+    if codec is None:
+        raise ValueError(f"Unsupported mixed MLA codec: {cache_dtype}")
+    return KVCacheView.bind_mla(cache, codec, 448, 64, page_tokens=page_tokens)
 
 
 def needs_software_fp8() -> bool:
@@ -38,6 +51,10 @@ def quantize_and_insert_k_kernel(
     slot_mapping_ptr,  # [num_tokens] int64
     # Output tensor
     k_cache_ptr,  # [num_blocks, block_bytes] as uint8 (flattened view)
+    scales_ptr,
+    scales_stride_block,
+    scales_stride_token,
+    num_cache_slots,
     # Dimensions
     num_tokens,
     input_dim: tl.constexpr,  # 512
@@ -51,6 +68,7 @@ def quantize_and_insert_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
     use_software_fp8: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -69,7 +87,7 @@ def quantize_and_insert_k_kernel(
 
     # Get slot mapping
     slot_idx = tl.load(slot_mapping_ptr + pid)
-    if slot_idx == -1:
+    if slot_idx < 0 or slot_idx >= num_cache_slots:
         return
 
     block_idx = slot_idx // cache_block_size
@@ -89,7 +107,9 @@ def quantize_and_insert_k_kernel(
     # Scale pointer: scales are stored after ALL token data in the block
     # Scale for this token is at offset (64 * 576) + pos_in_block * 8
     token_scale_ptr = (
-        cache_block_ptr + cache_block_size * token_data_size + pos_in_block * scale_dim
+        scales_ptr
+        + block_idx.to(tl.int64) * scales_stride_block
+        + pos_in_block * scales_stride_token
     )
 
     # Token data layout: [0:448] fp8, [448:576] bf16
@@ -108,39 +128,14 @@ def quantize_and_insert_k_kernel(
             # Load bf16 input
             x = tl.load(input_row_ptr + offsets, mask=mask, other=0.0)
 
-            # Compute absmax scale (same as CUDA kernel)
-            abs_x = tl.abs(x)
-            block_max = tl.max(abs_x, axis=0)
-            block_max = tl.maximum(block_max, 1e-4)  # Match CUDA: fmaxf(amax, 1e-4)
-
-            # UE8M0: Round scale UP to next power of 2
-            # scale = 2^ceil(log2(block_max / fp8_max))
-            raw_scale = block_max / fp8_max
-            log_scale = tl.log2(raw_scale)
-            exponent = tl.ceil(log_scale)  # Round UP to next integer exponent
-            scale = tl.exp2(exponent)  # scale = 2^exponent (power of 2)
-
-            # Quantize to fp8: fp8_value = bf16_value / scale
-            x_scaled = x / scale
-            x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
-
-            if use_software_fp8:
-                x_uint8 = fp32_to_fp8_e4m3fn_bits(x_clamped.to(tl.float32))
-            else:
-                x_fp8 = x_clamped.to(tl.float8e4nv)
-                x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-
-            # Store as uint8 (1 byte each)
-            tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
-
-            # UE8M0 scale encoding: stored_value = exponent + 127 (bias)
-            # During dequant: scale = 2^(stored_value - 127)
-            encoded_scale = exponent + 127.0
-            encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-            tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
+            packed, encoded_scale = encode_mla_cache_group(
+                x.to(tl.float32), CODEC, 0, use_software_fp8
+            )
+            tl.store(token_fp8_ptr + offsets, packed, mask=mask)
+            tl.store(token_scale_ptr + qblock_idx, encoded_scale)
 
     # Padding scale at index 7
-    tl.store(token_scale_ptr + 7, tl.zeros((), dtype=tl.uint8))
+    tl.store(token_scale_ptr + 7, 0)
 
     # ========== Store BF16 portion (last 64 elements, no quantization) ==========
     bf16_input_offset = fp8_dim
@@ -159,6 +154,8 @@ def quantize_and_insert_k_cache(
     slot_mapping: torch.Tensor,  # [num_tokens] int64
     block_size: int = 64,
     is_ue8m0: bool = True,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ):
     """
     Quantize K tensor and insert into paged K cache.
@@ -176,7 +173,10 @@ def quantize_and_insert_k_cache(
     assert k.dtype in (torch.float16, torch.bfloat16), (
         f"K must be fp16 or bf16, got {k.dtype}"
     )
-    assert is_ue8m0, "Only support ue8m0 quantization."
+    view = mixed_mla_cache_view(k_cache, kv_cache_dtype, block_size)
+    assert view.key_scale is not None
+    if view.codec.native_id == 1 and not is_ue8m0:
+        raise ValueError("FP8 mixed MLA requires its UE8M0 representation")
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
     # padding. Always use slot_mapping.shape[0] as the token count.
@@ -188,14 +188,17 @@ def quantize_and_insert_k_cache(
     TOKEN_SCALE_DIM = 8
     QUANT_BLOCK_SIZE = 64
     FP8_MAX = 448.0
-    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     grid = (num_tokens,)
 
     quantize_and_insert_k_kernel[grid](
         k,
         slot_mapping,
-        k_cache,
+        view.key,
+        view.key_scale,
+        view.key_scale.stride(0),
+        view.key_scale.stride(1),
+        view.key.shape[0] * block_size,
         num_tokens,
         input_dim=512,
         fp8_dim=TOKEN_FP8_DIM,
@@ -203,11 +206,12 @@ def quantize_and_insert_k_cache(
         scale_dim=TOKEN_SCALE_DIM,
         quant_block=QUANT_BLOCK_SIZE,
         cache_block_size=block_size,
-        token_data_size=TOKEN_DATA_SIZE,
+        token_data_size=view.key.stride(1),
         block_stride=block_stride,
         fp8_max=FP8_MAX,
         n_quant_blocks=8,
         use_software_fp8=needs_software_fp8(),
+        CODEC=view.codec.native_id,
     )
 
 
@@ -217,6 +221,9 @@ def _dequantize_and_gather_k_kernel(
     out_stride0,
     out_stride1,
     k_cache_ptr,
+    scales_ptr,
+    scales_stride_block,
+    scales_stride_token,
     seq_lens_ptr,
     block_table_ptr,
     offset,
@@ -234,6 +241,7 @@ def _dequantize_and_gather_k_kernel(
     fp8_max: tl.constexpr,
     n_quant_blocks: tl.constexpr,  # 7 real blocks
     use_software_fp8: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
@@ -268,9 +276,9 @@ def _dequantize_and_gather_k_kernel(
 
         # Scale pointer: after all token data
         token_scale_ptr = (
-            cache_block_ptr
-            + cache_block_size * token_data_size
-            + pos_in_block * scale_dim
+            scales_ptr
+            + physical_block_idx.to(tl.int64) * scales_stride_block
+            + pos_in_block * scales_stride_token
         )
 
         # Token data layout: [0:448] fp8, [448:576] bf16
@@ -291,20 +299,15 @@ def _dequantize_and_gather_k_kernel(
                 # Load quantized fp8 values (stored as uint8)
                 x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
 
-                if use_software_fp8:
-                    x_float = fp8_e4m3fn_bits_to_fp32(x_uint8)
-                else:
-                    x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-                    x_float = x_fp8.to(tl.float32)
-
-                # Load and decode UE8M0 scale
-                # UE8M0: scale = 2^(stored_value - 127)
                 encoded_scale = tl.load(token_scale_ptr + qblock_idx)
-                exponent = encoded_scale.to(tl.float32) - 127.0
-                scale = tl.exp2(exponent)
-
-                # Dequantize: bf16_value = fp8_value * scale
-                x_dequant = x_float * scale
+                x_dequant = decode_mla_cache_group(
+                    x_uint8,
+                    encoded_scale,
+                    CODEC,
+                    OUTPUT_DTYPE=out_ptr.type.element_ty,
+                    FP16_SCALE_FIRST=False,
+                    SOFTWARE_FP8=use_software_fp8,
+                )
 
                 tl.store(
                     output_row_ptr + offsets,
@@ -338,13 +341,16 @@ def dequantize_and_gather_k_cache_triton(
     block_table: torch.Tensor,
     block_size: int,
     offset: int,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> None:
+    view = mixed_mla_cache_view(k_cache, kv_cache_dtype, block_size)
+    assert view.key_scale is not None
     TOKEN_FP8_DIM = 448
     TOKEN_BF16_DIM = 64
     TOKEN_SCALE_DIM = 8
     QUANT_BLOCK_SIZE = 64
     FP8_MAX = 448.0
-    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     num_reqs = seq_lens.shape[0]
     NUM_WORKERS = 128
@@ -352,7 +358,10 @@ def dequantize_and_gather_k_cache_triton(
         out,
         out.stride(0),
         out.stride(1),
-        k_cache,
+        view.key,
+        view.key_scale,
+        view.key_scale.stride(0),
+        view.key_scale.stride(1),
         seq_lens,
         block_table,
         offset,
@@ -363,12 +372,13 @@ def dequantize_and_gather_k_cache_triton(
         scale_dim=TOKEN_SCALE_DIM,
         quant_block=QUANT_BLOCK_SIZE,
         cache_block_size=block_size,
-        token_data_size=TOKEN_DATA_SIZE,
+        token_data_size=view.key.stride(1),
         block_stride=k_cache.stride(0),
         output_dim=512,
         fp8_max=FP8_MAX,
         n_quant_blocks=7,
         use_software_fp8=needs_software_fp8(),
+        CODEC=view.codec.native_id,
     )
 
 
@@ -385,9 +395,14 @@ def dequantize_and_gather_k_cache(
     block_table: torch.Tensor,
     block_size: int,
     offset: int,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> None:
     # The CuteDSL path needs native FP8 units, see needs_software_fp8.
-    use_cutedsl = has_cutedsl() and not needs_software_fp8()
+    view = mixed_mla_cache_view(k_cache, kv_cache_dtype, block_size)
+    use_cutedsl = (
+        view.codec.native_id == 1 and has_cutedsl() and not needs_software_fp8()
+    )
     if use_cutedsl:
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (
@@ -395,12 +410,25 @@ def dequantize_and_gather_k_cache(
         )
 
         dequantize_and_gather_k_cache_cutedsl(
-            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+            out,
+            k_cache,
+            seq_lens,
+            gather_lens,
+            block_table,
+            block_size,
+            offset,
         )
         return
 
     dequantize_and_gather_k_cache_triton(
-        out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        out,
+        k_cache,
+        seq_lens,
+        gather_lens,
+        block_table,
+        block_size,
+        offset,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 

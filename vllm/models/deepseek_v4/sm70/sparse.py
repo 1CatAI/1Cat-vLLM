@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
 
+from vllm.config.cache import CacheDType
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.deepseek_v4.common.ops import (
@@ -36,6 +37,8 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
+from vllm.v1.attention.kv_cache_view import MLAPageLayout
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
@@ -68,7 +71,7 @@ def _bmm_blocker(
     if min(q.shape) <= 0:
         return "requires nonempty query dimensions"
     if not prefill and q.shape[-1] != 512:
-        return "packed cache requires 448 FP8 and 64 RoPE dimensions"
+        return "packed cache requires 448 grouped latent and 64 RoPE dimensions"
     if not prefill and prefer_paged:
         # Compare the work the paged route would launch, including its actual
         # head grouping. This admits larger matrices without tying selection to
@@ -96,6 +99,43 @@ def _qk_dsplit_block_h(num_heads: int) -> int:
 
 class DeepseekV4SM70SparseBackend(DeepseekV4FlashMLASparseBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "bfloat16",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_ds_mla",
+        "int8",
+    ]
+
+    @staticmethod
+    def get_kv_cache_layout(head_size: int, cache_dtype: str) -> MLAPageLayout | None:
+        codec = resolve_kv_codec(cache_dtype, representation="mla_mixed")
+        if codec is None:
+            return None
+        if head_size != 512:
+            raise ValueError(
+                "Mixed sparse MLA requires 448 latent and 64 RoPE dimensions"
+            )
+        assert codec.scale_dtype is not None
+        return MLAPageLayout(448, 64, scale_bytes=codec.scale_dtype.itemsize)
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        layout = DeepseekV4SM70SparseBackend.get_kv_cache_layout(
+            head_size, cache_dtype_str
+        )
+        if layout is None:
+            return DeepseekV4FlashMLASparseBackend.get_kv_cache_shape(
+                num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
+            )
+        return (num_blocks, block_size, layout.slot_bytes)
 
     @staticmethod
     def get_name() -> str:
@@ -267,7 +307,10 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
         )
         if bmm_reason is None:
             bmm_reason = sparse_decode_bmm_blocker(
-                q, layer.swa_cache_layer.kv_cache, compressed_cache
+                q,
+                layer.swa_cache_layer.kv_cache,
+                compressed_cache,
+                kv_cache_dtype=layer.kv_cache_dtype,
             )
         if bmm_reason is None:
             keys, scores, logits, probs = current_workspace_manager().get_simultaneous(
@@ -296,6 +339,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 scores,
                 logits,
                 probs,
+                kv_cache_dtype=layer.kv_cache_dtype,
             )
             return
         logger.info_once("SM70 sparse decode: paged fallback because %s.", bmm_reason)
@@ -363,9 +407,12 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                     partial_probs=partial_probs,
                     stage1_block_h=_qk_dsplit_block_h(q.shape[1]),
                     **common_kwargs,
+                    kv_cache_dtype=layer.kv_cache_dtype,
                 )
             else:
-                sm70_sparse_attention_paged_fp8_splitk(**common_kwargs)
+                sm70_sparse_attention_paged_fp8_splitk(
+                    **common_kwargs, kv_cache_dtype=layer.kv_cache_dtype
+                )
         else:
             sm70_sparse_attention_paged_fp8(
                 q=q,
@@ -378,6 +425,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 extra_cache=compressed_cache,
                 extra_indices=topk_indices,
                 extra_lengths=topk_lens,
+                kv_cache_dtype=layer.kv_cache_dtype,
             )
 
     @staticmethod
@@ -471,6 +519,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                     ],
                     block_size=sparse_metadata.block_size // layer.compress_ratio,
                     offset=0,
+                    kv_cache_dtype=layer.kv_cache_dtype,
                 )
 
             dequantize_and_gather_k_cache(
@@ -483,6 +532,7 @@ class DeepseekV4SM70SparseImpl(DeepseekV4SparseMLAAttentionImpl):
                 ],
                 block_size=swa_metadata.block_size,
                 offset=chunk_N,
+                kv_cache_dtype=layer.kv_cache_dtype,
             )
 
             query_start = (

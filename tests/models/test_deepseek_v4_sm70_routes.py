@@ -431,15 +431,20 @@ def test_v4_c128_metadata_keeps_upstream_packed_layout_by_default():
     assert prefill_local.stride() == (128, 1)
 
 
-def test_sm70_sparse_bmm_decode_takes_graph_workspace_buffers():
+@pytest.mark.parametrize("cache_dtype,slot_bytes", [("fp8_ds_mla", 584), ("int8", 608)])
+def test_sm70_sparse_bmm_decode_takes_graph_workspace_buffers(cache_dtype, slot_bytes):
     from vllm.models.deepseek_v4.sm70 import sparse
 
     q = torch.empty((6, 64, 512), dtype=torch.float16)
     output = torch.empty_like(q)
     layer = MagicMock()
+    layer.kv_cache_dtype = cache_dtype
     layer.sm70_sparse = Sm70SparseConfig()
     layer.compress_ratio = 1
-    layer.swa_cache_layer.kv_cache = torch.empty((1, 256, 584), dtype=torch.uint8)
+    layer.swa_cache_layer.kv_cache = torch.empty(
+        (1, 256, slot_bytes),
+        dtype=torch.int8 if cache_dtype == "int8" else torch.uint8,
+    )
     layer.scale = 512**-0.5
     layer.attn_sink = torch.zeros(64, dtype=torch.float32)
 
