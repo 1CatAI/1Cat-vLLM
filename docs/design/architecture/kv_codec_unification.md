@@ -896,4 +896,25 @@ with four existing CPU checks. The stacked representation/page/spec subset
 passes 62 CPU cases. Initial compiler/reference failures and their fixes,
 unchanged MLA numerical bounds and remaining engine/package/quality/latency
 gates are recorded in [latent MLA qualification](kv_mla_latent_20261012.md).
-R04/R07 and mixed MLA execution are not qualified by these view declarations.
+Those view declarations do not qualify mixed MLA execution. The separate
+stage below supplies component evidence; the frozen latent MLA cost comparison
+retains the failed q1 writer and drifting final q9 control.
+
+## Shared mixed MLA executors, 2026-10-12
+
+The existing mixed MLA paged, split-K, QK-D split, gather/BMM, C4/C128
+compression and QNorm/RoPE writers now consume the common codec/view.
+FP8 retains 448 grouped latent dimensions, 64 BF16 RoPE fields and UE8M0
+scales; INT8 uses the same fields with FP32 group scales. Main and sliding
+window allocation carry the provider's physical layout rather than infer
+byte counts from a model name. Independent indexer codec selection remains
+independent of attention storage.
+
+The R2 stage records 88 passing GPU checks, including 40 new mixed MLA
+writer/algorithm cases, ten new fusion cases and 38 existing codec/FP8
+regressions. Fifty focused CPU cases pass after making an existing policy
+fixture's CPU device explicit; that fixture's implicit CUDA failure is also
+reproduced on the parent. Numerical limits remain unchanged. The QK-D reader
+now indexes scale groups correctly for supported tile32/128 as well as tile64.
+Full-engine, package, quality, lifecycle and latency gates remain separate in
+[mixed MLA evidence](kv_mla_mixed_20261012.md); generic Triton MLA R07 is open.

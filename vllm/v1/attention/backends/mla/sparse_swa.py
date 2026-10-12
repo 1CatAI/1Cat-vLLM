@@ -18,6 +18,8 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.kv_cache_view import MLAPageLayout
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
 from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, get_mla_metadata
 from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
@@ -84,7 +86,15 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
         # determines the SWA block size of 64 tokens per block.
         # TODO(yifan): make SWA block size automatically determined and configurable.
         self.block_size = 64
-        assert self.dtype == torch.uint8
+        codec = resolve_kv_codec(cache_config.cache_dtype, representation="mla_mixed")
+        if codec is None or self.dtype != codec.storage_dtype:
+            raise ValueError(
+                "SWA carrier dtype must match its mixed MLA representation"
+            )
+        assert codec.scale_dtype is not None
+        self.kv_cache_layout = MLAPageLayout(
+            448, 64, scale_bytes=codec.scale_dtype.itemsize
+        )
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         return SlidingWindowMLASpec(
@@ -96,6 +106,7 @@ class DeepseekV4SWACache(torch.nn.Module, AttentionLayerBase):
             cache_dtype_str=self.cache_config.cache_dtype,
             alignment=576,  # NOTE: FlashMLA requires 576B alignment
             model_version="deepseek_v4",
+            kv_cache_layout=self.kv_cache_layout,
         )
 
     def forward(self): ...
@@ -140,10 +151,14 @@ class DeepseekSparseSWABackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         assert num_kv_heads == 1
-        if cache_dtype_str == "fp8_ds_mla":
-            # DeepseekV4 SWA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
+        if cache_dtype_str in {"fp8", "fp8_e4m3", "fp8_ds_mla", "int8"}:
+            # Mixed SWA uses the codec's data/scale layout, including owner padding.
             # head_size passed in is the semantic head_dim (512).
-            return (num_blocks, block_size, 584)
+            codec = resolve_kv_codec(cache_dtype_str, representation="mla_mixed")
+            assert codec is not None
+            assert codec.scale_dtype is not None
+            layout = MLAPageLayout(448, 64, scale_bytes=codec.scale_dtype.itemsize)
+            return (num_blocks, block_size, layout.slot_bytes)
         else:
             return (num_blocks, block_size, head_size)
 

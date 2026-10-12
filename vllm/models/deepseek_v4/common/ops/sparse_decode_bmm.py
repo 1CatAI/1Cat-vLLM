@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Sparse MLA decode attention on the packed FP8 cache as one indexed
+"""Sparse MLA decode attention on the grouped byte cache as one indexed
 dequantizing gather and two batched matmuls.
 
 Same idea as sparse_prefill_bmm: every head of a token reads the same keys, so
 they are gathered once per token and the rest goes to the BLAS library. The
-gather reads the paged fp8_ds_mla cache by slot index and dequantizes on the
+gather reads the declared mixed MLA cache by slot index and dequantizes on the
 way. Against the split-K QK-D Triton kernel at 6 query tokens and 64 heads:
 C4 (512 + 128 keys) 1.14 to 0.19 ms on RTX 8000 and 0.68 to 0.19 ms on V100,
 C128 0.38 to 0.20 and 0.28 to 0.20 ms, same output to 1.2e-4. All shapes are
@@ -15,13 +15,13 @@ static, so it captures into CUDA graphs.
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.kv_codec import decode_mla_cache_group
 
-from .cache_utils import needs_software_fp8
-from .fp8_software import fp8_e4m3fn_bits_to_fp32
+from .cache_utils import mixed_mla_cache_view, needs_software_fp8
 from .sparse_prefill_bmm import WorkspaceSpec, _fit, attend_gathered_keys
 
-# fp8_ds_mla token layout: 448 fp8 values in seven 64-wide scale groups, then
-# 64 bfloat16 rope values; the UE8M0 scales of a block follow its token data.
+# Mixed MLA: 448 byte values in seven 64-wide scale groups and 64 BF16 RoPE
+# fields. The common view supplies the UE8M0 or FP32 scale region separately.
 _NOPE_DIM = 448
 _ROPE_DIM = 64
 _HEAD_DIM = _NOPE_DIM + _ROPE_DIM
@@ -31,7 +31,11 @@ _TOKEN_SCALE_BYTES = 8
 
 
 def sparse_decode_bmm_blocker(
-    q: torch.Tensor, main_cache: torch.Tensor, extra_cache: torch.Tensor | None
+    q: torch.Tensor,
+    main_cache: torch.Tensor,
+    extra_cache: torch.Tensor | None,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> str | None:
     """Admission for the actual packed gather layout, including padded blocks."""
     if q.ndim != 3 or q.dtype != torch.float16 or q.shape[-1] != _HEAD_DIM:
@@ -39,16 +43,10 @@ def sparse_decode_bmm_blocker(
     for cache in (main_cache, extra_cache):
         if cache is None:
             continue
-        if (
-            cache.ndim != 3
-            or cache.dtype != torch.uint8
-            or min(cache.shape[:2]) <= 0
-            or cache.shape[2] != _TOKEN_DATA_BYTES + _TOKEN_SCALE_BYTES
-            or cache.stride(1) != cache.shape[2]
-            or cache.stride(2) != 1
-            or cache.device != q.device
-        ):
-            return "requires device-local packed FP8 cache with contiguous block bytes"
+        try:
+            mixed_mla_cache_view(cache, kv_cache_dtype)
+        except (ValueError, RuntimeError) as error:
+            return f"incompatible mixed MLA cache view: {error}"
     return None
 
 
@@ -56,6 +54,9 @@ def sparse_decode_bmm_blocker(
 def _dequant_gather_rows_kernel(
     out_ptr,
     cache_ptr,
+    scales_ptr,
+    scale_stride_block,
+    scale_stride_token,
     slots_ptr,
     num_cache_rows,
     cache_stride_block,
@@ -69,16 +70,22 @@ def _dequant_gather_rows_kernel(
     TOKEN_DATA_BYTES: tl.constexpr,
     TOKEN_SCALE_BYTES: tl.constexpr,
     SOFTWARE_FP8: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     token = tl.program_id(0)
     col = tl.program_id(1)
     slot = tl.load(slots_ptr + token * slots_stride_t + col)
     # An unused slot (-1) reads row 0; the caller zeroes what it gathered.
-    safe = tl.where((slot >= 0) & (slot < num_cache_rows), slot, 0).to(tl.int64)
+    valid = (slot >= 0) & (slot < num_cache_rows)
+    safe = tl.where(valid, slot, 0).to(tl.int64)
     block = cache_ptr + (safe // BLOCK_SIZE) * cache_stride_block
     pos = safe % BLOCK_SIZE
     data = block + pos * TOKEN_DATA_BYTES
-    scales = block + BLOCK_SIZE * TOKEN_DATA_BYTES + pos * TOKEN_SCALE_BYTES
+    scales = (
+        scales_ptr
+        + (safe // BLOCK_SIZE) * scale_stride_block
+        + pos * scale_stride_token
+    )
     out_row = (
         out_ptr
         + token.to(tl.int64) * out_stride_t
@@ -87,16 +94,24 @@ def _dequant_gather_rows_kernel(
 
     for group in tl.static_range(NOPE_DIM // SCALE_GROUP):
         offsets = group * SCALE_GROUP + tl.arange(0, SCALE_GROUP)
-        bits = tl.load(data + offsets)
-        if SOFTWARE_FP8:
-            values = fp8_e4m3fn_bits_to_fp32(bits)
-        else:
-            values = bits.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        scale = tl.exp2(tl.load(scales + group).to(tl.float32) - 127.0)
-        tl.store(out_row + offsets, (values * scale).to(out_ptr.dtype.element_ty))
+        bits = tl.load(data + offsets, mask=valid, other=0)
+        encoded = tl.load(scales + group, mask=valid, other=127 if CODEC == 1 else 1.0)
+        value = decode_mla_cache_group(
+            bits,
+            encoded,
+            CODEC,
+            OUTPUT_DTYPE=out_ptr.type.element_ty,
+            FP16_SCALE_FIRST=False,
+            SOFTWARE_FP8=SOFTWARE_FP8,
+        )
+        tl.store(out_row + offsets, value)
 
     rope_offsets = tl.arange(0, ROPE_DIM)
-    rope = tl.load((data + NOPE_DIM).to(tl.pointer_type(tl.bfloat16)) + rope_offsets)
+    rope = tl.load(
+        (data + NOPE_DIM).to(tl.pointer_type(tl.bfloat16)) + rope_offsets,
+        mask=valid,
+        other=0,
+    )
     tl.store(out_row + NOPE_DIM + rope_offsets, rope.to(out_ptr.dtype.element_ty))
 
 
@@ -105,14 +120,13 @@ def dequant_gather_rows(
     col_offset: int,
     cache: torch.Tensor,
     slots: torch.Tensor,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> None:
     """Fill keys[:, col_offset : col_offset + W] with the cache rows named by
     slots [T, W]. cache is the packed [blocks, block_size, bytes] uint8 cache."""
-    assert cache.dtype == torch.uint8 and cache.ndim == 3
-    assert cache.shape[2] == _TOKEN_DATA_BYTES + _TOKEN_SCALE_BYTES
-    # Blocks may be padded (stride(0) larger than their bytes); inside a
-    # block the bytes are contiguous.
-    assert cache.stride(1) == cache.shape[2] and cache.stride(2) == 1
+    view = mixed_mla_cache_view(cache, kv_cache_dtype)
+    assert view.key_scale is not None
     assert keys.shape[2] == _HEAD_DIM and keys.is_contiguous()
     assert slots.dtype == torch.int32 and slots.stride(1) == 1
     num_tokens, width = slots.shape
@@ -120,7 +134,10 @@ def dequant_gather_rows(
         return
     _dequant_gather_rows_kernel[(num_tokens, width)](
         keys,
-        cache,
+        view.key,
+        view.key_scale,
+        view.key_scale.stride(0),
+        view.key_scale.stride(1),
         slots,
         cache.shape[0] * cache.shape[1],
         cache.stride(0),
@@ -131,9 +148,10 @@ def dequant_gather_rows(
         NOPE_DIM=_NOPE_DIM,
         ROPE_DIM=_ROPE_DIM,
         SCALE_GROUP=_SCALE_GROUP,
-        TOKEN_DATA_BYTES=_TOKEN_DATA_BYTES,
+        TOKEN_DATA_BYTES=view.key.stride(1),
         TOKEN_SCALE_BYTES=_TOKEN_SCALE_BYTES,
         SOFTWARE_FP8=needs_software_fp8(),
+        CODEC=view.codec.native_id,
     )
 
 
@@ -170,6 +188,8 @@ def sparse_attn_decode_bmm(
     scores: torch.Tensor,
     logits: torch.Tensor,
     probs: torch.Tensor,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> None:
     """q [T, H, D]; main/extra indices are global slot ids into their packed
     caches (-1 = unused) with per-token lengths; attn_sink [H]. The four
@@ -193,16 +213,22 @@ def sparse_attn_decode_bmm(
 
     columns = torch.arange(max(main_width, extra_width), device=q.device)[None, :]
     unused = torch.empty((num_tokens, width), dtype=torch.bool, device=q.device)
-    unused[:, :main_width] = (main_slots < 0) | (
-        columns[:, :main_width] >= main_lengths.reshape(-1, 1)
+    unused[:, :main_width] = (
+        (main_slots < 0)
+        | (main_slots >= main_cache.shape[0] * main_cache.shape[1])
+        | (columns[:, :main_width] >= main_lengths.reshape(-1, 1))
     )
-    dequant_gather_rows(keys, 0, main_cache, main_slots)
+    dequant_gather_rows(keys, 0, main_cache, main_slots, kv_cache_dtype=kv_cache_dtype)
     if has_extra:
         assert extra_cache is not None and extra_lengths is not None
-        unused[:, main_width:] = (extra_slots < 0) | (
-            columns[:, :extra_width] >= extra_lengths.reshape(-1, 1)
+        unused[:, main_width:] = (
+            (extra_slots < 0)
+            | (extra_slots >= extra_cache.shape[0] * extra_cache.shape[1])
+            | (columns[:, :extra_width] >= extra_lengths.reshape(-1, 1))
         )
-        dequant_gather_rows(keys, main_width, extra_cache, extra_slots)
+        dequant_gather_rows(
+            keys, main_width, extra_cache, extra_slots, kv_cache_dtype=kv_cache_dtype
+        )
 
     attend_gathered_keys(
         q, keys, unused, scale, attn_sink, output, scores, logits, probs

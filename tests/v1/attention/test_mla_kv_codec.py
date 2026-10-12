@@ -13,7 +13,7 @@ from vllm.v1.attention.kv_codecs import (
     kv_codecs_for_representation,
     resolve_kv_codec,
 )
-from vllm.v1.kv_cache_interface import MLAAttentionSpec
+from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
 pytestmark = pytest.mark.cpu_test
 CODECS = (
@@ -119,3 +119,73 @@ def test_mla_layer_emits_provider_layout_without_model_name(cache_dtype, size):
     assert spec.page_size_bytes == 64 * size
     assert spec.cache_dtype_str == cache_dtype
     assert spec.layout_cache_dtype("auto") == cache_dtype
+
+
+@pytest.mark.parametrize("cache_dtype,size", [("fp8_ds_mla", 584), ("int8", 608)])
+def test_mixed_mla_flattened_pages_require_explicit_capacity(cache_dtype, size):
+    codec = resolve_kv_codec(cache_dtype, representation="mla_mixed")
+    page = 64
+    storage = torch.full((3, page * size + 576), 77, dtype=codec.storage_dtype)
+    view = KVCacheView.bind_mla(storage, codec, 448, 64, page_tokens=page)
+    assert view.page_size_bytes == page * size
+    assert view.page_stride_bytes == storage.stride(0)
+    view.key.fill_(3)
+    view.key_scale.fill_(2)
+    view.unquantized_field("rope").fill_(1)
+    assert torch.all(storage[:, page * size :] == 77)
+    with pytest.raises(ValueError, match="explicit token capacity"):
+        KVCacheView.bind_mla(storage, codec, 448, 64)
+    with pytest.raises(ValueError, match="reserve payload/scales"):
+        KVCacheView.bind_mla(
+            storage[:, : page * size - 1], codec, 448, 64, page_tokens=page
+        )
+
+
+@pytest.mark.parametrize("cache_dtype,size", [("fp8_ds_mla", 584), ("int8", 608)])
+def test_mixed_mla_engine_specs_share_declared_layout(monkeypatch, cache_dtype, size):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4.attention import DeepseekV4MLAAttention
+    from vllm.models.deepseek_v4.sm70.sparse import DeepseekV4SM70SparseBackend
+    from vllm.v1.attention.backends.mla import sparse_swa
+
+    codec = resolve_kv_codec(cache_dtype, representation="mla_mixed")
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        cache_config=SimpleNamespace(cache_dtype=cache_dtype, block_size=512),
+    )
+    monkeypatch.setattr(sparse_swa, "get_current_vllm_config", lambda: config)
+    swa = sparse_swa.DeepseekV4SWACache(
+        512, 128, codec.storage_dtype, "swa", config.cache_config
+    )
+    spec = swa.get_kv_cache_spec(config)
+    assert isinstance(spec, SlidingWindowMLASpec)
+    assert spec.real_page_size_bytes == 64 * size
+    assert spec.page_size_bytes == ((64 * size + 575) // 576) * 576
+    assert spec.layout_cache_dtype("auto") == cache_dtype
+    assert SlidingWindowMLASpec.merge([spec, spec]) == spec
+    assert sparse_swa.DeepseekSparseSWABackend.get_kv_cache_shape(
+        3, 64, 1, 512, cache_dtype
+    ) == (3, 64, size)
+    with pytest.raises(AssertionError, match="same quantization"):
+        SlidingWindowMLASpec.merge([spec, replace(spec, kv_cache_layout=None)])
+    with pytest.raises(ValueError, match="storage codec"):
+        replace(spec, cache_dtype_str=None).layout_cache_dtype("int8")
+
+    layer = object.__new__(DeepseekV4MLAAttention)
+    torch.nn.Module.__init__(layer)
+    layer.head_dim, layer.kv_cache_dtype, layer.kv_codec = 512, cache_dtype, codec
+    layer.kv_cache_layout = DeepseekV4SM70SparseBackend.get_kv_cache_layout(
+        512, cache_dtype
+    )
+    for ratio in (4, 128):
+        layer.compress_ratio = ratio
+        compressed = layer.get_kv_cache_spec(config)
+        assert compressed.real_page_size_bytes == (512 // ratio) * size
+        assert compressed.layout_cache_dtype("fp8") == cache_dtype
+        assert compressed.page_size_bytes >= compressed.real_page_size_bytes
+        assert DeepseekV4SM70SparseBackend.get_kv_cache_shape(
+            3, 512 // ratio, 1, 512, cache_dtype
+        ) == (3, 512 // ratio, size)
+    layer.compress_ratio = 1
+    assert layer.get_kv_cache_spec(config) is None

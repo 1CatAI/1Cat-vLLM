@@ -7,12 +7,11 @@ import torch
 
 from vllm.config.sm70_sparse import sparse_policy
 from vllm.models.deepseek_v4.common.ops.cache_utils import (
+    mixed_mla_cache_view,
     quantize_and_insert_k_cache,
 )
-from vllm.models.deepseek_v4.common.ops.fp8_software import (
-    fp32_to_fp8_e4m3fn_bits,
-)
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.kv_codec import encode_mla_cache_group
 
 _HEAD_DIM = 512
 _ROPE_DIM = 64
@@ -102,6 +101,10 @@ def _sm70_qnorm_rope_parallel_kv_insert_kernel(
     q_ptr,
     kv_ptr,
     cache_ptr,
+    scales_ptr,
+    scale_stride_block,
+    scale_stride_token,
+    num_cache_slots,
     slot_mapping_ptr,
     positions_ptr,
     cos_sin_cache_ptr,
@@ -115,6 +118,7 @@ def _sm70_qnorm_rope_parallel_kv_insert_kernel(
     NOPE_DIM: tl.constexpr,
     HALF_ROPE: tl.constexpr,
     TOKEN_DATA_SIZE: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     """Fuse TP4 Q transform with eight exact packed-KV writer CTAs."""
     token_idx = tl.program_id(0)
@@ -157,7 +161,7 @@ def _sm70_qnorm_rope_parallel_kv_insert_kernel(
     else:
         part_idx = worker_idx - num_heads
         slot_idx = tl.load(slot_mapping_ptr + token_idx)
-        if slot_idx < 0:
+        if slot_idx < 0 or slot_idx >= num_cache_slots:
             return
 
         block_idx = slot_idx // cache_block_size
@@ -165,23 +169,20 @@ def _sm70_qnorm_rope_parallel_kv_insert_kernel(
         cache_block = cache_ptr + block_idx.to(tl.int64) * cache_stride0
         token_data = cache_block + pos_in_block * TOKEN_DATA_SIZE
         token_scales = (
-            cache_block + cache_block_size * TOKEN_DATA_SIZE + pos_in_block * 8
+            scales_ptr
+            + block_idx.to(tl.int64) * scale_stride_block
+            + pos_in_block * scale_stride_token
         )
         kv_row = kv_ptr + token_idx * HEAD_DIM
         kv_offsets = tl.arange(0, 64)
         if part_idx < 7:
             input_offsets = part_idx * 64 + kv_offsets
             kv_values = tl.load(kv_row + input_offsets)
-            block_max = tl.maximum(tl.max(tl.abs(kv_values), axis=0), 1.0e-4)
-            exponent = tl.ceil(tl.log2(block_max / 448.0))
-            scale = tl.exp2(exponent)
-            scaled = tl.clamp(kv_values / scale, -448.0, 448.0)
-            packed = fp32_to_fp8_e4m3fn_bits(scaled.to(tl.float32))
+            packed, encoded = encode_mla_cache_group(kv_values, CODEC, 0)
             tl.store(token_data + input_offsets, packed)
-            encoded = tl.maximum(tl.minimum(exponent + 127.0, 255.0), 0.0)
-            tl.store(token_scales + part_idx, encoded.to(tl.uint8))
+            tl.store(token_scales + part_idx, encoded)
         else:
-            tl.store(token_scales + 7, tl.zeros((), dtype=tl.uint8))
+            tl.store(token_scales + 7, 0)
             kv_position = tl.load(positions_ptr + token_idx).to(tl.int64)
             kv_pair_idx = tl.arange(0, HALF_ROPE)
             kv_cos = tl.load(
@@ -211,6 +212,8 @@ def sm70_qnorm_rope_kv_fp8_insert(
     cos_sin_cache: torch.Tensor,
     eps: float,
     block_size: int,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> torch.Tensor:
     """Apply the V4 Q/KV transform using FP16 compute on exact SM70."""
     assert q.dtype == torch.float16 and kv.dtype == torch.float16, (
@@ -220,21 +223,26 @@ def sm70_qnorm_rope_kv_fp8_insert(
     assert kv.ndim == 2 and kv.shape == (q.shape[0], _HEAD_DIM)
     assert q.is_contiguous() and kv.is_contiguous()
 
+    view = mixed_mla_cache_view(swa_kv_cache, kv_cache_dtype, block_size)
+    assert view.key_scale is not None
     num_tokens, num_heads, _ = q.shape
     if (
         sparse_policy().value("qnorm_kv_fused_tp4")
         and num_tokens == 1
         and num_heads == 16
     ):
-        cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
         _sm70_qnorm_rope_parallel_kv_insert_kernel[(num_tokens, num_heads + 8)](
             q,
             kv,
-            cache_2d,
+            view.key,
+            view.key_scale,
+            view.key_scale.stride(0),
+            view.key_scale.stride(1),
+            view.key.shape[0] * block_size,
             slot_mapping,
             positions,
             cos_sin_cache,
-            cache_2d.stride(0),
+            view.key.stride(0),
             eps,
             num_tokens,
             num_heads=num_heads,
@@ -243,7 +251,8 @@ def sm70_qnorm_rope_kv_fp8_insert(
             ROPE_DIM=_ROPE_DIM,
             NOPE_DIM=_NOPE_DIM,
             HALF_ROPE=_HALF_ROPE,
-            TOKEN_DATA_SIZE=576,
+            TOKEN_DATA_SIZE=view.key.stride(1),
+            CODEC=view.codec.native_id,
             num_warps=4,
         )
         return q
@@ -269,5 +278,9 @@ def sm70_qnorm_rope_kv_fp8_insert(
         swa_kv_cache.view(swa_kv_cache.shape[0], -1),
         slot_mapping,
         block_size=block_size,
+        kv_cache_dtype=kv_cache_dtype,
     )
     return q
+
+
+sm70_qnorm_rope_kv_insert = sm70_qnorm_rope_kv_fp8_insert

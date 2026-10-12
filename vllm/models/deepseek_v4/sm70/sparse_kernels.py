@@ -5,11 +5,9 @@
 
 import torch
 
-from vllm.models.deepseek_v4.common.ops.fp8_software import (
-    fp8_e4m3fn_bits_to_fp32,
-    fp8_e4m3fn_bits_to_fp32_bitcast,
-)
+from vllm.models.deepseek_v4.common.ops.cache_utils import mixed_mla_cache_view
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.kv_codec import decode_mla_cache_group
 
 _HEAD_DIM = 512
 _NOPE_DIM = 448
@@ -118,9 +116,15 @@ def _sm70_sparse_gathered_kernel(
 def _sm70_sparse_paged_fp8_kernel(
     q_ptr,
     main_cache_ptr,
+    main_scales_ptr,
+    main_scale_stride0,
+    main_scale_stride_token,
     main_indices_ptr,
     main_lengths_ptr,
     extra_cache_ptr,
+    extra_scales_ptr,
+    extra_scale_stride0,
+    extra_scale_stride_token,
     extra_indices_ptr,
     extra_lengths_ptr,
     sink_ptr,
@@ -146,6 +150,8 @@ def _sm70_sparse_paged_fp8_kernel(
     NOPE_DIM: tl.constexpr,
     NOPE_BLOCK: tl.constexpr,
     ROPE_DIM: tl.constexpr,
+    DATA_ROW_BYTES: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     head_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -187,22 +193,24 @@ def _sm70_sparse_paged_fp8_kernel(
         block_idx = safe_slots // main_block_size
         pos_in_block = safe_slots % main_block_size
         cache_block = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
-        token_data = cache_block + pos_in_block * 576
-        token_scales = cache_block + main_block_size * 576 + pos_in_block * 8
+        token_data = cache_block + pos_in_block * DATA_ROW_BYTES
+        token_scales = (
+            main_scales_ptr
+            + block_idx.to(tl.int64) * main_scale_stride0
+            + pos_in_block * main_scale_stride_token
+        )
 
         packed = tl.load(
             token_data[:, None] + nope_offsets[None, :],
             mask=valid[:, None] & nope_mask[None, :],
             other=0,
         )
-        fp8 = fp8_e4m3fn_bits_to_fp32(packed)
         encoded_scale = tl.load(
             token_scales[:, None] + nope_offsets[None, :] // 64,
             mask=valid[:, None] & nope_mask[None, :],
-            other=127,
+            other=127 if CODEC == 1 else 1.0,
         )
-        dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
-        k_nope = fp8.to(tl.float16) * dequant_scale.to(tl.float16)
+        k_nope = decode_mla_cache_group(packed, encoded_scale, CODEC, False)
         k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, 0.0)
 
         rope_ptr = (token_data + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
@@ -244,22 +252,24 @@ def _sm70_sparse_paged_fp8_kernel(
             block_idx = safe_slots // extra_block_size
             pos_in_block = safe_slots % extra_block_size
             cache_block = extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
-            token_data = cache_block + pos_in_block * 576
-            token_scales = cache_block + extra_block_size * 576 + pos_in_block * 8
+            token_data = cache_block + pos_in_block * DATA_ROW_BYTES
+            token_scales = (
+                extra_scales_ptr
+                + block_idx.to(tl.int64) * extra_scale_stride0
+                + pos_in_block * extra_scale_stride_token
+            )
 
             packed = tl.load(
                 token_data[:, None] + nope_offsets[None, :],
                 mask=valid[:, None] & nope_mask[None, :],
                 other=0,
             )
-            fp8 = fp8_e4m3fn_bits_to_fp32(packed)
             encoded_scale = tl.load(
                 token_scales[:, None] + nope_offsets[None, :] // 64,
                 mask=valid[:, None] & nope_mask[None, :],
-                other=127,
+                other=127 if CODEC == 1 else 1.0,
             )
-            dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
-            k_nope = fp8.to(tl.float16) * dequant_scale.to(tl.float16)
+            k_nope = decode_mla_cache_group(packed, encoded_scale, CODEC, False)
             k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, 0.0)
 
             rope_ptr = (token_data + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
@@ -321,9 +331,15 @@ def _sm70_sparse_paged_fp8_kernel(
 def _sm70_sparse_paged_fp8_splitk_kernel(
     q_ptr,
     main_cache_ptr,
+    main_scales_ptr,
+    main_scale_stride0,
+    main_scale_stride_token,
     main_indices_ptr,
     main_lengths_ptr,
     extra_cache_ptr,
+    extra_scales_ptr,
+    extra_scale_stride0,
+    extra_scale_stride_token,
     extra_indices_ptr,
     extra_lengths_ptr,
     partial_max_ptr,
@@ -349,6 +365,8 @@ def _sm70_sparse_paged_fp8_splitk_kernel(
     NOPE_DIM: tl.constexpr,
     NOPE_BLOCK: tl.constexpr,
     ROPE_DIM: tl.constexpr,
+    DATA_ROW_BYTES: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     head_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -390,8 +408,12 @@ def _sm70_sparse_paged_fp8_splitk_kernel(
         block_idx = safe_slots // main_block_size
         pos_in_block = safe_slots % main_block_size
         cache_block = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
-        token_data = cache_block + pos_in_block * 576
-        token_scales = cache_block + main_block_size * 576 + pos_in_block * 8
+        token_data = cache_block + pos_in_block * DATA_ROW_BYTES
+        token_scales = (
+            main_scales_ptr
+            + block_idx.to(tl.int64) * main_scale_stride0
+            + pos_in_block * main_scale_stride_token
+        )
     else:
         source_len = tl.load(extra_lengths_ptr + query_idx)
         slots = tl.load(
@@ -404,29 +426,30 @@ def _sm70_sparse_paged_fp8_splitk_kernel(
         block_idx = safe_slots // extra_block_size
         pos_in_block = safe_slots % extra_block_size
         cache_block = extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
-        token_data = cache_block + pos_in_block * 576
-        token_scales = cache_block + extra_block_size * 576 + pos_in_block * 8
+        token_data = cache_block + pos_in_block * DATA_ROW_BYTES
+        token_scales = (
+            extra_scales_ptr
+            + block_idx.to(tl.int64) * extra_scale_stride0
+            + pos_in_block * extra_scale_stride_token
+        )
 
     packed = tl.load(
         token_data[:, None] + nope_offsets[None, :],
         mask=valid[:, None] & nope_mask[None, :],
         other=0,
     )
-    fp8 = fp8_e4m3fn_bits_to_fp32_bitcast(packed)
     scale_group_offsets = tl.arange(0, NOPE_BLOCK // 64)
     scale_group_mask = scale_group_offsets * 64 < NOPE_DIM
     encoded_scale = tl.load(
         token_scales[:, None] + scale_group_offsets[None, :],
         mask=valid[:, None] & scale_group_mask[None, :],
-        other=127,
+        other=127 if CODEC == 1 else 1.0,
     )
-    dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
-    fp8_grouped = tl.reshape(fp8, (BLOCK_K, NOPE_BLOCK // 64, 64))
-    scale_grouped = tl.reshape(
-        dequant_scale.to(tl.float16), (BLOCK_K, NOPE_BLOCK // 64, 1)
-    )
+    packed_grouped = tl.reshape(packed, (BLOCK_K, NOPE_BLOCK // 64, 64))
+    scale_grouped = tl.reshape(encoded_scale, (BLOCK_K, NOPE_BLOCK // 64, 1))
     k_nope = tl.reshape(
-        fp8_grouped.to(tl.float16) * scale_grouped, (BLOCK_K, NOPE_BLOCK)
+        decode_mla_cache_group(packed_grouped, scale_grouped, CODEC, True),
+        (BLOCK_K, NOPE_BLOCK),
     )
     k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, 0.0)
 
@@ -469,9 +492,15 @@ def _sm70_sparse_paged_fp8_splitk_kernel(
 def _sm70_sparse_paged_fp8_splitk_qk_tiles_kernel(
     q_ptr,
     main_cache_ptr,
+    main_scales_ptr,
+    main_scale_stride0,
+    main_scale_stride_token,
     main_indices_ptr,
     main_lengths_ptr,
     extra_cache_ptr,
+    extra_scales_ptr,
+    extra_scale_stride0,
+    extra_scale_stride_token,
     extra_indices_ptr,
     extra_lengths_ptr,
     partial_qk_ptr,
@@ -495,6 +524,8 @@ def _sm70_sparse_paged_fp8_splitk_qk_tiles_kernel(
     NOPE_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     D_TILES: tl.constexpr,
+    DATA_ROW_BYTES: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     head_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -526,8 +557,12 @@ def _sm70_sparse_paged_fp8_splitk_qk_tiles_kernel(
         block_idx = safe_slots // main_block_size
         pos_in_block = safe_slots % main_block_size
         cache_block = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
-        token_data = cache_block + pos_in_block * 576
-        token_scales = cache_block + main_block_size * 576 + pos_in_block * 8
+        token_data = cache_block + pos_in_block * DATA_ROW_BYTES
+        token_scales = (
+            main_scales_ptr
+            + block_idx.to(tl.int64) * main_scale_stride0
+            + pos_in_block * main_scale_stride_token
+        )
     else:
         source_len = tl.load(extra_lengths_ptr + query_idx)
         slots = tl.load(
@@ -540,8 +575,12 @@ def _sm70_sparse_paged_fp8_splitk_qk_tiles_kernel(
         block_idx = safe_slots // extra_block_size
         pos_in_block = safe_slots % extra_block_size
         cache_block = extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
-        token_data = cache_block + pos_in_block * 576
-        token_scales = cache_block + extra_block_size * 576 + pos_in_block * 8
+        token_data = cache_block + pos_in_block * DATA_ROW_BYTES
+        token_scales = (
+            extra_scales_ptr
+            + block_idx.to(tl.int64) * extra_scale_stride0
+            + pos_in_block * extra_scale_stride_token
+        )
 
     q_row = q_ptr + query_idx * q_stride_t + head_offsets[:, None] * q_stride_h
     q_tile = tl.load(
@@ -554,14 +593,20 @@ def _sm70_sparse_paged_fp8_splitk_qk_tiles_kernel(
         mask=valid[:, None] & nope_mask[None, :],
         other=0,
     )
-    fp8 = fp8_e4m3fn_bits_to_fp32_bitcast(packed)
-    encoded_scale = tl.load(
-        token_scales + d_tile,
-        mask=valid & (d_tile * BLOCK_D < NOPE_DIM),
-        other=127,
-    )
-    dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
-    k_nope = fp8.to(tl.float16) * dequant_scale[:, None].to(tl.float16)
+    if BLOCK_D == 64:
+        encoded_scale = tl.load(
+            token_scales + d_tile,
+            mask=valid & (d_tile * BLOCK_D < NOPE_DIM),
+            other=127 if CODEC == 1 else 1.0,
+        )
+        k_nope = decode_mla_cache_group(packed, encoded_scale[:, None], CODEC, True)
+    else:
+        encoded_scale = tl.load(
+            token_scales[:, None] + dim_offsets[None, :] // 64,
+            mask=valid[:, None] & nope_mask[None, :],
+            other=127 if CODEC == 1 else 1.0,
+        )
+        k_nope = decode_mla_cache_group(packed, encoded_scale, CODEC, True)
 
     rope_offsets = dim_offsets - NOPE_DIM
     rope_ptr = (token_data + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
@@ -668,9 +713,15 @@ def _sm70_sparse_paged_fp8_splitk_qk_reduce_kernel(
 @triton.jit
 def _sm70_sparse_paged_fp8_splitk_values_kernel(
     main_cache_ptr,
+    main_scales_ptr,
+    main_scale_stride0,
+    main_scale_stride_token,
     main_indices_ptr,
     main_lengths_ptr,
     extra_cache_ptr,
+    extra_scales_ptr,
+    extra_scale_stride0,
+    extra_scale_stride_token,
     extra_indices_ptr,
     extra_lengths_ptr,
     partial_probs_ptr,
@@ -693,6 +744,8 @@ def _sm70_sparse_paged_fp8_splitk_values_kernel(
     NOPE_DIM: tl.constexpr,
     BLOCK_D: tl.constexpr,
     D_TILES: tl.constexpr,
+    DATA_ROW_BYTES: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     head_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -724,8 +777,12 @@ def _sm70_sparse_paged_fp8_splitk_values_kernel(
         block_idx = safe_slots // main_block_size
         pos_in_block = safe_slots % main_block_size
         cache_block = main_cache_ptr + block_idx.to(tl.int64) * main_cache_stride0
-        token_data = cache_block + pos_in_block * 576
-        token_scales = cache_block + main_block_size * 576 + pos_in_block * 8
+        token_data = cache_block + pos_in_block * DATA_ROW_BYTES
+        token_scales = (
+            main_scales_ptr
+            + block_idx.to(tl.int64) * main_scale_stride0
+            + pos_in_block * main_scale_stride_token
+        )
     else:
         source_len = tl.load(extra_lengths_ptr + query_idx)
         slots = tl.load(
@@ -738,8 +795,12 @@ def _sm70_sparse_paged_fp8_splitk_values_kernel(
         block_idx = safe_slots // extra_block_size
         pos_in_block = safe_slots % extra_block_size
         cache_block = extra_cache_ptr + block_idx.to(tl.int64) * extra_cache_stride0
-        token_data = cache_block + pos_in_block * 576
-        token_scales = cache_block + extra_block_size * 576 + pos_in_block * 8
+        token_data = cache_block + pos_in_block * DATA_ROW_BYTES
+        token_scales = (
+            extra_scales_ptr
+            + block_idx.to(tl.int64) * extra_scale_stride0
+            + pos_in_block * extra_scale_stride_token
+        )
 
     state_offsets = (query_idx * num_heads + head_offsets) * NUM_PARTIALS + partial_idx
     prob_row = partial_probs_ptr + state_offsets[:, None] * BLOCK_K
@@ -750,14 +811,20 @@ def _sm70_sparse_paged_fp8_splitk_values_kernel(
         mask=valid[:, None] & nope_mask[None, :],
         other=0,
     )
-    fp8 = fp8_e4m3fn_bits_to_fp32_bitcast(packed)
-    encoded_scale = tl.load(
-        token_scales + d_tile,
-        mask=valid & (d_tile * BLOCK_D < NOPE_DIM),
-        other=127,
-    )
-    dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
-    k_nope = fp8.to(tl.float16) * dequant_scale[:, None].to(tl.float16)
+    if BLOCK_D == 64:
+        encoded_scale = tl.load(
+            token_scales + d_tile,
+            mask=valid & (d_tile * BLOCK_D < NOPE_DIM),
+            other=127 if CODEC == 1 else 1.0,
+        )
+        k_nope = decode_mla_cache_group(packed, encoded_scale[:, None], CODEC, True)
+    else:
+        encoded_scale = tl.load(
+            token_scales[:, None] + dim_offsets[None, :] // 64,
+            mask=valid[:, None] & nope_mask[None, :],
+            other=127 if CODEC == 1 else 1.0,
+        )
+        k_nope = decode_mla_cache_group(packed, encoded_scale, CODEC, True)
 
     rope_offsets = dim_offsets - NOPE_DIM
     rope_ptr = (token_data + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
@@ -890,11 +957,14 @@ def sm70_sparse_attention_paged_fp8(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_lengths: torch.Tensor | None = None,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> None:
     """Decode directly from the packed DeepSeek FP8 paged-cache layout."""
     assert q.dtype == out.dtype == torch.float16
     assert q.shape == out.shape and q.shape[-1] == _HEAD_DIM
-    assert main_cache.dtype == torch.uint8 and main_cache.ndim == 3
+    main_view = mixed_mla_cache_view(main_cache, kv_cache_dtype)
+    assert main_view.key_scale is not None
 
     main_indices_2d = main_indices.reshape(q.shape[0], -1)
     main_lengths = main_lengths.reshape(-1).to(torch.int32)
@@ -907,21 +977,31 @@ def sm70_sparse_attention_paged_fp8(
         assert extra_cache is not None
         assert extra_indices is not None
         assert extra_lengths is not None
-        assert extra_cache.dtype == torch.uint8 and extra_cache.ndim == 3
+        extra_view = mixed_mla_cache_view(extra_cache, kv_cache_dtype)
+        assert extra_view.key_scale is not None
         extra_indices_2d = extra_indices.reshape(q.shape[0], -1)
         extra_lengths_1d = extra_lengths.reshape(-1).to(torch.int32)
     else:
         extra_cache = main_cache
+        extra_view = main_view
         extra_indices_2d = main_indices_2d[:, :1]
         extra_lengths_1d = torch.zeros_like(main_lengths)
+
+    assert extra_view.key_scale is not None
 
     block_h = 8
     _sm70_sparse_paged_fp8_kernel[(q.shape[0], triton.cdiv(q.shape[1], block_h))](
         q,
-        main_cache,
+        main_view.key,
+        main_view.key_scale,
+        main_view.key_scale.stride(0),
+        main_view.key_scale.stride(1),
         main_indices_2d,
         main_lengths,
-        extra_cache,
+        extra_view.key,
+        extra_view.key_scale,
+        extra_view.key_scale.stride(0),
+        extra_view.key_scale.stride(1),
         extra_indices_2d,
         extra_lengths_1d,
         attn_sink.contiguous(),
@@ -947,6 +1027,8 @@ def sm70_sparse_attention_paged_fp8(
         NOPE_DIM=_NOPE_DIM,
         NOPE_BLOCK=_HEAD_DIM,
         ROPE_DIM=_ROPE_DIM,
+        DATA_ROW_BYTES=main_view.key.stride(1),
+        CODEC=main_view.codec.native_id,
         num_warps=4,
     )
 
@@ -967,11 +1049,14 @@ def sm70_sparse_attention_paged_fp8_splitk(
     partial_acc: torch.Tensor,
     stage1_num_warps: int = 4,
     stage1_block_h: int = 8,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> None:
     """Split sparse KV blocks across CTAs, then reduce online-softmax states."""
     assert q.dtype == out.dtype == torch.float16
     assert q.shape == out.shape and q.shape[-1] == _HEAD_DIM
-    assert main_cache.dtype == torch.uint8 and main_cache.ndim == 3
+    main_view = mixed_mla_cache_view(main_cache, kv_cache_dtype)
+    assert main_view.key_scale is not None
 
     main_indices_2d = main_indices.reshape(q.shape[0], -1)
     main_lengths_1d = main_lengths.reshape(-1).to(torch.int32)
@@ -985,11 +1070,13 @@ def sm70_sparse_attention_paged_fp8_splitk(
         assert extra_cache is not None
         assert extra_indices is not None
         assert extra_lengths is not None
-        assert extra_cache.dtype == torch.uint8 and extra_cache.ndim == 3
+        extra_view = mixed_mla_cache_view(extra_cache, kv_cache_dtype)
+        assert extra_view.key_scale is not None
         extra_indices_2d = extra_indices.reshape(q.shape[0], -1)
         extra_lengths_1d = extra_lengths.reshape(-1).to(torch.int32)
     else:
         extra_cache = main_cache
+        extra_view = main_view
         extra_indices_2d = main_indices_2d[:, :0]
         extra_lengths_1d = main_lengths_1d
     main_partials = triton.cdiv(main_indices_2d.shape[1], _SPLITK_BLOCK_K)
@@ -1004,6 +1091,8 @@ def sm70_sparse_attention_paged_fp8_splitk(
     assert partial_max.is_contiguous() and partial_sum.is_contiguous()
     assert partial_acc.is_contiguous()
 
+    assert extra_view.key_scale is not None
+
     block_h = stage1_block_h
     _sm70_sparse_paged_fp8_splitk_kernel[
         (
@@ -1013,10 +1102,16 @@ def sm70_sparse_attention_paged_fp8_splitk(
         )
     ](
         q,
-        main_cache,
+        main_view.key,
+        main_view.key_scale,
+        main_view.key_scale.stride(0),
+        main_view.key_scale.stride(1),
         main_indices_2d,
         main_lengths_1d,
-        extra_cache,
+        extra_view.key,
+        extra_view.key_scale,
+        extra_view.key_scale.stride(0),
+        extra_view.key_scale.stride(1),
         extra_indices_2d,
         extra_lengths_1d,
         partial_max,
@@ -1042,6 +1137,8 @@ def sm70_sparse_attention_paged_fp8_splitk(
         NOPE_DIM=_NOPE_DIM,
         NOPE_BLOCK=_HEAD_DIM,
         ROPE_DIM=_ROPE_DIM,
+        DATA_ROW_BYTES=main_view.key.stride(1),
+        CODEC=main_view.codec.native_id,
         num_warps=stage1_num_warps,
     )
     _sm70_sparse_paged_fp8_splitk_reduce_kernel[
@@ -1086,11 +1183,14 @@ def sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
     stage1_num_warps: int = 4,
     stage1_block_h: int = 8,
     block_d: int = 64,
+    *,
+    kv_cache_dtype: str = "fp8_ds_mla",
 ) -> None:
     """Partition both QK and PV into 64-column CTA tiles."""
     assert q.dtype == out.dtype == torch.float16
     assert q.shape == out.shape and q.shape[-1] == _HEAD_DIM
-    assert main_cache.dtype == torch.uint8 and main_cache.ndim == 3
+    main_view = mixed_mla_cache_view(main_cache, kv_cache_dtype)
+    assert main_view.key_scale is not None
 
     main_indices_2d = main_indices.reshape(q.shape[0], -1)
     main_lengths_1d = main_lengths.reshape(-1).to(torch.int32)
@@ -1104,11 +1204,13 @@ def sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
         assert extra_cache is not None
         assert extra_indices is not None
         assert extra_lengths is not None
-        assert extra_cache.dtype == torch.uint8 and extra_cache.ndim == 3
+        extra_view = mixed_mla_cache_view(extra_cache, kv_cache_dtype)
+        assert extra_view.key_scale is not None
         extra_indices_2d = extra_indices.reshape(q.shape[0], -1)
         extra_lengths_1d = extra_lengths.reshape(-1).to(torch.int32)
     else:
         extra_cache = main_cache
+        extra_view = main_view
         extra_indices_2d = main_indices_2d[:, :0]
         extra_lengths_1d = main_lengths_1d
 
@@ -1139,6 +1241,8 @@ def sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
     assert partial_max.is_contiguous() and partial_sum.is_contiguous()
     assert partial_probs.is_contiguous() and partial_acc.is_contiguous()
 
+    assert extra_view.key_scale is not None
+
     block_h = stage1_block_h
     head_groups = triton.cdiv(q.shape[1], block_h)
     common_kwargs = dict(
@@ -1152,10 +1256,16 @@ def sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
         (q.shape[0], head_groups, num_partials * d_tiles)
     ](
         q,
-        main_cache,
+        main_view.key,
+        main_view.key_scale,
+        main_view.key_scale.stride(0),
+        main_view.key_scale.stride(1),
         main_indices_2d,
         main_lengths_1d,
-        extra_cache,
+        extra_view.key,
+        extra_view.key_scale,
+        extra_view.key_scale.stride(0),
+        extra_view.key_scale.stride(1),
         extra_indices_2d,
         extra_lengths_1d,
         partial_qk,
@@ -1172,6 +1282,8 @@ def sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
         q.shape[1],
         HEAD_DIM=_HEAD_DIM,
         NOPE_DIM=_NOPE_DIM,
+        DATA_ROW_BYTES=main_view.key.stride(1),
+        CODEC=main_view.codec.native_id,
         BLOCK_D=block_d,
         D_TILES=d_tiles,
         num_warps=stage1_num_warps,
@@ -1201,10 +1313,16 @@ def sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
     _sm70_sparse_paged_fp8_splitk_values_kernel[
         (q.shape[0], head_groups, num_partials * d_tiles)
     ](
-        main_cache,
+        main_view.key,
+        main_view.key_scale,
+        main_view.key_scale.stride(0),
+        main_view.key_scale.stride(1),
         main_indices_2d,
         main_lengths_1d,
-        extra_cache,
+        extra_view.key,
+        extra_view.key_scale,
+        extra_view.key_scale.stride(0),
+        extra_view.key_scale.stride(1),
         extra_indices_2d,
         extra_lengths_1d,
         partial_probs,
@@ -1220,6 +1338,8 @@ def sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
         q.shape[1],
         HEAD_DIM=_HEAD_DIM,
         NOPE_DIM=_NOPE_DIM,
+        DATA_ROW_BYTES=main_view.key.stride(1),
+        CODEC=main_view.codec.native_id,
         BLOCK_D=block_d,
         D_TILES=d_tiles,
         num_warps=4,
@@ -1242,3 +1362,11 @@ def sm70_sparse_attention_paged_fp8_splitk_qk_dsplit(
         BLOCK_D=64,
         num_warps=4,
     )
+
+
+# Codec-neutral entry points share the historical algorithm implementations.
+sm70_sparse_attention_paged = sm70_sparse_attention_paged_fp8
+sm70_sparse_attention_paged_splitk = sm70_sparse_attention_paged_fp8_splitk
+sm70_sparse_attention_paged_splitk_qk_dsplit = (
+    sm70_sparse_attention_paged_fp8_splitk_qk_dsplit
+)

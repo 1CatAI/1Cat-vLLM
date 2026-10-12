@@ -25,7 +25,8 @@ format is retained when the outer target/draft configuration differs.
 The qualified NoPE representation has 512 latent dimensions: 520 bytes per
 token with eight UE8M0 scales, or 544 bytes with eight FP32 INT8 scales. The
 mixed representation view also describes 448 latent and 64 BF16 RoPE fields;
-that view's CPU validation does not qualify DeepSeek execution.
+that view's CPU validation does not qualify DeepSeek execution. The separate
+[mixed MLA stage](kv_mla_mixed_20261012.md) records its actual bindings.
 
 ## GPU component evidence
 
@@ -52,11 +53,40 @@ After stacking on the QSA page-view stage, 62 focused CPU checks pass across
 MLA representations/specs, ordinary/history/indexer identities and owner-page
 mapping. These CPU checks do not substitute for GPU or engine evidence.
 
-## Remaining gates
+## Frozen component cost comparison
+
+`benchmark_sm70_mla_codec_cost.py` reproduces the fixed seed/workload and
+measurement protocol: 4096 cached tokens, 2048 selected tokens, page64,
+16 heads and 512 latent dimensions. Each process runs 30 eager warmups,
+2000 graph warmups and nine samples of 1000 graph replays. Two independent
+FP8 controls precede a frozen noise envelope; INT8/FP8 then run in the order
+INT8, INT8, FP8. Output hashes repeat within each codec. This is component
+timing with dynamic group scales, not a calibrated model-quality baseline.
+
+| Case | INT8 / two-control FP8 median | Frozen decision |
+| --- | --- | --- |
+| Writer q1 | 1.0473 | Failed: one candidate exceeds the 6.1932% control envelope |
+| Writer q32 | 1.0381 | Inside the 8.4769% envelope |
+| Paged q1 | 0.8144 | Both candidates and the final control satisfy the frozen envelope |
+| Paged q9 | 0.8393 | Inconclusive: final FP8 control drifts beyond the 0.02331% envelope |
+| Gather/GEMM q1 | 0.9616 | Both candidates and the final control satisfy the frozen envelope |
+| Batched GEMM q8 | 0.9844 | Both candidates and the final control satisfy the frozen envelope |
+
+The envelope is the maximum relative deviation of the pre-candidate control
+process/sample medians. Each candidate is judged separately; averaging does
+not erase the failed writer sample. No limit is enlarged after results.
+Receipt SHA256 values for control0/control1/candidate0/candidate1/control2 are
+`0843672c450f39732cbae79364dcfe68c7aa99734aea0ed90e755179daf2913a`,
+`76d2734b6e6659371ccab31d9a9ccd1536dd469256f01a8fe91041b3aa03d378`,
+`3cd2cb1d7846a07e24b8eb5f43d025f73593b2d14db177787480305cfb8f8704`,
+`c96cc5f2899c2fafad1b31d61eff465a8901e8d91c45335fa68770c40f5852cf`,
+`3a41bc98dce7c453f9e951100d51639e24e1847657e2c4708c449861c00719bb`.
+The aggregate latency gate remains open.
+
+## Remaining engine gates
 
 R05's bounded codec/executor binding is implemented. Representative GLM engine
 quality, state lifecycle, normal whole-package initialization and latency are
-pending; R05 remains experimental. DeepSeek mixed MLA writers/readers/fusion,
-generic Triton MLA and the other inventory components require their own
-execution evidence. No global MLA or end-to-end speed claim follows from
+pending; R05 remains experimental. Generic Triton MLA and the other inventory
+components require their own execution evidence. No global MLA or end-to-end speed claim follows from
 this stage.

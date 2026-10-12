@@ -73,6 +73,8 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+from vllm.v1.attention.kv_cache_view import MLAPageLayout
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 if TYPE_CHECKING:
@@ -252,13 +254,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Per-head RMS normalization for Q (no learnable weights)
         self.q_head_norm = RMSNorm(head_dim, eps=self.eps, has_weight=False)
 
-        # TODO(yifan): currently hardcoded for FP8 sparse, make it more generic
-        head_bytes = (
-            self.nope_head_dim  # 448 fp8 NoPE
-            + self.rope_head_dim * 2  # 64 bf16 RoPE
-            + self.nope_head_dim // 64  # 7B scale factors
-            + 1  # 1B pad
+        assert cache_config is not None, "Sparse attention requires cache_config"
+        cache_codec = resolve_kv_codec(
+            cache_config.cache_dtype, representation="mla_mixed"
         )
+        if cache_codec is None:
+            raise ValueError(f"Unsupported mixed MLA cache: {cache_config.cache_dtype}")
+        assert cache_codec.scale_dtype is not None
+        cache_layout = MLAPageLayout(
+            self.nope_head_dim,
+            self.rope_head_dim,
+            scale_bytes=cache_codec.scale_dtype.itemsize,
+        )
+        head_bytes = cache_layout.slot_bytes
 
         # Will be None on ROCm for now.
         self.aux_stream_list = mla_modules.aux_stream_list
@@ -271,7 +279,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         self.swa_cache_layer = DeepseekV4SWACache(
             head_dim=self.head_dim,
             window_size=self.window_size,
-            dtype=torch.uint8,
+            dtype=cache_codec.storage_dtype,
             prefix=f"{prefix}.swa_cache",
             cache_config=cache_config,
         )
@@ -700,6 +708,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.rotary_emb.cos_sin_cache,
                 self.eps,
                 swa_metadata.block_size,
+                kv_cache_dtype=self.mla_attn.kv_cache_dtype,
             )
 
         # Horizontally fused:
@@ -798,12 +807,21 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # Forward passes run outside the config context, so the engine's
         # sparse attention policy is kept with the layer.
         self.sm70_sparse = vllm_config.kernel_config.sm70_sparse
-        # DeepseekV4 only supports fp8 kv-cache format for now.
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
-
-        assert kv_cache_dtype.startswith("fp8"), (
-            f"DeepseekV4 only supports fp8 kv-cache format for now, "
-            f"got {kv_cache_dtype}"
+        codec = resolve_kv_codec(kv_cache_dtype, representation="mla_mixed")
+        if codec is None:
+            raise ValueError(f"Unsupported mixed MLA cache format: {kv_cache_dtype}")
+        if codec.native_id == 3 and not self.get_attn_backend().supports_kv_cache_dtype(
+            kv_cache_dtype
+        ):
+            raise ValueError(
+                f"{self.get_attn_backend().get_name()} has no binding for "
+                f"{kv_cache_dtype}"
+            )
+        self.kv_codec = codec
+        provider = getattr(self.get_attn_backend(), "get_kv_cache_layout", None)
+        self.kv_cache_layout = (
+            provider(self.head_dim, kv_cache_dtype) if provider else None
         )
         assert issubclass(self.get_attn_backend(), FlashMLASparseBackend), (
             "Only FlashMLA Sparse Attention backend is supported for DeepseekV4 for now"
@@ -843,11 +861,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_dim,
-            dtype=torch.uint8,
+            dtype=self.kv_codec.storage_dtype,
             compress_ratio=self.compress_ratio,
             cache_dtype_str=self.kv_cache_dtype,
             alignment=576,  # NOTE: FlashMLA requires 576B alignment
             model_version="deepseek_v4",
+            kv_cache_layout=self.kv_cache_layout,
         )
 
     def forward(
