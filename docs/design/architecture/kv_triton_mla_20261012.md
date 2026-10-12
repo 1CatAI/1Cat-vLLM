@@ -77,6 +77,14 @@ on the new no-tensor ABI probe's incorrect CUDA-only registration. Registering
 the probe through CompositeExplicitAutograd fixes normal dispatch; R3 exercises
 it through the real writer/gather/fusion calls. Numerical bounds were not changed.
 
+## Additional valid-partition gap
+
+A subsequent 8192-token single-partition case exposes an INT8 weighted-Half
+cast failure outside the initial short-context checks. Its unchanged limits,
+shared binary-rescaling repair and finite-value/graph boundary checks are in
+[weighted-partial qualification](kv_mla_weighted_tail_20261012.md). The initial
+68-case result does not cover that gap.
+
 ## Open gates
 
 This supplies R07 component bindings, not a final release or performance claim.

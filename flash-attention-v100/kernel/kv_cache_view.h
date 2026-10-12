@@ -113,7 +113,8 @@ inline KVScaleView bind_dense_scale_view(
   TORCH_CHECK(key_scale.has_value() == value_scale.has_value(),
               "Dense KV requires both scale planes or neither");
   return key_scale ? KVScaleView{bind_scale_plane(*key_scale, key),
-                                 bind_scale_plane(*value_scale, value)}
+                                 bind_scale_plane(*value_scale, value),
+                                 {}}
                    : KVScaleView{};
 }
 

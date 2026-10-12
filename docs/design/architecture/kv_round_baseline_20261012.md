@@ -43,3 +43,20 @@ Keep the current model and weights fixed. Reuse the historical complete-round
 protocol and frozen current paired corpus to separate runtime cost, cache
 attention cost, accepted drafts and milliseconds per emitted token.
 Profiled target/draft/communication service remains diagnostic only.
+
+## Reusable normal-API measurement
+
+`benchmarks/benchmark_sm70_dflash2_round_baseline.py` retains the eight-prompt,
+600-output, three sampling values, seed123 and 20-event warmup protocol using
+normal chat/completion metrics endpoints. It records streaming complete-round
+intervals separately from decode/round metrics, accepted draft tokens and cost
+per emitted token. Missing decode timing is rejected rather than reported as
+zero. It is a timing fixture with ignored EOS, not a quality qualification.
+
+The retained available Oct5 sampling-state fixture is copied without changes
+to `benchmarks/fixtures/sm70_dflash2_c1.json`, SHA256
+`f61c2b62fc869fc0bc677bcc8c7e6884348db37327ae0124b6284695d6607618`.
+An exact Oct8 fixture fingerprint has not been recovered, so this reuse does
+not establish byte-identical inputs for that older accepted result. New FP8
+and INT8 arms must use this same frozen fixture, record actual prompt usage
+and keep the historical admission as a separately identified reference.

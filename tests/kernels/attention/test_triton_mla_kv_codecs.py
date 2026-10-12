@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 CODECS = kv_codecs_for_representation("mla_concat")
 
 
-def allocate(codec, dim, page, padding=16, dense_dtype=None):
+def allocate(codec, dim, page, padding=16, dense_dtype=None, blocks=8):
     slot = dim + (4 if codec.native_id == 3 else 0)
     dtype = (
         torch.float8_e4m3fn
@@ -30,9 +30,9 @@ def allocate(codec, dim, page, padding=16, dense_dtype=None):
     )
     size = torch.empty(0, dtype=dtype).element_size()
     stride = page * slot + padding // size
-    owner = torch.empty(8 * stride, dtype=dtype, device="cuda")
+    owner = torch.empty(blocks * stride, dtype=dtype, device="cuda")
     owner.view(torch.uint8).fill_(43)
-    carrier = owner.as_strided((8, page, slot), (stride, slot, 1))
+    carrier = owner.as_strided((blocks, page, slot), (stride, slot, 1))
     scale = torch.tensor(0.03125, device="cuda", dtype=torch.float32)
     view = KVCacheView.bind_mla_concat(carrier, codec, dim, scale)
     return owner, carrier, view, scale
@@ -266,4 +266,117 @@ def test_fused_rope_writer_matches_shared_encoder(codec, dtype, is_neox):
 def test_bf16_query_actual_triton_mla(codec):
     test_actual_triton_mla_forward_codec_masks_and_changed_graph(
         codec, 512, 64, 16, 16, query_dtype=torch.bfloat16
+    )
+
+
+@pytest.mark.parametrize("codec", CODECS, ids=lambda c: c.name)
+def test_single_partition_mla_retains_small_weighted_tail_mass(codec):
+    from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
+
+    rank, dim, page, tokens = 256, 288, 64, 8192
+    _, cache, view, scale = allocate(codec, dim, page, blocks=tokens // page)
+    dtype = codec.storage_dtype if codec.native_id == 0 else torch.float16
+    values = torch.full((tokens, dim), 0.2, device="cuda", dtype=dtype)
+    values[:, rank:].zero_()
+    # Non-contiguous page order, with the dominant logit encountered first.
+    table = torch.arange(tokens // page - 1, -1, -1, device="cuda", dtype=torch.int32)[
+        None
+    ]
+    values[(tokens // page - 1) * page, :rank].neg_()
+    slots = torch.arange(tokens, device="cuda", dtype=torch.int64)
+    ops.concat_and_cache_mla(
+        values[:, :rank], values[:, rank:], cache, slots, codec.name, scale
+    )
+    query = torch.zeros((1, 16, dim), device="cuda", dtype=torch.float16)
+    query[..., 0] = -6 * dim**0.5 / float(values[0, 0])
+    output = torch.empty((1, 16, rank), device="cuda", dtype=query.dtype)
+    lse = torch.empty((1, 16), device="cuda", dtype=query.dtype)
+    partial = torch.empty((1, 16, 1, rank + 1), device="cuda", dtype=torch.float32)
+    lengths = torch.tensor([tokens], device="cuda", dtype=torch.int32)
+    decode_attention_fwd(
+        query,
+        view.key,
+        view.key[..., :rank],
+        output,
+        lse,
+        table,
+        lengths,
+        partial,
+        1,
+        dim**-0.5,
+        page,
+        k_scale=scale,
+        v_scale=scale,
+        is_mla=True,
+        cache_view=view,
+    )
+    rows = (
+        view.key.squeeze(2).double() * view.key_scale.double()
+        if codec.native_id == 3
+        else reconstructed(view, scale)
+    ).reshape(tokens, dim)
+    dominant, tail = rows[(tokens // page - 1) * page], rows[0]
+    dominant_logit = query[0, :, 0].double() * dominant[0] * dim**-0.5
+    tail_logit = query[0, :, 0].double() * tail[0] * dim**-0.5
+    tail_mass = (tokens - 1) * torch.exp(tail_logit - dominant_logit)
+    expected = (dominant[:rank] + tail_mass[:, None] * tail[:rank]) / (
+        1 + tail_mass[:, None]
+    )
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output[0].double(), expected, atol=0.004, rtol=0.03)
+
+
+@pytest.mark.parametrize(
+    "value,next_value", [(4062, 4064), (4064, 4062), (5000, 65504), (65504, 5000)]
+)
+def test_int8_large_finite_row_does_not_overflow_weighted_partial(value, next_value):
+    from vllm.v1.attention.kv_codecs import resolve_kv_codec
+    from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
+
+    codec = resolve_kv_codec("int8", representation="mla_concat")
+    _, cache, view, scale = allocate(codec, 288, 16)
+    values = torch.full((16, 288), value, device="cuda", dtype=torch.float16)
+    slots = torch.arange(16, device="cuda", dtype=torch.int64)
+    query = torch.zeros((1, 16, 288), device="cuda", dtype=torch.float16)
+    output = torch.empty((1, 16, 256), device="cuda", dtype=query.dtype)
+    partial = torch.empty((1, 16, 1, 257), device="cuda", dtype=torch.float32)
+    lse = torch.empty((1, 16), device="cuda", dtype=query.dtype)
+    table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([16], device="cuda", dtype=torch.int32)
+
+    def execute():
+        ops.concat_and_cache_mla(
+            values[:, :256], values[:, 256:], cache, slots, "int8", scale
+        )
+        decode_attention_fwd(
+            query,
+            view.key,
+            view.key[..., :256],
+            output,
+            lse,
+            table,
+            lengths,
+            partial,
+            1,
+            288**-0.5,
+            16,
+            k_scale=scale,
+            v_scale=scale,
+            is_mla=True,
+            cache_view=view,
+        )
+
+    execute()
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        output, torch.full_like(output, value), atol=0.004, rtol=0.03
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        execute()
+    values.fill_(next_value)
+    graph.replay()
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(
+        output, torch.full_like(output, next_value), atol=0.004, rtol=0.03
     )
