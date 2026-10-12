@@ -34,3 +34,15 @@ qualification remain open. The installation build began with parent
 `ac8be7ef26`; final artifacts must include this follow-up's source before
 promotion. Keep the earlier parent failure and initial bounded support scope
 visible in [concatenated MLA evidence](kv_triton_mla_20261012.md).
+
+## Normal artifact build gap
+
+The complete source build additionally exposes a missing aggregate initializer
+in `bind_dense_scale_view`: QSA added the shared page-mapping field, but the
+dense constructor still initialized only its two scale planes. The normal FA2
+Split-D translation unit fails with `-Werror=missing-field-initializers`.
+Initialize the existing third field with its default mapping, preserving the
+dense address and scale contracts. This is a build integration fix, not a new
+kernel path or numerical change. Keep the failed normal build separate from
+previous standalone component successes and require the complete artifact
+check and normal installation before release admission.
