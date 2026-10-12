@@ -64,6 +64,14 @@ def expression(node, values):
         }
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
         return expression(node.left, values) | expression(node.right, values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = expression(node.left, values), expression(node.right, values)
+        if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+            return list(left) + list(right)
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        declared = values.get(node.value.id)
+        if isinstance(declared, dict) and node.attr in declared:
+            return declared[node.attr]
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
@@ -172,7 +180,7 @@ def read_codecs(root):
         node = assignment(tree, symbol.id)
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
             raise DeclarationError(f"{symbol.id}: expected KVCodec declaration")
-        keywords = {k.arg: expression(k.value, {}) for k in node.keywords}
+        keywords = {k.arg: expression(k.value, known) for k in node.keywords}
         if node.func.id == "KVCodec":
             data = construct(spec, [expression(a, {}) for a in node.args], keywords)
         elif (

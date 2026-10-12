@@ -882,3 +882,18 @@ reference RN-division correction retain every numerical/storage bound.
 Actual execution, normal component fingerprints, old-binary behavior and
 remaining full-engine/quality/latency/lifecycle gates are recorded in
 [paged QSA qualification](kv_qsa_paged_20261012.md).
+
+## Shared grouped MLA latent codecs, 2026-10-12
+
+The GLM NoPE paged, gather/GEMM and batched GEMM executors share declared
+G64 codec/view bindings. FP8 keeps its UE8M0 scales and 520-byte slots; INT8
+uses FP32 group scales and 544-byte slots. Exact allocation is declared by
+the backend's layout instead of a model-name condition. Ordinary INT8 keeps
+its token/head representation. Old FP8 names remain compatibility aliases.
+
+Twenty-four new GPU checks and six existing GPU regressions pass, together
+with four existing CPU checks. The stacked representation/page/spec subset
+passes 62 CPU cases. Initial compiler/reference failures and their fixes,
+unchanged MLA numerical bounds and remaining engine/package/quality/latency
+gates are recorded in [latent MLA qualification](kv_mla_latent_20261012.md).
+R04/R07 and mixed MLA execution are not qualified by these view declarations.

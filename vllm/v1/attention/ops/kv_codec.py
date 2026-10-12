@@ -228,3 +228,49 @@ def encode_indexer_cache_group(
         else:
             encoded = normalized.to(tl.float8e4nv).to(tl.uint8, bitcast=True)
         return encoded, scale
+
+
+@triton.jit
+def encode_mla_cache_group(values, CODEC: tl.constexpr, AXIS: tl.constexpr = -1):
+    """G64 latent encoder; FP8 retains its UE8M0 division and rounding order."""
+    values = values.to(tl.float32)
+    if CODEC == 3:
+        scale = kv_token_head_scale(values, 127.0, True, AXIS)
+        return (
+            encode_kv_per_token_head(
+                values, tl.expand_dims(scale, AXIS), -128.0, 127.0, True
+            )
+            .to(tl.int8)
+            .to(tl.uint8, bitcast=True),
+            scale,
+        )
+    else:
+        tl.static_assert(CODEC == 1, "Missing MLA grouped encoder binding")
+        absolute = tl.maximum(tl.max(tl.abs(values), AXIS), 1e-4)
+        exponent = tl.ceil(tl.log2(absolute / 448.0))
+        normalized = tl.clamp(
+            values / tl.expand_dims(tl.exp2(exponent), AXIS), -448.0, 448.0
+        )
+        encoded = fp32_to_fp8_e4m3fn_bits(normalized)
+        scale = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.uint8)
+        return encoded, scale
+
+
+@triton.jit
+def decode_mla_cache_group(
+    payload, encoded_scale, CODEC: tl.constexpr, E4M3_BITS: tl.constexpr = False
+):
+    """Decode a latent group; unquantized representation fields stay separate."""
+    raw = decode_kv_payload(payload, CODEC, E4M3_BITS)
+    if CODEC == 3:
+        value = raw.to(tl.float32) * encoded_scale.to(tl.float32)
+        finite_scale = (encoded_scale == encoded_scale) & (
+            tl.abs(encoded_scale) != float("inf")
+        )
+        value = tl.where(finite_scale, tl.clamp(value, -65504.0, 65504.0), value)
+        return value.to(tl.float16)
+    else:
+        tl.static_assert(CODEC == 1, "Missing MLA grouped decoder binding")
+        # Preserve the existing FP8 reader's FP16 multiply by exponent scale.
+        scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0).to(tl.float16)
+        return raw.to(tl.float16) * scale

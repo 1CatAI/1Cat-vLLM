@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.kv_cache_view import MLAPageLayout
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -398,6 +399,8 @@ class MLAAttentionSpec(FullAttentionSpec):
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1  # Default to 1 for no compression.
     model_version: str | None = None
+    # Provider-declared representation; avoids inferring byte regions from a model.
+    kv_cache_layout: MLAPageLayout | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -407,8 +410,17 @@ class MLAAttentionSpec(FullAttentionSpec):
     def storage_block_size(self) -> int:
         return self.block_size // self.compress_ratio
 
+    def layout_cache_dtype(self, configured_dtype: str) -> str:
+        if self.kv_cache_layout is not None:
+            if self.cache_dtype_str is None:
+                raise ValueError("Grouped MLA layout requires its storage codec")
+            return self.cache_dtype_str
+        return super().layout_cache_dtype(configured_dtype)
+
     @property
     def real_page_size_bytes(self) -> int:
+        if self.kv_cache_layout is not None:
+            return self.kv_cache_layout.page_size_bytes(self.storage_block_size)
         if self.model_version == "glm5_next" and self.cache_dtype_str in {
             "fp8",
             "fp8_e4m3",
@@ -439,10 +451,12 @@ class MLAAttentionSpec(FullAttentionSpec):
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
+        layout_set = {spec.kv_cache_layout for spec in specs}
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
+            and len(layout_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, compress ratio, and model version."
@@ -458,6 +472,7 @@ class MLAAttentionSpec(FullAttentionSpec):
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
+            kv_cache_layout=layout_set.pop(),
         )
 
 

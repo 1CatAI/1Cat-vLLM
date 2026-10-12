@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Packed E4M3FN KV-cache kernels for GLM-5.3 NoPE MLA on SM70."""
+"""Shared grouped KV-cache kernels for NoPE MLA on SM70.
+
+Historical FP8 names remain compatibility aliases. Storage and scale addressing
+come from the common borrowed view; GEMM/paged algorithms stay shared.
+"""
 
 import torch
 
-from vllm.models.deepseek_v4.common.ops.fp8_software import (
-    fp8_e4m3fn_bits_to_fp32_bitcast,
-    fp32_to_fp8_e4m3fn_bits,
-)
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.kv_cache_view import KVCacheView
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
+from vllm.v1.attention.ops.kv_codec import (
+    decode_mla_cache_group,
+    encode_mla_cache_group,
+)
 
 GLM5_FP8_KV_DIM = 512
 GLM5_FP8_KV_GROUP_SIZE = 64
@@ -17,31 +23,38 @@ GLM5_FP8_KV_NUM_SCALES = GLM5_FP8_KV_DIM // GLM5_FP8_KV_GROUP_SIZE
 GLM5_FP8_KV_SLOT_BYTES = GLM5_FP8_KV_DIM + GLM5_FP8_KV_NUM_SCALES
 
 
+def _cache_view(cache: torch.Tensor, kv_cache_dtype: str) -> KVCacheView:
+    codec = resolve_kv_codec(kv_cache_dtype, representation="mla_latent")
+    if codec is None:
+        raise ValueError(f"Unsupported grouped MLA cache codec: {kv_cache_dtype}")
+    return KVCacheView.bind_mla(cache, codec, GLM5_FP8_KV_DIM)
+
+
 @triton.jit
 def _sm70_glm5_fp8_kv_insert_kernel(
     kv_ptr,
     slot_mapping_ptr,
     cache_ptr,
+    scales_ptr,
     cache_stride_block,
+    scales_stride_block,
+    scales_stride_token,
+    num_cache_slots,
     block_size: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     slot_idx = tl.load(slot_mapping_ptr + token_idx)
-    if slot_idx < 0:
+    if slot_idx < 0 or slot_idx >= num_cache_slots:
         return
 
     offsets = tl.arange(0, HEAD_DIM)
     values = tl.load(kv_ptr + token_idx * HEAD_DIM + offsets).to(tl.float32)
     grouped = tl.reshape(values, (NUM_GROUPS, GROUP_SIZE))
-    absmax = tl.max(tl.abs(grouped), axis=1)
-    absmax = tl.maximum(absmax, 1.0e-4)
-    exponent = tl.ceil(tl.log2(absmax / 448.0))
-    scales = tl.exp2(exponent)
-    quantized = tl.clamp(grouped / scales[:, None], -448.0, 448.0)
-    packed = fp32_to_fp8_e4m3fn_bits(quantized)
+    packed, encoded_scales = encode_mla_cache_group(grouped, CODEC, 1)
 
     block_idx = slot_idx // block_size
     pos_in_block = slot_idx % block_size
@@ -50,8 +63,11 @@ def _sm70_glm5_fp8_kv_insert_kernel(
     tl.store(token_data + offsets, tl.reshape(packed, (HEAD_DIM,)))
 
     scale_offsets = tl.arange(0, NUM_GROUPS)
-    encoded_scales = tl.clamp(exponent + 127.0, 0.0, 255.0).to(tl.uint8)
-    token_scales = block_base + block_size * HEAD_DIM + pos_in_block * NUM_GROUPS
+    token_scales = (
+        scales_ptr
+        + block_idx.to(tl.int64) * scales_stride_block
+        + pos_in_block * scales_stride_token
+    )
     tl.store(token_scales + scale_offsets, encoded_scales)
 
 
@@ -59,12 +75,15 @@ def _sm70_glm5_fp8_kv_insert_kernel(
 def _sm70_glm5_sparse_paged_fp8_kernel(
     q_ptr,
     cache_ptr,
+    scales_ptr,
     indices_ptr,
     lengths_ptr,
     out_ptr,
     q_stride_t,
     q_stride_h,
     cache_stride_block,
+    scales_stride_block,
+    scales_stride_token,
     indices_stride_t,
     out_stride_t,
     out_stride_h,
@@ -77,6 +96,7 @@ def _sm70_glm5_sparse_paged_fp8_kernel(
     BLOCK_K: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     head_offsets = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -116,7 +136,9 @@ def _sm70_glm5_sparse_paged_fp8_kernel(
         block_base = cache_ptr + block_idx.to(tl.int64) * cache_stride_block
         token_data = block_base + pos_in_block * HEAD_DIM
         token_scales = (
-            block_base + block_size * HEAD_DIM + pos_in_block * (HEAD_DIM // GROUP_SIZE)
+            scales_ptr
+            + block_idx.to(tl.int64) * scales_stride_block
+            + pos_in_block * scales_stride_token
         )
 
         packed = tl.load(
@@ -124,21 +146,15 @@ def _sm70_glm5_sparse_paged_fp8_kernel(
             mask=valid[:, None],
             other=0,
         )
-        fp8 = fp8_e4m3fn_bits_to_fp32_bitcast(packed)
         scale_group_offsets = tl.arange(0, HEAD_DIM // GROUP_SIZE)
         encoded_scale = tl.load(
             token_scales[:, None] + scale_group_offsets[None, :],
             mask=valid[:, None],
             other=127,
         )
-        dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
-        fp8_grouped = tl.reshape(fp8, (BLOCK_K, HEAD_DIM // GROUP_SIZE, GROUP_SIZE))
-        scale_grouped = tl.reshape(
-            dequant_scale.to(tl.float16),
-            (BLOCK_K, HEAD_DIM // GROUP_SIZE, 1),
-        )
+        grouped = tl.reshape(packed, (BLOCK_K, HEAD_DIM // GROUP_SIZE, GROUP_SIZE))
         kv = tl.reshape(
-            fp8_grouped.to(tl.float16) * scale_grouped,
+            decode_mla_cache_group(grouped, encoded_scale[:, :, None], CODEC, True),
             (BLOCK_K, HEAD_DIM),
         )
         kv = tl.where(valid[:, None], kv, 0.0)
@@ -169,15 +185,19 @@ def _sm70_glm5_sparse_paged_fp8_kernel(
 @triton.jit
 def _sm70_glm5_fp8_kv_gather_dequant_kernel(
     cache_ptr,
+    scales_ptr,
     indices_ptr,
     lengths_ptr,
     gathered_ptr,
     cache_stride_block,
+    scales_stride_block,
+    scales_stride_token,
     num_cache_slots,
     block_size,
     INDEX_WIDTH: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     position = tl.program_id(0)
     dim_offsets = tl.arange(0, HEAD_DIM)
@@ -190,21 +210,21 @@ def _sm70_glm5_fp8_kv_gather_dequant_kernel(
     block_base = cache_ptr + block_idx.to(tl.int64) * cache_stride_block
     token_data = block_base + pos_in_block * HEAD_DIM
     token_scales = (
-        block_base + block_size * HEAD_DIM + pos_in_block * (HEAD_DIM // GROUP_SIZE)
+        scales_ptr
+        + block_idx.to(tl.int64) * scales_stride_block
+        + pos_in_block * scales_stride_token
     )
 
     packed = tl.load(token_data + dim_offsets, mask=valid, other=0)
-    fp8 = fp8_e4m3fn_bits_to_fp32_bitcast(packed)
     scale_group_offsets = tl.arange(0, HEAD_DIM // GROUP_SIZE)
     encoded_scale = tl.load(
         token_scales + scale_group_offsets,
         mask=valid,
         other=127,
     )
-    scales = tl.exp2(encoded_scale.to(tl.float32) - 127.0).to(tl.float16)
-    grouped = tl.reshape(fp8, (HEAD_DIM // GROUP_SIZE, GROUP_SIZE))
+    grouped = tl.reshape(packed, (HEAD_DIM // GROUP_SIZE, GROUP_SIZE))
     dequantized = tl.reshape(
-        grouped.to(tl.float16) * scales[:, None],
+        decode_mla_cache_group(grouped, encoded_scale[:, None], CODEC, True),
         (HEAD_DIM,),
     )
     tl.store(
@@ -216,10 +236,13 @@ def _sm70_glm5_fp8_kv_gather_dequant_kernel(
 @triton.jit
 def _sm70_glm5_fp8_kv_gather_dequant_batched_kernel(
     cache_ptr,
+    scales_ptr,
     indices_ptr,
     lengths_ptr,
     gathered_ptr,
     cache_stride_block,
+    scales_stride_block,
+    scales_stride_token,
     indices_stride_t,
     gathered_stride_t,
     gathered_stride_k,
@@ -228,6 +251,7 @@ def _sm70_glm5_fp8_kv_gather_dequant_batched_kernel(
     INDEX_WIDTH: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    CODEC: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
     position = tl.program_id(1)
@@ -245,21 +269,21 @@ def _sm70_glm5_fp8_kv_gather_dequant_batched_kernel(
     block_base = cache_ptr + block_idx.to(tl.int64) * cache_stride_block
     token_data = block_base + pos_in_block * HEAD_DIM
     token_scales = (
-        block_base + block_size * HEAD_DIM + pos_in_block * (HEAD_DIM // GROUP_SIZE)
+        scales_ptr
+        + block_idx.to(tl.int64) * scales_stride_block
+        + pos_in_block * scales_stride_token
     )
 
     packed = tl.load(token_data + dim_offsets, mask=valid, other=0)
-    fp8 = fp8_e4m3fn_bits_to_fp32_bitcast(packed)
     scale_group_offsets = tl.arange(0, HEAD_DIM // GROUP_SIZE)
     encoded_scale = tl.load(
         token_scales + scale_group_offsets,
         mask=valid,
         other=127,
     )
-    scales = tl.exp2(encoded_scale.to(tl.float32) - 127.0).to(tl.float16)
-    grouped = tl.reshape(fp8, (HEAD_DIM // GROUP_SIZE, GROUP_SIZE))
+    grouped = tl.reshape(packed, (HEAD_DIM // GROUP_SIZE, GROUP_SIZE))
     dequantized = tl.reshape(
-        grouped.to(tl.float16) * scales[:, None],
+        decode_mla_cache_group(grouped, encoded_scale[:, None], CODEC, True),
         (HEAD_DIM,),
     )
     tl.store(
@@ -373,24 +397,32 @@ def sm70_glm5_fp8_kv_insert(
     kv: torch.Tensor,
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
+    *,
+    kv_cache_dtype: str = "fp8",
 ) -> None:
     """Quantize FP16 latent KV into the packed GLM-5.3 paged layout."""
     assert kv.dtype == torch.float16 and kv.ndim == 2
     assert kv.shape[1] == GLM5_FP8_KV_DIM and kv.is_contiguous()
-    assert cache.dtype == torch.uint8 and cache.ndim == 3
-    assert cache.shape[2] == GLM5_FP8_KV_SLOT_BYTES
+    view = _cache_view(cache, kv_cache_dtype)
+    assert view.key_scale is not None
+    assert kv.device == slot_mapping.device == cache.device
     num_tokens = slot_mapping.numel()
     if num_tokens == 0:
         return
     _sm70_glm5_fp8_kv_insert_kernel[(num_tokens,)](
         kv,
         slot_mapping,
-        cache,
-        cache.stride(0),
+        view.key,
+        view.key_scale,
+        view.key.stride(0),
+        view.key_scale.stride(0),
+        view.key_scale.stride(1),
+        cache.shape[0] * cache.shape[1],
         block_size=cache.shape[1],
         HEAD_DIM=GLM5_FP8_KV_DIM,
         GROUP_SIZE=GLM5_FP8_KV_GROUP_SIZE,
         NUM_GROUPS=GLM5_FP8_KV_NUM_SCALES,
+        CODEC=view.codec.native_id,
         num_warps=8,
     )
 
@@ -402,12 +434,14 @@ def sm70_glm5_sparse_attention_paged_fp8(
     lengths: torch.Tensor,
     scale: float,
     out: torch.Tensor,
+    *,
+    kv_cache_dtype: str = "fp8",
 ) -> None:
     """Run sparse NoPE MLA directly over the packed GLM-5.3 FP8 cache."""
     assert q.dtype == out.dtype == torch.float16
     assert q.shape == out.shape and q.shape[-1] == GLM5_FP8_KV_DIM
-    assert cache.dtype == torch.uint8 and cache.ndim == 3
-    assert cache.shape[2] == GLM5_FP8_KV_SLOT_BYTES
+    view = _cache_view(cache, kv_cache_dtype)
+    assert view.key_scale is not None
     indices_2d = indices.reshape(q.shape[0], -1)
     lengths_1d = lengths.reshape(-1).to(torch.int32)
     assert indices_2d.shape[0] == q.shape[0] == lengths_1d.shape[0]
@@ -415,13 +449,16 @@ def sm70_glm5_sparse_attention_paged_fp8(
     block_h = 8
     _sm70_glm5_sparse_paged_fp8_kernel[(q.shape[0], triton.cdiv(q.shape[1], block_h))](
         q,
-        cache,
+        view.key,
+        view.key_scale,
         indices_2d,
         lengths_1d,
         out,
         q.stride(0),
         q.stride(1),
-        cache.stride(0),
+        view.key.stride(0),
+        view.key_scale.stride(0),
+        view.key_scale.stride(1),
         indices_2d.stride(0),
         out.stride(0),
         out.stride(1),
@@ -434,6 +471,7 @@ def sm70_glm5_sparse_attention_paged_fp8(
         BLOCK_K=16,
         HEAD_DIM=GLM5_FP8_KV_DIM,
         GROUP_SIZE=GLM5_FP8_KV_GROUP_SIZE,
+        CODEC=view.codec.native_id,
         num_warps=4,
     )
 
@@ -448,13 +486,15 @@ def sm70_glm5_sparse_attention_paged_fp8_gemm(
     gathered_kv: torch.Tensor,
     scores: torch.Tensor,
     probs: torch.Tensor,
+    *,
+    kv_cache_dtype: str = "fp8",
 ) -> None:
     """Run B1 sparse MLA with an SM70 dequant + tensor-core GEMM pipeline."""
     assert q.dtype == out.dtype == torch.float16
     assert q.shape == out.shape and q.shape[-1] == GLM5_FP8_KV_DIM
     assert q.shape[0] == 1
-    assert cache.dtype == torch.uint8 and cache.ndim == 3
-    assert cache.shape[2] == GLM5_FP8_KV_SLOT_BYTES
+    view = _cache_view(cache, kv_cache_dtype)
+    assert view.key_scale is not None
     indices_2d = indices.reshape(1, -1)
     lengths_1d = lengths.reshape(-1).to(torch.int32)
     index_width = indices_2d.shape[1]
@@ -466,16 +506,20 @@ def sm70_glm5_sparse_attention_paged_fp8_gemm(
     assert scores.is_contiguous() and probs.is_contiguous()
 
     _sm70_glm5_fp8_kv_gather_dequant_kernel[(index_width,)](
-        cache,
+        view.key,
+        view.key_scale,
         indices_2d,
         lengths_1d,
         gathered_kv,
-        cache.stride(0),
+        view.key.stride(0),
+        view.key_scale.stride(0),
+        view.key_scale.stride(1),
         cache.shape[0] * cache.shape[1],
         cache.shape[1],
         INDEX_WIDTH=index_width,
         HEAD_DIM=GLM5_FP8_KV_DIM,
         GROUP_SIZE=GLM5_FP8_KV_GROUP_SIZE,
+        CODEC=view.codec.native_id,
         num_warps=4,
     )
     torch.mm(q[0], gathered_kv.t(), out=scores)
@@ -504,12 +548,14 @@ def sm70_glm5_sparse_attention_paged_fp8_batched_gemm(
     gathered_kv: torch.Tensor,
     scores: torch.Tensor,
     probs: torch.Tensor,
+    *,
+    kv_cache_dtype: str = "fp8",
 ) -> None:
     """Run small-batch sparse MLA with the B1 tensor-core arithmetic path."""
     assert q.dtype == out.dtype == torch.float16
     assert q.shape == out.shape and q.shape[-1] == GLM5_FP8_KV_DIM
-    assert cache.dtype == torch.uint8 and cache.ndim == 3
-    assert cache.shape[2] == GLM5_FP8_KV_SLOT_BYTES
+    view = _cache_view(cache, kv_cache_dtype)
+    assert view.key_scale is not None
     num_tokens, num_heads = q.shape[:2]
     indices_2d = indices.reshape(num_tokens, -1)
     lengths_1d = lengths.reshape(-1).to(torch.int32)
@@ -522,11 +568,14 @@ def sm70_glm5_sparse_attention_paged_fp8_batched_gemm(
     assert scores.is_contiguous() and probs.is_contiguous()
 
     _sm70_glm5_fp8_kv_gather_dequant_batched_kernel[(num_tokens, index_width)](
-        cache,
+        view.key,
+        view.key_scale,
         indices_2d,
         lengths_1d,
         gathered_kv,
-        cache.stride(0),
+        view.key.stride(0),
+        view.key_scale.stride(0),
+        view.key_scale.stride(1),
         indices_2d.stride(0),
         gathered_kv.stride(0),
         gathered_kv.stride(1),
@@ -535,6 +584,7 @@ def sm70_glm5_sparse_attention_paged_fp8_batched_gemm(
         INDEX_WIDTH=index_width,
         HEAD_DIM=GLM5_FP8_KV_DIM,
         GROUP_SIZE=GLM5_FP8_KV_GROUP_SIZE,
+        CODEC=view.codec.native_id,
         num_warps=4,
     )
     torch.bmm(q, gathered_kv.transpose(1, 2), out=scores)
@@ -559,3 +609,12 @@ def sm70_glm5_sparse_attention_paged_fp8_batched_gemm(
     # arithmetic as B1 so speculative verification preserves target logits.
     for token_idx in range(num_tokens):
         torch.mm(probs[token_idx], gathered_kv[token_idx], out=out[token_idx])
+
+
+# One implementation and schedule; retain historical entry points for callers.
+sm70_glm5_kv_insert = sm70_glm5_fp8_kv_insert
+sm70_glm5_sparse_attention_paged = sm70_glm5_sparse_attention_paged_fp8
+sm70_glm5_sparse_attention_paged_gemm = sm70_glm5_sparse_attention_paged_fp8_gemm
+sm70_glm5_sparse_attention_paged_batched_gemm = (
+    sm70_glm5_sparse_attention_paged_fp8_batched_gemm
+)
