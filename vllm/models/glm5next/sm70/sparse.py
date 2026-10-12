@@ -16,11 +16,10 @@ from vllm.models.deepseek_v4.sm70.sparse_kernels import (
     sm70_sparse_attention_gathered,
 )
 from vllm.models.glm5next.sm70.fp8_kv import (
-    GLM5_FP8_KV_SLOT_BYTES,
-    sm70_glm5_fp8_kv_insert,
-    sm70_glm5_sparse_attention_paged_fp8,
-    sm70_glm5_sparse_attention_paged_fp8_batched_gemm,
-    sm70_glm5_sparse_attention_paged_fp8_gemm,
+    sm70_glm5_kv_insert,
+    sm70_glm5_sparse_attention_paged,
+    sm70_glm5_sparse_attention_paged_batched_gemm,
+    sm70_glm5_sparse_attention_paged_gemm,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionLayer, SparseMLAAttentionImpl
@@ -31,6 +30,8 @@ from vllm.v1.attention.backends.mla.flashmla_sparse import (
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
 )
+from vllm.v1.attention.kv_cache_view import MLAPageLayout
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
@@ -48,6 +49,7 @@ class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
         "float16",
         "fp8",
         "fp8_e4m3",
+        "int8",
     ]
 
     @staticmethod
@@ -71,9 +73,25 @@ class Glm5NextSM70SparseBackend(FlashMLASparseBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         del num_kv_heads
-        if cache_dtype_str in {"fp8", "fp8_e4m3"}:
-            return (num_blocks, block_size, GLM5_FP8_KV_SLOT_BYTES)
+        layout = Glm5NextSM70SparseBackend.get_kv_cache_layout(
+            head_size, cache_dtype_str
+        )
+        if layout is not None:
+            return (num_blocks, block_size, layout.slot_bytes)
         return (num_blocks, block_size, head_size)
+
+    @staticmethod
+    def get_kv_cache_layout(
+        head_size: int, cache_dtype_str: str
+    ) -> MLAPageLayout | None:
+        codec = resolve_kv_codec(cache_dtype_str, representation="mla_latent")
+        if codec is None:
+            return None
+        if head_size != 512:
+            raise ValueError("This NoPE MLA provider requires a 512-wide latent")
+        return MLAPageLayout(
+            head_size, scale_bytes=4 if codec.scale_encoding == "fp32" else 1
+        )
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
@@ -128,9 +146,10 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             raise NotImplementedError(
                 "GLM-5.3 SM70 sparse MLA requires one 512-wide latent KV head."
             )
-        if kv_cache_dtype not in {"auto", "float16", "fp8", "fp8_e4m3"}:
+        codec = resolve_kv_codec(kv_cache_dtype, representation="mla_latent")
+        if codec is None and kv_cache_dtype not in {"auto", "float16"}:
             raise NotImplementedError(
-                "GLM-5.3 SM70 sparse MLA supports FP16 or E4M3 KV cache."
+                "NoPE SM70 sparse MLA supports FP16, E4M3 or INT8 KV cache."
             )
         if mla_args["qk_rope_head_dim"] != 0 or mla_args["kv_lora_rank"] != 512:
             raise NotImplementedError(
@@ -145,7 +164,9 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         self.softmax_scale = float(scale)
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
-        self.use_fp8_cache = kv_cache_dtype in {"fp8", "fp8_e4m3"}
+        self.kv_codec = codec
+        self.use_quantized_cache = codec is not None
+        self.use_fp8_cache = codec is not None and codec.native_id == 1
         self.kv_lora_rank = 512
         topk_indices_buffer = indexer.topk_indices_buffer
         if topk_indices_buffer is None:
@@ -161,7 +182,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
             ((max_tokens, num_heads, self.kv_lora_rank), torch.float16),
         ]
-        if self.use_fp8_cache:
+        if self.use_quantized_cache:
             workspace_specs.extend(
                 (
                     (
@@ -185,10 +206,10 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         current_workspace_manager().get_simultaneous(*workspace_specs)
         logger.info_once(
             "GLM-5.3-Flash route: SM70 FP16 sparse MLA with %s KV%s.",
-            "packed E4M3FN" if self.use_fp8_cache else "FP16",
+            codec.name if codec is not None else "FP16",
             (
                 " and B1/M2-M8 dequant + tensor-core GEMM decode"
-                if self.use_fp8_cache
+                if self.use_quantized_cache
                 else ""
             ),
         )
@@ -202,7 +223,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         kv_cache_dtype: str,
         k_scale: torch.Tensor,
     ) -> None:
-        if not self.use_fp8_cache:
+        if not self.use_quantized_cache:
             return super().do_kv_cache_update(
                 kv_c_normed,
                 k_pe,
@@ -211,15 +232,17 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 kv_cache_dtype,
                 k_scale,
             )
+        assert self.kv_codec is not None
         del k_scale
         if kv_cache.numel() == 0 or slot_mapping is None:
             return
         if k_pe.shape[-1] != 0:
             raise NotImplementedError("GLM-5.3 packed FP8 KV is NoPE-only.")
-        sm70_glm5_fp8_kv_insert(
+        sm70_glm5_kv_insert(
             kv_c_normed,
-            kv_cache.view(torch.uint8),
+            kv_cache.view(self.kv_codec.storage_dtype),
             slot_mapping.flatten(),
+            kv_cache_dtype=self.kv_cache_dtype,
         )
 
     def forward_mqa(
@@ -287,7 +310,8 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 )
                 diagnostic_history("glm_sparse_indices")["seen"] = True
         workspace_manager = current_workspace_manager()
-        if self.use_fp8_cache:
+        if self.use_quantized_cache:
+            assert self.kv_codec is not None
             if num_tokens == 1:
                 out, gathered_kv, scores, probs = workspace_manager.get_simultaneous(
                     ((1, self.num_heads, self.kv_lora_rank), torch.float16),
@@ -295,9 +319,9 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     ((self.num_heads, self.index_width), torch.float16),
                     ((self.num_heads, self.index_width), torch.float16),
                 )
-                sm70_glm5_sparse_attention_paged_fp8_gemm(
+                sm70_glm5_sparse_attention_paged_gemm(
                     q,
-                    kv_c_and_k_pe_cache.view(torch.uint8),
+                    kv_c_and_k_pe_cache.view(self.kv_codec.storage_dtype),
                     global_indices,
                     valid_counts,
                     self.softmax_scale,
@@ -305,6 +329,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     gathered_kv,
                     scores,
                     probs,
+                    kv_cache_dtype=self.kv_cache_dtype,
                 )
             elif num_tokens <= self.fp8_gemm_max_tokens:
                 out, gathered_kv, scores, probs = workspace_manager.get_simultaneous(
@@ -325,9 +350,9 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                         torch.float16,
                     ),
                 )
-                sm70_glm5_sparse_attention_paged_fp8_batched_gemm(
+                sm70_glm5_sparse_attention_paged_batched_gemm(
                     q,
-                    kv_c_and_k_pe_cache.view(torch.uint8),
+                    kv_c_and_k_pe_cache.view(self.kv_codec.storage_dtype),
                     global_indices,
                     valid_counts,
                     self.softmax_scale,
@@ -335,6 +360,7 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                     gathered_kv,
                     scores,
                     probs,
+                    kv_cache_dtype=self.kv_cache_dtype,
                 )
             else:
                 (out,) = workspace_manager.get_simultaneous(
@@ -343,13 +369,14 @@ class Glm5NextSM70SparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                         torch.float16,
                     ),
                 )
-                sm70_glm5_sparse_attention_paged_fp8(
+                sm70_glm5_sparse_attention_paged(
                     q,
-                    kv_c_and_k_pe_cache.view(torch.uint8),
+                    kv_c_and_k_pe_cache.view(self.kv_codec.storage_dtype),
                     global_indices,
                     valid_counts,
                     self.softmax_scale,
                     out,
+                    kv_cache_dtype=self.kv_cache_dtype,
                 )
         else:
             if kv_c_and_k_pe_cache.dtype != torch.float16:

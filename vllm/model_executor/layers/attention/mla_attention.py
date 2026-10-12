@@ -971,13 +971,20 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             and self.kv_cache_dtype in {"fp8", "fp8_e4m3"}
             else None
         )
+        layout_provider = getattr(self.attn_backend, "get_kv_cache_layout", None)
+        storage_layout = (
+            layout_provider(self.head_size, self.kv_cache_dtype)
+            if callable(layout_provider)
+            else None
+        )
         return MLAAttentionSpec(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
-            cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            cache_dtype_str=self.kv_cache_dtype,
             model_version=model_version,
+            kv_cache_layout=storage_layout,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):

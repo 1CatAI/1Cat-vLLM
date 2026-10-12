@@ -104,9 +104,14 @@ class KVCodec:
             grouped = self._group_values(cache.view(self.element_dtype).float())
             if not isinstance(scale, torch.Tensor) or scale.shape != grouped.shape[:-1]:
                 raise ValueError("Grouped decoding needs one scale per token/group")
-            decoded = grouped * scale[..., None]
+            decoded_scale = (
+                torch.exp2(scale.float() - 127)
+                if self.scale_encoding == "ue8m0"
+                else scale
+            )
+            decoded = grouped * decoded_scale[..., None]
             if self.element_dtype == torch.int8:
-                limit = torch.finfo(out_dtype).max
+                limit = min(torch.finfo(out_dtype).max, torch.finfo(decoded.dtype).max)
                 decoded = torch.where(
                     torch.isfinite(scale[..., None]),
                     decoded.clamp(-limit, limit),
@@ -279,12 +284,45 @@ HISTORY_FP8 = replace(
     layout="history_planes",
 )
 HISTORY_INT8 = replace(INT8, representation="history", layout="history_planes")
+MLA_LATENT_FP8 = replace(
+    FP8_E4M3,
+    representation="mla_latent",
+    scale_granularity="token_group",
+    group_axis=-1,
+    group_size=64,
+    scale_dtype=torch.uint8,
+    scale_encoding="ue8m0",
+    layout="group_planar",
+)
+MLA_LATENT_INT8 = replace(
+    INT8,
+    representation="mla_latent",
+    scale_granularity="token_group",
+    group_axis=-1,
+    group_size=64,
+    layout="group_planar",
+)
+MLA_MIXED_FP8 = replace(
+    MLA_LATENT_FP8,
+    aliases=FP8_E4M3.aliases + ("fp8_ds_mla",),
+    representation="mla_mixed",
+    unquantized_fields=("rope",),
+)
+MLA_MIXED_INT8 = replace(
+    MLA_LATENT_INT8,
+    representation="mla_mixed",
+    unquantized_fields=("rope",),
+)
 KV_REPRESENTATION_CODECS = (
     INDEXER_FP8,
     INDEXER_INT8,
     HISTORY_FP16,
     HISTORY_FP8,
     HISTORY_INT8,
+    MLA_LATENT_FP8,
+    MLA_LATENT_INT8,
+    MLA_MIXED_FP8,
+    MLA_MIXED_INT8,
 )
 
 
@@ -300,14 +338,16 @@ def resolve_kv_codec(
     """Map a ``kv_cache_dtype`` string to its codec; ``None`` if unknown."""
     if kv_cache_dtype is None:
         return None
-    codec = _BY_ALIAS.get(kv_cache_dtype)
-    if representation == "ordinary" or codec is None:
-        return codec
+    if representation == "ordinary":
+        return _BY_ALIAS.get(kv_cache_dtype)
     return next(
         (
             bound
             for bound in KV_REPRESENTATION_CODECS
-            if bound.representation == representation and bound.name == codec.name
+            if (
+                bound.representation == representation
+                and kv_cache_dtype in bound.aliases
+            )
         ),
         None,
     )

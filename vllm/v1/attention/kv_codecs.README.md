@@ -25,6 +25,15 @@ The descriptor is immutable. Cache allocation, page/stride contracts, persistent
 metadata, capture addresses and workspace lifetime belong to the cache manager,
 metadata builder and attention resource owners, not the codec.
 
+Representation codecs additionally describe grouped MLA latent payloads and
+latent plus unquantized RoPE. `MLAPageLayout` supplies exact data/scale byte
+budgets; `KVCacheView.bind_mla` borrows these fields without allocating another
+cache. G64 E4M3 retains UE8M0 scales and its numerical order. Grouped INT8 uses
+FP32 scales and nearest-even encoding. Neither representation changes ordinary
+INT8's token/head scale axis. The GLM NoPE paged, gather/GEMM and batched GEMM
+algorithms now share these bindings; other MLA execution remains separately
+qualified in the [coverage inventory](../../../docs/design/architecture/kv_fastpath_inventory.md).
+
 ## Admission, execution and fallback
 
 The [Flash-V100 component](backends/flash_v100/README.md) combines codec identity

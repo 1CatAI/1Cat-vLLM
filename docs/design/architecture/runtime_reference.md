@@ -99,18 +99,22 @@ A registered storage descriptor does not establish native support.
 
 | Symbol | Canonical / aliases | Storage / element | Representation / group | Version / layout | Scales / rounding | Native codec ID | Source |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| FP16 | auto / auto, float16 | torch.float16 / None | ordinary / None:0 | 1 / dense | none (None, none) / none | 0 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L177) |
-| BF16 | bfloat16 / bfloat16 | torch.bfloat16 / None | ordinary / None:0 | 1 / dense | none (None, none) / none | None | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L178) |
-| FP8_E4M3 | fp8_e4m3 / fp8, fp8_e4m3 | torch.uint8 / torch.float8_e4m3fn | ordinary / None:0 | 1 / dense | tensor (torch.float32, fp32) / nearest_even | 1 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L179) |
-| FP8_E5M2 | fp8_e5m2 / fp8_e5m2 | torch.uint8 / torch.float8_e5m2 | ordinary / None:0 | 1 / dense | tensor (torch.float32, fp32) / nearest_even | 2 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L191) |
-| INT8 | int8 / int8 | torch.int8 / torch.int8 | ordinary / None:0 | 1 / planar_scales | token_head (torch.float32, fp32) / nearest_even | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L203) |
-| INT8_PER_TOKEN_HEAD | int8_per_token_head / int8_per_token_head | torch.int8 / torch.int8 | ordinary / None:0 | 1 / inline_scale | token_head (torch.float32, fp32) / truncate | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L216) |
-| FP8_PER_TOKEN_HEAD | fp8_per_token_head / fp8_per_token_head | torch.uint8 / torch.float8_e4m3fn | ordinary / None:0 | 1 / inline_scale | token_head (torch.float32, fp32) / nearest_even | None | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L229) |
-| INDEXER_FP8 | fp8_e4m3 / fp8, fp8_e4m3 | torch.uint8 / torch.float8_e4m3fn | indexer / -1:128 | 1 / group_planar | token_group (torch.float32, fp32) / nearest_even | 1 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L255) |
-| INDEXER_INT8 | int8 / int8 | torch.int8 / torch.int8 | indexer / -1:128 | 1 / group_planar | token_group (torch.float32, fp32) / nearest_even | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L263) |
-| HISTORY_FP16 | auto / auto, float16 | torch.float16 / None | history / None:0 | 1 / history_planes | none (None, none) / none | 0 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L271) |
-| HISTORY_FP8 | fp8_e4m3 / fp8, fp8_e4m3 | torch.uint8 / torch.float8_e4m3fn | history / None:0 | 1 / history_planes | token_head (torch.float32, fp32) / nearest_even | 1 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L272) |
-| HISTORY_INT8 | int8 / int8 | torch.int8 / torch.int8 | history / None:0 | 1 / history_planes | token_head (torch.float32, fp32) / nearest_even | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L281) |
+| FP16 | auto / auto, float16 | torch.float16 / None | ordinary / None:0 | 1 / dense | none (None, none) / none | 0 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L182) |
+| BF16 | bfloat16 / bfloat16 | torch.bfloat16 / None | ordinary / None:0 | 1 / dense | none (None, none) / none | None | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L183) |
+| FP8_E4M3 | fp8_e4m3 / fp8, fp8_e4m3 | torch.uint8 / torch.float8_e4m3fn | ordinary / None:0 | 1 / dense | tensor (torch.float32, fp32) / nearest_even | 1 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L184) |
+| FP8_E5M2 | fp8_e5m2 / fp8_e5m2 | torch.uint8 / torch.float8_e5m2 | ordinary / None:0 | 1 / dense | tensor (torch.float32, fp32) / nearest_even | 2 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L196) |
+| INT8 | int8 / int8 | torch.int8 / torch.int8 | ordinary / None:0 | 1 / planar_scales | token_head (torch.float32, fp32) / nearest_even | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L208) |
+| INT8_PER_TOKEN_HEAD | int8_per_token_head / int8_per_token_head | torch.int8 / torch.int8 | ordinary / None:0 | 1 / inline_scale | token_head (torch.float32, fp32) / truncate | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L221) |
+| FP8_PER_TOKEN_HEAD | fp8_per_token_head / fp8_per_token_head | torch.uint8 / torch.float8_e4m3fn | ordinary / None:0 | 1 / inline_scale | token_head (torch.float32, fp32) / nearest_even | None | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L234) |
+| INDEXER_FP8 | fp8_e4m3 / fp8, fp8_e4m3 | torch.uint8 / torch.float8_e4m3fn | indexer / -1:128 | 1 / group_planar | token_group (torch.float32, fp32) / nearest_even | 1 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L260) |
+| INDEXER_INT8 | int8 / int8 | torch.int8 / torch.int8 | indexer / -1:128 | 1 / group_planar | token_group (torch.float32, fp32) / nearest_even | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L268) |
+| HISTORY_FP16 | auto / auto, float16 | torch.float16 / None | history / None:0 | 1 / history_planes | none (None, none) / none | 0 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L276) |
+| HISTORY_FP8 | fp8_e4m3 / fp8, fp8_e4m3 | torch.uint8 / torch.float8_e4m3fn | history / None:0 | 1 / history_planes | token_head (torch.float32, fp32) / nearest_even | 1 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L277) |
+| HISTORY_INT8 | int8 / int8 | torch.int8 / torch.int8 | history / None:0 | 1 / history_planes | token_head (torch.float32, fp32) / nearest_even | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L286) |
+| MLA_LATENT_FP8 | fp8_e4m3 / fp8, fp8_e4m3 | torch.uint8 / torch.float8_e4m3fn | mla_latent / -1:64 | 1 / group_planar | token_group (torch.uint8, ue8m0) / nearest_even | 1 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L287) |
+| MLA_LATENT_INT8 | int8 / int8 | torch.int8 / torch.int8 | mla_latent / -1:64 | 1 / group_planar | token_group (torch.float32, fp32) / nearest_even | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L297) |
+| MLA_MIXED_FP8 | fp8_e4m3 / fp8, fp8_e4m3, fp8_ds_mla | torch.uint8 / torch.float8_e4m3fn | mla_mixed / -1:64 | 1 / group_planar | token_group (torch.uint8, ue8m0) / nearest_even | 1 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L305) |
+| MLA_MIXED_INT8 | int8 / int8 | torch.int8 / torch.int8 | mla_mixed / -1:64 | 1 / group_planar | token_group (torch.float32, fp32) / nearest_even | 3 | [vllm/v1/attention/kv_codecs.py](../../../vllm/v1/attention/kv_codecs.py#L311) |
 
 ## Attention route declarations
 

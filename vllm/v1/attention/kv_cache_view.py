@@ -111,6 +111,45 @@ class KVPageMapping:
 
 
 @dataclass(frozen=True)
+class MLAPageLayout:
+    """Grouped latent payload with a separate scale plane and optional RoPE."""
+
+    latent_dim: int
+    rope_dim: int = 0
+    group_size: int = 64
+    scale_bytes: int = 1
+
+    def __post_init__(self) -> None:
+        if (
+            self.latent_dim <= 0
+            or self.group_size <= 0
+            or self.latent_dim % self.group_size
+            or self.rope_dim < 0
+            or self.scale_bytes not in (1, 4)
+        ):
+            raise ValueError("Invalid grouped MLA page layout")
+
+    @property
+    def groups(self) -> int:
+        return self.latent_dim // self.group_size
+
+    @property
+    def scale_slots(self) -> int:
+        return (self.groups + 7) // 8 * 8
+
+    @property
+    def data_row_bytes(self) -> int:
+        return self.latent_dim + 2 * self.rope_dim
+
+    @property
+    def slot_bytes(self) -> int:
+        return self.data_row_bytes + self.scale_slots * self.scale_bytes
+
+    def page_size_bytes(self, tokens: int) -> int:
+        return tokens * self.slot_bytes
+
+
+@dataclass(frozen=True)
 class KVCacheView:
     codec: KVCodec
     key: torch.Tensor
@@ -119,6 +158,95 @@ class KVCacheView:
     value_scale: torch.Tensor | None
     page_stride_bytes: int
     page_size_bytes: int
+    unquantized: tuple[tuple[str, torch.Tensor], ...] = ()
+
+    def unquantized_field(self, name: str) -> torch.Tensor:
+        for field, tensor in self.unquantized:
+            if field == name:
+                return tensor
+        raise ValueError(f"Cache view has no unquantized field {name!r}")
+
+    @classmethod
+    def bind_mla(
+        cls,
+        cache: torch.Tensor,
+        codec: KVCodec,
+        latent_dim: int,
+        rope_dim: int = 0,
+        rope_dtype: torch.dtype = torch.bfloat16,
+    ) -> "KVCacheView":
+        """Borrow grouped latent data, scale plane and optional unquantized RoPE.
+
+        The carrier reserves physical page bytes; its token stride is not the
+        payload stride. Eight-slot scale alignment preserves the legacy G64
+        formats' padding group, with FP32 scales for INT8.
+        """
+        if (
+            codec.representation not in ("mla_latent", "mla_mixed")
+            or codec.layout != "group_planar"
+            or codec.group_size != 64
+            or latent_dim <= 0
+            or latent_dim % codec.group_size
+            or rope_dim < 0
+            or rope_dtype not in (torch.float16, torch.bfloat16)
+            or codec.unquantized_fields != (("rope",) if rope_dim else ())
+        ):
+            raise ValueError("Invalid MLA grouped representation")
+        if (
+            cache.ndim != 3
+            or cache.dtype != codec.storage_dtype
+            or cache.stride(-1) != 1
+            or cache.stride(1) != cache.shape[2]
+        ):
+            raise ValueError("MLA carrier requires block-major byte pages")
+        if (codec.scale_encoding, codec.scale_dtype) not in (
+            ("fp32", torch.float32),
+            ("ue8m0", torch.uint8),
+        ):
+            raise ValueError("Unsupported MLA scale encoding")
+        layout = MLAPageLayout(
+            latent_dim,
+            rope_dim,
+            codec.group_size,
+            4 if codec.scale_encoding == "fp32" else 1,
+        )
+        pages, tokens, capacity = cache.shape
+        groups, scale_slots = layout.groups, layout.scale_slots
+        scale_bytes, row_bytes = layout.scale_bytes, layout.data_row_bytes
+        page_size = layout.page_size_bytes(tokens)
+        stride = cache.stride(0)
+        base = cache.storage_offset()
+        if (
+            capacity < layout.slot_bytes
+            or stride < page_size
+            or base % scale_bytes
+            or stride % scale_bytes
+            or (rope_dim and ((base + latent_dim) % 2 or stride % 2))
+        ):
+            raise ValueError("MLA carrier does not reserve aligned data and scales")
+        if pages and base + (pages - 1) * stride + page_size > (
+            cache.untyped_storage().nbytes()
+        ):
+            raise ValueError("MLA regions exceed the allocation")
+        key = cache.as_strided(
+            (pages, tokens, 1, latent_dim), (stride, row_bytes, latent_dim, 1)
+        )
+        scales = torch.empty(0, dtype=codec.scale_dtype, device=cache.device).set_(
+            cache.untyped_storage(),
+            (base + tokens * row_bytes) // scale_bytes,
+            (pages, tokens, groups),
+            (stride // scale_bytes, scale_slots, 1),
+        )
+        fields: tuple[tuple[str, torch.Tensor], ...] = ()
+        if rope_dim:
+            rope = torch.empty(0, dtype=rope_dtype, device=cache.device).set_(
+                cache.untyped_storage(),
+                (base + latent_dim) // 2,
+                (pages, tokens, 1, rope_dim),
+                (stride // 2, row_bytes // 2, rope_dim, 1),
+            )
+            fields = (("rope", rope),)
+        return cls(codec, key, key, scales, scales, stride, page_size, fields)
 
     def subpage_mapping(self, page_tokens: int) -> KVPageMapping:
         return KVPageMapping.bind_payload(self.key, self.value, page_tokens)
