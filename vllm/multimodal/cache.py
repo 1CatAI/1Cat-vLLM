@@ -312,6 +312,14 @@ class BaseMultiModalProcessorCache(
         """
         raise NotImplementedError
 
+    def release_sender_touches(self) -> None:
+        """
+        End a batch of `touch_sender_cache_item` calls. Caches whose touch
+        holds a reference release the ones that were not consumed by an
+        update.
+        """
+        return None
+
     @abstractmethod
     def make_stats(self, *, delta: bool = False) -> CacheInfo:
         """
@@ -525,7 +533,16 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
                 )
             return mm_item
         except MemoryError as e:
-            # Cache full and protected items prevent eviction.
+            # Cache full and protected items prevent eviction. Said once at
+            # warning level: an item that is never fetched by the workers
+            # (its request was rejected or aborted first) stays protected,
+            # and from then on every input takes this path.
+            logger.warning_once(
+                "Multimodal shm cache is full and its oldest item is still "
+                "in use, so new inputs are sent uncached. If this persists, "
+                "an item was never fetched by the workers and the cache "
+                "stays bypassed until the server restarts."
+            )
             logger.debug(
                 "mm_input %s not cached; shm cache full, "
                 "consider raising --mm-processor-cache-gb. (%s)",
@@ -537,8 +554,12 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
     @override
     def touch_sender_cache_item(self, mm_hash: str) -> None:
         """Touch the item in shared memory cache to prevent eviction.
-        Increments writer_flag on sender side."""
+        Counts the coming reference in writer_flag on sender side."""
         self._shm_cache.touch(mm_hash)
+
+    @override
+    def release_sender_touches(self) -> None:
+        self._shm_cache.release_touches()
 
     @override
     def clear_cache(self) -> None:
@@ -728,13 +749,9 @@ class ShmObjectStoreReceiverCache(BaseMultiModalReceiverCache):
         mm_hash: str,
         mm_item: MultiModalKwargsItem | None = None,
     ) -> None:
-        """Touch the item in shared memory cache to prevent eviction.
-        Increments reader_count on receiver side."""
-        assert mm_item is not None
-        if "address" in mm_item:
-            address = cast(int, mm_item["address"].data)
-            monotonic_id = cast(int, mm_item["monotonic_id"].data)
-            self._shm_cache.touch(mm_hash, address=address, monotonic_id=monotonic_id)
+        """Nothing to do on the receiver side: the sender's touch protects
+        the item, and each reference is fetched exactly once per reader."""
+        return None
 
     @override
     def clear_cache(self) -> None:

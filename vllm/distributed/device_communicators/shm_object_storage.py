@@ -487,6 +487,11 @@ class SingleWriterShmObjectStorage:
             self.id_index: dict[int, str] = {}
             # Writer flag to track in-use status: monotonic_id -> count
             self.writer_flag: dict[int, int] = {}
+            # References touch() has already counted in writer_flag and that
+            # the following get_cached() must not count again:
+            # monotonic_id -> count. Scoped to one batch, which relies on the
+            # single writer thread this storage is designed for.
+            self._touched: dict[int, int] = {}
         else:
             if reader_lock is None:
                 raise ValueError("Lock must be provided for readers.")
@@ -500,6 +505,7 @@ class SingleWriterShmObjectStorage:
             self.key_index.clear()
             self.id_index.clear()
             self.writer_flag.clear()
+            self._touched.clear()
             logger.debug("Object storage cleared and reinitialized.")
 
     def copy_to_buffer(
@@ -545,6 +551,7 @@ class SingleWriterShmObjectStorage:
             del self.key_index[key_to_free]
             del self.id_index[freed_id]
             del self.writer_flag[freed_id]
+            self._touched.pop(freed_id, None)
 
     def is_cached(self, key: str) -> bool:
         """
@@ -557,8 +564,25 @@ class SingleWriterShmObjectStorage:
         Get the cached object by key if it exists.
         """
         address, monotonic_id = self.key_index[key]
-        self.increment_writer_flag(monotonic_id)
+        touched = self._touched.get(monotonic_id, 0)
+        if touched > 1:
+            self._touched[monotonic_id] = touched - 1
+        elif touched == 1:
+            del self._touched[monotonic_id]
+        else:
+            self.increment_writer_flag(monotonic_id)
         return address, monotonic_id
+
+    def release_touches(self) -> None:
+        """Drop the references of touch() calls that no get_cached() followed.
+
+        A touch protects an item only until the same batch looks it up; one
+        left behind (the batch failed half-way) would keep the item, and
+        every item written after it, from ever being freed.
+        """
+        for monotonic_id, count in self._touched.items():
+            self.writer_flag[monotonic_id] -= count
+        self._touched.clear()
 
     def put(self, key: str, value: Any) -> tuple[int, int]:
         """
@@ -640,36 +664,37 @@ class SingleWriterShmObjectStorage:
         monotonic_id: int = 0,
     ) -> None:
         """
-        Touch an existing cached item to update its eviction status.
+        Protect an existing cached item from eviction until it is looked up.
 
-        For writers (ShmObjectStoreSenderCache): Increment writer_flag
-        For readers (ShmObjectStoreReceiverCache): Increment reader_count
+        For writers (ShmObjectStoreSenderCache): count the coming reference
+        in writer_flag now, so that a put() in the same batch cannot free the
+        item; the get_cached() that follows does not count it a second time.
+        For readers (ShmObjectStoreReceiverCache): nothing. A reference is
+        one writer count and one get() per reader.
+
+        The reader used to add a count of its own here to match a second
+        writer count, but only when it saw reader_count >= n_readers. A
+        second request carrying a new item could reach a reader before every
+        reader had fetched the first one; that reader skipped the count, the
+        item stayed short of writer_flag * n_readers for good, and because
+        the ring frees in FIFO order nothing behind it was freed either --
+        once the ring had filled, no item was cached again until a restart
+        (reproduced 2026-10-01 with pairs of concurrent requests carrying
+        the same new image). The reader also wrote to `address` without
+        checking that the entry was still the one it expected.
 
         Args:
             key: String key of the object to touch
-            address: Address of the object (only for readers)
-            monotonic_id: Monotonic ID of the object (only for readers)
+            address: Address of the object (unused)
+            monotonic_id: Monotonic ID of the object (unused)
 
         """
         if self._reader_lock is None:
             if key not in self.key_index:
                 return None
-            address, monotonic_id = self.key_index[key]
-            # Writer side: increment writer_flag to raise eviction threshold
+            _, monotonic_id = self.key_index[key]
             self.increment_writer_flag(monotonic_id)
-        else:
-            with (
-                self._reader_lock,
-                self.ring_buffer.access_buf(address) as (data_view, _),
-            ):
-                reader_count = self.ring_buffer.byte2int(data_view[: self.flag_bytes])
-
-                # NOTE(Long):
-                # Avoid increasing flag on newly added item (sync with sender)
-                # Since when a new item is added
-                # pre-touch has no effect on writer side
-                if reader_count >= self.n_readers:
-                    self.increment_reader_flag(data_view[: self.flag_bytes])
+            self._touched[monotonic_id] = self._touched.get(monotonic_id, 0) + 1
 
     def close(self) -> None:
         """Close the shared memory."""
