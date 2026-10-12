@@ -61,6 +61,10 @@ def test_reference_is_deterministic_and_links_actual_owners(source_tree):
         "MLA_LATENT_INT8",
         "MLA_MIXED_FP8",
         "MLA_MIXED_INT8",
+        "MLA_CONCAT_FP16",
+        "MLA_CONCAT_BF16",
+        "MLA_CONCAT_FP8",
+        "MLA_CONCAT_INT8",
     }
     assert first["routes"] == sorted(first["routes"], key=lambda r: r["name"])
     int8 = next(row for row in first["codecs"] if row["symbol"] == "INT8")

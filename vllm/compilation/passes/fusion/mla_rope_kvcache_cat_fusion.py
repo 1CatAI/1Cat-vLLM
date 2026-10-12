@@ -244,6 +244,15 @@ class MLARoPEKVCacheCatFusionPass(VllmFusionPatternMatcherPass):
         attn_layers = get_layers_from_vllm_config(config, MLAAttention)
 
         for _, layer in attn_layers.items():
+            if layer.kv_cache_dtype == "int8":
+                abi = getattr(torch.ops._C_cache_ops, "mla_row_kv_abi", None)
+                if abi is None or abi() != 2:
+                    # An older row writer may be usable without the fusion.
+                    # Check this before replacing the graph or mutating Q/K.
+                    logger.debug(
+                        "MLA RoPE fusion rejected: missing INT8 native binding"
+                    )
+                    continue
             for is_neox in [False, True]:
                 for use_deepseek_scaling in [False, True]:
                     if RotaryEmbedding.enabled():

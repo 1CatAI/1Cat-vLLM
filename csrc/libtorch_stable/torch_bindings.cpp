@@ -688,7 +688,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                     Tensor! kv_cache,"
       "                     Tensor slot_mapping,"
       "                     str kv_cache_dtype,"
-      "                     Tensor scale) -> ()");
+      "                     Tensor scale, Tensor(a!)? row_scales=None) -> ()");
+  ops.def("mla_row_kv_abi() -> int");
 
   // Rotate Q and K, then write to kv cache for MLA
   ops.def(
@@ -702,7 +703,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                     Tensor slot_mapping,"
       "                     Tensor! kv_cache,"
       "                     str kv_cache_dtype,"
-      "                     Tensor kv_cache_scale) -> ()");
+      "                     Tensor kv_cache_scale, Tensor(a!)? "
+      "row_scales=None) -> ()");
 
   // Convert the key and value cache to fp8 data type.
   ops.def(
@@ -717,7 +719,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                               Tensor token_to_seq, "
       "                               int num_tokens, "
       "                               str kv_cache_dtype, "
-      "                               Tensor scale, Tensor? seq_starts) -> ()");
+      "                               Tensor scale, Tensor? seq_starts, "
+      "Tensor? row_scales=None) -> ()");
 
   ops.def(
       "cp_gather_cache(Tensor src_cache, Tensor! dst, Tensor block_table, "
@@ -772,6 +775,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CUDA, ops) {
 }
 
 STABLE_TORCH_LIBRARY_IMPL(_C_cache_ops, CompositeExplicitAutograd, ops) {
+  ops.impl("mla_row_kv_abi", TORCH_BOX(&mla_row_kv_abi));
   ops.impl("indexer_k_quant_codec_abi", TORCH_BOX(&indexer_k_quant_codec_abi));
   ops.impl("reshape_and_cache_flash_kv_abi",
            TORCH_BOX(&reshape_and_cache_flash_kv_abi));

@@ -118,6 +118,7 @@ class MLAPageLayout:
     rope_dim: int = 0
     group_size: int = 64
     scale_bytes: int = 1
+    scale_alignment: int = 8
 
     def __post_init__(self) -> None:
         if (
@@ -126,6 +127,7 @@ class MLAPageLayout:
             or self.latent_dim % self.group_size
             or self.rope_dim < 0
             or self.scale_bytes not in (1, 4)
+            or self.scale_alignment <= 0
         ):
             raise ValueError("Invalid grouped MLA page layout")
 
@@ -135,7 +137,11 @@ class MLAPageLayout:
 
     @property
     def scale_slots(self) -> int:
-        return (self.groups + 7) // 8 * 8
+        return (
+            (self.groups + self.scale_alignment - 1)
+            // self.scale_alignment
+            * self.scale_alignment
+        )
 
     @property
     def data_row_bytes(self) -> int:
@@ -183,12 +189,19 @@ class KVCacheView:
         payload stride. Eight-slot scale alignment preserves the legacy G64
         formats' padding group, with FP32 scales for INT8.
         """
+        row_scaled = codec.representation == "mla_concat"
+        group_size = latent_dim if row_scaled else codec.group_size
+        valid_codec = (
+            codec.native_id == 3 and codec.layout == "mla_row_planar" and not rope_dim
+            if row_scaled
+            else codec.representation in ("mla_latent", "mla_mixed")
+            and codec.layout == "group_planar"
+            and codec.group_size == 64
+        )
         if (
-            codec.representation not in ("mla_latent", "mla_mixed")
-            or codec.layout != "group_planar"
-            or codec.group_size != 64
+            not valid_codec
             or latent_dim <= 0
-            or latent_dim % codec.group_size
+            or latent_dim % group_size
             or rope_dim < 0
             or rope_dtype not in (torch.float16, torch.bfloat16)
             or codec.unquantized_fields != (("rope",) if rope_dim else ())
@@ -202,8 +215,9 @@ class KVCacheView:
         layout = MLAPageLayout(
             latent_dim,
             rope_dim,
-            codec.group_size,
+            group_size,
             4 if codec.scale_encoding == "fp32" else 1,
+            1 if row_scaled else 8,
         )
         if cache.ndim == 2:
             if page_tokens is None or page_tokens <= 0 or cache.stride(1) != 1:
@@ -259,6 +273,49 @@ class KVCacheView:
             )
             fields = (("rope", rope),)
         return cls(codec, key, key, scales, scales, stride, page_size, fields)
+
+    @classmethod
+    def bind_mla_concat(
+        cls,
+        cache: torch.Tensor,
+        codec: KVCodec,
+        head_size: int,
+        scale: torch.Tensor,
+    ) -> "KVCacheView":
+        """Concatenated MLA shares a row scale across latent and quantized RoPE."""
+        if codec.representation != "mla_concat":
+            raise ValueError("Concatenated MLA requires its representation codec")
+        if codec.native_id == 3:
+            return cls.bind_mla(cache, codec, head_size)
+        if cache.ndim != 3 or cache.shape[-1] != head_size or cache.stride(-1) != 1:
+            raise ValueError("Concatenated MLA requires block-major payload pages")
+        if cache.stride(1) != head_size or cache.stride(0) < cache.shape[1] * head_size:
+            raise ValueError("Concatenated MLA payload rows must not overlap")
+        if codec.native_id == 1:
+            if cache.dtype not in (torch.uint8, torch.float8_e4m3fn):
+                raise ValueError("E4M3 MLA requires E4M3 payload bytes")
+            if (
+                scale.dtype != torch.float32
+                or scale.numel() != 1
+                or scale.device != cache.device
+            ):
+                raise ValueError("E4M3 MLA requires its FP32 tensor scale")
+            key = cache.view(torch.uint8).unsqueeze(2)
+            scales = scale
+        else:
+            if cache.dtype not in (torch.float16, torch.bfloat16):
+                raise ValueError("Dense MLA requires FP16 or BF16 payloads")
+            key, scales = cache.unsqueeze(2), None
+        size = cache.element_size()
+        return cls(
+            codec,
+            key,
+            key,
+            scales,
+            scales,
+            cache.stride(0) * size,
+            cache.shape[1] * head_size * size,
+        )
 
     def subpage_mapping(self, page_tokens: int) -> KVPageMapping:
         return KVPageMapping.bind_payload(self.key, self.value, page_tokens)

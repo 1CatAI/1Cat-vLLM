@@ -36,6 +36,7 @@ from packaging import version
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.kv_codec import decode_kv_payload
 
 is_hip_ = current_platform.is_rocm()
 
@@ -61,6 +62,15 @@ if version.parse(triton.__version__) < version.parse("3.2.0"):
         "The following error message 'operation scheduled before its operands' "
         "can be ignored."
     )
+
+
+@triton.jit
+def _decode_payload(payload, scale, CODEC: tl.constexpr, OUT: tl.constexpr):
+    if CODEC == 1:
+        return (decode_kv_payload(payload, CODEC).to(tl.float32) * scale).to(OUT)
+    elif payload.dtype.is_fp8():
+        return (payload.to(tl.float32) * scale).to(OUT)
+    return payload.to(OUT)
 
 
 @triton.jit
@@ -90,6 +100,13 @@ def _fwd_kernel_stage1(
     stride_mid_os,
     k_scale,
     v_scale,
+    Row_Scales,
+    stride_buf_kpage,
+    stride_buf_vpage,
+    stride_scale_page,
+    stride_scale_token,
+    CODEC: tl.constexpr,
+    PAGE_CAPACITY: tl.constexpr,
     kv_group_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
@@ -136,45 +153,54 @@ def _fwd_kernel_stage1(
                 mask=offs_n < split_kv_end,
                 other=0,
             )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
-            offs_buf_k = (
-                kv_loc[:, None] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[None, :]
+            page_valid = (kv_page_number >= 0) & (kv_page_number < PAGE_CAPACITY)
+            token_valid = (offs_n < split_kv_end) & page_valid
+            k_loc = (
+                kv_page_number * stride_buf_kpage + offs_n % PAGE_SIZE * stride_buf_kbs
             )
+            v_loc = (
+                kv_page_number * stride_buf_vpage + offs_n % PAGE_SIZE * stride_buf_vbs
+            )
+            if CODEC == 3:
+                row_scale = tl.load(
+                    Row_Scales
+                    + kv_page_number * stride_scale_page
+                    + offs_n % PAGE_SIZE * stride_scale_token,
+                    mask=token_valid,
+                    other=0.0,
+                )
+            offs_buf_k = k_loc[:, None] + cur_kv_head * stride_buf_kh + offs_d[None, :]
             k = tl.load(
                 K_Buffer + offs_buf_k,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
+                mask=token_valid[:, None] & (mask_d[None, :]),
                 other=0.0,
             )
-            if k.dtype.is_fp8():
-                k = (k.to(tl.float32) * ks).to(q.dtype)
+            k = _decode_payload(k, ks, CODEC, q.dtype)
             qk = tl.sum(q[None, :] * k, 1)
+            if CODEC == 3:
+                qk *= row_scale
             qk *= sm_scale
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
 
-            qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
+            qk = tl.where(token_valid, qk, float("-inf"))
 
-            offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
+            offs_buf_v = v_loc[:, None] + cur_kv_head * stride_buf_vh + offs_dv[None, :]
             v = tl.load(
                 V_Buffer + offs_buf_v,
-                mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                mask=token_valid[:, None] & (mask_dv[None, :]),
                 other=0.0,
             )
-            if v.dtype.is_fp8():
-                v = (v.to(tl.float32) * vs).to(q.dtype)
+            v = _decode_payload(v, vs, CODEC, q.dtype)
 
             n_e_max = tl.maximum(tl.max(qk, 0), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max)
+            safe_max = tl.where(n_e_max == -float("inf"), 0.0, n_e_max)
+            re_scale = tl.exp(e_max - safe_max)
+            p = tl.exp(qk - safe_max)
             acc *= re_scale
-            acc += tl.sum(p[:, None] * v, 0)
+            pv = p * row_scale if CODEC == 3 else p
+            acc += tl.sum(pv[:, None] * v, 0)
 
             e_sum = e_sum * re_scale + tl.sum(p, 0)
             e_max = n_e_max
@@ -188,7 +214,7 @@ def _fwd_kernel_stage1(
 
         tl.store(
             Att_Out + offs_mid_o,
-            acc / e_sum,
+            tl.where(e_sum == 0, 0.0, acc / e_sum),
             mask=(mask_dv),
         )
 
@@ -218,6 +244,7 @@ def _decode_att_m_fwd(
     logit_cap,
     k_scale,
     v_scale,
+    cache_view=None,
 ):
     BLOCK = 64 if not is_hip_ else 8
 
@@ -257,6 +284,23 @@ def _decode_att_m_fwd(
         att_out.stride(2),
         k_scale,
         v_scale,
+        cache_view.key_scale
+        if cache_view is not None and cache_view.key_scale is not None
+        else k_scale,
+        k_buffer.stride(0) if k_buffer.ndim == 4 else page_size * k_buffer.stride(-3),
+        v_buffer.stride(0) if v_buffer.ndim == 4 else page_size * v_buffer.stride(-3),
+        cache_view.key_scale.stride(0)
+        if cache_view is not None and cache_view.codec.native_id == 3
+        else 0,
+        cache_view.key_scale.stride(1)
+        if cache_view is not None and cache_view.codec.native_id == 3
+        else 0,
+        CODEC=cache_view.codec.native_id
+        if cache_view is not None
+        else (1 if k_buffer.dtype == torch.uint8 else 0),
+        PAGE_CAPACITY=k_buffer.shape[0]
+        if k_buffer.ndim == 4
+        else k_buffer.shape[0] // page_size,
         kv_group_num=kv_group_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
@@ -292,6 +336,13 @@ def _fwd_grouped_kernel_stage1(
     stride_mid_os,
     k_scale,
     v_scale,
+    Row_Scales,
+    stride_buf_kpage,
+    stride_buf_vpage,
+    stride_scale_page,
+    stride_scale_token,
+    CODEC: tl.constexpr,
+    PAGE_CAPACITY: tl.constexpr,
     kv_group_num: tl.constexpr,
     q_head_num: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -370,49 +421,61 @@ def _fwd_grouped_kernel_stage1(
                 other=0,
                 cache_modifier=".ca",
             )
-            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+            page_valid = (kv_page_number >= 0) & (kv_page_number < PAGE_CAPACITY)
+            token_valid = (offs_n < split_kv_end) & page_valid
+            k_loc = (
+                kv_page_number * stride_buf_kpage + offs_n % PAGE_SIZE * stride_buf_kbs
+            )
+            v_loc = (
+                kv_page_number * stride_buf_vpage + offs_n % PAGE_SIZE * stride_buf_vbs
+            )
+            if CODEC == 3:
+                row_scale = tl.load(
+                    Row_Scales
+                    + kv_page_number * stride_scale_page
+                    + offs_n % PAGE_SIZE * stride_scale_token,
+                    mask=token_valid,
+                    other=0.0,
+                )
 
             # explicitly facilitate overlapping load/compute
-            offs_buf_k = kv_loc[None, :] * stride_buf_kbs + base_offs_k
+            offs_buf_k = k_loc[None, :] + base_offs_k
             k = tl.load(
                 K_Buffer + offs_buf_k,
-                mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
+                mask=token_valid[None, :] & (mask_d[:, None]),
                 other=0.0,
                 cache_modifier=".cg",
             )
 
-            if k.dtype.is_fp8():
-                k = (k.to(tl.float32) * ks).to(q.dtype)
+            k = _decode_payload(k, ks, CODEC, q.dtype)
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
-                offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
+                offs_buf_kpe = k_loc[None, :] + base_offs_kpe
                 kpe = tl.load(
                     K_Buffer + offs_buf_kpe,
-                    mask=(offs_n[None, :] < split_kv_end) & (mask_dpe[:, None]),
+                    mask=token_valid[None, :] & (mask_dpe[:, None]),
                     other=0.0,
                     cache_modifier=".cg",
                 )
-                if kpe.dtype.is_fp8():
-                    kpe = (kpe.to(tl.float32) * ks).to(qpe.dtype)
+                kpe = _decode_payload(kpe, ks, CODEC, qpe.dtype)
                 qk += tl.dot(qpe, kpe.to(qpe.dtype))
+            if CODEC == 3:
+                qk *= row_scale
             qk *= sm_scale
 
             if logit_cap > 0:
                 qk = logit_cap * tanh(qk / logit_cap)
 
-            qk = tl.where(
-                mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
-            )
+            qk = tl.where(mask_h[:, None] & token_valid[None, :], qk, float("-inf"))
 
             if not IS_MLA:
-                offs_buf_v = kv_loc[:, None] * stride_buf_vbs + base_offs_v
+                offs_buf_v = v_loc[:, None] + base_offs_v
                 v = tl.load(
                     V_Buffer + offs_buf_v,
-                    mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
+                    mask=token_valid[:, None] & (mask_dv[None, :]),
                     other=0.0,
                 )
-                if v.dtype.is_fp8():
-                    v = (v.to(tl.float32) * vs).to(q.dtype)
+                v = _decode_payload(v, vs, CODEC, q.dtype)
             else:
                 # MLA uses a single c_kv.
                 # loading the same c_kv to interpret it as v is not necessary.
@@ -420,10 +483,17 @@ def _fwd_grouped_kernel_stage1(
                 v = tl.trans(k)
 
             n_e_max = tl.maximum(tl.max(qk, 1), e_max)
-            re_scale = tl.exp(e_max - n_e_max)
-            p = tl.exp(qk - n_e_max[:, None])
+            safe_max = tl.where(n_e_max == -float("inf"), 0.0, n_e_max)
+            re_scale = tl.exp(e_max - safe_max)
+            p = tl.exp(qk - safe_max[:, None])
             acc *= re_scale[:, None]
-            acc += tl.dot(p.to(v.dtype), v)
+            if CODEC == 3:
+                pv = p * row_scale[None, :]
+                hi = pv.to(v.dtype)
+                lo = (pv - hi.to(tl.float32)).to(v.dtype)
+                acc += tl.dot(hi, v) + tl.dot(lo, v)
+            else:
+                acc += tl.dot(p.to(v.dtype), v)
 
             e_sum = e_sum * re_scale + tl.sum(p, 1)
             e_max = n_e_max
@@ -437,7 +507,7 @@ def _fwd_grouped_kernel_stage1(
 
         tl.store(
             Att_Out + offs_mid_o,
-            acc / e_sum[:, None],
+            tl.where(e_sum[:, None] == 0, 0.0, acc / e_sum[:, None]),
             mask=(mask_h[:, None]) & (mask_dv[None, :]),
         )
 
@@ -469,6 +539,7 @@ def _decode_grouped_att_m_fwd(
     k_scale,
     v_scale,
     is_mla=False,
+    cache_view=None,
 ):
     # with is_mla there is only a single c_kv in smem.
     # could increase BLOCK or num_stages.
@@ -551,6 +622,23 @@ def _decode_grouped_att_m_fwd(
         att_out.stride(2),
         k_scale,
         v_scale,
+        cache_view.key_scale
+        if cache_view is not None and cache_view.key_scale is not None
+        else k_scale,
+        k_buffer.stride(0) if k_buffer.ndim == 4 else page_size * k_buffer.stride(-3),
+        v_buffer.stride(0) if v_buffer.ndim == 4 else page_size * v_buffer.stride(-3),
+        cache_view.key_scale.stride(0)
+        if cache_view is not None and cache_view.codec.native_id == 3
+        else 0,
+        cache_view.key_scale.stride(1)
+        if cache_view is not None and cache_view.codec.native_id == 3
+        else 0,
+        CODEC=cache_view.codec.native_id
+        if cache_view is not None
+        else (1 if k_buffer.dtype == torch.uint8 else 0),
+        PAGE_CAPACITY=k_buffer.shape[0]
+        if k_buffer.ndim == 4
+        else k_buffer.shape[0] // page_size,
         kv_group_num=kv_group_num,
         q_head_num=head_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
@@ -614,15 +702,16 @@ def _fwd_kernel_stage2(
             tlogic = tl.load(Mid_O + offs_logic + split_kv_id * stride_mid_os)
             n_e_max = tl.maximum(tlogic, e_max)
 
-            old_scale = tl.exp(e_max - n_e_max)
+            safe_max = tl.where(n_e_max == -float("inf"), 0.0, n_e_max)
+            old_scale = tl.exp(e_max - safe_max)
             acc *= old_scale
-            exp_logic = tl.exp(tlogic - n_e_max)
+            exp_logic = tl.exp(tlogic - safe_max)
             acc += exp_logic * tv
 
             e_sum = e_sum * old_scale + exp_logic
             e_max = n_e_max
 
-    result = acc / e_sum
+    result = tl.where(e_sum == 0, 0.0, acc / e_sum)
     if OUTPUT_FP16:
         result = result.to(tl.float16)
     tl.store(
@@ -694,6 +783,7 @@ def decode_attention_fwd_normal(
     logit_cap=0.0,
     k_scale=None,
     v_scale=None,
+    cache_view=None,
 ):
     _decode_att_m_fwd(
         q,
@@ -708,6 +798,7 @@ def decode_attention_fwd_normal(
         logit_cap,
         k_scale,
         v_scale,
+        cache_view=cache_view,
     )
     _decode_softmax_reducev_fwd(
         attn_logits, q, o, lse, v_buffer, b_seq_len, num_kv_splits
@@ -730,6 +821,7 @@ def decode_attention_fwd_grouped(
     k_scale=None,
     v_scale=None,
     is_mla=False,
+    cache_view=None,
 ):
     _decode_grouped_att_m_fwd(
         q,
@@ -745,6 +837,7 @@ def decode_attention_fwd_grouped(
         k_scale,
         v_scale,
         is_mla=is_mla,
+        cache_view=cache_view,
     )
     _decode_softmax_reducev_fwd(
         attn_logits, q, o, lse, v_buffer, b_seq_len, num_kv_splits
@@ -767,6 +860,7 @@ def decode_attention_fwd(
     k_scale=None,
     v_scale=None,
     is_mla=False,
+    cache_view=None,
 ):
     assert num_kv_splits == attn_logits.shape[2]
 
@@ -774,6 +868,12 @@ def decode_attention_fwd(
         k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
     if v_scale is None:
         v_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
+
+    if k_buffer.dtype == torch.int8 and cache_view is None:
+        raise ValueError("INT8 decode requires its typed cache view and scales")
+    if k_buffer.dtype == torch.float8_e4m3fn and not current_platform.supports_fp8():
+        k_buffer = k_buffer.view(torch.uint8)
+        v_buffer = v_buffer.view(torch.uint8)
 
     kv_group_num = q.shape[1] // v_buffer.shape[-2]
 
@@ -794,6 +894,7 @@ def decode_attention_fwd(
             logit_cap,
             k_scale,
             v_scale,
+            cache_view=cache_view,
         )
     else:
         # GQA/MQA/MLA
@@ -813,4 +914,5 @@ def decode_attention_fwd(
             k_scale,
             v_scale,
             is_mla=is_mla,
+            cache_view=cache_view,
         )

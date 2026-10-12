@@ -24,6 +24,8 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
+from vllm.v1.attention.kv_cache_view import KVCacheView, MLAPageLayout
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
 from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 
 logger = init_logger(__name__)
@@ -41,6 +43,7 @@ class TritonMLABackend(MLACommonBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "int8",
     ]
 
     @classmethod
@@ -60,6 +63,28 @@ class TritonMLABackend(MLACommonBackend):
     @staticmethod
     def get_name() -> str:
         return "TRITON_MLA"
+
+    @staticmethod
+    def get_kv_cache_layout(head_size: int, cache_dtype: str) -> MLAPageLayout | None:
+        codec = resolve_kv_codec(cache_dtype, representation="mla_concat")
+        if codec is not None and codec.native_id == 3:
+            return MLAPageLayout(
+                head_size, group_size=head_size, scale_bytes=4, scale_alignment=1
+            )
+        return None
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if num_kv_heads != 1:
+            raise ValueError("MLA cache requires one shared KV head")
+        layout = TritonMLABackend.get_kv_cache_layout(head_size, cache_dtype_str)
+        return (num_blocks, block_size, layout.slot_bytes if layout else head_size)
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:
@@ -188,16 +213,20 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             device=q.device,
         )
 
-        # Add a head dim of 1
-        kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)
-        kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
-        PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
+        codec = resolve_kv_codec(self.kv_cache_dtype, representation="mla_concat")
+        if codec is None:
+            raise ValueError(f"Unbound concatenated MLA codec: {self.kv_cache_dtype}")
+        view = KVCacheView.bind_mla_concat(
+            kv_c_and_k_pe_cache, codec, self.head_size, layer._k_scale
+        )
+        kv_c_cache = view.value[..., : self.kv_lora_rank]
+        PAGE_SIZE = view.key.size(1)
 
         # Run MQA — always pass layer scales. When KV cache is
         # BF16 the kernel's `if dtype.is_fp8()` check is a no-op.
         decode_attention_fwd(
             q,
-            kv_c_and_k_pe_cache,
+            view.key,
             kv_c_cache,
             o,
             lse,
@@ -210,6 +239,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             k_scale=layer._k_scale,
             v_scale=layer._k_scale,
             is_mla=True,
+            cache_view=view,
         )
 
         return o, lse
