@@ -1,0 +1,1233 @@
+{
+  "research_only": true,
+  "serving_route": false,
+  "source_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+  "machine": "54633, four V100-SXM2-32GB, all-pair NV2",
+  "counter_clock_control": "none",
+  "counter_records": [
+    {
+      "kernel": "void <unnamed>::dense_mv<(int)4, (int)4, (int)6, (int)5, (int)-1, (bool)0>(<unnamed>::Segs, const __half *, int, int, int, int, int, int, float *, int *, unsigned long *)",
+      "metrics": {
+        "gpu__time_duration.sum": {
+          "value": "42.816000",
+          "unit": "usecond"
+        },
+        "gpc__cycles_elapsed.avg.per_second": {
+          "value": "1.237228",
+          "unit": "cycle/nsecond"
+        },
+        "dram__cycles_elapsed.avg.per_second": {
+          "value": "720.104634",
+          "unit": "cycle/usecond"
+        },
+        "dram__bytes.sum.per_second": {
+          "value": "441.125561",
+          "unit": "Gbyte/second"
+        },
+        "smsp__inst_executed.sum": {
+          "value": "7294768.000000",
+          "unit": "inst"
+        },
+        "smsp__average_warps_issue_stalled_no_instruction_per_issue_active.ratio": {
+          "value": "0.960113",
+          "unit": "inst"
+        },
+        "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio": {
+          "value": "0.272041",
+          "unit": "inst"
+        },
+        "smsp__issue_active.avg.pct_of_peak_sustained_active": {
+          "value": "55.094697",
+          "unit": "%"
+        },
+        "memory_l1_wavefronts_shared": {
+          "value": "1884523.000000",
+          "unit": "sectors"
+        },
+        "memory_l1_wavefronts_shared_ideal": {
+          "value": "1107040.000000",
+          "unit": "sectors"
+        },
+        "launch__registers_per_thread": {
+          "value": "97.000000",
+          "unit": "register/thread"
+        }
+      }
+    },
+    {
+      "kernel": "void <unnamed>::common_dense_mv<(int)4, (int)4, (int)6, (int)5, (int)-1, (bool)0>(<unnamed>::Segs, const __half *, int, int, int, int, int, int, float *, int *, unsigned long *)",
+      "metrics": {
+        "gpu__time_duration.sum": {
+          "value": "51.360000",
+          "unit": "usecond"
+        },
+        "gpc__cycles_elapsed.avg.per_second": {
+          "value": "1.302917",
+          "unit": "cycle/nsecond"
+        },
+        "dram__cycles_elapsed.avg.per_second": {
+          "value": "751.713396",
+          "unit": "cycle/usecond"
+        },
+        "dram__bytes.sum.per_second": {
+          "value": "367.742056",
+          "unit": "Gbyte/second"
+        },
+        "smsp__inst_executed.sum": {
+          "value": "7824488.000000",
+          "unit": "inst"
+        },
+        "smsp__average_warps_issue_stalled_no_instruction_per_issue_active.ratio": {
+          "value": "0.410815",
+          "unit": "inst"
+        },
+        "smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio": {
+          "value": "1.906774",
+          "unit": "inst"
+        },
+        "smsp__issue_active.avg.pct_of_peak_sustained_active": {
+          "value": "48.570045",
+          "unit": "%"
+        },
+        "memory_l1_wavefronts_shared": {
+          "value": "1884523.000000",
+          "unit": "sectors"
+        },
+        "memory_l1_wavefronts_shared_ideal": {
+          "value": "1107040.000000",
+          "unit": "sectors"
+        },
+        "launch__registers_per_thread": {
+          "value": "98.000000",
+          "unit": "register/thread"
+        }
+      }
+    }
+  ],
+  "code_footprints": [
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c815common_dense_mvILi4ELi4ELi0ELi5ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2664,
+      "code_bytes": 42624
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c88dense_mvILi4ELi4ELi0ELi5ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2920,
+      "code_bytes": 46720
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c815common_dense_mvILi4ELi4ELi5ELi0ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2664,
+      "code_bytes": 42624
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c88dense_mvILi4ELi4ELi5ELi0ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2920,
+      "code_bytes": 46720
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c815common_dense_mvILi4ELi4ELi5ELi3ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2784,
+      "code_bytes": 44544
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c88dense_mvILi4ELi4ELi5ELi3ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 3040,
+      "code_bytes": 48640
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c815common_dense_mvILi4ELi4ELi3ELi5ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2784,
+      "code_bytes": 44544
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c88dense_mvILi4ELi4ELi3ELi5ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 3040,
+      "code_bytes": 48640
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c815common_dense_mvILi4ELi4ELi5ELi6ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2712,
+      "code_bytes": 43392
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c88dense_mvILi4ELi4ELi5ELi6ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2984,
+      "code_bytes": 47744
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c815common_dense_mvILi4ELi4ELi6ELi5ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2712,
+      "code_bytes": 43392
+    },
+    {
+      "name": "_ZN47_GLOBAL__N__a7a1e596_14_shared_loop_cu_b16ff8c88dense_mvILi4ELi4ELi6ELi5ELin1ELb0EEEvNS_4SegsEPK6__halfiiiiiiPfPiPm",
+      "instructions": 2984,
+      "code_bytes": 47744
+    }
+  ],
+  "ranks": [
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "rank": 0,
+      "source_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+      "generated_cuda_sha256": "4e6342b30fb1f39e98cb52b826717d40232094489561d0da0ff0bfab08b13f7b",
+      "cases": [
+        {
+          "layer": 22,
+          "types": [
+            18,
+            21
+          ],
+          "formats": [
+            6,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005860157543793321,
+            0.0006013346137478948,
+            0.0006149661494418979
+          ]
+        },
+        {
+          "layer": 38,
+          "types": [
+            21,
+            18
+          ],
+          "formats": [
+            5,
+            6
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005905678262934089,
+            0.0005940221017226577,
+            0.0005939012044109404
+          ]
+        },
+        {
+          "layer": 39,
+          "types": [
+            23,
+            21
+          ],
+          "formats": [
+            3,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005785956745967269,
+            0.0005730515695177019,
+            0.000608287809882313
+          ]
+        },
+        {
+          "layer": 42,
+          "types": [
+            21,
+            23
+          ],
+          "formats": [
+            5,
+            3
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005885198479518294,
+            0.000591002986766398,
+            0.0006145432707853615
+          ]
+        },
+        {
+          "layer": 36,
+          "types": [
+            21,
+            12
+          ],
+          "formats": [
+            5,
+            0
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0008466960862278938,
+            0.0008746926323510706,
+            0.0008525775047019124
+          ]
+        },
+        {
+          "layer": 47,
+          "types": [
+            12,
+            21
+          ],
+          "formats": [
+            0,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0008443249389529228,
+            0.0008721973863430321,
+            0.0008923927671276033
+          ]
+        }
+      ],
+      "performance": {
+        "original_chain_us": 258.8283519744873,
+        "common_chain_us": 278.42150688171387,
+        "samples_us": {
+          "False": [
+            215.69536209106445,
+            244.40895080566406,
+            256.22528076171875,
+            269.6806335449219,
+            266.62912368774414,
+            269.1891288757324,
+            269.2505645751953,
+            266.13759994506836,
+            265.6255912780762,
+            265.4412841796875
+          ],
+          "True": [
+            226.50880813598633,
+            246.33344650268555,
+            288.68608474731445,
+            293.6012840270996,
+            289.6486473083496,
+            292.22911834716797,
+            288.39935302734375,
+            285.347843170166,
+            285.0201606750488,
+            288.44032287597656
+          ]
+        },
+        "timing_intervals": [
+          {
+            "common": false,
+            "chain_us": 215.69536209106445,
+            "wall_start": 1791449969.5923917,
+            "wall_end": 1791449969.60532
+          },
+          {
+            "common": true,
+            "chain_us": 226.50880813598633,
+            "wall_start": 1791449969.6061664,
+            "wall_end": 1791449969.6197448
+          },
+          {
+            "common": true,
+            "chain_us": 246.33344650268555,
+            "wall_start": 1791449969.620518,
+            "wall_end": 1791449969.635173
+          },
+          {
+            "common": false,
+            "chain_us": 244.40895080566406,
+            "wall_start": 1791449969.635545,
+            "wall_end": 1791449969.650061
+          },
+          {
+            "common": false,
+            "chain_us": 256.22528076171875,
+            "wall_start": 1791449969.6507785,
+            "wall_end": 1791449969.6660957
+          },
+          {
+            "common": true,
+            "chain_us": 288.68608474731445,
+            "wall_start": 1791449969.6666486,
+            "wall_end": 1791449969.6839356
+          },
+          {
+            "common": true,
+            "chain_us": 293.6012840270996,
+            "wall_start": 1791449969.684453,
+            "wall_end": 1791449969.70201
+          },
+          {
+            "common": false,
+            "chain_us": 269.6806335449219,
+            "wall_start": 1791449969.70248,
+            "wall_end": 1791449969.7186437
+          },
+          {
+            "common": false,
+            "chain_us": 266.62912368774414,
+            "wall_start": 1791449969.7192285,
+            "wall_end": 1791449969.7352116
+          },
+          {
+            "common": true,
+            "chain_us": 289.6486473083496,
+            "wall_start": 1791449969.7359324,
+            "wall_end": 1791449969.7532396
+          },
+          {
+            "common": true,
+            "chain_us": 292.22911834716797,
+            "wall_start": 1791449969.7538078,
+            "wall_end": 1791449969.771315
+          },
+          {
+            "common": false,
+            "chain_us": 269.1891288757324,
+            "wall_start": 1791449969.7719827,
+            "wall_end": 1791449969.7880914
+          },
+          {
+            "common": false,
+            "chain_us": 269.2505645751953,
+            "wall_start": 1791449969.788653,
+            "wall_end": 1791449969.804763
+          },
+          {
+            "common": true,
+            "chain_us": 288.39935302734375,
+            "wall_start": 1791449969.8051517,
+            "wall_end": 1791449969.8224368
+          },
+          {
+            "common": true,
+            "chain_us": 285.347843170166,
+            "wall_start": 1791449969.8230188,
+            "wall_end": 1791449969.840119
+          },
+          {
+            "common": false,
+            "chain_us": 266.13759994506836,
+            "wall_start": 1791449969.8406744,
+            "wall_end": 1791449969.8566039
+          },
+          {
+            "common": false,
+            "chain_us": 265.6255912780762,
+            "wall_start": 1791449969.857027,
+            "wall_end": 1791449969.872931
+          },
+          {
+            "common": true,
+            "chain_us": 285.0201606750488,
+            "wall_start": 1791449969.873364,
+            "wall_end": 1791449969.8904324
+          },
+          {
+            "common": true,
+            "chain_us": 288.44032287597656,
+            "wall_start": 1791449969.8909502,
+            "wall_end": 1791449969.9082217
+          },
+          {
+            "common": false,
+            "chain_us": 265.4412841796875,
+            "wall_start": 1791449969.9086964,
+            "wall_end": 1791449969.9246018
+          }
+        ],
+        "changed_input_graph_replays": 20
+      },
+      "clocks_after_timing": "1447 MHz, 877 MHz"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "rank": 1,
+      "source_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+      "generated_cuda_sha256": "4e6342b30fb1f39e98cb52b826717d40232094489561d0da0ff0bfab08b13f7b",
+      "cases": [
+        {
+          "layer": 22,
+          "types": [
+            18,
+            21
+          ],
+          "formats": [
+            6,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005814699688926339,
+            0.0005877996445633471,
+            0.0005976519896648824
+          ]
+        },
+        {
+          "layer": 38,
+          "types": [
+            21,
+            18
+          ],
+          "formats": [
+            5,
+            6
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.000584122259169817,
+            0.0005872674519196153,
+            0.0006102556944824755
+          ]
+        },
+        {
+          "layer": 39,
+          "types": [
+            23,
+            21
+          ],
+          "formats": [
+            3,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005749562405981123,
+            0.0005806273547932506,
+            0.0005783083033747971
+          ]
+        },
+        {
+          "layer": 42,
+          "types": [
+            21,
+            23
+          ],
+          "formats": [
+            5,
+            3
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005724080838263035,
+            0.0005751986755058169,
+            0.0005787577829323709
+          ]
+        },
+        {
+          "layer": 36,
+          "types": [
+            21,
+            12
+          ],
+          "formats": [
+            5,
+            0
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.000860031577758491,
+            0.0008816810441203415,
+            0.0008658631704747677
+          ]
+        },
+        {
+          "layer": 47,
+          "types": [
+            12,
+            21
+          ],
+          "formats": [
+            0,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0008636974380351603,
+            0.0008715781150385737,
+            0.0009226285037584603
+          ]
+        }
+      ],
+      "performance": {
+        "original_chain_us": 254.47430229187012,
+        "common_chain_us": 272.63379287719727,
+        "samples_us": {
+          "False": [
+            215.85920333862305,
+            237.589111328125,
+            253.70624542236328,
+            267.7964782714844,
+            265.97375869750977,
+            265.0931167602539,
+            262.47167587280273,
+            261.3043212890625,
+            257.4950408935547,
+            257.4540710449219
+          ],
+          "True": [
+            226.32448196411133,
+            240.9062385559082,
+            287.1494483947754,
+            290.38591384887695,
+            284.9996757507324,
+            283.1564712524414,
+            280.84224700927734,
+            280.41215896606445,
+            276.0704040527344,
+            276.0908889770508
+          ]
+        },
+        "timing_intervals": [
+          {
+            "common": false,
+            "chain_us": 215.85920333862305,
+            "wall_start": 1791449969.5923176,
+            "wall_end": 1791449969.6052625
+          },
+          {
+            "common": true,
+            "chain_us": 226.32448196411133,
+            "wall_start": 1791449969.6061444,
+            "wall_end": 1791449969.6197228
+          },
+          {
+            "common": true,
+            "chain_us": 240.9062385559082,
+            "wall_start": 1791449969.6205711,
+            "wall_end": 1791449969.63484
+          },
+          {
+            "common": false,
+            "chain_us": 237.589111328125,
+            "wall_start": 1791449969.635699,
+            "wall_end": 1791449969.64989
+          },
+          {
+            "common": false,
+            "chain_us": 253.70624542236328,
+            "wall_start": 1791449969.650815,
+            "wall_end": 1791449969.6660073
+          },
+          {
+            "common": true,
+            "chain_us": 287.1494483947754,
+            "wall_start": 1791449969.666598,
+            "wall_end": 1791449969.6836298
+          },
+          {
+            "common": true,
+            "chain_us": 290.38591384887695,
+            "wall_start": 1791449969.684493,
+            "wall_end": 1791449969.701872
+          },
+          {
+            "common": false,
+            "chain_us": 267.7964782714844,
+            "wall_start": 1791449969.7025125,
+            "wall_end": 1791449969.7185628
+          },
+          {
+            "common": false,
+            "chain_us": 265.97375869750977,
+            "wall_start": 1791449969.71926,
+            "wall_end": 1791449969.735189
+          },
+          {
+            "common": true,
+            "chain_us": 284.9996757507324,
+            "wall_start": 1791449969.7359474,
+            "wall_end": 1791449969.7530086
+          },
+          {
+            "common": true,
+            "chain_us": 283.1564712524414,
+            "wall_start": 1791449969.7538607,
+            "wall_end": 1791449969.7708302
+          },
+          {
+            "common": false,
+            "chain_us": 265.0931167602539,
+            "wall_start": 1791449969.7720218,
+            "wall_end": 1791449969.7878826
+          },
+          {
+            "common": false,
+            "chain_us": 262.47167587280273,
+            "wall_start": 1791449969.7885745,
+            "wall_end": 1791449969.8043044
+          },
+          {
+            "common": true,
+            "chain_us": 280.84224700927734,
+            "wall_start": 1791449969.8053136,
+            "wall_end": 1791449969.822123
+          },
+          {
+            "common": true,
+            "chain_us": 280.41215896606445,
+            "wall_start": 1791449969.823136,
+            "wall_end": 1791449969.8398528
+          },
+          {
+            "common": false,
+            "chain_us": 261.3043212890625,
+            "wall_start": 1791449969.8407252,
+            "wall_end": 1791449969.8563695
+          },
+          {
+            "common": false,
+            "chain_us": 257.4950408935547,
+            "wall_start": 1791449969.857107,
+            "wall_end": 1791449969.8725302
+          },
+          {
+            "common": true,
+            "chain_us": 276.0704040527344,
+            "wall_start": 1791449969.8734958,
+            "wall_end": 1791449969.8900263
+          },
+          {
+            "common": true,
+            "chain_us": 276.0908889770508,
+            "wall_start": 1791449969.8911772,
+            "wall_end": 1791449969.90763
+          },
+          {
+            "common": false,
+            "chain_us": 257.4540710449219,
+            "wall_start": 1791449969.9087582,
+            "wall_end": 1791449969.9241712
+          }
+        ],
+        "changed_input_graph_replays": 20
+      },
+      "clocks_after_timing": "1455 MHz, 877 MHz"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "rank": 2,
+      "source_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+      "generated_cuda_sha256": "4e6342b30fb1f39e98cb52b826717d40232094489561d0da0ff0bfab08b13f7b",
+      "cases": [
+        {
+          "layer": 22,
+          "types": [
+            18,
+            21
+          ],
+          "formats": [
+            6,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.000580310937948525,
+            0.0006293777259998024,
+            0.0006030772929079831
+          ]
+        },
+        {
+          "layer": 38,
+          "types": [
+            21,
+            18
+          ],
+          "formats": [
+            5,
+            6
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005825257976539433,
+            0.0005824465770274401,
+            0.0006307823932729661
+          ]
+        },
+        {
+          "layer": 39,
+          "types": [
+            23,
+            21
+          ],
+          "formats": [
+            3,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005702457274310291,
+            0.0005761180655099452,
+            0.0005904249264858663
+          ]
+        },
+        {
+          "layer": 42,
+          "types": [
+            21,
+            23
+          ],
+          "formats": [
+            5,
+            3
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005683223134838045,
+            0.0005805750261060894,
+            0.0005835371557623148
+          ]
+        },
+        {
+          "layer": 36,
+          "types": [
+            21,
+            12
+          ],
+          "formats": [
+            5,
+            0
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0008687561494298279,
+            0.0008554248488508165,
+            0.000874024408403784
+          ]
+        },
+        {
+          "layer": 47,
+          "types": [
+            12,
+            21
+          ],
+          "formats": [
+            0,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0008557603578083217,
+            0.00086722441483289,
+            0.0008901112014427781
+          ]
+        }
+      ],
+      "performance": {
+        "original_chain_us": 257.96409606933594,
+        "common_chain_us": 275.73043060302734,
+        "samples_us": {
+          "False": [
+            215.73631286621094,
+            246.78400039672852,
+            255.73440551757812,
+            271.1552047729492,
+            270.49983978271484,
+            265.87135314941406,
+            264.8678398132324,
+            263.90527725219727,
+            263.372802734375,
+            261.713924407959
+          ],
+          "True": [
+            231.13727569580078,
+            239.90272521972656,
+            284.03711318969727,
+            291.2256050109863,
+            287.4367904663086,
+            286.33087158203125,
+            281.08800888061523,
+            284.54912185668945,
+            285.6959915161133,
+            285.9008026123047
+          ]
+        },
+        "timing_intervals": [
+          {
+            "common": false,
+            "chain_us": 215.73631286621094,
+            "wall_start": 1791449969.5922313,
+            "wall_end": 1791449969.6054115
+          },
+          {
+            "common": true,
+            "chain_us": 231.13727569580078,
+            "wall_start": 1791449969.6061788,
+            "wall_end": 1791449969.619996
+          },
+          {
+            "common": true,
+            "chain_us": 239.90272521972656,
+            "wall_start": 1791449969.6204932,
+            "wall_end": 1791449969.6348484
+          },
+          {
+            "common": false,
+            "chain_us": 246.78400039672852,
+            "wall_start": 1791449969.6356952,
+            "wall_end": 1791449969.6502237
+          },
+          {
+            "common": false,
+            "chain_us": 255.73440551757812,
+            "wall_start": 1791449969.6507807,
+            "wall_end": 1791449969.666007
+          },
+          {
+            "common": true,
+            "chain_us": 284.03711318969727,
+            "wall_start": 1791449969.6666377,
+            "wall_end": 1791449969.6836216
+          },
+          {
+            "common": true,
+            "chain_us": 291.2256050109863,
+            "wall_start": 1791449969.6844645,
+            "wall_end": 1791449969.701896
+          },
+          {
+            "common": false,
+            "chain_us": 271.1552047729492,
+            "wall_start": 1791449969.7025542,
+            "wall_end": 1791449969.7187026
+          },
+          {
+            "common": false,
+            "chain_us": 270.49983978271484,
+            "wall_start": 1791449969.719246,
+            "wall_end": 1791449969.735426
+          },
+          {
+            "common": true,
+            "chain_us": 287.4367904663086,
+            "wall_start": 1791449969.7359233,
+            "wall_end": 1791449969.753158
+          },
+          {
+            "common": true,
+            "chain_us": 286.33087158203125,
+            "wall_start": 1791449969.7537546,
+            "wall_end": 1791449969.7708895
+          },
+          {
+            "common": false,
+            "chain_us": 265.87135314941406,
+            "wall_start": 1791449969.7720437,
+            "wall_end": 1791449969.7879722
+          },
+          {
+            "common": false,
+            "chain_us": 264.8678398132324,
+            "wall_start": 1791449969.7886117,
+            "wall_end": 1791449969.804479
+          },
+          {
+            "common": true,
+            "chain_us": 281.08800888061523,
+            "wall_start": 1791449969.8052037,
+            "wall_end": 1791449969.8220556
+          },
+          {
+            "common": true,
+            "chain_us": 284.54912185668945,
+            "wall_start": 1791449969.8230221,
+            "wall_end": 1791449969.8400073
+          },
+          {
+            "common": false,
+            "chain_us": 263.90527725219727,
+            "wall_start": 1791449969.8406286,
+            "wall_end": 1791449969.8564534
+          },
+          {
+            "common": false,
+            "chain_us": 263.372802734375,
+            "wall_start": 1791449969.8570232,
+            "wall_end": 1791449969.8727787
+          },
+          {
+            "common": true,
+            "chain_us": 285.6959915161133,
+            "wall_start": 1791449969.8733819,
+            "wall_end": 1791449969.8904786
+          },
+          {
+            "common": true,
+            "chain_us": 285.9008026123047,
+            "wall_start": 1791449969.89094,
+            "wall_end": 1791449969.9080517
+          },
+          {
+            "common": false,
+            "chain_us": 261.713924407959,
+            "wall_start": 1791449969.9086573,
+            "wall_end": 1791449969.9243505
+          }
+        ],
+        "changed_input_graph_replays": 20
+      },
+      "clocks_after_timing": "1447 MHz, 877 MHz"
+    },
+    {
+      "research_only": true,
+      "serving_runtime": false,
+      "rank": 3,
+      "source_sha": "c4f6245f841466782752a8c3283e4727565cf17a",
+      "generated_cuda_sha256": "4e6342b30fb1f39e98cb52b826717d40232094489561d0da0ff0bfab08b13f7b",
+      "cases": [
+        {
+          "layer": 22,
+          "types": [
+            18,
+            21
+          ],
+          "formats": [
+            6,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005831677699461579,
+            0.0005699346074834466,
+            0.0006034776451997459
+          ]
+        },
+        {
+          "layer": 38,
+          "types": [
+            21,
+            18
+          ],
+          "formats": [
+            5,
+            6
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005830473965033889,
+            0.0005860651726834476,
+            0.0006367728929035366
+          ]
+        },
+        {
+          "layer": 39,
+          "types": [
+            23,
+            21
+          ],
+          "formats": [
+            3,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005749371484853327,
+            0.0005836806958541274,
+            0.0005997888511046767
+          ]
+        },
+        {
+          "layer": 42,
+          "types": [
+            21,
+            23
+          ],
+          "formats": [
+            5,
+            3
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0005772518343292177,
+            0.0005910209147259593,
+            0.0006041494198143482
+          ]
+        },
+        {
+          "layer": 36,
+          "types": [
+            21,
+            12
+          ],
+          "formats": [
+            5,
+            0
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0008613842655904591,
+            0.0008750873384997249,
+            0.0008624680922366679
+          ]
+        },
+        {
+          "layer": 47,
+          "types": [
+            12,
+            21
+          ],
+          "formats": [
+            0,
+            5
+          ],
+          "bitwise_equal": true,
+          "official_relative_l2": [
+            0.0008592093363404274,
+            0.000854241312481463,
+            0.0008740060147829354
+          ]
+        }
+      ],
+      "performance": {
+        "original_chain_us": 251.74835205078125,
+        "common_chain_us": 267.10841941833496,
+        "samples_us": {
+          "False": [
+            215.49055099487305,
+            236.9331169128418,
+            248.87296676635742,
+            265.1955223083496,
+            261.98015213012695,
+            257.1059226989746,
+            257.3721694946289,
+            258.04800033569336,
+            257.5155258178711,
+            258.9695930480957
+          ],
+          "True": [
+            229.49888229370117,
+            230.78912734985352,
+            274.2892837524414,
+            282.31679916381836,
+            275.9065628051758,
+            274.55488204956055,
+            275.8860778808594,
+            277.6678466796875,
+            274.65728759765625,
+            275.5174446105957
+          ]
+        },
+        "timing_intervals": [
+          {
+            "common": false,
+            "chain_us": 215.49055099487305,
+            "wall_start": 1791449969.5924742,
+            "wall_end": 1791449969.605283
+          },
+          {
+            "common": true,
+            "chain_us": 229.49888229370117,
+            "wall_start": 1791449969.6062253,
+            "wall_end": 1791449969.619883
+          },
+          {
+            "common": true,
+            "chain_us": 230.78912734985352,
+            "wall_start": 1791449969.6206193,
+            "wall_end": 1791449969.634359
+          },
+          {
+            "common": false,
+            "chain_us": 236.9331169128418,
+            "wall_start": 1791449969.635792,
+            "wall_end": 1791449969.6498985
+          },
+          {
+            "common": false,
+            "chain_us": 248.87296676635742,
+            "wall_start": 1791449969.6508842,
+            "wall_end": 1791449969.665581
+          },
+          {
+            "common": true,
+            "chain_us": 274.2892837524414,
+            "wall_start": 1791449969.6666992,
+            "wall_end": 1791449969.6829839
+          },
+          {
+            "common": true,
+            "chain_us": 282.31679916381836,
+            "wall_start": 1791449969.6845787,
+            "wall_end": 1791449969.701414
+          },
+          {
+            "common": false,
+            "chain_us": 265.1955223083496,
+            "wall_start": 1791449969.7024925,
+            "wall_end": 1791449969.7183752
+          },
+          {
+            "common": false,
+            "chain_us": 261.98015213012695,
+            "wall_start": 1791449969.719377,
+            "wall_end": 1791449969.7349563
+          },
+          {
+            "common": true,
+            "chain_us": 275.9065628051758,
+            "wall_start": 1791449969.7358856,
+            "wall_end": 1791449969.7524126
+          },
+          {
+            "common": true,
+            "chain_us": 274.55488204956055,
+            "wall_start": 1791449969.7538402,
+            "wall_end": 1791449969.770288
+          },
+          {
+            "common": false,
+            "chain_us": 257.1059226989746,
+            "wall_start": 1791449969.7720351,
+            "wall_end": 1791449969.787431
+          },
+          {
+            "common": false,
+            "chain_us": 257.3721694946289,
+            "wall_start": 1791449969.78858,
+            "wall_end": 1791449969.8039749
+          },
+          {
+            "common": true,
+            "chain_us": 275.8860778808594,
+            "wall_start": 1791449969.805402,
+            "wall_end": 1791449969.8218055
+          },
+          {
+            "common": true,
+            "chain_us": 277.6678466796875,
+            "wall_start": 1791449969.8231473,
+            "wall_end": 1791449969.8397079
+          },
+          {
+            "common": false,
+            "chain_us": 258.04800033569336,
+            "wall_start": 1791449969.840801,
+            "wall_end": 1791449969.8561802
+          },
+          {
+            "common": false,
+            "chain_us": 257.5155258178711,
+            "wall_start": 1791449969.8572304,
+            "wall_end": 1791449969.872575
+          },
+          {
+            "common": true,
+            "chain_us": 274.65728759765625,
+            "wall_start": 1791449969.8734744,
+            "wall_end": 1791449969.8898933
+          },
+          {
+            "common": true,
+            "chain_us": 275.5174446105957,
+            "wall_start": 1791449969.8911684,
+            "wall_end": 1791449969.9075844
+          },
+          {
+            "common": false,
+            "chain_us": 258.9695930480957,
+            "wall_start": 1791449969.9088433,
+            "wall_end": 1791449969.9242854
+          }
+        ],
+        "changed_input_graph_replays": 20
+      },
+      "clocks_after_timing": "1470 MHz, 877 MHz"
+    }
+  ],
+  "four_rank_mean_original_chain_us": 255.75377559661865,
+  "four_rank_mean_common_chain_us": 273.47353744506836
+}
