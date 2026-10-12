@@ -53,6 +53,8 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.attention.kv_cache_view import KVCacheView
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
@@ -190,7 +192,22 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "int8",
     ]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+        return TritonAttentionBackend.get_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
+        )
 
     @staticmethod
     def get_name() -> str:
@@ -237,11 +254,38 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             "bfloat16",
             "fp8",
             "fp8_e4m3",
+            "int8",
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
+                "Qwen4Exp QSA requires FP16/BF16, E4M3 or INT8 main KV cache"
             )
         self.supports_quant_query_input = False
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        codec = resolve_kv_codec(self.kv_cache_dtype)
+        if codec is None or not codec.per_token_head:
+            return super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+        from vllm import _custom_ops
+
+        view = KVCacheView.bind(kv_cache, codec, self.head_size)
+        _custom_ops.reshape_and_cache_flash(
+            key,
+            value,
+            view.key,
+            view.value,
+            slot_mapping,
+            codec.name,
+            layer._k_scale,
+            layer._v_scale,
+            **view.scale_kwargs,
+        )
 
     def forward_qsa(
         self,
@@ -301,7 +345,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             return output
         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
         # [num_blocks, 2, block_size, num_kv_heads, head_size].
-        key_cache, value_cache = kv_cache.unbind(1)
+        scale_kwargs: dict[str, torch.Tensor] = {}
+        codec = resolve_kv_codec(self.kv_cache_dtype)
+        if codec is not None and codec.quantized:
+            view = KVCacheView.bind(kv_cache, codec, self.head_size)
+            key_cache, value_cache = view.key, view.value
+            scale_kwargs = view.scale_kwargs
+        else:
+            key_cache, value_cache = kv_cache.unbind(1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
         if query.dtype not in (torch.float16, torch.bfloat16):
@@ -309,6 +360,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if self.kv_cache_dtype in ("fp8", "fp8_e4m3"):
             if key_cache.dtype != torch.uint8 or value_cache.dtype != torch.uint8:
                 raise RuntimeError("Qwen4Exp QSA E4M3 cache must use uint8 storage")
+        elif self.kv_cache_dtype == "int8":
+            if key_cache.dtype != torch.int8 or value_cache.dtype != torch.int8:
+                raise RuntimeError("Qwen4Exp QSA INT8 cache must use signed storage")
         elif key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
             raise RuntimeError("Qwen4Exp QSA FP16/BF16 cache must match query dtype")
 
@@ -349,6 +403,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 token_to_req,
                 output[:num_tokens],
                 output_gate[:num_tokens],
+                scale_kwargs,
             )
             return output
 
@@ -370,6 +425,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             kv_cache_dtype=self.kv_cache_dtype,
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
+            **scale_kwargs,
+            selection_group_size=getattr(
+                getattr(layer, "indexer", None), "compress_ratio", 1
+            ),
             **qsa_metadata,
         )
         return output
@@ -385,6 +444,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         token_to_req: torch.Tensor,
         output: torch.Tensor,
         output_gate: torch.Tensor,
+        scale_kwargs: dict[str, torch.Tensor],
     ) -> None:
         from vllm.distributed import get_dcp_group
 
@@ -439,6 +499,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             kv_cache_dtype=self.kv_cache_dtype,
             k_scale=layer._k_scale_float,
             v_scale=layer._v_scale_float,
+            **scale_kwargs,
             lse=partial_lse,
         )
         merged = cast(
@@ -457,18 +518,27 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         _qsa_output_gate(output, output_gate.view_as(output))
 
 
-def _verify_e4m3_kv_requirements(
+def _verify_quantized_kv_requirements(
     vllm_config: VllmConfig,
     model_config: ModelConfig,
     cache_config: CacheConfig,
 ) -> None:
-    """Admit calibrated E4M3 from kernel capabilities, independent of TP/MTP."""
-    if cache_config.cache_dtype not in ("fp8", "fp8_e4m3"):
+    """Admit codec operands from device capabilities, independent of TP/MTP."""
+    codec = resolve_kv_codec(cache_config.cache_dtype)
+    if codec is None or not codec.quantized:
         return
     from .ops.qsa import qsa_e4m3_capability_reason
 
     if reason := qsa_e4m3_capability_reason(model_config.dtype):
-        raise NotImplementedError(f"QSA E4M3 cache unavailable: {reason}")
+        label = "E4M3" if codec.element_dtype == torch.float8_e4m3fn else "INT8"
+        raise NotImplementedError(f"QSA {label} cache unavailable: {reason}")
+
+
+def _verify_e4m3_kv_requirements(
+    vllm_config: VllmConfig, model_config: ModelConfig, cache_config: CacheConfig
+) -> None:
+    """Compatibility wrapper for the common quantized-cache admission."""
+    _verify_quantized_kv_requirements(vllm_config, model_config, cache_config)
 
 
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
@@ -507,11 +577,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             "bfloat16",
             "fp8",
             "fp8_e4m3",
+            "int8",
         ):
             raise NotImplementedError(
-                "Qwen4Exp QSA requires FP16/BF16 or E4M3 main KV cache"
+                "QSA requires FP16/BF16, E4M3 or INT8 main KV cache"
             )
-        _verify_e4m3_kv_requirements(vllm_config, model_config, cache_config)
+        _verify_quantized_kv_requirements(vllm_config, model_config, cache_config)
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
         parallel_config = vllm_config.parallel_config
@@ -638,7 +709,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         if (
             not self.host_kv_enabled
-            and self.kv_cache_dtype not in ("fp8", "fp8_e4m3")
+            and self.kv_cache_dtype not in ("fp8", "fp8_e4m3", "int8")
             and (self.kv_cache_torch_dtype != model_config.dtype)
         ):
             raise NotImplementedError(

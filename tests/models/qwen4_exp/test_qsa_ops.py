@@ -376,7 +376,10 @@ def test_qsa_xqa_page4_splits_non_grouped_large_batch(
         fake_xqa_batch,
     )
 
-    cache = torch.empty(0)
+    cache = torch.empty(
+        (4, 64, 1, 256),
+        dtype=torch.uint8 if kv_cache_dtype == "fp8_e4m3" else torch.float16,
+    )
     logical_indices = torch.empty(rows, 2051, dtype=torch.int32)
     block_table = torch.empty(4, 1, dtype=torch.int32)
     token_to_req = torch.empty(rows, dtype=torch.int32)

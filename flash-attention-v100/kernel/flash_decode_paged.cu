@@ -652,7 +652,8 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
     const int tile_page_offset, const int kv_tile_start, const int block_size,
     const int kv_head_idx, const int64_t block_stride,
     const int64_t token_stride, const int64_t head_stride,
-    const int panel_offset, const uint16_t* __restrict__ e4m3_lut = nullptr) {
+    const int panel_offset, const uint16_t* __restrict__ e4m3_lut = nullptr,
+    const flash_v100::KVPageMapping mapping = {}) {
   const int row = copy_idx / panel_d_stride_uint4;
   const int vec_col = copy_idx % panel_d_stride_uint4;
   const int token_offset = tile_page_offset + kv_tile_start + row;
@@ -707,9 +708,8 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
                       static_cast<int64_t>(block_offset) * kHeadDim +
                       panel_offset;
   } else {
-    physical_offset = static_cast<int64_t>(physical_block) * block_stride +
-                      static_cast<int64_t>(block_offset) * token_stride +
-                      static_cast<int64_t>(kv_head_idx) * head_stride +
+    physical_offset = mapping.offset(physical_block, block_offset, kv_head_idx,
+                                     block_stride, token_stride, head_stride) +
                       panel_offset;
   }
   return flash_v100::KVCodecTraits<KV_DTYPE>::template load_half8<
@@ -727,7 +727,8 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
     const int kv_head_idx, const int64_t block_stride,
     const int64_t token_stride, const int64_t head_stride,
     const int panel_offset, const int copy_thread_idx = threadIdx.x,
-    const uint16_t* __restrict__ e4m3_lut = nullptr) {
+    const uint16_t* __restrict__ e4m3_lut = nullptr,
+    const flash_v100::KVPageMapping mapping = {}) {
   uint4* shared_vec = reinterpret_cast<uint4*>(shared_kv);
   if constexpr (FP8_PAIR_LOAD) {
     static_assert(flash_v100::KVCodecTraits<KV_DTYPE>::paired_byte_load,
@@ -782,10 +783,10 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
             static_cast<int64_t>(physical_block) * kPhysicalBlockStride +
             static_cast<int64_t>(block_offset) * kHeadDim + panel_offset;
       } else {
-        physical_offset = static_cast<int64_t>(physical_block) * block_stride +
-                          static_cast<int64_t>(block_offset) * token_stride +
-                          static_cast<int64_t>(kv_head_idx) * head_stride +
-                          panel_offset;
+        physical_offset =
+            mapping.offset(physical_block, block_offset, kv_head_idx,
+                           block_stride, token_stride, head_stride) +
+            panel_offset;
       }
       const uint4 raw = __ldg(reinterpret_cast<const uint4*>(kv_cache) +
                               physical_offset / 16 + vec_pair);
@@ -812,7 +813,8 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
                                 E4M3_SHARED_LUT>(
               kv_cache, page_ids, copy_idx, panel_d_stride_uint4,
               tile_page_offset, kv_tile_start, block_size, kv_head_idx,
-              block_stride, token_stride, head_stride, panel_offset, e4m3_lut);
+              block_stride, token_stride, head_stride, panel_offset, e4m3_lut,
+              mapping);
     }
   }
 }
@@ -828,7 +830,8 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel_and_zero(
     const int kv_head_idx, const int64_t block_stride,
     const int64_t token_stride, const int64_t head_stride,
     const int panel_offset, const int copy_thread_idx,
-    const uint16_t* __restrict__ e4m3_lut = nullptr) {
+    const uint16_t* __restrict__ e4m3_lut = nullptr,
+    const flash_v100::KVPageMapping mapping = {}) {
   const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
   uint4* shared_vec = reinterpret_cast<uint4*>(shared_kv);
   constexpr int kLoadStages = 4;
@@ -844,8 +847,8 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel_and_zero(
                                   E4M3_SHARED_LUT>(
                 kv_cache, page_ids, copy_idx, panel_d_stride_uint4,
                 tile_page_offset, kv_tile_start, block_size, kv_head_idx,
-                block_stride, token_stride, head_stride, panel_offset,
-                e4m3_lut);
+                block_stride, token_stride, head_stride, panel_offset, e4m3_lut,
+                mapping);
       }
     }
 #pragma unroll
@@ -1405,7 +1408,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
               smem.k_buffer(0), k_cache, smem.page_ids, valid_kv_tile_rows,
               qk_panel_d_stride_uint4, qk_smem_stride_uint4, tile_page_offset,
               kv_tile_start, block_size, kv_head_idx, k_block_stride,
-              k_token_stride, k_head_stride, 0, producer_tid, e4m3_lut);
+              k_token_stride, k_head_stride, 0, producer_tid, e4m3_lut,
+              BLOCK_SIZE == 4 ? scales.pages : flash_v100::KVPageMapping{});
         }
         __syncthreads();
 
@@ -1421,7 +1425,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
                 qk_smem_stride_uint4, tile_page_offset, kv_tile_start,
                 block_size, kv_head_idx, k_block_stride, k_token_stride,
                 k_head_stride, panel_offset + kQKPanelDim, producer_tid,
-                e4m3_lut);
+                e4m3_lut,
+                BLOCK_SIZE == 4 ? scales.pages : flash_v100::KVPageMapping{});
           }
           if (warp_id < kConsumerWarps) {
             const int tile_n = warp_id * WMMA_N;
@@ -1450,7 +1455,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
               qk_panel_d_stride_uint4, qk_smem_stride_uint4, tile_page_offset,
               kv_tile_start, block_size, kv_head_idx, k_block_stride,
               k_token_stride, k_head_stride, panel_offset, threadIdx.x,
-              e4m3_lut);
+              e4m3_lut,
+              BLOCK_SIZE == 4 ? scales.pages : flash_v100::KVPageMapping{});
           for (int idx = tid + valid_kv_tile_rows * qk_panel_d_stride_uint4;
                idx < kXQATCBlockN * qk_panel_d_stride_uint4;
                idx += NUM_THREADS) {
@@ -1617,7 +1623,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
             sV, v_cache, smem.page_ids, valid_kv_tile_rows,
             pv_panel_d_stride_uint4, kv_smem_stride_uint4, tile_page_offset,
             kv_tile_start, block_size, kv_head_idx, v_block_stride,
-            v_token_stride, v_head_stride, panel_offset, threadIdx.x, e4m3_lut);
+            v_token_stride, v_head_stride, panel_offset, threadIdx.x, e4m3_lut,
+            BLOCK_SIZE == 4 ? scales.pages : flash_v100::KVPageMapping{});
         for (int idx = tid + valid_kv_tile_rows * pv_panel_d_stride_uint4;
              idx < kXQATCBlockN * pv_panel_d_stride_uint4; idx += NUM_THREADS) {
           const int row = idx / pv_panel_d_stride_uint4;
@@ -1964,19 +1971,21 @@ __device__ __forceinline__ void load_grouped_kv_panel(
     __half* shared, const void* cache, const int* pages, int rows,
     int panel_stride, int shared_stride, int first_token, int page_size,
     int64_t block_stride, int64_t token_stride, int64_t head_stride,
-    bool aligned_pair) {
+    bool aligned_pair, const flash_v100::KVPageMapping mapping = {}) {
   if constexpr (PAIRED) {
     if (aligned_pair) {
       load_xqa_tc_kv_panel<PAGE_SIZE, FIXED_LAYOUT, kGroupedVerifyThreads,
                            CODEC, true>(
           shared, cache, pages, rows, panel_stride, shared_stride, first_token,
-          0, page_size, 0, block_stride, token_stride, head_stride, 0);
+          0, page_size, 0, block_stride, token_stride, head_stride, 0,
+          threadIdx.x, nullptr, mapping);
       return;
     }
   }
   load_xqa_tc_kv_panel<PAGE_SIZE, FIXED_LAYOUT, kGroupedVerifyThreads, CODEC>(
       shared, cache, pages, rows, panel_stride, shared_stride, first_token, 0,
-      page_size, 0, block_stride, token_stride, head_stride, 0);
+      page_size, 0, block_stride, token_stride, head_stride, 0, threadIdx.x,
+      nullptr, mapping);
 }
 
 template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE = 0,
@@ -2003,9 +2012,10 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
     const bool aligned_pair = true) {
   static_assert(!ROW_SEQLENS || !SPARSE_PAGE4,
                 "explicit row lengths apply to dense causal groups only");
-  static_assert(
-      !COMPENSATE_P || (ROW_SEQLENS && std::is_same_v<PARTIAL_T, float>),
-      "probability compensation requires explicit-row FP32 groups");
+  static_assert(!COMPENSATE_P || SPARSE_PAGE4 ||
+                    (ROW_SEQLENS && std::is_same_v<PARTIAL_T, float>),
+                "probability compensation requires sparse output or "
+                "explicit-row FP32 groups");
   constexpr bool kRowScales =
       flash_v100::KVCodecTraits<KV_DTYPE>::per_token_head;
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
@@ -2187,7 +2197,8 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
                !SPARSE_PAGE4 && !ROW_SEQLENS)>(
           shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
           kSharedStrideVec, tile_page_offset, page_block_size, k_block_stride,
-          k_token_stride, k_head_stride, aligned_pair);
+          k_token_stride, k_head_stride, aligned_pair,
+          SPARSE_PAGE4 ? scales.pages : flash_v100::KVPageMapping{});
       for (int idx = tid + valid_k_rows * kSharedStrideVec;
            idx < kGroupedVerifyBlockN * kSharedStrideVec;
            idx += kGroupedVerifyThreads) {
@@ -2301,10 +2312,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         PAIRED_BYTE_LOAD ||
             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 && !ROW_SEQLENS) ||
             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 && !SPARSE_PAGE4 &&
-             !ROW_SEQLENS)>(shared_kv, k_cache, page_ids, valid_k_rows,
-                            kPanelStrideVec, kSharedStrideVec, tile_page_offset,
-                            page_block_size, k_block_stride, k_token_stride,
-                            k_head_stride, aligned_pair);
+             !ROW_SEQLENS)>(
+        shared_kv, k_cache, page_ids, valid_k_rows, kPanelStrideVec,
+        kSharedStrideVec, tile_page_offset, page_block_size, k_block_stride,
+        k_token_stride, k_head_stride, aligned_pair,
+        SPARSE_PAGE4 ? scales.pages : flash_v100::KVPageMapping{});
     for (int idx = tid + valid_k_rows * kSharedStrideVec;
          idx < kGroupedVerifyBlockN * kSharedStrideVec;
          idx += kGroupedVerifyThreads) {
@@ -2480,10 +2492,11 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
         PAIRED_BYTE_LOAD ||
             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 && !ROW_SEQLENS) ||
             (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 && !SPARSE_PAGE4 &&
-             !ROW_SEQLENS)>(shared_kv, v_cache, page_ids, valid_k_rows,
-                            kPanelStrideVec, kSharedStrideVec, tile_page_offset,
-                            page_block_size, v_block_stride, v_token_stride,
-                            v_head_stride, aligned_pair);
+             !ROW_SEQLENS)>(
+        shared_kv, v_cache, page_ids, valid_k_rows, kPanelStrideVec,
+        kSharedStrideVec, tile_page_offset, page_block_size, v_block_stride,
+        v_token_stride, v_head_stride, aligned_pair,
+        SPARSE_PAGE4 ? scales.pages : flash_v100::KVPageMapping{});
     for (int idx = tid + valid_k_rows * kSharedStrideVec;
          idx < kGroupedVerifyBlockN * kSharedStrideVec;
          idx += kGroupedVerifyThreads) {
@@ -3764,7 +3777,9 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             max_logits.data_ptr<float>(), exp_sums.data_ptr<float>(),          \
             block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),             \
             active_num_partitions.data_ptr<int>(), batch_size, max_num_blocks, \
-            launch_num_partitions, num_heads_q, num_heads_kv, k_cache.size(1), \
+            launch_num_partitions, num_heads_q, num_heads_kv,                  \
+            (scales.pages.subpage_tokens > 0 ? scales.pages.subpage_tokens     \
+                                             : k_cache.size(1)),               \
             q.stride(0), q.stride(1), tmp_out.stride(0), tmp_out.stride(1),    \
             tmp_out.stride(2), max_logits.stride(0), max_logits.stride(1),     \
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),           \
@@ -4164,23 +4179,18 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
               : (query_visible_tokens < sequence_length
                      ? static_cast<int>(query_visible_tokens)
                      : max(sequence_length, 0));
-      const int row_complete_page4_count =
-          min(min(visible_tokens / 4, sequence_length / 4), full_page4_count);
-      if (selected_page >= row_complete_page4_count) {
+      if (visible_tokens <= 0) {
         continue;
       }
       const int* selected = logical_indices +
                             static_cast<int64_t>(row) * logical_indices_stride +
                             selected_page * 4;
       const int first_token = __ldg(selected);
-      if (first_token < 0) {
-        continue;
-      }
-      const bool full_page4 = __ldg(selected + 1) == first_token + 1 &&
-                              __ldg(selected + 2) == first_token + 2 &&
-                              __ldg(selected + 3) == first_token + 3 &&
-                              (first_token & 3) == 0 &&
-                              first_token + 3 < sequence_length;
+      const bool full_page4 =
+          first_token >= 0 && first_token <= visible_tokens - 4 &&
+          __ldg(selected + 1) == first_token + 1 &&
+          __ldg(selected + 2) == first_token + 2 &&
+          __ldg(selected + 3) == first_token + 3 && (first_token & 3) == 0;
       if (full_page4) {
         const int physical_microblock = grouped_sparse_physical_microblock(
             first_token, request_idx, request_block_table,
@@ -4193,7 +4203,7 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
 #pragma unroll
         for (int token_offset = 0; token_offset < 4; ++token_offset) {
           const int token = __ldg(selected + token_offset);
-          if (token >= 0 && token < sequence_length) {
+          if (token >= 0 && token < visible_tokens) {
             const int physical_microblock = grouped_sparse_physical_microblock(
                 token, request_idx, request_block_table,
                 request_block_table_stride, block_table_width, page_size,
@@ -4219,27 +4229,23 @@ __launch_bounds__(kGroupedSparsePlannerThreads, 1) void grouped_sparse_page4_pla
               : (query_visible_tokens < sequence_length
                      ? static_cast<int>(query_visible_tokens)
                      : max(sequence_length, 0));
-      const int complete_page4_count =
-          min(min(visible_tokens / 4, sequence_length / 4), full_page4_count);
-      const int tail_count = visible_tokens & 3;
-      const int tail_index = complete_page4_count * 4;
-      const int selected_tail_token =
-          tail_index < selection_width
-              ? __ldg(logical_indices +
-                      static_cast<int64_t>(row) * logical_indices_stride +
-                      tail_index)
-              : -1;
-      const int expected_tail_token = (visible_tokens / 4) * 4;
-      if (tail_count > 0 && selected_tail_token == expected_tail_token &&
-          selected_tail_token < sequence_length) {
+      // Complete selection groups above can themselves contain a partial
+      // page. Only the final selection-width remainder is left here; read
+      // its actual tokens rather than synthesizing the causal tail mask.
+      for (int column = full_page4_count * 4; column < selection_width;
+           ++column) {
+        const int token =
+            __ldg(logical_indices +
+                  static_cast<int64_t>(row) * logical_indices_stride + column);
+        if (token < 0 || token >= visible_tokens) continue;
         const int physical_microblock = grouped_sparse_physical_microblock(
-            selected_tail_token, request_idx, request_block_table,
-            request_block_table_stride, block_table_width, page_size,
-            physical_page_stride, num_cache_blocks);
-        const uint32_t tail_mask = ((1u << tail_count) - 1) << (query * 4);
+            token, request_idx, request_block_table, request_block_table_stride,
+            block_table_width, page_size, physical_page_stride,
+            num_cache_blocks);
+        const uint32_t tail_mask = 1u << (query * 4 + (token & 3));
         grouped_sparse_hash_insert(hash_table, logical_owners,
                                    physical_microblock, tail_mask, query,
-                                   selected_tail_token);
+                                   token);
       }
     }
   }
@@ -4970,29 +4976,33 @@ at::Tensor flash_attention_grouped_verify_paged(
   return out;
 }
 
-at::Tensor flash_attention_grouped_sparse_page4(
+at::Tensor flash_attention_grouped_sparse_page4_with_view(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& token_masks, const at::Tensor& seq_lens, at::Tensor& lse,
     const float softmax_scale, const std::string& kv_cache_dtype,
-    const float k_scale, const float v_scale) {
+    const float k_scale, const float v_scale,
+    const std::optional<at::Tensor>& k_scale_cache,
+    const std::optional<at::Tensor>& v_scale_cache,
+    const int scale_page_group_size, const int scale_subpage_tokens) {
   constexpr int kQueriesPerGroup = kGroupedVerifyQ8MaxQ;
   TORCH_CHECK(q.is_cuda() && k_cache.is_cuda() && v_cache.is_cuda(),
               "grouped sparse page4 q/K/V must be CUDA tensors");
   TORCH_CHECK(block_table.is_cuda() && token_masks.is_cuda() &&
                   seq_lens.is_cuda() && lse.is_cuda(),
               "grouped sparse page4 metadata must be CUDA tensors");
-  const bool e4m3_kv = kv_cache_dtype == "fp8" || kv_cache_dtype == "fp8_e4m3";
+  const int codec = kv_cache_dtype_code_from_string(kv_cache_dtype);
+  TORCH_CHECK(codec == 0 || codec == 1 || codec == 3,
+              "grouped sparse page4 requires FP16, E4M3 or INT8 KV");
+  const bool e4m3_kv = codec == 1;
   TORCH_CHECK(q.dtype() == torch::kFloat16,
               "grouped sparse page4 requires fp16 queries");
-  TORCH_CHECK(e4m3_kv ? (k_cache.dtype() == torch::kUInt8 &&
-                         v_cache.dtype() == torch::kUInt8)
-                      : (k_cache.dtype() == torch::kFloat16 &&
-                         v_cache.dtype() == torch::kFloat16),
-              "grouped sparse page4 KV storage does not match kv_cache_dtype");
-  TORCH_CHECK(
-      e4m3_kv || kv_cache_dtype == "auto" || kv_cache_dtype == "float16",
-      "grouped sparse page4 supports fp16 and fp8_e4m3 KV only");
+  flash_v100::visit_kv_codec(codec, [&](auto tag) {
+    constexpr auto dtype = flash_v100::kv_storage_type<decltype(tag)::value>();
+    TORCH_CHECK(
+        k_cache.scalar_type() == dtype && v_cache.scalar_type() == dtype,
+        "grouped sparse page4 KV storage does not match its codec");
+  });
   TORCH_CHECK(!e4m3_kv || (std::isfinite(k_scale) && std::isfinite(v_scale) &&
                            k_scale > 0.0f && v_scale > 0.0f),
               "grouped sparse page4 E4M3 scales must be finite and positive");
@@ -5006,7 +5016,11 @@ at::Tensor flash_attention_grouped_sparse_page4(
                   q.size(2) == kGroupedVerifyHeadDim,
               "grouped sparse page4 q must have shape [8*N, 6, 256]");
   TORCH_CHECK(k_cache.dim() == 4 && v_cache.dim() == 4 &&
-                  k_cache.sizes() == v_cache.sizes() && k_cache.size(1) == 4 &&
+                  k_cache.sizes() == v_cache.sizes() &&
+                  ((scale_subpage_tokens == 4 &&
+                    k_cache.size(1) ==
+                        static_cast<int64_t>(scale_page_group_size) * 4) ||
+                   (scale_subpage_tokens == 0 && k_cache.size(1) == 4)) &&
                   k_cache.size(2) == 1 &&
                   k_cache.size(3) == kGroupedVerifyHeadDim,
               "grouped sparse page4 KV must have shape [blocks, 4, 1, 256]");
@@ -5045,18 +5059,35 @@ at::Tensor flash_attention_grouped_sparse_page4(
               "grouped sparse page4 supports SM70 only");
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
   const dim3 grid(1, 1, static_cast<unsigned>(num_groups));
-  const size_t shared_mem = sizeof(GroupedVerifySmem);
+  const auto scales = flash_v100::bind_scale_view(
+      codec, k_cache, v_cache, k_scale_cache, v_scale_cache,
+      scale_page_group_size, scale_subpage_tokens);
+  flash_v100::visit_kv_codec(codec, [&](auto tag) {
+    constexpr int code = decltype(tag)::value;
+    constexpr bool compensate = flash_v100::KVCodecTraits<code>::per_token_head;
+    const size_t shared_mem =
+        sizeof(GroupedVerifySmem) +
+        (compensate
+             ? kGroupedVerifyRows * kGroupedVerifyProbStride * sizeof(__half)
+             : 0);
+    static_assert(sizeof(GroupedVerifySmem) + kGroupedVerifyRows *
+                                                  kGroupedVerifyProbStride *
+                                                  sizeof(__half) <=
+                      64 * 1024,
+                  "sparse compensated probabilities exceed the SM70 budget");
 #define LAUNCH_GROUPED_SPARSE_PAGE4(KV_DTYPE_CODE)                             \
   do {                                                                         \
     auto kernel = (void*)flash_attention_grouped_verify_e5m2_partial_kernel<   \
-        kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE, true>; \
+        kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE, true,  \
+        __half, false, compensate>;                                            \
     const cudaError_t smem_status = cudaFuncSetAttribute(                      \
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);      \
     TORCH_CHECK(smem_status == cudaSuccess,                                    \
                 "Failed to set grouped sparse page4 shared memory: ",          \
                 cudaGetErrorString(smem_status));                              \
     flash_attention_grouped_verify_e5m2_partial_kernel<                        \
-        kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE, true>  \
+        kQueriesPerGroup, false, 4, false, false, false, KV_DTYPE_CODE, true,  \
+        __half, false, compensate>                                             \
         <<<grid, kGroupedVerifyThreads, shared_mem, stream>>>(                 \
             reinterpret_cast<const __half*>(q.data_ptr()), k_cache.data_ptr(), \
             v_cache.data_ptr(), block_table.data_ptr<int>(),                   \
@@ -5067,16 +5098,25 @@ at::Tensor flash_attention_grouped_sparse_page4(
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),           \
             softmax_scale * (e4m3_kv ? k_scale : 1.0f),                        \
             e4m3_kv ? v_scale : 1.0f, token_masks.data_ptr<uint32_t>(),        \
-            static_cast<int>(num_groups));                                     \
+            static_cast<int>(num_groups), nullptr, scales);                    \
   } while (0)
-  if (e4m3_kv) {
-    LAUNCH_GROUPED_SPARSE_PAGE4(flash_v100::KV_CACHE_DTYPE_FP8_E4M3);
-  } else {
-    LAUNCH_GROUPED_SPARSE_PAGE4(flash_v100::KV_CACHE_DTYPE_FP16);
-  }
+    LAUNCH_GROUPED_SPARSE_PAGE4(code);
 #undef LAUNCH_GROUPED_SPARSE_PAGE4
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+at::Tensor flash_attention_grouped_sparse_page4(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& token_masks, const at::Tensor& seq_lens, at::Tensor& lse,
+    const float softmax_scale, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale) {
+  return flash_attention_grouped_sparse_page4_with_view(
+      q, k_cache, v_cache, out_, block_table, token_masks, seq_lens, lse,
+      softmax_scale, kv_cache_dtype, k_scale, v_scale, std::nullopt,
+      std::nullopt, 1, 0);
 }
 
 at::Tensor flash_attention_decode_paged_with_scales(
@@ -5325,7 +5365,10 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
     const float k_scale, const float v_scale, const int window_size_left,
     const int window_size_right, const int batch_context_max_seq_len,
     const std::optional<at::Tensor>& k_scale_cache,
-    const std::optional<at::Tensor>& v_scale_cache) {
+    const std::optional<at::Tensor>& v_scale_cache,
+    const int scale_page_group_size = 1, const int scale_subpage_tokens = 0) {
+  const int page_block_size =
+      scale_subpage_tokens > 0 ? scale_subpage_tokens : k_cache.size(1);
   using PARTIAL_T =
       std::conditional_t<flash_v100::KVCodecTraits<KV_DTYPE>::fp32_partials,
                          float, __half>;
@@ -5397,13 +5440,14 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
       generic_partition ||
           (flash_v100::KVCodecTraits<KV_DTYPE>::quantized && q_per_kv == 6 &&
            (small_wave_partition ||
-            (large_wave_partition && q.size(0) == 1 && k_cache.size(1) >= 256 &&
-             k_cache.size(1) % 16 == 0))),
+            (large_wave_partition && q.size(0) == 1 && page_block_size >= 256 &&
+             page_block_size % 16 == 0))),
       "Unsupported XQA partition for the requested geometry: ", partition_size);
   TORCH_CHECK(launch_num_partitions > 0,
               "launch_num_partitions must be positive");
-  const auto scales = flash_v100::bind_scale_view(KV_DTYPE, k_cache, v_cache,
-                                                  k_scale_cache, v_scale_cache);
+  const auto scales = flash_v100::bind_scale_view(
+      KV_DTYPE, k_cache, v_cache, k_scale_cache, v_scale_cache,
+      scale_page_group_size, scale_subpage_tokens);
   const auto expected_partial_dtype =
       flash_v100::KVCodecTraits<KV_DTYPE>::fp32_partials ? torch::kFloat32
                                                          : torch::kFloat16;
@@ -5442,7 +5486,7 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
     if (use_wave_plan) {
       const bool e4m3_batch_allowed = q.size(0) > 1 && xqa_e4m3_batch_enabled();
       const bool e4m3_aligned_page =
-          k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0;
+          page_block_size >= 256 && page_block_size % 16 == 0;
       const bool use_large_partition =
           q.size(0) == 1 &&
           (partition_size == 512 || partition_size == 896 ||
@@ -5458,7 +5502,7 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
                   "1024, and 1664");
       const bool e4m3_batch_optimized =
           q.size(0) > 1 && xqa_e4m3_batch_optimized_enabled() &&
-          k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
+          page_block_size >= 256 && page_block_size % 16 == 0 &&
           pair_load_aligned;
       const XQABatchContextRoute e4m3_batch_route =
           e4m3_batch_optimized && batch_context_max_seq_len > 0 &&
@@ -5473,7 +5517,7 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
           e4m3_batch_route == XQABatchContextRoute::kDualCtaSplit;
       constexpr int64_t kPage800HeadDim256Elements = 800 * 256;
       const bool e4m3_page800_contiguous =
-          xqa_e4m3_page800_fastpath_enabled() && k_cache.size(1) == 800 &&
+          xqa_e4m3_page800_fastpath_enabled() && page_block_size == 800 &&
           k_cache.size(2) == 1 && k_cache.size(3) == 256 &&
           k_cache.stride(0) ==
               (2 * kPage800HeadDim256Elements +
@@ -5490,7 +5534,7 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
           v_cache.stride(1) == 256 && v_cache.stride(2) == 256 &&
           v_cache.stride(3) == 1;
       trace_xqa_batch_context_route(q.size(0), batch_context_max_seq_len,
-                                    partition_size, k_cache.size(1),
+                                    partition_size, page_block_size,
                                     e4m3_batch_route);
       trace_xqa_e4m3_page800_fastpath(q.size(0), partition_size,
                                       e4m3_dual_cta && e4m3_page800_contiguous);
@@ -5536,21 +5580,21 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
                                      e4m3_aligned_page &&
                                      !decode_partition_size_overridden() &&
                                      xqa_e4m3_g6_p64_p256_auto_enabled();
-      const int64_t page_head_dim_elements = k_cache.size(1) * 256;
+      const int64_t page_head_dim_elements = page_block_size * 256;
       const bool fixed_interleaved_hkv1_layout =
-          (k_cache.size(1) == 800 || k_cache.size(1) == 1568) &&
+          (page_block_size == 800 || page_block_size == 1568) &&
           k_cache.size(3) == 256 &&
           k_cache.stride(0) ==
               (2 * page_head_dim_elements +
                (flash_v100::KVCodecTraits<KV_DTYPE>::per_token_head
-                    ? 2 * k_cache.size(1) * 4
+                    ? 2 * page_block_size * 4
                     : 0)) &&
           k_cache.stride(1) == 256 && k_cache.stride(2) == 256 &&
           k_cache.stride(3) == 1 &&
           v_cache.stride(0) ==
               (2 * page_head_dim_elements +
                (flash_v100::KVCodecTraits<KV_DTYPE>::per_token_head
-                    ? 2 * k_cache.size(1) * 4
+                    ? 2 * page_block_size * 4
                     : 0)) &&
           v_cache.stride(1) == 256 && v_cache.stride(2) == 256 &&
           v_cache.stride(3) == 1;
@@ -5808,15 +5852,15 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
   const bool use_padded_smem =
       padded_smem_enabled && q_per_kv == 6 && partition_size == 256;
   const bool use_g6_dual_cta_dense = !use_padded_smem &&
-                                     k_cache.size(1) == 784 &&
+                                     page_block_size == 784 &&
                                      xqa_g6_dual_cta_dense_enabled();
   const bool use_g6_p1024_auto =
       q.size(0) == 1 && q_per_kv == 6 && partition_size == 1024 &&
-      k_cache.size(1) == 784 && k_cache.size(2) == 1 &&
+      page_block_size == 784 && k_cache.size(2) == 1 &&
       xqa_g6_p1024_auto_enabled();
   const bool use_g6_p1024_sawtooth =
       q.size(0) == 1 && q_per_kv == 6 && partition_size == 256 &&
-      k_cache.size(1) == 784 && k_cache.size(2) == 1 &&
+      page_block_size == 784 && k_cache.size(2) == 1 &&
       !decode_partition_size_overridden() && xqa_block784_index_enabled() &&
       xqa_g6_p1024_sawtooth_enabled();
   const bool use_g6_qk_pipeline = use_g6_p1024_sawtooth &&
@@ -5846,18 +5890,18 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
       g6_p1024_sawtooth_p256_long_seq_len, ", ",
       g6_p1024_sawtooth_p1024_final_seq_len);
   const bool use_mtp5_dual_cta =
-      q.size(0) == 5 && q_per_kv == 6 && k_cache.size(1) == 1616 &&
+      q.size(0) == 5 && q_per_kv == 6 && page_block_size == 1616 &&
       k_cache.size(2) > 0 && flash_v100::KVCodecTraits<KV_DTYPE>::quantized &&
       xqa_mtp5_dual_cta_enabled();
   const bool use_e5m2_g6_dual_cta =
       q.size(0) == 1 && q_per_kv == 6 && partition_size == 256 &&
-      k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
+      page_block_size >= 256 && page_block_size % 16 == 0 &&
       k_cache.size(2) == 1 && flash_v100::KVCodecTraits<KV_DTYPE>::quantized &&
       !decode_partition_size_overridden() && xqa_e5m2_g6_dual_cta_enabled() &&
       xqa_e5m2_g6_split_reduce_enabled();
   const bool batch_context_page_supported =
-      k_cache.size(1) == 16 ||
-      (k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0);
+      page_block_size == 16 ||
+      (page_block_size >= 256 && page_block_size % 16 == 0);
   const bool use_e5m2_g6_batch_context_route =
       batch_context_max_seq_len > 0 && q.size(0) >= 4 && q_per_kv == 6 &&
       batch_context_page_supported && k_cache.size(2) == 1 &&
@@ -5902,19 +5946,19 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
   // one partition always fits the existing shared page-id capacity.
   const bool use_e5m2_batch_wide_load =
       use_e5m2_g6_batch_context_route && partition_size == 256 &&
-      k_cache.size(1) >= 256 && k_cache.size(1) % 16 == 0 &&
+      page_block_size >= 256 && page_block_size % 16 == 0 &&
       (batch_context_route == XQABatchContextRoute::kDualCta ||
        batch_context_route == XQABatchContextRoute::kDualCtaSplit) &&
       pair_load_aligned && xqa_e5m2_batch_wide_load_enabled();
   const bool use_qsa_page4 = q.size(0) >= 4096 && q_per_kv == 6 &&
                              (partition_size == 256 || partition_size == 512 ||
                               partition_size == 1024) &&
-                             k_cache.size(1) == 4 && k_cache.size(2) == 1 &&
+                             page_block_size == 4 && k_cache.size(2) == 1 &&
                              k_cache.scalar_type() == at::kHalf &&
                              block_table.size(1) == 513;
   const bool use_g6_dual_cta =
-      use_qsa_page4 || use_g6_p1024_auto || use_g6_p1024_sawtooth ||
-      use_mtp5_dual_cta || use_e5m2_g6_dual_cta ||
+      scales.pages.subpage_tokens == 4 || use_qsa_page4 || use_g6_p1024_auto ||
+      use_g6_p1024_sawtooth || use_mtp5_dual_cta || use_e5m2_g6_dual_cta ||
       batch_context_route == XQABatchContextRoute::kDualCta ||
       batch_context_route == XQABatchContextRoute::kDualCtaSplit ||
       (xqa_g6_dual_cta_enabled() && (use_padded_smem || use_g6_dual_cta_dense));
@@ -5922,8 +5966,8 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
       use_g6_p1024_auto || use_g6_p1024_sawtooth || use_e5m2_g6_dual_cta ||
       batch_context_route == XQABatchContextRoute::kDualCtaSplit ||
       (use_g6_dual_cta && xqa_split_reduce_enabled());
-  const bool supports_block16_index = use_g6_dual_cta && k_cache.size(1) == 16;
-  const bool use_block4_index = use_g6_dual_cta && k_cache.size(1) == 4;
+  const bool supports_block16_index = use_g6_dual_cta && page_block_size == 16;
+  const bool use_block4_index = use_g6_dual_cta && page_block_size == 4;
   constexpr int64_t block16_stride =
       flash_v100::KVCodecTraits<KV_DTYPE>::per_token_head ? 2 * 16 * 260 : 4096;
   const bool supports_block16_contiguous_layout =
@@ -5933,7 +5977,7 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
       v_cache.stride(0) == block16_stride && v_cache.stride(1) == 256 &&
       v_cache.stride(2) == 256 && v_cache.stride(3) == 1;
   const bool use_block784_index =
-      use_g6_dual_cta && k_cache.size(1) == 784 && xqa_block784_index_enabled();
+      use_g6_dual_cta && page_block_size == 784 && xqa_block784_index_enabled();
   const bool use_aligned_padded_smem = use_padded_smem && use_block784_index &&
                                        xqa_aligned_padded_smem_enabled();
   const int requested_block16_layout_mode = xqa_block16_layout_mode();
@@ -5947,12 +5991,12 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
         block16_layout_mode == requested_block16_layout_mode,
         "Requested block16 XQA mode ", requested_block16_layout_mode,
         " but the live KV cache does not satisfy its layout gate: block_size=",
-        k_cache.size(1), ", num_kv_heads=", k_cache.size(2), ", k_strides=[",
+        page_block_size, ", num_kv_heads=", k_cache.size(2), ", k_strides=[",
         k_cache.stride(0), ",", k_cache.stride(1), ",", k_cache.stride(2), ",",
         k_cache.stride(3), "]");
   }
   trace_xqa_batch_context_route(q.size(0), batch_context_max_seq_len,
-                                partition_size, k_cache.size(1),
+                                partition_size, page_block_size,
                                 batch_context_route);
   auto& traced_e5m2_batch_wide_load = flash_v100::policy::observation(4);
   if (xqa_batch_context_routing_trace_enabled() && use_e5m2_batch_wide_load &&
@@ -5966,7 +6010,7 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
   if (xqa_block16_layout_trace_enabled() && block16_layout_mode != 0 &&
       !traced_block16_layout) {
     TORCH_WARN("Flash-V100 XQA block16 mode ", block16_layout_mode,
-               " active for KV shape [blocks,", k_cache.size(1), ",",
+               " active for KV shape [blocks,", page_block_size, ",",
                k_cache.size(2), ",", k_cache.size(3), "]");
     traced_block16_layout = true;
   }
@@ -5976,7 +6020,7 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
     TORCH_WARN(
         "Flash-V100 XQA block784 index specialization active for KV "
         "shape [blocks,",
-        k_cache.size(1), ",", k_cache.size(2), ",", k_cache.size(3), "]");
+        page_block_size, ",", k_cache.size(2), ",", k_cache.size(3), "]");
     traced_block784_index = true;
   }
   auto& traced_g6_p1024_auto = flash_v100::policy::observation(7);
@@ -6014,7 +6058,7 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
         "Flash-V100 XQA E5M2 G6 device-side p256/p1024 route active; "
         "thresholds=",
         e5m2_p1024_begin, ", ", e5m2_g6_dual_cta_seq_len, ", KV shape [blocks,",
-        k_cache.size(1), ",", k_cache.size(2), ",", k_cache.size(3),
+        page_block_size, ",", k_cache.size(2), ",", k_cache.size(3),
         "], split_reduce=", use_split_reduce,
         ", partition_page_ids=", use_e5m2_partition_page_ids,
         ", pair_load=", use_e5m2_pair_load,
@@ -6349,6 +6393,30 @@ at::Tensor flash_attention_decode_paged_xqa_impl(
   return out;
 }
 
+at::Tensor flash_attention_decode_paged_xqa_with_view(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
+    at::Tensor& exp_sums, const at::Tensor& active_num_partitions,
+    const float softmax_scale, const int partition_size,
+    const int launch_num_partitions, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale, const int window_size_left,
+    const int window_size_right, const int batch_context_max_seq_len,
+    const std::optional<at::Tensor>& k_scale_cache,
+    const std::optional<at::Tensor>& v_scale_cache,
+    const int scale_page_group_size, const int scale_subpage_tokens) {
+  return flash_v100::visit_kv_codec(
+      kv_cache_dtype_code_from_string(kv_cache_dtype), [&](auto tag) {
+        return flash_attention_decode_paged_xqa_impl<decltype(tag)::value>(
+            q, k_cache, v_cache, out_, block_table, seq_lens, tmp_out,
+            max_logits, exp_sums, active_num_partitions, softmax_scale,
+            partition_size, launch_num_partitions, kv_cache_dtype, k_scale,
+            v_scale, window_size_left, window_size_right,
+            batch_context_max_seq_len, k_scale_cache, v_scale_cache,
+            scale_page_group_size, scale_subpage_tokens);
+      });
+}
+
 at::Tensor flash_attention_decode_paged_xqa_with_scales(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
@@ -6360,15 +6428,12 @@ at::Tensor flash_attention_decode_paged_xqa_with_scales(
     const int window_size_right, const int batch_context_max_seq_len,
     const std::optional<at::Tensor>& k_scale_cache,
     const std::optional<at::Tensor>& v_scale_cache) {
-  return flash_v100::visit_kv_codec(
-      kv_cache_dtype_code_from_string(kv_cache_dtype), [&](auto tag) {
-        return flash_attention_decode_paged_xqa_impl<decltype(tag)::value>(
-            q, k_cache, v_cache, out_, block_table, seq_lens, tmp_out,
-            max_logits, exp_sums, active_num_partitions, softmax_scale,
-            partition_size, launch_num_partitions, kv_cache_dtype, k_scale,
-            v_scale, window_size_left, window_size_right,
-            batch_context_max_seq_len, k_scale_cache, v_scale_cache);
-      });
+  return flash_attention_decode_paged_xqa_with_view(
+      q, k_cache, v_cache, out_, block_table, seq_lens, tmp_out, max_logits,
+      exp_sums, active_num_partitions, softmax_scale, partition_size,
+      launch_num_partitions, kv_cache_dtype, k_scale, v_scale, window_size_left,
+      window_size_right, batch_context_max_seq_len, k_scale_cache,
+      v_scale_cache, 1, 0);
 }
 
 at::Tensor flash_attention_decode_paged_xqa(

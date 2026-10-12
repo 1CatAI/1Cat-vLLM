@@ -7,6 +7,7 @@ import torch
 
 from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_sparse_paged_attention
 from vllm.models.qwen4_exp.nvidia.ops.qsa_dcp import qsa_localize_dcp_indices
+from vllm.v1.attention.kv_codecs import FP8_E4M3, FP16, INT8
 
 pytestmark = [
     pytest.mark.skip_global_cleanup,
@@ -14,21 +15,29 @@ pytestmark = [
 ]
 
 
-@pytest.mark.parametrize("e4m3", [False, True])
+@pytest.mark.parametrize("codec", [FP16, FP8_E4M3, INT8], ids=lambda c: c.name)
 @pytest.mark.parametrize("width", [3, 2051])
-def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
+def test_dcp2_g12_attention_lse_matches_fp32_reference(codec, width):
     generator = torch.Generator().manual_seed(57431)
     tokens, page, heads, dim = 128, 16, 12, 256
     world, interleave = 2, 4
     k = torch.randn((tokens, 1, dim), generator=generator).half()
     v = torch.randn((tokens, 1, dim), generator=generator).half()
     q = torch.randn((3, heads, dim), generator=generator).half().cuda()
-    k_scale, v_scale = (0.125, 0.25) if e4m3 else (1.0, 1.0)
-    if e4m3:
+    k_scale, v_scale = (0.125, 0.25) if codec is FP8_E4M3 else (1.0, 1.0)
+    key_scales = value_scales = None
+    if codec.per_token_head:
+        k, key_scales = codec.encode(k)
+        v, value_scales = codec.encode(v)
+        k_ref = (k.float() * key_scales[..., None]).cuda()
+        v_ref = (v.float() * value_scales[..., None]).cuda()
+        key_scales, value_scales = key_scales.cuda(), value_scales.cuda()
+    elif codec is FP8_E4M3:
         k = k.to(torch.float8_e4m3fn)
         v = v.to(torch.float8_e4m3fn)
-    k_ref, v_ref = k.float().cuda() * k_scale, v.float().cuda() * v_scale
-    if e4m3:
+    if not codec.per_token_head:
+        k_ref, v_ref = k.float().cuda() * k_scale, v.float().cuda() * v_scale
+    if codec is FP8_E4M3:
         k, v = k.view(torch.uint8), v.view(torch.uint8)
     k, v = k.cuda(), v.cuda()
     selection = torch.full((3, width), -1, dtype=torch.int32)
@@ -49,6 +58,17 @@ def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
         physical_k, physical_v = torch.empty_like(local_k), torch.empty_like(local_v)
         physical_k[table[0].long()] = local_k
         physical_v[table[0].long()] = local_v
+        scale_kwargs = {}
+        if key_scales is not None:
+            assert value_scales is not None
+            for name, scales in (
+                ("k_scale_cache", key_scales),
+                ("v_scale_cache", value_scales),
+            ):
+                local_scales = scales[owned].reshape(-1, page, 1)
+                physical_scales = torch.empty_like(local_scales)
+                physical_scales[table[0].long()] = local_scales
+                scale_kwargs[name] = physical_scales
         qsa_localize_dcp_indices(
             indices,
             local_ids,
@@ -68,9 +88,10 @@ def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
             token_to_req,
             out=out,
             lse=lse,
-            kv_cache_dtype="fp8_e4m3" if e4m3 else "auto",
+            kv_cache_dtype=codec.name,
             k_scale=k_scale,
             v_scale=v_scale,
+            **scale_kwargs,
         )
         assert torch.isfinite(out).all()
         assert torch.isneginf(lse[2]).all()
@@ -98,6 +119,13 @@ def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
     torch.testing.assert_close(global_lse, expected_lse, rtol=1e-4, atol=2e-3)
     # Exercise the unchanged DCP1 call signature and its FP16 output route.
     full_table = torch.arange(tokens // page, dtype=torch.int32, device="cuda")[None]
+    full_scale_kwargs = {}
+    if key_scales is not None:
+        assert value_scales is not None
+        full_scale_kwargs = {
+            "k_scale_cache": key_scales.reshape(-1, page, 1),
+            "v_scale_cache": value_scales.reshape(-1, page, 1),
+        }
     baseline = qsa_sparse_paged_attention(
         q,
         k.reshape(-1, page, 1, dim),
@@ -105,9 +133,10 @@ def test_dcp2_g12_attention_lse_matches_fp32_reference(e4m3, width):
         indices,
         full_table,
         token_to_req,
-        kv_cache_dtype="fp8_e4m3" if e4m3 else "auto",
+        kv_cache_dtype=codec.name,
         k_scale=k_scale,
         v_scale=v_scale,
+        **full_scale_kwargs,
     )
     torch.testing.assert_close(baseline.float(), reference, rtol=3e-3, atol=2e-3)
     assert torch.equal(indices.cpu(), selection)

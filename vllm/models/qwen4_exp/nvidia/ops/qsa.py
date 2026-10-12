@@ -13,12 +13,11 @@ import torch
 
 from vllm.config.sm70_sparse import sparse_policy
 from vllm.logger import init_logger
-from vllm.models.deepseek_v4.common.ops.fp8_software import (
-    fp8_e4m3fn_bits_to_fp32_bitcast as fp8_e4m3fn_bits_to_fp32,
-)
 from vllm.models.qwen4_exp.nvidia.ops.host_kv_reader import load_host_kv
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.attention.kv_cache_view import KVPageMapping
+from vllm.v1.attention.kv_codecs import resolve_kv_codec
 from vllm.v1.attention.ops.kv_codec import decode_kv_payload
 from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
 
@@ -72,6 +71,7 @@ _SM70_QSA_GROUPED_PAGE4_WORKSPACES: dict[
     ],
 ] = {}
 _SM70_QSA_GROUPED_PAGE4_ABI_CACHE: tuple[object, int] | None = None
+KVSubpageScaleArgs = tuple[torch.Tensor | None, torch.Tensor | None, int, int]
 
 
 def _qsa_grouped_page4_abi_version(flash_attn_v100_cuda) -> int:
@@ -106,6 +106,12 @@ def _qsa_grouped_page4_abi_version(flash_attn_v100_cuda) -> int:
             elif highest_argument >= 8:
                 version = 1
 
+    if (
+        getattr(flash_attn_v100_cuda, "grouped_sparse_page4_kv_abi", 0) >= 1
+        and getattr(flash_attn_v100_cuda, "grouped_sparse_page4_kv_view_abi", 0) >= 1
+        and callable(getattr(flash_attn_v100_cuda, "grouped_sparse_page4_kv_fwd", None))
+    ):
+        version = max(version, 3)
     _SM70_QSA_GROUPED_PAGE4_ABI_CACHE = (flash_attn_v100_cuda, version)
     return version
 
@@ -119,6 +125,11 @@ def _qsa_grouped_page4_supported(
     if not callable(forward) or not callable(planner):
         return False
     abi_version = _qsa_grouped_page4_abi_version(flash_attn_v100_cuda)
+    codec = resolve_kv_codec(kv_cache_dtype)
+    if codec is not None and codec.per_token_head:
+        return abi_version >= 3 and codec.name in getattr(
+            flash_attn_v100_cuda, "grouped_sparse_page4_kv_codecs", ()
+        )
     return abi_version >= 2 or (
         abi_version == 1 and kv_cache_dtype in ("auto", "float16")
     )
@@ -487,6 +498,18 @@ def _qsa_xqa_page4_table_kernel(
         mask=(row < rows) & is_complete,
         other=-1,
     )
+    # Native XQA represents complete aligned page4 selections and one causal
+    # tail. Check the complete groups and count actual valid pages, so empty
+    # selections and missing physical pages cannot enter the native reader.
+    is_complete &= (selected_token >= 0) & (selected_token % 4 == 0)
+    for offset in tl.static_range(1, 4):
+        selected_next = tl.load(
+            indices_ptr + row * stride_indices_row + slots * 4 + offset,
+            mask=(row < rows) & is_complete,
+            other=-1,
+        )
+        is_complete &= selected_next == selected_token + offset
+    is_complete &= selected_token + 3 < visible_tokens
     tail_token = (visible_tokens // 4) * 4
     selected_tail_token = tl.load(
         indices_ptr + row * stride_indices_row + complete_pages * 4,
@@ -541,7 +564,8 @@ def _qsa_xqa_page4_table_kernel(
     )
     tl.store(
         xqa_sequence_lengths_ptr + row,
-        complete_pages * 4 + tl.where(tail_is_valid, tail_count, 0),
+        tl.sum((valid & is_complete).to(tl.int32), 0) * 4
+        + tl.sum(tl.where(valid & is_tail, tail_count, 0), 0),
         mask=row < rows,
     )
 
@@ -643,6 +667,15 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     DEVICE_HISTORY: tl.constexpr = False,
     HISTORY_E4M3: tl.constexpr = False,
     HISTORY_CODEC: tl.constexpr = -1,
+    KV_CODEC: tl.constexpr = -1,
+    K_SCALES=None,
+    V_SCALES=None,
+    KS_BLOCK: tl.constexpr = 0,
+    KS_TOKEN: tl.constexpr = 0,
+    KS_HEAD: tl.constexpr = 0,
+    VS_BLOCK: tl.constexpr = 0,
+    VS_TOKEN: tl.constexpr = 0,
+    VS_HEAD: tl.constexpr = 0,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -773,10 +806,32 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 decode_kv_payload(values, HISTORY_CODEC if HISTORY_CODEC >= 0 else 1)
                 * value_scales[:, None]
             ).to(query.dtype)
-        if KV_E4M3:
-            keys = fp8_e4m3fn_bits_to_fp32(keys).to(query.dtype)
-            values = fp8_e4m3fn_bits_to_fp32(values).to(query.dtype)
+        if KV_E4M3 or KV_CODEC == 3:
+            keys = decode_kv_payload(keys, 3 if KV_CODEC == 3 else 1, True).to(
+                query.dtype
+            )
+            values = decode_kv_payload(values, 3 if KV_CODEC == 3 else 1, True).to(
+                query.dtype
+            )
         scores = tl.dot(query, keys)
+        if KV_CODEC == 3:
+            key_scales = tl.load(
+                K_SCALES
+                + safe_page * KS_BLOCK
+                + page_offset * KS_TOKEN
+                + kv_head * KS_HEAD,
+                valid,
+                other=1.0,
+            )
+            value_scales = tl.load(
+                V_SCALES
+                + safe_page * VS_BLOCK
+                + page_offset * VS_TOKEN
+                + kv_head * VS_HEAD,
+                valid,
+                other=1.0,
+            )
+            scores *= key_scales[None, :]
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= qk_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
@@ -785,11 +840,20 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
-        accumulator = tl.dot(
-            probabilities.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
+        if KV_CODEC == 3:
+            weighted = probabilities * value_scales[None, :]
+            high = weighted.to(values.dtype)
+            low = ((weighted - high.to(tl.float32)) * 2048.0).to(values.dtype)
+            residual = tl.dot(low, values) * (1.0 / 2048.0)
+            accumulator = (
+                tl.dot(high, values, acc=accumulator * alpha[:, None]) + residual
+            )
+        else:
+            accumulator = tl.dot(
+                probabilities.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
 
@@ -1756,7 +1820,7 @@ def _qsa_xqa_page4_shape_supported(
         and sequence_lengths is not None
         and q.dtype == torch.float16
         and k_cache.dtype == v_cache.dtype
-        and k_cache.dtype in (torch.float16, torch.uint8)
+        and k_cache.dtype in (torch.float16, torch.uint8, torch.int8)
         and q.device
         == k_cache.device
         == v_cache.device
@@ -1775,7 +1839,8 @@ def _qsa_xqa_page4_shape_supported(
         and k_cache.stride(3) == v_cache.stride(3) == 1
         and k_cache.stride(1) == v_cache.stride(1) == 256
         and k_cache.stride(0) == v_cache.stride(0)
-        and k_cache.stride(0) in (k_cache.shape[1] * 256, 2 * k_cache.shape[1] * 256)
+        and k_cache.stride(0) >= k_cache.shape[1] * 256
+        and k_cache.stride(0) * k_cache.element_size() % 16 == 0
         and logical_indices.shape == (q.shape[0], 2051)
         and logical_indices.dtype == torch.int32
         and logical_indices.stride(1) == 1
@@ -1791,8 +1856,7 @@ def _qsa_xqa_page4_shape_supported(
         and sequence_lengths.shape == (block_table.shape[0],)
         and sequence_lengths.dtype == torch.int32
         and sequence_lengths.stride(0) == 1
-        and k_cache.shape[0] * (k_cache.stride(0) // (4 * 256))
-        < _SM70_QSA_XQA_PAGE4_MARKER
+        and k_cache.shape[0] * (k_cache.shape[1] // 4) < _SM70_QSA_XQA_PAGE4_MARKER
     )
 
 
@@ -1811,7 +1875,7 @@ def _use_sm70_qsa_xqa_page4(
         and current_platform.is_device_capability(70)
         and (
             q.shape[0] >= sparse_policy().value("qsa_xqa_page4_min_rows")
-            or (k_cache.dtype == torch.uint8 and q.shape[0] > 16)
+            or (k_cache.element_size() == 1 and q.shape[0] > 16)
         )
         and _qsa_xqa_page4_shape_supported(
             q,
@@ -1884,7 +1948,9 @@ def _qsa_xqa_page4_workspace(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     device_index = q.device.index if q.device.index is not None else -1
     stream_id = int(torch.cuda.current_stream(q.device).cuda_stream)
-    e4m3_output = kv_cache_dtype == "fp8_e4m3"
+    codec = resolve_kv_codec(kv_cache_dtype)
+    assert codec is not None
+    e4m3_output = codec.fp32_attention_partials
     key = (
         device_index,
         stream_id,
@@ -2013,6 +2079,17 @@ def _qsa_xqa_page4_physical_kv(
     return physical_k_cache, physical_v_cache
 
 
+def _qsa_page4_legacy_mapping_supported(k_cache: torch.Tensor) -> bool:
+    """The old ABI encodes physical affine page4 IDs, without owner strides."""
+    if k_cache.ndim != 4 or k_cache.shape[-1] <= 0:
+        return False
+    tile = 4 * k_cache.shape[-1]
+    return (
+        k_cache.stride(0) % tile == 0
+        and k_cache.shape[0] * (k_cache.stride(0) // tile) < _SM70_QSA_XQA_PAGE4_MARKER
+    )
+
+
 def _qsa_grouped_page4_forward(
     flash_attn_v100_cuda,
     q: torch.Tensor,
@@ -2027,6 +2104,7 @@ def _qsa_grouped_page4_forward(
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
+    scale_view: KVSubpageScaleArgs = (None, None, 1, 0),
 ) -> None:
     forward_args = (
         q,
@@ -2040,6 +2118,21 @@ def _qsa_grouped_page4_forward(
         softmax_scale,
     )
     abi_version = _qsa_grouped_page4_abi_version(flash_attn_v100_cuda)
+    if abi_version >= 3:
+        from flash_attn_v100.kv_binding import bind_kv
+
+        binding = bind_kv(
+            flash_attn_v100_cuda,
+            "grouped_sparse_page4",
+            kv_cache_dtype,
+            scale_view[0],
+            scale_view[1],
+            page_mapping=scale_view[2:],
+        )
+        binding.operation(
+            *forward_args, kv_cache_dtype, k_scale, v_scale, *binding.scale_args
+        )
+        return
     if abi_version >= 2:
         flash_attn_v100_cuda.grouped_sparse_page4_fwd(
             *forward_args,
@@ -2069,11 +2162,17 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
     k_scale: float,
     v_scale: float,
     flash_attn_v100_cuda,
+    scale_view: KVSubpageScaleArgs = (None, None, 1, 0),
 ) -> torch.Tensor:
     grouped_pages, token_masks, grouped_sequence_lengths, lse = (
         _qsa_grouped_page4_workspace(q)
     )
-    physical_page_stride = k_cache.stride(0) // (4 * q.shape[2])
+    native_view = (
+        getattr(flash_attn_v100_cuda, "grouped_sparse_page4_kv_view_abi", 0) >= 1
+    )
+    physical_page_stride = (
+        scale_view[2] if native_view else k_cache.stride(0) // (4 * q.shape[2])
+    )
     flash_attn_v100_cuda.grouped_sparse_page4_plan_fwd(
         logical_indices,
         block_table,
@@ -2099,7 +2198,11 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
         grouped_pages.copy_(
             torch.where(token_masks == 0, grouped_pages[:, :1], grouped_pages)
         )
-    physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
+    physical_k_cache, physical_v_cache = (
+        (k_cache, v_cache)
+        if native_view
+        else _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
+    )
     _qsa_grouped_page4_forward(
         flash_attn_v100_cuda,
         q,
@@ -2114,6 +2217,7 @@ def _qsa_sparse_paged_attention_sm70_grouped_page4(
         kv_cache_dtype,
         k_scale,
         v_scale,
+        scale_view,
     )
     logger.info_once(
         "Using SM70 grouped QSA Flash-V100 page4 prefill route (rows=%d, groups=%d).",
@@ -2137,7 +2241,9 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
     k_scale: float,
     v_scale: float,
     flash_attn_v100_cuda,
+    scale_view: KVSubpageScaleArgs = (None, None, 1, 0),
 ) -> torch.Tensor:
+    native_view = getattr(flash_attn_v100_cuda, "decode_paged_xqa_kv_view_abi", 0) >= 1
     virtual_block_table, xqa_sequence_lengths = _qsa_xqa_page4_block_table(
         logical_indices,
         block_table,
@@ -2146,19 +2252,23 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
         sequence_lengths,
         k_cache.shape[0],
         k_cache.shape[1],
-        k_cache.stride(0) // (4 * q.shape[2]),
+        scale_view[2] if native_view else k_cache.stride(0) // (4 * q.shape[2]),
     )
     # Generic E4M3 G6 XQA supports P256 for virtual page4 caches. Its P1024
     # specialization is restricted to the page1568 layout.
-    partition_size = (
-        256 if kv_cache_dtype == "fp8_e4m3" else _SM70_QSA_XQA_PAGE4_PARTITION
-    )
+    codec = resolve_kv_codec(kv_cache_dtype)
+    assert codec is not None
+    partition_size = 256 if codec.quantized else _SM70_QSA_XQA_PAGE4_PARTITION
     num_partitions = math.ceil(logical_indices.shape[1] / partition_size)
     temporary_output, max_logits, exp_sums, active_num_partitions = (
         _qsa_xqa_page4_workspace(q, num_partitions, kv_cache_dtype)
     )
-    physical_k_cache, physical_v_cache = _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
-    flash_attn_v100_cuda.decode_paged_xqa_fwd(
+    physical_k_cache, physical_v_cache = (
+        (k_cache, v_cache)
+        if native_view
+        else _qsa_xqa_page4_physical_kv(q, k_cache, v_cache)
+    )
+    forward_args = (
         q,
         physical_k_cache,
         physical_v_cache,
@@ -2179,6 +2289,21 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4_batch(
         -1,
         0,
     )
+    if getattr(flash_attn_v100_cuda, "decode_paged_xqa_kv_view_abi", 0) >= 1:
+        from flash_attn_v100.kv_binding import bind_kv
+
+        binding = bind_kv(
+            flash_attn_v100_cuda,
+            "decode_paged_xqa",
+            kv_cache_dtype,
+            scale_view[0],
+            scale_view[1],
+            page_mapping=scale_view[2:],
+        )
+        binding.operation(*forward_args, *binding.scale_args)
+    else:
+        assert not codec.per_token_head, "Missing native subpage scale binding"
+        flash_attn_v100_cuda.decode_paged_xqa_fwd(*forward_args)
     logger.info_once(
         "Using SM70 QSA Flash-V100 XQA page4 prefill route (rows=%d, partitions=%d).",
         q.shape[0],
@@ -2200,6 +2325,8 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     kv_cache_dtype: str,
     k_scale: float,
     v_scale: float,
+    scale_view: KVSubpageScaleArgs = (None, None, 1, 0),
+    complete_page4_selections: bool = True,
 ) -> torch.Tensor | None:
     try:
         from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
@@ -2216,9 +2343,40 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
         )
         return None
 
+    codec = resolve_kv_codec(kv_cache_dtype)
+    assert codec is not None
+    if codec.per_token_head and (
+        getattr(flash_attn_v100_cuda, "decode_paged_xqa_kv_view_abi", 0) < 1
+        or not callable(getattr(flash_attn_v100_cuda, "decode_paged_xqa_kv_fwd", None))
+    ):
+        logger.warning_once(
+            "QSA page4 native_codec_binding_unavailable for %s; using Triton.",
+            codec.name,
+        )
+        return None
+
+    if getattr(
+        flash_attn_v100_cuda, "decode_paged_xqa_kv_view_abi", 0
+    ) < 1 and not _qsa_page4_legacy_mapping_supported(k_cache):
+        logger.warning_once(
+            "QSA page4 native_layout_binding_unavailable; using Triton."
+        )
+        return None
+
     grouped_enabled = sparse_policy().value(
         "qsa_grouped_page4"
     ) and _qsa_grouped_page4_supported(flash_attn_v100_cuda, kv_cache_dtype)
+    grouped_enabled = grouped_enabled and (
+        getattr(flash_attn_v100_cuda, "grouped_sparse_page4_kv_view_abi", 0) >= 1
+        or _qsa_page4_legacy_mapping_supported(k_cache)
+    )
+    if not complete_page4_selections and (
+        not grouped_enabled or q.shape[0] % _SM70_QSA_GROUPED_PAGE4_QUERIES
+    ):
+        # XQA's compact table represents complete page4 groups and one causal
+        # tail. Arbitrary token masks need grouped page4 or the shared Triton
+        # reader, rather than dropping tokens to fit that representation.
+        return None
     if grouped_enabled:
         grouped_rows = (
             q.shape[0] // _SM70_QSA_GROUPED_PAGE4_QUERIES
@@ -2238,6 +2396,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
                 k_scale,
                 v_scale,
                 flash_attn_v100_cuda,
+                scale_view,
             )
         if grouped_rows == q.shape[0]:
             return out
@@ -2263,10 +2422,11 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
             k_scale,
             v_scale,
             flash_attn_v100_cuda,
+            scale_view,
         )
         return out
 
-    if kv_cache_dtype == "fp8_e4m3" and q.shape[0] > 16:
+    if codec.quantized and q.shape[0] > 16:
         # The generic E4M3 XQA kernel accepts at most 16 query rows. Scheduler
         # iterations can mix a large prefill (or catch-up chunk) with decode
         # rows. If an older Flash-V100 build lacks the quantized grouped ABI,
@@ -2274,7 +2434,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
         # This avoids both an invalid B>16 launch and the larger Triton split-K
         # fallback workspace.
         logger.info_once(
-            "Splitting an E4M3 page4 batch across supported XQA launches "
+            "Splitting a quantized page4 batch across supported XQA launches "
             "because this Flash-V100 build lacks the quantized grouped ABI "
             "(rows=%d).",
             q.shape[0],
@@ -2295,6 +2455,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
                 k_scale,
                 v_scale,
                 flash_attn_v100_cuda,
+                scale_view,
             )
         return out
 
@@ -2312,6 +2473,7 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
         k_scale,
         v_scale,
         flash_attn_v100_cuda,
+        scale_view,
     )
 
 
@@ -2355,11 +2517,18 @@ def qsa_sparse_paged_attention(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     lse: torch.Tensor | None = None,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
+    selection_group_size: int = 1,
 ) -> torch.Tensor:
     """Run sparse GQA, optionally returning base-2 LSE for a cross-rank merge.
 
     LSE callers may supply FP32 output to avoid rounding each rank's partial
     result. Apply output gating after the cross-rank merge, not per rank.
+
+    A selection producer may declare complete aligned page4 groups with
+    ``selection_group_size=4``. Arbitrary token lists retain grouped/Triton
+    mask semantics; shape alone does not establish XQA compatibility.
     """
 
     if not q.is_cuda or not HAS_TRITON:
@@ -2374,13 +2543,34 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention cache and block table must be nonempty")
     if logical_indices.shape[1] <= 0:
         raise ValueError("QSA sparse attention requires a positive selection width")
+    if selection_group_size <= 0:
+        raise ValueError("QSA selection group size must be positive")
     if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("QSA sparse attention requires FP16 or BF16 queries")
-    kv_e4m3 = kv_cache_dtype in ("fp8", "fp8_e4m3")
+    codec = resolve_kv_codec("auto" if kv_cache_dtype == "bfloat16" else kv_cache_dtype)
+    if codec is None or codec.native_id not in (0, 1, 3):
+        raise ValueError(f"Unsupported QSA K/V cache dtype: {kv_cache_dtype}")
+    if codec.quantized and (reason := qsa_e4m3_capability_reason(q.dtype)):
+        raise ValueError(f"QSA quantized operands unavailable: {reason}")
+    kv_e4m3 = codec.native_id == 1
+    if codec.per_token_head:
+        if k_cache.dtype != codec.storage_dtype or v_cache.dtype != codec.storage_dtype:
+            raise ValueError("QSA token/head K/V cache has incompatible storage")
+        for plane in (k_scale_cache, v_scale_cache):
+            if (
+                plane is None
+                or plane.shape != k_cache.shape[:3]
+                or plane.dtype != torch.float32
+                or plane.device != q.device
+                or any(stride <= 0 for stride in plane.stride())
+            ):
+                raise ValueError("QSA token/head caches require FP32 K/V scale planes")
+    elif k_scale_cache is not None or v_scale_cache is not None:
+        raise ValueError("This QSA codec does not use token/head scale planes")
     if kv_e4m3:
         if k_cache.dtype != torch.uint8 or v_cache.dtype != torch.uint8:
             raise ValueError("QSA E4M3 K/V caches must use uint8 storage")
@@ -2388,7 +2578,7 @@ def qsa_sparse_paged_attention(
             raise ValueError("QSA E4M3 K/V scales must be finite")
         if k_scale <= 0.0 or v_scale <= 0.0:
             raise ValueError("QSA E4M3 K/V scales must be positive")
-    else:
+    elif not codec.quantized:
         if kv_cache_dtype not in ("auto", "float16", "bfloat16"):
             raise ValueError(f"Unsupported QSA K/V cache dtype: {kv_cache_dtype}")
         if q.dtype != k_cache.dtype or q.dtype != v_cache.dtype:
@@ -2440,6 +2630,13 @@ def qsa_sparse_paged_attention(
         sequence_lengths,
     ):
         assert query_positions is not None and sequence_lengths is not None
+        mapping = KVPageMapping.bind_payload(k_cache, v_cache, 4)
+        scale_view: KVSubpageScaleArgs = (
+            k_scale_cache,
+            v_scale_cache,
+            mapping.owner_page_span,
+            mapping.subpage_tokens,
+        )
         xqa_output = _qsa_sparse_paged_attention_sm70_xqa_page4(
             q,
             k_cache,
@@ -2450,9 +2647,11 @@ def qsa_sparse_paged_attention(
             query_positions,
             sequence_lengths,
             out,
-            "fp8_e4m3" if kv_e4m3 else "auto",
+            codec.name,
             k_scale,
             v_scale,
+            scale_view,
+            complete_page4_selections=selection_group_size == 4,
         )
         if xqa_output is not None:
             if output_gate_view is not None:
@@ -2559,6 +2758,15 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         KV_E4M3=kv_e4m3,
+        KV_CODEC=codec.native_id,
+        K_SCALES=k_scale_cache,
+        V_SCALES=v_scale_cache,
+        KS_BLOCK=k_scale_cache.stride(0) if k_scale_cache is not None else 0,
+        KS_TOKEN=k_scale_cache.stride(1) if k_scale_cache is not None else 0,
+        KS_HEAD=k_scale_cache.stride(2) if k_scale_cache is not None else 0,
+        VS_BLOCK=v_scale_cache.stride(0) if v_scale_cache is not None else 0,
+        VS_TOKEN=v_scale_cache.stride(1) if v_scale_cache is not None else 0,
+        VS_HEAD=v_scale_cache.stride(2) if v_scale_cache is not None else 0,
         RESOLVED_INDICES=resolved_indices,
         num_warps=partial_warps,
         num_stages=2,

@@ -123,8 +123,8 @@ W02 是缺原生绑定的事实，不是已经测得 Triton 比 CUDA 慢；接�
 
 | 编号 | 算法族及必须分开的子路径 | INT8 判断 |
 | --- | --- | --- |
-| R01 | QSA dense prefix、稀疏 paged split-K/merge、grouped page4 planner/attention、尾行 XQA、按请求拆分 | QSA backend、软件 FP8 解码、native page4 仍为 FP16/E4M3 范围，缺 INT8；普通 D01 的绑定不使 QSA 的 page4 planner/readers 自动具备 scale-plane 支持 |
-| R02 | QSA 压缩键 scorer、cuBLAS gather/scoring、shared-key、lexicographic top-k、physical-index resolution、DCP | scorer 常消费独立 FP16 压缩表示，top-k/index 算法可复用，但全链仍受 R01 backend 约束；FP16-only resolved-index 特化也不能冒充 FP8 已有路径。压缩 scale、索引/重复/无效页和 DCP 必须各自保留 |
+| R01 | QSA dense prefix、稀疏 paged split-K/merge、grouped page4 planner/attention、尾行 XQA、按请求拆分 | 公共 view/planner、原生 XQA/grouped 与 Triton split-K 已接 INT8；主 owner/backend 和 writer 已接入。79 项 GPU 组件检查通过，并确认实际 codec-3 原生执行；小页/padding、尾行和变输入图均覆盖。完整 QSA 引擎、质量、延迟及生命周期仍开放，不以这些组件结果关闭 R01 |
+| R02 | QSA 压缩键 scorer、cuBLAS gather/scoring、shared-key、lexicographic top-k、physical-index resolution、DCP | 独立压缩表示和 top-k 算法保留公共语义；两 rank 的 FP16/E4M3/INT8 output/LSE 组合通过。新增 mask 用例发现并修复原有 grouped planner 的无效首索引/尾行问题，门槛不变。FP16-only resolved-index 特化保留原有范围；全链引擎、压缩及索引状态资格仍未关闭 |
 | R03 | host history 写入/保护、FP16 hot cache、miss gather、直接 host/device history attention | FP16／动态 E4M3／RNE INT8 共用 codec/view、写入和读取；正常 CMake 原生实例 0/1/3 已绑定，144 项 GPU 组件检查通过，其中追踪确认 `partial<3>`。hot cache 保持 FP16。实际完整引擎、独立 scale owner 的 offload/sleep/transfer、质量和性能仍待验收，不能以组件通过关闭 L04/L05 |
 | R04 | DeepSeek sparse MLA：paged、split-K、QK-D split、gathered/BMM prefill；压缩与 SWA | G64/exponent scales 与 FP16 RoPE 专用表示，尚无 INT8；应复用各算法及公共 index/merge，补表示级读写，不套普通 token/head 布局 |
 | R05 | GLM NoPE latent MLA：直接 paged、B1 gather+GEMM、M2..8 batched GEMM、较大行数 paged | **本轮单独补记**。512 维 latent、G64 exponent scale、520-byte slot 契约，现有专门 E4M3 实现；缺 INT8，不能只检查 DeepSeek sparse 就宣布 MLA 全覆盖 |

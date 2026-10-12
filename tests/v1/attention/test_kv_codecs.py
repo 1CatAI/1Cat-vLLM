@@ -50,6 +50,23 @@ def test_int8_rounding_and_cache_identity_are_not_legacy_aliases():
     assert INT8.cache_identity != INT8_PER_TOKEN_HEAD.cache_identity
 
 
+def test_int8_reference_uses_correctly_rounded_scale_division():
+    # 9/1024 is exactly representable in all supported input dtypes. A
+    # rounded FP32 reciprocal of 127 produces a scale one ULP too small.
+    values = torch.tensor([[9 / 1024, -9 / 1024]], dtype=torch.float32)
+    _, scale = INT8.encode(values)
+    assert scale.view(torch.int32).item() == 949035589
+    reciprocal_scale = values.abs().amax(-1) * torch.tensor(1 / 127)
+    assert reciprocal_scale.view(torch.int32).item() == 949035588
+    # The legacy codec keeps the original Torch division/truncation order.
+    legacy, legacy_scale = INT8_PER_TOKEN_HEAD.encode(values)
+    expected_scale = (values.abs().amax(-1) / 127.0).clamp_min(1e-6)
+    assert torch.equal(legacy_scale, expected_scale)
+    assert torch.equal(
+        legacy, (values * expected_scale.reciprocal()[..., None]).trunc().to(torch.int8)
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_int8_finite_extremes_and_reconstruction_error(dtype):
     limit = torch.finfo(dtype).max

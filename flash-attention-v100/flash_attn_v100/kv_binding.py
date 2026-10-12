@@ -27,7 +27,11 @@ def codec_names(native: Any, algorithm: str) -> frozenset[str]:
 @dataclass(frozen=True)
 class KVBinding:
     operation: Any
-    scale_args: tuple[torch.Tensor | None, torch.Tensor | None] | tuple[()]
+    scale_args: (
+        tuple[torch.Tensor | None, torch.Tensor | None]
+        | tuple[torch.Tensor | None, torch.Tensor | None, int, int]
+        | tuple[()]
+    )
     partial_dtype: torch.dtype
 
 
@@ -39,6 +43,7 @@ def bind_kv(
     value_scale: torch.Tensor | None,
     *,
     partial_dtype: torch.dtype | None = None,
+    page_mapping: tuple[int, int] | None = None,
 ) -> KVBinding:
     # Check the binary before allocating workspaces or entering graph capture.
     if codec not in codec_names(native, algorithm):
@@ -55,9 +60,24 @@ def bind_kv(
     explicit = int(getattr(native, f"{algorithm}_kv_abi", 0)) == 1 and callable(
         getattr(native, f"{algorithm}_kv_fwd", None)
     )
+    view_binding = getattr(native, f"{algorithm}_kv_view_abi", 0) >= 1
+    scale_args: (
+        tuple[torch.Tensor | None, torch.Tensor | None]
+        | tuple[torch.Tensor | None, torch.Tensor | None, int, int]
+        | tuple[()]
+    )
+    if view_binding:
+        if not explicit:
+            raise RuntimeError("Native cache-view capability requires a KV binding")
+        mapping = page_mapping if page_mapping is not None else (1, 0)
+        scale_args = (key_scale, value_scale, mapping[0], mapping[1])
+    elif page_mapping is not None:
+        raise RuntimeError("Native codec binding does not support mapped KV pages")
+    else:
+        scale_args = (key_scale, value_scale) if explicit else ()
     return KVBinding(
         getattr(native, f"{algorithm}_{'kv_' if explicit else ''}fwd"),
-        (key_scale, value_scale) if explicit else (),
+        scale_args,
         partial_dtype
         or (torch.float32 if codec in _FP32_PARTIAL_CODECS else torch.float16),
     )
