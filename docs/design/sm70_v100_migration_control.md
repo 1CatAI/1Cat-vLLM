@@ -2,6 +2,25 @@
 
 Date: 2026-05-30
 
+## Qwen38 structural weight-flow screen, 2026-10-08
+
+Integration control `c4f6245f8414`, ordinary wheel, TP4 V100-SXM2-32GB,
+1530/877 MHz and 300 W. Current whole-round C1 stays 13.456/13.860 ms
+(1K/8K); the new screens have no serving admission. Complete cold-L2 layer
+graphs reject the two-group M8 register queue (-2.796 us), late GDN L2
+prefetch (-1.777 us) and norm/shared-weight staging (-29.983 us). Resident
+MLP saves 0.988 us; the independently isolated L2-prefix increment saves
+2.463 us. These gains are below a 0.3-ms whole-round implementation budget
+and must not be summed across separate runs. All those screens retain bits.
+
+The kernel-interval/NCU ledger is in
+`docs/design/sm70_qpn_operand_schedule_screen.md`; raw artifacts are retained
+under `qwen38-structural-pipeline-20261008`. Volta lacks Nsight Systems GPU
+metrics, so the interval chart is not instantaneous HBM utilization.
+The next GDN/out/collective resident screen has compiled with 64 registers,
+33,180 bytes shared memory and no spills. GPU speed and numerical admission
+remain pending. Keep independent extensions out of serving wheels.
+
 ## Pre-release packaging and video cancellation fixes, 2026-09-29
 
 The release audit against main `357d07bcb0ee` reproduced three P2 issues:
