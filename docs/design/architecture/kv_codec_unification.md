@@ -860,7 +860,7 @@ reported as final whole-wheel qualification.
 
 The INT8 specialization of the existing packed reader now uses exact half2
 subtraction instead of eight scalar conversions. Exhaustive byte-pair checks,
-86 distinct affected GPU cases and four PTX/packaging checks qualify the
+86 distinct affected operator/engine checks and four PTX/packaging checks qualify the
 bounded component change. Stable separate-process control/control/A/B/B/A
 comparisons show 5.7–7.2% lower XQA GPU service and smaller grouped benefits
 at 4K/32K; FP8 stays within 0.31%. Initial short timing and a combined-run

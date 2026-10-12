@@ -20,7 +20,8 @@ elimination in the conversion experiment. Its conversion-only median changes
 from 0.217600 ms to 0.141312 ms; this is not an attention or engine result.
 
 The affected installed XQA, grouped, long-context and engine-binding checks
-pass **86 distinct GPU cases**. The combined run passed 85 and failed one
+pass **86 distinct affected checks**, comprising GPU operators and CPU engine
+binding checks run on the V100 host. The combined run passed 85 and failed one
 profiler assertion because no partition-kernel event was returned. That
 unchanged q16 fixed-stride case passes in a fresh isolated profiler process,
 which records actual native execution. The initial failure remains recorded.
