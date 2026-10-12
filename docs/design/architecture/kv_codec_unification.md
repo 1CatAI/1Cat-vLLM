@@ -855,3 +855,17 @@ included in offload/sleep/transfer; that remains in L04/L05. Ordinary paged
 QSA, MLA, representative engine quality, latency and a clean complete package
 still require their own evidence. The source/component test overlay is not
 reported as final whole-wheel qualification.
+
+## Shared packed-byte reader cost, 2026-10-12
+
+The INT8 specialization of the existing packed reader now uses exact half2
+subtraction instead of eight scalar conversions. Exhaustive byte-pair checks,
+86 distinct affected operator/engine checks and four PTX/packaging checks qualify the
+bounded component change. Stable separate-process control/control/A/B/B/A
+comparisons show 5.7–7.2% lower XQA GPU service and smaller grouped benefits
+at 4K/32K; FP8 stays within 0.31%. Initial short timing and a combined-run
+profiler failure are retained separately from qualified evidence.
+
+Full inputs, protocol, limits and normal component fingerprints are in
+[shared reader qualification](kv_packed_reader_20261012.md). This does not
+close the remaining algorithm coverage or end-to-end quality/latency gates.

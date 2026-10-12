@@ -187,6 +187,20 @@ __device__ __forceinline__ uint4 fp8_e4m3fn_vector_to_half8_lut(
           (static_cast<uint32_t>(lut[static_cast<uint8_t>(raw >> 56)]) << 16));
 }
 
+__device__ __forceinline__ uint32_t int8_pair_to_half2_bits(uint16_t raw) {
+  // 1024+u8 and 1024+256*sign are exactly representable half integers.
+  // Their packed subtraction gives the signed bytes exactly without eight
+  // separate integer-to-float conversions per vector. Zero remains +0.
+  union {
+    uint32_t bits;
+    __half2 half;
+  } values, biases, result;
+  values.bits = 0x64006400u | (raw & 0xffu) | ((raw & 0xff00u) << 8);
+  biases.bits = 0x64006400u | ((raw & 0x80u) << 1) | ((raw & 0x8000u) << 9);
+  result.half = __hsub2(values.half, biases.half);
+  return result.bits;
+}
+
 template <int KV_DTYPE, bool E4M3_BITS = false>
 struct KVReader {
   static_assert(KV_DTYPE == KV_CACHE_DTYPE_FP16 ||
@@ -212,22 +226,11 @@ struct KVReader {
         return fp8_e4m3fn_vector_to_half8(raw);
       }
     } else if constexpr (KV_DTYPE == KV_CACHE_DTYPE_INT8) {
-      uint4 result;
-      uint32_t* pairs = reinterpret_cast<uint32_t*>(&result);
-#pragma unroll
-      for (int pair = 0; pair < 4; ++pair) {
-        const int8_t lo = static_cast<int8_t>(raw >> (16 * pair));
-        const int8_t hi = static_cast<int8_t>(raw >> (16 * pair + 8));
-        const __half2 h =
-            __floats2half2_rn(static_cast<float>(lo), static_cast<float>(hi));
-        union {
-          __half2 h;
-          uint32_t bits;
-        } packed;
-        packed.h = h;
-        pairs[pair] = packed.bits;
-      }
-      return result;
+      return make_uint4(
+          int8_pair_to_half2_bits(static_cast<uint16_t>(raw)),
+          int8_pair_to_half2_bits(static_cast<uint16_t>(raw >> 16)),
+          int8_pair_to_half2_bits(static_cast<uint16_t>(raw >> 32)),
+          int8_pair_to_half2_bits(static_cast<uint16_t>(raw >> 48)));
     } else {
       // Packed panels historically allow an unused LUT hint for E5M2.
       return fp8_e5m2_vector_to_half8(raw);
