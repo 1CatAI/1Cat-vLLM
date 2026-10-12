@@ -85,6 +85,11 @@ class KVCodec:
             return self in (FP16, FP8_E4M3, FP8_E5M2)
         return self.name in formats
 
+    @property
+    def fp32_attention_partials(self) -> bool:
+        """Accumulation contract shared with native KVCodecTraits."""
+        return self.per_token_head or self.element_dtype == torch.float8_e4m3fn
+
     def dequantize(
         self,
         cache: torch.Tensor,
@@ -142,12 +147,16 @@ class KVCodec:
         x = values.float()
         if self.scale_granularity == "token_group":
             x = self._group_values(x)
-        scale = (x.abs().amax(dim=-1) / 127.0).clamp_min(1e-6)
+        absmax = x.abs().amax(dim=-1)
         if self.rounding == "nearest_even":
+            # Match CUDA/Triton RN FP32 division. Torch may strength-reduce a
+            # scalar division to multiplication by a rounded reciprocal.
+            scale = (absmax.double() / 127.0).float().clamp_min(1e-6)
             finite = torch.isfinite(x).all(dim=-1)
             scale = torch.where(finite, scale, float("nan"))
-            q = (x / scale[..., None]).round()
+            q = (x.double() / scale[..., None].double()).float().round()
         else:
+            scale = (absmax / 127.0).clamp_min(1e-6)
             q = (x * scale.reciprocal()[..., None]).trunc()
         return q.clamp(-128, 127).to(torch.int8).reshape_as(values), scale
 

@@ -41,33 +41,58 @@ constexpr at::ScalarType kv_storage_type() {
 }
 
 inline KVScalePlane bind_scale_plane(const at::Tensor& scale,
-                                     const at::Tensor& payload) {
+                                     const at::Tensor& payload,
+                                     int page_group_size = 1,
+                                     int subpage_tokens = 0) {
   TORCH_CHECK(scale.device() == payload.device(),
               "KV scales and payload must use the same device");
   TORCH_CHECK(scale.scalar_type() == at::kFloat && scale.dim() == 3,
               "KV scales must be FP32 [page, token, head]");
-  TORCH_CHECK(scale.sizes() == payload.sizes().slice(0, 3),
-              "KV scale shape must match payload rows");
+  TORCH_CHECK(page_group_size >= 1, "Invalid KV scale page mapping");
+  if (page_group_size == 1) {
+    TORCH_CHECK(scale.sizes() == payload.sizes().slice(0, 3),
+                "KV scale shape must match payload rows");
+  } else {
+    TORCH_CHECK(
+        subpage_tokens > 0 && scale.sizes() == payload.sizes().slice(0, 3) &&
+            payload.size(1) ==
+                static_cast<int64_t>(page_group_size) * subpage_tokens,
+        "KV scales must cover the owning pages and their mapped subpages");
+  }
   TORCH_CHECK(scale.stride(0) > 0 && scale.stride(1) > 0 && scale.stride(2) > 0,
               "KV scales require positive strides");
   return {scale.data_ptr<float>(), scale.stride(0), scale.stride(1),
-          scale.stride(2)};
+          scale.stride(2),         page_group_size, subpage_tokens};
 }
 
-inline KVScaleView bind_scale_view(
-    int codec, const at::Tensor& key, const at::Tensor& value,
-    const std::optional<at::Tensor>& key_scale,
-    const std::optional<at::Tensor>& value_scale) {
+inline KVScaleView bind_scale_view(int codec, const at::Tensor& key,
+                                   const at::Tensor& value,
+                                   const std::optional<at::Tensor>& key_scale,
+                                   const std::optional<at::Tensor>& value_scale,
+                                   int page_group_size = 1,
+                                   int subpage_tokens = 0) {
+  TORCH_CHECK(page_group_size >= 1 && subpage_tokens >= 0,
+              "Invalid KV subpage mapping");
+  if (subpage_tokens > 0) {
+    TORCH_CHECK(key.dim() == 4 && value.dim() == 4 &&
+                    key.size(1) == static_cast<int64_t>(page_group_size) *
+                                       subpage_tokens &&
+                    value.size(1) == key.size(1),
+                "KV subpage mapping must match the payload owner");
+  }
   return visit_kv_codec(codec, [&](auto tag) -> KVScaleView {
     if constexpr (KVCodecTraits<decltype(tag)::value>::per_token_head) {
       TORCH_CHECK(key_scale.has_value() && value_scale.has_value(),
                   "Token/head KV codecs require both scale planes");
-      return {bind_scale_plane(*key_scale, key),
-              bind_scale_plane(*value_scale, value)};
+      return {
+          bind_scale_plane(*key_scale, key, page_group_size, subpage_tokens),
+          bind_scale_plane(*value_scale, value, page_group_size,
+                           subpage_tokens),
+          {page_group_size, subpage_tokens}};
     } else {
       TORCH_CHECK(!key_scale.has_value() && !value_scale.has_value(),
                   "This KV codec uses tensor scales, not scale planes");
-      return {};
+      return {{}, {}, {page_group_size, subpage_tokens}};
     }
   });
 }

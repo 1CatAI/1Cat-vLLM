@@ -63,6 +63,19 @@ at::Tensor flash_attention_decode_paged_xqa_with_scales(
     const std::optional<at::Tensor>& k_scale_cache,
     const std::optional<at::Tensor>& v_scale_cache);
 
+at::Tensor flash_attention_decode_paged_xqa_with_view(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
+    at::Tensor& exp_sums, const at::Tensor& active_num_partitions,
+    const float softmax_scale, const int partition_size,
+    const int launch_num_partitions, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale, const int window_size_left,
+    const int window_size_right, const int batch_context_max_seq_len,
+    const std::optional<at::Tensor>& k_scale_cache,
+    const std::optional<at::Tensor>& v_scale_cache,
+    const int scale_page_group_size, const int scale_subpage_tokens);
+
 at::Tensor flash_attention_decode_paged_xqa_staged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
@@ -120,6 +133,16 @@ at::Tensor flash_attention_grouped_sparse_page4(
     const at::Tensor& token_masks, const at::Tensor& seq_lens, at::Tensor& lse,
     const float softmax_scale, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale);
+
+at::Tensor flash_attention_grouped_sparse_page4_with_view(
+    const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_, const at::Tensor& block_table,
+    const at::Tensor& token_masks, const at::Tensor& seq_lens, at::Tensor& lse,
+    const float softmax_scale, const std::string& kv_cache_dtype,
+    const float k_scale, const float v_scale,
+    const std::optional<at::Tensor>& k_scale_cache,
+    const std::optional<at::Tensor>& v_scale_cache,
+    const int scale_page_group_size, const int scale_subpage_tokens);
 
 at::Tensor flash_attention_grouped_sparse_page4_plan(
     const at::Tensor& logical_indices, const at::Tensor& block_table,

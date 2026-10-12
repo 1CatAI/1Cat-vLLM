@@ -869,3 +869,16 @@ profiler failure are retained separately from qualified evidence.
 Full inputs, protocol, limits and normal component fingerprints are in
 [shared reader qualification](kv_packed_reader_20261012.md). This does not
 close the remaining algorithm coverage or end-to-end quality/latency gates.
+
+## Shared ordinary QSA page4 view, 2026-10-12
+
+Ordinary QSA now binds payload/scales through the public owner-page mapping
+for grouped page4, XQA and its tail, and the shared Triton split-K reader.
+Main-owner admission, native publication and DCP scale forwarding are wired.
+79 GPU cases and 118 affected flat/routing checks pass. New mask checks
+reproduce a parent planner failure in all formats; the shared repair and the
+reference RN-division correction retain every numerical/storage bound.
+
+Actual execution, normal component fingerprints, old-binary behavior and
+remaining full-engine/quality/latency/lifecycle gates are recorded in
+[paged QSA qualification](kv_qsa_paged_20261012.md).

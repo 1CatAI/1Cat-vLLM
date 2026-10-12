@@ -75,6 +75,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode_paged_xqa_kv_fwd",
         &flash_attention_decode_paged_xqa_with_scales,
         "Shared XQA decode with explicit KV scale views (Volta)");
+  m.def("decode_paged_xqa_kv_fwd", &flash_attention_decode_paged_xqa_with_view,
+        "Shared XQA decode with an explicit subpage scale mapping (Volta)");
+  m.attr("decode_paged_xqa_kv_view_abi") = 1;
   m.attr("decode_paged_xqa_kv_abi") = 1;
   m.attr("decode_paged_xqa_kv_codecs") = m.attr("decode_paged_kv_codecs");
   m.def("decode_paged_xqa_staged_fwd", &flash_attention_decode_paged_xqa_staged,
@@ -117,6 +120,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Request-major grouped DFlash2 forward ABI version");
   m.def("grouped_sparse_page4_fwd", &flash_attention_grouped_sparse_page4,
         "Grouped exact QSA page4 attention over paged KV cache (Volta)");
+  m.def("grouped_sparse_page4_kv_fwd",
+        &flash_attention_grouped_sparse_page4_with_view,
+        "Shared sparse grouped page4 attention with an explicit cache view");
+  m.attr("grouped_sparse_page4_kv_abi") = 1;
+  m.attr("grouped_sparse_page4_kv_view_abi") = 1;
+  m.attr("grouped_sparse_page4_kv_codecs") =
+      py::make_tuple("auto", "fp8_e4m3", "int8", "int8_per_token_head");
   m.def("grouped_sparse_page4_abi_version",
         &flash_attention_grouped_sparse_page4_abi_version,
         "Grouped sparse page4 forward ABI version");
@@ -180,6 +190,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("decode_paged_xqa_kv_fwd_configured",
         flash_v100::policy::with_policy(
             &flash_attention_decode_paged_xqa_with_scales));
+  m.def("decode_paged_xqa_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_decode_paged_xqa_with_view));
   m.def("decode_paged_xqa_staged_fwd_configured",
         flash_v100::policy::with_policy(
             &flash_attention_decode_paged_xqa_staged));
@@ -195,6 +208,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             &flash_attention_tp2_e4m3_scalar_fast_launch_count));
   m.def("grouped_sparse_page4_fwd_configured",
         flash_v100::policy::with_policy(&flash_attention_grouped_sparse_page4));
+  m.def("grouped_sparse_page4_kv_fwd_configured",
+        flash_v100::policy::with_policy(
+            &flash_attention_grouped_sparse_page4_with_view));
   m.def("grouped_sparse_page4_plan_fwd_configured",
         flash_v100::policy::with_policy(
             &flash_attention_grouped_sparse_page4_plan));

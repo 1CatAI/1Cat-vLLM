@@ -48,9 +48,21 @@ struct KVScalePlaneT {
   int64_t block_stride = 0;
   int64_t token_stride = 0;
   int64_t head_stride = 0;
+  // Logical subpages retain their owner's FP32 scale strides, including
+  // padding and the other regions in the shared physical allocation.
+  int page_group_size = 1;
+  int subpage_tokens = 0;
 
   __device__ __forceinline__ int64_t offset(int block, int token,
                                             int head) const {
+    if (page_group_size > 1) {
+      const int owner = block / page_group_size;
+      const int subpage = block - owner * page_group_size;
+      return static_cast<int64_t>(owner) * block_stride +
+             (static_cast<int64_t>(subpage) * subpage_tokens + token) *
+                 token_stride +
+             static_cast<int64_t>(head) * head_stride;
+    }
     return static_cast<int64_t>(block) * block_stride +
            static_cast<int64_t>(token) * token_stride +
            static_cast<int64_t>(head) * head_stride;
@@ -64,9 +76,29 @@ struct KVScalePlaneT {
 using KVScalePlane = KVScalePlaneT<const float>;
 using KVScaleOutputPlane = KVScalePlaneT<float>;
 
+struct KVPageMapping {
+  int owner_page_span = 1;
+  int subpage_tokens = 0;
+
+  __device__ __forceinline__ int64_t offset(int block, int token, int head,
+                                            int64_t block_stride,
+                                            int64_t token_stride,
+                                            int64_t head_stride) const {
+    if (subpage_tokens > 0) {
+      const int owner = block / owner_page_span;
+      token += (block - owner * owner_page_span) * subpage_tokens;
+      block = owner;
+    }
+    return static_cast<int64_t>(block) * block_stride +
+           static_cast<int64_t>(token) * token_stride +
+           static_cast<int64_t>(head) * head_stride;
+  }
+};
+
 struct KVScaleView {
   KVScalePlane key;
   KVScalePlane value;
+  KVPageMapping pages;
 };
 
 struct KVScaleOutputView {

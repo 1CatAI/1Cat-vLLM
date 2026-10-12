@@ -77,6 +77,40 @@ class KVPageLayout:
 
 
 @dataclass(frozen=True)
+class KVPageMapping:
+    """Logical subpage IDs; payload/scale views retain physical owner strides."""
+
+    owner_page_span: int
+    subpage_tokens: int
+    owner_tokens: int
+
+    @classmethod
+    def bind_payload(
+        cls, key: torch.Tensor, value: torch.Tensor, subpage_tokens: int
+    ) -> "KVPageMapping":
+        if (
+            key.ndim != 4
+            or key.shape != value.shape
+            or key.dtype != value.dtype
+            or key.device != value.device
+            or subpage_tokens <= 0
+            or key.shape[1] % subpage_tokens
+        ):
+            raise ValueError("Invalid KV subpage geometry")
+        row_elements = key.shape[2] * key.shape[3]
+        if any(
+            payload.stride(3) != 1
+            or payload.stride(2) != payload.shape[3]
+            or payload.stride(1) != row_elements
+            or payload.stride(0) * payload.element_size() % 16
+            or payload.stride(0) < key.shape[1] * row_elements
+            for payload in (key, value)
+        ) or key.stride(0) != value.stride(0):
+            raise ValueError("KV subpages require aligned contiguous payload rows")
+        return cls(key.shape[1] // subpage_tokens, subpage_tokens, key.shape[1])
+
+
+@dataclass(frozen=True)
 class KVCacheView:
     codec: KVCodec
     key: torch.Tensor
@@ -85,6 +119,9 @@ class KVCacheView:
     value_scale: torch.Tensor | None
     page_stride_bytes: int
     page_size_bytes: int
+
+    def subpage_mapping(self, page_tokens: int) -> KVPageMapping:
+        return KVPageMapping.bind_payload(self.key, self.value, page_tokens)
 
     @property
     def scale_kwargs(self) -> dict[str, torch.Tensor]:
