@@ -514,7 +514,40 @@ not measured achieved occupancy. It motivates a bounded short-K tile screen
 inside the existing provider, with smaller row tiles and the existing padded
 activation loader. Its accelerated subset is grouped M>=512 routed rows,
 N=2560 and K=160, for IQ4/group32 and affine U2/group32; other shapes retain
-the existing tuner candidates. New GPU correctness and timing are pending.
+the existing tuner candidates.
+
+The first short-K build used CTA_K=64, which is ineligible for K160 because
+`Kernel::is_feasible` requires K divisible by CTA_K. All 40 tests passed but
+trace records show the old down tactic still executing. Its small timing
+movement is not credited as candidate benefit. Artifact SHA256:
+`df27efc944ddebbc238ddf0dc6252b74bc5a5807d6e7057b7fee7f1508f1bd01`;
+logs are archived with the `ineligible-k64-` prefix. The corrected experiment
+uses K32 and distinct 2x2 warp layouts, preserving that eligibility constraint.
+It builds as `041038bcecae84a18e845bdc48e8999c86aa83c8e2de7b767f40f8a4cf1c0485`
+and passes 40 boundary/graph tests and all eight real-weight numerical checks.
+The 32-row variants reduce register use to 126/132, but tuning still chooses
+the old 128x128x16 kernel at 40960 routed rows. At 20480 routed rows it chooses
+the new 64x128x32 IQ4 kernel (184 registers, two resident CTAs maximum).
+Complete chains at layers 0/1/17/47 and 7344/5347 tokens are
+6.634/4.871, 6.075/4.317, 6.968/5.172 and 6.327/4.928 ms. Compared with the
+earlier accepted artifact, several tails regress and there is no stable
+material gain. **Reject** these tactics; restore the accepted native artifact
+and source before model testing. The rejected source/native files are retained
+in the owned experiment archive; `moe-down.json`, `down-prefill-tests.log` and
+`down-tile-resources.json` distinguish execution from resource estimates.
+
+The GDN core's 180 launches total 271.8 ms; each launches 48 CTAs with 128
+threads, 255 registers/thread and approximately 90 KiB shared memory. This
+motivates a separate value-width screen, not a claim of measured SM occupancy.
+`gdn_value_tiles.py` compares the existing TileLang core at value widths 32
+and 16, using normalized synthetic TP4 operands and indexed FP32 state.
+State reset is included in every timing; operand preparation is excluded.
+The predeclared output/state maximum row-relative L2 limit is 0.003, with
+finite output and exact untouched state slots required. Both cases are in
+fact bit-exact. Width 16 takes 2.065/1.438 ms at 7344/5347 tokens, versus
+width 32 at 1.853/1.175 ms (repeated controls 1.694/1.177). **Reject** the
+finer tiling: extra CTAs do not compensate for duplicated work. No GDN
+runtime change or wider quality qualification follows.
 
 The first candidate's 260089-token quality prompt passes retrieval, arithmetic,
 normal EOS and repetition checks (181 output tokens; maximum repeated ten-word
