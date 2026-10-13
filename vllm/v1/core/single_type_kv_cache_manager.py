@@ -270,7 +270,8 @@ class SingleTypeKVCacheManager(ABC):
         if num_external_computed_tokens > 0:
             # Allocate new blocks for external computed tokens.
             allocated_blocks = self.block_pool.get_new_blocks(
-                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+                cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks),
+                self.kv_cache_group_id,
             )
             req_blocks.extend(allocated_blocks)
             if type(self.kv_cache_spec) in (
@@ -303,7 +304,9 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+            new_blocks = self.block_pool.get_new_blocks(
+                num_new_blocks, self.kv_cache_group_id
+            )
             req_blocks.extend(new_blocks)
             if type(self.kv_cache_spec) in (
                 FullAttentionSpec,
@@ -690,7 +693,7 @@ class CircularBufferManager(FullAttentionManager):
         req_blocks = self.req_to_blocks[request_id]
         if req_blocks:
             return []
-        new_blocks = self.block_pool.get_new_blocks(1)
+        new_blocks = self.block_pool.get_new_blocks(1, self.kv_cache_group_id)
         req_blocks.extend(new_blocks)
         self.new_block_ids.extend(block.block_id for block in new_blocks)
         return new_blocks
@@ -1069,7 +1072,7 @@ class KpoolTailManager(FullAttentionManager):
         req_blocks = self.req_to_blocks[request_id]
         if req_blocks:
             return []
-        new_blocks = self.block_pool.get_new_blocks(1)
+        new_blocks = self.block_pool.get_new_blocks(1, self.kv_cache_group_id)
         req_blocks.extend(new_blocks)
         self.new_block_ids.extend(block.block_id for block in new_blocks)
         return new_blocks
@@ -1503,7 +1506,9 @@ class MambaManager(SingleTypeKVCacheManager):
                     assert num_new_blocks <= 1
                 else:
                     assert num_new_blocks <= self.num_speculative_blocks + 1
-                new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+                new_blocks = self.block_pool.get_new_blocks(
+                    num_new_blocks, self.kv_cache_group_id
+                )
                 req_blocks.extend(new_blocks)
                 self._allocated_block_reqs.add(request_id)
                 return req_blocks[prev_block_len:]

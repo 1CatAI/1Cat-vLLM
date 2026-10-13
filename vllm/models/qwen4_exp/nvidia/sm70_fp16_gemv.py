@@ -19,7 +19,7 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.sm70_decode_graph import use_sm70_decode_graph_semantics
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config, get_current_vllm_config_or_none
 from vllm.config.execution_policy import layer_policy
 from vllm.config.gdn_projection import projection_policy
 from vllm.config.speculative_sampling import mtp_batch_enabled
@@ -277,6 +277,16 @@ def _pack_router_batch_weight(weight: torch.Tensor) -> torch.Tensor:
     )
 
 
+def _router_batch_storage(weight: torch.Tensor, storage: str) -> torch.Tensor:
+    if storage == "row_major":
+        if weight.shape != (512, 2560) or not weight.is_contiguous():
+            raise ValueError("Router storage requires contiguous [512,2560] weights")
+        return weight.detach()
+    if storage != "dual":
+        raise ValueError(f"Unknown router weight storage: {storage}")
+    return _pack_router_batch_weight(weight)
+
+
 def _shared_batch_runtime_ok(x: torch.Tensor) -> bool:
     return bool(
         mtp_batch_enabled("shared_batch")
@@ -371,7 +381,7 @@ def _router_batch_runtime_ok(x, packed) -> bool:
         and x.is_contiguous()
         and x.data_ptr() % 16 == 0
         and packed is not None
-        and packed.shape == (64, 40, 2, 4, 8, 8)
+        and tuple(packed.shape) in ((64, 40, 2, 4, 8, 8), (512, 2560))
         and packed.device == x.device
         and packed.dtype == x.dtype
         and packed.is_contiguous()
@@ -677,9 +687,15 @@ class Qwen38SM70FP16LinearMethod(UnquantizedLinearMethod):
             if weight.is_cuda and weight.dtype == torch.float16:
                 if not hasattr(torch.ops._C, "qwen38_router_batch_sm70_out"):
                     raise RuntimeError("Rebuild the SM70 extension for batch router")
+                config = get_current_vllm_config_or_none()
+                storage = (
+                    config.kernel_config.sm70_router_weight_storage
+                    if config is not None
+                    else "dual"
+                )
                 layer.register_buffer(
                     "_sm70_mtp_router_packed",
-                    _pack_router_batch_weight(weight),
+                    _router_batch_storage(weight, storage),
                     persistent=False,
                 )
         if not getattr(layer, "_sm70_qwen38_prepare_gdn_batch", False):

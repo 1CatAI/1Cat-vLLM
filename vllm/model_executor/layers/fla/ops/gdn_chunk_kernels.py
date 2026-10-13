@@ -9,6 +9,7 @@ from itertools import product
 import torch
 
 from vllm.config.gdn_schedule import GdnScheduleConfig
+from vllm.platforms import current_platform
 from vllm.runtime_resources import current_runtime_resources, runtime_resources_for
 from vllm.triton_utils import triton
 
@@ -49,7 +50,7 @@ def create_chunk_kernels(schedule: GdnScheduleConfig) -> GdnChunkKernels | None:
     from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
     from .utils import use_cuda_graph
 
-    sm70 = torch.cuda.get_device_capability() == (7, 0)
+    sm70 = current_platform.is_device_capability((7, 0))
     kkt = (
         _configs({"BK": schedule.kkt_bk}, schedule.kkt_warps, schedule.kkt_stages)
         if sm70 and schedule.kkt_enabled
@@ -131,7 +132,7 @@ def create_kda_kernels(schedule, delta_h):
     )
 
     enabled = (
-        torch.cuda.get_device_capability() == (7, 0) and schedule.kda_prefill_enabled
+        current_platform.is_device_capability((7, 0)) and schedule.kda_prefill_enabled
     )
     recompute = _configs({}, [4, 8], [2]) if enabled else _recompute_w_u_configs
     output = (

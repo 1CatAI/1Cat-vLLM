@@ -155,6 +155,16 @@ def test_loaded_dense_projection_prepares_existing_fp16_method(monkeypatch):
         "VLLM_SM70_QWEN4_EXP_ONLINE_QPN8": False,
     }.items():
         monkeypatch.setattr(envs, name, value)
+    from vllm.config.execution_policy import LayerExecutionPolicy
+    from vllm.models.qwen4_exp.nvidia import sm70_fp16_gemv
+
+    policy = LayerExecutionPolicy(
+        fp16_gemv=True,
+        batch_fastpath=False,
+        fused_gdn_input=False,
+        online_qpn8=False,
+    )
+    monkeypatch.setattr(sm70_fp16_gemv, "layer_policy", lambda: policy)
     layer = LinearBase.__new__(LinearBase)
     torch.nn.Module.__init__(layer)
     layer.prefix = "model.layers.0.linear_attn.in_proj_ba"
@@ -177,3 +187,81 @@ def test_loaded_dense_projection_prepares_existing_fp16_method(monkeypatch):
     method.process_weights_after_loading(layer)
     enable_qwen38_sm70_fp16_gemv(model, torch.float16, model.vllm_config)
     assert isinstance(layer.quant_method, Qwen38SM70FP16LinearMethod)
+
+
+@pytest.mark.parametrize("embedding_storage", ["dense", "original"])
+@pytest.mark.parametrize("embedding_type", ["F16", "IQ4_XS"])
+def test_flashnext_loader_configures_embedding_and_floating_modules(
+    monkeypatch, embedding_storage, embedding_type
+):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.kernels.ple import gguf_pinned
+    from vllm.model_executor.model_loader import gguf_loader
+    from vllm.model_executor.model_loader.gguf_adapters.qwen4exp import Qwen4ExpAdapter
+
+    hf_config = SimpleNamespace(
+        num_hidden_layers=0,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=2,
+        linear_value_head_dim=2,
+        tie_word_embeddings=False,
+    )
+    adapter = Qwen4ExpAdapter(hf_config, tp_size=4)
+    loader = gguf_loader.GGUFModelLoader.__new__(gguf_loader.GGUFModelLoader)
+    loader._native_adapter = adapter
+    loader._native_tensors = {"output.weight": SimpleNamespace()}
+    types = {
+        "model.embed_tokens.weight": embedding_type,
+        "model.layers.0.mlp.gate.weight": "F32",
+        "model.layers.0.hyper_connection_attn.input_mix_weight_down.weight": "BF16",
+        "model.layers.0.linear_attn.in_proj_a.weight": "BF16",
+    }
+    monkeypatch.setattr(loader, "_prepare_weights", lambda *_: "fixture.gguf")
+    monkeypatch.setattr(
+        loader,
+        "_get_gguf_weights_map",
+        lambda *_: {"output.weight": "lm_head.weight"},
+    )
+    monkeypatch.setattr(
+        loader, "_get_all_gguf_files", lambda *_: ["main.gguf", "ple.gguf"]
+    )
+    monkeypatch.setattr(
+        gguf_loader,
+        "get_gguf_extra_tensor_names",
+        lambda filename, _: ["lm_head.weight"] if filename == "ple.gguf" else [],
+    )
+    monkeypatch.setattr(loader, "_get_gguf_weight_type", lambda *_: types)
+    monkeypatch.setattr(gguf_pinned, "prepare_pinned_gguf_ple", lambda *_: None)
+
+    class ModelConstructionReached(Exception):
+        pass
+
+    def check_config(**kwargs):
+        config = kwargs["vllm_config"]
+        assert not hf_config.tie_word_embeddings
+        assert adapter.packed_embeddings == (embedding_storage == "original")
+        expected = {
+            "model.layers.0.mlp.gate",
+            "model.layers.0.hyper_connection_attn.input_mix_weight_down",
+        }
+        if embedding_type == "F16":
+            expected.add("model.embed_tokens")
+        assert set(config.quant_config.unquantized_modules) == expected
+        raise ModelConstructionReached
+
+    monkeypatch.setattr(gguf_loader, "initialize_model", check_config)
+    config = SimpleNamespace(
+        device_config=SimpleNamespace(device="cpu"),
+        parallel_config=SimpleNamespace(tensor_parallel_size=4),
+        kernel_config=SimpleNamespace(
+            sm70_gguf=SimpleNamespace(
+                embedding_storage=embedding_storage, enabled=False
+            )
+        ),
+        quant_config=GGUFConfig(),
+    )
+    model_config = SimpleNamespace(hf_config=hf_config, dtype=torch.float16)
+    with pytest.raises(ModelConstructionReached):
+        loader.load_model(config, model_config)

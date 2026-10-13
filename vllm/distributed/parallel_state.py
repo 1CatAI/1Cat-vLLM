@@ -59,6 +59,7 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
+    from vllm.config import ParallelConfig
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -1749,7 +1750,7 @@ def get_pcp_group() -> GroupCoordinator:
 
 
 @contextmanager
-def graph_capture(device: torch.device):
+def graph_capture(device: torch.device, context: GraphCaptureContext | None = None):
     """
     `graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that some
@@ -1763,7 +1764,8 @@ def graph_capture(device: torch.device):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    context = GraphCaptureContext(torch.cuda.Stream(device=device))
+    if context is None:
+        context = GraphCaptureContext(torch.cuda.Stream(device=device))
     with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
         yield context
 
@@ -1947,6 +1949,16 @@ def init_distributed_environment(
             )
         else:
             _INNER_DP_WORLD = _WORLD
+
+
+def _ep_device_communicator_required(parallel_config: "ParallelConfig") -> bool:
+    """TP-only MoE uses TP collectives and only EP membership metadata."""
+    return bool(
+        parallel_config.enable_expert_parallel
+        or parallel_config.data_parallel_size > 1
+        or parallel_config.prefill_context_parallel_size > 1
+        or parallel_config.enable_eplb
+    )
 
 
 def initialize_model_parallel(
@@ -2150,8 +2162,21 @@ def initialize_model_parallel(
             )
         else:
             _EP = init_model_parallel_group(
-                group_ranks, get_world_group().local_rank, backend, group_name="ep"
+                group_ranks,
+                get_world_group().local_rank,
+                backend,
+                use_device_communicator=_ep_device_communicator_required(
+                    parallel_config
+                ),
+                group_name="ep",
             )
+
+        if not _EP.use_device_communicator:
+            config.kernel_config.collective_kernel_selections[_EP.unique_name] = {
+                "enabled": False,
+                "reason": "tp_only_moe_uses_tp_collectives",
+                "scope": "group_device_communicator",
+            }
 
         # Create EPLB group with the same ranks as EP if EPLB is enabled.
         # This is a separate process group to isolate EPLB communications

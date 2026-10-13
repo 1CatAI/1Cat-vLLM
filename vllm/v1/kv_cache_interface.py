@@ -978,6 +978,8 @@ class KVCacheTensor:
 
     host_backed: bool = False
     """Pinned host allocation exposed through a lifetime-owning CUDA view."""
+    physical_num_blocks: int | None = None
+    """A fixed physical state pool independent of logical history capacity."""
 
 
 @dataclass
@@ -1013,6 +1015,8 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    device_state_blocks: int = 0
+    device_state_group_ids: tuple[int, ...] = ()
 
     @property
     def has_mamba_layers(self) -> bool:

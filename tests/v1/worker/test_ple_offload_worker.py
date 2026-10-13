@@ -863,7 +863,10 @@ def test_ple_offload_runner_groups_registrations_by_dp_rank(
         ),
     )
     runner._layers = {
-        "ple": SimpleNamespace(get_offload_output_dtype=lambda default: default)
+        "ple": SimpleNamespace(
+            get_offload_output_dtype=lambda default: default,
+            get_offload_output_dim=lambda default: default,
+        )
     }
     runner._worker_targets = {}
     runner._pinned_bufs = {}

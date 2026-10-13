@@ -186,6 +186,238 @@ def _hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Te
 
 
 @triton.jit
+def _hc_gate_mix_gathered_kernel(
+    x_ptr,
+    g_ptr,
+    y_ptr,
+    stride_x,
+    stride_g,
+    stride_rank,
+    stride_y,
+    R0: tl.constexpr,
+    R1: tl.constexpr,
+    R2: tl.constexpr,
+    R3: tl.constexpr,
+    HC_DIM: tl.constexpr,
+    HC: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    """_hc_gate_mix_kernel reading the gate as all-gathered by 4 ranks.
+
+    Rank r's [stream, HC_DIM // 4] block of row `row` is at
+    g + r * stride_rank + row * stride_g; logical rank j is physical rank
+    R<j>. Same arithmetic as the logical-layout kernel.
+    """
+    COLS: tl.constexpr = HC_DIM // 4
+    row = tl.program_id(0)
+    offs_inner = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs_inner < HC_DIM
+    j = offs_inner // COLS
+    rank = tl.where(j == 0, R0, tl.where(j == 1, R1, tl.where(j == 2, R2, R3)))
+    base = rank.to(tl.int64) * stride_rank + row * stride_g + offs_inner % COLS
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for stream in tl.static_range(HC):
+        g = tl.load(g_ptr + base + stream * COLS, mask, other=0.0)
+        x = tl.load(
+            x_ptr + row * stride_x + stream * HC_DIM + offs_inner, mask, other=0.0
+        )
+        acc += tl.sigmoid(g.to(tl.float32)) * x.to(tl.float32)
+    acc /= HC
+    tl.store(y_ptr + row * stride_y + offs_inner, acc, mask)
+
+
+def hc_gate_mix_gathered(
+    x: torch.Tensor, gathered: torch.Tensor, order: tuple[int, ...]
+) -> torch.Tensor:
+    """hc_gate_mix(x, gate, 4) where gate is the all-gather of the per-rank
+    [rows, stream * HC_DIM // 4] gate blocks, either along rows (rank-major
+    [4 * rows, HC_DIM]) or columns ([rows, 4 * HC_DIM]); no permute copy."""
+    N, DIM = x.shape
+    hc_count = len(order)
+    assert hc_count == 4 and x.stride(1) == 1 and gathered.stride(1) == 1
+    HC_DIM = DIM // hc_count
+    if gathered.shape == (hc_count * N, HC_DIM):
+        stride_g, stride_rank = gathered.stride(0), N * gathered.stride(0)
+    else:
+        assert gathered.shape == x.shape
+        stride_g, stride_rank = gathered.stride(0), HC_DIM
+    out = x.new_empty(N, HC_DIM)
+    BLOCK_SIZE = 512
+    _hc_gate_mix_gathered_kernel[(N, triton.cdiv(HC_DIM, BLOCK_SIZE))](
+        x,
+        gathered,
+        out,
+        x.stride(0),
+        stride_g,
+        stride_rank,
+        out.stride(0),
+        *order,
+        HC_DIM,
+        hc_count,
+        BLOCK_SIZE,
+    )
+    return out
+
+
+@triton.jit
+def _hc_gate_mix_local_kernel(
+    x_ptr,
+    g_ptr,
+    y_ptr,
+    stride_x,
+    stride_g,
+    stride_y,
+    col0,
+    COLS: tl.constexpr,
+    HC_DIM: tl.constexpr,
+    HC: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    """Columns [col0, col0 + COLS) of _hc_gate_mix_kernel from this rank's
+    gate shard g[row] = [stream, COLS]. Same arithmetic per element."""
+    row = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < COLS
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+    for stream in tl.static_range(HC):
+        g = tl.load(g_ptr + row * stride_g + stream * COLS + offs, mask, other=0.0)
+        x = tl.load(
+            x_ptr + row * stride_x + stream * HC_DIM + col0 + offs, mask, other=0.0
+        )
+        acc += tl.sigmoid(g.to(tl.float32)) * x.to(tl.float32)
+    acc /= HC
+    tl.store(y_ptr + row * stride_y + offs, acc, mask)
+
+
+@triton.jit
+def _hc_assemble_kernel(
+    src_ptr,
+    dst_ptr,
+    rows,
+    R0: tl.constexpr,
+    R1: tl.constexpr,
+    R2: tl.constexpr,
+    R3: tl.constexpr,
+    COLS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    """dst[row, j * COLS + c] = src[R<j> * rows + row, c] (rank-major gather
+    to logical column order)."""
+    row = tl.program_id(0)
+    j = tl.program_id(1)
+    rank = tl.where(j == 0, R0, tl.where(j == 1, R1, tl.where(j == 2, R2, R3)))
+    for start in tl.static_range(0, COLS, BLOCK_SIZE):
+        offs = start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < COLS
+        value = tl.load(src_ptr + (rank.to(tl.int64) * rows + row) * COLS + offs, mask)
+        tl.store(dst_ptr + row.to(tl.int64) * 4 * COLS + j * COLS + offs, value, mask)
+
+
+def hc_gate_mix_local(
+    x: torch.Tensor, local_gate: torch.Tensor, logical_rank: int, hc_count: int
+) -> torch.Tensor:
+    """This rank's [rows, HC_DIM // ranks] slice of hc_gate_mix(x, gate)."""
+    N, DIM = x.shape
+    HC_DIM = DIM // hc_count
+    COLS = local_gate.shape[1] // hc_count
+    assert x.stride(1) == 1 and local_gate.stride(1) == 1
+    out = x.new_empty(N, COLS)
+    BLOCK_SIZE = 256
+    _hc_gate_mix_local_kernel[(N, triton.cdiv(COLS, BLOCK_SIZE))](
+        x,
+        local_gate,
+        out,
+        x.stride(0),
+        local_gate.stride(0),
+        out.stride(0),
+        logical_rank * COLS,
+        COLS,
+        HC_DIM,
+        hc_count,
+        BLOCK_SIZE,
+    )
+    return out
+
+
+def hc_assemble_ranks(gathered: torch.Tensor, order: tuple[int, ...]) -> torch.Tensor:
+    """[ranks * rows, cols] rank-major gather -> [rows, ranks * cols] in
+    logical rank order."""
+    ranks = len(order)
+    assert ranks == 4 and gathered.is_contiguous()
+    rows, cols = gathered.shape[0] // ranks, gathered.shape[1]
+    out = gathered.new_empty(rows, ranks * cols)
+    _hc_assemble_kernel[(rows, ranks)](
+        gathered,
+        out,
+        rows,
+        *order,
+        cols,
+        256,
+    )
+    return out
+
+
+@triton.jit
+def _hc_packet_silu_kernel(
+    src_ptr,
+    lora_ptr,
+    inj_ptr,
+    rows,
+    R0: tl.constexpr,
+    R1: tl.constexpr,
+    R2: tl.constexpr,
+    R3: tl.constexpr,
+    WIDTH: tl.constexpr,
+    LORA: tl.constexpr,
+    INJ: tl.constexpr,
+    HC: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    """From a rank-major packet gather src[rank * rows + row, WIDTH]:
+    lora[row, j * LORA + c] = silu(src[R<j>, c] / HC) (as _hc_silu_kernel) and
+    inj[row, :] = src[R3, LORA:LORA + INJ] (logical rank 3)."""
+    row = tl.program_id(0)
+    j = tl.program_id(1)
+    rank = tl.where(j == 0, R0, tl.where(j == 1, R1, tl.where(j == 2, R2, R3)))
+    offs = tl.arange(0, BLOCK)
+    base = src_ptr + (rank.to(tl.int64) * rows + row) * WIDTH
+    x = tl.load(base + offs, offs < LORA).to(tl.float32) / HC
+    y = x * tl.sigmoid(x)
+    tl.store(lora_ptr + row.to(tl.int64) * 4 * LORA + j * LORA + offs, y, offs < LORA)
+    if j == 3:
+        inj = tl.load(base + LORA + offs, offs < INJ)
+        tl.store(inj_ptr + row.to(tl.int64) * INJ + offs, inj, offs < INJ)
+
+
+def hc_packet_silu(
+    gathered: torch.Tensor,
+    order: tuple[int, ...],
+    hc_count: int,
+    lora_width: int = 80,
+    inj_width: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(hc_silu(lora), injection) from the row-gathered HC down packet."""
+    ranks = len(order)
+    assert ranks == 4 and gathered.is_contiguous()
+    rows, width = gathered.shape[0] // ranks, gathered.shape[1]
+    lora = gathered.new_empty(rows, ranks * lora_width)
+    inj = gathered.new_empty(rows, inj_width)
+    _hc_packet_silu_kernel[(rows, ranks)](
+        gathered,
+        lora,
+        inj,
+        rows,
+        *order,
+        width,
+        lora_width,
+        inj_width,
+        hc_count,
+        triton.next_power_of_2(lora_width),
+    )
+    return lora, inj
+
+
+@triton.jit
 def _hc_combine_kernel(
     block_ptr,
     res_ptr,
@@ -499,5 +731,9 @@ __all__ = [
     "hc_combine",
     "hc_combine_norm",
     "hc_gate_mix",
+    "hc_assemble_ranks",
+    "hc_gate_mix_gathered",
+    "hc_gate_mix_local",
+    "hc_packet_silu",
     "hc_silu",
 ]

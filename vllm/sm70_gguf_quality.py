@@ -275,6 +275,33 @@ class GGUFTeacherWorkerExtension(GraphParityWorkerExtension):
                     raise RuntimeError("Teacher logits must cover the full vocabulary")
                 self._teacher_count += 1
                 if self.rank == 0:
+                    ple_samples = {}
+                    for name, module in runner.model.named_modules():
+                        packet = getattr(module, "_gpu_output_buffer", None)
+                        if packet is None:
+                            continue
+                        decoded = getattr(module, "_packed_result_output", packet)
+                        sample = {
+                            "packet": packet[:5].detach().cpu().clone(),
+                            "decoded": decoded[:5].detach().cpu().clone(),
+                            "layout": getattr(module, "_packed_result_layout", None),
+                        }
+                        book = getattr(module, "_packed_result_codebook", None)
+                        if book is not None:
+                            sample["codebook"] = book.detach().cpu().clone()
+                        ple_samples[name] = sample
+                    if ple_samples:
+                        torch.save(
+                            {
+                                "layers": ple_samples,
+                                "input_ids": batch.input_ids[:5].detach().cpu(),
+                                "positions": batch.positions[:5].detach().cpu(),
+                                "ngram_context": runner.model_state.ngram_context[:1]
+                                .detach()
+                                .cpu(),
+                            },
+                            root / f"{key}-ple.pt",
+                        )
                     kv_samples = {}
                     mappings = state.slot_mappings_by_layer or {}
                     for (

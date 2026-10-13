@@ -100,7 +100,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       ", Tensor(g!) bar, Tensor(h!) seq, int[] ar, int[] lora, int[] hb, int "
       "rank, Tensor? dbg, int full, Tensor? ox, Tensor? ocodes, Tensor? ohigh"
       ", Tensor? oscale, int ofmt, Tensor? gz, Tensor? gw, float geps, Tensor"
-      "(i!)? gscr) -> ()");
+      "(i!)? gscr, bool local_schedule=False) -> ()");
   ops.impl("sm70_hcx_out", torch::kCUDA, &sm70_hcx_out);
   ops.def(
       "sm70_dmv13_out(Tensor x, Tensor[] codes, Tensor[] high, Tensor[] scale, "
@@ -199,6 +199,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "ple_disk_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
       "int num_rows, int row_bytes, Tensor(a!) out) -> ()");
   ops.impl("ple_disk_gather_u8", torch::kCPU, &ple_disk_gather_u8);
+  ops.def(
+      "ple_disk_cached_gather_u8(Tensor ids, Tensor pointers, int shard_size, "
+      "int num_rows, int row_bytes, Tensor(a!) out, Tensor(b!) cache_ids, "
+      "Tensor(c!) cache_rows) -> ()");
+  ops.impl("ple_disk_cached_gather_u8", torch::kCPU,
+           &ple_disk_cached_gather_u8);
+
+  // Native owner thread for host-mapped PLE requests and packed results.
+  ops.def(
+      "ple_fast_lane_start(Tensor request, int max_reqs, int max_tokens, "
+      "int table_ptr, int row_bytes, int num_rows, int[] multipliers, "
+      "int[] sizes, int[] offsets, int eos, int[] result_ptrs, "
+      "int[] flag_ptrs, int cache_bytes, int idle_spin_us, "
+      "bool clamp_tokens, Tensor? draft_ring, int ring_reqs, "
+      "int ring_spec) -> int");
+  ops.impl("ple_fast_lane_start", torch::kCPU, &ple_fast_lane_start);
+  ops.def("ple_fast_lane_stats(int handle) -> Tensor");
+  ops.impl("ple_fast_lane_stats", &ple_fast_lane_stats);
+  ops.def("ple_fast_lane_stop(int handle) -> ()");
+  ops.impl("ple_fast_lane_stop", &ple_fast_lane_stop);
 
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
 #ifdef VLLM_REGISTER_BASIC_ACTIVATION_IN_C
@@ -359,6 +379,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_dp4a_down_unroute_sm70_out", torch::kCUDA,
            &gguf_dp4a_down_unroute_sm70_out);
   ops.def(
+      "gguf_dp4a_raw_down_unroute_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor ids, Tensor probabilities, Tensor weights, int source_type, "
+      "int left=0) -> ()");
+  ops.impl("gguf_dp4a_raw_down_unroute_sm70_out", torch::kCUDA,
+           &gguf_dp4a_raw_down_unroute_sm70_out);
+  ops.def(
       "gguf_dense_restore_canonical_sm70_out(Tensor(a!) weight, Tensor(b!) "
       "stats, "
       "Tensor codes, Tensor high, Tensor scale, int fmt, int k, int n) -> ()");
@@ -469,6 +495,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int group_size, str? native_policy=None) -> ()");
   ops.impl("gguf_lattice_grouped_gemm_sm70_out", torch::kCUDA,
            vllm::sm70::with_policy(&gguf_lattice_grouped_gemm_sm70_out));
+  ops.def(
+      "gguf_grouped_prefill_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int family, "
+      "int decoder, int n, int num_experts, int group_size, bool gated, "
+      "bool tune, Tensor? a_indices=None, str? native_policy=None) -> ()");
+  ops.impl("gguf_grouped_prefill_gemm_sm70_out", torch::kCUDA,
+           vllm::sm70::with_policy(&gguf_grouped_prefill_gemm_sm70_out));
+  ops.def(
+      "gguf_prefill_transcode_sm70(Tensor(a!) dst_w, Tensor(b!) dst_s, "
+      "int w_stride, int s_stride, Tensor src0, Tensor? src1, Tensor experts, "
+      "Tensor count, int ctas, int source_type, int n_out, int k, "
+      "int k_offset, int src_stride, "
+      "Tensor(c!) error) -> ()");
+  ops.impl("gguf_prefill_transcode_sm70", torch::kCUDA,
+           &gguf_prefill_transcode_sm70);
   ops.def(
       "gguf_lattice_grouped_vec_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "

@@ -203,6 +203,7 @@ class Sm70HcxRuntime:
         self.reason: str | None = None
         self.top1_enabled = False
         self.diagnostic = False
+        self.local_schedule = False
         self.snapshots: dict[str, dict[str, torch.Tensor]] = {}
         self.group = group
         self.rank = dist.get_rank(group)
@@ -281,7 +282,9 @@ class Sm70HcxRuntime:
             self.dpart = torch.zeros(
                 80 * 8 * 96 * 4, device=device, dtype=torch.float32
             )
-            self.bar = torch.zeros(2, device=device, dtype=torch.int32)
+            # Legacy arrival/reset counters and separate local-schedule
+            # cumulative counter/base permit alternating graph policies.
+            self.bar = torch.zeros(4, device=device, dtype=torch.int32)
             self.seq = torch.zeros(1, device=device, dtype=torch.int32)
             torch.accelerator.synchronize()
         dist.barrier(group=group)
@@ -379,6 +382,7 @@ class Sm70HcxRuntime:
             None,
             1e-6,
             None,
+            self.local_schedule,
         )
         if snapshot is not None:
             for key, value in (

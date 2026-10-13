@@ -81,7 +81,7 @@
  "vllm/config/vllm.py": {
   "env": 2,
   "model": 80,
-  "platform": 69
+  "platform": 67
  },
  "vllm/diagnostics.py": {
   "platform": 3
@@ -236,7 +236,7 @@
  "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py": {
   "env": 14,
   "model": 236,
-  "platform": 409
+  "platform": 407
  },
  "vllm/model_executor/layers/mamba/mamba_utils.py": {
   "platform": 1
@@ -544,13 +544,13 @@
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/speculator.py": {
   "model": 1,
-  "platform": 7
+  "platform": 11
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/utils.py": {
   "platform": 1
  },
  "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py": {
-  "model": 9
+  "model": 10
  },
  "vllm/v1/worker/gpu/spec_decode/speculator.py": {
   "model": 2

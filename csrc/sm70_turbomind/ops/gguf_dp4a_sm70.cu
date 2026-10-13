@@ -23,7 +23,7 @@ __global__ void quantize_q8(Q8_1* out, const half* input, int k) {
 
 template <int Type, bool Activated, class Index, int Lanes = 16,
           bool Quantized = false, bool Canonical = false,
-          bool ScalarLut = false, bool BankAware = false>
+          bool ScalarLut = false, bool BankAware = false, int FixedGroups = 0>
 __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
                         const uint8_t* gate, const uint8_t* up, int n, int k,
                         int stride, int top_k,
@@ -55,18 +55,32 @@ __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
   const uint8_t* g = gate + expert_row * stride;
   const uint8_t* u = up + expert_row * stride;
   float gs = 0.f, us = 0.f;
-  for (int group = lane % Lanes; group < groups; group += Lanes) {
-    if constexpr (Canonical) {
-      const int expert = ids[route];
-      const auto* gate_ptrs = reinterpret_cast<const StridedPtr*>(gate);
-      const auto* up_ptrs = reinterpret_cast<const StridedPtr*>(up);
-      gs += Dot::dot(gate_ptrs[expert].ptr, gate_stats[expert].ptr, n, k, row,
-                     group, shared_x[group]);
-      us += Dot::dot(up_ptrs[expert].ptr, up_stats[expert].ptr, n, k, row,
-                     group, shared_x[group]);
-    } else {
+  if constexpr (FixedGroups > 0 && !Canonical) {
+    // Compile-time K: each lane's groups are a fixed, fully unrolled list, so
+    // every group's weight loads can be in flight together instead of one
+    // dependent global round trip per loop iteration. The accumulation order
+    // (lane's groups ascending, gate and up separately) is unchanged.
+    static_assert(FixedGroups % Lanes == 0);
+#pragma unroll
+    for (int i = 0; i < FixedGroups / Lanes; ++i) {
+      const int group = lane % Lanes + i * Lanes;
       gs += Dot::dot(g, group, shared_x[group], book, masks);
       us += Dot::dot(u, group, shared_x[group], book, masks);
+    }
+  } else {
+    for (int group = lane % Lanes; group < groups; group += Lanes) {
+      if constexpr (Canonical) {
+        const int expert = ids[route];
+        const auto* gate_ptrs = reinterpret_cast<const StridedPtr*>(gate);
+        const auto* up_ptrs = reinterpret_cast<const StridedPtr*>(up);
+        gs += Dot::dot(gate_ptrs[expert].ptr, gate_stats[expert].ptr, n, k, row,
+                       group, shared_x[group]);
+        us += Dot::dot(up_ptrs[expert].ptr, up_stats[expert].ptr, n, k, row,
+                       group, shared_x[group]);
+      } else {
+        gs += Dot::dot(g, group, shared_x[group], book, masks);
+        us += Dot::dot(u, group, shared_x[group], book, masks);
+      }
     }
   }
 #pragma unroll
@@ -137,12 +151,13 @@ void dispatch_lut4_gate_up(torch::Tensor out, torch::Tensor activation,
                                          up, up_stats, n);
 }
 
-template <int Type, class Index, int Lanes, bool BankAware = false>
+template <int Type, class Index, int Lanes, bool BankAware = false,
+          int FixedGroups = 0>
 void launch_quantized_gate_up(torch::Tensor out, torch::Tensor activation,
                               torch::Tensor ids, torch::Tensor gate,
                               torch::Tensor up) {
   const int n = gate.size(1), top_k = ids.size(1);
-  gate_up<Type, true, Index, Lanes, true, false, false, BankAware>
+  gate_up<Type, true, Index, Lanes, true, false, false, BankAware, FixedGroups>
       <<<dim3(n / 32, activation.size(0) * top_k), 32 * Lanes,
          activation.size(1) * sizeof(Q8_1), at::cuda::getCurrentCUDAStream()>>>(
           out.data_ptr(), reinterpret_cast<const Q8_1*>(activation.data_ptr()),
@@ -156,7 +171,10 @@ void launch_gate_up(torch::Tensor out, torch::Tensor activation,
                     torch::Tensor ids, torch::Tensor gate, torch::Tensor up,
                     bool activated, int lanes) {
   if (out.scalar_type() == torch::kUInt8) {
-    if (lanes == 4)
+    if (lanes == 0)  // K2560, 16 lanes, unrolled bank-aware schedule
+      launch_quantized_gate_up<Type, Index, 16, true, 80>(out, activation, ids,
+                                                          gate, up);
+    else if (lanes == 4)
       launch_quantized_gate_up<Type, Index, 4, BankAware>(out, activation, ids,
                                                           gate, up);
     else if (lanes == 8)
@@ -358,9 +376,13 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                 torch::Tensor up, int64_t source_type,
                                 bool activated, int64_t lanes_per_row,
                                 bool bank_aware) {
-  TORCH_CHECK(source_type == 18 || source_type == 21 || source_type == 22,
+  TORCH_CHECK(source_type == 18 || source_type == 20 || source_type == 21 ||
+                  source_type == 22 || source_type == 23,
               "Unsupported GGUF lattice dp4a reader");
-  const int block_bytes = source_type == 18 ? 98 : source_type == 21 ? 110 : 82;
+  const int block_bytes = source_type == 18   ? 98
+                          : source_type == 21 ? 110
+                          : source_type == 23 ? 136
+                                              : 82;
   TORCH_CHECK(activation.is_cuda() &&
                   activation.scalar_type() == torch::kUInt8 &&
                   activation.dim() == 3 && activation.size(2) == sizeof(Q8_1) &&
@@ -374,19 +396,24 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                   ids.is_contiguous() && ids.dim() == 2 && ids.size(0) == m &&
                   ids.size(1) > 0 && ids.size(1) <= 16,
               "Invalid routing indices");
-  TORCH_CHECK(gate.device() == activation.device() &&
-                  up.device() == activation.device() &&
-                  gate.scalar_type() == torch::kUInt8 &&
-                  up.scalar_type() == torch::kUInt8 && gate.is_contiguous() &&
-                  up.is_contiguous() && gate.dim() == 3 &&
-                  gate.sizes() == up.sizes() && gate.size(0) > 0 &&
-                  gate.size(1) > 0 && k % 256 == 0 &&
-                  gate.size(2) == ((k / 256 * block_bytes + 7) / 8 * 8),
-              "Expected aligned original GGUF lattice expert rows");
+  TORCH_CHECK(
+      gate.device() == activation.device() &&
+          up.device() == activation.device() &&
+          gate.scalar_type() == torch::kUInt8 &&
+          up.scalar_type() == torch::kUInt8 && gate.is_contiguous() &&
+          up.is_contiguous() && gate.dim() == 3 && gate.sizes() == up.sizes() &&
+          gate.size(0) > 0 && gate.size(1) > 0 && k % 256 == 0 &&
+          (source_type == 20
+               ? gate.size(2) == k / 32 * 18
+               : (gate.size(2) == k / 256 * block_bytes ||
+                  gate.size(2) == ((k / 256 * block_bytes + 7) / 8 * 8))),
+      "Expected aligned original GGUF lattice expert rows");
   const int n = gate.size(1), top_k = ids.size(1);
   const bool quantized = out.scalar_type() == torch::kUInt8;
+  // lanes_per_row 0: K2560 16-lane schedule with a fully unrolled group loop.
   TORCH_CHECK(lanes_per_row == 16 ||
-                  (quantized && (lanes_per_row == 4 || lanes_per_row == 8)),
+                  (quantized && (lanes_per_row == 4 || lanes_per_row == 8 ||
+                                 (lanes_per_row == 0 && k == 2560))),
               "Unsupported expert integer-dot row partition");
   TORCH_CHECK(
       out.device() == activation.device() && out.is_contiguous() &&
@@ -408,8 +435,12 @@ void gguf_dp4a_gate_up_sm70_out(torch::Tensor out, torch::Tensor activation,
                                   lanes_per_row)
   if (source_type == 18) {
     DISPATCH_LATTICE(18);
+  } else if (source_type == 20) {
+    DISPATCH_LATTICE(20);
   } else if (source_type == 21) {
     DISPATCH_LATTICE(21);
+  } else if (source_type == 23) {
+    DISPATCH_LATTICE(23);
   } else {
     DISPATCH_LATTICE(22);
   }
@@ -505,6 +536,132 @@ void gguf_dp4a_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
     dispatch_down<20>(out, input, ids, route_weights, weight_ptrs, stats_ptrs);
   else
     dispatch_down<42>(out, input, ids, route_weights, weight_ptrs, stats_ptrs);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+namespace {
+template <int Type, class Index, bool Quantized>
+__global__ void raw_down_unroute(half* output, const void* input,
+                                 const Index* ids, const float* route_weights,
+                                 const uint8_t* weights, int n, int k,
+                                 int row_stride, int left_groups, int top_k) {
+  extern __shared__ Q8_1 x[];
+  __shared__ float partial[4][32];
+  const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+  const int groups = k / 32, token = blockIdx.y;
+  if constexpr (Quantized) {
+    const auto* source = static_cast<const uint32_t*>(input) +
+                         int64_t{token} * top_k * groups * 9;
+    for (int i = threadIdx.x; i < top_k * groups * 9; i += blockDim.x)
+      reinterpret_cast<uint32_t*>(x)[i] = source[i];
+  } else {
+    for (int i = warp; i < top_k * groups; i += 4) {
+      const half value = static_cast<const half*>(
+          input)[int64_t{token} * top_k * k + i * 32 + lane];
+      vllm::sm70_gguf::quantize_q8_1_warp(x + i, __half2float(value));
+    }
+  }
+  __syncthreads();
+  const int col = blockIdx.x * 32 + lane;
+  float total = 0.f;
+  for (int route = warp; route < top_k; route += 4) {
+    const int slot = token * top_k + route;
+    const uint8_t* row = weights + (int64_t{ids[slot]} * n + col) * row_stride;
+    float dot = 0.f;
+    for (int group = 0; group < groups; ++group)
+      dot += vllm::sm70_gguf::OriginalIntegerDot<Type>::dot(
+          row, group + left_groups, x[route * groups + group]);
+    total += __half2float(__float2half_rn(dot)) * route_weights[slot];
+  }
+  partial[warp][lane] = total;
+  __syncthreads();
+  if (!warp) {
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) sum += partial[i][lane];
+    output[int64_t{token} * n + col] = __float2half_rn(sum);
+  }
+}
+
+template <int Type, class Index, bool Quantized>
+void launch_raw_down(torch::Tensor out, torch::Tensor input, torch::Tensor ids,
+                     torch::Tensor probabilities, torch::Tensor weights,
+                     int left) {
+  const int k = input.size(2) * (Quantized ? 32 : 1);
+  raw_down_unroute<Type, Index, Quantized>
+      <<<dim3(out.size(1) / 32, out.size(0)), 128,
+         ids.size(1) * (k / 32) * sizeof(Q8_1),
+         at::cuda::getCurrentCUDAStream()>>>(
+          reinterpret_cast<half*>(out.data_ptr()), input.data_ptr(),
+          ids.data_ptr<Index>(), probabilities.data_ptr<float>(),
+          weights.data_ptr<uint8_t>(), out.size(1), k, weights.size(2),
+          left / 32, ids.size(1));
+}
+
+template <int Type, class Index>
+void dispatch_raw_down(torch::Tensor out, torch::Tensor input,
+                       torch::Tensor ids, torch::Tensor probabilities,
+                       torch::Tensor weights, int left) {
+  if (input.scalar_type() == torch::kUInt8)
+    launch_raw_down<Type, Index, true>(out, input, ids, probabilities, weights,
+                                       left);
+  else
+    launch_raw_down<Type, Index, false>(out, input, ids, probabilities, weights,
+                                        left);
+}
+}  // namespace
+
+void gguf_dp4a_raw_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
+                                         torch::Tensor ids,
+                                         torch::Tensor probabilities,
+                                         torch::Tensor weights,
+                                         int64_t source_type, int64_t left) {
+  TORCH_CHECK(source_type == 20 || source_type == 42,
+              "Original down requires IQ4_NL or Q2_0");
+  const bool quantized = input.scalar_type() == torch::kUInt8;
+  TORCH_CHECK(input.is_cuda() && input.is_contiguous() &&
+                  (quantized ? input.dim() == 4 && input.size(3) == sizeof(Q8_1)
+                             : input.dim() == 3 &&
+                                   input.scalar_type() == torch::kFloat16),
+              "Expected routed FP16 or Q8_1 input");
+  const int k = input.size(2) * (quantized ? 32 : 1);
+  const int block = source_type == 20 ? 32 : 64;
+  TORCH_CHECK(input.size(0) > 0 && input.size(0) <= 20 && input.size(1) > 0 &&
+                  input.size(1) <= 16 && k > 0 && k <= 256 && k % 32 == 0 &&
+                  left >= 0 && left < block && left % 32 == 0,
+              "Unsupported original down geometry");
+  for (const auto& tensor : {out, ids, probabilities, weights})
+    TORCH_CHECK(tensor.device() == input.device() && tensor.is_contiguous(),
+                "Original down tensors must share a CUDA device");
+  TORCH_CHECK(out.scalar_type() == torch::kFloat16 && out.dim() == 2 &&
+                  out.size(0) == input.size(0) && out.size(1) > 0 &&
+                  out.size(1) % 32 == 0 && ids.dim() == 2 &&
+                  ids.size(0) == input.size(0) &&
+                  ids.size(1) == input.size(1) &&
+                  (ids.scalar_type() == torch::kInt32 ||
+                   ids.scalar_type() == torch::kInt64) &&
+                  probabilities.scalar_type() == torch::kFloat32 &&
+                  probabilities.sizes() == ids.sizes() &&
+                  weights.scalar_type() == torch::kUInt8 &&
+                  weights.dim() == 3 && weights.size(0) > 0 &&
+                  weights.size(0) <= 65535 && weights.size(1) == out.size(1) &&
+                  weights.size(2) == ((left + k + block - 1) / block) * 18,
+              "Invalid original down storage or routing");
+  const c10::cuda::CUDAGuard guard(input.device());
+  require_sm70();
+#define DISPATCH_RAW(TYPE)                                                    \
+  if (ids.scalar_type() == torch::kInt32)                                     \
+    dispatch_raw_down<TYPE, int32_t>(out, input, ids, probabilities, weights, \
+                                     left);                                   \
+  else                                                                        \
+    dispatch_raw_down<TYPE, int64_t>(out, input, ids, probabilities, weights, \
+                                     left)
+  if (source_type == 20) {
+    DISPATCH_RAW(20);
+  } else {
+    DISPATCH_RAW(42);
+  }
+#undef DISPATCH_RAW
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

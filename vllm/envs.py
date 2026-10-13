@@ -446,6 +446,13 @@ if TYPE_CHECKING:
     VLLM_SM70_ASYNC_CPU_TRACE: bool = False
     VLLM_SM70_ASYNC_CPU_TRACE_EVERY: int = 16
     VLLM_TP_ALLREDUCE_TRACE: bool = False
+    VLLM_EXPERT_CACHE_MEMLOG: bool = False
+    VLLM_EXPERT_CACHE_STACKS: bool = False
+    VLLM_TM_COLD_DMA: bool = True
+    VLLM_TM_COLD_CTAS: int | None = None
+    VLLM_QSA_DUMP_DIR: str | None = None
+    VLLM_GGUF_LOAD_PROFILE: bool = False
+    VLLM_BALANCED_PREFILL_CHUNKS: bool = False
     VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT: int | None = None
     VLLM_SM70_TP4_MTP_AR_BLOCK_TUNING: bool = False
     VLLM_SM70_TP4_M5_AR_THREADS: int | None = None
@@ -7014,6 +7021,107 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "torch fallback paths."
         ),
         category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=True,
+    ),
+    "VLLM_EXPERT_CACHE_MEMLOG": env_var(
+        lambda: bool(os.getenv("VLLM_EXPERT_CACHE_MEMLOG")),
+        description=(
+            "Diagnostic: log CUDA memory around the first and last TurboMind "
+            "prefill MoE layer of the GGUF routed-expert cache."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_EXPERT_CACHE_STACKS": env_var(
+        lambda: bool(os.getenv("VLLM_EXPERT_CACHE_STACKS")),
+        description=(
+            "Diagnostic: dump all thread stacks when a GGUF routed-expert cache "
+            "miss waits on the host lane for too long."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_TM_COLD_DMA": env_var(
+        lambda: os.getenv("VLLM_TM_COLD_DMA", "1") == "1",
+        description=(
+            "GGUF routed-expert cache TurboMind prefill: stage host-resident (cold) "
+            "experts on the device with copy-engine DMA before transcoding. 0 "
+            "transcodes them straight from mapped host memory with few CTAs, which "
+            "slows concurrent kernels on V100."
+        ),
+        category="tuning",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_TM_COLD_CTAS": env_var(
+        lambda: (
+            int(os.environ["VLLM_TM_COLD_CTAS"])
+            if "VLLM_TM_COLD_CTAS" in os.environ
+            else None
+        ),
+        description=(
+            "CTAs of the cold-expert transcode in the GGUF routed-expert cache "
+            "TurboMind prefill. Unset: 64 with DMA staging, 8 when reading mapped "
+            "host memory."
+        ),
+        category="tuning",
+        declared_default="None",
+        effective_default="Computed when unset: 64 with VLLM_TM_COLD_DMA, else 8",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_QSA_DUMP_DIR": env_var(
+        lambda: os.getenv("VLLM_QSA_DUMP_DIR"),
+        description=(
+            "Diagnostic: directory where TP rank 0 saves the inputs and output of a "
+            "few long-context QSA prefill attention calls for offline kernel "
+            "benchmarks."
+        ),
+        category="debug",
+        declared_default="None",
+        effective_default="None",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_GGUF_LOAD_PROFILE": env_var(
+        lambda: bool(os.getenv("VLLM_GGUF_LOAD_PROFILE")),
+        description=(
+            "Diagnostic: sample the GGUF loading thread every 50 ms and log where "
+            "the load time goes."
+        ),
+        category="debug",
+        declared_default="False",
+        effective_default="False",
+        automatic_conditions=(),
+        acceleration_paths=(),
+        user_visible=False,
+    ),
+    "VLLM_BALANCED_PREFILL_CHUNKS": env_var(
+        lambda: os.getenv("VLLM_BALANCED_PREFILL_CHUNKS", "0") == "1",
+        description=(
+            "Split a prompt that needs n prefill chunks into n near-equal block- "
+            "aligned chunks instead of full chunks and a short tail. Helps when "
+            "every prefill step has a fixed cost (e.g. host-resident experts "
+            "streamed over PCIe)."
+        ),
+        category="tuning",
         declared_default="False",
         effective_default="False",
         automatic_conditions=(),
@@ -19174,6 +19282,13 @@ def compile_factors(kernel_config=None, *, vllm_config=None) -> dict[str, object
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        "VLLM_EXPERT_CACHE_MEMLOG",
+        "VLLM_EXPERT_CACHE_STACKS",
+        "VLLM_TM_COLD_DMA",
+        "VLLM_TM_COLD_CTAS",
+        "VLLM_QSA_DUMP_DIR",
+        "VLLM_GGUF_LOAD_PROFILE",
+        "VLLM_BALANCED_PREFILL_CHUNKS",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
