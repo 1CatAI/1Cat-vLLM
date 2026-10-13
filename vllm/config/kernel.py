@@ -518,6 +518,38 @@ class Sm70GgufConfig:
     This avoids interleaving permanent expert banks with loading temporaries.
     """
 
+    expert_trace_tokens: int = Field(default=0, ge=0)
+    """Diagnostic: record decode routing in a per-layer ring of this many
+    tokens (and prefill expert histograms) for sizing an expert cache. Off at 0."""
+
+    expert_cache_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Keep only this fraction of each layer's routed experts in GPU slots and
+    the rest in pinned host memory (requires ``expert_arena``). Decode misses
+    are copied in by a native host thread while the step waits in-graph; LRU
+    keeps the slots hot. Prefill assembles each layer's full bank. Off at 0."""
+
+    expert_cache_spare_slots: int = Field(default=8, ge=1, le=64)
+    """Free GPU slots kept per layer so decode misses never wait on eviction."""
+
+    expert_cache_host_slack: float = Field(default=0.1, ge=0.0, le=1.0)
+    """Extra host slots per layer, as a fraction of experts, that keep copies
+    of resident experts so evicting them needs no device-to-host copy."""
+
+    expert_cache_profile: str | None = None
+    """Optional ``[layers, experts]`` routing-count tensor (torch.save) that
+    picks the initially resident experts; otherwise the lowest expert ids."""
+
+    expert_cache_prefill: Literal["turbomind", "mmq"] = "turbomind"
+    """Prefill with an expert cache: ``turbomind`` transcodes each layer's
+    experts (GPU slots and host arena) into canonical banks on side streams,
+    one layer ahead, and runs TurboMind grouped GEMMs with fused gate/up SiLU;
+    ``mmq`` assembles the original bank and runs the upstream MMQ kernels."""
+
+    expert_cache_prefill_tokens: int = Field(default=4096, ge=256)
+    """Tokens per TurboMind MoE sub-batch within a prefill chunk. The layer's
+    banks are transcoded once per chunk; sub-batches bound the routed
+    activations (about 50 KiB per token at top-10)."""
+
     dense_storage: Literal["canonical", "original"] = "canonical"
     """Keep calibrated canonical projections or dispatch original packed rows."""
 
@@ -777,6 +809,20 @@ class KernelConfig:
     """Verify greedy MTP drafts from TP-local target argmax pairs instead of
     gathering full-vocabulary logits for the rejection sampler."""
 
+    sm70_sparse_target_sampling: bool = False
+    """Verify argmax drafts of top-k 20 sampled requests from TP-local target
+    candidates (merged global top-k) instead of full-vocabulary logits and the
+    dense sampler. Exact: requests with an ambiguous top-k/top-p cutoff fall
+    back to the full-vocabulary sampler."""
+
+    sm70_sparse_target_reference_check: bool = True
+    """With sparse target sampling, copy the candidates to the host each round
+    and send requests with an ambiguous cutoff (score ties at top-k, a top-p
+    boundary within rounding) to the full-vocabulary sampler, for bit-exact
+    agreement with it. Off: no host synchronization; those rare boundary cases
+    are decided on the compact candidates (ties within the 64-candidate probe
+    are kept in vocabulary order), still a valid top-k/top-p sample."""
+
     sm70_gdn_verify: bool = False
     """Run single-request MTP GDN verification with the SM70 sequential CUDA
     recurrence instead of the Triton fused kernel."""
@@ -840,6 +886,13 @@ class KernelConfig:
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
     qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
     """Shared host-miss staging capacity; larger batches use bounded row chunks."""
+    qsa_host_kv_prefill_stage_tokens: int = Field(default=0, ge=0)
+    """Prefill with host KV: copy each request's whole history for a layer to
+    one shared device buffer (DMA, once per layer and chunk) and read it there,
+    instead of resolving every query row's selection through the hot cache and
+    mapped host memory (re-reading the same history per row over PCIe).
+    Capacity in tokens (about 0.5 KiB each, shared by all layers); longer
+    contexts keep the hot-cache path. 0 disables it."""
     qsa_host_indexer_history: bool = False
     """Keep the FP16 compressed indexer history and its co-owned compressor
     state in mapped host storage when QSA host KV is active. Exact score

@@ -465,6 +465,46 @@ class GGUFModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         model.load_weights(self.get_all_weights(model_config, model))
 
+    @staticmethod
+    def _start_load_sampler():
+        """Diagnostic (VLLM_GGUF_LOAD_PROFILE=1): sample the loading thread's
+        stack every 50 ms and log where the load time goes."""
+        import collections
+        import os
+        import sys
+        import threading
+        import time
+
+        if not os.environ.get("VLLM_GGUF_LOAD_PROFILE"):
+            return None
+        target = threading.get_ident()
+        counts = collections.Counter()
+        stop = threading.Event()
+
+        def run():
+            while not stop.wait(0.05):
+                frame = sys._current_frames().get(target)
+                seen = set()
+                while frame is not None:
+                    code = frame.f_code
+                    if "site-packages/torch" not in code.co_filename:
+                        key = (code.co_filename.split("vllm/")[-1], code.co_name)
+                        if key not in seen:
+                            seen.add(key)
+                            counts[key] += 1
+                    frame = frame.f_back
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+
+        def finish():
+            stop.set()
+            thread.join()
+            for (path, name), n in counts.most_common(40):
+                logger.info("load profile %6.1f s  %s:%s", n * 0.05, path, name)
+
+        return finish
+
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
@@ -565,10 +605,21 @@ class GGUFModelLoader(BaseModelLoader):
                     gguf_expert_storage,
                 )
 
-                gguf_expert_storage.prepare_original_expert_arena(
-                    model, gguf_weights_map, self._native_tensors, target_device
+                adapter.bulk_experts = (
+                    gguf_expert_storage.prepare_original_expert_arena(
+                        model, gguf_weights_map, self._native_tensors, target_device
+                    )
+                    or {}
                 )
+                # Expert banks are read in the background while dense weights
+                # load, in the order the adapter yields them.
+                gguf_expert_storage.start_prefetch(
+                    adapter.bulk_experts, self._native_tensors
+                )
+            finish = self._start_load_sampler()
             self.load_weights(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)
+            if finish is not None:
+                finish()
         return model

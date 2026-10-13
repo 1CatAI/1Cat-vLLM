@@ -148,6 +148,9 @@ struct TurboMindRuntime : vllm::sm70::RuntimeResource {
   std::map<std::pair<int, uint64_t>, GemmHolder> gemm_cache;
   std::unordered_set<DenseTuneKey, DenseTuneKeyHash> dense_tuned_shapes;
   std::unordered_set<MoeTuneKey, MoeTuneKeyHash> moe_tuned_shapes;
+  // Prefill descriptor families (total_tokens = 0) with at least one
+  // measured batch size.
+  std::unordered_set<MoeTuneKey, MoeTuneKeyHash> prefill_tuned_families;
   std::set<std::pair<int, uint64_t>> imported_cache_devices;
   std::unordered_map<Sm70F16WeightCacheKey, Sm70F16WeightCacheEntry,
                      Sm70F16WeightCacheKeyHash>
@@ -562,6 +565,27 @@ turbomind::gemm::DispatchPolicy select_moe_dispatch_policy_impl(
   }
   runtime().moe_tuned_shapes.insert(key);
   return turbomind::gemm::DispatchPolicy::kMeasure;
+}
+
+turbomind::gemm::DispatchPolicy select_prefill_moe_dispatch_policy(
+    int device, int total_tokens, int n, int k, int num_experts, int group_size,
+    cudaStream_t stream, TuneKeyKind kind, bool tune) {
+  // The caller measures a fixed set of batch sizes once (warmup) with
+  // tune=true; every other call reuses the smallest measured batch size that
+  // covers it, so no prefill chunk is ever measured on the serving path.
+  MoeTuneKey family{kind, device, 0, n, k, num_experts, group_size};
+  std::lock_guard<std::mutex> lock(runtime().tune_mutex);
+  const bool measured = runtime().prefill_tuned_families.count(family) != 0;
+  if (tune && !is_stream_capturing(stream)) {
+    MoeTuneKey key{kind, device, total_tokens, n, k, num_experts, group_size};
+    if (runtime().moe_tuned_shapes.insert(key).second) {
+      runtime().prefill_tuned_families.insert(family);
+      return turbomind::gemm::DispatchPolicy::kMeasure;
+    }
+    return turbomind::gemm::DispatchPolicy::kReuse;
+  }
+  return measured ? turbomind::gemm::DispatchPolicy::kReuse
+                  : turbomind::gemm::DispatchPolicy::kDefault;
 }
 
 turbomind::gemm::DispatchPolicy select_moe_dispatch_policy(

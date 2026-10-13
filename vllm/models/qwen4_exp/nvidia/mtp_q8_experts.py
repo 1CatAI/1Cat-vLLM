@@ -23,6 +23,9 @@ from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
 
+# Tokens per draft MoE call during prefill (bounds its temporaries).
+_PREFILL_CHUNK = 2048
+
 GGML_Q8_0 = 8
 _BLOCK = 32
 _BLOCK_BYTES = 34  # FP16 scale + 32 int8 values
@@ -153,16 +156,28 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
             raise ValueError("Q8_0 MTP experts need TP-only output-weighted SiLU")
         from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
 
-        return fused_moe_gguf(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights,
-            topk_ids,
-            GGML_Q8_0,
-            GGML_Q8_0,
-            "silu",
-        )
+        def run(rows):
+            return fused_moe_gguf(
+                x[rows],
+                layer.w13_weight,
+                layer.w2_weight,
+                topk_weights[rows],
+                topk_ids[rows],
+                GGML_Q8_0,
+                GGML_Q8_0,
+                "silu",
+            )
+
+        tokens = x.shape[0]
+        if tokens <= _PREFILL_CHUNK:
+            return run(slice(None))
+        # Prefill: the GGUF MoE path keeps [tokens * top_k, hidden]
+        # temporaries; token chunks bound them (tokens are independent).
+        out = torch.empty_like(x)
+        for start in range(0, tokens, _PREFILL_CHUNK):
+            rows = slice(start, min(tokens, start + _PREFILL_CHUNK))
+            out[rows] = run(rows)
+        return out
 
 
 class MTPQ80Config(QuantizationConfig):

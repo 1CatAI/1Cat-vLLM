@@ -496,6 +496,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_lattice_grouped_gemm_sm70_out", torch::kCUDA,
            vllm::sm70::with_policy(&gguf_lattice_grouped_gemm_sm70_out));
   ops.def(
+      "gguf_grouped_prefill_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int family, "
+      "int decoder, int n, int num_experts, int group_size, bool gated, "
+      "bool tune, Tensor? a_indices=None, str? native_policy=None) -> ()");
+  ops.impl("gguf_grouped_prefill_gemm_sm70_out", torch::kCUDA,
+           vllm::sm70::with_policy(&gguf_grouped_prefill_gemm_sm70_out));
+  ops.def(
+      "gguf_prefill_transcode_sm70(Tensor(a!) dst_w, Tensor(b!) dst_s, "
+      "int w_stride, int s_stride, Tensor src0, Tensor? src1, Tensor experts, "
+      "Tensor count, int ctas, int source_type, int n_out, int k, "
+      "int k_offset, int src_stride, "
+      "Tensor(c!) error) -> ()");
+  ops.impl("gguf_prefill_transcode_sm70", torch::kCUDA,
+           &gguf_prefill_transcode_sm70);
+  ops.def(
       "gguf_lattice_grouped_vec_sm70_out(Tensor(a!) out, Tensor input, "
       "Tensor offsets, Tensor weight_ptrs, Tensor stats_ptrs, int source_type, "
       "int num_experts, int group_size) -> ()");

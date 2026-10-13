@@ -140,12 +140,22 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         self.q8_intermediate = bool(
             config and config.kernel_config.sm70_gguf.q8_expert_intermediate
         )
+        self.expert_trace_tokens = (
+            config.kernel_config.sm70_gguf.expert_trace_tokens if config else 0
+        )
+        self.trace_layers = (
+            getattr(config.model_config.hf_text_config, "num_hidden_layers", 0)
+            if config and config.model_config
+            else 0
+        )
         self.weight_types: dict[str, int] = {}
         self.guarded_shards: set[str] = set()
         self.input_padding: dict[str, tuple[int, int]] = {}
         self.loaded_experts: dict[str, set[int]] = {
             shard: set() for shard in ("w1", "w3", "w2")
         }
+        self.expert_cache = None
+        self.cache_layer = -1
 
     @property
     def topk_indices_dtype(self):
@@ -253,7 +263,10 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             layer.register_buffer(name, storage, persistent=False)
         if expert_id in self.loaded_experts[shard_id]:
             raise ValueError(f"Duplicate GGUF {shard_id} expert {expert_id}")
-        getattr(layer, name)[expert_id].copy_(local)
+        if self.expert_cache is not None:
+            self.expert_cache.store(self.cache_layer, shard_id, expert_id, local)
+        else:
+            getattr(layer, name)[expert_id].copy_(local)
         self.loaded_experts[shard_id].add(expert_id)
 
     def process_weights_after_loading(self, layer):
@@ -345,31 +358,48 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         if layer.apply_router_weight_on_input or layer.activation != MoEActivation.SILU:
             raise ValueError("Native GGUF experts require output-weighted SiLU routing")
         ids = topk_ids.to(torch.int32).contiguous()
+        if self.expert_trace_tokens:
+            from .gguf_expert_trace import trace_routing
+
+            trace_routing(
+                layer, ids, self.expert_trace_tokens, self.trace_layers,
+                self.num_experts,
+            )
         mask = None
         if layer.expert_map is not None:
             ids = layer.expert_map[ids.long()].to(torch.int32)
             mask = ids >= 0
             ids = ids.clamp_min(0).contiguous()
         tokens, top_k = ids.shape
+        cache = self.expert_cache
+        w1, w3, w2 = layer.gguf_w1, layer.gguf_w3, layer.gguf_w2
         if (
             self.dp4a_admitted
             and 1 <= tokens <= 20
             and layer.expert_map is None
             and topk_weights.dtype == torch.float32
         ):
+            if cache is not None:
+                ids = cache.resolve(self.cache_layer, ids)
             return torch.ops.vllm.gguf_original_expert_dp4a(
                 x.contiguous(),
                 ids,
                 topk_weights.contiguous(),
-                layer.gguf_w1,
-                layer.gguf_w3,
-                layer.gguf_w2,
+                w1,
+                w3,
+                w2,
                 self.weight_types["w1"],
                 self.weight_types["w2"],
                 self.input_padding.get("w2", (0, 0))[0],
                 self.q8_intermediate,
                 self.weight_types["w1"] == 21,
             )
+        if cache is not None and cache.tm is not None:
+            return cache.prefill_moe(
+                self.cache_layer, x.contiguous(), ids, topk_weights
+            )
+        if cache is not None:
+            w1, w3, w2, ids = cache.prefill(self.cache_layer, ids)
         native = torch.ops._C_gguf
 
         def projection(shard):
@@ -382,7 +412,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
 
         gate = projection("w1")(
             x.contiguous(),
-            layer.gguf_w1,
+            w1,
             ids,
             self.weight_types["w1"],
             self.intermediate_size,
@@ -391,7 +421,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         )
         up = projection("w3")(
             x.contiguous(),
-            layer.gguf_w3,
+            w3,
             ids,
             self.weight_types["w3"],
             self.intermediate_size,
@@ -407,13 +437,15 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         routed_ids = ids.reshape(-1, 1)
         down = projection("w2")(
             hidden.contiguous(),
-            layer.gguf_w2,
+            w2,
             routed_ids,
             self.weight_types["w2"],
             self.hidden_size,
             1,
             tokens * top_k,
         )
+        if cache is not None:
+            cache.prefill_done(self.cache_layer)
         down = down.view(tokens, top_k, self.hidden_size)
         if mask is not None:
             down = torch.where(mask[..., None], down, 0)

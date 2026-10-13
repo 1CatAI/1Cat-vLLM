@@ -9,6 +9,8 @@ indexer q/k) runs as extra CTAs of the same launch instead of its own GEMV.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
@@ -105,26 +107,16 @@ class Dmv13Projection:
         k = None
         for raw, qtype in shards:
             device = raw.device if raw.is_cuda else device
-            fmt, q, s, m, gs = dense.decode(raw.detach().cpu().numpy(), qtype)
-            if (
-                q.shape[0] % 32
-                or q.shape[1] % 128
-                or (k is not None and k != q.shape[1])
-            ):
+            packed = _PREPACKED.pop(_shard_key(raw, qtype), None)
+            fmt, rows, cols, codes, high, scale = packed or _decode_pack(raw, qtype)
+            if rows % 32 or cols % 128 or (k is not None and k != cols):
                 return
-            k = q.shape[1]
-            codes, high, scale = dense.pack(fmt, q, s, m, gs)
-            if fmt == dense.LUT4:
-                from vllm.model_executor.layers.quantization.gguf_dmv_formats import (
-                    compact_lut4_scale,
-                )
-
-                scale = compact_lut4_scale(scale)
+            k = cols
             self.codes.append(torch.from_numpy(np.ascontiguousarray(codes)))
             self.high.append(torch.from_numpy(np.ascontiguousarray(high)))
             self.scale.append(torch.from_numpy(np.ascontiguousarray(scale)))
             self.formats.append(int(fmt))
-            self.widths.append(int(q.shape[0]))
+            self.widths.append(int(rows))
         device = device or torch.device(
             "cuda", torch.accelerator.current_device_index()
         )
@@ -191,6 +183,50 @@ direct_register_custom_op(
     op_func=_side_projection,
     fake_impl=_side_projection_fake,
 )
+
+
+_PREPACKED: dict = {}
+
+
+def _shard_key(raw, qtype):
+    return raw.data_ptr(), tuple(raw.shape), int(qtype)
+
+
+def _decode_pack(raw, qtype):
+    """(format, rows, cols, codes, high, scale) of one raw GGUF shard."""
+    fmt, q, s, m, gs = dense.decode(raw.detach().cpu().numpy(), qtype)
+    codes, high, scale = dense.pack(fmt, q, s, m, gs)
+    if fmt == dense.LUT4:
+        from vllm.model_executor.layers.quantization.gguf_dmv_formats import (
+            compact_lut4_scale,
+        )
+
+        scale = compact_lut4_scale(scale)
+    return fmt, q.shape[0], q.shape[1], codes, high, scale
+
+
+def prepack(layers) -> None:
+    """Decode and pack the shards of ``layers`` concurrently (NumPy releases
+    the GIL in its array kernels); ``attach`` then consumes the results."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    shards = []
+    for layer in layers:
+        found = _raw_shards(layer) or []
+        if found and all(t in _DENSE_FORMATS for _, t in found):
+            shards.extend(found)
+    if not shards:
+        return
+    workers = max(1, min(8, (os.cpu_count() or 1) // 4))
+    with ThreadPoolExecutor(workers) as pool:
+        results = list(pool.map(lambda shard: _decode_pack(*shard), shards))
+    for (raw, qtype), result in zip(shards, results):
+        _PREPACKED[_shard_key(raw, qtype)] = result
+
+
+def drop_prepacked() -> None:
+    """Release prepacked shards that no projection consumed."""
+    _PREPACKED.clear()
 
 
 def attach(layer, extra, attr: str) -> bool:

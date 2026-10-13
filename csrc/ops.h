@@ -942,6 +942,19 @@ void gguf_lattice_grouped_gemm_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
     torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
     int64_t num_experts, int64_t group_size);
+void gguf_grouped_prefill_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t family,
+    int64_t decoder, int64_t n, int64_t num_experts, int64_t group_size,
+    bool gated, bool tune, std::optional<torch::Tensor> a_indices);
+void gguf_prefill_transcode_sm70(torch::Tensor dst_w, torch::Tensor dst_s,
+                                 int64_t w_stride, int64_t s_stride,
+                                 torch::Tensor src0,
+                                 std::optional<torch::Tensor> src1,
+                                 torch::Tensor experts, torch::Tensor count,
+                                 int64_t ctas, int64_t source_type,
+                                 int64_t n_out, int64_t k, int64_t k_offset,
+                                 int64_t src_stride, torch::Tensor error);
 
 void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor offsets,

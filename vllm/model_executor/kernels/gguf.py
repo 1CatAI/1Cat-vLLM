@@ -587,7 +587,10 @@ def moe_mmq_supported(weight, weight_type: int, dtype) -> bool:
         if weight.dtype == torch.uint8
         else matrix.shape[-1]
     )
-    probe = torch.empty((1, k), dtype=dtype, device=weight.device)
+    # Probe inside upstream's MMQ batch range: at batch 1 the performance
+    # heuristic prefers MMVQ and clears the MMQ bit on every type on SM70,
+    # which sent all prefill experts through per-expert MMVQ launches.
+    probe = torch.empty((32, k), dtype=dtype, device=weight.device)
     bits = torch.ops._C_gguf.ggml_dense_upstream_capabilities(
         matrix, probe, weight_type, matrix.shape[0]
     )
