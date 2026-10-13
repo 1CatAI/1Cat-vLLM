@@ -77,6 +77,34 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
     state.device_history_workspace = _WORKSPACES[key]
 
 
+# Rows per native launch over staged prefill history (the op's maximum).
+PREFILL_ROWS = 64
+
+
+def prefill_history_workspace(state):
+    """Native reader workspace for staged prefill history (PREFILL_ROWS rows).
+
+    Staged history is device memory, so this also serves owners the
+    host-history reader does not admit (the speculative draft).
+    """
+    if not current_platform.is_device_capability(70) or not 0 < state.width <= 4096:
+        return None
+    try:
+        importlib.import_module("vllm._sm70_qsa_device_C")
+    except ImportError:
+        return None
+    key = (state.history.device, state.width, "prefill")
+    if key not in _WORKSPACES:
+        elements = PREFILL_ROWS * 6 * ((state.width + 63) // 64)
+        _WORKSPACES[key] = (
+            torch.empty(elements * 256, dtype=torch.float32,
+                        device=state.history.device),
+            torch.empty(2 * elements, dtype=torch.float32,
+                        device=state.history.device),
+        )
+    return _WORKSPACES[key]
+
+
 def cfg_allows_host_native(cfg) -> bool:
     return bool(cfg is None or cfg.kernel_config.sm70_qsa_host_native)
 

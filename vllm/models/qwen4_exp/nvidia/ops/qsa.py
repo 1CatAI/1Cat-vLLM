@@ -1593,8 +1593,13 @@ def qsa_select_paged_tokens(
     out: torch.Tensor | None = None,
     query_start_loc_cpu: torch.Tensor | None = None,
     shared_key_scoring: bool = False,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
-    """Score, select, and expand QSA indices without host synchronization."""
+    """Score, select, and expand QSA indices without host synchronization.
+
+    ``max_seq_len``: host upper bound of ``sequence_lengths`` (the scheduler's
+    value); it bounds the cuBLAS scoring columns without reading the device.
+    """
 
     rows = q.shape[0]
     output_width = token_topk + compress_ratio - 1
@@ -1634,11 +1639,15 @@ def qsa_select_paged_tokens(
         # cuBLAS has a rectangular host-side launch shape, unlike the paged
         # Triton kernel's device-side early exit. Bound it to this chunk's live
         # prefix so early-context prefill does not multiply the unused 140K
-        # model-capacity tail. This is one scalar sync per QSA layer.
-        score_columns = min(
-            capacity_columns,
-            max(block_topk, int(all_visible.max().item())),
+        # model-capacity tail. Visible blocks never exceed seq_len // ratio,
+        # so the host bound needs no sync; columns past a row's visible
+        # blocks are ignored by the top-k. Without it, one scalar sync.
+        live_blocks = (
+            max_seq_len // compress_ratio
+            if max_seq_len is not None
+            else int(all_visible.max().item())
         )
+        score_columns = min(capacity_columns, max(block_topk, live_blocks))
         if _qsa_indexer_cublas_work_supported(rows, score_columns):
             logger.info_once(
                 "Using SM70 QSA indexer prefill cuBLAS path "
