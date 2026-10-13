@@ -313,11 +313,19 @@ def mixed_projection_capabilities(projections):
 
 def apply_prepared_gguf_projections(x, projections):
     capabilities = mixed_projection_capabilities(projections)
-    if not capabilities or any(c.reason is not None for c in capabilities):
+    bindings = [p.kernel.native_ops for p in projections if p.kernel is not None]
+    same_owner = bindings and all(b.owner is bindings[0].owner for b in bindings)
+    if (
+        not capabilities
+        or any(c.reason is not None for c in capabilities)
+        or not same_owner
+    ):
         outputs = [projection(x) for projection in projections]
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=-1)
-    return torch.ops.vllm.prepared_gguf_mixed_projection(
-        x, *prepared_projection_arguments(projections)
+    return bindings[0].invoke(
+        torch.ops.vllm.prepared_gguf_mixed_projection,
+        x,
+        *prepared_projection_arguments(projections),
     )
 
 
@@ -686,7 +694,11 @@ class GGUFPreparedProjection(Module):
                 family, decoder = 3, self.segment_format
             capabilities = getattr(kernel, "operator_capabilities", ())
             blas = tuple(c for c in capabilities if "blas" in c.operator)
-            return torch.ops.vllm.prepared_gguf_projection(
+            # Sampling can invoke a shared head outside the model's forward
+            # context. Borrow its prepared owner so native scratch still uses
+            # the engine budget, including during draft graph warmup.
+            return kernel.native_ops.invoke(
+                torch.ops.vllm.prepared_gguf_projection,
                 x,
                 self.codes,
                 self.stats,
