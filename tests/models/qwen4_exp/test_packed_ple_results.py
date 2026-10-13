@@ -205,7 +205,9 @@ def test_mapped_registration_binds_geometry_before_buffer_validation():
         model_config=SimpleNamespace(
             dtype=torch.float16, hf_text_config=SimpleNamespace(ple_embed_dim=2560)
         ),
-        kernel_config=SimpleNamespace(ple_packed_gguf_results=True),
+        kernel_config=SimpleNamespace(
+            ple_packed_gguf_results=True, ple_fast_lane=False
+        ),
     )
     registrations = []
     for rank in range(4):

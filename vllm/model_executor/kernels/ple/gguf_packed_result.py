@@ -64,7 +64,7 @@ def prepare_packed_gguf_results(config, tensors, names):
             sm70=current_platform.is_device_capability(70),
             offloaded=ple_offload_enabled(),
             local_tables=(
-                ple_policy(config).hybrid
+                getattr(ple_policy(config), "hybrid", False)
                 or pinned_decode_active(config)
                 or policy.ple_disk_cascade_active
             ),
