@@ -840,7 +840,7 @@ def _sharded_hc_project(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm.distributed.parallel_state import get_tp_group
 
-    from .ops.hc import hc_gate_mix, hc_silu
+    from .ops.hc import hc_assemble_ranks, hc_gate_mix_local, hc_packet_silu
 
     group = get_tp_group()
     communicator = getattr(group.device_communicator, "hc_ll_comm", None)
@@ -851,16 +851,19 @@ def _sharded_hc_project(
     # Keep large-M prefill usable without retaining replicated checkpoint banks.
     # The LL topology can reorder ranks; gathered rows must follow logical order.
     local_down, local_up = _unpack_hc_storage(down, up)
+    order = tuple(communicator.order)
     local = torch.mm(x, local_down.T)
-    packet = group.all_gather(local, dim=-1).reshape(x.shape[0], 4, 88)
-    packet = _logical_hc_rank_rows(packet, communicator.order)
-    lora = hc_silu(packet[:, :, :80].reshape(x.shape[0], 320), 4)
-    injection = packet[:, 3, 80:84].contiguous()
+    # Gather along rows (no reorder copy); one kernel takes the logical rank
+    # order, applies the HC SiLU and extracts the injection logits.
+    packet = group.all_gather(local, dim=0)
+    lora, injection = hc_packet_silu(packet, order, 4)
     local_gate = torch.mm(lora, local_up.T)
-    gate = group.all_gather(local_gate, dim=-1).reshape(x.shape[0], 4, 4, 640)
-    gate = _logical_hc_rank_rows(gate, communicator.order)
-    gate = gate.permute(0, 2, 1, 3).reshape(x.shape[0], 10240)
-    return hc_gate_mix(x, gate, 4), injection
+    # The mix is elementwise per hidden column and this rank holds every
+    # stream's gate for its columns: mix locally, gather the 4x narrower
+    # result (rank-major rows) and assemble it in logical rank order.
+    mixed = hc_gate_mix_local(x, local_gate, order.index(group.rank_in_group), 4)
+    gathered = group.all_gather(mixed, dim=0)
+    return hc_assemble_ranks(gathered, order), injection
 
 
 def _sharded_hc_project_fake(

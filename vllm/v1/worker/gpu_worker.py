@@ -516,6 +516,36 @@ class Worker(WorkerBase):
         self.model_runner.reload_weights(*args, **kwargs)
 
     @torch.inference_mode()
+    def _prefill_graph_reserve(self, activation_peak: int) -> int:
+        """Graph pool bytes to keep out of the KV budget without the estimator.
+
+        Graph pools are allocated at capture, after the KV cache. Decode-width
+        pools are small, but capturing prefill sizes (piecewise) needs about a
+        prefill forward's activations; reserve them first so the KV cache only
+        takes what is left. An explicit VLLM_V2_CUDAGRAPH_MEM_MIB wins.
+        """
+        compilation = self.vllm_config.compilation_config
+        if compilation.cudagraph_mode == CUDAGraphMode.NONE:
+            return 0
+        if "VLLM_V2_CUDAGRAPH_MEM_MIB" in os.environ:
+            from vllm.v1.worker.gpu.cudagraph_utils import (
+                get_explicit_cudagraph_memory_reserve,
+            )
+
+            return get_explicit_cudagraph_memory_reserve(compilation.cudagraph_mode)
+        spec = self.vllm_config.speculative_config
+        decode_width = self.vllm_config.scheduler_config.max_num_seqs * (
+            1 + (spec.num_speculative_tokens if spec is not None else 0)
+        )
+        if max(compilation.cudagraph_capture_sizes or [0]) <= decode_width:
+            return 0
+        logger.info(
+            "Reserving %.2f GiB (profiled activation peak) for prefill-size "
+            "CUDA graph pools before sizing the KV cache.",
+            activation_peak / 2**30,
+        )
+        return max(0, activation_peak)
+
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
@@ -590,7 +620,14 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            snapshot_path = os.environ.get("PROFILE_MEMSNAP_PATH")
+            if snapshot_path and self.rank == 0:
+                # Diagnostics: allocation history of the profiling forward.
+                torch.cuda.memory._record_memory_history(max_entries=400000)
             self.model_runner.profile_run()
+            if snapshot_path and self.rank == 0:
+                torch.cuda.memory._dump_snapshot(snapshot_path)
+                torch.cuda.memory._record_memory_history(enabled=None)
 
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
@@ -645,7 +682,7 @@ class Worker(WorkerBase):
         cudagraph_memory_estimate_applied = (
             cudagraph_memory_estimate
             if graph_policy(self.vllm_config).estimate_graph_memory
-            else 0
+            else self._prefill_graph_reserve(profile_result.torch_peak_increase)
         )
 
         self.non_torch_memory = profile_result.non_torch_increase

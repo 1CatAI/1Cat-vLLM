@@ -628,8 +628,22 @@ def enable_sm70_hcx(
 
 
 def _maybe_fuse_sm70_side_projections(model: nn.Module) -> None:
-    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import attach
+    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
+        attach,
+        drop_prepacked,
+        prepack,
+    )
 
+    candidates = []
+    for layer in model.layers:
+        if not isinstance(layer, Qwen4ExpDecoderLayer):
+            continue
+        if layer.layer_type == "linear_attention":
+            if layer.linear_attn.in_proj_ba is not None:
+                candidates.append(layer.linear_attn.in_proj_qkvz)
+        else:
+            candidates.append(layer.self_attn.qkv_proj)
+    prepack(candidates)
     fused = 0
     for layer in model.layers:
         if not isinstance(layer, Qwen4ExpDecoderLayer):
@@ -648,6 +662,7 @@ def _maybe_fuse_sm70_side_projections(model: nn.Module) -> None:
             ):
                 attn.sm70_side_projection = attn.qkv_proj.sm70_side_projection
                 fused += 1
+    drop_prepacked()
     logger.info_once("SM70 fused side projections attached to %d layers.", fused)
 
 
@@ -1336,6 +1351,25 @@ class Qwen4ExpForCausalLM(
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
+    def get_topk_tokens_and_logits(self, hidden_states: torch.Tensor, top_k: int):
+        return self.logits_processor.get_topk_tokens_and_logits(
+            self.lm_head, hidden_states, top_k
+        )
+
+    def get_topk_tokens_and_logits_with_fallback(
+        self, hidden_states: torch.Tensor, top_k: int
+    ):
+        return self.logits_processor.get_topk_tokens_and_logits_with_fallback(
+            self.lm_head, hidden_states, top_k
+        )
+
+    def get_compact_target_probe_with_fallback(
+        self, hidden_states: torch.Tensor, top_k: int
+    ):
+        return self.logits_processor.get_compact_target_probe_with_fallback(
+            self.lm_head, hidden_states, top_k
+        )
+
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
 
@@ -1530,6 +1564,23 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)
+
+    def get_topk_tokens_and_logits(self, hidden_states: torch.Tensor, top_k: int):
+        return self.language_model.get_topk_tokens_and_logits(hidden_states, top_k)
+
+    def get_topk_tokens_and_logits_with_fallback(
+        self, hidden_states: torch.Tensor, top_k: int
+    ):
+        return self.language_model.get_topk_tokens_and_logits_with_fallback(
+            hidden_states, top_k
+        )
+
+    def get_compact_target_probe_with_fallback(
+        self, hidden_states: torch.Tensor, top_k: int
+    ):
+        return self.language_model.get_compact_target_probe_with_fallback(
+            hidden_states, top_k
+        )
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Forward decode compiler setup to the wrapped language model."""
