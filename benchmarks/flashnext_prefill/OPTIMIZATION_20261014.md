@@ -343,6 +343,66 @@ prefill/decode, fragmented/slack-free host arenas, untouched staging holes,
 and using the saved snapshot after the live CPU residency table changes.
 Full-model latency remains a separate acceptance gate.
 
+### 9. Reject padded expert-batch FP16 BLAS
+
+`moe_blas.py` screens real layer-zero TP4 weights at 7344 tokens, top-10,
+512 experts and 192 padded rows/expert. It includes per-batch dequantization,
+padded activation gather, gate/up, SiLU, down, scatter and weighted unroute.
+Contiguous compressed GPU banks are an optimistic input layout; production
+would also need to gather resident/cold slots. Both arms omit routing and DMA.
+
+The current quantized chain takes 6.414 ms (repeat 6.478). Batches of 32, 64,
+and 128 experts take 19.860, 17.301 and 16.972 ms respectively. All outputs
+are finite with paired maximum row-relative L2 0.001142, within the preset
+0.003 bound, but performance rejects this implementation. For 64 experts,
+gate/up and down GEMMs alone take 0.688 and 0.255 ms, or about 7.54 ms for
+all eight batches before dequantization/gather/scatter. FP16 gate/up output
+only reduces its 0.688 ms to 0.661; it cannot close the gap. No runtime route
+is added. Raw artifacts: `moe-blas.json` and `moe-blas-first.json`.
+
+### 10. Restore the calibrated policy after segment-bank restoration
+
+The matched serving trace exposed a missing integration path: no affine BLAS
+or affine dequantization kernels execute, despite the four admitted physical
+layouts. With `small_m_hmma=true`, initialization replaces canonical weights
+with segment storage. Its prefill fallback restores canonical weights but
+always invokes fused GEMM, and serialization discards the BLAS bands.
+Thus the first 7.099 s result below does not demonstrate dense BLAS execution.
+The earlier direct-kernel and ordinary opaque-path tests did not cover this
+production storage mode.
+
+The follow-up carries the existing admitted bands through single and mixed
+segment wrappers, retaining the small-M route. After canonical restoration,
+it reuses the existing affine BLAS operator and engine-owned scratch only
+inside those bands; all other inputs retain fused GEMM. Mixed output views
+use a contiguous temporary because the existing native BLAS API requires it.
+No native operator, configuration flag or extra persistent workspace is added.
+`dense_segments.py` measures this actual restoration chain on real weights;
+`test_gguf_segment_prefill.py` covers threshold neighbors, a range interior,
+return to decode, compiled opaque calls, changed-input graph replay, mixed
+output views and an uncalibrated fallback. **44 GPU/dispatch tests pass**,
+including the existing segment codec, restoration, small-M graph and runtime
+opacity regressions. Actual native BLAS dispatch is observed in the restored
+chain; opaque and compiled surfaces produce the same qualified outputs.
+
+Real-weight restored-chain medians (ms), including canonical restoration and
+weight dequantization on every call:
+
+| Projection / source | M | Restored fused | Restored BLAS | Fused repeat |
+|---|---:|---:|---:|---:|
+| blk.0.attn_qkv.weight / 14 | 7344 | 1.959 | 1.309 | 1.938 |
+| blk.0.attn_qkv.weight / 14 | 5347 | 1.464 | 1.016 | 1.398 |
+| blk.1.attn_qkv.weight / 13 | 7344 | 1.991 | 1.229 | 1.918 |
+| blk.1.attn_qkv.weight / 13 | 5347 | 1.440 | 0.980 | 1.475 |
+| blk.0.ssm_out.weight / 14 | 7344 | 1.148 | 0.824 | 1.144 |
+| blk.0.ssm_out.weight / 14 | 5347 | 0.882 | 0.610 | 0.882 |
+| blk.1.attn_gate.weight / 14 | 7344 | 2.077 | 0.814 | 2.038 |
+| blk.1.attn_gate.weight / 14 | 5347 | 1.061 | 0.777 | 1.063 |
+
+All eight cases are finite and meet the preset 0.003 maximum row-relative
+L2 bounds against both the FP32 oracle and the paired fused output. Full-model
+route observation, quality and unprofiled speed with this fix remain pending.
+
 ### Matched request measurement
 
 `measure_prefill.py` uses deterministic word sequences and per-request hashes,
@@ -378,7 +438,8 @@ busy but around 85–90 W). No long-context quality result or candidate
 regression is inferred. Complete this baseline/candidate boundary check
 before promotion; the configured limit and deployment remain unchanged.
 
-First combined candidate, same five prompt hashes and token counts as control:
+First candidate (before the segment-policy fix), same five prompt hashes and
+token counts as control:
 
 | Prompt tokens | Client first text s | Server prefill s | Server TTFT s |
 |---:|---:|---:|---:|
@@ -401,6 +462,70 @@ graph compilation. This is not the warmed deployment's startup time. No OOM
 occurred. The owned candidate was stopped after these checks for a bounded
 expert-batch FP16 MoE screen and a matched Nsight profile. Its descendants
 were recorded and only its verified API process received SIGTERM.
+
+### Matched candidate trace and boundary quality
+
+The first-candidate profile uses the same index-2 request as the unprofiled
+runs: 34688 tokens, hash
+`126bc5319be9170da4f07bd2bca263e083d2d636da17d0697d7a19d746b04342`.
+Client first text is 7.312 s, server prefill 6.952 s and server TTFT 7.209 s.
+The four main-stream spans are 6.914 s. This capture also enables NCCL
+INIT/TUNING logging, so its wall time is not an unprofiled performance result.
+The profiled prefill chunk row counts are 7344, 6528 and 6128; do not assume
+that every request uses the historical 7344/5347 microbenchmark shapes.
+
+GPU0 closes as 6045.9 ms main-stream kernel/copy union, approximately 793 ms submitted
+GPU wait and 75 ms host gap. The 397.9 ms outside the stream span remains
+an unattributed HTTP/server residual; it is not added to kernel categories.
+Main-stream categories from `nsys_breakdown.py`, in ms:
+
+| Work | Kernel/copy time |
+|---|---:|
+| TurboMind dense projections | 987 |
+| MoE gate/up + down | 662 + 501 |
+| MoE unroute + routing | 122 + 68 |
+| QSA sparse partial + other + merge | 624 + 354 + 12 |
+| AllReduce + AllGather | 501 + 381 |
+| HC combine/norm + other HC | 348 + 125 |
+| Other cuBLAS, including HC down | 589 |
+| GDN | 350 |
+| Elementwise/other, MTP, memcpy, dense helpers | 258 + 66 + 55 + 42 |
+
+The HC down cuBLAS kernel alone is 272.2 ms / 500 launches. GPU0 union
+coverage is 87.44% main-stream kernel/copy, 89.88% all kernels, and 97.88%
+all kernels/copies. These are timeline coverage, not SM, Tensor Core or HBM
+utilization counters. NCU counters remain unavailable. Cold-stream H2D is
+13.620 GB/rank over 3.553–3.766 s, about 3.62–3.83 GB/s. It overlaps
+computation and must not be added to the wall-clock table.
+
+Across ranks, 500 main FP16 all-reduces spend 434.5 ms after the last rank's
+arrival; arrival spread sums to 245.1 ms, with GPU0 arriving last 366 times.
+The 1030 all-gathers have 335.9 ms after the last arrival and 133.3 ms spread.
+NCCL 2.27.5 TUNING logs explicitly select RING/SIMPLE for the prefill payloads
+(37,601,280-byte reduce; 1,292,544/9,400,320-byte per-rank gather inputs).
+The trace kernel name ends in RING_LL even for these calls: that name alone
+is not evidence of actual protocol. This explains why forcing Simple in the
+previous handoff gave no benefit; no protocol override is promoted.
+
+The dominant grouped down kernel uses 255 registers/thread, 128 threads
+and 32784 bytes shared memory per CTA. Register capacity bounds it to two
+resident CTAs/SM, or eight warps (12.5% of 64); this is a resource ceiling,
+not measured achieved occupancy. It motivates a bounded short-K tile screen
+inside the existing provider, with smaller row tiles and the existing padded
+activation loader. Its accelerated subset is grouped M>=512 routed rows,
+N=2560 and K=160, for IQ4/group32 and affine U2/group32; other shapes retain
+the existing tuner candidates. New GPU correctness and timing are pending.
+
+The first candidate's 260089-token quality prompt passes retrieval, arithmetic,
+normal EOS and repetition checks (181 output tokens; maximum repeated ten-word
+span 1). Hash:
+`2c78b9e46e325dfd708b4d8c8f8c7c8fa2b9696bcb3d54f2a62313c70fb76665`.
+The full response takes 821.64 s, under the existing 131072-token staging limit
+and direct-host fallback beyond it. This is a boundary quality pass, not a
+paired speed comparison; matching control is still pending. The owned API,
+workers and Nsight launcher are stopped, with process ids archived in
+`profile-stop-tree.json`. The remote trace files were removed only after
+matching local SHA256 checks; local raw artifacts are `candidate-matched.*`.
 
 ## Execution discipline
 
@@ -436,7 +561,7 @@ The effective unchanged residency log is 402/512 experts plus eight spare GPU
 slots, 136 host slots, 9.46 GiB GPU expert slots and 3.14 GiB pinned host per
 rank, matching the historical deployment with configured fraction 0.8.
 
-Pending: candidate model quality, matched unprofiled end-to-end measurement,
-and paired near-256K qualification. The original 256K deployment has not been
-promoted to a candidate. The isolated candidate server is starting with the
-corrected MoE tiles, four dense calibrations, and occupied-slot staging.
+Draft PR: <https://github.com/1CatAI/1Cat-vLLM/pull/1205>. The first candidate
+passed matched 32K quality and unprofiled performance checks; 6K tokens/s is
+not achieved. Paired 128K/near-256K qualification and the newly identified
+segment-policy fix remain pending. The original deployment is unchanged.
