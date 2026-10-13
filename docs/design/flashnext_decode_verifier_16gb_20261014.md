@@ -59,7 +59,7 @@ overlap; these values must not be added into an endpoint wall table.
 
 Explicit synchronized step timing retains every TP worker. At 32K, the two
 reference requests have mean per-round maximum verifier CPU walls of
-20.289 / 17.701 ms, p90 25.496 / 20.319 ms, and p99 40.704 / 25.687 ms.
+20.354 / 17.701 ms, p90 25.496 / 20.319 ms, and p99 40.704 / 25.687 ms.
 Target sampling is approximately 0.42 ms and state update 0.02 ms.
 Event collection, fences and interval-one logging perturb endpoint latency;
 ordinary HTTP remains the accepted emitted-token speed measurement.
@@ -103,8 +103,11 @@ The step-profiler suite passes 13 cases on GPU0.
 The first candidate's 32K second request improves maximum verifier CPU-wall
 mean from 17.701 to 16.704 ms, p90 from 20.319 to 18.388 ms, and p99 from
 25.687 to 19.113 ms. Its first request is 20.598 ms with an 87.139-ms maximum,
-versus the reference 20.289-ms mean; retain this first-request variation.
-The second candidate model measurement is pending.
+versus the reference 20.354-ms mean; retain this first-request variation.
+The second candidate's first/second 32K means are 20.054 / 16.864 ms; its
+second-request p90/p99 are 18.373 / 25.294 ms. This does not establish a
+further gain or satisfy 16 ms. Ordinary candidate HTTP qualification remains
+pending while optimization continues.
 
 Existing tests had compared the full 32-row workspace against a smaller
 active request and passed capacity-sized metadata to attention. The
@@ -134,8 +137,70 @@ and memguard terminated an early capture; the user chose compiler priority.
 The serving CLI does not expose `--observability-config`; the existing
 captured MTP profiling compatibility flags enable the diagnostic instead.
 
-An eight-warp direct-resolve screen regresses FP8 M5 churn by approximately
-30% and other M5 cases by approximately 12%; retain W4. A scalar reservation
-of four CLOCK probe ranges improves FP8 M5 only 0–2%, with noisy FP16
-regressions; retain the existing per-page atomics. These rejected choices do
-not change the final runtime or introduce startup switches.
+Initial direct-resolve screens retained one KV epoch across replays. They
+measure a protected-cache regime: selected pages remain pinned and later
+misses fall back instead of installing. They do not represent normal decode
+churn. The corrected fixture advances the epoch before every resolve,
+matching the protection transition of a decode KV write.
+
+With advancing epochs, the adversarial FP8 M5 churn screen measures W4/W8
+at 693 / 660 us, while shared/overflow selections regress about 10% at W8.
+Eight-token tiles improve that churn case only about 2%; four-token tiles
+regress both shared selections and churn. Retain the existing W4, 16-token
+tile and per-page CLOCK atomics. Register counts are 127 for W4/T16, 76 for
+W8/T16 and 72 for W4/T8, with no spills. This is a synthetic operator screen;
+register reduction alone does not qualify model speed. No new tiling or warp
+startup switches are added.
+
+An exact-word HC gather experiment encoded Half storage words as integers in
+FP32 and used the existing peer reduction. Every Half bit pattern and changed
+graph passed exact equality, but the complete M5 boundary regressed from
+69.824 to 79.296 us; the model's second 32K verifier mean was 17.472 ms. The
+helper was reverted. Collective substitution alone is not a speedup.
+
+The existing 32768-token hot-cache setting also failed admission: the first
+real request needed a 144-MiB allocation with only 75.94 MiB free. It retained
+the expert ratio and context capacity but cannot run on this 16GB deployment.
+The 16384-token setting runs successfully and measures first/second 32K
+verifier means of 18.435 / 16.059 ms, with second-request p90/p99 of
+17.209 / 18.848 ms. It is a separate configuration screen and still misses
+16 ms. Arithmetic, Python evaluation, two 32K retrieval tasks and a 1809-token
+CPU explanation pass their task/EOS gates; the explanation has no six-word
+phrase repeated more than twice. Ordinary throughput qualification is pending.
+
+The two target-graph NCCL gathers occur after the early PLE boundary. PLE
+materializes the pending MoE residual before adding its result, then calls
+standalone HC `mix()`. Retaining the six-dimensional HCX fusion pack at that
+boundary forces unpacking and two gathers, because standalone LL projection
+consumes the existing five-dimensional pack. A candidate leaves partial
+residual ownership intact and prepares the LL bank at PLE boundaries instead
+of the unused HCX bank. This changes one target boundary on the measured
+model and allocates no duplicate bank. HCX schedules at other boundaries,
+partial residual ownership, normalization and request state are unchanged.
+
+The actual layer-1 checkpoint screen on four ranks measures complete M5
+boundaries at 76.672 / 19.140 us for reference / LL storage. M1/M8/M20 are
+also faster; M21 and M256 retain fallback with exact outputs. Native arithmetic
+uses the existing FP16 HC error gate, rtol 0.003 and atol 0.003, fixed before
+the screen. Both variants replay changed inputs exactly against their own
+eager results, with finite outputs. CPU dispatch/lifetime tests pass 21 cases;
+the corrected fallback suite passes 17 GPU cases across two rank orders,
+both storage layouts, M5/M20/M21 and M512. The model screen retains HOT8192
+to separate this source change from cache tuning. Model quality and endpoint
+measurements remain pending.
+
+The old fallback oracle omitted the physical rank and simulated peers by
+scaling an already mixed local result. That does not model each peer's
+different input columns and nonlinear gates; it fails the unchanged HCX
+fallback too. The corrected oracle computes remote projections and columns,
+includes the actual local packet, and retains exact assertions and changed
+input graph checks.
+
+An asynchronous final verifier replay can finish after the HTTP stream.
+The original before-counter read occasionally assigned that replay to the
+next request. Retained API POST boundaries align all four workers and keep
+every final replay with its preceding request; aligned counts differ from
+independent committed draft metrics by at most one. Raw and aligned ledgers
+are both preserved. New event probes wait for all-rank counters to remain
+stable for 200 ms between requests. This does not change measured decode
+timestamps or ordinary production requests.

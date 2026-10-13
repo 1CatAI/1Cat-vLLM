@@ -216,7 +216,8 @@ def test_compiled_projection_resolves_actual_rows(monkeypatch):
     del library
 
 
-def test_hcx_only_consumes_partial_producers(monkeypatch):
+@pytest.mark.parametrize("ple", [False, True])
+def test_hcx_only_consumes_partial_producers(monkeypatch, ple):
     from vllm.v1.attention.backends import fa_utils
 
     monkeypatch.setattr(fa_utils, "get_flash_attn_version", lambda *a, **k: 2)
@@ -237,6 +238,7 @@ def test_hcx_only_consumes_partial_producers(monkeypatch):
 
         def enable_partial_inputs(self, name, runtime=None):
             self.partial = True
+            self.runtime = runtime
 
     class MoE:
         def __init__(self):
@@ -246,6 +248,7 @@ def test_hcx_only_consumes_partial_producers(monkeypatch):
         def __init__(self, index, moe):
             self.layer_idx = index
             self.layer_type = "linear_attention"
+            self.ple = object() if ple and index == 1 else None
             self.linear_attn = SimpleNamespace(
                 out_proj=SimpleNamespace(reduce_results=True)
             )
@@ -268,9 +271,12 @@ def test_hcx_only_consumes_partial_producers(monkeypatch):
     assert model_module.enable_sm70_hcx(model, torch.device("cpu"))
     assert not model.layers[0].attn_hyper_connection.partial
     assert model.layers[1].attn_hyper_connection._hcx_moe_payload
+    assert (model.layers[1].attn_hyper_connection.runtime is None) == ple
+    assert all(layer.mlp_hyper_connection.runtime is not None for layer in model.layers)
     assert not model.layers[2].attn_hyper_connection.partial
     assert model.hyper_connection_mixer._hcx_moe_payload
     assert model.sm70_hcx_status["prepared_modules"] == 4
+    assert model.sm70_hcx_status["ple_mix_modules"] == int(ple)
 
 
 def test_compiled_moe_payload_keeps_both_dependencies_live():

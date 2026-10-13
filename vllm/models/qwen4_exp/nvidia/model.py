@@ -533,6 +533,7 @@ def enable_sm70_hcx(
         min_m=1,
         max_m=8,
         prepared_modules=0,
+        ple_mix_modules=0,
         deferred_projections=0,
         output_projection_policy="fused" if fuse_output_projection else "separate",
         local_schedule=bool(local_schedule and runtime.enabled and runtime.full),
@@ -614,7 +615,14 @@ def enable_sm70_hcx(
             register_moe_runner(prefix, runner)
         if previous_moe:
             layer.attn_hyper_connection._hcx_moe_payload = True
-            layer.attn_hyper_connection.enable_partial_inputs(prefix + ".attn", runtime)
+            # PLE materializes the pending residual before its addition and
+            # then calls mix(), so this boundary cannot use fused HCX. Keep
+            # its existing LL projection pack rather than unpacking HCX banks
+            # and gathering checkpoint projections on every decode step.
+            layer.attn_hyper_connection.enable_partial_inputs(
+                prefix + ".attn", runtime if layer.ple is None else None
+            )
+            status["ple_mix_modules"] += int(layer.ple is not None)
             status["prepared_modules"] += 1
         layer.mlp_hyper_connection.enable_partial_inputs(prefix + ".mlp", runtime)
         status["prepared_modules"] += 1

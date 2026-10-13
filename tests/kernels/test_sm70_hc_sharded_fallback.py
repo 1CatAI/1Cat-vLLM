@@ -16,35 +16,65 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("tokens", [5, 20, 512])
+@pytest.mark.parametrize("tokens", [5, 20, 21, 512])
 @pytest.mark.parametrize("order", [(0, 1, 2, 3), (0, 2, 1, 3)])
-def test_hcx_sharded_fallback_graph_matches_rank_reorder(tokens, order, monkeypatch):
-    communicator = SimpleNamespace(status={"enabled": True}, order=order)
-
-    def gather(value, dim):
-        return torch.cat([value * (rank + 1) for rank in range(4)], dim=dim)
+@pytest.mark.parametrize("storage", ["hcx", "ll"])
+def test_hcx_sharded_fallback_graph_matches_rank_reorder(
+    tokens, order, storage, monkeypatch
+):
+    communicator = SimpleNamespace(
+        status={"enabled": True}, order=order, apply=lambda *_: None
+    )
 
     group = SimpleNamespace(
+        rank_in_group=0,
         device_communicator=SimpleNamespace(hc_ll_comm=communicator),
-        all_gather=gather,
     )
     monkeypatch.setattr("vllm.distributed.parallel_state.get_tp_group", lambda: group)
     down_weight = torch.randn(336, 10240, device="cuda", dtype=torch.float16) * 0.002
     up_weight = torch.randn(10240, 320, device="cuda", dtype=torch.float16) * 0.002
-    down, up = pack_down(down_weight, 0), pack_up(up_weight, 0)
-    local_down, local_up = hc._unpack_hc_storage(down, up)
-    index = torch.tensor(order, device="cuda", dtype=torch.int64)
+    packs = []
+    for rank in range(4):
+        if storage == "hcx":
+            packs.append((pack_down(down_weight, rank), pack_up(up_weight, rank)))
+        else:
+            packs.append(
+                (
+                    hc._pack_hc_batch_weight(down_weight, "down", rank),
+                    hc._pack_hc_batch_weight(up_weight, "up", rank),
+                )
+            )
+    down, up = packs[0]
+    local_weights = [hc._unpack_hc_storage(*pack) for pack in packs]
     x = torch.randn(tokens, 10240, device="cuda", dtype=torch.float16)
 
     def reference():
-        local = x @ local_down.T
-        packet = gather(local, -1).reshape(tokens, 4, 88).index_select(1, index)
-        lora = hc_silu(packet[:, :, :80].reshape(tokens, 320), 4)
-        injection = packet[:, 3, 80:84].contiguous()
-        local_gate = lora @ local_up.T
-        gate = gather(local_gate, -1).reshape(tokens, 4, 4, 640)
-        gate = gate.index_select(1, index).permute(0, 2, 1, 3).reshape(tokens, 10240)
-        return hc_gate_mix(x, gate, 4), injection
+        packets = [x @ weights[0].T for weights in local_weights]
+        lora = hc_silu(torch.cat([packet[:, :80] for packet in packets], dim=1), 4)
+        gate = torch.cat(
+            [
+                (lora @ weights[1].T).reshape(tokens, 4, 640)
+                for weights in local_weights
+            ],
+            dim=2,
+        ).reshape(tokens, 10240)
+        return hc_gate_mix(x, gate, 4), packets[3][:, 80:84].contiguous()
+
+    def gather(value, dim):
+        assert dim == 0
+        # Model each peer's projection and input columns before its nonlinear
+        # mix, and keep the actual local packet as part of the collective.
+        if value.shape[1] == 88:
+            logical = [x @ weights[0].T for weights in local_weights]
+        else:
+            assert value.shape[1] == 640
+            block, _ = reference()
+            logical = list(block.split(640, dim=1))
+        physical = [logical[order.index(rank)] for rank in range(4)]
+        physical[group.rank_in_group] = value
+        return torch.cat(physical, dim=0)
+
+    group.all_gather = gather
 
     # Compile the unchanged arithmetic before capture, as model warmup does.
     expected = reference()
