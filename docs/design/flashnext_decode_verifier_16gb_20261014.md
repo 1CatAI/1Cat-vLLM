@@ -176,7 +176,7 @@ consumes the existing five-dimensional pack. A candidate leaves partial
 residual ownership intact and prepares the LL bank at PLE boundaries instead
 of the unused HCX bank. This changes one target boundary on the measured
 model and allocates no duplicate bank. HCX schedules at other boundaries,
-partial residual ownership, normalization and request state are unchanged.
+partial residual ownership, normalization and request state were unchanged.
 
 The actual layer-1 checkpoint screen on four ranks measures complete M5
 boundaries at 76.672 / 19.140 us for reference / LL storage. M1/M8/M20 are
@@ -186,8 +186,18 @@ the screen. Both variants replay changed inputs exactly against their own
 eager results, with finite outputs. CPU dispatch/lifetime tests pass 21 cases;
 the corrected fallback suite passes 17 GPU cases across two rank orders,
 both storage layouts, M5/M20/M21 and M512. The model screen retains HOT8192
-to separate this source change from cache tuning. Model quality and endpoint
-measurements remain pending.
+to separate this source change from cache tuning.
+
+That model screen rejects the PLE storage change. First/second 32K verifier
+means are 18.077 / 17.048 ms; the second-request p90/p99 are 19.262 / 23.022 ms.
+Committed draft steps rise to 91 for 192 output tokens, versus 75 in the
+preceding HOT8192 candidate. Four integer tasks pass, but the CPU explanation
+remains in reasoning at the fixed 2048-token limit. This does not establish a
+quality regression by itself, but gives no qualification for promotion.
+The runtime and dispatch-test changes are reverted to the preceding candidate.
+Retain the corrected fallback oracle and its passed GPU coverage. The large
+operator speedup and node-trace NCCL waits did not predict lower live verifier
+cost; do not promote this route based on the microbenchmark alone.
 
 The old fallback oracle omitted the physical rank and simulated peers by
 scaling an already mixed local result. That does not model each peer's
