@@ -17,19 +17,23 @@ from vllm import _custom_ops  # noqa: F401 -- register mapped-view operator
 from vllm.model_executor.layers.quantization.gguf_expert_cache import _apply_plan
 
 POLICIES = {
-    "reference": (16, 8, 1024, 8),
-    "o2s64b256w4": (2, 64, 256, 4),
-    "o4s32b256w4": (4, 32, 256, 4),
-    "o4s64b256w4": (4, 64, 256, 4),
-    "o8s16b512w4": (8, 16, 512, 4),
-    "o2s32b512w4": (2, 32, 512, 4),
+    "reference": (16, 8, 1024, 8, False),
+    "o2s64b256w4": (2, 64, 256, 4, False),
+    "o4s32b256w4": (4, 32, 256, 4, False),
+    "o4s64b256w4": (4, 64, 256, 4, False),
+    "o8s16b512w4": (8, 16, 512, 4, False),
+    "o2s32b512w4": (2, 32, 512, 4, False),
+    "o2s32b256w4p3": (2, 32, 256, 4, True),
+    "o4s32b256w4p3": (4, 32, 256, 4, True),
+    "o4s64b256w4p3": (4, 64, 256, 4, True),
 }
 
 
 def launch(buffers, policy):
-    programs, split, block, warps = POLICIES[policy]
+    programs, split, block, warps, parallel_shards = POLICIES[policy]
     plan, arena, mapped, device_offsets, host_offsets, words = buffers
-    _apply_plan[(programs, split)](
+    grid = (programs, split, 3) if parallel_shards else (programs, split)
+    _apply_plan[grid](
         plan,
         arena,
         mapped,
@@ -40,6 +44,7 @@ def launch(buffers, policy):
         OPS_PROGRAMS=programs,
         SPLIT=split,
         BLOCK=block,
+        PARALLEL_SHARDS=parallel_shards,
         num_warps=warps,
     )
 
@@ -66,7 +71,11 @@ def main():
     parser.add_argument("--samples", type=int, default=12)
     parser.add_argument("--repeats", type=int, default=16)
     parser.add_argument("--boundary-only", action="store_true")
+    parser.add_argument("--policies", nargs="+", choices=POLICIES)
     args = parser.parse_args()
+    policies = (
+        {name: POLICIES[name] for name in args.policies} if args.policies else POLICIES
+    )
     rank = int(os.environ["LOCAL_RANK"])
     torch.accelerator.set_device_index(rank)
     dist.init_process_group("gloo")
@@ -97,7 +106,7 @@ def main():
         layouts = {-1: {"w1": 255, "w3": 256, "w2": 257}}
     output = {
         "world_size": 4,
-        "policies": POLICIES,
+        "policies": policies,
         "samples": args.samples,
         "repeats": args.repeats,
         "cases": [],
@@ -165,7 +174,7 @@ def main():
             torch.accelerator.synchronize()
             oracle_arena, oracle_host = arena.clone(), host.clone()
             graphs = {}
-            for name in POLICIES:
+            for name in policies:
                 reset()
                 invoke(name)
                 torch.accelerator.synchronize()
@@ -222,9 +231,9 @@ def main():
                 assert torch.equal(host, changed_host), (rank, name, "changed host")
                 del changed_arena, changed_host
 
-            timings = {name: [] for name in POLICIES}
+            timings = {name: [] for name in policies}
             for sample in range(args.samples):
-                order = list(POLICIES)
+                order = list(policies)
                 if sample % 2:
                     order.reverse()
                 for name in order:

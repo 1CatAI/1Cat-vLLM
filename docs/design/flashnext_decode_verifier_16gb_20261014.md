@@ -67,31 +67,44 @@ ordinary HTTP remains the accepted emitted-token speed measurement.
 ## Candidate and operator evidence
 
 The existing expert copy kernel changes from 16 operation programs with
-8 word splits, BLOCK1024/W8, to 4 operation programs with 64 splits,
-BLOCK256/W4. This increases parallel work for small miss plans. Whole-word
+8 word splits, BLOCK1024/W8, to 4 operation programs with 32 word splits
+and 3 parallel projections, BLOCK256/W4. This increases parallel work for
+small miss plans without serializing all three projections in each CTA. Whole-word
 storage, swap ordering and masked tails retain their exact byte contract.
 
 The paired TP4 screen uses real per-expert byte geometry from layers 0, 1,
 17 and 47, with production 410 device / 136 host slot counts. All six
 policies pass eager and changed-input graph equality over complete host and
-device banks, including guards. Common one/two-miss cases improve roughly
-6–20%; one layer's eight-miss case regresses 6.4%. End-to-end admission is
-therefore required. Word lengths 255/256/257 and operation counts around
-4 and 16, through 128, also pass four-rank byte checks.
+device banks, including guards. The initial 4-by-64 word split improves
+common one/two-miss cases roughly 6–20%, with a 6.4% regression in one
+eight-miss case. The projection-parallel screen additionally improves paired
+miss plans by 0.5–17.5% versus that first candidate, while some swap cases
+regress. End-to-end admission is required. Word lengths 255/256/257 and
+operation counts around 4 and 16, through 128, also pass four-rank byte checks.
 
 For QSA direct resolution (STAGE0), values that cannot be installed are
 read later by the authoritative native attention reader. The candidate
-omits the unused host read/decode and mixed-tile cached-value read. It
+omits the unused host read/decode and mixed-tile cached-value read, and
+skips the entire value-materialization block when no page is installed. It
 preserves tags, ownership, counters, resolved indices and consumed values.
-Staging modes 1/2 retain their original value-read masks.
+Staging modes 1/2 retain their original value-read masks; staging writes
+complete before the same release of cache metadata.
 
 Correctness support retains the existing valid page4/D256 geometry and
 FP16/E4M3 storage. The changed subset is direct resolution with failed
 installations or mixed hit/miss tiles. Shape admission and existing native
 and staged fallbacks are unchanged. No numerical tolerance is relaxed.
-The host KV suite passes 104 cases on both reference and candidate,
-including protected-capacity fallback and changed-input graph replay.
+The first host KV suite passes 104 cases on both reference and candidate,
+including protected-capacity fallback and changed-input graph replay. The
+second candidate passes 108 host KV cases and 7 expert cache cases, including
+probe-pointer signed/unsigned wrap, graph replay and decode/prefill interleaving.
 The step-profiler suite passes 13 cases on GPU0.
+
+The first candidate's 32K second request improves maximum verifier CPU-wall
+mean from 17.701 to 16.704 ms, p90 from 20.319 to 18.388 ms, and p99 from
+25.687 to 19.113 ms. Its first request is 20.598 ms with an 87.139-ms maximum,
+versus the reference 20.289-ms mean; retain this first-request variation.
+The second candidate model measurement is pending.
 
 Existing tests had compared the full 32-row workspace against a smaller
 active request and passed capacity-sized metadata to attention. The
@@ -120,3 +133,9 @@ node tracing succeeds. A concurrent prefill compiler exhausted host headroom
 and memguard terminated an early capture; the user chose compiler priority.
 The serving CLI does not expose `--observability-config`; the existing
 captured MTP profiling compatibility flags enable the diagnostic instead.
+
+An eight-warp direct-resolve screen regresses FP8 M5 churn by approximately
+30% and other M5 cases by approximately 12%; retain W4. A scalar reservation
+of four CLOCK probe ranges improves FP8 M5 only 0–2%, with noisy FP16
+regressions; retain the existing per-page atomics. These rejected choices do
+not change the final runtime or introduce startup switches.

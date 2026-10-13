@@ -347,49 +347,66 @@ def _gather(
     # Direct readers consume existing hot values themselves, and read a
     # failed installation from authoritative history. Resolve only needs
     # values that it actually writes to a new hot slot or staging.
-    need_cached = token_hits & (STAGE > 0)
-    need_history = valid & ~token_hits
-    if STAGE == 0:
-        need_history &= token_installs
-    cached = tl.load(
-        Hot
-        + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
-        + dims[None, None, :],
-        need_cached[:, None, None],
-        other=0,
-    )
-    codes = tl.load(
-        History
-        + (
-            (tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2 + kv[None, :, None])
-            * Page
-            + (tl.maximum(logical, 0) % Page)[:, None, None]
-        )
-        * Dim
-        + dims[None, None, :],
-        need_history[:, None, None],
-        other=0,
-    )
-    if FP8:
-        scales = tl.load(
-            Scales + tokens[:, None] * 2 + kv[None, :],
-            need_history[:, None],
+    # A failed direct installation has no values to materialize.
+    if STAGE > 0 or tl.sum(install.to(tl.int32), 0) > 0:
+        need_cached = token_hits & (STAGE > 0)
+        need_history = valid & ~token_hits
+        if STAGE == 0:
+            need_history &= token_installs
+        cached = tl.load(
+            Hot
+            + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
+            + dims[None, None, :],
+            need_cached[:, None, None],
             other=0,
         )
-        decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
-            tl.float16
+        codes = tl.load(
+            History
+            + (
+                (
+                    tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2
+                    + kv[None, :, None]
+                )
+                * Page
+                + (tl.maximum(logical, 0) % Page)[:, None, None]
+            )
+            * Dim
+            + dims[None, None, :],
+            need_history[:, None, None],
+            other=0,
         )
-    else:
-        decoded = codes.to(tl.float16)
-    values = tl.where(token_hits[:, None, None], cached, decoded)
-    tl.store(
-        Hot
-        + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
-        + dims[None, None, :],
-        values,
-        token_installs[:, None, None],
-    )
-    tl.debug_barrier()
+        if FP8:
+            scales = tl.load(
+                Scales + tokens[:, None] * 2 + kv[None, :],
+                need_history[:, None],
+                other=0,
+            )
+            decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
+                tl.float16
+            )
+        else:
+            decoded = codes.to(tl.float16)
+        values = tl.where(token_hits[:, None, None], cached, decoded)
+        tl.store(
+            Hot
+            + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
+            + dims[None, None, :],
+            values,
+            token_installs[:, None, None],
+        )
+        if STAGE > 0:
+            store_values = columns < Padded
+            if STAGE == 2:
+                store_values &= valid & ~(token_hits | token_installs)
+            tl.store(
+                Out
+                + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
+                * Dim
+                + dims[None, None, :],
+                values,
+                store_values[:, None, None],
+            )
+        tl.debug_barrier()
     tl.atomic_cas(Tags + slots, tl.where(install, old_tag, -2), first, sem="release")
     tl.atomic_cas(PageSlots + first, tl.where(install, -2, -3), slots, sem="release")
     tl.atomic_cas(
@@ -402,17 +419,6 @@ def _gather(
         tl.where(valid, tl.where(token_hits | token_installs, hot_tokens, -1), -2),
         columns < Width,
     )
-    if STAGE > 0:
-        store_values = columns < Padded
-        if STAGE == 2:
-            store_values &= valid & ~(token_hits | token_installs)
-        tl.store(
-            Out
-            + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None]) * Dim
-            + dims[None, None, :],
-            values,
-            store_values[:, None, None],
-        )
     counter = (row * tl.cdiv(Width, 16) + tile) * 3
     counters = tl.arange(0, 4)
     hits = tl.sum((valid & token_hits).to(tl.int64), 0)

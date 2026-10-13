@@ -65,6 +65,64 @@ def test_direct_resolve_protected_capacity_fallback_and_changed_graph(dtype, row
 
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+@pytest.mark.parametrize("initial_hand", [2**31 - 16, -16])
+def test_direct_resolve_probe_range_wrap_and_changed_graph(dtype, initial_hand):
+    device = torch.device("cuda:0")
+    state = HostQSAKV(2, 64, 256, device, hot_tokens=64, rows=5, width=16, dtype=dtype)
+    key = torch.randn(128, 1, 256, device=device, dtype=torch.float16)
+    state.write(key, -key, torch.arange(128, device=device))
+    indices = torch.arange(80, dtype=torch.int32, device=device).view(5, 16)
+    table = torch.arange(2, dtype=torch.int32, device=device).view(1, -1)
+    requests = torch.zeros(5, dtype=torch.int32, device=device)
+    positions = torch.full((5,), 127, dtype=torch.int64, device=device)
+    lengths = torch.full((1,), 128, dtype=torch.int32, device=device)
+
+    def run():
+        state.tags.fill_(-1)
+        state.page_slots.fill_(-1)
+        state.stamps.zero_()
+        state.hands.fill_(initial_hand)
+        state.resolve_hot(indices, table, requests, positions, lengths)
+
+    def check():
+        torch.accelerator.synchronize()
+        resolved = state.resolved[:5]
+        hits = resolved >= 0
+        assert hits.any() and (resolved == -1).any()
+        assert not (state.page_slots == -2).any()
+        assert not (state.stamps == -1).any()
+        probe_count = (state.hands.item() - initial_hand) % 2**32
+        assert probe_count > 0 and probe_count % 16 == 0
+        tokens = indices.cpu().long()
+        codes = state.host.view(128 // 64, 2, 64, 256)[tokens // 64, :, tokens % 64]
+        if dtype == torch.uint8:
+            expected = (
+                codes.view(torch.float8_e4m3fn).float()
+                * state.host_scales[tokens, :, None]
+            ).half()
+        else:
+            expected = codes
+        actual = state.hot_values[resolved.clamp_min(0).long()].cpu()
+        assert torch.equal(actual[hits.cpu()], expected[hits.cpu()])
+        pages = state.tags.view(-1)
+        live = pages >= 0
+        assert torch.equal(
+            state.page_slots[pages[live].long()],
+            torch.arange(pages.numel(), device=device, dtype=torch.int32)[live],
+        )
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    indices.add_(48)
+    for _ in range(3):
+        graph.replay()
+        check()
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 def test_shared_physical_page_rewrite_updates_every_logical_alias(dtype):
     device = torch.device("cuda:0")
     state = HostQSAKV(2, 816, 256, device, hot_tokens=64, rows=2, width=4, dtype=dtype)
