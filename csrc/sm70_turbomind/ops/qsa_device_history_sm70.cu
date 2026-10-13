@@ -23,8 +23,8 @@ struct Args {
   const int64_t* positions;
   const int* lengths;
   const half* gate;
-  const half* hot;       // [hot_tokens, 2, D] FP16, or null
-  const int* resolved;   // [M, width] hot token, -1 host, -2 invalid
+  const half* hot;      // [hot_tokens, 2, D] FP16, or null
+  const int* resolved;  // [M, width] hot token, -1 host, -2 invalid
   half* out;
   float* partial;
   float* state;
@@ -100,8 +100,7 @@ __device__ __forceinline__ float e4m3_bits(unsigned c) {
   return __half2float(__ushort_as_half(h)) * 256.f;
 }
 
-__device__ __forceinline__ uint4 decode8_bits(const uint2 packed,
-                                              float scale) {
+__device__ __forceinline__ uint4 decode8_bits(const uint2 packed, float scale) {
   uint4 result;
   unsigned* words = reinterpret_cast<unsigned*>(&result);
 #pragma unroll
@@ -128,16 +127,14 @@ __device__ __forceinline__ uint32_t e4m3x2_half(uint32_t word,
 
 // Eight E4M3 codes as four FP16 pairs of value * 2^-8 (unscaled).
 __device__ __forceinline__ uint4 decode8_unscaled(const uint2 packed) {
-  return make_uint4(e4m3x2_half(packed.x, 0x4140u),
-                    e4m3x2_half(packed.x, 0x4342u),
-                    e4m3x2_half(packed.y, 0x4140u),
-                    e4m3x2_half(packed.y, 0x4342u));
+  return make_uint4(
+      e4m3x2_half(packed.x, 0x4140u), e4m3x2_half(packed.x, 0x4342u),
+      e4m3x2_half(packed.y, 0x4140u), e4m3x2_half(packed.y, 0x4342u));
 }
 
 __device__ __forceinline__ uint4 decode8(const unsigned char* source,
                                          float scale, const float* lut) {
-  return decode8_raw(__ldg(reinterpret_cast<const uint2*>(source)), scale,
-                     lut);
+  return decode8_raw(__ldg(reinterpret_cast<const uint2*>(source)), scale, lut);
 }
 
 // Read one 8-value chunk of token K (kv=0) or V (kv=1): from the protected
@@ -234,8 +231,7 @@ __global__ __launch_bounds__(256) void partial(Args a) {
           const int64_t element =
               ((int64_t(block) * 2 + 1) * a.page + off) * D + dim;
           if constexpr (FP8) {
-            raw[i] =
-                __ldg(reinterpret_cast<const uint2*>(a.history + element));
+            raw[i] = __ldg(reinterpret_cast<const uint2*>(a.history + element));
             raw_scale[i] = __ldg(a.scales + slot * 2 + 1);
           } else {
             raw[i] = __ldg(reinterpret_cast<const uint4*>(
@@ -267,8 +263,9 @@ __global__ __launch_bounds__(256) void partial(Args a) {
     __syncthreads();
     for (int v = t; v < 8 * C; v += 256) {
       const int h = v / C, k = v % C;
-      const float sum = ((scores[0][h][k] + scores[1][h][k]) +
-                         scores[2][h][k]) + scores[3][h][k];
+      const float sum =
+          ((scores[0][h][k] + scores[1][h][k]) + scores[2][h][k]) +
+          scores[3][h][k];
       scores[0][h][k] =
           slots[k] >= 0 ? sum * (0.0625f * 1.4426950408889634f) : -1e20f;
     }
@@ -342,19 +339,16 @@ __global__ __launch_bounds__(256) void partial(Args a) {
 // scratch: weights/denom_parts[64], scalars[2].
 __device__ __forceinline__ void merge_head(const Args& a, int row, int head,
                                            int t, float* weights,
-                                           float* denom_parts,
-                                           float* scalars) {
+                                           float* denom_parts, float* scalars) {
   const int64_t state_base = int64_t(row * H + head) * a.splits * 2;
   if (t < 32) {
     const int s0 = t, s1 = t + 32;
-    const float m0 =
-        s0 < a.splits && a.state[state_base + s0 * 2 + 1] > 0
-            ? a.state[state_base + s0 * 2]
-            : -1e20f;
-    const float m1 =
-        s1 < a.splits && a.state[state_base + s1 * 2 + 1] > 0
-            ? a.state[state_base + s1 * 2]
-            : -1e20f;
+    const float m0 = s0 < a.splits && a.state[state_base + s0 * 2 + 1] > 0
+                         ? a.state[state_base + s0 * 2]
+                         : -1e20f;
+    const float m1 = s1 < a.splits && a.state[state_base + s1 * 2 + 1] > 0
+                         ? a.state[state_base + s1 * 2]
+                         : -1e20f;
     float maximum = fmaxf(m0, m1);
 #pragma unroll
     for (int s = 16; s; s >>= 1)
@@ -363,16 +357,11 @@ __device__ __forceinline__ void merge_head(const Args& a, int row, int head,
   }
   __syncthreads();
   if (t < 64) {
-    const bool valid =
-        t < a.splits && a.state[state_base + t * 2 + 1] > 0;
+    const bool valid = t < a.splits && a.state[state_base + t * 2 + 1] > 0;
     const float weight =
-        valid ? fast_exp2(a.state[state_base + t * 2] -
-                          scalars[0])
-              : 0.f;
+        valid ? fast_exp2(a.state[state_base + t * 2] - scalars[0]) : 0.f;
     weights[t] = weight;
-    denom_parts[t] =
-        valid ? weight * a.state[state_base + t * 2 + 1]
-              : 0.f;
+    denom_parts[t] = valid ? weight * a.state[state_base + t * 2 + 1] : 0.f;
   }
   __syncthreads();
   if (t < 32) {
@@ -384,10 +373,9 @@ __device__ __forceinline__ void merge_head(const Args& a, int row, int head,
   __syncthreads();
   float numerator = 0.f;
   for (int s = 0; s < a.splits; ++s)
-    numerator = __fmaf_rn(
-        weights[s],
-        a.partial[((row * H + head) * a.splits + s) * D + t],
-        numerator);
+    numerator = __fmaf_rn(weights[s],
+                          a.partial[((row * H + head) * a.splits + s) * D + t],
+                          numerator);
   const float denominator = scalars[1];
   float result = denominator > 0 ? __fdiv_rn(numerator, denominator) : 0.f;
   if (a.gate) {
@@ -449,8 +437,8 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
       const int block = slot / a.page, off = slot % a.page;
       const int64_t base = (int64_t(block) * 2 * a.page + off) * D + dim;
       kraw = __ldg(reinterpret_cast<const uint2*>(a.history + base));
-      vraw[i] = __ldg(reinterpret_cast<const uint2*>(
-          a.history + base + int64_t(a.page) * D));
+      vraw[i] = __ldg(reinterpret_cast<const uint2*>(a.history + base +
+                                                     int64_t(a.page) * D));
     }
     *reinterpret_cast<uint2*>(&tile[token][dim]) = kraw;
   }
@@ -466,10 +454,10 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
     const int k = kw * 64 + s * 16;
     const uint4 q0 = *reinterpret_cast<const uint4*>(&query[r8][k]);
     const uint4 q1 = *reinterpret_cast<const uint4*>(&query[r8][k + 8]);
-    const uint4 k0 = decode8_raw(
-        *reinterpret_cast<const uint2*>(&tile[nr][k]), ks, lut);
-    const uint4 k1 = decode8_raw(
-        *reinterpret_cast<const uint2*>(&tile[nr][k + 8]), ks, lut);
+    const uint4 k0 =
+        decode8_raw(*reinterpret_cast<const uint2*>(&tile[nr][k]), ks, lut);
+    const uint4 k1 =
+        decode8_raw(*reinterpret_cast<const uint2*>(&tile[nr][k + 8]), ks, lut);
     mma(acc, q0.x, q0.y, k0.x, k0.y);
     mma(acc, q0.z, q0.w, k0.z, k0.w);
     mma(acc, q1.x, q1.y, k1.x, k1.y);
@@ -519,8 +507,8 @@ __global__ __launch_bounds__(256, 3) void partial_fp8_lite(Args a) {
   float result[H] = {};
 #pragma unroll 4
   for (int k = 0; k < C; ++k) {
-    const float value = __half2float(
-        __float2half_rn(__fmul_rn(lut[tile[k][t]], vscale[k])));
+    const float value =
+        __half2float(__float2half_rn(__fmul_rn(lut[tile[k][t]], vscale[k])));
 #pragma unroll
     for (int h = 0; h < H; ++h)
       result[h] = __fmaf_rn(scores[0][h][k], value, result[h]);
@@ -593,7 +581,7 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
   };
   constexpr int kChunks = C * 32 / 256;
   uint2 kraw[kChunks], vraw[kChunks];
-  auto load = [&](uint2 (&raw)[kChunks], int b, int kv) {
+  auto load = [&](uint2(&raw)[kChunks], int b, int kv) {
 #pragma unroll
     for (int i = 0; i < kChunks; ++i) {
       const int v = t + i * 256, token = v / 32, dim = (v % 32) * 8;
@@ -607,7 +595,7 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
       }
     }
   };
-  auto store = [&](const uint2 (&raw)[kChunks]) {
+  auto store = [&](const uint2(&raw)[kChunks]) {
 #pragma unroll
     for (int i = 0; i < kChunks; ++i) {
       const int v = t + i * 256, token = v / 32, dim = (v % 32) * 8;
@@ -666,8 +654,8 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
         const uint4 q1 = *reinterpret_cast<const uint4*>(&query[r8][k + 8]);
         const uint4 k0 =
             decode8_unscaled(*reinterpret_cast<const uint2*>(&tile[nr][k]));
-        const uint4 k1 = decode8_unscaled(
-            *reinterpret_cast<const uint2*>(&tile[nr][k + 8]));
+        const uint4 k1 =
+            decode8_unscaled(*reinterpret_cast<const uint2*>(&tile[nr][k + 8]));
         mma(acc, q0.x, q0.y, k0.x, k0.y);
         mma(acc, q0.z, q0.w, k0.z, k0.w);
         mma(acc, q1.x, q1.y, k1.x, k1.y);
@@ -695,8 +683,7 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
                  scores[3][warp][lane + 32];
       const bool v0 = slots[b][lane] >= 0, v1 = slots[b][lane + 32] >= 0;
       // Per-key K scale after the dot product (unscaled K operands).
-      s0 = v0 ? s0 * kscale[b][lane] * (0.0625f * 1.4426950408889634f)
-              : -1e20f;
+      s0 = v0 ? s0 * kscale[b][lane] * (0.0625f * 1.4426950408889634f) : -1e20f;
       s1 = v1 ? s1 * kscale[b][lane + 32] * (0.0625f * 1.4426950408889634f)
               : -1e20f;
       float maximum = fmaxf(s0, s1);
@@ -779,7 +766,7 @@ __global__ __launch_bounds__(256, MIN_BLOCKS) void rows_fp8(Args a) {
 __global__ void merge(Args a) {
   __shared__ float weights[64], denom_parts[64], scalars[2];
   merge_head(a, blockIdx.x / H, blockIdx.x % H, threadIdx.x, weights,
-                    denom_parts, scalars);
+             denom_parts, scalars);
 }
 }  // namespace device_qsa
 
@@ -795,8 +782,8 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
                     int64_t whole_rows = 0) {
   const c10::cuda::CUDAGuard guard(q.device());
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
-              q.size(0) > 0 && (whole_rows || q.size(0) <= 64) && q.size(1) == 6 &&
-              q.size(2) == 256 && q.stride(2) == 1);
+              q.size(0) > 0 && (whole_rows || q.size(0) <= 64) &&
+              q.size(1) == 6 && q.size(2) == 256 && q.stride(2) == 1);
   TORCH_CHECK((history.scalar_type() == at::kByte ||
                history.scalar_type() == at::kHalf) &&
               history.dim() == 5 && history.size(1) == 2 &&
@@ -869,10 +856,10 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
   TORCH_CHECK(a.tiles >= 1);
   a.splits = (a.width + 64 * a.tiles - 1) / (64 * a.tiles);
   TORCH_CHECK(whole_rows || (partial.scalar_type() == at::kFloat &&
-              state.scalar_type() == at::kFloat && partial.is_contiguous() &&
-              state.is_contiguous() &&
-              partial.numel() >= a.M * 6 * a.splits * 256 &&
-              state.numel() >= a.M * 6 * a.splits * 2));
+                             state.scalar_type() == at::kFloat &&
+                             partial.is_contiguous() && state.is_contiguous() &&
+                             partial.numel() >= a.M * 6 * a.splits * 256 &&
+                             state.numel() >= a.M * 6 * a.splits * 2));
   a.qs0 = q.stride(0);
   a.qs1 = q.stride(1);
   a.is0 = indices.stride(0);
@@ -889,11 +876,20 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
     // whole_rows: CTAs per SM (2 or 3), +10 for tensor-core PV.
     TORCH_CHECK(fp8 && !hot);
     switch (whole_rows) {
-      case 2: device_qsa::rows_fp8<2, false><<<a.M, 256, 0, stream>>>(a); break;
-      case 3: device_qsa::rows_fp8<3, false><<<a.M, 256, 0, stream>>>(a); break;
-      case 12: device_qsa::rows_fp8<2, true><<<a.M, 256, 0, stream>>>(a); break;
-      case 13: device_qsa::rows_fp8<3, true><<<a.M, 256, 0, stream>>>(a); break;
-      default: TORCH_CHECK(false, "invalid whole_rows ", whole_rows);
+      case 2:
+        device_qsa::rows_fp8<2, false><<<a.M, 256, 0, stream>>>(a);
+        break;
+      case 3:
+        device_qsa::rows_fp8<3, false><<<a.M, 256, 0, stream>>>(a);
+        break;
+      case 12:
+        device_qsa::rows_fp8<2, true><<<a.M, 256, 0, stream>>>(a);
+        break;
+      case 13:
+        device_qsa::rows_fp8<3, true><<<a.M, 256, 0, stream>>>(a);
+        break;
+      default:
+        TORCH_CHECK(false, "invalid whole_rows ", whole_rows);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;

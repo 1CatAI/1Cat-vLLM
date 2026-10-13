@@ -544,13 +544,13 @@
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/speculator.py": {
   "model": 1,
-  "platform": 7
+  "platform": 11
  },
  "vllm/v1/worker/gpu/spec_decode/eagle/utils.py": {
   "platform": 1
  },
  "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py": {
-  "model": 9
+  "model": 10
  },
  "vllm/v1/worker/gpu/spec_decode/speculator.py": {
   "model": 2

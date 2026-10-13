@@ -634,11 +634,13 @@ class PleOffloadConnector:
         for region in getattr(self, "_host_result_regions", {}).values():
             region.close()
         self._host_result_regions = {}
-        if getattr(self, "draft_ring", None) is not None:
-            self.draft_ring.close()
+        draft_ring = getattr(self, "draft_ring", None)
+        if draft_ring is not None:
+            draft_ring.close()
             self.draft_ring = None
-        if getattr(self, "fast_lane", None) is not None:
-            self.fast_lane.close()
+        fast_lane = getattr(self, "fast_lane", None)
+        if fast_lane is not None:
+            fast_lane.close()
             self.fast_lane = None
         self._d2h_event_pool = None
         if self._registration_socket is not None:

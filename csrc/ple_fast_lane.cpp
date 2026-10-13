@@ -277,7 +277,8 @@ class Lane {
     const int64_t* context = starts + config_.max_reqs + 1;
     const int64_t* tokens = context + config_.max_reqs * 2;
     hash(tokens, starts, context, num_tokens, num_reqs);
-    if (config_.ring != nullptr) check_window(tokens, starts, context, num_reqs);
+    if (config_.ring != nullptr)
+      check_window(tokens, starts, context, num_reqs);
     const int64_t hashed = now_ns();
 
     // The consumers must have released the previous result.
@@ -305,7 +306,8 @@ class Lane {
     stats_[kResetWaitNs].fetch_add(reset - hashed);
     stats_[kLookupNs].fetch_add(done - reset);
     stats_[kTotalNs].fetch_add(done - start);
-    if (done - start > stats_[kMaxNs].load()) stats_[kMaxNs].store(done - start);
+    if (done - start > stats_[kMaxNs].load())
+      stats_[kMaxNs].store(done - start);
     stats_[kLastSeq].store(last_seq_);
     return kOk;
   }
@@ -316,8 +318,8 @@ class Lane {
     const int64_t eos = config_.eos;
     const uint64_t* m = config_.multipliers;
     uint64_t previous = static_cast<uint64_t>(previous_value);
-    uint64_t previous2 = static_cast<uint64_t>(
-        previous_value == eos ? eos : previous2_value);
+    uint64_t previous2 =
+        static_cast<uint64_t>(previous_value == eos ? eos : previous2_value);
     uint64_t mixed2 = (current * m[0]) ^ (previous * m[1]);
     uint64_t mixed3 = mixed2 ^ (previous2 * m[2]);
     for (int64_t h = 0; h < 8; ++h) {
@@ -351,7 +353,8 @@ class Lane {
     int64_t rows[kHeads];
     int64_t pages = 0;
 #ifdef __linux__
-    static const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGE_SIZE));
+    static const uintptr_t page =
+        static_cast<uintptr_t>(sysconf(_SC_PAGE_SIZE));
 #endif
     for (int64_t r = 0; r < num_reqs; ++r) {
       // window: context0, context1, bonus, d1 .. dK
@@ -392,8 +395,8 @@ class Lane {
   }
 
   // Port of Qwen4ExpNGramEmbedding._compute_ngram_ids_cpu_small.
-  void hash(const int64_t* tokens, const int64_t* starts, const int64_t* context,
-            int64_t num_tokens, int64_t num_reqs) {
+  void hash(const int64_t* tokens, const int64_t* starts,
+            const int64_t* context, int64_t num_tokens, int64_t num_reqs) {
     const int64_t eos = config_.eos;
     int64_t max_seq = 1;
     for (int64_t r = 0; r < num_reqs; ++r) {
@@ -416,7 +419,8 @@ class Lane {
     int64_t req = 0;
     for (int64_t pos = 0; pos < num_tokens; ++pos) {
       while (req + 1 < num_reqs && pos >= starts[req + 1]) ++req;
-      int64_t col = std::min(std::max<int64_t>(pos - starts[req], 0), max_seq - 1);
+      int64_t col =
+          std::min(std::max<int64_t>(pos - starts[req], 0), max_seq - 1);
       hash_position(static_cast<uint64_t>(token_at(req, col + 2)),
                     token_at(req, col + 1), token_at(req, col),
                     rows_.data() + pos * kHeads);
@@ -465,7 +469,8 @@ class Lane {
     if (misses_.empty()) return kOk;
 #ifdef __linux__
     // Start every cold read before touching any, so the I/O overlaps.
-    static const uintptr_t page = static_cast<uintptr_t>(sysconf(_SC_PAGE_SIZE));
+    static const uintptr_t page =
+        static_cast<uintptr_t>(sysconf(_SC_PAGE_SIZE));
     for (int64_t i : misses_) {
       uintptr_t address =
           reinterpret_cast<uintptr_t>(config_.table + rows_[i] * row_bytes);
@@ -510,17 +515,14 @@ int64_t next_lane = 1;
 
 }  // namespace
 
-int64_t ple_fast_lane_start(torch::Tensor request, int64_t max_reqs,
-                            int64_t max_tokens, int64_t table_ptr,
-                            int64_t row_bytes, int64_t num_rows,
-                            std::vector<int64_t> multipliers,
-                            std::vector<int64_t> sizes,
-                            std::vector<int64_t> offsets, int64_t eos,
-                            std::vector<int64_t> result_ptrs,
-                            std::vector<int64_t> flag_ptrs, int64_t cache_bytes,
-                            int64_t idle_spin_us, bool clamp_tokens,
-                            std::optional<torch::Tensor> draft_ring,
-                            int64_t ring_reqs, int64_t ring_spec) {
+int64_t ple_fast_lane_start(
+    torch::Tensor request, int64_t max_reqs, int64_t max_tokens,
+    int64_t table_ptr, int64_t row_bytes, int64_t num_rows,
+    std::vector<int64_t> multipliers, std::vector<int64_t> sizes,
+    std::vector<int64_t> offsets, int64_t eos, std::vector<int64_t> result_ptrs,
+    std::vector<int64_t> flag_ptrs, int64_t cache_bytes, int64_t idle_spin_us,
+    bool clamp_tokens, std::optional<torch::Tensor> draft_ring,
+    int64_t ring_reqs, int64_t ring_spec) {
   TORCH_CHECK(request.device().is_cpu() && request.scalar_type() == at::kLong &&
                   request.is_contiguous(),
               "PLE fast lane request must be a contiguous CPU int64 tensor");
@@ -573,10 +575,9 @@ int64_t ple_fast_lane_start(torch::Tensor request, int64_t max_reqs,
   }
   std::lock_guard<std::mutex> guard(lanes_mutex);
   int64_t handle = next_lane++;
-  lanes.emplace(handle,
-                std::make_unique<Lane>(std::move(config),
-                                       std::max<int64_t>(cache_bytes, 0) /
-                                           row_bytes));
+  lanes.emplace(handle, std::make_unique<Lane>(
+                            std::move(config),
+                            std::max<int64_t>(cache_bytes, 0) / row_bytes));
   return handle;
 }
 

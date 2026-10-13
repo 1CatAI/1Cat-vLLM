@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -25,13 +26,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -298,9 +299,7 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
-        self.balanced_prefill_chunks = (
-            os.environ.get("VLLM_BALANCED_PREFILL_CHUNKS", "0") == "1"
-        )
+        self.balanced_prefill_chunks = envs.VLLM_BALANCED_PREFILL_CHUNKS
         # A Mamba state is materialized only when a scheduler chunk ends on
         # the Mamba group's own block grid. The global cache block size can be
         # much smaller in heterogeneous layouts (Qwen3.8 uses 16-token hashes
@@ -463,8 +462,7 @@ class Scheduler(SchedulerInterface):
         if not self.balanced_prefill_chunks or num_new_tokens <= 0:
             return num_new_tokens
         remaining = (
-            max(request.num_prompt_tokens, request.num_tokens - 1)
-            - num_computed_tokens
+            max(request.num_prompt_tokens, request.num_tokens - 1) - num_computed_tokens
         )
         if remaining <= num_new_tokens:
             return num_new_tokens

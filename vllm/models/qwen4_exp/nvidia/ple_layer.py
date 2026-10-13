@@ -1952,7 +1952,7 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
         layout = getattr(self, "_packed_result_layout", None)
         if layout is None:
             return super().wait_offloaded_output(hidden_states, num_tokens)
-        import vllm.model_executor.kernels.ple.packed_result  # noqa: F401
+        import vllm.model_executor.kernels.ple.gguf_packed_result  # noqa: F401
 
         workspace = self._packed_result_output
         cpu_output = getattr(self, "_cpu_output_buffer", None)
@@ -2201,7 +2201,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         # workers, so preserve the model-dtype scale contract explicitly for
         # its checkpoint-only load path.
         self.ple_embedding._offload_model_dtype = model_config.dtype
-        from vllm.model_executor.kernels.ple.packed_result import packed_result_layout
+        from vllm.model_executor.kernels.ple.gguf_packed_result import (
+            packed_result_layout,
+        )
 
         self.ple_embedding._packed_result_layout = packed_result_layout(
             f"{prefix}.ple_embedding"

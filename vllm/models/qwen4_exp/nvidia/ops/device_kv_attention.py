@@ -97,10 +97,10 @@ def prefill_history_workspace(state):
     if key not in _WORKSPACES:
         elements = PREFILL_ROWS * 6 * ((state.width + 63) // 64)
         _WORKSPACES[key] = (
-            torch.empty(elements * 256, dtype=torch.float32,
-                        device=state.history.device),
-            torch.empty(2 * elements, dtype=torch.float32,
-                        device=state.history.device),
+            torch.empty(
+                elements * 256, dtype=torch.float32, device=state.history.device
+            ),
+            torch.empty(2 * elements, dtype=torch.float32, device=state.history.device),
         )
     return _WORKSPACES[key]
 

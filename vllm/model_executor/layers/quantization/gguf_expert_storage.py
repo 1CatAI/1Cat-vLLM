@@ -7,7 +7,6 @@ import math
 import torch
 
 from vllm.logger import init_logger
-
 from vllm.model_executor.layers.quantization.gguf_moe import GGUFNativeMoEMethod
 from vllm.model_executor.layers.quantization.gguf_native import (
     NATIVE_TYPES,
@@ -162,7 +161,7 @@ def _read(fd, ranges, out):
 
     def one(job):
         offset, position, n = job
-        view = memoryview(flat[position: position + n])
+        view = memoryview(flat[position : position + n])
         while n:
             got = os.preadv(fd, [view], offset)
             if got <= 0:
@@ -188,9 +187,9 @@ def _local_slice(tensor, shard, rows, packed_span):
     source = _source(tensor)
     if source is None:
         if shard == "w2":
-            out[...] = data[:, :, packed_span[0]:packed_span[1]]
+            out[...] = data[:, :, packed_span[0] : packed_span[1]]
         else:
-            out[...] = data[:, rows[0]:rows[1]]
+            out[...] = data[:, rows[0] : rows[1]]
         return local
     fd, offset = source
     stride = all_rows * width
@@ -198,11 +197,14 @@ def _local_slice(tensor, shard, rows, packed_span):
         # K slices interleave with every row: read the whole bank.
         whole = np.empty((experts, all_rows, width), dtype=np.uint8)
         _read(fd, [(offset, experts * stride)], whole)
-        out[...] = whole[:, :, packed_span[0]:packed_span[1]]
+        out[...] = whole[:, :, packed_span[0] : packed_span[1]]
         return local
     length = (rows[1] - rows[0]) * width
-    _read(fd, [(offset + e * stride + rows[0] * width, length)
-               for e in range(experts)], out)
+    _read(
+        fd,
+        [(offset + e * stride + rows[0] * width, length) for e in range(experts)],
+        out,
+    )
     return local
 
 
@@ -229,7 +231,8 @@ class _Prefetcher:
         while self.next < len(self.jobs) and self.slots.acquire(blocking=False):
             raw, tensor, shard, rows, span = self.jobs[self.next]
             self.futures[raw] = self.pool.submit(
-                _local_slice, tensor, shard, rows, span)
+                _local_slice, tensor, shard, rows, span
+            )
             self.next += 1
 
     def take(self, raw):
@@ -248,8 +251,7 @@ def _slice_spec(layer, method, shard, tensor):
         value = int(tensor.tensor_type)
         block, size = quant_size(value)
         full_k = tensor.data.shape[2] // size * block
-        first, last, _, _ = packed_tp_span(
-            full_k, value, layer.tp_size, layer.tp_rank)
+        first, last, _, _ = packed_tp_span(full_k, value, layer.tp_size, layer.tp_rank)
         return None, (first, last)
     rows = method.intermediate_size
     return (layer.tp_rank * rows, (layer.tp_rank + 1) * rows), None
@@ -301,8 +303,9 @@ def load_expert_bank(layer, method, shard, tensor, raw=None) -> None:
     else:
         bank = getattr(layer, "gguf_" + shard)
         if tuple(bank.shape) != tuple(local.shape):
-            raise ValueError(f"GGUF {shard} bank {tuple(bank.shape)} != "
-                             f"{tuple(local.shape)}")
+            raise ValueError(
+                f"GGUF {shard} bank {tuple(bank.shape)} != {tuple(local.shape)}"
+            )
         bank.copy_(local)
     method.loaded_experts[shard] = set(range(method.num_experts))
     global _LOADED_BYTES, _LOADED_BANKS, _READ_S, _STORE_S
@@ -311,9 +314,14 @@ def load_expert_bank(layer, method, shard, tensor, raw=None) -> None:
     _READ_S += read - started
     _STORE_S += time.perf_counter() - read
     if _LOADED_BANKS % 48 == 0:
-        logger.info("Loaded %d GGUF expert banks (%.2f GiB) by whole-bank "
-                    "reads: %.1f s reading, %.1f s storing",
-                    _LOADED_BANKS, _LOADED_BYTES / 2**30, _READ_S, _STORE_S)
+        logger.info(
+            "Loaded %d GGUF expert banks (%.2f GiB) by whole-bank "
+            "reads: %.1f s reading, %.1f s storing",
+            _LOADED_BANKS,
+            _LOADED_BYTES / 2**30,
+            _READ_S,
+            _STORE_S,
+        )
 
 
 _LOADED_BANKS = 0
@@ -338,7 +346,7 @@ def _prepare_expert_cache(banks, config, device):
 
     entries = []
     for layer, method, shard, shape, _, _, tail, source in banks:
-        name = getattr(layer, "layer_name", None) or getattr(layer, "prefix", "")
+        name = str(getattr(layer, "layer_name", None) or getattr(layer, "prefix", ""))
         index = gguf_expert_cache.layer_index(name)
         if index < 0:
             raise ValueError(f"Expert cache cannot index layer {name}")

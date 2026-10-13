@@ -40,9 +40,7 @@ def _prefill_chunks(prompt_tokens: int, budget: int) -> list[int]:
     ],
 )
 def test_balanced_prefill_chunks(monkeypatch, prompt_tokens, budget, balanced):
-    assert _prefill_chunks(prompt_tokens, budget)[:1] == [
-        min(budget, prompt_tokens)
-    ]
+    assert _prefill_chunks(prompt_tokens, budget)[:1] == [min(budget, prompt_tokens)]
     monkeypatch.setenv("VLLM_BALANCED_PREFILL_CHUNKS", "1")
     chunks = _prefill_chunks(prompt_tokens, budget)
     assert sum(chunks) == prompt_tokens

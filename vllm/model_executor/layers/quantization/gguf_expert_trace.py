@@ -8,8 +8,7 @@ Prefill-sized calls add to per-layer expert histograms. Tracing is a
 diagnostic: it is off unless ``sm70_gguf.expert_trace_tokens`` is set.
 """
 
-import re
-
+import regex as re
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -18,8 +17,17 @@ _LAYER = re.compile(r"layers\.(\d+)\.")
 
 
 @triton.jit
-def _append_decode(ids, ring, counter, layer, ring_base, tokens,
-                   TOPK: tl.constexpr, RING: tl.constexpr, BLOCK: tl.constexpr):
+def _append_decode(
+    ids,
+    ring,
+    counter,
+    layer,
+    ring_base,
+    tokens,
+    TOPK: tl.constexpr,
+    RING: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
     offsets = tl.arange(0, BLOCK)
     mask = offsets < tokens * TOPK
     values = tl.load(ids + offsets, mask=mask, other=-1)
@@ -30,8 +38,9 @@ def _append_decode(ids, ring, counter, layer, ring_base, tokens,
 
 
 @triton.jit
-def _add_prefill(ids, hist, hist_base, count, EXPERTS: tl.constexpr,
-                 BLOCK: tl.constexpr):
+def _add_prefill(
+    ids, hist, hist_base, count, EXPERTS: tl.constexpr, BLOCK: tl.constexpr
+):
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < count
     values = tl.load(ids + offsets, mask=mask, other=0)
@@ -61,16 +70,25 @@ class ExpertTrace:
             return
         if tokens <= self.DECODE_MAX_TOKENS:
             _append_decode[(1,)](
-                ids, self.ring, self.counter, layer_index,
-                layer_index * self.ring_tokens * top_k, tokens,
-                TOPK=top_k, RING=self.ring_tokens,
+                ids,
+                self.ring,
+                self.counter,
+                layer_index,
+                layer_index * self.ring_tokens * top_k,
+                tokens,
+                TOPK=top_k,
+                RING=self.ring_tokens,
                 BLOCK=triton.next_power_of_2(self.DECODE_MAX_TOKENS * top_k),
             )
         else:
             count = tokens * top_k
             _add_prefill[(triton.cdiv(count, 1024),)](
-                ids, self.prefill, layer_index * self.num_experts, count,
-                EXPERTS=self.num_experts, BLOCK=1024,
+                ids,
+                self.prefill,
+                layer_index * self.num_experts,
+                count,
+                EXPERTS=self.num_experts,
+                BLOCK=1024,
             )
 
     @torch.inference_mode()
@@ -80,7 +98,7 @@ class ExpertTrace:
         self.prefill.zero_()
 
     def snapshot(self) -> dict[str, torch.Tensor]:
-        torch.cuda.synchronize(self.ring.device)
+        torch.accelerator.synchronize(self.ring.device)
         return {
             "ring": self.ring.cpu(),
             "counter": self.counter.cpu(),
@@ -110,8 +128,9 @@ def trace_routing(layer, ids, ring_tokens, num_layers, num_experts) -> None:
     if _TRACE is None:
         if torch.cuda.is_current_stream_capturing():
             return  # buffers must exist before capture; the eager warmup creates them
-        _TRACE = ExpertTrace(ids.device, num_layers, ring_tokens, ids.shape[1],
-                             num_experts)
+        _TRACE = ExpertTrace(
+            ids.device, num_layers, ring_tokens, ids.shape[1], num_experts
+        )
     _TRACE.record(index, ids)
 
 

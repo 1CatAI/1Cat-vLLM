@@ -303,9 +303,7 @@ def test_paged_score_budget_keeps_exact_selected_indices(
     query = torch.randn(rows, 4, 128, dtype=torch.float16, device="cuda")
     table = torch.randperm(pages, device="cuda").to(torch.int32)[None]
     requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
-    positions = torch.arange(
-        context - rows, context, dtype=torch.int64, device="cuda"
-    )
+    positions = torch.arange(context - rows, context, dtype=torch.int64, device="cuda")
     lengths = torch.full((1,), context, dtype=torch.int32, device="cuda")
     set_qsa_option(monkeypatch, "qsa_score_tile_mb", 64)
     reference = qsa_ops.qsa_select_paged_tokens(
@@ -320,7 +318,9 @@ def test_paged_score_budget_keeps_exact_selected_indices(
 
 @requires_sm70
 @pytest.mark.parametrize("rows", [68, 69, 74])
-def test_score_tile_tails_keep_exact_selected_indices(monkeypatch, workspace_init, rows):
+def test_score_tile_tails_keep_exact_selected_indices(
+    monkeypatch, workspace_init, rows
+):
     """Tail chunks of 4/5/10 rows reach the verify-sized scorer and selector."""
     torch.manual_seed(rows)
     set_qsa_option(monkeypatch, "qsa_indexer_cublas", False)
@@ -338,7 +338,14 @@ def test_score_tile_tails_keep_exact_selected_indices(monkeypatch, workspace_ini
     def select(tile_mb):
         set_qsa_option(monkeypatch, "qsa_score_tile_mb", tile_mb)
         return qsa_ops.qsa_select_paged_tokens(
-            query, cache, table, requests, positions, lengths, 2048, 4,
+            query,
+            cache,
+            table,
+            requests,
+            positions,
+            lengths,
+            2048,
+            4,
             shared_key_scoring=True,
         )
 

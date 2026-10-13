@@ -310,9 +310,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 self.params_dtype,
                 is_sm70=current_platform.is_device_capability(70),
                 enabled=self.native_enabled,
-                mmq_supported=moe_mmq_supported(
-                    prepared, value, self.params_dtype
-                ),
+                mmq_supported=moe_mmq_supported(prepared, value, self.params_dtype),
                 top_k=getattr(layer, "top_k", 10),
             )
             self.prefill_capabilities[shard] = prefill
@@ -362,7 +360,10 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             from .gguf_expert_trace import trace_routing
 
             trace_routing(
-                layer, ids, self.expert_trace_tokens, self.trace_layers,
+                layer,
+                ids,
+                self.expert_trace_tokens,
+                self.trace_layers,
                 self.num_experts,
             )
         mask = None

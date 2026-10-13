@@ -216,7 +216,8 @@ class KVBlockZeroer:
         self.device = device
         self.pin_memory = pin_memory
         self._meta: (
-            tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]
+            | None
         ) = None
 
     def init_meta(

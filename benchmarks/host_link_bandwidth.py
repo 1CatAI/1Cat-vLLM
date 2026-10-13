@@ -25,7 +25,7 @@ def _uva_read(src, dst, n, BLOCK: tl.constexpr):
 
 
 def measure(device, nbytes, repeats, barrier=None):
-    torch.cuda.set_device(device)
+    torch.accelerator.set_device_index(device)
     host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
     host.fill_(1)
     dev = torch.empty(nbytes, dtype=torch.uint8, device=device)
@@ -39,8 +39,11 @@ def measure(device, nbytes, repeats, barrier=None):
                     dev.copy_(host, non_blocking=True)
                 else:
                     _uva_read[(triton.cdiv(nbytes // 4, 1024),)](
-                        view.view(torch.int32), dev.view(torch.int32), nbytes // 4,
-                        BLOCK=1024)
+                        view.view(torch.int32),
+                        dev.view(torch.int32),
+                        nbytes // 4,
+                        BLOCK=1024,
+                    )
             stream.synchronize()
             if barrier is not None:
                 barrier.wait()
@@ -50,8 +53,11 @@ def measure(device, nbytes, repeats, barrier=None):
                     dev.copy_(host, non_blocking=True)
                 else:
                     _uva_read[(triton.cdiv(nbytes // 4, 1024),)](
-                        view.view(torch.int32), dev.view(torch.int32), nbytes // 4,
-                        BLOCK=1024)
+                        view.view(torch.int32),
+                        dev.view(torch.int32),
+                        nbytes // 4,
+                        BLOCK=1024,
+                    )
             stream.synchronize()
             elapsed = (time.perf_counter() - start) / repeats
         out[name] = (nbytes / elapsed / 1e9, elapsed * 1e6)
@@ -63,17 +69,22 @@ def main():
     parser.add_argument("--sizes", default="490240,67108864")
     parser.add_argument("--repeats", type=int, default=20)
     args = parser.parse_args()
-    gpus = torch.cuda.device_count()
+    gpus = torch.accelerator.device_count()
     for nbytes in (int(x) for x in args.sizes.split(",")):
         for gpu in range(gpus):
             result = measure(gpu, nbytes, args.repeats)
-            print(f"alone  gpu{gpu} {nbytes:>10} B  " + "  ".join(
-                f"{k}={gbps:6.2f} GB/s {us:8.1f} us" for k, (gbps, us) in result.items()),
-                flush=True)
+            print(
+                f"alone  gpu{gpu} {nbytes:>10} B  "
+                + "  ".join(
+                    f"{k}={gbps:6.2f} GB/s {us:8.1f} us"
+                    for k, (gbps, us) in result.items()
+                ),
+                flush=True,
+            )
         barrier = threading.Barrier(gpus)
         results = [None] * gpus
 
-        def run(index):
+        def run(index, results=results, nbytes=nbytes, barrier=barrier):
             results[index] = measure(index, nbytes, args.repeats, barrier)
 
         threads = [threading.Thread(target=run, args=(i,)) for i in range(gpus)]
@@ -82,9 +93,14 @@ def main():
         for thread in threads:
             thread.join()
         for gpu, result in enumerate(results):
-            print(f"concur gpu{gpu} {nbytes:>10} B  " + "  ".join(
-                f"{k}={gbps:6.2f} GB/s {us:8.1f} us" for k, (gbps, us) in result.items()),
-                flush=True)
+            print(
+                f"concur gpu{gpu} {nbytes:>10} B  "
+                + "  ".join(
+                    f"{k}={gbps:6.2f} GB/s {us:8.1f} us"
+                    for k, (gbps, us) in result.items()
+                ),
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

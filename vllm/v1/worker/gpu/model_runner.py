@@ -384,9 +384,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ngram_context_source=ngram_context_source,
         )
         ring = self._ple_offload_connector.draft_ring
-        if ring is not None and hasattr(self.speculator, "draft_step_listener"):
+        speculator = self.speculator
+        if (
+            ring is not None
+            and speculator is not None
+            and hasattr(speculator, "draft_step_listener")
+        ):
             # Set before graph capture so every draft graph publishes.
-            self.speculator.draft_step_listener = ring.publish_draft_step
+            speculator.draft_step_listener = ring.publish_draft_step
             self._ple_draft_ring = ring
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
@@ -2030,8 +2035,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._ple_offload_connector.close()
             self._ple_offload_connector = None
         self._ple_draft_ring = None
-        if getattr(getattr(self, "speculator", None), "draft_step_listener", None):
-            self.speculator.draft_step_listener = None
+        speculator = getattr(self, "speculator", None)
+        if speculator is not None and getattr(speculator, "draft_step_listener", None):
+            speculator.draft_step_listener = None
 
         target_model = getattr(self, "model", None)
         speculator = getattr(self, "speculator", None)

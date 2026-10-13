@@ -11,6 +11,7 @@ from typing import ClassVar, cast
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -78,27 +79,49 @@ _PREFETCH: dict = {"stream": None, "free": [None, None], "pending": {}}
 
 # Diagnostics: real prefill reader inputs (TP rank 0, one long-context step
 # per selected target layer) for offline kernel work. Off unless set.
-_QSA_DUMP_DIR = os.environ.get("VLLM_QSA_DUMP_DIR")
+_QSA_DUMP_DIR = envs.VLLM_QSA_DUMP_DIR
 _QSA_DUMPED: set[int] = set()
 
 
-def _dump_prefill_inputs(order, query, history, scales, indices, table,
-                         requests, positions, lengths, output, gate):
+def _dump_prefill_inputs(
+    order,
+    query,
+    history,
+    scales,
+    indices,
+    table,
+    requests,
+    positions,
+    lengths,
+    output,
+    gate,
+):
     from vllm.distributed import get_tensor_model_parallel_rank
 
-    if (order in _QSA_DUMPED or get_tensor_model_parallel_rank() != 0
-            or query.shape[0] < 8000 or int(lengths.max()) < 24000):
+    if (
+        order in _QSA_DUMPED
+        or get_tensor_model_parallel_rank() != 0
+        or query.shape[0] < 8000
+        or int(lengths.max()) < 24000
+    ):
         return
     _QSA_DUMPED.add(order)
     tensors = {
-        "query": query, "history": history, "scales": scales,
-        "indices": indices, "table": table, "requests": requests,
-        "positions": positions, "lengths": lengths, "output": output,
+        "query": query,
+        "history": history,
+        "scales": scales,
+        "indices": indices,
+        "table": table,
+        "requests": requests,
+        "positions": positions,
+        "lengths": lengths,
+        "output": output,
         "gate": gate,
     }
-    torch.save({k: v.detach().cpu() if v is not None else None
-                for k, v in tensors.items()},
-               os.path.join(_QSA_DUMP_DIR, f"qsa_prefill_{order}.pt"))
+    torch.save(
+        {k: v.detach().cpu() if v is not None else None for k, v in tensors.items()},
+        os.path.join(str(_QSA_DUMP_DIR), f"qsa_prefill_{order}.pt"),
+    )
     logger.info("Dumped QSA prefill reader inputs of target layer %d.", order)
 
 
@@ -117,11 +140,14 @@ def _prefetch_next_prefix(order, plan, new_tokens, capacity_tokens):
         _PREFETCH["stream"] = torch.cuda.Stream()
     slot = (order + 1) % 2
     done, prefix = nxt.prefetch_prefix(
-        plan, new_tokens, capacity_tokens, slot, _PREFETCH["stream"],
+        plan,
+        new_tokens,
+        capacity_tokens,
+        slot,
+        _PREFETCH["stream"],
         _PREFETCH["free"][slot],
     )
     _PREFETCH["pending"][id(nxt)] = (plan, done, prefix)
-
 
 
 def _qsa_rope_cache_length(config, model_config) -> int:
@@ -901,7 +927,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
 
     def host_kv_forward(
-        self, query, indices, table, requests, positions, lengths, output, gate,
+        self,
+        query,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        output,
+        gate,
         metadata=None,
     ) -> None:
         from .ops.host_kv_attention import host_qsa_attention
@@ -955,26 +989,43 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             # into the stage buffer directly (write_staged) instead of being
             # copied back from the host they were just written to.
             new_kv = getattr(self, "_host_kv_new", None)
-            self._host_kv_new = None
+            self._host_kv_new: tuple[torch.Tensor, ...] | None = None
             upto = None
             if plan and new_kv is not None and len(plan[4]) == 1:
                 old_tokens = max(0, plan[4][0] - query.shape[0])
                 upto = -(-old_tokens // state.page_size)
             staged = plan and state.stage_history(
-                table, lengths, self.host_kv_prefill_stage_tokens, plan,
-                slot=slot, staged_pages=staged_pages, upto=upto,
+                table,
+                lengths,
+                self.host_kv_prefill_stage_tokens,
+                plan,
+                slot=slot,
+                staged_pages=staged_pages,
+                upto=upto,
             )
             if staged is not None:
                 history, scales, staged_table = staged
-                if upto is not None:
-                    state.write_staged(*new_kv, plan, history, scales)
+                if upto is not None and new_kv is not None:
+                    new_key, new_value, new_slots = new_kv
+                    state.write_staged(
+                        new_key, new_value, new_slots, plan, history, scales
+                    )
                 gate_rows = gate.view_as(query) if gate is not None else None
                 if history.dtype == torch.uint8:
                     # One CTA per row over all its keys (tensor-core QK/PV,
                     # 2 CTAs per SM): no partial workspace, no merge pass.
                     torch.ops.vllm_sm70_qsa_device.run_rows(
-                        query, history, scales, indices, staged_table,
-                        requests, positions, lengths, output, gate_rows, 12,
+                        query,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate_rows,
+                        12,
                     )
                 else:
                     torch.ops.vllm_sm70_qsa_device.run_tiled(
@@ -993,17 +1044,28 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     )
                 if order >= 0:
                     _prefetch_next_prefix(
-                        order, plan, query.shape[0],
+                        order,
+                        plan,
+                        query.shape[0],
                         self.host_kv_prefill_stage_tokens,
                     )
                 if _QSA_DUMP_DIR and order in (0, 5, 11):
                     _dump_prefill_inputs(
-                        order, query, history, scales, indices, staged_table,
-                        requests, positions, lengths, output, gate,
+                        order,
+                        query,
+                        history,
+                        scales,
+                        indices,
+                        staged_table,
+                        requests,
+                        positions,
+                        lengths,
+                        output,
+                        gate,
                     )
                 logger.info_once(
-                    "QSA prefill reads host history staged on device "
-                    "(draft=%s).", self.host_kv_is_draft,
+                    "QSA prefill reads host history staged on device (draft=%s).",
+                    self.host_kv_is_draft,
                 )
                 return
         if (

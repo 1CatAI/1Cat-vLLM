@@ -30,7 +30,9 @@ def test_prefill_sized_inputs_use_batched_mmq(operators, kind, k, n, m):
         assert not cap.supports_m(decode)
 
 
-@pytest.mark.parametrize("supported,reason", [(True, None), (False, "mmq_not_supported_for_source_type")])
+@pytest.mark.parametrize(
+    "supported,reason", [(True, None), (False, "mmq_not_supported_for_source_type")]
+)
 def test_installed_mmq_support_decides_source_admission(operators, supported, reason):
     cap = original_moe_prefill_capability(
         20, 2560, 160, 512, torch.float16, is_sm70=True, mmq_supported=supported

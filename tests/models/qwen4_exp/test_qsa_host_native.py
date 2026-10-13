@@ -30,24 +30,33 @@ def test_host_native_matches_device_history(dtype, rows):
     dev = torch.device("cuda")
     blocks, page, context = 160, 64, 9000
     state = HostQSAKV(
-        blocks, page, 256, dev, hot_tokens=1024, rows=8, width=WIDTH,
-        dtype=dtype, direct_device=False,
+        blocks,
+        page,
+        256,
+        dev,
+        hot_tokens=1024,
+        rows=8,
+        width=WIDTH,
+        dtype=dtype,
+        direct_device=False,
     )
     # Write the whole context through the normal writer (fills host history).
     table = torch.randperm(blocks, device=dev, dtype=torch.int32)[None]
-    slots = (table[0].long()[torch.arange(context, device=dev) // page] * page
-             + torch.arange(context, device=dev) % page).to(torch.int32)
+    slots = (
+        table[0].long()[torch.arange(context, device=dev) // page] * page
+        + torch.arange(context, device=dev) % page
+    ).to(torch.int32)
     key = torch.randn(context, 1, 256, device=dev, dtype=torch.float16)
     value = torch.randn(context, 1, 256, device=dev, dtype=torch.float16)
     state.write(key, value, slots)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     positions = torch.arange(context - rows, context, device=dev, dtype=torch.int64)
     requests = torch.zeros(rows, dtype=torch.int32, device=dev)
     lengths = torch.tensor([context], dtype=torch.int32, device=dev)
-    indices = torch.stack([
-        torch.randperm(context, device=dev)[:WIDTH].sort().values for _ in range(rows)
-    ]).to(torch.int32)
+    indices = torch.stack(
+        [torch.randperm(context, device=dev)[:WIDTH].sort().values for _ in range(rows)]
+    ).to(torch.int32)
     indices[:, -7:] = -1  # padded selections
     query = torch.randn(rows, 6, 256, device=dev, dtype=torch.float16)
     gate = torch.randn(rows, 6, 256, device=dev, dtype=torch.float16)
@@ -57,8 +66,17 @@ def test_host_native_matches_device_history(dtype, rows):
     device_scales = state.scales.clone()
     reference = torch.empty_like(query)
     torch.ops.vllm_sm70_qsa_device.run(
-        query, device_history, device_scales, indices, table, requests,
-        positions, lengths, reference, gate, *_workspace(rows, dev),
+        query,
+        device_history,
+        device_scales,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        reference,
+        gate,
+        *_workspace(rows, dev),
     )
 
     # The 1024-token hot cache holds only part of the 2051-wide selection:
@@ -69,18 +87,40 @@ def test_host_native_matches_device_history(dtype, rows):
     host_reads = int((resolved == -1).sum())
     out = torch.empty_like(query)
     torch.ops.vllm_sm70_qsa_device.run_hot(
-        query, state.history, state.scales, indices, table, requests, positions,
-        lengths, out, gate, *_workspace(rows, dev), state.hot_values, resolved,
+        query,
+        state.history,
+        state.scales,
+        indices,
+        table,
+        requests,
+        positions,
+        lengths,
+        out,
+        gate,
+        *_workspace(rows, dev),
+        state.hot_values,
+        resolved,
     )
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert hot_hits > 0 and host_reads > 0  # both sources exercised
     assert torch.equal(out.view(torch.int16), reference.view(torch.int16))
 
 
 def test_history_is_mapped_host_memory():
     dev = torch.device("cuda")
-    state = HostQSAKV(4, 64, 256, dev, hot_tokens=64, rows=8, width=WIDTH,
-                      dtype=torch.uint8, direct_device=False)
+    state = HostQSAKV(
+        4,
+        64,
+        256,
+        dev,
+        hot_tokens=64,
+        rows=8,
+        width=WIDTH,
+        dtype=torch.uint8,
+        direct_device=False,
+    )
     assert state.host is not None and state.host.is_pinned()
-    assert state.history.data_ptr() == get_accelerator_view_from_cpu_tensor(
-        state.host).data_ptr()
+    assert (
+        state.history.data_ptr()
+        == get_accelerator_view_from_cpu_tensor(state.host).data_ptr()
+    )

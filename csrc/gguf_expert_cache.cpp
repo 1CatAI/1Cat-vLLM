@@ -215,11 +215,10 @@ class ExpertCacheLane {
       TORCH_CHECK(row < capacity, "expert cache: prefill bank too small");
       int32_t h = host_slot_of_[layer * experts_ + e];
       for (int shard = 0; shard < kShards; ++shard) {
-        check(cudaMemcpyAsync(
-                  reinterpret_cast<uint8_t*>(dst[shard]) +
-                      row * bytes(layer, shard),
-                  host(layer, shard, h), bytes(layer, shard),
-                  cudaMemcpyHostToDevice, stream),
+        check(cudaMemcpyAsync(reinterpret_cast<uint8_t*>(dst[shard]) +
+                                  row * bytes(layer, shard),
+                              host(layer, shard, h), bytes(layer, shard),
+                              cudaMemcpyHostToDevice, stream),
               "prefill cold expert");
       }
       map[e] = static_cast<int32_t>(row);
@@ -523,8 +522,8 @@ void copy_h2d(int64_t dst, int64_t src, int64_t bytes, int64_t stream_ptr) {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   pybind11::class_<ExpertCacheLane>(m, "ExpertCacheLane")
-      .def(pybind11::init<int64_t, int64_t, int64_t, int64_t, int64_t,
-                          int64_t, std::vector<int64_t>, std::vector<int64_t>,
+      .def(pybind11::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                          std::vector<int64_t>, std::vector<int64_t>,
                           std::vector<int64_t>, int64_t, int64_t, int64_t,
                           int64_t, int64_t, int64_t, torch::Tensor,
                           torch::Tensor>())

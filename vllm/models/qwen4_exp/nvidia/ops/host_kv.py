@@ -23,9 +23,17 @@ _STAGES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 @triton.jit
-def _stage_pages(src, dst, src_scales, dst_scales, blocks,
-                 WORDS: tl.constexpr, SCALES: tl.constexpr,
-                 BLOCK: tl.constexpr, SCALE_BLOCK: tl.constexpr):
+def _stage_pages(
+    src,
+    dst,
+    src_scales,
+    dst_scales,
+    blocks,
+    WORDS: tl.constexpr,
+    SCALES: tl.constexpr,
+    BLOCK: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+):
     """dst page p = src page blocks[p] (int64 words), plus its token scales.
 
     src/src_scales may be device-mapped pinned host memory: one launch reads
@@ -38,13 +46,11 @@ def _stage_pages(src, dst, src_scales, dst_scales, blocks,
     mask = offs < WORDS
     value = tl.load(src + block * WORDS + offs, mask=mask)
     tl.store(dst + page.to(tl.int64) * WORDS + offs, value, mask=mask)
-    if SCALES > 0:
-        if chunk == 0:
-            s = tl.arange(0, SCALE_BLOCK)
-            smask = s < SCALES
-            scale = tl.load(src_scales + block * SCALES + s, mask=smask)
-            tl.store(dst_scales + page.to(tl.int64) * SCALES + s, scale,
-                     mask=smask)
+    if SCALES > 0 and chunk == 0:
+        s = tl.arange(0, SCALE_BLOCK)
+        smask = s < SCALES
+        scale = tl.load(src_scales + block * SCALES + s, mask=smask)
+        tl.store(dst_scales + page.to(tl.int64) * SCALES + s, scale, mask=smask)
 
 
 @triton.jit
@@ -526,6 +532,7 @@ class HostQSAKV:
 
         self.device_history_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
         self.device_history_reason: str | None = None
+        self.device_history_hot = False
         initialize_device_history_attention(self, direct_device)
 
     def write(self, key: torch.Tensor, value: torch.Tensor, slots: torch.Tensor):
@@ -561,13 +568,15 @@ class HostQSAKV:
         if not slots.numel() or not k:
             return
         page = self.page_size
-        staged_of = torch.full((self.blocks,), -1, dtype=torch.int64,
-                               device=slots.device)
+        staged_of = torch.full(
+            (self.blocks,), -1, dtype=torch.int64, device=slots.device
+        )
         staged_of[pages.long()] = torch.arange(k, device=slots.device)
         source = slots.long()
         target = staged_of[(source // page).clamp(0, self.blocks - 1)]
-        target = torch.where((source >= 0) & (target >= 0),
-                             target * page + source % page, -1)
+        target = torch.where(
+            (source >= 0) & (target >= 0), target * page + source % page, -1
+        )
         _write[(slots.numel(),)](
             key,
             value,
@@ -626,8 +635,13 @@ class HostQSAKV:
         device = self.history.device
         staged = torch.from_numpy(staged).pin_memory()
         pages = torch.from_numpy(sources).pin_memory()
-        return (runs, k, staged.to(device, non_blocking=True),
-                pages.to(device, non_blocking=True), lengths_host)
+        return (
+            runs,
+            k,
+            staged.to(device, non_blocking=True),
+            pages.to(device, non_blocking=True),
+            lengths_host,
+        )
 
     def _stage_capacity(self, capacity_tokens):
         # One byte budget (capacity_tokens E4M3 K/V tokens) shared by every
@@ -645,8 +659,7 @@ class HostQSAKV:
         if key not in _STAGES:
             _STAGES[key] = (
                 torch.empty(budget, dtype=torch.uint8, device=device),
-                torch.empty((capacity_tokens, 2), dtype=torch.float32,
-                            device=device),
+                torch.empty((capacity_tokens, 2), dtype=torch.float32, device=device),
             )
         raw, raw_scales = _STAGES[key]
         source = self.host if self.host is not None else self.history
@@ -671,8 +684,11 @@ class HostQSAKV:
             _stage_pages[(last - first, triton.cdiv(words, block))](
                 source.view(-1).view(torch.int64),
                 history[first:].reshape(-1).view(torch.int64),
-                self.scales, scales[first * page:] if self.fp8 else scales,
-                pages[first:last], WORDS=words, SCALES=scale_count,
+                self.scales,
+                scales[first * page :] if self.fp8 else scales,
+                pages[first:last],
+                WORDS=words,
+                SCALES=scale_count,
                 BLOCK=block,
                 SCALE_BLOCK=triton.next_power_of_2(max(scale_count, 1)),
             )
@@ -682,10 +698,10 @@ class HostQSAKV:
             if lo >= hi:
                 continue
             src = source_block + lo - target
-            history[lo:hi].copy_(source[src: src + hi - lo], non_blocking=True)
+            history[lo:hi].copy_(source[src : src + hi - lo], non_blocking=True)
             if self.fp8:
-                scales[lo * page: hi * page].copy_(
-                    self.host_scales[src * page: (src + hi - lo) * page],
+                scales[lo * page : hi * page].copy_(
+                    self.host_scales[src * page : (src + hi - lo) * page],
                     non_blocking=True,
                 )
 
@@ -697,8 +713,9 @@ class HostQSAKV:
             return 0
         return max(0, lengths[0] - new_tokens) // self.page_size
 
-    def prefetch_prefix(self, plan, new_tokens, capacity_tokens, slot, stream,
-                        buffer_free):
+    def prefetch_prefix(
+        self, plan, new_tokens, capacity_tokens, slot, stream, buffer_free
+    ):
         """Stage this owner's prefix pages into buffer `slot` on `stream`
         (after `buffer_free`); returns the completion event."""
         prefix = self.prefix_pages(plan, new_tokens)
@@ -714,8 +731,16 @@ class HostQSAKV:
             done.record(stream)
         return done, prefix
 
-    def stage_history(self, block_table, lengths, capacity_tokens, plan=None,
-                      slot=0, staged_pages=0, upto=None):
+    def stage_history(
+        self,
+        block_table,
+        lengths,
+        capacity_tokens,
+        plan=None,
+        slot=0,
+        staged_pages=0,
+        upto=None,
+    ):
         """Copy every request's history pages to a shared device buffer.
 
         Returns (history, scales, table) for the device-history reader, the
@@ -734,8 +759,9 @@ class HostQSAKV:
         _, k, staged_table, _, _ = plan
         page = self.page_size
         history, scales = self._stage_views(capacity_tokens, slot)
-        self._stage_range(plan, history, scales, staged_pages,
-                          k if upto is None else min(upto, k))
+        self._stage_range(
+            plan, history, scales, staged_pages, k if upto is None else min(upto, k)
+        )
         if not self.fp8 and not staged_pages:
             scales.copy_(self.host_scales, non_blocking=True)
         return history[:k], scales[: k * page] if self.fp8 else scales, staged_table

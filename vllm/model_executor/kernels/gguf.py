@@ -561,8 +561,7 @@ def original_moe_prefill_capability(
     elif mmq_supported is False:
         reason = "mmq_not_supported_for_source_type"
     elif mmq_supported is None and not (
-        source_type in (18, 21, 22, 23) and gate
-        or source_type in (20, 42) and down
+        source_type in (18, 21, 22, 23) and gate or source_type in (20, 42) and down
     ):
         reason = "original_prefill_shape_or_source_unmeasured"
     elif not hasattr(torch.ops._C_gguf, operator):

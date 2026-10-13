@@ -29,17 +29,43 @@ FILLER = (
 )
 
 PROMPTS = [
-    ("chat-cpu", "Explain how a modern out-of-order CPU executes instructions: "
-     "front end, renaming, reorder buffer, reservation stations, branch prediction."),
-    ("chat-history", "Write a detailed essay on the causes and consequences of the "
-     "Industrial Revolution in Britain."),
+    (
+        "chat-cpu",
+        (
+            "Explain how a modern out-of-order CPU executes instructions: "
+            "front end, renaming, reorder buffer, reservation stations, "
+            "branch prediction."
+        ),
+    ),
+    (
+        "chat-history",
+        (
+            "Write a detailed essay on the causes and consequences of the "
+            "Industrial Revolution in Britain."
+        ),
+    ),
     ("chat-zh", "请详细介绍一下量子计算的基本原理、主要技术路线以及目前面临的挑战。"),
-    ("code-py", "Write a Python implementation of a thread-safe LRU cache with TTL "
-     "expiry, including unit tests."),
-    ("code-cpp", "Implement a lock-free single-producer single-consumer ring buffer "
-     "in C++17 and explain the memory ordering."),
-    ("math", "Prove that there are infinitely many primes, then explain the prime "
-     "number theorem and its significance."),
+    (
+        "code-py",
+        (
+            "Write a Python implementation of a thread-safe LRU cache with TTL "
+            "expiry, including unit tests."
+        ),
+    ),
+    (
+        "code-cpp",
+        (
+            "Implement a lock-free single-producer single-consumer ring buffer "
+            "in C++17 and explain the memory ordering."
+        ),
+    ),
+    (
+        "math",
+        (
+            "Prove that there are infinitely many primes, then explain the prime "
+            "number theorem and its significance."
+        ),
+    ),
 ]
 
 
@@ -77,24 +103,38 @@ def main():
     parser.add_argument("--long", default="8000,24000")
     args = parser.parse_args()
 
-    serve = open(args.serve_script).read()
+    with open(args.serve_script) as f:
+        serve = f.read()
     kc = json.loads(serve.split("KC='")[1].split("'\n")[0].replace("'$HOT'", "8192"))
     kc.setdefault("sm70_gguf", {})["expert_trace_tokens"] = args.ring_tokens
     llm = LLM(
-        model=args.model, quantization="gguf", tensor_parallel_size=4, dtype="half",
-        kv_cache_dtype="float16", mamba_ssm_cache_dtype="float32",
-        max_model_len=args.max_model_len, max_num_seqs=1,
-        max_num_batched_tokens=512, gpu_memory_utilization=0.95,
-        enable_prefix_caching=True, mamba_cache_mode="align",
+        model=args.model,
+        quantization="gguf",
+        tensor_parallel_size=4,
+        dtype="half",
+        kv_cache_dtype="float16",
+        mamba_ssm_cache_dtype="float32",
+        max_model_len=args.max_model_len,
+        max_num_seqs=1,
+        max_num_batched_tokens=512,
+        gpu_memory_utilization=0.95,
+        enable_prefix_caching=True,
+        mamba_cache_mode="align",
         language_model_only=True,
-        compilation_config={"mode": 3, "cudagraph_mode": "FULL",
-                            "cudagraph_capture_sizes": [5],
-                            "inductor_compile_config": {"benchmark_combo_kernel": False}},
+        compilation_config={
+            "mode": 3,
+            "cudagraph_mode": "FULL",
+            "cudagraph_capture_sizes": [5],
+            "inductor_compile_config": {"benchmark_combo_kernel": False},
+        },
         kernel_config=kc,
-        speculative_config={"method": "mtp", "model": args.draft,
-                            "num_speculative_tokens": 4,
-                            "draft_load_config": {"load_format": "safetensors"},
-                            "draft_sample_method": "greedy"},
+        speculative_config={
+            "method": "mtp",
+            "model": args.draft,
+            "num_speculative_tokens": 4,
+            "draft_load_config": {"load_format": "safetensors"},
+            "draft_sample_method": "greedy",
+        },
     )
     prompts = list(PROMPTS)
     for n in (int(x) for x in args.long.split(",") if x):
@@ -104,17 +144,29 @@ def main():
     for label, text in prompts:
         assert all(llm.collective_rpc(reset)), "expert tracing is not active"
         message = [{"role": "user", "content": text}]
-        out = llm.chat(message, sampling, use_tqdm=False,
-                       chat_template_kwargs={"enable_thinking": False})[0]
+        out = llm.chat(
+            message,
+            sampling,
+            use_tqdm=False,
+            chat_template_kwargs={"enable_thinking": False},
+        )[0]
         trace = llm.collective_rpc(snapshot)[0]
-        records.append({
-            "label": label,
-            "prompt_tokens": len(out.prompt_token_ids),
-            "output_tokens": len(out.outputs[0].token_ids),
-            **trace,
-        })
-        print(label, records[-1]["prompt_tokens"], records[-1]["output_tokens"],
-              "decode rows", int(trace["counter"][3]), flush=True)
+        records.append(
+            {
+                "label": label,
+                "prompt_tokens": len(out.prompt_token_ids),
+                "output_tokens": len(out.outputs[0].token_ids),
+                **trace,
+            }
+        )
+        print(
+            label,
+            records[-1]["prompt_tokens"],
+            records[-1]["output_tokens"],
+            "decode rows",
+            int(trace["counter"][3]),
+            flush=True,
+        )
     torch.save(records, args.output)
     print("saved", args.output, flush=True)
 

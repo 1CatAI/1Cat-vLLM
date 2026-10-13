@@ -22,8 +22,10 @@ def test_decode_ring_and_prefill_histogram():
         expected = [[layer, 5], [1, 2], [layer, 5], [1, 2]]
         assert snap["ring"][layer, :4].tolist() == expected
         assert (snap["ring"][layer, 4:] == -1).all()
-    assert snap["prefill"][1].tolist() == torch.bincount(
-        big.flatten().cpu(), minlength=6).tolist()
+    assert (
+        snap["prefill"][1].tolist()
+        == torch.bincount(big.flatten().cpu(), minlength=6).tolist()
+    )
     assert snap["prefill"][0].sum() == 0 and snap["prefill"][2].sum() == 0
 
 
@@ -33,4 +35,6 @@ def test_ring_wraps():
         trace.record(0, torch.tensor([[value % 4]], dtype=torch.int32, device="cuda"))
     snap = trace.snapshot()
     assert int(snap["counter"][0]) == 6
-    assert snap["ring"][0, :, 0].tolist() == [0, 1, 2, 3][::1][:0] + [0, 1, 0, 1][:2] + [2, 3]
+    assert snap["ring"][0, :, 0].tolist() == [0, 1, 2, 3][::1][:0] + [0, 1, 0, 1][
+        :2
+    ] + [2, 3]

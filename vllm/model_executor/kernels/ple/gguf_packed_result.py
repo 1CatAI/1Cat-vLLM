@@ -39,7 +39,7 @@ def packed_result_capability(
 
 
 def prepare_packed_gguf_results(config, tensors, names):
-    import vllm.envs as envs
+    from vllm.config.execution_policy import ple_policy
     from vllm.model_executor.kernels.ple.gguf_pinned import pinned_decode_active
     from vllm.model_executor.layers.ple_offload_layer import ple_offload_enabled
     from vllm.platforms import current_platform
@@ -64,7 +64,7 @@ def prepare_packed_gguf_results(config, tensors, names):
             sm70=current_platform.is_device_capability(70),
             offloaded=ple_offload_enabled(),
             local_tables=(
-                envs.VLLM_SM70_QWEN38_HYBRID_PLE
+                ple_policy(config).hybrid
                 or pinned_decode_active(config)
                 or policy.ple_disk_cascade_active
             ),

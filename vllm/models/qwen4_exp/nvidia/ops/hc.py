@@ -218,8 +218,9 @@ def _hc_gate_mix_gathered_kernel(
     acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     for stream in tl.static_range(HC):
         g = tl.load(g_ptr + base + stream * COLS, mask, other=0.0)
-        x = tl.load(x_ptr + row * stride_x + stream * HC_DIM + offs_inner, mask,
-                    other=0.0)
+        x = tl.load(
+            x_ptr + row * stride_x + stream * HC_DIM + offs_inner, mask, other=0.0
+        )
         acc += tl.sigmoid(g.to(tl.float32)) * x.to(tl.float32)
     acc /= HC
     tl.store(y_ptr + row * stride_y + offs_inner, acc, mask)
@@ -243,8 +244,17 @@ def hc_gate_mix_gathered(
     out = x.new_empty(N, HC_DIM)
     BLOCK_SIZE = 512
     _hc_gate_mix_gathered_kernel[(N, triton.cdiv(HC_DIM, BLOCK_SIZE))](
-        x, gathered, out, x.stride(0), stride_g, stride_rank, out.stride(0),
-        *order, HC_DIM, hc_count, BLOCK_SIZE,
+        x,
+        gathered,
+        out,
+        x.stride(0),
+        stride_g,
+        stride_rank,
+        out.stride(0),
+        *order,
+        HC_DIM,
+        hc_count,
+        BLOCK_SIZE,
     )
     return out
 
@@ -270,10 +280,10 @@ def _hc_gate_mix_local_kernel(
     mask = offs < COLS
     acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
     for stream in tl.static_range(HC):
-        g = tl.load(g_ptr + row * stride_g + stream * COLS + offs, mask,
-                    other=0.0)
-        x = tl.load(x_ptr + row * stride_x + stream * HC_DIM + col0 + offs,
-                    mask, other=0.0)
+        g = tl.load(g_ptr + row * stride_g + stream * COLS + offs, mask, other=0.0)
+        x = tl.load(
+            x_ptr + row * stride_x + stream * HC_DIM + col0 + offs, mask, other=0.0
+        )
         acc += tl.sigmoid(g.to(tl.float32)) * x.to(tl.float32)
     acc /= HC
     tl.store(y_ptr + row * stride_y + offs, acc, mask)
@@ -299,10 +309,8 @@ def _hc_assemble_kernel(
     for start in tl.static_range(0, COLS, BLOCK_SIZE):
         offs = start + tl.arange(0, BLOCK_SIZE)
         mask = offs < COLS
-        value = tl.load(src_ptr + (rank.to(tl.int64) * rows + row) * COLS + offs,
-                        mask)
-        tl.store(dst_ptr + row.to(tl.int64) * 4 * COLS + j * COLS + offs, value,
-                 mask)
+        value = tl.load(src_ptr + (rank.to(tl.int64) * rows + row) * COLS + offs, mask)
+        tl.store(dst_ptr + row.to(tl.int64) * 4 * COLS + j * COLS + offs, value, mask)
 
 
 def hc_gate_mix_local(
@@ -316,8 +324,17 @@ def hc_gate_mix_local(
     out = x.new_empty(N, COLS)
     BLOCK_SIZE = 256
     _hc_gate_mix_local_kernel[(N, triton.cdiv(COLS, BLOCK_SIZE))](
-        x, local_gate, out, x.stride(0), local_gate.stride(0), out.stride(0),
-        logical_rank * COLS, COLS, HC_DIM, hc_count, BLOCK_SIZE,
+        x,
+        local_gate,
+        out,
+        x.stride(0),
+        local_gate.stride(0),
+        out.stride(0),
+        logical_rank * COLS,
+        COLS,
+        HC_DIM,
+        hc_count,
+        BLOCK_SIZE,
     )
     return out
 
@@ -330,7 +347,12 @@ def hc_assemble_ranks(gathered: torch.Tensor, order: tuple[int, ...]) -> torch.T
     rows, cols = gathered.shape[0] // ranks, gathered.shape[1]
     out = gathered.new_empty(rows, ranks * cols)
     _hc_assemble_kernel[(rows, ranks)](
-        gathered, out, rows, *order, cols, 256,
+        gathered,
+        out,
+        rows,
+        *order,
+        cols,
+        256,
     )
     return out
 
@@ -361,16 +383,18 @@ def _hc_packet_silu_kernel(
     base = src_ptr + (rank.to(tl.int64) * rows + row) * WIDTH
     x = tl.load(base + offs, offs < LORA).to(tl.float32) / HC
     y = x * tl.sigmoid(x)
-    tl.store(lora_ptr + row.to(tl.int64) * 4 * LORA + j * LORA + offs, y,
-             offs < LORA)
+    tl.store(lora_ptr + row.to(tl.int64) * 4 * LORA + j * LORA + offs, y, offs < LORA)
     if j == 3:
         inj = tl.load(base + LORA + offs, offs < INJ)
         tl.store(inj_ptr + row.to(tl.int64) * INJ + offs, inj, offs < INJ)
 
 
 def hc_packet_silu(
-    gathered: torch.Tensor, order: tuple[int, ...], hc_count: int,
-    lora_width: int = 80, inj_width: int = 4,
+    gathered: torch.Tensor,
+    order: tuple[int, ...],
+    hc_count: int,
+    lora_width: int = 80,
+    inj_width: int = 4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(hc_silu(lora), injection) from the row-gathered HC down packet."""
     ranks = len(order)
@@ -379,8 +403,16 @@ def hc_packet_silu(
     lora = gathered.new_empty(rows, ranks * lora_width)
     inj = gathered.new_empty(rows, inj_width)
     _hc_packet_silu_kernel[(rows, ranks)](
-        gathered, lora, inj, rows, *order, width, lora_width, inj_width,
-        hc_count, triton.next_power_of_2(lora_width),
+        gathered,
+        lora,
+        inj,
+        rows,
+        *order,
+        width,
+        lora_width,
+        inj_width,
+        hc_count,
+        triton.next_power_of_2(lora_width),
     )
     return lora, inj
 

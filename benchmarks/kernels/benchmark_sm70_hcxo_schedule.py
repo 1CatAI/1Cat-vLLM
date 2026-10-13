@@ -156,7 +156,7 @@ def benchmark_rows(args, runtime, weights, rows, rank):
                     run(weight, mode)
         graphs[mode] = graph
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     for seed in (20261200, 20261201, 20261202):
         change_input(seed)
         graphs["separate"].replay()
@@ -169,7 +169,7 @@ def benchmark_rows(args, runtime, weights, rows, rank):
     for _ in range(4):
         for graph in graphs.values():
             graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     times = {mode: [] for mode in modes}
     for sample in range(args.samples):
         offset = sample % len(modes)
@@ -203,7 +203,7 @@ def benchmark_rows(args, runtime, weights, rows, rank):
         for mode in modes
     }
     del graphs
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return dict(
         rows=rows,
         critical_median_us={mode: statistics.median(v) for mode, v in critical.items()},
@@ -226,7 +226,7 @@ def main():
     if args.samples < 1 or args.repeats < 1:
         parser.error("samples and repeats must be positive")
     rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(rank)
+    torch.accelerator.set_device_index(rank)
     torch.set_num_threads(1)
     dist.init_process_group("gloo")
     runtime = Sm70HcxRuntime(dist.group.WORLD, torch.device("cuda", rank))

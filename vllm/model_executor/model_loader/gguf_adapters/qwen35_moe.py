@@ -129,7 +129,8 @@ class Qwen35MoeAdapter(Qwen35Adapter):
                     load_expert_bank,
                 )
 
-                load_expert_bank(*bulk, tensor, raw)
+                bank_layer, bank_method, bank_shard = bulk
+                load_expert_bank(bank_layer, bank_method, bank_shard, tensor, raw)
                 continue
             packed = (
                 self._dense(tensor, dtype)

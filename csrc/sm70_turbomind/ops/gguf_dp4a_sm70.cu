@@ -73,8 +73,8 @@ __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
         const int expert = ids[route];
         const auto* gate_ptrs = reinterpret_cast<const StridedPtr*>(gate);
         const auto* up_ptrs = reinterpret_cast<const StridedPtr*>(up);
-        gs += Dot::dot(gate_ptrs[expert].ptr, gate_stats[expert].ptr, n, k,
-                       row, group, shared_x[group]);
+        gs += Dot::dot(gate_ptrs[expert].ptr, gate_stats[expert].ptr, n, k, row,
+                       group, shared_x[group]);
         us += Dot::dot(up_ptrs[expert].ptr, up_stats[expert].ptr, n, k, row,
                        group, shared_x[group]);
       } else {

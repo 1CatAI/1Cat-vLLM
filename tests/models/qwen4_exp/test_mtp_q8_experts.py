@@ -17,9 +17,7 @@ def test_q8_0_bytes_match_gguf_reference():
     weight = torch.randn(40, 160) * 0.02
     weight[3, :32] = 0  # all-zero block keeps d = 0
     ours = quantize_q8_0(weight).numpy()
-    reference = gguf.quants.quantize(
-        weight.numpy(), gguf.GGMLQuantizationType.Q8_0
-    )
+    reference = gguf.quants.quantize(weight.numpy(), gguf.GGMLQuantizationType.Q8_0)
     np.testing.assert_array_equal(ours, reference)
     np.testing.assert_array_equal(
         dequantize_q8_0(torch.from_numpy(ours)).numpy(),

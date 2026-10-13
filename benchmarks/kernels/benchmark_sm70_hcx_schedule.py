@@ -99,7 +99,7 @@ def measure(runtime, packed, rank, m, args):
                 run(weight, schedule, second, norm)
                 assert_bitwise(outputs, reference)
                 checks += 1
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graphs = {}
     for schedule in (False, True):
         graph = torch.cuda.CUDAGraph()
@@ -109,7 +109,7 @@ def measure(runtime, packed, rank, m, args):
                     run(weight, schedule)
         graphs[schedule] = graph
         graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     for seed in (20261012, 20261013, 20261014):
         change_input(seed)
         graphs[False].replay()
@@ -131,11 +131,11 @@ def measure(runtime, packed, rank, m, args):
                 assert_bitwise(outputs, reference)
                 checks += 1
                 counter_wrap_checks += 1
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     for _ in range(4):
         for graph in graphs.values():
             graph.replay()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     times = {"reference": [], "candidate": []}
     for sample in range(args.samples):
         order = (
@@ -169,7 +169,7 @@ def measure(runtime, packed, rank, m, args):
     }
     medians = {key: statistics.median(values) for key, values in critical.items()}
     del graphs
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     return dict(
         M=m,
         bitwise_checks_per_rank=checks,
@@ -195,7 +195,7 @@ def main():
     if min(args.samples, args.repeats) < 1:
         raise ValueError("Positive sample and repeat counts required")
     rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(rank)
+    torch.accelerator.set_device_index(rank)
     torch.set_num_threads(1)
     dist.init_process_group("gloo")
     if dist.get_world_size() != 4:

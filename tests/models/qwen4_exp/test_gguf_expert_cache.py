@@ -25,19 +25,27 @@ def _shape(layer, shard):
 
 
 def _cache(fraction=0.75, spare=4, slack=0.1):
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     generator = torch.Generator().manual_seed(0)
     original = {
         (layer, shard): torch.randint(
-            0, 256, (EXPERTS, *_shape(layer, shard)), dtype=torch.uint8,
+            0,
+            256,
+            (EXPERTS, *_shape(layer, shard)),
+            dtype=torch.uint8,
             generator=generator,
         )
         for layer in LAYERS
         for shard in SHAPES
     }
     banks = [
-        (layer, shard, (EXPERTS, *_shape(layer, shard)), 16 if shard == "w2" else 0,
-         (0, 0, 0))
+        (
+            layer,
+            shard,
+            (EXPERTS, *_shape(layer, shard)),
+            16 if shard == "w2" else 0,
+            (0, 0, 0),
+        )
         for layer in LAYERS
         for shard in SHAPES
     ]
@@ -59,13 +67,19 @@ def _cache(fraction=0.75, spare=4, slack=0.1):
 def _check_decode(cache, original, layer, ids, slots):
     for shard in SHAPES:
         got = cache.bank(layer, shard)[slots.long()]
-        torch.testing.assert_close(got, original[layer, shard][ids.long()], rtol=0, atol=0)
+        torch.testing.assert_close(
+            got, original[layer, shard][ids.long()], rtol=0, atol=0
+        )
 
 
 def _random_ids(generator, tokens, hot=None):
     pool = hot if hot is not None else torch.arange(EXPERTS)
-    picks = torch.stack([pool[torch.randperm(len(pool), generator=generator)[:10]]
-                         for _ in range(tokens)])
+    picks = torch.stack(
+        [
+            pool[torch.randperm(len(pool), generator=generator)[:10]]
+            for _ in range(tokens)
+        ]
+    )
     return picks.to(torch.int32).cuda().contiguous()
 
 
@@ -78,7 +92,7 @@ def test_decode_resolve_serves_original_experts(slack):
         ids = _random_ids(generator, 5)
         slots = cache.resolve(layer, ids)
         _check_decode(cache, original, layer, ids, slots)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     stats = cache.stats()
     assert stats["errors"] == 0 and stats["loaded"] > 0 and stats["evicted"] > 0
     if slack == 0.0:
@@ -90,16 +104,15 @@ def test_resolve_inside_cuda_graph():
     generator = torch.Generator().manual_seed(2)
     static = _random_ids(generator, 5)
     cache.resolve(LAYERS[0], static)  # eager first: starts the lane
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
-        with torch.cuda.graph(graph, stream=stream):
-            outs = [cache.resolve(layer, static) for layer in LAYERS]
+    with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+        outs = [cache.resolve(layer, static) for layer in LAYERS]
     for _ in range(100):
         static.copy_(_random_ids(generator, 5))
         graph.replay()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         for layer, slots in zip(LAYERS, outs):
             _check_decode(cache, original, layer, static, slots)
 
@@ -113,14 +126,16 @@ def test_prefill_bank_matches_and_interleaves_with_decode():
             w1, w3, w2, mapped = cache.prefill(layer, ids)
             for shard, bank in zip(("w1", "w3", "w2"), (w1, w3, w2)):
                 torch.testing.assert_close(
-                    bank[mapped.long()], original[layer, shard][ids.long()],
-                    rtol=0, atol=0,
+                    bank[mapped.long()],
+                    original[layer, shard][ids.long()],
+                    rtol=0,
+                    atol=0,
                 )
             cache.prefill_done(layer)
         for layer in LAYERS:
             ids = _random_ids(generator, 5)
             _check_decode(cache, original, layer, ids, cache.resolve(layer, ids))
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert cache.stats()["errors"] == 0
 
 
@@ -129,29 +144,42 @@ HIDDEN, INTER, TOP_K = 256, 32, 10
 
 def _iq4_nl_bank(generator, rows, k):
     """Valid IQ4_NL rows [EXPERTS, rows, k / 32 * 18] with small scales."""
-    blocks = torch.randint(0, 256, (EXPERTS, rows, k // 32, 18),
-                           dtype=torch.uint8, generator=generator)
-    scale = (torch.rand(EXPERTS, rows, k // 32, generator=generator) * 0.02
-             + 0.005).half()
+    blocks = torch.randint(
+        0, 256, (EXPERTS, rows, k // 32, 18), dtype=torch.uint8, generator=generator
+    )
+    scale = (
+        torch.rand(EXPERTS, rows, k // 32, generator=generator) * 0.02 + 0.005
+    ).half()
     blocks[..., :2] = scale.view(torch.uint8).reshape(*scale.shape, 2)
     return blocks.reshape(EXPERTS, rows, -1)
 
 
 def _turbomind_cache(fraction=0.75, spare=4, prefill_tokens=4096):
     """IQ4_NL gate/up/down banks of real (decodable) GGUF blocks."""
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cuda", torch.accelerator.current_device_index())
     generator = torch.Generator().manual_seed(7)
     shapes = {"w1": (INTER, HIDDEN), "w3": (INTER, HIDDEN), "w2": (HIDDEN, INTER)}
-    original = {(layer, shard): _iq4_nl_bank(generator, *shapes[shard])
-                for layer in LAYERS for shard in shapes}
+    original = {
+        (layer, shard): _iq4_nl_bank(generator, *shapes[shard])
+        for layer in LAYERS
+        for shard in shapes
+    }
     banks = [
-        (layer, shard, tuple(original[layer, shard].shape), 0,
-         (20, shapes[shard][1], 0))
-        for layer in LAYERS for shard in shapes
+        (
+            layer,
+            shard,
+            tuple(original[layer, shard].shape),
+            0,
+            (20, shapes[shard][1], 0),
+        )
+        for layer in LAYERS
+        for shard in shapes
     ]
     config = SimpleNamespace(
-        expert_cache_fraction=fraction, expert_cache_spare_slots=spare,
-        expert_cache_host_slack=0.1, expert_cache_profile=None,
+        expert_cache_fraction=fraction,
+        expert_cache_spare_slots=spare,
+        expert_cache_host_slack=0.1,
+        expert_cache_profile=None,
         expert_cache_prefill="turbomind",
         expert_cache_prefill_tokens=prefill_tokens,
     )
@@ -167,8 +195,9 @@ def _reference(original, layer, x, ids, weights):
 
     def weight(shard):
         bank = original[layer, shard].numpy()
-        return torch.stack([torch.from_numpy(dequantize(bank[e], 20))
-                            for e in range(EXPERTS)]).cuda()
+        return torch.stack(
+            [torch.from_numpy(dequantize(bank[e], 20)) for e in range(EXPERTS)]
+        ).cuda()
 
     gate, up, down = weight("w1"), weight("w3"), weight("w2")
     x = x.float()
@@ -190,8 +219,16 @@ def test_turbomind_prefill_matches_reference_and_follows_decode(prefill_tokens):
         for layer in LAYERS:
             tokens = 700
             x = (torch.randn(tokens, HIDDEN, generator=generator) * 0.5).half().cuda()
-            ids = torch.stack([torch.randperm(EXPERTS, generator=generator)[:TOP_K]
-                               for _ in range(tokens)]).to(torch.int32).cuda()
+            ids = (
+                torch.stack(
+                    [
+                        torch.randperm(EXPERTS, generator=generator)[:TOP_K]
+                        for _ in range(tokens)
+                    ]
+                )
+                .to(torch.int32)
+                .cuda()
+            )
             weights = torch.rand(tokens, TOP_K, generator=generator).cuda()
             out = cache.prefill_moe(layer, x, ids, weights)
             ref = _reference(original, layer, x, ids, weights)
@@ -202,7 +239,7 @@ def test_turbomind_prefill_matches_reference_and_follows_decode(prefill_tokens):
         for layer in LAYERS:
             decode = _random_ids(generator, 5)
             cache.resolve(layer, decode)
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     assert int(cache.tm.error_host[0]) == 0
     assert cache.stats()["errors"] == 0 and cache.stats()["loaded"] > 0
 
@@ -216,8 +253,19 @@ def test_decode_does_not_deadlock_on_one_hardware_queue():
 
     env = dict(os.environ, CUDA_DEVICE_MAX_CONNECTIONS="1")
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-x", "-q", __file__,
-         "-k", "decode_resolve or inside_cuda_graph or interleaves"],
-        env=env, timeout=600, capture_output=True, text=True,
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-x",
+            "-q",
+            __file__,
+            "-k",
+            "decode_resolve or inside_cuda_graph or interleaves",
+        ],
+        env=env,
+        timeout=600,
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stdout[-2000:] + result.stderr[-2000:]

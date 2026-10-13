@@ -75,7 +75,7 @@ def test_draft_row_ids_match_the_verify_window(monkeypatch, split):
 class RecordingPrefetcher(DraftRowPrefetcher):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.advised = []
+        self.advised: list[tuple[int, int, int]] = []
         self._madvise = lambda address, size, advice: self.advised.append(
             (address, size, advice)
         )

@@ -972,17 +972,14 @@ void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
                                torch::Tensor cache_ids,
                                torch::Tensor cache_rows);
 
-int64_t ple_fast_lane_start(torch::Tensor request, int64_t max_reqs,
-                            int64_t max_tokens, int64_t table_ptr,
-                            int64_t row_bytes, int64_t num_rows,
-                            std::vector<int64_t> multipliers,
-                            std::vector<int64_t> sizes,
-                            std::vector<int64_t> offsets, int64_t eos,
-                            std::vector<int64_t> result_ptrs,
-                            std::vector<int64_t> flag_ptrs, int64_t cache_bytes,
-                            int64_t idle_spin_us, bool clamp_tokens,
-                            std::optional<torch::Tensor> draft_ring,
-                            int64_t ring_reqs, int64_t ring_spec);
+int64_t ple_fast_lane_start(
+    torch::Tensor request, int64_t max_reqs, int64_t max_tokens,
+    int64_t table_ptr, int64_t row_bytes, int64_t num_rows,
+    std::vector<int64_t> multipliers, std::vector<int64_t> sizes,
+    std::vector<int64_t> offsets, int64_t eos, std::vector<int64_t> result_ptrs,
+    std::vector<int64_t> flag_ptrs, int64_t cache_bytes, int64_t idle_spin_us,
+    bool clamp_tokens, std::optional<torch::Tensor> draft_ring,
+    int64_t ring_reqs, int64_t ring_spec);
 torch::Tensor ple_fast_lane_stats(int64_t handle);
 void ple_fast_lane_stop(int64_t handle);
 

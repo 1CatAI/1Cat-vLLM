@@ -90,21 +90,34 @@ def _validate_embedding_range(tensor, dtype, name, rows_per_chunk=1024):
     if base is not None and base.filename is not None:
         path = str(base.filename)
         stat = os.stat(path)
-        key = json.dumps([path, stat.st_size, stat.st_mtime_ns,
-                          int(getattr(tensor, "data_offset", 0)), str(dtype)])
+        key = json.dumps(
+            [
+                path,
+                stat.st_size,
+                stat.st_mtime_ns,
+                int(getattr(tensor, "data_offset", 0)),
+                str(dtype),
+            ]
+        )
         marker = os.path.join(
-            envs.VLLM_CACHE_ROOT, "gguf_range_checks",
-            hashlib.sha256(key.encode()).hexdigest()[:32])
+            envs.VLLM_CACHE_ROOT,
+            "gguf_range_checks",
+            hashlib.sha256(key.encode()).hexdigest()[:32],
+        )
         if os.path.exists(marker):
             return
     rows = int(tensor.shape[-1])
     workers = max(1, min(6, (os.cpu_count() or 1) // 4))
     with ThreadPoolExecutor(workers) as pool:
         # list() re-raises the first failing chunk in row order.
-        list(pool.map(
-            lambda start: _decode_embedding_rows(
-                tensor, dtype, name, start, min(start + rows_per_chunk, rows)),
-            range(0, rows, rows_per_chunk)))
+        list(
+            pool.map(
+                lambda start: _decode_embedding_rows(
+                    tensor, dtype, name, start, min(start + rows_per_chunk, rows)
+                ),
+                range(0, rows, rows_per_chunk),
+            )
+        )
     if marker is not None:
         try:
             os.makedirs(os.path.dirname(marker), exist_ok=True)

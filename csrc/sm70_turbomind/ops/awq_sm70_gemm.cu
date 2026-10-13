@@ -3242,19 +3242,18 @@ void gguf_grouped_prefill_gemm_sm70_out(
                   offsets.scalar_type() == torch::kInt32 &&
                   weight_ptrs.scalar_type() == torch::kUInt8 &&
                   stats_ptrs.scalar_type() == torch::kUInt8 &&
-                  input.dim() == 2 && out.dim() == 2 &&
-                  input.stride(1) == 1 && out.stride(1) == 1 &&
-                  offsets.is_contiguous() && weight_ptrs.is_contiguous() &&
-                  stats_ptrs.is_contiguous(),
+                  input.dim() == 2 && out.dim() == 2 && input.stride(1) == 1 &&
+                  out.stride(1) == 1 && offsets.is_contiguous() &&
+                  weight_ptrs.is_contiguous() && stats_ptrs.is_contiguous(),
               "GGUF prefill GEMM requires FP16 rows and prepared pointers");
   // Rows are routes in expert order: input rows themselves, or input rows
   // selected by a_indices (no gathered copy of the activations).
   const bool indexed = a_indices.has_value();
-  TORCH_CHECK(!indexed || (a_indices->is_cuda() &&
-                           a_indices->scalar_type() == torch::kInt32 &&
-                           a_indices->is_contiguous() &&
-                           a_indices->device() == input.device()),
-              "GGUF prefill GEMM a_indices must be contiguous int32 CUDA");
+  TORCH_CHECK(
+      !indexed ||
+          (a_indices->is_cuda() && a_indices->scalar_type() == torch::kInt32 &&
+           a_indices->is_contiguous() && a_indices->device() == input.device()),
+      "GGUF prefill GEMM a_indices must be contiguous int32 CUDA");
   const int64_t m = indexed ? a_indices->numel() : input.size(0);
   const int64_t k = input.size(1);
   TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
@@ -3301,13 +3300,13 @@ void gguf_grouped_prefill_gemm_sm70_out(
     layout.ld = 0;
     layout.num = num_experts;
   }
-  turbomind::gemm::MatrixLayout a{
-      turbomind::kHalf, turbomind::gemm::kRowMajor, static_cast<int>(m),
-      static_cast<int>(k), static_cast<int>(input.stride(0))};
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
   // Logical N before the gated epilogue; the epilogue halves the columns.
-  turbomind::gemm::MatrixLayout d{
-      turbomind::kHalf, turbomind::gemm::kRowMajor, static_cast<int>(m),
-      static_cast<int>(n), static_cast<int>(out.stride(0))};
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
   a.num = d.num = num_experts;
   a.offsets = d.offsets = offsets.data_ptr<int>();
   a.idxs = indexed ? a_indices->data_ptr<int>() : nullptr;

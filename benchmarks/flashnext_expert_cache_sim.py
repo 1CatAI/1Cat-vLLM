@@ -79,7 +79,9 @@ def simulate(rounds, slots, policy, profile, adapt_every, adapt_swaps, decay):
                 resident.add(expert)
         elif policy == "adaptive" and (step + 1) % adapt_every == 0:
             candidates = [e for e, _ in heat.most_common() if e not in resident]
-            victims = sorted(resident, key=lambda e: (heat.get(e, 0), last_used.get(e, -1)))
+            victims = sorted(
+                resident, key=lambda e: (heat.get(e, 0), last_used.get(e, -1))
+            )
             swaps = []
             for incoming, outgoing in zip(candidates[:adapt_swaps], victims):
                 if heat[incoming] > heat.get(outgoing, 0):
@@ -98,10 +100,15 @@ def main():
     parser.add_argument("--layers", type=int, default=48)
     parser.add_argument("--round-rows", type=int, default=5)
     parser.add_argument("--fractions", default="0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9")
-    parser.add_argument("--expert-mib", type=float, default=0.4675,
-                        help="per-rank bytes of one (layer, expert), MiB")
-    parser.add_argument("--link-gbps", default="6,3,6,1.6",
-                        help="effective host->GPU GB/s per rank")
+    parser.add_argument(
+        "--expert-mib",
+        type=float,
+        default=0.4675,
+        help="per-rank bytes of one (layer, expert), MiB",
+    )
+    parser.add_argument(
+        "--link-gbps", default="6,3,6,1.6", help="effective host->GPU GB/s per rank"
+    )
     parser.add_argument("--adapt-every", type=int, default=4)
     parser.add_argument("--adapt-swaps", type=int, default=2)
     parser.add_argument("--decay", type=float, default=0.9)
@@ -123,25 +130,45 @@ def main():
                     if not len(rounds):
                         continue
                     profile = frequency(records, layer, args.experts, record["label"])
-                    hit, unique = simulate(rounds, slots, policy, profile,
-                                           args.adapt_every, args.adapt_swaps, args.decay)
+                    hit, unique = simulate(
+                        rounds,
+                        slots,
+                        policy,
+                        profile,
+                        args.adapt_every,
+                        args.adapt_swaps,
+                        args.decay,
+                    )
                     hit_sum += hit * len(rounds)
                     hit_n += len(rounds)
-                    layer_misses = unique if layer_misses is None else layer_misses + unique
+                    layer_misses = (
+                        unique if layer_misses is None else layer_misses + unique
+                    )
                 if layer_misses is not None:
                     per_round.extend(layer_misses.tolist())
             per_round = np.array(per_round, dtype=np.float64)
             mib = per_round * args.expert_mib
             extra_ms = mib / 1024 / min(links) * 1000
             row = {
-                "fraction": fraction, "policy": policy,
+                "fraction": fraction,
+                "policy": policy,
                 "hit_rate": round(hit_sum / max(hit_n, 1), 4),
                 "miss_experts_per_round_mean": round(float(per_round.mean()), 1),
-                "miss_experts_per_round_p90": round(float(np.percentile(per_round, 90)), 1),
+                "miss_experts_per_round_p90": round(
+                    float(np.percentile(per_round, 90)), 1
+                ),
                 "extra_ms_slowest_link_mean": round(float(extra_ms.mean()), 2),
-                "extra_ms_slowest_link_p90": round(float(np.percentile(extra_ms, 90)), 2),
-                "vram_freed_gib_per_rank": round((1 - fraction) * args.layers
-                                                 * args.experts * args.expert_mib / 1024, 2),
+                "extra_ms_slowest_link_p90": round(
+                    float(np.percentile(extra_ms, 90)), 2
+                ),
+                "vram_freed_gib_per_rank": round(
+                    (1 - fraction)
+                    * args.layers
+                    * args.experts
+                    * args.expert_mib
+                    / 1024,
+                    2,
+                ),
             }
             results.append(row)
             print(json.dumps(row), flush=True)

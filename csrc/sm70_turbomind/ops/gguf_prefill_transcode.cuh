@@ -67,8 +67,7 @@ struct Format<42> {
 };
 
 __device__ __forceinline__ float f16(const uint8_t* p) {
-  return __half2float(
-      __ushort_as_half(uint16_t(p[0]) | (uint16_t(p[1]) << 8)));
+  return __half2float(__ushort_as_half(uint16_t(p[0]) | (uint16_t(p[1]) << 8)));
 }
 
 // Round to FP16 like torch's .half(); flag finite values that overflow.
@@ -88,8 +87,8 @@ struct Group;
 // Packets of one group: uint16 per octet for U2 carriers (lattice, Q2_0),
 // uint32 for U4 (LUT4).
 template <int Type>
-using PacketOf = std::conditional_t<Type == 20 || Type == 23, uint32_t,
-                                    uint16_t>;
+using PacketOf =
+    std::conditional_t<Type == 20 || Type == 23, uint32_t, uint16_t>;
 
 template <>
 struct Group<21> {

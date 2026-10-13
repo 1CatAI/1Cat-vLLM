@@ -309,7 +309,9 @@ def test_greedy_draft_sparse_topk_matches_dense_rejection(
             target_top_k, device=device
         ).flip(0) * 1e-3
         target_dense = torch.full(
-            (num_logits, VOCAB_SIZE), -float("inf"), dtype=torch.float32,
+            (num_logits, VOCAB_SIZE),
+            -float("inf"),
+            dtype=torch.float32,
             device=device,
         )
         target_dense.scatter_(1, target_topk_ids, target_topk_logits)
@@ -317,8 +319,7 @@ def test_greedy_draft_sparse_topk_matches_dense_rejection(
 
         processed_target = apply_top_k_top_p(
             target_dense.clone() / temperature,
-            torch.full((num_logits,), target_top_k, dtype=torch.int32,
-                       device=device),
+            torch.full((num_logits,), target_top_k, dtype=torch.int32, device=device),
             torch.full((num_logits,), top_p, dtype=torch.float32, device=device),
         )
         # Drafts: mostly a target candidate (often the argmax), sometimes not.
@@ -334,8 +335,7 @@ def test_greedy_draft_sparse_topk_matches_dense_rejection(
                 k = 0 if choice == 1 else torch.randint(0, 5, ()).item()
                 draft_sampled[row] = target_topk_ids[source, k]
         cu_num_logits = (
-            torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
-            * rows_per_req
+            torch.arange(num_reqs + 1, dtype=torch.int32, device=device) * rows_per_req
         )
         idx_mapping = torch.arange(num_reqs, dtype=torch.int32, device=device)
         expanded_idx_mapping = idx_mapping.repeat_interleave(rows_per_req)
@@ -345,17 +345,34 @@ def test_greedy_draft_sparse_topk_matches_dense_rejection(
         pos = torch.arange(num_logits, dtype=torch.int64, device=device) + 4096
         temperatures = torch.full((num_reqs,), temperature, device=device)
         top_ps = torch.full((num_reqs,), top_p, device=device)
-        seeds = torch.arange(7 + trial, 7 + trial + num_reqs, dtype=torch.int64,
-                             device=device)
+        seeds = torch.arange(
+            7 + trial, 7 + trial + num_reqs, dtype=torch.int64, device=device
+        )
 
         dense_sampled, dense_num = rejection_sample(
-            processed_target, None, draft_sampled, cu_num_logits, pos,
-            idx_mapping, expanded_idx_mapping, expanded_local_pos,
-            temperatures, seeds, num_speculative_steps,
+            processed_target,
+            None,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            idx_mapping,
+            expanded_idx_mapping,
+            expanded_local_pos,
+            temperatures,
+            seeds,
+            num_speculative_steps,
         )
         sparse_sampled, sparse_num = greedy_draft_sparse_topk_rejection_sample(
-            target_topk_ids, target_topk_logits, draft_sampled, cu_num_logits,
-            pos, idx_mapping, temperatures, top_ps, seeds, num_speculative_steps,
+            target_topk_ids,
+            target_topk_logits,
+            draft_sampled,
+            cu_num_logits,
+            pos,
+            idx_mapping,
+            temperatures,
+            top_ps,
+            seeds,
+            num_speculative_steps,
         )
         assert torch.equal(sparse_num, dense_num), trial
         steps = torch.arange(rows_per_req, device=device).unsqueeze(0)

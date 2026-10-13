@@ -928,6 +928,7 @@ class PleOffloadRunner:
             return
         registration = next(r for r in registrations if r.fast_lane_request is not None)
         request = registration.fast_lane_request
+        assert registration.fast_lane_geometry is not None
         max_reqs, max_tokens = registration.fast_lane_geometry
         layer = next(iter(self._layers.values()))
         reader = layer.ngram_embedding._cpu_reader
@@ -945,7 +946,7 @@ class PleOffloadRunner:
             layer.ngram_heads_vocab_sizes.tolist(),
             layer.ngram_heads_offsets.tolist(),
             int(layer.eos_token_id),
-            [t.cpu_output_buffer.data_ptr() for t in targets],
+            [t.cpu_output_buffer.data_ptr() for t in targets],  # type: ignore[union-attr]
             [t.sem.flag_tensor.data_ptr() for t in targets],
             int(self.vllm_config.kernel_config.ple_row_cache_mib) << 20,
             50_000,

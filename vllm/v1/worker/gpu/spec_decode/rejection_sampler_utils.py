@@ -792,7 +792,7 @@ def greedy_draft_sparse_topk_rejection_sample(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact rejection of argmax drafts against compact target supports.
 
-    Same target contract as ``dflash2_sparse_topk_rejection_sample``; the
+    Same target contract as the compact-support chain rejection below; the
     proposal is one-hot on the drafted token, so no draft scores are needed.
     """
     if target_topk_ids.ndim != 2 or target_topk_ids.shape != target_topk_logits.shape:

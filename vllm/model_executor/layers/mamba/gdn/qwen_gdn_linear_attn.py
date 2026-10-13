@@ -2775,8 +2775,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.activation in ("silu", "swish")
         )
         if self.enable_sm70_dflash2_fused_gdn_norm or num_tokens > 64:
-            # Prefill (and the DFlash2 path): RMSNormGated is decomposed into
-            # a nine-kernel native chain when
+            # Prefill (and the fused-norm draft path): RMSNormGated is
+            # decomposed into a nine-kernel native chain when
             # it is reached from the opaque Qwen GDN op under the default
             # inductor custom-op policy. Its canonical CUDA implementation is
             # a one-pass Triton kernel with the same FP32 accumulation and

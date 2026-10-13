@@ -26,11 +26,10 @@ void launch(torch::Tensor& dst_w, torch::Tensor& dst_s, int64_t w_stride,
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, int(smem)));
   kernel<<<grid, kThreads, smem, at::cuda::getCurrentCUDAStream()>>>(
-      dst_w.data_ptr<uint8_t>(), dst_s.data_ptr<uint8_t>(), w_stride,
-      s_stride, src0.data_ptr<int64_t>(),
-      src1 ? src1->data_ptr<int64_t>() : nullptr, experts.data_ptr<int32_t>(),
-      count.data_ptr<int32_t>(), packs, int(n_out), int(k), int(k_offset), int(src_stride),
-      error.data_ptr<int32_t>());
+      dst_w.data_ptr<uint8_t>(), dst_s.data_ptr<uint8_t>(), w_stride, s_stride,
+      src0.data_ptr<int64_t>(), src1 ? src1->data_ptr<int64_t>() : nullptr,
+      experts.data_ptr<int32_t>(), count.data_ptr<int32_t>(), packs, int(n_out),
+      int(k), int(k_offset), int(src_stride), error.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 }  // namespace
@@ -56,12 +55,11 @@ void gguf_prefill_transcode_sm70(torch::Tensor dst_w, torch::Tensor dst_s,
                   count.scalar_type() == at::kInt && count.numel() >= 1 &&
                   ctas > 0,
               "prefill transcode: tensors must be CUDA");
-  TORCH_CHECK(dst_w.scalar_type() == at::kByte &&
-                  dst_s.scalar_type() == at::kByte &&
-                  src0.scalar_type() == at::kLong &&
-                  experts.scalar_type() == at::kInt &&
-                  error.scalar_type() == at::kInt,
-              "prefill transcode: bad dtypes");
+  TORCH_CHECK(
+      dst_w.scalar_type() == at::kByte && dst_s.scalar_type() == at::kByte &&
+          src0.scalar_type() == at::kLong &&
+          experts.scalar_type() == at::kInt && error.scalar_type() == at::kInt,
+      "prefill transcode: bad dtypes");
   TORCH_CHECK(!src1 || (src1->is_cuda() && src1->scalar_type() == at::kLong &&
                         src1->numel() == src0.numel()),
               "prefill transcode: bad second source");
@@ -76,12 +74,12 @@ void gguf_prefill_transcode_sm70(torch::Tensor dst_w, torch::Tensor dst_s,
     return k % 32 == 0 && k_offset >= 0 && src_stride % bytes == 0 &&
            src_stride / bytes * block >= k_offset + k;
   };
-#define CASE(TYPE, BLOCK, BYTES)                                            \
-  case TYPE:                                                                \
-    TORCH_CHECK(rows_ok(BLOCK, BYTES), "prefill transcode: GGUF type ",     \
-                TYPE, " rows do not cover the requested columns");          \
-    launch<TYPE>(dst_w, dst_s, w_stride, s_stride, src0, src1, experts,     \
-                 count, ctas, n_out, k, k_offset, src_stride, error);       \
+#define CASE(TYPE, BLOCK, BYTES)                                               \
+  case TYPE:                                                                   \
+    TORCH_CHECK(rows_ok(BLOCK, BYTES), "prefill transcode: GGUF type ", TYPE,  \
+                " rows do not cover the requested columns");                   \
+    launch<TYPE>(dst_w, dst_s, w_stride, s_stride, src0, src1, experts, count, \
+                 ctas, n_out, k, k_offset, src_stride, error);                 \
     break;
   switch (source_type) {
     CASE(18, 256, 98)

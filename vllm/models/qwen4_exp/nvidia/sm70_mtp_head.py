@@ -297,7 +297,7 @@ def prepare_mtp_gguf_hot_head(head, hot: int, ranking_path: str = ""):
         or not current_platform.is_device_capability(70)
         or get_tensor_model_parallel_world_size() != 4
         or not raw.is_cuda
-        or getattr(shard, "num_added_elements", 0)
+        or bool(getattr(shard, "num_added_elements", 0))
         or any(
             not hasattr(torch.ops._C, name)
             for name in (

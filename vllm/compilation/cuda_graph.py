@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 import dataclasses
+import os
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -334,7 +334,9 @@ class CUDAGraphWrapper:
             if self.check_input_addresses:
                 entry.input_debug = self._collect_tensor_debug(args, kwargs)
             cudagraph = torch.cuda.CUDAGraph()
-            reserved_before = torch.cuda.memory_reserved() if _GRAPH_MEMLOG else 0
+            reserved_before = (
+                torch.accelerator.memory_reserved() if _GRAPH_MEMLOG else 0
+            )
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -395,11 +397,16 @@ class CUDAGraphWrapper:
                 logger.info(
                     "Graph pool capture %s %s: reserved %.1f MiB (+%.1f), "
                     "output %.1f MiB, weak_ref_output=%s",
-                    self.runtime_mode.name, entry.batch_descriptor.num_tokens,
-                    torch.cuda.memory_reserved() / 2**20,
-                    (torch.cuda.memory_reserved() - reserved_before) / 2**20,
-                    sum(t.numel() * t.element_size() for t in outputs
-                        if isinstance(t, torch.Tensor)) / 2**20,
+                    self.runtime_mode.name,
+                    entry.batch_descriptor.num_tokens,
+                    torch.accelerator.memory_reserved() / 2**20,
+                    (torch.accelerator.memory_reserved() - reserved_before) / 2**20,
+                    sum(
+                        t.numel() * t.element_size()
+                        for t in outputs
+                        if isinstance(t, torch.Tensor)
+                    )
+                    / 2**20,
                     self.cudagraph_options.weak_ref_output,
                 )
 

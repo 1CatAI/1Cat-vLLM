@@ -9,6 +9,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
@@ -470,15 +471,13 @@ class GGUFModelLoader(BaseModelLoader):
         """Diagnostic (VLLM_GGUF_LOAD_PROFILE=1): sample the loading thread's
         stack every 50 ms and log where the load time goes."""
         import collections
-        import os
         import sys
         import threading
-        import time
 
-        if not os.environ.get("VLLM_GGUF_LOAD_PROFILE"):
+        if not envs.VLLM_GGUF_LOAD_PROFILE:
             return None
         target = threading.get_ident()
-        counts = collections.Counter()
+        counts: collections.Counter[tuple[str, str]] = collections.Counter()
         stop = threading.Event()
 
         def run():
@@ -580,7 +579,7 @@ class GGUFModelLoader(BaseModelLoader):
             )
 
             prepare_pinned_gguf_ple(vllm_config, self._native_tensors, gguf_weights_map)
-            from vllm.model_executor.kernels.ple.packed_result import (
+            from vllm.model_executor.kernels.ple.gguf_packed_result import (
                 prepare_packed_gguf_results,
             )
 

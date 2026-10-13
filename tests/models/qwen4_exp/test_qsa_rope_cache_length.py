@@ -38,8 +38,14 @@ def test_text_only_mrope_cache_covers_exactly_the_engine_positions():
 def test_bounded_mrope_rows_match_the_full_cache(default_vllm_config):
     def cache(max_position):
         return MRotaryEmbedding(
-            256, 64, max_position, 10000000, True, torch.float16,
-            mrope_section=[11, 11, 10], mrope_interleaved=True,
+            256,
+            64,
+            max_position,
+            10000000,
+            True,
+            torch.float16,
+            mrope_section=[11, 11, 10],
+            mrope_interleaved=True,
         ).cos_sin_cache
 
     short, full = cache(2048), cache(8192)

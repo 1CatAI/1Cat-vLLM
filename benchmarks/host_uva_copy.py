@@ -23,12 +23,15 @@ def _gather(src, dst, rows, ROW: tl.constexpr, BLOCK: tl.constexpr):
     for start in range(0, ROW, BLOCK * tl.num_programs(0)):
         offs = start + base
         mask = offs < ROW
-        tl.store(dst + tl.program_id(1).to(tl.int64) * ROW + offs,
-                 tl.load(src + row.to(tl.int64) * ROW + offs, mask=mask), mask=mask)
+        tl.store(
+            dst + tl.program_id(1).to(tl.int64) * ROW + offs,
+            tl.load(src + row.to(tl.int64) * ROW + offs, mask=mask),
+            mask=mask,
+        )
 
 
 def run(gpu, count, ctas, block, warps, repeats, barrier, out):
-    torch.cuda.set_device(gpu)
+    torch.accelerator.set_device_index(gpu)
     row = 490240 // 16  # int4-sized elements
     host = torch.empty((64, row, 4), dtype=torch.int32).pin_memory()
     view = torch.ops._C.get_cuda_view_from_cpu_tensor(host)
@@ -38,19 +41,23 @@ def run(gpu, count, ctas, block, warps, repeats, barrier, out):
     d = dst.view(torch.int64)
     ROW = row * 2
     for mode in ("uva", "dma"):
-        def once():
+
+        def once(mode=mode):
             if mode == "uva":
-                _gather[(ctas, count)](src, d, rows, ROW=ROW, BLOCK=block,
-                                       num_warps=warps)
+                _gather[(ctas, count)](
+                    src, d, rows, ROW=ROW, BLOCK=block, num_warps=warps
+                )
             else:
                 for i, r in enumerate(rows.tolist()):
                     dst[i].copy_(host[r], non_blocking=True)
-        once(); torch.cuda.synchronize()
+
+        once()
+        torch.accelerator.synchronize()
         barrier.wait()
         t = time.perf_counter()
         for _ in range(repeats):
             once()
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         dt = (time.perf_counter() - t) / repeats
         out[gpu, mode] = (count * 490240 / dt / 1e9, dt * 1e6)
 
@@ -61,19 +68,26 @@ def main():
     p.add_argument("--ctas", type=int, default=8)
     p.add_argument("--block", type=int, default=1024)
     p.add_argument("--warps", type=int, default=8)
-    p.add_argument("--gpus", type=int, default=torch.cuda.device_count())
+    p.add_argument("--gpus", type=int, default=torch.accelerator.device_count())
     a = p.parse_args()
     for gpus in (1, a.gpus):
         out = {}
         barrier = threading.Barrier(gpus)
-        ts = [threading.Thread(target=run, args=(g, a.count, a.ctas, a.block,
-                                                  a.warps, 20, barrier, out))
-              for g in range(gpus)]
+        ts = [
+            threading.Thread(
+                target=run,
+                args=(g, a.count, a.ctas, a.block, a.warps, 20, barrier, out),
+            )
+            for g in range(gpus)
+        ]
         [t.start() for t in ts]
         [t.join() for t in ts]
         for (g, mode), (gbps, us) in sorted(out.items()):
-            print(f"gpus={gpus} gpu{g} {mode}: {gbps:5.2f} GB/s {us:7.0f} us "
-                  f"for {a.count} experts (ctas={a.ctas} block={a.block})", flush=True)
+            print(
+                f"gpus={gpus} gpu{g} {mode}: {gbps:5.2f} GB/s {us:7.0f} us "
+                f"for {a.count} experts (ctas={a.ctas} block={a.block})",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

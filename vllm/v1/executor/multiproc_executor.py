@@ -196,8 +196,9 @@ class MultiprocExecutor(Executor):
                     )
 
                 with ThreadPoolExecutor(self.local_world_size) as pool:
-                    futures = [pool.submit(start, r)
-                               for r in range(self.local_world_size)]
+                    futures = [
+                        pool.submit(start, r) for r in range(self.local_world_size)
+                    ]
                     for future in futures:
                         # Record each started worker so a failure still
                         # terminates the others.
