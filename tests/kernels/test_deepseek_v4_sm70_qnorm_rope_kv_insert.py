@@ -159,3 +159,46 @@ def test_sm70_tp4_fused_qnorm_kv_insert_matches_legacy(
     fused_q, fused_storage = run(True)
     torch.testing.assert_close(fused_q, legacy_q, rtol=0, atol=0)
     torch.testing.assert_close(fused_storage, legacy_storage, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_sm70_qnorm_kv_insert_uses_the_passed_engine_policy(
+    monkeypatch: pytest.MonkeyPatch, fused: bool
+):
+    """DSpark inserts context KV outside a forward context and passes its
+    engine's sparse policy; the kernel must neither look the policy up again
+    nor follow the environment."""
+    from vllm.config.sm70_sparse import Sm70SparseConfig
+    from vllm.models.deepseek_v4.sm70 import qnorm_rope_kv_fp8_insert as module
+
+    def fail():
+        raise AssertionError("insert looked the sparse policy up again")
+
+    monkeypatch.setattr(module, "sparse_policy", fail)
+    monkeypatch.setenv("VLLM_SM70_DSV4_QNORM_KV_FUSED_TP4", "0" if fused else "1")
+    policy = Sm70SparseConfig(qnorm_kv_fused_tp4=fused)
+    policy.resolve()
+
+    torch.manual_seed(20261011)
+    device = "cuda"
+    num_heads = 16
+    block_size = 256
+    block_stride = round_up(block_size * HEAD_BYTES, TOKEN_DATA_BYTES)
+    q = torch.randn(1, num_heads, HEAD_DIM, dtype=torch.float16, device=device)
+    kv = torch.randn(1, HEAD_DIM, dtype=torch.float16, device=device)
+    storage = torch.full((3 * block_stride,), 0xA5, dtype=torch.uint8, device=device)
+    cache = storage.as_strided(
+        (3, block_size, HEAD_BYTES), (block_stride, HEAD_BYTES, 1)
+    )
+    sm70_qnorm_rope_kv_fp8_insert(
+        q,
+        kv,
+        cache,
+        torch.tensor([block_size + 3], dtype=torch.int64, device=device),
+        torch.tensor([1024], dtype=torch.int64, device=device),
+        _make_cos_sin_cache(2048, device),
+        eps=1e-6,
+        block_size=block_size,
+        policy=policy,
+    )
+    torch.accelerator.synchronize()

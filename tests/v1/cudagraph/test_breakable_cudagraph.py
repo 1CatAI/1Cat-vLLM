@@ -261,6 +261,39 @@ def test_decorator_breaks_when_invoked_inside_capture(cuda_capture_stream):
     assert torch.equal(x, torch.full((4,), 15.0, device="cuda"))
 
 
+def test_decorator_applied_before_policy_still_breaks(cuda_capture_stream, monkeypatch):
+    """Ops are decorated at import, before an engine resolves its graph
+    policy (which may enable breakable capture through runtime defaults
+    rather than the environment). An op decorated while the standalone
+    policy reads "off" must still break once a capture is active."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+        is_breakable_cudagraph_enabled,
+    )
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "0")
+    assert not is_breakable_cudagraph_enabled()
+
+    @eager_break_during_capture
+    def attention_like(t: torch.Tensor) -> None:
+        t.mul_(2.0)
+
+    x = torch.zeros(4, device="cuda")
+    cap = BreakableCUDAGraphCapture()
+    with cap:
+        x.add_(5.0)
+        attention_like(x)
+        x.add_(1.0)
+    assert cap.num_graphs == 2
+    assert cap.num_eager_breaks == 1
+
+    x.fill_(2.0)
+    cap.replay()
+    torch.accelerator.synchronize()
+    assert torch.equal(x, torch.full((4,), 15.0, device="cuda"))
+
+
 # ---------------------------------------------------------------------------
 # Replay ordering
 # ---------------------------------------------------------------------------

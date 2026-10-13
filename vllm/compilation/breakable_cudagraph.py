@@ -88,9 +88,12 @@ def eager_break_during_capture(fn: F) -> F:
         @maybe_transfer_kv_layer
         def unified_attention_with_output(...):
             ...
+
+    The decorator always wraps. Decoration runs at import, before any engine
+    has resolved its graph policy, so it cannot tell whether breakable capture
+    will be used; only an active capture, which the runner opens when the
+    engine's policy enables it, makes the wrapper break.
     """
-    if not is_breakable_cudagraph_enabled():
-        return fn
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
