@@ -528,8 +528,12 @@ class HostQSAKV:
         ) = _WORKSPACES[workspace_key]
         self.table = self.requests.view(-1, 1)
 
-        from .device_kv_attention import initialize_device_history_attention
+        from .device_kv_attention import (
+            host_history_stage_copy,
+            initialize_device_history_attention,
+        )
 
+        self._stage_host_run = host_history_stage_copy()
         self.device_history_workspace: tuple[torch.Tensor, torch.Tensor] | None = None
         self.device_history_reason: str | None = None
         self.device_history_hot = False
@@ -676,6 +680,28 @@ class HostQSAKV:
         page = self.page_size
         source = self.host if self.host is not None else self.history
         if source.is_cuda:
+            # A long contiguous host run can use DMA without occupying SMs.
+            # Fragmented plans retain the gather kernel: one memcpy per page
+            # loses badly. The helper rejects actual device history without
+            # writing, and older native builds retain the qualified fallback.
+            if (
+                len(runs) == 1
+                and self._stage_host_run is not None
+                and (last - first) * 2 * page * self.dim * source.element_size()
+                >= 512 * 1024
+            ):
+                source_block, target, count = runs[0]
+                lo, hi = max(target, first), min(target + count, last)
+                if lo < hi and self._stage_host_run(
+                    source,
+                    self.scales,
+                    history,
+                    scales,
+                    source_block + lo - target,
+                    lo,
+                    hi - lo,
+                ):
+                    return
             # Device-addressable history (the mapped serving pool): one
             # gather launch for the pages and their scales.
             words = 2 * page * self.dim * source.element_size() // 8

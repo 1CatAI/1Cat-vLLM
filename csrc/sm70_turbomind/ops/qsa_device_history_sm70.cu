@@ -907,7 +907,85 @@ void device_qsa_out(torch::Tensor q, torch::Tensor history,
   device_qsa::merge<<<a.M * 6, 256, 0, stream>>>(a);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+// Copy a contiguous run of authoritative host pages with the copy engine.
+// History is a CUDA-addressable view of pinned storage; using its host alias
+// avoids treating that view as an ordinary device-to-device tensor copy.
+// Return false without writes for actual device history (the gather fallback).
+bool stage_host_run(torch::Tensor history, torch::Tensor scales,
+                    torch::Tensor out, torch::Tensor out_scales,
+                    int64_t source_page, int64_t target_page, int64_t pages) {
+  TORCH_CHECK(history.is_cuda() && out.is_cuda() &&
+                  history.device() == out.device() && history.is_contiguous() &&
+                  out.is_contiguous(),
+              "QSA stage history must have contiguous same-device views");
+  TORCH_CHECK(history.dim() == 5 && out.dim() == 5 && history.size(1) == 2 &&
+                  history.size(2) > 0 && history.size(2) % 4 == 0 &&
+                  history.size(3) == 1 && history.size(4) == 256 &&
+                  history.sizes().slice(1) == out.sizes().slice(1) &&
+                  history.scalar_type() == out.scalar_type() &&
+                  (history.scalar_type() == at::kByte ||
+                   history.scalar_type() == at::kHalf),
+              "QSA stage history requires matching page-major E4M3/FP16 views");
+  TORCH_CHECK(source_page >= 0 && source_page <= history.size(0) &&
+                  target_page >= 0 && target_page <= out.size(0) &&
+                  pages >= 0 && pages <= history.size(0) - source_page &&
+                  pages <= out.size(0) - target_page,
+              "QSA stage page range is outside its source or destination");
+  const bool fp8 = history.scalar_type() == at::kByte;
+  const int64_t scale_stride = 2 * history.size(2);
+  if (fp8) {
+    TORCH_CHECK(scales.is_cuda() && out_scales.is_cuda() &&
+                    scales.device() == out.device() &&
+                    out_scales.device() == out.device() &&
+                    scales.scalar_type() == at::kFloat &&
+                    out_scales.scalar_type() == at::kFloat &&
+                    scales.is_contiguous() && out_scales.is_contiguous() &&
+                    scales.numel() >= history.size(0) * scale_stride &&
+                    out_scales.numel() >= out.size(0) * scale_stride,
+                "QSA stage scales must cover the page-major FP8 views");
+  }
+  if (!pages) return true;
+  const c10::cuda::CUDAGuard guard(out.device());
+  cudaPointerAttributes source{}, destination{}, source_scales{}, dest_scales{};
+  C10_CUDA_CHECK(cudaPointerGetAttributes(&source, history.data_ptr()));
+  if (source.type != cudaMemoryTypeHost || source.hostPointer == nullptr)
+    return false;
+  C10_CUDA_CHECK(cudaPointerGetAttributes(&destination, out.data_ptr()));
+  TORCH_CHECK(destination.type == cudaMemoryTypeDevice,
+              "QSA stage destination must be device memory");
+  if (fp8) {
+    C10_CUDA_CHECK(cudaPointerGetAttributes(&source_scales, scales.data_ptr()));
+    C10_CUDA_CHECK(
+        cudaPointerGetAttributes(&dest_scales, out_scales.data_ptr()));
+    TORCH_CHECK(source_scales.type == cudaMemoryTypeHost &&
+                    source_scales.hostPointer != nullptr &&
+                    dest_scales.type == cudaMemoryTypeDevice,
+                "QSA stage requires host scales and device scale storage");
+  }
+  // Validate both copies before issuing either. Preserve the caller's stream
+  // and existing buffer-free / completion events; no allocation or host wait.
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int64_t page_bytes = history.stride(0) * history.element_size();
+  C10_CUDA_CHECK(cudaMemcpyAsync(
+      static_cast<char*>(out.data_ptr()) + target_page * page_bytes,
+      static_cast<const char*>(source.hostPointer) + source_page * page_bytes,
+      pages * page_bytes, cudaMemcpyHostToDevice, stream));
+  if (fp8) {
+    C10_CUDA_CHECK(cudaMemcpyAsync(
+        out_scales.data_ptr<float>() + target_page * scale_stride,
+        static_cast<const float*>(source_scales.hostPointer) +
+            source_page * scale_stride,
+        pages * scale_stride * sizeof(float), cudaMemcpyHostToDevice, stream));
+  }
+  return true;
+}
+
 TORCH_LIBRARY(vllm_sm70_qsa_device, m) {
+  m.def(
+      "stage_host_run(Tensor history, Tensor scales, Tensor(a!) out, "
+      "Tensor(b!) out_scales, int source_page, int target_page, int pages) "
+      "-> bool");
+  m.impl("stage_host_run", torch::kCUDA, &stage_host_run);
   m.def(
       "run(Tensor q, Tensor history, Tensor scales, Tensor indices, Tensor "
       "table, Tensor requests, Tensor positions, Tensor lengths, Tensor(a!) "

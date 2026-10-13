@@ -639,9 +639,76 @@ The matching original baseline passes both 131070- and 260089-token quality
 tasks, with identical prompt hashes to the first candidate. It returns the
 expected retrieval/arithmetic JSON, normal EOS and maximum ten-word repetition
 of one; completion lengths are 173 and 152 tokens. These are quality results,
-not matched throughput tests. The segment fix passes 32761 and 131070 tokens
-(166 and 155 output tokens); its near-256K task is still running.
+not matched throughput tests. The segment fix passes all three matched tasks:
+32761, 131070 and 260089 tokens, with 166, 155 and 155 output tokens.
+Retrieval/arithmetic, normal EOS and repetition checks all pass. Full response
+times are 8.917, 56.448 and 774.606 s. The long task retains the same
+131072-token staging cap and host fallback as the original baseline
+(802.810 s); this is a quality boundary, not the 32K throughput workload.
+`paired-quality-summary.json` verifies matching hashes. The owned service
+was stopped after these checks.
 
 Draft PR: <https://github.com/1CatAI/1Cat-vLLM/pull/1205>. The original deployment
-is unchanged. The uninstalled eight-warp down tactic remains a separate
-experiment and is not part of the measured runtime above.
+is unchanged. The following experiments are separate from that measured runtime.
+
+## Subsequent root-cause screens
+
+An eight-warp 64x256x32 down tactic uses 168/175 registers per thread for
+U2/IQ4, allowing only one CTA and still eight warps per SM. All 40 GPU checks
+and four real-weight chains pass (bit-exact), but complete chains show no
+stable gain. Layer 0 at 7344 tokens is 6.622 / 6.672 / 6.691 ms for control /
+candidate / repeated control; layer 1 is 6.163 / 6.178 / 6.270 ms. The tuner
+still selects the old tactic for the important 40960/32480-route down calls.
+**Reject** the tactic. The source and installed `_C` are restored to the
+qualified implementation; `wide-down-rejected.json` records archive and hash
+checks. Installed rejected SHA256 was
+`7b79c4267de2e9f8f8ec98a669429c27efbd5254e6e3f974c4a6ad6a9bc1dfbc`.
+
+Fresh-process CUDA work-queue counts 8 / 32 / 8 give foreground medians
+1.520 / 1.515 / 1.522 ms during background H2D (idle about 1.37 ms).
+`dma_dispatch.py` uses 12 streams at each priority, 16 x 16 MiB copies, and
+32 queued four-million-float adds. No material benefit appears in this
+screen; **do not promote** a queue-count override. It does not establish that
+every copy size or model dependency pattern behaves identically.
+
+### Contiguous QSA history staging
+
+Hypothesis: mapped-host `_stage_pages` uses SMs while waiting for PCIe;
+a contiguous copy-engine transfer can overlap the main compute stream.
+Existing host-copy versus mapped-gather branches at 1785 FP8 pages give
+5.444 / 3.338 / 5.357 ms for a concurrent four-HC-projection chain. Isolated
+copy time is not faster. About 53 separate copy runs regress to 6.517 ms;
+1785 individual runs regress to 153.915 ms. Admit only one contiguous run.
+
+The candidate adds `stage_host_run` to the existing QSA native component,
+uses CUDA's mapped-host alias and the caller's current stream, and copies
+encoded history and scales exactly. `HostQSAKV` selects it for one run of
+at least 512 KiB. Fragmentation, smaller transfers, actual device history,
+other hardware or an older native artifact preserve the existing gather.
+It retains the same stage owner, capacity and ready/free events, and allocates
+no extra device storage. Native binding is independent of decode admission.
+
+The 47 focused GPU tests pass, covering FP8/FP16, pinned/raw host allocations,
+offsets, invalid ranges/scales, threshold neighbors, fallbacks, prefetch and
+partial-page updates, plus graph replay with changed source bytes/scales.
+Actual-native microbenchmarks confirm one successful DMA call for contiguous
+layouts and zero for fragmented fallbacks. FP8 concurrent-chain medians are
+5.463 / 3.309 / 5.218 ms; FP16 is 8.207 / 6.501 / 8.407 ms. These are synthetic
+single-GPU overlap results, not a model latency claim.
+
+The normal `_sm70_qsa_device_C` CMake component builds and installs SHA256
+`cf09ff3f9624897f66a6590bc4eea8381aba40790c55697c33308ab6e71d6716`
+after whitespace formatting (tested pre-format artifact `fa4dc0e8...`). The
+qualified control's QSA SHA256 remains
+`ed1d3a854e673cec3c646076bbc7d3b3010d5840fa4c17867d1fc445a2e41eac`.
+The candidate is **pending full-model qualification** on owned port 8002:
+matched unprofiled requests, a separate four-worker native/H2D route profile,
+then paired quality if the preliminary median TTFT is below 6.86 s. This
+screen precedes promotion because QSA and cold experts share a copy engine.
+
+Raw local evidence is retained under
+`/tmp/flashnext-prefill-6k-20261014/`; remote task logs are under
+`/home/test/flashnext-256k/codex-prefill-6k-20261014/logs/`.
+Relevant files: `wide-down-*.json`, `dma-dispatch-*.json`,
+`qsa-stage-{64,256}.json`, `qsa-dma-native-micro.json`, and
+`qsa-dma-tests.log`. No shared venv or production source was changed.

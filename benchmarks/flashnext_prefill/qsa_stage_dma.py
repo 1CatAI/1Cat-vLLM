@@ -15,20 +15,43 @@ import statistics
 from pathlib import Path
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 
+class CopyCalls(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.completed = 0
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        result = func(*args, **(kwargs or {}))
+        if str(func) == "vllm_sm70_qsa_device.stage_host_run.default" and result:
+            self.completed += 1
+        return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--pages", type=int, default=1785)
+    parser.add_argument("--native-copy", action="store_true")
+    parser.add_argument(
+        "--layouts",
+        nargs="+",
+        choices=("contiguous", "32_page_runs", "random_pages"),
+        default=["contiguous", "32_page_runs", "random_pages"],
+    )
     args = parser.parse_args()
+    if not 1 <= args.pages <= 4096:
+        parser.error("pages must be between 1 and 4096")
     torch.manual_seed(9683)
     device = torch.device("cuda", 0)
     torch.accelerator.set_device_index(device)
     # Last full chunk's prefix in the matched service trace is 1785 pages.
-    page, blocks, used = 16, 4096, 1785
+    page, blocks, used = 16, 4096, args.pages
     x = torch.randn(7344, 10240, device=device, dtype=torch.float16) * 0.01
     weight = torch.randn(88, 10240, device=device, dtype=torch.float16) * 0.01
     result = torch.empty(7344, 88, device=device, dtype=torch.float16)
@@ -53,8 +76,11 @@ def main():
             rows=8,
             width=2051,
         )
+        native_copy = getattr(state, "_stage_host_run", None)
+        if args.native_copy:
+            assert native_copy is not None, "candidate native helper was not loaded"
         state.host_scales.fill_(0.03125)
-        for layout in ("contiguous", "32_page_runs", "random_pages"):
+        for layout in args.layouts:
             if layout == "contiguous":
                 pages = torch.arange(used, dtype=torch.int32)
             elif layout == "32_page_runs":
@@ -91,8 +117,12 @@ def main():
                     stage()
 
             for mode in ("gather", "dma", "gather_repeat"):
-                state.host = host if mode == "dma" else None
-                actual = stage()
+                state.host = host if mode == "dma" and not args.native_copy else None
+                state._stage_host_run = (
+                    native_copy if mode == "dma" and args.native_copy else None
+                )
+                with CopyCalls() as calls:
+                    actual = stage()
                 torch.accelerator.synchronize()
                 assert torch.equal(actual[0].cpu(), expected)
                 assert torch.equal(actual[1].cpu(), expected_scales)
@@ -112,6 +142,7 @@ def main():
                         samples.append(begin.elapsed_time(end) / 5)
                     row = {
                         "dtype": str(dtype),
+                        "pages": used,
                         "layout": layout,
                         "runs": len(plan[0]),
                         "mode": mode,
@@ -119,6 +150,8 @@ def main():
                         "median_ms": statistics.median(samples),
                         "samples_ms": samples,
                         "exact_bytes_and_scales": True,
+                        "native_copy": args.native_copy,
+                        "native_copy_completions": calls.completed,
                     }
                     report["cases"].append(row)
                     print(json.dumps(row), flush=True)
