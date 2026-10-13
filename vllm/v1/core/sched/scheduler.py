@@ -25,6 +25,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
 )
@@ -297,6 +298,9 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        self.balanced_prefill_chunks = (
+            os.environ.get("VLLM_BALANCED_PREFILL_CHUNKS", "0") == "1"
+        )
         # A Mamba state is materialized only when a scheduler chunk ends on
         # the Mamba group's own block grid. The global cache block size can be
         # much smaller in heterogeneous layouts (Qwen3.8 uses 16-token hashes
@@ -445,6 +449,34 @@ class Scheduler(SchedulerInterface):
             - request.num_output_placeholders,
         )
 
+    def _balanced_prefill_chunk(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """Cap a prefill chunk so the prompt's remaining chunks are equal.
+
+        With VLLM_BALANCED_PREFILL_CHUNKS=1, a prompt needing n chunks of at
+        most `num_new_tokens` is split into n near-equal chunks instead of
+        n - 1 full ones and a short tail. On models whose prefill step has a
+        fixed floor (e.g. streaming host-resident experts over PCIe every
+        step), the short tail step otherwise costs a full step.
+        """
+        if not self.balanced_prefill_chunks or num_new_tokens <= 0:
+            return num_new_tokens
+        remaining = (
+            max(request.num_prompt_tokens, request.num_tokens - 1)
+            - num_computed_tokens
+        )
+        if remaining <= num_new_tokens:
+            return num_new_tokens
+        unit = (
+            self.mamba_state_block_size or self.cache_config.block_size
+            if self.need_mamba_block_aligned_split
+            else self.cache_config.block_size
+        )
+        chunks = cdiv(remaining, num_new_tokens)
+        balanced = cdiv(cdiv(remaining, chunks), unit) * unit
+        return min(num_new_tokens, balanced)
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -476,6 +508,13 @@ class Scheduler(SchedulerInterface):
             last_cache_position = max(last_cache_position - block_size, 0)
 
         end = start + num_new_tokens
+        # The rest of the prompt fits this step and no tail checkpoint is
+        # wanted: do not split it at the last cacheable (replay) boundary.
+        skip_tail = end >= prefill_end and not getattr(
+            self.cache_config, "mamba_tail_checkpoint", True
+        )
+        if skip_tail:
+            last_cache_position = 0
         if end < prefill_end:
             aligned_end = end // block_size * block_size
             # Only take the aligned end when it advances past `start`. Otherwise
@@ -502,9 +541,13 @@ class Scheduler(SchedulerInterface):
         if retention_interval is None:
             retained_boundaries = [(start // block_size + 1) * block_size]
         else:
-            retained_boundaries = list(
-                self.kv_cache_manager.coordinator.get_replay_boundaries(
-                    request, block_size
+            retained_boundaries = (
+                []
+                if skip_tail
+                else list(
+                    self.kv_cache_manager.coordinator.get_replay_boundaries(
+                        request, block_size
+                    )
                 )
             )
             if retention_interval:
@@ -715,6 +758,9 @@ class Scheduler(SchedulerInterface):
             if 0 < long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = long_prefill_token_threshold
             num_new_tokens = min(num_new_tokens, token_budget)
+            num_new_tokens = self._balanced_prefill_chunk(
+                request, request.num_computed_tokens, num_new_tokens
+            )
 
             num_new_tokens = limit_prefill(request.request_id, num_new_tokens)
 
@@ -1050,6 +1096,9 @@ class Scheduler(SchedulerInterface):
 
                     num_new_tokens = min(num_new_tokens, token_budget)
                     assert num_new_tokens > 0
+                    num_new_tokens = self._balanced_prefill_chunk(
+                        request, num_computed_tokens, num_new_tokens
+                    )
                     prefill_remaining[request.request_id] = max(
                         0,
                         max(request.num_prompt_tokens, request.num_tokens - 1)

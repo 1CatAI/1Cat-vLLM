@@ -409,3 +409,42 @@ def test_bounded_state_pool_ignores_block_ids_past_its_pages() -> None:
     torch.testing.assert_close(state[1], torch.zeros_like(state[1]))
     torch.testing.assert_close(state[2], torch.ones_like(state[2]))
     torch.testing.assert_close(guard, torch.ones_like(guard))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_host_backed_layers_are_not_zeroed() -> None:
+    device = torch.device("cuda")
+    spec = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+    )
+    names = ["attn.device", "attn.host"]
+    caches = {
+        name: torch.ones(N_BLOCKS, 16, 1, 8, dtype=torch.float16, device=device)
+        for name in names
+    }
+    group = SimpleNamespace(
+        kv_cache_spec=spec,
+        kv_cache_group_id=0,
+        layer_names=names,
+        backend=_BlockFirstAttentionBackend,
+    )
+    zeroer = KVBlockZeroer(device, pin_memory=False)
+    zeroer.init_meta(
+        [group],
+        kernel_block_sizes=[spec.block_size],
+        cache_dtype="auto",
+        runner_only_attn_layers=set(),
+        static_forward_context={
+            name: SimpleNamespace(kv_cache=cache) for name, cache in caches.items()
+        },
+        host_backed_layers={"attn.host"},
+    )
+    zeroer.zero_block_ids([1])
+    torch.accelerator.synchronize()
+
+    zeroed = caches["attn.device"].flatten(1).eq(0).all(1).tolist()
+    assert zeroed == [False, True, False, False]
+    assert bool(caches["attn.host"].eq(1).all())

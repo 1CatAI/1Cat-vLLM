@@ -226,6 +226,7 @@ class KVBlockZeroer:
         cache_dtype: str,
         runner_only_attn_layers: set[str],
         static_forward_context: dict[str, Any],
+        host_backed_layers: set[str] | None = None,
     ) -> None:
         """One-time precomputation for zero_block_ids.
 
@@ -242,7 +243,13 @@ class KVBlockZeroer:
         they can contribute multiple segments. Mamba/GDN layers expose typed
         state tensor views over one raw page per block; the first state tensor
         starts at the page base, so one segment per layer zeros the whole page.
+
+        Host-backed layers (pinned host history mapped into the device address
+        space) are not zeroed: their readers only touch slots below each
+        request's length, and zeroing them writes every new block across PCIe
+        (~13 ms per 8K-token prefill step on x8 Gen3).
         """
+        host_backed_layers = host_backed_layers or set()
         seen_ptrs: dict[int, int] = {}
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
@@ -265,7 +272,10 @@ class KVBlockZeroer:
                 continue
 
             for layer_name in group.layer_names:
-                if layer_name in runner_only_attn_layers:
+                if (
+                    layer_name in runner_only_attn_layers
+                    or layer_name in host_backed_layers
+                ):
                     continue
                 kv = static_forward_context[layer_name].kv_cache
                 if isinstance(spec, FullAttentionSpec):
@@ -315,6 +325,13 @@ class KVBlockZeroer:
                     # scheduler's block-ID range.
                     add_segment(dp, cur_page_el, first_state.shape[0])
 
+        logger.info(
+            "KV block zeroer: %d segments, %.1f MiB per block (skipped %d "
+            "host-backed layers)",
+            len(seg_addrs),
+            sum(seg_page_sizes) * 4 / 2**20,
+            len(host_backed_layers),
+        )
         if not seg_addrs:
             self._meta = None
             return

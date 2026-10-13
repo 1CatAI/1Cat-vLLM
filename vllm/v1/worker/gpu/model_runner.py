@@ -660,6 +660,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cache_dtype=self.cache_config.cache_dtype,
             runner_only_attn_layers=set(),
             static_forward_context=self.compilation_config.static_forward_context,
+            host_backed_layers={
+                name
+                for tensor in self.kv_cache_config.kv_cache_tensors
+                if tensor.host_backed
+                for name in tensor.shared_by
+            },
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:
