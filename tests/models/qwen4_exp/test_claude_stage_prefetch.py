@@ -7,10 +7,20 @@ from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 
+def page_order(layout, blocks, used):
+    if layout == "contiguous":
+        return torch.arange(used).int()
+    if layout == "few_runs":
+        width = (used + 2) // 3
+        pages = torch.arange(used)
+        return ((pages // width) * (width + 17) + pages % width).int()
+    return torch.randperm(blocks)[:used].int()
+
+
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("new_tokens", [1, 700, 8160])
-@pytest.mark.parametrize("contiguous", [False, True])
-def test_prefetched_prefix_then_rest_equals_full_staging(dtype, new_tokens, contiguous):
+@pytest.mark.parametrize("layout", ["fragmented", "contiguous", "few_runs"])
+def test_prefetched_prefix_then_rest_equals_full_staging(dtype, new_tokens, layout):
     torch.manual_seed(new_tokens)
     dev = torch.device("cuda", 0)
     page, blocks, length = 16, 4096, 16 * 1500 + 9
@@ -22,9 +32,7 @@ def test_prefetched_prefix_then_rest_equals_full_staging(dtype, new_tokens, cont
     )
     used = (length + page - 1) // page
     table = torch.full((1, 2048), -1, dtype=torch.int32)
-    table[0, :used] = (
-        torch.arange(used).int() if contiguous else torch.randperm(blocks)[:used].int()
-    )
+    table[0, :used] = page_order(layout, blocks, used)
     table = table.to(dev)
     pos = torch.arange(length, device=dev)
     slots = table[0, pos // page].long() * page + pos % page
@@ -47,10 +55,8 @@ def test_prefetched_prefix_then_rest_equals_full_staging(dtype, new_tokens, cont
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("new_tokens", [1, 700, 8160])
-@pytest.mark.parametrize("contiguous", [False, True])
-def test_write_staged_equals_copying_back_this_steps_pages(
-    dtype, new_tokens, contiguous
-):
+@pytest.mark.parametrize("layout", ["fragmented", "contiguous", "few_runs"])
+def test_write_staged_equals_copying_back_this_steps_pages(dtype, new_tokens, layout):
     torch.manual_seed(new_tokens + 1)
     dev = torch.device("cuda", 0)
     page, blocks, length = 16, 4096, 16 * 1500 + 9
@@ -62,9 +68,7 @@ def test_write_staged_equals_copying_back_this_steps_pages(
     )
     used = (length + page - 1) // page
     table = torch.full((1, 2048), -1, dtype=torch.int32)
-    table[0, :used] = (
-        torch.arange(used).int() if contiguous else torch.randperm(blocks)[:used].int()
-    )
+    table[0, :used] = page_order(layout, blocks, used)
     table = table.to(dev)
     pos = torch.arange(length, device=dev)
     slots = table[0, pos // page].long() * page + pos % page

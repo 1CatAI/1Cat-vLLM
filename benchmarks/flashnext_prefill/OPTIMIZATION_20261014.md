@@ -701,10 +701,87 @@ The normal `_sm70_qsa_device_C` CMake component builds and installs SHA256
 after whitespace formatting (tested pre-format artifact `fa4dc0e8...`). The
 qualified control's QSA SHA256 remains
 `ed1d3a854e673cec3c646076bbc7d3b3010d5840fa4c17867d1fc445a2e41eac`.
-The candidate is **pending full-model qualification** on owned port 8002:
-matched unprofiled requests, a separate four-worker native/H2D route profile,
-then paired quality if the preliminary median TTFT is below 6.86 s. This
-screen precedes promotion because QSA and cold experts share a copy engine.
+The first full-model screen at source `481cf2b1e4` gives median TTFT
+**6.979 s / 4971 tokens/s**, not an improvement over the qualified control.
+A separate 8667-token profile shows **zero native DMA calls on every worker**, while
+the 136 affine-BLAS calls/worker remain present. Therefore this does not
+measure the proposed DMA path; **do not promote or credit a model speedup**.
+The performance screen fails its admission criterion, so longer quality
+runs are not warranted. Follow-up work records actual stage-plan geometry
+and screens the normal native copy operation on 2/4/8/approximately 53 runs.
+Those measurements must distinguish failed admission from copy contention.
+
+### Bounded-run QSA admission and merged dense projections
+
+A temporary DEBUG probe on the owned server shows native-copy binding present
+on all four workers, but the full-model page plans contain two or three runs.
+One 1785-page plan is `(source, target, count)` = `(1989,0,51)`,
+`(3672,51,459)`, `(4182,510,1275)`. This explains the zero-call result above;
+the copy operation itself was available. Diagnostic logging is removed from
+the candidate after capturing this geometry.
+
+The follow-up clips each run to the actual `[first,last)` transfer before
+counting, and admits at most four active runs with at least 512 KiB total.
+It checks the run count before submitting any copy. More fragmented transfers,
+small copies, device history and unavailable native bindings retain gather.
+The existing constructor still requires D256 and positive page sizes divisible
+by four; these are not new geometry support claims.
+
+`qsa_stage_dma.py --native-copy --native-run-screen 4 --layouts
+serving_three_runs` reproduces the captured layout (with a common source-page
+translation) through the normal native artifact. Concurrent four-HC-projection
+chain medians, gather / DMA / gather repeat, are **5.029 / 3.311 / 5.343 ms**
+for encoded FP8 and **8.410 / 6.379 / 8.178 ms** for FP16. Exactly three native
+copy calls execute and bytes/scales match exactly. A two-run full plan whose
+copied 892-page prefix lies in only one run gives **3.715 / 2.207 / 3.599 ms**
+for FP8 and **4.934 / 3.243 / 5.327 ms** for FP16, with one actual native copy.
+These are overlap microbenchmarks, not serving latency savings.
+
+The earlier fragmented-copy rejection used Python tensor views/copy calls.
+The native 2/4/8/approximately-53-run screen does improve this overlap workload;
+it does not establish that fragmentation inherently defeats native DMA. The
+four-run bound conservatively covers the observed full-model geometry.
+The extended tests cover clipped ranges, 3/4/5-run neighbors and few-run
+prefetch/partial-page updates. The first attempt reports 69 passes and two
+incorrect test assumptions about unsupported constructor geometry; those two
+tests are removed rather than widening runtime support. The clean rerun passes
+all **69** GPU tests on the normal `cf09ff3f...` native artifact.
+
+The qualified short serving trace also exposes merged Q5/Q6 matrices that
+miss the original four-layout BLAS calibration. `dense_blas.py --merged`
+constructs actual rank-zero GDN QKV/gate and QSA Q/K/V groups from real weights,
+including independent GDN Q/K/V TP slices and replicated QSA KV heads.
+All ten M7344/M5347 cases pass the predeclared finite/FP32/paired 0.003 gate;
+paired outputs are bit-exact. Timings include weight dequantization each call:
+
+| Physical projection | M | Fused ms | DQ + BLAS ms | Fused repeat ms |
+|---|---:|---:|---:|---:|
+| GDN4 Q6 QKV + gate, N4096 | 7344 | 2.806 | 1.854 | 2.791 |
+| GDN4 Q6 QKV + gate, N4096 | 5347 | 2.002 | 1.367 | 2.068 |
+| GDN38 Q5 QKV + gate, N4096 | 7344 | 2.942 | 1.772 | 3.055 |
+| GDN38 Q5 QKV + gate, N4096 | 5347 | 2.225 | 1.381 | 2.233 |
+| QSA31 Q6 QKV, N3584 | 7344 | 2.302 | 1.619 | 2.552 |
+| QSA31 Q6 QKV, N3584 | 5347 | 1.779 | 1.192 | 1.766 |
+| QSA19 Q5 QV, N3328 | 7344 | 2.285 | 1.473 | 2.515 |
+| QSA19 Q5 QV, N3328 | 5347 | 1.851 | 1.096 | 1.866 |
+| QSA23 Q5 Q, N3072 | 7344 | 2.296 | 1.380 | 2.310 |
+| QSA23 Q5 Q, N3072 | 5347 | 1.731 | 1.083 | 1.708 |
+
+The candidate adds these five physical layouts at M >= 2048 to the same
+affine provider, without increasing its shared workspace maximum. Threshold
+microbenchmarks, restored-segment execution and affected graph/compiled/mixed
+output-view checks gate the next owned full-model run. Selection and speed
+are still separate from paired task quality; no new serving result is claimed.
+
+`moe_reduce_traffic.py` separately rejects a routed FP32-atomic output
+epilogue traffic screen before a large native build. At 4096 tokens, the
+materialize-plus-unroute control takes 0.814 ms (repeat 0.810), versus
+1.203/2.225 ms for 256/1024-column atomic tiles including zeroing and the
+final FP16 conversion. At 3248 tokens, control is 0.655/0.656 ms versus
+0.863/1.678 ms. Maximum paired row-relative L2 is at most 0.000057, within
+the predeclared 0.001 limit, with finite outputs. Both paths read an identical
+synthetic FP16 GEMM result; this does not predict exact fused-GEMM timing,
+but the proposed output traffic does not justify implementation.
 
 Raw local evidence is retained under
 `/tmp/flashnext-prefill-6k-20261014/`; remote task logs are under

@@ -24,7 +24,17 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 @pytest.mark.parametrize(
     "source,k,n",
-    [(13, 2560, 2560), (14, 2560, 2560), (14, 2560, 1536), (14, 1536, 2560)],
+    [
+        (13, 2560, 2560),
+        (14, 2560, 2560),
+        (14, 2560, 1536),
+        (14, 1536, 2560),
+        (13, 2560, 4096),
+        (14, 2560, 4096),
+        (14, 2560, 3584),
+        (13, 2560, 3328),
+        (13, 2560, 3072),
+    ],
 )
 def test_segment_storage_prefill_and_decode(source, k, n):
     if torch.cuda.get_device_capability() != (7, 0):
@@ -91,17 +101,18 @@ def test_segment_storage_prefill_and_decode(source, k, n):
                 check(graph_out)
 
 
-def test_mixed_segment_output_views_and_unqualified_fallback():
+@pytest.mark.parametrize("segments", [((14, 1536), (12, 128)), ((13, 3328), (14, 256))])
+def test_mixed_segment_output_views_and_unqualified_fallback(segments):
     config = SimpleNamespace(
         kernel_config=KernelConfig(),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     with set_current_vllm_config(config):
-        # A calibrated Q6 projection plus an uncalibrated Q4 projection:
+        # A calibrated projection plus an uncalibrated projection:
         # only one segment uses BLAS, whose native API requires contiguous out.
         sources = [
             (torch.from_numpy(raw_weights(source, n, 2560)).cuda(), source)
-            for source, n in ((14, 1536), (12, 128))
+            for source, n in segments
         ]
         projections = prepare_gguf_projections(sources, torch.float16, True, 8)
         assert all(hasattr(p, "segment_format") for p in projections)

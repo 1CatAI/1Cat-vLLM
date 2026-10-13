@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from dense_blas import CASES
+from dense_blas import weight_cases
 from moe_tiles import artifact_identity, measure, relative_l2
 
 from tools.sm70.native_trace import NativeDispatchTrace
@@ -30,6 +30,8 @@ from vllm.transformers_utils.gguf_tensor_reader import GGUFReader, dequantize
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model")
+    parser.add_argument("--merged", action="store_true")
+    parser.add_argument("--tokens", type=int, nargs="+", default=[7344, 5347])
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     config = SimpleNamespace(
@@ -39,12 +41,17 @@ def main():
     report = {"artifact": artifact_identity(), "cases": []}
     reader = GGUFReader(args.model)
     with set_current_vllm_config(config):
-        for name, axis in CASES[:4]:
-            tensor = next(t for t in reader.tensors if t.name == name)
-            raw = np.asarray(tensor.data)
-            raw = raw[: raw.shape[0] // 4] if axis == 0 else raw[:, : raw.shape[1] // 4]
+        cases = list(weight_cases(reader, args.merged))
+        if not args.merged:
+            cases = cases[:4]
+        for name, source, raw, axis in cases:
+            if axis >= 0:
+                raw = (
+                    raw[: raw.shape[0] // 4]
+                    if axis == 0
+                    else raw[:, : raw.shape[1] // 4]
+                )
             raw = np.ascontiguousarray(raw)
-            source = int(tensor.tensor_type)
             reference_weight = torch.from_numpy(dequantize(raw, source).copy()).cuda()
             projection = prepare_gguf_projections(
                 [(torch.from_numpy(raw).cuda(), source)], torch.float16, True, 8
@@ -56,7 +63,7 @@ def main():
             control[3] = actual[3][:-1] + [0]
             control[5] = []
             k, n = projection.kernel.config.partition_weight_shape
-            for m in (7344, 5347):
+            for m in args.tokens:
                 torch.manual_seed(9683 + m)
                 x = (torch.randn(m, k, device="cuda") * 0.125).half()
 
