@@ -474,8 +474,10 @@ INIT/TUNING logging, so its wall time is not an unprofiled performance result.
 The profiled prefill chunk row counts are 7344, 6528 and 6128; do not assume
 that every request uses the historical 7344/5347 microbenchmark shapes.
 
-GPU0 closes as 6045.9 ms main-stream kernel/copy union, approximately 793 ms submitted
-GPU wait and 75 ms host gap. The 397.9 ms outside the stream span remains
+GPU0 closes as 6053.5 ms main-stream kernel/copy/memset union, approximately
+785.6 ms submitted GPU gaps and 75.1 ms host gap. The initial analysis omitted
+7.6 ms of memsets and therefore counted them as gaps; `nsys_breakdown.py` now
+includes them. The 397.9 ms outside the stream span remains
 an unattributed HTTP/server residual; it is not added to kernel categories.
 Main-stream categories from `nsys_breakdown.py`, in ms:
 
@@ -490,13 +492,35 @@ Main-stream categories from `nsys_breakdown.py`, in ms:
 | Other cuBLAS, including HC down | 589 |
 | GDN | 350 |
 | Elementwise/other, MTP, memcpy, dense helpers | 258 + 66 + 55 + 42 |
+| Memset | 8 |
 
 The HC down cuBLAS kernel alone is 272.2 ms / 500 launches. GPU0 union
-coverage is 87.44% main-stream kernel/copy, 89.88% all kernels, and 97.88%
+coverage is 87.44% main-stream kernel/copy (87.55% including memsets),
+89.88% all kernels, and 97.88%
 all kernels/copies. These are timeline coverage, not SM, Tensor Core or HBM
 utilization counters. NCU counters remain unavailable. Cold-stream H2D is
 13.620 GB/rank over 3.553–3.766 s, about 3.62–3.83 GB/s. It overlaps
 computation and must not be added to the wall-clock table.
+
+`nsys_wait_dependencies.py` further distinguishes recorded event dependencies
+from submitted gaps. It joins event records by process/event/synchronization
+ID, follows their source-stream work and earlier dependencies, and reconstructs
+a lower bound for event readiness. Synchronization activity timestamps are CPU
+API durations and are not used as GPU wait durations. In this trace every
+kernel/copy/memset/event record has a process-matched runtime correlation.
+The directly attributable event stalls total **108.0 ms**: 61.4 ms before the
+first down projection and 46.6 ms before the first gate/up projection, over
+five chunks. Thus the approximately 786 ms gap bucket does not establish an
+equally large opportunity for cold-expert double buffering.
+
+Among queued gaps of 20–100 microseconds, 342.2 ms total overlaps side-stream
+DMA for 331.0 ms. Many larger gaps overlap `_stage_pages`, which gathers QSA
+history directly from mapped host memory (98.5 ms of side-stream kernels).
+Overlap alone is not causation. Two cheap pending screens distinguish these
+hypotheses: `dma_dispatch.py` compares fresh processes with 8/32/8 CUDA work
+queues, and `qsa_stage_dma.py` compares the existing mapped-gather and pinned
+host-copy staging branches, including concurrent HC-shaped computation.
+Neither changes production runtime or establishes a model speedup.
 
 Across ranks, 500 main FP16 all-reduces spend 434.5 ms after the last rank's
 arrival; arrival spread sums to 245.1 ms, with GPU0 arriving last 366 times.
@@ -594,7 +618,30 @@ The effective unchanged residency log is 402/512 experts plus eight spare GPU
 slots, 136 host slots, 9.46 GiB GPU expert slots and 3.14 GiB pinned host per
 rank, matching the historical deployment with configured fraction 0.8.
 
-Draft PR: <https://github.com/1CatAI/1Cat-vLLM/pull/1205>. The first candidate
-passed matched 32K quality and unprofiled performance checks; 6K tokens/s is
-not achieved. Paired 128K/near-256K qualification and the newly identified
-segment-policy fix remain pending. The original deployment is unchanged.
+## Segment-policy full-model result
+
+Runtime source `3faaa58d08`, native `_C` SHA256 `5d389732...`, preserves all
+deployment settings above. With profiling disabled, the same three measured
+prompts take **6.977 / 6.907 / 6.885 s** to first text. Median TTFT is
+**6.907 s / 5010 tokens/s**, versus baseline **7.513 s / 4606 tokens/s**:
+8.1% lower latency, and another 0.192 s below the first candidate. Server
+prefill times are 6.647 / 6.613 / 6.609 s. The five prompt hashes/token counts,
+including two warmups, match the earlier runs. This remains below 6000 tokens/s.
+
+After unprofiled timing, a separate 8667-token Torch profile verifies actual
+execution: each of the four workers records **136 native affine-BLAS calls
+and 136 affine-dequantization CUDA kernels**. Its timing is not credited as
+unprofiled performance. Raw evidence is `service-candidate-final-measure.json`,
+`service-candidate-final-route.json`, `final-route-check.json`, and four
+compressed `final-route` worker traces.
+
+The matching original baseline passes both 131070- and 260089-token quality
+tasks, with identical prompt hashes to the first candidate. It returns the
+expected retrieval/arithmetic JSON, normal EOS and maximum ten-word repetition
+of one; completion lengths are 173 and 152 tokens. These are quality results,
+not matched throughput tests. The segment fix passes 32761 and 131070 tokens
+(166 and 155 output tokens); its near-256K task is still running.
+
+Draft PR: <https://github.com/1CatAI/1Cat-vLLM/pull/1205>. The original deployment
+is unchanged. The uninstalled eight-warp down tactic remains a separate
+experiment and is not part of the measured runtime above.

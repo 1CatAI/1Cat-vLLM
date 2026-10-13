@@ -32,9 +32,14 @@ ms = c.execute(
     "from CUPTI_ACTIVITY_KIND_MEMCPY where deviceId=?",
     (dev,),
 ).fetchall()
+zs = c.execute(
+    "select start,end,streamId,correlationId,-1,0,0,globalPid "
+    "from CUPTI_ACTIVITY_KIND_MEMSET where deviceId=?",
+    (dev,),
+).fetchall()
 st = collections.Counter((r[-1], r[2]) for r in ks)
 main = st.most_common(1)[0][0]
-m = sorted(r for r in ks + ms if (r[-1], r[2]) == main)
+m = sorted(r for r in ks + ms + zs if (r[-1], r[2]) == main)
 phase = "gu"
 
 
@@ -42,6 +47,8 @@ def seg(n, gx, gy):
     global phase
     if n is None:
         return "memcpy"
+    if n == "MEMSET":
+        return "memset"
     if "_sub_bounds" in n or "_sub_fill" in n:
         phase = "dn"
     if "_route_rows" in n:
@@ -134,7 +141,7 @@ wait = collections.defaultdict(float)
 host = 0
 end = m[0][0]
 for s, e, _, cid, nm, gx, gy, pid in m:
-    name = names.get(nm) if nm is not None else None
+    name = "MEMSET" if nm == -1 else names.get(nm) if nm is not None else None
     g = seg(name, gx, gy)
     if s > end:
         submitted = api.get((pid >> 24, cid))
