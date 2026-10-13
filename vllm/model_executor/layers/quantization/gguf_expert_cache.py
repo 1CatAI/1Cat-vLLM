@@ -38,7 +38,9 @@ SHARDS = ("w1", "w3", "w2")
 _ENTRY_HEADER = 8
 _RING_ENTRIES = 1024
 _MAX_OPS = 256
-_COPY_PROGRAMS = (16, 8)
+# Small miss plans need more word splits than operation programs to expose
+# enough independent mapped-host transfers. See the paired TP4 copy screen.
+_COPY_PROGRAMS = (4, 64)
 _LAYER = re.compile(r"layers\.(\d+)\.")
 _MEMLOG = envs.VLLM_EXPERT_CACHE_MEMLOG
 
@@ -582,8 +584,8 @@ class ExpertCache:
             i,
             OPS_PROGRAMS=_COPY_PROGRAMS[0],
             SPLIT=_COPY_PROGRAMS[1],
-            BLOCK=1024,
-            num_warps=8,
+            BLOCK=256,
+            num_warps=4,
         )
         out = torch.empty_like(ids)
         _remap[(1,)](

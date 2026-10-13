@@ -10,6 +10,61 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
+@pytest.mark.parametrize("rows", [1, 5])
+def test_direct_resolve_protected_capacity_fallback_and_changed_graph(dtype, rows):
+    device = torch.device("cuda:0")
+    state = HostQSAKV(
+        9, 256, 256, device, hot_tokens=16, rows=rows, width=2051, dtype=dtype
+    )
+    key = torch.randn(2304, 1, 256, device=device, dtype=torch.float16)
+    value = torch.randn_like(key)
+    state.write(key, value, torch.arange(2304, device=device))
+    torch.accelerator.synchronize()
+    cached = state.host[0, :, :16, 0].transpose(0, 1)
+    if dtype == torch.uint8:
+        cached = cached.view(torch.float8_e4m3fn).float()
+        cached = (cached * state.host_scales[:16, :, None]).half()
+    state.hot_values.copy_(cached)
+    state.tags.view(-1).copy_(torch.arange(4, device=device))
+    state.page_slots[:4] = torch.arange(4, device=device)
+    before = state.hot_values.clone()
+    state.staging.fill_(float("nan"))
+    indices = torch.arange(2051, dtype=torch.int32, device=device).repeat(rows, 1)
+    table = torch.arange(9, dtype=torch.int32, device=device).view(1, -1)
+    requests = torch.zeros(rows, dtype=torch.int32, device=device)
+    positions = torch.full((rows,), 2050, dtype=torch.int64, device=device)
+    lengths = torch.full((1,), 2051, dtype=torch.int32, device=device)
+
+    def run():
+        state.resolve_hot(indices, table, requests, positions, lengths)
+
+    def check():
+        torch.accelerator.synchronize()
+        valid = (indices >= 0) & (indices <= positions[:, None])
+        expected = torch.where(valid, -1, -2)
+        expected = torch.where(valid & (indices < 16), indices, expected)
+        assert torch.equal(state.resolved[:rows], expected)
+        assert torch.equal(state.hot_values, before)
+        assert torch.isnan(state.staging).all()
+        assert not (state.page_slots == -2).any()
+        assert not (state.stamps == -1).any()
+        hits, misses, contended = state.stats.tolist()
+        assert hits > 0 and misses > 0 and contended > 0
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    indices[:, -3:] = torch.tensor([-1, 2047, 2050], device=device)
+    positions.fill_(2047)
+    for _ in range(3):
+        graph.replay()
+        check()
+    state.staging.zero_()
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 def test_shared_physical_page_rewrite_updates_every_logical_alias(dtype):
     device = torch.device("cuda:0")
     state = HostQSAKV(2, 816, 256, device, hot_tokens=64, rows=2, width=4, dtype=dtype)
@@ -82,8 +137,8 @@ def test_host_gather_collisions_rejection_and_graph(rows, page, dtype):
                 indices, table, requests, positions, lengths
             )
         else:
-            actual_k, actual_v = state.staging.unbind(1)
-            remap = state.remapped
+            actual_k, actual_v = state.staging[:rows].unbind(1)
+            remap = state.remapped[:rows]
         torch.accelerator.synchronize()
         cpu_indices = indices.cpu().long()
         valid = (
@@ -240,11 +295,11 @@ def test_host_attention_causal_boundary_and_padding(visible):
         k,
         v,
         remapped,
-        state.table,
-        state.requests,
+        state.table[:5],
+        state.requests[:5],
         output,
-        query_positions=state.positions,
-        sequence_lengths=state.lengths,
+        query_positions=state.positions[:5],
+        sequence_lengths=state.lengths[:5],
     )
     scores = (
         torch.einsum("mhd,mkd->mhk", query.float(), k[:, : len(selected), 0].float())
@@ -255,7 +310,9 @@ def test_host_attention_causal_boundary_and_padding(visible):
     )
     assert torch.isfinite(output).all()
     assert ((output.float() - reference).norm() / reference.norm()).item() < 0.002
-    assert torch.equal(state.lengths, torch.full_like(state.lengths, len(selected)))
+    assert torch.equal(
+        state.lengths[:5], torch.full_like(state.lengths[:5], len(selected))
+    )
 
 
 def test_host_attention_empty_padded_rows():
@@ -276,11 +333,11 @@ def test_host_attention_empty_padded_rows():
         k,
         v,
         remapped,
-        state.table,
-        state.requests,
+        state.table[:5],
+        state.requests[:5],
         output,
-        query_positions=state.positions,
-        sequence_lengths=state.lengths,
+        query_positions=state.positions[:5],
+        sequence_lengths=state.lengths[:5],
     )
     assert torch.isfinite(output).all()
     assert torch.count_nonzero(output).item() == 0
@@ -327,11 +384,11 @@ def test_direct_host_attention_matches_staging_on_misses_and_replay(
             k,
             v,
             remap,
-            state.table,
-            state.requests,
+            state.table[:rows],
+            state.requests[:rows],
             reference,
-            query_positions=state.positions,
-            sequence_lengths=state.lengths,
+            query_positions=state.positions[:rows],
+            sequence_lengths=state.lengths[:rows],
             output_gate=gate,
         )
         host_qsa_attention(

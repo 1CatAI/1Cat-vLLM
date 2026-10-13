@@ -343,11 +343,19 @@ def _gather(
     )
     hot_tokens = tl.reshape(slots[:, None] * 4 + page_lanes[None, :], (16,))
     token_hits = tl.reshape(tl.broadcast_to(hit[:, None], (4, 4)), (16,))
+    token_installs = tl.reshape(tl.broadcast_to(install[:, None], (4, 4)), (16,))
+    # Direct readers consume existing hot values themselves, and read a
+    # failed installation from authoritative history. Resolve only needs
+    # values that it actually writes to a new hot slot or staging.
+    need_cached = token_hits & (STAGE > 0)
+    need_history = valid & ~token_hits
+    if STAGE == 0:
+        need_history &= token_installs
     cached = tl.load(
         Hot
         + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
         + dims[None, None, :],
-        token_hits[:, None, None],
+        need_cached[:, None, None],
         other=0,
     )
     codes = tl.load(
@@ -359,13 +367,13 @@ def _gather(
         )
         * Dim
         + dims[None, None, :],
-        (valid & ~token_hits)[:, None, None],
+        need_history[:, None, None],
         other=0,
     )
     if FP8:
         scales = tl.load(
             Scales + tokens[:, None] * 2 + kv[None, :],
-            (valid & ~token_hits)[:, None],
+            need_history[:, None],
             other=0,
         )
         decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
@@ -374,7 +382,6 @@ def _gather(
     else:
         decoded = codes.to(tl.float16)
     values = tl.where(token_hits[:, None, None], cached, decoded)
-    token_installs = tl.reshape(tl.broadcast_to(install[:, None], (4, 4)), (16,))
     tl.store(
         Hot
         + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
