@@ -1359,6 +1359,10 @@ class Qwen4ExpForCausalLM(
             input_ids, inputs_embeds, intermediate_tensors, kwargs
         )
         if sequence_parallel:
+            logger.info_once(
+                "Using qualified TP4 HC prefill row owners with FP32 partial "
+                "communication; decode keeps its existing GEMM policy."
+            )
             if self._hc_prefill_sequence_model is None:
                 config = copy.copy(self.vllm_config)
                 config.compilation_config = copy.copy(config.compilation_config)
@@ -1398,7 +1402,6 @@ class Qwen4ExpForCausalLM(
             and intermediate_tensors is None
             and kwargs.get("deepstack_input_embeds") is None
             and (inputs_embeds is None or inputs_embeds.dtype == torch.float16)
-            and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
             and not torch.backends.cuda.matmul.allow_fp16_accumulation
             and is_forward_context_available()
             and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE

@@ -313,7 +313,9 @@ def _combine_norm(
             hidden, first, second, injection, weight, eps, normalize
         )
     if partial:
-        source = first if second is None else first.float() + second.float()
+        # Attention can supply one partial, while MoE supplies two. Both
+        # use the qualified FP32 transport before the original FP16 combine.
+        source = first.float() if second is None else first.float() + second.float()
         reduced = group.reduce_scatter(source, dim=0).to(first.dtype)
     else:
         reduced = first.reshape(4, -1, first.shape[-1])[group.rank_in_group]

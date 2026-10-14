@@ -100,6 +100,33 @@ the requested allocator operation; models without a host-QSA consumer do
 not apply it. CPU admission/hash tests pass; GPU graph/cache-pressure and
 matched model/headroom/performance qualification are pending.
 
+## HC prefill admission under MTP
+
+Both allocator384 and512 candidates fail actual prefill while still leaving
+physical bytes free. The cached fallback requests144/160MiB full residual
+temporaries. Inspection finds that the HC row-owner admission additionally
+requires FP16 reduced-precision reductions to be disabled. The established
+MTP decode policy retains them, so requesting HC sequence prefill alone did
+not select the measured low-memory path. The earlier whole-model result is
+not evidence that row ownership executed; its stage tests explicitly set
+the different reduction policy.
+
+The repair preserves the existing process GEMM policy and MTP packed routes.
+HC prefill partials communicate in FP32 for attention's single contribution
+as well as MoE's separate contributions, then retain the existing FP16
+combine/projection interface. Admission may therefore preserve either
+qualified reduction setting; FP16 accumulation and high-level captured
+prefill remain excluded. A route log distinguishes actual execution from
+the requested flag. Other model/shape/topology guards remain in place.
+
+The true-reduction FP16 transport screen fails the original48-step factor
+allowance at8192 rows and is retained as failed. FP32 transport passes the
+unchanged independent-reference and48-step allowances at7344/8192 on all
+four ranks. Model-adapter padding, changed-input capture and compilation
+checks pass4096/4097/7344/7345/8192 with the actual MTP reduction setting.
+CPU admission/owner tests pass43 cases. Whole-model quality, selected route,
+memory and verifier curves remain required before promoting this repair.
+
 ## Rejected screens
 
 Warp-aggregated histograms regress random inputs. Warp-local emission

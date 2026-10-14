@@ -142,6 +142,10 @@ def main():
     )
     parser.add_argument("--tokens", type=int, nargs="+", default=[7344, 8976, 11424])
     parser.add_argument("--drift-steps", type=int, default=0)
+    parser.add_argument("--reduced-precision", action="store_true")
+    parser.add_argument(
+        "--drift-communication", choices=("fp16", "fp32"), default="fp16"
+    )
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     torch.accelerator.set_device_index(rank)
@@ -149,7 +153,9 @@ def main():
     assert dist.get_world_size() == 4
     nccl = PyNcclCommunicator(dist.group.WORLD, rank)
     assert not nccl.disabled
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+        args.reduced_precision
+    )
     report = {"cases": [], "paired_max_row_l2_limit": 0.001}
     passed = True
     try:
@@ -288,7 +294,12 @@ def main():
                         ch, cb, ci = control(
                             hidden=ch, injection=ci, partial=(noise + cb * 0.025).half()
                         )
-                        sh, sb, si = candidate(
+                        drift_candidate = (
+                            fp32_candidate
+                            if args.drift_communication == "fp32"
+                            else candidate
+                        )
+                        sh, sb, si = drift_candidate(
                             hidden=sh, injection=si, partial=(noise + sb * 0.025).half()
                         )
                         rh, rb, ri = fp32_reference(

@@ -194,13 +194,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--peer", action="store_true")
+    parser.add_argument("--reduced-precision", action="store_true")
     parser.add_argument("--tokens", type=int, nargs="+", default=[4096, 7344, 11424])
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     torch.accelerator.set_device_index(rank)
     torch.set_grad_enabled(False)
     dist.init_process_group("gloo")
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = (
+        args.reduced_precision
+    )
     group = Group(rank)
     pp = NS(is_first_rank=True, is_last_rank=True)
     cfg = NS(

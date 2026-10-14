@@ -10,6 +10,69 @@ from vllm.models.qwen4_exp.nvidia import sm70_hc_prefill_peer as peer
 from vllm.runtime_resources import release_runtime_resources, runtime_resources_for
 
 
+@pytest.mark.parametrize("reduced", [False, True])
+@pytest.mark.parametrize(
+    "rows,accepted",
+    [(4095, False), (4096, True), (4097, True), (16384, True), (16385, False)],
+)
+def test_prefill_admission_preserves_mtp_precision_policy(
+    monkeypatch, reduced, rows, accepted
+):
+    from vllm.config import CUDAGraphMode
+    from vllm.models.qwen4_exp.nvidia import model
+
+    monkeypatch.setattr(
+        torch.backends.cuda.matmul, "allow_fp16_reduced_precision_reduction", reduced
+    )
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", False)
+    monkeypatch.setattr(model, "is_forward_context_available", lambda: True)
+    context = NS(cudagraph_runtime_mode=CUDAGraphMode.NONE)
+    monkeypatch.setattr(model, "get_forward_context", lambda: context)
+    owner = NS(_hc_prefill_sequence_qualified=True)
+    inputs = torch.empty(rows, dtype=torch.long)
+    selected = model.Qwen4ExpForCausalLM._use_hc_prefill_sequence_rows(
+        owner, inputs, None, None, {}
+    )
+    assert selected is accepted
+    assert torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction is reduced
+    context.cudagraph_runtime_mode = CUDAGraphMode.FULL
+    assert not model.Qwen4ExpForCausalLM._use_hc_prefill_sequence_rows(
+        owner, inputs, None, None, {}
+    )
+    context.cudagraph_runtime_mode = CUDAGraphMode.NONE
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_fp16_accumulation", True)
+    assert not model.Qwen4ExpForCausalLM._use_hc_prefill_sequence_rows(
+        owner, inputs, None, None, {}
+    )
+
+
+def test_single_attention_partial_uses_fp32_transport(monkeypatch):
+    from vllm import distributed
+    from vllm.models.qwen4_exp.nvidia.ops import hc
+
+    seen = []
+
+    def reduce_scatter(value, dim):
+        seen.append(value)
+        assert value.dtype == torch.float32 and dim == 0
+        return value[:1024]
+
+    monkeypatch.setattr(
+        distributed, "get_tp_group", lambda: NS(reduce_scatter=reduce_scatter)
+    )
+    monkeypatch.setattr(peer, "current_runtime_resources", lambda: {})
+    monkeypatch.setattr(
+        hc, "hc_combine_norm", lambda hidden, payload, *args: (payload, hidden)
+    )
+    payload = torch.arange(4096 * 4).reshape(4096, 4).half()
+    hidden = torch.zeros(1024, 16, dtype=torch.half)
+    actual, _ = peer._combine_norm(
+        hidden, payload, torch.zeros(1024, 4), torch.zeros(16), 1e-6, False, True, True
+    )
+    assert len(seen) == 1 and torch.equal(seen[0], payload.float())
+    assert actual.dtype == payload.dtype and torch.equal(actual, payload[:1024])
+
+
 @pytest.mark.parametrize("separate", [False, True])
 def test_peer_fallback_keeps_unrounded_moe_sum(monkeypatch, separate):
     from vllm import distributed
