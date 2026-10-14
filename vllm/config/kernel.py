@@ -572,6 +572,12 @@ class Sm70GgufConfig:
 
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
+    small_m_dp4a_max_m: int = Field(default=20, ge=1, le=40)
+    """Maximum logical batch; native fragments remain at most 20 rows.
+
+    Values above 20 opt into tiled original-block experts, including small
+    prefill tails. Larger batches retain the existing TurboMind path.
+    """
 
     lut4_expert_dp4a: bool = True
     """Admit canonical IQ4 gate/up integer dots at calibrated expert shapes."""
@@ -830,6 +836,12 @@ class KernelConfig:
     sm70_hcx: bool = False
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""
+    sm70_hcx_batch_max_m: int = Field(default=8, ge=1, le=40)
+    """Maximum HCX batch, executed with the qualified eight-row native tiles.
+
+    Values above 8 opt into tiling; larger batches retain the existing
+    projection and communication fallback. Bound independently on each module.
+    """
 
     sm70_hcx_local_schedule: bool = False
     """Experimentally delay HC up-weight prefetch and distribute gate-mix for
@@ -870,6 +882,18 @@ class KernelConfig:
     M1..20, H6, D256. Speculative draft attention retains its existing path."""
     sm70_qsa_shared_key: bool = True
     """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
+    sm70_qsa_shared_key_batch: bool = False
+    """Reuse that scorer per request for small verification batches.
+
+    Requires ``sm70_qsa_shared_key`` and a valid host query-start layout.
+    Unqualified layouts retain the existing batched scorer. Off by default.
+    """
+    sm70_qsa_indexer_single_rank: bool = False
+    """Select host-backed replicated QSA indices on TP rank zero and broadcast.
+
+    Applies to qualified SM70 FP16 TP4/PP1/CP1 small batches. Each rank still
+    updates its own key caches. Other shapes retain independent selection.
+    """
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
     qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
@@ -907,6 +931,12 @@ class KernelConfig:
 
     Zero retains the shared capacity. A nonzero pool retains active states and
     bounded prefix checkpoints while history IDs use a separate range.
+    """
+    qsa_host_kv_state_compact: bool = False
+    """Give bounded recurrent groups independent, compact device state banks.
+
+    Requires the host-KV layout, PP1 and CP1. Scheduler block IDs remain unique;
+    block tables map each state group to its own physical bank. Off by default.
     """
     qsa_host_kv_active: bool = Field(default=False, init=False)
     """Whether the host QSA cache geometry has been admitted."""
@@ -1081,6 +1111,16 @@ class KernelConfig:
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
+        if not self.sm70_hcx:
+            ignored_factors.add("sm70_hcx_batch_max_m")
+        if not self.sm70_qsa_shared_key:
+            ignored_factors.add("sm70_qsa_shared_key_batch")
+        if (
+            not self.qsa_host_kv
+            or not self.qsa_host_indexer_history
+            or self.qsa_host_kv_device_reference
+        ):
+            ignored_factors.add("sm70_qsa_indexer_single_rank")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:

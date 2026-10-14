@@ -46,7 +46,7 @@ def _worker_run(rank, port, results):
         runtime = get_hcx_runtime(torch.device("cuda", rank))
         assert runtime.enabled, runtime.reason
         runtime.diagnostic = True
-        module.enable_partial_inputs("payload", runtime)
+        module.enable_partial_inputs("payload", runtime, batch_max_m=40)
         module._hcx_moe_payload = True
         final_module = (
             GatedResidual(config, use_combine=False, prefix="final").cuda().half()
@@ -54,11 +54,12 @@ def _worker_run(rank, port, results):
         with torch.no_grad():
             for parameter in final_module.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.02)
-        final_module.enable_partial_inputs("final")
+        final_module.enable_partial_inputs("final", batch_max_m=40)
         final_module._hcx_moe_payload = True
         register_moe_runner(
             "payload",
             SimpleNamespace(
+                _hcx_batch_max_m=40,
                 _maybe_sm70_moe_sum2_allreduce=lambda a, b, n: (
                     tensor_model_parallel_all_reduce_sum2(a, b)
                 ),
@@ -110,7 +111,7 @@ def _worker_run(rank, port, results):
                 ple_layer._PLE_DIAGNOSTIC_BUFFERS["after"], ple_result
             )
             torch.testing.assert_close(ple_scratch, ple_input * 17)
-        for rows in (20, 5):
+        for rows in (5, 8, 9, 10, 20, 30, 40, 41):
             torch.manual_seed(1)
             hidden = (torch.randn(rows, 10240, device="cuda") * 0.5).half()
             injection = torch.randn(rows, 4, device="cuda").half()

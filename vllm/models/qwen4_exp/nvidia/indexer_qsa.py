@@ -15,6 +15,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -130,6 +131,29 @@ class QSAIndexer(nn.Module):
         # while continuing to update the QSA side cache.
         self.skip_topk = False
         self.shared_key_scoring = vllm_config.kernel_config.sm70_qsa_shared_key
+        self.shared_key_batch_scoring = (
+            vllm_config.kernel_config.sm70_qsa_shared_key_batch
+        )
+        self.selection_tp_group = None
+        parallel = vllm_config.parallel_config
+        if (
+            vllm_config.kernel_config.sm70_qsa_indexer_single_rank
+            and vllm_config.kernel_config.qsa_host_kv
+            and vllm_config.kernel_config.qsa_host_kv_active
+            and vllm_config.kernel_config.qsa_host_indexer_history
+            and not vllm_config.kernel_config.qsa_host_kv_device_reference
+            and vllm_config.model_config.dtype == torch.float16
+            and current_platform.is_device_capability(70)
+            and (self.index_n_heads, self.index_kv_heads, self.index_head_dim)
+            == (4, 1, 128)
+            and parallel.tensor_parallel_size == 4
+            and parallel.pipeline_parallel_size == 1
+            and parallel.decode_context_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+        ):
+            from vllm.distributed import get_tp_group
+
+            self.selection_tp_group = get_tp_group()
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -222,7 +246,6 @@ class QSAIndexer(nn.Module):
 
         from .ops.qsa import (
             qsa_compress_groups_with_ratio,
-            qsa_select_paged_tokens,
             qsa_store_cache_rows,
         )
 
@@ -348,7 +371,35 @@ class QSAIndexer(nn.Module):
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out
 
-        # Score compressed keys, select blocks, then expand them to token indices.
+        return self._select_tokens(q, compressed_key_cache, compressed_metadata, out)
+
+    def _select_tokens(
+        self,
+        q: torch.Tensor,
+        compressed_key_cache: torch.Tensor,
+        compressed_metadata: QSAForwardMetadata,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        group = self.selection_tp_group if 0 < q.shape[0] <= 64 else None
+        if out is None:
+            out = torch.empty(
+                q.shape[0], self.output_width, dtype=torch.int32, device=q.device
+            )
+        if group is None or group.rank_in_group == 0:
+            self._select_local_tokens(q, compressed_key_cache, compressed_metadata, out)
+        if group is not None:
+            group.broadcast(out, src=0)
+        return out
+
+    def _select_local_tokens(
+        self,
+        q: torch.Tensor,
+        compressed_key_cache: torch.Tensor,
+        compressed_metadata: QSAForwardMetadata,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        from .ops.qsa import qsa_select_paged_tokens
+
         return qsa_select_paged_tokens(
             q,
             compressed_key_cache,
@@ -361,6 +412,7 @@ class QSAIndexer(nn.Module):
             out,
             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
             shared_key_scoring=self.shared_key_scoring,
+            shared_key_batch_scoring=self.shared_key_batch_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
         )
 

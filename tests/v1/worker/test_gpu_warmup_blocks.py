@@ -93,6 +93,56 @@ def test_kernel_prefill_warmup_runs_default_batch_and_extra_profile(
     assert len(samples) == 4
 
 
+def test_compact_warmup_respects_group_ranges_and_physical_capacity(monkeypatch):
+    from vllm.v1.kv_cache_interface import map_device_state_block_ids
+
+    state = MambaSpec(
+        block_size=4,
+        shapes=((1,),),
+        dtypes=(torch.float16,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=0,
+    )
+    runner = SimpleNamespace(
+        num_speculative_steps=4,
+        scheduler_config=SimpleNamespace(max_num_seqs=2, max_num_batched_tokens=128),
+        max_model_len=64,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=s)
+                for s in (state, _full_attention_spec(), state)
+            ],
+            num_blocks=64,
+            device_state_blocks=4,
+            device_state_group_ids=(0, 2),
+            device_state_group_offsets=(0, 3),
+        ),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=4),
+        model_state=SimpleNamespace(max_encoder_len=0),
+        is_pooling_model=False,
+        is_last_pp_rank=True,
+        model_config=SimpleNamespace(get_vocab_size=lambda: 64),
+        kv_connector=SimpleNamespace(set_disabled=lambda _: None),
+    )
+    outputs: list[Any] = []
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
+    warmup_kernels(runner, outputs.append, lambda _: None)
+    prefill, decode, cleanup = outputs
+    assert len(prefill.scheduled_new_reqs) == 1
+    ids = prefill.scheduled_new_reqs[0].block_ids
+    assert ids == ([1, 2], [7], [4, 5])
+    additions = decode.scheduled_cached_reqs.new_block_ids[0]
+    assert additions == ([3], [], [6])
+    for group, offset in ((0, 0), (2, 3)):
+        assert map_device_state_block_ids(ids[group] + additions[group], offset, 4) == [
+            1,
+            2,
+            3,
+        ]
+    assert cleanup.finished_req_ids
+
+
 def _speculative_config(method: str) -> SpeculativeConfig:
     config = object.__new__(SpeculativeConfig)
     object.__setattr__(config, "method", method)

@@ -81,3 +81,76 @@ def maybe_shared_key_scores(
     )
     logger.info_once("Using SM70 QSA shared-key indexer for M=%d.", q.shape[0])
     return scores, visible
+
+
+def maybe_shared_key_batch_scores(
+    q,
+    cache,
+    table,
+    requests,
+    positions,
+    lengths,
+    compress,
+    columns,
+    divisor,
+    query_start_loc_cpu,
+):
+    """Reuse the single-request provider without changing batched top-k.
+
+    Query starts are the owner's host layout, including capture padding.
+    All device metadata remains live across graph replays. An unqualified
+    group sends the entire batch to the existing scorer.
+    """
+    if (
+        table.shape[0] < 2
+        or not 1 <= q.shape[0] <= 64
+        or query_start_loc_cpu.device.type != "cpu"
+        or query_start_loc_cpu.ndim != 1
+        or query_start_loc_cpu.dtype not in (torch.int32, torch.int64)
+    ):
+        return None
+    starts = query_start_loc_cpu.tolist()
+    if len(starts) != table.shape[0] + 1 or starts[0] != 0 or starts[-1] != q.shape[0]:
+        return None
+    if any(end < start for start, end in zip(starts, starts[1:])):
+        return None
+    groups = [
+        (i, start, end)
+        for i, (start, end) in enumerate(zip(starts, starts[1:]))
+        if end > start
+    ]
+    if not groups or any(not 2 <= end - start <= 8 for _, start, end in groups):
+        return None
+    for i, start, end in groups:
+        if (
+            shared_key_reason(
+                q[start:end],
+                cache,
+                table[i : i + 1],
+                requests[start:end],
+                positions[start:end],
+                lengths[i : i + 1],
+            )
+            is not None
+        ):
+            return None
+    scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
+    visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+    for i, start, end in groups:
+        local_requests = (requests[start:end] - i).contiguous()
+        torch.ops.vllm_sm70_qsa_indexer.run(
+            scores[start:end],
+            visible[start:end],
+            q[start:end],
+            cache,
+            table[i : i + 1],
+            local_requests,
+            positions[start:end],
+            lengths[i : i + 1],
+            float(divisor),
+            compress,
+        )
+    logger.info_once(
+        "Using SM70 shared-key indexer for %d request groups.", len(groups)
+    )
+    return scores, visible

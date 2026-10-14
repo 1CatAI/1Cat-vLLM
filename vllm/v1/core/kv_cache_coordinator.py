@@ -61,6 +61,7 @@ class KVCacheCoordinator(ABC):
             metrics_collector=metrics_collector,
             device_state_blocks=kv_cache_config.device_state_blocks,
             device_state_group_ids=kv_cache_config.device_state_group_ids,
+            device_state_group_offsets=kv_cache_config.device_state_group_offsets,
         )
 
         # KV cache group indices that get the EAGLE last-block drop.

@@ -7,7 +7,7 @@ from unittest import mock
 
 import torch
 
-from vllm import envs
+from vllm.platforms import current_platform
 from vllm.v1.worker.gpu import model_runner as mrv2
 from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
 
@@ -34,6 +34,9 @@ def test_v2_initializes_kv_zeroer_from_all_attention_groups(monkeypatch) -> None
     runner.attn_groups = groups
     runner._kernel_block_sizes = [16, 32]
     runner.cache_config = SimpleNamespace(cache_dtype="auto")
+    runner.kv_cache_config = SimpleNamespace(
+        kv_cache_tensors=[], state_block_id_offsets={}
+    )
     runner.compilation_config = SimpleNamespace(
         static_forward_context=static_forward_context
     )
@@ -50,6 +53,8 @@ def test_v2_initializes_kv_zeroer_from_all_attention_groups(monkeypatch) -> None
         "cache_dtype": "auto",
         "runner_only_attn_layers": set(),
         "static_forward_context": static_forward_context,
+        "host_backed_layers": set(),
+        "state_block_id_offsets": {},
     }
 
 
@@ -122,16 +127,11 @@ def test_v2_warms_qwen38_mtp_moe_prefill_and_decode_shapes(monkeypatch) -> None:
     runner._dummy_run = mock.Mock()
 
     with (
-        mock.patch.object(
-            mrv2.current_platform, "is_device_capability", return_value=True
-        ),
+        mock.patch.object(current_platform, "is_device_capability", return_value=True),
         mock.patch(
-            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
-            "_warmup_sm70_qwen_gdn_causal_conv1d",
-            return_value=False,
+            "vllm.v1.worker.gpu.spec_decode.eagle.speculator.unquantized_moe_policy",
+            return_value=SimpleNamespace(value=lambda name: name == "mtp_tuned"),
         ),
-        mock.patch.object(envs, "VLLM_SM70_AUX_KERNEL_WARMUP", True),
-        mock.patch.object(envs, "VLLM_SM70_MTP_MOE_TUNED_CONFIG", True),
         mock.patch.object(torch.accelerator, "synchronize"),
     ):
         runner._warmup_sm70_aux_kernels()

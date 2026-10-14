@@ -135,38 +135,75 @@ class _PartitionedBlockQueue:
     without growing GPU state tensors to the host-history capacity.
     """
 
-    def __init__(self, blocks, state_blocks, state_group_ids):
+    def __init__(self, blocks, state_blocks, state_group_ids, state_group_offsets=()):
         self.state_blocks = state_blocks
         self.state_group_ids = frozenset(state_group_ids)
-        self.state = FreeKVCacheBlockQueue(blocks[1:state_blocks])
-        self.history = FreeKVCacheBlockQueue(blocks[state_blocks:])
+        if state_group_offsets:
+            if tuple(state_group_offsets) != tuple(
+                i * (state_blocks - 1) for i in range(len(state_group_ids))
+            ):
+                raise ValueError("Compact state groups require consecutive ID ranges")
+            self.states = {
+                group_id: FreeKVCacheBlockQueue(
+                    blocks[offset + 1 : offset + state_blocks]
+                )
+                for group_id, offset in zip(
+                    state_group_ids, state_group_offsets, strict=True
+                )
+            }
+            self.logical_state_blocks = 1 + (state_blocks - 1) * len(state_group_ids)
+        else:
+            state = FreeKVCacheBlockQueue(blocks[1:state_blocks])
+            self.states = dict.fromkeys(state_group_ids, state)
+            self.logical_state_blocks = state_blocks
+        self._state_queues = list(dict.fromkeys(self.states.values()))
+        self._state_group_order = list(self.states)
+        self.history = FreeKVCacheBlockQueue(blocks[self.logical_state_blocks :])
 
     @property
     def num_free_blocks(self):
-        return self.state.num_free_blocks + self.history.num_free_blocks
+        return (
+            sum(q.num_free_blocks for q in self._state_queues)
+            + self.history.num_free_blocks
+        )
 
     def for_group(self, group_id):
         if group_id is None:
             raise ValueError("Partitioned cache allocation requires a group ID")
-        return self.state if group_id in self.state_group_ids else self.history
+        return self.states.get(group_id, self.history)
+
+    def for_block(self, block):
+        if block.block_id >= self.logical_state_blocks:
+            return self.history
+        if len(self._state_queues) == 1:
+            return self._state_queues[0]
+        index = (block.block_id - 1) // (self.state_blocks - 1)
+        return self.states[self._state_group_order[index]]
 
     def popleft_n(self, n, group_id=None):
         return self.for_group(group_id).popleft_n(n)
 
     def remove(self, block):
-        queue = self.state if block.block_id < self.state_blocks else self.history
-        queue.remove(block)
+        self.for_block(block).remove(block)
 
     def append_n(self, blocks):
-        self.state.append_n([b for b in blocks if b.block_id < self.state_blocks])
-        self.history.append_n([b for b in blocks if b.block_id >= self.state_blocks])
+        for queue in [*self._state_queues, self.history]:
+            queue.append_n(
+                [block for block in blocks if self.for_block(block) is queue]
+            )
 
     def prepend_n(self, blocks):
-        self.state.prepend_n([b for b in blocks if b.block_id < self.state_blocks])
-        self.history.prepend_n([b for b in blocks if b.block_id >= self.state_blocks])
+        for queue in [*self._state_queues, self.history]:
+            queue.prepend_n(
+                [block for block in blocks if self.for_block(block) is queue]
+            )
 
     def get_all_free_blocks(self):
-        return self.state.get_all_free_blocks() + self.history.get_all_free_blocks()
+        return [
+            block
+            for q in [*self._state_queues, self.history]
+            for block in q.get_all_free_blocks()
+        ]
 
 
 class BlockPool:
@@ -197,6 +234,7 @@ class BlockPool:
         metrics_collector: KVCacheMetricsCollector | None = None,
         device_state_blocks: int = 0,
         device_state_group_ids: tuple[int, ...] = (),
+        device_state_group_offsets: tuple[int, ...] = (),
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
@@ -227,8 +265,13 @@ class BlockPool:
             if not 1 < device_state_blocks < num_gpu_blocks:
                 raise ValueError("State partition must leave history capacity")
             self.free_block_queue = _PartitionedBlockQueue(
-                self.blocks, device_state_blocks, device_state_group_ids
+                self.blocks,
+                device_state_blocks,
+                device_state_group_ids,
+                device_state_group_offsets,
             )
+            if self.free_block_queue.logical_state_blocks >= num_gpu_blocks:
+                raise ValueError("State partition must leave history capacity")
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
@@ -591,13 +634,12 @@ class BlockPool:
         """Check partition quotas; callers still check aggregate free capacity."""
         if not isinstance(self.free_block_queue, _PartitionedBlockQueue):
             return True
-        state = sum(
-            n for i, n in demand.items() if i in self.free_block_queue.state_group_ids
-        )
-        history = sum(demand.values()) - state
-        return (
-            state <= self.free_block_queue.state.num_free_blocks
-            and history <= self.free_block_queue.history.num_free_blocks
+        queue_demand: dict[FreeKVCacheBlockQueue, int] = {}
+        for group_id, count in demand.items():
+            queue = self.free_block_queue.for_group(group_id)
+            queue_demand[queue] = queue_demand.get(queue, 0) + count
+        return all(
+            count <= queue.num_free_blocks for queue, count in queue_demand.items()
         )
 
     def get_usage(self) -> float:

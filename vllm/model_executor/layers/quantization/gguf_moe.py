@@ -134,6 +134,9 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             config.kernel_config.sm70_gguf.enabled if config is not None else True
         )
         self.small_m_dp4a = bool(config and config.kernel_config.sm70_gguf.small_m_dp4a)
+        self.small_m_dp4a_max_m = (
+            config.kernel_config.sm70_gguf.small_m_dp4a_max_m if config else 20
+        )
         self.lut4_expert_dp4a = bool(
             config and config.kernel_config.sm70_gguf.lut4_expert_dp4a
         )
@@ -337,7 +340,8 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             if self.dp4a_admitted
             else "original_dp4a_shape_or_operator_unavailable",
             "min_m": 1,
-            "max_m": 20,
+            "max_m": self.small_m_dp4a_max_m,
+            "native_max_m": 20,
             "storage": "original",
             "accumulation": "FP32",
         }
@@ -376,25 +380,42 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         w1, w3, w2 = layer.gguf_w1, layer.gguf_w3, layer.gguf_w2
         if (
             self.dp4a_admitted
-            and 1 <= tokens <= 20
+            and 1 <= tokens <= getattr(self, "small_m_dp4a_max_m", 20)
             and layer.expert_map is None
             and topk_weights.dtype == torch.float32
         ):
+            step = 20
             if cache is not None:
-                ids = cache.resolve(self.cache_layer, ids)
-            return torch.ops.vllm.gguf_original_expert_dp4a(
-                x.contiguous(),
-                ids,
-                topk_weights.contiguous(),
-                w1,
-                w3,
-                w2,
-                self.weight_types["w1"],
-                self.weight_types["w2"],
-                self.input_padding.get("w2", (0, 0))[0],
-                self.q8_intermediate,
-                self.weight_types["w1"] == 21,
-            )
+                capacity = min(cache.resident0, cache.ring.shape[1] - 8)
+                step = min(step, capacity // top_k)
+                if step < 1:
+                    raise ValueError("Expert cache cannot hold one routed token")
+            output = torch.empty_like(x) if tokens > step else None
+            for start in range(0, tokens, step):
+                stop = min(start + step, tokens)
+                fragment_ids = ids[start:stop].contiguous()
+                if cache is not None:
+                    # Finish each fragment before resolving the next one, which
+                    # may evict its slots. The existing model stream owns both.
+                    fragment_ids = cache.resolve(self.cache_layer, fragment_ids)
+                fragment = torch.ops.vllm.gguf_original_expert_dp4a(
+                    x.contiguous() if output is None else x[start:stop].contiguous(),
+                    fragment_ids,
+                    topk_weights[start:stop].contiguous(),
+                    w1,
+                    w3,
+                    w2,
+                    self.weight_types["w1"],
+                    self.weight_types["w2"],
+                    self.input_padding.get("w2", (0, 0))[0],
+                    self.q8_intermediate,
+                    self.weight_types["w1"] == 21,
+                )
+                if output is None:
+                    return fragment
+                output[start:stop].copy_(fragment)
+            assert output is not None
+            return output
         if cache is not None and cache.tm is not None:
             return cache.prefill_moe(
                 self.cache_layer, x.contiguous(), ids, topk_weights

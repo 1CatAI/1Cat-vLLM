@@ -158,6 +158,7 @@ def _zero_kv_blocks_kernel(
     seg_block_strides_ptr,
     seg_page_sizes_ptr,
     seg_num_blocks_ptr,
+    seg_block_id_offsets_ptr,
     block_ids_ptr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -189,7 +190,13 @@ def _zero_kv_blocks_kernel(
     chunk_offset = chunk_index.to(tl.int64) * BLOCK_SIZE
     if chunk_offset >= page_size_el:
         return
-    block_id = tl.load(block_ids_ptr + block_index)
+    logical_id = tl.load(block_ids_ptr + block_index)
+    offset = 0
+    if seg_block_id_offsets_ptr is not None:
+        offset = tl.load(seg_block_id_offsets_ptr + seg_index)
+    block_id = tl.where(logical_id == 0, 0, logical_id - offset)
+    if logical_id != 0 and block_id <= 0:
+        return
     if block_id < 0 or block_id >= tl.load(seg_num_blocks_ptr + seg_index):
         return
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
@@ -215,6 +222,7 @@ class KVBlockZeroer:
     def __init__(self, device: torch.device, pin_memory: bool):
         self.device = device
         self.pin_memory = pin_memory
+        self._segment_block_id_offsets: torch.Tensor | None = None
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]
             | None
@@ -228,6 +236,7 @@ class KVBlockZeroer:
         runner_only_attn_layers: set[str],
         static_forward_context: dict[str, Any],
         host_backed_layers: set[str] | None = None,
+        state_block_id_offsets: dict[int, int] | None = None,
     ) -> None:
         """One-time precomputation for zero_block_ids.
 
@@ -251,14 +260,20 @@ class KVBlockZeroer:
         (~13 ms per 8K-token prefill step on x8 Gen3).
         """
         host_backed_layers = host_backed_layers or set()
+        state_block_id_offsets = state_block_id_offsets or {}
         seen_ptrs: dict[int, int] = {}
         seg_addrs: list[int] = []
         seg_page_sizes: list[int] = []
         # Logical blocks each segment's tensor actually holds.
         seg_num_blocks: list[int] = []
+        seg_block_id_offsets: list[int] = []
 
-        def add_segment(address: int, page_size_el: int, num_blocks: int) -> None:
+        def add_segment(
+            address: int, page_size_el: int, num_blocks: int, block_id_offset: int
+        ) -> None:
             if (index := seen_ptrs.get(address)) is not None:
+                if seg_block_id_offsets[index] != block_id_offset:
+                    raise ValueError("Independent state groups must not alias storage")
                 seg_page_sizes[index] = max(seg_page_sizes[index], page_size_el)
                 seg_num_blocks[index] = min(seg_num_blocks[index], num_blocks)
                 return
@@ -266,8 +281,10 @@ class KVBlockZeroer:
             seg_addrs.append(address)
             seg_page_sizes.append(page_size_el)
             seg_num_blocks.append(num_blocks)
+            seg_block_id_offsets.append(block_id_offset)
 
         for group in attn_groups_iter:
+            block_id_offset = state_block_id_offsets.get(group.kv_cache_group_id, 0)
             spec = group.kv_cache_spec
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
@@ -310,7 +327,9 @@ class KVBlockZeroer:
                     num_blocks = kv.shape[block_dim] // ratio
                     for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                         off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                        add_segment(dp + off_bytes, cur_page_el, num_blocks)
+                        add_segment(
+                            dp + off_bytes, cur_page_el, num_blocks, block_id_offset
+                        )
                 elif isinstance(spec, MambaSpec):
                     if not isinstance(kv, (list, tuple)) or not kv:
                         continue
@@ -324,7 +343,7 @@ class KVBlockZeroer:
                     cur_page_el = page_bytes // 4
                     # A bounded state pool exposes fewer pages than the
                     # scheduler's block-ID range.
-                    add_segment(dp, cur_page_el, first_state.shape[0])
+                    add_segment(dp, cur_page_el, first_state.shape[0], block_id_offset)
 
         logger.info(
             "KV block zeroer: %d segments, %.1f MiB per block (skipped %d "
@@ -361,6 +380,11 @@ class KVBlockZeroer:
             block_strides,
             dtype=torch.int64,
             device=self.device,
+        )
+        self._segment_block_id_offsets = (
+            torch.tensor(seg_block_id_offsets, dtype=torch.int64, device=self.device)
+            if any(seg_block_id_offsets)
+            else None
         )
 
         self._meta = (
@@ -404,6 +428,7 @@ class KVBlockZeroer:
             seg_block_strides,
             seg_page_sizes,
             seg_num_blocks,
+            self._segment_block_id_offsets,
             idx,
             BLOCK_SIZE=blk_size,
         )

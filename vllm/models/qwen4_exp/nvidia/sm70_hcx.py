@@ -47,10 +47,11 @@ def _output_projection(x: torch.Tensor, name: str) -> torch.Tensor:
     # Resolve actual M inside the opaque op, rather than freezing a decode
     # choice while compiling a range that also includes C4 and prefill.
     layer, defer = _OUTPUT_PROJECTIONS[name]
-    if 0 < x.shape[0] <= HCX_MAX_M and defer:
+    maximum = getattr(layer, "_hcx_batch_max_m", HCX_MAX_M)
+    if 0 < x.shape[0] <= maximum and defer:
         return torch.nn.functional.pad(x, (0, layer.output_size - x.shape[1]))
     projected, _ = layer(x)
-    if x.shape[0] > HCX_MAX_M:
+    if x.shape[0] > maximum:
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         projected = tensor_model_parallel_all_reduce(projected)
@@ -66,14 +67,15 @@ def _moe_output(
     shared: torch.Tensor | None, fused: torch.Tensor, name: str, trunc_size: int
 ) -> torch.Tensor:
     rows = fused.shape[0]
-    if 0 < rows <= HCX_MAX_M:
+    runner = _MOE_RUNNERS[name]
+    maximum = getattr(runner, "_hcx_batch_max_m", HCX_MAX_M)
+    if 0 < rows <= maximum:
         # An owned payload makes both contributions explicit to the compiler
         # and graph allocator. Hidden references to producer temporaries are
         # unsafe: the memory planner cannot see those additional consumers.
         first = fused[..., :trunc_size]
         second = torch.zeros_like(first) if shared is None else shared[..., :trunc_size]
         return torch.cat((first, second), dim=0)
-    runner = _MOE_RUNNERS[name]
     reduced = runner._maybe_sm70_moe_sum2_allreduce(shared, fused, trunc_size)
     if reduced is None:
         summed = fused if shared is None else shared + fused
@@ -324,6 +326,7 @@ class Sm70HcxRuntime:
         oproj=None,
         secondary=None,
         snapshot_name=None,
+        batch_max_m=HCX_MAX_M,
     ):
         m = partial.shape[0]
         ox = ocodes = ohigh = oscale = None
@@ -350,40 +353,45 @@ class Sm70HcxRuntime:
             if "epoch" not in snapshot:
                 snapshot["epoch"] = torch.empty_like(self.seq)
             snapshot["epoch"].copy_(self.seq)
-        torch.ops._C.sm70_hcx_out(
-            partial if ox is not None else partial.contiguous(),
-            secondary,
-            hidden.contiguous(),
-            injection.contiguous(),
-            norm_weight,
-            eps,
-            packed_down,
-            packed_up,
-            hidden_out,
-            block,
-            injection_out,
-            self.xn,
-            self.sq,
-            self.dpart,
-            self.bar,
-            self.seq,
-            self.ar,
-            self.lora,
-            self.hb,
-            self.logical_rank,
-            None,
-            int(self.full),
-            ox,
-            ocodes,
-            ohigh,
-            oscale,
-            ofmt,
-            None,
-            None,
-            1e-6,
-            None,
-            self.local_schedule,
-        )
+        if not 0 < m <= batch_max_m:
+            raise ValueError("HCX batch exceeds its initialized policy")
+        for start in range(0, m, HCX_MAX_M):
+            stop = min(start + HCX_MAX_M, m)
+            tile = slice(start, stop)
+            torch.ops._C.sm70_hcx_out(
+                partial[tile] if ox is not None else partial[tile].contiguous(),
+                secondary[tile] if secondary is not None else None,
+                hidden[tile].contiguous(),
+                injection[tile].contiguous(),
+                norm_weight,
+                eps,
+                packed_down,
+                packed_up,
+                hidden_out[tile],
+                block[tile],
+                injection_out[tile],
+                self.xn,
+                self.sq,
+                self.dpart,
+                self.bar,
+                self.seq,
+                self.ar,
+                self.lora,
+                self.hb,
+                self.logical_rank,
+                None,
+                int(self.full),
+                ox[tile] if ox is not None else None,
+                ocodes,
+                ohigh,
+                oscale,
+                ofmt,
+                None,
+                None,
+                1e-6,
+                None,
+                self.local_schedule,
+            )
         if snapshot is not None:
             for key, value in (
                 ("hidden_out", hidden_out),

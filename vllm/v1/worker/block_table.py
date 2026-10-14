@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import map_device_state_block_ids
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
@@ -64,6 +65,8 @@ class BlockTable:
                 Will be the same as `block_size` if `block_size` is supported
                 by the attention kernel.
         """
+        self.state_block_id_offset: int | None = None
+        self.device_state_blocks = 0
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.pin_memory = pin_memory
@@ -141,6 +144,10 @@ class BlockTable:
     ) -> None:
         if not block_ids:
             return
+        if self.state_block_id_offset is not None:
+            block_ids = map_device_state_block_ids(
+                block_ids, self.state_block_id_offset, self.device_state_blocks
+            )
 
         if self.use_hybrid_blocks:
             block_ids = self.map_to_kernel_blocks(
@@ -447,6 +454,14 @@ class MultiGroupBlockTable:
                 block_sizes, kernel_block_sizes, max_num_blocks, dcp_sharded
             )
         ]
+
+    def set_device_state_mapping(self, offsets: dict[int, int], capacity: int) -> None:
+        """Bind the cache layout before any request writes its block tables."""
+        for i, table in enumerate(self.block_tables):
+            if table.num_blocks_per_row.any():
+                raise ValueError("Cannot replace a live state block-table mapping")
+            table.state_block_id_offset = offsets.get(i)
+            table.device_state_blocks = capacity
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):

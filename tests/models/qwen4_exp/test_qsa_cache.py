@@ -266,20 +266,27 @@ def test_qsa_e4m3_forward_cannot_bypass_scale_finalization() -> None:
         )
 
 
-@pytest.mark.parametrize("active", [0, 3, 5])
-def test_host_qsa_only_initializes_graph_padding(active: int) -> None:
+@pytest.mark.parametrize(
+    "active,padded", [(0, 5), (3, 5), (5, 5), (7, 10), (33, 40), (40, 40)]
+)
+def test_host_qsa_only_initializes_graph_padding(active: int, padded: int) -> None:
     impl = object.__new__(Qwen4ExpQSAFlashAttentionImpl)
     impl.alibi_slopes = None
     impl.sinks = None
     impl.sliding_window = (-1, -1)
-    query = torch.ones(5, 2, 8, dtype=torch.float16)
+    query = torch.ones(padded, 2, 8, dtype=torch.float16)
+    gate = torch.ones(padded, 16, dtype=torch.float16)
     output = torch.full_like(query, float("nan"))
     calls = []
 
-    def host_forward(q, indices, table, requests, positions, lengths, out, gate):
+    def host_forward(
+        q, indices, table, requests, positions, lengths, out, gate, metadata
+    ):
         # The producer owns the active output. It must not depend on a fill.
         assert torch.isnan(out).all()
         assert out.shape[0] == active
+        assert gate.view_as(q).shape[0] == active
+        assert metadata.num_actual_tokens == active
         out.copy_(q * 2)
         calls.append(active)
 
@@ -287,7 +294,7 @@ def test_host_qsa_only_initializes_graph_padding(active: int) -> None:
         SimpleNamespace(
             host_kv_enabled=True,
             host_kv_forward=host_forward,
-            topk_indices_buffer=torch.zeros(5, 4, dtype=torch.int32),
+            topk_indices_buffer=torch.zeros(padded, 4, dtype=torch.int32),
         ),
         query,
         query[:, :1],
@@ -295,9 +302,10 @@ def test_host_qsa_only_initializes_graph_padding(active: int) -> None:
         torch.empty(0),
         SimpleNamespace(num_actual_tokens=active, block_table=torch.zeros(1, 1)),
         output,
-        torch.zeros(5, dtype=torch.int32),
-        query_positions=torch.arange(5),
-        sequence_lengths=torch.tensor([5]),
+        torch.zeros(padded, dtype=torch.int32),
+        query_positions=torch.arange(padded),
+        sequence_lengths=torch.tensor([padded]),
+        output_gate=gate,
     )
     assert result is output
     assert torch.equal(output[:active], query[:active] * 2)

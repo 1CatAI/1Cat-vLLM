@@ -390,7 +390,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 query_positions[:num_tokens],
                 sequence_lengths,
                 output[:num_tokens],
-                output_gate,
+                output_gate[:num_tokens] if output_gate is not None else None,
                 attn_metadata,
             )
             return output
@@ -729,6 +729,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # Cache binding runs under the target worker's config, also for draft
         # layers. Retain each owner's policy from model construction.
         self.host_kv_is_draft = vllm_config.is_speculative_draft
+        speculative_config = vllm_config.speculative_config
+        self.host_kv_decode_query_len = 1 + (
+            (speculative_config.num_speculative_tokens or 0)
+            if speculative_config is not None
+            else 0
+        )
         if self.host_kv_is_draft:
             self.host_kv_hot_tokens = (
                 vllm_config.kernel_config.qsa_host_kv_draft_hot_tokens
@@ -955,6 +961,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if (
             self.host_kv_prefill_stage_tokens
             and query.shape[0] > state.resolve_rows
+            # A verifier batch can exceed resolve_rows while every request
+            # still has only its decode query. Staging plans read metadata on
+            # the CPU and cannot be captured or reused for those requests.
+            and (
+                metadata is None
+                or metadata.max_query_len > self.host_kv_decode_query_len
+            )
             and query.shape[1:] == (6, 256)
             and indices.shape[1] <= state.width
         ):
