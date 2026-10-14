@@ -30,21 +30,31 @@ from vllm.transformers_utils.gguf_tensor_reader import GGUFReader, dequantize
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model")
-    parser.add_argument("--merged", action="store_true")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--merged", action="store_true")
+    group.add_argument("--remaining-affine", action="store_true")
     parser.add_argument("--tokens", type=int, nargs="+", default=[7344, 5347])
+    parser.add_argument("--select", nargs="+", help="Physical projection names to test")
+    parser.add_argument(
+        "--force-minimum",
+        type=int,
+        help="Benchmark-only candidate bands; does not establish runtime admission",
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     config = SimpleNamespace(
         kernel_config=KernelConfig(),
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
-    report = {"artifact": artifact_identity(), "cases": []}
+    report = {"artifact": artifact_identity(), "cases": [], "unqualified": []}
     reader = GGUFReader(args.model)
     with set_current_vllm_config(config):
-        cases = list(weight_cases(reader, args.merged))
-        if not args.merged:
+        cases = list(weight_cases(reader, args.merged, args.remaining_affine))
+        if not args.merged and not args.remaining_affine:
             cases = cases[:4]
         for name, source, raw, axis in cases:
+            if args.select and name not in args.select:
+                continue
             if axis >= 0:
                 raw = (
                     raw[: raw.shape[0] // 4]
@@ -58,7 +68,19 @@ def main():
             )[0]
             assert hasattr(projection, "segment_format")
             actual = prepared_projection_arguments([projection])
-            assert actual[3][0] == 3 and actual[5] == [2048, -1]
+            runtime_bands = actual[5]
+            if args.force_minimum is not None:
+                actual = list(actual)
+                actual[3] = actual[3][:-1] + [2]
+                actual[5] = [args.force_minimum, -1]
+            if not actual[5]:
+                report["unqualified"].append(name)
+                print(json.dumps({"tensor": name, "admitted": False}), flush=True)
+                args.output.write_text(json.dumps(report, indent=2) + "\n")
+                continue
+            minimum = args.force_minimum or (4096 if name == "qsa23_q" else 2048)
+            assert actual[3][0] == 3 and actual[5] == [minimum, -1]
+            assert min(args.tokens) >= minimum, "restored BLAS timing needs admitted M"
             control = list(actual)
             control[3] = actual[3][:-1] + [0]
             control[5] = []
@@ -93,6 +115,8 @@ def main():
                     "tensor": name,
                     "source_type": source,
                     "shape_mnk": [m, n, k],
+                    "runtime_blas_bands": runtime_bands,
+                    "benchmark_blas_bands": actual[5],
                     "restore_fused": measure(fused, 5),
                     "restore_blas": measure(blas, 5),
                     "restore_fused_repeat": measure(fused, 5),
@@ -103,7 +127,9 @@ def main():
                 report["cases"].append(row)
                 print(json.dumps(row), flush=True)
                 args.output.write_text(json.dumps(report, indent=2) + "\n")
-    raise SystemExit(0 if all(r["passed"] for r in report["cases"]) else 1)
+    raise SystemExit(
+        0 if report["cases"] and all(r["passed"] for r in report["cases"]) else 1
+    )
 
 
 if __name__ == "__main__":

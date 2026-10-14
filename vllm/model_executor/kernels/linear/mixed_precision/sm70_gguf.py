@@ -53,9 +53,8 @@ _AFFINE_BLAS_MIN_M = {
     # Same-codec GDN QKV/gate and QSA Q/K/V segments after TP4 merging.
     (5, 32, 2560, 4096): 2048,
     (6, 16, 2560, 4096): 2048,
-    (6, 16, 2560, 3584): 2048,
     (5, 32, 2560, 3328): 2048,
-    (5, 32, 2560, 3072): 2048,
+    (5, 32, 2560, 3072): 4096,
 }
 _AFFINE_BLAS_WORKSPACE_ELEMENTS = max(k * n for _, _, k, n in _AFFINE_BLAS_MIN_M)
 _affine_blas_workspaces: weakref.WeakValueDictionary = weakref.WeakValueDictionary()

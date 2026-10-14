@@ -767,11 +767,59 @@ paired outputs are bit-exact. Timings include weight dequantization each call:
 | QSA23 Q5 Q, N3072 | 7344 | 2.296 | 1.380 | 2.310 |
 | QSA23 Q5 Q, N3072 | 5347 | 1.731 | 1.083 | 1.708 |
 
-The candidate adds these five physical layouts at M >= 2048 to the same
-affine provider, without increasing its shared workspace maximum. Threshold
-microbenchmarks, restored-segment execution and affected graph/compiled/mixed
-output-view checks gate the next owned full-model run. Selection and speed
-are still separate from paired task quality; no new serving result is claimed.
+The restored-segment screen rejects two initial M2048 admissions: QSA31 Q6
+gives only 4.3% improvement and QSA23 Q5 about 1%, below the predeclared 5%
+margin. Follow-up QSA31 at M6144 is 2.067 / 2.064 / 2.108 ms, so its calibration
+is removed entirely. QSA23 passes at M4096 (1.298 / 0.882 / 1.291 ms) and
+M6144 (1.996 / 1.794 / 1.994 ms); its minimum is raised to 4096 tokens.
+The two GDN layouts and QSA19 retain M >= 2048. There are thus eight new
+Flash-Next layouts in total, including the original four, with no increase in
+the shared workspace maximum. The original eleven segment tests pass; two
+follow-up threshold tests cover M4095/4096/4097/8193, eager/compiled execution,
+changed-input graph replay, native route hits and small-M decode. Removing
+QSA31 leaves ten cases in the current affected test file.
+
+The combined bounded-run QSA and corrected dense candidate gives **6.889 s /
+5023 tokens/s** on the five matched cold-prefix requests at chunk size 8192.
+Its three measured TTFTs are 6.905 / 6.889 / 6.857 s. The independent short
+profile proves selection on all four workers: 26 native staging calls, 50
+linked H2D copies (35,564,544 bytes), and 156 affine-BLAS calls per worker.
+Despite these route hits, it fails the predeclared 6.86 s serving gate against
+the qualified 6.907 s runtime. **Do not claim a new serving improvement or
+run expensive long-context quality on this result.** The owned service exits
+normally. The earlier 6.907 s result remains the fully qualified result.
+
+### Chunk size and autotuner coverage
+
+The 34,688-token trace has five main prefill chunks: 7344, 7344, 7344, 6528
+and 6128 tokens. A first larger-M MoE screen that still tunes at 8192 is not
+a valid test of a correctly initialized larger-chunk service. At M8976, the
+layer-zero gate/up takes 10.581 ms and the complete chain 14.155 ms under 8K
+tuning. Fresh-process tuning at 9216 reduces these to 3.688 / 7.536 ms;
+repeating 8K tuning restores 10.611 / 14.251 ms. All checks against the
+predeclared FP32 numerical bound pass. Four real expert formats at M8976
+give complete chains of 7.536 / 7.503 / 7.753 / 7.476 ms with 9216 tuning;
+at M7344 they give 6.560 / 6.275 / 6.645 / 6.449 ms.
+
+The existing runtime tuner already takes its first actual prefill row count
+into account. No tuning-policy source change is justified by this finding.
+The next service experiment uses a separate cache and chunk size 9216; all
+other startup settings, including 256K capacity, expert residency, MTP4,
+prefix caching and FULL graphs, remain fixed. Actual chunk shapes, native
+execution, unprofiled TTFT and task quality must establish its result.
+
+Six remaining affine shapes pass a direct DQ-plus-BLAS screen, but they are
+not added to runtime calibration. A benchmark-only forced-band option in
+`dense_segments.py` allows the serving restoration cost to be tested before
+admission and records both runtime and forced bands separately.
+
+`qsa_fp16_tiles.py` tests the existing FP16 tile-loop parameter on real main
+QSA selections, decoding saved FP8 history to FP16. Tiles 1 / 2 / 4 / 8 / 1
+take 25.140 / 23.688 / 24.788 / 25.019 / 25.137 ms. Finite, paired and
+independent FP32 row checks pass the predeclared relative-L2 0.003 limit.
+This is not a draft-model quality qualification; the best 6% kernel gain
+would contribute less than approximately 10 ms at the measured model's
+draft attention share. No runtime tile default is changed.
 
 `moe_reduce_traffic.py` separately rejects a routed FP32-atomic output
 epilogue traffic screen before a large native build. At 4096 tokens, the
