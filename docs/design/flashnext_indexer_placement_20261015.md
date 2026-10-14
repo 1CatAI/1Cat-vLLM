@@ -320,3 +320,45 @@ The initial fixture allocated scratch before capture, which itself already
 cleared the cache; that failed memory-drop assertion is retained and corrected
 to reproduce post-capture auxiliary warmup. Whole-model memory headroom,
 unprofiled performance and fresh-process public serving remain pending.
+
+## Exact decode Top-K partition candidate
+
+The Top-K node is the leading long-context growth hypothesis. Warp-aggregated
+histogram atomics fail the rejection screen because random/tied cases regress.
+A warp-local final emission screen preserves all90exact cases but releases
+only about10% of kernel cost, insufficient to justify a native rebuild. Both
+remain rejected research artifacts; qualified native sources/artifacts are
+restored, and no private kernel DSO is a runtime dependency.
+
+The new opt-in `sm70_sparse.qsa_decode_partition_topk` instead composes the
+existing exact selector over8192-column FP32 partitions, then selects the
+global Top512 from their union. A globally selected item must be in its local
+Top512. Local and merged selections retain lower-index ties and increasing
+index order; gathering candidates in partition/index order preserves the
+original global tie and accumulation order. The contiguous causal prefix
+produces a contiguous candidate prefix, including a short tail. No score
+precision, index validity or state/rollback semantics change.
+
+Admission is SM70, single-request M5/M10, tokenTop2048/compression4 through
+the existing exact selector and32768..69632physical compressed-score columns.
+These are capacity-column units, not input-token limits. Other batches,
+devices, widths and prefill rows retain the existing selector. The policy
+defaults to false, is serialized normally and contributes to the consuming
+QSA engine hash only when active. Both native stages are shipped normal
+package operations; three source Triton layout kernels prepare/gather/remap.
+
+Destination28cases pass, including5/10rows,32768/65600/69632capacities,
+strided input, guarded caller output, changed-input/length graph replay,
+negative/empty/511/512/513/8191/8192/8193 live-length neighbors, narrow scores,
+ties, signed zero, infinities, an independent stable-sort oracle and existing
+selector regressions. Configuration transfer and qualified/unused hash checks
+pass. The first hash fixture named a nonexistent policy field; its corrected
+fixture does not change runtime behavior or relax a gate.
+
+The8192-tile prototype at65536live columns measures0.0704/0.0831/0.0881/
+0.1063ms versus0.1099/0.2602/0.2370/0.2955ms for random/narrow/tied/zero rows,
+with exact outputs. At8192live columns it is slightly slower, so whole-model
+short/long verifier distributions remain required. A unique64-bit key final
+merge using Torch Top-K is slower and rejected. The combined model candidate
+retains HC/PLE/TP-row acceleration and enables startup cache trimming;
+task quality, physical/live headroom and all-context16ms acceptance are pending.

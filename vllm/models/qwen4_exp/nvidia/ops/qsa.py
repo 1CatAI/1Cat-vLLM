@@ -1757,7 +1757,17 @@ def qsa_select_paged_tokens(
                 "Using exact SM70 QSA lexicographic top-k "
                 "(score descending, block index ascending)."
             )
-            if sparse_policy().value("qsa_mtp_topk") and blocks.shape[0] in (5, 10):
+            if (
+                sparse_policy().qsa_decode_partition_topk
+                and q.shape[0] in (5, 10)
+                and page_table.shape[0] == 1
+                and 32768 <= score_columns <= 69632
+            ):
+                from .qsa_partition_topk import qsa_partition_topk
+
+                qsa_partition_topk(logits, visible_blocks, blocks)
+                logger.info_once("Using exact SM70 QSA partitioned decode Top-K.")
+            elif sparse_policy().value("qsa_mtp_topk") and blocks.shape[0] in (5, 10):
                 torch.ops._C.qsa_lexicographic_topk(
                     logits, visible_blocks, blocks, block_topk, True
                 )

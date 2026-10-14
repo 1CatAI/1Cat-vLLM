@@ -79,6 +79,8 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
     """Score workspace budget; retain the qualified 64 MiB default."""
     qsa_prefill_tp_rows: bool = False
     """Partition eligible replicated QSA prefill scoring across four TP ranks."""
+    qsa_decode_partition_topk: bool = False
+    """Reuse exact local/merged Top-K stages for qualified M5/M10 decode rows."""
     qsa_cublas_min_rows: int | None = None
     """Minimum query rows for the cuBLAS scorer."""
     qsa_cublas_min_score_elements: int | None = None
@@ -174,6 +176,11 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
             or any(field.startswith("qsa_") for field in self.hash_fields)
         ):
             factors["qsa_prefill_tp_rows"] = True
+        if self.qsa_decode_partition_topk and (
+            self.hash_fields is None
+            or any(field.startswith("qsa_") for field in self.hash_fields)
+        ):
+            factors["qsa_decode_partition_topk"] = True
         if self.hash_fields is None or any(
             not field.startswith("qsa_") for field in self.hash_fields
         ):
