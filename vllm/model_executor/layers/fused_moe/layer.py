@@ -1361,6 +1361,14 @@ class FusedMoE(PluggableLayer):
             input_ids,
         )
 
+    def forward_partials(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.runner.forward_partials(hidden_states, router_logits, input_ids)
+
     @property
     def expert_map(self) -> torch.Tensor | None:
         return (

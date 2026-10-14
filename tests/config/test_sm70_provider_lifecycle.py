@@ -290,6 +290,31 @@ def test_prefill_convolution_policy_is_engine_local_and_hashed():
     assert second.layer_execution.compute_hash() == baseline
 
 
+def test_hc_sequence_policy_is_engine_local_and_hashes_only_its_consumer():
+    from vllm.config.kernel import KernelConfig
+    from vllm.model_executor.models.config import effective_layer_policy_hash_fields
+
+    first, second = KernelConfig(), KernelConfig()
+    first.layer_execution.resolve()
+    second.layer_execution.resolve()
+    baseline = first.layer_execution.compute_hash()
+    second.layer_execution.hc_prefill_peer_norm = True
+    assert second.layer_execution.compute_hash() == baseline
+    second.layer_execution.hc_prefill_sequence_parallel = True
+    assert first.layer_execution.compute_hash() == baseline
+    assert second.layer_execution.compute_hash() != baseline
+    peer_hash = second.layer_execution.compute_hash()
+    second.layer_execution.hc_prefill_peer_norm = False
+    assert second.layer_execution.compute_hash() != peer_hash
+    fields = ("hc_prefill_sequence_parallel", "hc_prefill_peer_norm")
+    plain = NS(hf_text_config=NS(hc_count=1))
+    residual = NS(hf_text_config=NS(hc_count=4))
+    assert effective_layer_policy_hash_fields(plain, None, fields) == ()
+    assert effective_layer_policy_hash_fields(residual, None, fields) == fields
+    first.layer_execution.hash_fields = second.layer_execution.hash_fields = ()
+    assert second.layer_execution.compute_hash() == first.layer_execution.compute_hash()
+
+
 @pytest.mark.parametrize(
     "raw,expected", [(None, True), ("", False), ("2", False), ("1", True)]
 )

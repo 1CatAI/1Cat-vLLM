@@ -227,6 +227,53 @@ Local port checks:64CPU cases pass with24GPU skips;50 PLE GPU cases pass. At the
 actual7344-row geometry, compared with this branch's bounded quarter-channel
 control, fused PLE reduces additional peak from227123712 to150405120 bytes,
 with bitwise-equal output and state, and0.85545 versus7.34761ms in the repeated
-control. Destination affected suites pass98cases. Destination TP4 selector and
-final combined serving/quality/memory gates are pending; neither opt-in is
-promoted from these operator checks alone.
+control. Destination affected suites pass98cases. The TP4 selector passes all
+four ranks at query threshold neighbors4095/4096/4097 and9216/9217, 65536
+compressed history columns, mixed requests and captured fallback.
+
+The combined serving candidate passes arithmetic, a tool roundtrip and
+natural-EOS retrieval/arithmetic at32761/131070/260977 input tokens. The same
+cold-prefill hashes give median5126.6801tok/s and6.766172s, versus4881.6560tok/s
+and7.088988s before the opt-ins. A further261044-input,192-output SSE passes.
+Across all four ranks, the minimum estimated live headroom is530.963MiB;
+driver sampling reaches60MiB. These are different quantities: unused allocator
+reservation explains part of the gap, but the physical margin is still too
+small for final deployment acceptance. Shared packages and native artifacts
+are unchanged, and all ten changed Python runtime files match the owned source.
+
+## Further HC memory candidate
+
+Port the peer's row-owned HC stages into this checkout while keeping the
+ordinary decode and fallback backbones. The candidate partitions the
+multi-stream residual by physical query-row owner, defers attention and MoE
+reductions to that owner, and gathers block inputs and the final MTP state at
+their existing boundaries. Partial routed/shared MoE tensors remain separate
+until their FP32 sum and reduction. Unaligned tails pad only the HC carrier;
+PLE and MTP copy only actual query rows and retain untouched capacity tails.
+
+The typed opt-ins default to false. Deployment qualification is deliberately
+restricted to SM70 FP16 GGUF with HC4/H2560/lowrank320, sharded HC storage,
+HCX, TP4/PP1/DCP1/PCP1, one sequence, backed dynamic shapes, no LoRA,
+4096..16384 query-token chunks, no graph capture and no FP16 partial
+accumulation/reduction. Other inputs retain the existing backbone. A separate
+compiled view borrows the original parameter/state owner; nested/exceptional
+forward calls restore the reduction context. Native sources and ABI are
+unchanged. The optional peer-normalization owner is kept **off** for this
+deployment candidate; its allocation is not required for row partitioning.
+
+The imported synthetic contract is declared before destination runs: finite
+hidden/block outputs, maximum row-relative L2<=0.001 against independent FP32
+arithmetic, injection-logit aggregate L2<=0.001, column-RMS-normalized maximum
+error<=four FP16 epsilons, and injection-factor absolute error<=0.0005. A
+48-step recurrence uses relative L2<=0.003 and the same factor allowance.
+This preserves the peer's earlier failed near-zero paired-logit metric as a
+failure; it is not relabeled or relaxed after a destination run. Checkpoint
+task answers, EOS, repetition and state semantics remain required gates.
+
+Local configuration/model/producer checks pass74cases on an explicit
+UnspecifiedPlatform harness. One initial fixture failed because that harness
+already registered the CPU custom-op implementation; the fixture now adds its
+test implementation only when absent, and the entire affected suite passes.
+Destination native stage/model-adapter tests, whole-model peak memory, paired
+long-context quality and fresh-process verifier measurements are pending.
+The library defaults and production defaults are not promoted from CPU tests.

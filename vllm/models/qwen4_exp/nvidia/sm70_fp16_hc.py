@@ -886,6 +886,57 @@ direct_register_custom_op(
 sharded_hc_project = torch.ops.vllm.qwen38_sharded_hc_project
 
 
+def _sharded_hc_project_sequence_rows(
+    x: torch.Tensor, down: torch.Tensor, up: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project row-owned residuals using transient copies of existing shards."""
+    from vllm.distributed.parallel_state import get_tp_group
+
+    from .ops.hc import hc_gate_mix_gathered, hc_packet_silu
+
+    group = get_tp_group()
+    communicator = getattr(group.device_communicator, "hc_ll_comm", None)
+    if (
+        group.world_size != 4
+        or communicator is None
+        or not communicator.status["enabled"]
+    ):
+        raise ValueError("HC sequence rows require qualified TP4 sharded transport")
+    order = tuple(communicator.order)
+    local_down, local_up = _unpack_hc_storage(down, up)
+    full_down = group.all_gather(local_down, dim=0)
+    del local_down
+    projected = torch.mm(x, full_down.T)
+    del full_down
+    lora, injection = hc_packet_silu(projected, order, 4, rank_columns=True)
+    del projected
+    full_up = group.all_gather(local_up, dim=0)
+    del local_up
+    gate = torch.mm(lora, full_up.T)
+    del lora, full_up
+    local_block = hc_gate_mix_gathered(x, gate, order)
+    del gate
+    block = group.all_gather(local_block, dim=0)
+    logger.info_once("SM70 HC prefill keeps query rows local and gathers block inputs.")
+    return block, injection
+
+
+def _sharded_hc_project_sequence_rows_fake(
+    x: torch.Tensor, down: torch.Tensor, up: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return x.new_empty((4 * x.shape[0], 2560)), x.new_empty((x.shape[0], 4))
+
+
+direct_register_custom_op(
+    op_name="qwen38_sharded_hc_project_sequence_rows",
+    op_func=_sharded_hc_project_sequence_rows,
+    fake_impl=_sharded_hc_project_sequence_rows_fake,
+)
+sharded_hc_project_sequence_rows = (
+    torch.ops.vllm.qwen38_sharded_hc_project_sequence_rows
+)
+
+
 def prepare_sharded_hc_storage(model, vllm_config) -> None:
     """Replace replicated FP16 HC matrices with the existing lossless LL pack."""
     if vllm_config.kernel_config.hc_weight_storage != "sharded":
