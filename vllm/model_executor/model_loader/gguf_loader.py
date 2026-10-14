@@ -9,6 +9,7 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
@@ -465,6 +466,44 @@ class GGUFModelLoader(BaseModelLoader):
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         model.load_weights(self.get_all_weights(model_config, model))
 
+    @staticmethod
+    def _start_load_sampler():
+        """Diagnostic (VLLM_GGUF_LOAD_PROFILE=1): sample the loading thread's
+        stack every 50 ms and log where the load time goes."""
+        import collections
+        import sys
+        import threading
+
+        if not envs.VLLM_GGUF_LOAD_PROFILE:
+            return None
+        target = threading.get_ident()
+        counts: collections.Counter[tuple[str, str]] = collections.Counter()
+        stop = threading.Event()
+
+        def run():
+            while not stop.wait(0.05):
+                frame = sys._current_frames().get(target)
+                seen = set()
+                while frame is not None:
+                    code = frame.f_code
+                    if "site-packages/torch" not in code.co_filename:
+                        key = (code.co_filename.split("vllm/")[-1], code.co_name)
+                        if key not in seen:
+                            seen.add(key)
+                            counts[key] += 1
+                    frame = frame.f_back
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+
+        def finish():
+            stop.set()
+            thread.join()
+            for (path, name), n in counts.most_common(40):
+                logger.info("load profile %6.1f s  %s:%s", n * 0.05, path, name)
+
+        return finish
+
     def load_model(
         self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = ""
     ) -> nn.Module:
@@ -476,9 +515,11 @@ class GGUFModelLoader(BaseModelLoader):
         self._gguf_prepared_weights_map = gguf_weights_map
         # we can only know if tie word embeddings after mapping weights
         gguf_files = self._get_all_gguf_files(local_model_path)
-        all_extra_names = []
+        all_extra_names = set(gguf_weights_map.values())
         for f in gguf_files:
-            all_extra_names.extend(get_gguf_extra_tensor_names(f, gguf_weights_map))
+            all_extra_names.intersection_update(
+                get_gguf_extra_tensor_names(f, gguf_weights_map)
+            )
         if "lm_head.weight" in all_extra_names:
             model_config.hf_config.update({"tie_word_embeddings": True})
 
@@ -487,6 +528,13 @@ class GGUFModelLoader(BaseModelLoader):
         )
         # filter out unquantized modules to skip
         adapter = getattr(self, "_native_adapter", None)
+        if adapter is not None:
+            adapter.packed_embeddings = (
+                getattr(
+                    vllm_config.kernel_config.sm70_gguf, "embedding_storage", "dense"
+                )
+                == "original"
+            )
         unquant_names = [
             name.removesuffix(".weight")
             for name, weight_type in weight_type_map.items()
@@ -506,11 +554,18 @@ class GGUFModelLoader(BaseModelLoader):
             quant_config.canonical_expert_storage = (
                 quant_config.native_expert_storage
                 and vllm_config.kernel_config.sm70_gguf.enabled
+                and getattr(
+                    vllm_config.kernel_config.sm70_gguf,
+                    "expert_storage",
+                    "canonical",
+                )
+                == "canonical"
                 and model_config.dtype == torch.float16
                 and current_platform.get_device_capability() == (7, 0)
                 and hasattr(torch.ops._C, "gguf_affine_grouped_gemm_sm70_out")
             )
             adapter.canonical_expert_storage = quant_config.canonical_expert_storage
+            adapter.preserve_expert_blocks = quant_config.native_expert_storage
             if "output.weight" not in self._native_tensors:
                 model_config.hf_config.tie_word_embeddings = True
         logger.debug("GGUF unquantized modules: %s", unquant_names)
@@ -524,6 +579,13 @@ class GGUFModelLoader(BaseModelLoader):
             )
 
             prepare_pinned_gguf_ple(vllm_config, self._native_tensors, gguf_weights_map)
+            from vllm.model_executor.kernels.ple.gguf_packed_result import (
+                prepare_packed_gguf_results,
+            )
+
+            prepare_packed_gguf_results(
+                vllm_config, self._native_tensors, gguf_weights_map
+            )
 
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
@@ -532,7 +594,31 @@ class GGUFModelLoader(BaseModelLoader):
                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
                 )
             model._gguf_model_path = local_model_path
+            if (
+                adapter is not None
+                and quant_config.native_expert_storage
+                and not quant_config.canonical_expert_storage
+                and vllm_config.kernel_config.sm70_gguf.expert_arena
+            ):
+                from vllm.model_executor.layers.quantization import (
+                    gguf_expert_storage,
+                )
+
+                adapter.bulk_experts = (
+                    gguf_expert_storage.prepare_original_expert_arena(
+                        model, gguf_weights_map, self._native_tensors, target_device
+                    )
+                    or {}
+                )
+                # Expert banks are read in the background while dense weights
+                # load, in the order the adapter yields them.
+                gguf_expert_storage.start_prefetch(
+                    adapter.bulk_experts, self._native_tensors
+                )
+            finish = self._start_load_sampler()
             self.load_weights(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)
+            if finish is not None:
+                finish()
         return model

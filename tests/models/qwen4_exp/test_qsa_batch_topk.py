@@ -71,3 +71,86 @@ def test_empty_batch_topk():
     lengths = torch.empty(0, dtype=torch.int32, device="cuda")
     output = torch.empty(0, 512, dtype=torch.int32, device="cuda")
     torch.ops._C.qsa_lexicographic_topk(logits, lengths, output, 512, True)
+
+
+@pytest.mark.parametrize(
+    "rows,columns",
+    [(1, 32767), (4, 32768), (5, 8364), (20, 32844), (32, 65600), (33, 32844)],
+)
+def test_long_score_selection_keeps_exact_cutoff_and_order(rows, columns):
+    """Narrow score bands and FP16 overflow cannot discard FP32 candidates."""
+    torch.manual_seed(20261011)
+    logits = torch.empty(rows, columns + 7, device="cuda")[:, :columns]
+    lengths = torch.full((rows,), columns, device="cuda", dtype=torch.int32)
+    output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
+    op = torch.ops._C.qsa_lexicographic_topk
+    logits.normal_()
+    op(logits, lengths, output, 512)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(logits, lengths, output, 512)
+    for distribution in (
+        "random",
+        "narrow",
+        "overflow",
+        "cutoff",
+        "short",
+        "uniform_prefix",
+        "uniform_tail",
+        "uniform_middle",
+    ):
+        logits.normal_()
+        lengths.fill_(columns)
+        if distribution == "narrow":
+            logits.copy_(1 + torch.rand_like(logits) / 10000)
+        elif distribution == "overflow":
+            logits.copy_(70000 + torch.rand_like(logits) * 10000)
+        elif distribution == "cutoff":
+            logits.fill_(1)
+            logits[:, 100:500] = float("inf")
+        elif distribution == "short":
+            lengths.copy_(torch.arange(rows, device="cuda", dtype=torch.int32) + 500)
+        elif distribution == "uniform_prefix":
+            logits[:, :1024] = 0
+        elif distribution == "uniform_tail":
+            logits[:, 1024:] = 10
+        elif distribution == "uniform_middle":
+            logits[:, 1024:-1024] = 10
+        graph.replay()
+        for row, length in enumerate(lengths.tolist()):
+            chosen = (
+                torch.argsort(logits[row, :length], descending=True, stable=True)[:512]
+                .sort()
+                .values.to(torch.int32)
+            )
+            expected = torch.full((512,), -1, device="cuda", dtype=torch.int32)
+            expected[: chosen.numel()] = chosen
+            assert torch.equal(output[row], expected), (distribution, row)
+
+
+def test_independent_selection_graphs_keep_their_own_addresses():
+    """A later, larger capture cannot redirect an earlier graph's buffers."""
+    op = torch.ops._C.qsa_lexicographic_topk
+    captures = []
+    for rows, columns in ((1, 32844), (4, 65688)):
+        logits = torch.arange(columns, device="cuda", dtype=torch.float32)
+        logits = logits.repeat(rows, 1)
+        lengths = torch.full((rows,), columns, device="cuda", dtype=torch.int32)
+        output = torch.empty(rows, 512, device="cuda", dtype=torch.int32)
+        op(logits, lengths, output, 512)
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            op(logits, lengths, output, 512)
+        captures.append((graph, logits, lengths, output))
+    for step in range(3):
+        for graph, logits, lengths, output in reversed(captures):
+            lengths.fill_(logits.shape[1] - step * 1000)
+            graph.replay()
+            expected = torch.arange(
+                logits.shape[1] - step * 1000 - 512,
+                logits.shape[1] - step * 1000,
+                device="cuda",
+                dtype=torch.int32,
+            )
+            assert torch.equal(output, expected.expand_as(output))

@@ -3220,6 +3220,110 @@ void gguf_lattice_grouped_gemm_sm70_out(
   TORCH_CHECK(result == 0, "GGUF lattice TurboMind grouped GEMM failed");
 }
 
+// Prefill grouped GEMM over canonical banks written by the prefill transcode
+// (any source buffer per expert through the pointer tables). family: 0
+// lattice (decoder = GGUF type), 1 LUT4 (decoder = lut id), 2 affine
+// (decoder = bits). gated: the bank interleaves gate/up columns and the
+// epilogue writes silu(gate) * up, so out has n / 2 columns. tune: measure
+// this batch size (warmup only); otherwise reuse the closest measured one.
+void gguf_grouped_prefill_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t family,
+    int64_t decoder, int64_t n, int64_t num_experts, int64_t group_size,
+    bool gated, bool tune, std::optional<torch::Tensor> a_indices) {
+  TORCH_CHECK(family >= 0 && family <= 2, "GGUF prefill GEMM family");
+  TORCH_CHECK(input.is_cuda() && out.device() == input.device() &&
+                  offsets.device() == input.device() &&
+                  weight_ptrs.device() == input.device() &&
+                  stats_ptrs.device() == input.device(),
+              "GGUF prefill GEMM tensors must share a CUDA device");
+  TORCH_CHECK(input.scalar_type() == torch::kFloat16 &&
+                  out.scalar_type() == torch::kFloat16 &&
+                  offsets.scalar_type() == torch::kInt32 &&
+                  weight_ptrs.scalar_type() == torch::kUInt8 &&
+                  stats_ptrs.scalar_type() == torch::kUInt8 &&
+                  input.dim() == 2 && out.dim() == 2 && input.stride(1) == 1 &&
+                  out.stride(1) == 1 && offsets.is_contiguous() &&
+                  weight_ptrs.is_contiguous() && stats_ptrs.is_contiguous(),
+              "GGUF prefill GEMM requires FP16 rows and prepared pointers");
+  // Rows are routes in expert order: input rows themselves, or input rows
+  // selected by a_indices (no gathered copy of the activations).
+  const bool indexed = a_indices.has_value();
+  TORCH_CHECK(
+      !indexed ||
+          (a_indices->is_cuda() && a_indices->scalar_type() == torch::kInt32 &&
+           a_indices->is_contiguous() && a_indices->device() == input.device()),
+      "GGUF prefill GEMM a_indices must be contiguous int32 CUDA");
+  const int64_t m = indexed ? a_indices->numel() : input.size(0);
+  const int64_t k = input.size(1);
+  TORCH_CHECK(num_experts > 0 && num_experts <= INT_MAX && m <= INT_MAX &&
+                  n > 0 && n <= INT_MAX && k > 0 && k <= INT_MAX &&
+                  n % 32 == 0 && k % group_size == 0 && out.size(0) == m &&
+                  out.size(1) == (gated ? n / 2 : n) &&
+                  offsets.numel() == num_experts + 1 &&
+                  weight_ptrs.numel() == num_experts * 16 &&
+                  stats_ptrs.numel() == num_experts * 16,
+              "GGUF prefill GEMM descriptor shape mismatch");
+  if (m == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  const auto stream = at::cuda::getCurrentCUDAStream();
+  const int device = input.get_device();
+  std::array<turbomind::gemm::MatrixLayout, 2> layouts{};
+  turbomind::gemm::Operation operation{};
+  TuneKeyKind kind;
+  if (family == 0) {
+    TORCH_CHECK(gguf_lattice_group_supported(decoder, group_size),
+                "GGUF lattice canonical group is not supported");
+    layouts = gguf_lattice_layouts(n, k, decoder, group_size);
+    operation.quant_b = {gguf_lattice_quant_type(decoder),
+                         static_cast<int>(group_size)};
+    kind = static_cast<TuneKeyKind>(18 + gguf_lattice_type_index(decoder));
+  } else if (family == 1) {
+    TORCH_CHECK(gguf_lut4_group_supported(decoder, group_size),
+                "GGUF LUT4 canonical group is not supported");
+    layouts = gguf_lut4_layouts(n, k, group_size);
+    operation.quant_b = {gguf_lut4_quant_type(decoder),
+                         static_cast<int>(group_size)};
+    kind = decoder == 0 ? TuneKeyKind::kGgufLut4IQ : TuneKeyKind::kGgufLut4E2M1;
+  } else {
+    TORCH_CHECK(!gated, "GGUF affine prefill GEMM is not gated");
+    gguf_affine_weight_type(decoder);
+    TORCH_CHECK(gguf_affine_group_supported(decoder, group_size),
+                "GGUF affine canonical group is not supported");
+    layouts = gguf_affine_layouts(n, k, decoder, group_size);
+    operation.quant_b = {gguf_affine_quant_type(decoder),
+                         static_cast<int>(group_size)};
+    TORCH_CHECK(decoder == 2, "GGUF affine prefill GEMM supports U2 only");
+    kind = TuneKeyKind::kGgufAffineU2;
+  }
+  for (auto& layout : layouts) {
+    layout.ld = 0;
+    layout.num = num_experts;
+  }
+  turbomind::gemm::MatrixLayout a{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(k),
+                                  static_cast<int>(input.stride(0))};
+  // Logical N before the gated epilogue; the epilogue halves the columns.
+  turbomind::gemm::MatrixLayout d{turbomind::kHalf, turbomind::gemm::kRowMajor,
+                                  static_cast<int>(m), static_cast<int>(n),
+                                  static_cast<int>(out.stride(0))};
+  a.num = d.num = num_experts;
+  a.offsets = d.offsets = offsets.data_ptr<int>();
+  a.idxs = indexed ? a_indices->data_ptr<int>() : nullptr;
+  operation.dispatch = select_prefill_moe_dispatch_policy(
+      device, m, n, k, num_experts, group_size, stream, kind, tune);
+  operation.epilogue = gated ? turbomind::gemm::Epilogue::kGatedSilu
+                             : turbomind::gemm::Epilogue::kNone;
+  operation.quant_a = {turbomind::gemm::QuantType::kNone, 0};
+  operation.batch_dim = 0;
+  auto& workspace = workspace_for(device, stream);
+  const int result = get_gemm(device).Run(
+      operation, 1.f, input.data_ptr(), a, nullptr, {}, weight_ptrs.data_ptr(),
+      layouts[0], stats_ptrs.data_ptr(), layouts[1], 0.f, out.data_ptr(), d,
+      out.data_ptr(), d, workspace, stream);
+  TORCH_CHECK(result == 0, "GGUF prefill TurboMind grouped GEMM failed");
+}
+
 std::vector<torch::Tensor> awq_sm70_prepare_impl(
     torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros,
     int64_t group_size, bool interleave_gated_silu, bool compact_metadata) {
@@ -6030,6 +6134,16 @@ void gguf_lattice_gemm_sm70_out(torch::Tensor out, torch::Tensor input,
                                 int64_t group_size) {
   vllm::awq_sm70::gguf_lattice_gemm_sm70_out(
       out, input, weight, stats, source_type, k_ld, q_ld, group_size);
+}
+
+void gguf_grouped_prefill_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t family,
+    int64_t decoder, int64_t n, int64_t num_experts, int64_t group_size,
+    bool gated, bool tune, std::optional<torch::Tensor> a_indices) {
+  vllm::awq_sm70::gguf_grouped_prefill_gemm_sm70_out(
+      out, input, offsets, weight_ptrs, stats_ptrs, family, decoder, n,
+      num_experts, group_size, gated, tune, std::move(a_indices));
 }
 
 void gguf_lattice_grouped_gemm_sm70_out(

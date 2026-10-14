@@ -19,11 +19,16 @@ from vllm.config import VllmConfig
 from vllm.config.execution_policy import ple_policy
 from vllm.distributed.parallel_state import get_dp_group, get_tp_group
 from vllm.logger import init_logger
-from vllm.model_executor.kernels.ple.host_result import HostResultRegion
+from vllm.model_executor.kernels.ple.host_result import (
+    HostResultRegion,
+    host_result_capability,
+)
 from vllm.model_executor.layers.ple_offload_layer import (
     CpuGpuSemaphore,
     PleOffloadLayer,
 )
+from vllm.v1.ple_offload.draft_prefetch import DraftTokenRing
+from vllm.v1.ple_offload.fast_lane import FastLaneRequest
 from vllm.v1.ple_offload.protocol import (
     PleOffloadRegistration,
     PleOffloadRequest,
@@ -129,6 +134,8 @@ class PleOffloadConnector:
         self._validate_input_sources()
 
         self._pinned_input_buffers: list[torch.Tensor] = []
+        self.draft_ring = self._create_draft_ring(vllm_config)
+        self.fast_lane = self._create_fast_lane(vllm_config)
         # MRV2 may queue more than one batch under asynchronous scheduling.
         # MRV1 remains strictly serialized and retains its existing depth-one
         # CPU staging contract.
@@ -166,6 +173,46 @@ class PleOffloadConnector:
             self.close()
             raise
 
+    def _create_fast_lane(self, vllm_config: VllmConfig) -> FastLaneRequest | None:
+        """TP0's mapped request slot for the owner's native request lane."""
+        scheduler = vllm_config.scheduler_config
+        if (
+            self.tp_rank != 0
+            or not self._uses_cuda_inputs
+            or self._ngram_context_source is None
+            or self._ngram_context_source.shape[-1] != 2
+            or not vllm_config.kernel_config.ple_fast_lane
+            or host_result_capability(self.device) is not None
+        ):
+            return None
+        try:
+            return FastLaneRequest(
+                self.device, scheduler.max_num_seqs, scheduler.max_num_batched_tokens
+            )
+        except RuntimeError as error:
+            logger.warning("PLE fast lane unavailable: %s", error)
+            return None
+
+    def _create_draft_ring(self, vllm_config: VllmConfig) -> DraftTokenRing | None:
+        """TP0 publishes drafted tokens so the worker can prefetch their rows."""
+        speculative = vllm_config.speculative_config
+        num_spec = getattr(speculative, "num_speculative_tokens", 0) or 0
+        if (
+            self.tp_rank != 0
+            or not self._uses_cuda_inputs
+            or num_spec <= 0
+            or not vllm_config.kernel_config.ple_draft_prefetch
+            or host_result_capability(self.device) is not None
+        ):
+            return None
+        try:
+            return DraftTokenRing(
+                self.device, vllm_config.scheduler_config.max_num_seqs, num_spec
+            )
+        except RuntimeError as error:
+            logger.warning("PLE draft prefetch unavailable: %s", error)
+            return None
+
     def _setup_layers(
         self,
         vllm_config: VllmConfig,
@@ -192,7 +239,7 @@ class PleOffloadConnector:
                 # placeholder waits on the paired cross-process semaphore.
                 output_buffer = torch.empty(
                     max_num_tokens,
-                    int(config.ple_embed_dim),
+                    layer.get_offload_output_dim(int(config.ple_embed_dim)),
                     dtype=layer.get_offload_output_dtype(
                         vllm_config.model_config.dtype
                     ),
@@ -227,6 +274,8 @@ class PleOffloadConnector:
                     "mode": "mapped" if region is not None else "cuda",
                     "reason": reason,
                     "pinned_result_bytes": region.pinned_bytes if region else 0,
+                    "result_dtype": str(output_buffer.dtype),
+                    "result_width": output_buffer.shape[1],
                     "scope": "prepared_layer_transport",
                 }
         except Exception:
@@ -303,11 +352,32 @@ class PleOffloadConnector:
                 for name, layer in self._layers.items()
                 if (placement := layer.remote_placement()) is not None
             },
+            result_layouts={
+                name: layout
+                for name, layer in self._layers.items()
+                if (layout := layer.offload_result_layout()) is not None
+            },
+            draft_ring=None if self.draft_ring is None else self.draft_ring.host,
+            fast_lane_request=(None if self.fast_lane is None else self.fast_lane.host),
+            fast_lane_geometry=(
+                None
+                if self.fast_lane is None
+                else (self.fast_lane.max_reqs, self.fast_lane.max_tokens)
+            ),
+            draft_ring_geometry=(
+                None
+                if self.draft_ring is None
+                else (self.draft_ring.max_reqs, self.draft_ring.num_spec)
+            ),
         )
 
         payload = _dump_registration(registration)
         for region in self._host_result_regions.values():
             region.validate_registration()
+        if self.draft_ring is not None:
+            self.draft_ring.validate_registration()
+        if self.fast_lane is not None:
+            self.fast_lane.validate_registration()
         assert self._registration_socket is not None
         self._registration_socket.send(payload)
 
@@ -476,6 +546,18 @@ class PleOffloadConnector:
         # the CPU result fan-out to every registered TP output buffer.
         if self.tp_rank != 0:
             return
+        fast_lane = self.fast_lane
+        if fast_lane is not None and fast_lane.active:
+            # The owner's native thread serves this mapped request directly.
+            assert self._ngram_context_source is not None
+            fast_lane.publish(
+                self._input_ids_source,
+                self._query_start_loc_source,
+                self._ngram_context_source,
+                num_reqs,
+                num_tokens,
+            )
+            return
 
         request = PleOffloadRequest(
             dp_rank=self.dp_rank,
@@ -552,6 +634,14 @@ class PleOffloadConnector:
         for region in getattr(self, "_host_result_regions", {}).values():
             region.close()
         self._host_result_regions = {}
+        draft_ring = getattr(self, "draft_ring", None)
+        if draft_ring is not None:
+            draft_ring.close()
+            self.draft_ring = None
+        fast_lane = getattr(self, "fast_lane", None)
+        if fast_lane is not None:
+            fast_lane.close()
+            self.fast_lane = None
         self._d2h_event_pool = None
         if self._registration_socket is not None:
             self._registration_socket.close(linger=0)

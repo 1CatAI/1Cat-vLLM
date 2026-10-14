@@ -301,6 +301,19 @@ class PleOffloadLayer(nn.Module, ABC):
         """Return the dtype used by cross-process output buffers."""
         return default_dtype
 
+    def get_offload_output_dim(self, default_dim: int) -> int:
+        """Return the transport width, which may differ from decoded width."""
+        return default_dim
+
+    def offload_result_layout(self) -> dict[str, Any] | None:
+        """Describe an encoded result to the separately spawned CPU owner."""
+        return None
+
+    def bind_offload_result_layout(self, layout: dict[str, Any] | None) -> None:
+        """Validate the consumers' result geometry against loaded CPU rows."""
+        if layout is not None:
+            raise ValueError("This PLE layer does not support encoded result layouts")
+
     def setup_cross_process_offload(
         self,
         gpu_output_buffer: torch.Tensor,
@@ -325,6 +338,10 @@ class PleOffloadLayer(nn.Module, ABC):
         raise NotImplementedError(
             f"{type(self).__name__} does not serve tiered PLE placements"
         )
+
+    def needs_weight_prefault(self) -> bool:
+        """Whether this worker serves any table rows after registration."""
+        return True
 
     def wait_offloaded_output(
         self, hidden_states: torch.Tensor, num_tokens: int

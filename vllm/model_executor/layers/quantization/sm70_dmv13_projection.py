@@ -9,6 +9,8 @@ indexer q/k) runs as extra CTAs of the same launch instead of its own GEMV.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
@@ -20,7 +22,14 @@ logger = init_logger(__name__)
 
 MAX_M = 8
 MAX_SEGMENTS = 4
-_DENSE_TYPES = {8, 12, 13, 14, 20, 23}
+_DENSE_FORMATS = {
+    8: dense.Q8,
+    12: dense.Q4K,
+    13: dense.Q5K,
+    14: dense.Q6K,
+    20: dense.LUT4,
+    23: dense.LUT4,
+}
 _F16_TYPES = {1, 30}  # F16 and BF16 use the existing FP16 dense contract.
 
 
@@ -79,7 +88,18 @@ class Dmv13Projection:
         shards = _raw_shards(layer)
         if not shards or len(shards) > MAX_SEGMENTS:
             return
-        if any(t not in _DENSE_TYPES for _, t in shards):
+        if any(t not in _DENSE_FORMATS for _, t in shards):
+            return
+        formats = {_DENSE_FORMATS[t] for _, t in shards}
+        if len(formats) > 2 or (
+            dense.Q8 in formats and not formats <= {dense.Q8, dense.LUT4}
+        ):
+            logger.info(
+                "SM70 fused side projection %s skipped: unsupported format "
+                "combination %s; retaining separate projections.",
+                self.name,
+                sorted(formats),
+            )
             return
         device = None
         self.codes, self.high, self.scale = [], [], []
@@ -87,26 +107,16 @@ class Dmv13Projection:
         k = None
         for raw, qtype in shards:
             device = raw.device if raw.is_cuda else device
-            fmt, q, s, m, gs = dense.decode(raw.detach().cpu().numpy(), qtype)
-            if (
-                q.shape[0] % 32
-                or q.shape[1] % 128
-                or (k is not None and k != q.shape[1])
-            ):
+            packed = _PREPACKED.pop(_shard_key(raw, qtype), None)
+            fmt, rows, cols, codes, high, scale = packed or _decode_pack(raw, qtype)
+            if rows % 32 or cols % 128 or (k is not None and k != cols):
                 return
-            k = q.shape[1]
-            codes, high, scale = dense.pack(fmt, q, s, m, gs)
-            if fmt == dense.LUT4:
-                from vllm.model_executor.layers.quantization.gguf_dmv_formats import (
-                    compact_lut4_scale,
-                )
-
-                scale = compact_lut4_scale(scale)
+            k = cols
             self.codes.append(torch.from_numpy(np.ascontiguousarray(codes)))
             self.high.append(torch.from_numpy(np.ascontiguousarray(high)))
             self.scale.append(torch.from_numpy(np.ascontiguousarray(scale)))
             self.formats.append(int(fmt))
-            self.widths.append(int(q.shape[0]))
+            self.widths.append(int(rows))
         device = device or torch.device(
             "cuda", torch.accelerator.current_device_index()
         )
@@ -121,7 +131,7 @@ class Dmv13Projection:
                 return
             self.extra = weight.contiguous()
         tiles = sum((w + 31) // 32 for w in self.widths)
-        self.workspace = torch.zeros(tiles * 256, device=device)
+        self.workspace = torch.zeros(tiles * 256, device=device, dtype=torch.float32)
         self.counters = torch.zeros(tiles, device=device, dtype=torch.int32)
         self.ready = hasattr(torch.ops._C, "sm70_dmv13_out")
 
@@ -175,10 +185,139 @@ direct_register_custom_op(
 )
 
 
+_PREPACKED: dict = {}
+
+
+def _shard_key(raw, qtype):
+    return raw.data_ptr(), tuple(raw.shape), int(qtype)
+
+
+def _decode_pack(raw, qtype):
+    """(format, rows, cols, codes, high, scale) of one raw GGUF shard."""
+    fmt, q, s, m, gs = dense.decode(raw.detach().cpu().numpy(), qtype)
+    codes, high, scale = dense.pack(fmt, q, s, m, gs)
+    if fmt == dense.LUT4:
+        from vllm.model_executor.layers.quantization.gguf_dmv_formats import (
+            compact_lut4_scale,
+        )
+
+        scale = compact_lut4_scale(scale)
+    return fmt, q.shape[0], q.shape[1], codes, high, scale
+
+
+def prepack(layers) -> None:
+    """Decode and pack the shards of ``layers`` concurrently (NumPy releases
+    the GIL in its array kernels); ``attach`` then consumes the results."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    shards = []
+    for layer in layers:
+        found = _raw_shards(layer) or []
+        if found and all(t in _DENSE_FORMATS for _, t in found):
+            shards.extend(found)
+    if not shards:
+        return
+    workers = max(1, min(8, (os.cpu_count() or 1) // 4))
+    with ThreadPoolExecutor(workers) as pool:
+        results = list(pool.map(lambda shard: _decode_pack(*shard), shards))
+    for (raw, qtype), result in zip(shards, results):
+        _PREPACKED[_shard_key(raw, qtype)] = result
+
+
+def drop_prepacked() -> None:
+    """Release prepacked shards that no projection consumed."""
+    _PREPACKED.clear()
+
+
 def attach(layer, extra, attr: str) -> bool:
     projection = Dmv13Projection(layer, extra)
     if not projection.ready:
         return False
     _PROJECTIONS[projection.name] = projection
     setattr(layer, attr, projection)
+    _register_banks(layer, attr, projection)
     return True
+
+
+def _register_banks(layer, attr, projection):
+    """Expose backing storage to normal model accounting without copying it."""
+    if not isinstance(layer, torch.nn.Module):
+        return
+    for family in ("codes", "high", "scale"):
+        for index, tensor in enumerate(getattr(projection, family)):
+            layer.register_buffer(f"_{attr}_{family}_{index}", tensor, persistent=False)
+    for family in ("workspace", "counters", "extra"):
+        layer.register_buffer(
+            f"_{attr}_{family}", getattr(projection, family), persistent=False
+        )
+
+
+def share_prepared_banks(layer):
+    """Share resident segment planes with the fused side projection.
+
+    Both readers use the same row and bit-plane layout. LUT4's fused reader
+    uses compact half scales; only that small coefficient stream is separate.
+    No weight is reconstructed or requantized here.
+    """
+    prepared = getattr(layer, "gguf_tm_projections", None)
+    if prepared is None:
+        return 0
+    projections = [
+        (attr, value)
+        for attr, value in vars(layer).items()
+        if isinstance(value, Dmv13Projection) and value.ready
+    ]
+    reused = 0
+    for attr, projection in projections:
+        banks = []
+        for p in prepared:
+            if not hasattr(p, "segment_format") or p.input_layout_restored:
+                break
+            k, n = p.kernel.config.partition_weight_shape
+            if k != projection.k or p.output_padding:
+                break
+            groups = (k + 127) // 128
+            strides = (
+                groups * 2048 * (2 if p.segment_format == dense.Q8 else 1),
+                groups * 512 * (2 if p.segment_format == dense.Q6K else 1)
+                if p.segment_format in (dense.Q5K, dense.Q6K)
+                else 0,
+                groups * 512,
+            )
+            tile = 0
+            for width in p.source_output_sizes:
+                if width % 32:
+                    break
+                end = tile + width // 32
+                planes = [
+                    tensor[tile * stride : end * stride]
+                    for tensor, stride in zip(
+                        (p.codes, p.segment_high, p.stats), strides
+                    )
+                ]
+                banks.append((width, p.segment_format, planes))
+                tile = end
+            if tile * 32 != n:
+                break
+        else:
+            if [(b[0], b[1]) for b in banks] != list(
+                zip(projection.widths, projection.formats)
+            ):
+                continue
+            for family, index in (("codes", 0), ("high", 1), ("scale", 2)):
+                values = []
+                for _, fmt, planes in banks:
+                    tensor = planes[index].detach()
+                    if family == "scale" and fmt == dense.LUT4:
+                        tensor = (
+                            tensor.view(torch.int16)
+                            .reshape(-1, 4, 2)[:, :, 0]
+                            .contiguous()
+                            .view(torch.uint8)
+                            .reshape(-1)
+                        )
+                    values.append(tensor)
+                setattr(projection, family, values)
+            _register_banks(layer, attr, projection)
+            reused += 1
+    return reused

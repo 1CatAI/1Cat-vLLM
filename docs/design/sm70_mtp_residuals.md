@@ -1,7 +1,7 @@
 # Retained SM70 MTP optimizations
 
 This PR is synchronized with main
-`c39f53abae51df6bf8ef122e34975a9f3596a93c`.
+`6f3557c973b4602905037e086fd4acba9b0d867f`.
 The full serving comparison remains frozen on main
 `4e5357b59294edd31c46e66ae8219503a843b2bd`. Its measured E commit is
 `d686ca549b6087ad36211d4a2cb771c840399925`. The subsequent report-only rebase
@@ -15,6 +15,14 @@ It has CPU/static checks only: no native rebuild, GPU run, model-performance
 remeasurement or production deployment was performed. In particular, the
 historical results do not validate PR1164's changed native implementation.
 The measured numbers and their original source revisions remain unchanged.
+
+The 2026-10-14 synchronization preserves draft row selection alongside the
+upstream shared graph-capture context and draft-step listener. Explicit
+Inductor combo options remain unchanged. Upstream sparse target sampling
+uses the retained platform adapter without adding generic-layer coupling.
+This synchronization has offline/static validation only. The macOS repair
+environment has no PyTorch or CUDA runtime; runtime CPU and GPU validation
+remain outstanding. Historical CPU and GPU counts refer to earlier revisions.
 
 This change retains the parts of PR903 that are absent from main. Ordinary
 upstream collective, graph, GDN projection, attention and native resource

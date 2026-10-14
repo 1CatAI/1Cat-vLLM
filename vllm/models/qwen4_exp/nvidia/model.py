@@ -513,6 +513,7 @@ def enable_sm70_hcx(
     *,
     fuse_output_projection: bool = True,
     diagnostic: bool = False,
+    local_schedule: bool = False,
 ) -> bool:
     """Leave supported small-M outputs partial; retain larger-batch reductions."""
     from .sm70_hcx import (
@@ -524,6 +525,7 @@ def enable_sm70_hcx(
 
     runtime = get_hcx_runtime(device)
     runtime.diagnostic = diagnostic
+    runtime.local_schedule = local_schedule
     status: dict[str, Any] = dict(
         enabled=False,
         reason=runtime.reason,
@@ -533,6 +535,7 @@ def enable_sm70_hcx(
         prepared_modules=0,
         deferred_projections=0,
         output_projection_policy="fused" if fuse_output_projection else "separate",
+        local_schedule=bool(local_schedule and runtime.enabled and runtime.full),
         large_m_policy="original_projection_and_reduction",
     )
     model.sm70_hcx_status = status
@@ -625,8 +628,22 @@ def enable_sm70_hcx(
 
 
 def _maybe_fuse_sm70_side_projections(model: nn.Module) -> None:
-    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import attach
+    from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
+        attach,
+        drop_prepacked,
+        prepack,
+    )
 
+    candidates = []
+    for layer in model.layers:
+        if not isinstance(layer, Qwen4ExpDecoderLayer):
+            continue
+        if layer.layer_type == "linear_attention":
+            if layer.linear_attn.in_proj_ba is not None:
+                candidates.append(layer.linear_attn.in_proj_qkvz)
+        else:
+            candidates.append(layer.self_attn.qkv_proj)
+    prepack(candidates)
     fused = 0
     for layer in model.layers:
         if not isinstance(layer, Qwen4ExpDecoderLayer):
@@ -645,6 +662,7 @@ def _maybe_fuse_sm70_side_projections(model: nn.Module) -> None:
             ):
                 attn.sm70_side_projection = attn.qkv_proj.sm70_side_projection
                 fused += 1
+    drop_prepacked()
     logger.info_once("SM70 fused side projections attached to %d layers.", fused)
 
 
@@ -665,6 +683,7 @@ def _maybe_enable_sm70_peer_paths(vllm_config: VllmConfig, model: nn.Module) -> 
             device,
             fuse_output_projection=kernel_config.sm70_hcx_output_projection,
             diagnostic=kernel_config.sm70_hcx_diagnostics,
+            local_schedule=kernel_config.sm70_hcx_local_schedule,
         )
         kernel_config.collective_kernel_selections["hcx:target"] = model.sm70_hcx_status
 
@@ -784,7 +803,18 @@ class Qwen4ExpModel(nn.Module):
                 self.dcp_local_indices_buffer = dcp_local_indices_buffer
                 self.dcp_partial_output_buffer = dcp_partial_output_buffer
                 self.dcp_partial_lse_buffer = dcp_partial_lse_buffer
-        self.embed_tokens = VocabParallelEmbedding(self.vocab_size, config.hidden_size)
+        embedding_quant = (
+            vllm_config.quant_config
+            if vllm_config.model_config.quantization == "gguf"
+            and vllm_config.kernel_config.sm70_gguf.embedding_storage == "original"
+            else None
+        )
+        self.embed_tokens = VocabParallelEmbedding(
+            self.vocab_size,
+            config.hidden_size,
+            quant_config=embedding_quant,
+            prefix=maybe_prefix(prefix, "embed_tokens"),
+        )
 
         def get_layer(prefix: str) -> Qwen4ExpDecoderLayer:
             layer_idx = extract_layer_index(prefix)
@@ -1114,6 +1144,19 @@ class Qwen4ExpForCausalLM(
             method = getattr(module, "quant_method", None)
             if method is not None and method is not previous.get(module):
                 method.process_weights_after_loading(module)
+        from vllm.model_executor.layers.quantization.sm70_dmv13_projection import (
+            share_prepared_banks,
+        )
+
+        shared_banks = sum(share_prepared_banks(module) for module in self.modules())
+        logger.info("Shared resident GGUF planes in %d fused projections", shared_banks)
+        from .sm70_fp16_hc import prepare_sharded_hc_storage
+
+        prepare_sharded_hc_storage(self, self.vllm_config)
+        if self.vllm_config.kernel_config.hc_weight_storage == "sharded":
+            # Return released replicated-bank pages before draft construction.
+            # This is a loading boundary, never an inference-time operation.
+            torch.accelerator.empty_cache()
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Create the shared-weight decode compiler just before graph capture.
@@ -1307,6 +1350,25 @@ class Qwen4ExpForCausalLM(
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
+    def get_topk_tokens_and_logits(self, hidden_states: torch.Tensor, top_k: int):
+        return self.logits_processor.get_topk_tokens_and_logits(
+            self.lm_head, hidden_states, top_k
+        )
+
+    def get_topk_tokens_and_logits_with_fallback(
+        self, hidden_states: torch.Tensor, top_k: int
+    ):
+        return self.logits_processor.get_topk_tokens_and_logits_with_fallback(
+            self.lm_head, hidden_states, top_k
+        )
+
+    def get_compact_target_probe_with_fallback(
+        self, hidden_states: torch.Tensor, top_k: int
+    ):
+        return self.logits_processor.get_compact_target_probe_with_fallback(
+            self.lm_head, hidden_states, top_k
+        )
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
@@ -1502,6 +1564,23 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)
+
+    def get_topk_tokens_and_logits(self, hidden_states: torch.Tensor, top_k: int):
+        return self.language_model.get_topk_tokens_and_logits(hidden_states, top_k)
+
+    def get_topk_tokens_and_logits_with_fallback(
+        self, hidden_states: torch.Tensor, top_k: int
+    ):
+        return self.language_model.get_topk_tokens_and_logits_with_fallback(
+            hidden_states, top_k
+        )
+
+    def get_compact_target_probe_with_fallback(
+        self, hidden_states: torch.Tensor, top_k: int
+    ):
+        return self.language_model.get_compact_target_probe_with_fallback(
+            hidden_states, top_k
+        )
 
     def prepare_sm70_decode_graph_model(self) -> bool:
         """Forward decode compiler setup to the wrapped language model."""

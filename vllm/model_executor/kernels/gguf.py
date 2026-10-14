@@ -525,6 +525,77 @@ def admit_moe_fallback(weight, weight_type: int, dtype) -> GGUFOperatorCapabilit
     )
 
 
+def original_moe_prefill_capability(
+    source_type: int,
+    k: int,
+    n: int,
+    experts: int,
+    dtype: torch.dtype,
+    *,
+    is_sm70: bool,
+    enabled: bool = True,
+    mmq_supported: bool | None = None,
+    top_k: int = 10,
+) -> GGUFOperatorCapability:
+    """Batched MMQ for prefill-sized original TP4 expert banks.
+
+    M is the projection input count: down sees ``tokens * top_k`` routed rows.
+    Every chunk from 64 tokens up uses the batched kernel; the per-token MMVQ
+    fallback would otherwise launch thousands of tiny kernels for any chunk
+    that is not exactly 512 tokens. Decode keeps its prepared capabilities.
+    """
+    operator = "ggml_moe_mmq"
+    gate = (k, n) == (2560, 160)
+    down = n == 2560 and k in (160, 192)
+    min_tokens = 64
+    m = min_tokens * top_k if down else min_tokens
+    reason = None
+    if not enabled:
+        reason = "disabled_by_kernel_config"
+    elif not is_sm70:
+        reason = "requires_sm70"
+    elif dtype != torch.float16:
+        reason = "requires_fp16_activations"
+    elif experts != 512 or not (gate or down):
+        reason = "original_prefill_shape_or_source_unmeasured"
+    elif mmq_supported is False:
+        reason = "mmq_not_supported_for_source_type"
+    elif mmq_supported is None and not (
+        source_type in (18, 21, 22, 23) and gate or source_type in (20, 42) and down
+    ):
+        reason = "original_prefill_shape_or_source_unmeasured"
+    elif not hasattr(torch.ops._C_gguf, operator):
+        reason = f"operator_missing:{operator}"
+    return GGUFOperatorCapability(
+        decoder_family(source_type),
+        quant_type_name(source_type),
+        operator,
+        True,
+        min_m=m,
+        max_m=1 << 30,
+        reason=reason,
+    )
+
+
+def moe_mmq_supported(weight, weight_type: int, dtype) -> bool:
+    """Whether the installed upstream MMQ kernel handles this expert bank."""
+    matrix = weight[0]
+    block, size = quant_size(weight_type)
+    k = (
+        matrix.shape[-1] // size * block
+        if weight.dtype == torch.uint8
+        else matrix.shape[-1]
+    )
+    # Probe inside upstream's MMQ batch range: at batch 1 the performance
+    # heuristic prefers MMVQ and clears the MMQ bit on every type on SM70,
+    # which sent all prefill experts through per-expert MMVQ launches.
+    probe = torch.empty((32, k), dtype=dtype, device=weight.device)
+    bits = torch.ops._C_gguf.ggml_dense_upstream_capabilities(
+        matrix, probe, weight_type, matrix.shape[0]
+    )
+    return bool(bits & 8)
+
+
 def small_output_capability(
     source_type: int,
     k: int,

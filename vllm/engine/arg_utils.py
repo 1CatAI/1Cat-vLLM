@@ -539,6 +539,7 @@ class EngineArgs:
     prefix_cache_retention_interval: int | None = (
         CacheConfig.prefix_cache_retention_interval
     )
+    mamba_tail_checkpoint: bool = CacheConfig.mamba_tail_checkpoint
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
@@ -1186,6 +1187,9 @@ class EngineArgs:
         cache_group.add_argument(
             "--prefix-cache-retention-interval",
             **cache_kwargs["prefix_cache_retention_interval"],
+        )
+        cache_group.add_argument(
+            "--mamba-tail-checkpoint", **cache_kwargs["mamba_tail_checkpoint"]
         )
         cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
@@ -2021,6 +2025,7 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=self.prefix_cache_retention_interval,
+            mamba_tail_checkpoint=self.mamba_tail_checkpoint,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,

@@ -942,6 +942,19 @@ void gguf_lattice_grouped_gemm_sm70_out(
     torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
     torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t source_type,
     int64_t num_experts, int64_t group_size);
+void gguf_grouped_prefill_gemm_sm70_out(
+    torch::Tensor out, torch::Tensor input, torch::Tensor offsets,
+    torch::Tensor weight_ptrs, torch::Tensor stats_ptrs, int64_t family,
+    int64_t decoder, int64_t n, int64_t num_experts, int64_t group_size,
+    bool gated, bool tune, std::optional<torch::Tensor> a_indices);
+void gguf_prefill_transcode_sm70(torch::Tensor dst_w, torch::Tensor dst_s,
+                                 int64_t w_stride, int64_t s_stride,
+                                 torch::Tensor src0,
+                                 std::optional<torch::Tensor> src1,
+                                 torch::Tensor experts, torch::Tensor count,
+                                 int64_t ctas, int64_t source_type,
+                                 int64_t n_out, int64_t k, int64_t k_offset,
+                                 int64_t src_stride, torch::Tensor error);
 
 void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
                                        torch::Tensor offsets,
@@ -953,6 +966,22 @@ void gguf_lattice_grouped_vec_sm70_out(torch::Tensor out, torch::Tensor input,
 void ple_disk_gather_u8(torch::Tensor ids, torch::Tensor pointers,
                         int64_t shard_size, int64_t num_rows, int64_t row_bytes,
                         torch::Tensor out);
+void ple_disk_cached_gather_u8(torch::Tensor ids, torch::Tensor pointers,
+                               int64_t shard_size, int64_t num_rows,
+                               int64_t row_bytes, torch::Tensor out,
+                               torch::Tensor cache_ids,
+                               torch::Tensor cache_rows);
+
+int64_t ple_fast_lane_start(
+    torch::Tensor request, int64_t max_reqs, int64_t max_tokens,
+    int64_t table_ptr, int64_t row_bytes, int64_t num_rows,
+    std::vector<int64_t> multipliers, std::vector<int64_t> sizes,
+    std::vector<int64_t> offsets, int64_t eos, std::vector<int64_t> result_ptrs,
+    std::vector<int64_t> flag_ptrs, int64_t cache_bytes, int64_t idle_spin_us,
+    bool clamp_tokens, std::optional<torch::Tensor> draft_ring,
+    int64_t ring_reqs, int64_t ring_spec);
+torch::Tensor ple_fast_lane_stats(int64_t handle);
+void ple_fast_lane_stop(int64_t handle);
 
 void gguf_lattice_dequantize_sm70_out(torch::Tensor out, torch::Tensor weight,
                                       torch::Tensor stats, int64_t source_type,
@@ -999,6 +1028,12 @@ void gguf_dp4a_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
                                      torch::Tensor weight_ptrs,
                                      torch::Tensor stats_ptrs,
                                      int64_t source_type, int64_t num_experts);
+
+void gguf_dp4a_raw_down_unroute_sm70_out(torch::Tensor out, torch::Tensor input,
+                                         torch::Tensor ids,
+                                         torch::Tensor probabilities,
+                                         torch::Tensor weights,
+                                         int64_t source_type, int64_t left);
 void gguf_quantize_q8_1_sm70_out(torch::Tensor out, torch::Tensor input);
 void gguf_dp4a_scalar_lut_gate_up_sm70_out(torch::Tensor out,
                                            torch::Tensor activation,
@@ -1076,7 +1111,7 @@ void sm70_hcx_out(
     std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
     int64_t ofmt, std::optional<torch::Tensor> gz,
     std::optional<torch::Tensor> gw, double geps,
-    std::optional<torch::Tensor> gscr);
+    std::optional<torch::Tensor> gscr, bool local_schedule);
 
 void sm70_dmv13_out(torch::Tensor x, std::vector<torch::Tensor> codes,
                     std::vector<torch::Tensor> high,

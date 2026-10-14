@@ -97,3 +97,25 @@ def warmup_moe(
         logger.warning_once("SM70 V2 MTP MoE warmup skipped: %s", err)
         return ()
     return tuple(warmed)
+
+
+def try_sample_target(
+    speculator, model, rejection_sampler, hidden_states, input_batch, grammar_output
+):
+    """Compact top-k target sampling for argmax drafts (SM70, opt-in)."""
+    if speculator.draft_logits is not None or not getattr(
+        speculator.vllm_config.kernel_config, "sm70_sparse_target_sampling", False
+    ):
+        return None
+    from vllm.v1.worker.gpu.spec_decode.sm70_sparse_target import (
+        try_greedy_draft_sparse_rejection,
+    )
+
+    return try_greedy_draft_sparse_rejection(
+        model,
+        rejection_sampler,
+        hidden_states,
+        input_batch,
+        grammar_output,
+        reference_check=speculator.vllm_config.kernel_config.sm70_sparse_target_reference_check,
+    )

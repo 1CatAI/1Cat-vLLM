@@ -22,10 +22,17 @@ _workspaces = {}
 def workspace(device, shared=False):
     key = (device, shared)
     if key not in _workspaces:
+        # Bound canonical restoration by the admitted local shapes. Ordinary
+        # projections allow K2560/N4096, including u8 codes and eight-byte
+        # Q6_K/group16 statistics. Shared projections have at most N320 at
+        # K2560, or K160/N2560. Keep independent banks for overlapping streams.
+        weight_bytes = (1 if shared else 10) * 1024**2
+        stats_bytes = (1 if shared else 5) * 1024**2
+        partial_elements = 128 * 1024 if shared else 1024 * 1024
         _workspaces[key] = dict(
-            weight=torch.empty(16 * 1024 * 1024, device=device, dtype=torch.uint8),
-            stats=torch.empty(8 * 1024 * 1024, device=device, dtype=torch.uint8),
-            partial=torch.empty(1024 * 1024, device=device, dtype=torch.float32),
+            weight=torch.empty(weight_bytes, device=device, dtype=torch.uint8),
+            stats=torch.empty(stats_bytes, device=device, dtype=torch.uint8),
+            partial=torch.empty(partial_elements, device=device, dtype=torch.float32),
             counters=torch.zeros(1024, device=device, dtype=torch.int32),
             h=torch.empty((32, 160), device=device, dtype=torch.float16),
             gate=torch.empty(32, device=device, dtype=torch.float16),

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -28,6 +29,8 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
+# Diagnostics: log graph-pool growth per captured graph.
+_GRAPH_MEMLOG = bool(os.environ.get("GRAPH_POOL_MEMLOG"))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -331,6 +334,9 @@ class CUDAGraphWrapper:
             if self.check_input_addresses:
                 entry.input_debug = self._collect_tensor_debug(args, kwargs)
             cudagraph = torch.cuda.CUDAGraph()
+            reserved_before = (
+                torch.accelerator.memory_reserved() if _GRAPH_MEMLOG else 0
+            )
 
             with ExitStack() as stack:
                 if self.cudagraph_options.gc_disable:
@@ -386,6 +392,23 @@ class CUDAGraphWrapper:
             # to save memory
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
+            if _GRAPH_MEMLOG:
+                outputs = output if isinstance(output, (tuple, list)) else [output]
+                logger.info(
+                    "Graph pool capture %s %s: reserved %.1f MiB (+%.1f), "
+                    "output %.1f MiB, weak_ref_output=%s",
+                    self.runtime_mode.name,
+                    entry.batch_descriptor.num_tokens,
+                    torch.accelerator.memory_reserved() / 2**20,
+                    (torch.accelerator.memory_reserved() - reserved_before) / 2**20,
+                    sum(
+                        t.numel() * t.element_size()
+                        for t in outputs
+                        if isinstance(t, torch.Tensor)
+                    )
+                    / 2**20,
+                    self.cudagraph_options.weak_ref_output,
+                )
 
             compilation_counter.num_cudagraph_captured += 1
 

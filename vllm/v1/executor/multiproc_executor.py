@@ -175,7 +175,46 @@ class MultiprocExecutor(Executor):
 
             # For CPU backend only, to setup OpenMP threads affinity
             cpu_omp_manager = OMPProcessManager(self.vllm_config)
-            for local_rank in range(self.local_world_size):
+            if inherited_fds is None and current_platform.is_cuda():
+                # A spawned worker only receives its arguments after it has
+                # started the interpreter and imported vLLM (~15 s), so
+                # starting workers one after another serializes that import.
+                # Start them concurrently; the OMP setup is CPU-only.
+                from concurrent.futures import ThreadPoolExecutor
+
+                def start(local_rank: int) -> UnreadyWorkerProcHandle:
+                    global_rank = global_start_rank + local_rank
+                    return WorkerProc.make_worker_process(
+                        vllm_config=self.vllm_config,
+                        local_rank=local_rank,
+                        rank=global_rank,
+                        distributed_init_method=distributed_init_method,
+                        input_shm_handle=scheduler_output_handle,
+                        shared_worker_lock=shared_worker_lock,
+                        is_driver_worker=self._is_driver_worker(global_rank),
+                        inherited_fds=None,
+                    )
+
+                with ThreadPoolExecutor(self.local_world_size) as pool:
+                    futures = [
+                        pool.submit(start, r) for r in range(self.local_world_size)
+                    ]
+                    for future in futures:
+                        # Record each started worker so a failure still
+                        # terminates the others.
+                        try:
+                            unready_workers.append(future.result())
+                        except Exception:
+                            for other in futures:
+                                if other is not future and not other.exception():
+                                    handle = other.result()
+                                    if handle not in unready_workers:
+                                        unready_workers.append(handle)
+                            raise
+            for local_rank in range(
+                0 if not unready_workers else self.local_world_size,
+                self.local_world_size,
+            ):
                 global_rank = global_start_rank + local_rank
                 is_driver_worker = self._is_driver_worker(global_rank)
                 with cpu_omp_manager.configure_omp_envs(

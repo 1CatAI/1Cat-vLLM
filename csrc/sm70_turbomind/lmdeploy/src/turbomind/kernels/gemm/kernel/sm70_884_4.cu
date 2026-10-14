@@ -7,6 +7,7 @@
 #include "src/turbomind/kernels/gemm/types.h"
 
 #include <cstdlib>
+#include <type_traits>
 
 namespace turbomind::gemm {
 
@@ -43,6 +44,18 @@ class GgufLatticeNarrowKernelImpl final : public KernelImpl<Gemm> {
  public:
   bool is_feasible(const GemmDesc& desc) const noexcept override {
     return desc.n <= 256 && (desc.m <= 64 || desc.m >= 512) &&
+           KernelImpl<Gemm>::is_feasible(desc);
+  }
+};
+
+// Prefill expert projections with N = 160 (gate/up) or 320 (interleaved
+// gate|up): N64 tiles avoid the N128 padding. Prefill-sized batches only, so
+// decode and verify descriptors keep their measured candidates.
+template <class Gemm>
+class GgufPrefillNarrowKernelImpl final : public KernelImpl<Gemm> {
+ public:
+  bool is_feasible(const GemmDesc& desc) const noexcept override {
+    return desc.n <= 512 && desc.n % 64 == 0 && desc.m >= 512 &&
            KernelImpl<Gemm>::is_feasible(desc);
   }
 };
@@ -103,6 +116,15 @@ void Registry::sm70_884_4() {
             GgufLatticeNarrowKernelImpl<typename Grouped16::Kernel>>());
       }
 
+      if constexpr (Type == 18 || Type == 21 || Type == 22) {
+        // Like the type-17 narrow candidate: CTA_K equals the group size
+        // (a K16 tile under a 32-value group produced wrong results).
+        using Prefill128x64 =
+            typename G::template Type<128, 64, Group, 2, 1, 1, D, D, 2, true,
+                                      1, Group, 64, 64>;
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Prefill128x64::Kernel>>());
+      }
       Add<typename C::template Type<128, 256, Group, 2, 4, 1, D, D, 2, true, 1,
                                     Group, 128, 128>>();
       Add<typename C::template Type<64, 128, 32, 1, 4, 1, D, S, 2, true, 1,
@@ -130,6 +152,14 @@ void Registry::sm70_884_4() {
     add_lattice.template operator()<22, 16>();
     add_lattice.template operator()<29, 16>();
     auto add_lut = [this]<class C, class G, int GroupSize>() {
+      if constexpr (GroupSize == 32 &&
+                    std::is_same_v<C, Config_GgufLut4_IQ<kColMajor>>) {
+        using Prefill128x64 =
+            typename G::template Type<128, 64, 32, 2, 1, 1, D, D, 2, true, 1,
+                                      GroupSize, 64, 64>;
+        Add(std::make_unique<
+            GgufPrefillNarrowKernelImpl<typename Prefill128x64::Kernel>>());
+      }
       Add<typename C::template Type<128, 256, 16, 2, 4, 1, D, D, 2, true, 1,
                                     GroupSize, 128, 128>>();
       Add<typename G::template Type<128, 128, 16, 2, 2, 1, D, D, 2, true, 1,

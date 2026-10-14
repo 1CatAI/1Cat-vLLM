@@ -69,6 +69,64 @@ def _decode_embedding_rows(tensor, dtype, name, start, stop):
     return converted
 
 
+def _validate_embedding_range(tensor, dtype, name, rows_per_chunk=1024):
+    """Check that every decoded row fits ``dtype`` (the dense loader's range
+    check) without keeping the table.
+
+    The answer depends only on the file, so it is recorded next to vLLM's
+    cache keyed by file identity and tensor offset; the first check decodes
+    row chunks on a few threads.
+    """
+    import hashlib
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vllm import envs
+
+    base = tensor.data
+    while base is not None and not isinstance(base, np.memmap):
+        base = base.base
+    marker = None
+    if base is not None and base.filename is not None:
+        path = str(base.filename)
+        stat = os.stat(path)
+        key = json.dumps(
+            [
+                path,
+                stat.st_size,
+                stat.st_mtime_ns,
+                int(getattr(tensor, "data_offset", 0)),
+                str(dtype),
+            ]
+        )
+        marker = os.path.join(
+            envs.VLLM_CACHE_ROOT,
+            "gguf_range_checks",
+            hashlib.sha256(key.encode()).hexdigest()[:32],
+        )
+        if os.path.exists(marker):
+            return
+    rows = int(tensor.shape[-1])
+    workers = max(1, min(6, (os.cpu_count() or 1) // 4))
+    with ThreadPoolExecutor(workers) as pool:
+        # list() re-raises the first failing chunk in row order.
+        list(
+            pool.map(
+                lambda start: _decode_embedding_rows(
+                    tensor, dtype, name, start, min(start + rows_per_chunk, rows)
+                ),
+                range(0, rows, rows_per_chunk),
+            )
+        )
+    if marker is not None:
+        try:
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w") as file:
+                file.write(key)
+        except OSError:
+            pass
+
+
 def _dequantize_embedding(tensor, dtype, name, rows_per_chunk=1024):
     """Bound temporary decode/range-check memory for dense vocabulary tables.
 
@@ -237,8 +295,7 @@ class Qwen35Adapter:
                     # Validate the same FP16 range as the dense loader, using
                     # only a bounded row chunk. Serving decodes selected rows
                     # from the original GGML bytes through GGUFEmbeddingMethod.
-                    for _ in _embedding_chunks(tensor, dtype, raw):
-                        pass
+                    _validate_embedding_range(tensor, dtype, raw)
                     yield (
                         name.removesuffix(".weight") + ".qweight",
                         torch.from_numpy(tensor.data.copy()),

@@ -8,26 +8,121 @@ from typing import TYPE_CHECKING
 import torch
 from torch.nn import Parameter
 
+from vllm._sm70.policy import register_policy_op
 from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.kernels.gguf import (
     GGUFDecoderFamily,
     admit_moe_fallback,
     decoder_family,
+    moe_mmq_supported,
+    original_moe_prefill_capability,
 )
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     MoEActivation,
 )
+from vllm.model_executor.layers.fused_moe.moe_fused_mul_sum import moe_fused_mul_sum
 from vllm.model_executor.layers.quantization.gguf_native import (
     NATIVE_TYPES,
+    empty_guarded_weight,
     native_available,
+    packed_tp_span,
     pad_weight_tail,
 )
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 from vllm.transformers_utils.gguf_tensor_reader import quant_size, quant_type_name
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.gguf import GGUFConfig
+
+
+def _original_expert_dp4a(
+    x,
+    ids,
+    probabilities,
+    gate,
+    up,
+    down,
+    source_type,
+    down_type,
+    left,
+    quantized_hidden,
+    bank_aware,
+):
+    m, top_k = ids.shape
+    n = gate.shape[1]
+    q8 = torch.empty((m, x.shape[1] // 32, 36), dtype=torch.uint8, device=x.device)
+    hidden = (
+        torch.empty((m, top_k, n // 32, 36), dtype=torch.uint8, device=x.device)
+        if quantized_hidden
+        else x.new_empty((m, top_k, n))
+    )
+    output = torch.empty_like(x)
+    torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
+    torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+        hidden,
+        q8,
+        ids,
+        gate,
+        up,
+        source_type,
+        True,
+        4 if quantized_hidden and source_type in (20, 23) else 16,
+        bank_aware,
+    )
+    torch.ops._C.gguf_dp4a_raw_down_unroute_sm70_out(
+        output,
+        hidden,
+        ids,
+        probabilities,
+        down,
+        down_type,
+        left,
+    )
+    return output
+
+
+def _original_expert_dp4a_fake(
+    x,
+    ids,
+    probabilities,
+    gate,
+    up,
+    down,
+    source_type,
+    down_type,
+    left,
+    quantized_hidden,
+    bank_aware,
+):
+    return torch.empty_like(x)
+
+
+register_policy_op(
+    "gguf_original_expert_dp4a",
+    "(Tensor x, Tensor ids, Tensor probabilities, Tensor gate, Tensor up, "
+    "Tensor down, int source_type, int down_type, int left, "
+    "bool quantized_hidden, bool bank_aware) -> Tensor",
+    _original_expert_dp4a,
+    _original_expert_dp4a_fake,
+)
+
+
+def _original_expert_reduce(down, probabilities):
+    return moe_fused_mul_sum(down, probabilities)
+
+
+def _original_expert_reduce_fake(down, probabilities):
+    return down.new_empty((down.shape[0], down.shape[2]))
+
+
+register_policy_op(
+    "gguf_original_expert_reduce",
+    "(Tensor down, Tensor probabilities) -> Tensor",
+    _original_expert_reduce,
+    _original_expert_reduce_fake,
+)
 
 
 class GGUFNativeMoEMethod(FusedMoEMethodBase):
@@ -38,10 +133,29 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         self.native_enabled = (
             config.kernel_config.sm70_gguf.enabled if config is not None else True
         )
+        self.small_m_dp4a = bool(config and config.kernel_config.sm70_gguf.small_m_dp4a)
+        self.lut4_expert_dp4a = bool(
+            config and config.kernel_config.sm70_gguf.lut4_expert_dp4a
+        )
+        self.q8_intermediate = bool(
+            config and config.kernel_config.sm70_gguf.q8_expert_intermediate
+        )
+        self.expert_trace_tokens = (
+            config.kernel_config.sm70_gguf.expert_trace_tokens if config else 0
+        )
+        self.trace_layers = (
+            getattr(config.model_config.hf_text_config, "num_hidden_layers", 0)
+            if config and config.model_config
+            else 0
+        )
         self.weight_types: dict[str, int] = {}
+        self.guarded_shards: set[str] = set()
+        self.input_padding: dict[str, tuple[int, int]] = {}
         self.loaded_experts: dict[str, set[int]] = {
             shard: set() for shard in ("w1", "w3", "w2")
         }
+        self.expert_cache = None
+        self.cache_layer = -1
 
     @property
     def topk_indices_dtype(self):
@@ -106,38 +220,53 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             else (self.intermediate_size, self.hidden_size)
         )
         block, size = quant_size(value)
-        if k % block:
+        if k % block and not (
+            shard_id == "w2" and value in NATIVE_TYPES and weight.dtype == torch.uint8
+        ):
             raise ValueError(
                 f"GGUF {shard_id} local K={k} is not aligned to block {block}; "
                 "convert the checkpoint projection before TP slicing"
             )
-        packed_k = k // block * size if weight.dtype == torch.uint8 else k
         tp_size, tp_rank = layer.tp_size, layer.tp_rank
-        expected = (
-            (rows, packed_k * tp_size)
-            if shard_id == "w2"
-            else (rows * tp_size, packed_k)
-        )
+        if shard_id == "w2" and weight.dtype == torch.uint8:
+            first, last, left, physical_k = packed_tp_span(
+                k * tp_size, value, tp_size, tp_rank
+            )
+            packed_k = last - first
+            expected = (rows, k * tp_size // block * size)
+            local = weight[:, first:last]
+            self.input_padding[shard_id] = (left, physical_k)
+        else:
+            packed_k = k // block * size if weight.dtype == torch.uint8 else k
+            expected = (
+                (rows, packed_k * tp_size)
+                if shard_id == "w2"
+                else (rows * tp_size, packed_k)
+            )
+            local = (
+                weight[:, tp_rank * packed_k : (tp_rank + 1) * packed_k]
+                if shard_id == "w2"
+                else weight[tp_rank * rows : (tp_rank + 1) * rows]
+            )
         if tuple(weight.shape) != expected:
             raise ValueError(
                 f"GGUF {shard_id} shape {tuple(weight.shape)} != {expected}"
             )
-        local = (
-            weight[:, tp_rank * packed_k : (tp_rank + 1) * packed_k]
-            if shard_id == "w2"
-            else weight[tp_rank * rows : (tp_rank + 1) * rows]
-        )
         name = "gguf_" + shard_id
         if not hasattr(layer, name):
-            storage = torch.empty(
-                (self.num_experts, rows, packed_k),
-                dtype=weight.dtype,
-                device=param.device,
-            )
+            shape = (self.num_experts, rows, packed_k)
+            if value in NATIVE_TYPES and weight.dtype == torch.uint8:
+                storage = empty_guarded_weight(shape, value, param.device)
+                self.guarded_shards.add(shard_id)
+            else:
+                storage = torch.empty(shape, dtype=weight.dtype, device=param.device)
             layer.register_buffer(name, storage, persistent=False)
         if expert_id in self.loaded_experts[shard_id]:
             raise ValueError(f"Duplicate GGUF {shard_id} expert {expert_id}")
-        getattr(layer, name)[expert_id].copy_(local)
+        if self.expert_cache is not None:
+            self.expert_cache.store(self.cache_layer, shard_id, expert_id, local)
+        else:
+            getattr(layer, name)[expert_id].copy_(local)
         self.loaded_experts[shard_id].add(expert_id)
 
     def process_weights_after_loading(self, layer):
@@ -152,6 +281,8 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             "projections": {},
         }
         self.projection_capabilities = {}
+        self.prefill_capabilities = {}
+        self.native_admission["prefill_projections"] = {}
         for shard in ("w1", "w3", "w2"):
             if self.loaded_experts[shard] != set(range(self.num_experts)):
                 raise ValueError(f"Incomplete GGUF {shard} expert payloads")
@@ -159,14 +290,57 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             if not weight.is_cuda:
                 raise ValueError("Native GGUF experts require CUDA storage")
             value = self.weight_types[shard]
-            prepared = pad_weight_tail(weight, value)
+            prepared = pad_weight_tail(
+                weight, value, storage_has_zero_tail=shard in self.guarded_shards
+            )
             setattr(layer, "gguf_" + shard, prepared)
             capability = admit_moe_fallback(prepared, value, self.params_dtype)
             self.projection_capabilities[shard] = capability
+            block, size = quant_size(value)
+            k = (
+                prepared.shape[-1] // size * block
+                if prepared.dtype == torch.uint8
+                else prepared.shape[-1]
+            )
+            prefill = original_moe_prefill_capability(
+                value,
+                k,
+                prepared.shape[1],
+                self.num_experts,
+                self.params_dtype,
+                is_sm70=current_platform.is_device_capability(70),
+                enabled=self.native_enabled,
+                mmq_supported=moe_mmq_supported(prepared, value, self.params_dtype),
+                top_k=getattr(layer, "top_k", 10),
+            )
+            self.prefill_capabilities[shard] = prefill
+            self.native_admission["prefill_projections"][shard] = asdict(prefill)
             self.native_admission["projections"][shard] = {
                 **asdict(capability),
                 "shape": list(weight.shape),
+                "activation_padding": list(self.input_padding.get(shard, (0, 0))),
             }
+        self.dp4a_admitted = bool(
+            self.small_m_dp4a
+            and self.params_dtype == torch.float16
+            and (self.num_experts, self.hidden_size, self.intermediate_size)
+            == (512, 2560, 160)
+            and self.weight_types["w1"] == self.weight_types["w3"]
+            and self.weight_types["w1"] in (18, 20, 21, 22, 23)
+            and (self.weight_types["w1"] not in (20, 23) or self.lut4_expert_dp4a)
+            and self.weight_types["w2"] in (20, 42)
+            and hasattr(torch.ops._C, "gguf_dp4a_raw_down_unroute_sm70_out")
+        )
+        self.native_admission["small_m_dp4a"] = {
+            "enabled": self.dp4a_admitted,
+            "reason": None
+            if self.dp4a_admitted
+            else "original_dp4a_shape_or_operator_unavailable",
+            "min_m": 1,
+            "max_m": 20,
+            "storage": "original",
+            "accumulation": "FP32",
+        }
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -182,21 +356,64 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         if layer.apply_router_weight_on_input or layer.activation != MoEActivation.SILU:
             raise ValueError("Native GGUF experts require output-weighted SiLU routing")
         ids = topk_ids.to(torch.int32).contiguous()
+        if self.expert_trace_tokens:
+            from .gguf_expert_trace import trace_routing
+
+            trace_routing(
+                layer,
+                ids,
+                self.expert_trace_tokens,
+                self.trace_layers,
+                self.num_experts,
+            )
         mask = None
         if layer.expert_map is not None:
             ids = layer.expert_map[ids.long()].to(torch.int32)
             mask = ids >= 0
             ids = ids.clamp_min(0).contiguous()
         tokens, top_k = ids.shape
+        cache = self.expert_cache
+        w1, w3, w2 = layer.gguf_w1, layer.gguf_w3, layer.gguf_w2
+        if (
+            self.dp4a_admitted
+            and 1 <= tokens <= 20
+            and layer.expert_map is None
+            and topk_weights.dtype == torch.float32
+        ):
+            if cache is not None:
+                ids = cache.resolve(self.cache_layer, ids)
+            return torch.ops.vllm.gguf_original_expert_dp4a(
+                x.contiguous(),
+                ids,
+                topk_weights.contiguous(),
+                w1,
+                w3,
+                w2,
+                self.weight_types["w1"],
+                self.weight_types["w2"],
+                self.input_padding.get("w2", (0, 0))[0],
+                self.q8_intermediate,
+                self.weight_types["w1"] == 21,
+            )
+        if cache is not None and cache.tm is not None:
+            return cache.prefill_moe(
+                self.cache_layer, x.contiguous(), ids, topk_weights
+            )
+        if cache is not None:
+            w1, w3, w2, ids = cache.prefill(self.cache_layer, ids)
         native = torch.ops._C_gguf
 
         def projection(shard):
             capability = self.projection_capabilities[shard]
+            prefill = getattr(self, "prefill_capabilities", {}).get(shard)
+            m = tokens * top_k if shard == "w2" else tokens
+            if prefill is not None and prefill.reason is None and prefill.supports_m(m):
+                capability = prefill
             return getattr(native, capability.operator)
 
         gate = projection("w1")(
             x.contiguous(),
-            layer.gguf_w1,
+            w1,
             ids,
             self.weight_types["w1"],
             self.intermediate_size,
@@ -205,7 +422,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         )
         up = projection("w3")(
             x.contiguous(),
-            layer.gguf_w3,
+            w3,
             ids,
             self.weight_types["w3"],
             self.intermediate_size,
@@ -213,17 +430,30 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             tokens,
         )
         hidden = torch.nn.functional.silu(gate) * up
+        left, physical_k = self.input_padding.get("w2", (0, self.intermediate_size))
+        if left or physical_k != self.intermediate_size:
+            hidden = torch.nn.functional.pad(
+                hidden, (left, physical_k - left - self.intermediate_size)
+            )
         routed_ids = ids.reshape(-1, 1)
         down = projection("w2")(
             hidden.contiguous(),
-            layer.gguf_w2,
+            w2,
             routed_ids,
             self.weight_types["w2"],
             self.hidden_size,
             1,
             tokens * top_k,
         )
+        if cache is not None:
+            cache.prefill_done(self.cache_layer)
         down = down.view(tokens, top_k, self.hidden_size)
         if mask is not None:
             down = torch.where(mask[..., None], down, 0)
+        if down.is_cuda:
+            # Reuse the existing FP32 weighted reduction without materializing
+            # two [tokens, top_k, hidden] FP32 checkpoint-sized temporaries.
+            return torch.ops.vllm.gguf_original_expert_reduce(
+                down, topk_weights.contiguous()
+            )
         return (down.float() * topk_weights[..., None].float()).sum(1).to(x.dtype)

@@ -295,8 +295,19 @@ def _expert_dp4a(
                 4 if quantized_hidden else 16,
             )
         else:
+            # Bank-aware codebook loads: byte-identical and faster in the full
+            # model. The fully unrolled K2560 loop (lanes 0) wins in isolation
+            # but loses in-model next to the concurrent shared expert.
             torch.ops._C.gguf_dp4a_gate_up_sm70_out(
-                hidden, q8, ids, raw_gate, raw_up, source_type, True
+                hidden,
+                q8,
+                ids,
+                raw_gate,
+                raw_up,
+                source_type,
+                True,
+                16,
+                quantized_hidden,
             )
         torch.ops._C.gguf_dp4a_down_unroute_sm70_out(
             output,
@@ -507,6 +518,16 @@ def _acquire_staging(nbytes: int) -> torch.Tensor:
 
 def _release_staging(buf: torch.Tensor) -> None:
     _STAGING_POOL.append(buf)
+
+
+def release_staging_pool() -> int:
+    """Return pinned staging chunks to the OS once loading has finished."""
+    freed = sum(buf.numel() for buf in _STAGING_POOL)
+    _STAGING_POOL.clear()
+    empty_host_cache = getattr(torch._C, "_host_emptyCache", None)
+    if empty_host_cache is not None:
+        empty_host_cache()
+    return freed
 
 
 def _tp_rows(source, weight_type, rank, size, axis):
