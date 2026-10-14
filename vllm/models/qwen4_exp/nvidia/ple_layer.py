@@ -2639,11 +2639,14 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         max_num_seqs=8 one such step ran out of memory. Keep each padded buffer
         at most half of one unpadded step by splitting channels; the
         convolution is depthwise, so per-channel arithmetic is unchanged.
+        Long single prefills also need headroom: keep each temporary at most
+        a quarter of the step instead of retaining two full-sized buffers.
         """
-        if num_prefills <= 1:
+        if num_prefills <= 0 or (num_prefills == 1 and max_len < 4096):
             return None
         per_channel = num_prefills * (self.conv_state_len + max_len)
-        budget = (num_prefill_tokens + self.conv_state_len) * hidden_size // 2
+        divisor = 4 if num_prefills == 1 else 2
+        budget = (num_prefill_tokens + self.conv_state_len) * hidden_size // divisor
         if per_channel * hidden_size <= budget:
             return None
         chunk = max(64, (budget // per_channel) // 64 * 64)

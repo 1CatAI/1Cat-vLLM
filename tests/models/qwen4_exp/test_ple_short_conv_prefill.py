@@ -259,7 +259,10 @@ def test_prefill_short_conv_holds_two_batch_sized_buffers() -> None:
 @pytest.mark.parametrize(
     ("lengths", "hidden_size", "expected"),
     [
-        ([100_000], 10240, None),  # one prefill pads nothing
+        ([100_000], 10240, 2560),  # long single prefills need transient headroom
+        ([4095], 10240, None),
+        ([4096], 10240, 2560),
+        ([6944], 10240, 2560),
         ([5, 1, 7, 3], 16, None),  # narrower than one chunk
         ([512] * 4, 1024, 448),
         ([1024] + [16] * 7, 10240, 704),
@@ -403,3 +406,66 @@ def test_prefill_short_conv_channel_chunks_bound_memory(monkeypatch) -> None:
     # Output plus at most half a step per chunk buffer, plus index scratch.
     assert chunked <= 2.5 * batch_bytes, (chunked, batch_bytes)
     assert padded >= 4 * batch_bytes, (padded, batch_bytes)
+
+
+@pytest.mark.parametrize("device,dtype", _devices())
+@pytest.mark.parametrize("state_mode", ["initial", "fresh", "null", "empty"])
+def test_long_single_prefill_channel_chunks_preserve_output_and_state(
+    monkeypatch, device, dtype, state_mode
+) -> None:
+    module, x_p, args = _case(
+        device,
+        dtype,
+        lengths=[4096],
+        decode_tokens=2,
+        state_indices=[NULL_BLOCK_ID if state_mode == "null" else 3],
+        has_initial=[state_mode == "initial"],
+        hidden_size=320,
+        empty_cache=state_mode == "empty",
+    )
+    metadata, conv_state, *rest = args
+    actual_state = conv_state.clone()
+    expected_state = conv_state.clone()
+    with _single_threaded_on_cpu(device):
+        actual = module._short_conv_dilated_prefill_batched(
+            x_p, metadata, actual_state, *rest
+        )
+        _single_pass(monkeypatch)
+        expected = module._short_conv_dilated_prefill_batched(
+            x_p, metadata, expected_state, *rest
+        )
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_state, expected_state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_long_single_prefill_channel_chunks_release_device_headroom(monkeypatch):
+    module, x_p, args = _case(
+        "cuda",
+        torch.float16,
+        lengths=[6944],
+        decode_tokens=0,
+        state_indices=[3],
+        has_initial=[True],
+        hidden_size=10240,
+    )
+    metadata, conv_state, *rest = args
+    batch_bytes = x_p.numel() * x_p.element_size()
+
+    def peak(state):
+        torch.accelerator.synchronize()
+        torch.accelerator.reset_peak_memory_stats()
+        base = torch.accelerator.memory_allocated()
+        result = module._short_conv_dilated_prefill_batched(x_p, metadata, state, *rest)
+        torch.accelerator.synchronize()
+        return torch.accelerator.max_memory_allocated() - base, result
+
+    actual_state, expected_state = conv_state.clone(), conv_state.clone()
+    chunked, actual = peak(actual_state)
+    _single_pass(monkeypatch)
+    single, expected = peak(expected_state)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual_state, expected_state)
+    assert chunked <= 1.9 * batch_bytes, (chunked, batch_bytes)
+    assert single - chunked >= 0.4 * batch_bytes, (single, chunked, batch_bytes)
+    print(f"single_prefill_peak_bytes: single={single} chunked={chunked}")
