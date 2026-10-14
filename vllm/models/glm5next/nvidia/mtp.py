@@ -30,6 +30,7 @@ from .model import (
     Glm5NextMoE,
     _try_load_fp8_attn_proj,
     _try_load_fp8_indexer_wk,
+    exl3_checkpoint_weights,
     get_spec_layer_idx_from_weight_name,
 )
 from .ops.fused_eh_norm import fused_eh_norm
@@ -284,6 +285,7 @@ class Glm5NextMTP(nn.Module, DeepseekV2MixtureOfExperts):
         return name
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = exl3_checkpoint_weights(weights, self.quant_config)
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
