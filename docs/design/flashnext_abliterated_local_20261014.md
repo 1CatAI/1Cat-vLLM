@@ -60,9 +60,11 @@ bash examples/serve_flashnext_gguf_256k.sh
 
 Acquire the selected GPUs' locks and start the memory guard as part of the
 service manager. The local deployment retains the existing user service and
-public tunnel, with a dedicated internal API port. Public forwarding is enabled
-after authenticated generation, tools, prefix reuse and capacity checks pass.
-Credentials stay outside the source repository.
+public tunnel, with a dedicated internal API port. The existing bridge now
+forwards to the verified model instance. Read the tunnel client's published
+endpoint when connecting: its assigned public port can differ from the port
+requested in the preset configuration. Credentials stay outside the source
+repository.
 
 ## Evidence
 
@@ -75,7 +77,40 @@ abliterated model on the local machine.
 The combined build passes 81 focused GPU cases covering encoded/protected KV,
 expert-cache swaps, grouped-prefill boundaries and segment-prefill restoration.
 All twelve normal native components are built and their library search paths
-are audited. Route checks, unprofiled prefill/decode, tools, prefix reuse
-and long-context results are recorded after validation. Raw download journals,
-checksums, builds and model responses are retained in the task's external
+are audited. All model files pass their complete SHA256 checks. Worker logs
+confirm native encoded QSA, Q8_0 MTP expert storage and the existing GDN/PLE paths.
+
+Five unprofiled cold-prefix requests use two warmups and three measured trials,
+with the same 32000-word/seed-9683 workload and an early per-request nonce.
+Production development cache-reset routes remain disabled; the unique first
+block prevents prefix reuse. Measured inputs are 34688, 34606 and 34631 tokens.
+Median first-choice latency is **6.805 s**, or **5088.8 input tokens/s**. Server
+prefill time is recorded separately. This is the local abliterated model's
+measurement, rather than a projected gain from the dependency results.
+
+Eight prefix-warm, unprofiled 32774-input / 192-output requests at production
+sampling measure **6.454 ms/output token**, or **154.9 output tokens/s**.
+Mean decode time is 1.233 s, excluding 0.893-s TTFT. The whole-round HTTP
+estimate is 18.128 ms with 2.838 emitted tokens per round. It includes draft and
+scheduling and must not be labelled an isolated GPU verifier timer. The
+recorded affinity changes affect only this service's API/worker descendants.
+
+Arithmetic and automatic tool-call/follow-up checks pass with natural EOS.
+Retrieval/arithmetic tasks at 32761, 131070 and 260977 input tokens pass all
+answer, EOS and repetition checks, with 181, 165 and 188 output tokens. The
+largest case uses 261165 total tokens and finishes in 286.959 s without OOM
+or a memory-guard intervention. These are capacity and task checks, not cold
+throughput baselines at each length.
+
+Prefix-cache counters prove 31824 cached tokens on the third identical
+32774-input request after the long-context checks. Total request time falls
+from 8.921/9.304 s to 2.731 s. A separate 18282-token repeated prompt does not
+produce a hit in two trials; that observation is retained. Prefix caching uses
+the existing Mamba alignment/admission policy and finite cache capacity. This
+evidence establishes reuse for the measured workload, not every prompt length
+or guaranteed residency after other requests.
+
+Public authentication, model discovery and streaming arithmetic are checked
+through the existing tunnel before delivery. Raw download journals, checksums,
+builds, counters and model responses are retained in the task's external
 `flashnext-abliterated-local-20261014` report directory.
