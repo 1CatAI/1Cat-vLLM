@@ -884,6 +884,11 @@ class KernelConfig:
     device and the remainder directly from mapped host history."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_hot_dtype: Literal["float16", "fp8_e4m3"] = "float16"
+    """Target hot storage; encoded E4M3 requires E4M3 authoritative history.
+    Encoded hot reads round to the same FP16 operands as the decoded cache."""
+    qsa_host_kv_draft_hot_tokens: int | None = Field(default=None, gt=0, multiple_of=16)
+    """Optional independent draft hot capacity; None preserves target capacity."""
     qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
     """Shared host-miss staging capacity; larger batches use bounded row chunks."""
     qsa_host_kv_prefill_stage_tokens: int = Field(default=0, ge=0)
