@@ -262,6 +262,34 @@ def test_sparse_hash_and_errors_only_include_consumed_family(
         policy.validate_active()
 
 
+@pytest.mark.parametrize("family", ["qsa", "indexer"])
+def test_prefill_row_partition_is_hashed_for_its_family(family):
+    first = Sm70SparseConfig()
+    second = Sm70SparseConfig(qsa_prefill_tp_rows=True)
+    for policy in (first, second):
+        policy.resolve()
+        policy.qualify(family)
+    assert first.compute_hash() == second.compute_hash()  # Inactive owner.
+    first.active = second.active = True
+    assert (first.compute_hash() != second.compute_hash()) == (family == "qsa")
+    second.qsa_prefill_tp_rows = False
+    assert first.compute_hash() == second.compute_hash()
+
+
+def test_prefill_convolution_policy_is_engine_local_and_hashed():
+    from vllm.config.kernel import KernelConfig
+
+    first, second = KernelConfig(), KernelConfig()
+    first.layer_execution.resolve()
+    second.layer_execution.resolve()
+    baseline = first.layer_execution.compute_hash()
+    second.layer_execution.ple_prefill_conv = True
+    assert first.layer_execution.compute_hash() == baseline
+    assert second.layer_execution.compute_hash() != baseline
+    second.layer_execution.ple_prefill_conv = False
+    assert second.layer_execution.compute_hash() == baseline
+
+
 @pytest.mark.parametrize(
     "raw,expected", [(None, True), ("", False), ("2", False), ("1", True)]
 )

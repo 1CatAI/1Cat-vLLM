@@ -837,3 +837,231 @@ Raw local evidence is retained under
 Relevant files: `wide-down-*.json`, `dma-dispatch-*.json`,
 `qsa-stage-{64,256}.json`, `qsa-dma-native-micro.json`, and
 `qsa-dma-tests.log`. No shared venv or production source was changed.
+
+### Initial GPU queue: indexer and HC screens (resolved below)
+
+At 2026-10-14 00:31 UTC the other task's paired test has completed, but its
+port-8001 service remains resident on all four GPUs. No preemption is authorized;
+the owned queue waits for the locks and empty devices. Runtime source for the
+queued chunk-9216 experiment matches `ae2f6da127` (nine changed runtime files
+checked by SHA256). The installed indexer remains the original
+`c5b7bb4abe18118488418081d085498049a99e0c665e913fb07559beb8052aba` artifact.
+
+The pending microbenchmarks are hypothesis screens, not qualified improvements:
+
+- `hc_combine_norm.py`: the existing HC4/D2560 combine/norm kernel at M7344
+  and M8976, testing warp/tile parameters with identical preallocated outputs.
+  Finite and FP32/paired maximum-row relative-L2 must be <= 0.001. Rounding the
+  materialized combine result to FP16 remains part of the reference.
+- `qsa_indexer_tiles.py`: the existing 32/64/128 MiB score budget and a repeated
+  32 MiB control. It includes the actual outer logits-cap loop and the existing
+  native top-512 selector; at N8672 the 32 MiB policy limits each outer chunk
+  to 1934 rows. Timing a single M7344 score matrix would not represent this path.
+- The same script's `--native` arm screens a source-owned fused prefill
+  scorer, reusing the decode kernel's Volta MMA fragment layout for 8/32 query
+  rows per CTA. It writes reduced FP32 logits directly without a four-head
+  score temporary. No Python runtime admission changes are made. Its normal
+  CMake component is installed only in the independent `indexer-probe` tree,
+  SHA256 `2926a624623cad653c8afb63a18528099f42ae5602da2e9b0cbd5f194fea3b38`.
+  The two variants use 34/66 registers with no stack/local memory. Dependencies
+  are standard CUDA/Torch libraries; CPU import/registration succeeds. These
+  checks are not evidence of CUDA execution or correctness.
+- `qsa_indexer_tp.py`: the model uses a replicated index projection. Partition
+  query rows over TP4, score/select with the existing provider, then all-gather
+  512 block indices per row. Timings include padding, copies, native selection
+  and PyNccl communication, and use maximum-rank CUDA-event time. Test M7344,
+  M8976 and M7345 (uneven partition). A second pair includes token expansion
+  and all-gathers the full 2051-token selection, measuring the simpler runtime
+  integration's larger transfer. Expansion from the same selected blocks must
+  be exact on every rank. Key gathering is common to both arms and excluded.
+  No cache-state writes or runtime dispatch change.
+
+Before any indexer candidate runs, the numerical screen is fixed as follows:
+exact finite/negative-infinity mask; maximum row-relative L2 <= 0.0001 against
+control and independently computed FP32 checked rows; distinct valid selected
+indices; at most one block replacement per row and <= 0.00001 of all selected
+blocks. Exact selection equality and replacement counts are reported separately.
+The selection allowance accounts for FP32 reduction ordering at the ranking
+boundary; it is not output-quality acceptance. Any promising candidate still
+requires representative paired task/EOS/repetition checks, including long
+context, before promotion. No failed numerical limit has been relaxed.
+
+Remote queue order: `chunk9k-queue.sh` (restored dense screen, then owned service
+and its checker), `hc-combine-queue.sh`, `qsa-indexer-tiles-queue.sh`,
+`indexer-prefill-queue.sh`, `qsa-indexer-tp-queue.sh`. Each micro runner checks
+GPU locks and occupancy again before executing. The experimental fused scorer
+is not installed into the serving candidate or production tree.
+
+The native candidate must improve the complete bounded score/selection chain
+by at least 20% at both measured query sizes before
+`indexer-prefill-tests-queue.sh` runs its 32 new GPU boundary/graph/invalid-input
+cases and 16 existing shared-key decode regressions. These tests are prepared,
+not yet executed. All applicable source checks pass; no GPU test pass is
+inferred from compilation or import success. The current service's startup
+state is recorded privately for exact model/configuration restoration only if
+the user authorizes a temporary pause; no signal has been sent to that service.
+
+### Authorized four-GPU session: QSA partition and PLE prefill
+
+The user subsequently authorized stopping the resident service and using all
+four GPUs. Its exact startup state was saved privately; only that idle service
+and its owned guard were stopped. The shared venv and production source remain
+unchanged. Current raw evidence is retained outside the checkout under
+`artifacts/flashnext-prefill-20261014/` in the workspace; the remote task log
+directory above remains authoritative. The earlier local `/tmp` directory is
+not available on this desktop host.
+
+The queued screens now have measured decisions:
+
+- HC combine/norm launch tuning is rejected. At M7344 the control/repeat are
+  0.780/0.775 ms and the best variant is 0.775 ms; at M8976 the control/repeat
+  are 0.942/0.945 ms and variants span 0.942--0.948 ms. Numerical checks pass,
+  but these changes do not establish a material gain.
+- Increasing QSA score budget from 32 to 64/128 MiB reduces score/selection
+  time, but adds transient memory. At M7344/N8672 the times are
+  10.172/5.855/5.410 ms, with a 10.998 ms repeated 32 MiB control. This is
+  evidence of repeated tiled work, not an admission to raise the memory cap.
+- The experimental fused native scorer is rejected by its predeclared gate.
+  At M7344 its best 7.230 ms result improves only 7.4% over the faster 7.808 ms
+  control, below the required 20%. M8976 improves from 11.646 to 8.766 ms,
+  but both sizes must pass. The proposed CUDA changes and unrun tests are
+  archived outside the checkout; the original indexer source and installed
+  serving artifact are retained. The conditional GPU test queue exits 77
+  (skipped), not passed.
+- Query-row partition over TP4 justifies integration. The existing scorer,
+  native selector and an AllGather of 512 compressed block indices take
+  2.531/3.572/2.887 ms at M7344/M8976/M7345, versus faster replicated controls
+  of 9.766/11.564/9.422 ms. All four ranks produce exactly equal selections.
+  This screen excludes the common key gather; the complete selector is
+  measured separately below.
+
+The opt-in `kernel_config.sm70_sparse.qsa_prefill_tp_rows` path binds the
+existing TP group in the QSA model adapter, which qualifies replicated queries
+and index-cache content. It partitions queries, runs the existing bounded
+cuBLAS/native-top-k stages and gathers compressed indices over the existing
+communication provider before expansion. It preserves the 32 MiB score budget,
+cache writes and output-buffer identity. Admission is SM70, FP16, TP4 with
+DCP=PCP=1, one request, H4/D128, 2048 selected tokens, compression ratio 4,
+4096--9216 query-token rows, and sufficient existing cuBLAS work per partition.
+Other shapes, mixed requests, smaller/larger chunks and CUDA graph capture use
+the original selector. Context remains bounded by the existing paged-cache
+contract; the 4096-row boundary is a query-chunk size, not a context limit.
+The flag defaults to false and participates in the active QSA policy hash.
+
+`qsa_prefill_tp.py` tests the complete serving selector, including key gather,
+masks, padding, selection, compressed-index AllGather and expansion. Maximum
+rank times (control / candidate / repeated control, ms) are:
+
+| Query rows / compressed key columns | Control | TP4 | Repeat |
+|---|---:|---:|---:|
+| 7344 / 1836 | 3.659 | 2.110 | 3.276 |
+| 7345 / 8672 | 12.057 | 4.777 | 11.288 |
+| 9216 / 8672 | 14.460 | 4.361 | 14.204 |
+
+All four ranks have exact output equality, valid causal masks and unchanged
+guard regions. Coverage includes query rows 0, 5, 4095/4096/4097, 7344/7345,
+9216/9217, mixed requests, 65536 compressed columns (256K-token context), and
+changed-input graph replay through the fallback. Actual AllGather counts prove
+one call per admitted selector and zero for fallback. An initial harness run
+omitted policy resolution and did not enter the fast path; its artifacts are
+marked `unresolved-policy-*` and are not performance evidence.
+
+The first chunk-9216 service attempt failed before producing a timing: PLE's
+padded-history convolution needed another 176 MiB with only 73.94 MiB free.
+The new opt-in `kernel_config.layer_execution.ple_prefill_conv` removes that
+history materialization. A Triton stage reads request-local rows and old state
+directly; a separate stage commits valid base states, then native FP16 SiLU
+retains the existing rounding boundary. Empty/null slots and speculative state
+tails are preserved. The initial acceleration contract is SM70 FP16,
+10240 channels, four taps, dilation 3, base state length 9, contiguous channels
+and device metadata, including strided state layouts. Other layouts and the
+default false policy retain the existing convolution. Policy hashes distinguish
+the enabled path on models with PLE consumers.
+
+The complete PLE convolution/state/SiLU benchmark gives:
+
+| Requests / query rows | Faster control ms | Candidate ms | Peak temporary MiB, control / candidate |
+|---|---:|---:|---:|
+| 1 / 7344 | 7.827 | 0.941 | 287.7 / 143.4 |
+| 1 / 8976 | 8.634 | 1.081 | 351.4 / 175.3 |
+| 4 / 1600 each | 6.277 | 0.805 | recorded in raw JSON |
+| Mixed 4, 0, 13, 7 with a null slot | 2.575 | 0.491 | recorded in raw JSON |
+
+The predeclared output limit is finite maximum row-relative L2 <= 0.001 with
+exact state updates; all measured outputs and states are actually bit-exact.
+The GPU suite covers initial/no-initial state, lengths 0/1/8/9/10/16/17/2049,
+mixed empty/null requests, decode offsets, transposed cache layout, changed
+inputs and reordered state slots during repeated graph replay. The initial
+combined run gives 48 passed and one test-only missing-import failure; after
+fixing the import, all three new policy tests pass. The extended graph cases
+give 2 passed. Together these runs cover all 27 PLE cases and 23 policy cases;
+there is no claim of a single clean combined test log. All affected pre-commit
+checks pass, including architecture, runtime ownership and generated reference.
+
+An owned chunk-9216 service now tests both flags with the prior dense and QSA
+DMA changes. It retains 256K context, TP4, 80% GPU / 20% host experts, host QSA
+KV, disk PLE, MTP4, prefix caching, thinking, tools and FULL decode graphs.
+All 16 candidate runtime files are frozen and SHA256-matched to the local
+checkout before startup. The benchmark uses the same five prompt hashes and
+actual token counts as the qualified 6.907 s result. Its predeclared screen is
+median TTFT < 6.78 s, followed by paired 32K/128K/near-256K retrieval/arithmetic,
+EOS and repetition checks. An independent full-prefill trace establishes
+execution and chunk shapes; profiled timing is not used as serving performance.
+At this checkpoint startup is still running: no end-to-end gain or default
+promotion is inferred from the microbenchmarks.
+
+The first combined service then passes startup and PLE but fails on the first
+request in HC's second AllGather: a 44 MiB allocation finds only 33.94 MiB
+free. It produces no valid timing. The HC projection still holds its completed
+gate, LoRA, packet and unpacked-weight tensors while allocating gathered and
+assembled outputs. Releasing each temporary after its last queued use changes
+no arithmetic, transport or storage contract. `hc_lifetime.py` measures the
+actual serving function with packed weights and real four-rank NCCL transport:
+temporary peak falls from 131.0 to 71.8 MiB at M7344, 159.3 to 87.7 MiB at
+M8976, and 163.4 to 90.1 MiB at M9216. Outputs match exactly on every rank,
+including three changed-input graph replays at M7344. Timing is variable and
+does not establish a compute speedup; this is a memory-lifetime fix.
+
+The updated `nvlink9k-mem` service freezes and matches 17 runtime files,
+retains the same model settings, and repeats the same serving/quality gate.
+No other process owns the GPUs. The first attempt's logs are retained separately.
+An additional benchmark-only HC row-partition screen is prepared: it includes
+two transient weight gathers and the final result gather, without increasing
+resident weight storage. It must beat both faster repeated controls by 10%
+at M7344 and M8976, with finite block/injection outputs and paired row-relative
+L2 <= 0.001, before any runtime integration is considered.
+
+That HC row-partition screen is rejected: complete chains take 1.693 / 1.687 /
+1.992 ms at M7344 / M8976 / M7345, versus faster repeated controls of 1.363 /
+1.567 / 1.334 ms. The additional weight transport and layouts outweigh the
+improved GEMM geometry. All numerical checks pass; maximum block error is
+0.000074 and injection error 0.000944. No row-partition HC path is added.
+
+The `nvlink9k-mem` service also fails on its first request, now at the HC output
+assembly allocation. Reclaiming HC temporaries alone does not make 9216-token
+capacity viable under the fixed GPU/host expert and KV settings. Its timing and
+quality are unqualified. The next owned service, `nvlink8k`, retains the original
+8192-token limit and the same 17-file candidate to isolate QSA/PLE/HC-lifetime
+changes from larger-chunk memory pressure. It uses the same predeclared 6.78 s
+performance screen and subsequent output-quality checks. No GPU-residency or
+context-capacity concession is used to make the larger chunk fit.
+
+The 8K candidate passes the predeclared serving screen with median TTFT
+**6.746936 s / 5129.143 tokens/s**, versus the fully qualified 6.907495 s
+result (2.32% lower) and original 7.513460 s baseline (10.20% lower).
+Three measured TTFTs are 7.064238 / 6.746936 / 6.722450 s on the same
+34688 / 34606 / 34631-token prompts. The first measured request still has
+warming drift, as in the earlier control. Pure server prefill times are
+6.623776 / 6.418930 / 6.478647 s (median 6.478647 s). All five prompt hashes
+and actual token counts match the qualified comparison. These measurements
+are unprofiled and remain below the 6000-token/s objective.
+
+The paired 32761- and 131070-token tasks pass with 166 / 155 generated tokens,
+correct retrieval/arithmetic JSON, normal EOS and maximum ten-word repetition
+of one. The 260089-token check is still running at this checkpoint. The
+independent full-prefill trace sees 65 compressed-block AllGathers per worker
+and ten new PLE kernels (five convolution/state pairs). Actual query chunks
+are 7344, 7344, 7344, 6528 and 6108 tokens for its separate 34668-token prompt.
+Its profiled TTFT is 7.596847 s, so its larger collective waits are not an
+unprofiled communication-cost estimate. Native execution is established;
+hardware SM/Tensor Core/link utilization counters have not been collected.
