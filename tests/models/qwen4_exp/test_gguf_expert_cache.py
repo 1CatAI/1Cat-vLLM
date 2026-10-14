@@ -139,6 +139,46 @@ def test_prefill_bank_matches_and_interleaves_with_decode():
     assert cache.stats()["errors"] == 0
 
 
+@pytest.mark.parametrize("slack", [0.0, 0.25])
+def test_cold_stage_uses_snapshot_and_preserves_slot_offsets(slack):
+    cache, original = _cache(slack=slack)
+    generator = torch.Generator().manual_seed(9683)
+    try:
+        # Fill holes and exercise write-backs before taking the prefill snapshot.
+        for _ in range(10):
+            for layer in LAYERS:
+                cache.resolve(layer, _random_ids(generator, 5))
+        torch.accelerator.synchronize()
+        stream = torch.cuda.current_stream().cuda_stream
+        for i, layer in enumerate(LAYERS):
+            snapshot = torch.empty(2, EXPERTS, dtype=torch.int32, device="cuda")
+            cache.lane.residency(i, snapshot.data_ptr(), stream)
+            torch.accelerator.synchronize()
+            gpu_slots, host_slots = snapshot.cpu()
+            cold = torch.nonzero(gpu_slots < 0).flatten()
+            selected = host_slots[cold].long()
+            # Source selection must use the saved snapshot, not a later CPU map.
+            saved = cache.slot_of[i].clone()
+            cache.slot_of[i].fill_(0)
+            try:
+                for s, shard in enumerate(gguf_expert_cache.SHARDS):
+                    stage = torch.full_like(
+                        cache.host[layer, shard], 0xA5, device="cuda"
+                    )
+                    cache.lane.stage_cold(i, s, stage.data_ptr(), stream)
+                    torch.testing.assert_close(
+                        stage[selected], original[layer, shard][cold], rtol=0, atol=0
+                    )
+                    holes = torch.ones(cache.host_slots, dtype=torch.bool)
+                    holes[selected] = False
+                    assert (stage[holes] == 0xA5).all()
+            finally:
+                cache.slot_of[i].copy_(saved)
+    finally:
+        torch.accelerator.synchronize()
+        cache.close()
+
+
 HIDDEN, INTER, TOP_K = 256, 32, 10
 
 

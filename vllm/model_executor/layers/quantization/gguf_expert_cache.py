@@ -1019,17 +1019,8 @@ class TurboMindPrefill:
             # (decode write-backs precede it) and the previous layer's cold
             # transcode (stream order), not the bank: it runs ahead.
             cold.wait_event(self.fresh)
-            rows = self.extent[p]
             for s in (0, 1) if key == "gu" else (2,):
-                shard = SHARDS[s]
-                nbytes = rows * cache.sizes[layer, shard]
-                if nbytes:
-                    _native().copy_h2d(
-                        self.stage_at[s],
-                        cache.host[layer, shard].data_ptr(),
-                        nbytes,
-                        cold.cuda_stream,
-                    )
+                cache.lane.stage_cold(i, s, self.stage_at[s], cold.cuda_stream)
         cold.wait_stream(stream)
         spec = info[key]
         weight, stats = self.bank(key, spec, slot[1])
