@@ -10,6 +10,9 @@ from torch.nn import Parameter
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.sm70_moe import Sm70MoEFormatConfig, capture_sm70_moe_config
+from vllm.distributed.device_communicators.custom_all_reduce import (
+    custom_ar_ipc_safe_allocation,
+)
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -806,12 +809,15 @@ class AWQSM70MoEMethod(Sm70MoEMethodBase):
             persistent_tokens,
             _DEFAULT_PERSISTENT_MAX_TOKENS,
         )
-        layer._awq_moe_buf_output = torch.empty(
-            persistent_tokens,
-            layer.sm70_hidden_logical_size,
-            dtype=torch.float16,
-            device=device,
-        )
+        # Graph capture reuses this resident buffer as the routed input of the
+        # captured custom all_reduce_sum2, which must be CUDA-IPC exportable.
+        with custom_ar_ipc_safe_allocation():
+            layer._awq_moe_buf_output = torch.empty(
+                persistent_tokens,
+                layer.sm70_hidden_logical_size,
+                dtype=torch.float16,
+                device=device,
+            )
         layer._awq_moe_buf_permuted_input = torch.empty(
             max_slots,
             layer.sm70_hidden_logical_size,
