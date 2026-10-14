@@ -729,6 +729,15 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # Cache binding runs under the target worker's config, also for draft
         # layers. Retain each owner's policy from model construction.
         self.host_kv_is_draft = vllm_config.is_speculative_draft
+        if self.host_kv_is_draft:
+            self.host_kv_hot_tokens = (
+                vllm_config.kernel_config.qsa_host_kv_draft_hot_tokens
+                or self.host_kv_hot_tokens
+            )
+        self.host_kv_hot_fp8 = (
+            not self.host_kv_is_draft
+            and vllm_config.kernel_config.qsa_host_kv_hot_dtype == "fp8_e4m3"
+        )
         self.host_kv_direct_device = vllm_config.kernel_config.sm70_qsa_device_history
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
@@ -912,13 +921,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 device_reference=self.host_kv_device_reference,
                 direct_device=self.host_kv_direct_device,
                 is_speculative_draft=self.host_kv_is_draft,
+                hot_fp8=self.host_kv_hot_fp8,
             )
             if not self.host_kv_is_draft:
                 _TARGET_HOST_KV.append(self.host_kv)
             logger.info_once(
                 "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
                 "direct device M1..20/H6/D256=%s, fallback_reason=%s; "
-                "other shapes use protected FP16 hot pages and miss staging.",
+                "other shapes use protected hot pages and FP16 miss staging.",
                 "device_reference" if self.host_kv_device_reference else "host",
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,

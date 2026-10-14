@@ -257,6 +257,43 @@ class ExpertCacheLane {
     return extent;
   }
 
+  // Stage only host slots used by the most recent residency snapshot. Keep
+  // their offsets unchanged: the GPU source map still addresses those slots.
+  // The caller orders the copy after decode write-backs and the preceding
+  // cold transcode, exactly as for a full-arena copy.
+  void stage_cold(int64_t layer, int64_t shard, int64_t destination,
+                  int64_t stream_ptr) {
+    TORCH_CHECK(layer >= 0 && layer < layers_ && shard >= 0 && shard < kShards,
+                "expert cache: bad cold stage bank");
+    auto stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    std::lock_guard<std::mutex> guard(mutex_);
+    const int32_t* map = residency_maps_ + 2 * layer * experts_;
+    std::vector<uint8_t> occupied(host_slots_, 0);
+    for (int64_t e = 0; e < experts_; ++e) {
+      if (map[e] >= 0) continue;
+      const int32_t h = map[experts_ + e];
+      TORCH_CHECK(h >= 0 && h < host_slots_,
+                  "expert cache: non-resident expert has no host slot");
+      occupied[h] = 1;
+    }
+    check(cudaSetDevice(static_cast<int>(device_)), "set device");
+    const int64_t stride = bytes(layer, shard);
+    for (int64_t begin = 0; begin < host_slots_;) {
+      if (!occupied[begin]) {
+        ++begin;
+        continue;
+      }
+      int64_t end = begin + 1;
+      while (end < host_slots_ && occupied[end]) ++end;
+      check(cudaMemcpyAsync(
+                reinterpret_cast<uint8_t*>(destination) + begin * stride,
+                host(layer, shard, begin), (end - begin) * stride,
+                cudaMemcpyHostToDevice, stream),
+            "stage cold experts");
+      begin = end;
+    }
+  }
+
  private:
   int64_t bytes(int64_t layer, int shard) const {
     return slot_bytes_[layer * kShards + shard];
@@ -533,6 +570,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("prefill", &ExpertCacheLane::prefill,
            pybind11::call_guard<pybind11::gil_scoped_release>())
       .def("residency", &ExpertCacheLane::residency,
+           pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("stage_cold", &ExpertCacheLane::stage_cold,
            pybind11::call_guard<pybind11::gil_scoped_release>());
   m.def("host_register", &host_register);
   m.def("host_unregister", &host_unregister);
