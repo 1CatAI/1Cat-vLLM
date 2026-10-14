@@ -191,6 +191,11 @@ def test_qwen4_exp_v2_model_state_uses_committed_ngram_context() -> None:
     model_state.ngram_context = torch.empty((4, 3), dtype=torch.int32)
     model_state.ngram_context_offsets = torch.arange(-3, 0, dtype=torch.int64)
     model_state.ple_query_start_loc = torch.empty(5, dtype=torch.int32)
+    # Admission state read by prepare_inputs since #988; keep the torch path.
+    model_state._ple_kernel_config = SimpleNamespace(
+        ple_input_prepare=False, ple_input_preparations={}
+    )
+    model_state._ple_input_hardware = False
 
     input_batch = SimpleNamespace(
         num_reqs=2,

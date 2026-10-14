@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -253,3 +254,152 @@ def test_prefill_short_conv_holds_two_batch_sized_buffers() -> None:
     # two of them alive at once, plus index scratch.
     assert optimized <= 2.25 * batch_bytes, (optimized, batch_bytes)
     assert reference - optimized >= 2 * batch_bytes, (reference, optimized)
+
+
+@pytest.mark.parametrize(
+    ("lengths", "hidden_size", "expected"),
+    [
+        ([100_000], 10240, None),  # one prefill pads nothing
+        ([5, 1, 7, 3], 16, None),  # narrower than one chunk
+        ([512] * 4, 1024, 448),
+        ([1024] + [16] * 7, 10240, 704),
+    ],
+)
+def test_prefill_short_conv_channel_chunk_width(lengths, hidden_size, expected) -> None:
+    module = _module(conv_state_len=9, dilation=3)
+    num_prefills, max_len, tokens = len(lengths), max(lengths), sum(lengths)
+
+    chunk = module._short_conv_prefill_channel_chunk(
+        num_prefills, max_len, tokens, hidden_size
+    )
+
+    assert chunk == expected
+    if chunk is not None:
+        # Each padded chunk buffer is at most half of one unpadded step.
+        padded = num_prefills * chunk * (module.conv_state_len + max_len)
+        assert padded <= (tokens + module.conv_state_len) * hidden_size // 2
+
+
+# One long prefill next to short ones pads every request to the long one; the
+# channel-chunked path must give the same bits and keep its buffers bounded by
+# the unpadded step.
+SKEWED_CASES = {
+    "skewed_with_state": dict(
+        lengths=[200, 3, 2, 1],
+        decode_tokens=2,
+        state_indices=[3, 0, 5, 1],
+        has_initial=[True, False, True, True],
+        hidden_size=256,
+    ),
+    "skewed_null_and_empty": dict(
+        lengths=[1, 150, 0, 4],
+        decode_tokens=0,
+        state_indices=[2, 4, 1, NULL_BLOCK_ID],
+        has_initial=[True, True, False, True],
+        hidden_size=192,
+    ),
+    "skewed_no_cache_rows": dict(
+        lengths=[90, 2],
+        decode_tokens=1,
+        state_indices=[0, 1],
+        has_initial=[False, False],
+        hidden_size=320,
+        empty_cache=True,
+    ),
+}
+
+
+@contextmanager
+def _single_threaded_on_cpu(device):
+    # ATen's CPU kernels can round an element one ulp differently at the edges
+    # of their thread partitions, which move with the tensor shape. Compare the
+    # layouts single-threaded; CUDA computes every element the same way.
+    if device != "cpu":
+        yield
+        return
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(threads)
+
+
+def _single_pass(monkeypatch) -> None:
+    monkeypatch.setattr(
+        Qwen4ExpPLELayer,
+        "_short_conv_prefill_channel_chunk",
+        lambda self, *args: None,
+    )
+
+
+@pytest.mark.parametrize("device,dtype", _devices())
+@pytest.mark.parametrize("name", sorted(SKEWED_CASES))
+def test_prefill_short_conv_channel_chunks_bitwise(
+    name, device, dtype, monkeypatch
+) -> None:
+    module, x_p, args = _case(device, dtype, **SKEWED_CASES[name])
+    metadata, conv_state, *rest = args
+    reference_state = conv_state.clone()
+    single_pass_state = conv_state.clone()
+
+    chunks = []
+    original = Qwen4ExpPLELayer._short_conv_prefill_channel_chunk
+
+    def spy(self, *args):
+        chunks.append(original(self, *args))
+        return chunks[-1]
+
+    monkeypatch.setattr(Qwen4ExpPLELayer, "_short_conv_prefill_channel_chunk", spy)
+    with _single_threaded_on_cpu(device):
+        expected = _reference_prefill_batched(
+            module, x_p, metadata, reference_state, *rest
+        )
+        actual = module._short_conv_dilated_prefill_batched(
+            x_p, metadata, conv_state, *rest
+        )
+        _single_pass(monkeypatch)
+        single_pass = module._short_conv_dilated_prefill_batched(
+            x_p, metadata, single_pass_state, *rest
+        )
+
+    assert chunks and chunks[0] is not None and chunks[0] < x_p.shape[1], chunks
+    assert actual.is_contiguous()
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual, single_pass)
+    assert torch.equal(conv_state, reference_state)
+    assert torch.equal(conv_state, single_pass_state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prefill_short_conv_channel_chunks_bound_memory(monkeypatch) -> None:
+    lengths = [1024] + [16] * 7
+    module, x_p, args = _case(
+        "cuda",
+        torch.float16,
+        lengths=lengths,
+        decode_tokens=0,
+        state_indices=list(range(8)),
+        has_initial=[True] * 8,
+        hidden_size=1024,
+        state_slots=8,
+    )
+    metadata, conv_state, *rest = args
+    batch_bytes = x_p.numel() * x_p.element_size()
+
+    def peak(state):
+        torch.accelerator.synchronize()
+        torch.accelerator.reset_peak_memory_stats()
+        base = torch.accelerator.memory_allocated()
+        result = module._short_conv_dilated_prefill_batched(x_p, metadata, state, *rest)
+        torch.accelerator.synchronize()
+        grown = torch.accelerator.max_memory_allocated() - base
+        return grown, result
+
+    chunked, actual = peak(conv_state.clone())
+    _single_pass(monkeypatch)
+    padded, expected = peak(conv_state.clone())
+    assert torch.equal(actual, expected)
+    # Output plus at most half a step per chunk buffer, plus index scratch.
+    assert chunked <= 2.5 * batch_bytes, (chunked, batch_bytes)
+    assert padded >= 4 * batch_bytes, (padded, batch_bytes)
