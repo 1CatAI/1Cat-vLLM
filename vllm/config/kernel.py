@@ -902,6 +902,11 @@ class KernelConfig:
     """Shared prefix staging buffers. One slot reuses the current layer's
     buffer after its attention completion event; prefetch still overlaps the
     following non-QSA computation. Two preserves the alternating layout."""
+    qsa_host_kv_trim_warmup_cache: bool = False
+    """Return unused allocator pages once after host-QSA kernel/graph warmup.
+    Active tensors and captured private pools remain owned; inference does
+    not trim pages. This initialization resource policy does not change
+    compiled model computation."""
     qsa_host_indexer_history: bool = False
     """Keep the FP16 compressed indexer history and its co-owned compressor
     state in mapped host storage when QSA host KV is active. Exact score
@@ -1082,6 +1087,7 @@ class KernelConfig:
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",
+            "qsa_host_kv_trim_warmup_cache",  # Startup allocator hygiene only.
         }
         if not self.qsa_host_kv_prefill_stage_tokens or not (
             self.qsa_host_kv or self.qsa_host_kv_active

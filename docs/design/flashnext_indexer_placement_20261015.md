@@ -277,3 +277,46 @@ test implementation only when absent, and the entire affected suite passes.
 Destination native stage/model-adapter tests, whole-model peak memory, paired
 long-context quality and fresh-process verifier measurements are pending.
 The library defaults and production defaults are not promoted from CPU tests.
+
+Destination HC qualification subsequently passes79affected cases and the
+four-rank model-adapter cases4096/4097/7344/7345/8192, including padding,
+compilation, changed-input replay and preserved PLE/MTP capacity tails.
+Independent FP32-reference and48-step recurrence checks pass7344/8192. At8192,
+the stage's temporary peak drops502.28125to170.015625MiB. The paired near-zero
+logit metric remains explicitly failed. Whole-model retrieval/arithmetic/EOS
+passes through260977 tokens, a further261044-input192-output SSE passes, and
+cold-prefill median is5196.6917tok/s /6.664047s.
+
+The ordinary source760context curve reconciles2480exact committed windows:
+means15.893678/16.259436/16.365536/17.544996ms at32774/65604/131124/261044
+input tokens. Corresponding p99 values are31.449087/31.458691/30.764757/
+28.706752ms. The long mean increases10.39%; graph-to-state residual remains
+about0.676ms. This is not an all-context16ms result. Short node traces are
+used only for composition: rank-zero Top-K service grows0.5225to1.8246ms,
+index scoring0.2093to0.7054ms and hot resolution0.9679to1.4489ms. These
+overlapping/category service measurements are not an additive wall-clock table.
+
+## Startup allocator reservation
+
+The HC run reduces live allocation, but its driver-free memory remains low.
+An allocator snapshot shows1257.7MiB unused in ordinary expandable segments
+and another50MiB reserved in captured private pools. Several CUDA streams
+retain roughly170--204MiB unused each. These are allocator reservations rather
+than additional live model weights or a change in expert placement.
+
+`kernel_config.qsa_host_kv_trim_warmup_cache` defaults to false. When requested
+and an actual host-QSA consumer exists, the common GPU Worker returns unused
+allocator pages once after model/graph and auxiliary kernel warmup. Inference
+does not trim. Active tensor/state ownership and captured pools are retained.
+This startup resource policy is excluded from the computation hash and is
+serialized through the normal per-engine configuration; no shell/import-order
+requirement or package installation is introduced. Both V1 and V2 reach the
+same final warmup boundary. Models without host-QSA consumers keep a no-op.
+
+Five configuration/consumer CPU cases and all six destination cases pass.
+The GPU case creates auxiliary scratch after capture, returns that unused
+reservation, preserves active state bitwise and replays changed inputs.
+The initial fixture allocated scratch before capture, which itself already
+cleared the cache; that failed memory-drop assertion is retained and corrected
+to reproduce post-capture auxiliary warmup. Whole-model memory headroom,
+unprofiled performance and fresh-process public serving remain pending.
