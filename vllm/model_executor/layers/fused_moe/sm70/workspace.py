@@ -4,6 +4,9 @@
 
 import torch
 
+from vllm.distributed.device_communicators.custom_all_reduce import (
+    custom_ar_ipc_safe_allocation,
+)
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.quantization.utils.sm70_layer_workspaces import (
     LayerWorkspaceView,
@@ -41,9 +44,12 @@ class Fp8MoEWorkspace:
         buffers.max_tokens = persistent_tokens
         buffers.max_slots = max_slots
         buffers.top_k = top_k
-        buffers.output = torch.empty(
-            persistent_tokens, hidden_size, dtype=torch.float16, device=device
-        )
+        # Graph capture reuses this resident buffer as the routed input of the
+        # captured custom all_reduce_sum2, which must be CUDA-IPC exportable.
+        with custom_ar_ipc_safe_allocation():
+            buffers.output = torch.empty(
+                persistent_tokens, hidden_size, dtype=torch.float16, device=device
+            )
         buffers.permuted_input = torch.empty(
             max_slots, hidden_size, dtype=torch.float16, device=device
         )
