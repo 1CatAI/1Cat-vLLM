@@ -38,7 +38,9 @@ SHARDS = ("w1", "w3", "w2")
 _ENTRY_HEADER = 8
 _RING_ENTRIES = 1024
 _MAX_OPS = 256
-_COPY_PROGRAMS = (16, 8)
+# Split both words and projections to expose independent mapped-host
+# transfers for small miss plans. See the paired TP4 copy screen.
+_COPY_PROGRAMS = (4, 32, 3)
 _LAYER = re.compile(r"layers\.(\d+)\.")
 _MEMLOG = envs.VLLM_EXPERT_CACHE_MEMLOG
 
@@ -109,6 +111,7 @@ def _apply_plan(
     OPS_PROGRAMS: tl.constexpr,
     SPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
+    PARALLEL_SHARDS: tl.constexpr = False,
 ):
     """Write back, then load, the planned experts (int64 words).
 
@@ -121,7 +124,8 @@ def _apply_plan(
         slot = tl.load(plan + 8 + op * 5).to(tl.int64)
         load = tl.load(plan + 9 + op * 5).to(tl.int64)
         back = tl.load(plan + 10 + op * 5).to(tl.int64)
-        for shard in tl.static_range(3):
+        for shard_index in tl.static_range(1 if PARALLEL_SHARDS else 3):
+            shard = tl.program_id(2) if PARALLEL_SHARDS else shard_index
             n = tl.load(words + layer * 3 + shard)
             device = tl.load(device_offsets + layer * 3 + shard) + slot * n
             host_base = tl.load(host_offsets + layer * 3 + shard)
@@ -582,8 +586,9 @@ class ExpertCache:
             i,
             OPS_PROGRAMS=_COPY_PROGRAMS[0],
             SPLIT=_COPY_PROGRAMS[1],
-            BLOCK=1024,
-            num_warps=8,
+            BLOCK=256,
+            PARALLEL_SHARDS=True,
+            num_warps=4,
         )
         out = torch.empty_like(ids)
         _remap[(1,)](

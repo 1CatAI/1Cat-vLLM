@@ -641,6 +641,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     HISTORY_LENGTHS=None,
     DEVICE_HISTORY: tl.constexpr = False,
     HISTORY_E4M3: tl.constexpr = False,
+    HOT_SCALES=None,
+    HOST_CACHE_E4M3: tl.constexpr = False,
 ) -> None:
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -739,6 +741,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 dim_offsets,
                 tl.cdiv(TOPK, 4) * 4,
                 HEAD_DIM,
+                HotScales=HOT_SCALES,
+                HOT_FP8=HOST_CACHE_E4M3,
             )
         else:
             keys = tl.load(
