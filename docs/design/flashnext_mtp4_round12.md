@@ -781,3 +781,13 @@ to submission. [TensorRT-LLM's speculative-decoding integration](https://github.
 also discusses capturing dependent draft and target work. The local
 single-graph draft experiment already regresses endpoint latency, so graph
 consolidation is not selected merely because it reduces replay count.
+
+### Expert weight reuse follow-up
+
+The [SM70 expert microbenchmark report](flashnext_expert_weight_reuse_sm70.md)
+compares full gate/up + down chains across 38 real routing windows for three
+quantization pairs. It separates existing grouped HMMA from new research
+readers, includes route density and official FP32 dequantization checks, and
+retains failed resident, scalar-code, K-parallel and integer Tensor Core designs.
+It does not revise this document's historical end-to-end measurements or enable
+a model route. M20 routing is synthesized from four captured M5 windows.
