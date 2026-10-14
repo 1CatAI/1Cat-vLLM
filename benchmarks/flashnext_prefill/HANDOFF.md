@@ -135,3 +135,27 @@
 - `pkill -f <模式>`：如果模式也出现在你自己的 ssh 命令行里，会把自己的会话杀掉，ssh 返回 255。
 - `HostQSAKV.write_staged` 的 `Blocks` 是 constexpr，必须固定为 `self.blocks`。每步传不同的值会让 Triton 每步重编，TTFT 多出约 0.7 s。
 - `cudaHostRegister` 注册的内存，在 torch 看来 `is_pinned()` 是 False，`.copy_(non_blocking=True)` 会退化成同步拷贝。要异步 H2D 用原生的 `copy_h2d`。
+
+## 8. 9683 MTP HC 显存诊断（2026-10-15）
+
+主模型的 HC 行分片不能代替草稿模型的显存验证。启用 MTP 时必须保留
+已验收的 FP16 GEMM reduction 策略；旧主模型 admission 的 reduction=False
+条件曾使配置请求了行分片，却没有实际执行。移除该条件后，主模型路径
+实际命中，但 8192 行的草稿 `mtp.layers.48` 仍在 HC combine/norm 申请
+两个 160 MiB 输出；分配上限 384/512 MiB 留余量的整模型试验仍然 OOM。
+
+候选 `kernel_config.layer_execution.hc_mtp_prefill_sequence_parallel` 默认
+关闭，独立于主模型行分片配置。其加速范围是 SM70、FP16、HC4/H2560/L320、
+sharded HC、Q8_0 MTP experts、TP4/PP1/DCP1/PCP1、C1、BACKED 动态形状，
+无 LoRA/诊断，实际 query 行数 4096..16384，非 CUDA Graph prefill。
+范围外继续原草稿模型；MTP 的小形状 decode 编译和 FULL Graph 不受该开关
+影响。输入 target hidden 只借用，不原地修改；草稿 attention/expert 保留
+原归约，HC 行分片复用现有投影/通信/归一化实现，最终恢复原 token 顺序和
+两路完整输出，padding 行不暴露给 proposer。
+
+`hc_mtp_sequence_runtime.py` 验证真实 MTP/decoder/HC adapter 的数值、行边界、
+编译、变输入 graph replay、target hidden 不变和输出所有权；合成 producer
+测试不能替代整模型质量或性能。候选尚需整模型 cold prefill、长文任务、
+显存余量与验证成本验收。不要把验证 kernel 总和、MTP 轮间隔或 tok/s 当成
+验证成本：长文使用 TP4 最早 target graph GPU 开始至最晚状态提交的完整
+wall time，同时记录尾部和不完整轮次。

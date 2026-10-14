@@ -13,6 +13,7 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
     multi stream [T, hc_count*H] (fed to the next draft step).
 """
 
+import copy
 from collections.abc import Iterable
 
 import regex as re
@@ -21,13 +22,22 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.compilation.sm70_decode_graph import is_sm70_decode_graph_compiling
-from vllm.config import SpeculativeConfig, VllmConfig, replace, set_current_vllm_config
+from vllm.config import (
+    CUDAGraphMode,
+    SpeculativeConfig,
+    VllmConfig,
+    replace,
+    set_current_vllm_config,
+)
+from vllm.config.compilation import DynamicShapesType
 from vllm.config.execution_policy import graph_policy
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, get_tp_group
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.ple_offload_layer import is_offload_process
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -43,6 +53,7 @@ from vllm.model_executor.models.utils import (
     maybe_fuse_shared_experts,
     maybe_prefix,
 )
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
@@ -69,6 +80,7 @@ from .model import (
     _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
+    _hc_sequence_rows,
     _make_qwen38_decode_compile_config,
 )
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
@@ -440,6 +452,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
+        hc_sequence_parallel: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
         hc_count = self.hc_count
         hidden_size = self.hidden_size
@@ -485,6 +498,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
+        if hc_sequence_parallel:
+            hidden_states = _hc_sequence_rows(hidden_states)
         hidden_states, block_output, injection = layer(
             hidden_states=hidden_states,
             prev_block_output=None,
@@ -493,16 +508,27 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             input_ids=None,
             query_start_loc=None,
             ngram_context=None,
+            hc_sequence_parallel=hc_sequence_parallel,
         )
         # Last PP rank finalize. Keep both:
         #   (A) sample_hidden_states [T, H]  -> single stream for the LM head
         #   (B) multi_hidden [T, hc_count*H] -> pre-final-mixer multi stream
         #       for the next draft step (zero extra compute, just kept).
-        multi_hidden, sample_hidden_states, _ = (
-            self.hyper_connection_mixer.combine_and_mix(
-                hidden_states, block_output, injection
-            )
+        final_mix = (
+            self.hyper_connection_mixer.sequence_parallel_combine_and_mix
+            if hc_sequence_parallel
+            else self.hyper_connection_mixer.combine_and_mix
         )
+        multi_hidden, sample_hidden_states, _ = final_mix(
+            hidden_states, block_output, injection
+        )
+        if hc_sequence_parallel:
+            # The proposer owns full-row outputs. Keep padded rows internal;
+            # neither output aliases the target's hidden-state buffer.
+            sample_hidden_states = sample_hidden_states[: positions.shape[-1]]
+            multi_hidden = get_tp_group().all_gather(multi_hidden, dim=0)[
+                : positions.shape[-1]
+            ]
         return sample_hidden_states, multi_hidden
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -557,6 +583,42 @@ class _Qwen4ExpMTPDecodeGraphModel(nn.Module):
             intermediate_tensors,
             inputs_embeds,
             spec_step_idx,
+        )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "hidden_states": 0,
+    }
+)
+class _Qwen4ExpMTPPrefillSequenceModel(nn.Module):
+    """Borrow the drafter's weights/state for a separate row-owned prefill."""
+
+    def __init__(self, *, target_model, vllm_config: VllmConfig):
+        super().__init__()
+        object.__setattr__(self, "_target_model", target_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        spec_step_idx: int = 0,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        return self._target_model.forward(
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors,
+            inputs_embeds,
+            spec_step_idx,
+            hc_sequence_parallel=True,
         )
 
 
@@ -647,6 +709,30 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         enable_qwen38_sm70_fp16_gemv(self, config_dtype, vllm_config)
         enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
         object.__setattr__(self, "_sm70_decode_graph_model", None)
+        object.__setattr__(self, "_hc_prefill_sequence_model", None)
+        parallel = vllm_config.parallel_config
+        self._hc_prefill_sequence_qualified = bool(
+            vllm_config.kernel_config.layer_execution.hc_mtp_prefill_sequence_parallel
+            and vllm_config.kernel_config.sm70_mtp_q8_0_experts
+            and not is_offload_process()
+            and current_platform.is_device_capability(70)
+            and vllm_config.model_config.dtype == torch.float16
+            and (config.hc_count, config.hidden_size, config.hc_lowrank)
+            == (4, 2560, 320)
+            and vllm_config.kernel_config.hc_weight_storage == "sharded"
+            and not vllm_config.kernel_config.sm70_hcx_diagnostics
+            and vllm_config.lora_config is None
+            and vllm_config.scheduler_config.max_num_seqs == 1
+            and vllm_config.compilation_config.dynamic_shapes_config.type
+            == DynamicShapesType.BACKED
+            and (
+                parallel.tensor_parallel_size,
+                parallel.pipeline_parallel_size,
+                parallel.decode_context_parallel_size,
+                parallel.prefill_context_parallel_size,
+            )
+            == (4, 1, 1, 1)
+        )
         self._sm70_draft_head = None
 
     def prepare_loaded_linear_weights(self) -> None:
@@ -690,6 +776,19 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    def _use_hc_prefill_sequence_rows(self, positions, hidden_states, intermediate):
+        return bool(
+            getattr(self, "_hc_prefill_sequence_qualified", False)
+            and 4096 <= positions.shape[-1] <= 16384
+            and hidden_states is not None
+            and hidden_states.dtype == torch.float16
+            and hidden_states.shape == (positions.shape[-1], 10240)
+            and intermediate is None
+            and not torch.backends.cuda.matmul.allow_fp16_accumulation
+            and is_forward_context_available()
+            and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+        )
+
     def forward(  # type: ignore[override]
         self,
         input_ids: torch.Tensor | None,
@@ -711,14 +810,38 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 # full 304-MiB TP vocabulary shard during graph startup. The
                 # outer CUDA graph still captures lookup and its TP reduction.
                 inputs_embeds = self.model.embed_input_ids(input_ids)
-        return backbone(
-            input_ids,
-            positions,
-            hidden_states,
-            intermediate_tensors,
-            inputs_embeds,
-            spec_step_idx=spec_step_idx,
-        )
+        if self._use_hc_prefill_sequence_rows(
+            positions, hidden_states, intermediate_tensors
+        ):
+            logger.info_once(
+                "Using qualified TP4 Q8_0 MTP HC prefill row owners; "
+                "attention/expert reductions and decode are unchanged."
+            )
+            if self._hc_prefill_sequence_model is None:
+                config = copy.copy(self.vllm_config)
+                config.compilation_config = copy.copy(config.compilation_config)
+                config.compilation_config.cache_dir = ""
+                config.compilation_config.local_cache_dir = ""
+                config.compilation_config.traced_files = set()
+                with set_current_vllm_config(config):
+                    view = _Qwen4ExpMTPPrefillSequenceModel(
+                        target_model=self.model, vllm_config=config
+                    )
+                object.__setattr__(self, "_hc_prefill_sequence_model", view)
+            backbone = self._hc_prefill_sequence_model
+        # Draft row stages keep the original replicated producer reductions;
+        # they must not inherit the target's partial-producer context.
+        from .sm70_hcx import hc_prefill_sequence_parallel_context
+
+        with hc_prefill_sequence_parallel_context(False):
+            return backbone(
+                input_ids,
+                positions,
+                hidden_states,
+                intermediate_tensors,
+                inputs_embeds,
+                spec_step_idx=spec_step_idx,
+            )
 
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0

@@ -556,7 +556,11 @@ class Qwen4ExpDecoderLayer(nn.Module):
             block_input = block_input[: positions.shape[-1]]
         mlp_out = (
             self.mlp.forward_partials(block_input)
-            if hc_sequence_parallel and isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
+            if (
+                hc_sequence_parallel
+                and isinstance(self.mlp, Qwen4ExpSparseMoeBlock)
+                and getattr(self.mlp_hyper_connection, "_partial_inputs", False)
+            )
             else self.mlp(block_input)
         )
         return hidden_states, mlp_out, injection

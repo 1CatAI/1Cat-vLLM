@@ -74,6 +74,7 @@ def effective_layer_policy_hash_fields(model, speculative, fields):
     text = getattr(model, "hf_text_config", None)
     if text is not None and getattr(text, "hc_count", 1) <= 1:
         selected.discard("hc_prefill_sequence_parallel")
+        selected.discard("hc_mtp_prefill_sequence_parallel")
         selected.discard("hc_prefill_peer_norm")
     if text is not None and not getattr(text, "ple_layer_ids", None):
         selected.discard("ple_spec_conv")

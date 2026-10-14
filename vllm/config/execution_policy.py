@@ -286,6 +286,8 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Use the FP16 PLE prefill convolution without a padded history."""
     hc_prefill_sequence_parallel: bool = False
     """Partition prefill residual rows across TP before HC projection."""
+    hc_mtp_prefill_sequence_parallel: bool = False
+    """Partition qualified Q8_0 MTP prefill HC rows; keep expert reductions."""
     hc_prefill_peer_norm: bool = False
     """Fuse qualified row-owned HC reduction/norm through full-mesh NVLink."""
     quant_backend: Literal["auto", "marlin", "turbomind"] | None = None
@@ -400,6 +402,15 @@ class LayerExecutionPolicy(ExecutionPolicy):
             )
         ):
             factors["hc_prefill_sequence_parallel"] = True
+        if (
+            self.active
+            and self.hc_mtp_prefill_sequence_parallel
+            and (
+                self.hash_fields is None
+                or "hc_mtp_prefill_sequence_parallel" in self.hash_fields
+            )
+        ):
+            factors["hc_mtp_prefill_sequence_parallel"] = True
         if (
             self.active
             and self.hc_prefill_sequence_parallel
