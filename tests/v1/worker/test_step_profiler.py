@@ -106,6 +106,39 @@ def test_disabled_context_never_allocates_events(monkeypatch):
     assert profiler.calls == 0 and not profiler.totals
 
 
+@pytest.mark.parametrize("role", ["runner", "runner_v2", "proposer"])
+def test_v2_reports_nonzero_tp_rank_timings(monkeypatch, role):
+    monkeypatch.setattr(
+        "vllm.v1.spec_decode.profiling.is_last_pp_first_tp_rank", lambda: False
+    )
+    config = SimpleNamespace(
+        observability_config=ObservabilityConfig(
+            step_profiler=StepProfilerConfig(enabled=True, interval=1)
+        ),
+        speculative_config=SimpleNamespace(method="mtp"),
+    )
+    messages = []
+    profiler = create_step_profiler(
+        config,
+        torch.device("cuda"),
+        role=role,
+        logger=SimpleNamespace(info=lambda msg, *args: messages.append(msg % args)),
+    )
+    if role == "runner_v2":
+        profiler.report(
+            dict(
+                events=[("target_forward", Event(7), Event())],
+                num_tokens=5,
+                num_draft_tokens=4,
+                target_verifier_wall_cpu=8,
+                total_wall_start=0,
+            )
+        )
+        assert any("target_forward=7.000" in message for message in messages)
+    else:
+        assert not profiler.report_rank()
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_config_snapshot_priority_serialization_and_hash(monkeypatch, reverse):
     monkeypatch.setenv("VLLM_SM70_MTP_PROFILE", "1")
