@@ -323,6 +323,30 @@ class CudaPlatformBase(Platform):
         return torch.cuda.max_memory_allocated(device)
 
     @classmethod
+    def limit_allocator_headroom(
+        cls, headroom_bytes: int, device: torch.types.Device | None = None
+    ) -> int:
+        """Leave bytes beyond current non-Torch use outside the CUDA allocator."""
+        if headroom_bytes <= 0:
+            raise ValueError("Allocator headroom must be positive")
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info(device)
+        retained = torch.cuda.memory_reserved(device)
+        non_torch = total - free - retained
+        fraction = min(
+            torch.cuda.get_per_process_memory_fraction(device),
+            (total - non_torch - headroom_bytes) / total,
+        )
+        limit = int(fraction * total)
+        if fraction <= 0 or limit < retained:
+            raise ValueError(
+                f"Allocator limit {limit} bytes cannot retain {retained} bytes "
+                "of active allocations and captured pools"
+            )
+        torch.cuda.set_per_process_memory_fraction(fraction, device)
+        return limit
+
+    @classmethod
     def get_valid_backends(
         cls,
         device_capability: DeviceCapability,

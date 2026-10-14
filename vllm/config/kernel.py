@@ -911,6 +911,11 @@ class KernelConfig:
     Active tensors and captured private pools remain owned; inference does
     not trim pages. This initialization resource policy does not change
     compiled model computation."""
+    qsa_host_kv_allocator_headroom_mib: int = Field(default=0, ge=0, le=4096)
+    """Device bytes kept outside the Torch allocator after host-QSA warmup.
+    MiB units; zero retains the existing allocator policy. This reservation
+    limit preserves active tensors and graph pools and may reject workloads
+    whose retained allocations cannot fit. It does not change computation."""
     qsa_host_indexer_history: bool = False
     """Keep the FP16 compressed indexer history and its co-owned compressor
     state in mapped host storage when QSA host KV is active. Exact score
@@ -1092,6 +1097,7 @@ class KernelConfig:
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",
             "qsa_host_kv_trim_warmup_cache",  # Startup allocator hygiene only.
+            "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
         }
         if not self.qsa_host_kv_prefill_stage_tokens or not (
             self.qsa_host_kv or self.qsa_host_kv_active

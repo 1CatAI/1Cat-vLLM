@@ -76,6 +76,30 @@ this setting is a queue bound, not a total pinned-memory quota. Tests cover
 queue bounds, ordered values, configuration delivery and hash invariance.
 Fresh startup and complete-model memory qualification remain required.
 
+The zero-swap attempt finishes GPU warmup but triggers the unchanged 5 GiB
+MemAvailable guard at 5067 MiB. The subsequent owned-service 2 GiB swap
+budget completes startup and the paired tools, arithmetic and natural-EOS
+quality gates through 260977 tokens. Its median cold 32K prefill is 5170.79
+tokens/s and 6.69260 s. These results do not qualify an every-round 16 ms
+claim. The allocator trim briefly leaves approximately 1 GiB driver free,
+but inference grows ordinary reservations again: a measured boundary has
+only 113.94 MiB free despite about 684 MiB of estimated live headroom.
+Diagnostic libc trimming releases only about 170 MiB across all ranks and
+initialization phases; it is not promoted as a material runtime fix.
+
+`qsa_host_kv_allocator_headroom_mib` is a separate, default-zero resource
+candidate. After all warmups, an actual host-QSA consumer may request a
+CUDA allocator ceiling beyond the measured non-Torch use. The platform
+returns unused ordinary pages, retains captured pools and active tensors,
+and never raises an existing tighter process ceiling. Impossible retained
+budgets are explicitly rejected. The ceiling is fixed for that worker
+process; later native allocations or foreign GPU use can reduce the physical
+margin, so sampled destination peaks remain required. It neither trims each
+inference step nor changes model computation/hash. Other platforms reject
+the requested allocator operation; models without a host-QSA consumer do
+not apply it. CPU admission/hash tests pass; GPU graph/cache-pressure and
+matched model/headroom/performance qualification are pending.
+
 ## Rejected screens
 
 Warp-aggregated histograms regress random inputs. Warp-local emission

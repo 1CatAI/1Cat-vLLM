@@ -1008,18 +1008,33 @@ class Worker(WorkerBase):
 
     def _trim_qsa_warmup_cache(self) -> bool:
         """Release unused warmup pages after all active buffers are prepared."""
-        if not self.vllm_config.kernel_config.qsa_host_kv_trim_warmup_cache:
+        policy = self.vllm_config.kernel_config
+        if not (
+            policy.qsa_host_kv_trim_warmup_cache
+            or policy.qsa_host_kv_allocator_headroom_mib
+        ):
             return False
         if not any(
             getattr(module, "host_kv", None) is not None
             for module in self.compilation_config.static_forward_context.values()
         ):
             return False
-        torch.accelerator.empty_cache()
-        logger.info(
-            "Returned unused host-QSA warmup allocator pages; "
-            "active buffers and captured private pools remain owned."
-        )
+        if policy.qsa_host_kv_trim_warmup_cache:
+            torch.accelerator.empty_cache()
+            logger.info(
+                "Returned unused host-QSA warmup allocator pages; "
+                "active buffers and captured private pools remain owned."
+            )
+        if policy.qsa_host_kv_allocator_headroom_mib:
+            limit = current_platform.limit_allocator_headroom(
+                policy.qsa_host_kv_allocator_headroom_mib * 1024**2, self.device
+            )
+            logger.info(
+                "Host-QSA Torch allocator limit=%d bytes; requested "
+                "headroom=%d MiB beyond measured non-Torch use.",
+                limit,
+                policy.qsa_host_kv_allocator_headroom_mib,
+            )
         return True
 
     def reset_mm_cache(self) -> None:
