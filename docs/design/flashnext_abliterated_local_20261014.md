@@ -55,6 +55,7 @@ export PYTHON_BIN=/path/to/venv/bin/python
 export CUDA_HOME=/path/to/cuda-12.8
 export VLLM_API_KEY='your-key'
 export GPU_IDS=4,5,6,7 CPU_SET=24-47,72-95
+export QSA_HOST_INDEXER_HISTORY=false
 bash examples/serve_flashnext_gguf_256k.sh
 ```
 
@@ -65,6 +66,12 @@ forwards to the verified model instance. Read the tunnel client's published
 endpoint when connecting: its assigned public port can differ from the port
 requested in the preset configuration. Credentials stay outside the source
 repository.
+
+`QSA_HOST_INDEXER_HISTORY` accepts `true` or `false` and defaults to `false`,
+preserving this local measurement's configuration. `true` selects the existing
+host-backed compressed-indexer cache, reserving more device memory for prefill
+temporaries. The [9683 deployment](flashnext_abliterated_9683_20261014.md)
+records the separate qualification of that setting.
 
 ## Evidence
 

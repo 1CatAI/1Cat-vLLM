@@ -13,6 +13,7 @@ PORT=${PORT:-8000}
 GPU_IDS=${GPU_IDS:-4,5,6,7}
 CPU_SET=${CPU_SET:-24-47,72-95}
 EXPERT_PROFILE=${EXPERT_PROFILE:-}
+QSA_HOST_INDEXER_HISTORY=${QSA_HOST_INDEXER_HISTORY:-false}
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 export PATH="$CUDA_HOME/bin:$(dirname "$PYTHON_BIN"):$PATH"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_IDS"
@@ -31,9 +32,11 @@ export TORCH_EXTENSIONS_DIR="$CACHE_DIR/torch_extensions"
 export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 unset LD_PRELOAD LD_AUDIT ONECAT_VLLM_EXTENSION_DIR
 mkdir -p "$CACHE_DIR"
-KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" <<'PY'
+KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" "$QSA_HOST_INDEXER_HISTORY" <<'PY'
 import json
 import sys
+if sys.argv[2].lower() not in ("true", "false"):
+    raise ValueError("QSA_HOST_INDEXER_HISTORY must be true or false")
 config = {
     "sm70_gguf": {
         "expert_storage": "original", "expert_arena": True,
@@ -51,7 +54,8 @@ config = {
     "sm70_hcx_output_projection": False, "sm70_hcx_local_schedule": True,
     "sm70_qsa_shared_key": True, "sm70_qsa_device_history": True,
     "sm70_qsa_host_native": True, "qsa_host_kv": True,
-    "qsa_host_indexer_history": False, "qsa_host_kv_dtype": "fp8_e4m3",
+    "qsa_host_indexer_history": sys.argv[2].lower() == "true",
+    "qsa_host_kv_dtype": "fp8_e4m3",
     "qsa_host_kv_draft_dtype": "float16", "qsa_host_kv_device_reference": False,
     "qsa_host_kv_hot_tokens": 32768, "qsa_host_kv_hot_dtype": "fp8_e4m3",
     "qsa_host_kv_draft_hot_tokens": 16384, "qsa_host_kv_staging_rows": 8,
