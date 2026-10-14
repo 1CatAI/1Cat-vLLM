@@ -77,6 +77,8 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
     """Retain the M5/M10 sparse top-k compaction route."""
     qsa_score_tile_mb: int | None = None
     """Score workspace budget; retain the qualified 64 MiB default."""
+    qsa_prefill_tp_rows: bool = False
+    """Partition eligible replicated QSA prefill scoring across four TP ranks."""
     qsa_cublas_min_rows: int | None = None
     """Minimum query rows for the cuBLAS scorer."""
     qsa_cublas_min_score_elements: int | None = None
@@ -167,6 +169,11 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
         if not self.active:
             return hash_factors({})
         factors: dict[str, object] = {"policy": super().compute_hash()}
+        if self.qsa_prefill_tp_rows and (
+            self.hash_fields is None
+            or any(field.startswith("qsa_") for field in self.hash_fields)
+        ):
+            factors["qsa_prefill_tp_rows"] = True
         if self.hash_fields is None or any(
             not field.startswith("qsa_") for field in self.hash_fields
         ):

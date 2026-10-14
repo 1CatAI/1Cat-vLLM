@@ -44,6 +44,17 @@ _AFFINE_BLAS_MIN_M = {
     (5, 32, 5120, 2560): 2048,
     (6, 16, 6144, 5120): 2048,
     (6, 16, 1536, 5120): 2048,
+    # Flash-Next TP4 Q5_K/Q6_K projections; dequantization is included in
+    # the paired timings in benchmarks/flashnext_prefill/OPTIMIZATION_20261014.md.
+    (5, 32, 2560, 2560): 2048,
+    (6, 16, 2560, 2560): 2048,
+    (6, 16, 2560, 1536): 2048,
+    (6, 16, 1536, 2560): 2048,
+    # Same-codec GDN QKV/gate and QSA Q/K/V segments after TP4 merging.
+    (5, 32, 2560, 4096): 2048,
+    (6, 16, 2560, 4096): 2048,
+    (5, 32, 2560, 3328): 2048,
+    (5, 32, 2560, 3072): 4096,
 }
 _AFFINE_BLAS_WORKSPACE_ELEMENTS = max(k * n for _, _, k, n in _AFFINE_BLAS_MIN_M)
 _affine_blas_workspaces: weakref.WeakValueDictionary = weakref.WeakValueDictionary()

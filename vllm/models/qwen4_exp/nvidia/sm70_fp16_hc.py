@@ -853,16 +853,24 @@ def _sharded_hc_project(
     local_down, local_up = _unpack_hc_storage(down, up)
     order = tuple(communicator.order)
     local = torch.mm(x, local_down.T)
+    del local_down
     # Gather along rows (no reorder copy); one kernel takes the logical rank
     # order, applies the HC SiLU and extracts the injection logits.
     packet = group.all_gather(local, dim=0)
+    del local
     lora, injection = hc_packet_silu(packet, order, 4)
+    del packet
     local_gate = torch.mm(lora, local_up.T)
+    del lora, local_up
     # The mix is elementwise per hidden column and this rank holds every
     # stream's gate for its columns: mix locally, gather the 4x narrower
     # result (rank-major rows) and assemble it in logical rank order.
     mixed = hc_gate_mix_local(x, local_gate, order.index(group.rank_in_group), 4)
+    # Large prefill gates are no longer needed. Reclaim their storage before
+    # allocating the full gathered block and its assembled output.
+    del local_gate
     gathered = group.all_gather(mixed, dim=0)
+    del mixed
     return hc_assemble_ranks(gathered, order), injection
 
 

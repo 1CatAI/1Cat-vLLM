@@ -282,6 +282,8 @@ class LayerExecutionPolicy(ExecutionPolicy):
     """Retain the independent SM70 shared-expert overlap rollback."""
     ple_spec_conv: bool | None = None
     """Retain the existing PLE MTP convolution and state-commit kernel."""
+    ple_prefill_conv: bool = False
+    """Use the FP16 PLE prefill convolution without a padded history."""
     quant_backend: Literal["auto", "marlin", "turbomind"] | None = None
     """Shared pre-Ampere quantization backend; format flags retain their gates."""
     gptq_turbomind: bool | None = None
@@ -379,6 +381,12 @@ class LayerExecutionPolicy(ExecutionPolicy):
 
     def compute_hash(self) -> str:
         factors: dict[str, object] = {"policy": super().compute_hash()}
+        if (
+            self.active
+            and self.ple_prefill_conv
+            and (self.hash_fields is None or "ple_spec_conv" in self.hash_fields)
+        ):
+            factors["ple_prefill_conv"] = True
         errors = {
             field: error
             for field, error in self.provider_errors.items()
