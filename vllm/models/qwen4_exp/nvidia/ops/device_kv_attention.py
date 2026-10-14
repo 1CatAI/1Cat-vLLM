@@ -17,6 +17,28 @@ logger = init_logger(__name__)
 _WORKSPACES: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
+def _history_workspace(device, width, rows):
+    key = (device, width, rows)
+    if key not in _WORKSPACES:
+        reference_elements = max(
+            m * 6 * _attention_profile(m, width)[2] for m in range(1, 21)
+        )
+        native_elements = rows * 6 * ((width + 63) // 64)
+        _WORKSPACES[key] = (
+            torch.empty(
+                max(reference_elements, native_elements) * 256,
+                dtype=torch.float32,
+                device=device,
+            ),
+            torch.empty(
+                max(reference_elements, 2 * native_elements),
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+    return _WORKSPACES[key]
+
+
 def initialize_device_history_attention(state, enabled: bool | None) -> None:
     cfg = get_current_vllm_config_or_none()
     if enabled is None:
@@ -57,34 +79,13 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
     state.device_history_workspace = None
     if reason is not None:
         return
-    key = (state.history.device, state.width, getattr(state, "resolve_rows", 20))
-    if key not in _WORKSPACES:
-        # The protected launch policy uses 16-column tiles and up to 64 splits,
-        # including at short widths. Bound all admitted M values before capture.
-        reference_elements = max(
-            rows * 6 * _attention_profile(rows, state.width)[2] for rows in range(1, 21)
-        )
-        native_rows = max(20, getattr(state, "resolve_rows", 20))
-        native_elements = native_rows * 6 * ((state.width + 63) // 64)
-        # Native split states contain both a maximum and a denominator. Keep
-        # enough room for the arithmetic-preserving diagnostic reference too.
-        _WORKSPACES[key] = (
-            torch.empty(
-                max(reference_elements, native_elements) * 256,
-                dtype=torch.float32,
-                device=state.history.device,
-            ),
-            torch.empty(
-                max(reference_elements, 2 * native_elements),
-                dtype=torch.float32,
-                device=state.history.device,
-            ),
-        )
-    state.device_history_workspace = _WORKSPACES[key]
+    state.device_history_workspace = _history_workspace(
+        state.history.device, state.width, max(20, getattr(state, "resolve_rows", 20))
+    )
 
 
-# Rows per native launch over staged prefill history (the op's maximum).
-PREFILL_ROWS = 64
+# Prefill tiles share the ordinary 32-row history workspace.
+PREFILL_ROWS = 32
 
 
 def prefill_history_workspace(state):
@@ -99,16 +100,11 @@ def prefill_history_workspace(state):
         importlib.import_module("vllm._sm70_qsa_device_C")
     except ImportError:
         return None
-    key = (state.history.device, state.width, "prefill")
-    if key not in _WORKSPACES:
-        elements = PREFILL_ROWS * 6 * ((state.width + 63) // 64)
-        _WORKSPACES[key] = (
-            torch.empty(
-                elements * 256, dtype=torch.float32, device=state.history.device
-            ),
-            torch.empty(2 * elements, dtype=torch.float32, device=state.history.device),
-        )
-    return _WORKSPACES[key]
+    # Native attention uses the same independent per-row split states in
+    # prefill and decode. Owners execute serially on the model stream, so the
+    # ordinary 32-row history workspace can serve both phases without retaining
+    # a separate 64-row prefill allocation.
+    return _history_workspace(state.history.device, state.width, PREFILL_ROWS)
 
 
 def cfg_allows_host_native(cfg) -> bool:

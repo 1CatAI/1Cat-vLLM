@@ -8,8 +8,10 @@ import pytest
 import torch
 
 from vllm.models.qwen4_exp.nvidia.ops.device_kv_attention import (
+    PREFILL_ROWS,
     _direct_history_triton,
     initialize_device_history_attention,
+    prefill_history_workspace,
 )
 from vllm.models.qwen4_exp.nvidia.ops.host_kv import HostQSAKV
 from vllm.models.qwen4_exp.nvidia.ops.host_kv_attention import host_qsa_attention
@@ -443,3 +445,85 @@ def test_native_hot_rejects_misaligned_storage(encoded):
         args += (state.hot_scales,)
     with pytest.raises(RuntimeError, match="aligned vector loads"):
         op(*args)
+
+
+@pytest.mark.parametrize("prefill_first", [False, True])
+def test_prefill_and_decode_share_native_workspace(monkeypatch, prefill_first):
+    import vllm.models.qwen4_exp.nvidia.ops.device_kv_attention as module
+
+    monkeypatch.setattr(module, "_WORKSPACES", {})
+    state = SimpleNamespace(
+        history=torch.empty(1, 2, 64, 1, 256, dtype=torch.float16, device="cuda"),
+        width=2051,
+        resolve_rows=32,
+        device_reference=True,
+        is_speculative_draft=False,
+    )
+    if prefill_first:
+        prefill = prefill_history_workspace(state)
+    initialize_device_history_attention(state, True)
+    decode = state.device_history_workspace
+    prefill = prefill_history_workspace(state)
+    assert prefill is decode
+    assert len(module._WORKSPACES) == 1
+    assert PREFILL_ROWS == 32
+    assert prefill[0].numel() >= 32 * 6 * 33 * 256
+    assert prefill[1].numel() >= 2 * 32 * 6 * 33
+
+
+@pytest.mark.parametrize("rows", [31, 32, 33, 64, 65])
+def test_prefill_workspace_reuse_preserves_tiled_output_and_graph(rows):
+    importlib.import_module("vllm._sm70_qsa_device_C")
+    torch.manual_seed(9683)
+    history = torch.randn(16, 2, 256, 1, 256, dtype=torch.float16, device="cuda")
+    state = SimpleNamespace(history=history, width=2051)
+    workspace = prefill_history_workspace(state)
+    elements = 64 * 6 * 33
+    old_workspace = (
+        torch.empty(elements * 256, dtype=torch.float32, device="cuda"),
+        torch.empty(2 * elements, dtype=torch.float32, device="cuda"),
+    )
+    query = torch.randn(rows, 6, 256, dtype=torch.float16, device="cuda")
+    gate = torch.randn_like(query)
+    table = torch.arange(16, dtype=torch.int32, device="cuda").repeat(2, 1)
+    requests = torch.arange(rows, dtype=torch.int32, device="cuda") % 2
+    requests[-1] = -1
+    positions = torch.full((rows,), 3790, dtype=torch.int64, device="cuda")
+    lengths = torch.full((2,), 4096, dtype=torch.int32, device="cuda")
+    groups = torch.randperm(947, device="cuda")[:512].int().sort().values
+    selected = (groups[:, None] * 4 + torch.arange(4, device="cuda")).flatten()
+    indices = torch.cat([selected, torch.tensor([3788, 3789, 3790], device="cuda")])
+    indices = indices.int().repeat(rows, 1)
+    scales = torch.ones(2, dtype=torch.float32, device="cuda")
+    actual, expected = torch.empty_like(query), torch.empty_like(query)
+
+    def run():
+        for output, scratch, step in (
+            (actual, workspace, PREFILL_ROWS),
+            (expected, old_workspace, 64),
+        ):
+            torch.ops.vllm_sm70_qsa_device.run_tiled(
+                query,
+                history,
+                scales,
+                indices,
+                table,
+                requests,
+                positions,
+                lengths,
+                output,
+                gate,
+                *scratch,
+                step,
+            )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(3):
+        query.mul_(0.75)
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert torch.isfinite(actual).all()
+        assert torch.equal(actual, expected)

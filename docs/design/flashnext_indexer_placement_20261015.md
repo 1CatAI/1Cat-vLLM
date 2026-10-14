@@ -77,6 +77,37 @@ unchanged. Shared environment packages are not modified.
 - End-to-end candidate decode, cold prefill, tools and 256K capacity/quality:
   pending service restart and matched measurements; no speed claim yet.
 
+The first GPU-indexer attempt passes 32K and 64K decode, reaching 119.53 and
+101.94 output tok/s with unchanged measured acceptance lengths. At 128K,
+`hc_assemble_ranks` fails a 40 MiB allocation with 11.94 MiB device memory free.
+The PLE repair alone is therefore insufficient for the full-context workload.
+This failed attempt is retained separately and is not the final deployment.
+
+A separate four-stream, graph-captured FP16 cuBLAS score-matrix screen measures
+34079744 workspace bytes under the default configuration versus 525312 with
+`CUBLAS_WORKSPACE_CONFIG=:16:8`. Output SHA256 is identical. One timing screen
+measures 0.1217 versus 0.0967 ms; this is only a rejection screen for a large
+slowdown, not an accepted performance gain. The final deployment additionally
+uses this standard CUDA library workspace configuration, requiring a fresh
+process and new graph capture. Whole-model speed, task quality and long-prefill
+headroom remain the final acceptance gate.
+
+The second attempt restores 32K/64K decode to 121.63/109.16 tok/s but still
+fails the same 40 MiB HC allocation at 128K, now with 39.94 MiB free. Retain
+that failure rather than treating a near-fitting allocation as accepted capacity.
+
+Reuse the existing history-attention workspace across decode and tiled FP16
+prefill, processing the latter in 32-row slices instead of 64. Rows retain the
+same native split states and accumulation order. The FP8 target's direct
+`run_rows` path remains unchanged. Removing the separately cached 64-row
+workspace releases about 12.5 MiB at selection width 2051. The shared allocator
+retains sufficient reference and native capacity regardless of initialization
+order. Existing attention checks pass 43 cases; two allocation-order checks and
+five bitwise tiled/capture/replay checks at rows 31/32/33/64/65 pass. The first
+five failures were an invalid FP16 test scale fixture (per-token scales belong
+to encoded history); the corrected fixture uses the existing two-scale FP16
+contract. No runtime limits or numerical tolerances were loosened.
+
 Artifacts are retained in `reports/flashnext-9683-decode-parity-20261015/` and
 the remote deployment's `decode-parity-20261015/` subdirectory. The original
 PLE implementation and launcher are backed up for rollback. The baseline's
