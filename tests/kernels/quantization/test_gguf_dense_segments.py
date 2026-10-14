@@ -115,6 +115,92 @@ def test_reject_m33_without_launch():
 
 
 @pytest.mark.parametrize("source", [8, 12, 13, 14, 20, 23])
+@pytest.mark.parametrize(
+    "m,k,n,split,warps",
+    [
+        (9, 2560, 512, 1, 4),
+        (10, 2560, 4096, 1, 4),
+        (17, 2560, 3584, 1, 8),
+        (20, 2560, 3328, 1, 4),
+        (25, 1536, 2560, 1, 8),
+        (30, 2560, 160, 5, 8),
+        (33, 2560, 4096, 1, 4),
+        (40, 2560, 3328, 1, 4),
+    ],
+)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batch_weight_reuse_official_and_changed_graph(source, m, k, n, split, warps):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 required")
+    import vllm._C  # noqa: F401
+
+    raw = raw_weights(source, n=n, k=k)
+    fmt, q, scale, minimum, group = decode(raw, source)
+    payload = [torch.from_numpy(p).cuda() for p in pack(fmt, q, scale, minimum, group)]
+    x = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.125
+    output = torch.empty(m, n + 5, device="cuda", dtype=torch.float16)[:, 3 : n + 3]
+    tiles = (n + 31) // 32
+    ws = torch.empty(
+        tiles * ((m + 7) // 8) * split * 256, device="cuda", dtype=torch.float32
+    )
+    counter = torch.zeros(tiles * ((m + 7) // 8), device="cuda", dtype=torch.int32)
+    official = torch.from_numpy(reconstruct(fmt, q, scale, minimum, group)).cuda()
+
+    def run():
+        torch.ops._C.gguf_dense_segments_batch_sm70_out(
+            x,
+            [payload[0]],
+            [payload[1]],
+            [payload[2]],
+            [output],
+            [fmt],
+            [n],
+            k,
+            split,
+            warps,
+            ws,
+            counter,
+            None,
+        )
+
+    run()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for shift in (0.0, 0.125):
+        x.normal_(mean=shift, std=0.125)
+        graph.replay()
+        reference = x.float() @ official.float().T
+        torch.accelerator.synchronize()
+        assert bool(torch.isfinite(output).all())
+        assert float((output.float() - reference).norm() / reference.norm()) < 0.003
+        assert not bool(counter.any())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_batch_rejects_m41_before_launch():
+    import vllm._C  # noqa: F401
+
+    with pytest.raises(RuntimeError, match="1..40"):
+        torch.ops._C.gguf_dense_segments_batch_sm70_out(
+            torch.empty(41, 256, device="cuda", dtype=torch.float16),
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            256,
+            1,
+            4,
+            torch.empty(1, device="cuda"),
+            torch.empty(1, device="cuda", dtype=torch.int32),
+            None,
+        )
+
+
+@pytest.mark.parametrize("source", [8, 12, 13, 14, 20, 23])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_transient_restore_matches_turbomind_storage(source):
     import vllm._C  # noqa: F401

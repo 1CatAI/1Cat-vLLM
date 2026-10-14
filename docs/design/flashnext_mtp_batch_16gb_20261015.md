@@ -130,7 +130,7 @@ The trace retains a separate wall residual and incomplete-round exclusions.
   existing TP communicator broadcasts them. Every rank still writes its own
   raw/compressed keys. Larger batches retain independent selection. Device
   indexer history, including the qualified C1 layout, remains on its existing
-  path. The 32K task gate passes; fresh ordinary-worker paired performance is pending.
+  path. The 32K task gate and fresh ordinary-worker paired task/performance gates pass (see the updated evidence below).
 
 These are explicit opt-ins until the paired end-to-end gates pass. No kernel
 sidecars, copied extensions or preloads are required.
@@ -241,7 +241,159 @@ Python deduplication, automatic weather-tool calls and tool replies pass with
 thinking, production sampling and natural EOS. The tool test initially required
 `finish_reason=stop` for a successful tool call; that harness mistake was fixed
 to admit the expected `tool_calls` completion, and tool/reply checks were rerun.
-Fresh ordinary-worker paired task and emitted-token measurements are pending.
+Fresh ordinary-worker paired task and emitted-token measurements completed; see the updated evidence below. Further batch latency optimization remains necessary.
 The affected final CPU suite passes 73 cases. A stale warmup fixture originally
 patched the removed runner platform/environment hooks; it now exercises the
 existing bound warmup policy. No runtime compatibility workaround was added.
+
+## Updated acceptance target and completed clean control
+
+The requested costs refer to the **whole MTP4 verifier batch**, not its share
+per request: C1 approximately 16 ms, C2 17–18 ms, C4 approximately 22 ms and
+C8 approximately 28 ms. The previous 111 ms C8 result does not satisfy that
+objective even when divided by eight. All further results retain five target
+rows and four draft rows per request, and separate draft time.
+
+Fresh ordinary workers with profiling and NVTX disabled completed paired
+root-selection controls, using the same capacity-eight host-indexer setup.
+Common decode intervals exclude prefill and generation boundaries:
+
+| Concurrency | Retained independent selection tok/s | Root selection tok/s |
+| ---: | ---: | ---: |
+| 1 | 76.46 | 107.91 |
+| 2 | 99.35 | 116.72 |
+| 4 | 94.74 | 157.36 |
+| 6 | 95.92 | 144.65 |
+| 8 | 98.71 | 150.58 |
+
+Both runs pass the same task gates: eight seeded 32K exact-field retrieval
+answers with natural EOS, executable deduplication code, automatic weather
+tool invocation and its response. These are emitted-token speed evidence,
+not replacement measurements for the verifier cost. The local GPU-indexer
+C1 control is 14.655 ms and C2 25.472 ms at capacity two. A capacity-four
+GPU-indexer experiment failed near full VRAM and is not accepted speed evidence.
+
+## Bounded shared-page indexer staging
+
+`sm70_qsa_indexer_stage_keys` defaults to false. A qualified host FP16
+H4/KV1/D128 indexer borrows one engine-owned device bank, bounded to 32768
+compressed keys rounded to physical pages (about 8 MiB at page size 204).
+Every selection resets its map, deduplicates live physical pages across up to
+eight requests, and refreshes their keys. The host history stays authoritative;
+missing pages and overflow retain the existing scorer's paged-reader semantics.
+The native `run_staged` entry reuses its original arithmetic; `run` keeps its ABI.
+PP/DCP/PCP above one, other query layouts and absent native entries retain their
+qualified paths. The bank never exposes borrowed output views and does not
+cross engine configuration transfers.
+
+The short scorer test at 32K improves C8 shared-prefix scoring from 3.74 to
+0.36 ms; independent histories improve approximately 1.9x. This is not a claim
+that arbitrary independent contexts obtain the shared-prefix gain. Twenty-three
+GPU tests pass, including changed key contents, page reorder, padding, missing
+pages, graph replay, exact selection and a deliberately overflowing one-page bank.
+
+The full model diagnostic uses an 8 MiB QSA score tile and the same sampler,
+256K capacity, prefix cache, 80% GPU / 20% host experts and MTP4. A previous
+32 MiB score-tile run exhausted VRAM on a 64 MiB prefill score allocation;
+that failure is retained. The bounded setting completes all 32K shared-prefix
+streams with no incomplete TP4 verifier rounds:
+
+| Concurrency | Rounds | Whole verifier mean ms | p50 ms | p90 ms | p99 ms | Draft mean ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 202 | 17.887 | 17.733 | 18.616 | 19.950 | 3.881 |
+| 2 | 193 | 29.413 | 29.124 | 30.535 | 32.590 | 4.610 |
+| 4 | 191 | 36.992 | 36.497 | 38.333 | 41.594 | 5.935 |
+| 6 | 181 | 52.411 | 51.824 | 54.096 | 60.300 | 7.513 |
+| 8 | 178 | 66.309 | 65.201 | 69.296 | 80.457 | 8.807 |
+
+These are diagnostic GPU events with critical-rank alignment, not clean
+production throughput. They remain above the requested whole-batch costs.
+The staging candidate's fresh clean paired throughput, long-output drift and
+256K boundary gates remain pending; no default is promoted.
+
+## Follow-up candidates and rejected directions
+
+Large dense projections now have an opt-in `sm70_gguf.small_m_hmma_batch`.
+It reuses the existing segment format and native decoder across token tiles;
+qualified DMV Q4/IQ4 banks provide their equivalent full scale representation.
+The six-array prepared-operand ABI is retained. The accelerated initialization
+subset is K2560/N>=1536 or K1536/N2560 in the existing qualified formats and
+layouts. Runtime acceleration is limited to M9..16; M1..8 and M17..40
+retain the previous projection routes, and larger batches retain canonical
+restoration. The native batch operator has separately tested M1..40 coverage. The old native entry retains
+its M1..32 contract; the batch entry is explicit. Eighty-six dense native GPU
+cases and 111 affected storage/runtime cases pass, including capture/replay
+and the M40/M41 fallback boundary. The initial wider M9..40 model experiment
+produced C1/C2/C4/C6/C8 costs 17.931/26.655/38.265/51.922/63.368 ms:
+C2 improves, but C4 regresses. That wider runtime admission is rejected;
+M9..16 retains its C2 opportunity and preserves the prior M20 route. The
+narrowed policy still needs matched full-model evidence.
+
+A single-grid HC experiment passed its small numerical check but did not
+improve C8 (approximately 0.192 ms for both retained and candidate calls).
+Its implementation is removed from the runtime and retained as a research
+patch in the private artifacts. Existing eight-row HC tiles remain qualified.
+
+A separate default-off `sm70_gguf.grouped_gate_up` candidate reuses the
+original lattice weight decoder for up to four routes to one expert. The
+accelerated shape is M9..20, source types18/21/22, N divisible by32 and K by256,
+with the existing Q8_1 intermediate. Routing is sorted and admitted on the GPU
+each replay; outputs return directly to their original route order. Sparse
+routes retain the original single-route algorithm. Changed-input graph tests
+exercise both live admission outcomes and exact Q8_1 bytes; full-model benefit
+remains unqualified. The first merged grouped/sparse kernel regressed sparse
+routes because they inherited its register and shared-memory footprint; it is
+rejected in favor of a separately guarded retained kernel.
+
+Rejected experiments are preserved in the task artifacts:
+
+* Parallel mapped-host indexer scoring in request-major and interleaved grids
+  slowed independent-history scoring approximately threefold. They are removed.
+* The retained full-batch HC matrix path is slower at C1/C2 and improves C8
+  only slightly; it is not promoted as a scaling fix.
+* Expert lane-width and bank-layout changes improve the leading integer kernels
+  by only about 10%; they do not establish the requested scaling.
+* Upstream MoE MMQ at M40 takes 1.6–1.9 ms for gate/up in representative real
+  banks, versus about 0.22 ms for the retained integer route; it is rejected.
+* Sorting routed experts alone passes exact Q8 output checks but slows the
+  complete scorer by approximately 2–4%; its private native entry is removed.
+* The expert-cache entry already holds 248 route IDs. At top-k ten the C8
+  native path uses two twenty-row fragments. The 136 count in startup logs is
+  host weight slots, not request-entry capacity; it does not justify a ring fix.
+
+Hardware counter attribution is not available to the local unprivileged user
+(`RmProfilingAdminOnly=1`). Cache/decode hypotheses are therefore based on
+paired exact-shape experiments, not claimed Nsight Compute counters.
+
+## Combined narrowed dense and grouped-expert diagnostic
+
+The narrowed dense policy (M9..16) plus grouped experts completes all five
+32K shared-prefix cases under the same capacity-eight, score-tile 8 MiB,
+chunk 512, host-history contract. Whole verifier includes target forward,
+sampling and state commit; draft remains separate.
+
+| Concurrency | Complete rounds | Whole verifier mean ms | p99 ms | Draft mean ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 202 | 17.768 | 20.321 | 3.871 |
+| 2 | 202 | 26.779 | 31.678 | 4.601 |
+| 4 | 203 | 36.705 | 41.995 | 5.915 |
+| 6 | 203 | 51.769 | 59.463 | 7.472 |
+| 8 | 190 | 64.895 | 80.106 | 8.808 |
+
+There are no incomplete TP4 rounds. This combined experiment does not isolate
+the contribution of grouping: the preceding wider dense policy also differs.
+Relative to page staging alone, its C8 improvement is about 2.1%; this is not
+the requested 28 ms C8 target. At C8 forward is 64.005 ms; sampling 0.860 ms and
+state commit 0.030 ms cannot explain the inflation. A new matched node trace
+will decide the next bottleneck rather than attributing it from micro gains.
+
+The eight submitted 32K retrieval/arithmetic tasks, executable Python function,
+automatic weather-tool call and its reply all pass with natural EOS. The
+quality run still has worker diagnostic fences, so clean emitted-token
+qualification and the 256K boundary remain pending. The first model run uses
+the owned native build immediately before a symbol rename/formatting pass;
+the final formatted source artifacts are subsequently rebuilt and installed
+atomically. The final artifacts pass 54 affected GPU cases, including changed-route
+graph replay, independent expert output oracles and four-rank indexer state
+checks. Clean model speed and longer-context gates remain separate before
+any promotion.

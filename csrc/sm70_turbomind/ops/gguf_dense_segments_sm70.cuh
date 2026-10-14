@@ -368,18 +368,39 @@ __global__ void __launch_bounds__(32 * W)
 
 template <int W>
 void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
-            int G, int split, float* ws, int* cnt, int tiles, cudaStream_t st) {
-  // Small-M verification needs three token tiles, but each uses the same
-  // weights. Keep the original path for other shapes and split-K schedules.
+            int G, int split, float* ws, int* cnt, int tiles, cudaStream_t st,
+            bool batch) {
+  // Reuse one weight decode across verification token tiles. Unsupported
+  // shapes and split-K schedules keep the existing row-tiled path.
   int total_n = 0;
   for (int i = 0; i < segs.nseg; ++i) total_n += segs.s[i].n;
   if constexpr (W == 4 || W == 8) {
-    if (M == 20 && split == 1 &&
-        ((K == 2560 && (total_n == 4096 || total_n == 3584)) ||
-         (K == 1536 && total_n == 2560))) {
-      dense_weight_major<W, 3>
-          <<<dim3(tiles, split), 32 * W, 3 * W * 256 * 4, st>>>(
-              segs, x, ldx, M, K, S, G, split, ws, cnt);
+    const bool legacy =
+        M == 20 && ((K == 2560 && (total_n == 4096 || total_n == 3584)) ||
+                    (K == 1536 && total_n == 2560));
+    const bool batched =
+        batch && M > 8 && M <= 40 &&
+        ((K == 2560 && total_n > 320) || (K == 1536 && total_n == 2560));
+    if (split == 1 && (legacy || batched)) {
+#define LAUNCH_WEIGHT_MAJOR(TM)                               \
+  dense_weight_major<W, TM>                                   \
+      <<<dim3(tiles, split), 32 * W, TM * W * 256 * 4, st>>>( \
+          segs, x, ldx, M, K, S, G, split, ws, cnt)
+      switch ((M + 7) / 8) {
+        case 2:
+          LAUNCH_WEIGHT_MAJOR(2);
+          break;
+        case 3:
+          LAUNCH_WEIGHT_MAJOR(3);
+          break;
+        case 4:
+          LAUNCH_WEIGHT_MAJOR(4);
+          break;
+        case 5:
+          LAUNCH_WEIGHT_MAJOR(5);
+          break;
+      }
+#undef LAUNCH_WEIGHT_MAJOR
       C10_CUDA_KERNEL_LAUNCH_CHECK();
       return;
     }
@@ -410,15 +431,20 @@ void launch(const Segs& segs, const half* x, int ldx, int M, int K, int S,
 }  // namespace
 
 // codes/high/scale: per segment planes; out: per segment [M, n] views.
-void gguf_dense_segments_sm70_out(
-    torch::Tensor x, std::vector<torch::Tensor> codes,
-    std::vector<torch::Tensor> high, std::vector<torch::Tensor> scale,
-    std::vector<torch::Tensor> out, std::vector<int64_t> fmt,
-    std::vector<int64_t> n, int64_t K, int64_t split, int64_t warps,
-    torch::Tensor ws, torch::Tensor cnt, std::optional<torch::Tensor> sgate) {
-  TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
-                  x.stride(1) == 1 && x.size(0) > 0 && x.size(0) <= 32,
-              "input must be CUDA FP16 [1..32, K] with contiguous rows");
+template <bool Batch>
+void gguf_dense_segments_impl(torch::Tensor x, std::vector<torch::Tensor> codes,
+                              std::vector<torch::Tensor> high,
+                              std::vector<torch::Tensor> scale,
+                              std::vector<torch::Tensor> out,
+                              std::vector<int64_t> fmt, std::vector<int64_t> n,
+                              int64_t K, int64_t split, int64_t warps,
+                              torch::Tensor ws, torch::Tensor cnt,
+                              std::optional<torch::Tensor> sgate) {
+  TORCH_CHECK(
+      x.is_cuda() && x.scalar_type() == at::kHalf && x.dim() == 2 &&
+          x.stride(1) == 1 && x.size(0) > 0 && x.size(0) <= (Batch ? 40 : 32),
+      Batch ? "input must be CUDA FP16 [1..40, K] with contiguous rows"
+            : "input must be CUDA FP16 [1..32, K] with contiguous rows");
   const c10::cuda::CUDAGuard guard(x.device());
   const auto* properties = at::cuda::getCurrentDeviceProperties();
   TORCH_CHECK(properties->major == 7 && properties->minor == 0,
@@ -492,7 +518,7 @@ void gguf_dense_segments_sm70_out(
           cnt.numel() >= tiles * ((x.size(0) + 7) / 8),
       "split workspace or counter storage is too small");
   const int M = static_cast<int>(x.size(0));
-  TORCH_CHECK(M <= 32);
+  TORCH_CHECK(M <= 40);
   const int S = static_cast<int>((K + 31) / 32);
   const int G = (S + 3) / 4;
   auto st = at::cuda::getCurrentCUDAStream();
@@ -502,31 +528,51 @@ void gguf_dense_segments_sm70_out(
   int* cp = cnt.data_ptr<int>();
   switch (warps) {
     case 1:
-      launch<1>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
+      launch<1>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, Batch);
       break;
     case 2:
-      launch<2>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
+      launch<2>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, Batch);
       break;
     case 4:
-      launch<4>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
+      launch<4>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, Batch);
       break;
     case 16:
-      launch<16>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
+      launch<16>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, Batch);
       break;
     case 5:
-      launch<5>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
+      launch<5>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, Batch);
       break;
     case 6:
-      launch<6>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
+      launch<6>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, Batch);
       break;
     case 10:
-      launch<10>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
+      launch<10>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, Batch);
       break;
     case 12:
-      launch<12>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
+      launch<12>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, Batch);
       break;
     default:
-      launch<8>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st);
+      launch<8>(segs, xp, ldx, M, K, S, G, split, wsp, cp, tiles, st, Batch);
       break;
   }
+}
+
+void gguf_dense_segments_sm70_out(
+    torch::Tensor x, std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> high, std::vector<torch::Tensor> scale,
+    std::vector<torch::Tensor> out, std::vector<int64_t> fmt,
+    std::vector<int64_t> n, int64_t K, int64_t split, int64_t warps,
+    torch::Tensor ws, torch::Tensor cnt, std::optional<torch::Tensor> sgate) {
+  gguf_dense_segments_impl<false>(x, codes, high, scale, out, fmt, n, K, split,
+                                  warps, ws, cnt, sgate);
+}
+
+void gguf_dense_segments_batch_sm70_out(
+    torch::Tensor x, std::vector<torch::Tensor> codes,
+    std::vector<torch::Tensor> high, std::vector<torch::Tensor> scale,
+    std::vector<torch::Tensor> out, std::vector<int64_t> fmt,
+    std::vector<int64_t> n, int64_t K, int64_t split, int64_t warps,
+    torch::Tensor ws, torch::Tensor cnt, std::optional<torch::Tensor> sgate) {
+  gguf_dense_segments_impl<true>(x, codes, high, scale, out, fmt, n, K, split,
+                                 warps, ws, cnt, sgate);
 }

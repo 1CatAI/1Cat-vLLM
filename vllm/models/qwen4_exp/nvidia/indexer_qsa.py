@@ -135,7 +135,31 @@ class QSAIndexer(nn.Module):
             vllm_config.kernel_config.sm70_qsa_shared_key_batch
         )
         self.selection_tp_group = None
+        self.indexer_staging_workspace = None
         parallel = vllm_config.parallel_config
+        if (
+            vllm_config.kernel_config.sm70_qsa_indexer_stage_keys
+            and self.shared_key_scoring
+            and vllm_config.kernel_config.qsa_host_kv
+            and vllm_config.kernel_config.qsa_host_kv_active
+            and vllm_config.kernel_config.qsa_host_indexer_history
+            and not vllm_config.kernel_config.qsa_host_kv_device_reference
+            and vllm_config.model_config.dtype == torch.float16
+            and current_platform.is_device_capability(70)
+            and (self.index_n_heads, self.index_kv_heads, self.index_head_dim)
+            == (4, 1, 128)
+            and parallel.pipeline_parallel_size == 1
+            and parallel.decode_context_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+        ):
+            from vllm.runtime_resources import runtime_resources_for
+
+            from .ops.qsa_indexer_staging import QSAIndexerStagingWorkspace
+
+            resources = runtime_resources_for(vllm_config)
+            self.indexer_staging_workspace = resources.setdefault(
+                "qsa_indexer_staging", QSAIndexerStagingWorkspace()
+            )
         if (
             vllm_config.kernel_config.sm70_qsa_indexer_single_rank
             and vllm_config.kernel_config.qsa_host_kv
@@ -414,6 +438,7 @@ class QSAIndexer(nn.Module):
             shared_key_scoring=self.shared_key_scoring,
             shared_key_batch_scoring=self.shared_key_batch_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
+            indexer_staging_workspace=self.indexer_staging_workspace,
         )
 
 

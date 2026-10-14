@@ -22,10 +22,16 @@ def test_mtp_batch_policy_is_owned_hashed_and_serializable():
         sm70_hcx_batch_max_m=40,
         qsa_host_kv_state_compact=True,
         sm70_qsa_shared_key_batch=True,
-        sm70_gguf={"small_m_dp4a": True, "small_m_dp4a_max_m": 40},
+        sm70_gguf={
+            "small_m_dp4a": True,
+            "small_m_dp4a_max_m": 40,
+            "small_m_hmma_batch": True,
+            "grouped_gate_up": True,
+        },
         qsa_host_kv=True,
         qsa_host_indexer_history=True,
         sm70_qsa_indexer_single_rank=True,
+        sm70_qsa_indexer_stage_keys=True,
     )
     tiled.sm70_gguf.active = True
     context = multiprocessing.get_context("spawn")
@@ -53,13 +59,21 @@ def test_mtp_batch_policy_is_owned_hashed_and_serializable():
         "qsa_host_kv_state_compact",
         "sm70_qsa_shared_key_batch",
         "sm70_qsa_indexer_single_rank",
+        "sm70_qsa_indexer_stage_keys",
     ):
         changed = copy.deepcopy(tiled)
         setattr(changed, field, getattr(legacy, field))
         assert changed.compute_hash() != tiled.compute_hash()
     transferred.sm70_gguf.small_m_dp4a_max_m = 20
     assert transferred.compute_hash() != tiled.compute_hash()
+
+    transferred = copy.deepcopy(tiled)
+    transferred.sm70_gguf.grouped_gate_up = False
+    assert transferred.compute_hash() != tiled.compute_hash()
     assert tiled.sm70_gguf.small_m_dp4a_max_m == 40
+    transferred = copy.deepcopy(tiled)
+    transferred.sm70_gguf.small_m_hmma_batch = False
+    assert transferred.compute_hash() != tiled.compute_hash()
 
 
 def test_disabled_parents_keep_inactive_batch_options_out_of_hash():
@@ -69,6 +83,7 @@ def test_disabled_parents_keep_inactive_batch_options_out_of_hash():
         sm70_qsa_shared_key=False,
         sm70_hcx_batch_max_m=40,
         sm70_qsa_shared_key_batch=True,
+        sm70_qsa_indexer_stage_keys=True,
     )
     assert a.compute_hash() == b.compute_hash()
 
@@ -82,6 +97,7 @@ def test_single_rank_indexer_is_inactive_without_host_history(host, history):
         qsa_host_kv=host,
         qsa_host_indexer_history=history,
         sm70_qsa_indexer_single_rank=True,
+        sm70_qsa_indexer_stage_keys=True,
     )
     assert a.compute_hash() == b.compute_hash()
 

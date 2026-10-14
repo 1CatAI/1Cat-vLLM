@@ -69,10 +69,12 @@ def test_small_m_hc_consumes_unrounded_moe_pair():
     # both originals and sum in FP32 instead of consuming that rounded sum.
     fused = torch.full((5, 4), 2048, dtype=torch.float16)
     shared = torch.ones_like(fused)
+    hcx.register_moe_runner("p", SimpleNamespace(_hcx_batch_max_m=8))
     partial = hcx._moe_output(shared, fused, "p", 4)
     seen = []
 
-    def run(first, *args, secondary):
+    def run(first, *args, secondary, batch_max_m):
+        assert batch_max_m == 8
         seen.append((first, secondary))
         return args[0], first, args[1]
 
@@ -235,7 +237,7 @@ def test_hcx_only_consumes_partial_producers(monkeypatch):
             )
             self.partial = False
 
-        def enable_partial_inputs(self, name, runtime=None):
+        def enable_partial_inputs(self, name, runtime=None, *, batch_max_m=8):
             self.partial = True
 
     class MoE:
@@ -283,7 +285,8 @@ def test_compiled_moe_payload_keeps_both_dependencies_live():
         if not torch._C._dispatch_has_kernel_for_dispatch_key("vllm::" + name, "CPU"):
             library.impl(name, function)
 
-    def native(first, hidden, injection, *args, secondary):
+    def native(first, hidden, injection, *args, secondary, batch_max_m):
+        assert batch_max_m == 8
         block = ((first.float() + secondary.float()) * 0.5).half()
         return hidden.clone(), block, injection.clone()
 

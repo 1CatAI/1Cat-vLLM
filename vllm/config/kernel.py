@@ -584,6 +584,10 @@ class Sm70GgufConfig:
 
     small_m_hmma: bool = True
     """Use one coalesced integer bank and fused FP16 MMA projections at M1..8."""
+    small_m_hmma_batch: bool = False
+    """Reuse large resident projection weights at M9..16 on qualified shapes."""
+    grouped_gate_up: bool = False
+    """Reuse original expert decoding across M9..20 routed rows on SM70."""
 
     q8_expert_intermediate: bool = True
     """Encode routed intermediates once in qualified integer expert gate/up."""
@@ -894,6 +898,12 @@ class KernelConfig:
     Applies to qualified SM70 FP16 TP4/PP1/CP1 small batches. Each rank still
     updates its own key caches. Other shapes retain independent selection.
     """
+    sm70_qsa_indexer_stage_keys: bool = False
+    """Copy live shared physical indexer pages once per small verification batch.
+
+    Qualified SM70 FP16 host indexer history borrows a bounded engine-owned
+    device bank. Overflow pages retain the authoritative paged reader.
+    """
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
     qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
@@ -1115,12 +1125,14 @@ class KernelConfig:
             ignored_factors.add("sm70_hcx_batch_max_m")
         if not self.sm70_qsa_shared_key:
             ignored_factors.add("sm70_qsa_shared_key_batch")
+            ignored_factors.add("sm70_qsa_indexer_stage_keys")
         if (
             not self.qsa_host_kv
             or not self.qsa_host_indexer_history
             or self.qsa_host_kv_device_reference
         ):
             ignored_factors.add("sm70_qsa_indexer_single_rank")
+            ignored_factors.add("sm70_qsa_indexer_stage_keys")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:

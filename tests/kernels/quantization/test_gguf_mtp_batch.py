@@ -67,6 +67,7 @@ def test_tiled_mtp_experts_match_q8_oracle_and_changed_graph(rows):
     method.weight_types = {"w1": 21, "w3": 21, "w2": 42}
     method.input_padding = {"w2": (left, intermediate + left)}
     method.q8_intermediate = True
+    method.grouped_gate_up = True
     torch.manual_seed(rows)
     x = (torch.randn(rows, hidden, device="cuda") * 0.125).half()
     ids = torch.randint(experts, (rows, top_k), dtype=torch.int32, device="cuda")

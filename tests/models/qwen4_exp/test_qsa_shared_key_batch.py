@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from vllm.models.qwen4_exp.nvidia.ops.qsa import qsa_mqa_paged, qsa_select_paged_tokens
+from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer_staging import (
+    QSAIndexerStagingWorkspace,
+)
 from vllm.models.qwen4_exp.nvidia.ops.qsa_shared_key import (
     maybe_shared_key_batch_scores,
 )
@@ -18,7 +21,10 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize("requests", [2, 4, 6, 8])
 @pytest.mark.parametrize("host", [False, True])
-def test_shared_key_batch_scores_and_replay_match_retained_paged_reader(requests, host):
+@pytest.mark.parametrize("staged", [False, True])
+def test_shared_key_batch_scores_and_replay_match_retained_paged_reader(
+    requests, host, staged
+):
     if torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("SM70 required")
     rows, page = requests * 5, 204
@@ -41,6 +47,8 @@ def test_shared_key_batch_scores_and_replay_match_retained_paged_reader(requests
         torch.arange(1, requests + 1, dtype=torch.int32, device="cuda") * 128 + 1024
     )
     starts = torch.arange(0, rows + 1, 5, dtype=torch.int32)
+    # One-page bank forces the remainder through the unchanged paged reader.
+    owner = QSAIndexerStagingWorkspace(tokens=page) if staged else None
 
     def run(enabled):
         return qsa_mqa_paged(
@@ -53,6 +61,7 @@ def test_shared_key_batch_scores_and_replay_match_retained_paged_reader(requests
             4,
             shared_key_scoring=enabled,
             shared_key_query_start_loc_cpu=starts if enabled else None,
+            indexer_staging_workspace=owner if enabled else None,
         )
 
     def check(actual, visible):
@@ -75,8 +84,17 @@ def test_shared_key_batch_scores_and_replay_match_retained_paged_reader(requests
         positions.sub_(47)
         lengths[0] = 0
         req[-1] = -1
+        if host:
+            data.mul_(0.875)
+        else:
+            cache.mul_(0.875)
         graph.replay()
         check(*output)
+    if owner is not None:
+        bank, slots, _, count = next(iter(owner.banks.values()))
+        assert bank.shape[0] == 1
+        assert int((slots >= 0).sum()) == 1
+        assert int(count.item()) <= cache.shape[0]
 
 
 @pytest.mark.parametrize("requests", [2, 8])
@@ -99,6 +117,7 @@ def test_grouped_selection_matches_independent_native_requests(requests):
     positions = torch.full((rows,), 4095, device="cuda", dtype=torch.int64)
     lengths = torch.full((requests,), 4096, device="cuda", dtype=torch.int32)
     starts = torch.arange(0, rows + 1, 5, dtype=torch.int32)
+    owner = QSAIndexerStagingWorkspace()
 
     def run():
         return qsa_select_paged_tokens(
@@ -113,6 +132,7 @@ def test_grouped_selection_matches_independent_native_requests(requests):
             query_start_loc_cpu=starts,
             shared_key_scoring=True,
             shared_key_batch_scoring=True,
+            indexer_staging_workspace=owner,
         )
 
     run()

@@ -177,6 +177,24 @@ def prepare_bank(projection, raw_weight, canonical):
         ),
     )
     projection.dmv_format = fmt
+    projection.register_buffer("gguf_batch_stats", None, persistent=False)
+    cfg = get_current_vllm_config_or_none()
+    if (
+        cfg is not None
+        and cfg.kernel_config.sm70_gguf.small_m_hmma
+        and cfg.kernel_config.sm70_gguf.small_m_hmma_batch
+        and fmt in (0, 3)
+        and ((k == 2560 and n >= 1536) or (k, n) == (1536, 2560))
+        and hasattr(torch.ops._C, "gguf_dense_segments_batch_sm70_out")
+    ):
+        full_scale = scale
+        if fmt == 3:
+            # Invert compact_lut4_scale without reconstructing the weights.
+            half_bits = scale.view(np.uint16).astype(np.uint32)
+            full_scale = (half_bits | (half_bits << 16)).view(np.uint8)
+        projection.gguf_batch_stats = torch.from_numpy(
+            np.ascontiguousarray(full_scale)
+        ).to(raw_weight.device)
     projection.cache_capabilities = ()
     projection.dmv_capability = GGUFOperatorCapability(
         decoder_family(kind),

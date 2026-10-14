@@ -35,6 +35,11 @@ def _worker(rank, port, results):
             indexer.token_topk, indexer.compress_ratio = 2048, 4
             indexer.shared_key_scoring = True
             indexer.shared_key_batch_scoring = True
+            from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer_staging import (
+                QSAIndexerStagingWorkspace,
+            )
+
+            indexer.indexer_staging_workspace = QSAIndexerStagingWorkspace()
             indexer.selection_tp_group = get_tp_group()
             report = []
             for rows in (1, 5, 10, 20, 30, 40, 64, 65):

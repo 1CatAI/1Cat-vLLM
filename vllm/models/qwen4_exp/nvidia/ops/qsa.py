@@ -1179,6 +1179,7 @@ def qsa_mqa_paged(
     score_scale: float | None = None,
     shared_key_scoring: bool = False,
     shared_key_query_start_loc_cpu: torch.Tensor | None = None,
+    indexer_staging_workspace=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
 
@@ -1227,6 +1228,7 @@ def qsa_mqa_paged(
                 columns,
                 score_divisor,
                 shared_key_query_start_loc_cpu,
+                indexer_staging_workspace,
             )
             if result is not None:
                 return result
@@ -1241,6 +1243,7 @@ def qsa_mqa_paged(
             compress_ratio,
             columns,
             score_divisor,
+            indexer_staging_workspace,
         )
         if result is not None:
             return result
@@ -1619,6 +1622,7 @@ def qsa_select_paged_tokens(
     shared_key_scoring: bool = False,
     max_seq_len: int | None = None,
     shared_key_batch_scoring: bool = False,
+    indexer_staging_workspace=None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization.
 
@@ -1734,6 +1738,7 @@ def qsa_select_paged_tokens(
                     if shared_key_batch_scoring and row_start == 0 and row_end == rows
                     else None
                 ),
+                indexer_staging_workspace=indexer_staging_workspace,
             )
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (

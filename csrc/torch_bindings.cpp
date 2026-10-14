@@ -397,6 +397,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("gguf_dense_segments_sm70_out", torch::kCUDA,
            &gguf_dense_segments_sm70_out);
   ops.def(
+      "gguf_dense_segments_batch_sm70_out(Tensor x, Tensor[] codes, Tensor[] "
+      "high, "
+      "Tensor[] scale, Tensor(a!)[] out, int[] fmt, int[] n, int k, int split, "
+      "int warps, Tensor(b!) ws, Tensor(c!) cnt, Tensor? sgate=None) -> ()");
+  ops.impl("gguf_dense_segments_batch_sm70_out", torch::kCUDA,
+           &gguf_dense_segments_batch_sm70_out);
+  ops.def(
       "gguf_shared_gate_up_sm70_out(Tensor x, Tensor[] gate, Tensor[] up, "
       "int[] fmts, Tensor wg, Tensor(a!) h, Tensor(b!) sg, Tensor(c!) ws, "
       "Tensor(d!) cnt, int split, int warps) -> ()");
@@ -432,6 +439,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int lanes_per_row=16, bool bank_aware=False) -> ()");
   ops.impl("gguf_dp4a_gate_up_sm70_out", torch::kCUDA,
            &gguf_dp4a_gate_up_sm70_out);
+
+  ops.def(
+      "gguf_dp4a_gate_up_grouped_sm70_out(Tensor(a!) out, Tensor activation, "
+      "Tensor ids, Tensor gate, Tensor up, int source_type, bool bank_aware, "
+      "Tensor route_tokens, Tensor order, Tensor original_ids, Tensor mode) -> "
+      "()");
+  ops.impl("gguf_dp4a_gate_up_grouped_sm70_out", torch::kCUDA,
+           &gguf_dp4a_gate_up_grouped_sm70_out);
   ops.def(
       "gguf_dp4a_lut4_gate_up_sm70_out(Tensor(a!) out, Tensor activation, "
       "Tensor ids, Tensor gate, Tensor gate_stats, Tensor up, Tensor up_stats, "

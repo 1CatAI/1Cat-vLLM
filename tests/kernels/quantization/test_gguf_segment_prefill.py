@@ -22,6 +22,45 @@ from vllm.model_executor.layers.quantization.gguf_turbomind import (
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.mark.parametrize("source,dmv", [(12, True), (23, True), (14, False)])
+def test_batch_storage_uses_native_then_retained_prefill(source, dmv):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 required")
+    k, n = 2560, 2560
+    raw = raw_weights(source, n, k)
+    reference_weight = torch.from_numpy(
+        gguf.quants.dequantize(raw, gguf.GGMLQuantizationType(source))
+    ).cuda()
+    config = SimpleNamespace(
+        kernel_config=KernelConfig(sm70_gguf={"small_m_hmma_batch": True}),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    with set_current_vllm_config(config):
+        projections = prepare_gguf_projections(
+            [(torch.from_numpy(raw).cuda(), source)],
+            torch.float16,
+            True,
+            8,
+            dmv_enabled=dmv,
+        )
+        assert projections[0].gguf_batch_stats is not None
+        serialized = prepared_projection_arguments(projections)
+        assert len(serialized) == 6 and serialized[3][0] == (6 if dmv else 5)
+        for m in (5, 8, 9, 10, 20, 30, 40, 41):
+            x = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.125
+            apply_prepared_gguf_projections(x, projections)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = apply_prepared_gguf_projections(x, projections)
+            for shift in (0.0, 0.125):
+                x.normal_(mean=shift, std=0.125)
+                graph.replay()
+                expected = x.float() @ reference_weight.T
+                torch.accelerator.synchronize()
+                assert bool(torch.isfinite(out).all())
+                assert float((out.float() - expected).norm() / expected.norm()) < 0.003
+
+
 @pytest.mark.parametrize(
     "source,k,n",
     [(13, 2560, 2560), (14, 2560, 2560), (14, 2560, 1536), (14, 1536, 2560)],

@@ -35,6 +35,25 @@ def load_operator():
     ):
         return None
 
+    if hasattr(torch.ops.vllm_sm70_qsa_indexer, "run_staged"):
+
+        @torch.library.register_fake("vllm_sm70_qsa_indexer::run_staged")
+        def fake_staged(
+            scores,
+            visible,
+            q,
+            cache,
+            table,
+            requests,
+            positions,
+            lengths,
+            divisor,
+            compress,
+            staged,
+            page_slots,
+        ):
+            return None
+
     return True
 
 
@@ -59,7 +78,16 @@ def shared_key_reason(q, cache, table, requests, positions, lengths):
 
 
 def maybe_shared_key_scores(
-    q, cache, table, requests, positions, lengths, compress, columns, divisor
+    q,
+    cache,
+    table,
+    requests,
+    positions,
+    lengths,
+    compress,
+    columns,
+    divisor,
+    staging_workspace=None,
 ):
     reason = shared_key_reason(q, cache, table, requests, positions, lengths)
     if reason is not None:
@@ -67,7 +95,21 @@ def maybe_shared_key_scores(
         return None
     scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
-    torch.ops.vllm_sm70_qsa_indexer.run(
+    staged = (
+        staging_workspace.prepare(
+            cache, table, requests, positions, lengths, compress, columns
+        )
+        if staging_workspace is not None
+        and table.shape[0] <= 8
+        and hasattr(torch.ops.vllm_sm70_qsa_indexer, "run_staged")
+        else ()
+    )
+    op = (
+        torch.ops.vllm_sm70_qsa_indexer.run_staged
+        if staged
+        else torch.ops.vllm_sm70_qsa_indexer.run
+    )
+    op(
         scores,
         visible,
         q,
@@ -78,6 +120,7 @@ def maybe_shared_key_scores(
         lengths,
         float(divisor),
         compress,
+        *staged,
     )
     logger.info_once("Using SM70 QSA shared-key indexer for M=%d.", q.shape[0])
     return scores, visible
@@ -94,6 +137,7 @@ def maybe_shared_key_batch_scores(
     columns,
     divisor,
     query_start_loc_cpu,
+    staging_workspace=None,
 ):
     """Reuse the single-request provider without changing batched top-k.
 
@@ -136,9 +180,23 @@ def maybe_shared_key_batch_scores(
             return None
     scores = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
+    staged = (
+        staging_workspace.prepare(
+            cache, table, requests, positions, lengths, compress, columns
+        )
+        if staging_workspace is not None
+        and table.shape[0] <= 8
+        and hasattr(torch.ops.vllm_sm70_qsa_indexer, "run_staged")
+        else ()
+    )
+    op = (
+        torch.ops.vllm_sm70_qsa_indexer.run_staged
+        if staged
+        else torch.ops.vllm_sm70_qsa_indexer.run
+    )
     for i, start, end in groups:
         local_requests = (requests[start:end] - i).contiguous()
-        torch.ops.vllm_sm70_qsa_indexer.run(
+        op(
             scores[start:end],
             visible[start:end],
             q[start:end],
@@ -149,8 +207,11 @@ def maybe_shared_key_batch_scores(
             lengths[i : i + 1],
             float(divisor),
             compress,
+            *staged,
         )
     logger.info_once(
         "Using SM70 shared-key indexer for %d request groups.", len(groups)
     )
+    if staged:
+        logger.info_once("Using bounded SM70 indexer page staging with paged overflow.")
     return scores, visible

@@ -49,6 +49,7 @@ def _original_expert_dp4a(
     left,
     quantized_hidden,
     bank_aware,
+    grouped_gate: bool = False,
 ):
     m, top_k = ids.shape
     n = gate.shape[1]
@@ -60,17 +61,23 @@ def _original_expert_dp4a(
     )
     output = torch.empty_like(x)
     torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
-    torch.ops._C.gguf_dp4a_gate_up_sm70_out(
-        hidden,
-        q8,
-        ids,
-        gate,
-        up,
-        source_type,
-        True,
-        4 if quantized_hidden and source_type in (20, 23) else 16,
-        bank_aware,
-    )
+    grouped = False
+    if grouped_gate and quantized_hidden:
+        from .gguf_grouped_gate import grouped_gate_up
+
+        grouped = grouped_gate_up(hidden, q8, ids, gate, up, source_type, bank_aware)
+    if not grouped:
+        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+            hidden,
+            q8,
+            ids,
+            gate,
+            up,
+            source_type,
+            True,
+            4 if quantized_hidden and source_type in (20, 23) else 16,
+            bank_aware,
+        )
     torch.ops._C.gguf_dp4a_raw_down_unroute_sm70_out(
         output,
         hidden,
@@ -95,6 +102,7 @@ def _original_expert_dp4a_fake(
     left,
     quantized_hidden,
     bank_aware,
+    grouped_gate: bool = False,
 ):
     return torch.empty_like(x)
 
@@ -105,6 +113,45 @@ register_policy_op(
     "Tensor down, int source_type, int down_type, int left, "
     "bool quantized_hidden, bool bank_aware) -> Tensor",
     _original_expert_dp4a,
+    _original_expert_dp4a_fake,
+)
+
+
+def _grouped_expert_dp4a(
+    x,
+    ids,
+    probabilities,
+    gate,
+    up,
+    down,
+    source_type,
+    down_type,
+    left,
+    quantized_hidden,
+    bank_aware,
+):
+    return _original_expert_dp4a(
+        x,
+        ids,
+        probabilities,
+        gate,
+        up,
+        down,
+        source_type,
+        down_type,
+        left,
+        quantized_hidden,
+        bank_aware,
+        grouped_gate=True,
+    )
+
+
+register_policy_op(
+    "gguf_grouped_expert_dp4a",
+    "(Tensor x, Tensor ids, Tensor probabilities, Tensor gate, Tensor up, "
+    "Tensor down, int source_type, int down_type, int left, "
+    "bool quantized_hidden, bool bank_aware) -> Tensor",
+    _grouped_expert_dp4a,
     _original_expert_dp4a_fake,
 )
 
@@ -142,6 +189,9 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         )
         self.q8_intermediate = bool(
             config and config.kernel_config.sm70_gguf.q8_expert_intermediate
+        )
+        self.grouped_gate_up = bool(
+            config and config.kernel_config.sm70_gguf.grouped_gate_up
         )
         self.expert_trace_tokens = (
             config.kernel_config.sm70_gguf.expert_trace_tokens if config else 0
@@ -345,6 +395,25 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             "storage": "original",
             "accumulation": "FP32",
         }
+        grouped_shape = (
+            self.dp4a_admitted
+            and self.q8_intermediate
+            and self.weight_types["w1"] in (18, 21, 22)
+        )
+        if (
+            self.grouped_gate_up
+            and grouped_shape
+            and not hasattr(torch.ops._C, "gguf_dp4a_gate_up_grouped_sm70_out")
+        ):
+            raise ValueError("Grouped GGUF experts require the matching native build")
+        self.grouped_gate_up = self.grouped_gate_up and grouped_shape
+        self.native_admission["grouped_gate_up"] = {
+            "enabled": self.grouped_gate_up,
+            "min_m": 9,
+            "max_m": 20,
+            "device_admission": "distinct_experts_at_most_two_thirds_of_routes",
+            "fallback": "original_single_route_integer_dot",
+        }
 
     def get_fused_moe_quant_config(self, layer):
         return None
@@ -391,6 +460,11 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                 if step < 1:
                     raise ValueError("Expert cache cannot hold one routed token")
             output = torch.empty_like(x) if tokens > step else None
+            operation = (
+                torch.ops.vllm.gguf_grouped_expert_dp4a
+                if getattr(self, "grouped_gate_up", False)
+                else torch.ops.vllm.gguf_original_expert_dp4a
+            )
             for start in range(0, tokens, step):
                 stop = min(start + step, tokens)
                 fragment_ids = ids[start:stop].contiguous()
@@ -398,7 +472,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                     # Finish each fragment before resolving the next one, which
                     # may evict its slots. The existing model stream owns both.
                     fragment_ids = cache.resolve(self.cache_layer, fragment_ids)
-                fragment = torch.ops.vllm.gguf_original_expert_dp4a(
+                fragment = operation(
                     x.contiguous() if output is None else x[start:stop].contiguous(),
                     fragment_ids,
                     topk_weights[start:stop].contiguous(),

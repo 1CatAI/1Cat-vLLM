@@ -23,12 +23,17 @@ __global__ void quantize_q8(Q8_1* out, const half* input, int k) {
 
 template <int Type, bool Activated, class Index, int Lanes = 16,
           bool Quantized = false, bool Canonical = false,
-          bool ScalarLut = false, bool BankAware = false, int FixedGroups = 0>
+          bool ScalarLut = false, bool BankAware = false, int FixedGroups = 0,
+          bool SparseFallback = false>
 __global__ void gate_up(void* output, const Q8_1* activation, const Index* ids,
                         const uint8_t* gate, const uint8_t* up, int n, int k,
                         int stride, int top_k,
                         const StridedPtr* gate_stats = nullptr,
-                        const StridedPtr* up_stats = nullptr) {
+                        const StridedPtr* up_stats = nullptr,
+                        const int* grouping_mode = nullptr) {
+  if constexpr (SparseFallback) {
+    if (grouping_mode[0] != 0) return;
+  }
   using Dot = std::conditional_t<
       Canonical, vllm::sm70_gguf::CanonicalIntegerDot<Type>,
       std::conditional_t<ScalarLut, vllm::sm70_gguf::SignedLutDot<Type>,
@@ -712,3 +717,5 @@ void gguf_dp4a_scalar_lut_gate_up_sm70_out(
     dispatch_scalar_lut_gate_up<22>(out, activation, ids, gate, up, activated);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
+
+#include "gguf_grouped_gate_sm70.cuh"
