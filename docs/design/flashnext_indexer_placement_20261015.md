@@ -113,3 +113,67 @@ the remote deployment's `decode-parity-20261015/` subdirectory. The original
 PLE implementation and launcher are backed up for rollback. The baseline's
 host-indexer workaround solved capacity but was not decode-speed qualified;
 capacity and performance acceptance must remain separate.
+
+## Takeover: memory headroom and the 128K staging boundary
+
+The fourth attempt sets NCCL's standard buffer to 1 MiB. Its complete decode
+sweep reaches 132.73 / 116.50 / 105.20 output tok/s at the same 32774 /
+65604 / 131124 inputs. Round estimates are 18.216 / 21.292 / 21.111 ms;
+measured acceptance is now 2.418 / 2.481 / 2.233, so unchanged acceptance is
+not claimed. Arithmetic, tool roundtrip and natural-EOS retrieval/arithmetic
+pass at 32761 / 131070 / 260977 inputs. The last quality request takes
+345.94 seconds. A second separate boundary-speed request is cancelled to
+proceed with the memory repair. This attempt reaches only 6 MiB free in
+200-ms driver sampling and is not accepted as a deployment with headroom.
+
+Both machines use Torch 2.10.0+cu128, NCCL 2.27.5, cuDNN 9.10.2,
+CUDA runtime 12.8.90 and cuBLAS 12.8.4.1. Their four-card topology differs:
+9683 has NV2 between every pair; the local group has mixed NV1/NV2 links.
+The same two-process-group all-gather probe with a 1 MiB buffer uses
+406847488 non-Torch bytes locally and 591396864 on 9683: 176 MiB additional
+usage. NCCL INFO reports local 8 collective / 8 P2P channels, versus remote
+12 collective / 16 P2P channels. Setting `NCCL_MAX_CTAS=8` on 9683 makes
+both counts 8 and matches the local 406847488-byte footprint. The 40 MiB
+all-gather screen changes from about 0.37--0.40 to 0.50 ms; it is not a
+whole-model speed qualification. A 4 MiB buffer with that limit uses
+440401920 bytes and measures 0.467 ms. Four CTAs with a 1 MiB buffer uses
+272629760 bytes but measures 0.783 ms, so it is not chosen solely for memory.
+These are standard NCCL configuration inputs, not a replacement communicator.
+
+Two additional lifetime repairs retain existing operators and arithmetic:
+
+- HC sharded fallback releases the local projections, packet and gates as
+  soon as consumed. At 8192 rows, the same-operator GPU comparison reduces
+  additional peak allocation from 152436736 to 83951616 bytes (65.3125 MiB),
+  with bitwise-equal finite outputs. Existing eager and changed-input graph
+  checks cover both packed layouts and rank orders.
+- QSA scoring releases each cuBLAS score tile and each consumed logits tile
+  before the next allocation. CPU lifetime checks exercise multiple column
+  and row tiles; the CUDA test compares the same tiled arithmetic bitwise
+  and replays changed query/key inputs.
+
+`kernel_config.qsa_host_kv_prefill_stage_slots` is a typed initialization
+policy, accepting only 1 or 2, defaulting to the existing 2. It is serialized
+and included in the effective hash only when host prefill staging is selected.
+One slot retains prefix prefetch on the existing side stream: the preceding
+attention completion event fences reuse, while the following non-QSA work can
+still overlap the next prefix copy. No new kernel, precision, cache storage,
+request indexing or state commit algorithm is introduced.
+
+For E4M3 authoritative history, one 262144-token stage occupies the same raw
+bytes as two 131072-token stages (128 MiB total, plus scales), and removes the
+128K fallback to per-query host reads. These context units are tokens in
+encoded target history. FP16 history consumes twice the bytes, so a byte
+budget described by 262144 E4M3 tokens holds only 131072 FP16 tokens; the
+existing fallback remains in effect outside that capacity. This does not
+change the model's attention algorithm or establish constant-time prefill.
+
+Destination validation: 63 passing cases, including configuration transfer
+and hashing, exact staged prefix/current-token writes, HC output/graph tests,
+QSA tiled score/graph tests, and delayed-reader reuse for both slot counts at
+4096 / 131088 / 262144 E4M3 tokens. The unused-policy hash checks pass locally.
+The new whole-model run retains TP4, MTP4, FULL M5 graphs, encoded HOT32768,
+FP16 draft HOT16384, 80/20 expert placement, 256K context and chunk8192.
+Whole-model peak live/driver memory, verifier distribution, cold prefill,
+long-context quality and fresh-process reproduction remain pending; no
+512-MiB headroom or 16-ms verifier acceptance is claimed from operator tests.

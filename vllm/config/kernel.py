@@ -898,6 +898,10 @@ class KernelConfig:
     mapped host memory (re-reading the same history per row over PCIe).
     Capacity in tokens (about 0.5 KiB each, shared by all layers); longer
     contexts keep the hot-cache path. 0 disables it."""
+    qsa_host_kv_prefill_stage_slots: int = Field(default=2, ge=1, le=2)
+    """Shared prefix staging buffers. One slot reuses the current layer's
+    buffer after its attention completion event; prefetch still overlaps the
+    following non-QSA computation. Two preserves the alternating layout."""
     qsa_host_indexer_history: bool = False
     """Keep the FP16 compressed indexer history and its co-owned compressor
     state in mapped host storage when QSA host KV is active. Exact score
@@ -1079,6 +1083,10 @@ class KernelConfig:
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",
         }
+        if not self.qsa_host_kv_prefill_stage_tokens or not (
+            self.qsa_host_kv or self.qsa_host_kv_active
+        ):
+            ignored_factors.add("qsa_host_kv_prefill_stage_slots")
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
         if not self.fused_fp16_aux_gemv_applicable:

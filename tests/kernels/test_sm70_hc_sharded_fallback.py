@@ -94,3 +94,63 @@ def test_hcx_sharded_fallback_graph_matches_rank_reorder(
 def test_identity_hc_order_keeps_storage():
     value = torch.randn(5, 4, 88, device="cuda", dtype=torch.float16)
     assert hc._logical_hc_rank_rows(value, (0, 1, 2, 3)) is value
+
+
+@pytest.mark.parametrize("tokens", [512, 8192])
+def test_sharded_prefill_releases_projection_temporaries(
+    tokens, monkeypatch, record_property
+):
+    from vllm.models.qwen4_exp.nvidia.ops.hc import (
+        hc_assemble_ranks,
+        hc_gate_mix_local,
+        hc_packet_silu,
+    )
+
+    order = (0, 1, 2, 3)
+    group = SimpleNamespace(
+        rank_in_group=0,
+        device_communicator=SimpleNamespace(
+            hc_ll_comm=SimpleNamespace(
+                status={"enabled": True}, order=order, apply=lambda *_: None
+            )
+        ),
+        all_gather=lambda value, dim: torch.cat([value] * 4, dim=dim),
+    )
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_tp_group", lambda: group)
+    down = pack_down(torch.randn(336, 10240, device="cuda", dtype=torch.float16), 0)
+    up = pack_up(torch.randn(10240, 320, device="cuda", dtype=torch.float16), 0)
+    x = torch.randn(tokens, 10240, device="cuda", dtype=torch.float16) * 0.001
+
+    def retained_temporaries():
+        # The original fallback: all Python locals survive until assembly.
+        local_down, local_up = hc._unpack_hc_storage(down, up)
+        local = torch.mm(x, local_down.T)
+        packet = group.all_gather(local, dim=0)
+        lora, injection = hc_packet_silu(packet, order, 4)
+        local_gate = torch.mm(lora, local_up.T)
+        mixed = hc_gate_mix_local(x, local_gate, 0, 4)
+        gathered = group.all_gather(mixed, dim=0)
+        return hc_assemble_ranks(gathered, order), injection
+
+    # Compile the same kernels before measuring either allocation sequence.
+    retained_temporaries()
+    hc._sharded_hc_project(x, down, up)
+    torch.cuda.synchronize()
+
+    def measure(operation):
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        result = operation()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - baseline
+        return peak, tuple(value.cpu() for value in result)
+
+    old_peak, expected = measure(retained_temporaries)
+    new_peak, actual = measure(lambda: hc._sharded_hc_project(x, down, up))
+    record_property("old_peak_bytes", old_peak)
+    record_property("new_peak_bytes", new_peak)
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    assert all(torch.isfinite(value).all() for value in actual)
+    # At least the full local gate is dead before gather/assembly allocation.
+    assert old_peak - new_peak >= tokens * 2560 * x.element_size()

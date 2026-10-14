@@ -857,12 +857,18 @@ def _sharded_hc_project(
     # order, applies the HC SiLU and extracts the injection logits.
     packet = group.all_gather(local, dim=0)
     lora, injection = hc_packet_silu(packet, order, 4)
+    # These projections are row-local temporaries, not borrowed output/state.
+    # Release them before allocating the next full-prefill projection.
+    del local, local_down, packet
     local_gate = torch.mm(lora, local_up.T)
+    del lora, local_up
     # The mix is elementwise per hidden column and this rank holds every
     # stream's gate for its columns: mix locally, gather the 4x narrower
     # result (rank-major rows) and assemble it in logical rank order.
     mixed = hc_gate_mix_local(x, local_gate, order.index(group.rank_in_group), 4)
+    del local_gate
     gathered = group.all_gather(mixed, dim=0)
+    del mixed
     return hc_assemble_ranks(gathered, order), injection
 
 
