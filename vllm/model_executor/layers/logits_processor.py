@@ -25,7 +25,10 @@ from vllm.distributed import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
-from vllm.model_executor.layers.sm70_topk_gather import gather_topk_pairs
+from vllm.model_executor.layers.sm70_topk_gather import (
+    capture_top1_transport,
+    gather_topk_pairs,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.platforms import current_platform
 
@@ -181,6 +184,7 @@ class LogitsProcessor(PluggableLayer):
         self._top1_exchange = (
             cfg.kernel_config.top1_exchange_callback() if cfg else None
         )
+        self._top1_transport = capture_top1_transport()
         self._packed_topk_enabled = (
             cfg is not None and cfg.kernel_config.sm70_packed_topk_gather
         )
@@ -323,6 +327,15 @@ class LogitsProcessor(PluggableLayer):
                 num_pad = lm_head.shard_indices.num_org_vocab_padding
                 if num_pad > 0:
                     logits[..., -num_pad:] = -float("inf")
+
+                top_tokens = self._top1_transport(
+                    logits, lm_head.shard_indices.org_vocab_start_index, tp_size
+                )
+                if top_tokens is not None:
+                    self._maybe_dump_top_token_margin(
+                        lm_head, hidden_states, embedding_bias, top_tokens
+                    )
+                    return top_tokens
 
                 local_max_vals, local_max_indices = logits.max(dim=-1)
 

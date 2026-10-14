@@ -24,8 +24,12 @@ SM70_QSA_TUNING = QsaTuning()
 
 
 def read_sparse_legacy(name):
+    import os
+
     from vllm import envs
 
+    if name == "ONECAT_QSA48":
+        return os.getenv(name, "") == "split"
     raw = envs.environment_variables[name]()
     defaults = {
         "VLLM_SM70_QSA_INDEXER_SCORE_TILE_MB": SM70_QSA_TUNING.score_tile_mb,
@@ -87,6 +91,8 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
     """Retain the calibrated page-four row crossover."""
     qsa_grouped_page4: bool | None = None
     """Enable the existing grouped page-four verifier."""
+    qsa_segmented_page4: bool | None = None
+    """Split qualified grouped page-four verification by request and query tile."""
     qsa_grouped_pad_fix: bool | None = None
     """Retain the grouped verifier's padding correction semantics."""
 
@@ -144,6 +150,7 @@ class Sm70SparseConfig(DeferredExecutionPolicy):
         "qsa_xqa_page4": "VLLM_SM70_QSA_XQA_PAGE4",
         "qsa_xqa_page4_min_rows": "VLLM_SM70_QSA_XQA_PAGE4_MIN_ROWS",
         "qsa_grouped_page4": "VLLM_SM70_QSA_GROUPED_PAGE4",
+        "qsa_segmented_page4": "ONECAT_QSA48",
         "qsa_grouped_pad_fix": "VLLM_SM70_QSA_GROUPED_PAD_FIX",
     }
 

@@ -41,10 +41,21 @@ class GdnStateConfig:
             return
         from vllm import envs
 
+        legacy_group_metadata = os.getenv(
+            "ONECAT_MTP_GDN_GROUP_META", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         for field, name in GDN_STATE_FIELDS.items():
             if getattr(self, field) is None:
-                setattr(self, field, envs.environment_variables[name]())
+                value = envs.environment_variables[name]()
+                if field in ("shared_mtp_metadata", "fused_mtp_metadata"):
+                    value = value or legacy_group_metadata
+                setattr(self, field, value)
                 self.sources[field] = name if name in os.environ else "default"
+                if legacy_group_metadata and field in (
+                    "shared_mtp_metadata",
+                    "fused_mtp_metadata",
+                ):
+                    self.sources[field] = "ONECAT_MTP_GDN_GROUP_META"
             else:
                 self.sources[field] = "typed"
         self.resolved = True

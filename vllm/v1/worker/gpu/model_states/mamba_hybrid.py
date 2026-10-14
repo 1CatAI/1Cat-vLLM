@@ -75,6 +75,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     prepared_dflash2_smallq_metadata: (
         dict[int, DFlash2SmallQPreparedMetadata] | None
     ) = None
+    prepared_ple_shortconv_metadata: dict[int, Any] | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -145,6 +146,11 @@ class MambaHybridModelState(DefaultModelState):
             self._use_mtp4_common_gdn_metadata
             and self.gdn_state_policy.fused_mtp_metadata
             and self.cache_config.mamba_cache_mode in ("none", "align")
+        )
+        self._shortconv_metadata_provider = (
+            vllm_config.kernel_config.shortconv_metadata_provider(
+                vllm_config, device, self.cache_config.mamba_cache_mode
+            )
         )
         self._dflash2_gdn_builders: (
             list[tuple[int, GDNAttentionMetadataBuilder]] | None
@@ -348,6 +354,7 @@ class MambaHybridModelState(DefaultModelState):
         common_gdn_metadata = None
         prepared_dflash2_gdn_metadata = None
         prepared_dflash2_smallq_metadata = None
+        prepared_ple_shortconv_metadata = None
         if not for_capture:
             num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
@@ -429,6 +436,29 @@ class MambaHybridModelState(DefaultModelState):
                         self._dflash2_fused_gdn_metadata_logged = True
 
             if (
+                self._shortconv_metadata_provider.enabled
+                and cudagraph_mode == CUDAGraphMode.FULL
+            ):
+                prepared_ple_shortconv_metadata = (
+                    self._shortconv_metadata_provider.prepare(
+                        input_batch,
+                        block_tables,
+                        attn_groups,
+                        query_start_loc_cpu,
+                        num_decode_draft_tokens_cpu,
+                        num_accepted_tokens,
+                        num_reqs,
+                        num_tokens,
+                        state_start_indices=self._mamba_state_idx_gpu
+                        if self._align_mode
+                        else None,
+                        req_index_mapping=input_batch.idx_mapping
+                        if self._align_mode
+                        else None,
+                    )
+                )
+
+            if (
                 self._use_dflash2_grouped_smallq_metadata
                 and cudagraph_mode == CUDAGraphMode.FULL
                 and common_gdn_metadata is not None
@@ -467,6 +497,7 @@ class MambaHybridModelState(DefaultModelState):
             common_gdn_metadata=common_gdn_metadata,
             prepared_dflash2_gdn_metadata=prepared_dflash2_gdn_metadata,
             prepared_dflash2_smallq_metadata=prepared_dflash2_smallq_metadata,
+            prepared_ple_shortconv_metadata=prepared_ple_shortconv_metadata,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

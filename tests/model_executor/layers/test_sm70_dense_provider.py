@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -66,7 +67,9 @@ def test_glm_missing_native_retains_error_and_bias_fallback(monkeypatch):
     )
     x = torch.empty((8, 4096), dtype=torch.float16, device="meta")
     # Missing op is an error for the admitted geometry, not a silent generic GEMM.
-    monkeypatch.delattr(torch.ops._C, "sm70_glm53_tp8_cublaslt_out", raising=False)
+    # Deleting an attribute does not unregister an already loaded torch op:
+    # the namespace can resolve it again from the dispatcher.
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
     with pytest.raises(RuntimeError, match="requires its native op"):
         provider._maybe_sm70_dense_forward(prepared, x, None)
     assert (
