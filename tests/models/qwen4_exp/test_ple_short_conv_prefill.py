@@ -469,3 +469,77 @@ def test_long_single_prefill_channel_chunks_release_device_headroom(monkeypatch)
     assert chunked <= 1.9 * batch_bytes, (chunked, batch_bytes)
     assert single - chunked >= 0.4 * batch_bytes, (single, chunked, batch_bytes)
     print(f"single_prefill_peak_bytes: single={single} chunked={chunked}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("length", [0, 1, 8, 9, 10, 16, 17, 2049])
+@pytest.mark.parametrize("initial", [False, True])
+def test_sm70_prefill_convolution_output_and_state(length, initial):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 admission")
+    module, x, args = _case(
+        "cuda",
+        torch.float16,
+        lengths=[length, 0, 3],
+        decode_tokens=2,
+        state_indices=[3, 4, NULL_BLOCK_ID],
+        has_initial=[initial, True, True],
+        hidden_size=10240,
+    )
+    metadata, state, *rest = args
+    expected_state = state.clone()
+    expected = module._short_conv_dilated_prefill_batched(
+        x, metadata, expected_state, *rest
+    )
+    module._prefill_short_conv = True
+    actual = module._short_conv_dilated_prefill_batched(x, metadata, state, *rest)
+    assert torch.equal(state, expected_state)
+    assert bool(torch.isfinite(actual).all())
+    # Preserve the operation-aware predeclared FP16 bound. These constructed
+    # cases also record the stronger exact equality through assert_close.
+    error = (actual.float() - expected.float()).norm(dim=1)
+    scale = expected.float().norm(dim=1).clamp_min(1e-6)
+    assert (error / scale).max() <= 0.001
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("transpose_state", [False, True])
+def test_sm70_prefill_convolution_changed_input_graph_and_continuation(transpose_state):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 admission")
+    module, x, args = _case(
+        "cuda",
+        torch.float16,
+        lengths=[7, 18],
+        decode_tokens=1,
+        state_indices=[4, 2],
+        has_initial=[True, False],
+        hidden_size=10240,
+    )
+    metadata, state, *rest = args
+    if transpose_state:
+        state = state.transpose(1, 2).contiguous().transpose(1, 2)
+    seed = state.clone()
+    module._prefill_short_conv = True
+    module._short_conv_dilated_prefill_batched(x, metadata, state, *rest)
+    state.copy_(seed)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual = module._short_conv_dilated_prefill_batched(x, metadata, state, *rest)
+    torch.cuda.current_stream().wait_stream(stream)
+    state.copy_(seed)
+    x.mul_(-0.75)
+    metadata.has_initial_states_p.fill_(True)
+    rest[1].copy_(rest[1].flip(0))
+    reference_state = state.clone()
+    module._prefill_short_conv = False
+    for _ in range(3):
+        expected = module._short_conv_dilated_prefill_batched(
+            x, metadata, reference_state, *rest
+        )
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.equal(state, reference_state)

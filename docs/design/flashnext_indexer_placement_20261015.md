@@ -177,3 +177,56 @@ FP16 draft HOT16384, 80/20 expert placement, 256K context and chunk8192.
 Whole-model peak live/driver memory, verifier distribution, cold prefill,
 long-context quality and fresh-process reproduction remain pending; no
 512-MiB headroom or 16-ms verifier acceptance is claimed from operator tests.
+
+## Ordinary verifier window and peer prefill port
+
+The standard Worker restart, without step-event fences, passes the matched
+32K/64K/128K sweep at 152.15 / 139.99 / 110.49 output tok/s. Natural-EOS
+quality again passes through 260977 tokens, taking 113.85 seconds at the long
+boundary. The equivalent preceding single-stage diagnostic run took114.02s,
+compared with345.94s on the 128K-stage workaround; full staging repairs most of
+that cliff. A diagnostic private CPU-pool screen gives 15.96ms rank-max verifier
+mean at32K (p99 23.97ms); this is kept separate from ordinary tracing.
+
+Ordinary CUDA graph-envelope tracing measures504 committed target rounds over
+eight matched192-token32K requests. Every rank has512 state-commit triples:
+one prefill plus63 metric-reconciled target verifications per request. There
+is no extra pipeline-end commit in this trace. All504 target graph starts are
+present and associate uniquely with their following same-stream commit. This
+is distinguished from the older trace's extra pipeline-end replay; the parser
+has an explicit tail-count selection, rather than imputing or dropping events.
+
+From the earliest target GPU start to the latest target state-commit end across
+TP4, mean is **15.216741ms**, p50 14.5569745ms, p90 16.915299ms, p99 24.133488ms,
+maximum40.109622ms. All504 windows are exact; there are no conservative missing
+start bounds. This passes the historical mean<=16ms criterion, not an every
+round or p99 target. The source is996e3a161c, main history on host, compressed
+indexing on GPU, MTP4/FULL M5, encoded HOT32768 and FP16 draft HOT16384. Helper,
+EngineCore and PLE threads use disjoint physical-core pools. Standard NCCL
+MAX_CTAS6/buffer4MiB uses390070272 bytes in the two-group screen,48MiB less
+than8CTAs/buffer4MiB, with0.499ms all-gather. Unprofiled output throughput,
+round estimates and this independently traced verifier window remain separate.
+
+Further reuse of peer commit31edb1fe3d adds only its qualified QSA TP-row and PLE
+prefill stages. Target/decode graphs and native sources remain unchanged. The
+QSA adapter qualifies replicated queries/history for TP4/DCP1/PCP1; the selector
+admits single-request FP16/H4/D128 prefill at4096..9216 query rows with sufficient
+score work, gathers compressed512-block selections and expands globally.
+Decode, capture, mixed requests, threshold neighbors and other layouts retain
+the existing selector. The per-tile logits lifetime repair stays inside the
+loop for both paths. The opt-in remains a typed active-QSA computation policy.
+
+The PLE stage reuses the generic PLE kernel owner, consumes existing input and
+state directly, commits valid base state separately and retains the native FP16
+SiLU boundary. SM70/FP16/10240channels/4taps/dilation3/base9 are the accelerated
+subset; unsupported layouts use the existing convolution. Both opt-ins default
+to false in the library. No private kernel artifact or native ABI update is
+required: the Triton source is shipped with the ordinary package.
+
+Local port checks:64CPU cases pass with24GPU skips;50 PLE GPU cases pass. At the
+actual7344-row geometry, compared with this branch's bounded quarter-channel
+control, fused PLE reduces additional peak from227123712 to150405120 bytes,
+with bitwise-equal output and state, and0.85545 versus7.34761ms in the repeated
+control. Destination affected suites pass98cases. Destination TP4 selector and
+final combined serving/quality/memory gates are pending; neither opt-in is
+promoted from these operator checks alone.

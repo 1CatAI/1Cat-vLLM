@@ -2175,6 +2175,9 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         self.conv_kernel_size = int(config.ple_conv_kernel_size)
         self.short_conv_dilation = int(config.ngram_size)
         self.conv_state_len = (self.conv_kernel_size - 1) * self.short_conv_dilation
+        self._prefill_short_conv = (
+            vllm_config.kernel_config.layer_execution.ple_prefill_conv
+        )
         self.num_spec_tokens = vllm_config.num_speculative_tokens
         self.activation = "silu"
         # The offload subprocess constructs the surrounding model on meta, but
@@ -2526,6 +2529,54 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
 
         hidden_size = x_p.shape[1]
         state_len = self.conv_state_len
+        if (
+            getattr(self, "_prefill_short_conv", False)
+            and current_platform.is_device_capability(70)
+            and hidden_size == 10240
+            and state_len == 9
+            and self.short_conv_dilation == 3
+            and conv_weights.shape == (hidden_size, 4)
+            and conv_state.ndim == 3
+            and conv_state.shape[1] == hidden_size
+            and conv_state.shape[2] >= state_len
+            and x_p.stride(1) == 1
+            and all(
+                t.is_cuda and t.dtype == torch.float16
+                for t in (x_p, conv_state, conv_weights)
+            )
+            and all(
+                t.device == x_p.device
+                for t in (
+                    conv_state,
+                    conv_weights,
+                    q_starts,
+                    state_indices_tensor_p,
+                    has_initial_states_p,
+                )
+            )
+            and state_indices_tensor_p.is_contiguous()
+            and has_initial_states_p.is_contiguous()
+        ):
+            from vllm.model_executor.kernels.ple.short_conv import (
+                dilated_prefill_short_conv,
+            )
+
+            logger.info_once(
+                "Using SM70 PLE prefill convolution without padded history."
+            )
+            return dilated_prefill_short_conv(
+                x_p,
+                conv_state,
+                conv_weights,
+                q_starts,
+                state_indices_tensor_p[:num_prefills],
+                has_initial_states_p[:num_prefills],
+                max_len,
+                0,
+                self.short_conv_dilation,
+                NULL_BLOCK_ID,
+                token_tile=16,
+            )
         positions = torch.arange(
             num_prefill_tokens, device=x_p.device, dtype=torch.int64
         )
