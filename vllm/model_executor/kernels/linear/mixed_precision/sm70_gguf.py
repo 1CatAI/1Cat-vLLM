@@ -51,25 +51,51 @@ _AFFINE_BLAS_MIN_M = {
     (6, 16, 2560, 1536): 2048,
     (6, 16, 1536, 2560): 2048,
 }
-_AFFINE_BLAS_WORKSPACE_ELEMENTS = max(k * n for _, _, k, n in _AFFINE_BLAS_MIN_M)
 _affine_blas_workspaces: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+_affine_blas_views: dict = {}
 
 
-def _get_affine_blas_workspace(weight: torch.Tensor) -> torch.Tensor | None:
+def _get_affine_blas_workspace(
+    weight: torch.Tensor, elements: int | None = None
+) -> torch.Tensor | None:
+    """The engine's shared FP16 scratch of the admitted large-M BLAS path.
+
+    Prepare-time callers pass their projection's k * n: the scratch grows to
+    the largest projection actually admitted on this device, not the largest
+    calibrated shape of any model (5120 x 17408 = 170 MiB). Views bound with
+    `_bind_affine_blas_workspace` follow it when it grows. Runtime callers
+    (elements=None) only borrow the scratch their prepared shape reserved.
+    """
     key = (weight.device, torch.float16)
     pool = workspace_pool("gguf_affine_blas", _affine_blas_workspaces)
     workspace = pool.get(key)
+    if elements is None or (workspace is not None and workspace.numel() >= elements):
+        return workspace
+    try:
+        grown = torch.empty(elements, dtype=torch.float16, device=weight.device)
+    except torch.OutOfMemoryError:
+        return None
+    pool[key] = grown
+    views = workspace_pool("gguf_affine_blas_views", _affine_blas_views)
+    for ref, k, n in views.get(key, ()):
+        layer = ref()
+        if layer is not None:
+            layer.gguf_tm_blas_workspace = grown[: k * n].view(k, n)
+    return grown
+
+
+def _bind_affine_blas_workspace(
+    layer: torch.nn.Module, weight: torch.Tensor, k: int, n: int
+) -> bool:
+    """Reserve k * n scratch elements and give `layer` its (k, n) view."""
+    workspace = _get_affine_blas_workspace(weight, k * n)
     if workspace is None:
-        try:
-            workspace = torch.empty(
-                _AFFINE_BLAS_WORKSPACE_ELEMENTS,
-                dtype=torch.float16,
-                device=weight.device,
-            )
-        except torch.OutOfMemoryError:
-            return None
-        pool[key] = workspace
-    return workspace
+        return False
+    key = (weight.device, torch.float16)
+    views = workspace_pool("gguf_affine_blas_views", _affine_blas_views)
+    views.setdefault(key, []).append((weakref.ref(layer), k, n))
+    layer.gguf_tm_blas_workspace = workspace[: k * n].view(k, n)
+    return True
 
 
 @dataclass
@@ -161,12 +187,8 @@ class TurboMindGgufAffineKernel(MPLinearKernel):
             reason = "operator_missing:gguf_affine_blas_sm70_out"
         elif minimum_m is None:
             reason = "local_shape_has_no_prefill_calibration"
-        else:
-            workspace = _get_affine_blas_workspace(weight)
-            if workspace is None:
-                reason = "prefill_workspace_allocation_failed"
-            else:
-                layer.gguf_tm_blas_workspace = workspace[: k * n].view(k, n)
+        elif not _bind_affine_blas_workspace(layer, weight, k, n):
+            reason = "prefill_workspace_allocation_failed"
         self.prefill_capability = GGUFOperatorCapability(
             GGUFDecoderFamily.AFFINE,
             quant_type_name(self.config.source_type),
