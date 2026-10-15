@@ -72,6 +72,8 @@ def _write(
     Sets: tl.constexpr,
     FP8: tl.constexpr,
     HOT: tl.constexpr = True,
+    HOT_FP8: tl.constexpr = False,
+    HotScales=None,
 ):
     # HOT=False: a plain history copy (a prefill stage buffer): no epoch,
     # no hot-cache update.
@@ -108,6 +110,13 @@ def _write(
             if FP8:
                 decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, None]).to(
                     tl.float16
+                )
+            if HOT_FP8:
+                decoded = codes
+                tl.store(
+                    HotScales + tl.maximum(resident, 0) * 8 + slot % 4 * 2 + kv,
+                    scales,
+                    (resident >= 0) & (tag == page),
                 )
             tl.store(
                 Hot
@@ -215,6 +224,8 @@ def _gather(
     Sets: tl.constexpr,
     FP8: tl.constexpr,
     STAGE: tl.constexpr,
+    HOT_FP8: tl.constexpr = False,
+    HotScales=None,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
     lanes = tl.arange(0, 16)
@@ -257,6 +268,15 @@ def _gather(
                 initial_hit[:, None, None],
                 other=0,
             )
+            if HOT_FP8:
+                scales = tl.load(
+                    HotScales + tl.maximum(initial, 0)[:, None] * 2 + kv[None, :],
+                    initial_hit[:, None],
+                    other=0,
+                )
+                values = (
+                    fp8_e4m3fn_bits_to_fp32_bitcast(values) * scales[:, :, None]
+                ).to(tl.float16)
             tl.store(
                 Out
                 + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
@@ -343,46 +363,85 @@ def _gather(
     )
     hot_tokens = tl.reshape(slots[:, None] * 4 + page_lanes[None, :], (16,))
     token_hits = tl.reshape(tl.broadcast_to(hit[:, None], (4, 4)), (16,))
-    cached = tl.load(
-        Hot
-        + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
-        + dims[None, None, :],
-        token_hits[:, None, None],
-        other=0,
-    )
-    codes = tl.load(
-        History
-        + (
-            (tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2 + kv[None, :, None])
-            * Page
-            + (tl.maximum(logical, 0) % Page)[:, None, None]
-        )
-        * Dim
-        + dims[None, None, :],
-        (valid & ~token_hits)[:, None, None],
-        other=0,
-    )
-    if FP8:
-        scales = tl.load(
-            Scales + tokens[:, None] * 2 + kv[None, :],
-            (valid & ~token_hits)[:, None],
+    token_installs = tl.reshape(tl.broadcast_to(install[:, None], (4, 4)), (16,))
+    # Direct readers consume existing hot values themselves, and read a
+    # failed installation from authoritative history. Resolve only needs
+    # values that it actually writes to a new hot slot or staging.
+    # A failed direct installation has no values to materialize.
+    if STAGE > 0 or tl.sum(install.to(tl.int32), 0) > 0:
+        need_cached = token_hits & (STAGE > 0)
+        need_history = valid & ~token_hits
+        if STAGE == 0:
+            need_history &= token_installs
+        cached = tl.load(
+            Hot
+            + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
+            + dims[None, None, :],
+            need_cached[:, None, None],
             other=0,
         )
-        decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
-            tl.float16
+        if HOT_FP8:
+            cached_scales = tl.load(
+                HotScales + hot_tokens[:, None] * 2 + kv[None, :],
+                need_cached[:, None],
+                other=0,
+            )
+            cached = (
+                fp8_e4m3fn_bits_to_fp32_bitcast(cached) * cached_scales[:, :, None]
+            ).to(tl.float16)
+        codes = tl.load(
+            History
+            + (
+                (
+                    tl.maximum(blocks, 0).to(tl.int64)[:, None, None] * 2
+                    + kv[None, :, None]
+                )
+                * Page
+                + (tl.maximum(logical, 0) % Page)[:, None, None]
+            )
+            * Dim
+            + dims[None, None, :],
+            need_history[:, None, None],
+            other=0,
         )
-    else:
-        decoded = codes.to(tl.float16)
-    values = tl.where(token_hits[:, None, None], cached, decoded)
-    token_installs = tl.reshape(tl.broadcast_to(install[:, None], (4, 4)), (16,))
-    tl.store(
-        Hot
-        + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
-        + dims[None, None, :],
-        values,
-        token_installs[:, None, None],
-    )
-    tl.debug_barrier()
+        if FP8:
+            scales = tl.load(
+                Scales + tokens[:, None] * 2 + kv[None, :],
+                need_history[:, None],
+                other=0,
+            )
+            decoded = (fp8_e4m3fn_bits_to_fp32_bitcast(codes) * scales[:, :, None]).to(
+                tl.float16
+            )
+        else:
+            decoded = codes.to(tl.float16)
+        values = tl.where(token_hits[:, None, None], cached, decoded)
+        tl.store(
+            Hot
+            + (hot_tokens[:, None, None] * 2 + kv[None, :, None]) * Dim
+            + dims[None, None, :],
+            codes if HOT_FP8 else values,
+            token_installs[:, None, None],
+        )
+        if HOT_FP8:
+            tl.store(
+                HotScales + hot_tokens[:, None] * 2 + kv[None, :],
+                scales,
+                token_installs[:, None],
+            )
+        if STAGE > 0:
+            store_values = columns < Padded
+            if STAGE == 2:
+                store_values &= valid & ~(token_hits | token_installs)
+            tl.store(
+                Out
+                + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None])
+                * Dim
+                + dims[None, None, :],
+                values,
+                store_values[:, None, None],
+            )
+        tl.debug_barrier()
     tl.atomic_cas(Tags + slots, tl.where(install, old_tag, -2), first, sem="release")
     tl.atomic_cas(PageSlots + first, tl.where(install, -2, -3), slots, sem="release")
     tl.atomic_cas(
@@ -395,17 +454,6 @@ def _gather(
         tl.where(valid, tl.where(token_hits | token_installs, hot_tokens, -1), -2),
         columns < Width,
     )
-    if STAGE > 0:
-        store_values = columns < Padded
-        if STAGE == 2:
-            store_values &= valid & ~(token_hits | token_installs)
-        tl.store(
-            Out
-            + ((row * 2 + kv[None, :, None]) * Padded + columns[:, None, None]) * Dim
-            + dims[None, None, :],
-            values,
-            store_values[:, None, None],
-        )
     counter = (row * tl.cdiv(Width, 16) + tile) * 3
     counters = tl.arange(0, 4)
     hits = tl.sum((valid & token_hits).to(tl.int64), 0)
@@ -435,6 +483,7 @@ class HostQSAKV:
         direct_device: bool | None = None,
         is_speculative_draft: bool = False,
         resolve_rows: int = 32,
+        hot_fp8: bool = False,
     ):
         if blocks <= 0 or page_size <= 0 or page_size % 4 or dim != 256:
             raise ValueError("Host QSA KV requires positive page4 geometry and D256")
@@ -451,6 +500,9 @@ class HostQSAKV:
         if dtype not in (torch.uint8, torch.float16):
             raise ValueError("Host history requires E4M3 bytes or FP16 values")
         self.fp8 = dtype == torch.uint8
+        if hot_fp8 and not self.fp8:
+            raise ValueError("Encoded hot cache requires E4M3 authoritative history")
+        self.hot_fp8 = hot_fp8
         self.device_reference = device_reference
         self.is_speculative_draft = is_speculative_draft
         self.host = None
@@ -485,7 +537,14 @@ class HostQSAKV:
                 )
                 self.scales = get_accelerator_view_from_cpu_tensor(self.host_scales)
         self.hot_values = torch.empty(
-            (hot_tokens, 2, dim), dtype=torch.float16, device=device
+            (hot_tokens, 2, dim),
+            dtype=torch.uint8 if hot_fp8 else torch.float16,
+            device=device,
+        )
+        self.hot_scales = torch.empty(
+            (hot_tokens, 2) if hot_fp8 else (0,),
+            dtype=torch.float32,
+            device=device,
         )
         self.tags = torch.full((self.sets, 4), -1, dtype=torch.int32, device=device)
         self.stamps = torch.zeros_like(self.tags)
@@ -556,6 +615,8 @@ class HostQSAKV:
                 self.dim,
                 self.sets,
                 self.fp8,
+                HOT_FP8=self.hot_fp8,
+                HotScales=self.hot_scales,
                 num_warps=4,
             )
 
@@ -598,6 +659,8 @@ class HostQSAKV:
             self.sets,
             self.fp8,
             HOT=False,
+            HOT_FP8=self.hot_fp8,
+            HotScales=self.hot_scales,
             num_warps=4,
         )
 
@@ -846,6 +909,8 @@ class HostQSAKV:
                 self.sets,
                 self.fp8,
                 stage,
+                HOT_FP8=self.hot_fp8,
+                HotScales=self.hot_scales,
                 num_warps=4,
             )
 

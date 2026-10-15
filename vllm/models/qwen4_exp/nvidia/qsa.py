@@ -390,7 +390,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 query_positions[:num_tokens],
                 sequence_lengths,
                 output[:num_tokens],
-                output_gate,
+                output_gate[:num_tokens] if output_gate is not None else None,
                 attn_metadata,
             )
             return output
@@ -729,6 +729,21 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         # Cache binding runs under the target worker's config, also for draft
         # layers. Retain each owner's policy from model construction.
         self.host_kv_is_draft = vllm_config.is_speculative_draft
+        speculative_config = vllm_config.speculative_config
+        self.host_kv_decode_query_len = 1 + (
+            (speculative_config.num_speculative_tokens or 0)
+            if speculative_config is not None
+            else 0
+        )
+        if self.host_kv_is_draft:
+            self.host_kv_hot_tokens = (
+                vllm_config.kernel_config.qsa_host_kv_draft_hot_tokens
+                or self.host_kv_hot_tokens
+            )
+        self.host_kv_hot_fp8 = (
+            not self.host_kv_is_draft
+            and vllm_config.kernel_config.qsa_host_kv_hot_dtype == "fp8_e4m3"
+        )
         self.host_kv_direct_device = vllm_config.kernel_config.sm70_qsa_device_history
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
@@ -912,13 +927,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 device_reference=self.host_kv_device_reference,
                 direct_device=self.host_kv_direct_device,
                 is_speculative_draft=self.host_kv_is_draft,
+                hot_fp8=self.host_kv_hot_fp8,
             )
             if not self.host_kv_is_draft:
                 _TARGET_HOST_KV.append(self.host_kv)
             logger.info_once(
                 "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
                 "direct device M1..20/H6/D256=%s, fallback_reason=%s; "
-                "other shapes use protected FP16 hot pages and miss staging.",
+                "other shapes use protected hot pages and FP16 miss staging.",
                 "device_reference" if self.host_kv_device_reference else "host",
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,
@@ -945,6 +961,13 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if (
             self.host_kv_prefill_stage_tokens
             and query.shape[0] > state.resolve_rows
+            # A verifier batch can exceed resolve_rows while every request
+            # still has only its decode query. Staging plans read metadata on
+            # the CPU and cannot be captured or reused for those requests.
+            and (
+                metadata is None
+                or metadata.max_query_len > self.host_kv_decode_query_len
+            )
             and query.shape[1:] == (6, 256)
             and indices.shape[1] <= state.width
         ):

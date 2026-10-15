@@ -316,7 +316,7 @@ except AttributeError as error:
     raise error
 
 
-def _fused_moe_gguf(
+def _fused_moe_gguf_impl(
     x: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -325,7 +325,10 @@ def _fused_moe_gguf(
     qweight_type: int,
     qweight_type2: int,
     activation: str,
+    row_batch: bool = False,
 ) -> torch.Tensor:
+    if x.shape[0] == 0:
+        return torch.empty_like(x)
     activation_enum = MoEActivation.from_str(activation)
 
     def act(x: torch.Tensor):
@@ -385,12 +388,11 @@ def _fused_moe_gguf(
         E, N, _ = w1.shape
         top_k = topk_ids.shape[1]
 
-        out = ops.ggml_moe_a8_vec(x, w1, topk_ids, top_k, qweight_type, N, num_tokens)
+        vec = ops.ggml_moe_a8_vec_rows if row_batch else ops.ggml_moe_a8_vec
+        out = vec(x, w1, topk_ids, top_k, qweight_type, N, num_tokens)
         out = act(out)
 
-        out = ops.ggml_moe_a8_vec(
-            out, w2, topk_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k
-        )
+        out = vec(out, w2, topk_ids, 1, qweight_type2, w2.shape[1], num_tokens * top_k)
         out = out.reshape(num_tokens, top_k, w2.shape[1]).mul_(
             topk_weights.view(num_tokens, top_k, 1)
         )
@@ -422,6 +424,46 @@ def _fused_moe_gguf(
     return out_hidden_states
 
 
+def _fused_moe_gguf(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    qweight_type: int,
+    qweight_type2: int,
+    activation: str,
+) -> torch.Tensor:
+    return _fused_moe_gguf_impl(
+        x, w1, w2, topk_weights, topk_ids, qweight_type, qweight_type2, activation
+    )
+
+
+def _fused_moe_gguf_rows(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    qweight_type: int,
+    qweight_type2: int,
+    activation: str,
+) -> torch.Tensor:
+    if qweight_type != 8 or qweight_type2 != 8:
+        raise ValueError("Row-batched GGUF MoE requires Q8_0 experts")
+    return _fused_moe_gguf_impl(
+        x,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        qweight_type,
+        qweight_type2,
+        activation,
+        row_batch=True,
+    )
+
+
 def _fused_moe_gguf_fake(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -442,6 +484,12 @@ try:
         fake_impl=_fused_moe_gguf_fake,
     )
     fused_moe_gguf = torch.ops.vllm._fused_moe_gguf
+    direct_register_custom_op(
+        op_name="_fused_moe_gguf_rows",
+        op_func=_fused_moe_gguf_rows,
+        fake_impl=_fused_moe_gguf_fake,
+    )
+    fused_moe_gguf_rows = torch.ops.vllm._fused_moe_gguf_rows
 
 except AttributeError as error:
     raise error

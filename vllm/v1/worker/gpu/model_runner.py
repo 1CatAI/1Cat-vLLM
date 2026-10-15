@@ -596,6 +596,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cp_interleave=self.cp_interleave,
             slot_mapping_enabled=slot_mapping_enabled,
             dcp_sharded=dcp_sharded,
+            state_block_id_offsets=getattr(
+                self.kv_cache_config, "state_block_id_offsets", {}
+            ),
+            device_state_blocks=self.kv_cache_config.device_state_blocks,
         )
         initialize_mamba_ssu_backend(
             self.vllm_config.mamba_config, self.kv_cache_config
@@ -671,6 +675,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 if tensor.host_backed
                 for name in tensor.shared_by
             },
+            state_block_id_offsets=getattr(
+                self.kv_cache_config, "state_block_id_offsets", {}
+            ),
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:

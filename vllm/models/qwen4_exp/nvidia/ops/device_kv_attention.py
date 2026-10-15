@@ -44,6 +44,12 @@ def initialize_device_history_attention(state, enabled: bool | None) -> None:
                 torch.ops.vllm_sm70_qsa_device, "run_hot"
             ):
                 reason = "native_hot_cache_unavailable"
+            elif (
+                not state.device_reference
+                and getattr(state, "hot_fp8", False)
+                and not hasattr(torch.ops.vllm_sm70_qsa_device, "run_hot_fp8")
+            ):
+                reason = "native_encoded_hot_cache_unavailable"
     state.device_history_reason = reason
     # Host-authoritative history: resolve selected pages into the protected
     # hot cache, then read hot tokens on device and the rest from mapped host.
@@ -153,7 +159,13 @@ def device_history_attention(
     gate = gate.view_as(query) if gate is not None else None
     if hot:
         resolved = state.resolve_hot(indices, table, requests, positions, lengths)
-        torch.ops.vllm_sm70_qsa_device.run_hot(
+        op = (
+            torch.ops.vllm_sm70_qsa_device.run_hot_fp8
+            if getattr(state, "hot_fp8", False)
+            else torch.ops.vllm_sm70_qsa_device.run_hot
+        )
+        extra = (state.hot_scales,) if getattr(state, "hot_fp8", False) else ()
+        op(
             query,
             state.history,
             state.scales,
@@ -167,11 +179,13 @@ def device_history_attention(
             *workspace,
             state.hot_values,
             resolved,
+            *extra,
         )
         state.device_history_reason = None
         logger.info_once(
             "Using SM70 native QSA attention over host history with a device "
-            "hot cache (FP32 PV)"
+            "hot cache (%s storage, FP32 PV)",
+            "E4M3" if getattr(state, "hot_fp8", False) else "FP16",
         )
         return True
     torch.ops.vllm_sm70_qsa_device.run(

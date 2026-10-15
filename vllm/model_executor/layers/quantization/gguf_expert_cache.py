@@ -38,7 +38,9 @@ SHARDS = ("w1", "w3", "w2")
 _ENTRY_HEADER = 8
 _RING_ENTRIES = 1024
 _MAX_OPS = 256
-_COPY_PROGRAMS = (16, 8)
+# Split both words and projections to expose independent mapped-host
+# transfers for small miss plans. See the paired TP4 copy screen.
+_COPY_PROGRAMS = (4, 32, 3)
 _LAYER = re.compile(r"layers\.(\d+)\.")
 _MEMLOG = envs.VLLM_EXPERT_CACHE_MEMLOG
 
@@ -109,6 +111,7 @@ def _apply_plan(
     OPS_PROGRAMS: tl.constexpr,
     SPLIT: tl.constexpr,
     BLOCK: tl.constexpr,
+    PARALLEL_SHARDS: tl.constexpr = False,
 ):
     """Write back, then load, the planned experts (int64 words).
 
@@ -121,7 +124,8 @@ def _apply_plan(
         slot = tl.load(plan + 8 + op * 5).to(tl.int64)
         load = tl.load(plan + 9 + op * 5).to(tl.int64)
         back = tl.load(plan + 10 + op * 5).to(tl.int64)
-        for shard in tl.static_range(3):
+        for shard_index in tl.static_range(1 if PARALLEL_SHARDS else 3):
+            shard = tl.program_id(2) if PARALLEL_SHARDS else shard_index
             n = tl.load(words + layer * 3 + shard)
             device = tl.load(device_offsets + layer * 3 + shard) + slot * n
             host_base = tl.load(host_offsets + layer * 3 + shard)
@@ -222,6 +226,7 @@ class ExpertCache:
         device,
         prefill_mode="mmq",
         prefill_tokens=4096,
+        decode_rows=20,
     ):
         """``banks``: [(layer_index, shard, (experts, rows, bytes), tail,
         (gguf_type, logical_k, k_offset))]."""
@@ -229,6 +234,13 @@ class ExpertCache:
         if device.index is None:
             device = torch.device("cuda", torch.accelerator.current_device_index())
         self.device = device
+        if decode_rows not in (20, 40):
+            raise ValueError("Expert cache decode rows must be 20 or 40")
+        self.decode_rows = decode_rows
+        entry_ints = 512 if decode_rows == 40 else 256
+        self.max_ops = max(
+            _MAX_OPS, triton.next_power_of_2(entry_ints - _ENTRY_HEADER + spare)
+        )
         self.experts = num_experts
         self.spare = spare
         self.slots = max(
@@ -368,15 +380,19 @@ class ExpertCache:
             self.host_slot_of[i, cold] = torch.arange(len(cold), dtype=torch.int32)
         self.table = self.slot_of.to(device)
         self.counter = torch.zeros(1, dtype=torch.int64, device=device)
-        self.ring = torch.zeros((_RING_ENTRIES, 256), dtype=torch.int32).pin_memory()
+        self.ring = torch.zeros(
+            (_RING_ENTRIES, entry_ints), dtype=torch.int32
+        ).pin_memory()
         self.published = torch.zeros(8, dtype=torch.int64).pin_memory()
         self.ring_view = torch.ops._C.get_cuda_view_from_cpu_tensor(self.ring)
         self.published_view = torch.ops._C.get_cuda_view_from_cpu_tensor(self.published)
         # The lane's copy plan for the current miss, and its device copy.
-        self.reply = torch.full((8 + 5 * _MAX_OPS,), -1, dtype=torch.int32).pin_memory()
+        self.reply = torch.full(
+            (8 + 5 * self.max_ops,), -1, dtype=torch.int32
+        ).pin_memory()
         self.reply[1:8] = 0
         self.reply_view = torch.ops._C.get_cuda_view_from_cpu_tensor(self.reply)
-        self.plan = torch.zeros(8 + 5 * _MAX_OPS, dtype=torch.int32, device=device)
+        self.plan = torch.zeros(8 + 5 * self.max_ops, dtype=torch.int32, device=device)
         # Started lazily by start() on the first forward.
         self.lane: Any = None
         self.copy_stream: Any = None
@@ -460,7 +476,7 @@ class ExpertCache:
             self.ring.shape[1],
             self.published.data_ptr(),
             self.reply.data_ptr(),
-            _MAX_OPS,
+            self.max_ops,
             self.slot_of,
             self.host_slot_of,
         )
@@ -570,7 +586,7 @@ class ExpertCache:
             RING=_RING_ENTRIES,
             ENTRY=self.ring.shape[1],
             BLOCK=block,
-            PLAN=triton.next_power_of_2(5 * _MAX_OPS),
+            PLAN=triton.next_power_of_2(5 * self.max_ops),
         )
         _apply_plan[_COPY_PROGRAMS](
             self.plan,
@@ -582,8 +598,9 @@ class ExpertCache:
             i,
             OPS_PROGRAMS=_COPY_PROGRAMS[0],
             SPLIT=_COPY_PROGRAMS[1],
-            BLOCK=1024,
-            num_warps=8,
+            BLOCK=256,
+            PARALLEL_SHARDS=True,
+            num_warps=4,
         )
         out = torch.empty_like(ids)
         _remap[(1,)](
@@ -595,7 +612,7 @@ class ExpertCache:
             count,
             EXPERTS=self.experts,
             BLOCK=block,
-            OPS=_MAX_OPS,
+            OPS=self.max_ops,
         )
         return out
 
@@ -1014,17 +1031,8 @@ class TurboMindPrefill:
             # (decode write-backs precede it) and the previous layer's cold
             # transcode (stream order), not the bank: it runs ahead.
             cold.wait_event(self.fresh)
-            rows = self.extent[p]
             for s in (0, 1) if key == "gu" else (2,):
-                shard = SHARDS[s]
-                nbytes = rows * cache.sizes[layer, shard]
-                if nbytes:
-                    _native().copy_h2d(
-                        self.stage_at[s],
-                        cache.host[layer, shard].data_ptr(),
-                        nbytes,
-                        cold.cuda_stream,
-                    )
+                cache.lane.stage_cold(i, s, self.stage_at[s], cold.cuda_stream)
         cold.wait_stream(stream)
         spec = info[key]
         weight, stats = self.bank(key, spec, slot[1])
@@ -1298,5 +1306,6 @@ def create_cache(banks, num_experts, config, device) -> ExpertCache:
         device,
         prefill_mode=config.expert_cache_prefill,
         prefill_tokens=config.expert_cache_prefill_tokens,
+        decode_rows=getattr(config, "grouped_gate_up_max_m", 20),
     )
     return _CACHE

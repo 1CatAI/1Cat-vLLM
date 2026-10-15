@@ -572,13 +572,39 @@ class Sm70GgufConfig:
 
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
+    small_m_dp4a_max_m: int = Field(default=20, ge=1, le=40)
+    """Maximum logical batch; retained native fragments use at most 20 rows.
+
+    Values above 20 opt into tiled original-block experts, including small
+    prefill tails. Larger batches retain the existing TurboMind path.
+    """
 
     lut4_expert_dp4a: bool = True
     """Admit canonical IQ4 gate/up integer dots at calibrated expert shapes."""
 
     small_m_hmma: bool = True
     """Use one coalesced integer bank and fused FP16 MMA projections at M1..8."""
+    small_m_hmma_batch: bool = False
+    """Reuse large projection weights at M9..16 and M25..40 on qualified shapes.
 
+    Compatible small segment peers share the launch. M17..24 retains the
+    prior dispatch, including the separately qualified M20 projection route.
+    """
+    grouped_gate_up: bool = False
+    """Reuse original expert decoding across qualified routed rows on SM70."""
+    grouped_gate_up_max_m: Literal[20, 40] = 20
+    """Bound grouped expert fragments and the matching cache request capacity.
+
+    Forty rows opt into one cache lease and grouped gate/up across MTP4 C8.
+    Quantization and ordinary down retain their twenty-row native calls;
+    grouped_down separately admits the grouped down projection.
+    """
+    grouped_down: bool = False
+    """Reuse original IQ4_NL/Q2_0 down weights in qualified M25..40 batches.
+
+    Requires the forty-row grouped expert/cache policy. Smaller batches keep
+    the retained projection and its four ordered route subtotals.
+    """
     q8_expert_intermediate: bool = True
     """Encode routed intermediates once in qualified integer expert gate/up."""
 
@@ -830,6 +856,18 @@ class KernelConfig:
     sm70_hcx: bool = False
     """Leave block outputs as TP partials and run all-reduce, HC combine/norm,
     HC down and HC up as one SM70 kernel for verification batches up to 8."""
+    sm70_hcx_batch_max_m: int = Field(default=8, ge=1, le=40)
+    """Maximum HCX batch, executed with the qualified eight-row native tiles.
+
+    Values above 8 opt into tiling; larger batches retain the existing
+    projection and communication fallback. Bound independently on each module.
+    """
+    sm70_hcx_batch_fusion: bool = False
+    """Fuse M17..40 HC tiles on full-mesh SM70 TP4 with a local schedule.
+
+    Separate output projections use the whole-batch kernel. Producer-fused
+    projections and unsupported modes keep the retained eight-row tiles.
+    """
 
     sm70_hcx_local_schedule: bool = False
     """Experimentally delay HC up-weight prefetch and distribute gate-mix for
@@ -870,6 +908,32 @@ class KernelConfig:
     M1..20, H6, D256. Speculative draft attention retains its existing path."""
     sm70_qsa_shared_key: bool = True
     """Share FP16 indexer keys across M2..8 queries of one request on SM70."""
+    sm70_qsa_shared_key_batch: bool = False
+    """Reuse that scorer per request for small verification batches.
+
+    Requires ``sm70_qsa_shared_key`` and a valid host query-start layout.
+    Unqualified layouts retain the existing batched scorer. Off by default.
+    """
+    sm70_qsa_indexer_single_rank: bool = False
+    """Select host-backed replicated QSA indices on TP rank zero and broadcast.
+
+    Applies to qualified SM70 FP16 TP4/PP1/CP1 small batches. Each rank still
+    updates its own key caches. Other shapes retain independent selection.
+    """
+    sm70_qsa_indexer_stage_keys: bool = False
+    """Copy live shared physical indexer pages once per small verification batch.
+
+    Qualified SM70 FP16 host indexer history borrows a bounded engine-owned
+    device bank. Overflow pages retain the authoritative paged reader.
+    """
+
+    sm70_qsa_indexer_persistent_keys: bool = False
+    """Reuse versioned per-layer indexer pages on the staged TP4 host path.
+
+    Bound writers and cache rebinding invalidate the cached copy. A shared
+    refresh bank and the retained paged reader handle hash/capacity overflow.
+    External KV transfer/offload and tree-copy speculation are not admitted.
+    """
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
     qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
@@ -884,6 +948,11 @@ class KernelConfig:
     device and the remainder directly from mapped host history."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_hot_dtype: Literal["float16", "fp8_e4m3"] = "float16"
+    """Target hot storage; encoded E4M3 requires E4M3 authoritative history.
+    Encoded hot reads round to the same FP16 operands as the decoded cache."""
+    qsa_host_kv_draft_hot_tokens: int | None = Field(default=None, gt=0, multiple_of=16)
+    """Optional independent draft hot capacity; None preserves target capacity."""
     qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
     """Shared host-miss staging capacity; larger batches use bounded row chunks."""
     qsa_host_kv_prefill_stage_tokens: int = Field(default=0, ge=0)
@@ -902,6 +971,12 @@ class KernelConfig:
 
     Zero retains the shared capacity. A nonzero pool retains active states and
     bounded prefix checkpoints while history IDs use a separate range.
+    """
+    qsa_host_kv_state_compact: bool = False
+    """Give bounded recurrent groups independent, compact device state banks.
+
+    Requires the host-KV layout, PP1 and CP1. Scheduler block IDs remain unique;
+    block tables map each state group to its own physical bank. Off by default.
     """
     qsa_host_kv_active: bool = Field(default=False, init=False)
     """Whether the host QSA cache geometry has been admitted."""
@@ -1076,6 +1151,23 @@ class KernelConfig:
         }
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
+        if not self.sm70_hcx:
+            ignored_factors.add("sm70_hcx_batch_max_m")
+            ignored_factors.add("sm70_hcx_batch_fusion")
+        if not (self.sm70_qsa_indexer_stage_keys and self.sm70_qsa_indexer_single_rank):
+            ignored_factors.add("sm70_qsa_indexer_persistent_keys")
+        if not self.sm70_qsa_shared_key:
+            ignored_factors.add("sm70_qsa_shared_key_batch")
+            ignored_factors.add("sm70_qsa_indexer_stage_keys")
+            ignored_factors.add("sm70_qsa_indexer_persistent_keys")
+        if (
+            not self.qsa_host_kv
+            or not self.qsa_host_indexer_history
+            or self.qsa_host_kv_device_reference
+        ):
+            ignored_factors.add("sm70_qsa_indexer_single_rank")
+            ignored_factors.add("sm70_qsa_indexer_stage_keys")
+            ignored_factors.add("sm70_qsa_indexer_persistent_keys")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:

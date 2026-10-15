@@ -262,24 +262,20 @@ def test_host_state_pool_rejects_insufficient_active_capacity():
         _bounded_host_cache_config(state_blocks=2)
 
 
-@pytest.mark.parametrize(
-    "state_blocks, device_budget_mib, host_indexer",
-    [(29, 504, False), (32, 560, False), (29, 274, True)],
-)
-def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget(
-    state_blocks, device_budget_mib, host_indexer
-):
+def _tp4_mtp4_cache_groups(state_blocks, host_indexer, requests=1, compact=False):
     config = _vllm_config()
     config.model_config = SimpleNamespace(
         max_model_len=262144,
         get_num_kv_heads=lambda _: 1,
         get_total_num_hidden_layers=lambda: 49,
     )
-    config.scheduler_config.max_num_seqs = 1
+    config.scheduler_config.max_num_seqs = requests
     config.scheduler_config.max_num_batched_tokens = 512
     config.cache_config.mamba_cache_mode = "align"
     config.cache_config.enable_prefix_caching = True
-    config.kernel_config = SimpleNamespace(qsa_host_kv_state_blocks=state_blocks)
+    config.kernel_config = SimpleNamespace(
+        qsa_host_kv_state_blocks=state_blocks, qsa_host_kv_state_compact=compact
+    )
     specs = {}
     for layer in range(49):
         prefix = f"model.layers.{layer}" if layer < 48 else "mtp.layers.48"
@@ -325,6 +321,17 @@ def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget(
         tp_replicated=True,
     )
     groups = get_kv_cache_groups(config, specs)
+    return config, groups
+
+
+@pytest.mark.parametrize(
+    "state_blocks, device_budget_mib, host_indexer",
+    [(29, 504, False), (32, 560, False), (29, 274, True)],
+)
+def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget(
+    state_blocks, device_budget_mib, host_indexer
+):
+    config, groups = _tp4_mtp4_cache_groups(state_blocks, host_indexer)
     # Includes target/draft history, compressor and speculative recurrent state.
     cache = get_kv_cache_config_from_groups(config, groups, device_budget_mib * 1024**2)
     device_bytes = sum(t.size for t in cache.kv_cache_tensors if not t.host_backed)
@@ -339,6 +346,65 @@ def test_tp4_mtp4_full_context_pool_fits_bounded_device_budget(
     assert all(t.host_backed == host_indexer for t in side_pools)
     assert cache.device_state_blocks == state_blocks
     assert get_max_concurrency_for_kv_cache_config(config, cache) >= 1
+
+
+@pytest.mark.parametrize("requests", [1, 2, 4, 6, 8])
+def test_compact_state_banks_preserve_history_and_concurrency(requests):
+    state_blocks = 7 * requests + 1
+    config, groups = _tp4_mtp4_cache_groups(
+        state_blocks, True, requests=requests, compact=True
+    )
+    cache = get_kv_cache_config_from_groups(config, groups, 4 * 1024**3)
+    legacy_config, legacy_groups = _tp4_mtp4_cache_groups(
+        28 * requests + 1, True, requests=requests
+    )
+    legacy = get_kv_cache_config_from_groups(legacy_config, legacy_groups, 4 * 1024**3)
+    assert cache.num_blocks == legacy.num_blocks
+    assert cache.logical_state_blocks == legacy.device_state_blocks
+    assert cache.device_state_group_offsets == tuple(7 * requests * i for i in range(4))
+    assert get_max_concurrency_for_kv_cache_config(config, cache) >= requests
+    device_bytes = sum(t.size for t in cache.kv_cache_tensors if not t.host_backed)
+    old_device_bytes = sum(t.size for t in legacy.kv_cache_tensors if not t.host_backed)
+    assert device_bytes < old_device_bytes
+    assert sum(t.size for t in cache.kv_cache_tensors if t.host_backed) == sum(
+        t.size for t in legacy.kv_cache_tensors if t.host_backed
+    )
+    state_names = [
+        name for i in cache.device_state_group_ids for name in groups[i].layer_names
+    ]
+    banks = [t for t in cache.kv_cache_tensors if t.physical_num_blocks]
+    assert sorted(name for t in banks for name in t.shared_by) == sorted(state_names)
+    assert all(len(t.shared_by) == 1 for t in banks)
+    # Exact capacity succeeds; the adjacent smaller pool is rejected.
+    config.kernel_config.qsa_host_kv_state_blocks -= 1
+    with pytest.raises(ValueError, match=f"at least {state_blocks}"):
+        get_kv_cache_config_from_groups(config, groups, 4 * 1024**3)
+
+
+def test_compact_state_queues_keep_unique_ids_and_independent_quotas():
+    pool = BlockPool(
+        16,
+        True,
+        16,
+        device_state_blocks=4,
+        device_state_group_ids=(1, 2),
+        device_state_group_offsets=(0, 3),
+    )
+    first = pool.get_new_blocks(3, 1)
+    second = pool.get_new_blocks(3, 2)
+    history = pool.get_new_blocks(3, 0)
+    assert [b.block_id for b in first] == [1, 2, 3]
+    assert [b.block_id for b in second] == [4, 5, 6]
+    assert [b.block_id for b in history] == [7, 8, 9]
+    assert not pool.can_allocate_group_blocks({1: 1})
+    pool.free_blocks(first)
+    assert pool.can_allocate_group_blocks({1: 3})
+    assert not pool.can_allocate_group_blocks({2: 1})
+    pool.touch(first[:1])
+    assert pool.get_num_free_blocks(1) == 2
+    pool.free_blocks(first[:1] + second + history)
+    assert pool.get_num_free_blocks() == 15
+    assert pool.reset_prefix_cache()
 
 
 def test_partitioned_block_pool_keeps_prefix_lifetime_and_quota():

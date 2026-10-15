@@ -10,6 +10,24 @@ from vllm.utils.cpu_triton_utils import _FuncWrapper
 from vllm.v1.worker import block_table
 
 
+def test_compact_state_block_table_preserves_null_and_history_identity():
+    table = block_table.BlockTable(16, 2, 4, 8, False, torch.device("cpu"), 16, 1)
+    table.state_block_id_offset = 3
+    table.device_state_blocks = 4
+    table.add_row([0, 4, 6], 0)
+    assert table.block_table.np[0, :3].tolist() == [0, 1, 3]
+    table.add_row([5], 1)
+    table.swap_row(0, 1)
+    assert table.block_table.np[0, 0] == 2
+    assert table.block_table.np[1, :3].tolist() == [0, 1, 3]
+    for invalid in (3, 7, -1):
+        with pytest.raises(ValueError, match="State"):
+            table.add_row([invalid], 0)
+    history = block_table.BlockTable(16, 2, 4, 8, False, torch.device("cpu"), 16, 1)
+    history.add_row([0, 7, 9], 0)
+    assert history.block_table.np[0, :3].tolist() == [0, 7, 9]
+
+
 @pytest.mark.parametrize("num_reqs", [1, 2])
 @pytest.mark.parametrize("num_tokens", [1, 3, 5])
 def test_repeated_cpu_slot_mapping_keeps_registered_fallback(

@@ -932,12 +932,16 @@ def get_max_concurrency_for_kv_cache_config(
                 + 1
             )
             if i in state_groups:
-                state_per_request += demand
+                state_per_request = (
+                    max(state_per_request, demand)
+                    if kv_cache_config.device_state_group_offsets
+                    else state_per_request + demand
+                )
             else:
                 history_per_request += demand
         return min(
             (kv_cache_config.device_state_blocks - 1) / state_per_request,
-            (kv_cache_config.num_blocks - kv_cache_config.device_state_blocks)
+            (kv_cache_config.num_blocks - kv_cache_config.logical_state_blocks)
             / history_per_request,
         )
     num_blocks_per_request = sum(
@@ -1786,6 +1790,11 @@ def _host_kv_state_blocks(vllm_config: VllmConfig) -> int:
     return int(getattr(policy, "qsa_host_kv_state_blocks", 0))
 
 
+def _host_kv_compact_state(vllm_config: VllmConfig) -> bool:
+    policy = getattr(vllm_config, "kernel_config", None)
+    return bool(getattr(policy, "qsa_host_kv_state_compact", False))
+
+
 def _get_kv_cache_config_csa_linear(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1796,6 +1805,7 @@ def _get_kv_cache_config_csa_linear(
         return None
 
     state_blocks = _host_kv_state_blocks(vllm_config)
+    compact_state = _host_kv_compact_state(vllm_config)
     state_groups = tuple(
         i for i, group in enumerate(kv_cache_groups) if group in layout.mamba_groups
     )
@@ -1817,10 +1827,13 @@ def _get_kv_cache_config_csa_linear(
                 + 1
             )
 
-        active_states = 1 + requests * sum(
+        state_demands = [
             demand(group)
             for i, group in enumerate(kv_cache_groups)
             if i in state_groups
+        ]
+        active_states = 1 + requests * (
+            max(state_demands) if compact_state else sum(state_demands)
         )
         if state_blocks < active_states:
             raise ValueError(f"State pool needs at least {active_states} blocks")
@@ -1829,12 +1842,24 @@ def _get_kv_cache_config_csa_linear(
             for i, group in enumerate(kv_cache_groups)
             if i not in state_groups
         )
-        state_bytes = (
-            sum(layout.owner_page_size(i) for i in range(len(layout.main_kv_owners)))
-            * state_blocks
+        state_page_bytes = (
+            sum(
+                group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+                for group in layout.mamba_groups
+            )
+            if compact_state
+            else sum(
+                layout.owner_page_size(i) for i in range(len(layout.main_kv_owners))
+            )
         )
+        state_bytes = state_page_bytes * state_blocks
         history_page = layout.device_compressed_page_bytes
-        num_blocks = state_blocks + history_blocks
+        logical_states = (
+            1 + (state_blocks - 1) * len(state_groups)
+            if compact_state
+            else state_blocks
+        )
+        num_blocks = logical_states + history_blocks
         required = state_bytes + history_page * num_blocks
         if required > available_memory:
             raise ValueError(
@@ -1884,7 +1909,7 @@ def _get_kv_cache_config_csa_linear(
         device_members = [name for name in members if name not in host_members] + [
             group.layer_names[index]
             for group in layout.mamba_groups
-            if index < len(group.layer_names)
+            if not compact_state and index < len(group.layer_names)
         ]
         if device_members:
             kv_cache_tensors.append(
@@ -1895,6 +1920,18 @@ def _get_kv_cache_config_csa_linear(
                     physical_num_blocks=state_blocks or None,
                 )
             )
+    if compact_state:
+        if not state_blocks:
+            raise ValueError("Compact host state requires a bounded device state pool")
+        kv_cache_tensors.extend(
+            KVCacheTensor(
+                size=group.kv_cache_spec.page_size_bytes * state_blocks,
+                shared_by=[layer_name],
+                physical_num_blocks=state_blocks,
+            )
+            for group in layout.mamba_groups
+            for layer_name in group.layer_names
+        )
     kv_cache_tensors.extend(
         KVCacheTensor(
             size=layout.compressed_page_sizes[index] * num_blocks,
@@ -1922,6 +1959,17 @@ def get_kv_cache_config_from_groups(
     Returns:
         The generated KVCacheConfig
     """
+    if _host_kv_compact_state(vllm_config):
+        compact_layout = _get_csa_linear_tensor_layout(kv_cache_groups)
+        if compact_layout is None or not _host_kv_state_blocks(vllm_config):
+            raise ValueError("Compact host state requires the bounded host-KV layout")
+        parallel = vllm_config.parallel_config
+        if (
+            parallel.pipeline_parallel_size != 1
+            or parallel.decode_context_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+        ):
+            raise ValueError("Compact host state currently requires PP1 and CP1")
     if len(kv_cache_groups) == 0:
         # Attention free models do not have KV cache.
         # Return num_blocks=1 as BlockPool always needs a null_block.
@@ -2045,15 +2093,21 @@ def get_kv_cache_config_from_groups(
         if layout is not None and layout.host_main_kv_names
         else 0
     )
+    state_group_ids = tuple(
+        i
+        for i, group in enumerate(kv_cache_groups)
+        if layout is not None and state_blocks and group in layout.mamba_groups
+    )
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
         device_state_blocks=state_blocks,
-        device_state_group_ids=tuple(
-            i
-            for i, group in enumerate(kv_cache_groups)
-            if layout is not None and state_blocks and group in layout.mamba_groups
+        device_state_group_ids=state_group_ids,
+        device_state_group_offsets=(
+            tuple(i * (state_blocks - 1) for i in range(len(state_group_ids)))
+            if _host_kv_compact_state(vllm_config)
+            else ()
         ),
     )
 

@@ -6,6 +6,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import map_device_state_block_ids
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
 
 
@@ -23,12 +24,16 @@ class BlockTables:
         cp_interleave: int = 1,
         slot_mapping_enabled: list[bool] | None = None,
         dcp_sharded: list[bool] | None = None,
+        state_block_id_offsets: dict[int, int] | None = None,
+        device_state_blocks: int = 0,
     ):
         self.block_sizes = block_sizes
         self.kernel_block_sizes = kernel_block_sizes
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.device = device
+        self.state_block_id_offsets = state_block_id_offsets or {}
+        self.device_state_blocks = device_state_blocks
 
         self.cp_size = cp_size
         self.cp_rank = cp_rank
@@ -118,6 +123,10 @@ class BlockTables:
         for i in range(self.num_kv_cache_groups):
             start = self.num_blocks.np[i, req_index] if not overwrite else 0
             block_ids = new_block_ids[i]
+            if i in self.state_block_id_offsets:
+                block_ids = map_device_state_block_ids(
+                    block_ids, self.state_block_id_offsets[i], self.device_state_blocks
+                )
             bpk = self.blocks_per_kv_block[i]
             if bpk > 1:
                 block_ids = [b * bpk + k for b in block_ids for k in range(bpk)]

@@ -100,6 +100,8 @@ def test_original_experts_keep_fast_route_for_graph_padding(monkeypatch, m):
 
     method = object.__new__(GGUFNativeMoEMethod)
     method.dp4a_admitted = True
+    method.expert_cache = None
+    method.expert_trace_tokens = 0
     method.weight_types = {"w1": 21, "w3": 21, "w2": 42}
     method.input_padding = {"w2": (32, 192)}
     method.q8_intermediate = True

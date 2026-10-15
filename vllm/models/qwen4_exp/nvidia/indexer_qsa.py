@@ -15,6 +15,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.platforms import current_platform
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
@@ -130,6 +131,53 @@ class QSAIndexer(nn.Module):
         # while continuing to update the QSA side cache.
         self.skip_topk = False
         self.shared_key_scoring = vllm_config.kernel_config.sm70_qsa_shared_key
+        self.shared_key_batch_scoring = (
+            vllm_config.kernel_config.sm70_qsa_shared_key_batch
+        )
+        self.selection_tp_group = None
+        self.indexer_staging_workspace = None
+        parallel = vllm_config.parallel_config
+        if (
+            vllm_config.kernel_config.sm70_qsa_indexer_stage_keys
+            and self.shared_key_scoring
+            and vllm_config.kernel_config.qsa_host_kv
+            and vllm_config.kernel_config.qsa_host_kv_active
+            and vllm_config.kernel_config.qsa_host_indexer_history
+            and not vllm_config.kernel_config.qsa_host_kv_device_reference
+            and vllm_config.model_config.dtype == torch.float16
+            and current_platform.is_device_capability(70)
+            and (self.index_n_heads, self.index_kv_heads, self.index_head_dim)
+            == (4, 1, 128)
+            and parallel.pipeline_parallel_size == 1
+            and parallel.decode_context_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+        ):
+            from vllm.runtime_resources import runtime_resources_for
+
+            from .ops.qsa_indexer_staging import QSAIndexerStagingWorkspace
+
+            resources = runtime_resources_for(vllm_config)
+            self.indexer_staging_workspace = resources.setdefault(
+                "qsa_indexer_staging", QSAIndexerStagingWorkspace()
+            )
+        if (
+            vllm_config.kernel_config.sm70_qsa_indexer_single_rank
+            and vllm_config.kernel_config.qsa_host_kv
+            and vllm_config.kernel_config.qsa_host_kv_active
+            and vllm_config.kernel_config.qsa_host_indexer_history
+            and not vllm_config.kernel_config.qsa_host_kv_device_reference
+            and vllm_config.model_config.dtype == torch.float16
+            and current_platform.is_device_capability(70)
+            and (self.index_n_heads, self.index_kv_heads, self.index_head_dim)
+            == (4, 1, 128)
+            and parallel.tensor_parallel_size == 4
+            and parallel.pipeline_parallel_size == 1
+            and parallel.decode_context_parallel_size == 1
+            and parallel.prefill_context_parallel_size == 1
+        ):
+            from vllm.distributed import get_tp_group
+
+            self.selection_tp_group = get_tp_group()
 
         self.index_qk_proj = ReplicatedLinear(
             int(config.hidden_size),
@@ -158,6 +206,33 @@ class QSAIndexer(nn.Module):
             compress_ratio=self.compress_ratio,
             vllm_config=vllm_config,
         )
+        self._persistent_indexer_stage = None
+        if (
+            vllm_config.kernel_config.sm70_qsa_indexer_persistent_keys
+            and self.indexer_staging_workspace is not None
+            and self.selection_tp_group is not None
+        ):
+            spec = vllm_config.speculative_config
+            if (
+                vllm_config.kv_transfer_config is not None
+                or vllm_config.cache_config.kv_offloading_size is not None
+                or (spec is not None and spec.method not in (None, "mtp"))
+            ):
+                raise ValueError(
+                    "Persistent indexer pages require tracked local cache writers"
+                )
+            from .ops.qsa_shared_key import load_operator
+
+            if not load_operator() or not hasattr(
+                torch.ops.vllm_sm70_qsa_indexer, "run_staged_banked"
+            ):
+                raise ValueError(
+                    "Persistent indexer pages require the matching native build"
+                )
+            if self.selection_tp_group.rank_in_group == 0:
+                state = self.indexer_staging_workspace.persistent_layer(self.prefix)
+                self._persistent_indexer_stage = state
+                self.indexer_staging_workspace = state
         self.compressed_key_cache = QSACompressedKeyCache(
             head_size=self.index_head_dim,
             dtype=vllm_config.model_config.dtype,
@@ -165,6 +240,11 @@ class QSAIndexer(nn.Module):
             prefix=f"{cache_prefix}compressed_key_cache",
             cache_config=cache_config,
             vllm_config=vllm_config,
+            binding_observer=(
+                self._persistent_indexer_stage.bind
+                if self._persistent_indexer_stage is not None
+                else None
+            ),
         )
 
     @property
@@ -222,7 +302,6 @@ class QSAIndexer(nn.Module):
 
         from .ops.qsa import (
             qsa_compress_groups_with_ratio,
-            qsa_select_paged_tokens,
             qsa_store_cache_rows,
         )
 
@@ -343,12 +422,45 @@ class QSAIndexer(nn.Module):
                     position_rows,
                 )
 
+        if self._persistent_indexer_stage is not None:
+            self._persistent_indexer_stage.touch(
+                compressed_metadata.slot_mapping[:num_tokens]
+            )
+
         if self.skip_topk or not select:
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out
 
-        # Score compressed keys, select blocks, then expand them to token indices.
+        return self._select_tokens(q, compressed_key_cache, compressed_metadata, out)
+
+    def _select_tokens(
+        self,
+        q: torch.Tensor,
+        compressed_key_cache: torch.Tensor,
+        compressed_metadata: QSAForwardMetadata,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        group = self.selection_tp_group if 0 < q.shape[0] <= 64 else None
+        if out is None:
+            out = torch.empty(
+                q.shape[0], self.output_width, dtype=torch.int32, device=q.device
+            )
+        if group is None or group.rank_in_group == 0:
+            self._select_local_tokens(q, compressed_key_cache, compressed_metadata, out)
+        if group is not None:
+            group.broadcast(out, src=0)
+        return out
+
+    def _select_local_tokens(
+        self,
+        q: torch.Tensor,
+        compressed_key_cache: torch.Tensor,
+        compressed_metadata: QSAForwardMetadata,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        from .ops.qsa import qsa_select_paged_tokens
+
         return qsa_select_paged_tokens(
             q,
             compressed_key_cache,
@@ -361,7 +473,9 @@ class QSAIndexer(nn.Module):
             out,
             query_start_loc_cpu=compressed_metadata.query_start_loc_cpu,
             shared_key_scoring=self.shared_key_scoring,
+            shared_key_batch_scoring=self.shared_key_batch_scoring,
             max_seq_len=compressed_metadata.max_seq_len,
+            indexer_staging_workspace=self.indexer_staging_workspace,
         )
 
 
