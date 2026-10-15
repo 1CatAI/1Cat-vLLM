@@ -153,6 +153,14 @@ sharded HC、Q8_0 MTP experts、TP4/PP1/DCP1/PCP1、C1、BACKED 动态形状，
 原归约，HC 行分片复用现有投影/通信/归一化实现，最终恢复原 token 顺序和
 两路完整输出，padding 行不暴露给 proposer。
 
+启用该候选时，普通草稿回退模型使用独立的 UNBACKED token 维度编译配置，
+并声明 ids、position、hidden、embedding 的行数关系。大 prefill 由新 view
+处理后，原回退可能首次在 M1 编译；BACKED/AOT 关闭 guard 会将这一维度
+固化，后续 M6 的投影/position 错位。最小配对回归中，旧 BACKED 路径在
+M6 仍返回 M1 输出；UNBACKED 在首次 M1、随后 M6/M16/M2/M1/M64 及 AOT
+缓存重新加载时保留正确行数。只有完整满足上述 admission 的模型复制
+这一配置；主模型、decode view 和未加速模型保留原配置和计算策略。
+
 `hc_mtp_sequence_runtime.py` 验证真实 MTP/decoder/HC adapter 的数值、行边界、
 编译、变输入 graph replay、target hidden 不变和输出所有权；合成 producer
 测试不能替代整模型质量或性能。候选尚需整模型 cold prefill、长文任务、

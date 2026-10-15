@@ -89,6 +89,78 @@ from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
 logger = init_logger(__name__)
 
 
+_MTP_TOKEN_AXES = {
+    "input_ids": 0,
+    "positions": -1,
+    "hidden_states": 0,
+    "inputs_embeds": 0,
+}
+
+
+def _hc_mtp_prefill_sequence_qualified(vllm_config, config):
+    parallel = vllm_config.parallel_config
+    return bool(
+        vllm_config.kernel_config.layer_execution.hc_mtp_prefill_sequence_parallel
+        and vllm_config.kernel_config.sm70_mtp_q8_0_experts
+        and not is_offload_process()
+        and current_platform.is_device_capability(70)
+        and vllm_config.model_config.dtype == torch.float16
+        and (config.hc_count, config.hidden_size, config.hc_lowrank) == (4, 2560, 320)
+        and vllm_config.kernel_config.hc_weight_storage == "sharded"
+        and not vllm_config.kernel_config.sm70_hcx_diagnostics
+        and vllm_config.lora_config is None
+        and vllm_config.scheduler_config.max_num_seqs == 1
+        and vllm_config.compilation_config.dynamic_shapes_config.type
+        == DynamicShapesType.BACKED
+        and (
+            parallel.tensor_parallel_size,
+            parallel.pipeline_parallel_size,
+            parallel.decode_context_parallel_size,
+            parallel.prefill_context_parallel_size,
+        )
+        == (4, 1, 1, 1)
+    )
+
+
+def _make_mtp_prefill_fallback_config(vllm_config, *, qualified):
+    if not qualified:
+        return vllm_config
+    # The row view handles the large startup batch, so the fallback can first
+    # compile at M1. BACKED tracing specializes that singleton. Keep this one
+    # owner's token axes unbacked; decode views retain their original config.
+    config = copy.copy(vllm_config)
+    config.compilation_config = copy.copy(vllm_config.compilation_config)
+    config.compilation_config.dynamic_shapes_config = copy.copy(
+        vllm_config.compilation_config.dynamic_shapes_config
+    )
+    config.compilation_config.dynamic_shapes_config.type = DynamicShapesType.UNBACKED
+    config.compilation_config.cache_dir = ""
+    config.compilation_config.local_cache_dir = ""
+    config.compilation_config.traced_files = set()
+    return config
+
+
+def _mtp_token_shape_invariants(
+    self,
+    input_ids,
+    positions,
+    hidden_states=None,
+    intermediate_tensors=None,
+    inputs_embeds=None,
+    spec_step_idx=0,
+    hc_sequence_parallel=False,
+):
+    # A fallback can first compile on a singleton after the row-owned prefill
+    # view handles startup's large batch. Keep that singleton dynamic; guards
+    # are removed from the loaded AOT callable.
+    if hidden_states is not None:
+        torch._check(positions.size(-1) == hidden_states.size(0))
+        if input_ids is not None:
+            torch._check(input_ids.size(0) == hidden_states.size(0))
+        if inputs_embeds is not None:
+            torch._check(inputs_embeds.size(0) == hidden_states.size(0))
+
+
 def _remap_ignored_layers(
     ignored_layers: list[str],
     mtp_start_layer_idx: int,
@@ -313,7 +385,7 @@ def _make_draft_vllm_config(
         "intermediate_tensors": 0,
         "inputs_embeds": 0,
         "hidden_states": 0,
-    }
+    },
 )
 class Qwen4ExpMultiTokenPredictor(nn.Module):
     hf_to_vllm_mapper = _QWEN3_5_WEIGHTS_MAPPER | _HC_WEIGHTS_MAPPER
@@ -454,6 +526,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         spec_step_idx: int = 0,
         hc_sequence_parallel: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | IntermediateTensors:
+        if torch.compiler.is_compiling():
+            _mtp_token_shape_invariants(
+                self, input_ids, positions, hidden_states, inputs_embeds=inputs_embeds
+            )
         hc_count = self.hc_count
         hidden_size = self.hidden_size
 
@@ -679,11 +755,20 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             and speculative.method == "mtp"
             and get_pp_group().world_size == 1
         )
-        self.model = Qwen4ExpMultiTokenPredictor(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "mtp"),
-            share_target_embed_tokens=self.share_target_io_weights,
+        self._hc_prefill_sequence_qualified = _hc_mtp_prefill_sequence_qualified(
+            vllm_config, config
         )
+        predictor_config = _make_mtp_prefill_fallback_config(
+            vllm_config, qualified=self._hc_prefill_sequence_qualified
+        )
+        # The compiler wrapper also binds the current configuration during
+        # construction. Keep that binding equivalent to the explicit input.
+        with set_current_vllm_config(predictor_config):
+            self.model = Qwen4ExpMultiTokenPredictor(
+                vllm_config=predictor_config,
+                prefix=maybe_prefix(prefix, "mtp"),
+                share_target_embed_tokens=self.share_target_io_weights,
+            )
 
         if get_pp_group().is_last_rank:
             if self.share_target_io_weights:
@@ -710,29 +795,6 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         enable_qwen38_sm70_fp16_fused_hc(self, config_dtype, vllm_config)
         object.__setattr__(self, "_sm70_decode_graph_model", None)
         object.__setattr__(self, "_hc_prefill_sequence_model", None)
-        parallel = vllm_config.parallel_config
-        self._hc_prefill_sequence_qualified = bool(
-            vllm_config.kernel_config.layer_execution.hc_mtp_prefill_sequence_parallel
-            and vllm_config.kernel_config.sm70_mtp_q8_0_experts
-            and not is_offload_process()
-            and current_platform.is_device_capability(70)
-            and vllm_config.model_config.dtype == torch.float16
-            and (config.hc_count, config.hidden_size, config.hc_lowrank)
-            == (4, 2560, 320)
-            and vllm_config.kernel_config.hc_weight_storage == "sharded"
-            and not vllm_config.kernel_config.sm70_hcx_diagnostics
-            and vllm_config.lora_config is None
-            and vllm_config.scheduler_config.max_num_seqs == 1
-            and vllm_config.compilation_config.dynamic_shapes_config.type
-            == DynamicShapesType.BACKED
-            and (
-                parallel.tensor_parallel_size,
-                parallel.pipeline_parallel_size,
-                parallel.decode_context_parallel_size,
-                parallel.prefill_context_parallel_size,
-            )
-            == (4, 1, 1, 1)
-        )
         self._sm70_draft_head = None
 
     def prepare_loaded_linear_weights(self) -> None:
