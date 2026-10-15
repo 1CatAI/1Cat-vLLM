@@ -13,6 +13,11 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
   constexpr int AR_STRIDE = BATCH_ROWS * 32;
   __shared__ __align__(16) half xs[BATCH_ROWS][136];
   __shared__ __align__(16) half ls[BATCH_ROWS][328];
+  // The LoRA input tile is not populated until after the down projection
+  // and both grid rendezvous. Reuse its earlier lifetime for a coalesced
+  // split-K partial tile instead of allocating another shared-memory bank.
+  static_assert(sizeof(ls) >= 8 * 388 * sizeof(float));
+  float* const partial_tile = reinterpret_cast<float*>(ls);
   __shared__ float red[5][8][33];
   __shared__ float rr[BATCH_ROWS][4];
 
@@ -51,12 +56,24 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
       float v = __half2float(a.p0[row * HD + col]);
       if (a.p1) v += __half2float(a.p1[row * HD + col]);
       const int slot = i * AR_STRIDE + row * 32 + lane;
-      const float x1 =
-          __uint_as_float(poll2(a.ar[rk] + p1 * NC * AR_STRIDE + slot, tag));
-      const float x2 =
-          __uint_as_float(poll2(a.ar[rk] + p2 * NC * AR_STRIDE + slot, tag));
-      const float x3 =
-          __uint_as_float(poll2(a.ar[rk] + p3 * NC * AR_STRIDE + slot, tag));
+      // Retain the qualified small-HC schedule: issue all independent peer
+      // loads before waiting for any one epoch. Arithmetic order is unchanged.
+      unsigned u1, u2, u3, e1, e2, e3;
+      const auto start = clock64();
+      do {
+        asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(u1), "=r"(e1)
+                     : "l"(a.ar[rk] + p1 * NC * AR_STRIDE + slot));
+        asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(u2), "=r"(e2)
+                     : "l"(a.ar[rk] + p2 * NC * AR_STRIDE + slot));
+        asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
+                     : "=r"(u3), "=r"(e3)
+                     : "l"(a.ar[rk] + p3 * NC * AR_STRIDE + slot));
+        if (clock64() - start > 4000000000LL) __trap();
+      } while (e1 != tag || e2 != tag || e3 != tag);
+      const float x1 = __uint_as_float(u1), x2 = __uint_as_float(u2),
+                  x3 = __uint_as_float(u3);
       const float near = (rk & 1) ? x1 + v : v + x1;
       const float far = (rk & 1) ? x3 + x2 : x2 + x3;
       const float reduced =
@@ -83,11 +100,11 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
           make_float4(sums[0], sums[1], sums[2], sums[3]);
   }
   __syncthreads();
-  if (warp < 6) {
-    const int tile = warp >> 1, kh = warp & 1;
+  const int tile = warp >> 1, kh = warp & 1;
 #pragma unroll
-    for (int token_tile = 0; token_tile < 5; ++token_tile) {
-      if (token_tile * 8 >= a.M) break;
+  for (int token_tile = 0; token_tile < 5; ++token_tile) {
+    if (token_tile * 8 >= a.M) break;
+    if (warp < 6) {
       float acc0[8] = {}, acc1[8] = {};
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
@@ -108,12 +125,22 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
             token_tile * 8 + (e & 2) + ((lane & 16) ? 4 : 0) + (lane & 1);
         const int n = tile * 32 + quad * 8 +
                       ((e & 1) | (((lane >> 1) & 1) << 1) | ((e >> 2) << 2));
-        if (rw < a.M)
-          *reinterpret_cast<float2*>(
-              a.dpart + ((i * BATCH_ROWS + rw) * 96 + n) * 4 + 2 * kh) =
-              make_float2(acc0[e], acc1[e]);
+        *reinterpret_cast<float2*>(partial_tile + (rw - token_tile * 8) * 388 +
+                                   n * 4 + 2 * kh) =
+            make_float2(acc0[e], acc1[e]);
       }
     }
+    __syncthreads();
+    for (int cell = t; cell < 8 * 96; cell += 256) {
+      const int row = cell / 96, col = cell % 96;
+      if (token_tile * 8 + row < a.M)
+        *reinterpret_cast<float4*>(
+            a.dpart +
+            ((i * BATCH_ROWS + token_tile * 8 + row) * 96 + col) * 4) =
+            *reinterpret_cast<const float4*>(partial_tile + row * 388 +
+                                             col * 4);
+    }
+    __syncthreads();
   }
   grid_bar_epoch(a.bar + 2, base + NC);
   for (int row = warp; row < a.M; row += 8) {

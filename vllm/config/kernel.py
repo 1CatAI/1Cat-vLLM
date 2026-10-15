@@ -605,14 +605,6 @@ class Sm70GgufConfig:
     Requires the forty-row grouped expert/cache policy. Smaller batches keep
     the retained projection and its four ordered route subtotals.
     """
-    shared_expert_batch: bool = False
-    """Reuse the retained fused shared expert in M9..40 batches.
-
-    Qualified Q8_0 down projections use twenty-row native fragments sharing
-    bounded scratch. Larger batches and unqualified projections retain their
-    existing canonical continuation.
-    """
-
     q8_expert_intermediate: bool = True
     """Encode routed intermediates once in qualified integer expert gate/up."""
 

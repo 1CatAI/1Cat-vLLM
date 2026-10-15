@@ -30,7 +30,6 @@ def test_mtp_batch_policy_is_owned_hashed_and_serializable():
             "grouped_gate_up": True,
             "grouped_gate_up_max_m": 40,
             "grouped_down": True,
-            "shared_expert_batch": True,
         },
         qsa_host_kv=True,
         qsa_host_indexer_history=True,
@@ -78,9 +77,6 @@ def test_mtp_batch_policy_is_owned_hashed_and_serializable():
     assert transferred.compute_hash() != tiled.compute_hash()
     transferred = copy.deepcopy(tiled)
     transferred.sm70_gguf.grouped_down = False
-    assert transferred.compute_hash() != tiled.compute_hash()
-    transferred = copy.deepcopy(tiled)
-    transferred.sm70_gguf.shared_expert_batch = False
     assert transferred.compute_hash() != tiled.compute_hash()
 
     transferred = copy.deepcopy(tiled)

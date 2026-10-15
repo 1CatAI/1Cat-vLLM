@@ -608,7 +608,7 @@ correctness range remains M9..40; admission and measured benefit are distinct.
 
 The subsequent shared-expert experiment reuses the existing fused gate/up and
 down operations in bounded twenty-row fragments. It is explicitly enabled by
-`sm70_gguf.shared_expert_batch`, defaults off, admits Q8_0 down projections at
+`sm70_gguf.shared_expert_batch` during the experiment, admitting Q8_0 down projections at
 M9..40, and preserves the canonical continuation for other projections and
 larger batches. The existing two-integer internal down descriptor remains
 valid; the explicit opt-in adds a third policy integer without changing the
@@ -625,7 +625,21 @@ The first ordinary-worker shared-expert pass emits 110.24 / 151.25 / 244.01 /
 retrieval/arithmetic, coding and tool/reply gates pass. C6/C8 do not exceed the
 previous combined pass, and C2 remains below control. This is an unpromoted
 experiment; an isolated shared-expert speedup is insufficient to accept it.
-Its separate synchronized-verifier curve is still being collected.
+Its separate synchronized-verifier curve is 17.701 / 26.318 / 36.261 / 47.069 /
+61.686 ms, with 181 / 192 / 181 / 181 / 180 complete TP4 rounds and no
+incomplete rounds. The experiment does not improve whole-verifier cost and
+was removed, including its policy and runtime code. Its patch and tests remain
+in the raw artifact directory; operator micro speed does not justify retaining
+another runtime option.
+
+A subsequent ordinary run keeps shared-expert acceleration disabled and HC
+acceleration limited to M17..40. C2 repetitions emit 142.16 / 150.06 / 155.10
+tok/s with acceptance length 2.326 / 2.326 / 2.568. Its C1 cold prime and warm
+repeat have acceptance length 3.031; the eight short math primes used by the
+earlier paired run were omitted. Thus this isolated run does not establish
+recovery or isolate a numerical cause. Per-request seed alone is insufficient
+to treat these different runs as identical generation histories. The HC
+admission restriction remains while the acceptance variance is unresolved.
 
 The latest combined C8 node capture closes a 60.184 ms traced verifier wall
 with 12.465 ms HC/fused communication, 9.069 ms expert projections, 6.599 ms
@@ -636,3 +650,48 @@ time is not the 54.660 ms diagnostic result. The observed native expert route
 groups average approximately four rows per expert. Neither these counts nor
 collective durations establish memory bandwidth or intrinsic NVLink cost;
 Nsight Compute profiling counters remain unavailable to this user.
+
+## HC scheduling and partial-write follow-up
+
+The instrumented HC screen partitions each CTA's control-thread interval,
+separately from the ordinary-worker verifier measurement. At C8 its mean
+117.942 us consists of 24.627 us initial peer writes, 4.472 us weight prefetch,
+26.112 us peer reads/combine, 14.968 us down partials, 5.750 us first grid
+rendezvous, 18.591 us RMS/down reduction, 7.816 us LoRA peer writes,
+0.466 us LoRA completion, 3.310 us second grid rendezvous, 5.949 us LoRA
+shared-memory load, 5.164 us HC up/output writes and 0.717 us output completion.
+These are instrumented per-CTA phase intervals, not hardware counters or a
+sum of per-stage rank maxima.
+
+The retained small-HC local schedule issues three independent peer loads
+before inspecting their epochs. The first whole-batch kernel instead waited
+for each peer in sequence. The candidate reuses the retained independent-load
+schedule with the same tags, timeout and canonical addition order. Its down
+projection transposes partials in shared memory before coalesced global writes.
+The LoRA input tile is unused during this phase and owns that temporary view;
+no new shared-memory allocation, host pool or function attribute is required.
+
+The private research screen, using 64 calls per graph and twenty timed replays
+on all four ranks, improves C8 HC from 0.121 to 0.104 ms. Outputs match both the
+packaged native baseline and private retained kernel byte-for-byte; changed
+graph inputs pass too. This screen only admits the idea to the ordinary native
+build. Fresh normal-artifact graph/state and model measurements remain the
+qualification gate; its private research library is not a service dependency
+or a production speed result.
+
+The normal CMake artifact subsequently passes 44 CPU policy/dispatch cases,
+the four-rank compiled payload/state suite and the direct native changed-input
+graph screen. C1/2/4/6/8 direct native costs are 0.022427 / 0.042894 / 0.059882 /
+0.083102 / 0.107008 ms; C1 is a retained fallback. Corresponding retained
+eight-row tiles are 0.022294 / 0.045446 / 0.075752 / 0.104005 / 0.136468 ms.
+The native correctness range includes M10; runtime acceleration still begins
+at M17. The new ordinary `_C` SHA256 is
+`283b58ff6a99f358b74a4c2d579f6757b996cbe4ca79f908c721cbf5e03cda77`.
+Whole-model qualification remains separate.
+
+A subsequent two-shape expert-down screen compacts four-route group leaders
+and schedules persistent work blocks, retaining the original integer dot and
+unroute order. At M40, 128 expert IDs and 149 active groups, the sort/plan-inclusive
+cost changes 0.102674 to 0.100932 ms for IQ4_NL and 0.077722 to 0.076186 ms for
+Q2_0; outputs remain byte-exact. These 1.7%/2.0% gains fail the predeclared
+8% screen threshold. The research source is archived and not integrated.

@@ -9,7 +9,6 @@ import numpy as np
 import torch
 from torch.nn import Module, Parameter
 
-from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.kernels.gguf import (
     GGUFOperatorCapability,
     decoder_family,
@@ -567,10 +566,6 @@ class GGUFPreparedProjection(Module):
         self.kernel = None
         self.input_layout = input_layout
         self.dmv_enabled = dmv_enabled
-        cfg = get_current_vllm_config_or_none()
-        self.shared_expert_batch = bool(
-            cfg and cfg.kernel_config.sm70_gguf.shared_expert_batch
-        )
         self.input_layout_restored = False
         self.input_layout_rejection_reasons = []
         self.logical_output_size = weight.shape[0]
