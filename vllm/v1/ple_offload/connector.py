@@ -5,6 +5,7 @@
 import os
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from multiprocessing.reduction import ForkingPickler
 from typing import Any
@@ -26,10 +27,13 @@ from vllm.model_executor.kernels.ple.host_result import (
 from vllm.model_executor.layers.ple_offload_layer import (
     CpuGpuSemaphore,
     PleOffloadLayer,
+    begin_early_result_release,
+    finish_early_result_release,
 )
 from vllm.v1.ple_offload.draft_prefetch import DraftTokenRing
 from vllm.v1.ple_offload.fast_lane import FastLaneRequest
 from vllm.v1.ple_offload.protocol import (
+    PleCpuInputs,
     PleOffloadRegistration,
     PleOffloadRequest,
 )
@@ -39,10 +43,11 @@ logger = init_logger(__name__)
 
 @dataclass(frozen=True)
 class _PendingPleOffloadRequest:
-    """Bind request metadata to its MRV2 D2H completion event."""
+    """Bind request metadata to its MRV2 D2H event or its host inputs."""
 
     request: PleOffloadRequest
     d2h_done_event: torch.cuda.Event | None
+    cpu_inputs: PleCpuInputs | None = None
 
 
 def _cuda_check(result: Any, operation: str) -> Any:
@@ -125,6 +130,13 @@ class PleOffloadConnector:
                 device="cpu",
             ).share_memory_()
 
+        # The worker stores each finished request's seq here. Early requests
+        # stage their host inputs only after the previous request is done.
+        self._request_done_buf = torch.zeros(
+            1, dtype=torch.int64, device="cpu"
+        ).share_memory_()
+        self._next_seq = 0
+
         # Runner input allocations are address-stable, so bind them once and
         # pass only batch sizes through the per-forward request queue.
         self._input_ids_source = input_ids_source
@@ -132,6 +144,10 @@ class PleOffloadConnector:
         self._ngram_context_source = ngram_context_source
         self._uses_cuda_inputs = self._input_ids_source.is_cuda
         self._validate_input_sources()
+        self.early_prefill = (
+            vllm_config.kernel_config.ple_prefill_early_request
+            and self._uses_cuda_inputs
+        )
 
         self._pinned_input_buffers: list[torch.Tensor] = []
         self.draft_ring = self._create_draft_ring(vllm_config)
@@ -156,6 +172,8 @@ class PleOffloadConnector:
             self._registration_socket = self._zmq_ctx.socket(zmq.PUSH)
             self._registration_socket.connect(ipc_addr)
             self._register_with_offload_worker(vllm_config, ipc_addr)
+            # Registration may move CPU storage; view the final address.
+            self._request_done = self._request_done_buf.numpy()
 
             if self.tp_rank == 0:
                 # ForkingPickler may replace CPU storage while converting its
@@ -369,6 +387,7 @@ class PleOffloadConnector:
                 if self.draft_ring is None
                 else (self.draft_ring.max_reqs, self.draft_ring.num_spec)
             ),
+            request_done_buf=self._request_done_buf,
         )
 
         payload = _dump_registration(registration)
@@ -433,7 +452,13 @@ class PleOffloadConnector:
         """Wait for one staged batch and publish its request."""
         request = pending.request
         event = pending.d2h_done_event
-        if self._uses_cuda_inputs:
+        if pending.cpu_inputs is not None:
+            # The worker reads the shared buffers until it finishes a request.
+            with torch.cuda.nvtx.range("ple_offload.wait_previous_request"):
+                while self._request_done[0] < request.seq - 1:
+                    time.sleep(20e-6)
+            self._write_cpu_inputs(request, pending.cpu_inputs)
+        elif self._uses_cuda_inputs:
             event_pool = self._d2h_event_pool
             if event_pool is None or event is None:
                 raise RuntimeError("MRV2 PLE request is missing its D2H event")
@@ -452,6 +477,25 @@ class PleOffloadConnector:
         if event is not None:
             assert self._d2h_event_pool is not None
             self._d2h_event_pool.put_nowait(event)
+
+    def _write_cpu_inputs(
+        self, request: PleOffloadRequest, inputs: PleCpuInputs
+    ) -> None:
+        """Stage an early request's host inputs into the shared buffers."""
+        num_tokens = request.num_tokens
+        num_reqs = request.num_reqs
+        if (
+            inputs.input_ids.shape != (num_tokens,)
+            or inputs.query_start_loc.shape != (num_reqs + 1,)
+            or (inputs.ngram_context is None) != (self._ngram_context_buf is None)
+        ):
+            raise ValueError("Early PLE inputs do not match the request shape")
+        with torch.cuda.nvtx.range("ple_offload.write_cpu_inputs"):
+            self._input_ids_buf.numpy()[:num_tokens] = inputs.input_ids
+            self._query_start_loc_buf.numpy()[: num_reqs + 1] = inputs.query_start_loc
+            if self._ngram_context_buf is not None:
+                assert inputs.ngram_context is not None
+                self._ngram_context_buf.numpy()[:num_reqs] = inputs.ngram_context
 
     def _copy_cpu_inputs(self, request: PleOffloadRequest) -> None:
         """Stage MRV1's existing CPU mirrors in the notifier thread."""
@@ -540,6 +584,7 @@ class PleOffloadConnector:
         self,
         num_reqs: int,
         num_tokens: int,
+        cpu_inputs: PleCpuInputs | None = None,
     ) -> None:
         """Queue one batch while keeping staging off the model thread."""
         # Inputs are replicated across TP ranks. One request per DP rank drives
@@ -559,11 +604,20 @@ class PleOffloadConnector:
             )
             return
 
+        self._next_seq += 1
         request = PleOffloadRequest(
             dp_rank=self.dp_rank,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            seq=self._next_seq,
         )
+        if cpu_inputs is not None:
+            # Prompt-only inputs are known on the host: no D2H wait behind the
+            # previous forward on the model stream.
+            self._request_queue.put_nowait(
+                _PendingPleOffloadRequest(request, None, cpu_inputs)
+            )
+            return
         d2h_done_event = None
         if self._uses_cuda_inputs:
             if self._d2h_event_pool is None:
@@ -585,14 +639,26 @@ class PleOffloadConnector:
         num_tokens: int,
         dummy_run: bool,
         use_local_model: bool = False,
+        cpu_inputs: PleCpuInputs | None = None,
+        eager_forward: bool = False,
     ) -> None:
-        """Submit real inputs or satisfy the PLE wait for a dummy forward."""
+        """Submit real inputs or satisfy the PLE wait for a dummy forward.
+
+        ``cpu_inputs`` and ``eager_forward`` (no CUDA graph replay) are used
+        only with ``kernel_config.ple_prefill_early_request``.
+        """
         if dummy_run:
             self.signal_dummy_outputs(num_tokens)
             return
         if use_local_model and (self._ple_policy.hybrid or self._all_pinned_decode):
             return
-        self._launch(num_reqs, num_tokens)
+        begin_early_result_release(
+            self.early_prefill and eager_forward and bool(self._host_result_regions)
+        )
+        if self.early_prefill and cpu_inputs is not None:
+            self._launch(num_reqs, num_tokens, cpu_inputs)
+        else:
+            self._launch(num_reqs, num_tokens)
 
     def signal_dummy_outputs(self, num_tokens: int) -> None:
         """Locally satisfy PLE waits for dummy and capture forwards."""
@@ -608,9 +674,17 @@ class PleOffloadConnector:
     def release_outputs(self) -> None:
         """Mark GPU output buffers reusable after the model consumes them."""
         # Reset only after the consumer forward so the CPU worker cannot
-        # overwrite an output that a GPU PLE placeholder may still read.
+        # overwrite an output that a GPU PLE placeholder may still read. Mapped
+        # results released early by the wait op (eager prefill) are skipped:
+        # the worker may already have published the next chunk into them.
         stream = torch.cuda.current_stream(self.device)
+        released = finish_early_result_release()
         for layer in self._layers.values():
+            if (
+                layer._is_cpu_offloaded
+                and layer._sem.flag_tensor.data_ptr() in released
+            ):
+                continue
             layer.release_offloaded_output(stream)
 
     def close(self) -> None:

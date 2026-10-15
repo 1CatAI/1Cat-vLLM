@@ -115,6 +115,7 @@ from vllm.v1.worker.gpu.kv_connector import (
 from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states import init_model_state
+from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler, scatter_draft_tokens
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
@@ -383,6 +384,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             query_start_loc_source=query_start_loc_source,
             ngram_context_source=ngram_context_source,
         )
+        if (
+            self._ple_offload_connector.early_prefill
+            and type(self.model_state).ple_cpu_inputs is ModelState.ple_cpu_inputs
+        ):
+            raise RuntimeError(
+                "kernel_config.ple_prefill_early_request needs a model state "
+                "that builds host PLE inputs (ple_cpu_inputs)"
+            )
         ring = self._ple_offload_connector.draft_ring
         speculator = self.speculator
         if (
@@ -1287,10 +1296,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return self.model_state.prepare_inputs(input_batch, self.req_states), False
         if self._ple_offload_connector is not None and mode != CUDAGraphMode.FULL:
             inputs = self.model_state.prepare_inputs(input_batch, self.req_states)
-            self._ple_offload_connector.prepare_forward(
+            connector = self._ple_offload_connector
+            connector.prepare_forward(
                 input_batch.num_reqs,
                 input_batch.num_tokens_after_padding,
                 dummy_run=False,
+                cpu_inputs=(
+                    self.model_state.ple_cpu_inputs(input_batch)
+                    if connector.early_prefill
+                    else None
+                ),
+                eager_forward=mode == CUDAGraphMode.NONE,
             )
             return inputs, True
         return None, False
