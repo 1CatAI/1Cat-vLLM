@@ -792,9 +792,8 @@ void sm70_hcx_impl(
     TORCH_CHECK(xn.numel() >= 40 * hcx::KD && sq.numel() >= hcx::NC * 40 * 4 &&
                     dpart.numel() >= hcx::NC * 40 * 96 * 4 && bar.numel() >= 4,
                 "HCX batch workspace too small");
-    hcx::
-        hcx_batch_kernel<<<hcx::NC, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-            a);
+    hcx::hcx_batch_kernel<<<hcx::NC, hcx::BATCH_THREADS, 0,
+                            at::cuda::getCurrentCUDAStream()>>>(a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }

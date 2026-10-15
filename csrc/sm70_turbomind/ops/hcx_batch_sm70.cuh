@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 // Included in namespace hcx, after the retained HCX primitives. Full-mesh
-// TP4, separate output projection, local schedule, M9..40 only. One resident
+// TP4, separate output projection, local schedule, M9..40 only. Sixteen
+// warps expose independent row exchange/reduction work; the five HC up warps
+// and six HC down warps retain their original arithmetic. One resident
 // grid performs the exchange and both grid rendezvous for the whole batch.
 constexpr int BATCH_ROWS = 40;
+constexpr int BATCH_THREADS = 512;
 
-__global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
+__global__ __launch_bounds__(BATCH_THREADS, 1) void hcx_batch_kernel(Args a) {
+  constexpr int WARPS = BATCH_THREADS / 32;
   const int i = blockIdx.x, t = threadIdx.x, warp = t >> 5, lane = t & 31;
   const int rk = a.rank, p1 = rk ^ 1, p2 = rk ^ 2, p3 = rk ^ 3;
   const unsigned tag = ldv(a.seq) + 1, base = ldv(a.bar + 3);
@@ -21,7 +25,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
   __shared__ float red[5][8][33];
   __shared__ float rr[BATCH_ROWS][4];
 
-  for (int row = warp; row < a.M; row += 8) {
+  for (int row = warp; row < a.M; row += WARPS) {
     const int col = 32 * i + lane;
     float v = __half2float(a.p0[row * HD + col]);
     if (a.p1) v += __half2float(a.p1[row * HD + col]);
@@ -39,7 +43,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
       dhi[s] = ldgv(p + 32 + lane);
     }
   }
-  if (warp >= 3) {
+  if (warp >= 3 && warp < 8) {
 #pragma unroll
     for (int s = 0; s < 4; ++s) {
       const uint4* p = a.wu + ((i * 5 + warp - 3) * 4 + s) * 64;
@@ -47,7 +51,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
       uhi[s] = ldgv(p + 32 + lane);
     }
   }
-  for (int row = warp; row < BATCH_ROWS; row += 8) {
+  for (int row = warp; row < BATCH_ROWS; row += WARPS) {
     const int col = 32 * i + lane;
     float sums[4] = {};
 #pragma unroll
@@ -131,7 +135,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
       }
     }
     __syncthreads();
-    for (int cell = t; cell < 8 * 96; cell += 256) {
+    for (int cell = t; cell < 8 * 96; cell += BATCH_THREADS) {
       const int row = cell / 96, col = cell % 96;
       if (token_tile * 8 + row < a.M)
         *reinterpret_cast<float4*>(
@@ -143,7 +147,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
     __syncthreads();
   }
   grid_bar_epoch(a.bar + 2, base + NC);
-  for (int row = warp; row < a.M; row += 8) {
+  for (int row = warp; row < a.M; row += WARPS) {
     float4 qs[3];
 #pragma unroll
     for (int j = 0; j < 3; ++j)
@@ -172,7 +176,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
     }
   }
   __syncthreads();
-  for (int oi = i + NC * warp; oi < a.M * 96; oi += NC * 8) {
+  for (int oi = i + NC * warp; oi < a.M * 96; oi += NC * WARPS) {
     const int rw = oi / 96, n = oi % 96;
     if (!(n < 80 || (rk == 3 && n < 84))) continue;
     float pb[4] = {};
@@ -207,10 +211,11 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
     if (lane == 2) st2(a.lora[p2] + pos, value, tag);
     if (lane == 3) st2(a.lora[p3] + pos, value, tag);
   }
-  for (int idx = i * 256 + t; idx < a.M * 324; idx += NC * 256)
+  for (int idx = i * BATCH_THREADS + t; idx < a.M * 324;
+       idx += NC * BATCH_THREADS)
     poll2(a.lora[rk] + (idx / 324) * LW + idx % 324, tag);
   grid_bar_epoch(a.bar + 2, base + 2 * NC);
-  for (int idx = t; idx < BATCH_ROWS * 320; idx += 256)
+  for (int idx = t; idx < BATCH_ROWS * 320; idx += BATCH_THREADS)
     ls[idx / 320][idx % 320] =
         idx < a.M * 320
             ? __ushort_as_half(static_cast<unsigned short>(
@@ -223,7 +228,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
 #pragma unroll
   for (int token_tile = 0; token_tile < 5; ++token_tile) {
     if (token_tile * 8 >= a.M) break;
-    if (warp >= 3) {
+    if (warp >= 3 && warp < 8) {
       const int uw = warp - 3;
       float acc[8] = {};
 #pragma unroll
@@ -246,7 +251,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
     }
     __syncthreads();
     const int row = token_tile * 8 + warp;
-    if (row < a.M) {
+    if (warp < 8 && row < a.M) {
       const int h = 640 * rk + 8 * i + (lane & 7);
       float acc = red[0][warp][lane];
 #pragma unroll
@@ -273,7 +278,7 @@ __global__ __launch_bounds__(256, 1) void hcx_batch_kernel(Args a) {
     }
     __syncthreads();
   }
-  for (int u = t; u < 6 * a.M; u += 256) {
+  for (int u = t; u < 6 * a.M; u += BATCH_THREADS) {
     const int src = u % 3 == 0 ? p1 : u % 3 == 1 ? p2 : p3;
     const int row = (u / 3) >> 1, h = 640 * src + 8 * i + ((u / 3) & 1) * 4;
     *reinterpret_cast<uint2*>(a.blk_out + row * HD + h) =

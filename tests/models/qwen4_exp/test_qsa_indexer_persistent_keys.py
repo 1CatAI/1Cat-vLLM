@@ -17,9 +17,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 @pytest.mark.parametrize("c", [1, 2, 8])
 @pytest.mark.parametrize("capacity", [2, 4, 16])
-def test_versioned_keys_track_writes_rebind_and_changed_graph(c, capacity):
+@pytest.mark.parametrize("page", [32, 204])
+def test_versioned_keys_track_writes_rebind_and_changed_graph(c, capacity, page):
     owner = QSAIndexerStagingWorkspace(tokens=32)
-    page = 32
     torch.manual_seed(735 + c + capacity)
     data = (torch.randn(32, page, 1, 128, dtype=torch.float16) * 0.125).pin_memory()
     cache = get_accelerator_view_from_cpu_tensor(data)
@@ -30,8 +30,8 @@ def test_versioned_keys_track_writes_rebind_and_changed_graph(c, capacity):
     )
     q = torch.randn(c * 5, 4, 128, device="cuda", dtype=torch.float16) * 0.125
     req = torch.arange(c, device="cuda", dtype=torch.int32).repeat_interleave(5)
-    pos = torch.full((c * 5,), 511, device="cuda", dtype=torch.int64)
-    lens = torch.full((c,), 512, device="cuda", dtype=torch.int32)
+    pos = torch.full((c * 5,), page * 16 - 1, device="cuda", dtype=torch.int64)
+    lens = torch.full((c,), page * 16, device="cuda", dtype=torch.int32)
     starts = torch.arange(0, c * 5 + 1, 5, dtype=torch.int32)
     writes = torch.full((c * 5,), -1, device="cuda", dtype=torch.int64)
 
@@ -78,7 +78,10 @@ def test_versioned_keys_track_writes_rebind_and_changed_graph(c, capacity):
     check(output)
     output = run(state)
     check(output)
-    assert int(state.copied.sum().item()) == 0
+    # Collision winners may change between launches; stable, distinct leases
+    # must reuse all unchanged pages without copying.
+    if capacity >= c + 3:
+        assert int(state.copied.sum().item()) == 0
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         state.touch(writes)
@@ -101,7 +104,7 @@ def test_versioned_keys_track_writes_rebind_and_changed_graph(c, capacity):
             table[:, -1].copy_(
                 torch.arange(12, 12 + c, device="cuda", dtype=torch.int32)
             )
-            lens[0] = 128
+            lens[0] = page * 4
             pos.sub_(8)
         elif turn == 4:
             table.copy_(table.roll(1, 0))
@@ -123,12 +126,26 @@ def test_versioned_keys_track_writes_rebind_and_changed_graph(c, capacity):
     data2 = (data.clone() + 0.015625).pin_memory()
     newcache = get_accelerator_view_from_cpu_tensor(data2)
     state.bind(newcache)
+    # A caller still holding another generation uses protected full refresh.
+    data[1].add_(0.0625)
+    assert len(state.prepare(cache, table, req, pos, lens, 4, page * 4)) == 2
+    check(run(state))
     cache = newcache
     check(run(state))
     # Reusing an address is still a new cache generation.
     data2.add_(0.03125)
     state.bind(cache)
     check(run(state))
+    rebound_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(rebound_graph):
+        state.touch(writes)
+        rebound_output = run(state)
+    data2[1].mul_(0.75)
+    writes.fill_(-1)
+    writes[0] = page
+    rebound_graph.replay()
+    check(rebound_output)
+    del rebound_graph
     other = QSAIndexerPersistentLayer(
         QSAIndexerStagingWorkspace(tokens=32), tokens=capacity * page
     )

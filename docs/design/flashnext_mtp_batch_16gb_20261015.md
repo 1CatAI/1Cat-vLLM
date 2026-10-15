@@ -742,3 +742,72 @@ C8 from2.976 to2.309ms. These local figures do not establish whole-verifier
 speed, actual256K performance, broad numerical coverage or production quality.
 The one-bank variant regressed independent C8 by7.6% and was rejected before
 runtime integration. Normal-artifact state and model gates remain separate.
+
+The normal banked-indexer artifact subsequently completes the model gates.
+Its whole-batch C1/2/4/6/8 verifier means are15.925 /24.678 /33.724 /41.812 /
+53.130ms, with187 /181 /201 /213 /193 complete TP4 rounds and zero incomplete
+rounds. Corresponding p99 values are18.019 /28.322 /46.876 /59.045 /66.672ms.
+The single-stream mean returns to approximately16ms under this capacity-eight
+contract, while the desired C2/C4/C8 means remain unmet. C8 improves only0.756ms
+in this pass; its isolated indexer improvement is not a whole-batch speed claim.
+
+Fresh ordinary workers emit122.06 /182.21 /251.03 /288.93 /322.03 aggregate
+tok/s; extra C2/C8 repetitions give169.11 /308.37. Acceptance lengths change
+and C8 overlaps the prior repetition range. All five retrieval/arithmetic,
+executable-code and tool/reply gates pass, as do eight short natural-EOS checks.
+Observed peak root GPU allocation is16078MiB, leaving67MiB available on the
+16384MiB card after driver reservations; other ranks use16050..16052MiB.
+This fits the measured32K workload with unchanged80% GPU expert placement,
+but does not establish256K boundary memory or quality. No default is promoted.
+
+The normal indexer SHA256 is
+`ca41596598165c7ecb39c127f4b6c82ef5458dc5bdad16cf4abc4ca8e1237842`.
+Fresh-process dependency inspection and all four actual worker maps confirm
+ordinary source-owned extensions without a private research DSO or preload.
+Actual worker JIT-monitor entries confirm version tracking and bank planning.
+The first48 GPU and29 policy/cache tests, six writer-ordering cases and full
+changed-source hooks pass. A further18 GPU cases include the actual204-token
+compressed page size, stale-binding refresh fallback, same-address generation
+reset and changed-input replay after cache rebinding and recapture. Hash
+collision winners may change between launches; zero-copy reuse is required
+for unchanged pages with stable distinct leases, not for conflicting hashes.
+
+A follow-up dense screen tests smaller row chunks in the existing weight-major
+family. The trace shows244 registers/thread,112..128 CTAs of128 threads for
+large input projections, and80 CTAs of256 threads for the1536-to2560 output
+projection. These are launch resources, not measured occupancy or stall
+counters. Smaller chunks reduce registers to approximately168 but reload and
+decode weights. Across six M20/M40 shape screens, the dominant Q6_K input
+projection does not improve. One mixed IQ4_XS/Q8 case improves8.1%, while small
+chunks regress the output projection. Outputs and changed-input graph replay
+retain the normal artifact's bytes. The general candidate fails its8% benefit
+gate and is rejected; no runtime policy or native change is added for it.
+
+## HC independent-row parallelism
+
+The prior HC launch uses256 threads, with several exchange, row reduction and
+copy phases assigning independent rows to eight warps. The16-warp candidate
+keeps the same80-CTA resident grid, FP32 reduction order, six down-projection
+warps, five up-projection warps, shared-memory lifetime and peer epochs. Extra
+warps handle independent row exchanges/reductions and coalesced copies; up
+weights and eight-row gate tiles remain guarded to their original warps.
+The compiler reports113 registers/thread and43040 static shared bytes for the
+512-thread research kernel, without spilling. This is a launch-resource fact,
+not a measured occupancy or memory-bandwidth claim.
+
+Four-rank64-call graph screens preserve bytes with changed inputs. Critical
+rank maxima at C4 improve0.064814 to0.056273ms, and at C8 improve0.107693 to
+0.096882ms. A384-thread intermediate gives0.059313/0.097945ms. The512-thread
+schedule is then folded into the existing native HC batch operation, retaining
+its ABI, workspace and runtime M17..40 admission; M9..16 still uses the retained
+runtime path while the acceptance-history issue remains under investigation.
+
+The normal CMake artifact passes44 CPU policy/dispatch cases, the compiled
+four-rank payload/state suite and direct changed-input graphs. Direct C1/2/4/6/8
+costs are0.022916 /0.037545 /0.055384 /0.075440 /0.097872ms, versus retained
+8-row tiles0.022454 /0.045633 /0.074343 /0.104196 /0.136121ms. C1 is the same
+fallback; the direct M10 native result does not widen runtime admission.
+The new normal `_C` SHA256 is
+`a71013eeb238309d695d7f05977a20ea8681734af041b4671d08d45c16f5c700`.
+These local wins require separate whole-model qualification; they do not
+establish the requested28ms C8 verifier cost.
