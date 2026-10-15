@@ -40,6 +40,15 @@ processor caches are bounded to 0.25 GiB per process to preserve host headroom.
 Image tokens, aggregate payload size, encoder activations and available memory
 still constrain requests. The existing proxy's body limit also remains in force.
 
+The optional `--mm-encoder-batch-size` bounds items per runtime encoder forward
+in both worker runners, before input transfer, without dropping or reordering
+request items. Its default 0 preserves unrestricted batching. Positive values
+participate in the multimodal configuration hash; language-only mode ignores
+the inactive setting. Startup dummy profiling remains conservative and is not
+reduced by this runtime bound. The deployment uses one image per forward and
+`max_pixels=4194304`, automatically resizing larger images while preserving all
+request images. These are memory policies, not an increased image-count limit.
+
 The official `Qwen/Qwen3.8-Flash-Next` visual tensors were fetched directly on
 9683 using only HF-mirror byte ranges. The companion contains 333 original BF16
 tensors, 897862112 payload bytes, without quantization or numerical conversion.
@@ -53,4 +62,9 @@ field and existing PLE packed-result preparation stub. Real tower parameter
 layout was constructed on meta for TP4: 220.671 MiB per rank, all 333 names match
 and every real weight remains finite when converted to the deployment FP16 dtype.
 Meta construction is not native execution or an end-to-end vision quality gate.
-GPU execution, memory and public image-quality checks remain pending.
+TP4 native tower execution passed 1/4/17/64/256 images at 256 pixels and a
+1536-pixel single image, with bit-exact outputs against the normal unquantized
+vision loader on every rank. The selected native backend is TORCH_SDPA. A single
+256-image forward needs about 1 GiB of temporary activations, motivating the
+runtime microbatch bound above. Bounded-forward and public quality checks remain
+pending.

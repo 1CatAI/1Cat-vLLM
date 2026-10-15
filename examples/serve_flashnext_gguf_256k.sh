@@ -111,7 +111,8 @@ PY
   MM_ARGS=(--hf-config-path "$VISION_DIR" --tokenizer "$VISION_DIR"
     --model-loader-extra-config "$MM_LOAD"
     --limit-mm-per-prompt '{"image":2147483647,"video":0}'
-    --skip-mm-profiling --mm-encoder-tp-mode weights --mm-processor-cache-gb 0.25)
+    --skip-mm-profiling --mm-encoder-tp-mode weights --mm-encoder-batch-size 1
+    --mm-processor-cache-gb 0.25 --mm-processor-kwargs '{"max_pixels":4194304}')
 fi
 exec taskset -c "$CPU_SET" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL_FILE" \
   --served-model-name flash-next-abliterated flash-next qwen3.8-flash-next \
