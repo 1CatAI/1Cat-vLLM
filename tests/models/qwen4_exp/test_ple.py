@@ -734,7 +734,7 @@ def test_ngram_embedding_disk_offload_allocates_only_meta_table(
     monkeypatch.setattr(
         parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
     )
-    monkeypatch.setattr(ple_module.envs, "VLLM_PLE_DISK_OFFLOAD", True)
+    monkeypatch.setenv("VLLM_PLE_DISK_OFFLOAD", "1")
     monkeypatch.setattr(ple_module.envs, "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", 0)
     monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
     config = SimpleNamespace(
@@ -1045,7 +1045,7 @@ def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
     nn.Module.__init__(module)
     module._offload_model_dtype = torch.float16
     weight_scale = torch.tensor([0.25], dtype=torch.bfloat16)
-    monkeypatch.setattr(ple_module.envs, "VLLM_PLE_CPU_OFFLOAD", True)
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "1")
     monkeypatch.setattr(ple_module, "is_offload_process", lambda: False)
     monkeypatch.setattr(
         torch.accelerator,
@@ -1294,6 +1294,7 @@ def test_ngram_cpu_offload_padding_does_not_overwrite_real_tokens(
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
     module._packed_gguf = False
+    module.layer_name = "model.layers.0.ple"
     module.embedding_dim = 1
     module.head_dim = 1
     module.ngram_size = 2
@@ -1402,6 +1403,7 @@ def test_ngram_fp8_cpu_offload_preserves_quantized_output(
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
     module._packed_gguf = False
+    module.layer_name = "model.layers.0.ple"
     module.embedding_dim = 2
     module.head_dim = 2
     module.ngram_size = 2
