@@ -1754,6 +1754,9 @@ class Qwen4ExpForConditionalGeneration(
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
 
+    def prepare_loaded_linear_weights(self) -> None:
+        self.language_model.prepare_loaded_linear_weights()
+
     def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.language_model.get_top_tokens(hidden_states)
 

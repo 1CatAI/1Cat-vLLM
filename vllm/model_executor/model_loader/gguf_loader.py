@@ -14,7 +14,13 @@ from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.model_loader.gguf_multimodal import (
+    GGUFMultiModalWeights,
+    native_gguf_language_model,
+    qualify_native_gguf_names,
+)
 from vllm.model_executor.model_loader.utils import (
+    get_model_architecture,
     initialize_model,
     process_weights_after_loading,
 )
@@ -47,10 +53,16 @@ class GGUFModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
-        if load_config.model_loader_extra_config:
+        extra = load_config.model_loader_extra_config or {}
+        if set(extra) - {"multimodal_safetensors"}:
             raise ValueError(
                 f"Model loader extra config is not supported for "
                 f"load format {load_config.load_format}"
+            )
+        self.multimodal_weights: GGUFMultiModalWeights | None = None
+        if "multimodal_safetensors" in extra:
+            self.multimodal_weights = GGUFMultiModalWeights(
+                extra["multimodal_safetensors"]
             )
 
     def _prepare_weights(self, model_config: ModelConfig):
@@ -546,8 +558,12 @@ class GGUFModelLoader(BaseModelLoader):
             quant_config = cast("GGUFConfig", vllm_config.quant_config)
             for raw, name in gguf_weights_map.items():
                 adapter.needs_dense_fallback(name, self._native_tensors[raw])
-            quant_config.fallback_reasons = adapter.fallback_reasons
-            quant_config.linear_layouts = adapter.linear_layouts(gguf_weights_map)
+            quant_config.fallback_reasons = qualify_native_gguf_names(
+                adapter.fallback_reasons, adapter
+            )
+            quant_config.linear_layouts = qualify_native_gguf_names(
+                adapter.linear_layouts(gguf_weights_map), adapter
+            )
             quant_config.native_expert_storage = getattr(
                 adapter, "native_expert_storage", False
             )
@@ -568,6 +584,27 @@ class GGUFModelLoader(BaseModelLoader):
             adapter.preserve_expert_blocks = quant_config.native_expert_storage
             if "output.weight" not in self._native_tensors:
                 model_config.hf_config.tie_word_embeddings = True
+        multimodal_weights = getattr(self, "multimodal_weights", None)
+        if multimodal_weights is not None:
+            model_class, _ = get_model_architecture(model_config)
+            unquant_names.extend(
+                multimodal_weights.unquantized_modules(
+                    getattr(model_class, "hf_to_vllm_mapper", None)
+                )
+            )
+        elif (
+            adapter is not None
+            and bool(getattr(adapter, "language_model_prefix", ""))
+            and model_config.multimodal_config is not None
+            and any(
+                model_config.multimodal_config.get_limit_per_prompt(modality) > 0
+                for modality in ("image", "video")
+            )
+        ):
+            raise ValueError(
+                "This native GGUF checkpoint contains language weights only; "
+                "provide multimodal_safetensors or enable language_model_only"
+            )
         logger.debug("GGUF unquantized modules: %s", unquant_names)
         if TYPE_CHECKING:
             vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
@@ -594,6 +631,8 @@ class GGUFModelLoader(BaseModelLoader):
                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
                 )
             model._gguf_model_path = local_model_path
+            weight_model = native_gguf_language_model(model, adapter)
+            weight_model._gguf_model_path = local_model_path
             if (
                 adapter is not None
                 and quant_config.native_expert_storage
@@ -606,7 +645,10 @@ class GGUFModelLoader(BaseModelLoader):
 
                 adapter.bulk_experts = (
                     gguf_expert_storage.prepare_original_expert_arena(
-                        model, gguf_weights_map, self._native_tensors, target_device
+                        weight_model,
+                        gguf_weights_map,
+                        self._native_tensors,
+                        target_device,
                     )
                     or {}
                 )
@@ -616,7 +658,10 @@ class GGUFModelLoader(BaseModelLoader):
                     adapter.bulk_experts, self._native_tensors
                 )
             finish = self._start_load_sampler()
-            self.load_weights(model, model_config)
+            self.load_weights(weight_model, model_config)
+            if multimodal_weights is not None:
+                loaded = multimodal_weights.load(model)
+                logger.info("Loaded %d multimodal safetensors weights", len(loaded))
 
             process_weights_after_loading(model, model_config, target_device)
             if finish is not None:
