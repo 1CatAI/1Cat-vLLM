@@ -50,6 +50,7 @@ def make_layer():
     nn.Module.__init__(obj)
     obj.prefix, obj._sm70_hcx_diagnostics = "ple_row_screen", False
     obj.hc_count, obj.hidden_size, obj.conv_state_len = 4, 2560, 9
+    obj.num_spec_tokens = 4
     obj.short_conv_dilation, obj._prefill_short_conv = 3, True
     obj.ple_embedding = Embedding()
     obj.key_proj = Projection(2560, 10240, bias=False, device="cuda", dtype=torch.half)
@@ -59,11 +60,13 @@ def make_layer():
         norm.weight.data.normal_(0, 0.01)
         setattr(obj, name, norm)
     obj.register_buffer(
-        "state", torch.randn(6, 10240, 11, device="cuda", dtype=torch.half) * 0.1
+        "state", torch.randn(6, 10240, 13, device="cuda", dtype=torch.half) * 0.1
     )
     obj.register_buffer(
         "weights", torch.randn(10240, 4, device="cuda", dtype=torch.half) * 0.03
     )
+    obj.kv_cache = (obj.state,)
+    obj.conv1d = NS(weight=obj.weights.unsqueeze(1))
     obj.state_args = None
     return obj
 
@@ -90,18 +93,16 @@ def main():
         ):
             layer = make_layer()
 
-            def convolution(x):
-                metadata, indices, n = layer.state_args
-                result = layer._short_conv_dilated_prefill_batched(
-                    x, metadata, layer.state, layer.weights, indices, 2, 0, n
-                )
-                return result
-
-            layer._short_conv = convolution
-            with patch.object(
-                ple,
-                "get_forward_context",
-                lambda: NS(no_compile_layers={layer.prefix: layer}),
+            with (
+                patch.object(ple, "is_conv_state_dim_first", lambda: True),
+                patch.object(
+                    ple,
+                    "get_forward_context",
+                    lambda: NS(
+                        no_compile_layers={layer.prefix: layer},
+                        attn_metadata={layer.prefix: layer.state_args[0]},
+                    ),
+                ),
             ):
                 for rows in args.tokens:
                     torch.manual_seed(1700 + rows)
@@ -112,12 +113,23 @@ def main():
                     starts = torch.tensor(
                         [0, rows - 7, rows], device="cuda", dtype=torch.int32
                     )
-                    metadata = NS(
+                    indices = torch.tensor([1, 4], device="cuda", dtype=torch.int32)
+                    metadata = ple.PleShortConvAttentionMetadata.__new__(
+                        ple.PleShortConvAttentionMetadata
+                    )
+                    for name, value in dict(
+                        num_prefills=2,
+                        num_decodes=0,
+                        num_decode_tokens=0,
+                        num_prefill_tokens=rows,
+                        num_actual_tokens=rows,
+                        spec_sequence_masks=None,
+                        state_indices_tensor=indices,
                         non_spec_query_start_loc=starts,
                         has_initial_states_p=torch.tensor([True, False], device="cuda"),
                         max_prefill_query_len=rows - 7,
-                    )
-                    indices = torch.tensor([1, 4], device="cuda", dtype=torch.int32)
+                    ).items():
+                        setattr(metadata, name, value)
                     layer.state_args = metadata, indices, rows
                     layer.ple_embedding.data[:rows].normal_(0, 0.2)
                     hidden_local = hc_sequence_shard_rows(hidden)

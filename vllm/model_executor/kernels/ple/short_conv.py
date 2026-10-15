@@ -17,6 +17,8 @@ def _dilated_prefill_conv(
     Slots,
     Initial,
     Out,
+    OUT_START,
+    OUT_ROWS,
     D: tl.constexpr,
     X_STRIDE: tl.constexpr,
     S0: tl.constexpr,
@@ -31,6 +33,7 @@ def _dilated_prefill_conv(
     DILATION: tl.constexpr,
     BT: tl.constexpr,
     BD: tl.constexpr,
+    ROW_OWNED: tl.constexpr,
 ):
     req = tl.program_id(2)
     first = tl.load(Starts + req) - DECODE_TOKENS
@@ -39,8 +42,14 @@ def _dilated_prefill_conv(
     valid = slot != NULL_SLOT
     initial = tl.load(Initial + req).to(tl.int1) & valid
     times = tl.program_id(0) * BT + tl.arange(0, BT)
+    if ROW_OWNED:
+        times += tl.maximum(OUT_START - first, 0)
     cols = tl.program_id(1) * BD + tl.arange(0, BD)
     active = (times[:, None] < length) & (cols[None, :] < D)
+    if ROW_OWNED:
+        active &= (first + times[:, None] >= OUT_START) & (
+            first + times[:, None] < OUT_START + OUT_ROWS
+        )
     acc = tl.full((BT, BD), 0.0, tl.float32)
     for tap in tl.static_range(K):
         pos = times - (K - 1 - tap) * DILATION
@@ -61,7 +70,11 @@ def _dilated_prefill_conv(
             value += old
         weight = tl.load(Weight + cols * W0 + tap * W1, cols < D, 0).to(tl.float32)
         acc = tl.fma(value, weight[None, :], acc)
-    tl.store(Out + (first + times[:, None]) * D + cols[None, :], acc, active)
+    tl.store(
+        Out + (first + times[:, None] - OUT_START) * D + cols[None, :],
+        acc,
+        active,
+    )
 
 
 @triton.jit
@@ -126,15 +139,30 @@ def dilated_prefill_short_conv(
     *,
     token_tile=8,
     channel_tile=128,
+    output_start=0,
+    output_rows=None,
 ):
     """Compute request-local convolution, then commit each valid base state.
 
     Callers provide contiguous channels, unique non-null state slots, and the
     prefill suffix of query starts. Extra speculative state positions remain
     unchanged. This stage is screened independently before runtime admission.
+    An optional output row interval emits only those query rows while the
+    unchanged state kernel commits the complete input sequence. Rows past the
+    actual query are zero; an empty interval still commits all valid states.
     """
     rows, hidden = x.shape
-    out = torch.empty_like(x, memory_format=torch.contiguous_format)
+    owned = output_rows is not None
+    if output_start < 0 or (owned and output_rows < 0):
+        raise ValueError("PLE output rows must be non-negative")
+    if not owned and output_start:
+        raise ValueError("PLE output_start requires output_rows")
+    count = rows if output_rows is None else output_rows
+    out = torch.empty((count, hidden), dtype=x.dtype, device=x.device)
+    # A TP owner can extend beyond the actual query's final padded row.
+    valid_rows = max(0, min(count, rows - output_start))
+    if valid_rows < count:
+        out[valid_rows:].zero_()
     if rows == 0:
         return out
     kernel = weight.shape[1]
@@ -149,7 +177,12 @@ def dilated_prefill_short_conv(
     )
     _dilated_prefill_conv[
         (
-            triton.cdiv(max_length, token_tile),
+            max(
+                1,
+                triton.cdiv(
+                    min(max_length, count) if owned else max_length, token_tile
+                ),
+            ),
             triton.cdiv(hidden, channel_tile),
             slots.numel(),
         )
@@ -161,6 +194,8 @@ def dilated_prefill_short_conv(
         slots,
         initial,
         out,
+        output_start,
+        count,
         **common,
         W0=weight.stride(0),
         W1=weight.stride(1),
@@ -169,6 +204,7 @@ def dilated_prefill_short_conv(
         DILATION=dilation,
         BT=token_tile,
         BD=channel_tile,
+        ROW_OWNED=owned,
         num_warps=4,
     )
     state_length = (kernel - 1) * dilation
