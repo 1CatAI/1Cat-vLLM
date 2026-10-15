@@ -399,6 +399,7 @@ def test_ple_offload_uses_event_per_inflight_mrv2_batch() -> None:
     connector.dp_rank = 0
     connector.fast_lane = None
     connector._uses_cuda_inputs = True
+    connector._next_seq = 0
     connector._request_queue = queue.Queue(maxsize=2)
     connector._d2h_event_pool = queue.Queue(maxsize=2)
     first_event = Mock()
