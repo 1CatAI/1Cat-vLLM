@@ -28,7 +28,7 @@ def test_q8_0_bytes_match_gguf_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("tokens", [1, 5, 20])
+@pytest.mark.parametrize("tokens", [1, 5, 20, 65])
 def test_q8_0_moe_matches_dequantized_reference(tokens):
     import vllm._custom_ops  # noqa: F401
     from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
