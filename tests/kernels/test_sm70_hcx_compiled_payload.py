@@ -124,7 +124,7 @@ def _worker_run(rank, port, results):
                 ple_layer._PLE_DIAGNOSTIC_BUFFERS["after"], ple_result
             )
             torch.testing.assert_close(ple_scratch, ple_input * 17)
-        for rows in (5, 8, 9, 10, 17, 20, 24, 25, 30, 32, 33, 39, 40, 41):
+        for rows in (5, 8, 9, 10, 16, 17, 20, 24, 25, 30, 32, 33, 39, 40, 41):
             torch.manual_seed(1)
             hidden = (torch.randn(rows, 10240, device="cuda") * 0.5).half()
             injection = torch.randn(rows, 4, device="cuda").half()
@@ -145,6 +145,12 @@ def _worker_run(rank, port, results):
                 combined, final_outputs, final_scratch = materialize(
                     x, hidden, injection
                 )
+            # Reset only the local cumulative barrier near uint32 wrap; peer
+            # epochs retain their ordinary monotonic history. Replay must carry
+            # producer writes through the wrapped grid rendezvous as well.
+            runtime.bar[2:].fill_(-80)
+            torch.accelerator.synchronize()
+            torch.distributed.barrier()
             for _ in range(2):
                 x.copy_(torch.randn_like(x) * 0.02)
                 graph.replay()
@@ -171,6 +177,16 @@ def _worker_run(rank, port, results):
                 for actual, expected in zip(final_outputs[:2], final_reference[:2]):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 torch.testing.assert_close(final_scratch, x * 17, rtol=0, atol=0)
+                if 16 < rows <= 40:
+                    # Live inverse rows and their published epoch must follow
+                    # changing batch widths, including a prior tiled fallback.
+                    padded = runtime.dpart.view(80, 40, 96, 4)[79, :rows]
+                    assert torch.isfinite(padded[:, 84]).all()
+                    assert (padded[:, 84] > 0).all()
+                    flags = runtime.dpart.view(torch.int32).view(80, 40, 96, 4)[
+                        79, :rows, 85, 0
+                    ]
+                    assert torch.equal(flags, runtime.seq.expand_as(flags))
                 if rows == 5:
                     snapshot = runtime.snapshots["payload"]
                     torch.testing.assert_close(snapshot["partial"], x * 3)

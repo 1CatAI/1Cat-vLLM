@@ -914,3 +914,108 @@ The stable-libtorch SHA256 is
 the indexer SHA256 is
 `ae483cb461ce78a5f37a3c7f52c297f0cdd8d9211eacc4133acba58bf8d39848`.
 The HC/core artifact remains the qualified`a71013ee` build.
+
+## Whole-model indexer-grid and Q8-row result
+
+Checkpoint`b303bc4c6bf48633541a1a4aad8df9e6372ea802` passes fresh ordinary
+workers and a separate fenced diagnostic service. The matched32K shared-prefix
+capacity-eight contract, sampling, expert placement and graph sizes are
+unchanged. Both actual normal worker maps and startup binding logs confirm the
+source-owned core/stable/indexer artifacts. No private research library enters
+the service. C1/2/4/6/8 complete-round counts are187/211/192/182/178, with zero
+incomplete rounds.
+
+| C | Verifier before/after, ms | New verifier p99 | Draft before/after, ms | Ordinary aggregate tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| 1 |15.987 /15.793|18.245|3.706 /3.470|140.98|
+| 2 |24.517 /24.216|28.515|4.460 /3.966|190.86 /167.15|
+| 4 |32.963 /33.108|43.364|5.762 /4.901|241.54|
+| 6 |43.241 /40.769|47.697|7.692 /5.892|302.62|
+| 8 |51.328 /49.399|58.014|8.738 /6.710|362.03 /328.00|
+
+Verifier is the whole TP4 maximum of target forward, sample and state commit;
+it is never divided by concurrency. Draft statistics are on the critical
+verifier rank. Ordinary rates use a common decode interval; acceptance metrics
+cover the entire request batch and cannot be substituted into an exact
+per-round cost calculation. The candidate reduces C8 verification by1.929ms
+and draft by2.028ms; C4 verification is essentially unchanged/slightly worse.
+The requested18/22/28ms C2/C4/C8 verifier targets remain unmet. Natural-EOS
+arithmetic, C1/C8 retrieval/arithmetic, executable code and automatic tool/reply
+gates all pass. Actual256K and independent-prefix whole-model coverage remain
+unqualified. The latest memory sample is after shutdown and is not peak evidence.
+
+## Subsequent HC and recurrent scheduling decisions
+
+A private HC16 phase diagnostic keeps the normal arithmetic and uses timestamp
+stores only to localize work. At C8, mean CTA phases include approximately
+27.47us outbound peer stores,6.10us weight prefetch,14.16us peer wait/combine,
+4.11us down MMA/partial stores,18.02us repeated RMS-statistic reduction and
+normalization,5.34us down reduction,4.94us LoRA loading and5.24us up/gate-mix.
+Grid rendezvous and other waits are separate. These instrumented CTA phases
+are perturbed and are not a closed ordinary-worker model latency table. Launch
+resources alone do not establish occupancy, stalls or NVLink bandwidth.
+
+The two-tile HC experiment doubles independent down/up MMA row tiles within
+512 threads and uses48320 shared bytes. It retains bytes in four-rank changed
+input graphs, but C2/4/6/8 maxima improve only0.7/0.6/0.3/0.5%. C8 is
+0.097190 versus0.096711ms, below its predeclared8% benefit gate. The candidate
+is rejected before source integration. The hypothesis that serial MMA tiles
+explain most HC batch inflation is not supported by the measured phases.
+
+A separate existing-provider GDN schedule screen covers C1/4/8 and BV/warp
+pairs32/4,16/4,32/8,64/8. All twelve cases pass finite eager and10240-token
+recurrent-state comparisons with live accepted lengths. Output relative RMS
+is bounded to0.001; FP32 state relative RMS0.00003 and max absolute error
+0.00002. These operation/dtype-aware limits were declared before the screen.
+The best C8 kernel result is0.05904 to0.05503ms (6.8%), below its15% benefit
+gate. No runtime scheduling change or default is promoted.
+
+The next private hypothesis is duplicated HC RMS-statistic reads: every CTA
+currently recomputes the same per-row80-way reduction. Any experiment that
+publishes a shared result must preserve sum order, reset epochs before the
+existing grid rendezvous, use coherent payload accesses with matching GPU
+release/acquire, preserve workspace lifetime and retain all fallback paths.
+The [PTX memory model](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-synchronization)
+provides the ordering contract; normal native state and complete-model gates
+are required before accepting a corresponding source change.
+
+The RMS-owner private screen meets the8% C8 gate while retaining bytes in
+four-rank changed-input graphs. C2/4/6/8 critical-rank HC means change
+0.039163/0.059407/0.075162/0.097531 to
+0.036714/0.052471/0.067874/0.089070ms. The kernel retains512 threads,
+113 registers/thread and43040 shared bytes without spills. These are private
+operator results, not complete-model gains.
+
+The candidate is folded into the existing HC batch kernel without changing
+its ABI, allocations, peer exchange, fallback policies or M17..40 runtime
+admission. One resident CTA owns each row's canonical80-way RMS reduction;
+the FP32 sum, rsqrt and FP16 boundaries remain unchanged. It publishes four
+inverse values in padded down columns84..85 belonging to CTA79, which have
+no downstream down-reduction readers. The last producer resets epoch flags
+after its own partial stores and before the existing acq_rel grid barrier.
+The owner then uses a GPU release store; consumer leaders acquire the matching
+epoch before coherent payload loads and warp broadcast. All80 CTAs remain
+resident, so a polling consumer cannot prevent its producer from running.
+The first grid barrier carries reset/partial writes; no external initialization
+or stale-address assumption is added. Subsequent tile fallbacks may reuse the
+workspace; the next wide call resets all of its live row epochs again.
+
+Normal-artifact admission requires the affected compiled payload/state test,
+changed graph inputs and widths, the local cumulative grid counter crossing
+uint32 wrap, live inverse/epoch validation and the ordinary MTP4/task gate.
+The peer epoch protocol itself is unchanged; wrapping local counters does not
+claim peer-epoch wrap qualification. The Q8 row binding also explicitly rejects
+non-byte packed weights without changing valid-input computation.
+
+The normal RMS-owner artifact passes45 interface/admission cases and the
+four-rank compiled payload/state suite at M5/8/9/10/16/17/20/24/25/30/32/33/
+39/40/41. The latter includes changed-input replay after local barrier-counter
+wrap and validates live inverse values and publication epochs after changing
+widths. Direct C1/2/4/6/8 native graph costs are0.022196 /0.035205 /0.050418 /
+0.067357 /0.088446ms, with byte-exact retained-tile and changed-input results.
+The direct M10 result does not widen runtime admission. Full model gates remain
+pending for this artifact. Core SHA256 is
+`778595e26ca1c9957ad3f84f8a9d3c1d14a7bbb96e61f33de6353a5307e874c5`;
+the Q8 byte-layout guard's stable-libtorch artifact is
+`ac770d73a344357f610efd0fd0285e0bedbaedb708e8b76ba46b3d2d1422741f`.
+The indexer stays`ae483cb4`. Private operator libraries remain research-only.

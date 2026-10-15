@@ -555,6 +555,7 @@ torch::stable::Tensor ggml_moe_a8_vec_rows(torch::stable::Tensor X,
   STD_TORCH_CHECK(
       X.dim() == 2 && W.dim() == 3 && topk_ids.dim() == 2 &&
           X.is_contiguous() && W.is_contiguous() && topk_ids.is_contiguous() &&
+          W.scalar_type() == torch::headeronly::ScalarType::Byte &&
           X.size(1) % 32 == 0 && W.size(1) == row &&
           W.size(2) == X.size(1) / 32 * 34 && tokens == X.size(0) &&
           top_k > 0 && topk_ids.numel() == tokens * top_k &&

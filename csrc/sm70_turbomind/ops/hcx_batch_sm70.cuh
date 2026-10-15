@@ -146,8 +146,17 @@ __global__ __launch_bounds__(BATCH_THREADS, 1) void hcx_batch_kernel(Args a) {
     }
     __syncthreads();
   }
+  // Reserved padded down columns84..95 have no downstream readers. The
+  // producing CTA resets each row flag after all its partial stores, before
+  // the existing release/acquire grid barrier. No allocation/init dependency.
+  if (i == NC - 1 && t < a.M) {
+    float* slot = a.dpart + ((NC - 1) * BATCH_ROWS + t) * 96 * 4 + 84 * 4;
+    *reinterpret_cast<unsigned*>(slot + 4) = tag - 1;
+  }
   grid_bar_epoch(a.bar + 2, base + NC);
-  for (int row = warp; row < a.M; row += WARPS) {
+  // A resident owner computes the identical80-way statistic once per row.
+  if (i < a.M && warp == 0) {
+    const int row = i;
     float4 qs[3];
 #pragma unroll
     for (int j = 0; j < 3; ++j)
@@ -163,9 +172,40 @@ __global__ __launch_bounds__(BATCH_THREADS, 1) void hcx_batch_kernel(Args a) {
 #pragma unroll
       for (int b = 0; b < 4; ++b)
         sums[b] += __shfl_xor_sync(0xffffffff, sums[b], s);
+
+    if (lane == 0) {
+      float* slot = a.dpart + ((NC - 1) * BATCH_ROWS + row) * 96 * 4 + 84 * 4;
+      *reinterpret_cast<float4*>(slot) = make_float4(
+          rsqrtf(sums[0] / HD + a.eps), rsqrtf(sums[1] / HD + a.eps),
+          rsqrtf(sums[2] / HD + a.eps), rsqrtf(sums[3] / HD + a.eps));
+      asm volatile("st.release.gpu.global.u32 [%0], %1;" ::"l"(slot + 4),
+                   "r"(tag)
+                   : "memory");
+    }
+  }
+  for (int row = warp; row < a.M; row += WARPS) {
+    float inverse_values[4] = {};
+    if (lane == 0) {
+      const float* slot =
+          a.dpart + ((NC - 1) * BATCH_ROWS + row) * 96 * 4 + 84 * 4;
+      const auto start = clock64();
+      unsigned ready;
+      do {
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];"
+                     : "=r"(ready)
+                     : "l"(slot + 4)
+                     : "memory");
+        if (clock64() - start > 4000000000LL) __trap();
+      } while (ready != tag);
+      const float4 value = __ldcg(reinterpret_cast<const float4*>(slot));
+      inverse_values[0] = value.x;
+      inverse_values[1] = value.y;
+      inverse_values[2] = value.z;
+      inverse_values[3] = value.w;
+    }
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
-      const float inverse = rsqrtf(sums[b] / HD + a.eps);
+      const float inverse = __shfl_sync(0xffffffff, inverse_values[b], 0);
       if (lane == 0) rr[row][b] = inverse;
       const float o =
           __half2float(a.res_out[row * KD + b * HD + 32 * i + lane]);

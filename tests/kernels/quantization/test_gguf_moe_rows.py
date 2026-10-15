@@ -91,6 +91,8 @@ def test_rows_rejects_unqualified_dtype_and_geometry():
         ops.ggml_moe_a8_vec_rows(x.float(), w, ids, 2, 8, 9, 2)
     with pytest.raises(RuntimeError, match="layout"):
         ops.ggml_moe_a8_vec_rows(x, w, ids, 2, 8, 10, 2)
+    with pytest.raises(RuntimeError, match="layout"):
+        ops.ggml_moe_a8_vec_rows(x, w.float(), ids, 2, 8, 9, 2)
     with pytest.raises(ValueError, match="Q8_0"):
         fused_moe_gguf_rows(x, w, w, x, ids, 2, 8, "silu")
 
