@@ -99,13 +99,28 @@ print(json.dumps({
 PY
 )
 cd "$SOURCE_DIR"
+MM_ARGS=(--language-model-only)
+if [[ -n "${VISION_DIR:-}" ]]; then
+  test -f "$VISION_DIR/visual.safetensors"
+  MM_LOAD=$("$PYTHON_BIN" - "$VISION_DIR/visual.safetensors" <<'PY'
+import json
+import sys
+print(json.dumps({"multimodal_safetensors": sys.argv[1]}))
+PY
+)
+  MM_ARGS=(--hf-config-path "$VISION_DIR" --tokenizer "$VISION_DIR"
+    --model-loader-extra-config "$MM_LOAD"
+    --limit-mm-per-prompt '{"image":2147483647,"video":0}'
+    --skip-mm-profiling --mm-encoder-tp-mode weights --mm-encoder-batch-size 1
+    --mm-processor-cache-gb 0.25 --mm-processor-kwargs '{"max_pixels":4194304}')
+fi
 exec taskset -c "$CPU_SET" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MODEL_FILE" \
   --served-model-name flash-next-abliterated flash-next qwen3.8-flash-next \
   --host 127.0.0.1 --port "$PORT" --quantization gguf --tensor-parallel-size 4 \
   --dtype half --kv-cache-dtype float16 --mamba-ssm-cache-dtype float32 \
   --max-model-len 262144 --max-num-seqs 1 --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.95 --enable-prefix-caching \
-  --mamba-cache-mode align --no-mamba-tail-checkpoint --language-model-only \
+  --mamba-cache-mode align --no-mamba-tail-checkpoint "${MM_ARGS[@]}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
   --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20}' \
