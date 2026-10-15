@@ -131,3 +131,39 @@ def test_unknown_loader_options_still_reject():
         GGUFModelLoader(
             LoadConfig(load_format="gguf", model_loader_extra_config={"bad": 1})
         )
+
+
+@pytest.mark.parametrize(
+    "native,companion", [(True, True), (True, False), (False, True)]
+)
+def test_weight_types_do_not_require_legacy_mmproj(monkeypatch, native, companion):
+    from unittest.mock import Mock
+
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader import gguf_loader
+
+    loader = GGUFModelLoader(LoadConfig(load_format="gguf"))
+    loader._native_adapter = object() if native else None
+    loader.multimodal_weights = Mock() if companion else None
+    monkeypatch.setattr(loader, "_get_all_gguf_files", lambda _: ["text.gguf"])
+    monkeypatch.setattr(
+        gguf_loader, "get_gguf_weight_type_map", lambda *_: {"x": "Q8_0"}
+    )
+    detect = Mock(side_effect=AssertionError("must not search for legacy mmproj"))
+    monkeypatch.setattr(gguf_loader, "detect_gguf_multimodal", detect)
+    config = SimpleNamespace(hf_config=SimpleNamespace(vision_config=object()))
+    assert loader._get_gguf_weight_type(config, "text.gguf", {}) == {"x": "Q8_0"}
+    detect.assert_not_called()
+
+
+def test_legacy_multimodal_still_requires_mmproj(monkeypatch):
+    from vllm.config import LoadConfig
+    from vllm.model_executor.model_loader import gguf_loader
+
+    loader = GGUFModelLoader(LoadConfig(load_format="gguf"))
+    monkeypatch.setattr(loader, "_get_all_gguf_files", lambda _: ["text.gguf"])
+    monkeypatch.setattr(gguf_loader, "get_gguf_weight_type_map", lambda *_: {})
+    monkeypatch.setattr(gguf_loader, "detect_gguf_multimodal", lambda _: None)
+    config = SimpleNamespace(hf_config=SimpleNamespace(vision_config=object()))
+    with pytest.raises(AssertionError, match="mm_proj"):
+        loader._get_gguf_weight_type(config, "text.gguf", {})

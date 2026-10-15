@@ -392,7 +392,11 @@ class GGUFModelLoader(BaseModelLoader):
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
         is_multimodal = hasattr(model_config.hf_config, "vision_config")
-        if is_multimodal:
+        if (
+            is_multimodal
+            and getattr(self, "_native_adapter", None) is None
+            and getattr(self, "multimodal_weights", None) is None
+        ):
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
