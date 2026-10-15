@@ -4,6 +4,7 @@
 
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -11,6 +12,8 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
 from vllm.platforms import current_platform
+from vllm.v1.core.sched.output import NewRequestData
+from vllm.v1.ple_offload.protocol import PleCpuInputs
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
@@ -32,6 +35,15 @@ class Qwen4ExpModelState(MambaHybridModelState):
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        # Host copies of each request's prefill tokens for early PLE requests.
+        # all_token_ids is written by a GPU kernel, so its host view may still
+        # lag behind the previous forward.
+        self._ple_early_tokens: dict[int, np.ndarray] | None = (
+            {}
+            if self.uses_ngram_embedding
+            and vllm_config.kernel_config.ple_prefill_early_request
+            else None
+        )
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
@@ -64,6 +76,64 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         self._ple_kernel_config = vllm_config.kernel_config
         self._ple_input_hardware = current_platform.is_device_capability(70)
+
+    def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
+        super().add_request(req_index, new_req_data)
+        if self._ple_early_tokens is None:
+            return
+        if new_req_data.prompt_embeds is not None:
+            self._ple_early_tokens.pop(req_index, None)
+            return
+        assert new_req_data.prefill_token_ids is not None
+        self._ple_early_tokens[req_index] = np.asarray(
+            new_req_data.prefill_token_ids, dtype=np.int32
+        )
+
+    def ple_cpu_inputs(self, input_batch: InputBatch) -> PleCpuInputs | None:
+        """Build a prompt-only batch's PLE inputs on the host, else None.
+
+        Mirrors prepare_prefill_inputs and _prepare_ngram_context: tokens
+        ``[computed, computed + scheduled)`` of each request and the
+        ``ngram_context_len`` tokens before ``computed``, EOS-filled.
+        """
+        tokens_by_index = self._ple_early_tokens
+        num_reqs = input_batch.num_reqs
+        if (
+            tokens_by_index is None
+            or num_reqs == 0
+            or input_batch.num_draft_tokens != 0
+            or input_batch.num_tokens != input_batch.num_tokens_after_padding
+        ):
+            return None
+        starts = input_batch.num_computed_prefill_tokens_np[:num_reqs]
+        lengths = input_batch.num_scheduled_tokens[:num_reqs]
+        if np.any(starts + lengths > input_batch.prefill_len_np[:num_reqs]):
+            return None
+        sources = []
+        for req_index in input_batch.idx_mapping_np[:num_reqs]:
+            tokens = tokens_by_index.get(int(req_index))
+            if tokens is None:
+                return None
+            sources.append(tokens)
+
+        context_len = self.ngram_context_len
+        ngram_context = np.full(
+            (num_reqs, context_len), self.ngram_eos_token_id, dtype=np.int32
+        )
+        chunks = []
+        for i, tokens in enumerate(sources):
+            start, length = int(starts[i]), int(lengths[i])
+            chunks.append(tokens[start : start + length])
+            history = tokens[max(0, start - context_len) : start]
+            if history.size:
+                ngram_context[i, context_len - history.size :] = history
+        return PleCpuInputs(
+            input_ids=np.concatenate(chunks),
+            query_start_loc=np.array(
+                input_batch.query_start_loc_np[: num_reqs + 1], dtype=np.int32
+            ),
+            ngram_context=ngram_context,
+        )
 
     def _prepare_ngram_context(
         self,

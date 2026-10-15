@@ -318,6 +318,7 @@ class PleOffloadInputBuffers:
     input_ids_buf: torch.Tensor  # int32 (max_num_tokens,)
     query_start_loc_buf: torch.Tensor  # int32 (max_num_reqs + 1,)
     ngram_context_buf: torch.Tensor | None  # int32 (max_num_reqs, ngram_context_len)
+    request_done_buf: torch.Tensor | None = None  # int64 (1,), last finished seq
 
 
 @dataclass
@@ -841,6 +842,7 @@ class PleOffloadRunner:
                     input_ids_buf=registration.input_ids_buf,
                     query_start_loc_buf=registration.query_start_loc_buf,
                     ngram_context_buf=registration.ngram_context_buf,
+                    request_done_buf=registration.request_done_buf,
                 )
 
         if set(self._input_bufs) != set(range(dp_size)):
@@ -1177,3 +1179,10 @@ class PleOffloadRunner:
                         with torch.cuda.stream(target.copy_stream):
                             destination.copy_(result, non_blocking=True)
                             target.sem.signal(target.copy_stream)
+
+        # Every layer has read this request's inputs; the connector may now
+        # stage the next request into the shared input buffers.
+        for dp_rank, request in requests_by_dp.items():
+            done = self._input_bufs[dp_rank].request_done_buf
+            if done is not None and request.seq > 0:
+                done[0] = request.seq

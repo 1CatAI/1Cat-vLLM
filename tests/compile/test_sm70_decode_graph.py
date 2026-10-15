@@ -301,6 +301,8 @@ def test_qwen38_hybrid_ple_skips_decode_offload_request(monkeypatch) -> None:
     connector = SimpleNamespace(
         _ple_policy=ple_policy(),
         _launch=lambda num_reqs, num_tokens: launches.append((num_reqs, num_tokens)),
+        early_prefill=False,
+        _host_result_regions={},
     )
 
     PleOffloadConnector.prepare_forward(
@@ -376,7 +378,10 @@ def test_hybrid_ple_admits_target_decode_widths(monkeypatch, tokens):
     monkeypatch.setenv("VLLM_SM70_QWEN38_HYBRID_PLE", "1")
     launches = []
     connector = SimpleNamespace(
-        _ple_policy=ple_policy(), _launch=lambda *args: launches.append(args)
+        _ple_policy=ple_policy(),
+        _launch=lambda *args: launches.append(args),
+        early_prefill=False,
+        _host_result_regions={},
     )
     PleOffloadConnector.prepare_forward(connector, 1, tokens, False, True)
     assert launches == []
@@ -419,7 +424,7 @@ def test_shared_capture_context_reaches_target_and_draft(
     monkeypatch.setattr(cg, "graph_capture", lambda **kwargs: nullcontext())
     monkeypatch.setattr(cg, "is_global_first_rank", lambda: False)
     monkeypatch.setattr(torch.cuda, "CUDAGraph", object)
-    monkeypatch.setattr(torch.cuda, "graph", lambda *args: nullcontext())
+    monkeypatch.setattr(torch.cuda, "graph", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(
         cg,
         "get_offloader",
@@ -430,6 +435,7 @@ def test_shared_capture_context_reaches_target_and_draft(
     manager = object.__new__(cg.CudaGraphManager)
     manager.device = torch.device("cpu")
     manager.pool = None
+    manager.capture_context = SimpleNamespace(stream=None)
     manager.graphs = {}
     manager._capture_descs = {
         mode: [
