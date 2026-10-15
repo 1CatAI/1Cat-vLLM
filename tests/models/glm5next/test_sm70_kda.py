@@ -338,3 +338,15 @@ def test_sm70_glm_kda_fp32_staging_avoids_fp16_overflow_and_graph() -> None:
     torch.accelerator.synchronize()
     assert torch.isfinite(graph_output).all()
     assert torch.equal(graph_output, normalized)
+
+
+def test_sm70_exact_kda_gemv_is_single_token_only() -> None:
+    """The exact native projection is taken for one token only; verify rows use
+    the standard projection (cuBLAS is ~2x faster there on V100)."""
+    import inspect
+
+    from vllm.models.glm5next.nvidia import kda as kda_module
+
+    src = inspect.getsource(kda_module)
+    assert "and num_tokens == 1\n" in src
+    assert "and 1 <= num_tokens <= 8\n" not in src
