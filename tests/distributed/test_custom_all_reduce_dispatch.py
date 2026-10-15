@@ -10,6 +10,7 @@ import torch
 
 import vllm._custom_ops as ops
 from vllm.config.collective import CollectiveNativeConfig
+from vllm.distributed.device_communicators import custom_all_reduce
 from vllm.distributed.device_communicators.collective_provider import (
     CollectiveCapabilities,
     NativeCollectiveBindings,
@@ -32,6 +33,21 @@ def _mock_communicator() -> CustomAllreduce:
         4, True, False, 1024 * 1024, 1024 * 1024, False, False
     )
     return communicator
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_p2p_check_verifies_when_the_driver_report_is_not_enough(monkeypatch, verify):
+    # A PCIe host whose driver reports peer access that the real IPC write
+    # test rejects (seen on two V100-PCIE behind a PHB without iommu=pt).
+    monkeypatch.setattr(
+        custom_all_reduce, "envs", SimpleNamespace(VLLM_SKIP_P2P_CHECK=True)
+    )
+    monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda src, tgt: True)
+    real_test = Mock(return_value=False)
+    monkeypatch.setattr(custom_all_reduce, "gpu_p2p_access_check", real_test)
+
+    assert custom_all_reduce._can_p2p(0, 2, verify=verify) is (not verify)
+    assert real_test.called is verify
 
 
 @pytest.mark.parametrize("rows", [1, 4, 5, 16, 128])

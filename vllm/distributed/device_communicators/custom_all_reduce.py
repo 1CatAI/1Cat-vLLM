@@ -91,11 +91,13 @@ def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
     return (*range(clique_base, clique_base + 4), pair_rank)
 
 
-def _can_p2p(rank: int, world_size: int) -> bool:
+def _can_p2p(rank: int, world_size: int, verify: bool = False) -> bool:
+    """Whether this rank can reach every peer; ``verify`` forces the real
+    IPC write test even when VLLM_SKIP_P2P_CHECK trusts the driver report."""
     for i in range(world_size):
         if i == rank:
             continue
-        if envs.VLLM_SKIP_P2P_CHECK:
+        if envs.VLLM_SKIP_P2P_CHECK and not verify:
             logger.debug("Skipping P2P check and trusting the driver's P2P report.")
             return torch.cuda.can_device_access_peer(rank, i)
         if not gpu_p2p_access_check(rank, i):
@@ -117,6 +119,7 @@ class CustomAllreduce:
         max_size=8192 * 1024,
         symm_mem_enabled=False,
         long_prefill_fusion_enabled=False,
+        verify_p2p=False,
     ) -> None:
         """
         Args:
@@ -124,6 +127,8 @@ class CustomAllreduce:
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bound to f"cuda:{local_rank}".
+            verify_p2p: run the real P2P access test even when
+                VLLM_SKIP_P2P_CHECK trusts the driver's report.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -270,7 +275,7 @@ class CustomAllreduce:
         if (
             not tp8_hierarchical
             and not current_platform.is_rocm()
-            and not _can_p2p(rank, world_size)
+            and not _can_p2p(rank, world_size, verify=verify_p2p)
         ):
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "
