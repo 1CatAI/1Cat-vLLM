@@ -222,7 +222,6 @@ def main():
         with (
             patch.object(parallel_state, "get_tp_group", lambda: group),
             patch.object(distributed, "get_tp_group", lambda: group),
-            patch.object(adapter, "get_tp_group", lambda: group),
             patch.object(
                 adapter,
                 "get_pp_group",
@@ -267,7 +266,7 @@ def main():
                 assert (
                     counters["ar"] == 0
                     and counters["rs"] == expected_rs
-                    and counters["ag"] == 17
+                    and counters["ag"] == 16
                 ), counters
 
                 def check(output, targets, rows=rows):

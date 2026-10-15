@@ -116,14 +116,13 @@ def main():
     cfg = NS(
         kernel_config=KernelConfig(),
         parallel_config=NS(communication=CommunicationPolicy()),
-        compilation_config=CompilationConfig(mode=0),
+        compilation_config=CompilationConfig(mode=0, custom_ops=["all"]),
     )
     report = {"cases": [], "precision_reduction": True}
     try:
         with (
             patch.object(parallel_state, "get_tp_group", lambda: group),
             patch.object(distributed, "get_tp_group", lambda: group),
-            patch.object(adapter, "get_tp_group", lambda: group),
             patch.object(mtp, "get_tp_group", lambda: group),
             patch.object(sm70_mtp_fc, "get_tp_group", lambda: group),
             patch.object(linear, "tensor_model_parallel_all_gather", gather_columns),
@@ -163,18 +162,18 @@ def main():
                     assert actual[1].data_ptr() != hidden.data_ptr()
                     return errors
 
-                torch.cuda.synchronize()
-                base = torch.cuda.memory_allocated()
-                torch.cuda.reset_peak_memory_stats()
+                torch.accelerator.synchronize()
+                base = torch.accelerator.memory_allocated()
+                torch.accelerator.reset_peak_memory_stats()
                 reference = expected()
-                torch.cuda.synchronize()
-                baseline_peak = torch.cuda.max_memory_allocated() - base
+                torch.accelerator.synchronize()
+                baseline_peak = torch.accelerator.max_memory_allocated() - base
                 group.counts = {"ar": 0, "rs": 0, "ag": 0}
-                base = torch.cuda.memory_allocated()
-                torch.cuda.reset_peak_memory_stats()
+                base = torch.accelerator.memory_allocated()
+                torch.accelerator.reset_peak_memory_stats()
                 actual = view(ids, positions, hidden, inputs_embeds=embeds)
-                torch.cuda.synchronize()
-                candidate_peak = torch.cuda.max_memory_allocated() - base
+                torch.accelerator.synchronize()
+                candidate_peak = torch.accelerator.max_memory_allocated() - base
                 counters = group.counts.copy()
                 assert counters["ar"] == 2 and counters["rs"] == 0, counters
                 errors = check(actual, reference)

@@ -205,3 +205,59 @@ state commit 保持不变，仅向当前 TP owner 的输出行写入结果。734
 replay 通过原0.001数值限值，7344/7345行 PLE live tensor 峰值增量约
 188.28/188.86 MiB。整模型验收必须用普通 Worker、不加载剖析器或显存
 探针重新完成；这些微基准不代表最终物理余量、验证成本或 API 已可用。
+
+### 常驻去重与模块级峰值预算
+
+9683 的匹配诊断中，两次240K请求结束后的空闲 Torch allocated 从
+13946.25 MiB降到13532.68 MiB，减少413.57 MiB。该窗口峰值从
+14345.70 MiB降到13912.90 MiB，减少432.80 MiB；新峰值在草稿 QSA
+indexer，不再是旧的草稿 MoE 分配。原始快照在机器的
+`claude-memdiag/keep2/` 和 `claude-memdiag/out/`。两次启动后的首份
+GC census 与请求重叠，不作为空闲值；对象清单包含映射主机存储和别名，
+不能将其逐项相加当成物理 HBM。
+
+去重保留现有资源所有者：affine BLAS scratch 按实际准入投影增长，
+170 MiB变为12.5 MiB，旧 layer view 随之重绑；target 与 Eagle 共享已有
+160 MiB MTP hidden buffer；草稿共享按串行顺序使用的64 MiB top-k
+workspace 和逐值相同的32 MiB RoPE 表。工作区测试覆盖增长失败、独立
+engine 和清理边界；共享测试覆盖下一次 target 写入、草稿 compaction、
+容量尾部和不兼容形状的回退。
+
+target HC prefill 的最终 gather 直接写入已有 MTP hidden buffer，复用
+原 PyNCCL transport，不再先申请完整160 MiB结果再复制。最多三个 padding
+行暂存并恢复；padding 容量不足、非连续输入或无可用 PyNCCL 时，继续原
+gather/copy。decode 的原复制与 FULL graph 路径保留。76项模块单测及
+target/MTP 六形状四卡检查通过；变输入 graph replay、完整 hidden 输出和
+容量尾部保持原契约。合成 MTP FC/HC adapter 在4096行的 live peak 增量
+从500.18 MiB降至180.01 MiB，不将其作为整模型物理余量。
+
+### Q8 MTP 分块测量发现的专家边界错误
+
+1024/2048分块比较必须先证明全部输出有限。该模块基准发现原 MMQ
+通用 kernel 将专家编号上限写死为255，模型却有512个专家：高半区输出
+没有写入，分配器旧内容有时表现为有限值，有时造成异常大值或 NaN。
+因此不能引用原基准作为速度或质量证据。修复复用原 MMQ 家族，将权重
+张量的实际专家数传入边界检查，专家偏移使用64位乘法；公开 op ABI、
+量化位数和正常运算保留。
+
+针对性回归包含 Q8 的128/256/257/512专家、Q4_0的257/512专家，路由
+编号0/255/256/最后专家，以及变输入、变路由 graph replay；使用解量化
+FP32 oracle 与预先规定的2%范数误差。整层 Q8 测试另覆盖65 token，
+跨过原先只验证到20 token的 MMVQ/MMQ 分界。正常 `_C_stable_libtorch`
+CMake target 在任务自有 build 目录重建，随后进行模块数值、分块速度和
+staging 页边界验收；未完成前不恢复公网 API。
+
+正常扩展重建后，18项专家边界、完整 MoE 和 staging 预算回归通过。
+修复后的1024/2048分块输出逐位相同，但7344/8192行的1024分块分别多
+1.85/1.94 ms。最终保留原2048分块的吞吐，使用常驻去重和 HC buffer
+所有权降低显存；不将减小分块作为免费加速。
+
+旧262144 staging 参数是共享 E4M3字节预算，并非草稿 FP16的 token
+容量：816 token/页时只能存160页，即130560 token。513行真实
+`host_kv_forward` 模块对比中，130561 token跨界后旧路径约203 ms；
+525504预算的322页阶段约31 ms。262144 token边界从约225 ms降至
+约59 ms，配对最大行 L2 <0.000345、最大绝对误差7.63e-6；130560
+token两边均 staged，结果逐位一致。该配置为唯一共享 stage 增加约
+130.60 MiB，预计常驻净节省由413.57 MiB变为282.97 MiB；不能将
+尚未做整模型验收的预算预测当成最终显存结果。主 KV/hot KV、29个
+state block、专家比例和512 MiB allocator预留保留。

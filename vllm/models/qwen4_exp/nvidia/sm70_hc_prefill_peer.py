@@ -369,3 +369,59 @@ direct_register_custom_op(
     fake_impl=_shard_rows_fake,
 )
 hc_sequence_shard_rows = torch.ops.vllm.qwen38_hc_sequence_shard_rows
+
+
+def _gather_rows_into(output: torch.Tensor, local: torch.Tensor, tokens: int) -> None:
+    """Commit HC rows into their existing owner without a full temporary.
+
+    Only complete, contiguous TP4 receive spans use the existing PyNCCL
+    transport directly. A partial final rank preserves the owner's unused
+    capacity (at most three rows); insufficient padded capacity or unavailable
+    transport keeps the original gather/copy fallback.
+    """
+    from vllm.distributed import get_tp_group
+
+    group = get_tp_group()
+    if (
+        group.world_size != 4
+        or output.ndim != 2
+        or local.ndim != 2
+        or output.shape[1] != local.shape[1]
+        or output.dtype != local.dtype
+        or output.device != local.device
+        or not 0 <= tokens <= output.shape[0]
+        or local.shape[0] != (tokens + 3) // 4
+    ):
+        raise ValueError("HC row commit requires matching TP4 rows and capacity")
+    if tokens == 0:
+        return
+    padded = 4 * local.shape[0]
+    communicator = getattr(group.device_communicator, "pynccl_comm", None)
+    if (
+        communicator is None
+        or communicator.disabled
+        or output.shape[0] < padded
+        or not output.is_contiguous()
+        or not local.is_contiguous()
+    ):
+        output[:tokens].copy_(group.all_gather(local, dim=0)[:tokens])
+        return
+    tail = output[tokens:padded].clone() if tokens < padded else None
+    communicator.all_gather(output[:padded], local)
+    if tail is not None:
+        output[tokens:padded].copy_(tail)
+
+
+def _gather_rows_into_fake(
+    output: torch.Tensor, local: torch.Tensor, tokens: int
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    "qwen38_hc_sequence_gather_into",
+    _gather_rows_into,
+    mutates_args=["output"],
+    fake_impl=_gather_rows_into_fake,
+)
+hc_sequence_gather_into = torch.ops.vllm.qwen38_hc_sequence_gather_into

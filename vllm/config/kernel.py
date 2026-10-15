@@ -900,8 +900,10 @@ class KernelConfig:
     one shared device buffer (DMA, once per layer and chunk) and read it there,
     instead of resolving every query row's selection through the hot cache and
     mapped host memory (re-reading the same history per row over PCIe).
-    Capacity in tokens (about 0.5 KiB each, shared by all layers); longer
-    contexts keep the hot-cache path. 0 disables it."""
+    Byte budget in E4M3-equivalent K/V tokens (0.5 KiB each at D256), shared
+    by all layers and rounded down to complete pages. FP16 draft history fits
+    half as many tokens in the same buffer; scales use additional storage.
+    Histories exceeding that capacity keep the hot-cache path. 0 disables it."""
     qsa_host_kv_prefill_stage_slots: int = Field(default=2, ge=1, le=2)
     """Shared prefix staging buffers. One slot reuses the current layer's
     buffer after its attention completion event; prefetch still overlaps the

@@ -16,7 +16,7 @@ from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import DynamicShapesType
 from vllm.config.execution_policy import communication_policy, graph_policy
 from vllm.config.sm70_sparse import sparse_policy
-from vllm.distributed import get_pp_group, get_tp_group
+from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
@@ -1026,14 +1026,16 @@ class Qwen4ExpModel(nn.Module):
             sample_hidden_states = sample_hidden_states[: positions.shape[-1]]
         if self._mtp_hidden_buffer is not None:
             if hc_sequence_parallel:
-                multi_hidden = get_tp_group().all_gather(multi_hidden, dim=0)[
-                    : positions.shape[-1]
-                ]
-            # Capture the pre-final-mixer multi-stream hidden state
-            # [T, hc_count*H] for the MTP drafter (zero extra compute:
-            # this tensor is needed by the final mixer regardless).
-            num_tokens = multi_hidden.shape[0]
-            self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+                from .sm70_hc_prefill_peer import hc_sequence_gather_into
+
+                hc_sequence_gather_into(
+                    self._mtp_hidden_buffer, multi_hidden, positions.shape[-1]
+                )
+            else:
+                # Capture the pre-final-mixer multi-stream hidden state for
+                # the drafter; decode keeps its original copy and graph.
+                num_tokens = multi_hidden.shape[0]
+                self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

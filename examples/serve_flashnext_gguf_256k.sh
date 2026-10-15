@@ -19,6 +19,8 @@ export PATH="$CUDA_HOME/bin:$(dirname "$PYTHON_BIN"):$PATH"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_IDS"
 export PYTHONPATH="$SOURCE_DIR"
 export TORCH_CUDA_ARCH_LIST=7.0
+export CUBLAS_WORKSPACE_CONFIG=${CUBLAS_WORKSPACE_CONFIG:-:16:8}
+export NCCL_BUFFSIZE=${NCCL_BUFFSIZE:-4194304} NCCL_MAX_CTAS=${NCCL_MAX_CTAS:-6}
 export PYTORCH_ALLOC_CONF=expandable_segments:True OMP_NUM_THREADS=1 MALLOC_ARENA_MAX=2
 export VLLM_NO_USAGE_STATS=1 DO_NOT_TRACK=1
 export VLLM_EXPERT_CACHE_STACKS=1 VLLM_BALANCED_PREFILL_CHUNKS=1
@@ -45,7 +47,8 @@ config = {
         "small_m_hmma": True, "lut4_expert_dp4a": True,
         "device_transcode": True, "dequant_workspace_bytes": 33554432,
         "expert_cache_fraction": 0.8, "expert_cache_host_slack": 0.05,
-        "expert_cache_prefill": "turbomind", "expert_cache_prefill_tokens": 4096,
+        "expert_cache_prefill": "turbomind", "expert_cache_prefill_tokens": 2048,
+        "expert_load_prefetch_banks": 1,
     },
     "sm70_turbomind_workspace_bytes": 8388608,
     "sm70_router_weight_storage": "row_major", "sm70_mtp_q8_0_experts": True,
@@ -59,8 +62,19 @@ config = {
     "qsa_host_kv_draft_dtype": "float16", "qsa_host_kv_device_reference": False,
     "qsa_host_kv_hot_tokens": 32768, "qsa_host_kv_hot_dtype": "fp8_e4m3",
     "qsa_host_kv_draft_hot_tokens": 16384, "qsa_host_kv_staging_rows": 8,
-    "qsa_host_kv_prefill_stage_tokens": 131072,
-    "sm70_sparse": {"qsa_score_tile_mb": 32}, "qsa_host_kv_state_blocks": 29,
+    "qsa_host_kv_prefill_stage_tokens": 525504,
+    "qsa_host_kv_prefill_stage_slots": 1,
+    "qsa_host_kv_trim_warmup_cache": True,
+    "qsa_host_kv_allocator_headroom_mib": 512,
+    "sm70_sparse": {
+        "qsa_score_tile_mb": 32, "qsa_prefill_tp_rows": True,
+        "qsa_decode_partition_topk": True,
+    },
+    "layer_execution": {
+        "ple_prefill_conv": True, "hc_prefill_sequence_parallel": True,
+        "hc_mtp_prefill_sequence_parallel": True, "hc_prefill_peer_norm": True,
+    },
+    "qsa_host_kv_state_blocks": 29,
     "qsa_auto_e4m3": False, "ple_row_cache_mib": 512,
     "ple_input_prepare": True, "ple_pinned_decode": False,
     "ple_fast_lane": True, "ple_draft_prefetch": True,

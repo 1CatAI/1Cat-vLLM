@@ -10,6 +10,53 @@ from vllm.models.qwen4_exp.nvidia import sm70_hc_prefill_peer as peer
 from vllm.runtime_resources import release_runtime_resources, runtime_resources_for
 
 
+@pytest.mark.parametrize("tokens", [0, 1, 3, 4, 5, 7, 8, 9])
+@pytest.mark.parametrize("exact_capacity", [False, True])
+@pytest.mark.parametrize("disabled", [False, True])
+def test_gather_rows_into_preserves_owner_tail(
+    monkeypatch, tokens, exact_capacity, disabled
+):
+    from vllm import distributed
+
+    rows = (tokens + 3) // 4
+    local = torch.arange(rows * 8).reshape(rows, 8).half()
+    before = local.clone()
+    gathered = torch.cat([local + rank * 100 for rank in range(4)])
+    calls = []
+
+    def gather_into(output, source):
+        assert source is local
+        calls.append("into")
+        output.copy_(gathered)
+
+    def gather(source, dim):
+        assert source is local and dim == 0
+        calls.append("fallback")
+        return gathered
+
+    comm = NS(disabled=disabled, all_gather=gather_into)
+    group = NS(
+        world_size=4, device_communicator=NS(pynccl_comm=comm), all_gather=gather
+    )
+    monkeypatch.setattr(distributed, "get_tp_group", lambda: group)
+    capacity = tokens if exact_capacity else 4 * rows + 2
+    output = torch.full((capacity, 8), -7, dtype=torch.half)
+    peer._gather_rows_into(output, local, tokens)
+    assert torch.equal(output[:tokens], gathered[:tokens])
+    assert torch.all(output[tokens:] == -7)
+    assert torch.equal(local, before)
+    expected = "fallback" if disabled or capacity < 4 * rows else "into"
+    assert calls == ([expected] if tokens else [])
+
+
+def test_gather_rows_into_rejects_invalid_capacity(monkeypatch):
+    from vllm import distributed
+
+    monkeypatch.setattr(distributed, "get_tp_group", lambda: NS(world_size=4))
+    with pytest.raises(ValueError, match="capacity"):
+        peer._gather_rows_into(torch.empty(6, 8), torch.empty(2, 8), 7)
+
+
 @pytest.mark.parametrize("reduced", [False, True])
 @pytest.mark.parametrize(
     "rows,accepted",
