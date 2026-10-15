@@ -611,17 +611,22 @@ class GGUFModelLoader(BaseModelLoader):
         vllm_config.quant_config.unquantized_modules.extend(unquant_names)
 
         if adapter is not None:
+            language_prefix = getattr(adapter, "language_model_prefix", "")
+            transport_names = {
+                raw: f"{language_prefix}.{name}" if language_prefix else name
+                for raw, name in gguf_weights_map.items()
+            }
             from vllm.model_executor.kernels.ple.gguf_pinned import (
                 prepare_pinned_gguf_ple,
             )
 
-            prepare_pinned_gguf_ple(vllm_config, self._native_tensors, gguf_weights_map)
+            prepare_pinned_gguf_ple(vllm_config, self._native_tensors, transport_names)
             from vllm.model_executor.kernels.ple.gguf_packed_result import (
                 prepare_packed_gguf_results,
             )
 
             prepare_packed_gguf_results(
-                vllm_config, self._native_tensors, gguf_weights_map
+                vllm_config, self._native_tensors, transport_names
             )
 
         target_device = torch.device(device_config.device)
