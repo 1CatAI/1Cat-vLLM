@@ -23,8 +23,9 @@ from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
 
-# Tokens per draft MoE call during prefill (bounds its temporaries).
-_PREFILL_CHUNK = 2048
+# Tokens per draft MoE call during prefill: bounds its [tokens * top_k, hidden]
+# temporaries (~50 MiB per 1024 tokens), which sit at the prefill memory peak.
+_PREFILL_CHUNK = 1024
 
 GGML_Q8_0 = 8
 _BLOCK = 32

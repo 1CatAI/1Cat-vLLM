@@ -513,6 +513,28 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             selected = buffer.index_select(0, row_indices)
             buffer[:num_rows].copy_(selected)
 
+    def adopt_target_topk_indices(self, target: torch.Tensor) -> int:
+        """Use the target's QSA top-k workspace instead of a private one.
+
+        MTP step 0 always selects its own indices and later steps only reuse
+        them within the same proposal, never across a target forward, so the
+        target's serially reused [max_tokens, width] buffer can be shared.
+        Returns the bytes released.
+        """
+        released = 0
+        for attention in self._iter_qsa_attentions():
+            own = attention.topk_indices_buffer
+            if (
+                own is not target
+                and own.dtype == target.dtype
+                and own.device == target.device
+                and own.shape[1] == target.shape[1]
+                and own.shape[0] <= target.shape[0]
+            ):
+                released += own.numel() * own.element_size()
+                attention.topk_indices_buffer = target
+        return released
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -547,9 +569,14 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
-        from .sm70_mtp_fc import maybe_combine_fc
+        from .sm70_mtp_fc import maybe_combine_fc, maybe_sequence_rows_fc
 
-        combined = maybe_combine_fc(self, inputs_embeds, hidden_states)
+        combined = (
+            maybe_sequence_rows_fc(self, inputs_embeds, hidden_states)
+            if hc_sequence_parallel
+            else maybe_combine_fc(self, inputs_embeds, hidden_states)
+        )
+        fc_sequence_rows = hc_sequence_parallel and combined is not None
         if combined is not None:
             hidden_states = combined
         else:
@@ -574,7 +601,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         layer = self.layers[current_step_idx]
-        if hc_sequence_parallel:
+        if hc_sequence_parallel and not fc_sequence_rows:
             hidden_states = _hc_sequence_rows(hidden_states)
         hidden_states, block_output, injection = layer(
             hidden_states=hidden_states,
@@ -930,6 +957,52 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             getattr(self, "share_target_io_weights", False)
             and remapped.startswith(("model.embed_tokens.", "lm_head."))
         )
+
+    def adopt_target_buffers(self, target_model: nn.Module) -> None:
+        """Share serially reused target workspaces after both are built."""
+        target = next(
+            (
+                buffer
+                for module in target_model.modules()
+                if isinstance(
+                    buffer := getattr(module, "topk_indices_buffer", None),
+                    torch.Tensor,
+                )
+            ),
+            None,
+        )
+        if target is not None and hasattr(self.model, "adopt_target_topk_indices"):
+            released = self.model.adopt_target_topk_indices(target)
+            if released:
+                logger.info(
+                    "MTP shares the target QSA top-k workspace (%.1f MiB).",
+                    released / 2**20,
+                )
+        # Identical RoPE tables (the draft's text RoPE and the target's
+        # interleaved MRoPE share theta and length) are kept once.
+        target_tables = [
+            module.cos_sin_cache
+            for module in target_model.modules()
+            if isinstance(getattr(module, "cos_sin_cache", None), torch.Tensor)
+        ]
+        shared = 0
+        for module in self.modules():
+            own = getattr(module, "cos_sin_cache", None)
+            if not isinstance(own, torch.Tensor):
+                continue
+            for table in target_tables:
+                if (
+                    table is not own
+                    and table.shape == own.shape
+                    and table.dtype == own.dtype
+                    and table.device == own.device
+                    and torch.equal(table, own)
+                ):
+                    module.cos_sin_cache = table
+                    shared += own.numel() * own.element_size()
+                    break
+        if shared:
+            logger.info("MTP shares %.1f MiB of target RoPE tables.", shared / 2**20)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
