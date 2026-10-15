@@ -307,8 +307,11 @@ class LogitsProcessor(PluggableLayer):
         ):
             local_pair = pair_getter(hidden_states, embedding_bias)
         if local_pair is None:
-            local_top1 = lm_head.maybe_get_sm70_lm_head_top1(
-                hidden_states, embedding_bias
+            top1_getter = getattr(lm_head, "maybe_get_sm70_lm_head_top1", None)
+            local_top1 = (
+                None
+                if top1_getter is None
+                else top1_getter(hidden_states, embedding_bias)
             )
             if local_top1 is None:
                 logits = lm_head.quant_method.apply(

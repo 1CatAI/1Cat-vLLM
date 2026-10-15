@@ -33,11 +33,15 @@ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.draft_vocab import DraftVocab, make_draft_vocab
 from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
     PrefillEagleCudaGraphManager,
 )
-from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+    get_target_lm_head,
+    load_eagle_model,
+)
 from vllm.v1.worker.gpu.spec_decode.speculator import TargetSamplingHooks
 
 logger = init_logger(__name__)
@@ -228,6 +232,7 @@ class EagleSpeculator(TargetSamplingHooks):
         ).keys()
 
         self.model = load_eagle_model(target_model, self.vllm_config)
+        self.draft_vocab = self._maybe_make_draft_vocab(target_model)
         self._validate_local_argmax_reduction()
 
         draft_hf_config = self.draft_model_config.hf_config
@@ -423,6 +428,22 @@ class EagleSpeculator(TargetSamplingHooks):
             "(communication: O(2*tp_size) vs O(vocab_size))."
         )
 
+    def _maybe_make_draft_vocab(self, target_model: nn.Module) -> DraftVocab | None:
+        token_map = self.speculative_config.draft_token_map
+        if token_map is None:
+            return None
+        target_language_model = (
+            target_model.get_language_model()
+            if hasattr(target_model, "get_language_model")
+            else target_model
+        )
+        target_lm_head = get_target_lm_head(target_model, target_language_model)
+        if target_lm_head is None:
+            raise ValueError("draft_token_map requires the target lm_head.")
+        return make_draft_vocab(
+            token_map, self.vllm_config.model_config, self.model, target_lm_head
+        )
+
     def _sample_draft(
         self,
         hidden_states: torch.Tensor,
@@ -431,8 +452,14 @@ class EagleSpeculator(TargetSamplingHooks):
         draft_step: torch.Tensor,
         draft_logits: torch.Tensor | None,
     ) -> torch.Tensor:
+        draft_vocab = self.draft_vocab
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
+            if draft_vocab is not None:
+                # Rejection sampling reads the proposal over the full vocab.
+                logits = draft_vocab.scatter(
+                    draft_vocab.restrict(logits), self.vocab_size
+                )
             # This drafter's position contract keys the proposed token at pos + 1.
             return gumbel_sample(
                 logits,
@@ -447,9 +474,12 @@ class EagleSpeculator(TargetSamplingHooks):
                 use_fp64=self.use_fp64_gumbel,
             )
         if self.use_local_argmax_reduction:
-            return self.model.get_top_tokens(hidden_states)
+            top = self.model.get_top_tokens(hidden_states)
+            return top if draft_vocab is None else draft_vocab.col_to_target[top]
         logits = self.model.compute_logits(hidden_states)
-        return logits.argmax(dim=-1)
+        if draft_vocab is None:
+            return logits.argmax(dim=-1)
+        return draft_vocab.target_ids[draft_vocab.restrict(logits).argmax(dim=-1)]
 
     def _mtp_prefill_begin(self) -> None:
         if self.share_mtp_topk_indices:
