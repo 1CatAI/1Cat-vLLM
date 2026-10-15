@@ -161,15 +161,11 @@ class Ple(nn.Module):
         )
 
     def forward(self, hidden, ids, starts, context, *, hc_sequence_parallel=False):
-        assert hidden.shape[0] == ids.shape[0]
-        self.state[: hidden.shape[0]].copy_(hidden[:, 0])
-        output = hidden * 0.125
+        column = hidden[:, 0]
         if hc_sequence_parallel:
-            from vllm.models.qwen4_exp.nvidia.sm70_hc_prefill_peer import (
-                hc_sequence_shard_rows,
-            )
-
-            output = hc_sequence_shard_rows(output)
+            column = distributed.get_tp_group().all_gather(column.contiguous(), dim=0)
+        self.state[: ids.shape[0]].copy_(column[: ids.shape[0]])
+        output = hidden * 0.125
         return output
 
 

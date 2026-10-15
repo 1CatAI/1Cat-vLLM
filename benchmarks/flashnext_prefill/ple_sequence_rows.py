@@ -25,6 +25,7 @@ from vllm.config import CompilationConfig, set_current_vllm_config
 from vllm.config.kernel import KernelConfig
 from vllm.distributed import parallel_state
 from vllm.models.qwen4_exp.nvidia import ple_layer as ple
+from vllm.models.qwen4_exp.nvidia.sm70_hc_prefill_peer import hc_sequence_shard_rows
 
 
 class Projection(nn.Linear):
@@ -40,7 +41,6 @@ class Embedding(nn.Module):
         )
 
     def forward(self, hidden, ids, starts, context):
-        assert hidden.shape[0] == ids.shape[0]
         return self.data[: ids.shape[0]]
 
 
@@ -120,12 +120,13 @@ def main():
                     indices = torch.tensor([1, 4], device="cuda", dtype=torch.int32)
                     layer.state_args = metadata, indices, rows
                     layer.ple_embedding.data[:rows].normal_(0, 0.2)
+                    hidden_local = hc_sequence_shard_rows(hidden)
                     initial = layer.state.clone()
                     expected = layer(hidden, ids, starts, ids)
                     expected_state = layer.state.clone()
                     layer.state.copy_(initial)
                     actual_local = layer(
-                        hidden, ids, starts, ids, hc_sequence_parallel=True
+                        hidden_local, ids, starts, ids, hc_sequence_parallel=True
                     )
                     actual = group.all_gather(actual_local, dim=0)[:rows]
                     errors = [
@@ -153,7 +154,11 @@ def main():
                         for sequence in (False, True):
                             layer.state.copy_(initial)
                             compiled(
-                                hidden, ids, starts, ids, hc_sequence_parallel=sequence
+                                hidden_local if sequence else hidden,
+                                ids,
+                                starts,
+                                ids,
+                                hc_sequence_parallel=sequence,
                             )
                         layer.state.copy_(initial)
                         compiled_expected = compiled(
@@ -181,7 +186,11 @@ def main():
                             before = torch.accelerator.memory_allocated()
                             torch.accelerator.reset_peak_memory_stats()
                             result = compiled(
-                                hidden, ids, starts, ids, hc_sequence_parallel=sequence
+                                hidden_local if sequence else hidden,
+                                ids,
+                                starts,
+                                ids,
+                                hc_sequence_parallel=sequence,
                             )
                             torch.accelerator.synchronize()
                             peaks.append(
@@ -214,9 +223,14 @@ def main():
                         graph = torch.cuda.CUDAGraph()
                         with torch.cuda.graph(graph):
                             captured = compiled(
-                                hidden, ids, starts, ids, hc_sequence_parallel=True
+                                hidden_local,
+                                ids,
+                                starts,
+                                ids,
+                                hc_sequence_parallel=True,
                             )
                         hidden.mul_(0.75)
+                        hidden_local.mul_(0.75)
                         layer.ple_embedding.data[:rows].mul_(-0.5)
                         layer.state.copy_(initial)
                         changed = compiled(

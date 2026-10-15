@@ -477,15 +477,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            ple_hidden = (
-                get_tp_group().all_gather(hidden_states, dim=0)
-                if hc_sequence_parallel
-                else hidden_states
-            )
-            if hc_sequence_parallel:
-                ple_hidden = ple_hidden[: positions.shape[-1]]
             ple_output = self.ple(
-                ple_hidden,
+                hidden_states,
                 input_ids,
                 query_start_loc,
                 ngram_context,

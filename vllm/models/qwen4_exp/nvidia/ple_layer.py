@@ -1964,6 +1964,8 @@ class Qwen4ExpNGramEmbedding(PleOffloadLayer):
                 hidden_states,
                 self._packed_result_codebook,
                 layout["row_width"],
+                None,
+                num_tokens,
             )
         else:
             torch.ops.vllm.ple_offload_wait_decode_iq4nl(
@@ -3126,11 +3128,15 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         input_ids = snapshot_ple_diagnostic(
             input_ids, self.prefix + ":02_input_ids", diagnostic
         )
-        if input_ids.shape[0] != hidden_states.shape[0]:
+        expected_rows = (
+            (input_ids.shape[0] + 3) // 4
+            if hc_sequence_parallel
+            else input_ids.shape[0]
+        )
+        if expected_rows != hidden_states.shape[0]:
             raise ValueError(
-                "PLE expects input_ids and hidden_states to have the same "
-                f"token length, got {input_ids.shape[0]} and "
-                f"{hidden_states.shape[0]}"
+                f"PLE expects {expected_rows} hidden rows for "
+                f"{input_ids.shape[0]} query tokens, got {hidden_states.shape[0]}"
             )
         embeddings = self.ple_embedding(
             hidden_states,
@@ -3148,7 +3154,6 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             # Lookup/offload keeps its full-row ABI. Projection, gate and
             # grouped norms are row independent and need only this TP owner.
             embeddings = hc_sequence_shard_rows(embeddings)
-            hidden_states = hc_sequence_shard_rows(hidden_states)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         key = snapshot_ple_diagnostic(key, self.prefix + ":03_key", diagnostic)
