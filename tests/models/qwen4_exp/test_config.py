@@ -327,3 +327,28 @@ def test_qwen4_exp_qsa_uses_private_mrope_signature(
     assert calls == [
         (torch.Size([3, 2, 2]), torch.Size([3, 2, 2]), [1, 0, 0], 4, 2, True)
     ]
+
+
+@pytest.mark.parametrize("language_model_only", [True, False])
+def test_sm70_decode_lane_covers_vision_wrapper(language_model_only: bool) -> None:
+    from vllm.model_executor.models.runtime_defaults import (
+        _is_sm70_qwen38_decode_compile_contract,
+    )
+
+    model_config = SimpleNamespace(
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        multimodal_config=SimpleNamespace(language_model_only=language_model_only),
+        dtype=torch.float16,
+    )
+    assert _is_sm70_qwen38_decode_compile_contract(
+        model_config, None, SimpleNamespace()
+    )
+    model_config.dtype = torch.bfloat16
+    assert not _is_sm70_qwen38_decode_compile_contract(
+        model_config, None, SimpleNamespace()
+    )
+    model_config.dtype = torch.float16
+    model_config.multimodal_config = None
+    assert not _is_sm70_qwen38_decode_compile_contract(
+        model_config, None, SimpleNamespace()
+    )

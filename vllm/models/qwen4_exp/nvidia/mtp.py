@@ -82,6 +82,7 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     _hc_sequence_rows,
     _make_qwen38_decode_compile_config,
+    cublas_fp16_accumulation,
 )
 from .sm70_fp16_gemv import enable_qwen38_sm70_fp16_gemv
 from .sm70_fp16_hc import enable_qwen38_sm70_fp16_fused_hc
@@ -873,7 +874,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             and hidden_states.dtype == torch.float16
             and hidden_states.shape == (positions.shape[-1], 10240)
             and intermediate is None
-            and not torch.backends.cuda.matmul.allow_fp16_accumulation
+            and not cublas_fp16_accumulation()
             and is_forward_context_available()
             and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
         )

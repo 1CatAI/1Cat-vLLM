@@ -110,6 +110,13 @@ from .qsa import Qwen4ExpQSAAttention
 logger = init_logger(__name__)
 
 
+@torch.compiler.assume_constant_result
+def cublas_fp16_accumulation() -> bool:
+    """The process-wide cuBLAS FP16-accumulation flag, constant under Dynamo
+    (whose tracer cannot call its C getter)."""
+    return bool(torch.backends.cuda.matmul.allow_fp16_accumulation)
+
+
 def without_modelopt_fp4(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
@@ -1400,7 +1407,7 @@ class Qwen4ExpForCausalLM(
             and intermediate_tensors is None
             and kwargs.get("deepstack_input_embeds") is None
             and (inputs_embeds is None or inputs_embeds.dtype == torch.float16)
-            and not torch.backends.cuda.matmul.allow_fp16_accumulation
+            and not cublas_fp16_accumulation()
             and is_forward_context_available()
             and get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
         )
