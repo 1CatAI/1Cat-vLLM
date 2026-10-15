@@ -25,6 +25,8 @@ from vllm.config import CompilationConfig, set_current_vllm_config
 from vllm.config.execution_policy import CommunicationPolicy
 from vllm.config.kernel import KernelConfig
 from vllm.distributed import parallel_state
+from vllm.model_executor.layers import linear
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.models.qwen4_exp.nvidia import model as adapter
 from vllm.models.qwen4_exp.nvidia import mtp, sm70_mtp_fc
 
@@ -50,7 +52,7 @@ class MoE(adapter.Qwen4ExpSparseMoeBlock):
         raise AssertionError("Draft must preserve its original producer reduction")
 
 
-def make_predictor(group, rank):
+def make_predictor(group, rank, project_fc=False):
     owner = mtp.Qwen4ExpMultiTokenPredictor.__new__(mtp.Qwen4ExpMultiTokenPredictor)
     nn.Module.__init__(owner)
     owner.hc_count, owner.hidden_size, owner.num_mtp_layers = 4, 2560, 1
@@ -61,6 +63,21 @@ def make_predictor(group, rank):
         "fc_hidden",
     ):
         setattr(owner, name, nn.Identity())
+    if project_fc:
+        for name in ("fc_embedding", "fc_hidden"):
+            layer = object.__new__(linear.ColumnParallelLinear)
+            nn.Module.__init__(layer)
+            layer.weight = nn.Parameter(
+                torch.randn(640, 2560, device="cuda", dtype=torch.half) * 0.01,
+                requires_grad=False,
+            )
+            layer.bias, layer.skip_bias_add = None, False
+            layer.tp_size, layer.gather_output, layer.return_bias = 4, True, False
+            layer.quant_method = linear.UnquantizedLinearMethod()
+            layer._layer_trace = NS(unquant_debug=False)
+            setattr(owner, name, layer)
+        owner.pre_fc_norm_embedding = GemmaRMSNorm(2560).half().cuda()
+        owner.pre_fc_norm_hidden = GemmaRMSNorm(10240).half().cuda()
     layer = adapter.Qwen4ExpDecoderLayer.__new__(adapter.Qwen4ExpDecoderLayer)
     nn.Module.__init__(layer)
     layer.ple, layer.layer_type = None, "full_attention"
@@ -76,6 +93,7 @@ def make_predictor(group, rank):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--project-fc", action="store_true")
     parser.add_argument(
         "--tokens", nargs="+", type=int, default=[4096, 4097, 8192, 16384]
     )
@@ -86,6 +104,15 @@ def main():
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
     dist.init_process_group("gloo")
     group = Group(rank)
+
+    def gather_columns(x):
+        gathered = group.all_gather(x, dim=0)
+        return (
+            gathered.reshape(4, *x.shape)
+            .movedim(0, x.ndim - 1)
+            .reshape(*x.shape[:-1], 4 * x.shape[-1])
+        )
+
     cfg = NS(
         kernel_config=KernelConfig(),
         parallel_config=NS(communication=CommunicationPolicy()),
@@ -98,10 +125,12 @@ def main():
             patch.object(distributed, "get_tp_group", lambda: group),
             patch.object(adapter, "get_tp_group", lambda: group),
             patch.object(mtp, "get_tp_group", lambda: group),
+            patch.object(sm70_mtp_fc, "get_tp_group", lambda: group),
+            patch.object(linear, "tensor_model_parallel_all_gather", gather_columns),
             patch.object(sm70_mtp_fc, "maybe_combine_fc", lambda *args: None),
             set_current_vllm_config(cfg),
         ):
-            owner = make_predictor(group, rank)
+            owner = make_predictor(group, rank, args.project_fc)
             view = mtp._Qwen4ExpMTPPrefillSequenceModel(
                 target_model=owner, vllm_config=cfg
             )
@@ -134,9 +163,18 @@ def main():
                     assert actual[1].data_ptr() != hidden.data_ptr()
                     return errors
 
+                torch.cuda.synchronize()
+                base = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
                 reference = expected()
+                torch.cuda.synchronize()
+                baseline_peak = torch.cuda.max_memory_allocated() - base
                 group.counts = {"ar": 0, "rs": 0, "ag": 0}
+                base = torch.cuda.memory_allocated()
+                torch.cuda.reset_peak_memory_stats()
                 actual = view(ids, positions, hidden, inputs_embeds=embeds)
+                torch.cuda.synchronize()
+                candidate_peak = torch.cuda.max_memory_allocated() - base
                 counters = group.counts.copy()
                 assert counters["ar"] == 2 and counters["rs"] == 0, counters
                 errors = check(actual, reference)
@@ -154,6 +192,8 @@ def main():
                         errors=errors,
                         replay_errors=replay_errors,
                         collectives=counters,
+                        baseline_peak_mib=baseline_peak / 2**20,
+                        candidate_peak_mib=candidate_peak / 2**20,
                     )
                 )
                 del graph, captured, actual, reference, hidden, source, embeds
