@@ -206,6 +206,33 @@ class QSAIndexer(nn.Module):
             compress_ratio=self.compress_ratio,
             vllm_config=vllm_config,
         )
+        self._persistent_indexer_stage = None
+        if (
+            vllm_config.kernel_config.sm70_qsa_indexer_persistent_keys
+            and self.indexer_staging_workspace is not None
+            and self.selection_tp_group is not None
+        ):
+            spec = vllm_config.speculative_config
+            if (
+                vllm_config.kv_transfer_config is not None
+                or vllm_config.cache_config.kv_offloading_size is not None
+                or (spec is not None and spec.method not in (None, "mtp"))
+            ):
+                raise ValueError(
+                    "Persistent indexer pages require tracked local cache writers"
+                )
+            from .ops.qsa_shared_key import load_operator
+
+            if not load_operator() or not hasattr(
+                torch.ops.vllm_sm70_qsa_indexer, "run_staged_banked"
+            ):
+                raise ValueError(
+                    "Persistent indexer pages require the matching native build"
+                )
+            if self.selection_tp_group.rank_in_group == 0:
+                state = self.indexer_staging_workspace.persistent_layer(self.prefix)
+                self._persistent_indexer_stage = state
+                self.indexer_staging_workspace = state
         self.compressed_key_cache = QSACompressedKeyCache(
             head_size=self.index_head_dim,
             dtype=vllm_config.model_config.dtype,
@@ -213,6 +240,11 @@ class QSAIndexer(nn.Module):
             prefix=f"{cache_prefix}compressed_key_cache",
             cache_config=cache_config,
             vllm_config=vllm_config,
+            binding_observer=(
+                self._persistent_indexer_stage.bind
+                if self._persistent_indexer_stage is not None
+                else None
+            ),
         )
 
     @property
@@ -389,6 +421,11 @@ class QSAIndexer(nn.Module):
                     raw_metadata.slot_mapping,
                     position_rows,
                 )
+
+        if self._persistent_indexer_stage is not None:
+            self._persistent_indexer_stage.touch(
+                compressed_metadata.slot_mapping[:num_tokens]
+            )
 
         if self.skip_topk or not select:
             if out is None:

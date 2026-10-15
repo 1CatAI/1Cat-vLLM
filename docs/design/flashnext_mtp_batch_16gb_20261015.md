@@ -695,3 +695,50 @@ unroute order. At M40, 128 expert IDs and 149 active groups, the sort/plan-inclu
 cost changes 0.102674 to 0.100932 ms for IQ4_NL and 0.077722 to 0.076186 ms for
 Q2_0; outputs remain byte-exact. These 1.7%/2.0% gains fail the predeclared
 8% screen threshold. The research source is archived and not integrated.
+
+## Latest whole-model HC result and next indexer candidate
+
+The normal coalesced HC artifact completes ordinary task checks and the
+separate synchronized-verifier run. Whole-batch verifier means at C1/2/4/6/8
+are 17.652 / 26.573 / 36.066 / 43.682 / 53.886 ms, with 187 / 202 / 222 /
+189 / 199 complete TP4 rounds and no incomplete rounds. Draft means are
+3.857 / 4.604 / 5.949 / 7.499 / 8.754 ms. These are whole batches, without
+dividing by request count. C2/C4/C8 targets of 18/22/28 ms remain unmet.
+Ordinary common-interval aggregate rates are 125.41 / 138.15 / 239.56 /
+261.18 / 298.48 tok/s; additional C2/C8 repetitions give 141.43/327.25.
+Retrieval/arithmetic, executable code, automatic tools and natural EOS pass.
+The C2 regression remains unresolved, and this is not a general MTP speed win.
+
+A two-hop HC peer reduction retains bytes but regresses the direct graph
+screen: C4 0.061217 to 0.071124 ms and C8 0.105724 to 0.126098 ms. It remains
+research-only and is rejected. Its extra rendezvous does not amortize the
+smaller peer fanout.
+
+The next default-off candidate is `sm70_qsa_indexer_persistent_keys`. It
+reuses the existing FP16 shared-key scoring family, with one bounded per-layer
+bank plus the existing shared refresh bank. Physical-page tags and int64
+write versions identify reusable pages. Both fused and reference compressed
+writers advance versions before selection or its MTP skip path. Versions
+never rewind with speculative visibility. Every cache bind clears tags,
+including same-tensor rebinding before recapture. Hash collisions use freshly
+copied spill pages, then the existing authoritative paged reader for overflow.
+The default staging path still refreshes every live page on every selection.
+
+The accelerated subset is the existing SM70 FP16 H4/KV1/D128 host-indexer
+path with TP4 root selection, CP1 and PP1. External KV transfer, KV offload
+and speculation methods other than ordinary MTP have untracked writers and
+are explicitly rejected when this candidate would be selected. Other layouts
+retain the existing path. A mismatched cache binding retains protected
+refresh; closed owners reject reuse. Normal native loading requires the
+matching `run_staged_banked` operation; prior native schemas remain unchanged.
+This changes neither attention selection arithmetic nor KV storage format.
+
+At compressed page size204, 16384-key per-layer banks add approximately48MiB
+on the selection root across twelve QSA target layers; the shared refresh
+bank remains32768 keys. Startup, cold prefill and captured C8 generation must
+fit the unchanged expert placement and memory contract. A private NUMA1
+operator screen improves shared-prefix C8 from0.367 to0.197ms and independent
+C8 from2.976 to2.309ms. These local figures do not establish whole-verifier
+speed, actual256K performance, broad numerical coverage or production quality.
+The one-bank variant regressed independent C8 by7.6% and was rejected before
+runtime integration. Normal-artifact state and model gates remain separate.

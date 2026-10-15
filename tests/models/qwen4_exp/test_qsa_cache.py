@@ -38,6 +38,7 @@ def test_qsa_real_cache_specs_keep_only_target_main_sharded(
     config = SimpleNamespace(
         cache_config=SimpleNamespace(block_size=1600),
         parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+        kernel_config=SimpleNamespace(qsa_host_indexer_history=False),
     )
     main = _bare_qsa_attention(output_width=4)
     main.layer_name = prefix
@@ -81,6 +82,7 @@ def test_cache_binding_retains_owner_history_policy(monkeypatch, is_draft):
     attention.host_kv_device_reference = True
     attention.host_kv_is_draft = is_draft
     attention.host_kv_direct_device = True
+    attention.host_kv_hot_fp8 = False
     attention.host_kv_dtype = "float16" if is_draft else "fp8_e4m3"
     attention.head_dim = 256
     seen = {}
@@ -311,3 +313,26 @@ def test_host_qsa_only_initializes_graph_padding(active: int, padded: int) -> No
     assert torch.equal(output[:active], query[:active] * 2)
     assert torch.count_nonzero(output[active:]).item() == 0
     assert calls == ([active] if active else [])
+
+
+def test_compressed_cache_binding_notifies_each_generation():
+    from vllm.config import CacheConfig, VllmConfig
+
+    config = VllmConfig()
+    seen: list[torch.Tensor] = []
+    cache = QSACompressedKeyCache(
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        cache_config=CacheConfig(block_size=816),
+        prefix="test.compressed",
+        vllm_config=config,
+        binding_observer=seen.append,
+    )
+    first = torch.empty(2, 204, 1, 128, dtype=torch.float16)
+    second = torch.empty_like(first)
+    for bound in (first, first, second):
+        cache.bind_kv_cache(bound)
+        assert cache.kv_cache is bound
+    assert len(seen) == 3
+    assert seen[0] is first and seen[1] is first and seen[2] is second

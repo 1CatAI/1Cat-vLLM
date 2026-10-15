@@ -54,6 +54,27 @@ def load_operator():
         ):
             return None
 
+    if hasattr(torch.ops.vllm_sm70_qsa_indexer, "run_staged_banked"):
+
+        @torch.library.register_fake("vllm_sm70_qsa_indexer::run_staged_banked")
+        def fake_banked(
+            scores,
+            visible,
+            q,
+            cache,
+            table,
+            requests,
+            positions,
+            lengths,
+            divisor,
+            compress,
+            staged,
+            page_slots,
+            spill,
+            spill_slots,
+        ):
+            return None
+
     return True
 
 
@@ -105,7 +126,9 @@ def maybe_shared_key_scores(
         else ()
     )
     op = (
-        torch.ops.vllm_sm70_qsa_indexer.run_staged
+        torch.ops.vllm_sm70_qsa_indexer.run_staged_banked
+        if len(staged) == 4
+        else torch.ops.vllm_sm70_qsa_indexer.run_staged
         if staged
         else torch.ops.vllm_sm70_qsa_indexer.run
     )
@@ -190,7 +213,9 @@ def maybe_shared_key_batch_scores(
         else ()
     )
     op = (
-        torch.ops.vllm_sm70_qsa_indexer.run_staged
+        torch.ops.vllm_sm70_qsa_indexer.run_staged_banked
+        if len(staged) == 4
+        else torch.ops.vllm_sm70_qsa_indexer.run_staged
         if staged
         else torch.ops.vllm_sm70_qsa_indexer.run
     )

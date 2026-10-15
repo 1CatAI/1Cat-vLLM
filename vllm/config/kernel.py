@@ -926,6 +926,14 @@ class KernelConfig:
     Qualified SM70 FP16 host indexer history borrows a bounded engine-owned
     device bank. Overflow pages retain the authoritative paged reader.
     """
+
+    sm70_qsa_indexer_persistent_keys: bool = False
+    """Reuse versioned per-layer indexer pages on the staged TP4 host path.
+
+    Bound writers and cache rebinding invalidate the cached copy. A shared
+    refresh bank and the retained paged reader handle hash/capacity overflow.
+    External KV transfer/offload and tree-copy speculation are not admitted.
+    """
     qsa_host_kv: bool = False
     """Keep QSA attention history in pinned host storage on SM70."""
     qsa_host_kv_dtype: Literal["fp8_e4m3", "float16"] = "fp8_e4m3"
@@ -1146,9 +1154,12 @@ class KernelConfig:
         if not self.sm70_hcx:
             ignored_factors.add("sm70_hcx_batch_max_m")
             ignored_factors.add("sm70_hcx_batch_fusion")
+        if not (self.sm70_qsa_indexer_stage_keys and self.sm70_qsa_indexer_single_rank):
+            ignored_factors.add("sm70_qsa_indexer_persistent_keys")
         if not self.sm70_qsa_shared_key:
             ignored_factors.add("sm70_qsa_shared_key_batch")
             ignored_factors.add("sm70_qsa_indexer_stage_keys")
+            ignored_factors.add("sm70_qsa_indexer_persistent_keys")
         if (
             not self.qsa_host_kv
             or not self.qsa_host_indexer_history
@@ -1156,6 +1167,7 @@ class KernelConfig:
         ):
             ignored_factors.add("sm70_qsa_indexer_single_rank")
             ignored_factors.add("sm70_qsa_indexer_stage_keys")
+            ignored_factors.add("sm70_qsa_indexer_persistent_keys")
         if not self.fused_fp16_aux_gemv_applicable:
             ignored_factors.add("fused_fp16_aux_gemv")
         if not self.qsa_auto_e4m3_active:
