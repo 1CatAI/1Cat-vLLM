@@ -3118,6 +3118,8 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        *,
+        hc_sequence_parallel: bool = False,
     ) -> torch.Tensor:
         diagnostic = self._sm70_hcx_diagnostics
         input_ids = input_ids.reshape(-1)
@@ -3140,6 +3142,13 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             embeddings, self.prefix + ":02_embeddings", diagnostic
         )
         embeddings = self._dequantize_embeddings(embeddings, hidden_states.dtype)
+        if hc_sequence_parallel:
+            from .sm70_hc_prefill_peer import hc_sequence_shard_rows
+
+            # Lookup/offload keeps its full-row ABI. Projection, gate and
+            # grouped norms are row independent and need only this TP owner.
+            embeddings = hc_sequence_shard_rows(embeddings)
+            hidden_states = hc_sequence_shard_rows(hidden_states)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         key = snapshot_ple_diagnostic(key, self.prefix + ":03_key", diagnostic)
@@ -3160,15 +3169,33 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         normalized = snapshot_ple_diagnostic(
             normalized, self.prefix + ":07_conv_input", diagnostic
         )
-        conv_output = torch.zeros_like(normalized)
-        torch.ops.vllm.qwen4_exp_ple_short_conv(
-            normalized,
-            conv_output,
-            self.prefix,
-        )
+        if hc_sequence_parallel:
+            from vllm.distributed import get_tp_group
+
+            # Convolution and its commit retain the original complete query,
+            # segment metadata, causal history and state owner. Padding is not
+            # committed; the returned residual is local again.
+            normalized = get_tp_group().all_gather(normalized, dim=0)[
+                : input_ids.shape[0]
+            ]
+        if hc_sequence_parallel:
+            # The native family already owns a complete result. Returning it
+            # avoids a second full-width output, its zeroing and a copy.
+            conv_output = torch.ops.vllm.qwen4_exp_ple_short_conv_result(
+                normalized, self.prefix
+            )
+        else:
+            conv_output = torch.zeros_like(normalized)
+            torch.ops.vllm.qwen4_exp_ple_short_conv(
+                normalized,
+                conv_output,
+                self.prefix,
+            )
         conv_output = snapshot_ple_diagnostic(
             conv_output, self.prefix + ":08_conv_output", diagnostic
         )
+        if hc_sequence_parallel:
+            conv_output = hc_sequence_shard_rows(conv_output)
         return gated_value.flatten(-2) + conv_output
 
 
@@ -3188,6 +3215,30 @@ def qwen4_exp_ple_short_conv_fake(
     layer_name: str,
 ) -> None:
     return
+
+
+def qwen4_exp_ple_short_conv_result(
+    inputs: torch.Tensor, layer_name: str
+) -> torch.Tensor:
+    layer = get_forward_context().no_compile_layers[layer_name]
+    result = layer._short_conv(inputs)
+    if result.shape == inputs.shape:
+        return result
+    # Keep the old initialized-padding contract for padded or profiling calls.
+    output = torch.zeros_like(inputs)
+    output[: result.shape[0]].copy_(result)
+    return output
+
+
+def qwen4_exp_ple_short_conv_result_fake(inputs, layer_name):
+    return torch.empty_like(inputs)
+
+
+direct_register_custom_op(
+    op_name="qwen4_exp_ple_short_conv_result",
+    op_func=qwen4_exp_ple_short_conv_result,
+    fake_impl=qwen4_exp_ple_short_conv_result_fake,
+)
 
 
 def qwen4_exp_compute_ple_ngram_ids(

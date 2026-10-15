@@ -489,9 +489,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                **({"hc_sequence_parallel": True} if hc_sequence_parallel else {}),
             )
-            if hc_sequence_parallel:
-                ple_output = _hc_sequence_rows(ple_output)
             hidden_states = hidden_states + ple_output
             hidden_states = snapshot_ple_diagnostic(
                 hidden_states, self.ple.prefix + ":09_after_add", diagnostic

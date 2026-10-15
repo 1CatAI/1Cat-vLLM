@@ -160,10 +160,17 @@ class Ple(nn.Module):
             "state", torch.full((16384,), -99, device="cuda", dtype=torch.half)
         )
 
-    def forward(self, hidden, ids, starts, context):
+    def forward(self, hidden, ids, starts, context, *, hc_sequence_parallel=False):
         assert hidden.shape[0] == ids.shape[0]
         self.state[: hidden.shape[0]].copy_(hidden[:, 0])
-        return hidden * 0.125
+        output = hidden * 0.125
+        if hc_sequence_parallel:
+            from vllm.models.qwen4_exp.nvidia.sm70_hc_prefill_peer import (
+                hc_sequence_shard_rows,
+            )
+
+            output = hc_sequence_shard_rows(output)
+        return output
 
 
 def make_model(group, rank):
