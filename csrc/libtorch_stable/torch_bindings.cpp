@@ -466,6 +466,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor topk_ids, int top_k, "
       "int type, SymInt row, SymInt tokens) -> Tensor");
 
+  ops.def(
+      "ggml_moe_a8_vec_rows(Tensor X, Tensor W, Tensor topk_ids, int top_k, "
+      "int type, SymInt row, SymInt tokens) -> Tensor");
+
   ops.def("ggml_moe_get_block_size(int type) -> int");
 
   // Mamba selective scan kernel
@@ -623,6 +627,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));
+  ops.impl("ggml_moe_a8_vec_rows", TORCH_BOX(&ggml_moe_a8_vec_rows));
   ops.impl("selective_scan_fwd", TORCH_BOX(&selective_scan_fwd));
 
   ops.impl("paged_attention_v1", TORCH_BOX(&paged_attention_v1));

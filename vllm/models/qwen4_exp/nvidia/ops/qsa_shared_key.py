@@ -75,6 +75,11 @@ def load_operator():
         ):
             return None
 
+        if hasattr(torch.ops.vllm_sm70_qsa_indexer, "run_staged_banked_batch"):
+            torch.library.register_fake(
+                "vllm_sm70_qsa_indexer::run_staged_banked_batch"
+            )(fake_banked)
+
     return True
 
 
@@ -162,7 +167,7 @@ def maybe_shared_key_batch_scores(
     query_start_loc_cpu,
     staging_workspace=None,
 ):
-    """Reuse the single-request provider without changing batched top-k.
+    """Reuse shared-key scoring without changing batched top-k.
 
     Query starts are the owner's host layout, including capture padding.
     All device metadata remains live across graph replays. An unqualified
@@ -212,6 +217,27 @@ def maybe_shared_key_batch_scores(
         and hasattr(torch.ops.vllm_sm70_qsa_indexer, "run_staged")
         else ()
     )
+    if (
+        len(staged) == 4
+        and len(groups) == table.shape[0]
+        and all(end - start == 5 for _, start, end in groups)
+        and hasattr(torch.ops.vllm_sm70_qsa_indexer, "run_staged_banked_batch")
+    ):
+        torch.ops.vllm_sm70_qsa_indexer.run_staged_banked_batch(
+            scores,
+            visible,
+            q,
+            cache,
+            table,
+            requests,
+            positions,
+            lengths,
+            float(divisor),
+            compress,
+            *staged,
+        )
+        logger.info_once("Using one SM70 shared-key grid for MTP4 request groups.")
+        return scores, visible
     op = (
         torch.ops.vllm_sm70_qsa_indexer.run_staged_banked
         if len(staged) == 4

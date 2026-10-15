@@ -15,7 +15,7 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-@pytest.mark.parametrize("c", [1, 2, 8])
+@pytest.mark.parametrize("c", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("capacity", [2, 4, 16])
 @pytest.mark.parametrize("page", [32, 204])
 def test_versioned_keys_track_writes_rebind_and_changed_graph(c, capacity, page):

@@ -182,3 +182,85 @@ def test_shared_key_batch_declines_unqualified_host_layouts(starts):
         )
         is None
     )
+
+
+@pytest.mark.parametrize("sizes", [[5, 5], [4, 6]])
+@pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+def test_banked_uniform_grid_admission_and_old_binary_fallback(
+    monkeypatch, sizes, available, position_dtype
+):
+    from types import SimpleNamespace
+
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_indexer_staging import (
+        QSAIndexerPersistentLayer,
+    )
+    from vllm.models.qwen4_exp.nvidia.ops.qsa_shared_key import load_operator
+
+    assert load_operator()
+    namespace = torch.ops.vllm_sm70_qsa_indexer
+    assert hasattr(namespace, "run_staged_banked_batch")
+    calls = []
+
+    def batch(*args):
+        calls.append(True)
+        return namespace.run_staged_banked_batch(*args)
+
+    operations = {
+        name: getattr(namespace, name)
+        for name in ("run", "run_staged", "run_staged_banked")
+    }
+    if available:
+        operations["run_staged_banked_batch"] = batch
+    monkeypatch.setattr(
+        torch.ops, "vllm_sm70_qsa_indexer", SimpleNamespace(**operations)
+    )
+    q = torch.randn(10, 4, 256, device="cuda", dtype=torch.float16)[..., ::2]
+    cache = torch.randn(12, 204, 1, 128, device="cuda", dtype=torch.float16)
+    table = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 4]], device="cuda", dtype=torch.int32)
+    table = torch.stack((table, table), dim=-1)[..., 0]  # Noncontiguous page rows.
+    requests = torch.repeat_interleave(
+        torch.arange(2, device="cuda", dtype=torch.int32),
+        torch.tensor(sizes, device="cuda"),
+    )
+    positions = torch.full((10,), 3200, device="cuda", dtype=position_dtype)
+    lengths = torch.tensor([3201, 3199], device="cuda", dtype=torch.int32)
+    starts = torch.tensor([0, sizes[0], 10], dtype=torch.int32)
+    owner = QSAIndexerStagingWorkspace(tokens=204)
+    state = QSAIndexerPersistentLayer(owner, tokens=4 * 204)
+    state.bind(cache)
+
+    def run(workspace):
+        return maybe_shared_key_batch_scores(
+            q,
+            cache,
+            table,
+            requests,
+            positions,
+            lengths,
+            4,
+            816,
+            128**0.5,
+            starts,
+            workspace,
+        )
+
+    expected = run(None)
+    actual = run(state)
+    assert bool(calls) == (available and sizes == [5, 5])
+    assert torch.equal(actual[1], expected[1])
+    for row, n in enumerate(expected[1].tolist()):
+        assert torch.equal(actual[0][row, :n], expected[0][row, :n])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run(state)
+    requests[-1] = -1
+    lengths[0] = 0
+    positions.sub_(17)
+    table.copy_(table.roll(1, 0))
+    graph.replay()
+    expected = run(None)
+    assert torch.equal(output[1], expected[1])
+    for row, n in enumerate(expected[1].tolist()):
+        if n > 0:
+            assert torch.equal(output[0][row, :n], expected[0][row, :n])

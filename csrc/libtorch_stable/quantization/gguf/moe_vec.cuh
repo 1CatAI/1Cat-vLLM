@@ -117,11 +117,11 @@ static void moe_vec_q8_0_q8_1_cuda(const void* vx, const void* vy,
                                    scalar_t* dst, const int* topk_ids,
                                    const int top_k, const int tokens,
                                    const int ncols, const int nrows,
-                                   const int token_stride,
-                                   cudaStream_t stream) {
-  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+                                   const int token_stride, cudaStream_t stream,
+                                   const int rows_per_cta = GGML_CUDA_MMV_Y) {
+  const int block_num_y = (nrows + rows_per_cta - 1) / rows_per_cta;
   const dim3 block_nums(block_num_y, 1, tokens * top_k);
-  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  const dim3 block_dims(WARP_SIZE, rows_per_cta, 1);
   moe_vec_q<scalar_t, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ,
             vec_dot_q8_0_q8_1><<<block_nums, block_dims, 0, stream>>>(
       vx, vy, dst, topk_ids, top_k, ncols, nrows, token_stride);

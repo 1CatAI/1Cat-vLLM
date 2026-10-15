@@ -20,14 +20,29 @@ namespace {
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                          \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
-template <typename Position, bool Staged = false, bool Banked = false>
+template <typename Position, bool Staged = false, bool Banked = false,
+          bool Batch = false>
 __global__ void mqa_multiquery(
     const half* q, const half* cache, const int* table, const int* requests,
     const Position* positions, const int* lengths, float* scores, int* visible,
     int m, int columns, int pages, int page_size, int table_width, int sq0,
-    int sq1, int sq2, int sc0, int sc1, int sc3, int st1, float divisor,
-    int compress, const half* staged, const int* page_slots, int staged_pages,
-    const half* spill, const int* spill_slots, int spill_pages) {
+    int sq1, int sq2, int sc0, int sc1, int sc3, int st1, int st0,
+    float divisor, int compress, const half* staged, const int* page_slots,
+    int staged_pages, const half* spill, const int* spill_slots,
+    int spill_pages) {
+  // Each grid-Y group keeps the retained M5 MMA/reduction order. Live global
+  // request IDs also preserve invalid/padded rows without a per-group subtract.
+  const int request_index = Batch ? blockIdx.y : 0;
+  if constexpr (Batch) {
+    q += int64_t(request_index) * 5 * sq0;
+    table += int64_t(request_index) * st0;
+    requests += request_index * 5;
+    positions += request_index * 5;
+    lengths += request_index;
+    scores += int64_t(request_index) * 5 * columns;
+    visible += request_index * 5;
+    m = 5;
+  }
   const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
   const int quad = (lane >> 2) & 3;
   const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
@@ -36,7 +51,7 @@ __global__ void mqa_multiquery(
   int end = 0;
   for (int row = 0; row < m; ++row) {
     const long long prefix = positions[row] + 1;
-    const long long length = requests[row] == 0 ? lengths[0] : 0;
+    const long long length = requests[row] == request_index ? lengths[0] : 0;
     const long long causal = prefix < length ? prefix : length;
     // Triton's signed integer division truncates toward zero, including
     // negative padded positions. Keep its visible-length metadata unchanged.
@@ -133,7 +148,7 @@ __global__ void mqa_multiquery(
       const int key_lane = (lane & ~3) | (k * 2 + (lane & 1));
       const bool valid =
           __shfl_sync(0xffffffff, static_cast<int>(key_valid), key_lane);
-      if ((lane & 2) == 0 && row < m && requests[row] == 0 &&
+      if ((lane & 2) == 0 && row < m && requests[row] == request_index &&
           column < columns && column < (positions[row] + 1) / compress &&
           column < lengths[0] / compress) {
         scores[row * columns + column] = valid ? sum / divisor : -CUDART_INF_F;
@@ -144,7 +159,7 @@ __global__ void mqa_multiquery(
 
 #undef QSA_MMA
 
-template <bool Staged, bool Banked = false>
+template <bool Staged, bool Banked = false, bool Batch = false>
 void mqa_out_impl(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
                   torch::Tensor cache, torch::Tensor table,
                   torch::Tensor requests, torch::Tensor positions,
@@ -154,9 +169,16 @@ void mqa_out_impl(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
                   const torch::Tensor& spill_slots = {}) {
   const c10::cuda::CUDAGuard guard(q.device());
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kHalf && q.dim() == 3 &&
-                  q.size(0) > 0 && q.size(0) <= 8 && q.size(1) == 4 &&
-                  q.size(2) == 128 && table.dim() == 2 && table.size(0) == 1,
-              "Shared-key MQA requires FP16 M1..8/H4/D128 and one request");
+                  q.size(0) > 0 && q.size(0) <= (Batch ? 40 : 8) &&
+                  q.size(1) == 4 && q.size(2) == 128 && table.dim() == 2,
+              "Shared-key MQA requires FP16 queries with H4/D128");
+  if constexpr (Batch) {
+    TORCH_CHECK(table.size(0) >= 1 && table.size(0) <= 8 &&
+                    q.size(0) == 5 * table.size(0),
+                "Batched shared-key MQA requires five rows per request, C1..8");
+  } else {
+    TORCH_CHECK(table.size(0) == 1, "Shared-key MQA requires one request");
+  }
   const int m = q.size(0), columns = scores.size(1);
   TORCH_CHECK(cache.dim() == 4 && cache.size(2) == 1 && cache.size(3) == 128 &&
                   cache.scalar_type() == at::kHalf &&
@@ -169,7 +191,8 @@ void mqa_out_impl(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
                 "MQA metadata must use same-device int32");
   TORCH_CHECK(scores.device() == q.device() && cache.device() == q.device() &&
                   requests.numel() >= m && positions.numel() >= m &&
-                  visible.numel() >= m && lengths.numel() >= 1,
+                  visible.numel() >= m &&
+                  lengths.numel() >= (Batch ? table.size(0) : 1),
               "MQA tensor extent mismatch");
   TORCH_CHECK(positions.device() == q.device() && positions.is_contiguous() &&
                   (positions.scalar_type() == at::kLong ||
@@ -214,8 +237,9 @@ void mqa_out_impl(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
   }
   if (!columns) return;
   if (positions.scalar_type() == at::kLong) {
-    mqa_multiquery<int64_t, Staged, Banked>
-        <<<(columns + 31) / 32, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+    mqa_multiquery<int64_t, Staged, Banked, Batch>
+        <<<dim3((columns + 31) / 32, Batch ? table.size(0) : 1), 128, 0,
+           at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const half*>(q.data_ptr()),
             reinterpret_cast<const half*>(cache.data_ptr()),
             table.data_ptr<int>(), requests.data_ptr<int>(),
@@ -223,11 +247,13 @@ void mqa_out_impl(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
             scores.data_ptr<float>(), visible.data_ptr<int>(), m, columns,
             cache.size(0), cache.size(1), table.size(1), q.stride(0),
             q.stride(1), q.stride(2), cache.stride(0), cache.stride(1),
-            cache.stride(3), table.stride(1), divisor, compress, staged_ptr,
-            slots_ptr, staged_pages, spill_ptr, spill_slots_ptr, spill_pages);
+            cache.stride(3), table.stride(1), table.stride(0), divisor,
+            compress, staged_ptr, slots_ptr, staged_pages, spill_ptr,
+            spill_slots_ptr, spill_pages);
   } else {
-    mqa_multiquery<int32_t, Staged, Banked>
-        <<<(columns + 31) / 32, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
+    mqa_multiquery<int32_t, Staged, Banked, Batch>
+        <<<dim3((columns + 31) / 32, Batch ? table.size(0) : 1), 128, 0,
+           at::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<const half*>(q.data_ptr()),
             reinterpret_cast<const half*>(cache.data_ptr()),
             table.data_ptr<int>(), requests.data_ptr<int>(),
@@ -235,8 +261,9 @@ void mqa_out_impl(torch::Tensor scores, torch::Tensor visible, torch::Tensor q,
             scores.data_ptr<float>(), visible.data_ptr<int>(), m, columns,
             cache.size(0), cache.size(1), table.size(1), q.stride(0),
             q.stride(1), q.stride(2), cache.stride(0), cache.stride(1),
-            cache.stride(3), table.stride(1), divisor, compress, staged_ptr,
-            slots_ptr, staged_pages, spill_ptr, spill_slots_ptr, spill_pages);
+            cache.stride(3), table.stride(1), table.stride(0), divisor,
+            compress, staged_ptr, slots_ptr, staged_pages, spill_ptr,
+            spill_slots_ptr, spill_pages);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -267,6 +294,17 @@ void mqa_banked_out(torch::Tensor scores, torch::Tensor visible,
                            positions, lengths, divisor, compress, staged,
                            page_slots, spill, spill_slots);
 }
+void mqa_banked_batch_out(torch::Tensor scores, torch::Tensor visible,
+                          torch::Tensor q, torch::Tensor cache,
+                          torch::Tensor table, torch::Tensor requests,
+                          torch::Tensor positions, torch::Tensor lengths,
+                          double divisor, int64_t compress,
+                          torch::Tensor staged, torch::Tensor page_slots,
+                          torch::Tensor spill, torch::Tensor spill_slots) {
+  mqa_out_impl<true, true, true>(scores, visible, q, cache, table, requests,
+                                 positions, lengths, divisor, compress, staged,
+                                 page_slots, spill, spill_slots);
+}
 }  // namespace
 TORCH_LIBRARY(vllm_sm70_qsa_indexer, m) {
   m.def(
@@ -286,5 +324,12 @@ TORCH_LIBRARY(vllm_sm70_qsa_indexer, m) {
       "lengths, float divisor, int compress, Tensor staged, Tensor page_slots, "
       "Tensor spill, Tensor spill_slots) -> ()");
   m.impl("run_staged_banked", torch::kCUDA, &mqa_banked_out);
+  m.def(
+      "run_staged_banked_batch(Tensor(a!) scores, Tensor(b!) visible, Tensor "
+      "q, "
+      "Tensor cache, Tensor table, Tensor requests, Tensor positions, Tensor "
+      "lengths, float divisor, int compress, Tensor staged, Tensor page_slots, "
+      "Tensor spill, Tensor spill_slots) -> ()");
+  m.impl("run_staged_banked_batch", torch::kCUDA, &mqa_banked_batch_out);
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

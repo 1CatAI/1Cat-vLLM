@@ -733,9 +733,10 @@ refresh; closed owners reject reuse. Normal native loading requires the
 matching `run_staged_banked` operation; prior native schemas remain unchanged.
 This changes neither attention selection arithmetic nor KV storage format.
 
-At compressed page size204, 16384-key per-layer banks add approximately48MiB
-on the selection root across twelve QSA target layers; the shared refresh
-bank remains32768 keys. Startup, cold prefill and captured C8 generation must
+At compressed page size204, 16384-key per-layer banks add approximately52.4MiB
+on the selection root across twelve target layers and one MTP layer; actual
+worker snapshots confirm thirteen persistent banks. The shared refresh bank
+remains32768 keys. Startup, cold prefill and captured C8 generation must
 fit the unchanged expert placement and memory contract. A private NUMA1
 operator screen improves shared-prefix C8 from0.367 to0.197ms and independent
 C8 from2.976 to2.309ms. These local figures do not establish whole-verifier
@@ -811,3 +812,105 @@ The new normal `_C` SHA256 is
 `a71013eeb238309d695d7f05977a20ea8681734af041b4671d08d45c16f5c700`.
 These local wins require separate whole-model qualification; they do not
 establish the requested28ms C8 verifier cost.
+
+The normal HC16 artifact subsequently completes the capacity-eight model run.
+Whole-batch C1/2/4/6/8 verifier means are15.987 /24.517 /32.963 /43.241 /
+51.328ms, with187 /228 /172 /161 /178 aligned TP4 rounds and zero incomplete
+rounds. Draft means are3.706 /4.460 /5.762 /7.692 /8.738ms. C8 improves from
+53.130ms, but C6 regresses from41.812ms. This is not a general MTP speed win;
+C2/C4/C8 targets remain unmet. Ordinary common-interval aggregate rates are
+138.93 /184.64 /247.54 /274.36 /318.55tok/s, with extra C2/C8 repetitions
+184.71 /335.22. All eight natural-EOS arithmetic checks and the C1/C8
+32K retrieval/arithmetic, executable-code and tool/reply gates pass. Actual
+worker maps confirm the normal core/indexer binaries without research DSOs.
+
+## Batched launch amortization
+
+A separate five-range graph-node trace has163 /121 /96 /70 /61 complete
+C1/2/4/6/8 rounds. Traced verifier means20.249 /27.794 /35.067 /48.265 /
+55.313ms are perturbed attribution figures, not replacements for the untraced
+model timings. Exclusive critical-rank wall categories sum to each verifier.
+From C1 to C8, HC grows2.469 to9.749ms, expert projections2.885 to9.473ms,
+dense/shared projections2.493 to6.638ms and selected QSA attention1.402 to
+3.735ms. Concurrent categories occupy0.998 to9.329ms: that interval represents
+overlap, not an overhead that may be added to service sums. Root-only indexer
+service must be inspected separately from non-root critical-rank categories.
+The trace cannot establish actual occupancy, memory stalls or NVLink bandwidth;
+NCU hardware counters are unavailable on this host.
+
+End-of-capture metadata snapshots show shared-prefix C1/2/4 indexers with
+41/43/47 unique physical pages and the same number of distinct leases. Only
+1/2/4 tail pages are refreshed. There is no hash-collision evidence to justify
+changing the persistent-bank indexing. The remaining per-request score launches
+are instead independent M5 computations over shared bank metadata.
+
+The batched-grid candidate adds an optional normal native
+`run_staged_banked_batch` operation to the existing shared-key provider. A
+second grid dimension handles uniform five-query request groups, with original
+FP16 MMA, FP32 reduction, visibility and paged-overflow semantics. Global live
+request IDs replace per-group subtraction. Runtime admission requires the
+existing versioned four-tensor bank, C2..8, and exactly five queries per group.
+C1, ragged groups, refresh-only staging and older binaries retain their existing
+operations. The previous three native names and schemas are unchanged; the
+new mutation schema has its own fake registration. No new workspace, provider,
+weight/cache format, configuration parameter or default promotion is introduced.
+
+A normal-flag private graph screen includes page planning, tracked tail writes
+and scoring. At32K shared-prefix C1/2/4/6/8, retained/batched means are
+0.04474/0.04459,0.06750/0.05509,0.10023/0.07313,0.13306/0.09531 and
+0.17483/0.11679ms per indexer. Independent-prefix C8 is2.20451/2.22023ms
+(0.7% regression, within the predeclared3% bound); other measured independent
+cases improve. All ten cases retain score/visibility bytes with changed cache
+writes and live graph metadata. These are private operator screens; normal
+artifact and whole-model evidence are recorded separately.
+
+The MTP Q8_0 draft uses the existing GGUF MoE family. Its retained vector kernel
+launches one32-thread CTA per expert output row; the traced C8 down projection
+alone launches1,024,000 CTAs. The row-batched operation groups eight independent
+output warps in one CTA, retaining activation quantization, dp4a, per-warp
+FP32 accumulation, FP16 stores and weighted expert reduction. The shared GGUF
+executor keeps the above64-token MMQ path. Native and fused-MoE schemas gain
+new optional names while the existing public signatures remain unchanged.
+The MTP method binds the operation once after weight loading for SM70 with a
+matching native symbol; other hardware or older artifacts retain the previous
+executor. This does not alter quantized checkpoint bytes or expert placement.
+
+A fourteen-case private screen uses actual TP4 projection dimensions,64
+experts and logical M1/2/5/8/10/20/40. All eager and changed-input/routing graph
+outputs retain bytes. The down projection improves3.67..4.45x; C8-aligned
+M40 drops1.45110 to0.34090ms. Gate/up improves approximately1.08x at M40,
+with a1.6% M2 regression within the3% small-case limit. This optimization
+addresses draft cost, not the target verifier. Full512-expert weighted output,
+normal artifact, capture/AOT, threshold and complete MTP4 gates remain separate.
+
+The first normal-artifact pass has85 passing cases and one failing M65
+weighted-MoE boundary case. The retained MMQ kernel incorrectly skips every
+expert ID above255, leaving output rows uninitialized for this512-expert
+model. A smaller32-expert diagnostic is finite across K160/256/2560, ruling
+out the initial K-padding hypothesis. The shared MMQ kernel now skips only
+negative padding IDs; valid expert IDs still come from the existing checked
+route layout. Regression coverage includes expert-count neighbors256/257,
+the actual512 count and513, plus full512-expert weighted M64/M65 graphs.
+The operation order and MMQ/vector threshold remain unchanged. This fixes
+prefill/boundary draft computation; it does not claim a verifier speedup.
+
+The corrected normal artifacts pass90 GPU/initialization/state cases, including
+full512-expert M0/1/2/5/8/10/20/40/64/65 weighted outputs, changed-input and
+routing graph replay, row tails1/7/8/9/319/321, fake/AOT dispatch and compiled
+fused MoE. Versioned-bank cases now include C4/C6, two position integer types,
+noncontiguous Q/table views, ragged request groups and missing-new-op fallback.
+The existing approximate dequantized-reference checks also pass. Native byte
+comparisons are used where operation order is unchanged; MMQ vs vector
+expert-ID coverage uses a predeclared relative norm error bound of0.002.
+
+The normal512-expert vector-operation screen includes allocation, quantization
+and stores. At aligned M40, gate/up drops0.42917 to0.40934ms and down drops
+1.45505 to0.34477ms; eager and changed-input graphs retain bytes. The normal
+indexer screen reproduces shared-prefix C8 0.17455 to0.11694ms, while independent
+C8 is2.19487 to2.19086ms. Whole-model verification remains a separate gate.
+Fresh-process dependency inspection loads only normal source-owned artifacts.
+The stable-libtorch SHA256 is
+`45282c1a7a29f694d5d1832a23c0a0731bf9f3853546582c5c0a14f7bdfec37b`;
+the indexer SHA256 is
+`ae483cb461ce78a5f37a3c7f52c297f0cdd8d9211eacc4133acba58bf8d39848`.
+The HC/core artifact remains the qualified`a71013ee` build.
