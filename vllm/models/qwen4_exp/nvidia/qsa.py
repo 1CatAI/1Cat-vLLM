@@ -154,12 +154,15 @@ def _qsa_rope_cache_length(config, model_config) -> int:
     """Bound fixed-frequency text RoPE by the engine's position limit."""
     mm_config = model_config.multimodal_config
     text_only = mm_config is None or mm_config.language_model_only
-    if not text_only or config.rope_parameters.get("rope_type", "default") != "default":
+    # Image MRoPE positions advance by at most one per token, so they stay
+    # below max_model_len like text; only video time indices can exceed it.
+    bounded = text_only or mm_config.get_limit_per_prompt("video") == 0
+    if not bounded or config.rope_parameters.get("rope_type", "default") != "default":
         return config.max_position_embeddings
     limit = min(config.max_position_embeddings, model_config.max_model_len)
     if config.rope_parameters.get("mrope_section"):
-        # MRotaryEmbedding enlarges its cache 4x for video positions. Text-only
-        # positions stay below max_model_len, so a quarter covers every row;
+        # MRotaryEmbedding enlarges its cache 4x for video positions. Text and
+        # image positions stay below max_model_len, so a quarter covers every row;
         # each row's values do not depend on the table length.
         return -(-limit // 4)
     return limit
