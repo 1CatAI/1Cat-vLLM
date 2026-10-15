@@ -469,15 +469,25 @@ class GGUFModelLoader(BaseModelLoader):
             gguf_weights_map = self._get_gguf_weights_map(model_config)
             self._gguf_prepared_model_config = model_config
             self._gguf_prepared_weights_map = gguf_weights_map
+        adapter = getattr(self, "_native_adapter", None)
+        language_prefix = getattr(adapter, "language_model_prefix", "")
+        weight_prefix = ""
+        if (
+            language_prefix
+            and model is not None
+            and any(name == language_prefix for name, _ in model.named_modules())
+        ):
+            weight_prefix = language_prefix + "."
         if skip_weight is not None:
             gguf_weights_map = {
                 raw: name
                 for raw, name in gguf_weights_map.items()
-                if not skip_weight(name)
+                if not skip_weight(weight_prefix + name)
             }
-        yield from self._get_weights_iterator(
+        for name, tensor in self._get_weights_iterator(
             model_config, local_model_path, gguf_weights_map
-        )
+        ):
+            yield weight_prefix + name, tensor
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         model.load_weights(self.get_all_weights(model_config, model))

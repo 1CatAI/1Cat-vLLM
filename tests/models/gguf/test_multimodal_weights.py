@@ -167,3 +167,47 @@ def test_legacy_multimodal_still_requires_mmproj(monkeypatch):
     config = SimpleNamespace(hf_config=SimpleNamespace(vision_config=object()))
     with pytest.raises(AssertionError, match="mm_proj"):
         loader._get_gguf_weight_type(config, "text.gguf", {})
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_native_stream_names_follow_the_receiving_model(monkeypatch, wrapped):
+    from vllm.config import LoadConfig
+    from vllm.model_executor.models.qwen3_vl import Qwen3VLForConditionalGeneration
+    from vllm.model_executor.models.utils import AutoWeightsLoader
+
+    loader = GGUFModelLoader(LoadConfig(load_format="gguf"))
+    loader._native_adapter = SimpleNamespace(language_model_prefix="language_model")
+    root = torch.nn.Module()
+    root.language_model = torch.nn.Module()
+    root.language_model.model = torch.nn.Module()
+    root.language_model.model.ple = torch.nn.Linear(2, 2, bias=False)
+    receiving = root if wrapped else root.language_model
+    names = {"ple": "model.ple.weight", "unrelated": "model.other.weight"}
+    monkeypatch.setattr(loader, "_prepare_weights", lambda _: "text.gguf")
+    monkeypatch.setattr(loader, "_get_gguf_weights_map", lambda _: names)
+    touched = []
+
+    def iterator(config, path, filtered):
+        for raw, name in filtered.items():
+            assert raw == "ple", "non-PLE payload must not be touched"
+            touched.append(raw)
+            yield name, torch.ones(2, 2)
+
+    monkeypatch.setattr(loader, "_get_weights_iterator", iterator)
+    prefix = "language_model." if wrapped else ""
+    mapper = Qwen3VLForConditionalGeneration.hf_to_vllm_mapper if wrapped else None
+    seen = []
+
+    def skip(name):
+        seen.append(name)
+        return name != prefix + "model.ple.weight"
+
+    weights = list(
+        loader.get_all_weights(SimpleNamespace(), receiving, skip_weight=skip)
+    )
+    assert touched == ["ple"]
+    assert seen == [prefix + n for n in names.values()]
+    assert weights[0][0] == prefix + "model.ple.weight"
+    loaded = AutoWeightsLoader(receiving).load_weights(weights, mapper=mapper)
+    assert loaded == {prefix + "model.ple.weight"}
+    torch.testing.assert_close(root.language_model.model.ple.weight, torch.ones(2, 2))
