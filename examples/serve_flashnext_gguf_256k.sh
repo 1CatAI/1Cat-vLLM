@@ -65,7 +65,7 @@ config = {
     "qsa_host_kv_prefill_stage_tokens": 525504,
     "qsa_host_kv_prefill_stage_slots": 1,
     "qsa_host_kv_trim_warmup_cache": True,
-    "qsa_host_kv_allocator_headroom_mib": 512,
+    "qsa_host_kv_allocator_headroom_mib": 192,
     "sm70_sparse": {
         "qsa_score_tile_mb": 32, "qsa_prefill_tp_rows": True,
         "qsa_decode_partition_topk": True,
