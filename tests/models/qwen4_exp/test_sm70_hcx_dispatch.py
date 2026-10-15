@@ -378,7 +378,7 @@ def test_diagnostic_snapshots_own_storage_and_reuse_addresses(monkeypatch):
     assert snapshot["epoch"].item() == 1
 
 
-@pytest.mark.parametrize("rows", [9, 10, 16, 17, 20, 33, 40])
+@pytest.mark.parametrize("rows", [8, 9, 10, 16, 17, 20, 33, 40])
 @pytest.mark.parametrize("producer", [False, True])
 def test_batch_admission_retains_small_and_producer_paths(monkeypatch, rows, producer):
     runtime = hcx.Sm70HcxRuntime.__new__(hcx.Sm70HcxRuntime)
@@ -405,6 +405,7 @@ def test_batch_admission_retains_small_and_producer_paths(monkeypatch, rows, pro
         lambda *a: native("batch", *a),
         raising=False,
     )
+    runtime.batch_op = torch.ops._C.sm70_hcx_batch_out
     partial = torch.randn(rows, 2560)
     hidden = torch.randn(rows, 10240)
     injection = torch.randn(rows, 4)
@@ -423,8 +424,31 @@ def test_batch_admission_retains_small_and_producer_paths(monkeypatch, rows, pro
     assert torch.equal(actual[0], hidden)
     assert torch.equal(actual[1], partial)
     assert torch.equal(actual[2], injection)
-    if rows <= 16 or producer:
+    if rows <= 8 or producer:
         assert all(name == "retained" and m <= 8 for name, m in calls)
         assert sum(m for _, m in calls) == rows
     else:
         assert calls == [("batch", rows)]
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_batch_operator_binding_keeps_older_binary_fallback(monkeypatch, available):
+    retained, packed = object(), object()
+    native = SimpleNamespace(sm70_hcx_batch_out=retained)
+    if available:
+        native.sm70_hcx_batch_packed_out = packed
+    monkeypatch.setattr(torch.ops, "_C", native)
+    runtime = hcx.Sm70HcxRuntime.__new__(hcx.Sm70HcxRuntime)
+    runtime._bind_batch_operator()
+    assert runtime.batch_op is (packed if available else retained)
+    # Native availability is resolved once; later namespace changes do not
+    # silently change an existing engine's captured communication protocol.
+    native.sm70_hcx_batch_packed_out = object()
+    assert runtime.batch_op is (packed if available else retained)
+
+
+def test_batch_operator_binding_rejects_missing_legacy_contract(monkeypatch):
+    monkeypatch.setattr(torch.ops, "_C", SimpleNamespace())
+    runtime = hcx.Sm70HcxRuntime.__new__(hcx.Sm70HcxRuntime)
+    with pytest.raises(ValueError, match="matching native build"):
+        runtime._bind_batch_operator()

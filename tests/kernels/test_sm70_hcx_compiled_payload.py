@@ -177,7 +177,7 @@ def _worker_run(rank, port, results):
                 for actual, expected in zip(final_outputs[:2], final_reference[:2]):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 torch.testing.assert_close(final_scratch, x * 17, rtol=0, atol=0)
-                if 16 < rows <= 40:
+                if 8 < rows <= 40:
                     # Live inverse rows and their published epoch must follow
                     # changing batch widths, including a prior tiled fallback.
                     padded = runtime.dpart.view(80, 40, 96, 4)[79, :rows]
@@ -196,6 +196,85 @@ def _worker_run(rank, port, results):
                     ):
                         torch.testing.assert_close(snapshot[key], value, rtol=0, atol=0)
                 report.append((rows, errors))
+        # Raw-op equivalence covers contiguous FP16 views whose first element
+        # is only half-aligned, mixed secondary presence across ranks, live
+        # graph inputs, and a local FP32 sum beyond the FP16 finite range.
+        for rows in (9, 10, 16, 17, 25, 40):
+            for mode in ("none", "mixed"):
+                storage = torch.empty(
+                    rows * 2560 + 1, device="cuda", dtype=torch.float16
+                )
+                partial = storage[1:].view(rows, 2560)
+                assert partial.is_contiguous() and partial.data_ptr() % 4 == 2
+                secondary = (
+                    torch.empty_like(partial) if mode == "mixed" and rank % 2 else None
+                )
+                hidden = torch.randn(rows, 10240, device="cuda").half() * 0.5
+                injection = torch.randn(rows, 4, device="cuda").half()
+                outputs = (
+                    torch.empty_like(hidden),
+                    torch.empty_like(partial),
+                    torch.empty_like(injection),
+                )
+                args = (
+                    partial,
+                    secondary,
+                    hidden,
+                    injection,
+                    module.hc_norm.weight,
+                    1e-6,
+                    module._hcx_down,
+                    module._hcx_up,
+                    *outputs,
+                    runtime.xn,
+                    runtime.sq,
+                    runtime.dpart,
+                    runtime.bar,
+                    runtime.seq,
+                    runtime.ar,
+                    runtime.lora,
+                    runtime.hb,
+                    runtime.logical_rank,
+                    None,
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                    -1,
+                    None,
+                    None,
+                    1e-6,
+                    None,
+                    True,
+                )
+                partial.normal_(std=0.02)
+                if secondary is not None:
+                    secondary.normal_(std=0.02)
+                torch.ops._C.sm70_hcx_batch_packed_out(*args)
+                graph = torch.cuda.CUDAGraph()
+                with (
+                    graph_capture(device=torch.device("cuda", rank)) as context,
+                    torch.cuda.graph(graph, stream=context.stream),
+                ):
+                    torch.ops._C.sm70_hcx_batch_packed_out(*args)
+                for turn in (0, 1):
+                    if turn == 0:
+                        partial.normal_(std=0.02)
+                        if secondary is not None:
+                            secondary.normal_(std=0.02)
+                    else:
+                        partial.fill_(40000 if rank < 2 else -40000)
+                        if secondary is not None:
+                            secondary.fill_(40000 if rank < 2 else -40000)
+                    graph.replay()
+                    actual = tuple(x.clone() for x in outputs)
+                    torch.ops._C.sm70_hcx_batch_out(*args)
+                    torch.accelerator.synchronize()
+                    for a, b in zip(actual, outputs):
+                        assert torch.isfinite(a).all()
+                        torch.testing.assert_close(a, b, rtol=0, atol=0)
+                del graph
         results.put((rank, report))
 
 
@@ -235,3 +314,52 @@ def test_hcx_owned_payload_compilation_and_graph_replay():
     assert all(worker.exitcode == 0 for worker in workers)
     assert sorted(rank for rank, _ in reports) == list(range(4))
     print(sorted(reports))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_hcx_native_fake_registration():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    import vllm._custom_ops  # noqa: F401
+
+    if not hasattr(torch.ops._C, "sm70_hcx_batch_packed_out"):
+        pytest.skip("Matching optional packed HC build required")
+    with FakeTensorMode():
+        half = lambda *shape: torch.empty(*shape, dtype=torch.float16, device="cuda")
+        floats = lambda *shape: torch.empty(*shape, device="cuda")
+        ints = lambda *shape: torch.empty(*shape, dtype=torch.int32, device="cuda")
+        result = torch.ops._C.sm70_hcx_batch_packed_out(
+            half(20, 2560),
+            None,
+            half(20, 10240),
+            half(20, 4),
+            half(2560),
+            1e-6,
+            half(1),
+            half(1),
+            half(20, 10240),
+            half(20, 2560),
+            half(20, 4),
+            half(40, 10240),
+            floats(80 * 40 * 4),
+            floats(80 * 40 * 96 * 4),
+            ints(4),
+            ints(1),
+            [0] * 4,
+            [0] * 4,
+            [0] * 4,
+            0,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            None,
+            None,
+            1e-6,
+            None,
+            True,
+        )
+        assert result is None

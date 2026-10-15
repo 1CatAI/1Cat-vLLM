@@ -829,6 +829,46 @@ if hasattr(torch.ops._C, "ggml_moe_a8_vec_rows"):
     register_fake("_C::ggml_moe_a8_vec_rows")(_ggml_moe_a8_vec_fake)
 
 
+if hasattr(torch.ops._C, "sm70_hcx_batch_packed_out"):
+
+    @register_fake("_C::sm70_hcx_batch_packed_out")
+    def _sm70_hcx_batch_packed_fake(
+        p0,
+        p1,
+        res,
+        inj,
+        nw,
+        eps,
+        wd,
+        wu,
+        res_out,
+        blk_out,
+        inj_out,
+        xn,
+        sq,
+        dpart,
+        bar,
+        seq,
+        ar,
+        lora,
+        hb,
+        rank,
+        dbg,
+        full,
+        ox,
+        ocodes,
+        ohigh,
+        oscale,
+        ofmt,
+        gz,
+        gw,
+        geps,
+        gscr,
+        local_schedule=False,
+    ):
+        return None
+
+
 # cutlass
 def cutlass_scaled_mm_supports_fp4(cuda_device_capability: int) -> bool:
     return torch.ops._C.cutlass_scaled_mm_supports_fp4(cuda_device_capability)

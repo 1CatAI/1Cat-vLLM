@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""One-launch TP4 HC chain for Qwen3.8 Flash-Next verification on SM70.
+"""TP4 HC chains with retained small tiles and optional whole-batch execution.
 
-The block output reaching an HC ``combine_and_mix`` is left as a TP partial
-(the producing projection skips its all-reduce). For M <= 8 one kernel does the
-all-reduce, combine, grouped RMSNorm, HC down/SiLU and HC up/gate-mix
-(``sm70_hcx_out``); larger batches all-reduce explicitly and run the existing
-chain.
+SM70 M1..8 uses the original fused chain. Full-mesh, separate-projection
+M9..40 may use an initialized capacity-forty native batch binding; other admitted shapes
+retain tiles. Newer native builds losslessly pack FP16 partials and describe
+each peer's format with tagged headers, preserving optional secondary inputs.
 """
 
 from __future__ import annotations
@@ -277,8 +276,7 @@ class Sm70HcxRuntime:
             and cfg.kernel_config.sm70_hcx_local_schedule
             and cfg.kernel_config.sm70_hcx_batch_max_m > 16
         ):
-            if not hasattr(torch.ops._C, "sm70_hcx_batch_out"):
-                raise ValueError("Batch HC requires the matching native build")
+            self._bind_batch_operator()
             self.native_batch_max_m = 40
         capacity = self.native_batch_max_m
         ar_bytes = AR_BYTES * capacity // HCX_MAX_M
@@ -313,6 +311,13 @@ class Sm70HcxRuntime:
             tuple(order),
             self.full,
         )
+
+    def _bind_batch_operator(self):
+        retained = getattr(torch.ops._C, "sm70_hcx_batch_out", None)
+        if retained is None:
+            raise ValueError("Batch HC requires the matching native build")
+        self.batch_op = getattr(torch.ops._C, "sm70_hcx_batch_packed_out", retained)
+        logger.info_once("SM70 HC batch native binding: %s.", self.batch_op)
 
     @property
     def enabled(self) -> bool:
@@ -374,17 +379,13 @@ class Sm70HcxRuntime:
         if not 0 < m <= batch_max_m:
             raise ValueError("HCX batch exceeds its initialized policy")
         native_batch = (
-            16 < m <= self.native_batch_max_m
+            8 < m <= self.native_batch_max_m
             and self.full
             and self.local_schedule
             and ox is None
         )
         step = m if native_batch else HCX_MAX_M
-        op = (
-            torch.ops._C.sm70_hcx_batch_out
-            if native_batch
-            else torch.ops._C.sm70_hcx_out
-        )
+        op = self.batch_op if native_batch else torch.ops._C.sm70_hcx_out
         for start in range(0, m, step):
             stop = min(start + step, m)
             tile = slice(start, stop)

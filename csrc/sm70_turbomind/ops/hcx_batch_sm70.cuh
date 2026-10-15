@@ -8,6 +8,7 @@
 constexpr int BATCH_ROWS = 40;
 constexpr int BATCH_THREADS = 512;
 
+template <bool HalfPackets = false>
 __global__ __launch_bounds__(BATCH_THREADS, 1) void hcx_batch_kernel(Args a) {
   constexpr int WARPS = BATCH_THREADS / 32;
   const int i = blockIdx.x, t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -25,14 +26,46 @@ __global__ __launch_bounds__(BATCH_THREADS, 1) void hcx_batch_kernel(Args a) {
   __shared__ float red[5][8][33];
   __shared__ float rr[BATCH_ROWS][4];
 
-  for (int row = warp; row < a.M; row += WARPS) {
-    const int col = 32 * i + lane;
-    float v = __half2float(a.p0[row * HD + col]);
-    if (a.p1) v += __half2float(a.p1[row * HD + col]);
-    const int slot = (rk * NC + i) * AR_STRIDE + row * 32 + lane;
-    st2(a.ar[p1] + slot, __float_as_uint(v), tag);
-    st2(a.ar[p2] + slot, __float_as_uint(v), tag);
-    st2(a.ar[p3] + slot, __float_as_uint(v), tag);
+  if constexpr (HalfPackets) {
+    for (int row = warp; row < a.M; row += WARPS) {
+      const int col = 32 * i + lane;
+      const bool packed = a.p1 == nullptr;
+      const int slot = (rk * NC + i) * AR_STRIDE + row * 32 + lane;
+      if (!packed || lane < 16) {
+        unsigned value;
+        if (packed) {
+          const half* pair = a.p0 + row * HD + 32 * i + 2 * lane;
+          value = static_cast<unsigned>(__half_as_ushort(pair[0])) |
+                  (static_cast<unsigned>(__half_as_ushort(pair[1])) << 16);
+        } else {
+          float v = __half2float(a.p0[row * HD + col]);
+          v += __half2float(a.p1[row * HD + col]);
+          value = __float_as_uint(v);
+        }
+        st2(a.ar[p1] + slot, value, tag);
+        st2(a.ar[p2] + slot, value, tag);
+        st2(a.ar[p3] + slot, value, tag);
+      }
+      // A tagged header in previously unused LoRA padding preserves each peer's
+      // optional-secondary semantics, including mixed formats across TP ranks.
+      // Every data word retains its existing payload+epoch validation.
+      if (i == 0 && lane == 0) {
+        const int header = row * LW + 324 + rk;
+        st2(a.lora[p1] + header, packed, tag);
+        st2(a.lora[p2] + header, packed, tag);
+        st2(a.lora[p3] + header, packed, tag);
+      }
+    }
+  } else {
+    for (int row = warp; row < a.M; row += WARPS) {
+      const int col = 32 * i + lane;
+      float v = __half2float(a.p0[row * HD + col]);
+      if (a.p1) v += __half2float(a.p1[row * HD + col]);
+      const int slot = (rk * NC + i) * AR_STRIDE + row * 32 + lane;
+      st2(a.ar[p1] + slot, __float_as_uint(v), tag);
+      st2(a.ar[p2] + slot, __float_as_uint(v), tag);
+      st2(a.ar[p3] + slot, __float_as_uint(v), tag);
+    }
   }
   uint4 dlo[4], dhi[4], ulo[4], uhi[4];
   if (warp < 6) {
@@ -59,7 +92,13 @@ __global__ __launch_bounds__(BATCH_THREADS, 1) void hcx_batch_kernel(Args a) {
     if (row < a.M) {
       float v = __half2float(a.p0[row * HD + col]);
       if (a.p1) v += __half2float(a.p1[row * HD + col]);
-      const int slot = i * AR_STRIDE + row * 32 + lane;
+      unsigned f1 = 0, f2 = 0, f3 = 0;
+      if constexpr (HalfPackets) {
+        f1 = poll2(a.lora[rk] + row * LW + 324 + p1, tag);
+        f2 = poll2(a.lora[rk] + row * LW + 324 + p2, tag);
+        f3 = poll2(a.lora[rk] + row * LW + 324 + p3, tag);
+      }
+      const int slot = i * AR_STRIDE + row * 32;
       // Retain the qualified small-HC schedule: issue all independent peer
       // loads before waiting for any one epoch. Arithmetic order is unchanged.
       unsigned u1, u2, u3, e1, e2, e3;
@@ -67,17 +106,25 @@ __global__ __launch_bounds__(BATCH_THREADS, 1) void hcx_batch_kernel(Args a) {
       do {
         asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
                      : "=r"(u1), "=r"(e1)
-                     : "l"(a.ar[rk] + p1 * NC * AR_STRIDE + slot));
+                     : "l"(a.ar[rk] + p1 * NC * AR_STRIDE + slot +
+                           (f1 ? lane / 2 : lane)));
         asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
                      : "=r"(u2), "=r"(e2)
-                     : "l"(a.ar[rk] + p2 * NC * AR_STRIDE + slot));
+                     : "l"(a.ar[rk] + p2 * NC * AR_STRIDE + slot +
+                           (f2 ? lane / 2 : lane)));
         asm volatile("ld.volatile.global.v2.u32 {%0,%1}, [%2];"
                      : "=r"(u3), "=r"(e3)
-                     : "l"(a.ar[rk] + p3 * NC * AR_STRIDE + slot));
+                     : "l"(a.ar[rk] + p3 * NC * AR_STRIDE + slot +
+                           (f3 ? lane / 2 : lane)));
         if (clock64() - start > 4000000000LL) __trap();
       } while (e1 != tag || e2 != tag || e3 != tag);
-      const float x1 = __uint_as_float(u1), x2 = __uint_as_float(u2),
-                  x3 = __uint_as_float(u3);
+      const int shift = 16 * (lane & 1);
+      const float x1 = f1 ? __half2float(__ushort_as_half(u1 >> shift))
+                          : __uint_as_float(u1);
+      const float x2 = f2 ? __half2float(__ushort_as_half(u2 >> shift))
+                          : __uint_as_float(u2);
+      const float x3 = f3 ? __half2float(__ushort_as_half(u3 >> shift))
+                          : __uint_as_float(u3);
       const float near = (rk & 1) ? x1 + v : v + x1;
       const float far = (rk & 1) ? x3 + x2 : x2 + x3;
       const float reduced =

@@ -1019,3 +1019,67 @@ pending for this artifact. Core SHA256 is
 the Q8 byte-layout guard's stable-libtorch artifact is
 `ac770d73a344357f610efd0fd0285e0bedbaedb708e8b76ba46b3d2d1422741f`.
 The indexer stays`ae483cb4`. Private operator libraries remain research-only.
+
+## RMS-owner complete-model result and lossless partial packets
+
+The RMS-owner checkpoint`a7cf13b080c35abd7294316ee76e882c2db3a3a8` passes its
+separate ordinary/task and fenced model gates. Whole C1/2/4/6/8 verifier means
+are15.899 /24.508 /31.777 /40.926 /48.937ms; p99 is18.194 /27.965 /41.526 /
+51.258 /62.641ms. Draft means are3.485 /3.991 /4.792 /5.910 /6.712ms.
+C4 improves1.331ms, C8 improves0.462ms, and C6 is essentially unchanged.
+C8 p99 increases from58.014ms, so this is not a universal latency win. Ordinary
+rates are140.22 /172.45 /252.33 /309.26 /339.85tok/s; extra C2/C8 repetitions
+are157.47 /325.08. Acceptance varies and throughput overlaps previous ranges.
+All task and natural-EOS checks pass. Sampled root allocation16078MiB/free67MiB
+matches the earlier campaign, without proving transient or256K boundaries.
+
+The next experiment reduces HC peer bytes losslessly. A sender without a
+secondary partial sends two raw FP16 values in one32-bit payload; a sender
+with a secondary retains its original FP32 local sum and packet payload.
+Per-sender epoch-tagged format words occupy dead LoRA padding324..327, so
+mixed optional-secondary presence across ranks remains correct. Every data
+word retains the existing64-bit payload+epoch validation; no shared flag for
+a multiword payload or new cross-GPU fence assumption is introduced. The
+canonical rank sum, reductions and FP16 storage boundaries remain unchanged.
+Two scalar half loads support contiguous views aligned only to two bytes.
+
+The private four-rank C4/C8 graph screen retains bytes with changed inputs.
+C8 HC changes0.088271 to0.070946ms (19.6%) without secondary inputs. Mixed
+secondary presence regresses0.4%; all-secondary cases regress2.1%, within the
+predeclared3% bound. C4 no-secondary improves15.1%. These local figures do
+not establish complete-model speed. No workspace or allocator is added.
+
+Normal integration adds`sm70_hcx_batch_packed_out`; the prior batch and small
+native names/schemas retain their packet formats. The existing HC kernel is
+templated on the internal packet schedule rather than duplicated as a new
+provider. Initialization binds the new optional symbol once; older native
+artifacts retain the existing batch operation. Fake registration and missing
+symbol tests are separate from actual GPU execution. All TP workers must use
+the matching normal artifact, as for other collective kernels.
+
+C2 native-batch admission is requalified after the corrected512-expert MMQ
+prefill boundary. For an already initialized capacity-forty HC owner, separate
+projections may now use native M9..40; M1..8 and fused producers retain tiles.
+Startup configurations with maximum at most16 keep the previous smaller owner
+and tiled fallback, so this does not add an unmeasured memory requirement to
+those modes. The earlier C2 acceptance regression is retained as negative
+evidence; full-model acceptance/task and verifier gates are required before
+claiming this new admission is qualified. Numerical equivalence alone does
+not establish emitted-token throughput.
+
+The matching normal core SHA256 is
+`4fab324fc4082a3206523eafb7cb29f565c39cef4c93c6b0eb5165094d7b639d`.
+Fresh-process inspection confirms the normal core/stable/indexer libraries
+without private research DSOs or preload. Interface, fallback and focused
+M8-neighbor cases pass; the four-rank compiled-payload/state test and raw fake
+registration pass. Raw comparisons include M9/10/16/17/25/40 with unaligned
+contiguous FP16 views, absent/mixed secondary inputs, changed graph inputs and
+FP32 local sums beyond65504 that cancel before the final FP16 boundary.
+
+Normal paired graph costs at C4/C8 without secondary inputs are
+0.055074/0.091793 to0.046548/0.071998ms. Mixed-input changes are-0.1%/+0.3%,
+and all-secondary regressions2.2%/1.7%, within the declared bounds. The normal
+new operator and retained operator remain callable on the same owned buffers;
+no task-cache sidecar is needed. Stable-libtorch`ac770d73` and indexer`ae483cb4`
+are unchanged. Full changed-source hooks pass. Whole-model qualification of
+the packet schedule and renewed C2 admission is pending.

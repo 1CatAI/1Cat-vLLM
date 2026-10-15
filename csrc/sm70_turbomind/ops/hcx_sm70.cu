@@ -739,7 +739,7 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
 #include "hcx_batch_sm70.cuh"
 }  // namespace hcx
 
-template <bool Batch>
+template <bool Batch, bool HalfPackets = false>
 void sm70_hcx_impl(
     torch::Tensor p0, std::optional<torch::Tensor> p1, torch::Tensor res,
     torch::Tensor inj, torch::Tensor nw, double eps, torch::Tensor wd,
@@ -792,8 +792,9 @@ void sm70_hcx_impl(
     TORCH_CHECK(xn.numel() >= 40 * hcx::KD && sq.numel() >= hcx::NC * 40 * 4 &&
                     dpart.numel() >= hcx::NC * 40 * 96 * 4 && bar.numel() >= 4,
                 "HCX batch workspace too small");
-    hcx::hcx_batch_kernel<<<hcx::NC, hcx::BATCH_THREADS, 0,
-                            at::cuda::getCurrentCUDAStream()>>>(a);
+    hcx::hcx_batch_kernel<HalfPackets>
+        <<<hcx::NC, hcx::BATCH_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+            a);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return;
   }
@@ -933,4 +934,23 @@ void sm70_hcx_batch_out(
                       inj_out, xn, sq, dpart, bar, seq, ar, lora, hb, rank, dbg,
                       full, ox, ocodes, ohigh, oscale, ofmt, gz, gw, geps, gscr,
                       local_schedule);
+}
+
+void sm70_hcx_batch_packed_out(
+    torch::Tensor p0, std::optional<torch::Tensor> p1, torch::Tensor res,
+    torch::Tensor inj, torch::Tensor nw, double eps, torch::Tensor wd,
+    torch::Tensor wu, torch::Tensor res_out, torch::Tensor blk_out,
+    torch::Tensor inj_out, torch::Tensor xn, torch::Tensor sq,
+    torch::Tensor dpart, torch::Tensor bar, torch::Tensor seq,
+    std::vector<int64_t> ar, std::vector<int64_t> lora, std::vector<int64_t> hb,
+    int64_t rank, std::optional<torch::Tensor> dbg, int64_t full,
+    std::optional<torch::Tensor> ox, std::optional<torch::Tensor> ocodes,
+    std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
+    int64_t ofmt, std::optional<torch::Tensor> gz,
+    std::optional<torch::Tensor> gw, double geps,
+    std::optional<torch::Tensor> gscr, bool local_schedule) {
+  sm70_hcx_impl<true, true>(p0, p1, res, inj, nw, eps, wd, wu, res_out, blk_out,
+                            inj_out, xn, sq, dpart, bar, seq, ar, lora, hb,
+                            rank, dbg, full, ox, ocodes, ohigh, oscale, ofmt,
+                            gz, gw, geps, gscr, local_schedule);
 }

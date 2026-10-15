@@ -1224,3 +1224,17 @@ void sm70_hcx_batch_out(
     int64_t ofmt, std::optional<torch::Tensor> gz,
     std::optional<torch::Tensor> gw, double geps,
     std::optional<torch::Tensor> gscr, bool local_schedule);
+
+void sm70_hcx_batch_packed_out(
+    torch::Tensor p0, std::optional<torch::Tensor> p1, torch::Tensor res,
+    torch::Tensor inj, torch::Tensor nw, double eps, torch::Tensor wd,
+    torch::Tensor wu, torch::Tensor res_out, torch::Tensor blk_out,
+    torch::Tensor inj_out, torch::Tensor xn, torch::Tensor sq,
+    torch::Tensor dpart, torch::Tensor bar, torch::Tensor seq,
+    std::vector<int64_t> ar, std::vector<int64_t> lora, std::vector<int64_t> hb,
+    int64_t rank, std::optional<torch::Tensor> dbg, int64_t full,
+    std::optional<torch::Tensor> ox, std::optional<torch::Tensor> ocodes,
+    std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
+    int64_t ofmt, std::optional<torch::Tensor> gz,
+    std::optional<torch::Tensor> gw, double geps,
+    std::optional<torch::Tensor> gscr, bool local_schedule);

@@ -113,6 +113,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "(i!)? gscr, bool local_schedule=False) -> ()");
   ops.impl("sm70_hcx_batch_out", torch::kCUDA, &sm70_hcx_batch_out);
   ops.def(
+      "sm70_hcx_batch_packed_out(Tensor p0, Tensor? p1, Tensor res, Tensor "
+      "inj, "
+      "Tensor nw,"
+      " float eps, Tensor wd, Tensor wu, Tensor(a!) res_out, Tensor(b!) blk_o"
+      "ut, Tensor(c!) inj_out, Tensor(d!) xn, Tensor(e!) sq, Tensor(f!) dpart"
+      ", Tensor(g!) bar, Tensor(h!) seq, int[] ar, int[] lora, int[] hb, int "
+      "rank, Tensor? dbg, int full, Tensor? ox, Tensor? ocodes, Tensor? ohigh"
+      ", Tensor? oscale, int ofmt, Tensor? gz, Tensor? gw, float geps, Tensor"
+      "(i!)? gscr, bool local_schedule=False) -> ()");
+  ops.impl("sm70_hcx_batch_packed_out", torch::kCUDA,
+           &sm70_hcx_batch_packed_out);
+  ops.def(
       "sm70_dmv13_out(Tensor x, Tensor[] codes, Tensor[] high, Tensor[] scale, "
       "Tensor(a!)[] out, int[] fmt, int[] n, int K, int split, int warps, "
       "Tensor(b!) ws, Tensor(c!) cnt, int tp, Tensor? extra_weight, "
