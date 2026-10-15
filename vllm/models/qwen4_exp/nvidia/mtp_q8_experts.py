@@ -23,7 +23,8 @@ from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
 
-# Tokens per draft MoE call during prefill (bounds its temporaries).
+# Keep the calibrated large-M throughput after removing duplicate persistent
+# workspaces. Smaller chunks save transient bytes but cost ~2 ms per 8K call.
 _PREFILL_CHUNK = 2048
 
 GGML_Q8_0 = 8

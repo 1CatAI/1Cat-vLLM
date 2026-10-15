@@ -549,6 +549,10 @@ class Sm70GgufConfig:
     """Tokens per TurboMind MoE sub-batch within a prefill chunk. The layer's
     banks are transcoded once per chunk; sub-batches bound the routed
     activations (about 50 KiB per token at top-10)."""
+    expert_load_prefetch_banks: int = Field(default=4, ge=1, le=4)
+    """Banks queued in pinned host memory during original expert loading.
+    One reduces startup transient reservation; runtime expert placement,
+    weights and computation remain unchanged."""
 
     dense_storage: Literal["canonical", "original"] = "canonical"
     """Keep calibrated canonical projections or dispatch original packed rows."""
@@ -884,6 +888,11 @@ class KernelConfig:
     device and the remainder directly from mapped host history."""
     qsa_host_kv_hot_tokens: int = Field(default=8192, gt=0, multiple_of=16)
     """Per-layer device hot-page capacity; collisions use exact host gathers."""
+    qsa_host_kv_hot_dtype: Literal["float16", "fp8_e4m3"] = "float16"
+    """Target hot storage; encoded E4M3 requires E4M3 authoritative history.
+    Encoded hot reads round to the same FP16 operands as the decoded cache."""
+    qsa_host_kv_draft_hot_tokens: int | None = Field(default=None, gt=0, multiple_of=16)
+    """Optional independent draft hot capacity; None preserves target capacity."""
     qsa_host_kv_staging_rows: int = Field(default=32, gt=0, le=32)
     """Shared host-miss staging capacity; larger batches use bounded row chunks."""
     qsa_host_kv_prefill_stage_tokens: int = Field(default=0, ge=0)
@@ -891,8 +900,24 @@ class KernelConfig:
     one shared device buffer (DMA, once per layer and chunk) and read it there,
     instead of resolving every query row's selection through the hot cache and
     mapped host memory (re-reading the same history per row over PCIe).
-    Capacity in tokens (about 0.5 KiB each, shared by all layers); longer
-    contexts keep the hot-cache path. 0 disables it."""
+    Byte budget in E4M3-equivalent K/V tokens (0.5 KiB each at D256), shared
+    by all layers and rounded down to complete pages. FP16 draft history fits
+    half as many tokens in the same buffer; scales use additional storage.
+    Histories exceeding that capacity keep the hot-cache path. 0 disables it."""
+    qsa_host_kv_prefill_stage_slots: int = Field(default=2, ge=1, le=2)
+    """Shared prefix staging buffers. One slot reuses the current layer's
+    buffer after its attention completion event; prefetch still overlaps the
+    following non-QSA computation. Two preserves the alternating layout."""
+    qsa_host_kv_trim_warmup_cache: bool = False
+    """Return unused allocator pages once after host-QSA kernel/graph warmup.
+    Active tensors and captured private pools remain owned; inference does
+    not trim pages. This initialization resource policy does not change
+    compiled model computation."""
+    qsa_host_kv_allocator_headroom_mib: int = Field(default=0, ge=0, le=4096)
+    """Device bytes kept outside the Torch allocator after host-QSA warmup.
+    MiB units; zero retains the existing allocator policy. This reservation
+    limit preserves active tensors and graph pools and may reject workloads
+    whose retained allocations cannot fit. It does not change computation."""
     qsa_host_indexer_history: bool = False
     """Keep the FP16 compressed indexer history and its co-owned compressor
     state in mapped host storage when QSA host KV is active. Exact score
@@ -1073,7 +1098,13 @@ class KernelConfig:
             "ple_disk_row_readers",
             "qsa_auto_e4m3_reason",
             "qsa_host_kv_reason",
+            "qsa_host_kv_trim_warmup_cache",  # Startup allocator hygiene only.
+            "qsa_host_kv_allocator_headroom_mib",  # Process resource limit only.
         }
+        if not self.qsa_host_kv_prefill_stage_tokens or not (
+            self.qsa_host_kv or self.qsa_host_kv_active
+        ):
+            ignored_factors.add("qsa_host_kv_prefill_stage_slots")
         if not self.sm70_skinny_moe_applicable:
             ignored_factors.add("sm70_skinny_moe")
         if not self.fused_fp16_aux_gemv_applicable:
@@ -1123,6 +1154,8 @@ class KernelConfig:
                 entries.pop("active", None)
                 entries.pop("sources", None)
                 entries.pop("legacy", None)
+                if family == "gguf":
+                    entries.pop("expert_load_prefetch_banks", None)
                 for field, alias in getattr(
                     getattr(self, name), "loader_aliases", {}
                 ).items():

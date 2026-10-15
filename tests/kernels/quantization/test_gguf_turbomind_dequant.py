@@ -108,18 +108,30 @@ def test_canonical_dequant_blas_and_graph(bits, group):
         )
 
 
-def test_calibrated_prefill_framework_routes_and_shared_workspace():
+@pytest.mark.parametrize(
+    "bits,group,k,n",
+    [
+        (5, 32, 5120, 1536),
+        (5, 32, 2560, 2560),
+        (6, 16, 2560, 2560),
+        (6, 16, 2560, 1536),
+        (6, 16, 1536, 2560),
+    ],
+)
+def test_calibrated_prefill_framework_routes_and_shared_workspace(bits, group, k, n):
+    from tools.sm70.native_trace import NativeDispatchTrace
+    from vllm.model_executor.layers.quantization import gguf_turbomind  # noqa: F401
+
     torch._dynamo.reset()
-    k, n = 5120, 1536
     config = Sm70GgufAffineConfig(
         (k, n),
         (k, n),
-        scalar_types.uint5,
+        scalar_types.uint5 if bits == 5 else scalar_types.uint6,
         torch.float16,
-        32,
+        group,
         True,
         False,
-        source_type=13,
+        source_type=13 if bits == 5 else 14,
     )
     layers, kernels = [], []
     for _ in range(2):
@@ -127,9 +139,9 @@ def test_calibrated_prefill_framework_routes_and_shared_workspace():
         kernel = TurboMindGgufAffineKernel(config, "codes", "scales", "mins")
         for name, data in {
             "codes": torch.zeros((n, k), dtype=torch.uint8, device="cuda"),
-            "scales": torch.ones((n, k // 32), dtype=torch.float16, device="cuda"),
+            "scales": torch.ones((n, k // group), dtype=torch.float16, device="cuda"),
             "mins": torch.full(
-                (n, k // 32), 0.00390625, dtype=torch.float16, device="cuda"
+                (n, k // group), 0.00390625, dtype=torch.float16, device="cuda"
             ),
         }.items():
             layer.register_parameter(
@@ -144,11 +156,19 @@ def test_calibrated_prefill_framework_routes_and_shared_workspace():
         layers[0].gguf_tm_blas_workspace.data_ptr()
         == layers[1].gguf_tm_blas_workspace.data_ptr()
     )
-    for m in (512, 2048):
+    for m in (512, 2048) if k == 5120 else (2047, 2048, 2049, 4097):
         x = (torch.randn((m, k), device="cuda") * 0.125).half()
         expected = (x.float().sum(-1, keepdim=True) * 0.00390625).expand(m, n)
         run = lambda x: kernels[0].apply_weights(layers[0], x)
-        torch.testing.assert_close(run(x).float(), expected, rtol=0.003, atol=0.0002)
+        with NativeDispatchTrace() as trace:
+            eager = run(x)
+        operator = "blas" if m >= 2048 else "gemm"
+        assert any(
+            r["operator"] == f"_C::gguf_affine_{operator}_sm70_out"
+            and r["evidence"] == "cuda_dispatch"
+            for r in trace.records
+        )
+        torch.testing.assert_close(eager.float(), expected, rtol=0.003, atol=0.0002)
         compiled = torch.compile(run, backend="eager", fullgraph=True)
         torch.testing.assert_close(
             compiled(x).float(), expected, rtol=0.003, atol=0.0002
@@ -162,4 +182,26 @@ def test_calibrated_prefill_framework_routes_and_shared_workspace():
         with torch.cuda.graph(graph, stream=stream):
             out = run(x)
         graph.replay()
+        torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.0002)
+        # The serving graph passes the calibrated bands through its opaque op.
+        layer = layers[0]
+        opaque = torch.ops.vllm.prepared_gguf_projection(
+            x,
+            layer.codes,
+            layer.scales,
+            None,
+            0,
+            bits,
+            group,
+            layer.gguf_tm_k_ld,
+            layer.gguf_tm_q_ld,
+            n,
+            n,
+            [],
+            [2048, -1],
+        )
+        torch.testing.assert_close(opaque.float(), expected, rtol=0.003, atol=0.0002)
+        x.mul_(-0.5)
+        graph.replay()
+        expected = (x.float().sum(-1, keepdim=True) * 0.00390625).expand(m, n)
         torch.testing.assert_close(out.float(), expected, rtol=0.003, atol=0.0002)

@@ -11,6 +11,8 @@ chain.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import torch
@@ -26,6 +28,25 @@ HD, KD, LORA, INJ = 2560, 10240, 320, 4
 HCX_MAX_M = 8
 _OUTPUT_PROJECTIONS: dict[str, tuple] = {}
 _MOE_RUNNERS: dict[str, Any] = {}
+_PREFILL_SEQUENCE_PARALLEL: ContextVar[bool] = ContextVar(
+    "qwen4_exp_hc_prefill_sequence_parallel", default=False
+)
+
+
+@contextmanager
+def hc_prefill_sequence_parallel_context(enabled: bool):
+    """Bind one qualified forward call; nested calls and exceptions restore it."""
+    token = _PREFILL_SEQUENCE_PARALLEL.set(enabled)
+    try:
+        yield
+    finally:
+        _PREFILL_SEQUENCE_PARALLEL.reset(token)
+
+
+def hc_prefill_sequence_parallel_active() -> bool:
+    return _PREFILL_SEQUENCE_PARALLEL.get()
+
+
 AR_BYTES = 4 * 80 * 256 * 8
 LORA_BYTES = 8 * 336 * 8
 HB_BYTES = 8 * HD * 4
@@ -50,7 +71,7 @@ def _output_projection(x: torch.Tensor, name: str) -> torch.Tensor:
     if 0 < x.shape[0] <= HCX_MAX_M and defer:
         return torch.nn.functional.pad(x, (0, layer.output_size - x.shape[1]))
     projected, _ = layer(x)
-    if x.shape[0] > HCX_MAX_M:
+    if x.shape[0] > HCX_MAX_M and not hc_prefill_sequence_parallel_active():
         from vllm.distributed import tensor_model_parallel_all_reduce
 
         projected = tensor_model_parallel_all_reduce(projected)
@@ -74,6 +95,12 @@ def _moe_output(
         second = torch.zeros_like(first) if shared is None else shared[..., :trunc_size]
         return torch.cat((first, second), dim=0)
     runner = _MOE_RUNNERS[name]
+    if hc_prefill_sequence_parallel_active():
+        first = fused[..., :trunc_size]
+        second = torch.zeros_like(first) if shared is None else shared[..., :trunc_size]
+        # Keep both contributions finite until the row owner has received the
+        # FP32 sum. Narrowing each rank's sum before reduction can overflow.
+        return torch.cat((first, second), dim=0)
     reduced = runner._maybe_sm70_moe_sum2_allreduce(shared, fused, trunc_size)
     if reduced is None:
         summed = fused if shared is None else shared + fused

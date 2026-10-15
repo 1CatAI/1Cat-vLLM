@@ -220,7 +220,75 @@ class GatedResidual(nn.Module):
                 self._hcx_down = pack_down(down.data, runtime.logical_rank).to(device)
                 self._hcx_up = pack_up(up.data, runtime.logical_rank).to(device)
 
+    def _sequence_parallel_project(self, normalized):
+        from .sm70_fp16_hc import sharded_hc_project_sequence_rows
+
+        if not hasattr(self, "hc_shard_down"):
+            raise ValueError("HC sequence rows require prepared sharded weights")
+        block, injection = sharded_hc_project_sequence_rows(
+            normalized, self.hc_shard_down, self.hc_shard_up
+        )
+        return block, injection if self.use_combine else None
+
+    def sequence_parallel_mix(self, hidden_states):
+        normalized = grouped_gemma_rmsnorm(
+            hidden_states, self.hc_norm.weight, self.config.rms_norm_eps, self.hc_count
+        )
+        block, injection = self._sequence_parallel_project(normalized)
+        return hidden_states, block, injection
+
+    def _sequence_parallel_block(self, block_output):
+        from vllm.distributed import get_tp_group
+
+        group = get_tp_group()
+        first, second = self._partial_pair(block_output)
+        if getattr(self, "_partial_inputs", False):
+            if second is not None:
+                source = first.float() + second.float()
+                return group.reduce_scatter(source, dim=0).to(first.dtype)
+            return group.reduce_scatter(first, dim=0)
+        return first.reshape(4, -1, first.shape[-1])[group.rank_in_group]
+
+    def sequence_parallel_combine(self, hidden_states, block_output, injection):
+        from .sm70_hc_prefill_peer import hc_sequence_combine_norm
+
+        separate = isinstance(block_output, tuple)
+        first, second = block_output if separate else (block_output, None)
+        hidden, _ = hc_sequence_combine_norm(
+            hidden_states,
+            first,
+            injection,
+            self.hc_norm.weight,
+            self.config.rms_norm_eps,
+            getattr(self, "_hcx_moe_payload", False) and not separate,
+            getattr(self, "_partial_inputs", False),
+            False,
+            second,
+        )
+        return hidden
+
+    def sequence_parallel_combine_and_mix(self, hidden_states, block_output, injection):
+        from .sm70_hc_prefill_peer import hc_sequence_combine_norm
+
+        separate = isinstance(block_output, tuple)
+        first, second = block_output if separate else (block_output, None)
+        hidden, normalized = hc_sequence_combine_norm(
+            hidden_states,
+            first,
+            injection,
+            self.hc_norm.weight,
+            self.config.rms_norm_eps,
+            getattr(self, "_hcx_moe_payload", False) and not separate,
+            getattr(self, "_partial_inputs", False),
+            True,
+            second,
+        )
+        block, next_injection = self._sequence_parallel_project(normalized)
+        return hidden, block, next_injection
+
     def _partial_pair(self, block_output):
+        if isinstance(block_output, tuple):
+            return block_output
         if getattr(self, "_hcx_moe_payload", False):
             rows = block_output.shape[0] // 2
             return block_output[:rows], block_output[rows:]

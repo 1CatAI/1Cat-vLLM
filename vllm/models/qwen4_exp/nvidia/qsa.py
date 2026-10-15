@@ -125,12 +125,12 @@ def _dump_prefill_inputs(
     logger.info("Dumped QSA prefill reader inputs of target layer %d.", order)
 
 
-def _prefetch_next_prefix(order, plan, new_tokens, capacity_tokens):
+def _prefetch_next_prefix(order, plan, new_tokens, capacity_tokens, stage_slots=2):
     """After target layer `order`'s attention: mark its buffer free and stage
-    the next target layer's prefix pages into the other buffer."""
+    the next target layer's prefix pages into a released buffer."""
     free = torch.cuda.Event()
     free.record()
-    _PREFETCH["free"][order % 2] = free
+    _PREFETCH["free"][order % stage_slots] = free
     if order + 1 >= len(_TARGET_HOST_KV):
         return
     nxt = _TARGET_HOST_KV[order + 1]
@@ -138,7 +138,7 @@ def _prefetch_next_prefix(order, plan, new_tokens, capacity_tokens):
         return
     if _PREFETCH["stream"] is None:
         _PREFETCH["stream"] = torch.cuda.Stream()
-    slot = (order + 1) % 2
+    slot = (order + 1) % stage_slots
     done, prefix = nxt.prefetch_prefix(
         plan,
         new_tokens,
@@ -723,12 +723,24 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.host_kv_prefill_stage_tokens = (
             vllm_config.kernel_config.qsa_host_kv_prefill_stage_tokens
         )
+        self.host_kv_prefill_stage_slots = (
+            vllm_config.kernel_config.qsa_host_kv_prefill_stage_slots
+        )
         self.host_kv_device_reference = (
             vllm_config.kernel_config.qsa_host_kv_device_reference
         )
         # Cache binding runs under the target worker's config, also for draft
         # layers. Retain each owner's policy from model construction.
         self.host_kv_is_draft = vllm_config.is_speculative_draft
+        if self.host_kv_is_draft:
+            self.host_kv_hot_tokens = (
+                vllm_config.kernel_config.qsa_host_kv_draft_hot_tokens
+                or self.host_kv_hot_tokens
+            )
+        self.host_kv_hot_fp8 = (
+            not self.host_kv_is_draft
+            and vllm_config.kernel_config.qsa_host_kv_hot_dtype == "fp8_e4m3"
+        )
         self.host_kv_direct_device = vllm_config.kernel_config.sm70_qsa_device_history
         self.host_kv_dtype = (
             vllm_config.kernel_config.qsa_host_kv_draft_dtype
@@ -912,13 +924,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 device_reference=self.host_kv_device_reference,
                 direct_device=self.host_kv_direct_device,
                 is_speculative_draft=self.host_kv_is_draft,
+                hot_fp8=self.host_kv_hot_fp8,
             )
             if not self.host_kv_is_draft:
                 _TARGET_HOST_KV.append(self.host_kv)
             logger.info_once(
                 "QSA encoded history initialized: storage=%s, dtype=%s, hot_tokens=%d; "
                 "direct device M1..20/H6/D256=%s, fallback_reason=%s; "
-                "other shapes use protected FP16 hot pages and miss staging.",
+                "other shapes use protected hot pages and FP16 miss staging.",
                 "device_reference" if self.host_kv_device_reference else "host",
                 self.host_kv_dtype,
                 self.host_kv_hot_tokens,
@@ -970,7 +983,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                     table, lengths, self.host_kv_prefill_stage_tokens
                 )
             plan = plans[plan_key]
-            # Target layers alternate between two stage buffers. The previous
+            # Target layers reuse the configured stage buffers. The previous
             # layer staged this layer's prefix pages (written before this
             # step) on a side stream; only the rest is copied here, after
             # this step's writes.
@@ -979,7 +992,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 if not self.host_kv_is_draft and state in _TARGET_HOST_KV
                 else -1
             )
-            slot = order % 2 if order >= 0 else 0
+            stage_slots = getattr(self, "host_kv_prefill_stage_slots", 2)
+            slot = order % stage_slots if order >= 0 else 0
             staged_pages = 0
             pending = _PREFETCH["pending"].pop(id(state), None)
             if plan and pending is not None and pending[0] is plan:
@@ -1048,6 +1062,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                         plan,
                         query.shape[0],
                         self.host_kv_prefill_stage_tokens,
+                        stage_slots,
                     )
                 if _QSA_DUMP_DIR and order in (0, 5, 11):
                     _dump_prefill_inputs(
