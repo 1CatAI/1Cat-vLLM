@@ -27,7 +27,18 @@ def _worker_run(rank, port, results):
     torch.accelerator.set_device_index(rank)
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
-    with set_current_vllm_config(VllmConfig()):
+    from vllm.config.kernel import KernelConfig
+
+    with set_current_vllm_config(
+        VllmConfig(
+            kernel_config=KernelConfig(
+                sm70_hcx=True,
+                sm70_hcx_local_schedule=True,
+                sm70_hcx_batch_max_m=40,
+                sm70_hcx_batch_fusion=True,
+            )
+        )
+    ):
         init_distributed_environment(4, rank, f"tcp://127.0.0.1:{port}", rank, "nccl")
         initialize_model_parallel(4, 1)
         config = HyperConnectionConfig(
@@ -44,7 +55,9 @@ def _worker_run(rank, port, results):
             for parameter in module.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.02)
         runtime = get_hcx_runtime(torch.device("cuda", rank))
+        runtime.local_schedule = True
         assert runtime.enabled, runtime.reason
+        assert runtime.native_batch_max_m == 40
         runtime.diagnostic = True
         module.enable_partial_inputs("payload", runtime, batch_max_m=40)
         module._hcx_moe_payload = True
@@ -111,7 +124,7 @@ def _worker_run(rank, port, results):
                 ple_layer._PLE_DIAGNOSTIC_BUFFERS["after"], ple_result
             )
             torch.testing.assert_close(ple_scratch, ple_input * 17)
-        for rows in (5, 8, 9, 10, 20, 30, 40, 41):
+        for rows in (5, 8, 9, 10, 17, 20, 24, 25, 30, 32, 33, 39, 40, 41):
             torch.manual_seed(1)
             hidden = (torch.randn(rows, 10240, device="cuda") * 0.5).half()
             injection = torch.randn(rows, 4, device="cuda").half()

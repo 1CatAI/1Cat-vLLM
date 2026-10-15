@@ -50,6 +50,8 @@ def _original_expert_dp4a(
     quantized_hidden,
     bank_aware,
     grouped_gate: bool = False,
+    grouped_rows: int = 20,
+    grouped_down: bool = False,
 ):
     m, top_k = ids.shape
     n = gate.shape[1]
@@ -60,33 +62,45 @@ def _original_expert_dp4a(
         else x.new_empty((m, top_k, n))
     )
     output = torch.empty_like(x)
-    torch.ops._C.gguf_quantize_q8_1_sm70_out(q8, x)
+    for start in range(0, m, 20):
+        torch.ops._C.gguf_quantize_q8_1_sm70_out(
+            q8[start : start + 20], x[start : start + 20]
+        )
     grouped = False
     if grouped_gate and quantized_hidden:
         from .gguf_grouped_gate import grouped_gate_up
 
-        grouped = grouped_gate_up(hidden, q8, ids, gate, up, source_type, bank_aware)
-    if not grouped:
-        torch.ops._C.gguf_dp4a_gate_up_sm70_out(
-            hidden,
-            q8,
-            ids,
-            gate,
-            up,
-            source_type,
-            True,
-            4 if quantized_hidden and source_type in (20, 23) else 16,
-            bank_aware,
+        grouped = grouped_gate_up(
+            hidden, q8, ids, gate, up, source_type, bank_aware, max_rows=grouped_rows
         )
-    torch.ops._C.gguf_dp4a_raw_down_unroute_sm70_out(
-        output,
-        hidden,
-        ids,
-        probabilities,
-        down,
-        down_type,
-        left,
-    )
+    if not grouped:
+        for start in range(0, m, 20):
+            torch.ops._C.gguf_dp4a_gate_up_sm70_out(
+                hidden[start : start + 20],
+                q8[start : start + 20],
+                ids[start : start + 20],
+                gate,
+                up,
+                source_type,
+                True,
+                4 if quantized_hidden and source_type in (20, 23) else 16,
+                bank_aware,
+            )
+    if grouped_down and quantized_hidden:
+        from .gguf_grouped_gate import grouped_down as run_grouped_down
+
+        if run_grouped_down(output, hidden, ids, probabilities, down, down_type, left):
+            return output
+    for start in range(0, m, 20):
+        torch.ops._C.gguf_dp4a_raw_down_unroute_sm70_out(
+            output[start : start + 20],
+            hidden[start : start + 20],
+            ids[start : start + 20],
+            probabilities[start : start + 20],
+            down,
+            down_type,
+            left,
+        )
     return output
 
 
@@ -156,6 +170,88 @@ register_policy_op(
 )
 
 
+def _grouped_batch_expert_dp4a(
+    x,
+    ids,
+    probabilities,
+    gate,
+    up,
+    down,
+    source_type,
+    down_type,
+    left,
+    quantized_hidden,
+    bank_aware,
+):
+    return _original_expert_dp4a(
+        x,
+        ids,
+        probabilities,
+        gate,
+        up,
+        down,
+        source_type,
+        down_type,
+        left,
+        quantized_hidden,
+        bank_aware,
+        grouped_gate=True,
+        grouped_rows=40,
+    )
+
+
+register_policy_op(
+    "gguf_grouped_batch_expert_dp4a",
+    "(Tensor x, Tensor ids, Tensor probabilities, Tensor gate, Tensor up, "
+    "Tensor down, int source_type, int down_type, int left, "
+    "bool quantized_hidden, bool bank_aware) -> Tensor",
+    _grouped_batch_expert_dp4a,
+    _original_expert_dp4a_fake,
+)
+
+
+def _grouped_down_expert_dp4a(
+    x,
+    ids,
+    probabilities,
+    gate,
+    up,
+    down,
+    source_type,
+    down_type,
+    left,
+    quantized_hidden,
+    bank_aware,
+    grouped_gate,
+):
+    return _original_expert_dp4a(
+        x,
+        ids,
+        probabilities,
+        gate,
+        up,
+        down,
+        source_type,
+        down_type,
+        left,
+        quantized_hidden,
+        bank_aware,
+        grouped_gate=grouped_gate,
+        grouped_rows=40,
+        grouped_down=True,
+    )
+
+
+register_policy_op(
+    "gguf_grouped_down_expert_dp4a",
+    "(Tensor x, Tensor ids, Tensor probabilities, Tensor gate, Tensor up, "
+    "Tensor down, int source_type, int down_type, int left, "
+    "bool quantized_hidden, bool bank_aware, bool grouped_gate) -> Tensor",
+    _grouped_down_expert_dp4a,
+    _original_expert_dp4a_fake,
+)
+
+
 def _original_expert_reduce(down, probabilities):
     return moe_fused_mul_sum(down, probabilities)
 
@@ -193,6 +289,10 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         self.grouped_gate_up = bool(
             config and config.kernel_config.sm70_gguf.grouped_gate_up
         )
+        self.grouped_gate_up_max_m = (
+            config.kernel_config.sm70_gguf.grouped_gate_up_max_m if config else 20
+        )
+        self.grouped_down = bool(config and config.kernel_config.sm70_gguf.grouped_down)
         self.expert_trace_tokens = (
             config.kernel_config.sm70_gguf.expert_trace_tokens if config else 0
         )
@@ -407,12 +507,36 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
         ):
             raise ValueError("Grouped GGUF experts require the matching native build")
         self.grouped_gate_up = self.grouped_gate_up and grouped_shape
+        if (
+            self.grouped_gate_up
+            and self.grouped_gate_up_max_m == 40
+            and not hasattr(torch.ops._C, "gguf_dp4a_gate_up_grouped_batch_sm70_out")
+        ):
+            raise ValueError(
+                "Forty-row grouped experts require the matching native build"
+            )
         self.native_admission["grouped_gate_up"] = {
             "enabled": self.grouped_gate_up,
             "min_m": 9,
-            "max_m": 20,
+            "max_m": self.grouped_gate_up_max_m,
             "device_admission": "distinct_experts_at_most_two_thirds_of_routes",
             "fallback": "original_single_route_integer_dot",
+        }
+        self.grouped_down = (
+            self.grouped_down
+            and self.dp4a_admitted
+            and self.q8_intermediate
+            and self.grouped_gate_up_max_m == 40
+        )
+        if self.grouped_down and not hasattr(
+            torch.ops._C, "gguf_dp4a_raw_down_grouped_sm70_out"
+        ):
+            raise ValueError("Grouped GGUF down requires the matching native build")
+        self.native_admission["grouped_down"] = {
+            "enabled": self.grouped_down,
+            "min_m": 25,
+            "max_m": 40,
+            "fallback": "retained_twenty_row_integer_projection",
         }
 
     def get_fused_moe_quant_config(self, layer):
@@ -454,6 +578,10 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
             and topk_weights.dtype == torch.float32
         ):
             step = 20
+            grouped_rows = getattr(self, "grouped_gate_up_max_m", 20)
+            grouped_down = getattr(self, "grouped_down", False)
+            if getattr(self, "grouped_gate_up", False) or grouped_down:
+                step = grouped_rows
             if cache is not None:
                 capacity = min(cache.resident0, cache.ring.shape[1] - 8)
                 step = min(step, capacity // top_k)
@@ -461,7 +589,11 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                     raise ValueError("Expert cache cannot hold one routed token")
             output = torch.empty_like(x) if tokens > step else None
             operation = (
-                torch.ops.vllm.gguf_grouped_expert_dp4a
+                torch.ops.vllm.gguf_grouped_down_expert_dp4a
+                if grouped_down
+                else torch.ops.vllm.gguf_grouped_batch_expert_dp4a
+                if getattr(self, "grouped_gate_up", False) and grouped_rows == 40
+                else torch.ops.vllm.gguf_grouped_expert_dp4a
                 if getattr(self, "grouped_gate_up", False)
                 else torch.ops.vllm.gguf_original_expert_dp4a
             )
@@ -472,7 +604,7 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                     # Finish each fragment before resolving the next one, which
                     # may evict its slots. The existing model stream owns both.
                     fragment_ids = cache.resolve(self.cache_layer, fragment_ids)
-                fragment = operation(
+                arguments = (
                     x.contiguous() if output is None else x[start:stop].contiguous(),
                     fragment_ids,
                     topk_weights[start:stop].contiguous(),
@@ -484,6 +616,11 @@ class GGUFNativeMoEMethod(FusedMoEMethodBase):
                     self.input_padding.get("w2", (0, 0))[0],
                     self.q8_intermediate,
                     self.weight_types["w1"] == 21,
+                )
+                fragment = (
+                    operation(*arguments, getattr(self, "grouped_gate_up", False))
+                    if grouped_down
+                    else operation(*arguments)
                 )
                 if output is None:
                     return fragment

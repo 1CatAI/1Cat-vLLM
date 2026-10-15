@@ -220,6 +220,61 @@ using IQ3SDot = LatticeDot<21>;
 // canonical reader, without expanding a second expert bank at load time.
 template <int Type>
 struct OriginalIntegerDot {
+  struct Decoded {
+    int values[8];
+    float scale;
+  };
+  __device__ static Decoded decode(const uint8_t* row, int group) {
+    const uint8_t* b;
+    const uint8_t* codes;
+    float scale;
+    if constexpr (Type == 23) {
+      b = row + (group / 8) * 136;
+      const int sub = group % 8;
+      const uint16_t high = *reinterpret_cast<const uint16_t*>(b + 2);
+      const int subscale = ((b[4 + sub / 2] >> (4 * (sub % 2))) & 15) |
+                           (((high >> (2 * sub)) & 3) << 4);
+      // Match the canonical LUT reader's expanded FP16 coefficients.
+      scale = __half2float(__float2half_rn(
+          __half2float(*reinterpret_cast<const half*>(b)) * (subscale - 32)));
+      codes = b + 8 + sub * 16;
+    } else {
+      b = row + (Type == 20 ? group : group / 2) * 18;
+      scale = __half2float(*reinterpret_cast<const half*>(b));
+      codes = b + 2;
+    }
+    Decoded decoded;
+    decoded.scale = scale;
+#pragma unroll
+    for (int packet = 0; packet < 8; ++packet) {
+      uint32_t values = 0;
+      if constexpr (Type == 20 || Type == 23) {
+        const uint32_t bytes =
+            load_u32_2(codes + (packet % 4) * 4) >> ((packet / 4) * 4);
+        const uint32_t nibbles = (bytes & 15) | ((bytes >> 4) & 0xf0) |
+                                 ((bytes >> 8) & 0xf00) |
+                                 ((bytes >> 12) & 0xf000);
+        using Lut = turbomind::gemm::Transform_HMMA_SM70_Lut4<0>;
+        values = Lut::iq_values(nibbles) ^ 0x80808080U;
+      } else {
+        const uint32_t byte = b[2 + (group % 2) * 8 + packet];
+        const uint32_t codes = (byte & 3) | ((byte << 6) & 0x300) |
+                               ((byte << 12) & 0x30000) |
+                               ((byte << 18) & 0x3000000);
+        values = __vsub4(codes, 0x01010101U);
+      }
+      decoded.values[packet] = static_cast<int>(values);
+    }
+    return decoded;
+  }
+  __device__ static float dot_decoded(const Decoded& decoded, const Q8_1& x) {
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int sum = 0;
+#pragma unroll
+    for (int packet = 0; packet < 8; ++packet)
+      sum = __dp4a(decoded.values[packet], activation[packet], sum);
+    return float(sum) * (decoded.scale * __low2float(x.ds));
+  }
   static_assert(Type == 20 || Type == 23 || Type == 42);
   __device__ static float dot(const uint8_t* row, int group, const Q8_1& x) {
     const uint8_t* b;

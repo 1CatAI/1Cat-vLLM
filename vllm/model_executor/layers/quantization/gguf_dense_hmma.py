@@ -263,7 +263,16 @@ def _shared_expert(
     from .gguf_turbomind import _prepared_gguf_mixed_projection
 
     rows = x.reshape(-1, x.shape[-1]).contiguous()
-    if rows.shape[0] > 8 and rows.shape[0] != 20:
+    if len(down_specs) not in (2, 3) or (
+        len(down_specs) == 3 and down_specs[2] not in (0, 1)
+    ):
+        raise ValueError("Invalid shared expert descriptor")
+    batch = len(down_specs) == 3 and down_specs[2] == 1 and formats[2] == 4
+    if (
+        rows.shape[0] > 8
+        and rows.shape[0] != 20
+        and not (batch and rows.shape[0] <= 40)
+    ):
         gu = _prepared_gguf_mixed_projection(
             rows, gu_codes, gu_stats, gu_caches, gu_specs, gu_cache_bands, gu_blas_bands
         )
@@ -284,37 +293,39 @@ def _shared_expert(
         g = torch.mm(rows, weight_gate.reshape(-1, 1).to(rows.dtype))
         return (out * torch.sigmoid(g)).reshape(*x.shape[:-1], 2560)
     scratch = workspace(x.device, True)
-    h = scratch["h"][: rows.shape[0]]
     gate = scratch["gate"]
     out = torch.empty((rows.shape[0], 2560), device=x.device, dtype=x.dtype)
-    torch.ops._C.gguf_shared_gate_up_sm70_out(
-        rows,
-        [gate_codes, gate_high, gate_scale],
-        [up_codes, up_high, up_scale],
-        formats[:2],
-        weight_gate.reshape(-1),
-        h,
-        gate,
-        scratch["partial"],
-        scratch["counters"],
-        5,
-        8,
-    )
-    torch.ops._C.gguf_dense_segments_sm70_out(
-        h,
-        [down_codes],
-        [down_high],
-        [down_scale],
-        [out],
-        [formats[2]],
-        [2560],
-        160,
-        1,
-        8,
-        scratch["partial"],
-        scratch["counters"],
-        gate,
-    )
+    for start in range(0, rows.shape[0], 20):
+        stop = min(start + 20, rows.shape[0])
+        h = scratch["h"][: stop - start]
+        torch.ops._C.gguf_shared_gate_up_sm70_out(
+            rows[start:stop],
+            [gate_codes, gate_high, gate_scale],
+            [up_codes, up_high, up_scale],
+            formats[:2],
+            weight_gate.reshape(-1),
+            h,
+            gate,
+            scratch["partial"],
+            scratch["counters"],
+            5,
+            8,
+        )
+        torch.ops._C.gguf_dense_segments_sm70_out(
+            h,
+            [down_codes],
+            [down_high],
+            [down_scale],
+            [out[start:stop]],
+            [formats[2]],
+            [2560],
+            160,
+            1,
+            8,
+            scratch["partial"],
+            scratch["counters"],
+            gate,
+        )
     return out.reshape(*x.shape[:-1], 2560)
 
 
@@ -410,5 +421,10 @@ def maybe_apply_shared_expert(layer, x):
         weight,
         [pairs[0][3], pairs[1][3], p.segment_format],
         *prepared_projection_arguments(gu),
-        [p.gguf_tm_k_ld, p.gguf_tm_q_ld],
+        [p.gguf_tm_k_ld, p.gguf_tm_q_ld]
+        + (
+            [1]
+            if getattr(p, "shared_expert_batch", False) and p.segment_format == 4
+            else []
+        ),
     )

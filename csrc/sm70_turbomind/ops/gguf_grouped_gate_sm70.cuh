@@ -119,18 +119,21 @@ void launch_grouped_gate(torch::Tensor out, torch::Tensor activation,
 }
 }  // namespace
 
-void gguf_dp4a_gate_up_grouped_sm70_out(
-    torch::Tensor out, torch::Tensor activation, torch::Tensor ids,
-    torch::Tensor gate, torch::Tensor up, int64_t source_type, bool bank_aware,
-    torch::Tensor route_tokens, torch::Tensor order, torch::Tensor original_ids,
-    torch::Tensor mode) {
+template <int MaxRows>
+static void grouped_gate_out_impl(torch::Tensor out, torch::Tensor activation,
+                                  torch::Tensor ids, torch::Tensor gate,
+                                  torch::Tensor up, int64_t source_type,
+                                  bool bank_aware, torch::Tensor route_tokens,
+                                  torch::Tensor order,
+                                  torch::Tensor original_ids,
+                                  torch::Tensor mode) {
   TORCH_CHECK(source_type == 18 || source_type == 21 || source_type == 22,
               "Paired gate/up requires an original lattice format");
   const c10::cuda::CUDAGuard guard(activation.device());
   require_sm70();
   TORCH_CHECK(activation.is_cuda() && activation.scalar_type() == at::kByte &&
                   activation.is_contiguous() && activation.dim() == 3 &&
-                  activation.size(0) > 0 && activation.size(0) <= 20 &&
+                  activation.size(0) > 0 && activation.size(0) <= MaxRows &&
                   activation.size(2) == sizeof(Q8_1) &&
                   activation.size(1) % 8 == 0,
               "Invalid paired Q8_1 activation");
@@ -187,4 +190,24 @@ void gguf_dp4a_gate_up_grouped_sm70_out(
   }
 #undef PAIR
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void gguf_dp4a_gate_up_grouped_sm70_out(
+    torch::Tensor out, torch::Tensor activation, torch::Tensor ids,
+    torch::Tensor gate, torch::Tensor up, int64_t source_type, bool bank_aware,
+    torch::Tensor route_tokens, torch::Tensor order, torch::Tensor original_ids,
+    torch::Tensor mode) {
+  grouped_gate_out_impl<20>(out, activation, ids, gate, up, source_type,
+                            bank_aware, route_tokens, order, original_ids,
+                            mode);
+}
+
+void gguf_dp4a_gate_up_grouped_batch_sm70_out(
+    torch::Tensor out, torch::Tensor activation, torch::Tensor ids,
+    torch::Tensor gate, torch::Tensor up, int64_t source_type, bool bank_aware,
+    torch::Tensor route_tokens, torch::Tensor order, torch::Tensor original_ids,
+    torch::Tensor mode) {
+  grouped_gate_out_impl<40>(out, activation, ids, gate, up, source_type,
+                            bank_aware, route_tokens, order, original_ids,
+                            mode);
 }

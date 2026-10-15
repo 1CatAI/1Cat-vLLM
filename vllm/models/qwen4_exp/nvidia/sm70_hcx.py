@@ -206,6 +206,7 @@ class Sm70HcxRuntime:
         self.top1_enabled = False
         self.diagnostic = False
         self.local_schedule = False
+        self.native_batch_max_m = HCX_MAX_M
         self.snapshots: dict[str, dict[str, torch.Tensor]] = {}
         self.group = group
         self.rank = dist.get_rank(group)
@@ -266,23 +267,40 @@ class Sm70HcxRuntime:
         if not all(admitted):
             self.reason = "direct_cuda_peer_access_unavailable"
             return
-        total = AR_BYTES + LORA_BYTES + HB_BYTES + TOP1_BYTES
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+        if (
+            self.full
+            and cfg is not None
+            and cfg.kernel_config.sm70_hcx_batch_fusion
+            and cfg.kernel_config.sm70_hcx_local_schedule
+            and cfg.kernel_config.sm70_hcx_batch_max_m > 16
+        ):
+            if not hasattr(torch.ops._C, "sm70_hcx_batch_out"):
+                raise ValueError("Batch HC requires the matching native build")
+            self.native_batch_max_m = 40
+        capacity = self.native_batch_max_m
+        ar_bytes = AR_BYTES * capacity // HCX_MAX_M
+        lora_bytes = LORA_BYTES * capacity // HCX_MAX_M
+        hb_bytes = HB_BYTES * capacity // HCX_MAX_M
+        total = ar_bytes + lora_bytes + hb_bytes + TOP1_BYTES
         with torch.accelerator.device_index(local):
             pointers = CustomAllreduce.create_shared_buffer(
                 total, group=group, peer_ranks=peers
             )
             base = [pointers[r] for r in order]
             self.ar = [p if p else 0 for p in base]
-            self.lora = [p + AR_BYTES if p else 0 for p in base]
-            self.hb = [p + AR_BYTES + LORA_BYTES if p else 0 for p in base]
+            self.lora = [p + ar_bytes if p else 0 for p in base]
+            self.hb = [p + ar_bytes + lora_bytes if p else 0 for p in base]
             self.top1_buffers = [
-                p + AR_BYTES + LORA_BYTES + HB_BYTES if p else 0 for p in base
+                p + ar_bytes + lora_bytes + hb_bytes if p else 0 for p in base
             ]
             self.top1_seq = torch.zeros(1, device=device, dtype=torch.int32)
-            self.xn = torch.zeros(HCX_MAX_M, KD, device=device, dtype=torch.float16)
-            self.sq = torch.zeros(80 * 8 * 4, device=device, dtype=torch.float32)
+            self.xn = torch.zeros(capacity, KD, device=device, dtype=torch.float16)
+            self.sq = torch.zeros(80 * capacity * 4, device=device, dtype=torch.float32)
             self.dpart = torch.zeros(
-                80 * 8 * 96 * 4, device=device, dtype=torch.float32
+                80 * capacity * 96 * 4, device=device, dtype=torch.float32
             )
             # Legacy arrival/reset counters and separate local-schedule
             # cumulative counter/base permit alternating graph policies.
@@ -355,10 +373,22 @@ class Sm70HcxRuntime:
             snapshot["epoch"].copy_(self.seq)
         if not 0 < m <= batch_max_m:
             raise ValueError("HCX batch exceeds its initialized policy")
-        for start in range(0, m, HCX_MAX_M):
-            stop = min(start + HCX_MAX_M, m)
+        native_batch = (
+            16 < m <= self.native_batch_max_m
+            and self.full
+            and self.local_schedule
+            and ox is None
+        )
+        step = m if native_batch else HCX_MAX_M
+        op = (
+            torch.ops._C.sm70_hcx_batch_out
+            if native_batch
+            else torch.ops._C.sm70_hcx_out
+        )
+        for start in range(0, m, step):
+            stop = min(start + step, m)
             tile = slice(start, stop)
-            torch.ops._C.sm70_hcx_out(
+            op(
                 partial[tile] if ox is not None else partial[tile].contiguous(),
                 secondary[tile] if secondary is not None else None,
                 hidden[tile].contiguous(),

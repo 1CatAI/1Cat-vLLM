@@ -736,9 +736,11 @@ __global__ __launch_bounds__(256, 1) void hcx_kernel(Args a) {
     }
   }
 }
+#include "hcx_batch_sm70.cuh"
 }  // namespace hcx
 
-void sm70_hcx_out(
+template <bool Batch>
+void sm70_hcx_impl(
     torch::Tensor p0, std::optional<torch::Tensor> p1, torch::Tensor res,
     torch::Tensor inj, torch::Tensor nw, double eps, torch::Tensor wd,
     torch::Tensor wu, torch::Tensor res_out, torch::Tensor blk_out,
@@ -779,6 +781,23 @@ void sm70_hcx_out(
   a.dbg = dbg ? reinterpret_cast<unsigned long long*>(dbg->data_ptr<int64_t>())
               : nullptr;
   a.M = static_cast<int>(p0.size(0));
+  if constexpr (Batch) {
+    TORCH_CHECK(a.M >= 9 && a.M <= 40 && full && local_schedule && !ox && !gz,
+                "HCX batch requires M9..40, full mesh, local schedule and "
+                "separate projection");
+    const auto* props = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(props->major == 7 && props->minor == 0 &&
+                    props->multiProcessorCount >= hcx::NC,
+                "HCX batch requires SM70 with at least 80 SMs");
+    TORCH_CHECK(xn.numel() >= 40 * hcx::KD && sq.numel() >= hcx::NC * 40 * 4 &&
+                    dpart.numel() >= hcx::NC * 40 * 96 * 4 && bar.numel() >= 4,
+                "HCX batch workspace too small");
+    hcx::
+        hcx_batch_kernel<<<hcx::NC, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+            a);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
+  }
   TORCH_CHECK(a.M >= 1 && a.M <= 8, "HCX: M1..8");
   auto st = at::cuda::getCurrentCUDAStream();
   if (ox) {
@@ -877,4 +896,42 @@ void sm70_dmv13_out(torch::Tensor x, std::vector<torch::Tensor> codes,
   TORCH_CHECK(x.size(0) >= 1 && x.size(0) <= 8, "sm70_dmv13_out: M1..8");
   dmvns::run(x, codes, high, scale, out, fmt, n, K, split, warps, ws, cnt, tp,
              std::nullopt, std::nullopt, extra_weight, extra_out);
+}
+
+void sm70_hcx_out(
+    torch::Tensor p0, std::optional<torch::Tensor> p1, torch::Tensor res,
+    torch::Tensor inj, torch::Tensor nw, double eps, torch::Tensor wd,
+    torch::Tensor wu, torch::Tensor res_out, torch::Tensor blk_out,
+    torch::Tensor inj_out, torch::Tensor xn, torch::Tensor sq,
+    torch::Tensor dpart, torch::Tensor bar, torch::Tensor seq,
+    std::vector<int64_t> ar, std::vector<int64_t> lora, std::vector<int64_t> hb,
+    int64_t rank, std::optional<torch::Tensor> dbg, int64_t full,
+    std::optional<torch::Tensor> ox, std::optional<torch::Tensor> ocodes,
+    std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
+    int64_t ofmt, std::optional<torch::Tensor> gz,
+    std::optional<torch::Tensor> gw, double geps,
+    std::optional<torch::Tensor> gscr, bool local_schedule) {
+  sm70_hcx_impl<false>(p0, p1, res, inj, nw, eps, wd, wu, res_out, blk_out,
+                       inj_out, xn, sq, dpart, bar, seq, ar, lora, hb, rank,
+                       dbg, full, ox, ocodes, ohigh, oscale, ofmt, gz, gw, geps,
+                       gscr, local_schedule);
+}
+
+void sm70_hcx_batch_out(
+    torch::Tensor p0, std::optional<torch::Tensor> p1, torch::Tensor res,
+    torch::Tensor inj, torch::Tensor nw, double eps, torch::Tensor wd,
+    torch::Tensor wu, torch::Tensor res_out, torch::Tensor blk_out,
+    torch::Tensor inj_out, torch::Tensor xn, torch::Tensor sq,
+    torch::Tensor dpart, torch::Tensor bar, torch::Tensor seq,
+    std::vector<int64_t> ar, std::vector<int64_t> lora, std::vector<int64_t> hb,
+    int64_t rank, std::optional<torch::Tensor> dbg, int64_t full,
+    std::optional<torch::Tensor> ox, std::optional<torch::Tensor> ocodes,
+    std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
+    int64_t ofmt, std::optional<torch::Tensor> gz,
+    std::optional<torch::Tensor> gw, double geps,
+    std::optional<torch::Tensor> gscr, bool local_schedule) {
+  sm70_hcx_impl<true>(p0, p1, res, inj, nw, eps, wd, wu, res_out, blk_out,
+                      inj_out, xn, sq, dpart, bar, seq, ar, lora, hb, rank, dbg,
+                      full, ox, ocodes, ohigh, oscale, ofmt, gz, gw, geps, gscr,
+                      local_schedule);
 }

@@ -1199,3 +1199,28 @@ void gguf_dp4a_gate_up_grouped_sm70_out(
     torch::Tensor gate, torch::Tensor up, int64_t source_type, bool bank_aware,
     torch::Tensor route_tokens, torch::Tensor order, torch::Tensor original_ids,
     torch::Tensor mode);
+
+void gguf_dp4a_gate_up_grouped_batch_sm70_out(
+    torch::Tensor out, torch::Tensor activation, torch::Tensor ids,
+    torch::Tensor gate, torch::Tensor up, int64_t source_type, bool bank_aware,
+    torch::Tensor route_tokens, torch::Tensor order, torch::Tensor original_ids,
+    torch::Tensor mode);
+
+void gguf_dp4a_raw_down_grouped_sm70_out(
+    torch::Tensor out, torch::Tensor projected, torch::Tensor input,
+    torch::Tensor ids, torch::Tensor order, torch::Tensor probabilities,
+    torch::Tensor weights, int64_t source_type, int64_t left);
+
+void sm70_hcx_batch_out(
+    torch::Tensor p0, std::optional<torch::Tensor> p1, torch::Tensor res,
+    torch::Tensor inj, torch::Tensor nw, double eps, torch::Tensor wd,
+    torch::Tensor wu, torch::Tensor res_out, torch::Tensor blk_out,
+    torch::Tensor inj_out, torch::Tensor xn, torch::Tensor sq,
+    torch::Tensor dpart, torch::Tensor bar, torch::Tensor seq,
+    std::vector<int64_t> ar, std::vector<int64_t> lora, std::vector<int64_t> hb,
+    int64_t rank, std::optional<torch::Tensor> dbg, int64_t full,
+    std::optional<torch::Tensor> ox, std::optional<torch::Tensor> ocodes,
+    std::optional<torch::Tensor> ohigh, std::optional<torch::Tensor> oscale,
+    int64_t ofmt, std::optional<torch::Tensor> gz,
+    std::optional<torch::Tensor> gw, double geps,
+    std::optional<torch::Tensor> gscr, bool local_schedule);

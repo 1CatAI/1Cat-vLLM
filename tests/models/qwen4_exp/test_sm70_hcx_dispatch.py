@@ -376,3 +376,55 @@ def test_diagnostic_snapshots_own_storage_and_reuse_addresses(monkeypatch):
     torch.testing.assert_close(snapshot["partial"], partial)
     torch.testing.assert_close(snapshot["block_out"], partial + secondary)
     assert snapshot["epoch"].item() == 1
+
+
+@pytest.mark.parametrize("rows", [9, 10, 16, 17, 20, 33, 40])
+@pytest.mark.parametrize("producer", [False, True])
+def test_batch_admission_retains_small_and_producer_paths(monkeypatch, rows, producer):
+    runtime = hcx.Sm70HcxRuntime.__new__(hcx.Sm70HcxRuntime)
+    runtime.diagnostic = False
+    runtime.local_schedule = runtime.full = True
+    runtime.native_batch_max_m = 40
+    runtime.logical_rank = 0
+    runtime.xn = runtime.sq = runtime.dpart = runtime.bar = runtime.seq = None
+    runtime.ar = runtime.lora = runtime.hb = []
+    calls = []
+
+    def native(name, *args):
+        calls.append((name, args[0].shape[0]))
+        args[8].copy_(args[2])
+        args[9].copy_(args[0])
+        args[10].copy_(args[3])
+
+    monkeypatch.setattr(
+        torch.ops._C, "sm70_hcx_out", lambda *a: native("retained", *a), raising=False
+    )
+    monkeypatch.setattr(
+        torch.ops._C,
+        "sm70_hcx_batch_out",
+        lambda *a: native("batch", *a),
+        raising=False,
+    )
+    partial = torch.randn(rows, 2560)
+    hidden = torch.randn(rows, 10240)
+    injection = torch.randn(rows, 4)
+    projection = (16, None, None, None, 0) if producer else None
+    actual = runtime.run(
+        partial,
+        hidden,
+        injection,
+        torch.ones(2560),
+        1e-6,
+        None,
+        None,
+        oproj=projection,
+        batch_max_m=40,
+    )
+    assert torch.equal(actual[0], hidden)
+    assert torch.equal(actual[1], partial)
+    assert torch.equal(actual[2], injection)
+    if rows <= 16 or producer:
+        assert all(name == "retained" and m <= 8 for name, m in calls)
+        assert sum(m for _, m in calls) == rows
+    else:
+        assert calls == [("batch", rows)]

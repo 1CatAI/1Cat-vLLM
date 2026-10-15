@@ -318,9 +318,9 @@ It reuses the existing segment format and native decoder across token tiles;
 qualified DMV Q4/IQ4 banks provide their equivalent full scale representation.
 The six-array prepared-operand ABI is retained. The accelerated initialization
 subset is K2560/N>=1536 or K1536/N2560 in the existing qualified formats and
-layouts. Runtime acceleration is limited to M9..16; M1..8 and M17..40
-retain the previous projection routes, and larger batches retain canonical
-restoration. The native batch operator has separately tested M1..40 coverage. The old native entry retains
+layouts. Runtime acceleration covers M9..16 and M25..40; M1..8 and
+M17..24 retain the previous projection routes. Compatible small segment
+peers share the same batch launch. Larger batches retain canonical restoration. The native batch operator has separately tested M1..40 coverage. The old native entry retains
 its M1..32 contract; the batch entry is explicit. Eighty-six dense native GPU
 cases and 111 affected storage/runtime cases pass, including capture/replay
 and the M40/M41 fallback boundary. The initial wider M9..40 model experiment
@@ -397,3 +397,242 @@ atomically. The final artifacts pass 54 affected GPU cases, including changed-ro
 graph replay, independent expert output oracles and four-rank indexer state
 checks. Clean model speed and longer-context gates remain separate before
 any promotion.
+
+## Matched node attribution and mixed-segment fusion
+
+Five decode-only node captures use the final rebuilt source and identical
+C1/C2/C4/C6/C8 contracts. Their interior counts are150/113/87/60/49.
+Node tracing changes absolute latency: traced whole verifier means are
+22.105/29.934/39.397/57.967/71.533ms, separately from event measurements.
+
+| TP0 GPU service ms | C1 | C2 | C4 | C6 | C8 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dense/shared projections | 3.489 | 6.879 | 6.224 | 9.291 | 14.847 |
+| Routed expert projections | 2.880 | 4.639 | 7.573 | 12.015 | 15.439 |
+| HC and its fused exchange | 2.504 | 4.648 | 7.564 | 10.575 | 13.877 |
+| Indexer and top-k | 3.556 | 3.876 | 4.434 | 5.109 | 5.955 |
+| Expert-cache resolution/wait | 1.659 | 1.398 | 1.498 | 3.285 | 3.761 |
+
+These are service sums, with overlapping streams; they are not an additive
+wall decomposition. C8 peer broadcast includes waiting for TP0 indexer work.
+The actual local GPU4–7 mesh has mixed NV1/NV2 links; the remote9683 NV2 mesh
+is a separate hardware contract. CPU affinity matches NUMA node1.
+
+The captured operand descriptors expose a dispatch problem: QKV banks mix a
+large batch-enabled segment (family5) with existing small K/V segments
+(family3). Requiring every segment to have a batch tag splits compatible
+projections and restores the small peers before separate calls. The candidate
+admits one native batch launch when all segments have the compatible layout
+and at least one calibrated large segment enables batching. The old M20
+fusion remains unchanged. M9..16 and M25..40 are qualified separately from
+larger prefill fallback.
+
+Real-weight QKV screens across four layers improve M10 by2.07–3.63x,
+M30 by1.48–2.04x and M40 by1.98–2.81x. M20 arithmetic is unchanged.
+Relative output errors remain below0.00077 versus the FP32 dequantized-weight
+reference, under the predeclared0.003 norm bound. The affected111 GPU runtime
+cases pass; three additional mixed-format cases exercise11 boundary/interior
+M values, changed-input replay and exactly one native batch dispatch at the
+accelerated sizes. The matching complete model curve is being collected;
+these micro gains are not reported as whole-verifier gains.
+
+Two original-down scheduling screens are rejected: cooperative two/four-lane
+source reads usually regress despite exact outputs, and one-warp-per-route
+regresses IQ4_NL while offering no representative M20 gain for Q2_0. Both
+research patches and all15 real-weight cases are retained outside the runtime.
+
+The mixed-segment model experiment completes all five 32K shared-prefix
+cases with181/214/182/178/165 complete TP4 verifier rounds and no incomplete
+rounds. Whole means are17.513/26.114/36.692/50.150/61.131ms; C8 p99 is68.697ms
+and draft mean8.768ms. C8 improves5.8% relative to the preceding combined
+64.895ms diagnostic. Retrieval, executable code and automatic tool call/reply
+all pass. This remains above the requested18/22/28ms targets and uses worker
+fences; ordinary-worker qualification remains separate. Source/native sampler
+acceptance varies between runs, so HTTP gains alone are not attributed to the
+projection change.
+
+An isolated HC grid-barrier screen compares the existing cumulative arrival
+counter with distributed arrival flags. Both take approximately1.62us per
+barrier and pass ordering/wrap checks in that screen. No native protocol change
+is justified; the private prototype is retained as a negative result.
+
+## Closed verifier interval audit
+
+The five captures use the pre-mixed-fusion grouped-twenty-row candidate
+(the untraced C8 event mean was 64.895 ms). They were swept by GPU timestamp on each
+selected critical rank. Each interval belongs to exactly one category, a
+separate overlap bucket, or the idle residual. Categories below sum to verifier
+wall; they are not summed kernel service. Node tracing perturbs absolute latency
+and these numbers must not replace the untraced event measurements above.
+
+| Concurrency | Complete interior rounds | Verifier wall ms | HC ms | Experts ms | Dense/shared ms | TP collectives ms | Overlap ms | Idle ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 150 | 22.105 | 2.390 | 2.879 | 2.489 | 3.661 | 0.999 | 2.150 |
+| 2 | 113 | 29.934 | 4.592 | 2.411 | 3.577 | 3.988 | 5.689 | 2.590 |
+| 4 | 87 | 39.397 | 7.399 | 7.560 | 5.488 | 4.823 | 0.167 | 3.035 |
+| 6 | 60 | 57.967 | 10.565 | 11.416 | 5.086 | 5.821 | 4.334 | 4.364 |
+| 8 | 49 | 71.533 | 13.702 | 12.595 | 7.753 | 6.724 | 9.138 | 4.338 |
+
+The remaining wall belongs to selected-history attention, GDN, routing, cache
+resolution, normalization, sampling/state commit and uncategorized kernels.
+Raw `scaling-nodes-{1..5}-closed.json` files retain those categories and each
+round; `scaling-nodes-closed-summary.json` retains their means. The closure
+assertion tolerates at most 1e-7 ms. This audit includes target forward,
+sampling and state commit, and excludes MTP draft calls. Expert and HC scaling
+remain primary optimization targets. A collective can include a wait on the
+indexer root, so its duration does not establish intrinsic link cost.
+
+## Forty-row expert/cache experiment
+
+The default fragment and mailbox capacity remain twenty rows. An explicit
+`sm70_gguf.grouped_gate_up_max_m=40` permits one 400-route lease with a
+512-integer mailbox. Reply capacity accounts for all request entries plus
+spare restoration; it grows to the next power of two when required. Retained
+quantization and ordinary gate/up/down kernels still run in twenty-row tiles.
+Grouped original gate/up has a separate native forty-row entry point, keeping
+the legacy operator and opaque schemas unchanged.
+
+The matched diagnostic event curve with forty-row gate/up, without grouped
+down, is 17.752 / 26.270 / 37.187 / 47.641 / 61.115 ms for C1/2/4/6/8,
+with 202 / 200 / 190 / 196 / 174 complete rounds and no incomplete rounds.
+C6 improves versus the mixed-fusion twenty-row control; C8 does not. This is
+not evidence that a faster isolated gate/up microbenchmark speeds the service.
+Eight concurrent 32K exact retrieval/arithmetic responses, executable Python,
+automatic weather tool selection/reply and natural EOS checks all pass.
+
+The next default-off `sm70_gguf.grouped_down` candidate groups original
+IQ4_NL/Q2_0 down weights across at most four equal-expert routes. It keeps
+FP16 projection boundaries, the retained four warp-owned route subtotals and
+their addition order. Only M25..40 is accelerated, with the forty-row lease
+policy and admitted Q8 intermediate/native expert shape. Smaller fragments
+keep the retained down path. Unsupported shapes use that path or its existing
+TurboMind continuation; a requested qualified route without its native build
+rejects initialization.
+
+Twenty-seven real-weight down screens and twenty-one threshold/interior
+screens preserve the prior bytes, including the saved prior-binary references.
+At M40, sort-inclusive speedups are 1.12..1.92x for IQ4_NL and 1.17..1.57x
+for Q2_0. Sparse M20 IQ4_NL regresses and remains outside acceleration. Sparse
+M25 IQ4_NL only improves 1.013x; this boundary result is not a broad speed claim.
+The native, cache, state/graph and complete expert-chain checks pass 141 GPU
+cases after correcting a test parameter that shadowed its weight tensor.
+The combined service screen below establishes measured 32K performance and
+task evidence; 256K quality qualification remains outstanding.
+
+Additional rejected screens are retained in the report directory. A bounded
+mailbox-plan scan changed isolated cache time by less than 1% and was removed.
+A four-float HC partial-workspace pad appeared faster in a one-call graph,
+but the 64-call graph screen removed launch skew and showed no C8 gain
+(0.13680 ms retained versus 0.13803 ms padded). Its source was removed.
+
+## Rechecked whole-batch HC path
+
+The earlier whole-batch HC rejection did not establish a reliable native-path
+comparison: its launcher did not explicitly enable the fusion policy, and a
+single-call graph mixed GPU work with peer launch skew. Rechecking the native
+operator directly, with observed CUDA dispatch and sixty-four calls per graph,
+shows bit-identical outputs and critical-rank per-call times:
+
+| Concurrency | Retained tiled HC ms | Whole-batch HC ms | Speedup |
+| --- | --- | --- | --- |
+| 1 | 0.021842 | 0.021777 | 1.003x (retained fallback) |
+| 2 | 0.045594 | 0.043849 | 1.040x |
+| 4 | 0.073743 | 0.065897 | 1.119x |
+| 6 | 0.103555 | 0.092633 | 1.118x |
+| 8 | 0.136066 | 0.121190 | 1.123x |
+
+This supersedes the earlier HC rejection for the measured full-mesh TP4,
+separate-projection, local-schedule path. The default-off typed policy
+`sm70_hcx_batch_fusion` owns its larger peer buffers and local workspaces.
+Producer-fused output projections, non-full-mesh execution, unsupported local
+modes and M1..16 retain the original eight-row path. M9..16 was excluded after
+the ordinary-worker acceptance regression described below. M>40 retains the existing
+projection/collective continuation. Requested qualified fusion rejects a
+missing native build. Original operator signatures remain unchanged.
+
+The four-rank Inductor/graph payload test passes all M5/8/9/10/17/20/24/25/30/
+32/33/39/40/41 cases, including input mutation, retained/fast alternation,
+materialized/final HC consumers and output ownership checks. These results are
+kernel/state evidence. The combined service performance and task gates are
+being measured separately; 256K boundary qualification remains outstanding.
+
+## Combined expert-down and HC service screen
+
+With mixed dense fusion, forty-row expert leases, grouped down and whole-batch
+HC enabled, the matched MTP4 diagnostic GPU-event verifier costs are:
+
+| Concurrency | Complete rounds | Incomplete | Mean ms | P99 ms | Draft mean ms |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 202 | 0 | 17.650 | 20.388 | 3.875 |
+| 2 | 220 | 0 | 25.681 | 28.084 | 4.580 |
+| 4 | 214 | 0 | 35.286 | 42.640 | 5.936 |
+| 6 | 186 | 0 | 45.974 | 58.584 | 7.455 |
+| 8 | 193 | 0 | 54.660 | 64.421 | 8.749 |
+
+C8 improves from 61.131 to 54.660 ms (10.6%) versus the prior mixed-fusion
+screen. C4 improves from 36.692 to 35.286 ms and C6 from 50.150 to 45.974 ms.
+These are whole-batch costs, never costs divided by concurrency. The workload
+keeps 256K capacity, 32K shared input, MTP4, C8 capacity, the same host QSA and
+80% GPU expert storage, 512-token prefill chunks and natural-EOS sampling.
+Profiling events/fences are enabled. The 16/18/22/28 ms C1/2/4/8 targets remain
+unmet. Ordinary-worker throughput/acceptance and paired task checks are a
+separate gate; no default promotion follows from this screen.
+
+## Ordinary-worker acceptance audit
+
+Fresh ordinary workers, without event fences, NVTX tracing or worker wrappers,
+completed matched mixed-fusion control and combined expert-down/HC passes.
+Both use the same source/native artifact, 384 output tokens, 32774 input
+tokens, capacity eight, sampling and per-request seeds. The control retains
+twenty-row gate/up and tiled HC; the combined pass enables forty-row gate/up,
+grouped down and whole-batch HC. Each row is the measured common interval
+with all submitted requests still decoding; rates are aggregate emitted tokens.
+
+| Concurrency | Control tok/s | Combined tok/s | Control acceptance length | Combined acceptance length |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 110.15 | 125.34 | 2.477 | 2.824 |
+| 2 | 169.49 | 133.84 | 2.630 | 2.121 |
+| 4 | 213.31 | 235.15 | 2.339 | 2.473 |
+| 6 | 251.40 | 277.44 | 2.458 | 2.481 |
+| 8 | 259.09 | 305.02 | 2.259 | 2.451 |
+
+The C2 emitted-token regression is approximately 21%, despite a slightly
+faster diagnostic verifier. This candidate is not accepted as a general MTP
+speed improvement. C1 acceptance also changes, so its rate improvement cannot
+be attributed to verifier compute alone. Both passes complete the eight-way
+32K retrieval/arithmetic, executable Python, automatic tool-call/reply and
+natural-EOS gates. These bounded task checks do not establish unchanged MTP
+acceptance or broad quality. The runtime HC acceleration range is consequently
+narrowed to M17..40 while C2 acceptance is investigated. The native operator's
+correctness range remains M9..40; admission and measured benefit are distinct.
+
+The subsequent shared-expert experiment reuses the existing fused gate/up and
+down operations in bounded twenty-row fragments. It is explicitly enabled by
+`sm70_gguf.shared_expert_batch`, defaults off, admits Q8_0 down projections at
+M9..40, and preserves the canonical continuation for other projections and
+larger batches. The existing two-integer internal down descriptor remains
+valid; the explicit opt-in adds a third policy integer without changing the
+registered operator schema. Real-weight screens across six layers show
+1.34..2.18x isolated M40 speedups and paired relative-norm error at most
+0.000622 against the predeclared 0.003 bound. M5/M8/M20 retain their prior
+bytes. GPU graph tests cover M5/8/9/10/16/17/20/21/24/25/30/32/33/39/40/41,
+mixed source formats, the independent FP32 oracle, changed inputs and native
+execution/fallback. Eleven format combinations pass.
+
+The first ordinary-worker shared-expert pass emits 110.24 / 151.25 / 244.01 /
+253.33 / 292.45 tok/s at C1/2/4/6/8. C2's additional same-seed repetition emits
+159.54 tok/s, with acceptance length changing from 2.444 to 2.579. Eight-way
+retrieval/arithmetic, coding and tool/reply gates pass. C6/C8 do not exceed the
+previous combined pass, and C2 remains below control. This is an unpromoted
+experiment; an isolated shared-expert speedup is insufficient to accept it.
+Its separate synchronized-verifier curve is still being collected.
+
+The latest combined C8 node capture closes a 60.184 ms traced verifier wall
+with 12.465 ms HC/fused communication, 9.069 ms expert projections, 6.599 ms
+dense/shared projections, 6.453 ms TP collectives, 3.874 ms selected-history
+attention, 2.423 ms GDN, 9.191 ms overlap, 3.399 ms idle and 6.711 ms in the
+remaining categories. Categories are exclusive wall intervals; traced absolute
+time is not the 54.660 ms diagnostic result. The observed native expert route
+groups average approximately four rows per expert. Neither these counts nor
+collective durations establish memory bandwidth or intrinsic NVLink cost;
+Nsight Compute profiling counters remain unavailable to this user.

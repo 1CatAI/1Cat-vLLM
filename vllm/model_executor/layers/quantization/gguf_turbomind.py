@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from torch.nn import Module, Parameter
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.kernels.gguf import (
     GGUFOperatorCapability,
     decoder_family,
@@ -81,7 +82,7 @@ def _prepared_gguf_projection(
     rows = x.reshape(-1, x.shape[-1]).contiguous()
     # Batch variants keep their original small-row and prefill layouts.
     # Family 6 carries compact DMV stats plus its explicit full-scale bank.
-    batch_rows = 9 <= rows.shape[0] <= 16
+    batch_rows = 9 <= rows.shape[0] <= 16 or 25 <= rows.shape[0] <= 40
     if family == 6:
         if cache is None:
             raise ValueError("Batch DMV requires its explicit full-scale bank")
@@ -230,7 +231,7 @@ def _prepared_gguf_mixed_projection(
 ) -> torch.Tensor:
     rows = x.reshape(-1, x.shape[-1]).contiguous()
     specs = [descriptors[i : i + 9] for i in range(0, len(descriptors), 9)]
-    batch_rows = 9 <= rows.shape[0] <= 16
+    batch_rows = 9 <= rows.shape[0] <= 16 or 25 <= rows.shape[0] <= 40
     if not batch_rows:
         caches = list(caches)
         for i, spec in enumerate(specs):
@@ -254,7 +255,14 @@ def _prepared_gguf_mixed_projection(
         )
         cache_offset += cache_count
         blas_offset += blas_count
-    batched = batch_rows and all(spec[0] in (5, 6) for spec in specs)
+    # Algorithm tags must not split a compatible segment bank. A calibrated
+    # large projection can share one launch with its original small K/V peers;
+    # their storage and decoder layouts already use the same native segment API.
+    batched = (
+        batch_rows
+        and any(spec[0] in (5, 6) for spec in specs)
+        and all(spec[0] in (3, 5, 6) for spec in specs)
+    )
     if specs and (all(spec[0] == 3 for spec in specs) or batched):
         from .gguf_dense_hmma import apply_segments
 
@@ -559,6 +567,10 @@ class GGUFPreparedProjection(Module):
         self.kernel = None
         self.input_layout = input_layout
         self.dmv_enabled = dmv_enabled
+        cfg = get_current_vllm_config_or_none()
+        self.shared_expert_batch = bool(
+            cfg and cfg.kernel_config.sm70_gguf.shared_expert_batch
+        )
         self.input_layout_restored = False
         self.input_layout_rejection_reasons = []
         self.logical_output_size = weight.shape[0]

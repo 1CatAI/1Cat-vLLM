@@ -22,6 +22,62 @@ from vllm.model_executor.layers.quantization.gguf_turbomind import (
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
+@pytest.mark.parametrize("sources", [(23, 14, 14), (12, 14, 13), (13, 14, 13)])
+def test_mixed_large_small_batch_reuses_one_native_launch(sources):
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("SM70 required")
+    k, widths = 2560, (3072, 256, 256)
+    raw = [raw_weights(source, n, k) for source, n in zip(sources, widths)]
+    expected_weight = torch.cat(
+        [
+            torch.from_numpy(
+                gguf.quants.dequantize(weight, gguf.GGMLQuantizationType(source))
+            )
+            for source, weight in zip(sources, raw)
+        ]
+    ).cuda()
+    config = SimpleNamespace(
+        kernel_config=KernelConfig(sm70_gguf={"small_m_hmma_batch": True}),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+    )
+    with set_current_vllm_config(config):
+        projections = prepare_gguf_projections(
+            [
+                (torch.from_numpy(weight).cuda(), source)
+                for weight, source in zip(raw, sources)
+            ],
+            torch.float16,
+            True,
+            8,
+        )
+        operands = prepared_projection_arguments(projections)
+        assert 5 in operands[3][::9] and 3 in operands[3][::9]
+        for m in (8, 9, 10, 16, 17, 20, 24, 25, 30, 40, 41):
+            x = torch.randn(m, k, device="cuda", dtype=torch.float16) * 0.125
+            with NativeDispatchTrace() as trace:
+                _prepared_gguf_mixed_projection(x, *operands)
+            accelerated = 9 <= m <= 16 or 25 <= m <= 40
+            calls = [
+                r
+                for r in trace.records
+                if r["operator"] == "_C::gguf_dense_segments_batch_sm70_out"
+            ]
+            assert len(calls) == int(accelerated)
+            if calls:
+                assert calls[0]["evidence"] == "cuda_dispatch"
+                assert calls[0]["inputs"][0]["shape"] == [m, k]
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = apply_prepared_gguf_projections(x, projections)
+            for shift in (0.0, 0.125):
+                x.normal_(mean=shift, std=0.125)
+                graph.replay()
+                expected = x.float() @ expected_weight.float().T
+                torch.accelerator.synchronize()
+                assert bool(torch.isfinite(out).all())
+                assert float((out.float() - expected).norm() / expected.norm()) < 0.003
+
+
 @pytest.mark.parametrize("source,dmv", [(12, True), (23, True), (14, False)])
 def test_batch_storage_uses_native_then_retained_prefill(source, dmv):
     if torch.cuda.get_device_capability() != (7, 0):

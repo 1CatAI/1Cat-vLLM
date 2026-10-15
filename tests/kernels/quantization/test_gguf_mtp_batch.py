@@ -18,8 +18,13 @@ from vllm.transformers_utils.gguf_tensor_reader import dequantize, quant_size
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
-@pytest.mark.parametrize("rows", [20, 21, 30, 40])
-def test_tiled_mtp_experts_match_q8_oracle_and_changed_graph(rows):
+@pytest.mark.parametrize("rows", [20, 21, 24, 25, 30, 39, 40])
+@pytest.mark.parametrize(
+    "grouped_rows,reuse_down", [(20, False), (40, False), (40, True)]
+)
+def test_tiled_mtp_experts_match_q8_oracle_and_changed_graph(
+    rows, grouped_rows, reuse_down
+):
     experts, hidden, intermediate, top_k = 4, 256, 160, 2
     rng = np.random.default_rng(20261015)
 
@@ -68,6 +73,8 @@ def test_tiled_mtp_experts_match_q8_oracle_and_changed_graph(rows):
     method.input_padding = {"w2": (left, intermediate + left)}
     method.q8_intermediate = True
     method.grouped_gate_up = True
+    method.grouped_gate_up_max_m = grouped_rows
+    method.grouped_down = reuse_down
     torch.manual_seed(rows)
     x = (torch.randn(rows, hidden, device="cuda") * 0.125).half()
     ids = torch.randint(experts, (rows, top_k), dtype=torch.int32, device="cuda")

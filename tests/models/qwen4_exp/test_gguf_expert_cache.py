@@ -24,14 +24,14 @@ def _shape(layer, shard):
     return (rows, width + 16) if layer == 5 and shard != "w2" else (rows, width)
 
 
-def _cache(fraction=0.75, spare=4, slack=0.1):
+def _cache(fraction=0.75, spare=4, slack=0.1, experts=EXPERTS, decode_rows=20):
     device = torch.device("cuda", torch.accelerator.current_device_index())
     generator = torch.Generator().manual_seed(0)
     original = {
         (layer, shard): torch.randint(
             0,
             256,
-            (EXPERTS, *_shape(layer, shard)),
+            (experts, *_shape(layer, shard)),
             dtype=torch.uint8,
             generator=generator,
         )
@@ -42,7 +42,7 @@ def _cache(fraction=0.75, spare=4, slack=0.1):
         (
             layer,
             shard,
-            (EXPERTS, *_shape(layer, shard)),
+            (experts, *_shape(layer, shard)),
             16 if shard == "w2" else 0,
             (0, 0, 0),
         )
@@ -56,10 +56,11 @@ def _cache(fraction=0.75, spare=4, slack=0.1):
         expert_cache_profile=None,
         expert_cache_prefill="mmq",
         expert_cache_prefill_tokens=4096,
+        grouped_gate_up_max_m=decode_rows,
     )
-    cache = gguf_expert_cache.create_cache(banks, EXPERTS, config, device)
+    cache = gguf_expert_cache.create_cache(banks, experts, config, device)
     for (layer, shard), bank in original.items():
-        for expert in range(EXPERTS):
+        for expert in range(experts):
             cache.store(layer, shard, expert, bank[expert].to(device))
     return cache, {k: v.to(device) for k, v in original.items()}
 
@@ -115,6 +116,44 @@ def test_resolve_inside_cuda_graph():
         torch.accelerator.synchronize()
         for layer, slots in zip(LAYERS, outs):
             _check_decode(cache, original, layer, static, slots)
+
+
+@pytest.mark.parametrize("spare", [4, 12])
+@pytest.mark.parametrize("rows", [1, 5, 9, 10, 20, 21, 30, 39, 40])
+def test_forty_row_cache_lease_changed_graph_preserves_bytes(spare, rows):
+    # C8 MTP4 has 400 routes. Force evictions and host write-backs while a
+    # single lease protects every route, including ring/plan capacity edges.
+    cache, original = _cache(
+        fraction=0.82, spare=spare, slack=0.0, experts=512, decode_rows=40
+    )
+    assert cache.ring.shape[1] == 512
+    assert cache.max_ops >= 504 + spare
+    ids = torch.arange(rows * 10, dtype=torch.int32, device="cuda").view(rows, 10)
+    try:
+        cache.resolve(LAYERS[0], ids)
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            outs = [cache.resolve(layer, ids) for layer in LAYERS]
+        for shift in (0, 113, 257, 511, 32):
+            ids.copy_(
+                (torch.arange(rows * 10, device="cuda").view_as(ids) + shift) % 512
+            )
+            # Residency is deliberately shuffled at initialization. Ensure
+            # even the one-row graph exercises a miss and spare restoration.
+            cold = torch.nonzero(cache.table[0] < 0).flatten()
+            ids.view(-1)[0].copy_(cold[0])
+            graph.replay()
+            torch.accelerator.synchronize()
+            for layer, slots in zip(LAYERS, outs):
+                _check_decode(cache, original, layer, ids, slots)
+        assert cache.stats()["errors"] == 0
+        assert cache.stats()["evicted"] > 0
+        assert cache.stats()["writebacks"] > 0
+    finally:
+        torch.accelerator.synchronize()
+        cache.close()
 
 
 def test_prefill_bank_matches_and_interleaves_with_decode():

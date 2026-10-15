@@ -20,6 +20,7 @@ def test_mtp_batch_policy_is_owned_hashed_and_serializable():
     tiled = KernelConfig(
         sm70_hcx=True,
         sm70_hcx_batch_max_m=40,
+        sm70_hcx_batch_fusion=True,
         qsa_host_kv_state_compact=True,
         sm70_qsa_shared_key_batch=True,
         sm70_gguf={
@@ -27,6 +28,9 @@ def test_mtp_batch_policy_is_owned_hashed_and_serializable():
             "small_m_dp4a_max_m": 40,
             "small_m_hmma_batch": True,
             "grouped_gate_up": True,
+            "grouped_gate_up_max_m": 40,
+            "grouped_down": True,
+            "shared_expert_batch": True,
         },
         qsa_host_kv=True,
         qsa_host_indexer_history=True,
@@ -51,11 +55,13 @@ def test_mtp_batch_policy_is_owned_hashed_and_serializable():
     assert worker.exitcode == 0
     assert legacy.sm70_hcx_batch_max_m == 8
     assert legacy.sm70_gguf.small_m_dp4a_max_m == 20
+    assert legacy.sm70_gguf.grouped_gate_up_max_m == 20
     assert not legacy.qsa_host_kv_state_compact
     assert transferred == tiled
     assert transferred.compute_hash() == tiled.compute_hash()
     for field in (
         "sm70_hcx_batch_max_m",
+        "sm70_hcx_batch_fusion",
         "qsa_host_kv_state_compact",
         "sm70_qsa_shared_key_batch",
         "sm70_qsa_indexer_single_rank",
@@ -65,6 +71,16 @@ def test_mtp_batch_policy_is_owned_hashed_and_serializable():
         setattr(changed, field, getattr(legacy, field))
         assert changed.compute_hash() != tiled.compute_hash()
     transferred.sm70_gguf.small_m_dp4a_max_m = 20
+    assert transferred.compute_hash() != tiled.compute_hash()
+
+    transferred = copy.deepcopy(tiled)
+    transferred.sm70_gguf.grouped_gate_up_max_m = 20
+    assert transferred.compute_hash() != tiled.compute_hash()
+    transferred = copy.deepcopy(tiled)
+    transferred.sm70_gguf.grouped_down = False
+    assert transferred.compute_hash() != tiled.compute_hash()
+    transferred = copy.deepcopy(tiled)
+    transferred.sm70_gguf.shared_expert_batch = False
     assert transferred.compute_hash() != tiled.compute_hash()
 
     transferred = copy.deepcopy(tiled)
@@ -82,6 +98,7 @@ def test_disabled_parents_keep_inactive_batch_options_out_of_hash():
         sm70_hcx=False,
         sm70_qsa_shared_key=False,
         sm70_hcx_batch_max_m=40,
+        sm70_hcx_batch_fusion=True,
         sm70_qsa_shared_key_batch=True,
         sm70_qsa_indexer_stage_keys=True,
     )
@@ -108,3 +125,9 @@ def test_mtp_batch_policy_rejects_unsupported_limits(limit):
         KernelConfig(sm70_hcx_batch_max_m=limit)
     with pytest.raises(ValueError):
         KernelConfig(sm70_gguf={"small_m_dp4a_max_m": limit})
+
+
+@pytest.mark.parametrize("limit", [19, 21, 39, 41])
+def test_grouped_gate_policy_rejects_unqualified_fragments(limit):
+    with pytest.raises(ValueError):
+        KernelConfig(sm70_gguf={"grouped_gate_up_max_m": limit})

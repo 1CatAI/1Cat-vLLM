@@ -719,3 +719,5 @@ void gguf_dp4a_scalar_lut_gate_up_sm70_out(
 }
 
 #include "gguf_grouped_gate_sm70.cuh"
+
+#include "gguf_grouped_down_sm70.cuh"

@@ -573,7 +573,7 @@ class Sm70GgufConfig:
     small_m_dp4a: bool = True
     """Use Q8_1 activations and FP32 integer dots for calibrated small GGUF batches."""
     small_m_dp4a_max_m: int = Field(default=20, ge=1, le=40)
-    """Maximum logical batch; native fragments remain at most 20 rows.
+    """Maximum logical batch; retained native fragments use at most 20 rows.
 
     Values above 20 opt into tiled original-block experts, including small
     prefill tails. Larger batches retain the existing TurboMind path.
@@ -585,9 +585,33 @@ class Sm70GgufConfig:
     small_m_hmma: bool = True
     """Use one coalesced integer bank and fused FP16 MMA projections at M1..8."""
     small_m_hmma_batch: bool = False
-    """Reuse large resident projection weights at M9..16 on qualified shapes."""
+    """Reuse large projection weights at M9..16 and M25..40 on qualified shapes.
+
+    Compatible small segment peers share the launch. M17..24 retains the
+    prior dispatch, including the separately qualified M20 projection route.
+    """
     grouped_gate_up: bool = False
-    """Reuse original expert decoding across M9..20 routed rows on SM70."""
+    """Reuse original expert decoding across qualified routed rows on SM70."""
+    grouped_gate_up_max_m: Literal[20, 40] = 20
+    """Bound grouped expert fragments and the matching cache request capacity.
+
+    Forty rows opt into one cache lease and grouped gate/up across MTP4 C8.
+    Quantization and ordinary down retain their twenty-row native calls;
+    grouped_down separately admits the grouped down projection.
+    """
+    grouped_down: bool = False
+    """Reuse original IQ4_NL/Q2_0 down weights in qualified M25..40 batches.
+
+    Requires the forty-row grouped expert/cache policy. Smaller batches keep
+    the retained projection and its four ordered route subtotals.
+    """
+    shared_expert_batch: bool = False
+    """Reuse the retained fused shared expert in M9..40 batches.
+
+    Qualified Q8_0 down projections use twenty-row native fragments sharing
+    bounded scratch. Larger batches and unqualified projections retain their
+    existing canonical continuation.
+    """
 
     q8_expert_intermediate: bool = True
     """Encode routed intermediates once in qualified integer expert gate/up."""
@@ -845,6 +869,12 @@ class KernelConfig:
 
     Values above 8 opt into tiling; larger batches retain the existing
     projection and communication fallback. Bound independently on each module.
+    """
+    sm70_hcx_batch_fusion: bool = False
+    """Fuse M17..40 HC tiles on full-mesh SM70 TP4 with a local schedule.
+
+    Separate output projections use the whole-batch kernel. Producer-fused
+    projections and unsupported modes keep the retained eight-row tiles.
     """
 
     sm70_hcx_local_schedule: bool = False
@@ -1123,6 +1153,7 @@ class KernelConfig:
             ignored_factors.add("sm70_skinny_moe")
         if not self.sm70_hcx:
             ignored_factors.add("sm70_hcx_batch_max_m")
+            ignored_factors.add("sm70_hcx_batch_fusion")
         if not self.sm70_qsa_shared_key:
             ignored_factors.add("sm70_qsa_shared_key_batch")
             ignored_factors.add("sm70_qsa_indexer_stage_keys")
