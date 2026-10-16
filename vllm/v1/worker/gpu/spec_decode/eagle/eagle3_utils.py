@@ -49,6 +49,11 @@ def get_eagle3_aux_layers_from_config(
         target_layer_ids = getattr(hf_config, "target_layer_ids", None)
         if target_layer_ids:
             layer_ids = [i + 1 for i in target_layer_ids]
+    if not layer_ids:
+        # DSpark config uses zero-based decoder-layer IDs.
+        dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
+        if dspark_layer_ids:
+            layer_ids = [i + 1 for i in dspark_layer_ids]
     if layer_ids and isinstance(layer_ids, (list, tuple)):
         return tuple(layer_ids)
     return None
