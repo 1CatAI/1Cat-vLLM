@@ -537,6 +537,9 @@
  "vllm/v1/worker/gpu/spec_decode/__init__.py": {
   "model": 12
  },
+ "vllm/v1/worker/gpu/spec_decode/dspark/block_drafter.py": {
+  "model": 6
+ },
  "vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py": {
   "model": 6
  },

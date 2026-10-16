@@ -330,6 +330,9 @@ class CudaGraphManager:
         if (
             spec is None
             or spec.method != "dspark"
+            # Other DSpark drafters keep one draft width; graphs for the
+            # narrower verify shapes would only be captured, never replayed.
+            or not self.vllm_config._is_inkling2_dspark()
             or not isinstance(self, ModelCudaGraphManager)
             or self.decode_query_len <= 1
         ):
