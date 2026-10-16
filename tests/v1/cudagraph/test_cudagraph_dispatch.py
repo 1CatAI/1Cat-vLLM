@@ -15,6 +15,7 @@ from vllm.config import (
     CompilationConfig,
     CompilationMode,
     CUDAGraphMode,
+    ObservabilityConfig,
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
@@ -58,6 +59,8 @@ def _create_vllm_config(
         max_num_seqs=max_num_seqs,
     )
     mock_config.parallel_config = ParallelConfig()
+    # CUDAGraphWrapper builds a decode event tracer from the runtime trace policy.
+    mock_config.observability_config = ObservabilityConfig()
     mock_config.speculative_config = None  # No speculative decoding
     if not lora_config:
         mock_config.lora_config = None
