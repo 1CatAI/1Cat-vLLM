@@ -1000,11 +1000,36 @@ class Worker(WorkerBase):
         activate_triton_jit_monitor()
 
         self._trim_qsa_warmup_cache()
+        self._release_compile_artifact_records()
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,
         )
+
+    @staticmethod
+    def _release_compile_artifact_records() -> int:
+        """Drop torch's in-memory copies of loaded compile artifacts.
+
+        Torch records every loaded FX-graph artifact (pickled bytes) for
+        ``torch.compiler.save_cache_artifacts``; vLLM keeps its own compile
+        cache and never calls it, so after warmup the records only hold host
+        memory (~140 MiB per worker on Flash-Next).
+        """
+        try:
+            from torch.compiler._cache import CacheArtifactManager
+        except ImportError:
+            return 0
+        released = sum(
+            len(getattr(artifact, "content", b"") or b"")
+            for artifact in CacheArtifactManager._seen_artifacts
+        )
+        CacheArtifactManager.clear()
+        if released:
+            logger.info(
+                "Released %.1f MiB of recorded compile artifacts.", released / 2**20
+            )
+        return released
 
     def _trim_qsa_warmup_cache(self) -> bool:
         """Release unused warmup pages after all active buffers are prepared."""

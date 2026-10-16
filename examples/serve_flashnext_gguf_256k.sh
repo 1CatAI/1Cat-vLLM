@@ -46,7 +46,7 @@ config = {
         "small_m_dp4a": True, "q8_expert_intermediate": True,
         "small_m_hmma": True, "lut4_expert_dp4a": True,
         "device_transcode": True, "dequant_workspace_bytes": 33554432,
-        "expert_cache_fraction": 0.8, "expert_cache_host_slack": 0.05,
+        "expert_cache_fraction": 0.8, "expert_cache_host_slack": 0.0,
         "expert_cache_prefill": "turbomind", "expert_cache_prefill_tokens": 2048,
         "expert_load_prefetch_banks": 1,
     },
