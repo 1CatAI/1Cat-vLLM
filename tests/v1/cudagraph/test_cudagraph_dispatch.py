@@ -15,6 +15,7 @@ from vllm.config import (
     CompilationConfig,
     CompilationMode,
     CUDAGraphMode,
+    ObservabilityConfig,
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
@@ -26,6 +27,7 @@ from vllm.forward_context import (
     BatchDescriptor,
     set_forward_context,
 )
+from vllm.model_executor.models.graph_contract import GraphModelContract
 from vllm.platforms import current_platform
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 
@@ -57,6 +59,8 @@ def _create_vllm_config(
         max_num_seqs=max_num_seqs,
     )
     mock_config.parallel_config = ParallelConfig()
+    # CUDAGraphWrapper builds a decode event tracer from the runtime trace policy.
+    mock_config.observability_config = ObservabilityConfig()
     mock_config.speculative_config = None  # No speculative decoding
     if not lora_config:
         mock_config.lora_config = None
@@ -418,7 +422,7 @@ class TestCudagraphDispatcher:
             uniform_decode_query_len=1,
         )
 
-        assert dispatcher.sm70_dsv4_decode_context_buckets == (2048,)
+        assert dispatcher.sm70_dsv4_decode_context_buckets == (2048, 4096)
         bounded = BatchDescriptor(
             num_tokens=1,
             num_reqs=1,
@@ -430,6 +434,33 @@ class TestCudagraphDispatcher:
         config.compilation_config.runtime.dsv4_context_buckets = ()
         disabled = CudagraphDispatcher(config)
         assert not disabled.sm70_dsv4_decode_context_buckets
+
+    @pytest.mark.parametrize(
+        ("max_model_len", "expected"),
+        [
+            (4096, (2048, 4096)),
+            (131072, (2048, 4096, 16384, 65536, 131072)),
+            (307200, (2048, 4096, 16384, 65536, 131072, 307200)),
+        ],
+    )
+    def test_dsv4_decode_context_buckets_end_at_the_model_length(
+        self, max_model_len, expected
+    ):
+        # Without a bucket at the maximum length, contexts above the largest
+        # multiple replay the full-length graph, where the indexer leaves its
+        # cuBLAS decode route.
+        contract = GraphModelContract(
+            speculative=True,
+            max_model_len=max_model_len,
+            num_heads=64,
+            num_kv_heads=1,
+            head_dim=512,
+            index_topk=512,
+            compress_ratios=(4, 128),
+            cache_dtype="fp8",
+            attention_backend=None,
+        )
+        assert contract.compressed_context_buckets() == expected
 
     @pytest.mark.parametrize("speculative_tokens", [3, 5, 7])
     def test_dsv4_context_buckets_are_derived_for_mtp_on_sm70(
@@ -460,7 +491,7 @@ class TestCudagraphDispatcher:
             dispatcher = CudagraphDispatcher(config)
         # Speculative graphs bucket like single-row decode: the sparse indexer
         # needs a bounded key length to take its cuBLAS route under full graphs.
-        assert dispatcher.sm70_dsv4_decode_context_buckets == (2048,)
+        assert dispatcher.sm70_dsv4_decode_context_buckets == (2048, 4096)
         dispatcher.initialize_cudagraph_keys(
             cudagraph_mode=comp_config.cudagraph_mode,
             uniform_decode_query_len=query_rows,
