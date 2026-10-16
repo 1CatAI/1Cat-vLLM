@@ -35,19 +35,55 @@ def _mock_communicator() -> CustomAllreduce:
     return communicator
 
 
-@pytest.mark.parametrize("verify", [False, True])
-def test_p2p_check_verifies_when_the_driver_report_is_not_enough(monkeypatch, verify):
+def test_group_p2p_check_tests_the_group_devices_within_the_group(monkeypatch):
+    # The second TP group of a pipeline over mixed cards: this rank holds
+    # device 3, its peer device 2. The check must test those devices, not the
+    # group ranks 0 and 1, and must not reach the world-barrier cache check
+    # that ranks of other pipeline stages never enter.
+    tested = []
+
+    def real_test(batch_src, batch_tgt):
+        tested.append((list(batch_src), list(batch_tgt)))
+        return [True] * len(batch_src)
+
+    agreed = []
+
+    def all_gather_object(statuses, status, group):
+        agreed.append(group)
+        statuses[:] = [True, status]
+
+    group = object()
+    monkeypatch.setattr(custom_all_reduce, "run_p2p_access_test", real_test)
+    monkeypatch.setattr(custom_all_reduce.dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(
+        custom_all_reduce,
+        "gpu_p2p_access_check",
+        Mock(side_effect=AssertionError("world-barrier check reached")),
+    )
+
+    assert custom_all_reduce._group_p2p_verified(group, 3, [2, 3]) is True
+    assert tested == [([3], [2])]
+    assert agreed == [group]
+
+
+@pytest.mark.parametrize(("local_ok", "peer_ok"), [(False, True), (True, False)])
+def test_group_p2p_check_fails_on_every_rank_when_one_rank_fails(
+    monkeypatch, local_ok, peer_ok
+):
     # A PCIe host whose driver reports peer access that the real IPC write
     # test rejects (seen on two V100-PCIE behind a PHB without iommu=pt).
     monkeypatch.setattr(
-        custom_all_reduce, "envs", SimpleNamespace(VLLM_SKIP_P2P_CHECK=True)
+        custom_all_reduce,
+        "run_p2p_access_test",
+        lambda batch_src, batch_tgt: [local_ok] * len(batch_src),
     )
-    monkeypatch.setattr(torch.cuda, "can_device_access_peer", lambda src, tgt: True)
-    real_test = Mock(return_value=False)
-    monkeypatch.setattr(custom_all_reduce, "gpu_p2p_access_check", real_test)
 
-    assert custom_all_reduce._can_p2p(0, 2, verify=verify) is (not verify)
-    assert real_test.called is verify
+    def all_gather_object(statuses, status, group):
+        statuses[:] = [status, peer_ok]
+
+    monkeypatch.setattr(custom_all_reduce.dist, "all_gather_object", all_gather_object)
+
+    assert custom_all_reduce._group_p2p_verified(object(), 0, [0, 1]) is False
 
 
 @pytest.mark.parametrize("rows", [1, 4, 5, 16, 128])

@@ -16,6 +16,7 @@ from vllm.config.execution_policy import communication_policy
 from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
     gpu_p2p_access_check,
+    run_p2p_access_test,
 )
 from vllm.distributed.device_communicators.collective_provider import (
     CollectiveCapabilities,
@@ -91,18 +92,33 @@ def _sm70_tp8_hierarchical_peer_ranks(rank: int) -> tuple[int, ...]:
     return (*range(clique_base, clique_base + 4), pair_rank)
 
 
-def _can_p2p(rank: int, world_size: int, verify: bool = False) -> bool:
-    """Whether this rank can reach every peer; ``verify`` forces the real
-    IPC write test even when VLLM_SKIP_P2P_CHECK trusts the driver report."""
+def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
         if i == rank:
             continue
-        if envs.VLLM_SKIP_P2P_CHECK and not verify:
+        if envs.VLLM_SKIP_P2P_CHECK:
             logger.debug("Skipping P2P check and trusting the driver's P2P report.")
             return torch.cuda.can_device_access_peer(rank, i)
         if not gpu_p2p_access_check(rank, i):
             return False
     return True
+
+
+def _group_p2p_verified(
+    group: ProcessGroup, device_index: int, group_device_indices: list[int]
+) -> bool:
+    """Run the real CUDA IPC write test from this rank's device to every peer
+    device of the group and agree on the result within the group.
+
+    Unlike `gpu_p2p_access_check` it needs no world barrier, so ranks of other
+    pipeline stages that do not provision these collectives cannot wedge it,
+    and it tests the group's own devices rather than its rank numbers.
+    """
+    peers = [index for index in group_device_indices if index != device_index]
+    local_ok = all(run_p2p_access_test([device_index] * len(peers), peers))
+    statuses: list[bool | None] = [None] * len(group_device_indices)
+    dist.all_gather_object(statuses, local_ok, group=group)
+    return all(status is True for status in statuses)
 
 
 is_weak_contiguous = weak_contiguous
@@ -127,8 +143,8 @@ class CustomAllreduce:
                 default process group.
             device: the device to bind the CustomAllreduce to. If None,
                 it will be bound to f"cuda:{local_rank}".
-            verify_p2p: run the real P2P access test even when
-                VLLM_SKIP_P2P_CHECK trusts the driver's report.
+            verify_p2p: run the real P2P access test on the group's devices
+                even when VLLM_SKIP_P2P_CHECK trusts the driver's report.
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -272,11 +288,17 @@ class CustomAllreduce:
         # this is expensive to compute at the first time
         # then we cache the result
         # On AMD GPU, p2p is always enabled between XGMI connected GPUs
-        if (
-            not tp8_hierarchical
-            and not current_platform.is_rocm()
-            and not _can_p2p(rank, world_size, verify=verify_p2p)
-        ):
+        if tp8_hierarchical or current_platform.is_rocm():
+            p2p_ok = True
+        elif verify_p2p:
+            p2p_ok = _group_p2p_verified(
+                self.group,
+                device.index,
+                [device_ids.index(physical) for physical in physical_device_ids],
+            )
+        else:
+            p2p_ok = _can_p2p(rank, world_size)
+        if not p2p_ok:
             logger.warning(
                 "Custom allreduce is disabled because your platform lacks "
                 "GPU P2P capability or P2P test failed. To silence this "
