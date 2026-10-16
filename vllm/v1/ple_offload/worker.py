@@ -328,9 +328,23 @@ class PleOffloadWorkerHandle:
     death_writer: Connection | None
     ready_pipe_reader: Connection | None
     row_readers: dict[str, Any] = field(default_factory=dict)
+    # Background thread running proc.start(), and any error it raised.
+    starter: threading.Thread | None = None
+    start_error: BaseException | None = None
+
+    def join_starter(self) -> None:
+        """Wait for the background start; re-raise its error once."""
+        if self.starter is not None:
+            self.starter.join()
+            self.starter = None
+        if self.start_error is not None:
+            error, self.start_error = self.start_error, None
+            raise RuntimeError("PLE offload worker failed to start") from error
 
     def close(self) -> None:
         """Release all process resources. Safe to call more than once."""
+        with contextlib.suppress(RuntimeError):
+            self.join_starter()
         if self.ready_pipe_reader is not None:
             self.ready_pipe_reader.close()
             self.ready_pipe_reader = None
@@ -424,26 +438,41 @@ class PleOffloadWorker:
             daemon=True,
         )
 
-        # Python normally forbids a daemon WorkerProc from spawning children.
-        # vLLM owns this process through death_pipe and explicit shutdown, so
-        # temporarily clear the daemon flag while the child is created.
-        parent = multiprocessing.process._current_process  # type: ignore[attr-defined]
-        saved_daemon = parent._config.get("daemon")
-        parent._config["daemon"] = False
-        try:
-            proc.start()
-        finally:
-            parent._config["daemon"] = saved_daemon
-        ready_writer.close()
-        return PleOffloadWorkerHandle(
+        handle = PleOffloadWorkerHandle(
             proc=proc,
             death_writer=death_writer,
             ready_pipe_reader=ready_reader,
         )
 
+        def start() -> None:
+            # Python normally forbids a daemon WorkerProc from spawning
+            # children. vLLM owns this process through death_pipe and explicit
+            # shutdown, so temporarily clear the daemon flag while the child
+            # is created.
+            parent = multiprocessing.process._current_process  # type: ignore[attr-defined]
+            saved_daemon = parent._config.get("daemon")
+            parent._config["daemon"] = False
+            try:
+                proc.start()
+            except BaseException as error:  # surfaced by wait_for_ready
+                handle.start_error = error
+            finally:
+                parent._config["daemon"] = saved_daemon
+                ready_writer.close()
+
+        # Under spawn, start() blocks until the child has unpickled the config,
+        # which first imports vLLM (~15-20 s). Start it in the background so
+        # the spawning rank loads its weights meanwhile.
+        handle.starter = threading.Thread(
+            target=start, name="ple-offload-start", daemon=True
+        )
+        handle.starter.start()
+        return handle
+
     @staticmethod
     def wait_for_ready(handle: PleOffloadWorkerHandle) -> None:
         """Wait until weights and all GPU registrations are ready to serve."""
+        handle.join_starter()
         reader = handle.ready_pipe_reader
         if reader is None:
             return
