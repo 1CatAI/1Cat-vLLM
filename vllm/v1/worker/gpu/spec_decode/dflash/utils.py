@@ -35,7 +35,12 @@ def _validate_dflash_shared_weights(
     )
 
 
-def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+def get_parallel_draft_model(vllm_config: VllmConfig, model_tag: str) -> nn.Module:
+    """Build a DFlash-family (parallel query block) drafter from its own config.
+
+    Shared by DFlash and DSpark; each caller then shares target weights under
+    its own contract.
+    """
     from vllm.compilation.backends import set_model_tag
     from vllm.model_executor.models.qwen3_dflash import dflash_has_any_non_causal
 
@@ -73,10 +78,12 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             else vllm_config.cache_config
         ),
     )
-    with set_model_tag("dflash_head"):
-        dflash_model = get_model(
-            vllm_config=draft_vllm_config, model_config=draft_model_config
-        )
+    with set_model_tag(model_tag):
+        return get_model(vllm_config=draft_vllm_config, model_config=draft_model_config)
+
+
+def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
+    dflash_model = get_parallel_draft_model(vllm_config, "dflash_head")
 
     target_language_model = (
         target_model.get_language_model()
