@@ -29,6 +29,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.prompt_logprobs_limits import validate_prompt_logprobs_output
 
 logger = init_logger(__name__)
 
@@ -313,6 +314,15 @@ class InputProcessor:
         if isinstance(params, SamplingParams):
             # TODO: can we avoid cloning here in multiproc case?
             sampling_params = params.clone()
+            if self.use_v2_model_runner and sampling_params.prompt_logprobs is not None:
+                validate_prompt_logprobs_output(
+                    length_from_prompt_token_ids_or_embeds(
+                        prompt_token_ids, prompt_embeds
+                    ),
+                    sampling_params.prompt_logprobs,
+                    self.model_config.get_vocab_size(),
+                    envs.VLLM_PROMPT_LOGPROBS_MAX_OUTPUT_BYTES,
+                )
             # If unset max tokens, then generate up to the max_model_len.
             if sampling_params.max_tokens is None:
                 seq_len = length_from_prompt_token_ids_or_embeds(
