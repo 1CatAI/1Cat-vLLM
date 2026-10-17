@@ -49,6 +49,9 @@ if hasattr(torch.ops._C_qsa_sm70, "qsa_lexicographic_topk"):
         return None
 
 
+# Query heads per row of the native page4 routes (the Flash-Next TP4 rank);
+# ranks with a multiple of it run as several such rows.
+_SM70_QSA_PAGE4_HEADS = 6
 _SM70_QSA_XQA_PAGE4_PARTITION = 1024
 _SM70_QSA_XQA_PAGE4_PAGES = 513
 _SM70_QSA_XQA_PAGE4_MARKER = 1 << 30
@@ -1777,7 +1780,8 @@ def _qsa_xqa_page4_shape_supported(
         == query_positions.device
         == sequence_lengths.device
         and q.ndim == 3
-        and q.shape[1:] == (6, 256)
+        and q.shape[1] % _SM70_QSA_PAGE4_HEADS == 0
+        and q.shape[2] == 256
         and q.stride(2) == 1
         and k_cache.ndim == 4
         and v_cache.shape == k_cache.shape
@@ -1817,12 +1821,14 @@ def _use_sm70_qsa_xqa_page4(
     query_positions: torch.Tensor | None,
     sequence_lengths: torch.Tensor | None,
 ) -> bool:
+    # The native routes run one 6-head row per QSA row and head group.
+    page4_rows = q.shape[0] * (q.shape[1] // _SM70_QSA_PAGE4_HEADS)
     return (
         sparse_policy().value("qsa_xqa_page4")
         and current_platform.is_device_capability(70)
         and (
-            q.shape[0] >= sparse_policy().value("qsa_xqa_page4_min_rows")
-            or (k_cache.dtype == torch.uint8 and q.shape[0] > 16)
+            page4_rows >= sparse_policy().value("qsa_xqa_page4_min_rows")
+            or (k_cache.dtype == torch.uint8 and page4_rows > 16)
         )
         and _qsa_xqa_page4_shape_supported(
             q,
@@ -2212,6 +2218,34 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
     k_scale: float,
     v_scale: float,
 ) -> torch.Tensor | None:
+    head_rows = q.shape[1] // _SM70_QSA_PAGE4_HEADS
+    if head_rows > 1:
+        # All query heads of a QSA row share one latent KV head and one
+        # selection. A rank with 6*R heads therefore runs as R consecutive
+        # 6-head pseudo-rows that repeat the row's selection, position and
+        # request: a grouped tile of 8 pseudo-rows is 8/R rows x 6*R heads and
+        # loads the union of only 8/R selections.
+        rows = q.shape[0] * head_rows
+        shape = (rows, _SM70_QSA_PAGE4_HEADS, q.shape[2])
+        if (
+            _qsa_sparse_paged_attention_sm70_xqa_page4(
+                q.reshape(shape),
+                k_cache,
+                v_cache,
+                logical_indices.repeat_interleave(head_rows, dim=0),
+                block_table,
+                token_to_req.repeat_interleave(head_rows, dim=0),
+                query_positions.repeat_interleave(head_rows, dim=0),
+                sequence_lengths,
+                out.view(shape),
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+            is None
+        ):
+            return None
+        return out
     try:
         from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
     except ImportError:
