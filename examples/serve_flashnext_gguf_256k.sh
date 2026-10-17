@@ -14,6 +14,13 @@ GPU_IDS=${GPU_IDS:-4,5,6,7}
 CPU_SET=${CPU_SET:-24-47,72-95}
 EXPERT_PROFILE=${EXPERT_PROFILE:-}
 QSA_HOST_INDEXER_HISTORY=${QSA_HOST_INDEXER_HISTORY:-false}
+# Concurrent requests. MTP4 verifies 5 rows per request: capture one CUDA
+# graph per 5 * {1, 2, 4, ...} up to the limit (uncaptured batches run eager).
+MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
+CAPTURE_SIZES=$(r=1; s=""; while [ "$r" -lt "$MAX_NUM_SEQS" ]; do
+  s="$s$((5 * r)),"; r=$((r * 2)); done; echo "${s}$((5 * MAX_NUM_SEQS))")
+# Recurrent-state pool: 28 blocks cover one 256K-token request.
+STATE_BLOCKS=$((1 + 28 * MAX_NUM_SEQS))
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-12.8}
 export PATH="$CUDA_HOME/bin:$(dirname "$PYTHON_BIN"):$PATH"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_IDS"
@@ -34,7 +41,7 @@ export TORCH_EXTENSIONS_DIR="$CACHE_DIR/torch_extensions"
 export VLLM_SM70_GEMM_LUT_PATH="$CACHE_DIR/gemm-lut-{device}.bin"
 unset LD_PRELOAD LD_AUDIT ONECAT_VLLM_EXTENSION_DIR
 mkdir -p "$CACHE_DIR"
-KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" "$QSA_HOST_INDEXER_HISTORY" <<'PY'
+KC=$("$PYTHON_BIN" - "$EXPERT_PROFILE" "$QSA_HOST_INDEXER_HISTORY" "$STATE_BLOCKS" <<'PY'
 import json
 import sys
 if sys.argv[2].lower() not in ("true", "false"):
@@ -74,7 +81,7 @@ config = {
         "ple_prefill_conv": True, "hc_prefill_sequence_parallel": True,
         "hc_mtp_prefill_sequence_parallel": True, "hc_prefill_peer_norm": True,
     },
-    "qsa_host_kv_state_blocks": 29,
+    "qsa_host_kv_state_blocks": int(sys.argv[3]),
     "qsa_auto_e4m3": False, "ple_row_cache_mib": 512,
     "ple_input_prepare": True, "ple_pinned_decode": False,
     "ple_fast_lane": True, "ple_draft_prefetch": True,
@@ -118,12 +125,12 @@ exec taskset -c "$CPU_SET" "$PYTHON_BIN" -m vllm.entrypoints.cli.main serve "$MO
   --served-model-name flash-next-abliterated flash-next qwen3.8-flash-next \
   --host 127.0.0.1 --port "$PORT" --quantization gguf --tensor-parallel-size 4 \
   --dtype half --kv-cache-dtype float16 --mamba-ssm-cache-dtype float32 \
-  --max-model-len 262144 --max-num-seqs 1 --max-num-batched-tokens 8192 \
+  --max-model-len 262144 --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.95 --enable-prefix-caching \
   --mamba-cache-mode align --no-mamba-tail-checkpoint "${MM_ARGS[@]}" \
   --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 \
   --default-chat-template-kwargs '{"enable_thinking":true}' \
   --override-generation-config '{"temperature":0.6,"top_p":0.95,"top_k":20}' \
-  --compilation-config '{"mode":3,"cudagraph_mode":"FULL","cudagraph_capture_sizes":[5],"inductor_compile_config":{"benchmark_combo_kernel":false}}' \
+  --compilation-config '{"mode":3,"cudagraph_mode":"FULL","cudagraph_capture_sizes":['"$CAPTURE_SIZES"'],"inductor_compile_config":{"benchmark_combo_kernel":false}}' \
   --kernel-config "$KC" --speculative-config "$SPEC"
 
