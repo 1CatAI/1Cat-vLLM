@@ -140,21 +140,13 @@ def _resolve_gdn_prefill_backend(
         except ImportError:
             supports_flashqla_sm70 = False
         else:
-            supports_flashqla_sm70 = is_sm70 and supports_model_dtype
-        if is_sm75:
+            # Turing takes the TileLang kernel variant that fits its 64 KiB of
+            # opt-in shared memory (fused_gdr_fwd picks it per device).
+            supports_flashqla_sm70 = (is_sm70 or is_sm75) and supports_model_dtype
+        if (is_sm70 or is_sm75) and not supports_model_dtype:
             logger.warning_once(
-                "FlashQLA-SM70 GDN prefill cannot run on Turing (sm75): the "
-                "kernel asks for 86016 B of dynamic shared memory per block "
-                "and Turing caps the opt-in limit at 65536 B, so the worker "
-                "dies during engine init. Its VLK CUDA variant does fit but "
-                "is slower than Triton/FLA from 2048 tokens per chunk "
-                "upwards. Falling back to Triton/FLA."
-            )
-        if is_sm70 and not supports_model_dtype:
-            logger.warning_once(
-                "FlashQLA-SM70 GDN prefill is V100 production-validated only "
-                "for fp16 model activations; model dtype %s falls back to "
-                "Triton/FLA.",
+                "FlashQLA-SM70 GDN prefill is validated only for fp16 model "
+                "activations; model dtype %s falls back to Triton/FLA.",
                 model_dtype,
             )
     elif (
