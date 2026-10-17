@@ -18,7 +18,11 @@ OUTPUT_WIDTH = 4160
 def extension():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("requires a V100 / SM70 GPU")
-    return pytest.importorskip("flash_attn_v100_cuda")
+    # Import through the package like the QSA routes do. The top-level
+    # flash_attn_v100_cuda name may resolve to another tree's build, and loading
+    # both registers the extension's pybind types twice.
+    interface = pytest.importorskip("flash_attn_v100.flash_attn_interface")
+    return interface.flash_attn_v100_cuda
 
 
 def make_case(kind="mixed", page_size=16, permute_selection=False):
@@ -287,11 +291,13 @@ def test_single_row_page4_table_uses_logical_order(extension, permute_selection)
 def test_mixed_grouped_and_xqa_tail_is_allocation_invariant(
     extension, monkeypatch, kv_dtype
 ):
+    from vllm.config.sm70_sparse import sparse_policy
     from vllm.models.qwen4_exp.nvidia.ops import qsa
 
-    monkeypatch.setattr(qsa, "_SM70_QSA_XQA_PAGE4", True)
-    monkeypatch.setattr(qsa, "_SM70_QSA_XQA_PAGE4_MIN_ROWS", 64)
-    monkeypatch.setattr(qsa, "_SM70_QSA_GROUPED_PAGE4", True)
+    # The split below relies on the default page4 policy.
+    policy = sparse_policy()
+    assert policy.value("qsa_xqa_page4") and policy.value("qsa_grouped_page4")
+    assert policy.value("qsa_xqa_page4_min_rows") == 64
     calls = []
     grouped = qsa._qsa_sparse_paged_attention_sm70_grouped_page4
     tail = qsa._qsa_sparse_paged_attention_sm70_xqa_page4_batch
