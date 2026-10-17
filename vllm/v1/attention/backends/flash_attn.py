@@ -680,13 +680,12 @@ class FlashAttentionImpl(AttentionImpl):
         self,
         attn_metadata: FlashAttentionMetadata,
         key: torch.Tensor | None,
-        q_descale: torch.Tensor | None,
     ) -> bool:
         """Whether this batch takes `packed_gqa_verify_attention`.
 
         Only uniform multi-token decode batches qualify (every request holds
         the same number of new tokens), only on FA2, which packs GQA heads for
-        a single query token alone.
+        a single query token alone and ignores the descale factors.
         """
         query_len = attn_metadata.max_query_len
         num_reqs = attn_metadata.query_start_loc.shape[0] - 1
@@ -697,7 +696,6 @@ class FlashAttentionImpl(AttentionImpl):
             and self.vllm_flash_attn_version == 2
             and attn_metadata.causal
             and key is not None
-            and q_descale is None
             and self.sliding_window == (-1, -1)
             and self.alibi_slopes is None
             and self.sinks is None
@@ -828,7 +826,7 @@ class FlashAttentionImpl(AttentionImpl):
                     v_descale=v_descale,
                 )
                 return output
-            elif self._use_packed_gqa_verify(attn_metadata, key, q_descale):
+            elif self._use_packed_gqa_verify(attn_metadata, key):
                 packed_gqa_verify_attention(
                     output[:num_actual_tokens],
                     query[:num_actual_tokens],
