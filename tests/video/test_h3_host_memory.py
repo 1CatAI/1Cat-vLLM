@@ -48,7 +48,7 @@ def test_both_vae_stagers_honor_the_host_policy(monkeypatch, pin_memory, kind):
     monkeypatch.setattr(
         vae, "_load_component_config", lambda path: {"sample_rate": 44100}
     )
-    monkeypatch.setattr(vae, "_load_remote_component", lambda *args: remote)
+    monkeypatch.setattr(vae, "_load_remote_component", lambda *args, **kwargs: remote)
     monkeypatch.setattr(
         vae,
         "PinnedModuleStager",
