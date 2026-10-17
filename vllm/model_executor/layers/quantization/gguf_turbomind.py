@@ -97,17 +97,39 @@ def _prepared_gguf_projection(
             blas_bands,
         )
         return output.reshape(*x.shape[:-1], logical_size)
-    if family == 3:
+    if family in (3, 5):
         from .gguf_dense_hmma import apply_segments, restore_and_apply
 
         out = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
-        if rows.shape[0] <= 8 or rows.shape[0] == 20:
+        admitted = (
+            rows.shape[0] == 8
+            if family == 5
+            else (rows.shape[0] <= 8 or rows.shape[0] == 20)
+        )
+        if admitted:
             apply_segments(
-                rows, [codes], [stats], [cache], [decoder], [output_size], out, [out]
+                rows,
+                [codes],
+                [stats],
+                [cache],
+                [decoder],
+                [output_size],
+                out,
+                [out],
+                m8_only=family == 5,
             )
         else:
             restore_and_apply(
-                rows, codes, stats, cache, decoder, output_size, out, k_ld, q_ld
+                rows,
+                codes,
+                stats,
+                cache,
+                decoder,
+                output_size,
+                out,
+                k_ld,
+                q_ld,
+                blas_bands if family == 5 else (),
             )
         return out.reshape(*x.shape[:-1], logical_size)
     if cache is not None and _supports_band(rows.shape[0], cache_bands):
@@ -184,14 +206,25 @@ def _prepared_gguf_mixed_projection(
 ) -> torch.Tensor:
     rows = x.reshape(-1, x.shape[-1]).contiguous()
     specs = [descriptors[i : i + 9] for i in range(0, len(descriptors), 9)]
-    if specs and all(spec[0] == 3 for spec in specs):
+    if specs and (
+        all(spec[0] == 3 for spec in specs)
+        or (rows.shape[0] == 8 and all(spec[0] == 5 for spec in specs))
+    ):
         from .gguf_dense_hmma import apply_segments
 
         ns = [spec[6] for spec in specs]
         output = torch.empty((rows.shape[0], sum(ns)), dtype=x.dtype, device=x.device)
         views = list(output.split(ns, dim=1))
         apply_segments(
-            rows, codes, stats, caches, [spec[1] for spec in specs], ns, output, views
+            rows,
+            codes,
+            stats,
+            caches,
+            [spec[1] for spec in specs],
+            ns,
+            output,
+            views,
+            m8_only=specs[0][0] == 5,
         )
         return output.reshape(*x.shape[:-1], sum(ns))
     cache_offset = blas_offset = 0
@@ -209,7 +242,7 @@ def _prepared_gguf_mixed_projection(
     # Retain the calibrated per-projection policy outside measured target
     # verification sizes. This decision must use actual M inside the op.
     direct = (
-        not any(spec[0] in (3, 4) for spec in specs)
+        not any(spec[0] in (3, 4, 5) for spec in specs)
         and rows.shape[0] in (5, 20)
         and all(
             not _supports_band(rows.shape[0], cb)
@@ -352,13 +385,16 @@ def prepared_projection_arguments(projections):
             family, decoder = 4, projection.dmv_format
             cb = []
         if hasattr(projection, "segment_format"):
-            family, decoder = 3, projection.segment_format
-            cb = bb = []
+            family = 5 if projection.segment_m8_only else 3
+            decoder = projection.segment_format
+            cb = []
+            if family == 3:
+                bb = []
         caches.append(
             projection.dmv_high
             if family == 4
             else projection.segment_high
-            if family == 3
+            if family in (3, 5)
             else projection.fp16_cache
         )
         descriptors.extend(
@@ -683,7 +719,8 @@ class GGUFPreparedProjection(Module):
             if hasattr(self, "dmv_format"):
                 family, decoder = 4, self.dmv_format
             if hasattr(self, "segment_format"):
-                family, decoder = 3, self.segment_format
+                family = 5 if self.segment_m8_only else 3
+                decoder = self.segment_format
             capabilities = getattr(kernel, "operator_capabilities", ())
             blas = tuple(c for c in capabilities if "blas" in c.operator)
             return torch.ops.vllm.prepared_gguf_projection(
@@ -693,7 +730,7 @@ class GGUFPreparedProjection(Module):
                 self.dmv_high
                 if family == 4
                 else self.segment_high
-                if family == 3
+                if family in (3, 5)
                 else self.fp16_cache,
                 family,
                 decoder,
