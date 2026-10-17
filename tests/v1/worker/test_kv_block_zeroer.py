@@ -29,10 +29,111 @@ N_LAYERS = 3  # -> n_segs = 3 interleaved segments
 N_BLOCKS = 4
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_compact_state_ids_zero_only_the_owning_bank_and_graph_replay():
+    from vllm.v1.worker.utils import _zero_kv_blocks_kernel
+
+    capacity = 4
+    banks = [
+        torch.full((capacity, 8), 7, dtype=torch.int32, device="cuda") for _ in range(3)
+    ]
+    groups = [
+        SimpleNamespace(
+            kv_cache_spec=MambaSpec(
+                block_size=16, shapes=((8,),), dtypes=(torch.int32,)
+            ),
+            kv_cache_group_id=i,
+            layer_names=[f"state.{i}"],
+        )
+        for i in range(3)
+    ]
+    zeroer = KVBlockZeroer(torch.device("cuda"), pin_memory=False)
+    zeroer.init_meta(
+        groups,
+        [16] * 3,
+        "auto",
+        set(),
+        {
+            f"state.{i}": SimpleNamespace(kv_cache=[bank])
+            for i, bank in enumerate(banks)
+        },
+        state_block_id_offsets={0: 0, 1: 3, 2: 6},
+    )
+    zeroer.zero_block_ids([1, 6, 8, 10, -1])
+    torch.accelerator.synchronize()
+    for bank, local in zip(banks, (1, 3, 2)):
+        expected = torch.full_like(bank, 7)
+        expected[local] = 0
+        torch.testing.assert_close(bank, expected, rtol=0, atol=0)
+
+    addresses, strides, spans, counts, chunks, block_size, segments = zeroer._meta
+    ids = torch.tensor([2, 4, 9], device="cuda", dtype=torch.int64)
+
+    def run():
+        _zero_kv_blocks_kernel[(len(ids), segments, chunks)](
+            addresses,
+            strides,
+            spans,
+            counts,
+            zeroer._segment_block_id_offsets,
+            ids,
+            BLOCK_SIZE=block_size,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for updated, expected_local in (([3, 5, 7], (3, 2, 1)), ([0, 10, -1], (0, 0, 0))):
+        for bank in banks:
+            bank.fill_(7)
+        ids.copy_(torch.tensor(updated, device="cuda"))
+        graph.replay()
+        torch.accelerator.synchronize()
+        for bank, local in zip(banks, expected_local):
+            expected = torch.full_like(bank, 7)
+            expected[local] = 0
+            torch.testing.assert_close(bank, expected, rtol=0, atol=0)
+
+
 class _BlockFirstAttentionBackend:
     @staticmethod
     def get_kv_cache_block_dim(*args, **kwargs) -> int:
         return 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_compact_v2_tables_keep_group_identity_and_request_reorder_in_graph():
+    from vllm.v1.worker.gpu.block_table import BlockTables
+
+    tables = BlockTables(
+        [16, 16, 16],
+        3,
+        16,
+        [4, 4, 4],
+        torch.device("cuda"),
+        [16, 16, 16],
+        state_block_id_offsets={0: 3, 1: 0},
+        device_state_blocks=4,
+    )
+    tables.append_block_ids(0, ([0, 4, 6], [0, 1, 3], [0, 9, 12]), overwrite=True)
+    tables.append_block_ids(1, ([5], [2], [15]), overwrite=True)
+    tables.apply_staged_writes()
+    order = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    tables.gather_block_tables(order, 3)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = tables.gather_block_tables(order, 3)
+    for permutation in ([0, 1], [1, 0]):
+        order.copy_(torch.tensor(permutation, dtype=torch.int32, device="cuda"))
+        graph.replay()
+        torch.accelerator.synchronize()
+        for group, expected in zip(output, ([0, 1, 3], [0, 1, 3], [0, 9, 12])):
+            row = permutation.index(0)
+            assert group[row, :3].tolist() == expected
+            assert not group[2].count_nonzero()
+    with pytest.raises(ValueError, match="owning"):
+        tables.append_block_ids(2, ([7], [1], [19]), overwrite=True)
 
 
 @pytest.mark.parametrize(

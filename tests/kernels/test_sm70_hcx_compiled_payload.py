@@ -27,7 +27,18 @@ def _worker_run(rank, port, results):
     torch.accelerator.set_device_index(rank)
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_fp16_accumulation = False
-    with set_current_vllm_config(VllmConfig()):
+    from vllm.config.kernel import KernelConfig
+
+    with set_current_vllm_config(
+        VllmConfig(
+            kernel_config=KernelConfig(
+                sm70_hcx=True,
+                sm70_hcx_local_schedule=True,
+                sm70_hcx_batch_max_m=40,
+                sm70_hcx_batch_fusion=True,
+            )
+        )
+    ):
         init_distributed_environment(4, rank, f"tcp://127.0.0.1:{port}", rank, "nccl")
         initialize_model_parallel(4, 1)
         config = HyperConnectionConfig(
@@ -44,9 +55,11 @@ def _worker_run(rank, port, results):
             for parameter in module.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.02)
         runtime = get_hcx_runtime(torch.device("cuda", rank))
+        runtime.local_schedule = True
         assert runtime.enabled, runtime.reason
+        assert runtime.native_batch_max_m == 40
         runtime.diagnostic = True
-        module.enable_partial_inputs("payload", runtime)
+        module.enable_partial_inputs("payload", runtime, batch_max_m=40)
         module._hcx_moe_payload = True
         final_module = (
             GatedResidual(config, use_combine=False, prefix="final").cuda().half()
@@ -54,11 +67,12 @@ def _worker_run(rank, port, results):
         with torch.no_grad():
             for parameter in final_module.parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.02)
-        final_module.enable_partial_inputs("final")
+        final_module.enable_partial_inputs("final", batch_max_m=40)
         final_module._hcx_moe_payload = True
         register_moe_runner(
             "payload",
             SimpleNamespace(
+                _hcx_batch_max_m=40,
                 _maybe_sm70_moe_sum2_allreduce=lambda a, b, n: (
                     tensor_model_parallel_all_reduce_sum2(a, b)
                 ),
@@ -110,7 +124,7 @@ def _worker_run(rank, port, results):
                 ple_layer._PLE_DIAGNOSTIC_BUFFERS["after"], ple_result
             )
             torch.testing.assert_close(ple_scratch, ple_input * 17)
-        for rows in (20, 5):
+        for rows in (5, 8, 9, 10, 16, 17, 20, 24, 25, 30, 32, 33, 39, 40, 41):
             torch.manual_seed(1)
             hidden = (torch.randn(rows, 10240, device="cuda") * 0.5).half()
             injection = torch.randn(rows, 4, device="cuda").half()
@@ -131,6 +145,12 @@ def _worker_run(rank, port, results):
                 combined, final_outputs, final_scratch = materialize(
                     x, hidden, injection
                 )
+            # Reset only the local cumulative barrier near uint32 wrap; peer
+            # epochs retain their ordinary monotonic history. Replay must carry
+            # producer writes through the wrapped grid rendezvous as well.
+            runtime.bar[2:].fill_(-80)
+            torch.accelerator.synchronize()
+            torch.distributed.barrier()
             for _ in range(2):
                 x.copy_(torch.randn_like(x) * 0.02)
                 graph.replay()
@@ -157,6 +177,16 @@ def _worker_run(rank, port, results):
                 for actual, expected in zip(final_outputs[:2], final_reference[:2]):
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 torch.testing.assert_close(final_scratch, x * 17, rtol=0, atol=0)
+                if 8 < rows <= 40:
+                    # Live inverse rows and their published epoch must follow
+                    # changing batch widths, including a prior tiled fallback.
+                    padded = runtime.dpart.view(80, 40, 96, 4)[79, :rows]
+                    assert torch.isfinite(padded[:, 84]).all()
+                    assert (padded[:, 84] > 0).all()
+                    flags = runtime.dpart.view(torch.int32).view(80, 40, 96, 4)[
+                        79, :rows, 85, 0
+                    ]
+                    assert torch.equal(flags, runtime.seq.expand_as(flags))
                 if rows == 5:
                     snapshot = runtime.snapshots["payload"]
                     torch.testing.assert_close(snapshot["partial"], x * 3)
@@ -166,6 +196,85 @@ def _worker_run(rank, port, results):
                     ):
                         torch.testing.assert_close(snapshot[key], value, rtol=0, atol=0)
                 report.append((rows, errors))
+        # Raw-op equivalence covers contiguous FP16 views whose first element
+        # is only half-aligned, mixed secondary presence across ranks, live
+        # graph inputs, and a local FP32 sum beyond the FP16 finite range.
+        for rows in (9, 10, 16, 17, 25, 40):
+            for mode in ("none", "mixed"):
+                storage = torch.empty(
+                    rows * 2560 + 1, device="cuda", dtype=torch.float16
+                )
+                partial = storage[1:].view(rows, 2560)
+                assert partial.is_contiguous() and partial.data_ptr() % 4 == 2
+                secondary = (
+                    torch.empty_like(partial) if mode == "mixed" and rank % 2 else None
+                )
+                hidden = torch.randn(rows, 10240, device="cuda").half() * 0.5
+                injection = torch.randn(rows, 4, device="cuda").half()
+                outputs = (
+                    torch.empty_like(hidden),
+                    torch.empty_like(partial),
+                    torch.empty_like(injection),
+                )
+                args = (
+                    partial,
+                    secondary,
+                    hidden,
+                    injection,
+                    module.hc_norm.weight,
+                    1e-6,
+                    module._hcx_down,
+                    module._hcx_up,
+                    *outputs,
+                    runtime.xn,
+                    runtime.sq,
+                    runtime.dpart,
+                    runtime.bar,
+                    runtime.seq,
+                    runtime.ar,
+                    runtime.lora,
+                    runtime.hb,
+                    runtime.logical_rank,
+                    None,
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                    -1,
+                    None,
+                    None,
+                    1e-6,
+                    None,
+                    True,
+                )
+                partial.normal_(std=0.02)
+                if secondary is not None:
+                    secondary.normal_(std=0.02)
+                torch.ops._C.sm70_hcx_batch_packed_out(*args)
+                graph = torch.cuda.CUDAGraph()
+                with (
+                    graph_capture(device=torch.device("cuda", rank)) as context,
+                    torch.cuda.graph(graph, stream=context.stream),
+                ):
+                    torch.ops._C.sm70_hcx_batch_packed_out(*args)
+                for turn in (0, 1):
+                    if turn == 0:
+                        partial.normal_(std=0.02)
+                        if secondary is not None:
+                            secondary.normal_(std=0.02)
+                    else:
+                        partial.fill_(40000 if rank < 2 else -40000)
+                        if secondary is not None:
+                            secondary.fill_(40000 if rank < 2 else -40000)
+                    graph.replay()
+                    actual = tuple(x.clone() for x in outputs)
+                    torch.ops._C.sm70_hcx_batch_out(*args)
+                    torch.accelerator.synchronize()
+                    for a, b in zip(actual, outputs):
+                        assert torch.isfinite(a).all()
+                        torch.testing.assert_close(a, b, rtol=0, atol=0)
+                del graph
         results.put((rank, report))
 
 
@@ -205,3 +314,52 @@ def test_hcx_owned_payload_compilation_and_graph_replay():
     assert all(worker.exitcode == 0 for worker in workers)
     assert sorted(rank for rank, _ in reports) == list(range(4))
     print(sorted(reports))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_packed_hcx_native_fake_registration():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    import vllm._custom_ops  # noqa: F401
+
+    if not hasattr(torch.ops._C, "sm70_hcx_batch_packed_out"):
+        pytest.skip("Matching optional packed HC build required")
+    with FakeTensorMode():
+        half = lambda *shape: torch.empty(*shape, dtype=torch.float16, device="cuda")
+        floats = lambda *shape: torch.empty(*shape, device="cuda")
+        ints = lambda *shape: torch.empty(*shape, dtype=torch.int32, device="cuda")
+        result = torch.ops._C.sm70_hcx_batch_packed_out(
+            half(20, 2560),
+            None,
+            half(20, 10240),
+            half(20, 4),
+            half(2560),
+            1e-6,
+            half(1),
+            half(1),
+            half(20, 10240),
+            half(20, 2560),
+            half(20, 4),
+            half(40, 10240),
+            floats(80 * 40 * 4),
+            floats(80 * 40 * 96 * 4),
+            ints(4),
+            ints(1),
+            [0] * 4,
+            [0] * 4,
+            [0] * 4,
+            0,
+            None,
+            1,
+            None,
+            None,
+            None,
+            None,
+            -1,
+            None,
+            None,
+            1e-6,
+            None,
+            True,
+        )
+        assert result is None

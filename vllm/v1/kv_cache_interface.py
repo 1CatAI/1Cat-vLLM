@@ -1017,6 +1017,27 @@ class KVCacheConfig:
     """
     device_state_blocks: int = 0
     device_state_group_ids: tuple[int, ...] = ()
+    device_state_group_offsets: tuple[int, ...] = ()
+
+    @property
+    def logical_state_blocks(self) -> int:
+        if self.device_state_group_offsets:
+            return 1 + (self.device_state_blocks - 1) * len(self.device_state_group_ids)
+        return self.device_state_blocks
+
+    @property
+    def state_block_id_offsets(self) -> dict[int, int]:
+        return (
+            dict(
+                zip(
+                    self.device_state_group_ids,
+                    self.device_state_group_offsets,
+                    strict=True,
+                )
+            )
+            if self.device_state_group_offsets
+            else {}
+        )
 
     @property
     def has_mamba_layers(self) -> bool:
@@ -1025,3 +1046,15 @@ class KVCacheConfig:
     @property
     def needs_kv_cache_zeroing(self) -> bool:
         return self.has_mamba_layers
+
+
+def map_device_state_block_ids(
+    block_ids: list[int], offset: int, capacity: int
+) -> list[int]:
+    """Map one group's unique scheduler IDs to its independent device bank."""
+    mapped = [block - offset if block else 0 for block in block_ids]
+    if any(
+        block and not 0 < local < capacity for block, local in zip(block_ids, mapped)
+    ):
+        raise ValueError("State block ID is outside its owning cache group")
+    return mapped

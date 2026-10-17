@@ -226,6 +226,7 @@ class ExpertCache:
         device,
         prefill_mode="mmq",
         prefill_tokens=4096,
+        decode_rows=20,
     ):
         """``banks``: [(layer_index, shard, (experts, rows, bytes), tail,
         (gguf_type, logical_k, k_offset))]."""
@@ -233,6 +234,13 @@ class ExpertCache:
         if device.index is None:
             device = torch.device("cuda", torch.accelerator.current_device_index())
         self.device = device
+        if decode_rows not in (20, 40):
+            raise ValueError("Expert cache decode rows must be 20 or 40")
+        self.decode_rows = decode_rows
+        entry_ints = 512 if decode_rows == 40 else 256
+        self.max_ops = max(
+            _MAX_OPS, triton.next_power_of_2(entry_ints - _ENTRY_HEADER + spare)
+        )
         self.experts = num_experts
         self.spare = spare
         self.slots = max(
@@ -372,15 +380,19 @@ class ExpertCache:
             self.host_slot_of[i, cold] = torch.arange(len(cold), dtype=torch.int32)
         self.table = self.slot_of.to(device)
         self.counter = torch.zeros(1, dtype=torch.int64, device=device)
-        self.ring = torch.zeros((_RING_ENTRIES, 256), dtype=torch.int32).pin_memory()
+        self.ring = torch.zeros(
+            (_RING_ENTRIES, entry_ints), dtype=torch.int32
+        ).pin_memory()
         self.published = torch.zeros(8, dtype=torch.int64).pin_memory()
         self.ring_view = torch.ops._C.get_cuda_view_from_cpu_tensor(self.ring)
         self.published_view = torch.ops._C.get_cuda_view_from_cpu_tensor(self.published)
         # The lane's copy plan for the current miss, and its device copy.
-        self.reply = torch.full((8 + 5 * _MAX_OPS,), -1, dtype=torch.int32).pin_memory()
+        self.reply = torch.full(
+            (8 + 5 * self.max_ops,), -1, dtype=torch.int32
+        ).pin_memory()
         self.reply[1:8] = 0
         self.reply_view = torch.ops._C.get_cuda_view_from_cpu_tensor(self.reply)
-        self.plan = torch.zeros(8 + 5 * _MAX_OPS, dtype=torch.int32, device=device)
+        self.plan = torch.zeros(8 + 5 * self.max_ops, dtype=torch.int32, device=device)
         # Started lazily by start() on the first forward.
         self.lane: Any = None
         self.copy_stream: Any = None
@@ -464,7 +476,7 @@ class ExpertCache:
             self.ring.shape[1],
             self.published.data_ptr(),
             self.reply.data_ptr(),
-            _MAX_OPS,
+            self.max_ops,
             self.slot_of,
             self.host_slot_of,
         )
@@ -574,7 +586,7 @@ class ExpertCache:
             RING=_RING_ENTRIES,
             ENTRY=self.ring.shape[1],
             BLOCK=block,
-            PLAN=triton.next_power_of_2(5 * _MAX_OPS),
+            PLAN=triton.next_power_of_2(5 * self.max_ops),
         )
         _apply_plan[_COPY_PROGRAMS](
             self.plan,
@@ -600,7 +612,7 @@ class ExpertCache:
             count,
             EXPERTS=self.experts,
             BLOCK=block,
-            OPS=_MAX_OPS,
+            OPS=self.max_ops,
         )
         return out
 
@@ -1294,5 +1306,6 @@ def create_cache(banks, num_experts, config, device) -> ExpertCache:
         device,
         prefill_mode=config.expert_cache_prefill,
         prefill_tokens=config.expert_cache_prefill_tokens,
+        decode_rows=getattr(config, "grouped_gate_up_max_m", 20),
     )
     return _CACHE

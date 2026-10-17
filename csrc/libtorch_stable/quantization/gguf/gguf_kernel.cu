@@ -403,11 +403,11 @@ torch::stable::Tensor ggml_moe_a8(torch::stable::Tensor X,  // input
   return Y;
 }
 
-torch::stable::Tensor ggml_moe_a8_vec(
+static torch::stable::Tensor ggml_moe_a8_vec_impl(
     torch::stable::Tensor X,  // input
     torch::stable::Tensor W,  // expert weights
     torch::stable::Tensor topk_ids, int64_t top_k, int64_t type, int64_t row,
-    int64_t tokens) {
+    int64_t tokens, int rows_per_cta) {
   int col = X.sizes()[1];
   const int padded = (col + 512 - 1) / 512 * 512;
   const torch::stable::accelerator::DeviceGuard device_guard(
@@ -452,7 +452,7 @@ torch::stable::Tensor ggml_moe_a8_vec(
         moe_vec_q8_0_q8_1_cuda<scalar_t>(
             (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
             (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens,
-            col, row, quant_X.stride(0), stream);
+            col, row, quant_X.stride(0), stream, rows_per_cta);
         break;
       case 10:
         moe_vec_q2_K_q8_1_cuda<scalar_t>(
@@ -541,6 +541,43 @@ torch::stable::Tensor ggml_moe_a8_vec(
     }
   });
   return Y;
+}
+
+torch::stable::Tensor ggml_moe_a8_vec(torch::stable::Tensor X,
+                                      torch::stable::Tensor W,
+                                      torch::stable::Tensor topk_ids,
+                                      int64_t top_k, int64_t type, int64_t row,
+                                      int64_t tokens) {
+  return ggml_moe_a8_vec_impl(X, W, topk_ids, top_k, type, row, tokens,
+                              GGML_CUDA_MMV_Y);
+}
+
+torch::stable::Tensor ggml_moe_a8_vec_rows(torch::stable::Tensor X,
+                                           torch::stable::Tensor W,
+                                           torch::stable::Tensor topk_ids,
+                                           int64_t top_k, int64_t type,
+                                           int64_t row, int64_t tokens) {
+  // One independent warp per output row; quantization, dp4a and warp sums
+  // are identical to the retained one-row CTA. Only CTA scheduling changes.
+  STD_TORCH_CHECK(
+      type == 8 && X.scalar_type() == torch::headeronly::ScalarType::Half,
+      "Row-batched GGUF MoE requires FP16 inputs and Q8_0 weights");
+  STD_TORCH_CHECK(
+      X.dim() == 2 && W.dim() == 3 && topk_ids.dim() == 2 &&
+          X.is_contiguous() && W.is_contiguous() && topk_ids.is_contiguous() &&
+          W.scalar_type() == torch::headeronly::ScalarType::Byte &&
+          X.size(1) % 32 == 0 && W.size(1) == row &&
+          W.size(2) == X.size(1) / 32 * 34 && tokens == X.size(0) &&
+          top_k > 0 && topk_ids.numel() == tokens * top_k &&
+          topk_ids.scalar_type() == torch::headeronly::ScalarType::Int,
+      "Invalid row-batched GGUF MoE layout");
+  STD_TORCH_CHECK(X.device() == W.device() && X.device() == topk_ids.device(),
+                  "Row-batched GGUF MoE requires same-device tensors");
+  if (tokens == 0) {
+    return torch::stable::empty({0, row}, X.scalar_type(), std::nullopt,
+                                W.device());
+  }
+  return ggml_moe_a8_vec_impl(X, W, topk_ids, top_k, type, row, tokens, 8);
 }
 
 int64_t ggml_moe_get_block_size(int64_t type) {

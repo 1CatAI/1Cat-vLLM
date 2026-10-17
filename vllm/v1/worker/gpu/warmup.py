@@ -9,6 +9,7 @@ import torch
 
 from vllm import PoolingParams, SamplingParams
 from vllm.utils.math_utils import cdiv
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.sched.output import (
     CachedRequestData,
     GrammarOutput,
@@ -156,14 +157,42 @@ def warmup_kernels(
             )
             if profile_idx:
                 num_reqs = min(num_reqs, 1)
+            config = model_runner.kv_cache_config
+            state_blocks = getattr(config, "device_state_blocks", 0)
+            block_pool = (
+                BlockPool(
+                    config.num_blocks,
+                    False,
+                    1,
+                    device_state_blocks=state_blocks,
+                    device_state_group_ids=config.device_state_group_ids,
+                    device_state_group_offsets=config.device_state_group_offsets,
+                )
+                if state_blocks
+                else None
+            )
+            if block_pool is not None:
+                while num_reqs and not block_pool.can_allocate_group_blocks(
+                    {i: n * num_reqs for i, n in enumerate(decode_block_counts)}
+                ):
+                    num_reqs -= 1
             if num_reqs <= 0:
                 continue
 
             req_ids = [f"_warmup_{profile_idx}_{i}_" for i in range(num_reqs)]
             next_block_id = 1
 
-            def _alloc_blocks(num_blocks: int) -> list[int]:
+            def _alloc_blocks(
+                group_id: int, num_blocks: int, *, pool=block_pool
+            ) -> list[int]:
                 nonlocal next_block_id
+                if pool is not None:
+                    return [
+                        block.block_id
+                        for block in pool.get_new_blocks(
+                            num_blocks, kv_cache_group_id=group_id
+                        )
+                    ]
                 return list(
                     range(next_block_id, next_block_id := next_block_id + num_blocks)
                 )
@@ -176,7 +205,9 @@ def warmup_kernels(
                         sampling_params,
                         pooling_params,
                     ),
-                    block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+                    block_ids=tuple(
+                        _alloc_blocks(g, n) for g, n in enumerate(prefill_block_counts)
+                    ),
                     prefill_token_ids=prompt_token_ids,
                 )
                 for i in range(num_reqs)
@@ -214,7 +245,10 @@ def warmup_kernels(
                 new_block = any(decode_block_deltas)
                 cached_req_data.new_block_ids = [
                     (
-                        tuple(_alloc_blocks(n) for n in decode_block_deltas)
+                        tuple(
+                            _alloc_blocks(g, n)
+                            for g, n in enumerate(decode_block_deltas)
+                        )
                         if new_block
                         else None
                     )

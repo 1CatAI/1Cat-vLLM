@@ -1178,6 +1178,8 @@ def qsa_mqa_paged(
     num_columns: int | None = None,
     score_scale: float | None = None,
     shared_key_scoring: bool = False,
+    shared_key_query_start_loc_cpu: torch.Tensor | None = None,
+    indexer_staging_workspace=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute QSA scores directly from a paged compressed-key cache."""
 
@@ -1209,7 +1211,27 @@ def qsa_mqa_paged(
     if columns < 0:
         raise ValueError("QSA score width must be non-negative")
     if shared_key_scoring and 0 < columns <= capacity and q.shape[0]:
-        from .qsa_shared_key import maybe_shared_key_scores
+        from .qsa_shared_key import (
+            maybe_shared_key_batch_scores,
+            maybe_shared_key_scores,
+        )
+
+        if shared_key_query_start_loc_cpu is not None:
+            result = maybe_shared_key_batch_scores(
+                q,
+                k_cache,
+                page_table,
+                token_to_req,
+                query_positions,
+                sequence_lengths,
+                compress_ratio,
+                columns,
+                score_divisor,
+                shared_key_query_start_loc_cpu,
+                indexer_staging_workspace,
+            )
+            if result is not None:
+                return result
 
         result = maybe_shared_key_scores(
             q,
@@ -1221,6 +1243,7 @@ def qsa_mqa_paged(
             compress_ratio,
             columns,
             score_divisor,
+            indexer_staging_workspace,
         )
         if result is not None:
             return result
@@ -1601,6 +1624,8 @@ def qsa_select_paged_tokens(
     shared_key_scoring: bool = False,
     max_seq_len: int | None = None,
     tp_group=None,
+    shared_key_batch_scoring: bool = False,
+    indexer_staging_workspace=None,
 ) -> torch.Tensor:
     """Score, select, and expand QSA indices without host synchronization.
 
@@ -1740,6 +1765,12 @@ def qsa_select_paged_tokens(
                 sequence_lengths,
                 compress_ratio,
                 shared_key_scoring=shared_key_scoring,
+                shared_key_query_start_loc_cpu=(
+                    query_start_loc_cpu
+                    if shared_key_batch_scoring and row_start == 0 and row_end == rows
+                    else None
+                ),
+                indexer_staging_workspace=indexer_staging_workspace,
             )
         blocks = (
             blocks_buffer[row_slice]

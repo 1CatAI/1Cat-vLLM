@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe import (
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -132,6 +133,17 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer):
         if any(e != set(range(self.num_experts)) for e in self.loaded.values()):
             raise ValueError("Incomplete Q8_0 MTP expert checkpoint")
+        from vllm.model_executor.layers.quantization.gguf import (
+            fused_moe_gguf,
+            fused_moe_gguf_rows,
+        )
+
+        row_batch = current_platform.is_device_capability(70) and hasattr(
+            torch.ops._C, "ggml_moe_a8_vec_rows"
+        )
+        self._fused_moe = fused_moe_gguf_rows if row_batch else fused_moe_gguf
+        if row_batch:
+            logger.info("Q8_0 MTP experts use eight independent output warps per CTA.")
         stored = layer.w13_weight.numel() + layer.w2_weight.numel()
         fp16 = 2 * self.num_experts * 3 * self.local * self.hidden
         logger.info(
@@ -155,10 +167,9 @@ class MTPQ80MoEMethod(FusedMoEMethodBase):
             or layer.apply_router_weight_on_input
         ):
             raise ValueError("Q8_0 MTP experts need TP-only output-weighted SiLU")
-        from vllm.model_executor.layers.quantization.gguf import fused_moe_gguf
 
         def run(rows):
-            return fused_moe_gguf(
+            return self._fused_moe(
                 x[rows],
                 layer.w13_weight,
                 layer.w2_weight,

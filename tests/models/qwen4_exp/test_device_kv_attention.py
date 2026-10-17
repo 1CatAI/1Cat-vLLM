@@ -47,6 +47,99 @@ def decoded_history(state):
     return (values * scales[..., None]).half()
 
 
+@pytest.mark.parametrize("rows", [32, 33, 40, 64, 65])
+def test_batched_verifier_does_not_stage_prefill_history(rows, monkeypatch):
+    """Batch size must not put decode into a CPU-planned prefill route."""
+    from vllm.models.qwen4_exp.nvidia.qsa import Qwen4ExpQSAAttention
+
+    torch.manual_seed(rows)
+    device = torch.device("cuda:0")
+    state = HostQSAKV(
+        8,
+        256,
+        256,
+        device,
+        width=65,
+        hot_tokens=128,
+        rows=8,
+        direct_device=True,
+        hot_fp8=True,
+    )
+    layer = SimpleNamespace(
+        host_kv=state,
+        host_kv_prefill_stage_tokens=131072,
+        host_kv_decode_query_len=5,
+        host_kv_is_draft=False,
+    )
+    key = torch.randn(2048, 1, 256, device=device, dtype=torch.float16)
+    value = torch.randn_like(key)
+    slots = torch.arange(2048, device=device)
+    state.write(key, value, slots)
+    query = torch.randn(rows, 6, 256, device=device, dtype=torch.float16)
+    gate = torch.randn_like(query)
+    indices = torch.arange(65, device=device, dtype=torch.int32).repeat(rows, 1)
+    table = torch.arange(8, device=device, dtype=torch.int32).view(8, 1)
+    requests = torch.arange(rows, device=device, dtype=torch.int32) % 8
+    positions = torch.full((rows,), 100, device=device, dtype=torch.int64)
+    lengths = torch.full((8,), 200, device=device, dtype=torch.int32)
+    actual, reference = torch.empty_like(query), torch.empty_like(query)
+    metadata = SimpleNamespace(max_query_len=5)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("decode attempted a host prefill staging plan")
+
+    monkeypatch.setattr(state, "stage_plan", forbidden)
+
+    def run():
+        Qwen4ExpQSAAttention.host_kv_forward(
+            layer,
+            query,
+            indices,
+            table,
+            requests,
+            positions,
+            lengths,
+            actual,
+            gate,
+            metadata,
+        )
+
+    def check():
+        for start in range(0, rows, state.resolve_rows):
+            stop = min(start + state.resolve_rows, rows)
+            host_qsa_attention(
+                query[start:stop],
+                state,
+                indices[start:stop],
+                table,
+                requests[start:stop],
+                positions[start:stop],
+                lengths,
+                reference[start:stop],
+                gate[start:stop],
+            )
+        torch.accelerator.synchronize()
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, reference, rtol=0.003, atol=0.0002)
+
+    run()
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    # Reorder request pages, change selections/causal lengths and rewrite KV.
+    # Captured replay must observe live metadata, rather than a captured plan.
+    for length in (63, 177):
+        table.copy_(table.flip(0))
+        lengths.fill_(length)
+        positions.fill_(length - 1)
+        indices.add_(3)
+        query.mul_(0.75)
+        state.write(key * 0.5, value * 0.5, slots)
+        graph.replay()
+        check()
+
+
 @pytest.mark.parametrize("rows", [1, 5, 20])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("strided", [False, True])

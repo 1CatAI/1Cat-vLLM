@@ -204,9 +204,10 @@ class GatedResidual(nn.Module):
 
         return hidden_states, block_input, injection
 
-    def enable_partial_inputs(self, name: str, runtime=None) -> None:
+    def enable_partial_inputs(self, name: str, runtime=None, *, batch_max_m=8) -> None:
         """Block outputs reaching this module are TP partials from now on."""
         self._partial_inputs = True
+        self._hcx_batch_max_m = batch_max_m
         self._hcx_name = name
         _PARTIAL_MODULES[name] = self
         if runtime is not None and self.use_combine:
@@ -298,7 +299,7 @@ class GatedResidual(nn.Module):
         if not getattr(self, "_partial_inputs", False):
             return block_output
         first, second = self._partial_pair(block_output)
-        if first.shape[0] > 8:
+        if first.shape[0] > getattr(self, "_hcx_batch_max_m", 8):
             return first
         if second is not None:
             from vllm.distributed import tensor_model_parallel_all_reduce_sum2
@@ -384,7 +385,8 @@ def _hcx_combine_and_mix(
     runtime = getattr(module, "_hcx", None)
     oproj = getattr(module, "_hcx_oproj", None)
     block_output, secondary = module._partial_pair(block_output)
-    if runtime is not None and 0 < block_output.shape[0] <= 8:
+    maximum = getattr(module, "_hcx_batch_max_m", 8)
+    if runtime is not None and 0 < block_output.shape[0] <= maximum:
         diagnostic = (
             {"snapshot_name": name} if getattr(runtime, "diagnostic", False) else {}
         )
@@ -398,16 +400,17 @@ def _hcx_combine_and_mix(
             module._hcx_up,
             None if oproj is None else oproj[1:],
             secondary=secondary,
+            batch_max_m=maximum,
             **diagnostic,
         )
     from vllm.distributed import tensor_model_parallel_all_reduce
 
-    if oproj is not None and block_output.shape[0] <= 8:
+    if oproj is not None and block_output.shape[0] <= maximum:
         # Deferred projection: the block output carries the o-proj input.
         layer, k = oproj[0], oproj[1]
         block_output, _ = layer(block_output[:, :k].contiguous())
     reduced = block_output
-    if block_output.shape[0] <= 8:
+    if block_output.shape[0] <= maximum:
         if secondary is not None:
             from vllm.distributed import tensor_model_parallel_all_reduce_sum2
 

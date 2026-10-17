@@ -31,7 +31,9 @@ static __device__ __forceinline__ void moe_q(
   }
 
   const int exp_idx = expert_ids[blockIdx.y];
-  if (exp_idx >= num_experts || exp_idx < 0) return;
+  // Negative IDs mark padding; IDs at or above num_experts are invalid.
+  // Valid expert IDs may exceed 255 (e.g. 512 experts).
+  if (exp_idx < 0 || exp_idx >= num_experts) return;
   if (blockIdx.y * mmq_x > num_tokens_post_padded[0]) return;
 
   const block_q_t* x =

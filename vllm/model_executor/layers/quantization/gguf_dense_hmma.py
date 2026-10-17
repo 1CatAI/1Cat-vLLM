@@ -108,23 +108,40 @@ def prepare_segment_bank(projection, canonical, device):
     projection.stats = torch.nn.Parameter(payload[2], False)
     projection.register_parameter("segment_high", torch.nn.Parameter(payload[1], False))
     projection.segment_format = fmt
+    projection.gguf_batch_stats = (
+        projection.stats
+        if cfg is not None
+        and cfg.kernel_config.sm70_gguf.small_m_hmma_batch
+        and hasattr(torch.ops._C, "gguf_dense_segments_batch_sm70_out")
+        and ((k == 2560 and n >= 1536) or (k, n) == (1536, 2560))
+        else None
+    )
     projection.cache_capabilities = ()
     workspace(device, k == 160 or n <= 320)
     return True
 
 
 def apply_segments(
-    rows, codes, scales, high, formats, ns, output, views, *, blas_bands=()
+    rows, codes, scales, high, formats, ns, output, views, *, blas_bands=(), batch=False
 ):
     k = rows.shape[1]
     shared = k == 160 or sum(ns) <= 320
     scratch = workspace(rows.device, shared)
-    if 1 <= rows.shape[0] <= 8 or rows.shape[0] == 20:
+    if (
+        1 <= rows.shape[0] <= 8
+        or rows.shape[0] == 20
+        or (batch and rows.shape[0] <= 40)
+    ):
         warps = 4 if k == 2560 and sum(ns) > 320 else 8
         if k == 1536:
             warps = 8
         split = 5 if k == 2560 and sum(ns) <= 320 else 1
-        torch.ops._C.gguf_dense_segments_sm70_out(
+        op = (
+            torch.ops._C.gguf_dense_segments_batch_sm70_out
+            if batch and rows.shape[0] > 8
+            else torch.ops._C.gguf_dense_segments_sm70_out
+        )
+        op(
             rows,
             codes,
             high,

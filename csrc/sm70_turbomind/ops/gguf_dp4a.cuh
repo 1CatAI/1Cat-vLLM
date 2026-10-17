@@ -55,6 +55,93 @@ struct LatticeDot {
     return book[index];
   }
 
+  struct Decoded {
+    int words[8];
+    float scale;
+    int scale0, scale1;
+  };
+
+  __device__ static Decoded decode(const uint8_t* row, int group,
+                                   const uint32_t* book,
+                                   const uint32_t* masks) {
+    Decoded operand{};
+    const uint8_t* b = row + (group / 8) * kBlockBytes;
+    const int sub = group % 8;
+    const uint32_t low = load_u32_2(b + 2 + sub * (Type == 22 ? 4 : 8));
+    uint32_t high = 0, signs = 0;
+    if constexpr (Type != 22) high = load_u32_2(b + 6 + sub * 8);
+    if constexpr (Type == 18)
+      signs = load_u32_2(b + 66 + sub * 4);
+    else
+      signs = load_u32_2(b + (Type == 21 ? 74 : 34) + sub * 4);
+    const int qh = Type == 18 ? 0 : b[66 + sub];
+#pragma unroll
+    for (int octet = 0; octet < 4; ++octet) {
+      int first, second, sign;
+      if constexpr (Type == 22) {
+        first =
+            (((low >> (octet * 8)) & 255) | (((qh >> (2 * octet)) & 3) << 8)) *
+            2;
+        second = first + 1;
+      } else {
+        const uint32_t codes = octet < 2 ? low : high;
+        const int shift = (octet % 2) * 16;
+        first = ((codes >> shift) & 255);
+        second = ((codes >> (shift + 8)) & 255);
+        if constexpr (Type == 21) {
+          first |= ((qh >> (2 * octet)) & 1) << 8;
+          second |= ((qh >> (2 * octet + 1)) & 1) << 8;
+        }
+      }
+      if constexpr (Type == 18) {
+        sign = (signs >> (7 * octet)) & 127;
+        sign |= (__popc(sign) & 1) << 7;
+      } else {
+        sign = (signs >> (8 * octet)) & 255;
+      }
+      const uint32_t s0 = BankAware ? sign_mask(sign & 15) : masks[sign & 15];
+      const uint32_t s1 = BankAware ? sign_mask(sign >> 4) : masks[sign >> 4];
+      operand.words[2 * octet] = __vsub4(word(book, first) ^ s0, s0);
+      operand.words[2 * octet + 1] = __vsub4(word(book, second) ^ s1, s1);
+    }
+    operand.scale = __half2float(*reinterpret_cast<const half*>(b));
+    if constexpr (Type == 21) {
+      operand.scale0 = 1 + 2 * ((b[106 + sub / 2] >> (4 * (sub % 2))) & 15);
+    } else if constexpr (Type == 18) {
+      operand.scale0 = 1 + 2 * (signs >> 28);
+    } else {
+      operand.scale0 = 1 + 2 * (b[74 + sub] & 15);
+      operand.scale1 = 1 + 2 * (b[74 + sub] >> 4);
+    }
+    return operand;
+  }
+
+  __device__ static float dot_decoded(const Decoded& operand, const Q8_1& x) {
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int sum0 = 0, sum1 = 0;
+#pragma unroll
+    for (int octet = 0; octet < 4; ++octet) {
+      if constexpr (Type == 22) {
+        if (octet >= 2) {
+          sum1 = __dp4a(operand.words[2 * octet], activation[2 * octet], sum1);
+          sum1 = __dp4a(operand.words[2 * octet + 1], activation[2 * octet + 1],
+                        sum1);
+          continue;
+        }
+      }
+      sum0 = __dp4a(operand.words[2 * octet], activation[2 * octet], sum0);
+      sum0 =
+          __dp4a(operand.words[2 * octet + 1], activation[2 * octet + 1], sum0);
+    }
+    const float d = operand.scale * __low2float(x.ds);
+    if constexpr (Type == 21)
+      return d * float(sum0 * operand.scale0);
+    else if constexpr (Type == 18)
+      return d * (float(sum0) * float(operand.scale0) * .25f);
+    else
+      return d * float(sum0 * operand.scale0 + sum1 * operand.scale1) * .125f;
+  }
+
   __device__ static float dot(const uint8_t* row, int group, const Q8_1& x,
                               const uint32_t* book, const uint32_t* masks) {
     const uint8_t* b = row + (group / 8) * kBlockBytes;
@@ -133,6 +220,61 @@ using IQ3SDot = LatticeDot<21>;
 // canonical reader, without expanding a second expert bank at load time.
 template <int Type>
 struct OriginalIntegerDot {
+  struct Decoded {
+    int values[8];
+    float scale;
+  };
+  __device__ static Decoded decode(const uint8_t* row, int group) {
+    const uint8_t* b;
+    const uint8_t* codes;
+    float scale;
+    if constexpr (Type == 23) {
+      b = row + (group / 8) * 136;
+      const int sub = group % 8;
+      const uint16_t high = *reinterpret_cast<const uint16_t*>(b + 2);
+      const int subscale = ((b[4 + sub / 2] >> (4 * (sub % 2))) & 15) |
+                           (((high >> (2 * sub)) & 3) << 4);
+      // Match the canonical LUT reader's expanded FP16 coefficients.
+      scale = __half2float(__float2half_rn(
+          __half2float(*reinterpret_cast<const half*>(b)) * (subscale - 32)));
+      codes = b + 8 + sub * 16;
+    } else {
+      b = row + (Type == 20 ? group : group / 2) * 18;
+      scale = __half2float(*reinterpret_cast<const half*>(b));
+      codes = b + 2;
+    }
+    Decoded decoded;
+    decoded.scale = scale;
+#pragma unroll
+    for (int packet = 0; packet < 8; ++packet) {
+      uint32_t values = 0;
+      if constexpr (Type == 20 || Type == 23) {
+        const uint32_t bytes =
+            load_u32_2(codes + (packet % 4) * 4) >> ((packet / 4) * 4);
+        const uint32_t nibbles = (bytes & 15) | ((bytes >> 4) & 0xf0) |
+                                 ((bytes >> 8) & 0xf00) |
+                                 ((bytes >> 12) & 0xf000);
+        using Lut = turbomind::gemm::Transform_HMMA_SM70_Lut4<0>;
+        values = Lut::iq_values(nibbles) ^ 0x80808080U;
+      } else {
+        const uint32_t byte = b[2 + (group % 2) * 8 + packet];
+        const uint32_t codes = (byte & 3) | ((byte << 6) & 0x300) |
+                               ((byte << 12) & 0x30000) |
+                               ((byte << 18) & 0x3000000);
+        values = __vsub4(codes, 0x01010101U);
+      }
+      decoded.values[packet] = static_cast<int>(values);
+    }
+    return decoded;
+  }
+  __device__ static float dot_decoded(const Decoded& decoded, const Q8_1& x) {
+    const int* activation = reinterpret_cast<const int*>(x.qs);
+    int sum = 0;
+#pragma unroll
+    for (int packet = 0; packet < 8; ++packet)
+      sum = __dp4a(decoded.values[packet], activation[packet], sum);
+    return float(sum) * (decoded.scale * __low2float(x.ds));
+  }
   static_assert(Type == 20 || Type == 23 || Type == 42);
   __device__ static float dot(const uint8_t* row, int group, const Q8_1& x) {
     const uint8_t* b;

@@ -825,6 +825,50 @@ if hasattr(torch.ops._C, "ggml_moe_a8_vec"):
         return torch.empty((tokens * top_k, row), dtype=X.dtype, device=W.device)
 
 
+if hasattr(torch.ops._C, "ggml_moe_a8_vec_rows"):
+    register_fake("_C::ggml_moe_a8_vec_rows")(_ggml_moe_a8_vec_fake)
+
+
+if hasattr(torch.ops._C, "sm70_hcx_batch_packed_out"):
+
+    @register_fake("_C::sm70_hcx_batch_packed_out")
+    def _sm70_hcx_batch_packed_fake(
+        p0,
+        p1,
+        res,
+        inj,
+        nw,
+        eps,
+        wd,
+        wu,
+        res_out,
+        blk_out,
+        inj_out,
+        xn,
+        sq,
+        dpart,
+        bar,
+        seq,
+        ar,
+        lora,
+        hb,
+        rank,
+        dbg,
+        full,
+        ox,
+        ocodes,
+        ohigh,
+        oscale,
+        ofmt,
+        gz,
+        gw,
+        geps,
+        gscr,
+        local_schedule=False,
+    ):
+        return None
+
+
 # cutlass
 def cutlass_scaled_mm_supports_fp4(cuda_device_capability: int) -> bool:
     return torch.ops._C.cutlass_scaled_mm_supports_fp4(cuda_device_capability)
@@ -2263,6 +2307,20 @@ def ggml_moe_a8_vec(
     tokens: torch.SymInt,
 ) -> torch.Tensor:
     return torch.ops._C.ggml_moe_a8_vec(X, W, topk_ids, top_k, quant_type, row, tokens)
+
+
+def ggml_moe_a8_vec_rows(
+    X: torch.Tensor,
+    W: torch.Tensor,
+    topk_ids: torch.Tensor,
+    top_k: int,
+    quant_type: int,
+    row: torch.SymInt,
+    tokens: torch.SymInt,
+) -> torch.Tensor:
+    return torch.ops._C.ggml_moe_a8_vec_rows(
+        X, W, topk_ids, top_k, quant_type, row, tokens
+    )
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:

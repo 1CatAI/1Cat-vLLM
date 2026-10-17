@@ -57,3 +57,36 @@ def test_q8_0_moe_matches_dequantized_reference(tokens):
             reference[t] += weights[t, k] * (g2[e] @ act)
     error = (out.float() - reference).norm() / reference.norm()
     assert error < 2e-2, error
+
+
+@pytest.mark.parametrize("sm70", [False, True])
+@pytest.mark.parametrize("available", [False, True])
+def test_q8_row_batch_binding_preserves_missing_native_fallback(
+    monkeypatch, sm70, available
+):
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.quantization.gguf import (
+        fused_moe_gguf,
+        fused_moe_gguf_rows,
+    )
+    from vllm.models.qwen4_exp.nvidia import mtp_q8_experts as mtp
+
+    monkeypatch.setattr(mtp.current_platform, "is_device_capability", lambda _: sm70)
+    namespace = (
+        SimpleNamespace(ggml_moe_a8_vec_rows=object())
+        if available
+        else SimpleNamespace()
+    )
+    monkeypatch.setattr(torch.ops, "_C", namespace)
+    method = SimpleNamespace(
+        num_experts=1,
+        local=32,
+        hidden=32,
+        loaded={name: {0} for name in ("w1", "w3", "w2")},
+    )
+    layer = SimpleNamespace(w13_weight=torch.empty(1), w2_weight=torch.empty(1))
+    mtp.MTPQ80MoEMethod.process_weights_after_loading(method, layer)
+    assert method._fused_moe is (
+        fused_moe_gguf_rows if sm70 and available else fused_moe_gguf
+    )

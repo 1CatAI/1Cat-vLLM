@@ -14,6 +14,7 @@ shared by the generic cache-layout planner.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cache
 from typing import ClassVar
@@ -992,6 +993,20 @@ class QSAKeyStateCache(_QSAStateCache):
 
 class QSACompressedKeyCache(_QSAStateCache):
     """Normalized, group-first-RoPE 16-bit key per complete group."""
+
+    def __init__(
+        self,
+        *,
+        binding_observer: Callable[[torch.Tensor], None] | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._binding_observer = binding_observer
+
+    def bind_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        super().bind_kv_cache(kv_cache)
+        if self._binding_observer is not None:
+            self._binding_observer(kv_cache)
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         _, side_block_size, _ = qsa_dcp_block_geometry(vllm_config, self.prefix)

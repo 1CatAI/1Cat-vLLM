@@ -2011,6 +2011,11 @@ class GPUModelRunner(
         Delegates to KVBlockZeroer.init_meta with the runner's state.
         Called from gpu_worker.py outside the CuMem pool context.
         """
+        if self.kv_cache_config.state_block_id_offsets:
+            self.input_batch.block_table.set_device_state_mapping(
+                self.kv_cache_config.state_block_id_offsets,
+                self.kv_cache_config.device_state_blocks,
+            )
         self._kv_block_zeroer = KVBlockZeroer(self.device, self.pin_memory)
         self._kv_block_zeroer.init_meta(
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
@@ -2024,6 +2029,9 @@ class GPUModelRunner(
                 if tensor.host_backed
                 for name in tensor.shared_by
             },
+            state_block_id_offsets=getattr(
+                self.kv_cache_config, "state_block_id_offsets", {}
+            ),
         )
 
     def _zero_block_ids(self, block_ids: list[int]) -> None:

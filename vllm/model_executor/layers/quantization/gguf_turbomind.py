@@ -79,6 +79,31 @@ def _prepared_gguf_projection(
     # Keep M-dependent policy behind an opaque op: vLLM's range compilation
     # drops Dynamo guards and would otherwise freeze the prefill branch.
     rows = x.reshape(-1, x.shape[-1]).contiguous()
+    # Batch variants keep their original small-row and prefill layouts.
+    # Family 6 carries compact DMV stats plus its explicit full-scale bank.
+    batch_rows = 9 <= rows.shape[0] <= 16 or 25 <= rows.shape[0] <= 40
+    if family == 6:
+        if cache is None:
+            raise ValueError("Batch DMV requires its explicit full-scale bank")
+        if batch_rows:
+            from .gguf_dense_hmma import apply_segments
+
+            out = rows.new_empty((rows.shape[0], output_size))
+            apply_segments(
+                rows,
+                [codes],
+                [cache],
+                [cache[:0]],
+                [decoder],
+                [output_size],
+                out,
+                [out],
+                batch=True,
+            )
+            return out.reshape(*x.shape[:-1], logical_size)
+        family, cache = 4, cache[:0]
+    elif family == 5 and not batch_rows:
+        family = 3
     if family == 4:
         from .gguf_dmv import restore
 
@@ -97,13 +122,25 @@ def _prepared_gguf_projection(
             blas_bands,
         )
         return output.reshape(*x.shape[:-1], logical_size)
-    if family == 3:
+    if family in (3, 5):
         from .gguf_dense_hmma import apply_segments, restore_and_apply
 
         out = torch.empty((rows.shape[0], output_size), dtype=x.dtype, device=x.device)
-        if rows.shape[0] <= 8 or rows.shape[0] == 20:
+        if (
+            rows.shape[0] <= 8
+            or rows.shape[0] == 20
+            or (family == 5 and rows.shape[0] <= 40)
+        ):
             apply_segments(
-                rows, [codes], [stats], [cache], [decoder], [output_size], out, [out]
+                rows,
+                [codes],
+                [stats],
+                [cache],
+                [decoder],
+                [output_size],
+                out,
+                [out],
+                batch=family == 5,
             )
         else:
             restore_and_apply(
@@ -193,6 +230,18 @@ def _prepared_gguf_mixed_projection(
 ) -> torch.Tensor:
     rows = x.reshape(-1, x.shape[-1]).contiguous()
     specs = [descriptors[i : i + 9] for i in range(0, len(descriptors), 9)]
+    batch_rows = 9 <= rows.shape[0] <= 16 or 25 <= rows.shape[0] <= 40
+    if not batch_rows:
+        caches = list(caches)
+        for i, spec in enumerate(specs):
+            if spec[0] == 5:
+                spec[0] = 3
+            elif spec[0] == 6:
+                spec[0] = 4
+                full_scale = caches[i]
+                if full_scale is None:
+                    raise ValueError("Batch DMV requires its explicit full-scale bank")
+                caches[i] = full_scale[:0]
     cache_offset = blas_offset = 0
     policies = []
     for spec in specs:
@@ -205,7 +254,15 @@ def _prepared_gguf_mixed_projection(
         )
         cache_offset += cache_count
         blas_offset += blas_count
-    if specs and all(spec[0] == 3 for spec in specs):
+    # Algorithm tags must not split a compatible segment bank. A calibrated
+    # large projection can share one launch with its original small K/V peers;
+    # their storage and decoder layouts already use the same native segment API.
+    batched = (
+        batch_rows
+        and any(spec[0] in (5, 6) for spec in specs)
+        and all(spec[0] in (3, 5, 6) for spec in specs)
+    )
+    if specs and (all(spec[0] == 3 for spec in specs) or batched):
         from .gguf_dense_hmma import apply_segments
 
         ns = [spec[6] for spec in specs]
@@ -214,19 +271,26 @@ def _prepared_gguf_mixed_projection(
         apply_segments(
             rows,
             codes,
-            stats,
-            caches,
+            [
+                cache if spec[0] == 6 else stat
+                for cache, stat, spec in zip(caches, stats, specs)
+            ],
+            [
+                cache[:0] if spec[0] == 6 and cache is not None else cache
+                for cache, spec in zip(caches, specs)
+            ],
             [spec[1] for spec in specs],
             ns,
             output,
             views,
             blas_bands=[bb for _, bb in policies],
+            batch=batched,
         )
         return output.reshape(*x.shape[:-1], sum(ns))
     # Retain the calibrated per-projection policy outside measured target
     # verification sizes. This decision must use actual M inside the op.
     direct = (
-        not any(spec[0] in (3, 4) for spec in specs)
+        not any(spec[0] in (3, 4, 5, 6) for spec in specs)
         and rows.shape[0] in (5, 20)
         and all(
             not _supports_band(rows.shape[0], cb)
@@ -371,11 +435,21 @@ def prepared_projection_arguments(projections):
         if hasattr(projection, "segment_format"):
             family, decoder = 3, projection.segment_format
             cb = []
+        if getattr(projection, "gguf_batch_stats", None) is not None:
+            family, decoder = (
+                6 if hasattr(projection, "dmv_format") else 5,
+                getattr(
+                    projection, "segment_format", getattr(projection, "dmv_format", 0)
+                ),
+            )
+            cb = []
         caches.append(
-            projection.dmv_high
+            projection.gguf_batch_stats
+            if family == 6
+            else projection.dmv_high
             if family == 4
             else projection.segment_high
-            if family == 3
+            if family in (3, 5)
             else projection.fp16_cache
         )
         descriptors.extend(
@@ -701,16 +775,21 @@ class GGUFPreparedProjection(Module):
                 family, decoder = 4, self.dmv_format
             if hasattr(self, "segment_format"):
                 family, decoder = 3, self.segment_format
+            batch_stats = getattr(self, "gguf_batch_stats", None)
+            if batch_stats is not None:
+                family = 6 if hasattr(self, "dmv_format") else 5
             capabilities = getattr(kernel, "operator_capabilities", ())
             blas = tuple(c for c in capabilities if "blas" in c.operator)
             return torch.ops.vllm.prepared_gguf_projection(
                 x,
                 self.codes,
                 self.stats,
-                self.dmv_high
+                batch_stats
+                if family == 6
+                else self.dmv_high
                 if family == 4
                 else self.segment_high
-                if family == 3
+                if family in (3, 5)
                 else self.fp16_cache,
                 family,
                 decoder,
