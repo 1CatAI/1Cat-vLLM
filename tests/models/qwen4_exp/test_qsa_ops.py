@@ -467,7 +467,7 @@ def test_qsa_indexer_cublas_does_not_capture_decode_rows(monkeypatch):
     set_qsa_option(monkeypatch, "qsa_cublas_min_rows", 256)
     monkeypatch.setattr(
         qsa_ops.current_platform,
-        "is_device_capability",
+        "is_device_capability_family",
         lambda capability: capability == 70,
     )
 
@@ -489,7 +489,7 @@ def test_qsa_indexer_cublas_requires_enough_score_work(monkeypatch):
 def test_qsa_lexicographic_topk_is_limited_to_sm70_qsa_shape(monkeypatch):
     monkeypatch.setattr(
         qsa_ops.current_platform,
-        "is_device_capability",
+        "is_device_capability_family",
         lambda capability: capability == 70,
     )
 
@@ -498,7 +498,7 @@ def test_qsa_lexicographic_topk_is_limited_to_sm70_qsa_shape(monkeypatch):
 
     monkeypatch.setattr(
         qsa_ops.current_platform,
-        "is_device_capability",
+        "is_device_capability_family",
         lambda capability: False,
     )
     assert not _use_sm70_qsa_lexicographic_topk(512)
